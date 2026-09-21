@@ -427,6 +427,49 @@ impl IndexPages {
         }
     }
 
+    /// Whether the pages named are cached, or would fit beside what is
+    /// charged and a reservation of `reserve` bytes without an eviction:
+    /// what a probe of them would cost the cache, before any read. A
+    /// missing page counts at its parsed size, and the largest raw page
+    /// on top, since a read holds the raw bytes while it parses them
+    pub fn admits(
+        &self,
+        file: &IndexFile,
+        column: usize,
+        pages: impl Iterator<Item = (PageKind, usize)>,
+        reserve: usize,
+    ) -> std::io::Result<bool> {
+        let mut parsed = 0usize;
+        let mut raw = 0usize;
+        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        for (kind, number) in pages {
+            let key = PageKey {
+                file_id: file.file_id,
+                generation: file.directory.generation,
+                column: column as u32,
+                kind,
+                number: number as u32,
+            };
+            if !cache.pages.contains_key(&key) {
+                let len = file.directory.page_location(column, kind, number)?.1 as usize;
+                let entries = len.saturating_sub(PAGE_OVERHEAD);
+                parsed += match kind {
+                    PageKind::Keys => {
+                        entries / KEY_ENTRY
+                            * (std::mem::size_of::<i64>() + std::mem::size_of::<u64>())
+                    }
+                    PageKind::Positions => entries / POS_ENTRY * std::mem::size_of::<u32>(),
+                };
+                raw = raw.max(len);
+            }
+        }
+        drop(cache);
+        Ok(
+            (self.charged.load(Ordering::Acquire) + parsed + raw + reserve) as u64
+                <= self.budget.load(Ordering::Acquire),
+        )
+    }
+
     fn make_room(&self, incoming: usize) {
         let budget = self.budget.load(Ordering::Acquire);
         loop {
@@ -994,7 +1037,7 @@ impl IndexFile {
     /// None when the key is absent; reads at most one key page, through
     /// the cache alone: a page the cache refuses is this call's error.
     pub fn equal(&self, column: usize, key: i64) -> std::io::Result<Option<(u64, u64)>> {
-        equal_with(&mut Cached { file: self, column }, key)
+        equal_with(&Cached { file: self, column }, key)
     }
 
     /// The upper bound the directory alone gives on the positions of keys
@@ -1021,10 +1064,90 @@ impl IndexFile {
         Ok(end - start)
     }
 
+    /// What the directory alone says of the positions of keys in
+    /// `[low, high]`, without reading a page: None when no key page touches
+    /// the range; else the positions of the pages inside the range exactly
+    /// and of the boundary pages by key interpolation, one at least
+    pub fn candidate_estimate(
+        &self,
+        column: usize,
+        low: i64,
+        high: i64,
+    ) -> std::io::Result<Option<u64>> {
+        let col = self
+            .directory
+            .column(column)
+            .ok_or_else(|| invalid("column has no index"))?;
+        if low > high {
+            return Ok(None);
+        }
+        let first = col.key_pages.partition_point(|p| p.last_key < low);
+        let last = col.key_pages.partition_point(|p| p.first_key <= high);
+        if first >= last {
+            return Ok(None);
+        }
+        let positions_of = |page: usize| -> u64 {
+            let start = col.key_pages[page].pos_start;
+            col.key_pages
+                .get(page + 1)
+                .map_or(col.n_positions, |p| p.pos_start)
+                - start
+        };
+        let share_of = |page: usize| -> u64 {
+            let p = &col.key_pages[page];
+            let span = (p.last_key as i128 - p.first_key as i128 + 1) as u128;
+            let overlap = (high.min(p.last_key) as i128 - low.max(p.first_key) as i128 + 1) as u128;
+            (positions_of(page) as u128 * overlap / span) as u64
+        };
+        let estimate = if last - first == 1 {
+            share_of(first)
+        } else {
+            let interior = col.key_pages[last - 1].pos_start - col.key_pages[first + 1].pos_start;
+            share_of(first) + interior + share_of(last - 1)
+        };
+        Ok(Some(estimate.max(1)))
+    }
+
+    /// Whether the pages a probe of `[low, high]` touches (the key pages
+    /// the range spans and the position pages under them) are cached or
+    /// would fit in the cache beside a reader's reservation of `reserve`
+    /// bytes without an eviction
+    pub fn pages_admissible(
+        &self,
+        column: usize,
+        low: i64,
+        high: i64,
+        reserve: usize,
+    ) -> std::io::Result<bool> {
+        let col = self
+            .directory
+            .column(column)
+            .ok_or_else(|| invalid("column has no index"))?;
+        let first = col.key_pages.partition_point(|p| p.last_key < low);
+        let last = col.key_pages.partition_point(|p| p.first_key <= high);
+        if first >= last {
+            return Ok(true);
+        }
+        let start = col.key_pages[first].pos_start;
+        let end = col
+            .key_pages
+            .get(last)
+            .map_or(col.n_positions, |p| p.pos_start);
+        let pos_first = col
+            .pos_pages
+            .partition_point(|p| p.pos_start <= start)
+            .saturating_sub(1);
+        let pos_last = col.pos_pages.partition_point(|p| p.pos_start < end);
+        let pages = (first..last)
+            .map(|n| (PageKind::Keys, n))
+            .chain((pos_first..pos_last).map(|n| (PageKind::Positions, n)));
+        INDEX_PAGES.admits(self, column, pages, reserve)
+    }
+
     /// The exact position index range of keys in `[low, high]`; reads the
     /// boundary key pages through the cache alone.
     pub fn range(&self, column: usize, low: i64, high: i64) -> std::io::Result<(u64, u64)> {
-        range_with(&mut Cached { file: self, column }, low, high)
+        range_with(&Cached { file: self, column }, low, high)
     }
 
     /// A cursor over the positions at index range `[start, end)` of
@@ -1059,29 +1182,27 @@ impl IndexFile {
     /// cache admits it and through the reader's own buffers when it does
     /// not, so a cache that admits nothing or a budget lowered afterwards
     /// never stops it.
-    pub fn reader(&self, column: usize, window: usize) -> std::io::Result<Reader<'_>> {
+    pub fn reader(self: &Arc<Self>, column: usize, window: usize) -> std::io::Result<Reader> {
         let window = window.max(1);
-        let bytes = window * POS_ENTRY
-            + PAGE_BYTES
-            + KEYS_PER_PAGE * (std::mem::size_of::<i64>() + std::mem::size_of::<u64>())
-            + POSITIONS_PER_PAGE * std::mem::size_of::<u32>();
         let reservation = INDEX_PAGES
-            .try_reserve(bytes)
+            .try_reserve(reader_bytes(window))
             .ok_or_else(|| refused("a reader's working reservation"))?;
         Ok(Reader {
-            file: self,
+            file: Arc::clone(self),
             column,
             next: 0,
             end: 0,
             window,
             buffer: Vec::with_capacity(window),
-            raw: Vec::with_capacity(PAGE_BYTES),
-            own_keys: PageContent::Keys {
-                keys: Vec::with_capacity(KEYS_PER_PAGE),
-                ends: Vec::with_capacity(KEYS_PER_PAGE),
-            },
-            own_positions: PageContent::Positions(Vec::with_capacity(POSITIONS_PER_PAGE)),
-            own_pages: 0,
+            own: std::cell::RefCell::new(OwnPages {
+                raw: Vec::with_capacity(PAGE_BYTES),
+                keys: PageContent::Keys {
+                    keys: Vec::with_capacity(KEYS_PER_PAGE),
+                    ends: Vec::with_capacity(KEYS_PER_PAGE),
+                },
+                positions: PageContent::Positions(Vec::with_capacity(POSITIONS_PER_PAGE)),
+                pages: 0,
+            }),
             _reservation: reservation,
         })
     }
@@ -1089,37 +1210,49 @@ impl IndexFile {
 
 /// A reader with its own working space: the cursor window and one page
 /// of each kind, so an admitted walk completes whatever the cache admits.
-pub struct Reader<'a> {
-    file: &'a IndexFile,
+/// It holds its file, so a scanner can carry it across its rows.
+pub struct Reader {
+    file: Arc<IndexFile>,
     column: usize,
     next: u64,
     end: u64,
     window: usize,
     buffer: Vec<u32>,
-    raw: Vec<u8>,
-    own_keys: PageContent,
-    own_positions: PageContent,
-    /// Pages read through the reader's own buffers rather than the cache
-    own_pages: u64,
+    own: std::cell::RefCell<OwnPages>,
     _reservation: Reservation,
 }
 
-impl Reader<'_> {
+/// The reader's own page buffers, filled when the cache refuses a page
+struct OwnPages {
+    raw: Vec<u8>,
+    keys: PageContent,
+    positions: PageContent,
+    /// Pages read through these buffers rather than the cache
+    pages: u64,
+}
+
+impl Reader {
     /// Pages this reader read through its own buffers
     pub fn own_pages(&self) -> u64 {
-        self.own_pages
+        self.own.borrow().pages
     }
 
     /// The position index range `[start, end)` of `key`, or None when the
     /// key is absent; reads at most one key page.
-    pub fn equal(&mut self, key: i64) -> std::io::Result<Option<(u64, u64)>> {
+    pub fn equal(&self, key: i64) -> std::io::Result<Option<(u64, u64)>> {
         equal_with(self, key)
     }
 
     /// The exact position index range of keys in `[low, high]`; reads the
     /// boundary key pages.
-    pub fn range(&mut self, low: i64, high: i64) -> std::io::Result<(u64, u64)> {
+    pub fn range(&self, low: i64, high: i64) -> std::io::Result<(u64, u64)> {
         range_with(self, low, high)
+    }
+
+    /// The upper bound the directory alone gives on the positions of keys
+    /// in `[low, high]`, without reading a page
+    pub fn candidate_bound(&self, low: i64, high: i64) -> std::io::Result<u64> {
+        self.file.candidate_bound(self.column, low, high)
     }
 
     /// Starts a walk over the position index range `[start, end)`
@@ -1133,12 +1266,21 @@ impl Reader<'_> {
         self.end.saturating_sub(self.next)
     }
 
+    /// The window last returned by `next_window`, in the reader's own
+    /// reserved space
+    pub fn window(&self) -> &[u32] {
+        &self.buffer
+    }
+
     /// The next window of the walk, sorted ascending, or None at the end.
     /// A page that fails to read leaves the walk where the window began.
     pub fn next_window(&mut self) -> std::io::Result<Option<&[u32]>> {
         let mut buffer = std::mem::take(&mut self.buffer);
-        let (next, end, window) = (self.next, self.end, self.window);
-        let filled = next_window_with(self, next, end, window, &mut buffer);
+        let filled = next_window_with(self, self.next, self.end, self.window, &mut buffer);
+        if filled.is_err() {
+            // A failed window is no window: the walk stays where it began
+            buffer.clear();
+        }
         self.buffer = buffer;
         match filled? {
             Some(advanced) => {
@@ -1150,9 +1292,9 @@ impl Reader<'_> {
     }
 }
 
-impl<'a> Pages<'a> for Reader<'a> {
-    fn file(&self) -> &'a IndexFile {
-        self.file
+impl Pages for Reader {
+    fn file(&self) -> &IndexFile {
+        &self.file
     }
 
     fn column(&self) -> usize {
@@ -1163,12 +1305,12 @@ impl<'a> Pages<'a> for Reader<'a> {
     /// the reader's own buffers. A real read or checksum error is the
     /// walk's error.
     fn with_page<R>(
-        &mut self,
+        &self,
         kind: PageKind,
         number: usize,
         f: impl FnOnce(&PageContent) -> R,
     ) -> std::io::Result<R> {
-        match INDEX_PAGES.load(self.file, self.column, kind, number) {
+        match INDEX_PAGES.load(&self.file, self.column, kind, number) {
             Ok(page) => return Ok(f(page.content())),
             Err(error) if is_refused(&error) => {}
             Err(error) => return Err(error),
@@ -1177,14 +1319,16 @@ impl<'a> Pages<'a> for Reader<'a> {
             .file
             .directory
             .page_location(self.column, kind, number)?;
-        self.file.read_page_into(offset, len, &mut self.raw)?;
-        let (n, entries) = verified_entries(&self.raw)?;
-        let own = match kind {
+        let mut own = self.own.borrow_mut();
+        let own = &mut *own;
+        self.file.read_page_into(offset, len, &mut own.raw)?;
+        let (n, entries) = verified_entries(&own.raw)?;
+        let content = match kind {
             PageKind::Keys => {
                 if entries.len() != n * KEY_ENTRY {
                     return Err(invalid("key page length does not match its count"));
                 }
-                let PageContent::Keys { keys, ends } = &mut self.own_keys else {
+                let PageContent::Keys { keys, ends } = &mut own.keys else {
                     return Err(invalid("expected a key page"));
                 };
                 keys.clear();
@@ -1196,13 +1340,13 @@ impl<'a> Pages<'a> for Reader<'a> {
                 if keys.windows(2).any(|w| w[0] >= w[1]) || ends.windows(2).any(|w| w[0] >= w[1]) {
                     return Err(invalid("key page is not in order"));
                 }
-                &self.own_keys
+                &own.keys
             }
             PageKind::Positions => {
                 if entries.len() != n * POS_ENTRY {
                     return Err(invalid("position page length does not match its count"));
                 }
-                let PageContent::Positions(positions) = &mut self.own_positions else {
+                let PageContent::Positions(positions) = &mut own.positions else {
                     return Err(invalid("expected a position page"));
                 };
                 positions.clear();
@@ -1213,22 +1357,22 @@ impl<'a> Pages<'a> for Reader<'a> {
                         .iter()
                         .map(|e| u32::from_le_bytes(*e)),
                 );
-                &self.own_positions
+                &own.positions
             }
         };
-        self.own_pages += 1;
-        Ok(f(own))
+        own.pages += 1;
+        Ok(f(content))
     }
 }
 
 /// Where a search or a walk gets its pages: the file, the column, and
 /// one page at a time, however it is held. The search and the walk are
 /// written once over this.
-trait Pages<'a> {
-    fn file(&self) -> &'a IndexFile;
+trait Pages {
+    fn file(&self) -> &IndexFile;
     fn column(&self) -> usize;
     fn with_page<R>(
-        &mut self,
+        &self,
         kind: PageKind,
         number: usize,
         f: impl FnOnce(&PageContent) -> R,
@@ -1241,8 +1385,8 @@ struct Cached<'a> {
     column: usize,
 }
 
-impl<'a> Pages<'a> for Cached<'a> {
-    fn file(&self) -> &'a IndexFile {
+impl Pages for Cached<'_> {
+    fn file(&self) -> &IndexFile {
         self.file
     }
 
@@ -1251,7 +1395,7 @@ impl<'a> Pages<'a> for Cached<'a> {
     }
 
     fn with_page<R>(
-        &mut self,
+        &self,
         kind: PageKind,
         number: usize,
         f: impl FnOnce(&PageContent) -> R,
@@ -1261,7 +1405,7 @@ impl<'a> Pages<'a> for Cached<'a> {
     }
 }
 
-fn column_of<'a>(pages: &impl Pages<'a>) -> std::io::Result<&'a ColumnDirectory> {
+fn column_of(pages: &impl Pages) -> std::io::Result<&ColumnDirectory> {
     pages
         .file()
         .directory
@@ -1271,7 +1415,7 @@ fn column_of<'a>(pages: &impl Pages<'a>) -> std::io::Result<&'a ColumnDirectory>
 
 /// The position index range `[start, end)` of `key`, or None when the
 /// key is absent; reads at most one key page.
-fn equal_with<'a>(pages: &mut impl Pages<'a>, key: i64) -> std::io::Result<Option<(u64, u64)>> {
+fn equal_with(pages: &impl Pages, key: i64) -> std::io::Result<Option<(u64, u64)>> {
     let col = column_of(pages)?;
     let page_no = col.key_pages.partition_point(|p| p.last_key < key);
     let Some(meta) = col.key_pages.get(page_no) else {
@@ -1295,7 +1439,7 @@ fn equal_with<'a>(pages: &mut impl Pages<'a>, key: i64) -> std::io::Result<Optio
 
 /// The exact position index range of keys in `[low, high]`; reads the
 /// boundary key pages.
-fn range_with<'a>(pages: &mut impl Pages<'a>, low: i64, high: i64) -> std::io::Result<(u64, u64)> {
+fn range_with(pages: &impl Pages, low: i64, high: i64) -> std::io::Result<(u64, u64)> {
     let col = column_of(pages)?;
     if low > high {
         return Ok((0, 0));
@@ -1349,8 +1493,8 @@ fn range_with<'a>(pages: &mut impl Pages<'a>, low: i64, high: i64) -> std::io::R
 /// the walk stands after it; None at the end. Progress is reported only
 /// for a window filled whole: a page that failed leaves the walk where
 /// the window began.
-fn next_window_with<'a>(
-    pages: &mut impl Pages<'a>,
+fn next_window_with(
+    pages: &impl Pages,
     next: u64,
     end: u64,
     window: usize,
@@ -1434,7 +1578,10 @@ impl Cursor<'_> {
     pub fn next_window(&mut self) -> std::io::Result<Option<&[u32]>> {
         let mut buffer = std::mem::take(&mut self.buffer);
         let (next, end, window) = (self.next, self.end, self.window);
-        let filled = next_window_with(&mut self.pages, next, end, window, &mut buffer);
+        let filled = next_window_with(&self.pages, next, end, window, &mut buffer);
+        if filled.is_err() {
+            buffer.clear();
+        }
         self.buffer = buffer;
         match filled? {
             Some(advanced) => {
@@ -2548,6 +2695,156 @@ pub fn still_covers(side: &IndexFile, current: &[(usize, u64)]) -> bool {
         .any(|&(column, identity)| side.covers(column, identity))
 }
 
+// =============================================================================
+// The query path's side of the contract: what a reader counts, and the
+// walk a scanner carries
+// =============================================================================
+
+/// Counters of the reads through side files, for `PRAGMA INDEX_READ_STATS`
+/// and the tests; process-wide.
+pub struct ReadCounters {
+    /// Volumes whose side file answered a probe (an empty answer included)
+    pub probes: AtomicU64,
+    /// Probes whose answer was empty, so the volume was not read at all
+    pub misses: AtomicU64,
+    /// Candidate positions the probes named
+    pub candidates: AtomicU64,
+    /// Rows produced from candidates, after every visibility rule
+    pub rows: AtomicU64,
+    /// Windows walked
+    pub windows: AtomicU64,
+    /// Volumes served by the scan because the working reservation was refused
+    pub refused: AtomicU64,
+    /// Volumes served by the scan because no side file column stands for
+    /// the index (none attached, or another identity)
+    pub ineligible: AtomicU64,
+    /// Volumes served by the scan because the candidates were too many
+    pub cost_scans: AtomicU64,
+    /// Small volumes served by the scan because their pages are not
+    /// resident and the cache has no room for them without an eviction
+    pub page_scans: AtomicU64,
+    /// Metadata-only volumes reloaded because a probe had candidates
+    pub reloads: AtomicU64,
+}
+
+pub static READS: ReadCounters = ReadCounters {
+    probes: AtomicU64::new(0),
+    misses: AtomicU64::new(0),
+    candidates: AtomicU64::new(0),
+    rows: AtomicU64::new(0),
+    windows: AtomicU64::new(0),
+    refused: AtomicU64::new(0),
+    ineligible: AtomicU64::new(0),
+    cost_scans: AtomicU64::new(0),
+    page_scans: AtomicU64::new(0),
+    reloads: AtomicU64::new(0),
+};
+
+impl ReadCounters {
+    pub fn count(&self, counter: &AtomicU64, by: u64) {
+        counter.fetch_add(by, Ordering::Relaxed);
+    }
+
+    /// The counters by name, in a fixed order
+    pub fn snapshot(&self) -> [(&'static str, u64); 10] {
+        [
+            ("probes", self.probes.load(Ordering::Relaxed)),
+            ("misses", self.misses.load(Ordering::Relaxed)),
+            ("candidates", self.candidates.load(Ordering::Relaxed)),
+            ("rows", self.rows.load(Ordering::Relaxed)),
+            ("windows", self.windows.load(Ordering::Relaxed)),
+            ("refused", self.refused.load(Ordering::Relaxed)),
+            ("ineligible", self.ineligible.load(Ordering::Relaxed)),
+            ("cost_scans", self.cost_scans.load(Ordering::Relaxed)),
+            ("page_scans", self.page_scans.load(Ordering::Relaxed)),
+            ("reloads", self.reloads.load(Ordering::Relaxed)),
+        ]
+    }
+}
+
+/// Positions a side file walk yields per window
+pub const SIDE_WINDOW: usize = 4096;
+
+/// A reader's working reservation for a window: the window, a raw page and
+/// the parsed key and position pages
+pub fn reader_bytes(window: usize) -> usize {
+    window.max(1) * POS_ENTRY
+        + PAGE_BYTES
+        + KEYS_PER_PAGE * (std::mem::size_of::<i64>() + std::mem::size_of::<u64>())
+        + POSITIONS_PER_PAGE * std::mem::size_of::<u32>()
+}
+
+/// A walk decided for a volume: the side file, the physical column and the
+/// position index range the probe found. The reader and its working
+/// reservation are taken when the walk starts (`walk`), not when the
+/// decision is made, so volumes waiting their turn hold nothing.
+pub struct SidePlan {
+    file: Arc<IndexFile>,
+    column: usize,
+    range: (u64, u64),
+}
+
+impl SidePlan {
+    pub fn new(file: Arc<IndexFile>, column: usize, range: (u64, u64)) -> Self {
+        Self {
+            file,
+            column,
+            range,
+        }
+    }
+
+    /// Candidates the walk will name
+    pub fn candidates(&self) -> u64 {
+        self.range.1 - self.range.0
+    }
+
+    /// Starts the walk: takes the reader's working reservation now. Refused
+    /// (`is_refused`), the volume goes through the scan.
+    pub fn walk(&self, window: usize) -> std::io::Result<SideWalk> {
+        let mut reader = self.file.reader(self.column, window)?;
+        reader.walk(self.range);
+        Ok(SideWalk { reader, at: 0 })
+    }
+}
+
+/// The positions a reader's walk names, taken one at a time by a scanner
+/// or a collect loop from the reader's own window: windows are pulled as
+/// they are consumed, so a LIMIT that is satisfied early leaves the later
+/// windows unread, and nothing is copied out of the reservation.
+pub struct SideWalk {
+    reader: Reader,
+    at: usize,
+}
+
+impl SideWalk {
+    /// The next candidate position, None at the end; a page that fails to
+    /// read is the walk's error and the walk stays where it was
+    pub fn next_position(&mut self) -> std::io::Result<Option<usize>> {
+        if self.at >= self.reader.window().len() {
+            match self.reader.next_window() {
+                Ok(Some(window)) if !window.is_empty() => {
+                    self.at = 0;
+                    READS.count(&READS.windows, 1);
+                }
+                Ok(_) => return Ok(None),
+                Err(error) => {
+                    // The reader's window is empty now; so is this one
+                    self.at = 0;
+                    return Err(error);
+                }
+            }
+        }
+        let position = self.reader.window()[self.at] as usize;
+        self.at += 1;
+        Ok(Some(position))
+    }
+
+    /// Candidates left, including the current window's rest
+    pub fn remaining(&self) -> u64 {
+        self.reader.remaining() + (self.reader.window().len() - self.at) as u64
+    }
+}
+
 /// Discards a side file built for a volume whose index definitions
 /// changed before it was published: the volume is uncovered
 pub fn discard_side(side: Arc<IndexFile>) {
@@ -3278,6 +3575,97 @@ mod tests {
         assert!(IndexFile::open(&path, 3).is_err());
     }
 
+    /// A window that fails to read is no window: the walk stays where it
+    /// began, reports the same remainder, and once the file is repaired
+    /// the same walk yields every position once
+    #[test]
+    fn a_failed_window_is_retried_without_repeating_positions() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sidx");
+        build(
+            &path,
+            (0..20_000u32).map(|p| (p, 1i64)).collect(),
+            WORKSPACE,
+        );
+        let file = Arc::new(IndexFile::open(&path, 3).unwrap());
+        let good = std::fs::read(&path).unwrap();
+        let mut bad = good.clone();
+        let second_page = file.directory().column(1).unwrap().pos_pages[1].offset as usize + 10;
+        bad[second_page] ^= 0xff;
+        std::fs::write(&path, &bad).unwrap();
+        INDEX_PAGES.clear();
+        let mut walk = SidePlan::new(Arc::clone(&file), 1, (4096, 10_000))
+            .walk(4096)
+            .unwrap();
+        // The pages come through the reader's own buffers, not the cache
+        let charged = INDEX_PAGES.stats().charged_bytes;
+        INDEX_PAGES.set_budget_bytes(charged as u64);
+        let err = walk.next_position().unwrap_err();
+        assert!(err.to_string().contains("checksum"), "{err}");
+        assert_eq!(walk.remaining(), 5904, "the walk stayed where it began");
+        std::fs::write(&path, &good).unwrap();
+        let mut got = Vec::new();
+        while let Some(position) = walk.next_position().unwrap() {
+            got.push(position);
+        }
+        drop(walk);
+        INDEX_PAGES.set_budget_bytes(DEFAULT_BUDGET_BYTES);
+        INDEX_PAGES.clear();
+        assert_eq!(got.len(), 5904);
+        let unique: std::collections::BTreeSet<usize> = got.iter().copied().collect();
+        assert_eq!(unique.len(), 5904, "every position once");
+        assert_eq!(got[0], 4096);
+    }
+
+    /// A refill that fails after a window was served: the walk reports the
+    /// remainder from the window's end and, repaired, yields the rest once
+    #[test]
+    fn a_failed_refill_after_a_served_window_keeps_the_remainder() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sidx");
+        build(
+            &path,
+            (0..20_000u32).map(|p| (p, 1i64)).collect(),
+            WORKSPACE,
+        );
+        let file = Arc::new(IndexFile::open(&path, 3).unwrap());
+        let good = std::fs::read(&path).unwrap();
+        let mut bad = good.clone();
+        let second_page = file.directory().column(1).unwrap().pos_pages[1].offset as usize + 10;
+        bad[second_page] ^= 0xff;
+        INDEX_PAGES.clear();
+        let mut walk = SidePlan::new(Arc::clone(&file), 1, (0, 20_000))
+            .walk(4096)
+            .unwrap();
+        let charged = INDEX_PAGES.stats().charged_bytes;
+        INDEX_PAGES.set_budget_bytes(charged as u64);
+        let mut got = Vec::new();
+        for _ in 0..4096 {
+            got.push(walk.next_position().unwrap().unwrap());
+        }
+        assert_eq!(walk.remaining(), 15_904);
+        std::fs::write(&path, &bad).unwrap();
+        let err = walk.next_position().unwrap_err();
+        assert!(err.to_string().contains("checksum"), "{err}");
+        assert_eq!(
+            walk.remaining(),
+            15_904,
+            "the failed refill changed nothing"
+        );
+        std::fs::write(&path, &good).unwrap();
+        while let Some(position) = walk.next_position().unwrap() {
+            got.push(position);
+        }
+        drop(walk);
+        INDEX_PAGES.set_budget_bytes(DEFAULT_BUDGET_BYTES);
+        INDEX_PAGES.clear();
+        assert_eq!(got.len(), 20_000);
+        let unique: std::collections::BTreeSet<usize> = got.iter().copied().collect();
+        assert_eq!(unique.len(), 20_000, "every position once");
+    }
+
     #[test]
     fn a_page_read_after_the_file_was_replaced_reports_the_generation() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -3661,7 +4049,7 @@ mod tests {
             WORKSPACE,
         );
         INDEX_PAGES.clear();
-        let file = IndexFile::open(&path, 16).unwrap();
+        let file = Arc::new(IndexFile::open(&path, 16).unwrap());
         let refused_before = INDEX_PAGES.stats().refused;
         INDEX_PAGES.set_budget_bytes(INDEX_PAGES.stats().charged_bytes as u64);
         let err = match file.reader(1, 64) {
@@ -3681,7 +4069,7 @@ mod tests {
         let pairs: Vec<(u32, i64)> = (0..200_000u32).map(|p| (p, (p % 40_000) as i64)).collect();
         build(&path, pairs.clone(), WORKSPACE);
         INDEX_PAGES.clear();
-        let file = IndexFile::open(&path, 17).unwrap();
+        let file = Arc::new(IndexFile::open(&path, 17).unwrap());
         // What the cache path answers, with the budget open
         INDEX_PAGES.set_budget_bytes(DEFAULT_BUDGET_BYTES);
         let range = file.range(1, 100, 2_100).unwrap();
@@ -3724,7 +4112,7 @@ mod tests {
         let pairs: Vec<(u32, i64)> = (0..30_000u32).map(|p| (p, (p % 5000) as i64)).collect();
         build(&path, pairs, WORKSPACE);
         let good = std::fs::read(&path).unwrap();
-        let file = IndexFile::open(&path, 18).unwrap();
+        let file = Arc::new(IndexFile::open(&path, 18).unwrap());
         let second = file.directory().column(1).unwrap().pos_pages[1].offset as usize + 10;
         let mut bad = good.clone();
         bad[second] ^= 0xff;
@@ -3756,7 +4144,7 @@ mod tests {
         // One key over three position pages
         build(&path, (0..20_000u32).map(|p| (p, 42)).collect(), WORKSPACE);
         let good = std::fs::read(&path).unwrap();
-        let file = IndexFile::open(&path, 19).unwrap();
+        let file = Arc::new(IndexFile::open(&path, 19).unwrap());
         let second = file.directory().column(1).unwrap().pos_pages[1].offset as usize + 10;
         let mut bad = good.clone();
         bad[second] ^= 0xff;

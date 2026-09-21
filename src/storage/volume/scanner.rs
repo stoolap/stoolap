@@ -88,6 +88,23 @@ impl GroupColumnCache {
 /// the requested columns. Skips rows marked as deleted in the segment-scoped
 /// delete vector. Optionally evaluates a predicate to skip non-matching rows
 /// without full Value construction.
+/// A side file walk as a scanner carries it: the plan, the walk once
+/// started, and the rows served, counted once when the state goes
+struct SideState {
+    plan: super::secondary::SidePlan,
+    walk: Option<super::secondary::SideWalk>,
+    rows: u64,
+    done: bool,
+}
+
+impl Drop for SideState {
+    fn drop(&mut self) {
+        if self.rows > 0 {
+            super::secondary::READS.count(&super::secondary::READS.rows, self.rows);
+        }
+    }
+}
+
 pub struct VolumeScanner {
     /// Shared reference to the frozen volume
     volume: Arc<FrozenVolume>,
@@ -122,6 +139,11 @@ pub struct VolumeScanner {
     matching_indices: Option<Vec<usize>>,
     /// Current position in matching_indices.
     match_idx: usize,
+    /// The side file walk decided for this volume: its reader is taken
+    /// when the scanner starts and let go when the walk ends, so volumes
+    /// waiting their turn hold no reservation; set, the scanner reads the
+    /// walk's rows alone
+    side: Option<SideState>,
     /// Pre-computed inter-volume visibility bitmap.
     /// Bit i is set (1) if row at index i is visible (not overridden by a newer volume).
     /// Stored as packed u64 words: word w covers rows [w*64 .. w*64+63].
@@ -189,11 +211,10 @@ impl VolumeScanner {
         let target = match (bound, self.volume.columns.data_type(col_idx)) {
             (Value::Integer(v), crate::core::DataType::Integer) => *v,
             (Value::Timestamp(dt), crate::core::DataType::Timestamp) => {
-                dt.timestamp_nanos_opt().unwrap_or_else(|| {
-                    dt.timestamp()
-                        .saturating_mul(1_000_000_000)
-                        .saturating_add(dt.timestamp_subsec_nanos() as i64)
-                })
+                match dt.timestamp_nanos_opt() {
+                    Some(nanos) => nanos,
+                    None => return,
+                }
             }
             _ => return,
         };
@@ -358,6 +379,7 @@ impl VolumeScanner {
             column_mapping: None,
             dict_filters: Vec::new(),
             matching_indices: None,
+            side: None,
             match_idx: 0,
             visibility_bitmap: None,
             pending_cold_deletes: None,
@@ -417,6 +439,7 @@ impl VolumeScanner {
             column_mapping: None,
             dict_filters: Vec::new(),
             matching_indices: None,
+            side: None,
             match_idx: 0,
             visibility_bitmap: None,
             pending_cold_deletes: None,
@@ -508,6 +531,7 @@ impl VolumeScanner {
             column_mapping: None,
             dict_filters: Vec::new(),
             matching_indices: None,
+            side: None,
             match_idx: 0,
             visibility_bitmap: None,
             pending_cold_deletes: None,
@@ -618,7 +642,7 @@ impl VolumeScanner {
         // large Vec allocation — use streaming dict filter in the slow path instead.
         // An ordered walk may stop after a few rows, so it never pays for the
         // whole range up front.
-        if !self.dict_filters.is_empty() && !self.ordered_walk {
+        if !self.dict_filters.is_empty() && !self.ordered_walk && self.side.is_none() {
             let scan_range = self.end_idx - self.current_idx;
             let selectivity_cap = scan_range / 10; // 10% threshold
             let matches = if let Some(st) = store {
@@ -773,12 +797,12 @@ impl VolumeScanner {
                 (Value::Integer(v), crate::core::DataType::Integer) => TypedTarget::Int64(*v),
                 (Value::Float(v), crate::core::DataType::Float) => TypedTarget::Float64(*v),
                 (Value::Boolean(v), crate::core::DataType::Boolean) => TypedTarget::Bool(*v),
+                // A bound nanoseconds cannot hold is left to the filter
                 (Value::Timestamp(dt), crate::core::DataType::Timestamp) => {
-                    TypedTarget::Int64(dt.timestamp_nanos_opt().unwrap_or_else(|| {
-                        dt.timestamp()
-                            .saturating_mul(1_000_000_000)
-                            .saturating_add(dt.timestamp_subsec_nanos() as i64)
-                    }))
+                    match dt.timestamp_nanos_opt() {
+                        Some(nanos) => TypedTarget::Int64(nanos),
+                        None => continue,
+                    }
                 }
                 // Only lossless integers: `i as f64` rounds above 2^53 and
                 // the pre-filter must never reject rows the full filter
@@ -946,6 +970,20 @@ impl VolumeScanner {
     /// position: the rest of a row comes back as typed NULLs. Set after
     /// the mapping, before the filter, whose columns are added to it
     /// when it can name them
+    /// Reads the rows a side file's walk names, in the walk's order, with
+    /// every skip rule and the filter applied to each; the range and the
+    /// dictionary pre-filter are set aside. Set before the filter, so the
+    /// filter's dictionary pre-scan is not done for rows the walk names.
+    pub fn set_side_plan(&mut self, plan: super::secondary::SidePlan) {
+        self.side = Some(SideState {
+            plan,
+            walk: None,
+            rows: 0,
+            done: false,
+        });
+        self.matching_indices = None;
+    }
+
     pub fn set_needed_cols(&mut self, needed: &[bool]) {
         let len = needed
             .len()
@@ -1244,17 +1282,63 @@ impl VolumeScanner {
         if !use_group_cache_fast && self.group_cache.is_some() {
             self.group_cache = None;
         }
-        if self.matching_indices.is_some() {
-            loop {
-                let idx = match self.matching_indices.as_ref() {
-                    Some(indices) if self.match_idx < indices.len() => {
-                        let i = indices[self.match_idx];
-                        self.match_idx += 1;
-                        i
+        // The walk's reader is taken when the scanner starts; refused, the
+        // volume is read by the plain scan below, before any row was produced
+        if let Some(side) = self.side.as_mut() {
+            if side.done {
+                self.has_current = false;
+                return Ok(false);
+            }
+            if side.walk.is_none() {
+                match side.plan.walk(super::secondary::SIDE_WINDOW) {
+                    Ok(walk) => side.walk = Some(walk),
+                    Err(error) if super::secondary::is_refused(&error) => {
+                        super::secondary::READS.count(&super::secondary::READS.refused, 1);
+                        self.side = None;
                     }
-                    _ => {
+                    Err(error) => {
                         self.has_current = false;
-                        return Ok(false);
+                        return Err(crate::core::Error::internal(format!(
+                            "side index read failed: {error}"
+                        )));
+                    }
+                }
+            }
+        }
+        if self.matching_indices.is_some() || self.side.is_some() {
+            loop {
+                let idx = if let Some(side) = self.side.as_mut() {
+                    let next = side
+                        .walk
+                        .as_mut()
+                        .map_or(Ok(None), |walk| walk.next_position());
+                    match next {
+                        Ok(Some(i)) => i,
+                        Ok(None) => {
+                            // The walk is over: its reader and reservation go now
+                            side.walk = None;
+                            side.done = true;
+                            self.has_current = false;
+                            return Ok(false);
+                        }
+                        Err(error) => {
+                            self.has_current = false;
+                            return Err(crate::core::Error::internal(format!(
+                                "side index read failed: {error}"
+                            )));
+                        }
+                    }
+                } else {
+                    match self.matching_indices.as_ref() {
+                        Some(indices) if self.match_idx < indices.len() => {
+                            let i = indices[self.match_idx];
+                            self.match_idx += 1;
+                            i
+                        }
+                        _ => {
+                            self.has_current = false;
+                            return Ok(false);
+                        }
                     }
                 };
 
@@ -1282,6 +1366,9 @@ impl VolumeScanner {
                     continue;
                 }
 
+                if let Some(side) = self.side.as_mut() {
+                    side.rows += 1;
+                }
                 self.current_rid = self.volume.meta.row_ids[idx];
                 self.has_current = true;
                 return Ok(true);
@@ -1374,6 +1461,8 @@ impl Scanner for VolumeScanner {
 
     fn close(&mut self) -> Result<()> {
         self.has_current = false;
+        // The side walk's reader and reservation go with the scanner's use
+        self.side = None;
         Ok(())
     }
 

@@ -3604,6 +3604,10 @@ impl Table for MVCCTable {
         self.version_store.get_index_by_column(column_name)
     }
 
+    fn secondary_index_identities(&self) -> Vec<(usize, u64)> {
+        self.version_store.secondary_index_identities()
+    }
+
     fn get_index(&self, name: &str) -> Option<std::sync::Arc<dyn Index>> {
         self.version_store.get_index(name)
     }

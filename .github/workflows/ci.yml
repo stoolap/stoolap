@@ -106,7 +106,7 @@ jobs:
       run: cargo test --test differential_oracle_test --features sqlite
 
     - name: Failpoint tests
-      run: cargo test --test failpoint_io_test --test captured_version_payload_test --test cold_read_consistency_test --test limit_cold_read_consistency_test --test limit_seal_consistency_test --test secondary_side_file_test --features test-failpoints -- --test-threads=1
+      run: cargo test --test failpoint_io_test --test captured_version_payload_test --test cold_read_consistency_test --test limit_cold_read_consistency_test --test limit_seal_consistency_test --test secondary_side_file_test --test secondary_index_query_test --features test-failpoints -- --test-threads=1
 
   coverage:
     name: Code Coverage

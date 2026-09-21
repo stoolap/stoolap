@@ -1318,11 +1318,7 @@ impl SegmentManager {
             };
             let target = match value {
                 crate::core::Value::Integer(int_val) => Some(*int_val),
-                crate::core::Value::Timestamp(ts_val) => Some(
-                    ts_val
-                        .timestamp_nanos_opt()
-                        .unwrap_or(ts_val.timestamp() * 1_000_000_000),
-                ),
+                crate::core::Value::Timestamp(ts_val) => ts_val.timestamp_nanos_opt(),
                 _ => None,
             };
             if let Some(target) = target {

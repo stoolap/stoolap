@@ -809,6 +809,13 @@ pub trait Table: Send + Sync {
         None // Default implementation - override in concrete tables
     }
 
+    /// The columns a volume's side file may serve for this table's
+    /// indexes, each with the identity the catalog issued to the index:
+    /// empty for a table without such indexes
+    fn secondary_index_identities(&self) -> Vec<(usize, u64)> {
+        Vec::new()
+    }
+
     /// An index on `column_name` whose row ids cover every visible row of
     /// the table, so the executor may probe it directly. A table that keeps
     /// part of its rows outside the index returns None and the executor
