@@ -18,6 +18,14 @@
 
 use stoolap::Database;
 
+/// The decoded-group counter is process-wide, so the tests that measure
+/// it run one at a time, their fixtures included, whatever the runner does
+static DECODES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn measuring() -> std::sync::MutexGuard<'static, ()> {
+    DECODES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn ids(db: &Database, sql: &str) -> Vec<i64> {
     db.query(sql, ())
         .unwrap()
@@ -205,6 +213,7 @@ fn a_limit_over_an_exists_set_with_absent_members_counts_the_rows_found() {
 /// the fetch stops once the rows found satisfy it.
 #[test]
 fn a_small_limit_over_a_long_list_reads_a_few_rows() {
+    let _measuring = measuring();
     let dir = tempfile::tempdir().unwrap();
     let dsn = format!(
         "file://{}?sync_mode=none&checkpoint_on_close=off&checkpoint_interval=0&compact_threshold=100",
@@ -265,6 +274,7 @@ fn a_small_limit_over_a_long_list_reads_a_few_rows() {
 /// remaining member's.
 #[test]
 fn a_run_of_absent_members_does_not_make_the_next_fetch_read_everything() {
+    let _measuring = measuring();
     let dir = tempfile::tempdir().unwrap();
     let dsn = format!(
         "file://{}?sync_mode=none&checkpoint_on_close=off&checkpoint_interval=0&compact_threshold=100",
