@@ -2938,6 +2938,8 @@ impl Index for HnswIndex {
             }
         }
 
+        // The rows the batch takes out no longer stand in a newcomer's way
+        let departing: I64Set = leaving.iter().copied().collect();
         if self.is_unique {
             // Pre-validate full batch before mutating the graph so add_batch is atomic.
             let mut seen: ahash::AHashMap<&[u8], i64> =
@@ -2955,7 +2957,9 @@ impl Index for HnswIndex {
                     seen.insert(vec_bytes, row_id);
                 }
 
-                if Self::find_exact_duplicate_in_inner(&inner, vec_bytes, row_id, None).is_some() {
+                if Self::find_exact_duplicate_in_inner(&inner, vec_bytes, row_id, Some(&departing))
+                    .is_some()
+                {
                     return Err(crate::core::Error::unique_constraint(
                         &self.name,
                         self.column_names.join(", "),
@@ -3015,6 +3019,8 @@ impl Index for HnswIndex {
             }
         }
 
+        // The rows the batch takes out no longer stand in a newcomer's way
+        let departing: I64Set = leaving.iter().copied().collect();
         if self.is_unique {
             // Pre-validate full batch before mutating the graph so add_batch_slice is atomic.
             let mut seen: ahash::AHashMap<&[u8], i64> =
@@ -3032,7 +3038,9 @@ impl Index for HnswIndex {
                     seen.insert(vec_bytes, row_id);
                 }
 
-                if Self::find_exact_duplicate_in_inner(&inner, vec_bytes, row_id, None).is_some() {
+                if Self::find_exact_duplicate_in_inner(&inner, vec_bytes, row_id, Some(&departing))
+                    .is_some()
+                {
                     return Err(crate::core::Error::unique_constraint(
                         &self.name,
                         self.column_names.join(", "),
@@ -3297,15 +3305,30 @@ mod tests {
                 index.add(&[make_vector_value(&[1.0, 0.0])], 4, 4).is_err(),
                 "slice {slice}: row 1's vector stays unique"
             );
-            // An accepted batch does take the row out
-            let mut entries: I64Map<Vec<Value>> = I64Map::new();
-            entries.insert(1, vec![Value::Null(crate::core::DataType::Null)]);
-            index.add_batch(&entries).unwrap();
+            // An accepted batch does take the row out, and a newcomer may
+            // take the departing row's vector in the same batch
+            let reused = make_vector_value(&[1.0, 0.0]);
+            let accepted = if slice {
+                index.add_batch_slice(&[
+                    (1, std::slice::from_ref(&null)),
+                    (5, std::slice::from_ref(&reused)),
+                ])
+            } else {
+                let mut entries: I64Map<Vec<Value>> = I64Map::new();
+                entries.insert(1, vec![null.clone()]);
+                entries.insert(5, vec![reused.clone()]);
+                index.add_batch(&entries)
+            };
+            accepted.unwrap_or_else(|e| panic!("slice {slice}: the reuse is accepted: {e}"));
             let nearest = index.search_nearest(query, 1, 64);
             assert_eq!(
                 nearest.first().map(|(id, _)| *id),
-                Some(2),
-                "slice {slice}: row 1 left"
+                Some(5),
+                "slice {slice}: row 5 took the vector"
+            );
+            assert!(
+                index.add(&[make_vector_value(&[1.0, 0.0])], 6, 6).is_err(),
+                "slice {slice}: the vector is row 5's now"
             );
         }
     }
