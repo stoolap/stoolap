@@ -89,32 +89,86 @@ pub fn side_path_for(volume_path: &Path, generation: u64) -> PathBuf {
     volume_path.with_extension(format!("g{generation:x}.{SIDE_EXT}"))
 }
 
-/// The side files beside `volume_path`, of any generation
-fn side_files_of(volume_path: &Path) -> Vec<PathBuf> {
-    let Some(stem) = volume_path.file_stem().and_then(|s| s.to_str()) else {
-        return Vec::new();
-    };
-    let Some(dir) = volume_path.parent() else {
-        return Vec::new();
-    };
-    let plain = format!("{stem}.{SIDE_EXT}");
-    let prefix = format!("{stem}.g");
-    let suffix = format!(".{SIDE_EXT}");
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|name| {
-                    name == plain || (name.starts_with(&prefix) && name.ends_with(&suffix))
-                })
-        })
-        .collect();
-    files.sort();
-    files
+/// The side files of a table's directory, of every generation, grouped by
+/// the volume they stand beside: one directory read serves every volume
+/// of the table, at reopen and at retirement alike
+pub struct SideFiles {
+    by_volume: std::collections::HashMap<String, Vec<PathBuf>>,
+}
+
+impl SideFiles {
+    pub fn in_dir(dir: &Path) -> Self {
+        let mut by_volume: std::collections::HashMap<String, Vec<PathBuf>> =
+            std::collections::HashMap::new();
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some(SIDE_EXT) {
+                continue;
+            }
+            if let Some(stem) = side_stem(&path) {
+                by_volume.entry(stem).or_default().push(path);
+            }
+        }
+        for files in by_volume.values_mut() {
+            files.sort();
+        }
+        Self { by_volume }
+    }
+
+    /// The side files beside `volume_path`
+    pub fn of(&self, volume_path: &Path) -> &[PathBuf] {
+        volume_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|stem| self.by_volume.get(stem))
+            .map_or(&[], |files| files.as_slice())
+    }
+
+    /// The side file to attach beside `volume_path` at reopen: the newest
+    /// generation that opens; the older generations that open go, and a
+    /// file that does not open stays where it is, logged, since a failed
+    /// open shows nothing about the file
+    pub fn open_for(&self, volume_path: &Path, file_id: u64) -> Option<Arc<IndexFile>> {
+        let mut newest: Option<(PathBuf, Arc<IndexFile>)> = None;
+        let mut unreadable = 0usize;
+        for side in self.of(volume_path) {
+            let handle = VolumeFile::shared(side);
+            match IndexFile::open_through(&handle, file_id) {
+                Ok(file) => {
+                    let file = Arc::new(file);
+                    match newest.take() {
+                        Some((older_path, older)) if older.generation() >= file.generation() => {
+                            drop(file);
+                            retire_file(side);
+                            newest = Some((older_path, older));
+                        }
+                        Some((older_path, older)) => {
+                            drop(older);
+                            retire_file(&older_path);
+                            newest = Some((side.clone(), file));
+                        }
+                        None => newest = Some((side.clone(), file)),
+                    }
+                }
+                Err(error) => {
+                    eprintln!("Warning: side index {:?} unavailable: {error}", side);
+                    unreadable += 1;
+                }
+            }
+        }
+        if newest.is_none() && unreadable > 0 {
+            eprintln!("Warning: the volume {:?} is uncovered", volume_path);
+        }
+        newest.map(|(_, file)| file)
+    }
+
+    /// Retires the side files beside `volume_path`, of every generation:
+    /// each goes once its last holder lets go
+    pub fn retire_for(&self, volume_path: &Path) {
+        for side in self.of(volume_path) {
+            retire_file(side);
+        }
+    }
 }
 
 /// The volume id a side file's stem stands for, the generation stripped
@@ -2805,53 +2859,11 @@ pub fn stage_side_for(
     }
 }
 
-/// The side file beside `volume_path` at reopen, if there is one it can
-/// read. One it cannot read stays where it is, logged: a failed open
-/// does not show the file is bad, and the volume is uncovered until the
-/// next compaction rewrites it
+/// The side file to attach beside `volume_path` at reopen, from a read of
+/// its directory; see `SideFiles::open_for`
 pub fn open_side_for(volume_path: &Path, file_id: u64) -> Option<Arc<IndexFile>> {
-    // Of the generations beside the volume, the newest that opens is
-    // attached and the others go; a file that does not open stays only
-    // while no newer one opens
-    let mut newest: Option<(PathBuf, Arc<IndexFile>)> = None;
-    let mut unreadable: Vec<PathBuf> = Vec::new();
-    for side in side_files_of(volume_path) {
-        let handle = VolumeFile::shared(&side);
-        match IndexFile::open_through(&handle, file_id) {
-            Ok(file) => {
-                let file = Arc::new(file);
-                let older = newest.replace((side, file));
-                if let Some((path, older)) = older {
-                    if older.generation() > newest.as_ref().map_or(0, |(_, n)| n.generation()) {
-                        let (newer_path, newer) = newest.replace((path, older)).expect("set");
-                        retire_file(&newer_path);
-                        drop(newer);
-                    } else {
-                        drop(older);
-                        retire_file(&path);
-                    }
-                }
-            }
-            Err(error) => {
-                eprintln!("Warning: side index {:?} unavailable: {error}", side);
-                unreadable.push(side);
-            }
-        }
-    }
-    match newest {
-        Some((_, file)) => {
-            for path in unreadable {
-                retire_file(&path);
-            }
-            Some(file)
-        }
-        None => {
-            if !unreadable.is_empty() {
-                eprintln!("Warning: the volume {:?} is uncovered", volume_path);
-            }
-            None
-        }
-    }
+    let dir = volume_path.parent()?;
+    SideFiles::in_dir(dir).open_for(volume_path, file_id)
 }
 
 fn retire_file(side: &Path) {
@@ -2863,10 +2875,11 @@ fn retire_file(side: &Path) {
 }
 
 /// Retires the side files beside `volume_path`, of every generation: each
-/// goes once its last holder lets go
+/// goes once its last holder lets go. A loop over a table's volumes reads
+/// the directory once through `SideFiles` instead
 pub fn retire_side_of(volume_path: &Path) {
-    for side in side_files_of(volume_path) {
-        retire_file(&side);
+    if let Some(dir) = volume_path.parent() {
+        SideFiles::in_dir(dir).retire_for(volume_path);
     }
 }
 
@@ -3855,6 +3868,61 @@ mod tests {
         assert_eq!(got.len(), 20_000);
         let unique: std::collections::BTreeSet<usize> = got.iter().copied().collect();
         assert_eq!(unique.len(), 20_000, "every position once");
+    }
+
+    /// A directory read once groups the generations by volume; the newest
+    /// that opens is attached and a newer one that does not open stays
+    #[test]
+    fn side_files_are_grouped_by_volume_and_an_unreadable_newer_one_stays() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let volume = dir.path().join("vol_1.vol");
+        let other = dir.path().join("vol_2.vol");
+        build(
+            &side_path(&volume),
+            (0..10u32).map(|p| (p, 1i64)).collect(),
+            WORKSPACE,
+        );
+        build(
+            &side_path_for(&volume, 9),
+            (0..10u32).map(|p| (p, 2i64)).collect(),
+            WORKSPACE,
+        );
+        build(
+            &side_path(&other),
+            (0..10u32).map(|p| (p, 3i64)).collect(),
+            WORKSPACE,
+        );
+        let files = SideFiles::in_dir(dir.path());
+        assert_eq!(files.of(&volume).len(), 2);
+        assert_eq!(files.of(&other).len(), 1);
+        assert!(files.of(&dir.path().join("vol_3.vol")).is_empty());
+        INDEX_PAGES.clear();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let newer = side_path_for(&volume, 9);
+            std::fs::set_permissions(&newer, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let attached = files.open_for(&volume, 1).unwrap();
+            assert!(
+                attached.equal(1, 1).unwrap().is_some(),
+                "the older generation serves"
+            );
+            drop(attached);
+            assert!(
+                newer.exists(),
+                "the newer generation stays for a later open"
+            );
+            std::fs::set_permissions(&newer, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let attached = SideFiles::in_dir(dir.path()).open_for(&volume, 1).unwrap();
+        assert!(
+            attached.equal(1, 2).unwrap().is_some(),
+            "the newest generation"
+        );
+        drop(attached);
+        assert!(!side_path(&volume).exists(), "the older generation went");
+        assert!(side_path(&other).exists(), "the other volume's file stays");
     }
 
     #[test]

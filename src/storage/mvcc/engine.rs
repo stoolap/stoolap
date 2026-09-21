@@ -3444,6 +3444,9 @@ impl MVCCEngine {
                 Option<Arc<crate::storage::volume::secondary::IndexFile>>,
             )> = Vec::new();
 
+            // The table's side files, read once for every volume
+            let sides =
+                crate::storage::volume::secondary::SideFiles::in_dir(&vol_dir.join(&table_name));
             for path in paths {
                 let volume_id = parse_volume_id(&path);
                 let volume = match crate::storage::volume::io::read_volume_from_disk(&path) {
@@ -3458,7 +3461,7 @@ impl MVCCEngine {
                 };
 
                 let stable_id = volume_id.unwrap_or(0);
-                let side = crate::storage::volume::secondary::open_side_for(&path, stable_id);
+                let side = sides.open_for(&path, stable_id);
                 standalone.push((stable_id, volume, side));
             }
 
@@ -3529,6 +3532,8 @@ impl MVCCEngine {
             }
 
             let mgr = self.get_or_create_segment_manager(&table_name);
+            let sides =
+                crate::storage::volume::secondary::SideFiles::in_dir(&vol_dir.join(&table_name));
             for path in paths {
                 let volume_id = parse_volume_id(&path);
                 let stable_id = volume_id.unwrap_or(0);
@@ -3538,7 +3543,7 @@ impl MVCCEngine {
                 // without being deserialized.
                 if stable_id == 0 {
                     let _ = std::fs::remove_file(&path);
-                    crate::storage::volume::secondary::retire_side_of(&path);
+                    sides.retire_for(&path);
                     continue;
                 }
                 if mgr.has_segment(stable_id) {
@@ -3546,7 +3551,7 @@ impl MVCCEngine {
                 }
                 if !mgr.manifest_has_segment(stable_id) {
                     let _ = std::fs::remove_file(&path);
-                    crate::storage::volume::secondary::retire_side_of(&path);
+                    sides.retire_for(&path);
                     continue;
                 }
 
@@ -3561,7 +3566,7 @@ impl MVCCEngine {
                         continue;
                     }
                 };
-                let side = crate::storage::volume::secondary::open_side_for(&path, stable_id);
+                let side = sides.open_for(&path, stable_id);
                 mgr.load_volume_for_existing_segment(stable_id, volume, side);
             }
             // Recompute visibility bitmaps after all volumes for this table are loaded.
@@ -5795,15 +5800,16 @@ impl MVCCEngine {
             // attached before goes once its last holder lets go. Else the
             // staged file goes with its directory
             let _ddl = self.ddl_guard();
+            // The volume's file owner knows where a rename moved it, whether
+            // or not the segment is still registered, so a discard finds
+            // the build directory too
+            staged.relocate(&file.path());
             let now = mgr.cold_snapshot();
             let current_path = now
                 .segs
                 .get(&seg_id)
                 .and_then(|cs| cs.file.as_ref())
                 .map(|f| f.path());
-            if let Some(current_path) = current_path.as_ref() {
-                staged.relocate(current_path);
-            }
             if self.closing.load(Ordering::Acquire) {
                 report.discarded += 1;
                 break;
@@ -6483,10 +6489,9 @@ impl MVCCEngine {
                         }
                     }
                 }
+                let sides = crate::storage::volume::secondary::SideFiles::in_dir(&vol_table_dir);
                 for (id, _) in volumes.iter() {
-                    crate::storage::volume::secondary::retire_side_of(
-                        &vol_table_dir.join(format!("vol_{:016x}.vol", id)),
-                    );
+                    sides.retire_for(&vol_table_dir.join(format!("vol_{:016x}.vol", id)));
                 }
                 continue;
             }
@@ -6821,10 +6826,9 @@ impl MVCCEngine {
             }
             // The inputs' side files go with them, each once its last
             // holder lets go
+            let sides = crate::storage::volume::secondary::SideFiles::in_dir(&vol_table_dir);
             for (id, _) in volumes.iter() {
-                crate::storage::volume::secondary::retire_side_of(
-                    &vol_table_dir.join(format!("vol_{:016x}.vol", id)),
-                );
+                sides.retire_for(&vol_table_dir.join(format!("vol_{:016x}.vol", id)));
             }
         }
 

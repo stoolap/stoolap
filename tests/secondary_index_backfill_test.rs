@@ -875,3 +875,41 @@ fn a_rename_after_the_staging_publishes_where_the_volume_is_now() {
     db.close().unwrap();
     assert!(leftovers(dir.path(), "archived").is_empty());
 }
+
+/// A table renamed and then truncated or dropped while its volume's side
+/// file is staged: the staged file is found through the volume's file
+/// owner wherever the rename moved it, discarded, and nothing is left.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_rename_then_truncate_or_drop_after_the_staging_leaves_nothing() {
+    for drop_table in [false, true] {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(dir.path(), "");
+        create(&db);
+        seal_volumes(&db, 1);
+        db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+        let other = db.clone();
+        stoolap::test_failpoints::after_side_backfilled(move || {
+            other
+                .execute("ALTER TABLE t RENAME TO archived", ())
+                .unwrap();
+            if drop_table {
+                other.execute("DROP TABLE archived", ()).unwrap();
+            } else {
+                other.execute("TRUNCATE TABLE archived", ()).unwrap();
+            }
+        });
+        let pass = backfill(&db, None);
+        assert_eq!((pass["built"], pass["discarded"]), (0, 1), "{pass:?}");
+        assert!(
+            leftovers(dir.path(), "archived").is_empty(),
+            "drop {drop_table}: nothing left in the moved directory"
+        );
+        db.close().unwrap();
+        assert!(
+            leftovers(dir.path(), "archived").is_empty(),
+            "drop {drop_table}: after close"
+        );
+    }
+}

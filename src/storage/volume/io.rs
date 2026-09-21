@@ -528,15 +528,20 @@ pub fn delete_volume(path: &Path) -> Result<()> {
 /// Delete all volumes for a table, and the side files beside them.
 pub fn delete_all_volumes(dir: &Path, table_name: &str) -> Result<()> {
     let paths = list_volumes(dir, table_name);
-    for path in paths {
-        delete_volume(&path)?;
-    }
     let table_dir = dir.join(table_name);
-    // A side file whose volume is already gone goes the same way
+    // The side files, of every generation, read once; those whose volume
+    // is already gone go the same way
+    let sides = super::secondary::SideFiles::in_dir(&table_dir);
+    for path in paths {
+        super::writer::VolumeFile::retire_path(&path).map_err(|e| {
+            crate::core::Error::internal(format!("failed to delete volume {:?}: {}", path, e))
+        })?;
+        sides.retire_for(&path);
+    }
     if let Ok(entries) = std::fs::read_dir(&table_dir) {
         for path in entries.flatten().map(|e| e.path()) {
             if path.extension().and_then(|e| e.to_str()) == Some(super::secondary::SIDE_EXT) {
-                super::secondary::retire_side_of(&path.with_extension(VOLUME_EXT));
+                sides.retire_for(&path.with_extension(VOLUME_EXT));
             }
         }
     }
