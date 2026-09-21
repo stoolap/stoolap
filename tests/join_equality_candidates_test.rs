@@ -161,6 +161,92 @@ fn the_rest_of_the_on_clause_filters_the_probed_rows() {
         .all(|(a, b, _)| b.is_some_and(|b| b % 2 == 0 && *a < b)));
 }
 
+/// Orders of sixty users, forty per user, ten each
+fn orders_in(db: &Database) {
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, amount INTEGER NOT NULL)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_orders_user ON orders(user_id)", ())
+        .unwrap();
+    let user = db.prepare("INSERT INTO users VALUES (?, ?)").unwrap();
+    for id in 1..=60 {
+        user.execute((id, "u")).unwrap();
+    }
+    let order = db.prepare("INSERT INTO orders VALUES (?, ?, ?)").unwrap();
+    for id in 1..=2400i64 {
+        order.execute((id, (id - 1) % 60 + 1, 10)).unwrap();
+    }
+}
+
+const GROUPED: &str = "SELECT u.id, COUNT(o.id), SUM(o.amount) FROM users u \
+    INNER JOIN orders o ON u.id = o.user_id GROUP BY u.id LIMIT 5";
+
+/// The index still holds an order under the user it had when the
+/// transaction started, while the row itself moved to another user: the
+/// grouped join checks the fetched row's key and does not charge the moved
+/// order to its old user. The index takes the new key at commit, and the
+/// order counts under its new user from then on
+#[test]
+fn a_grouped_join_does_not_charge_a_moved_order_to_its_old_user() {
+    let db = Database::open("memory://join_eq_grouped_moved").unwrap();
+    orders_in(&db);
+    db.execute("BEGIN", ()).unwrap();
+    db.execute(
+        "UPDATE orders SET user_id = 2, amount = 1000 WHERE id = 1",
+        (),
+    )
+    .unwrap();
+    let inside = triples(&db, GROUPED);
+    db.execute("COMMIT", ()).unwrap();
+    assert_eq!(inside[0], (1, Some(39), 390), "not under the old user");
+    let after = triples(&db, GROUPED);
+    assert_eq!(after[0], (1, Some(39), 390));
+    assert_eq!(after[1], (2, Some(41), 1400), "under the new user");
+}
+
+/// EXPLAIN names the strategy the join runs with: a join the executor
+/// bounds probes the table's index, an unbounded one on a persistent table
+/// does not
+#[test]
+fn explain_reports_the_index_join_only_for_a_bounded_join() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = file_db(&dir);
+    users_in(&db, 600);
+    let plan = |sql: &str| -> String {
+        db.query(&format!("EXPLAIN {sql}"), ())
+            .unwrap()
+            .map(|r| r.unwrap().get::<String>(0).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let unbounded = "SELECT u1.id, u2.id FROM users u1 INNER JOIN users u2 ON u1.age = u2.age";
+    assert!(
+        !plan(unbounded).contains("Index Nested Loop"),
+        "no limit, no probe: {}",
+        plan(unbounded)
+    );
+    let bounded =
+        "SELECT u1.id, u2.id FROM users u1 INNER JOIN users u2 ON u1.age = u2.age LIMIT 5";
+    assert!(
+        plan(bounded).contains("Index Nested Loop"),
+        "{}",
+        plan(bounded)
+    );
+    let ordered = "SELECT u1.id, u2.id FROM users u1 INNER JOIN users u2 ON u1.age = u2.age ORDER BY u1.id LIMIT 5";
+    assert!(
+        !plan(ordered).contains("Index Nested Loop"),
+        "a limit under ORDER BY is not pushed: {}",
+        plan(ordered)
+    );
+}
+
 #[cfg(feature = "test-failpoints")]
 mod hot_index {
     use std::sync::atomic::{AtomicUsize, Ordering};

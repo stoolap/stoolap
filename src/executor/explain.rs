@@ -216,6 +216,7 @@ impl Executor {
                         lines,
                         indent + 1,
                         row_count,
+                        self.join_is_bounded(select),
                     );
                 }
 
@@ -322,6 +323,7 @@ impl Executor {
         lines: &mut Vec<String>,
         indent: usize,
         row_count: usize,
+        bounded_join: bool,
     ) {
         let prefix = "  ".repeat(indent);
 
@@ -436,6 +438,7 @@ impl Executor {
                     join.condition.as_deref(),
                     join.join_type.as_ref(),
                     &join.using_columns,
+                    bounded_join,
                 );
 
                 lines.push(format!(
@@ -470,12 +473,14 @@ impl Executor {
                     left_where.as_ref(),
                     lines,
                     indent + 1,
+                    bounded_join,
                 );
                 self.explain_table_expr_plan_only(
                     &join.right,
                     right_where.as_ref(),
                     lines,
                     indent + 1,
+                    bounded_join,
                 );
             }
             Expression::CteReference(cte_ref) => {
@@ -630,6 +635,7 @@ impl Executor {
                 select.where_clause.as_deref(),
                 lines,
                 indent + 1,
+                self.join_is_bounded(select),
             );
         }
 
@@ -677,8 +683,9 @@ impl Executor {
         where_clause: Option<&Expression>,
         lines: &mut Vec<String>,
         indent: usize,
+        bounded_join: bool,
     ) {
-        self.explain_table_expr_inner(expr, where_clause, lines, indent, false)
+        self.explain_table_expr_inner(expr, where_clause, lines, indent, false, bounded_join)
     }
 
     fn explain_table_expr_with_where(
@@ -687,8 +694,9 @@ impl Executor {
         where_clause: Option<&Expression>,
         lines: &mut Vec<String>,
         indent: usize,
+        bounded_join: bool,
     ) {
-        self.explain_table_expr_inner(expr, where_clause, lines, indent, true)
+        self.explain_table_expr_inner(expr, where_clause, lines, indent, true, bounded_join)
     }
 
     fn explain_table_expr_inner(
@@ -698,6 +706,7 @@ impl Executor {
         lines: &mut Vec<String>,
         indent: usize,
         show_join_cost: bool,
+        bounded_join: bool,
     ) {
         let prefix = "  ".repeat(indent);
 
@@ -777,6 +786,7 @@ impl Executor {
                     join.condition.as_deref(),
                     join.join_type.as_ref(),
                     &join.using_columns,
+                    bounded_join,
                 );
 
                 if show_join_cost {
@@ -873,6 +883,7 @@ impl Executor {
                     lines,
                     indent + 1,
                     show_join_cost,
+                    bounded_join,
                 );
                 self.explain_table_expr_inner(
                     &join.right,
@@ -880,6 +891,7 @@ impl Executor {
                     lines,
                     indent + 1,
                     show_join_cost,
+                    bounded_join,
                 );
             }
             Expression::CteReference(cte_ref) => {
@@ -924,6 +936,7 @@ impl Executor {
         join_condition: Option<&Expression>,
         join_type: &str,
         using_columns: &[Identifier],
+        bounded: bool,
     ) -> (String, Option<IndexLookupStrategy>) {
         // Check for INLJ opportunity on right side (default check)
         if let Some(cond) = join_condition {
@@ -939,6 +952,7 @@ impl Executor {
                 &join_type_upper,
                 left_alias.as_deref(),
                 right_alias.as_deref(),
+                bounded,
             );
 
             if let Some((_, strategy, _, _)) = inlj_info {
@@ -957,6 +971,7 @@ impl Executor {
                 &join_type_upper,
                 right_alias.as_deref(),
                 left_alias.as_deref(),
+                bounded,
             );
 
             if let Some((_, strategy, _, _)) = swapped_info {

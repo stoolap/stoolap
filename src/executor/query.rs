@@ -4388,6 +4388,7 @@ impl Executor {
             // This optimization avoids materializing the right side entirely
             // NOTE: Don't use Index NL for aggregation/window queries - they need full results
             // and the current implementation falls through to standard path, causing double execution
+            let pushed_limit = self.pushed_join_limit(stmt, ctx, classification, &join_type);
             let index_nl_info = if has_agg || has_window || correlated_where {
                 None
             } else {
@@ -4397,6 +4398,7 @@ impl Executor {
                     &join_type,
                     left_alias.as_deref(),
                     right_alias.as_deref(),
+                    pushed_limit.is_some(),
                 )
             };
 
@@ -4423,6 +4425,7 @@ impl Executor {
                     &join_type,
                     right_alias.as_deref(), // Swap aliases for the check
                     left_alias.as_deref(),
+                    pushed_limit.is_some(),
                 );
                 if left_as_inner.is_some() {
                     (left_as_inner, true) // Force swap
@@ -4461,6 +4464,7 @@ impl Executor {
                     &join_type,
                     right_alias.as_deref(), // Swap aliases
                     left_alias.as_deref(),
+                    pushed_limit.is_some(),
                 );
 
                 // Prefer swapped if it gives PK lookup (most efficient)
@@ -4548,47 +4552,8 @@ impl Executor {
                     nl_left_filter
                 };
 
-                // Compute join limit EARLY so we can use it for outer table optimization
-                let can_push_limit = !join_type.contains("FULL")
-                    && !classification.has_order_by
-                    && !classification.has_group_by
-                    && !classification.has_aggregation;
-
-                let join_limit = if can_push_limit {
-                    let limit = stmt.limit.as_ref().and_then(|limit_expr| {
-                        ExpressionEval::compile(limit_expr, &[])
-                            .ok()
-                            .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                            .and_then(|v| match v {
-                                Value::Integer(n) if n >= 0 => Some(n as u64),
-                                _ => None,
-                            })
-                    });
-                    // OFFSET rows are skipped after collection, so early
-                    // termination must gather LIMIT + OFFSET rows; a
-                    // non-evaluable OFFSET disables the pushdown
-                    match &stmt.offset {
-                        None => limit,
-                        Some(off_expr) => limit.and_then(|l| {
-                            ExpressionEval::compile(off_expr, &[])
-                                .ok()
-                                .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                                .and_then(|v| match v {
-                                    Value::Integer(n) if n >= 0 => Some(l.saturating_add(n as u64)),
-                                    _ => None,
-                                })
-                        }),
-                    }
-                } else {
-                    None
-                };
-                // Bounded probes serve a bounded join only: without a limit the
-                // batch join below would take the whole outer side first
-                if join_limit.is_none()
-                    && matches!(lookup_strategy, IndexLookupStrategy::TableEquality { .. })
-                {
-                    break 'index_nl;
-                }
+                // The limit the join is bounded by, decided with the strategy
+                let join_limit = pushed_limit;
 
                 // The outer side is fetched in chunks: the first one is the limit
                 // plus an eighth of slack, so the odd outer row without a match
@@ -7256,13 +7221,14 @@ impl Executor {
         if join_type != "INNER" && right_filter.is_some() {
             return Ok(None);
         }
-        let Some((table_name, lookup_strategy, _inner_key_col, outer_key_col)) = self
+        let Some((table_name, lookup_strategy, inner_key_col, outer_key_col)) = self
             .check_index_nested_loop_opportunity(
                 &join_source.right,
                 join_source.condition.as_deref(),
                 join_type,
                 left_alias,
                 right_alias,
+                true,
             )
         else {
             return Ok(None);
@@ -7344,6 +7310,13 @@ impl Executor {
             .iter()
             .map(|col| format!("{}.{}", inner_alias, col.name))
             .collect();
+        // The inner key column, checked on each fetched row: the ids name the
+        // rows the index held for the key, not the rows' keys now
+        let inner_key_idx = inner_cols.iter().position(|c| {
+            c.rsplit('.')
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case(&inner_key_col))
+        });
         let all_columns: Vec<String> = outer_cols
             .iter()
             .chain(inner_cols.iter())
@@ -7523,7 +7496,8 @@ impl Executor {
                 outer_key_idx,
                 lookup_strategy.clone(),
                 build_residual_filter(),
-            );
+            )
+            .with_inner_key(inner_key_idx);
             if let Some(filter) = &inner_filter {
                 op = op.with_inner_filter(filter.clone());
             }
@@ -11059,6 +11033,73 @@ impl Executor {
     ///
     /// The outer_key_idx will be determined after materializing the outer side.
     #[allow(clippy::type_complexity)]
+    /// The limit the executor pushes into a join of `stmt`: the statement's
+    /// LIMIT plus OFFSET when nothing orders, groups or aggregates the joined
+    /// rows and both evaluate; None when the join runs unbounded
+    pub(crate) fn pushed_join_limit(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        classification: &QueryClassification,
+        join_type: &str,
+    ) -> Option<u64> {
+        if join_type.contains("FULL")
+            || classification.has_order_by
+            || classification.has_group_by
+            || classification.has_aggregation
+        {
+            return None;
+        }
+        let evaluate = |expr: &Expression| {
+            ExpressionEval::compile(expr, &[])
+                .ok()
+                .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
+                .and_then(|v| match v {
+                    Value::Integer(n) if n >= 0 => Some(n as u64),
+                    _ => None,
+                })
+        };
+        let limit = evaluate(stmt.limit.as_ref()?)?;
+        // OFFSET rows are skipped after collection, so early termination
+        // must gather LIMIT + OFFSET rows; a non-evaluable OFFSET disables
+        // the pushdown
+        match &stmt.offset {
+            None => Some(limit),
+            Some(offset) => Some(limit.saturating_add(evaluate(offset)?)),
+        }
+    }
+
+    /// Whether a join in the FROM clause of `stmt` is bounded by a limit the
+    /// executor pushes into it: the streaming index join takes the limit
+    /// itself, and the grouped index join takes it from the reduction plan.
+    /// EXPLAIN asks this so it reports the strategy execution would choose.
+    pub(crate) fn join_is_bounded(&self, stmt: &SelectStatement) -> bool {
+        let Some(Expression::JoinSource(join)) = stmt.table_expr.as_deref() else {
+            return false;
+        };
+        let classification = get_classification(stmt);
+        let join_type = join.join_type.to_uppercase();
+        if self
+            .pushed_join_limit(stmt, &ExecutionContext::new(), &classification, &join_type)
+            .is_some()
+        {
+            return true;
+        }
+        let left_table = match join.left.as_ref() {
+            Expression::TableSource(ts) => Some(ts.name.value.as_str()),
+            _ => None,
+        };
+        self.get_semijoin_reduction_limit(
+            &join_type,
+            stmt,
+            get_table_alias_from_expr(&join.left).as_deref(),
+            left_table,
+            &join.condition,
+            &classification,
+        )
+        .is_some()
+    }
+
     pub(crate) fn check_index_nested_loop_opportunity(
         &self,
         right_expr: &Expression,
@@ -11066,6 +11107,7 @@ impl Executor {
         join_type: &str,
         left_alias: Option<&str>,
         right_alias: Option<&str>,
+        bounded: bool,
     ) -> Option<(
         String,              // table_name
         IndexLookupStrategy, // lookup strategy (index or PK)
@@ -11206,10 +11248,12 @@ impl Executor {
         }
 
         // A table that keeps rows outside its index still answers a bounded
-        // probe from it while it can, deciding per probe
-        if table
-            .get_index_on_column(&inner_col_unqualified)
-            .is_some_and(|index| index.index_type() == crate::core::IndexType::BTree)
+        // probe from it while it can, deciding per probe; only a join the
+        // executor bounds with a limit asks it, at execution and in EXPLAIN
+        if bounded
+            && table
+                .get_index_on_column(&inner_col_unqualified)
+                .is_some_and(|index| index.index_type() == crate::core::IndexType::BTree)
         {
             return Some((
                 table_name,

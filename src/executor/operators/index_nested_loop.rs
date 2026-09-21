@@ -174,6 +174,12 @@ impl IndexNestedLoopJoinOperator {
         // Pre-allocate row buffer for typical join output size
         let outer_col_count = outer.schema().len();
         let total_cols = outer_col_count + inner_col_count;
+        // A table probe copies up to the cap under the index lock, so the
+        // buffer holds the cap before the first probe and grows on none
+        let id_capacity = match lookup_strategy {
+            IndexLookupStrategy::TableEquality { .. } => EQUALITY_CANDIDATE_CAP,
+            _ => 16,
+        };
 
         Self {
             outer,
@@ -190,8 +196,7 @@ impl IndexNestedLoopJoinOperator {
             current_inner_rows: RowVec::new(),
             current_inner_idx: 0,
             outer_had_match: false,
-            // Pre-allocate buffer for typical number of matches (small)
-            row_id_buffer: Vec::with_capacity(16),
+            row_id_buffer: Vec::with_capacity(id_capacity),
             // Pre-allocate row buffer to avoid per-row allocation
             row_buffer: Row::with_capacity(total_cols),
             true_expr: ConstBoolExpr::true_expr(),
