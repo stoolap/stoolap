@@ -984,6 +984,31 @@ impl Executor {
         }
     }
 
+    /// Fetches the rows of `row_ids` in growing batches until `needed`
+    /// rows are found or the ids are spent: a member with no row, or with
+    /// a row not visible, costs its own fetch and nothing more, and a
+    /// small LIMIT over a long list reads a few rows
+    fn fetch_rows_up_to(
+        table: &dyn Table,
+        row_ids: &[i64],
+        filter: &dyn crate::storage::expression::Expression,
+        needed: usize,
+    ) -> Result<RowVec> {
+        if needed == usize::MAX || row_ids.len() <= needed {
+            return table.fetch_rows_by_ids(row_ids, filter);
+        }
+        let mut rows = RowVec::with_capacity(needed);
+        let mut at = 0;
+        let mut batch = needed.max(16);
+        while at < row_ids.len() && rows.len() < needed {
+            let end = at.saturating_add(batch).min(row_ids.len());
+            rows.extend(table.fetch_rows_by_ids(&row_ids[at..end], filter)?);
+            at = end;
+            batch = batch.saturating_mul(2);
+        }
+        Ok(rows)
+    }
+
     /// IN subquery index optimization
     ///
     /// For queries like `SELECT * FROM users WHERE id IN (SELECT user_id FROM orders WHERE ...)`
@@ -1186,10 +1211,17 @@ impl Executor {
                     }
                 }
             } else {
-                // IN: PRIMARY KEY - the value IS the row_id (for INTEGER PK)
+                // IN: PRIMARY KEY - the value is the row id, a float read as
+                // the comparison reads it
                 for value in &values {
-                    if let Value::Integer(id) = value {
-                        all_row_ids.push(*id);
+                    match value {
+                        Value::Integer(id) => all_row_ids.push(*id),
+                        Value::Float(f) => {
+                            if let Some(id) = Self::lossless_float_key(*f) {
+                                all_row_ids.push(id);
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1243,11 +1275,8 @@ impl Executor {
                     usize::MAX
                 };
 
-                // Truncate row_ids to avoid fetching unnecessary rows
-                if limit < usize::MAX {
-                    let take_count = (offset + limit).min(all_row_ids.len());
-                    all_row_ids.truncate(take_count);
-                }
+                // The rows are trimmed after the fetch: a member with no
+                // row, or with a row not visible, counts for nothing
                 (true, limit, offset)
             } else {
                 (false, usize::MAX, 0)
@@ -1259,7 +1288,12 @@ impl Executor {
             Box::new(ConstBoolExpr::true_expr());
 
         // Fetch rows by row_ids - returns RowVec directly
-        let mut rows = table.fetch_rows_by_ids(&all_row_ids, filter.as_ref())?;
+        let needed = if early_limit_applied {
+            early_offset.saturating_add(early_limit)
+        } else {
+            usize::MAX
+        };
+        let mut rows = Self::fetch_rows_up_to(table, &all_row_ids, filter.as_ref(), needed)?;
 
         // Apply remaining predicate if any
         if let Some(ref remaining) = remaining_predicate {
@@ -1428,10 +1462,19 @@ impl Executor {
         // Pre-allocate based on expected size to avoid reallocations
         let mut all_row_ids = Vec::with_capacity(values.len());
         if is_pk_column {
-            // PRIMARY KEY: the value IS the row_id (for INTEGER PK)
+            // PRIMARY KEY: the value is the row id. A float holding an
+            // integer is that key and one that does not matches nothing, as
+            // the comparison reads them; any other type is left to it
             for value in &values {
-                if let Value::Integer(id) = value {
-                    all_row_ids.push(*id);
+                match value {
+                    Value::Integer(id) => all_row_ids.push(*id),
+                    Value::Float(f) => {
+                        if let Some(id) = Self::lossless_float_key(*f) {
+                            all_row_ids.push(id);
+                        }
+                    }
+                    Value::Null(_) => {}
+                    _ => return Ok(None),
                 }
             }
         } else if let Some(ref idx) = index {
@@ -1482,11 +1525,8 @@ impl Executor {
                     usize::MAX
                 };
 
-                // Truncate row_ids to avoid fetching unnecessary rows
-                if limit < usize::MAX {
-                    let take_count = (offset + limit).min(all_row_ids.len());
-                    all_row_ids.truncate(take_count);
-                }
+                // The rows are trimmed after the fetch: a member with no
+                // row, or with a row not visible, counts for nothing
                 (true, limit, offset)
             } else {
                 (false, usize::MAX, 0)
@@ -1498,7 +1538,12 @@ impl Executor {
             Box::new(ConstBoolExpr::true_expr());
 
         // Fetch rows by row_ids - returns RowVec directly
-        let mut rows = table.fetch_rows_by_ids(&all_row_ids, filter.as_ref())?;
+        let needed = if early_limit_applied {
+            early_offset.saturating_add(early_limit)
+        } else {
+            usize::MAX
+        };
+        let mut rows = Self::fetch_rows_up_to(table, &all_row_ids, filter.as_ref(), needed)?;
 
         // Apply remaining predicate if any
         if let Some(ref remaining) = remaining_predicate {
@@ -1832,19 +1877,16 @@ impl Executor {
                 // is not a row to keep
                 all_row_ids.extend(table.visible_row_ids_excluding(&exclusion_set, target)?);
             } else {
-                // IN: PRIMARY KEY - the value IS the row_id (for INTEGER PK)
+                // IN: PRIMARY KEY - the value is the row id, a float read as
+                // the comparison reads it; a member with no row must not
+                // count toward the limit, so every member is taken
                 for value in values.iter() {
-                    // Early termination check
-                    if let Some(target) = early_termination_target {
-                        if all_row_ids.len() >= target {
-                            break;
-                        }
-                    }
                     match value {
                         Value::Integer(id) => all_row_ids.push(*id),
-                        // Handle case where integer was stored as float
-                        Value::Float(f) if f.fract() == 0.0 => {
-                            all_row_ids.push(*f as i64);
+                        Value::Float(f) => {
+                            if let Some(id) = Self::lossless_float_key(*f) {
+                                all_row_ids.push(id);
+                            }
                         }
                         _ => {}
                     }
@@ -1912,11 +1954,8 @@ impl Executor {
                     usize::MAX
                 };
 
-                // Truncate row_ids to avoid fetching unnecessary rows
-                if limit < usize::MAX {
-                    let take_count = (offset + limit).min(all_row_ids.len());
-                    all_row_ids.truncate(take_count);
-                }
+                // The rows are trimmed after the fetch: a member with no
+                // row, or with a row not visible, counts for nothing
                 (true, limit, offset)
             } else {
                 (false, usize::MAX, 0)
@@ -1928,7 +1967,12 @@ impl Executor {
             Box::new(ConstBoolExpr::true_expr());
 
         // Fetch rows by row_ids - returns RowVec directly
-        let mut rows = table.fetch_rows_by_ids(&all_row_ids, filter.as_ref())?;
+        let needed = if early_limit_applied {
+            early_offset.saturating_add(early_limit)
+        } else {
+            usize::MAX
+        };
+        let mut rows = Self::fetch_rows_up_to(table, &all_row_ids, filter.as_ref(), needed)?;
 
         // Apply remaining predicate if any
         if let Some(ref remaining) = remaining_predicate {
