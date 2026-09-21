@@ -913,6 +913,9 @@ fn read_u32(data: &[u8], pos: &mut usize) -> std::io::Result<u32> {
 /// was read at.
 pub struct IndexFile {
     file: Arc<VolumeFile>,
+    /// The bytes of this generation, open for the file's lifetime: a
+    /// build that replaces the path leaves a holder's pages as they were
+    descriptor: std::fs::File,
     file_id: u64,
     directory: Directory,
     _charges: Vec<Held>,
@@ -976,6 +979,7 @@ impl IndexFile {
         drop(raw_charge);
         Ok(Self {
             file: Arc::clone(handle),
+            descriptor: file,
             file_id,
             directory,
             _charges: charges,
@@ -1024,18 +1028,8 @@ impl IndexFile {
     }
 
     fn read_page(&self, offset: u64, len: u32) -> std::io::Result<Vec<u8>> {
-        let file = self.file.open()?;
-        let mut header = [0u8; HEADER_LEN as usize];
-        read_exact_at(&file, &mut header, 0)?;
-        if header[..4] != MAGIC {
-            return Err(invalid("bad magic"));
-        }
-        let generation = u64::from_le_bytes(header[8..16].try_into().expect("8 bytes"));
-        if generation != self.directory.generation {
-            return Err(invalid("generation changed"));
-        }
         let mut raw = vec![0u8; len as usize];
-        read_exact_at(&file, &mut raw, offset)?;
+        read_exact_at(&self.descriptor, &mut raw, offset)?;
         Ok(raw)
     }
 
@@ -1981,6 +1975,20 @@ pub fn build_side_file(
     columns: Vec<ColumnInput<'_>>,
     workspace_bytes: usize,
 ) -> std::io::Result<BuildReport> {
+    let (report, temps) = build_side_file_staged(path, generation, columns, workspace_bytes)?;
+    std::fs::rename(temps.tmp_path(), path)?;
+    temps.finished();
+    Ok(report)
+}
+
+/// `build_side_file` up to the rename: the output stays in its build
+/// directory beside `path`, to be published by the caller or dropped
+fn build_side_file_staged(
+    path: &Path,
+    generation: u64,
+    columns: Vec<ColumnInput<'_>>,
+    workspace_bytes: usize,
+) -> std::io::Result<(BuildReport, TempFiles)> {
     if workspace_bytes < MIN_WORKSPACE_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -2002,6 +2010,7 @@ pub fn build_side_file(
     let per_column = budget.take(columns.len() * COLUMN_SLOT_BYTES, "the directory's columns")?;
     let temps = TempFiles::new(path, generation)?;
     let tmp = temps.tmp_path();
+    let temps = temps;
     let mut out = BufWriter::with_capacity(OUT_BUFFER_BYTES, std::fs::File::create(&tmp)?);
     out.write_all(&MAGIC)?;
     out.write_all(&VERSION.to_le_bytes())?;
@@ -2125,8 +2134,6 @@ pub fn build_side_file(
     let file = out.into_inner().map_err(|e| e.into_error())?;
     file.sync_all()?;
     drop(file);
-    std::fs::rename(&tmp, path)?;
-    temps.finished();
     // Each owner before the charge that backs it
     drop(dir);
     drop(dir_charge);
@@ -2137,7 +2144,7 @@ pub fn build_side_file(
     report.file_bytes = offset + dir_len as u64 + FOOTER_LEN;
     report.workspace_peak = budget.peak.get();
     report.build_ns = started.elapsed().as_nanos() as u64;
-    Ok(report)
+    Ok((report, temps))
 }
 
 #[cfg(test)]
@@ -2436,9 +2443,15 @@ const BUILD_SHARE_BYTES: usize = 16 * 1024 * 1024;
 /// budget less the `input` decode admitted beside it, and at least what
 /// `rows` rows of `columns` columns need
 pub fn workspace_for(rows: usize, columns: usize, input: usize) -> usize {
-    let least = MIN_WORKSPACE_BYTES + columns * (metadata_allowance(rows) + COLUMN_SLOT_BYTES);
     let share = (INDEX_BUILDS.stats().budget_bytes as usize).min(BUILD_SHARE_BYTES);
-    share.saturating_sub(input).max(least)
+    share
+        .saturating_sub(input)
+        .max(least_workspace(rows, columns))
+}
+
+/// The least workspace a build of `rows` rows of `columns` columns needs
+pub fn least_workspace(rows: usize, columns: usize) -> usize {
+    MIN_WORKSPACE_BYTES + columns * (metadata_allowance(rows) + COLUMN_SLOT_BYTES)
 }
 
 fn integer_keys(data: &super::column::ColumnData) -> Option<(&[i64], &[bool])> {
@@ -2603,26 +2616,82 @@ pub fn build_side_for(
     file_id: u64,
     identities: &[(usize, u64)],
 ) -> std::io::Result<Option<Arc<IndexFile>>> {
-    Ok(
-        match build_side_within(volume, volume_path, file_id, identities, None)? {
-            SideBuild::Built(side) => Some(side),
-            SideBuild::Refused | SideBuild::Failed => None,
+    match stage_side_for(volume, volume_path, file_id, identities, None)? {
+        SideBuild::Built(staged) => match staged.publish(&side_path(volume_path), file_id) {
+            Ok(side) => Ok(Some(side)),
+            Err(error) => {
+                BUILDS_FAILED.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "Warning: side index {:?} unreadable after its build: {error}",
+                    side_path(volume_path)
+                );
+                retire_side_of(volume_path);
+                Ok(None)
+            }
         },
-    )
+        SideBuild::Refused | SideBuild::Failed => Ok(None),
+    }
 }
 
-/// What a build came to: the file, or the budget's refusal, or a failure
-/// that was logged and counted
+/// What a build came to: the staged file, or the budget's refusal, or a
+/// failure that was logged and counted
 pub enum SideBuild {
-    Built(Arc<IndexFile>),
+    Built(StagedSide),
     Refused,
     Failed,
 }
 
-/// `build_side_for` with the outcome told apart, and admitted only when
-/// the input's decode and the workspace together fit under `cap` bytes: a
-/// backfill takes at most its share of the builds budget
-pub fn build_side_within(
+/// A side file built and checked but not yet at its volume's path: it
+/// lives in its build directory beside the volume until `publish` renames
+/// it over the path, and goes with the directory when dropped before
+pub struct StagedSide {
+    temps: TempFiles,
+    file_id: u64,
+}
+
+impl StagedSide {
+    /// The staged file's directory, wherever the volume's directory is
+    /// now: a table rename moved it along
+    fn built_at(&self, volume_path: &Path) -> PathBuf {
+        let own = self.temps.tmp_path();
+        if own.exists() {
+            return own;
+        }
+        match (volume_path.parent(), self.temps.build_dir.file_name()) {
+            (Some(dir), Some(name)) => dir.join(name).join("out"),
+            _ => own,
+        }
+    }
+
+    /// Reads the staged file, to check what it covers before it is published
+    pub fn open(&self, volume_path: &Path) -> std::io::Result<IndexFile> {
+        let path = self.built_at(volume_path);
+        IndexFile::open(&path, self.file_id)
+    }
+
+    /// Renames the staged file over `side` and opens it through the
+    /// path's shared handle: the holders of the generation there before
+    /// keep their own bytes
+    pub fn publish(self, side: &Path, file_id: u64) -> std::io::Result<Arc<IndexFile>> {
+        let volume_path = side.with_extension("vol");
+        let built = self.built_at(&volume_path);
+        std::fs::rename(&built, side)?;
+        if let Some(dir) = built.parent() {
+            let _ = std::fs::remove_dir(dir);
+        }
+        let mut temps = self.temps;
+        temps.keep = true;
+        drop(temps);
+        let handle = VolumeFile::shared(side);
+        IndexFile::open_through(&handle, file_id).map(Arc::new)
+    }
+}
+
+/// Builds the side file of `volume` beside it, staged: admitted through the
+/// builds budget as the seal's build is, and when `cap` is given, sized to
+/// fit under it (a backfill takes at most its share of the budget, and a
+/// build that does not fit even at its least is refused)
+pub fn stage_side_for(
     volume: &super::writer::FrozenVolume,
     volume_path: &Path,
     file_id: u64,
@@ -2638,10 +2707,14 @@ pub fn build_side_within(
         .map(|&(column, _)| decode_allowance(volume, column))
         .max()
         .unwrap_or(0);
-    let workspace = workspace_for(volume.meta.row_count, identities.len(), input);
-    if cap.is_some_and(|cap| input + workspace > cap) {
-        INDEX_BUILDS.count_refused();
-        return Ok(SideBuild::Refused);
+    let mut workspace = workspace_for(volume.meta.row_count, identities.len(), input);
+    if let Some(cap) = cap {
+        let least = least_workspace(volume.meta.row_count, identities.len());
+        if input + least > cap {
+            INDEX_BUILDS.count_refused();
+            return Ok(SideBuild::Refused);
+        }
+        workspace = workspace.min(cap - input).max(least);
     }
     let Some(_input_admitted) = INDEX_BUILDS.try_charge(input) else {
         eprintln!(
@@ -2659,32 +2732,20 @@ pub fn build_side_within(
             pairs: Box::new(volume_pairs(volume, column, &failure)),
         })
         .collect();
-    let built = build_side_file(&side, next_generation(), columns, workspace);
+    let built = build_side_file_staged(&side, next_generation(), columns, workspace);
     if let Some(error) = failure.take() {
-        // The volume could not be read: whatever was written is short
-        retire_side_of(volume_path);
+        // The volume could not be read: whatever was written goes
         return Err(error);
     }
-    if let Err(error) = built {
-        if is_refused(&error) {
+    match built {
+        Ok((_, temps)) => Ok(SideBuild::Built(StagedSide { temps, file_id })),
+        Err(error) if is_refused(&error) => {
             eprintln!("Warning: side index {:?} not built: {error}", side);
-            return Ok(SideBuild::Refused);
+            Ok(SideBuild::Refused)
         }
-        BUILDS_FAILED.fetch_add(1, Ordering::Relaxed);
-        eprintln!("Warning: side index {:?} failed: {error}", side);
-        retire_side_of(volume_path);
-        return Ok(SideBuild::Failed);
-    }
-    let handle = VolumeFile::shared(&side);
-    match IndexFile::open_through(&handle, file_id) {
-        Ok(file) => Ok(SideBuild::Built(Arc::new(file))),
         Err(error) => {
             BUILDS_FAILED.fetch_add(1, Ordering::Relaxed);
-            eprintln!(
-                "Warning: side index {:?} unreadable after its build: {error}",
-                side
-            );
-            handle.retire();
+            eprintln!("Warning: side index {:?} failed: {error}", side);
             Ok(SideBuild::Failed)
         }
     }
@@ -3711,7 +3772,7 @@ mod tests {
     }
 
     #[test]
-    fn a_page_read_after_the_file_was_replaced_reports_the_generation() {
+    fn a_holder_keeps_its_generation_after_the_file_was_replaced() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sidx");
@@ -3727,12 +3788,13 @@ mod tests {
             WORKSPACE,
         );
         INDEX_PAGES.clear();
-        let err = old.equal(1, 5).unwrap_err();
-        assert!(is_generation_changed(&err), "{err}");
+        // The holder of the old generation keeps its own bytes
+        assert_eq!(old.equal(1, 5).unwrap(), Some((5, 6)));
         let new = IndexFile::open(&path, 4).unwrap();
         assert_ne!(new.generation(), old.generation());
         assert_eq!(new.equal(1, 5).unwrap(), None);
         assert!(new.equal(1, 10).unwrap().is_some());
+        assert_eq!(old.equal(1, 5).unwrap(), Some((5, 6)));
     }
 
     #[test]

@@ -519,6 +519,12 @@ pub struct MVCCEngine {
     /// Set while a backfill pass runs, so the periodic one and PRAGMA
     /// INDEX_BACKFILL never build side files together
     backfill_running: AtomicBool,
+    /// Set when close begins: no pass starts, a running one stops at its
+    /// next volume, and close waits for it before letting the files go
+    closing: AtomicBool,
+    /// Per table, the last segment a pass examined, so a volume that
+    /// cannot be built does not keep the newer ones from their turn
+    backfill_cursor: Mutex<FxHashMap<String, u64>>,
     /// Held across a DDL statement's schema change and its WAL record, so
     /// the log replays in the order the changes were applied
     ddl_serial: parking_lot::Mutex<()>,
@@ -633,6 +639,8 @@ impl MVCCEngine {
             seal_fence: Arc::new(parking_lot::RwLock::new(())),
             compaction_running: Arc::new(AtomicBool::new(false)),
             backfill_running: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
+            backfill_cursor: Mutex::new(FxHashMap::default()),
             ddl_serial: parking_lot::Mutex::new(()),
             #[cfg(not(target_arch = "wasm32"))]
             eviction_epoch: AtomicU64::new(0),
@@ -2250,6 +2258,12 @@ impl MVCCEngine {
         // resources. Without this, a detached compaction thread could still
         // be rewriting manifests and deleting volume files after close returns.
         while self.compaction_running.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // No backfill starts from here, and one running stops at its next
+        // volume; its files are this engine's until it has
+        self.closing.store(true, Ordering::Release);
+        while self.backfill_running.load(Ordering::Acquire) {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
@@ -5611,19 +5625,22 @@ impl MVCCEngine {
     /// serve although the catalog indexes one of their columns: sealed
     /// before the index existed, refused or failed at seal, of the earlier
     /// format, or built for an index recreated since. One volume at a time,
-    /// oldest first, each admitted into half the builds budget when the
-    /// ledger is idle, and published under the DDL guard once its file
-    /// covers every current identity and its segment is still registered.
-    /// A pass already running makes this one a no-op.
+    /// each table's candidates oldest first from where the last pass left
+    /// off, each admitted into half the builds budget when the ledger is
+    /// idle, staged beside its volume, and published under the DDL guard
+    /// once it covers every current identity and its segment is still
+    /// registered, at the path the segment's file has then. A pass already
+    /// running, or an engine closing, makes this one a no-op.
     pub fn backfill_side_files(&self, limit: usize) -> Result<BackfillReport> {
         use crate::storage::volume::secondary::{
-            build_side_within, covers_all, discard_side, SideBuild, INDEX_BUILDS,
+            covers_all, side_path, stage_side_for, SideBuild, INDEX_BUILDS,
         };
         let mut report = BackfillReport::default();
-        if self
-            .backfill_running
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
+        if self.closing.load(Ordering::Acquire)
+            || self
+                .backfill_running
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
         {
             return Ok(report);
         }
@@ -5635,7 +5652,7 @@ impl MVCCEngine {
                 .iter()
                 .filter_map(|(name, store)| {
                     mgrs.get(name)
-                        .map(|mgr| (Arc::clone(store), Arc::clone(mgr)))
+                        .map(|mgr| (name.clone(), Arc::clone(store), Arc::clone(mgr)))
                 })
                 .collect()
         };
@@ -5660,117 +5677,158 @@ impl MVCCEngine {
                 })
                 .collect()
         };
-        for (store, mgr) in tables {
-            if report.built + report.refused + report.discarded + report.failed >= limit {
-                break;
-            }
+        // Every candidate of every table first, so what is left is counted
+        // whole; each table's list starts after the segment its last pass
+        // examined and wraps
+        let mut work: Vec<(usize, u64)> = Vec::new();
+        let mut identities_of: Vec<Vec<(usize, u64)>> = Vec::with_capacity(tables.len());
+        for (index, (name, store, mgr)) in tables.iter().enumerate() {
             let identities = {
                 let _ddl = self.ddl_guard();
                 store.secondary_index_identities()
             };
-            if identities.is_empty() {
+            let snapshot = mgr.cold_snapshot();
+            let mut candidates: Vec<u64> = if identities.is_empty() {
+                Vec::new()
+            } else {
+                snapshot
+                    .seg_ids
+                    .iter()
+                    .copied()
+                    .filter(|seg_id| {
+                        snapshot.segs.get(seg_id).is_some_and(|cs| {
+                            let wanted = wanted_of(cs, &identities);
+                            !wanted.is_empty()
+                                && !cs
+                                    .side
+                                    .as_ref()
+                                    .is_some_and(|side| covers_all(side, &wanted))
+                        })
+                    })
+                    .collect()
+            };
+            candidates.sort_unstable();
+            let cursor = self.backfill_cursor.lock().unwrap().get(name).copied();
+            if let Some(last) = cursor {
+                let at = candidates.partition_point(|&id| id <= last);
+                candidates.rotate_left(at);
+            }
+            work.extend(candidates.into_iter().map(|id| (index, id)));
+            identities_of.push(identities);
+        }
+        let pending = work.len();
+        for (index, seg_id) in work {
+            if report.examined >= limit || self.closing.load(Ordering::Acquire) {
+                break;
+            }
+            let (name, store, mgr) = &tables[index];
+            let identities = &identities_of[index];
+            // Only into an idle ledger, and only into half of it: the seal
+            // keeps the other half. A busy ledger ends the pass; the
+            // volumes wait for the next one
+            let ledger = INDEX_BUILDS.stats();
+            if ledger.charged_bytes != 0 {
+                break;
+            }
+            report.examined += 1;
+            self.backfill_cursor
+                .lock()
+                .unwrap()
+                .insert(name.clone(), seg_id);
+            let snapshot = mgr.cold_snapshot();
+            let Some(cs) = snapshot.segs.get(&seg_id) else {
+                report.discarded += 1;
+                continue;
+            };
+            let wanted = wanted_of(cs, identities);
+            let Some(volume) = mgr.ensure_volume(seg_id)? else {
+                report.discarded += 1;
+                continue;
+            };
+            let Some(file) = mgr.file_of(seg_id) else {
+                report.discarded += 1;
+                continue;
+            };
+            let path = file.path();
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::backfill_volume_loaded();
+            let cap = (ledger.budget_bytes / 2) as usize;
+            let staged = match stage_side_for(&volume, &path, seg_id, &wanted, Some(cap)) {
+                Ok(SideBuild::Built(staged)) => staged,
+                Ok(SideBuild::Refused) => {
+                    report.refused += 1;
+                    continue;
+                }
+                Ok(SideBuild::Failed) => {
+                    report.failed += 1;
+                    continue;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "Warning: backfill of volume {seg_id} of {} could not read it: {error}",
+                        store.table_name()
+                    );
+                    report.failed += 1;
+                    continue;
+                }
+            };
+            drop(volume);
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::side_backfilled();
+            // Published under the DDL guard: the identities compared again
+            // through the segment's mapping as it is now, the segment must
+            // still be registered, and the file goes to the path the
+            // segment's file has now, a rename included; else the staged
+            // file goes with its directory
+            let _ddl = self.ddl_guard();
+            if self.closing.load(Ordering::Acquire) {
+                report.discarded += 1;
+                break;
+            }
+            let current = store.secondary_index_identities();
+            let now = mgr.cold_snapshot();
+            let Some(cs) = now.segs.get(&seg_id) else {
+                report.discarded += 1;
+                continue;
+            };
+            let still_wanted = wanted_of(cs, &current);
+            let covers = match staged.open(&path) {
+                Ok(built) => !still_wanted.is_empty() && covers_all(&built, &still_wanted),
+                Err(_) => false,
+            };
+            let Some(destination) = cs.file.as_ref().map(|f| side_path(&f.path())) else {
+                report.discarded += 1;
+                continue;
+            };
+            if !covers {
+                report.discarded += 1;
                 continue;
             }
-            let snapshot = mgr.cold_snapshot();
-            let mut candidates: Vec<u64> = snapshot
-                .seg_ids
-                .iter()
-                .copied()
-                .filter(|seg_id| {
-                    snapshot.segs.get(seg_id).is_some_and(|cs| {
-                        let wanted = wanted_of(cs, &identities);
-                        !wanted.is_empty()
-                            && !cs
-                                .side
-                                .as_ref()
-                                .is_some_and(|side| covers_all(side, &wanted))
-                    })
-                })
-                .collect();
-            candidates.sort_unstable();
-            for seg_id in candidates {
-                if report.built + report.refused + report.discarded + report.failed >= limit {
-                    report.left += 1;
+            let side = match staged.publish(&destination, seg_id) {
+                Ok(side) => side,
+                Err(error) => {
+                    eprintln!(
+                        "Warning: backfill of volume {seg_id} of {} could not publish: {error}",
+                        store.table_name()
+                    );
+                    report.failed += 1;
                     continue;
                 }
-                report.examined += 1;
-                let Some(cs) = snapshot.segs.get(&seg_id) else {
-                    report.left += 1;
-                    continue;
-                };
-                let wanted = wanted_of(cs, &identities);
-                // Only into an idle ledger, and only into half of it: the
-                // seal keeps the other half
-                let ledger = INDEX_BUILDS.stats();
-                if ledger.charged_bytes != 0 {
-                    report.left += 1;
-                    continue;
-                }
-                let Some(volume) = mgr.ensure_volume(seg_id)? else {
-                    report.left += 1;
-                    continue;
-                };
-                let Some(file) = mgr.file_of(seg_id) else {
-                    report.left += 1;
-                    continue;
-                };
-                let path = file.path();
-                #[cfg(feature = "test-failpoints")]
-                crate::test_failpoints::backfill_volume_loaded();
-                let cap = (ledger.budget_bytes / 2) as usize;
-                let side = match build_side_within(&volume, &path, seg_id, &wanted, Some(cap)) {
-                    Ok(SideBuild::Built(side)) => side,
-                    Ok(SideBuild::Refused) => {
-                        report.refused += 1;
-                        continue;
-                    }
-                    Ok(SideBuild::Failed) => {
-                        report.failed += 1;
-                        continue;
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "Warning: backfill of volume {seg_id} of {} could not read it: {error}",
-                            store.table_name()
-                        );
-                        report.failed += 1;
-                        continue;
-                    }
-                };
-                drop(volume);
-                #[cfg(feature = "test-failpoints")]
-                crate::test_failpoints::side_backfilled();
-                // Published under the DDL guard: the identities compared
-                // again through the segment's mapping as it is now, and the
-                // segment must still be registered; else the file goes
-                let _ddl = self.ddl_guard();
-                let current = store.secondary_index_identities();
-                let now = mgr.cold_snapshot();
-                let still_wanted = now
-                    .segs
-                    .get(&seg_id)
-                    .map(|cs| wanted_of(cs, &current))
-                    .unwrap_or_default();
-                if still_wanted.is_empty() || !covers_all(&side, &still_wanted) {
-                    discard_side(side);
-                    report.discarded += 1;
-                    continue;
-                }
-                if mgr.attach_side(seg_id, side) {
-                    report.built += 1;
-                } else {
-                    // The segment left meanwhile, and its volume's handle
-                    // takes the side file with it
-                    report.discarded += 1;
-                }
+            };
+            if mgr.attach_side(seg_id, side) {
+                report.built += 1;
+            } else {
+                report.discarded += 1;
             }
         }
+        report.left = pending - report.examined;
         Ok(report)
     }
 
     /// One volume of backfill on its own thread, when no pass is running
+    /// and the engine is not closing
     fn spawn_backfill(self: &Arc<Self>) {
-        if self.backfill_running.load(Ordering::Acquire) {
+        if self.backfill_running.load(Ordering::Acquire) || self.closing.load(Ordering::Acquire) {
             return;
         }
         let engine = Arc::clone(self);

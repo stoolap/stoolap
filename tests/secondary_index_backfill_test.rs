@@ -267,16 +267,18 @@ fn a_side_file_that_does_not_open_is_replaced_by_a_pass() {
     assert_eq!(served(&db, 100, 103), (2, 0), "the rebuilt file reopens");
 }
 
-/// A backfill takes at most half the builds budget: a volume whose build
-/// does not fit that half is refused and left, and taken once the budget
-/// has room.
+/// A backfill takes at most half the builds budget, and sizes its
+/// workspace to that share: a volume whose least workspace does not fit
+/// is refused and left, and one that fits is built in runs merged under
+/// the share.
 #[test]
-fn a_build_larger_than_half_the_budget_is_refused_and_left() {
+fn a_build_is_sized_to_half_the_budget_and_refused_only_below_its_least() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path(), "");
     create(&db);
-    // A single volume of 100,000 rows: its workspace is above half a megabyte
+    // A single volume of 100,000 rows: its workspace at the engine's share
+    // is above half a megabyte, its least is not
     for chunk_start in (1..=100_000i64).step_by(2000) {
         let values = (chunk_start..chunk_start + 2000)
             .map(|id| format!("({id},{},{})", (id * 7919) % 100_000, id))
@@ -287,16 +289,17 @@ fn a_build_larger_than_half_the_budget_is_refused_and_left() {
     }
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
-    db.execute("PRAGMA INDEX_BUILD_MB = 1", ()).unwrap();
+    db.execute("PRAGMA INDEX_BUILD_MB = 0", ()).unwrap();
     let pass = backfill(&db, None);
-    db.execute("PRAGMA INDEX_BUILD_MB = 64", ()).unwrap();
     assert_eq!(
         (pass["examined"], pass["refused"], pass["built"]),
         (1, 1, 0),
         "{pass:?}"
     );
     assert!(files(dir.path(), "t", "sidx").is_empty());
+    db.execute("PRAGMA INDEX_BUILD_MB = 1", ()).unwrap();
     let pass = backfill(&db, None);
+    db.execute("PRAGMA INDEX_BUILD_MB = 64", ()).unwrap();
     assert_eq!((pass["examined"], pass["built"]), (1, 1), "{pass:?}");
     let before = reads(&db);
     let rows: Vec<i64> = db
@@ -509,4 +512,244 @@ fn a_compaction_before_the_build_leaves_no_orphan_file() {
     assert_eq!(files(dir.path(), "t", "sidx"), vols, "no orphan side file");
     assert!(leftovers(dir.path(), "t").is_empty());
     assert_eq!(served(&db, 100, 103), (1, 0));
+}
+
+/// A pass replacing a volume's side file leaves a reader of the old file
+/// on its own bytes: a read through another handle inside the pass, with
+/// the page cache cleared, answers and probes as before.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn replacing_a_side_file_leaves_its_readers_on_their_own_bytes() {
+    use stoolap::storage::volume::secondary::INDEX_PAGES;
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "");
+    create(&db);
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    seal_volumes(&db, 1);
+    assert_eq!(served(&db, 100, 103), (1, 0), "covered for k");
+    db.execute("CREATE INDEX idx_t_v ON t(v)", ()).unwrap();
+    let other = db.clone();
+    let inside = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let seen = std::sync::Arc::clone(&inside);
+    stoolap::test_failpoints::after_side_backfilled(move || {
+        INDEX_PAGES.clear();
+        *seen.lock().unwrap() = Some(served(&other, 100, 103));
+    });
+    let pass = backfill(&db, None);
+    assert_eq!((pass["examined"], pass["built"]), (1, 1), "{pass:?}");
+    assert_eq!(
+        inside.lock().unwrap().take(),
+        Some((1, 0)),
+        "the read inside the pass came through the old file"
+    );
+    INDEX_PAGES.clear();
+    assert_eq!(
+        served(&db, 100, 103),
+        (1, 0),
+        "and through the new one after"
+    );
+}
+
+/// A replacement discarded at publication leaves the attached file and a
+/// later replacement alone: the file count holds through close and reopen.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_discarded_replacement_does_not_retire_the_file_a_retry_publishes() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "");
+    create(&db);
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    seal_volumes(&db, 1);
+    db.execute("CREATE INDEX idx_t_v ON t(v)", ()).unwrap();
+    let other = db.clone();
+    stoolap::test_failpoints::after_side_backfilled(move || {
+        other.execute("DROP INDEX idx_t_v ON t", ()).unwrap();
+        other.execute("CREATE INDEX idx_t_v ON t(v)", ()).unwrap();
+    });
+    let pass = backfill(&db, None);
+    assert_eq!((pass["built"], pass["discarded"]), (0, 1), "{pass:?}");
+    assert_eq!(served(&db, 100, 103), (1, 0), "k stays covered");
+    let pass = backfill(&db, None);
+    assert_eq!((pass["built"], pass["discarded"]), (1, 0), "{pass:?}");
+    assert_eq!(files(dir.path(), "t", "sidx").len(), 1);
+    assert!(leftovers(dir.path(), "t").is_empty());
+    db.close().unwrap();
+    assert_eq!(
+        files(dir.path(), "t", "sidx").len(),
+        1,
+        "the file survives close"
+    );
+    let db = open(dir.path(), "");
+    assert_eq!(served(&db, 100, 103), (1, 0));
+}
+
+/// Close waits for a pass that is running and starts no other; a pass
+/// paused inside its build holds close until it has let its volume go.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn close_waits_for_a_running_pass() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "");
+    create(&db);
+    seal_volumes(&db, 1);
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    let (loaded_tx, loaded_rx) = mpsc::channel::<()>();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    // The hook is the pass thread's own
+    let pass_db = db.clone();
+    let pass = std::thread::spawn(move || {
+        stoolap::test_failpoints::after_backfill_volume_loaded(move || {
+            loaded_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+        });
+        backfill(&pass_db, None)
+    });
+    loaded_rx.recv().unwrap();
+    let closed = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&closed);
+    let close_db = db.clone();
+    let closer = std::thread::spawn(move || {
+        close_db.close().unwrap();
+        flag.store(true, Ordering::SeqCst);
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(!closed.load(Ordering::SeqCst), "close waited for the pass");
+    go_tx.send(()).unwrap();
+    let report = pass.join().unwrap();
+    closer.join().unwrap();
+    assert!(closed.load(Ordering::SeqCst));
+    assert_eq!(
+        report["built"], 0,
+        "nothing published into a closing engine: {report:?}"
+    );
+    drop(db);
+    // The next engine's own pass covers the volume
+    let db = open(dir.path(), "");
+    let pass = backfill(&db, None);
+    assert_eq!(pass["built"], 1, "{pass:?}");
+    assert_eq!(served(&db, 100, 103), (1, 0));
+}
+
+/// A table renamed while its volume's side file is being built, its old
+/// name taken by a new table: the file is published where the volume is
+/// now, and reopens with it.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_rename_during_the_build_publishes_where_the_volume_is_now() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "");
+    create(&db);
+    seal_volumes(&db, 1);
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    let other = db.clone();
+    stoolap::test_failpoints::after_backfill_volume_loaded(move || {
+        other
+            .execute("ALTER TABLE t RENAME TO archived", ())
+            .unwrap();
+        other
+            .execute(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER NOT NULL, v INTEGER NOT NULL)",
+                (),
+            )
+            .unwrap();
+        other.execute("INSERT INTO t VALUES (1, 1, 1)", ()).unwrap();
+        other.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    });
+    let pass = backfill(&db, None);
+    assert_eq!(pass["built"], 1, "{pass:?}");
+    let archived = files(dir.path(), "archived", "vol");
+    assert_eq!(archived.len(), 1);
+    assert_eq!(files(dir.path(), "archived", "sidx"), archived);
+    assert!(
+        files(dir.path(), "t", "sidx").is_empty(),
+        "the new table has no side file"
+    );
+    let probed = |db: &Database| -> (i64, i64) {
+        let before = reads(db);
+        let rows: Vec<i64> = db
+            .query("SELECT id FROM archived WHERE k >= 100 AND k <= 103", ())
+            .unwrap()
+            .map(|r| r.unwrap().get(0).unwrap())
+            .collect();
+        assert_eq!(rows.len(), expected_range(100, 103).len());
+        let after = reads(db);
+        (
+            delta(&after, &before, "probes"),
+            delta(&after, &before, "ineligible"),
+        )
+    };
+    assert_eq!(probed(&db), (1, 0));
+    db.close().unwrap();
+    let db = open(dir.path(), "");
+    assert_eq!(probed(&db), (1, 0), "after reopen");
+}
+
+/// A small volume fits half of a small budget: its workspace is sized to
+/// the share, not to the engine's default.
+#[test]
+fn a_small_volume_is_built_under_a_small_budget() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "");
+    create(&db);
+    insert(&db, 1, 1000);
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    db.execute("PRAGMA INDEX_BUILD_MB = 8", ()).unwrap();
+    let pass = backfill(&db, None);
+    db.execute("PRAGMA INDEX_BUILD_MB = 64", ()).unwrap();
+    assert_eq!((pass["built"], pass["refused"]), (1, 0), "{pass:?}");
+    let before = reads(&db);
+    let rows: Vec<i64> = db
+        .query("SELECT id FROM t WHERE k = 100", ())
+        .unwrap()
+        .map(|r| r.unwrap().get(0).unwrap())
+        .collect();
+    assert_eq!(
+        rows,
+        (1..=1000)
+            .filter(|&id| key_of(id) == 100)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(delta(&reads(&db), &before, "probes"), 1);
+}
+
+/// A volume whose build keeps failing does not keep the newer ones from
+/// their turn: the next pass starts after it.
+#[test]
+fn a_failing_volume_does_not_starve_the_newer_ones() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "");
+    create(&db);
+    seal_volumes(&db, 2);
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    let mut vols: Vec<String> = files(dir.path(), "t", "vol").into_iter().collect();
+    vols.sort();
+    // The oldest volume's side path is taken by a directory: its build fails
+    let blocked = dir
+        .path()
+        .join("volumes")
+        .join("t")
+        .join(format!("{}.sidx", vols[0]));
+    std::fs::create_dir(&blocked).unwrap();
+    let first = backfill(&db, Some(1));
+    assert_eq!(
+        (first["examined"], first["failed"], first["left"]),
+        (1, 1, 1),
+        "{first:?}"
+    );
+    let second = backfill(&db, Some(1));
+    assert_eq!((second["examined"], second["built"]), (1, 1), "{second:?}");
+    assert_eq!(served(&db, 100, 103), (1, 1), "the newer volume is probed");
+    std::fs::remove_dir(&blocked).unwrap();
+    let third = backfill(&db, Some(1));
+    assert_eq!(third["built"], 1, "{third:?}");
+    assert_eq!(served(&db, 100, 103), (2, 0));
 }
