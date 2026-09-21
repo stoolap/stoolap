@@ -1025,3 +1025,65 @@ fn small_volumes_are_probed_only_when_their_pages_fit_the_cache() {
     assert_eq!(delta(&after, &before, "page_scans"), 0);
     assert_eq!(delta(&after, &before, "probes"), 16);
 }
+
+/// The admission a small volume's probe is decided on counts the missing
+/// pages at their parsed size and the raw page of a read beside them: a
+/// budget with that room serves repeated lookups from the cache without a
+/// load, and one short of it sends the volume to the scan rather than
+/// loading and evicting on every lookup.
+#[test]
+fn a_small_volumes_admission_counts_the_parsed_pages_and_the_raw_read() {
+    use stoolap::storage::volume::secondary::{reader_bytes, INDEX_PAGES, PAGE_BYTES, SIDE_WINDOW};
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "");
+    create(&db);
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    // One position page of rows, every key its own: three key pages
+    let values = (1..=8190)
+        .map(|id| format!("({id},{id},{})", id * 3))
+        .collect::<Vec<_>>()
+        .join(",");
+    db.execute(&format!("INSERT INTO t VALUES {values}"), ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let lookup = |db: &Database| assert_eq!(ids_db(db, EQ, &[100]), vec![100]);
+    // The parsed size of the two pages a lookup touches, from a warm probe
+    INDEX_PAGES.clear();
+    let idle = INDEX_PAGES.stats();
+    lookup(&db);
+    let parsed = INDEX_PAGES.stats().cached_bytes - idle.cached_bytes;
+    assert!(parsed > 0);
+    // Room for the reader, the parsed pages and one raw page: loaded once
+    INDEX_PAGES.clear();
+    INDEX_PAGES.set_budget_bytes(
+        (idle.charged_bytes + reader_bytes(SIDE_WINDOW) + parsed + PAGE_BYTES) as u64,
+    );
+    let (loads, evictions) = (INDEX_PAGES.stats().loads, INDEX_PAGES.stats().evictions);
+    let before = reads(&db);
+    lookup(&db);
+    lookup(&db);
+    lookup(&db);
+    let after = reads(&db);
+    let stats = INDEX_PAGES.stats();
+    assert_eq!(delta(&after, &before, "probes"), 3);
+    assert_eq!(delta(&after, &before, "page_scans"), 0);
+    assert_eq!(stats.loads - loads, 2, "the pages were loaded once");
+    assert_eq!(stats.evictions - evictions, 0);
+    // Short of the raw page: the scan, and nothing loaded or evicted
+    INDEX_PAGES.clear();
+    INDEX_PAGES.set_budget_bytes(
+        (idle.charged_bytes + reader_bytes(SIDE_WINDOW) + parsed + PAGE_BYTES / 2) as u64,
+    );
+    let (loads, evictions) = (INDEX_PAGES.stats().loads, INDEX_PAGES.stats().evictions);
+    let before = reads(&db);
+    lookup(&db);
+    lookup(&db);
+    let after = reads(&db);
+    let stats = INDEX_PAGES.stats();
+    INDEX_PAGES.set_budget_bytes(16 * 1024 * 1024);
+    assert_eq!(delta(&after, &before, "page_scans"), 2);
+    assert_eq!(delta(&after, &before, "probes"), 0);
+    assert_eq!(stats.loads - loads, 0, "nothing was loaded");
+    assert_eq!(stats.evictions - evictions, 0);
+}

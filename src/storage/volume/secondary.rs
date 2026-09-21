@@ -429,7 +429,9 @@ impl IndexPages {
 
     /// Whether the pages named are cached, or would fit beside what is
     /// charged and a reservation of `reserve` bytes without an eviction:
-    /// what a probe of them would cost the cache, before any read
+    /// what a probe of them would cost the cache, before any read. A
+    /// missing page counts at its parsed size, and the largest raw page
+    /// on top, since a read holds the raw bytes while it parses them
     pub fn admits(
         &self,
         file: &IndexFile,
@@ -437,7 +439,8 @@ impl IndexPages {
         pages: impl Iterator<Item = (PageKind, usize)>,
         reserve: usize,
     ) -> std::io::Result<bool> {
-        let mut incoming = 0usize;
+        let mut parsed = 0usize;
+        let mut raw = 0usize;
         let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         for (kind, number) in pages {
             let key = PageKey {
@@ -448,12 +451,21 @@ impl IndexPages {
                 number: number as u32,
             };
             if !cache.pages.contains_key(&key) {
-                incoming += file.directory.page_location(column, kind, number)?.1 as usize;
+                let len = file.directory.page_location(column, kind, number)?.1 as usize;
+                let entries = len.saturating_sub(PAGE_OVERHEAD);
+                parsed += match kind {
+                    PageKind::Keys => {
+                        entries / KEY_ENTRY
+                            * (std::mem::size_of::<i64>() + std::mem::size_of::<u64>())
+                    }
+                    PageKind::Positions => entries / POS_ENTRY * std::mem::size_of::<u32>(),
+                };
+                raw = raw.max(len);
             }
         }
         drop(cache);
         Ok(
-            (self.charged.load(Ordering::Acquire) + incoming + reserve) as u64
+            (self.charged.load(Ordering::Acquire) + parsed + raw + reserve) as u64
                 <= self.budget.load(Ordering::Acquire),
         )
     }
