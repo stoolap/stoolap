@@ -1286,29 +1286,64 @@ impl IndexFile {
     /// not, so a cache that admits nothing or a budget lowered afterwards
     /// never stops it.
     pub fn reader(self: &Arc<Self>, column: usize, window: usize) -> std::io::Result<Reader> {
+        self.reader_in(column, window, ReaderSpace::default())
+    }
+
+    /// A reader built on `space`, each buffer grown to the reader's size
+    /// when it is smaller, so a caller that probes key after key allocates
+    /// once. The reservation is taken here as for a fresh reader.
+    pub fn reader_in(
+        self: &Arc<Self>,
+        column: usize,
+        window: usize,
+        mut space: ReaderSpace,
+    ) -> std::io::Result<Reader> {
         let window = window.max(1);
         let reservation = INDEX_PAGES
             .try_reserve(reader_bytes(window))
             .ok_or_else(|| refused("a reader's working reservation"))?;
+        space.buffer.clear();
+        space.buffer.reserve(window);
+        space.raw.clear();
+        space.raw.reserve(PAGE_BYTES);
+        space.keys.clear();
+        space.keys.reserve(KEYS_PER_PAGE);
+        space.ends.clear();
+        space.ends.reserve(KEYS_PER_PAGE);
+        space.positions.clear();
+        space.positions.reserve(POSITIONS_PER_PAGE);
         Ok(Reader {
             file: Arc::clone(self),
             column,
             next: 0,
             end: 0,
             window,
-            buffer: Vec::with_capacity(window),
+            buffer: space.buffer,
             own: std::cell::RefCell::new(OwnPages {
-                raw: Vec::with_capacity(PAGE_BYTES),
+                raw: space.raw,
                 keys: PageContent::Keys {
-                    keys: Vec::with_capacity(KEYS_PER_PAGE),
-                    ends: Vec::with_capacity(KEYS_PER_PAGE),
+                    keys: space.keys,
+                    ends: space.ends,
                 },
-                positions: PageContent::Positions(Vec::with_capacity(POSITIONS_PER_PAGE)),
+                positions: PageContent::Positions(space.positions),
                 pages: 0,
             }),
             _reservation: reservation,
         })
     }
+}
+
+/// A reader's buffers between two readers: a caller that probes key after
+/// key hands them from the reader it releases to the one it builds next,
+/// so no probe allocates a reader's working space again. Uncharged while
+/// idle: it is the caller's own memory, one reader's worth.
+#[derive(Default)]
+pub struct ReaderSpace {
+    buffer: Vec<u32>,
+    raw: Vec<u8>,
+    keys: Vec<i64>,
+    ends: Vec<u64>,
+    positions: Vec<u32>,
 }
 
 /// A reader with its own working space: the cursor window and one page
@@ -1338,6 +1373,27 @@ impl Reader {
     /// Pages this reader read through its own buffers
     pub fn own_pages(&self) -> u64 {
         self.own.borrow().pages
+    }
+
+    /// The reader's buffers for the next reader; its reservation is released
+    pub fn into_space(self) -> ReaderSpace {
+        let Reader { buffer, own, .. } = self;
+        let own = own.into_inner();
+        let (keys, ends) = match own.keys {
+            PageContent::Keys { keys, ends } => (keys, ends),
+            PageContent::Positions(_) => (Vec::new(), Vec::new()),
+        };
+        let positions = match own.positions {
+            PageContent::Positions(positions) => positions,
+            PageContent::Keys { .. } => Vec::new(),
+        };
+        ReaderSpace {
+            buffer,
+            raw: own.raw,
+            keys,
+            ends,
+            positions,
+        }
     }
 
     /// The position index range `[start, end)` of `key`, or None when the

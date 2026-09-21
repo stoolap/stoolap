@@ -213,6 +213,14 @@ impl fmt::Display for ScanPlan {
     }
 }
 
+/// What a caller that probes a table's index key after key keeps between
+/// probes, so a table reuses it instead of allocating per probe
+#[derive(Default)]
+pub struct ProbeScratch {
+    pub(crate) identities: Vec<(usize, u64)>,
+    pub(crate) reader: Option<crate::storage::volume::secondary::ReaderSpace>,
+}
+
 /// Table represents a database table
 ///
 /// This trait defines the interface for interacting with a table,
@@ -816,6 +824,11 @@ pub trait Table: Send + Sync {
         Vec::new()
     }
 
+    /// The same identities, into a buffer the caller keeps
+    fn secondary_index_identities_into(&self, out: &mut Vec<(usize, u64)>) {
+        out.clear();
+    }
+
     /// An index on `column_name` whose row ids cover every visible row of
     /// the table, so the executor may probe it directly. A table that keeps
     /// part of its rows outside the index returns None and the executor
@@ -828,18 +841,22 @@ pub trait Table: Send + Sync {
     /// `out` when the index covers every visible row and holds at most `max`
     /// of them for the key; an absent key is `Copied` with nothing appended.
     /// None when the table cannot answer this way for this statement: no
-    /// such index, rows outside it, or the index moving while the ids were
-    /// taken. A caller building on earlier answers then joins another way
-    /// from the start.
+    /// such index, rows it cannot serve, a read the index cache refuses, or
+    /// the index moving while the ids were taken. A caller building on
+    /// earlier answers then joins another way from the start. A read that
+    /// fails is the statement's error, not a None.
+    ///
+    /// `scratch` is the caller's, kept across its probes
     fn equality_candidates(
         &self,
         column: &str,
         key: &Value,
         max: usize,
         out: &mut Vec<i64>,
-    ) -> Option<CappedEqual> {
-        let _ = (column, key, max, out);
-        None
+        scratch: &mut ProbeScratch,
+    ) -> Result<Option<CappedEqual>> {
+        let _ = (column, key, max, out, scratch);
+        Ok(None)
     }
 
     /// Gets all unique indexes on the table (for constraint checking).
