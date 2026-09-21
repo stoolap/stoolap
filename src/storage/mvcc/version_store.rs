@@ -3943,7 +3943,7 @@ impl VersionStore {
         let indexes = self.indexes.read();
         for index in indexes.values() {
             let column_names = index.column_names();
-            if column_names.len() == 1 && column_names[0] == column_name {
+            if column_names.len() == 1 && column_names[0].eq_ignore_ascii_case(column_name) {
                 return Some(index.clone());
             }
         }

@@ -117,6 +117,8 @@ CREATE INDEX idx_emb ON embeddings(embedding) USING HNSW
 WITH (m = 32, ef_construction = 400, ef_search = 128, metric = 'cosine');
 ```
 
+An index created without `USING` on a VECTOR column is an HNSW index with the defaults. Either way the index holds every row of the table, the rows sealed into volumes before it was created included, and it follows a row's vector wherever the row lives: an update of a sealed row moves it in the graph.
+
 ### HNSW Parameters
 
 | Parameter | Description | Default | Range |
@@ -145,7 +147,7 @@ ORDER BY VEC_DISTANCE_L2(embedding, '[...]')
 LIMIT 10;
 ```
 
-You can create multiple HNSW indexes with different metrics on the same column if you need to query with different distance functions.
+A column holds one index. Its metric decides which distance function the index serves; a query with another distance function scans.
 
 ### How HNSW Works
 
@@ -169,7 +171,7 @@ ORDER BY dist
 LIMIT 10;
 ```
 
-When an HNSW index is available, Stoolap first retrieves candidates from the index, then applies the WHERE filter. If no matching results are found after HNSW filtering, the optimizer falls back to a brute-force scan to ensure correct results.
+When an HNSW index is available, Stoolap first retrieves candidates from the index, then applies the WHERE filter. If no matching results are found after HNSW filtering, the optimizer falls back to a brute-force scan to ensure correct results. The graph is the committed table as it is now, so the index serves a statement whose view is that table; inside a transaction with local changes or under snapshot isolation, and when a commit publishes during the search, the rows decide instead. NULL vectors are never in the graph: `NULLS FIRST`, and a LIMIT past the rows the graph holds, leave the order to the rows, where a NULL distance sorts last by default.
 
 ## Utility Functions
 

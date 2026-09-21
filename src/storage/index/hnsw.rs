@@ -959,9 +959,21 @@ impl HnswInner {
         ef_construction: usize,
         ml: f64,
     ) {
-        // Check for existing mapping (duplicate or tombstoned reinsert)
+        // An existing mapping: the same row again, a changed vector under
+        // a live node, or a tombstoned node coming back
         if let Some(&existing_node) = self.row_id_to_node.get(row_id) {
-            if self.is_deleted(existing_node) {
+            if !self.is_deleted(existing_node) {
+                let offset = existing_node as usize * self.dims_bytes;
+                if self.vectors[offset..offset + self.dims_bytes] == *vector_bytes {
+                    // The same vector again (a snapshot, a WAL replay)
+                    return;
+                }
+                // The row's vector changed: the old one goes and the new
+                // one is connected as a reinsert
+                self.set_deleted(existing_node);
+                self.unique_map_remove(existing_node);
+            }
+            {
                 // Reinsert: update vector data in place and clear tombstone
                 let offset = existing_node as usize * self.dims_bytes;
                 self.vectors[offset..offset + self.dims_bytes].copy_from_slice(vector_bytes);
@@ -1005,8 +1017,6 @@ impl HnswInner {
                 }
                 return;
             }
-            // Not deleted — true duplicate (snapshot + WAL replay), skip
-            return;
         }
         let node_id = self.nodes.len() as u32;
         let level = random_level(ml);

@@ -2110,8 +2110,8 @@ impl Executor {
         }
 
         let order_by = &stmt.order_by[0];
-        if !order_by.ascending {
-            return Ok(None); // Vector search always returns closest first
+        if !order_by.ascending || order_by.nulls_first == Some(true) {
+            return Ok(None); // Vector search returns closest first, NULLs last
         }
 
         // Find the VEC_DISTANCE function call — either directly in ORDER BY, via alias,
@@ -2191,6 +2191,10 @@ impl Executor {
                     && idx.hnsw_distance_metric() == Some(expected)
             })
         });
+        // The graph is the committed table now: an older snapshot or a
+        // commit publishing makes it the wrong view, and the rows decide
+        let epoch = table.index_view_epoch();
+        let hnsw_index = if epoch.is_some() { hnsw_index } else { None };
 
         // Extract query vector from second argument
         let query_vec_value = match &func_call.arguments[1] {
@@ -2273,6 +2277,11 @@ impl Executor {
                 Some(r) => r,
                 None => return Ok(None),
             };
+            // The graph holds no NULL vector: fewer answers than asked for
+            // means the rest of the order is decided by the rows
+            if results.len() < k {
+                return Ok(None);
+            }
             if results.is_empty() {
                 let output_columns =
                     CompactArc::new(self.get_output_column_names(&stmt.columns, all_columns, None));
@@ -2284,6 +2293,11 @@ impl Executor {
             }
             let row_ids: Vec<i64> = results.iter().map(|(rid, _)| *rid).collect();
             let rows = table.collect_rows_by_ids(&row_ids)?;
+            // A commit between the search and the fetch may have moved a
+            // vector: the distances and the rows would disagree
+            if table.index_view_epoch() != epoch {
+                return Ok(None);
+            }
 
             // Post-filter with WHERE if present
             if let Some(ref filter) = where_filter {
