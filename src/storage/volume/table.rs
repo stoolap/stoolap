@@ -1437,8 +1437,7 @@ impl SegmentedTable {
                 SideAdmission::Probe(side, physical) => (side, physical),
             };
             let left = max - (out.len() - start);
-            let space = scratch.reader.take().unwrap_or_default();
-            let mut reader = match side.reader_in(physical, left, space) {
+            let mut reader = match side.reader_in(physical, left, &mut scratch.reader) {
                 Ok(reader) => reader,
                 Err(error) if is_refused(&error) => {
                     READS.count(&READS.refused, 1);
@@ -1462,7 +1461,7 @@ impl SegmentedTable {
                 None
             };
             if count == 0 || refused.is_some() {
-                scratch.reader = Some(reader.into_space());
+                reader.release_into(&mut scratch.reader);
                 match refused {
                     Some(answer) => return Ok(answer),
                     None => continue,
@@ -1485,7 +1484,7 @@ impl SegmentedTable {
                 served += window.len() as u64;
             }
             READS.count(&READS.rows, served);
-            scratch.reader = Some(reader.into_space());
+            reader.release_into(&mut scratch.reader);
         }
         Ok(Some(CappedEqual::Copied))
     }

@@ -398,6 +398,12 @@ impl Reservation {
         self.bytes
     }
 
+    /// Takes over another reservation's bytes, one holder for both
+    pub fn absorb(&mut self, mut other: Reservation) {
+        self.bytes += other.bytes;
+        other.bytes = 0;
+    }
+
     /// Reserves `more` bytes on top, for an owner whose allocation grew
     pub fn grow(&mut self, more: usize) {
         if more == 0 {
@@ -1286,46 +1292,70 @@ impl IndexFile {
     /// not, so a cache that admits nothing or a budget lowered afterwards
     /// never stops it.
     pub fn reader(self: &Arc<Self>, column: usize, window: usize) -> std::io::Result<Reader> {
-        self.reader_in(column, window, ReaderSpace::default())
+        let mut space = ReaderSpace::default();
+        self.reader_in(column, window, &mut space)
     }
 
-    /// A reader built on `space`, each buffer grown to the reader's size
-    /// when it is smaller, so a caller that probes key after key allocates
-    /// once. The reservation is taken here as for a fresh reader.
+    /// A reader built on `space`, which it empties: the buffers and the
+    /// reservation that covers them move into the reader, and back with
+    /// `Reader::release_into`. A buffer smaller than the reader needs is
+    /// grown, the growth admitted to the ledger before it happens; the
+    /// reservation covers the buffers at their capacity, and a smaller
+    /// window later shrinks nothing.
     pub fn reader_in(
         self: &Arc<Self>,
         column: usize,
         window: usize,
-        mut space: ReaderSpace,
+        space: &mut ReaderSpace,
     ) -> std::io::Result<Reader> {
         let window = window.max(1);
-        let reservation = INDEX_PAGES
-            .try_reserve(reader_bytes(window))
-            .ok_or_else(|| refused("a reader's working reservation"))?;
+        let wanted = space.buffer.capacity().max(window) * POS_ENTRY
+            + space.raw.capacity().max(PAGE_BYTES)
+            + space.keys.capacity().max(KEYS_PER_PAGE) * std::mem::size_of::<i64>()
+            + space.ends.capacity().max(KEYS_PER_PAGE) * std::mem::size_of::<u64>()
+            + space.positions.capacity().max(POSITIONS_PER_PAGE) * std::mem::size_of::<u32>();
+        let held = space.reservation.as_ref().map_or(0, Reservation::bytes);
+        if wanted > held {
+            let grown = INDEX_PAGES
+                .try_reserve(wanted - held)
+                .ok_or_else(|| refused("a reader's working reservation"))?;
+            match space.reservation.as_mut() {
+                Some(reservation) => reservation.absorb(grown),
+                None => space.reservation = Some(grown),
+            }
+        }
+        let Some(mut reservation) = space.reservation.take() else {
+            return Err(invalid("a reader's space holds no reservation"));
+        };
         space.buffer.clear();
-        space.buffer.reserve(window);
+        space.buffer.reserve_exact(window);
         space.raw.clear();
-        space.raw.reserve(PAGE_BYTES);
+        space.raw.reserve_exact(PAGE_BYTES);
         space.keys.clear();
-        space.keys.reserve(KEYS_PER_PAGE);
+        space.keys.reserve_exact(KEYS_PER_PAGE);
         space.ends.clear();
-        space.ends.reserve(KEYS_PER_PAGE);
+        space.ends.reserve_exact(KEYS_PER_PAGE);
         space.positions.clear();
-        space.positions.reserve(POSITIONS_PER_PAGE);
+        space.positions.reserve_exact(POSITIONS_PER_PAGE);
+        // The allocator may hand out more than asked; what is owned is charged
+        let owned = space.owned_bytes();
+        if owned > reservation.bytes() {
+            reservation.grow(owned - reservation.bytes());
+        }
         Ok(Reader {
             file: Arc::clone(self),
             column,
             next: 0,
             end: 0,
             window,
-            buffer: space.buffer,
+            buffer: std::mem::take(&mut space.buffer),
             own: std::cell::RefCell::new(OwnPages {
-                raw: space.raw,
+                raw: std::mem::take(&mut space.raw),
                 keys: PageContent::Keys {
-                    keys: space.keys,
-                    ends: space.ends,
+                    keys: std::mem::take(&mut space.keys),
+                    ends: std::mem::take(&mut space.ends),
                 },
-                positions: PageContent::Positions(space.positions),
+                positions: PageContent::Positions(std::mem::take(&mut space.positions)),
                 pages: 0,
             }),
             _reservation: reservation,
@@ -1333,10 +1363,11 @@ impl IndexFile {
     }
 }
 
-/// A reader's buffers between two readers: a caller that probes key after
-/// key hands them from the reader it releases to the one it builds next,
-/// so no probe allocates a reader's working space again. Uncharged while
-/// idle: it is the caller's own memory, one reader's worth.
+/// A reader's buffers between two readers, with the reservation that
+/// covers them at their capacity: a caller that probes key after key hands
+/// them from the reader it releases to the one it builds next, so no probe
+/// allocates a reader's working space again, and the ledger sees the
+/// memory for as long as it is held. Dropping the space releases both.
 #[derive(Default)]
 pub struct ReaderSpace {
     buffer: Vec<u32>,
@@ -1344,6 +1375,23 @@ pub struct ReaderSpace {
     keys: Vec<i64>,
     ends: Vec<u64>,
     positions: Vec<u32>,
+    reservation: Option<Reservation>,
+}
+
+impl ReaderSpace {
+    /// The bytes the buffers own at their capacity
+    fn owned_bytes(&self) -> usize {
+        self.buffer.capacity() * POS_ENTRY
+            + self.raw.capacity()
+            + self.keys.capacity() * std::mem::size_of::<i64>()
+            + self.ends.capacity() * std::mem::size_of::<u64>()
+            + self.positions.capacity() * std::mem::size_of::<u32>()
+    }
+
+    /// The bytes the ledger holds for this space
+    pub fn reserved_bytes(&self) -> usize {
+        self.reservation.as_ref().map_or(0, Reservation::bytes)
+    }
 }
 
 /// A reader with its own working space: the cursor window and one page
@@ -1375,9 +1423,15 @@ impl Reader {
         self.own.borrow().pages
     }
 
-    /// The reader's buffers for the next reader; its reservation is released
-    pub fn into_space(self) -> ReaderSpace {
-        let Reader { buffer, own, .. } = self;
+    /// Hands the reader's buffers and its reservation to `space`, for the
+    /// next reader built there; the ledger's charge stays with the buffers
+    pub fn release_into(self, space: &mut ReaderSpace) {
+        let Reader {
+            buffer,
+            own,
+            _reservation,
+            ..
+        } = self;
         let own = own.into_inner();
         let (keys, ends) = match own.keys {
             PageContent::Keys { keys, ends } => (keys, ends),
@@ -1387,13 +1441,15 @@ impl Reader {
             PageContent::Positions(positions) => positions,
             PageContent::Keys { .. } => Vec::new(),
         };
-        ReaderSpace {
+        // Whatever the space held before is replaced, its own charge released
+        *space = ReaderSpace {
             buffer,
             raw: own.raw,
             keys,
             ends,
             positions,
-        }
+            reservation: Some(_reservation),
+        };
     }
 
     /// The position index range `[start, end)` of `key`, or None when the
@@ -3322,6 +3378,61 @@ mod tests {
         INDEX_PAGES.clear();
         INDEX_PAGES.set_budget_bytes(DEFAULT_BUDGET_BYTES);
         assert_eq!(INDEX_PAGES.stats().charged_bytes, baseline);
+    }
+
+    #[test]
+    fn a_reader_space_keeps_its_charge_while_it_holds_the_buffers() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sidx");
+        let pairs: Vec<(u32, i64)> = (0..1000u32).map(|p| (p, p as i64)).collect();
+        build(&path, pairs, WORKSPACE);
+        INDEX_PAGES.clear();
+        let baseline = INDEX_PAGES.stats().charged_bytes;
+        let file = Arc::new(IndexFile::open(&path, 7).unwrap());
+
+        let mut space = ReaderSpace::default();
+        let reader = file.reader_in(1, 1024, &mut space).unwrap();
+        let active = INDEX_PAGES.stats().charged_bytes - baseline;
+        assert!(
+            active >= reader_bytes(1024),
+            "a reader is charged for its buffers"
+        );
+        reader.release_into(&mut space);
+        assert_eq!(
+            INDEX_PAGES.stats().charged_bytes - baseline,
+            active,
+            "the space holds the buffers and their charge"
+        );
+        assert_eq!(space.reserved_bytes(), active);
+
+        // A smaller window shrinks neither the buffers nor the charge
+        let reader = file.reader_in(1, 1, &mut space).unwrap();
+        assert_eq!(INDEX_PAGES.stats().charged_bytes - baseline, active);
+        reader.release_into(&mut space);
+        assert_eq!(INDEX_PAGES.stats().charged_bytes - baseline, active);
+
+        // A second space under a budget the first one fills is refused
+        INDEX_PAGES.set_budget_bytes((baseline + active) as u64);
+        let mut other = ReaderSpace::default();
+        let refused_reader = file.reader_in(1, 1024, &mut other);
+        assert!(refused_reader.is_err_and(|e| is_refused(&e)));
+        assert_eq!(other.reserved_bytes(), 0);
+        INDEX_PAGES.set_budget_bytes(DEFAULT_BUDGET_BYTES);
+
+        // A larger window grows the buffers, admitted before they grow
+        let reader = file.reader_in(1, 4096, &mut space).unwrap();
+        let grown = INDEX_PAGES.stats().charged_bytes - baseline;
+        assert!(grown >= active + (4096 - 1024) * POS_ENTRY);
+        reader.release_into(&mut space);
+        assert_eq!(INDEX_PAGES.stats().charged_bytes - baseline, grown);
+
+        drop(space);
+        assert_eq!(
+            INDEX_PAGES.stats().charged_bytes,
+            baseline,
+            "released with the buffers"
+        );
     }
 
     #[test]

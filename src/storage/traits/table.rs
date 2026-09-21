@@ -218,7 +218,7 @@ impl fmt::Display for ScanPlan {
 #[derive(Default)]
 pub struct ProbeScratch {
     pub(crate) identities: Vec<(usize, u64)>,
-    pub(crate) reader: Option<crate::storage::volume::secondary::ReaderSpace>,
+    pub(crate) reader: crate::storage::volume::secondary::ReaderSpace,
 }
 
 /// Table represents a database table
