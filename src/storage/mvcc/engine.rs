@@ -516,6 +516,15 @@ pub struct MVCCEngine {
     /// Background checkpoint skips compaction when set. Forced compaction
     /// (PRAGMA CHECKPOINT, close, restore) waits for it to finish first.
     compaction_running: Arc<AtomicBool>,
+    /// Set while a backfill pass runs, so the periodic one and PRAGMA
+    /// INDEX_BACKFILL never build side files together
+    backfill_running: AtomicBool,
+    /// Set when close begins: no pass starts, a running one stops at its
+    /// next volume, and close waits for it before letting the files go
+    closing: AtomicBool,
+    /// The table and segment a pass last examined, so a volume that cannot
+    /// be built, in any table, does not keep the rest from their turn
+    backfill_cursor: Mutex<Option<(String, u64)>>,
     /// Held across a DDL statement's schema change and its WAL record, so
     /// the log replays in the order the changes were applied
     ddl_serial: parking_lot::Mutex<()>,
@@ -523,6 +532,19 @@ pub struct MVCCEngine {
     /// cycle. Volumes whose last_access_epoch < eviction_epoch are idle.
     #[cfg(not(target_arch = "wasm32"))]
     eviction_epoch: AtomicU64,
+}
+
+/// What a backfill pass did: volumes examined, side files built and
+/// attached, builds the budget refused, files discarded at publication,
+/// builds that failed, and candidates left for a later pass
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BackfillReport {
+    pub examined: usize,
+    pub built: usize,
+    pub refused: usize,
+    pub discarded: usize,
+    pub failed: usize,
+    pub left: usize,
 }
 
 /// RAII guard that clears an AtomicBool on drop. Used to release the
@@ -616,6 +638,9 @@ impl MVCCEngine {
             checkpoint_mutex: Mutex::new(()),
             seal_fence: Arc::new(parking_lot::RwLock::new(())),
             compaction_running: Arc::new(AtomicBool::new(false)),
+            backfill_running: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
+            backfill_cursor: Mutex::new(None),
             ddl_serial: parking_lot::Mutex::new(()),
             #[cfg(not(target_arch = "wasm32"))]
             eviction_epoch: AtomicU64::new(0),
@@ -937,6 +962,11 @@ impl MVCCEngine {
                             }
                         }
                     }
+                }
+                // One uncovered volume per cycle gets its side file, so an
+                // old layout is covered in the background after open
+                if engine.persistence.is_some() {
+                    engine.spawn_backfill();
                 }
             }
         });
@@ -2239,6 +2269,12 @@ impl MVCCEngine {
         while self.compaction_running.load(Ordering::Acquire) {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        // No backfill starts from here, and one running stops at its next
+        // volume; its files are this engine's until it has
+        self.closing.store(true, Ordering::Release);
+        while self.backfill_running.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
 
         // Close all version stores
         let stores = self.version_stores.read().unwrap();
@@ -3417,6 +3453,9 @@ impl MVCCEngine {
                 Option<Arc<crate::storage::volume::secondary::IndexFile>>,
             )> = Vec::new();
 
+            // The table's side files, read once for every volume
+            let sides =
+                crate::storage::volume::secondary::SideFiles::in_dir(&vol_dir.join(&table_name));
             for path in paths {
                 let volume_id = parse_volume_id(&path);
                 let volume = match crate::storage::volume::io::read_volume_from_disk(&path) {
@@ -3431,7 +3470,7 @@ impl MVCCEngine {
                 };
 
                 let stable_id = volume_id.unwrap_or(0);
-                let side = crate::storage::volume::secondary::open_side_for(&path, stable_id);
+                let side = sides.open_for(&path, stable_id);
                 standalone.push((stable_id, volume, side));
             }
 
@@ -3502,6 +3541,8 @@ impl MVCCEngine {
             }
 
             let mgr = self.get_or_create_segment_manager(&table_name);
+            let sides =
+                crate::storage::volume::secondary::SideFiles::in_dir(&vol_dir.join(&table_name));
             for path in paths {
                 let volume_id = parse_volume_id(&path);
                 let stable_id = volume_id.unwrap_or(0);
@@ -3511,7 +3552,7 @@ impl MVCCEngine {
                 // without being deserialized.
                 if stable_id == 0 {
                     let _ = std::fs::remove_file(&path);
-                    crate::storage::volume::secondary::retire_side_of(&path);
+                    sides.retire_for(&path);
                     continue;
                 }
                 if mgr.has_segment(stable_id) {
@@ -3519,7 +3560,7 @@ impl MVCCEngine {
                 }
                 if !mgr.manifest_has_segment(stable_id) {
                     let _ = std::fs::remove_file(&path);
-                    crate::storage::volume::secondary::retire_side_of(&path);
+                    sides.retire_for(&path);
                     continue;
                 }
 
@@ -3534,7 +3575,7 @@ impl MVCCEngine {
                         continue;
                     }
                 };
-                let side = crate::storage::volume::secondary::open_side_for(&path, stable_id);
+                let side = sides.open_for(&path, stable_id);
                 mgr.load_volume_for_existing_segment(stable_id, volume, side);
             }
             // Recompute visibility bitmaps after all volumes for this table are loaded.
@@ -5594,6 +5635,256 @@ impl MVCCEngine {
         self.compact_volumes()
     }
 
+    /// Builds side files for up to `limit` volumes the query path cannot
+    /// serve although the catalog indexes one of their columns: sealed
+    /// before the index existed, refused or failed at seal, of the earlier
+    /// format, or built for an index recreated since. One volume at a time,
+    /// each table's candidates oldest first from where the last pass left
+    /// off, each admitted into half the builds budget when the ledger is
+    /// idle, staged beside its volume, and published under the DDL guard
+    /// once it covers every current identity and its segment is still
+    /// registered, at the path the segment's file has then. A pass already
+    /// running, or an engine closing, makes this one a no-op.
+    pub fn backfill_side_files(&self, limit: usize) -> Result<BackfillReport> {
+        use crate::storage::volume::secondary::{
+            covers_all, side_path_for, stage_side_for, SideBuild, INDEX_BUILDS,
+        };
+        let mut report = BackfillReport::default();
+        if self.closing.load(Ordering::Acquire)
+            || self
+                .backfill_running
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return Ok(report);
+        }
+        let _guard = AtomicBoolGuard(&self.backfill_running);
+        let mut tables: Vec<_> = {
+            let stores = self.version_stores.read().unwrap();
+            let mgrs = self.segment_managers.read().unwrap();
+            stores
+                .iter()
+                .filter_map(|(name, store)| {
+                    mgrs.get(name)
+                        .map(|mgr| (name.clone(), Arc::clone(store), Arc::clone(mgr)))
+                })
+                .collect()
+        };
+        tables.sort_by(|a, b| a.0.cmp(&b.0));
+        // The physical columns of `identities` a segment holds, through its
+        // captured mapping: an added column the volume has none of, and a
+        // dropped one, are no business of its side file
+        let wanted_of = |cs: &crate::storage::volume::manifest::ColdSegment,
+                         identities: &[(usize, u64)]|
+         -> Vec<(usize, u64)> {
+            identities
+                .iter()
+                .filter_map(|&(column, identity)| {
+                    let physical = match cs.mapping.sources.get(column) {
+                        Some(crate::storage::volume::writer::ColSource::Volume(p)) => *p,
+                        Some(crate::storage::volume::writer::ColSource::Default(_)) => return None,
+                        None if cs.mapping.is_identity && column < cs.volume.columns.len() => {
+                            column
+                        }
+                        None => return None,
+                    };
+                    Some((physical, identity))
+                })
+                .collect()
+        };
+        // Every candidate of every table first, in table then segment
+        // order, so what is left is counted whole; the sequence starts
+        // after the table and segment the last pass examined and wraps, so
+        // a volume that cannot be built in one table does not hold the
+        // rest, in any table, forever
+        let mut work: Vec<(usize, u64)> = Vec::new();
+        let mut identities_of: Vec<Vec<(usize, u64)>> = Vec::with_capacity(tables.len());
+        for (index, (_, store, mgr)) in tables.iter().enumerate() {
+            let identities = {
+                let _ddl = self.ddl_guard();
+                store.secondary_index_identities()
+            };
+            let snapshot = mgr.cold_snapshot();
+            let mut candidates: Vec<u64> = if identities.is_empty() {
+                Vec::new()
+            } else {
+                snapshot
+                    .seg_ids
+                    .iter()
+                    .copied()
+                    .filter(|seg_id| {
+                        snapshot.segs.get(seg_id).is_some_and(|cs| {
+                            let wanted = wanted_of(cs, &identities);
+                            !wanted.is_empty()
+                                && !cs
+                                    .side
+                                    .as_ref()
+                                    .is_some_and(|side| covers_all(side, &wanted))
+                        })
+                    })
+                    .collect()
+            };
+            candidates.sort_unstable();
+            work.extend(candidates.into_iter().map(|id| (index, id)));
+            identities_of.push(identities);
+        }
+        if let Some((table, segment)) = self.backfill_cursor.lock().unwrap().clone() {
+            let at = work.partition_point(|&(index, id)| {
+                (tables[index].0.as_str(), id) <= (table.as_str(), segment)
+            });
+            work.rotate_left(at);
+        }
+        let pending = work.len();
+        for (index, seg_id) in work {
+            if report.examined >= limit || self.closing.load(Ordering::Acquire) {
+                break;
+            }
+            let (name, store, mgr) = &tables[index];
+            let identities = &identities_of[index];
+            // Only into an idle ledger, and only into half of it: the seal
+            // keeps the other half. A busy ledger ends the pass; the
+            // volumes wait for the next one
+            let ledger = INDEX_BUILDS.stats();
+            if ledger.charged_bytes != 0 {
+                break;
+            }
+            report.examined += 1;
+            *self.backfill_cursor.lock().unwrap() = Some((name.clone(), seg_id));
+            let snapshot = mgr.cold_snapshot();
+            let Some(cs) = snapshot.segs.get(&seg_id) else {
+                report.discarded += 1;
+                continue;
+            };
+            let wanted = wanted_of(cs, identities);
+            let volume = match mgr.ensure_volume(seg_id) {
+                Ok(Some(volume)) => volume,
+                Ok(None) => {
+                    report.discarded += 1;
+                    continue;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "Warning: backfill of volume {seg_id} of {} could not load it: {error}",
+                        store.table_name()
+                    );
+                    report.failed += 1;
+                    continue;
+                }
+            };
+            let Some(file) = mgr.file_of(seg_id) else {
+                report.discarded += 1;
+                continue;
+            };
+            let path = file.path();
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::backfill_volume_loaded();
+            let cap = (ledger.budget_bytes / 2) as usize;
+            let mut staged = match stage_side_for(&volume, &path, seg_id, &wanted, Some(cap)) {
+                Ok(SideBuild::Built(staged)) => staged,
+                Ok(SideBuild::Refused) => {
+                    report.refused += 1;
+                    continue;
+                }
+                Ok(SideBuild::Failed) => {
+                    report.failed += 1;
+                    continue;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "Warning: backfill of volume {seg_id} of {} could not read it: {error}",
+                        store.table_name()
+                    );
+                    report.failed += 1;
+                    continue;
+                }
+            };
+            drop(volume);
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::side_backfilled();
+            // Published under the DDL guard: the staged file followed to
+            // where the volume's directory is now, a rename included; the
+            // identities compared again through the segment's mapping as it
+            // is now; the segment must still be registered; the file takes
+            // the name of its generation beside the volume, and the file
+            // attached before goes once its last holder lets go. Else the
+            // staged file goes with its directory
+            let _ddl = self.ddl_guard();
+            // The volume's file owner knows where a rename moved it, whether
+            // or not the segment is still registered, so a discard finds
+            // the build directory too
+            staged.relocate(&file.path());
+            let now = mgr.cold_snapshot();
+            let current_path = now
+                .segs
+                .get(&seg_id)
+                .and_then(|cs| cs.file.as_ref())
+                .map(|f| f.path());
+            if self.closing.load(Ordering::Acquire) {
+                report.discarded += 1;
+                break;
+            }
+            let Some(cs) = now.segs.get(&seg_id) else {
+                report.discarded += 1;
+                continue;
+            };
+            let Some(current_path) = current_path else {
+                report.discarded += 1;
+                continue;
+            };
+            let current = store.secondary_index_identities();
+            let still_wanted = wanted_of(cs, &current);
+            let covers = match staged.open() {
+                Ok(built) => !still_wanted.is_empty() && covers_all(&built, &still_wanted),
+                Err(_) => false,
+            };
+            if !covers {
+                report.discarded += 1;
+                continue;
+            }
+            let destination = side_path_for(&current_path, staged.generation());
+            let side = match staged.publish(&destination, seg_id) {
+                Ok(side) => side,
+                Err(error) => {
+                    eprintln!(
+                        "Warning: backfill of volume {seg_id} of {} could not publish: {error}",
+                        store.table_name()
+                    );
+                    report.failed += 1;
+                    continue;
+                }
+            };
+            match mgr.attach_side(seg_id, side) {
+                Some(before) => {
+                    report.built += 1;
+                    if let Some(before) = before {
+                        before.handle().retire();
+                    }
+                }
+                None => {
+                    // The segment left meanwhile, and its volume's handle
+                    // takes the side file with it
+                    report.discarded += 1;
+                }
+            }
+        }
+        report.left = pending - report.examined;
+        Ok(report)
+    }
+
+    /// One volume of backfill on its own thread, when no pass is running
+    /// and the engine is not closing
+    fn spawn_backfill(self: &Arc<Self>) {
+        if self.backfill_running.load(Ordering::Acquire) || self.closing.load(Ordering::Acquire) {
+            return;
+        }
+        let engine = Arc::clone(self);
+        std::thread::spawn(move || {
+            if let Err(e) = engine.backfill_side_files(1) {
+                eprintln!("Warning: side index backfill failed: {}", e);
+            }
+        });
+    }
+
     /// The identity the catalog issued to `index` on `table`, None when
     /// the table or the index is unknown or the index has none yet
     pub fn index_identity(&self, table: &str, index: &str) -> Option<u64> {
@@ -6207,10 +6498,9 @@ impl MVCCEngine {
                         }
                     }
                 }
+                let sides = crate::storage::volume::secondary::SideFiles::in_dir(&vol_table_dir);
                 for (id, _) in volumes.iter() {
-                    crate::storage::volume::secondary::retire_side_of(
-                        &vol_table_dir.join(format!("vol_{:016x}.vol", id)),
-                    );
+                    sides.retire_for(&vol_table_dir.join(format!("vol_{:016x}.vol", id)));
                 }
                 continue;
             }
@@ -6545,10 +6835,9 @@ impl MVCCEngine {
             }
             // The inputs' side files go with them, each once its last
             // holder lets go
+            let sides = crate::storage::volume::secondary::SideFiles::in_dir(&vol_table_dir);
             for (id, _) in volumes.iter() {
-                crate::storage::volume::secondary::retire_side_of(
-                    &vol_table_dir.join(format!("vol_{:016x}.vol", id)),
-                );
+                sides.retire_for(&vol_table_dir.join(format!("vol_{:016x}.vol", id)));
             }
         }
 

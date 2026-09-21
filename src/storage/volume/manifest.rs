@@ -1957,6 +1957,26 @@ impl SegmentManager {
         self.register_segment_with_owner(segment_id, volume, meta, schema, file, None);
     }
 
+    /// Attaches a side file to the segment registered under `segment_id`,
+    /// by the copy-on-write swap registration uses: a reader holding an
+    /// older snapshot keeps the segment as it was. None when the segment
+    /// is no longer registered; else the side attached before, if any,
+    /// which is the caller's to retire
+    pub(crate) fn attach_side(
+        &self,
+        segment_id: u64,
+        side: Arc<super::secondary::IndexFile>,
+    ) -> Option<Option<Arc<super::secondary::IndexFile>>> {
+        let mut segments = self.segments.write();
+        segments.get(&segment_id)?;
+        let mut new_map = (**segments).clone();
+        let before = new_map
+            .get_mut(&segment_id)
+            .and_then(|segment| segment.side.replace(side));
+        *segments = Arc::new(new_map);
+        Some(before)
+    }
+
     /// Register with a prepared file owner and side file; no path or
     /// registry lookup occurs.
     pub(crate) fn register_segment_with_owner(

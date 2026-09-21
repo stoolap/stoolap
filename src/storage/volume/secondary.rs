@@ -81,6 +81,113 @@ pub fn side_path(volume_path: &Path) -> PathBuf {
     volume_path.with_extension(SIDE_EXT)
 }
 
+/// The side file of `generation` beside `volume_path`: a build that
+/// replaces a volume's side file writes a file of its own name, so the
+/// holders of the one before keep theirs, on disk and by path. The seal's
+/// and the compaction's first file keeps the plain name
+pub fn side_path_for(volume_path: &Path, generation: u64) -> PathBuf {
+    volume_path.with_extension(format!("g{generation:x}.{SIDE_EXT}"))
+}
+
+/// The side files of a table's directory, of every generation, grouped by
+/// the volume they stand beside: one directory read serves every volume
+/// of the table, at reopen and at retirement alike
+pub struct SideFiles {
+    by_volume: std::collections::HashMap<String, Vec<PathBuf>>,
+}
+
+impl SideFiles {
+    pub fn in_dir(dir: &Path) -> Self {
+        let mut by_volume: std::collections::HashMap<String, Vec<PathBuf>> =
+            std::collections::HashMap::new();
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some(SIDE_EXT) {
+                continue;
+            }
+            if let Some(stem) = side_stem(&path) {
+                by_volume.entry(stem).or_default().push(path);
+            }
+        }
+        for files in by_volume.values_mut() {
+            files.sort();
+        }
+        Self { by_volume }
+    }
+
+    /// The side files beside `volume_path`
+    pub fn of(&self, volume_path: &Path) -> &[PathBuf] {
+        volume_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|stem| self.by_volume.get(stem))
+            .map_or(&[], |files| files.as_slice())
+    }
+
+    /// The side file to attach beside `volume_path` at reopen: the newest
+    /// generation that opens; the older generations that open go, and a
+    /// file that does not open stays where it is, logged, since a failed
+    /// open shows nothing about the file
+    pub fn open_for(&self, volume_path: &Path, file_id: u64) -> Option<Arc<IndexFile>> {
+        let mut newest: Option<(PathBuf, Arc<IndexFile>)> = None;
+        let mut unreadable = 0usize;
+        for side in self.of(volume_path) {
+            let handle = VolumeFile::shared(side);
+            match IndexFile::open_through(&handle, file_id) {
+                Ok(file) => {
+                    let file = Arc::new(file);
+                    match newest.take() {
+                        Some((older_path, older)) if older.generation() >= file.generation() => {
+                            drop(file);
+                            retire_file(side);
+                            newest = Some((older_path, older));
+                        }
+                        Some((older_path, older)) => {
+                            drop(older);
+                            retire_file(&older_path);
+                            newest = Some((side.clone(), file));
+                        }
+                        None => newest = Some((side.clone(), file)),
+                    }
+                }
+                Err(error) => {
+                    eprintln!("Warning: side index {:?} unavailable: {error}", side);
+                    unreadable += 1;
+                }
+            }
+        }
+        if newest.is_none() && unreadable > 0 {
+            eprintln!("Warning: the volume {:?} is uncovered", volume_path);
+        }
+        newest.map(|(_, file)| file)
+    }
+
+    /// Retires the side files beside `volume_path`, of every generation:
+    /// each goes once its last holder lets go
+    pub fn retire_for(&self, volume_path: &Path) {
+        for side in self.of(volume_path) {
+            retire_file(side);
+        }
+    }
+
+    /// Retires every side file of the directory, whatever volume it stood
+    /// beside: what a table's removal asks
+    pub fn retire_all(&self) {
+        for side in self.by_volume.values().flatten() {
+            retire_file(side);
+        }
+    }
+}
+
+/// The volume id a side file's stem stands for, the generation stripped
+pub fn side_stem(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    Some(match stem.rsplit_once(".g") {
+        Some((volume, generation)) if !generation.is_empty() => volume.to_string(),
+        _ => stem.to_string(),
+    })
+}
+
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// A generation no earlier side file of this process carries, and none of
@@ -164,6 +271,12 @@ impl Ledger {
             peak_bytes: self.peak.load(Ordering::Acquire),
             refused: self.refused.load(Ordering::Relaxed),
         }
+    }
+
+    /// Counts a refusal decided outside `try_charge`, by a share of the
+    /// budget a caller keeps to
+    pub fn count_refused(&self) {
+        self.refused.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn reset_peak(&self) {
@@ -1018,18 +1131,8 @@ impl IndexFile {
     }
 
     fn read_page(&self, offset: u64, len: u32) -> std::io::Result<Vec<u8>> {
-        let file = self.file.open()?;
-        let mut header = [0u8; HEADER_LEN as usize];
-        read_exact_at(&file, &mut header, 0)?;
-        if header[..4] != MAGIC {
-            return Err(invalid("bad magic"));
-        }
-        let generation = u64::from_le_bytes(header[8..16].try_into().expect("8 bytes"));
-        if generation != self.directory.generation {
-            return Err(invalid("generation changed"));
-        }
-        let mut raw = vec![0u8; len as usize];
-        read_exact_at(&file, &mut raw, offset)?;
+        let mut raw = Vec::new();
+        self.read_page_into(offset, len, &mut raw)?;
         Ok(raw)
     }
 
@@ -1810,6 +1913,12 @@ impl TempFiles {
         self.keep = true;
         let _ = std::fs::remove_dir(&self.build_dir);
     }
+
+    /// The same, for a directory a holder keeps
+    fn finished_at(&mut self) {
+        self.keep = true;
+        let _ = std::fs::remove_dir(&self.build_dir);
+    }
 }
 
 impl Drop for TempFiles {
@@ -1975,6 +2084,20 @@ pub fn build_side_file(
     columns: Vec<ColumnInput<'_>>,
     workspace_bytes: usize,
 ) -> std::io::Result<BuildReport> {
+    let (report, temps) = build_side_file_staged(path, generation, columns, workspace_bytes)?;
+    std::fs::rename(temps.tmp_path(), path)?;
+    temps.finished();
+    Ok(report)
+}
+
+/// `build_side_file` up to the rename: the output stays in its build
+/// directory beside `path`, to be published by the caller or dropped
+fn build_side_file_staged(
+    path: &Path,
+    generation: u64,
+    columns: Vec<ColumnInput<'_>>,
+    workspace_bytes: usize,
+) -> std::io::Result<(BuildReport, TempFiles)> {
     if workspace_bytes < MIN_WORKSPACE_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1996,6 +2119,7 @@ pub fn build_side_file(
     let per_column = budget.take(columns.len() * COLUMN_SLOT_BYTES, "the directory's columns")?;
     let temps = TempFiles::new(path, generation)?;
     let tmp = temps.tmp_path();
+    let temps = temps;
     let mut out = BufWriter::with_capacity(OUT_BUFFER_BYTES, std::fs::File::create(&tmp)?);
     out.write_all(&MAGIC)?;
     out.write_all(&VERSION.to_le_bytes())?;
@@ -2119,8 +2243,6 @@ pub fn build_side_file(
     let file = out.into_inner().map_err(|e| e.into_error())?;
     file.sync_all()?;
     drop(file);
-    std::fs::rename(&tmp, path)?;
-    temps.finished();
     // Each owner before the charge that backs it
     drop(dir);
     drop(dir_charge);
@@ -2131,7 +2253,7 @@ pub fn build_side_file(
     report.file_bytes = offset + dir_len as u64 + FOOTER_LEN;
     report.workspace_peak = budget.peak.get();
     report.build_ns = started.elapsed().as_nanos() as u64;
-    Ok(report)
+    Ok((report, temps))
 }
 
 #[cfg(test)]
@@ -2430,9 +2552,15 @@ const BUILD_SHARE_BYTES: usize = 16 * 1024 * 1024;
 /// budget less the `input` decode admitted beside it, and at least what
 /// `rows` rows of `columns` columns need
 pub fn workspace_for(rows: usize, columns: usize, input: usize) -> usize {
-    let least = MIN_WORKSPACE_BYTES + columns * (metadata_allowance(rows) + COLUMN_SLOT_BYTES);
     let share = (INDEX_BUILDS.stats().budget_bytes as usize).min(BUILD_SHARE_BYTES);
-    share.saturating_sub(input).max(least)
+    share
+        .saturating_sub(input)
+        .max(least_workspace(rows, columns))
+}
+
+/// The least workspace a build of `rows` rows of `columns` columns needs
+pub fn least_workspace(rows: usize, columns: usize) -> usize {
+    MIN_WORKSPACE_BYTES + columns * (metadata_allowance(rows) + COLUMN_SLOT_BYTES)
 }
 
 fn integer_keys(data: &super::column::ColumnData) -> Option<(&[i64], &[bool])> {
@@ -2597,8 +2725,92 @@ pub fn build_side_for(
     file_id: u64,
     identities: &[(usize, u64)],
 ) -> std::io::Result<Option<Arc<IndexFile>>> {
+    match stage_side_for(volume, volume_path, file_id, identities, None)? {
+        SideBuild::Built(staged) => match staged.publish(&side_path(volume_path), file_id) {
+            Ok(side) => Ok(Some(side)),
+            Err(error) => {
+                BUILDS_FAILED.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "Warning: side index {:?} unreadable after its build: {error}",
+                    side_path(volume_path)
+                );
+                retire_side_of(volume_path);
+                Ok(None)
+            }
+        },
+        SideBuild::Refused | SideBuild::Failed => Ok(None),
+    }
+}
+
+/// What a build came to: the staged file, or the budget's refusal, or a
+/// failure that was logged and counted
+pub enum SideBuild {
+    Built(StagedSide),
+    Refused,
+    Failed,
+}
+
+/// A side file built and checked but not yet at its volume's path: it
+/// lives in its build directory beside the volume until `publish` renames
+/// it over the path, and goes with the directory when dropped before
+pub struct StagedSide {
+    temps: TempFiles,
+    file_id: u64,
+    generation: u64,
+}
+
+impl StagedSide {
+    /// The generation the staged file carries: its name once published
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Follows the volume's directory to where it is now: a table rename
+    /// moved the build directory along, and every later step, a discard
+    /// included, must find it there
+    pub fn relocate(&mut self, volume_path: &Path) {
+        if self.temps.build_dir.exists() {
+            return;
+        }
+        if let (Some(dir), Some(name)) = (volume_path.parent(), self.temps.build_dir.file_name()) {
+            let moved = dir.join(name);
+            if moved.exists() {
+                self.temps.build_dir = moved;
+            }
+        }
+    }
+
+    /// Reads the staged file, to check what it covers before it is published
+    pub fn open(&self) -> std::io::Result<IndexFile> {
+        IndexFile::open(&self.temps.tmp_path(), self.file_id)
+    }
+
+    /// Renames the staged file to `side`, a name of its own generation,
+    /// and opens it through that path's shared handle
+    pub fn publish(self, side: &Path, file_id: u64) -> std::io::Result<Arc<IndexFile>> {
+        let built = self.temps.tmp_path();
+        std::fs::rename(&built, side)?;
+        let mut temps = self.temps;
+        temps.finished_at();
+        drop(temps);
+        let handle = VolumeFile::shared(side);
+        IndexFile::open_through(&handle, file_id).map(Arc::new)
+    }
+}
+
+/// Builds the side file of `volume` beside it, staged: admitted through the
+/// builds budget as the seal's build is, and when `cap` is given, sized to
+/// fit under it (a backfill takes at most its share of the budget, and a
+/// build that does not fit even at its least is refused)
+pub fn stage_side_for(
+    volume: &super::writer::FrozenVolume,
+    volume_path: &Path,
+    file_id: u64,
+    identities: &[(usize, u64)],
+    cap: Option<usize>,
+) -> std::io::Result<SideBuild> {
     if identities.is_empty() {
-        return Ok(None);
+        return Ok(SideBuild::Refused);
     }
     let side = side_path(volume_path);
     let input = identities
@@ -2606,12 +2818,21 @@ pub fn build_side_for(
         .map(|&(column, _)| decode_allowance(volume, column))
         .max()
         .unwrap_or(0);
+    let mut workspace = workspace_for(volume.meta.row_count, identities.len(), input);
+    if let Some(cap) = cap {
+        let least = least_workspace(volume.meta.row_count, identities.len());
+        if input + least > cap {
+            INDEX_BUILDS.count_refused();
+            return Ok(SideBuild::Refused);
+        }
+        workspace = workspace.min(cap - input).max(least);
+    }
     let Some(_input_admitted) = INDEX_BUILDS.try_charge(input) else {
         eprintln!(
             "Warning: side index {:?} not built: the budget refused its input's decode",
             side
         );
-        return Ok(None);
+        return Ok(SideBuild::Refused);
     };
     let failure = std::cell::Cell::new(None);
     let columns = identities
@@ -2622,68 +2843,51 @@ pub fn build_side_for(
             pairs: Box::new(volume_pairs(volume, column, &failure)),
         })
         .collect();
-    let workspace = workspace_for(volume.meta.row_count, identities.len(), input);
-    let built = build_side_file(&side, next_generation(), columns, workspace);
+    let generation = next_generation();
+    let built = build_side_file_staged(&side, generation, columns, workspace);
     if let Some(error) = failure.take() {
-        // The volume could not be read: whatever was written is short
-        retire_side_of(volume_path);
+        // The volume could not be read: whatever was written goes
         return Err(error);
     }
-    if let Err(error) = built {
-        if is_refused(&error) {
+    match built {
+        Ok((_, temps)) => Ok(SideBuild::Built(StagedSide {
+            temps,
+            file_id,
+            generation,
+        })),
+        Err(error) if is_refused(&error) => {
             eprintln!("Warning: side index {:?} not built: {error}", side);
-        } else {
+            Ok(SideBuild::Refused)
+        }
+        Err(error) => {
             BUILDS_FAILED.fetch_add(1, Ordering::Relaxed);
             eprintln!("Warning: side index {:?} failed: {error}", side);
-            retire_side_of(volume_path);
-        }
-        return Ok(None);
-    }
-    let handle = VolumeFile::shared(&side);
-    match IndexFile::open_through(&handle, file_id) {
-        Ok(file) => Ok(Some(Arc::new(file))),
-        Err(error) => {
-            BUILDS_FAILED.fetch_add(1, Ordering::Relaxed);
-            eprintln!(
-                "Warning: side index {:?} unreadable after its build: {error}",
-                side
-            );
-            handle.retire();
-            Ok(None)
+            Ok(SideBuild::Failed)
         }
     }
 }
 
-/// The side file beside `volume_path` at reopen, if there is one it can
-/// read. One it cannot read stays where it is, logged: a failed open
-/// does not show the file is bad, and the volume is uncovered until the
-/// next compaction rewrites it
+/// The side file to attach beside `volume_path` at reopen, from a read of
+/// its directory; see `SideFiles::open_for`
 pub fn open_side_for(volume_path: &Path, file_id: u64) -> Option<Arc<IndexFile>> {
-    let side = side_path(volume_path);
-    if !side.exists() {
-        return None;
-    }
-    let handle = VolumeFile::shared(&side);
-    match IndexFile::open_through(&handle, file_id) {
-        Ok(file) => Some(Arc::new(file)),
-        Err(error) => {
-            eprintln!(
-                "Warning: side index {:?} unavailable, the volume is uncovered: {error}",
-                side
-            );
-            None
-        }
-    }
+    let dir = volume_path.parent()?;
+    SideFiles::in_dir(dir).open_for(volume_path, file_id)
 }
 
-/// Retires the side file beside `volume_path`, if any: it goes once its
-/// last holder lets go
-pub fn retire_side_of(volume_path: &Path) {
-    let side = side_path(volume_path);
-    match VolumeFile::retire_path(&side) {
+fn retire_file(side: &Path) {
+    match VolumeFile::retire_path(side) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => eprintln!("Warning: side index {:?} not retired: {error}", side),
+    }
+}
+
+/// Retires the side files beside `volume_path`, of every generation: each
+/// goes once its last holder lets go. A loop over a table's volumes reads
+/// the directory once through `SideFiles` instead
+pub fn retire_side_of(volume_path: &Path) {
+    if let Some(dir) = volume_path.parent() {
+        SideFiles::in_dir(dir).retire_for(volume_path);
     }
 }
 
@@ -2693,6 +2897,14 @@ pub fn still_covers(side: &IndexFile, current: &[(usize, u64)]) -> bool {
     current
         .iter()
         .any(|&(column, identity)| side.covers(column, identity))
+}
+
+/// Whether `side` covers every column and identity in `wanted`: what a
+/// backfill asks of a volume's file before leaving it alone
+pub fn covers_all(side: &IndexFile, wanted: &[(usize, u64)]) -> bool {
+    wanted
+        .iter()
+        .all(|&(column, identity)| side.covers(column, identity))
 }
 
 // =============================================================================
@@ -3666,8 +3878,63 @@ mod tests {
         assert_eq!(unique.len(), 20_000, "every position once");
     }
 
+    /// A directory read once groups the generations by volume; the newest
+    /// that opens is attached and a newer one that does not open stays
     #[test]
-    fn a_page_read_after_the_file_was_replaced_reports_the_generation() {
+    fn side_files_are_grouped_by_volume_and_an_unreadable_newer_one_stays() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let volume = dir.path().join("vol_1.vol");
+        let other = dir.path().join("vol_2.vol");
+        build(
+            &side_path(&volume),
+            (0..10u32).map(|p| (p, 1i64)).collect(),
+            WORKSPACE,
+        );
+        build(
+            &side_path_for(&volume, 9),
+            (0..10u32).map(|p| (p, 2i64)).collect(),
+            WORKSPACE,
+        );
+        build(
+            &side_path(&other),
+            (0..10u32).map(|p| (p, 3i64)).collect(),
+            WORKSPACE,
+        );
+        let files = SideFiles::in_dir(dir.path());
+        assert_eq!(files.of(&volume).len(), 2);
+        assert_eq!(files.of(&other).len(), 1);
+        assert!(files.of(&dir.path().join("vol_3.vol")).is_empty());
+        INDEX_PAGES.clear();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let newer = side_path_for(&volume, 9);
+            std::fs::set_permissions(&newer, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let attached = files.open_for(&volume, 1).unwrap();
+            assert!(
+                attached.equal(1, 1).unwrap().is_some(),
+                "the older generation serves"
+            );
+            drop(attached);
+            assert!(
+                newer.exists(),
+                "the newer generation stays for a later open"
+            );
+            std::fs::set_permissions(&newer, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let attached = SideFiles::in_dir(dir.path()).open_for(&volume, 1).unwrap();
+        assert!(
+            attached.equal(1, 2).unwrap().is_some(),
+            "the newest generation"
+        );
+        drop(attached);
+        assert!(!side_path(&volume).exists(), "the older generation went");
+        assert!(side_path(&other).exists(), "the other volume's file stays");
+    }
+
+    #[test]
+    fn a_replacement_is_a_new_file_and_the_old_holder_keeps_its_own() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sidx");
@@ -3677,18 +3944,35 @@ mod tests {
             WORKSPACE,
         );
         let old = IndexFile::open(&path, 4).unwrap();
+        // A replacement is a file of its own generation's name: the old
+        // holder keeps its own file, through the cache and on its own
+        // buffers alike
+        let replacement = side_path_for(&dir.path().join("v.vol"), 7);
         build(
-            &path,
+            &replacement,
             (0..1000u32).map(|p| (p, (p * 2) as i64)).collect(),
             WORKSPACE,
         );
         INDEX_PAGES.clear();
-        let err = old.equal(1, 5).unwrap_err();
-        assert!(is_generation_changed(&err), "{err}");
-        let new = IndexFile::open(&path, 4).unwrap();
+        assert_eq!(old.equal(1, 5).unwrap(), Some((5, 6)));
+        let new = IndexFile::open(&replacement, 4).unwrap();
         assert_ne!(new.generation(), old.generation());
         assert_eq!(new.equal(1, 5).unwrap(), None);
         assert!(new.equal(1, 10).unwrap().is_some());
+        let mut reader = Arc::new(old).reader(1, 100).unwrap();
+        INDEX_PAGES.set_budget_bytes(INDEX_PAGES.stats().charged_bytes as u64);
+        INDEX_PAGES.clear();
+        assert_eq!(reader.equal(5).unwrap(), Some((5, 6)), "on its own buffers");
+        reader.walk((0, 1000));
+        assert_eq!(reader.next_window().unwrap().map(|w| w.len()), Some(100));
+        drop(reader);
+        INDEX_PAGES.set_budget_bytes(DEFAULT_BUDGET_BYTES);
+        INDEX_PAGES.clear();
+        // Beside a volume, the newest generation is the one attached
+        let volume = dir.path().join("v.vol");
+        let attached = open_side_for(&volume, 4).unwrap();
+        assert_eq!(attached.generation(), new.generation());
+        assert_eq!(side_stem(&replacement).as_deref(), Some("v"));
     }
 
     #[test]
