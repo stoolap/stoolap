@@ -81,6 +81,51 @@ pub fn side_path(volume_path: &Path) -> PathBuf {
     volume_path.with_extension(SIDE_EXT)
 }
 
+/// The side file of `generation` beside `volume_path`: a build that
+/// replaces a volume's side file writes a file of its own name, so the
+/// holders of the one before keep theirs, on disk and by path. The seal's
+/// and the compaction's first file keeps the plain name
+pub fn side_path_for(volume_path: &Path, generation: u64) -> PathBuf {
+    volume_path.with_extension(format!("g{generation:x}.{SIDE_EXT}"))
+}
+
+/// The side files beside `volume_path`, of any generation
+fn side_files_of(volume_path: &Path) -> Vec<PathBuf> {
+    let Some(stem) = volume_path.file_stem().and_then(|s| s.to_str()) else {
+        return Vec::new();
+    };
+    let Some(dir) = volume_path.parent() else {
+        return Vec::new();
+    };
+    let plain = format!("{stem}.{SIDE_EXT}");
+    let prefix = format!("{stem}.g");
+    let suffix = format!(".{SIDE_EXT}");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| {
+                    name == plain || (name.starts_with(&prefix) && name.ends_with(&suffix))
+                })
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// The volume id a side file's stem stands for, the generation stripped
+pub fn side_stem(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    Some(match stem.rsplit_once(".g") {
+        Some((volume, generation)) if !generation.is_empty() => volume.to_string(),
+        _ => stem.to_string(),
+    })
+}
+
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// A generation no earlier side file of this process carries, and none of
@@ -913,9 +958,6 @@ fn read_u32(data: &[u8], pos: &mut usize) -> std::io::Result<u32> {
 /// was read at.
 pub struct IndexFile {
     file: Arc<VolumeFile>,
-    /// The bytes of this generation, open for the file's lifetime: a
-    /// build that replaces the path leaves a holder's pages as they were
-    descriptor: std::fs::File,
     file_id: u64,
     directory: Directory,
     _charges: Vec<Held>,
@@ -979,7 +1021,6 @@ impl IndexFile {
         drop(raw_charge);
         Ok(Self {
             file: Arc::clone(handle),
-            descriptor: file,
             file_id,
             directory,
             _charges: charges,
@@ -1028,8 +1069,8 @@ impl IndexFile {
     }
 
     fn read_page(&self, offset: u64, len: u32) -> std::io::Result<Vec<u8>> {
-        let mut raw = vec![0u8; len as usize];
-        read_exact_at(&self.descriptor, &mut raw, offset)?;
+        let mut raw = Vec::new();
+        self.read_page_into(offset, len, &mut raw)?;
         Ok(raw)
     }
 
@@ -1807,6 +1848,12 @@ impl TempFiles {
 
     /// The output was renamed out; the directory is empty and goes
     fn finished(mut self) {
+        self.keep = true;
+        let _ = std::fs::remove_dir(&self.build_dir);
+    }
+
+    /// The same, for a directory a holder keeps
+    fn finished_at(&mut self) {
         self.keep = true;
         let _ = std::fs::remove_dir(&self.build_dir);
     }
@@ -2647,40 +2694,42 @@ pub enum SideBuild {
 pub struct StagedSide {
     temps: TempFiles,
     file_id: u64,
+    generation: u64,
 }
 
 impl StagedSide {
-    /// The staged file's directory, wherever the volume's directory is
-    /// now: a table rename moved it along
-    fn built_at(&self, volume_path: &Path) -> PathBuf {
-        let own = self.temps.tmp_path();
-        if own.exists() {
-            return own;
+    /// The generation the staged file carries: its name once published
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Follows the volume's directory to where it is now: a table rename
+    /// moved the build directory along, and every later step, a discard
+    /// included, must find it there
+    pub fn relocate(&mut self, volume_path: &Path) {
+        if self.temps.build_dir.exists() {
+            return;
         }
-        match (volume_path.parent(), self.temps.build_dir.file_name()) {
-            (Some(dir), Some(name)) => dir.join(name).join("out"),
-            _ => own,
+        if let (Some(dir), Some(name)) = (volume_path.parent(), self.temps.build_dir.file_name()) {
+            let moved = dir.join(name);
+            if moved.exists() {
+                self.temps.build_dir = moved;
+            }
         }
     }
 
     /// Reads the staged file, to check what it covers before it is published
-    pub fn open(&self, volume_path: &Path) -> std::io::Result<IndexFile> {
-        let path = self.built_at(volume_path);
-        IndexFile::open(&path, self.file_id)
+    pub fn open(&self) -> std::io::Result<IndexFile> {
+        IndexFile::open(&self.temps.tmp_path(), self.file_id)
     }
 
-    /// Renames the staged file over `side` and opens it through the
-    /// path's shared handle: the holders of the generation there before
-    /// keep their own bytes
+    /// Renames the staged file to `side`, a name of its own generation,
+    /// and opens it through that path's shared handle
     pub fn publish(self, side: &Path, file_id: u64) -> std::io::Result<Arc<IndexFile>> {
-        let volume_path = side.with_extension("vol");
-        let built = self.built_at(&volume_path);
+        let built = self.temps.tmp_path();
         std::fs::rename(&built, side)?;
-        if let Some(dir) = built.parent() {
-            let _ = std::fs::remove_dir(dir);
-        }
         let mut temps = self.temps;
-        temps.keep = true;
+        temps.finished_at();
         drop(temps);
         let handle = VolumeFile::shared(side);
         IndexFile::open_through(&handle, file_id).map(Arc::new)
@@ -2732,13 +2781,18 @@ pub fn stage_side_for(
             pairs: Box::new(volume_pairs(volume, column, &failure)),
         })
         .collect();
-    let built = build_side_file_staged(&side, next_generation(), columns, workspace);
+    let generation = next_generation();
+    let built = build_side_file_staged(&side, generation, columns, workspace);
     if let Some(error) = failure.take() {
         // The volume could not be read: whatever was written goes
         return Err(error);
     }
     match built {
-        Ok((_, temps)) => Ok(SideBuild::Built(StagedSide { temps, file_id })),
+        Ok((_, temps)) => Ok(SideBuild::Built(StagedSide {
+            temps,
+            file_id,
+            generation,
+        })),
         Err(error) if is_refused(&error) => {
             eprintln!("Warning: side index {:?} not built: {error}", side);
             Ok(SideBuild::Refused)
@@ -2756,31 +2810,63 @@ pub fn stage_side_for(
 /// does not show the file is bad, and the volume is uncovered until the
 /// next compaction rewrites it
 pub fn open_side_for(volume_path: &Path, file_id: u64) -> Option<Arc<IndexFile>> {
-    let side = side_path(volume_path);
-    if !side.exists() {
-        return None;
+    // Of the generations beside the volume, the newest that opens is
+    // attached and the others go; a file that does not open stays only
+    // while no newer one opens
+    let mut newest: Option<(PathBuf, Arc<IndexFile>)> = None;
+    let mut unreadable: Vec<PathBuf> = Vec::new();
+    for side in side_files_of(volume_path) {
+        let handle = VolumeFile::shared(&side);
+        match IndexFile::open_through(&handle, file_id) {
+            Ok(file) => {
+                let file = Arc::new(file);
+                let older = newest.replace((side, file));
+                if let Some((path, older)) = older {
+                    if older.generation() > newest.as_ref().map_or(0, |(_, n)| n.generation()) {
+                        let (newer_path, newer) = newest.replace((path, older)).expect("set");
+                        retire_file(&newer_path);
+                        drop(newer);
+                    } else {
+                        drop(older);
+                        retire_file(&path);
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("Warning: side index {:?} unavailable: {error}", side);
+                unreadable.push(side);
+            }
+        }
     }
-    let handle = VolumeFile::shared(&side);
-    match IndexFile::open_through(&handle, file_id) {
-        Ok(file) => Some(Arc::new(file)),
-        Err(error) => {
-            eprintln!(
-                "Warning: side index {:?} unavailable, the volume is uncovered: {error}",
-                side
-            );
+    match newest {
+        Some((_, file)) => {
+            for path in unreadable {
+                retire_file(&path);
+            }
+            Some(file)
+        }
+        None => {
+            if !unreadable.is_empty() {
+                eprintln!("Warning: the volume {:?} is uncovered", volume_path);
+            }
             None
         }
     }
 }
 
-/// Retires the side file beside `volume_path`, if any: it goes once its
-/// last holder lets go
-pub fn retire_side_of(volume_path: &Path) {
-    let side = side_path(volume_path);
-    match VolumeFile::retire_path(&side) {
+fn retire_file(side: &Path) {
+    match VolumeFile::retire_path(side) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => eprintln!("Warning: side index {:?} not retired: {error}", side),
+    }
+}
+
+/// Retires the side files beside `volume_path`, of every generation: each
+/// goes once its last holder lets go
+pub fn retire_side_of(volume_path: &Path) {
+    for side in side_files_of(volume_path) {
+        retire_file(&side);
     }
 }
 
@@ -3772,7 +3858,7 @@ mod tests {
     }
 
     #[test]
-    fn a_holder_keeps_its_generation_after_the_file_was_replaced() {
+    fn a_replacement_is_a_new_file_and_the_old_holder_keeps_its_own() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sidx");
@@ -3782,19 +3868,35 @@ mod tests {
             WORKSPACE,
         );
         let old = IndexFile::open(&path, 4).unwrap();
+        // A replacement is a file of its own generation's name: the old
+        // holder keeps its own file, through the cache and on its own
+        // buffers alike
+        let replacement = side_path_for(&dir.path().join("v.vol"), 7);
         build(
-            &path,
+            &replacement,
             (0..1000u32).map(|p| (p, (p * 2) as i64)).collect(),
             WORKSPACE,
         );
         INDEX_PAGES.clear();
-        // The holder of the old generation keeps its own bytes
         assert_eq!(old.equal(1, 5).unwrap(), Some((5, 6)));
-        let new = IndexFile::open(&path, 4).unwrap();
+        let new = IndexFile::open(&replacement, 4).unwrap();
         assert_ne!(new.generation(), old.generation());
         assert_eq!(new.equal(1, 5).unwrap(), None);
         assert!(new.equal(1, 10).unwrap().is_some());
-        assert_eq!(old.equal(1, 5).unwrap(), Some((5, 6)));
+        let mut reader = Arc::new(old).reader(1, 100).unwrap();
+        INDEX_PAGES.set_budget_bytes(INDEX_PAGES.stats().charged_bytes as u64);
+        INDEX_PAGES.clear();
+        assert_eq!(reader.equal(5).unwrap(), Some((5, 6)), "on its own buffers");
+        reader.walk((0, 1000));
+        assert_eq!(reader.next_window().unwrap().map(|w| w.len()), Some(100));
+        drop(reader);
+        INDEX_PAGES.set_budget_bytes(DEFAULT_BUDGET_BYTES);
+        INDEX_PAGES.clear();
+        // Beside a volume, the newest generation is the one attached
+        let volume = dir.path().join("v.vol");
+        let attached = open_side_for(&volume, 4).unwrap();
+        assert_eq!(attached.generation(), new.generation());
+        assert_eq!(side_stem(&replacement).as_deref(), Some("v"));
     }
 
     #[test]

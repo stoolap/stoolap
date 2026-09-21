@@ -138,21 +138,34 @@ fn served(db: &Database, low: i64, high: i64) -> (i64, i64) {
     )
 }
 
+/// The volumes with a file of `ext` beside them: a side file of a later
+/// generation is named `vol_<id>.g<generation>.sidx`
 fn files(dir: &Path, table: &str, ext: &str) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     if let Ok(entries) = std::fs::read_dir(dir.join("volumes").join(table)) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some(ext) {
-                names.insert(
-                    path.file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap()
-                        .to_string(),
-                );
+                names.insert(stoolap::storage::volume::secondary::side_stem(&path).unwrap());
             }
         }
     }
+    names
+}
+
+/// The side files beside `table`'s volumes, by name
+fn side_names(dir: &Path, table: &str) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir.join("volumes").join(table))
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("sidx"))
+                .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
     names
 }
 
@@ -480,7 +493,15 @@ fn a_file_covering_one_index_of_two_is_rebuilt_for_both() {
     assert_eq!((pass["examined"], pass["built"]), (1, 1), "{pass:?}");
     assert_eq!(on_v(&db), (1, 0));
     assert_eq!(served(&db, 100, 103), (1, 0), "still covered for k");
+    // The replacement has its generation's name; the file before goes
+    // with its last holder
     assert_eq!(files(dir.path(), "t", "sidx").len(), 1);
+    assert_eq!(
+        side_names(dir.path(), "t").len(),
+        1,
+        "{:?}",
+        side_names(dir.path(), "t")
+    );
 }
 
 /// A compaction that takes the volume away before its build: the file is
@@ -720,8 +741,17 @@ fn a_small_volume_is_built_under_a_small_budget() {
     assert_eq!(delta(&reads(&db), &before, "probes"), 1);
 }
 
+/// Makes a volume file unreadable, so its build fails, and readable again
+#[cfg(unix)]
+fn readable(path: &Path, yes: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if yes { 0o644 } else { 0o000 };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
 /// A volume whose build keeps failing does not keep the newer ones from
 /// their turn: the next pass starts after it.
+#[cfg(unix)]
 #[test]
 fn a_failing_volume_does_not_starve_the_newer_ones() {
     let _serial = serial();
@@ -730,15 +760,17 @@ fn a_failing_volume_does_not_starve_the_newer_ones() {
     create(&db);
     seal_volumes(&db, 2);
     db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    db.close().unwrap();
+    let db = open(dir.path(), "");
     let mut vols: Vec<String> = files(dir.path(), "t", "vol").into_iter().collect();
     vols.sort();
-    // The oldest volume's side path is taken by a directory: its build fails
+    // The oldest volume cannot be read: its build fails
     let blocked = dir
         .path()
         .join("volumes")
         .join("t")
-        .join(format!("{}.sidx", vols[0]));
-    std::fs::create_dir(&blocked).unwrap();
+        .join(format!("{}.vol", vols[0]));
+    readable(&blocked, false);
     let first = backfill(&db, Some(1));
     assert_eq!(
         (first["examined"], first["failed"], first["left"]),
@@ -747,9 +779,99 @@ fn a_failing_volume_does_not_starve_the_newer_ones() {
     );
     let second = backfill(&db, Some(1));
     assert_eq!((second["examined"], second["built"]), (1, 1), "{second:?}");
+    readable(&blocked, true);
     assert_eq!(served(&db, 100, 103), (1, 1), "the newer volume is probed");
-    std::fs::remove_dir(&blocked).unwrap();
     let third = backfill(&db, Some(1));
     assert_eq!(third["built"], 1, "{third:?}");
     assert_eq!(served(&db, 100, 103), (2, 0));
+}
+
+/// A volume that cannot be built in one table does not keep another
+/// table's volumes from their turn either: the cursor spans the tables.
+#[cfg(unix)]
+#[test]
+fn a_failing_volume_does_not_starve_another_table() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "");
+    // Table a sorts first; its only volume cannot be read
+    db.execute(
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER NOT NULL)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO a VALUES (1, 1), (2, 2)", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("CREATE INDEX idx_a_k ON a(k)", ()).unwrap();
+    create(&db);
+    seal_volumes(&db, 1);
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    db.close().unwrap();
+    let db = open(dir.path(), "");
+    let a_volume = std::fs::read_dir(dir.path().join("volumes").join("a"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("vol"))
+        .unwrap();
+    readable(&a_volume, false);
+    let first = backfill(&db, Some(1));
+    assert_eq!((first["failed"], first["left"]), (1, 1), "{first:?}");
+    let second = backfill(&db, Some(1));
+    assert_eq!(second["built"], 1, "t's volume takes its turn: {second:?}");
+    assert_eq!(served(&db, 100, 103), (1, 0));
+    readable(&a_volume, true);
+    let third = backfill(&db, Some(1));
+    assert_eq!(third["built"], 1, "{third:?}");
+}
+
+/// A table renamed after its volume's side file was staged: the staged
+/// file is found where the directory went, published there, and nothing
+/// is left behind; a discard after such a rename leaves nothing either.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_rename_after_the_staging_publishes_where_the_volume_is_now() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "");
+    create(&db);
+    seal_volumes(&db, 1);
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    let other = db.clone();
+    stoolap::test_failpoints::after_side_backfilled(move || {
+        other
+            .execute("ALTER TABLE t RENAME TO archived", ())
+            .unwrap();
+    });
+    let pass = backfill(&db, None);
+    assert_eq!(pass["built"], 1, "{pass:?}");
+    let archived = files(dir.path(), "archived", "vol");
+    assert_eq!(files(dir.path(), "archived", "sidx"), archived);
+    assert!(
+        leftovers(dir.path(), "archived").is_empty(),
+        "no build directory left"
+    );
+    // Renamed back and the index recreated inside the pass: discarded, nothing left
+    db.execute("ALTER TABLE archived RENAME TO t", ()).unwrap();
+    db.execute("DROP INDEX idx_t_k ON t", ()).unwrap();
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    let other = db.clone();
+    stoolap::test_failpoints::after_side_backfilled(move || {
+        other
+            .execute("ALTER TABLE t RENAME TO archived", ())
+            .unwrap();
+        other.execute("DROP INDEX idx_t_k ON archived", ()).unwrap();
+        other
+            .execute("CREATE INDEX idx_t_k ON archived(k)", ())
+            .unwrap();
+    });
+    let pass = backfill(&db, None);
+    assert_eq!((pass["built"], pass["discarded"]), (0, 1), "{pass:?}");
+    assert!(
+        leftovers(dir.path(), "archived").is_empty(),
+        "the discarded build left nothing"
+    );
+    db.close().unwrap();
+    assert!(leftovers(dir.path(), "archived").is_empty());
 }
