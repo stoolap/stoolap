@@ -236,6 +236,24 @@ pub(crate) fn join_probe_admitted() {
 }
 
 thread_local! {
+    static ROW_IDS_CLASSIFIED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next fetch of rows by id on a table
+/// holding volumes has decided which ids are hot and has not yet read them:
+/// the window a seal must not slip into unnoticed
+pub fn after_row_ids_classified(hook: impl FnOnce() + 'static) {
+    ROW_IDS_CLASSIFIED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn row_ids_classified() {
+    let hook = ROW_IDS_CLASSIFIED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static RENAME_MOVED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
