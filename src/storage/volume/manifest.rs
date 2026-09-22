@@ -2327,6 +2327,15 @@ impl SegmentManager {
             .is_some_and(|v| !v.is_empty())
     }
 
+    /// Whether any transaction holds a sealed row's replacement or deletion
+    /// that is not committed yet
+    pub fn has_any_pending_tombstones(&self) -> bool {
+        self.pending_txn_tombstones
+            .read()
+            .values()
+            .any(|v| !v.is_empty())
+    }
+
     /// Check if a row_id is tombstoned (any commit_seq).
     pub fn is_tombstoned(&self, row_id: i64) -> bool {
         self.tombstones.read().contains_key(&row_id)

@@ -257,3 +257,123 @@ fn graph_ids(db: &Database) -> Vec<i64> {
         .map(|(id, _)| id)
         .collect()
 }
+
+/// A vector index created while a transaction holds a sealed row's
+/// replacement is refused, since that transaction kept nothing for the
+/// index to take back; once the transaction is done the index is created
+/// and the graph is right
+#[test]
+fn a_vector_index_is_not_created_over_a_pending_sealed_write() {
+    let _guard = test_failpoints::FailpointGuard::new();
+    for statement in [
+        "UPDATE t SET v = '[100,0]' WHERE id = 1",
+        "DELETE FROM t WHERE id = 1",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dsn(&dir)).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v VECTOR(2))", ())
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, '[1,0]'), (2, '[10,0]')", ())
+            .unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+
+        let mut writer = db.begin().unwrap();
+        writer.execute(statement, ()).unwrap();
+        let created = db.execute("CREATE INDEX idx_t_v ON t(v) USING HNSW", ());
+        assert!(
+            matches!(
+                created,
+                Err(stoolap::core::Error::TableHasActiveTransactions)
+            ),
+            "{statement}: {created:?}"
+        );
+        writer.commit().unwrap();
+        db.execute("CREATE INDEX idx_t_v ON t(v) USING HNSW", ())
+            .unwrap();
+        let expected = if statement.starts_with("UPDATE") {
+            vec![2, 1]
+        } else {
+            vec![2]
+        };
+        assert_eq!(
+            graph_ids(&db),
+            expected,
+            "{statement}: the graph after the write"
+        );
+        db.close().unwrap();
+    }
+}
+
+/// A commit whose second table fails to apply leaves nothing of the first
+/// table visible: the rows the transaction changed are as they were, the
+/// row another transaction committed meanwhile stays, now and after reopen
+#[test]
+fn a_commit_that_fails_on_a_later_table_leaves_the_earlier_ones_as_they_were() {
+    let _guard = test_failpoints::FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dsn(&dir)).unwrap();
+    for table in ["a", "b"] {
+        db.execute(
+            &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, v INTEGER)"),
+            (),
+        )
+        .unwrap();
+        db.execute(
+            &format!("CREATE UNIQUE INDEX idx_{table}_v ON {table}(v)"),
+            (),
+        )
+        .unwrap();
+        db.execute(&format!("INSERT INTO {table} VALUES (1, 10), (2, 20)"), ())
+            .unwrap();
+    }
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+
+    // When the first table has published its indexes, another transaction
+    // takes the key the second table is about to publish
+    let other = db.clone();
+    test_failpoints::after_indexes_published(move || {
+        for table in ["a", "b"] {
+            let _ = other.execute(&format!("INSERT INTO {table} VALUES (3, 999)"), ());
+        }
+    });
+    let mut writer = db.begin().unwrap();
+    writer
+        .execute("UPDATE a SET v = 999 WHERE id = 1", ())
+        .unwrap();
+    writer
+        .execute("UPDATE b SET v = 999 WHERE id = 1", ())
+        .unwrap();
+    assert!(writer.commit().is_err(), "the second table's key is taken");
+
+    let check = |db: &Database, when: &str| {
+        for table in ["a", "b"] {
+            let rows = pairs(db, &format!("SELECT id, v FROM {table} ORDER BY id"));
+            assert_eq!(
+                rows[..2],
+                [(1, 10), (2, 20)],
+                "{when}: {table} is as it was"
+            );
+            assert!(rows.len() <= 3 && rows.get(2).is_none_or(|row| *row == (3, 999)));
+            let taken = rows.len() == 3;
+            let sum = if taken { 1029 } else { 30 };
+            assert_eq!(
+                pairs(db, &format!("SELECT COUNT(*), SUM(v) FROM {table}")),
+                vec![(rows.len() as i64, sum)],
+                "{when}: {table} counts as it was"
+            );
+            // The key the failed commit would have taken is free unless the
+            // other transaction took it
+            let free = db.execute(&format!("INSERT INTO {table} VALUES (4, 999)"), ());
+            assert_eq!(free.is_ok(), !taken, "{when}: {table} key 999: {free:?}");
+            if !taken {
+                db.execute(&format!("DELETE FROM {table} WHERE id = 4"), ())
+                    .unwrap();
+            }
+        }
+    };
+    check(&db, "before reopen");
+    db.close().unwrap();
+    drop(db);
+    let db = Database::open(&dsn(&dir)).unwrap();
+    check(&db, "after reopen");
+}

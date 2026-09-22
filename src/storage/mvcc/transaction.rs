@@ -486,35 +486,23 @@ impl Transaction for MvccTransaction {
             if let Some(ops) = &self.engine_operations {
                 let (any_committed, error) = ops.commit_all_tables(self.id);
                 if let Some(e) = error {
+                    // A table that failed leaves the transaction unfinished, and
+                    // nothing of it is visible yet: the tables that applied
+                    // their versions and index updates take them back, the
+                    // cold tombstones are dropped, and the transaction aborts
+                    // as if no table had committed. The WAL records written so
+                    // far carry no marker, so recovery drops them too.
                     if any_committed {
-                        // Partial commit: some tables already committed.
-                        // We MUST complete the commit to avoid orphaning those rows.
-                        // The commit sequence is read before the registry lets
-                        // the transaction go, since the tombstones carry it
-                        let commit_seq = self.registry.get_committing_sequence(self.id) as u64;
-                        self.registry.complete_commit(self.id);
                         if let Some(hold) = &publish {
-                            ops.request_seal_if_over(hold);
+                            hold.undo_publication();
                         }
-                        // Record commit marker so WAL recovery sees committed state.
-                        // The tables are visible whatever the marker does, so
-                        // the tombstones of the rows they replaced go with them
-                        let marker = ops.record_commit(self.id);
-                        ops.publish_pending_tombstones(self.id, commit_seq);
-                        marker?;
-                        self.state = TransactionState::Committed;
-                        self.cleanup();
-                        return Err(e);
-                    } else {
-                        // Nothing committed yet - safe to abort cleanly.
-                        // Release uncommitted_writes claims and remove from
-                        // txn_version_stores to prevent permanent row blocking.
-                        self.registry.abort_transaction(self.id);
-                        ops.rollback_all_tables(self.id);
-                        self.state = TransactionState::RolledBack;
-                        self.cleanup();
-                        return Err(e);
+                        ops.discard_pending_tombstones(self.id);
                     }
+                    self.registry.abort_transaction(self.id);
+                    ops.rollback_all_tables(self.id);
+                    self.state = TransactionState::RolledBack;
+                    self.cleanup();
+                    return Err(e);
                 }
             }
 

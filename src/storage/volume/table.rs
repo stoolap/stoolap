@@ -1390,6 +1390,18 @@ impl SegmentedTable {
         Ok(SideAdmission::Probe(Arc::clone(side), physical))
     }
 
+    /// An index that keeps sealed rows takes its old keys from the
+    /// transaction that replaces or deletes a sealed row, and that
+    /// transaction decided whether to keep them when it wrote the row. One
+    /// that wrote before the index existed kept nothing, so the index is not
+    /// created while such a write is pending.
+    fn refuse_hnsw_under_sealed_writes(&self) -> Result<()> {
+        if self.segment_mgr.has_segments() && self.segment_mgr.has_any_pending_tombstones() {
+            return Err(crate::core::Error::TableHasActiveTransactions);
+        }
+        Ok(())
+    }
+
     /// The identities of the indexes the side files may serve, taken once
     /// per read with the cold view
     fn side_identities(&self) -> Vec<(usize, u64)> {
@@ -5250,6 +5262,9 @@ impl Table for SegmentedTable {
         if is_unique && index_type != Some(IndexType::Hnsw) && self.segment_mgr.has_segments() {
             self.validate_cold_unique(name, columns)?;
         }
+        if index_type == Some(IndexType::Hnsw) {
+            self.refuse_hnsw_under_sealed_writes()?;
+        }
 
         self.hot
             .create_index_with_type(name, columns, is_unique, index_type)?;
@@ -5266,6 +5281,7 @@ impl Table for SegmentedTable {
         ef_search: usize,
         metric: crate::storage::index::HnswDistanceMetric,
     ) -> Result<()> {
+        self.refuse_hnsw_under_sealed_writes()?;
         // Delegate to hot store which creates the HNSW with custom params
         self.hot.create_hnsw_index(
             name,
