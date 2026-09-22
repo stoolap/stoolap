@@ -2827,40 +2827,46 @@ impl Table for SegmentedTable {
         }
 
         let schema = self.hot.schema().clone();
-        let mut result = RowVec::with_capacity(row_ids.len());
-        let mut hot_ids = Vec::new();
-        let mut cached: Option<(super::writer::RowReader, super::writer::ColumnMapping)> = None;
+        // An id decided hot before a seal and read after it finds nothing,
+        // so the read is settled: a seal landing across it starts it over
+        self.settled_across_seals(|| {
+            let mut result = RowVec::with_capacity(row_ids.len());
+            let mut hot_ids = Vec::new();
+            let mut cached: Option<(super::writer::RowReader, super::writer::ColumnMapping)> = None;
 
-        for &row_id in row_ids {
-            if let Some((seg_id, vol, idx)) = self.find_segment_row(row_id)? {
-                if !cached
-                    .as_ref()
-                    .is_some_and(|(reader, _)| Arc::ptr_eq(reader.volume(), &vol))
-                {
-                    cached = Some((
-                        super::writer::RowReader::new(Arc::clone(&vol)),
-                        self.segment_mgr.get_volume_mapping(seg_id, &schema),
-                    ));
+            for &row_id in row_ids {
+                if let Some((seg_id, vol, idx)) = self.find_segment_row(row_id)? {
+                    if !cached
+                        .as_ref()
+                        .is_some_and(|(reader, _)| Arc::ptr_eq(reader.volume(), &vol))
+                    {
+                        cached = Some((
+                            super::writer::RowReader::new(Arc::clone(&vol)),
+                            self.segment_mgr.get_volume_mapping(seg_id, &schema),
+                        ));
+                    }
+                    let (reader, mapping) = cached
+                        .as_mut()
+                        .map(|(reader, mapping)| (reader, &*mapping))
+                        .expect("reader just set");
+                    let row = reader.row(idx, mapping)?;
+                    result.push((row_id, row));
+                } else {
+                    hot_ids.push(row_id);
                 }
-                let (reader, mapping) = cached
-                    .as_mut()
-                    .map(|(reader, mapping)| (reader, &*mapping))
-                    .expect("reader just set");
-                let row = reader.row(idx, mapping)?;
-                result.push((row_id, row));
-            } else {
-                hot_ids.push(row_id);
             }
-        }
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::row_ids_classified();
 
-        if !hot_ids.is_empty() {
-            let hot_result = self.hot.collect_rows_by_ids(&hot_ids)?;
-            for (id, row) in hot_result {
-                result.push((id, row));
+            if !hot_ids.is_empty() {
+                let hot_result = self.hot.collect_rows_by_ids(&hot_ids)?;
+                for (id, row) in hot_result {
+                    result.push((id, row));
+                }
             }
-        }
 
-        Ok(result)
+            Ok(result)
+        })
     }
 
     fn fetch_rows_by_ids(&self, row_ids: &[i64], filter: &dyn Expression) -> Result<RowVec> {
@@ -2881,38 +2887,46 @@ impl Table for SegmentedTable {
             return result;
         }
 
-        let mut hot_ids = Vec::new();
         let schema = self.hot.schema();
-        let mut cached: Option<(super::writer::RowReader, super::writer::ColumnMapping)> = None;
+        let start = buffer.len();
+        // An id decided hot before a seal and read after it finds nothing,
+        // so the read is settled: a seal landing across it starts it over
+        self.settled_across_seals(|| {
+            buffer.truncate(start);
+            let mut hot_ids = Vec::new();
+            let mut cached: Option<(super::writer::RowReader, super::writer::ColumnMapping)> = None;
 
-        for &row_id in row_ids {
-            if let Some((seg_id, vol, idx)) = self.find_segment_row(row_id)? {
-                if !cached
-                    .as_ref()
-                    .is_some_and(|(reader, _)| Arc::ptr_eq(reader.volume(), &vol))
-                {
-                    cached = Some((
-                        super::writer::RowReader::new(Arc::clone(&vol)),
-                        self.segment_mgr.get_volume_mapping(seg_id, schema),
-                    ));
+            for &row_id in row_ids {
+                if let Some((seg_id, vol, idx)) = self.find_segment_row(row_id)? {
+                    if !cached
+                        .as_ref()
+                        .is_some_and(|(reader, _)| Arc::ptr_eq(reader.volume(), &vol))
+                    {
+                        cached = Some((
+                            super::writer::RowReader::new(Arc::clone(&vol)),
+                            self.segment_mgr.get_volume_mapping(seg_id, schema),
+                        ));
+                    }
+                    let (reader, mapping) = cached
+                        .as_mut()
+                        .map(|(reader, mapping)| (reader, &*mapping))
+                        .expect("reader just set");
+                    let row = reader.row(idx, mapping)?;
+                    if filter.evaluate_fast(&row) {
+                        buffer.push((row_id, row));
+                    }
+                } else {
+                    hot_ids.push(row_id);
                 }
-                let (reader, mapping) = cached
-                    .as_mut()
-                    .map(|(reader, mapping)| (reader, &*mapping))
-                    .expect("reader just set");
-                let row = reader.row(idx, mapping)?;
-                if filter.evaluate_fast(&row) {
-                    buffer.push((row_id, row));
-                }
-            } else {
-                hot_ids.push(row_id);
             }
-        }
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::row_ids_classified();
 
-        if !hot_ids.is_empty() {
-            self.hot.fetch_rows_by_ids_into(&hot_ids, filter, buffer)?;
-        }
-        Ok(())
+            if !hot_ids.is_empty() {
+                self.hot.fetch_rows_by_ids_into(&hot_ids, filter, buffer)?;
+            }
+            Ok(())
+        })
     }
 
     // =========================================================================

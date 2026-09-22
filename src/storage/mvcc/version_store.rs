@@ -2111,6 +2111,18 @@ impl VersionStore {
         if !uncommitted.is_empty() {
             return Err(crate::core::Error::TableHasActiveTransactions);
         }
+        // A reader that trusts the indexes' order stands down while the
+        // rows leave, and one that captured them before sees the epoch move
+        // afterwards, as it does across a commit's publication
+        struct Publishing<'a>(&'a VersionStore);
+        impl Drop for Publishing<'_> {
+            fn drop(&mut self) {
+                self.0.publish_epoch.fetch_add(1, Ordering::SeqCst);
+                self.0.publishing.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        self.publishing.fetch_add(1, Ordering::SeqCst);
+        let _publishing = Publishing(self);
 
         // Hold versions(W) while clearing BOTH versions AND arena atomically.
         // INSERT commits acquire versions(W) → arena(W) in the same order,
