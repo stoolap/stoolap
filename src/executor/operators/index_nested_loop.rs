@@ -144,6 +144,9 @@ pub struct IndexNestedLoopJoinOperator {
     ended_on: Option<Row>,
     // What a table probe keeps between probes
     probe_scratch: ProbeScratch,
+    // Whether the inner table holds this transaction's uncommitted rows,
+    // which the shared index does not name under their keys yet
+    inner_local: bool,
 }
 
 impl IndexNestedLoopJoinOperator {
@@ -209,6 +212,7 @@ impl IndexNestedLoopJoinOperator {
             needs_fallback: false,
             ended_on: None,
             probe_scratch: ProbeScratch::default(),
+            inner_local: false,
         }
     }
 
@@ -400,6 +404,15 @@ impl IndexNestedLoopJoinOperator {
             }
         }
 
+        // The rows this transaction moved under the key or inserted with it
+        // are not in the shared index yet
+        if self.inner_local {
+            if let Some(idx) = self.inner_key_idx {
+                self.inner_table
+                    .local_row_ids_with_value(idx, key_value, &mut self.row_id_buffer);
+            }
+        }
+
         if self.row_id_buffer.is_empty() {
             return Ok(());
         }
@@ -473,6 +486,7 @@ impl IndexNestedLoopJoinOperator {
 impl Operator for IndexNestedLoopJoinOperator {
     fn open(&mut self) -> Result<()> {
         self.outer.open()?;
+        self.inner_local = self.inner_table.has_local_changes();
 
         // Get first outer row
         self.advance_outer()?;
@@ -757,6 +771,7 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
 
         let is_left_join = matches!(self.join_type, JoinType::Left | JoinType::Full);
         let true_expr = ConstBoolExpr::true_expr();
+        let inner_local = self.inner_table.has_local_changes();
 
         // Step 1: Collect all outer rows and their join keys
         let mut outer_rows: Vec<Row> = Vec::new();
@@ -805,6 +820,18 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
                     }
                     _ => {}
                 },
+            }
+
+            // The rows this transaction moved under the key or inserted
+            // with it are not in the shared index yet
+            if inner_local {
+                if let Some(idx) = self.inner_key_idx {
+                    self.inner_table.local_row_ids_with_value(
+                        idx,
+                        &key_value,
+                        &mut self.row_id_buffer,
+                    );
+                }
             }
 
             // Map row IDs to outer row indices

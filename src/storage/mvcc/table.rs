@@ -3206,6 +3206,18 @@ impl Table for MVCCTable {
         Ok(Some(()))
     }
 
+    fn local_row_ids_with_value(&self, column: usize, value: &Value, out: &mut Vec<i64>) {
+        let txn_versions = self.txn_versions.read().unwrap();
+        for (row_id, version) in txn_versions.iter_local() {
+            if !version.is_deleted()
+                && version.data.get(column) == Some(value)
+                && !out.contains(&row_id)
+            {
+                out.push(row_id);
+            }
+        }
+    }
+
     fn get_pending_versions(&self) -> Vec<(i64, Row, bool, i64)> {
         let txn_versions = self.txn_versions.read().unwrap();
         txn_versions

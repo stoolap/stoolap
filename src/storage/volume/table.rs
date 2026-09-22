@@ -4902,6 +4902,10 @@ impl Table for SegmentedTable {
         self.hot.has_local_changes() || self.segment_mgr.has_pending_tombstones(self.txn_id())
     }
 
+    fn local_row_ids_with_value(&self, column: usize, value: &Value, out: &mut Vec<i64>) {
+        self.hot.local_row_ids_with_value(column, value, out);
+    }
+
     fn index_view_epoch(&self) -> Option<u64> {
         if self.segment_mgr.has_pending_tombstones(self.txn_id()) {
             return None;
