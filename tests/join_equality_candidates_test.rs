@@ -647,6 +647,37 @@ mod hot_index {
         );
     }
 
+    /// A probe reuses the space its operator keeps, so a second key is
+    /// admitted beside that space, not beside a second reader's worth: under
+    /// a budget with room for one reader, every key of the join is served
+    #[test]
+    fn a_second_key_is_admitted_beside_the_space_the_first_one_holds() {
+        use stoolap::storage::volume::secondary::INDEX_PAGES;
+        let dir = tempfile::tempdir().unwrap();
+        let db = file_db(&dir);
+        users_in(&db, 2000);
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        people_in(&db, &[20, 21, 22, 23]);
+
+        let sql = "SELECT p.id, u.id, p.age FROM people p \
+            INNER JOIN users u ON p.age = u.age LIMIT 1000";
+        // One reader's space plus the pages it reads, and no more
+        let budget = INDEX_PAGES.stats().budget_bytes;
+        INDEX_PAGES.clear();
+        INDEX_PAGES.set_budget_bytes((INDEX_PAGES.stats().charged_bytes + 200_000) as u64);
+        let before = super::reads(&db);
+        let got = triples(&db, sql);
+        let after = super::reads(&db);
+        INDEX_PAGES.set_budget_bytes(budget);
+        assert_eq!(got.len(), 4 * 34, "every key of the join");
+        assert_eq!(after["refused"], before["refused"], "no key was refused");
+        assert_eq!(
+            after["rows"] - before["rows"],
+            4 * 34,
+            "every key from the side file"
+        );
+    }
+
     /// A seal landing inside a probe over volumes: the rows it moved are in
     /// neither the cold view taken before it nor the hot index read after
     /// it, so the probe is not an answer and the join takes the hash path

@@ -1226,7 +1226,8 @@ impl SegmentedTable {
         let Some((column, identity, low, high)) = self.side_bounds(comparisons, identities) else {
             return Ok(SideDecision::Scan);
         };
-        let (side, physical) = match self.side_admits(cs, column, identity, low, high)? {
+        let reserve = super::secondary::reader_bytes(super::secondary::SIDE_WINDOW);
+        let (side, physical) = match self.side_admits(cs, column, identity, low, high, reserve)? {
             SideAdmission::Empty => return Ok(SideDecision::Empty),
             SideAdmission::Scan => return Ok(SideDecision::Scan),
             SideAdmission::Probe(side, physical) => (side, physical),
@@ -1340,9 +1341,10 @@ impl SegmentedTable {
     /// decided before any page is read: the file must cover the column under
     /// the index's identity, the directory must not rule the range out or
     /// estimate more candidates than the scan share, and a volume one
-    /// position page holds must have its pages admissible, since it is
-    /// scanned about as fast as its pages are read from the file. Counted
-    /// by why when not.
+    /// position page holds must have its pages admissible beside `reserve`,
+    /// the working space the reader will still take, since it is scanned
+    /// about as fast as its pages are read from the file. Counted by why
+    /// when not.
     fn side_admits(
         &self,
         cs: &super::manifest::ColdSegment,
@@ -1350,6 +1352,7 @@ impl SegmentedTable {
         identity: u64,
         low: i64,
         high: i64,
+        reserve: usize,
     ) -> Result<SideAdmission> {
         use super::secondary::READS;
         let Some((side, physical)) = cs.side_for(column, identity) else {
@@ -1370,12 +1373,7 @@ impl SegmentedTable {
         }
         if rows <= super::secondary::POSITIONS_PER_PAGE as u64
             && !side
-                .pages_admissible(
-                    physical,
-                    low,
-                    high,
-                    super::secondary::reader_bytes(super::secondary::SIDE_WINDOW),
-                )
+                .pages_admissible(physical, low, high, reserve)
                 .map_err(side_error)?
         {
             READS.count(&READS.page_scans, 1);
@@ -1431,12 +1429,17 @@ impl SegmentedTable {
             if skip {
                 continue;
             }
-            let (side, physical) = match self.side_admits(cs, column, identity, low, high)? {
-                SideAdmission::Empty => continue,
-                SideAdmission::Scan => return Ok(None),
-                SideAdmission::Probe(side, physical) => (side, physical),
-            };
+            // The reader is built on the space the caller keeps, so the pages
+            // are admitted beside what that space does not hold yet
             let left = max - (out.len() - start);
+            let reserve = super::secondary::reader_bytes(left)
+                .saturating_sub(scratch.reader.reserved_bytes());
+            let (side, physical) =
+                match self.side_admits(cs, column, identity, low, high, reserve)? {
+                    SideAdmission::Empty => continue,
+                    SideAdmission::Scan => return Ok(None),
+                    SideAdmission::Probe(side, physical) => (side, physical),
+                };
             let mut reader = match side.reader_in(physical, left, &mut scratch.reader) {
                 Ok(reader) => reader,
                 Err(error) if is_refused(&error) => {
