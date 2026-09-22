@@ -276,6 +276,15 @@ fn explain_reports_the_grouped_index_join_only_for_the_shape_it_takes() {
         "a window function is not the index join's: {}",
         plan(window)
     );
+    db.execute("CREATE TABLE flags (uid INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    let correlated = "SELECT u.id, o.id FROM users u INNER JOIN orders o ON u.id = o.user_id \
+        WHERE EXISTS (SELECT 1 FROM flags f WHERE f.uid = u.id) LIMIT 1";
+    assert!(
+        !plan(correlated).contains("Index Nested Loop"),
+        "a correlated WHERE keeps the index join out: {}",
+        plan(correlated)
+    );
 }
 #[cfg(feature = "test-failpoints")]
 mod hot_index {

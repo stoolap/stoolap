@@ -7228,14 +7228,15 @@ impl Executor {
             .into_iter()
             .flatten()
             .any(Self::filter_has_subquery);
-        if !self.grouped_index_join_applies(
+        let Some((aggregations, group_names)) = self.grouped_index_join_applies(
             stmt,
             join_type,
             right_filter.is_some(),
             filters_have_subquery,
-        )? {
+        )?
+        else {
             return Ok(None);
-        }
+        };
         let Some((table_name, lookup_strategy, inner_key_col, outer_key_col)) = self
             .check_index_nested_loop_opportunity(
                 &join_source.right,
@@ -7248,17 +7249,6 @@ impl Executor {
         else {
             return Ok(None);
         };
-        let (aggregations, _) = self.parse_aggregations(stmt)?;
-        let group_by = self.parse_group_by(stmt, &[])?;
-        let mut group_names = Vec::with_capacity(group_by.len());
-        for item in &group_by {
-            match item {
-                crate::executor::aggregation::GroupByItem::Column(name) => {
-                    group_names.push(name.clone())
-                }
-                _ => return Ok(None),
-            }
-        }
 
         // One transaction for the outer fetches and the inner probes; inside an
         // explicit transaction the outer side is read whole
@@ -11076,11 +11066,21 @@ impl Executor {
         join_type: &str,
         right_filter_present: bool,
         filters_have_subquery: bool,
-    ) -> Result<bool> {
+    ) -> Result<
+        Option<(
+            Vec<crate::executor::aggregation::SqlAggregateFunction>,
+            Vec<String>,
+        )>,
+    > {
         // A right-side filter on a LEFT JOIN changes what an unmatched left row
         // means; the reduction handles that shape
         if join_type != "INNER" && right_filter_present {
-            return Ok(false);
+            return Ok(None);
+        }
+        if stmt.group_by.modifier != crate::parser::ast::GroupByModifier::None
+            || filters_have_subquery
+        {
+            return Ok(None);
         }
         let (aggregations, _) = self.parse_aggregations(stmt)?;
         if aggregations.iter().any(|agg| {
@@ -11090,18 +11090,18 @@ impl Executor {
                 || agg.hidden
                 || self.function_registry.get_aggregate(&agg.name).is_none()
         }) {
-            return Ok(false);
+            return Ok(None);
         }
-        if stmt.group_by.modifier != crate::parser::ast::GroupByModifier::None {
-            return Ok(false);
+        // The group columns, which the operator then groups by: parsed once
+        // here for both the shape and the run
+        let mut group_names = Vec::new();
+        for item in self.parse_group_by(stmt, &[])? {
+            match item {
+                crate::executor::aggregation::GroupByItem::Column(name) => group_names.push(name),
+                _ => return Ok(None),
+            }
         }
-        if filters_have_subquery {
-            return Ok(false);
-        }
-        let group_by = self.parse_group_by(stmt, &[])?;
-        Ok(group_by
-            .iter()
-            .all(|item| matches!(item, crate::executor::aggregation::GroupByItem::Column(_))))
+        Ok(Some((aggregations, group_names)))
     }
 
     /// Which index join operator, if any, a join in the FROM clause of
@@ -11116,6 +11116,10 @@ impl Executor {
         };
         let classification = get_classification(stmt);
         let join_type = join.join_type.to_uppercase();
+        // A WHERE that reaches into the outer query keeps both operators out
+        if classification.where_has_correlated_subqueries {
+            return JoinIndexUse::None;
+        }
         if !classification.has_aggregation && !classification.has_window_functions {
             let bounded = self
                 .pushed_join_limit(stmt, &ExecutionContext::new(), &classification, &join_type)
@@ -11158,7 +11162,7 @@ impl Executor {
             right_filter_present,
             filters_have_subquery,
         ) {
-            Ok(true) => JoinIndexUse::Grouped,
+            Ok(Some(_)) => JoinIndexUse::Grouped,
             _ => JoinIndexUse::None,
         }
     }
