@@ -848,12 +848,12 @@ pub trait Table: Send + Sync {
     /// Gives this transaction's local version of `row_id` a volume's copy
     /// of the row as the version it replaces, so the commit removes the old
     /// keys from the indexes that keep sealed rows and a failed commit puts
-    /// them back. The hot store's alone; a table that holds volumes asks it.
+    /// them back. A table that holds volumes asks its hot store; a store
+    /// that keeps no original takes the copy and drops it, and the undo of
+    /// its commits has none to put back.
     fn mark_sealed_original(&mut self, row_id: i64, old_row: Row) -> Result<()> {
         let _ = (row_id, old_row);
-        Err(Error::internal(
-            "a sealed original is recorded by the hot store",
-        ))
+        Ok(())
     }
 
     /// An index on `column_name` whose row ids cover every visible row of
