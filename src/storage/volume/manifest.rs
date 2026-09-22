@@ -1977,6 +1977,32 @@ impl SegmentManager {
         Some(before)
     }
 
+    /// Takes the side file out of every registered segment `stale` says
+    /// so of, by the same copy-on-write swap: a reader holding an older
+    /// snapshot keeps the segments as they were. The files taken out are
+    /// the caller's to discard
+    pub(crate) fn uncover_where(
+        &self,
+        stale: impl Fn(&ColdSegment) -> bool,
+    ) -> Vec<Arc<super::secondary::IndexFile>> {
+        let mut segments = self.segments.write();
+        let ids: Vec<u64> = segments
+            .iter()
+            .filter(|(_, segment)| segment.side.is_some() && stale(segment))
+            .map(|(id, _)| *id)
+            .collect();
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let mut new_map = (**segments).clone();
+        let taken = ids
+            .iter()
+            .filter_map(|id| new_map.get_mut(id).and_then(|segment| segment.side.take()))
+            .collect();
+        *segments = Arc::new(new_map);
+        taken
+    }
+
     /// Register with a prepared file owner and side file; no path or
     /// registry lookup occurs.
     pub(crate) fn register_segment_with_owner(
