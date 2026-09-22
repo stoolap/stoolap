@@ -8910,8 +8910,7 @@ impl TransactionEngineOperations for EngineOperations {
         hold
     }
 
-    fn publish_pending_tombstones(&self, txn_id: i64) {
-        let commit_seq = self.registry.get_committing_sequence(txn_id) as u64;
+    fn publish_pending_tombstones(&self, txn_id: i64, commit_seq: u64) {
         let mgrs = self.segment_managers.read().unwrap();
         for mgr in mgrs.values() {
             mgr.commit_pending_tombstones(txn_id, commit_seq);

@@ -236,6 +236,16 @@ fn unpack_arena_idx(packed: Option<NonZeroU64>) -> Option<usize> {
 /// Tracks write operations with the version read for conflict detection
 ///
 
+#[derive(Clone, Debug)]
+/// What a commit's application of one version leaves for its undo: the
+/// row, whether the row did not exist before, and the version the head
+/// displaced when the chain's history was dropped with it
+pub struct Applied {
+    pub row_id: i64,
+    pub created: bool,
+    pub displaced: Option<RowVersion>,
+}
+
 #[derive(Clone)]
 pub struct WriteSetEntry {
     /// Version when first read (None if row didn't exist)
@@ -896,10 +906,10 @@ impl VersionStore {
     #[inline]
     /// Applies committed versions at the heads of their rows' chains; the
     /// rows that did not exist before come back, for an undo to remove
-    pub fn add_versions_batch(&self, batch: Vec<(i64, RowVersion)>) -> Vec<i64> {
-        let mut created = Vec::new();
+    pub fn add_versions_batch(&self, batch: Vec<(i64, RowVersion)>) -> Vec<Applied> {
+        let mut applied = Vec::with_capacity(batch.len());
         if self.closed.load(Ordering::Acquire) || batch.is_empty() {
-            return created;
+            return applied;
         }
 
         // Use write lock for the entire batch operation (MVCC single-writer semantics)
@@ -983,6 +993,7 @@ impl VersionStore {
                     // Build version chain entry
                     // When limit exceeded: drop entire history (no prev_chain allocation)
                     // When under limit: create prev_chain with existing version
+                    let displaced = can_reuse_arena.then(|| existing.version.clone());
                     let final_prev = if can_reuse_arena {
                         // Exceeded limit - drop all history, no allocation
                         None
@@ -1006,6 +1017,11 @@ impl VersionStore {
 
                     // Replace entry in-place (no additional tree traversal)
                     occupied.insert(new_entry);
+                    applied.push(Applied {
+                        row_id,
+                        created: false,
+                        displaced,
+                    });
                 }
                 crate::common::cow_btree::Entry::Vacant(vacant) => {
                     // First version for this row - store in arena with Arc reuse
@@ -1036,7 +1052,11 @@ impl VersionStore {
 
                     // Insert into vacant slot (no additional traversal)
                     vacant.insert(new_entry);
-                    created.push(row_id);
+                    applied.push(Applied {
+                        row_id,
+                        created: true,
+                        displaced: None,
+                    });
                 }
             }
         }
@@ -1049,7 +1069,7 @@ impl VersionStore {
             self.committed_row_count
                 .fetch_sub((-count_delta) as usize, Ordering::Relaxed);
         }
-        created
+        applied
     }
 
     /// Add a single version to the store (optimized for auto-commit single-row inserts)
@@ -1058,9 +1078,13 @@ impl VersionStore {
     /// True when the row did not exist before, so an undo removes it rather
     /// than restoring the version before
     #[inline]
-    pub fn add_version_single(&self, row_id: i64, version: RowVersion) -> bool {
+    pub fn add_version_single(&self, row_id: i64, version: RowVersion) -> Applied {
         if self.closed.load(Ordering::Acquire) {
-            return false;
+            return Applied {
+                row_id,
+                created: false,
+                displaced: None,
+            };
         }
 
         let is_new_version_deleted = version.deleted_at_txn_id != 0;
@@ -1136,6 +1160,9 @@ impl VersionStore {
                 // Build version chain entry
                 // When limit exceeded: drop entire history (no prev_chain allocation)
                 // When under limit: create prev_chain with existing version
+                // The version the head displaces is kept for the undo when
+                // the chain will not keep it
+                let displaced = can_reuse_arena.then(|| existing.version.clone());
                 let final_prev = if can_reuse_arena {
                     // Exceeded limit - drop all history, no allocation
                     None
@@ -1158,7 +1185,11 @@ impl VersionStore {
                 };
 
                 occupied.insert(new_entry);
-                false
+                Applied {
+                    row_id,
+                    created: false,
+                    displaced,
+                }
             }
             crate::common::cow_btree::Entry::Vacant(vacant) => {
                 let (arena_idx, final_version) = if version.deleted_at_txn_id == 0 {
@@ -1183,7 +1214,11 @@ impl VersionStore {
                 };
 
                 vacant.insert(new_entry);
-                true
+                Applied {
+                    row_id,
+                    created: true,
+                    displaced: None,
+                }
             }
         }
     }
@@ -1191,13 +1226,19 @@ impl VersionStore {
     /// Takes back the version `txn_id` put at the head of `row_id`'s chain
     /// when its commit failed after the version was applied: the version
     /// before it is the head again, in the arena too, a row the commit
-    /// created leaves, and the committed row count is what it was. A chain
-    /// whose history the application dropped keeps its head, invisible as
-    /// an aborted transaction's.
-    pub fn unpublish_version(&self, row_id: i64, txn_id: i64, created: bool) {
+    /// created leaves, and the committed row count is what it was; a chain
+    /// whose history the application dropped is restored from the version
+    /// the head displaced.
+    pub fn unpublish_version(&self, applied: &Applied, txn_id: i64) {
         if self.closed.load(Ordering::Acquire) {
             return;
         }
+        let Applied {
+            row_id,
+            created,
+            displaced,
+        } = applied;
+        let (row_id, created) = (*row_id, *created);
         let mut versions = self.versions.write();
         let Some(head) = versions.get(row_id) else {
             return;
@@ -1217,19 +1258,23 @@ impl VersionStore {
             }
             return;
         }
-        let Some(prev) = head.prev.clone() else {
-            return;
+        // The version before: the chain's, or the one the head displaced
+        // when the history was dropped with it
+        let (prev_version, prev_prev) = match (head.prev.clone(), displaced) {
+            (Some(prev), _) => (prev.version.clone(), prev.prev.clone()),
+            (None, Some(displaced)) => (displaced.clone(), None),
+            (None, None) => return,
         };
-        let prev_deleted = prev.version.deleted_at_txn_id != 0;
+        let prev_deleted = prev_version.deleted_at_txn_id != 0;
         if let Some(idx) = arena_idx {
             self.arena.update_at(
                 idx,
                 row_id,
-                prev.version.txn_id,
-                prev.version.data.clone().into_arc(),
+                prev_version.txn_id,
+                prev_version.data.clone().into_arc(),
             );
             if prev_deleted {
-                self.arena.mark_deleted(idx, prev.version.deleted_at_txn_id);
+                self.arena.mark_deleted(idx, prev_version.deleted_at_txn_id);
             }
         }
         if head_deleted && !prev_deleted {
@@ -1238,8 +1283,8 @@ impl VersionStore {
             self.committed_row_count.fetch_sub(1, Ordering::Relaxed);
         }
         let restored = VersionChainEntry {
-            version: prev.version.clone(),
-            prev: prev.prev.clone(),
+            version: prev_version,
+            prev: prev_prev,
             arena_idx: head.arena_idx,
         };
         versions.insert(row_id, restored);
@@ -5822,9 +5867,9 @@ pub struct TransactionVersionStore {
     write_set: Option<I64Map<WriteSetEntry>>,
     /// Index updates applied by commit, until the commit is visible or undone
     index_undo: Mutex<SmallVec<[IndexUndo; 2]>>,
-    /// The rows commit put a version at the head of, and whether it created
-    /// them, until the commit is visible or undone
-    applied: Mutex<SmallVec<[(i64, bool); 2]>>,
+    /// What commit's application of each version left for its undo, until
+    /// the commit is visible or undone
+    applied: Mutex<SmallVec<[Applied; 2]>>,
 }
 
 impl TransactionVersionStore {
@@ -5850,10 +5895,9 @@ impl TransactionVersionStore {
     /// the store describes the rows that stayed visible
     pub fn undo_publication(&self) {
         self.undo_index_updates();
-        let applied: SmallVec<[(i64, bool); 2]> = std::mem::take(&mut *self.applied.lock());
-        for &(row_id, created) in applied.iter().rev() {
-            self.parent_store
-                .unpublish_version(row_id, self.txn_id, created);
+        let applied: SmallVec<[Applied; 2]> = std::mem::take(&mut *self.applied.lock());
+        for entry in applied.iter().rev() {
+            self.parent_store.unpublish_version(entry, self.txn_id);
         }
     }
 
@@ -6294,7 +6338,7 @@ impl TransactionVersionStore {
     pub fn holds_hot_rows(&self) -> bool {
         self.write_set
             .as_ref()
-            .is_some_and(|ws| ws.values().any(|e| e.read_version.is_some()))
+            .is_some_and(|ws| ws.values().any(|e| e.read_version.is_some() && !e.sealed))
     }
 
     /// Returns true if this transaction has any uncommitted local changes
@@ -6493,8 +6537,8 @@ impl TransactionVersionStore {
                 // Single-row fast path: avoid Vec allocation
                 if let Some((row_id, mut versions)) = local_versions.drain().next() {
                     if let Some(version) = versions.pop() {
-                        let created = self.parent_store.add_version_single(row_id, version);
-                        self.applied.lock().push((row_id, created));
+                        let applied = self.parent_store.add_version_single(row_id, version);
+                        self.applied.lock().push(applied);
                     }
                 }
             } else {
@@ -6507,13 +6551,9 @@ impl TransactionVersionStore {
                 // Sort by row_id to ensure deterministic locking order
                 batch.sort_by_key(|(row_id, _)| *row_id);
 
-                let mut applied = self.applied.lock();
-                applied.extend(batch.iter().map(|(row_id, _)| (*row_id, false)));
-                for row_id in self.parent_store.add_versions_batch(batch) {
-                    if let Some(entry) = applied.iter_mut().find(|(id, _)| *id == row_id) {
-                        entry.1 = true;
-                    }
-                }
+                self.applied
+                    .lock()
+                    .extend(self.parent_store.add_versions_batch(batch));
             }
         }
 
@@ -7208,7 +7248,13 @@ mod tests {
         seed.commit().unwrap();
         assert_eq!(store.committed_row_count(), 2);
 
-        // Delete row 1, update row 2, create row 3, then take it all back
+        let row = |id: i64| {
+            store
+                .get_visible_version(id, 99)
+                .map(|version| version.data.get(1).cloned())
+        };
+
+        // Delete row 1 and update row 2, then take it back
         let mut txn = TransactionVersionStore::new(Arc::clone(&store), 2);
         txn.put(1, Row::new(), true).unwrap();
         txn.put(
@@ -7217,22 +7263,10 @@ mod tests {
             false,
         )
         .unwrap();
-        txn.put(
-            3,
-            Row::from(vec![Value::from(3i64), Value::from(30i64)]),
-            false,
-        )
-        .unwrap();
         txn.commit().unwrap();
-        assert_eq!(store.committed_row_count(), 2, "one deleted, one created");
+        assert_eq!(store.committed_row_count(), 1, "one deleted");
         txn.undo_publication();
-
         assert_eq!(store.committed_row_count(), 2, "the count is what it was");
-        let row = |id: i64| {
-            store
-                .get_visible_version(id, 3)
-                .map(|version| version.data.get(1).cloned())
-        };
         assert_eq!(
             row(1),
             Some(Some(Value::from(10i64))),
@@ -7243,9 +7277,52 @@ mod tests {
             Some(Some(Value::from(20i64))),
             "the update is undone"
         );
+        assert_eq!(store.get_all_visible_rows(99).len(), 2, "the arena agrees");
+
+        // A created row leaves with its commit
+        let mut txn = TransactionVersionStore::new(Arc::clone(&store), 3);
+        txn.put(
+            3,
+            Row::from(vec![Value::from(3i64), Value::from(30i64)]),
+            false,
+        )
+        .unwrap();
+        txn.commit().unwrap();
+        assert_eq!(store.committed_row_count(), 3);
+        txn.undo_publication();
+        assert_eq!(
+            store.committed_row_count(),
+            2,
+            "the created row is not counted"
+        );
         assert_eq!(row(3), None, "the created row is gone");
-        let rows = store.get_all_visible_rows(3);
-        assert_eq!(rows.len(), 2, "the arena agrees");
+
+        // At every chain depth, past the history limit included, a failed
+        // delete restores the last committed update
+        let mut txn_id = 10;
+        for update in 1..=25i64 {
+            let mut txn = TransactionVersionStore::new(Arc::clone(&store), txn_id);
+            txn.put(
+                2,
+                Row::from(vec![Value::from(2i64), Value::from(100 + update)]),
+                false,
+            )
+            .unwrap();
+            txn.commit().unwrap();
+            txn_id += 1;
+            let mut txn = TransactionVersionStore::new(Arc::clone(&store), txn_id);
+            txn.put(2, Row::new(), true).unwrap();
+            txn.commit().unwrap();
+            txn_id += 1;
+            assert_eq!(store.committed_row_count(), 1);
+            txn.undo_publication();
+            assert_eq!(store.committed_row_count(), 2, "after update {update}");
+            assert_eq!(
+                row(2),
+                Some(Some(Value::from(100 + update))),
+                "after update {update} the last committed update is the head again"
+            );
+        }
     }
 
     /// `compute_grouped_aggregates` is public and its signature allows an

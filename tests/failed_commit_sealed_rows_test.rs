@@ -110,6 +110,36 @@ fn a_failed_commit_leaves_the_sealed_row_visible() {
     }
 }
 
+/// A row updated past the chain's history limit: the version the failed
+/// commit displaced is restored although the chain no longer held it
+#[test]
+fn a_failed_commit_restores_a_row_past_its_history_limit() {
+    let _guard = test_failpoints::FailpointGuard::new();
+    for statement in [
+        "UPDATE t SET v = 99 WHERE id = 1",
+        "DELETE FROM t WHERE id = 1",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dsn(&dir)).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 0), (2, 20)", ())
+            .unwrap();
+        for v in 1..=12 {
+            db.execute(&format!("UPDATE t SET v = {v} WHERE id = 1"), ())
+                .unwrap();
+        }
+        failing(&db, statement);
+        assert_eq!(
+            pairs(&db, "SELECT id, v FROM t ORDER BY id"),
+            vec![(1, 12), (2, 20)],
+            "{statement}: the last committed update stays"
+        );
+        assert_eq!(pairs(&db, "SELECT COUNT(*), SUM(v) FROM t"), vec![(2, 32)]);
+        db.close().unwrap();
+    }
+}
+
 /// A unique key the failed commit would have moved stays where it was:
 /// the old value is still taken, the new one is free
 #[test]
@@ -160,13 +190,20 @@ fn a_failed_commit_leaves_the_sealed_vector_in_the_graph() {
         for statement in [
             "UPDATE t SET v = '[100,0]' WHERE id = 1",
             "UPDATE t SET v = NULL WHERE id = 1",
+            "UPDATE t SET v = '[100,0]' WHERE k = 1",
             "DELETE FROM t WHERE id = 1",
+            "DELETE FROM t WHERE id >= 1",
+            "DELETE FROM t WHERE k = 1",
+            "DELETE FROM t",
         ] {
             let dir = tempfile::tempdir().unwrap();
             let db = Database::open(&dsn(&dir)).unwrap();
-            db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v VECTOR(2))", ())
-                .unwrap();
-            db.execute("INSERT INTO t VALUES (1, '[1,0]'), (2, '[10,0]')", ())
+            db.execute(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v VECTOR(2))",
+                (),
+            )
+            .unwrap();
+            db.execute("INSERT INTO t VALUES (1, 1, '[1,0]'), (2, 2, '[10,0]')", ())
                 .unwrap();
             db.execute("CREATE INDEX idx_t_v ON t(v) USING HNSW", ())
                 .unwrap();

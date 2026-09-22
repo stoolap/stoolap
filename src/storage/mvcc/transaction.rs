@@ -134,11 +134,11 @@ pub trait TransactionEngineOperations: Send + Sync {
     /// This cleans up the transaction's entries in txn_version_stores
     fn rollback_all_tables(&self, txn_id: i64);
 
-    /// Makes the transaction's pending cold tombstones visible, once its
-    /// commit marker is durable; a commit whose marker fails discards them
-    /// instead, so the rows they name stay visible
-    fn publish_pending_tombstones(&self, txn_id: i64) {
-        let _ = txn_id;
+    /// Makes the transaction's pending cold tombstones visible under its
+    /// commit sequence, once its commit marker is durable; a commit whose
+    /// marker fails discards them instead, so the rows they name stay visible
+    fn publish_pending_tombstones(&self, txn_id: i64, commit_seq: u64) {
+        let _ = (txn_id, commit_seq);
     }
 
     /// Drops the transaction's pending cold tombstones after its commit
@@ -489,13 +489,19 @@ impl Transaction for MvccTransaction {
                     if any_committed {
                         // Partial commit: some tables already committed.
                         // We MUST complete the commit to avoid orphaning those rows.
+                        // The commit sequence is read before the registry lets
+                        // the transaction go, since the tombstones carry it
+                        let commit_seq = self.registry.get_committing_sequence(self.id) as u64;
                         self.registry.complete_commit(self.id);
                         if let Some(hold) = &publish {
                             ops.request_seal_if_over(hold);
                         }
-                        // Record commit marker so WAL recovery sees committed state
-                        ops.record_commit(self.id)?;
-                        ops.publish_pending_tombstones(self.id);
+                        // Record commit marker so WAL recovery sees committed state.
+                        // The tables are visible whatever the marker does, so
+                        // the tombstones of the rows they replaced go with them
+                        let marker = ops.record_commit(self.id);
+                        ops.publish_pending_tombstones(self.id, commit_seq);
+                        marker?;
                         self.state = TransactionState::Committed;
                         self.cleanup();
                         return Err(e);
@@ -537,7 +543,8 @@ impl Transaction for MvccTransaction {
                 }
                 // The marker is durable: the cold rows it deleted or replaced
                 // go out of sight with the hot rows it made visible
-                ops.publish_pending_tombstones(self.id);
+                let commit_seq = self.registry.get_committing_sequence(self.id) as u64;
+                ops.publish_pending_tombstones(self.id, commit_seq);
             }
 
             // Phase 4: Complete commit - make changes visible in registry

@@ -3641,6 +3641,13 @@ impl Table for MVCCTable {
         self.version_store.secondary_index_identities_into(out)
     }
 
+    fn keeps_sealed_rows_in_an_index(&self) -> bool {
+        self.version_store
+            .get_all_indexes()
+            .iter()
+            .any(|index| index.index_type() == IndexType::Hnsw)
+    }
+
     fn mark_sealed_original(&mut self, row_id: i64, old_row: Row) -> Result<()> {
         self.txn_versions
             .write()
