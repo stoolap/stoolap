@@ -122,6 +122,7 @@ mod probes {
 
 #[test]
 fn a_limited_self_join_on_a_hot_file_table_matches_the_memory_engine() {
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let db = file_db(&dir);
     users_in(&db, 2000);
@@ -449,6 +450,7 @@ fn a_sealed_key_past_the_cap_sends_the_join_to_the_hash_path() {
 /// same key counts once too
 #[test]
 fn a_sealed_order_moved_to_another_user_counts_there_only() {
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let db = file_db(&dir);
     orders_in(&db);
@@ -736,6 +738,7 @@ mod hot_index {
     /// join answers from the hash path
     #[test]
     fn a_seal_inside_the_probe_sends_the_join_to_the_hash_path() {
+        let _serial = super::serial();
         let dir = tempfile::tempdir().unwrap();
         let db = file_db(&dir);
         users_in(&db, 2000);
