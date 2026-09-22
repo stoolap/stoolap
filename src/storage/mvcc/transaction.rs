@@ -484,20 +484,19 @@ impl Transaction for MvccTransaction {
             // Phase 2: Commit all tables - apply local changes to global store
             // This now includes WAL recording internally (before each table commit)
             if let Some(ops) = &self.engine_operations {
-                let (any_committed, error) = ops.commit_all_tables(self.id);
+                let (_, error) = ops.commit_all_tables(self.id);
                 if let Some(e) = error {
                     // A table that failed leaves the transaction unfinished, and
                     // nothing of it is visible yet: the tables that applied
                     // their versions and index updates take them back, the
                     // cold tombstones are dropped, and the transaction aborts
-                    // as if no table had committed. The WAL records written so
-                    // far carry no marker, so recovery drops them too.
-                    if any_committed {
-                        if let Some(hold) = &publish {
-                            hold.undo_publication();
-                        }
-                        ops.discard_pending_tombstones(self.id);
+                    // as if no table had committed, its row claims released.
+                    // The WAL records written so far carry no marker, so
+                    // recovery drops them too.
+                    if let Some(hold) = &publish {
+                        hold.undo_publication();
                     }
+                    ops.discard_pending_tombstones(self.id);
                     self.registry.abort_transaction(self.id);
                     ops.rollback_all_tables(self.id);
                     self.state = TransactionState::RolledBack;

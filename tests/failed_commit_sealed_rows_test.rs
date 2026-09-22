@@ -258,50 +258,111 @@ fn graph_ids(db: &Database) -> Vec<i64> {
         .collect()
 }
 
-/// A vector index created while a transaction holds a sealed row's
-/// replacement is refused, since that transaction kept nothing for the
-/// index to take back; once the transaction is done the index is created
-/// and the graph is right
+/// A vector index created after a transaction replaced or deleted a sealed
+/// row and before it committed, named or chosen for the column, takes the
+/// old vector back when the commit fails: the transaction kept the old
+/// row whether or not an index wanted it at the time
 #[test]
-fn a_vector_index_is_not_created_over_a_pending_sealed_write() {
+fn a_vector_index_created_before_the_commit_keeps_the_old_vector_when_it_fails() {
     let _guard = test_failpoints::FailpointGuard::new();
-    for statement in [
-        "UPDATE t SET v = '[100,0]' WHERE id = 1",
-        "DELETE FROM t WHERE id = 1",
+    for create in [
+        "CREATE INDEX idx_t_v ON t(v) USING HNSW",
+        "CREATE INDEX idx_t_v ON t(v)",
     ] {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(&dsn(&dir)).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v VECTOR(2))", ())
-            .unwrap();
-        db.execute("INSERT INTO t VALUES (1, '[1,0]'), (2, '[10,0]')", ())
-            .unwrap();
-        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        for statement in [
+            "UPDATE t SET v = '[100,0]' WHERE id = 1",
+            "DELETE FROM t WHERE id = 1",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Database::open(&dsn(&dir)).unwrap();
+            db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v VECTOR(2))", ())
+                .unwrap();
+            db.execute("INSERT INTO t VALUES (1, '[1,0]'), (2, '[10,0]')", ())
+                .unwrap();
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
 
-        let mut writer = db.begin().unwrap();
-        writer.execute(statement, ()).unwrap();
-        let created = db.execute("CREATE INDEX idx_t_v ON t(v) USING HNSW", ());
-        assert!(
-            matches!(
-                created,
-                Err(stoolap::core::Error::TableHasActiveTransactions)
-            ),
-            "{statement}: {created:?}"
-        );
-        writer.commit().unwrap();
-        db.execute("CREATE INDEX idx_t_v ON t(v) USING HNSW", ())
-            .unwrap();
-        let expected = if statement.starts_with("UPDATE") {
-            vec![2, 1]
-        } else {
-            vec![2]
-        };
-        assert_eq!(
-            graph_ids(&db),
-            expected,
-            "{statement}: the graph after the write"
-        );
-        db.close().unwrap();
+            let mut writer = db.begin().unwrap();
+            writer.execute(statement, ()).unwrap();
+            db.execute(create, ()).unwrap();
+            assert_eq!(
+                graph_ids(&db),
+                vec![1, 2],
+                "{create}: built from the committed rows"
+            );
+            test_failpoints::WAL_SYNC_FAIL.store(true, Ordering::Release);
+            let committed = writer.commit();
+            test_failpoints::WAL_SYNC_FAIL.store(false, Ordering::Release);
+            assert!(committed.is_err(), "{create} {statement}");
+            assert_eq!(
+                pairs(&db, "SELECT id, id FROM t ORDER BY id"),
+                vec![(1, 1), (2, 2)],
+                "{create} {statement}: the rows"
+            );
+            assert_eq!(
+                graph_ids(&db),
+                vec![1, 2],
+                "{create} {statement}: the graph"
+            );
+            db.close().unwrap();
+        }
     }
+}
+
+/// A commit that fails releases the rows it claimed at once, whatever
+/// handles to its tables the caller still holds: the next writer takes
+/// the row
+#[test]
+fn a_failed_commit_releases_its_rows_while_table_handles_are_held() {
+    use stoolap::storage::traits::Engine;
+    let _guard = test_failpoints::FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dsn(&dir)).unwrap();
+    for table in ["a", "b"] {
+        db.execute(
+            &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, v INTEGER)"),
+            (),
+        )
+        .unwrap();
+        db.execute(
+            &format!("CREATE UNIQUE INDEX idx_{table}_v ON {table}(v)"),
+            (),
+        )
+        .unwrap();
+        db.execute(&format!("INSERT INTO {table} VALUES (1, 10), (2, 20)"), ())
+            .unwrap();
+    }
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+
+    let other = db.clone();
+    test_failpoints::after_indexes_published(move || {
+        for table in ["a", "b"] {
+            let _ = other.execute(&format!("INSERT INTO {table} VALUES (3, 999)"), ());
+        }
+    });
+    let mut tx = db.engine().begin_transaction().unwrap();
+    let mut a = tx.get_table("a").unwrap();
+    let mut b = tx.get_table("b").unwrap();
+    for table in [&mut a, &mut b] {
+        let mut set = |row: stoolap::core::Row| {
+            let mut row = row;
+            row.set(1, stoolap::core::Value::Integer(999)).unwrap();
+            Ok((row, true))
+        };
+        table.update_by_row_ids(&[1], &mut set).unwrap();
+    }
+    assert!(tx.commit().is_err(), "the second table's key is taken");
+    // The handles stay in scope while the next writer takes the rows
+    for table in ["a", "b"] {
+        db.execute(&format!("UPDATE {table} SET v = 11 WHERE id = 1"), ())
+            .unwrap();
+        assert_eq!(
+            pairs(&db, &format!("SELECT id, v FROM {table} WHERE id = 1")),
+            vec![(1, 11)],
+            "{table}: the row was free"
+        );
+    }
+    drop((a, b));
+    db.close().unwrap();
 }
 
 /// A commit whose second table fails to apply leaves nothing of the first

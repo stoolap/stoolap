@@ -845,13 +845,6 @@ pub trait Table: Send + Sync {
         out.clear();
     }
 
-    /// Whether an index of this table keeps the rows a volume holds, so a
-    /// sealed row's old keys must be known to a commit that replaces or
-    /// deletes it
-    fn keeps_sealed_rows_in_an_index(&self) -> bool {
-        false
-    }
-
     /// Gives this transaction's local version of `row_id` a volume's copy
     /// of the row as the version it replaces, so the commit removes the old
     /// keys from the indexes that keep sealed rows and a failed commit puts

@@ -1002,7 +1002,6 @@ impl SegmentedTable {
         txn_id: i64,
         change: ColdChange,
         has_int_pk: bool,
-        keep_old: bool,
     ) -> Result<()> {
         let ColdChange {
             row_id,
@@ -1013,7 +1012,7 @@ impl SegmentedTable {
         // old row (so UPDATE can find it), then update. If any step fails,
         // clean up to avoid phantoms.
         if has_int_pk {
-            let old_keys = keep_old.then(|| old_row.clone());
+            let old_keys = old_row.clone();
             match hot.insert_discard(old_row) {
                 Ok(())
                 | Err(crate::core::Error::PrimaryKeyConstraint { .. })
@@ -1031,9 +1030,7 @@ impl SegmentedTable {
             // The volume's copy is the version this one replaces: an index
             // that keeps sealed rows drops its keys at commit and takes them
             // back if the commit fails
-            if let Some(old_row) = old_keys {
-                hot.mark_sealed_original(row_id, old_row)?;
-            }
+            hot.mark_sealed_original(row_id, old_keys)?;
         } else {
             hot.insert_discard(new_row)?;
         }
@@ -1388,18 +1385,6 @@ impl SegmentedTable {
             return Ok(SideAdmission::Scan);
         }
         Ok(SideAdmission::Probe(Arc::clone(side), physical))
-    }
-
-    /// An index that keeps sealed rows takes its old keys from the
-    /// transaction that replaces or deletes a sealed row, and that
-    /// transaction decided whether to keep them when it wrote the row. One
-    /// that wrote before the index existed kept nothing, so the index is not
-    /// created while such a write is pending.
-    fn refuse_hnsw_under_sealed_writes(&self) -> Result<()> {
-        if self.segment_mgr.has_segments() && self.segment_mgr.has_any_pending_tombstones() {
-            return Err(crate::core::Error::TableHasActiveTransactions);
-        }
-        Ok(())
     }
 
     /// The identities of the indexes the side files may serve, taken once
@@ -2431,16 +2416,8 @@ impl Table for SegmentedTable {
             self.prepare_cold_updates(&self.segment_mgr, None, where_expr, setter)?;
         Self::claim_prepared(self.hot.as_ref(), &changes)?;
         let mut count = self.hot.update(where_expr, setter)?;
-        let keep_old = self.hot.keeps_sealed_rows_in_an_index();
         for change in changes {
-            Self::apply_cold_update(
-                &mut self.hot,
-                &self.segment_mgr,
-                txn_id,
-                change,
-                has_int_pk,
-                keep_old,
-            )?;
+            Self::apply_cold_update(&mut self.hot, &self.segment_mgr, txn_id, change, has_int_pk)?;
             count += 1;
         }
         if count > 0 {
@@ -2467,16 +2444,8 @@ impl Table for SegmentedTable {
             self.prepare_cold_updates(&self.segment_mgr, Some(row_ids), None, setter)?;
         Self::claim_prepared(self.hot.as_ref(), &changes)?;
         let mut count = 0i32;
-        let keep_old = self.hot.keeps_sealed_rows_in_an_index();
         for change in changes {
-            Self::apply_cold_update(
-                &mut self.hot,
-                &self.segment_mgr,
-                txn_id,
-                change,
-                has_int_pk,
-                keep_old,
-            )?;
+            Self::apply_cold_update(&mut self.hot, &self.segment_mgr, txn_id, change, has_int_pk)?;
             count += 1;
         }
         if !hot_ids.is_empty() {
@@ -2510,7 +2479,6 @@ impl Table for SegmentedTable {
             .columns
             .iter()
             .any(|c| c.primary_key && c.data_type == DataType::Integer);
-        let keep_old = self.hot.keeps_sealed_rows_in_an_index();
 
         for &row_id in row_ids {
             let located = match &cold_snapshot {
@@ -2519,7 +2487,7 @@ impl Table for SegmentedTable {
             };
             if let Some((_, cold, idx)) = located {
                 let txn_id = self.txn_id();
-                let old_row = if keep_old && has_int_pk {
+                let old_row = if has_int_pk {
                     Some(Self::cold_row_of(&cold, idx)?)
                 } else {
                     None
@@ -2598,10 +2566,9 @@ impl Table for SegmentedTable {
                     .columns
                     .iter()
                     .any(|c| c.primary_key && c.data_type == DataType::Integer);
-                let keep_old = self.hot.keeps_sealed_rows_in_an_index();
                 if let Some((_, cold, idx)) = self.find_segment_row_in(snap, pk)? {
                     let txn_id = self.txn_id();
-                    let old_row = if keep_old && has_int_pk {
+                    let old_row = if has_int_pk {
                         Some(Self::cold_row_of(&cold, idx)?)
                     } else {
                         None
@@ -2638,7 +2605,6 @@ impl Table for SegmentedTable {
             .columns
             .iter()
             .any(|c| c.primary_key && c.data_type == DataType::Integer);
-        let keep_old = self.hot.keeps_sealed_rows_in_an_index();
 
         // Build hot_skip from hot row_ids + pending tombstones.
         // Committed tombstones are kept as a shared Arc (no clone).
@@ -2792,7 +2758,7 @@ impl Table for SegmentedTable {
                     // The volume's copy is what the delete takes away: an
                     // index that keeps sealed rows drops its keys at commit
                     // and takes them back if the commit fails
-                    if keep_old {
+                    {
                         let old_row = super::writer::RowReader::new(Arc::clone(vol))
                             .row(i, &mapping)
                             .map_err(|e| {
@@ -5262,9 +5228,6 @@ impl Table for SegmentedTable {
         if is_unique && index_type != Some(IndexType::Hnsw) && self.segment_mgr.has_segments() {
             self.validate_cold_unique(name, columns)?;
         }
-        if index_type == Some(IndexType::Hnsw) {
-            self.refuse_hnsw_under_sealed_writes()?;
-        }
 
         self.hot
             .create_index_with_type(name, columns, is_unique, index_type)?;
@@ -5281,7 +5244,6 @@ impl Table for SegmentedTable {
         ef_search: usize,
         metric: crate::storage::index::HnswDistanceMetric,
     ) -> Result<()> {
-        self.refuse_hnsw_under_sealed_writes()?;
         // Delegate to hot store which creates the HNSW with custom params
         self.hot.create_hnsw_index(
             name,

@@ -466,9 +466,10 @@ impl PublishHold {
         })
     }
 
-    /// Takes back what a commit applied before its marker failed: the index
+    /// Takes back what a commit applied before it failed: the index
     /// updates and the versions, so the store and its indexes describe the
-    /// rows that stayed visible
+    /// rows that stayed visible; and releases the rows the transaction
+    /// claimed, whatever handles to its stores are still held
     pub fn undo_publication(&self) {
         for store in &self.stores {
             if let Ok(store) = store.read() {
@@ -5899,6 +5900,9 @@ impl TransactionVersionStore {
         for entry in applied.iter().rev() {
             self.parent_store.unpublish_version(entry, self.txn_id);
         }
+        // The rows the transaction claimed are free for the next writer now,
+        // not when the last handle to this store is dropped
+        self.release_all_claims();
     }
 
     /// Takes back the index updates of this transaction's commit, in reverse
@@ -7115,7 +7119,7 @@ impl TransactionVersionStore {
     }
 
     /// Release all row claims held by this transaction
-    fn release_all_claims(&self) {
+    pub(crate) fn release_all_claims(&self) {
         let Some(write_set) = self.write_set.as_ref() else {
             return;
         };
