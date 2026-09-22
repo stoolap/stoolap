@@ -30,7 +30,7 @@ use crate::core::{Result, Row, RowVec, Value};
 use crate::executor::expression::JoinFilter;
 use crate::executor::operator::{ColumnInfo, Operator, RowRef};
 use crate::storage::expression::{ConstBoolExpr, Expression};
-use crate::storage::traits::{CappedEqual, Index, Table};
+use crate::storage::traits::{CappedEqual, Index, ProbeScratch, Table};
 use smallvec::SmallVec;
 
 use super::hash_join::JoinType;
@@ -142,6 +142,8 @@ pub struct IndexNestedLoopJoinOperator {
     // The outer row the chunk ended on when it left with its last match,
     // kept for the executor's continuation
     ended_on: Option<Row>,
+    // What a table probe keeps between probes
+    probe_scratch: ProbeScratch,
 }
 
 impl IndexNestedLoopJoinOperator {
@@ -206,6 +208,7 @@ impl IndexNestedLoopJoinOperator {
             outer_rows_seen: 0,
             needs_fallback: false,
             ended_on: None,
+            probe_scratch: ProbeScratch::default(),
         }
     }
 
@@ -374,7 +377,8 @@ impl IndexNestedLoopJoinOperator {
                     key_value,
                     EQUALITY_CANDIDATE_CAP,
                     &mut self.row_id_buffer,
-                );
+                    &mut self.probe_scratch,
+                )?;
                 if found != Some(CappedEqual::Copied) {
                     self.row_id_buffer.clear();
                     self.needs_fallback = true;

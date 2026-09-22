@@ -48,9 +48,22 @@ enum SideDecision {
     Walk(Box<super::secondary::SidePlan>),
 }
 
+/// Whether a volume's side file is asked for a key range at all, decided
+/// from the directory before any page is read
+enum SideAdmission {
+    Empty,
+    Scan,
+    Probe(Arc<super::secondary::IndexFile>, usize),
+}
+
 /// The index serves a volume when the candidates are at most this share
 /// of its rows: one in twenty to start, to be measured
 const SIDE_SCAN_SHARE: u64 = 20;
+
+/// A side file read that failed is the statement's error
+fn side_error(error: std::io::Error) -> crate::core::Error {
+    crate::core::Error::internal(format!("side index read failed: {error}"))
+}
 
 /// Starts a decided walk for a loop that reads the volume now; refused,
 /// the volume goes through the scan, counted
@@ -1210,19 +1223,70 @@ impl SegmentedTable {
         identities: &[(usize, u64)],
     ) -> Result<SideDecision> {
         use super::secondary::{is_refused, SidePlan, READS};
-        use crate::core::Operator;
-        if identities.is_empty() || comparisons.is_empty() {
+        let Some((column, identity, low, high)) = self.side_bounds(comparisons, identities) else {
+            return Ok(SideDecision::Scan);
+        };
+        let reserve = super::secondary::reader_bytes(super::secondary::SIDE_WINDOW);
+        let (side, physical) = match self.side_admits(cs, column, identity, low, high, reserve)? {
+            SideAdmission::Empty => return Ok(SideDecision::Empty),
+            SideAdmission::Scan => return Ok(SideDecision::Scan),
+            SideAdmission::Probe(side, physical) => (side, physical),
+        };
+        let rows = cs.volume.meta.row_count as u64;
+        // The probe reads the boundary pages through a reader of its own,
+        // let go before the decision is handed on: the walk takes its
+        // reservation when it starts
+        let reader = match side.reader(physical, 1) {
+            Ok(reader) => reader,
+            Err(error) if is_refused(&error) => {
+                READS.count(&READS.refused, 1);
+                return Ok(SideDecision::Scan);
+            }
+            Err(error) => return Err(side_error(error)),
+        };
+        READS.count(&READS.probes, 1);
+        let range = if low == high {
+            reader.equal(low).map_err(side_error)?.unwrap_or((0, 0))
+        } else if low > high {
+            (0, 0)
+        } else {
+            reader.range(low, high).map_err(side_error)?
+        };
+        let count = range.1 - range.0;
+        if count == 0 {
+            READS.count(&READS.misses, 1);
+            return Ok(SideDecision::Empty);
+        }
+        if count * SIDE_SCAN_SHARE > rows.max(1) {
+            READS.count(&READS.cost_scans, 1);
             return Ok(SideDecision::Scan);
         }
-        // A bound that has no exact key (a timestamp outside the range
-        // nanoseconds hold) leaves the column to the scan
+        READS.count(&READS.candidates, count);
+        drop(reader);
+        Ok(SideDecision::Walk(Box::new(SidePlan::new(
+            Arc::clone(&side),
+            physical,
+            range,
+        ))))
+    }
+
+    /// The indexed column the comparisons bound, with its index identity
+    /// and the key range: one equality, or a lower and an upper bound. None
+    /// when they bound no indexed column, or a bound has no exact key (a
+    /// timestamp outside the range nanoseconds hold), and the scan decides.
+    fn side_bounds(
+        &self,
+        comparisons: &[(&str, crate::core::Operator, &Value)],
+        identities: &[(usize, u64)],
+    ) -> Option<(usize, u64, i64, i64)> {
+        use crate::core::Operator;
+        if identities.is_empty() || comparisons.is_empty() {
+            return None;
+        }
         let key = |value: &Value| match value {
             Value::Integer(i) => Some(Some(*i)),
             Value::Timestamp(ts) => Some(ts.timestamp_nanos_opt()),
             _ => None,
-        };
-        let side_error = |error: std::io::Error| {
-            crate::core::Error::internal(format!("side index read failed: {error}"))
         };
         let schema = self.hot.schema();
         for &(column, identity) in identities {
@@ -1237,7 +1301,7 @@ impl SegmentedTable {
                 }
                 let k = match key(value) {
                     Some(Some(k)) => k,
-                    Some(None) => return Ok(SideDecision::Scan),
+                    Some(None) => return None,
                     None => continue,
                 };
                 bounded = true;
@@ -1268,84 +1332,177 @@ impl SegmentedTable {
                 (None, None, Some(h)) => (i64::MIN, h),
                 (None, None, None) => continue,
             };
-            let Some((side, physical)) = cs.side_for(column, identity) else {
-                READS.count(&READS.ineligible, 1);
-                return Ok(SideDecision::Scan);
-            };
-            let rows = cs.volume.meta.row_count as u64;
-            // The directory decides what it can before any page is read or
-            // any reservation taken: no page in the range, or an estimate
-            // the scan share rules out
-            let Some(estimate) = side
-                .candidate_estimate(physical, low, high)
-                .map_err(side_error)?
-            else {
-                READS.count(&READS.misses, 1);
-                return Ok(SideDecision::Empty);
-            };
-            if estimate * SIDE_SCAN_SHARE > rows.max(1) {
-                READS.count(&READS.cost_scans, 1);
-                return Ok(SideDecision::Scan);
-            }
-            // A volume one position page holds is scanned about as fast as
-            // its pages are read from the file: its probe comes from the
-            // cache or not at all, the walk's reader counted beside the pages
-            if rows <= super::secondary::POSITIONS_PER_PAGE as u64
-                && !side
-                    .pages_admissible(
-                        physical,
-                        low,
-                        high,
-                        super::secondary::reader_bytes(super::secondary::SIDE_WINDOW),
-                    )
-                    .map_err(side_error)?
-            {
-                READS.count(&READS.page_scans, 1);
-                return Ok(SideDecision::Scan);
-            }
-            // The probe reads the boundary pages through a reader of its own,
-            // let go before the decision is handed on: the walk takes its
-            // reservation when it starts
-            let reader = match side.reader(physical, 1) {
-                Ok(reader) => reader,
-                Err(error) if is_refused(&error) => {
-                    READS.count(&READS.refused, 1);
-                    return Ok(SideDecision::Scan);
-                }
-                Err(error) => return Err(side_error(error)),
-            };
-            READS.count(&READS.probes, 1);
-            let range = if low == high {
-                reader.equal(low).map_err(side_error)?.unwrap_or((0, 0))
-            } else if low > high {
-                (0, 0)
-            } else {
-                reader.range(low, high).map_err(side_error)?
-            };
-            let count = range.1 - range.0;
-            if count == 0 {
-                READS.count(&READS.misses, 1);
-                return Ok(SideDecision::Empty);
-            }
-            if count * SIDE_SCAN_SHARE > rows.max(1) {
-                READS.count(&READS.cost_scans, 1);
-                return Ok(SideDecision::Scan);
-            }
-            READS.count(&READS.candidates, count);
-            drop(reader);
-            return Ok(SideDecision::Walk(Box::new(SidePlan::new(
-                Arc::clone(side),
-                physical,
-                range,
-            ))));
+            return Some((column, identity, low, high));
         }
-        Ok(SideDecision::Scan)
+        None
+    }
+
+    /// Whether a volume's side file is asked for `[low, high]` on `column`,
+    /// decided before any page is read: the file must cover the column under
+    /// the index's identity, the directory must not rule the range out or
+    /// estimate more candidates than the scan share, and a volume one
+    /// position page holds must have its pages admissible beside `reserve`,
+    /// the working space the reader will still take, since it is scanned
+    /// about as fast as its pages are read from the file. Counted by why
+    /// when not.
+    fn side_admits(
+        &self,
+        cs: &super::manifest::ColdSegment,
+        column: usize,
+        identity: u64,
+        low: i64,
+        high: i64,
+        reserve: usize,
+    ) -> Result<SideAdmission> {
+        use super::secondary::READS;
+        let Some((side, physical)) = cs.side_for(column, identity) else {
+            READS.count(&READS.ineligible, 1);
+            return Ok(SideAdmission::Scan);
+        };
+        let rows = cs.volume.meta.row_count as u64;
+        let Some(estimate) = side
+            .candidate_estimate(physical, low, high)
+            .map_err(side_error)?
+        else {
+            READS.count(&READS.misses, 1);
+            return Ok(SideAdmission::Empty);
+        };
+        if estimate * SIDE_SCAN_SHARE > rows.max(1) {
+            READS.count(&READS.cost_scans, 1);
+            return Ok(SideAdmission::Scan);
+        }
+        if rows <= super::secondary::POSITIONS_PER_PAGE as u64
+            && !side
+                .pages_admissible(physical, low, high, reserve)
+                .map_err(side_error)?
+        {
+            READS.count(&READS.page_scans, 1);
+            return Ok(SideAdmission::Scan);
+        }
+        Ok(SideAdmission::Probe(Arc::clone(side), physical))
     }
 
     /// The identities of the indexes the side files may serve, taken once
     /// per read with the cold view
     fn side_identities(&self) -> Vec<(usize, u64)> {
         self.hot.secondary_index_identities()
+    }
+
+    /// One key's ids from every volume's side file, newest volume first,
+    /// each volume admitted as the scan admits it and read through one
+    /// reader on the caller's own space, its window the cap left. A volume
+    /// the side file cannot serve, or a reader the ledger refuses, leaves
+    /// the probe unanswered; a page that fails to read is the statement's
+    /// error. The ids come from the resident row id column, so no volume is
+    /// reloaded here; the fetch reloads what it reads.
+    fn cold_equality_candidates(
+        &self,
+        column: &str,
+        key: &Value,
+        max: usize,
+        out: &mut Vec<i64>,
+        scratch: &mut crate::storage::traits::ProbeScratch,
+    ) -> Result<Option<crate::storage::traits::CappedEqual>> {
+        use super::secondary::{is_refused, READS};
+        use crate::storage::traits::CappedEqual;
+        self.hot
+            .secondary_index_identities_into(&mut scratch.identities);
+        let comparisons = [(column, crate::core::Operator::Eq, key)];
+        let Some((column, identity, low, high)) =
+            self.side_bounds(&comparisons, &scratch.identities)
+        else {
+            return Ok(None);
+        };
+        let bloom = [Some(super::column::ColumnBloomFilter::hash_value_static(
+            key,
+        ))];
+        self.segment_mgr
+            .check_schema_generation(self.schema_generation)?;
+        let view = self.segment_mgr.cold_snapshot();
+        self.segment_mgr
+            .check_schema_generation(self.schema_generation)?;
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::join_probe_admitted();
+        let start = out.len();
+        for (_, cs) in view.volumes() {
+            let (skip, _, _) = Self::prune_volume(&cs.volume, &cs.mapping, &comparisons, &bloom)?;
+            if skip {
+                continue;
+            }
+            // The reader is built on the space the caller keeps, so the pages
+            // are admitted beside what that space does not hold yet
+            let left = max - (out.len() - start);
+            let reserve = super::secondary::reader_bytes(left)
+                .saturating_sub(scratch.reader.reserved_bytes());
+            let (side, physical) =
+                match self.side_admits(cs, column, identity, low, high, reserve)? {
+                    SideAdmission::Empty => continue,
+                    SideAdmission::Scan => return Ok(None),
+                    SideAdmission::Probe(side, physical) => (side, physical),
+                };
+            let mut reader = match side.reader_in(physical, left, &mut scratch.reader) {
+                Ok(reader) => reader,
+                Err(error) if is_refused(&error) => {
+                    READS.count(&READS.refused, 1);
+                    return Ok(None);
+                }
+                Err(error) => return Err(side_error(error)),
+            };
+            READS.count(&READS.probes, 1);
+            let range = reader.equal(low).map_err(side_error)?.unwrap_or((0, 0));
+            let count = range.1 - range.0;
+            let rows = cs.volume.meta.row_count as u64;
+            let refused = if count == 0 {
+                READS.count(&READS.misses, 1);
+                None
+            } else if count * SIDE_SCAN_SHARE > rows.max(1) {
+                READS.count(&READS.cost_scans, 1);
+                Some(None)
+            } else if count as usize > left {
+                Some(Some(CappedEqual::OverCap))
+            } else {
+                None
+            };
+            if count == 0 || refused.is_some() {
+                reader.release_into(&mut scratch.reader);
+                match refused {
+                    Some(answer) => return Ok(answer),
+                    None => continue,
+                }
+            }
+            READS.count(&READS.candidates, count);
+            reader.walk(range);
+            let row_ids = cs.volume.row_ids()?;
+            let mut served = 0u64;
+            while let Some(window) = reader.next_window().map_err(side_error)? {
+                READS.count(&READS.windows, 1);
+                for &position in window {
+                    let Some(&row_id) = row_ids.get(position as usize) else {
+                        return Err(crate::core::Error::internal(
+                            "side index names a position past the volume",
+                        ));
+                    };
+                    out.push(row_id);
+                }
+                served += window.len() as u64;
+            }
+            READS.count(&READS.rows, served);
+            reader.release_into(&mut scratch.reader);
+        }
+        Ok(Some(CappedEqual::Copied))
+    }
+
+    /// Sorts the ids appended since `start` and drops the repeats
+    fn dedup_from(out: &mut Vec<i64>, start: usize) {
+        out[start..].sort_unstable();
+        let mut kept = start;
+        for at in start..out.len() {
+            if kept == start || out[at] != out[kept - 1] {
+                out[kept] = out[at];
+                kept += 1;
+            }
+        }
+        out.truncate(kept);
     }
 
     fn prune_volume(
@@ -5090,37 +5247,66 @@ impl Table for SegmentedTable {
         None
     }
 
-    /// The hot index answers one key while the table holds no volume, under
+    /// One key's ids from the volumes' side files and the hot index, under
     /// the checks of `walk_btree_groups`: a seal, a destructive publication
-    /// or a commit landing across the probe drops its ids.
+    /// or a commit landing across the probe drops its ids. The cold view is
+    /// taken before the hot index is read, so a seal between them moves the
+    /// generation and the probe is not an answer.
     fn equality_candidates(
         &self,
         column: &str,
         key: &Value,
         max: usize,
         out: &mut Vec<i64>,
-    ) -> Option<crate::storage::traits::CappedEqual> {
+        scratch: &mut crate::storage::traits::ProbeScratch,
+    ) -> Result<Option<crate::storage::traits::CappedEqual>> {
+        use crate::storage::traits::CappedEqual;
         if self.snapshot_seq.is_some() {
-            return None;
+            return Ok(None);
         }
         let generation = self.segment_mgr.seal_generation();
-        if self.segment_mgr.has_segments() || self.segment_mgr.is_destruction_in_progress() {
-            return None;
+        if self.segment_mgr.is_destruction_in_progress() {
+            return Ok(None);
         }
-        let epoch = self.hot.index_view_epoch()?;
-        #[cfg(any(test, feature = "test-failpoints"))]
-        crate::test_failpoints::join_probe_admitted();
+        let Some(epoch) = self.hot.index_view_epoch() else {
+            return Ok(None);
+        };
         let start = out.len();
-        let found = self.hot.equality_candidates(column, key, max, out)?;
+        if self.segment_mgr.has_segments() {
+            match self.cold_equality_candidates(column, key, max, out, scratch)? {
+                Some(CappedEqual::Copied) => {}
+                other => {
+                    out.truncate(start);
+                    return Ok(other);
+                }
+            }
+        } else {
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::join_probe_admitted();
+        }
+        let taken = out.len() - start;
+        let Some(found) =
+            self.hot
+                .equality_candidates(column, key, max.saturating_sub(taken), out, scratch)?
+        else {
+            out.truncate(start);
+            return Ok(None);
+        };
         if self.segment_mgr.is_destruction_in_progress()
             || self.segment_mgr.seal_generation() != generation
-            || self.segment_mgr.has_segments()
             || self.hot.index_view_epoch() != Some(epoch)
         {
             out.truncate(start);
-            return None;
+            return Ok(None);
         }
-        Some(found)
+        if found == CappedEqual::OverCap {
+            out.truncate(start);
+            return Ok(Some(found));
+        }
+        // An updated row keeps its old copy in a volume until compaction, so
+        // its id can come from two places; the fetch reads the newest copy
+        Self::dedup_from(out, start);
+        Ok(Some(found))
     }
 
     fn walk_btree_groups(

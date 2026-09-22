@@ -12,13 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A limited join against a persistent table whose rows are all still in
-//! memory asks the table for the ids of each key instead of scanning it.
-//! The table answers only while no volume holds rows, no probe returns more
+//! A limited join against a persistent table asks the table for the ids of
+//! each key instead of scanning it: the hot index for rows not sealed yet
+//! and each volume's side file for the sealed ones. The table answers only
+//! while every volume's side file serves the key, no probe returns more
 //! than the cap, and nothing moved its index across the probe; a join it
 //! stops answering runs once more on the hash path.
 
+use std::sync::Mutex;
+
 use stoolap::Database;
+
+/// The index page ledger is process-wide, so the tests that read side
+/// files run one at a time, and a budget a test lowers is restored when
+/// the test ends, however it ends
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 const SELF_JOIN: &str = "SELECT u1.id, u2.id, u1.age FROM users u1 \
     INNER JOIN users u2 ON u1.age = u2.age AND u1.id < u2.id LIMIT 100";
@@ -77,6 +89,18 @@ fn triples(db: &Database, sql: &str) -> Vec<(i64, Option<i64>, i64)> {
     rows
 }
 
+/// The read counters of `PRAGMA INDEX_READ_STATS`, by column name
+fn reads(db: &Database) -> std::collections::BTreeMap<String, i64> {
+    let rows = db.query("PRAGMA INDEX_READ_STATS", ()).unwrap();
+    let columns: Vec<String> = rows.columns().to_vec();
+    let row = rows.into_iter().next().unwrap().unwrap();
+    columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.clone(), row.get::<i64>(i).unwrap()))
+        .collect()
+}
+
 #[cfg(feature = "test-failpoints")]
 mod probes {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -98,6 +122,7 @@ mod probes {
 
 #[test]
 fn a_limited_self_join_on_a_hot_file_table_matches_the_memory_engine() {
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let db = file_db(&dir);
     users_in(&db, 2000);
@@ -108,12 +133,8 @@ fn a_limited_self_join_on_a_hot_file_table_matches_the_memory_engine() {
     assert_eq!(expected.len(), 100);
     assert_eq!(triples(&db, SELF_JOIN), expected, "hot rows");
 
-    // Sealed rows are joined on the hash path, which picks its own hundred
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
-    let every_pair = triples(&oracle, SELF_JOIN.trim_end_matches(" LIMIT 100"));
-    let sealed = triples(&db, SELF_JOIN);
-    assert_eq!(sealed.len(), 100, "sealed rows");
-    assert!(sealed.iter().all(|pair| every_pair.contains(pair)));
+    assert_eq!(triples(&db, SELF_JOIN), expected, "sealed rows");
 }
 
 /// An outer key no inner row carries joins nothing, and a LEFT join pads it
@@ -293,6 +314,248 @@ fn explain_reports_the_grouped_index_join_only_for_the_shape_it_takes() {
         plan(having)
     );
 }
+/// Sealed rows are joined from the volume's side file: the counters show
+/// the probes and the rows it served, and the pairs are the memory engine's
+#[test]
+fn a_sealed_table_answers_the_limited_join_from_its_side_file() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = file_db(&dir);
+    users_in(&db, 2000);
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let oracle = Database::open("memory://join_eq_oracle_sealed").unwrap();
+    users_in(&oracle, 2000);
+
+    let before = reads(&db);
+    let got = triples(&db, SELF_JOIN);
+    let after = reads(&db);
+    assert_eq!(got, triples(&oracle, SELF_JOIN));
+    assert!(
+        after["probes"] > before["probes"],
+        "the side file was probed"
+    );
+    assert!(
+        after["rows"] > before["rows"],
+        "the side file named the rows"
+    );
+}
+
+/// Rows updated, deleted and inserted after the seal: a row updated to a
+/// new key is joined once under it and not under the old one, a row updated
+/// under the same key once, a deleted row not at all, and the hot rows
+/// beside the sealed ones
+#[test]
+fn sealed_and_hot_rows_join_together_once_each() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = file_db(&dir);
+    let oracle = Database::open("memory://join_eq_oracle_mixed").unwrap();
+    users_in(&db, 2000);
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    users_in(&oracle, 2000);
+    for target in [&db, &oracle] {
+        target
+            .execute("UPDATE users SET age = 100 WHERE id IN (2, 62)", ())
+            .unwrap();
+        target
+            .execute("UPDATE users SET name = 'renamed' WHERE id = 182", ())
+            .unwrap();
+        target
+            .execute("DELETE FROM users WHERE id = 122", ())
+            .unwrap();
+        target
+            .execute(
+                "INSERT INTO users VALUES (3001, 'odd', 20), (3002, 'even', 100)",
+                (),
+            )
+            .unwrap();
+        people_in(target, &[20, 100]);
+    }
+
+    let sql = "SELECT p.id, u.id, p.age FROM people p \
+        INNER JOIN users u ON p.age = u.age LIMIT 1000";
+    let got = triples(&db, sql);
+    assert_eq!(got, triples(&oracle, sql));
+    assert_eq!(got.iter().filter(|(_, _, age)| *age == 20).count(), 32);
+    assert_eq!(got.iter().filter(|(_, _, age)| *age == 100).count(), 3);
+    assert!(got.contains(&(2, Some(2), 100)));
+    assert!(!got.contains(&(1, Some(122), 20)));
+    assert_eq!(
+        got.iter()
+            .filter(|pair| **pair == (1, Some(182), 20))
+            .count(),
+        1,
+        "a row updated under the same key is joined once"
+    );
+}
+
+/// A key that holds too large a share of a volume is the scan's, so the
+/// probe is refused and the join runs on the hash path
+#[test]
+fn a_key_holding_a_large_share_of_a_volume_sends_the_join_to_the_hash_path() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = file_db(&dir);
+    users_in(&db, 600);
+    let insert = db.prepare("INSERT INTO users VALUES (?, ?, ?)").unwrap();
+    for id in 1001..=1100 {
+        insert.execute((id, "odd", 99)).unwrap();
+    }
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    people_in(&db, &[99]);
+
+    let sql = "SELECT p.id, u.id, p.age FROM people p \
+        INNER JOIN users u ON p.age = u.age LIMIT 50";
+    let before = reads(&db);
+    let got = triples(&db, sql);
+    let after = reads(&db);
+    assert!(after["cost_scans"] > before["cost_scans"]);
+    assert_eq!(got.len(), 50);
+    assert!(got
+        .iter()
+        .all(|(p, u, age)| *p == 1 && *age == 99 && u.is_some_and(|u| u > 1000)));
+}
+
+/// A sealed key with more ids than the cap, at a share the scan would not
+/// take: refused before anything is copied, and the join runs on the hash
+/// path
+#[test]
+fn a_sealed_key_past_the_cap_sends_the_join_to_the_hash_path() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = file_db(&dir);
+    users_in(&db, 24_000);
+    let insert = db.prepare("INSERT INTO users VALUES (?, ?, ?)").unwrap();
+    for id in 30_001..=31_100 {
+        insert.execute((id, "odd", 99)).unwrap();
+    }
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    people_in(&db, &[99]);
+
+    let sql = "SELECT p.id, u.id, p.age FROM people p \
+        INNER JOIN users u ON p.age = u.age LIMIT 50";
+    let before = reads(&db);
+    let got = triples(&db, sql);
+    let after = reads(&db);
+    assert_eq!(after["rows"], before["rows"], "nothing was copied");
+    assert_eq!(got.len(), 50);
+    assert!(got
+        .iter()
+        .all(|(p, u, age)| *p == 1 && *age == 99 && u.is_some_and(|u| u > 30_000)));
+}
+
+/// A sealed order moved to another user: its old copy is still under the
+/// old user in the side file, and the fetched row's key decides. The
+/// moved order counts once, under its new user; an order updated under the
+/// same key counts once too
+#[test]
+fn a_sealed_order_moved_to_another_user_counts_there_only() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = file_db(&dir);
+    orders_in(&db);
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute(
+        "UPDATE orders SET user_id = 2, amount = 1000 WHERE id = 1",
+        (),
+    )
+    .unwrap();
+    db.execute("UPDATE orders SET amount = 20 WHERE id = 2", ())
+        .unwrap();
+    let got = triples(&db, GROUPED);
+    assert_eq!(got[0], (1, Some(39), 390), "not under the old user");
+    assert_eq!(got[1], (2, Some(41), 1410), "once under the new user");
+    assert_eq!(got[2], (3, Some(40), 400));
+}
+
+/// A side file page that fails its check is the statement's error, not a
+/// probe the table cannot answer: the join does not go on to the hash path
+/// as if the index were absent
+#[test]
+fn a_side_file_that_fails_to_read_fails_the_join() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = file_db(&dir);
+    users_in(&db, 2000);
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    people_in(&db, &[20]);
+    db.close().unwrap();
+
+    let side = walkdir(dir.path())
+        .into_iter()
+        .find(|path| path.extension().is_some_and(|ext| ext == "sidx"))
+        .expect("the volume's side file");
+    let mut bytes = std::fs::read(&side).unwrap();
+    let len = bytes.len();
+    for byte in &mut bytes[len / 2..len / 2 + 64] {
+        *byte ^= 0xA5;
+    }
+    std::fs::write(&side, bytes).unwrap();
+
+    let db = file_db(&dir);
+    let sql = "SELECT p.id, u.id, p.age FROM people p \
+        INNER JOIN users u ON p.age = u.age LIMIT 10";
+    let error = db
+        .query(sql, ())
+        .err()
+        .expect("a failed read fails the join");
+    assert!(
+        error.to_string().contains("side index"),
+        "the error names the side index: {error}"
+    );
+}
+
+/// A volume sealed before the index has no side file for the column: the
+/// probe is refused as ineligible and the join answers from the hash path,
+/// the sealed rows included
+#[test]
+fn a_volume_without_a_side_file_sends_the_join_to_the_hash_path() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = file_db(&dir);
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER NOT NULL)",
+        (),
+    )
+    .unwrap();
+    let insert = db.prepare("INSERT INTO users VALUES (?, ?, ?)").unwrap();
+    for id in 1..=600 {
+        insert.execute((id, "u", 18 + id % 60)).unwrap();
+    }
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("CREATE INDEX idx_users_age ON users(age)", ())
+        .unwrap();
+    people_in(&db, &[20]);
+
+    let sql = "SELECT p.id, u.id, p.age FROM people p \
+        INNER JOIN users u ON p.age = u.age LIMIT 100";
+    let before = reads(&db);
+    let got = triples(&db, sql);
+    let after = reads(&db);
+    assert!(after["ineligible"] > before["ineligible"]);
+    assert_eq!(got.len(), 10, "the sealed rows are joined");
+    assert!(got
+        .iter()
+        .all(|(_, u, age)| *age == 20 && u.is_some_and(|u| u % 60 == 2)));
+}
+
+/// Every file under `root`
+fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(feature = "test-failpoints")]
 mod hot_index {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -403,11 +666,79 @@ mod hot_index {
         );
     }
 
+    /// A probe reuses the space its operator keeps, so a second key is
+    /// admitted beside that space, not beside a second reader's worth: under
+    /// a budget with room for one reader, every key of the join is served
+    #[test]
+    fn a_second_key_is_admitted_beside_the_space_the_first_one_holds() {
+        let _serial = super::serial();
+        use stoolap::storage::volume::secondary::INDEX_PAGES;
+        let dir = tempfile::tempdir().unwrap();
+        let db = file_db(&dir);
+        users_in(&db, 2000);
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        people_in(&db, &[20, 21, 22, 23]);
+
+        let sql = "SELECT p.id, u.id, p.age FROM people p \
+            INNER JOIN users u ON p.age = u.age LIMIT 1000";
+        // One reader's space plus the pages it reads, and no more; the
+        // budget goes back when the test ends, however it ends
+        struct Budget(u64);
+        impl Drop for Budget {
+            fn drop(&mut self) {
+                INDEX_PAGES.set_budget_bytes(self.0);
+            }
+        }
+        let _budget = Budget(INDEX_PAGES.stats().budget_bytes);
+        INDEX_PAGES.clear();
+        INDEX_PAGES.set_budget_bytes((INDEX_PAGES.stats().charged_bytes + 200_000) as u64);
+        let before = super::reads(&db);
+        let got = triples(&db, sql);
+        let after = super::reads(&db);
+        assert_eq!(got.len(), 4 * 34, "every key of the join");
+        assert_eq!(after["refused"], before["refused"], "no key was refused");
+        assert_eq!(
+            after["rows"] - before["rows"],
+            4 * 34,
+            "every key from the side file"
+        );
+    }
+
+    /// A seal landing inside a probe over volumes: the rows it moved are in
+    /// neither the cold view taken before it nor the hot index read after
+    /// it, so the probe is not an answer and the join takes the hash path
+    #[test]
+    fn a_seal_inside_a_probe_over_volumes_sends_the_join_to_the_hash_path() {
+        let _serial = super::serial();
+        let dir = tempfile::tempdir().unwrap();
+        let db = file_db(&dir);
+        users_in(&db, 2000);
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        let insert = db.prepare("INSERT INTO users VALUES (?, ?, ?)").unwrap();
+        for id in 3001..=3010 {
+            insert.execute((id, "odd", 100)).unwrap();
+        }
+        people_in(&db, &[100]);
+
+        let other = db.clone();
+        stoolap::test_failpoints::after_join_probe_admitted(move || {
+            other.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        });
+        let sql = "SELECT p.id, u.id, p.age FROM people p \
+            INNER JOIN users u ON p.age = u.age LIMIT 100";
+        let got = triples(&db, sql);
+        assert_eq!(got.len(), 10, "the rows the seal moved are joined");
+        assert!(got
+            .iter()
+            .all(|(_, u, age)| *age == 100 && u.is_some_and(|u| u > 3000)));
+    }
+
     /// A seal that lands after the probe was admitted and before it reads
     /// the index would leave the moved rows out; the probe notices and the
     /// join answers from the hash path
     #[test]
     fn a_seal_inside_the_probe_sends_the_join_to_the_hash_path() {
+        let _serial = super::serial();
         let dir = tempfile::tempdir().unwrap();
         let db = file_db(&dir);
         users_in(&db, 2000);
@@ -425,12 +756,14 @@ mod hot_index {
             .iter()
             .all(|(_, u, age)| *age == 20 && u.is_some_and(|u| u % 60 == 2)));
 
-        // The rows are in a volume now, so no probe is admitted
-        let probed = Arc::new(AtomicUsize::new(0));
-        probes::count(Arc::clone(&probed));
-        assert_eq!(triples(&db, sql), got);
-        probes::stop();
-        assert_eq!(probed.load(Ordering::SeqCst), 0);
+        // The rows are in a volume now, and its side file answers the probe
+        let before = super::reads(&db);
+        let again = triples(&db, sql);
+        assert!(super::reads(&db)["probes"] > before["probes"]);
+        assert_eq!(again.len(), 10);
+        assert!(again
+            .iter()
+            .all(|(_, u, age)| *age == 20 && u.is_some_and(|u| u % 60 == 2)));
     }
 
     /// A truncate inside the second probe: the pairs of the first outer row

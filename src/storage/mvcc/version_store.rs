@@ -4053,12 +4053,19 @@ impl VersionStore {
     /// identity, in column order. An index the catalog has not issued an
     /// identity to is left out: nothing can be built or served for it.
     pub fn secondary_index_identities(&self) -> Vec<(usize, u64)> {
+        let mut result = Vec::new();
+        self.secondary_index_identities_into(&mut result);
+        result
+    }
+
+    /// The same identities, into a buffer the caller keeps
+    pub fn secondary_index_identities_into(&self, result: &mut Vec<(usize, u64)>) {
         use crate::core::types::{DataType, IndexType};
+        result.clear();
         let schema = self.schema();
         let pk = schema.pk_column_index();
         let indexes = self.indexes.read();
         let identities = self.index_identities.read();
-        let mut result: Vec<(usize, u64)> = Vec::new();
         for (index_name, idx) in indexes.iter() {
             if idx.index_type() != IndexType::BTree || idx.column_names().len() != 1 {
                 continue;
@@ -4087,7 +4094,6 @@ impl VersionStore {
             }
         }
         result.sort_unstable();
-        result
     }
 
     // =========================================================================

@@ -3610,16 +3610,23 @@ impl Table for MVCCTable {
         key: &Value,
         max: usize,
         out: &mut Vec<i64>,
-    ) -> Option<crate::storage::traits::CappedEqual> {
-        let index = self.version_store.get_index_by_column(column)?;
+        _scratch: &mut crate::storage::traits::ProbeScratch,
+    ) -> Result<Option<crate::storage::traits::CappedEqual>> {
+        let Some(index) = self.version_store.get_index_by_column(column) else {
+            return Ok(None);
+        };
         if index.index_type() != IndexType::BTree {
-            return None;
+            return Ok(None);
         }
-        index.get_row_ids_equal_capped_into(std::slice::from_ref(key), max, out)
+        Ok(index.get_row_ids_equal_capped_into(std::slice::from_ref(key), max, out))
     }
 
     fn secondary_index_identities(&self) -> Vec<(usize, u64)> {
         self.version_store.secondary_index_identities()
+    }
+
+    fn secondary_index_identities_into(&self, out: &mut Vec<(usize, u64)>) {
+        self.version_store.secondary_index_identities_into(out)
     }
 
     fn get_index(&self, name: &str) -> Option<std::sync::Arc<dyn Index>> {
