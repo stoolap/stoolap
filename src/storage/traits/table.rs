@@ -429,6 +429,14 @@ pub trait Table: Send + Sync {
     /// The number of rows deleted
     fn delete_by_row_ids(&mut self, row_ids: &[i64]) -> Result<i32>;
 
+    /// Deletes the rows of `row_ids` a scan of this table found, and only
+    /// those still there: a row another transaction deleted since the scan
+    /// is neither deleted nor counted. On return `row_ids` holds the ids
+    /// deleted, in the order given.
+    fn delete_scanned_rows(&mut self, row_ids: &mut Vec<i64>) -> Result<i32> {
+        self.delete_by_row_ids(row_ids)
+    }
+
     /// Returns all active row IDs visible to the current transaction.
     /// Used for NOT IN (anti-join) optimization.
     fn get_active_row_ids(&self) -> Result<Vec<i64>>;

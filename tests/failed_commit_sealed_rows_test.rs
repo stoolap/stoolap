@@ -565,3 +565,52 @@ fn a_delete_across_two_volumes_decodes_each_volume_once() {
     assert_eq!(pairs(&db, "SELECT id, v FROM t"), vec![]);
     db.close().unwrap();
 }
+
+/// A DELETE that scans its rows first deletes and returns only the rows
+/// still there when it deletes: a row another transaction deleted and
+/// committed after the scan is neither
+#[test]
+fn a_scanned_delete_leaves_out_a_row_another_transaction_deleted_meanwhile() {
+    let _guard = test_failpoints::FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    for (name, db) in [
+        (
+            "memory",
+            Database::open("memory://scanned_delete_meanwhile").unwrap(),
+        ),
+        ("file", Database::open(&dsn(&dir)).unwrap()),
+    ] {
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)", ())
+            .unwrap();
+        if name == "file" {
+            // Rows 1 and 2 sealed, row 3 hot: a sealed row and a hot row
+            // go missing under the scan alike
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+            db.execute("INSERT INTO t VALUES (4, 40)", ()).unwrap();
+        }
+        let mut other = db.begin().unwrap();
+        other
+            .execute("DELETE FROM t WHERE id = 1 OR id = 3", ())
+            .unwrap();
+        test_failpoints::after_delete_rows_scanned(move || {
+            other.commit().unwrap();
+        });
+        let returned: Vec<(i64, i64)> = db
+            .query("DELETE FROM t WHERE v >= 10 RETURNING id, v", ())
+            .unwrap()
+            .map(|r| {
+                let r = r.unwrap();
+                (r.get(0).unwrap(), r.get(1).unwrap())
+            })
+            .collect();
+        let expected = if name == "file" {
+            vec![(2, 20), (4, 40)]
+        } else {
+            vec![(2, 20)]
+        };
+        assert_eq!(returned, expected, "{name}: only the rows still there");
+        assert_eq!(pairs(&db, "SELECT id, v FROM t"), vec![], "{name}");
+    }
+}

@@ -3147,16 +3147,32 @@ impl Executor {
                 // An integer key is the row id, so the rows go in one call,
                 // read once from the volumes they sit in, as the rows named
                 // by id below do
-                let row_ids: Vec<i64> = rows_to_delete
+                let mut row_ids: Vec<i64> = rows_to_delete
                     .iter()
                     .map(|(pk, _)| match pk {
                         Value::Integer(id) => *id,
                         _ => 0,
                     })
                     .collect();
-                delete_count = table.delete_by_row_ids(&row_ids)?;
+                #[cfg(any(test, feature = "test-failpoints"))]
+                crate::test_failpoints::delete_rows_scanned();
+                let scanned = row_ids.len();
+                delete_count = table.delete_scanned_rows(&mut row_ids)?;
                 if has_returning {
-                    returning_rows.extend(rows_to_delete.into_iter().filter_map(|(_, row)| row));
+                    // A row gone since the scan was not deleted and is not
+                    // returned
+                    if row_ids.len() == scanned {
+                        returning_rows
+                            .extend(rows_to_delete.into_iter().filter_map(|(_, row)| row));
+                    } else {
+                        let deleted: I64Set = row_ids.iter().copied().collect();
+                        returning_rows.extend(rows_to_delete.into_iter().filter_map(
+                            |(pk, row)| match pk {
+                                Value::Integer(id) if deleted.contains(id) => row,
+                                _ => None,
+                            },
+                        ));
+                    }
                 }
             } else if let Some(ref pk_name) = pk_col_name {
                 for (pk_value, row_data) in rows_to_delete {

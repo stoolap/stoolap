@@ -28,6 +28,7 @@
 
 use std::sync::Arc;
 
+use crate::common::I64Set;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::core::{DataType, IndexType, Result, Row, RowVec, Schema, Value, ValueMap, ValueSet};
@@ -2092,27 +2093,77 @@ impl SegmentedTable {
     /// The row at `idx` of a located volume, read through its mapping by a
     /// reader kept across the rows of one volume, so its pins keep the
     /// groups decoded
-    /// Reads a sealed row through the statement's reader of its volume,
-    /// opened on the first row read from that volume: rows spread over
-    /// several volumes keep every volume's groups pinned
+    /// Reads a sealed row through `reader`, opened on the volume when it
+    /// is not the reader's: the rows of one volume share its pinned
+    /// groups, and the reader of a volume done with goes with them
     fn cold_row_of(
-        readers: &mut Vec<super::writer::RowReader>,
+        reader: &mut Option<super::writer::RowReader>,
         cold: &super::manifest::ColdSegment,
         idx: usize,
     ) -> Result<Row> {
-        let at = match readers
-            .iter()
-            .position(|r| Arc::ptr_eq(r.volume(), &cold.volume))
-        {
-            Some(at) => at,
-            None => {
-                readers.push(super::writer::RowReader::new(Arc::clone(&cold.volume)));
-                readers.len() - 1
-            }
-        };
-        readers[at]
+        let same = reader
+            .as_ref()
+            .is_some_and(|r| Arc::ptr_eq(r.volume(), &cold.volume));
+        if !same {
+            *reader = None;
+        }
+        reader
+            .get_or_insert_with(|| super::writer::RowReader::new(Arc::clone(&cold.volume)))
             .row(idx, &cold.mapping)
             .map_err(|e| crate::core::Error::internal(format!("cold row read failed: {e}")))
+    }
+
+    /// Deletes the sealed rows `row_ids` names, hands the rest to `hot`
+    /// as `hot_ids` and returns the sealed rows deleted. The sealed rows
+    /// go volume by volume, so one volume's reader and pinned groups live
+    /// at a time whatever order the ids visit the volumes
+    fn delete_cold_rows(
+        &mut self,
+        snap: Option<&super::manifest::StatementSnapshot>,
+        row_ids: &[i64],
+        hot_ids: &mut Vec<i64>,
+    ) -> Result<i32> {
+        let has_int_pk = self
+            .hot
+            .schema()
+            .columns
+            .iter()
+            .any(|c| c.primary_key && c.data_type == DataType::Integer);
+        let mut located: Vec<(u64, usize, i64)> = Vec::new();
+        let mut segments: FxHashMap<u64, super::manifest::ColdSegment> = FxHashMap::default();
+        for &row_id in row_ids {
+            let found = match snap {
+                Some(snap) => self.find_segment_row_in(snap, row_id)?,
+                None => None,
+            };
+            match found {
+                Some((seg_id, cold, idx)) => {
+                    segments.entry(seg_id).or_insert(cold);
+                    located.push((seg_id, idx, row_id));
+                }
+                None => hot_ids.push(row_id),
+            }
+        }
+        located.sort_by_key(|&(seg_id, idx, _)| (seg_id, idx));
+        let txn_id = self.txn_id();
+        let mut old_rows: Option<super::writer::RowReader> = None;
+        for &(seg_id, idx, row_id) in &located {
+            let cold = &segments[&seg_id];
+            let old_row = if has_int_pk {
+                Some(Self::cold_row_of(&mut old_rows, cold, idx)?)
+            } else {
+                None
+            };
+            Self::delete_located_cold_row(
+                &mut self.hot,
+                &self.segment_mgr,
+                txn_id,
+                row_id,
+                has_int_pk,
+                old_row,
+            )?;
+        }
+        Ok(located.len() as i32)
     }
 
     /// Deletes a sealed row the caller has already located in the statement
@@ -2479,7 +2530,8 @@ impl Table for SegmentedTable {
     }
 
     fn delete_by_row_ids(&mut self, row_ids: &[i64]) -> Result<i32> {
-        let _seal_guard = self.segment_mgr.acquire_seal_read();
+        let mgr = Arc::clone(&self.segment_mgr);
+        let _seal_guard = mgr.acquire_seal_read();
         // Capture a verified all-warm segment snapshot BEFORE mutating the
         // hot buffer and use it for the entire statement: eviction CoWs
         // new maps and new volume Arcs, so this snapshot's volumes keep
@@ -2490,43 +2542,38 @@ impl Table for SegmentedTable {
         } else {
             None
         };
-        let mut count = 0i32;
         let mut hot_ids = Vec::new();
-        let has_int_pk = self
-            .hot
-            .schema()
-            .columns
-            .iter()
-            .any(|c| c.primary_key && c.data_type == DataType::Integer);
-        let mut old_rows: Vec<super::writer::RowReader> = Vec::new();
-
-        for &row_id in row_ids {
-            let located = match &cold_snapshot {
-                Some(snap) => self.find_segment_row_in(snap, row_id)?,
-                None => None,
-            };
-            if let Some((_, cold, idx)) = located {
-                let txn_id = self.txn_id();
-                let old_row = if has_int_pk {
-                    Some(Self::cold_row_of(&mut old_rows, &cold, idx)?)
-                } else {
-                    None
-                };
-                Self::delete_located_cold_row(
-                    &mut self.hot,
-                    &self.segment_mgr,
-                    txn_id,
-                    row_id,
-                    has_int_pk,
-                    old_row,
-                )?;
-                count += 1;
-            } else {
-                hot_ids.push(row_id);
-            }
-        }
+        let mut count = self.delete_cold_rows(cold_snapshot.as_ref(), row_ids, &mut hot_ids)?;
         if !hot_ids.is_empty() {
             count += self.hot.delete_by_row_ids(&hot_ids)?;
+        }
+        Ok(count)
+    }
+
+    fn delete_scanned_rows(&mut self, row_ids: &mut Vec<i64>) -> Result<i32> {
+        let mgr = Arc::clone(&self.segment_mgr);
+        let _seal_guard = mgr.acquire_seal_read();
+        let cold_snapshot = if self.segment_mgr.has_segments() {
+            Some(self.segment_mgr.statement_snapshot()?)
+        } else {
+            None
+        };
+        // A sealed row the snapshot still holds is there to delete; a row
+        // it does not is the hot store's, deleted if still visible
+        let mut hot_ids = Vec::new();
+        let mut count = self.delete_cold_rows(cold_snapshot.as_ref(), row_ids, &mut hot_ids)?;
+        if !hot_ids.is_empty() {
+            let offered = hot_ids.clone();
+            count += self.hot.delete_scanned_rows(&mut hot_ids)?;
+            if hot_ids.len() != offered.len() {
+                let kept: I64Set = hot_ids.iter().copied().collect();
+                let gone: I64Set = offered
+                    .iter()
+                    .copied()
+                    .filter(|id| !kept.contains(*id))
+                    .collect();
+                row_ids.retain(|id| !gone.contains(*id));
+            }
         }
         Ok(count)
     }
@@ -2586,7 +2633,7 @@ impl Table for SegmentedTable {
                     .columns
                     .iter()
                     .any(|c| c.primary_key && c.data_type == DataType::Integer);
-                let mut old_rows: Vec<super::writer::RowReader> = Vec::new();
+                let mut old_rows: Option<super::writer::RowReader> = None;
                 if let Some((_, cold, idx)) = self.find_segment_row_in(snap, pk)? {
                     let txn_id = self.txn_id();
                     let old_row = if has_int_pk {

@@ -222,6 +222,94 @@ impl MVCCTable {
         row
     }
 
+    /// Deletes `row_ids`. With `scanned` None an id no version of this
+    /// transaction or of the store holds is a sealed row, deleted by a
+    /// marker so the log records it; with `scanned` given such an id is a
+    /// row gone since the scan that found it, left alone, and the ids
+    /// deleted are added to `scanned`.
+    fn delete_rows_by_id(&mut self, row_ids: &[i64], scanned: Option<&mut I64Set>) -> Result<i32> {
+        let schema = &self.cached_schema;
+        // Step 1: Check local versions first
+        // Use get_local_version to distinguish "no local version" from "locally deleted"
+        let mut local_deletes = RowVec::with_capacity(row_ids.len() / 4);
+        let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(row_ids.len());
+
+        {
+            let txn_versions = self.txn_versions.read().unwrap();
+            for &row_id in row_ids {
+                if let Some(local) = txn_versions.get_local_version(row_id) {
+                    if !local.is_deleted() {
+                        let row = self.normalize_row_to_schema(local.data.clone(), schema);
+                        local_deletes.push((row_id, row));
+                    }
+                    // Already locally deleted — skip, don't fall through
+                } else {
+                    remaining_row_ids.push(row_id);
+                }
+            }
+        }
+
+        // Step 2: Batch fetch remaining from version store
+        let mut rows_with_originals: Vec<(i64, Row, crate::storage::mvcc::RowVersion)> =
+            Vec::with_capacity(remaining_row_ids.len());
+        // Track which remaining row_ids have hot versions (cold-only rows won't)
+        let mut found_ids = rustc_hash::FxHashSet::default();
+        if !remaining_row_ids.is_empty() {
+            let batch_rows = self
+                .version_store
+                .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
+            for (row_id, row, version) in batch_rows {
+                found_ids.insert(row_id);
+                let row = self.normalize_row_to_schema(row, schema);
+                rows_with_originals.push((row_id, row, version));
+            }
+        }
+
+        // Cold-only row_ids: not in local versions and not in the hot version store.
+        // Create phantom delete markers so the WAL records the deletion, enabling
+        // tombstone recovery on restart.
+        let cold_only_ids: Vec<i64> = match scanned {
+            Some(scanned) => {
+                for (row_id, _) in &local_deletes {
+                    scanned.insert(*row_id);
+                }
+                scanned.extend(found_ids.iter().copied());
+                Vec::new()
+            }
+            None => remaining_row_ids
+                .iter()
+                .filter(|id| !found_ids.contains(id))
+                .copied()
+                .collect(),
+        };
+
+        // Step 3: Claim cold-only rows before acquiring txn_versions lock.
+        // Prevents concurrent DELETE + UPDATE from both committing (lost update).
+        // The claim is tracked in write_set via track_external_claim.
+        for row_id in &cold_only_ids {
+            self.try_claim_row(*row_id)?;
+        }
+
+        // Step 4: Batch delete all rows
+        let delete_count =
+            (local_deletes.len() + rows_with_originals.len() + cold_only_ids.len()) as i32;
+        if !local_deletes.is_empty() || !rows_with_originals.is_empty() || !cold_only_ids.is_empty()
+        {
+            let mut txn_versions = self.txn_versions.write().unwrap();
+            for (row_id, row) in local_deletes {
+                txn_versions.put(row_id, row, true)?;
+            }
+            for (row_id, row, orig) in rows_with_originals {
+                txn_versions.put_with_original(row_id, row, orig, true)?;
+            }
+            for row_id in cold_only_ids {
+                txn_versions.put(row_id, Row::new(), true)?;
+            }
+        }
+
+        Ok(delete_count)
+    }
+
     /// Try to extract a primary key lookup from the expression
     ///
     /// Returns Some(row_id) if the expression is a simple equality on the PK column
@@ -2542,78 +2630,16 @@ impl Table for MVCCTable {
     }
 
     fn delete_by_row_ids(&mut self, row_ids: &[i64]) -> Result<i32> {
-        let schema = &self.cached_schema;
+        self.delete_rows_by_id(row_ids, None)
+    }
 
-        // Step 1: Check local versions first
-        // Use get_local_version to distinguish "no local version" from "locally deleted"
-        let mut local_deletes = RowVec::with_capacity(row_ids.len() / 4);
-        let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(row_ids.len());
-
-        {
-            let txn_versions = self.txn_versions.read().unwrap();
-            for &row_id in row_ids {
-                if let Some(local) = txn_versions.get_local_version(row_id) {
-                    if !local.is_deleted() {
-                        let row = self.normalize_row_to_schema(local.data.clone(), schema);
-                        local_deletes.push((row_id, row));
-                    }
-                    // Already locally deleted — skip, don't fall through
-                } else {
-                    remaining_row_ids.push(row_id);
-                }
-            }
+    fn delete_scanned_rows(&mut self, row_ids: &mut Vec<i64>) -> Result<i32> {
+        let mut deleted = I64Set::new();
+        let count = self.delete_rows_by_id(row_ids, Some(&mut deleted))?;
+        if deleted.len() != row_ids.len() {
+            row_ids.retain(|id| deleted.contains(*id));
         }
-
-        // Step 2: Batch fetch remaining from version store
-        let mut rows_with_originals: Vec<(i64, Row, crate::storage::mvcc::RowVersion)> =
-            Vec::with_capacity(remaining_row_ids.len());
-        // Track which remaining row_ids have hot versions (cold-only rows won't)
-        let mut found_ids = rustc_hash::FxHashSet::default();
-        if !remaining_row_ids.is_empty() {
-            let batch_rows = self
-                .version_store
-                .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
-            for (row_id, row, version) in batch_rows {
-                found_ids.insert(row_id);
-                let row = self.normalize_row_to_schema(row, schema);
-                rows_with_originals.push((row_id, row, version));
-            }
-        }
-
-        // Cold-only row_ids: not in local versions and not in the hot version store.
-        // Create phantom delete markers so the WAL records the deletion, enabling
-        // tombstone recovery on restart.
-        let cold_only_ids: Vec<i64> = remaining_row_ids
-            .iter()
-            .filter(|id| !found_ids.contains(id))
-            .copied()
-            .collect();
-
-        // Step 3: Claim cold-only rows before acquiring txn_versions lock.
-        // Prevents concurrent DELETE + UPDATE from both committing (lost update).
-        // The claim is tracked in write_set via track_external_claim.
-        for row_id in &cold_only_ids {
-            self.try_claim_row(*row_id)?;
-        }
-
-        // Step 4: Batch delete all rows
-        let delete_count =
-            (local_deletes.len() + rows_with_originals.len() + cold_only_ids.len()) as i32;
-        if !local_deletes.is_empty() || !rows_with_originals.is_empty() || !cold_only_ids.is_empty()
-        {
-            let mut txn_versions = self.txn_versions.write().unwrap();
-            for (row_id, row) in local_deletes {
-                txn_versions.put(row_id, row, true)?;
-            }
-            for (row_id, row, orig) in rows_with_originals {
-                txn_versions.put_with_original(row_id, row, orig, true)?;
-            }
-            for row_id in cold_only_ids {
-                txn_versions.put(row_id, Row::new(), true)?;
-            }
-        }
-
-        Ok(delete_count)
+        Ok(count)
     }
 
     fn get_active_row_ids(&self) -> Result<Vec<i64>> {
