@@ -3206,6 +3206,18 @@ impl Table for MVCCTable {
         Ok(Some(()))
     }
 
+    fn local_column_values(
+        &self,
+        column: usize,
+        out: &mut Vec<(Value, i64)>,
+        written: &mut crate::common::I64Set,
+    ) {
+        self.txn_versions
+            .read()
+            .unwrap()
+            .local_values(column, out, written);
+    }
+
     fn get_pending_versions(&self) -> Vec<(i64, Row, bool, i64)> {
         let txn_versions = self.txn_versions.read().unwrap();
         txn_versions

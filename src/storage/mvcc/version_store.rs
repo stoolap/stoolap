@@ -6209,6 +6209,29 @@ impl TransactionVersionStore {
     }
 
     /// Iterate over local versions (returns most recent version per row)
+    /// The `column` value and id of every uncommitted row of this
+    /// transaction that holds a value there, and the id of every row it
+    /// wrote, deleted ones included: the transaction's version of a row is
+    /// the truth about it, whatever key the shared index holds it under
+    pub fn local_values(
+        &self,
+        column: usize,
+        out: &mut Vec<(Value, i64)>,
+        written: &mut crate::common::I64Set,
+    ) {
+        for (row_id, version) in self.iter_local() {
+            written.insert(row_id);
+            if version.is_deleted() {
+                continue;
+            }
+            if let Some(value) = version.data.get(column) {
+                if !value.is_null() {
+                    out.push((value.clone(), row_id));
+                }
+            }
+        }
+    }
+
     pub fn iter_local(&self) -> impl Iterator<Item = (i64, &RowVersion)> {
         self.local_versions
             .iter()

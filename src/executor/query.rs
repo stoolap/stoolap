@@ -7105,7 +7105,7 @@ impl Executor {
     /// The inner table of a join: from the explicit transaction when one is
     /// active, so the join sees what the transaction changed, otherwise from
     /// the statement snapshot the outer side reads through
-    fn join_table(
+    pub(super) fn join_table(
         &self,
         snapshot: &StatementSnapshot,
         name: &str,
@@ -7117,7 +7117,7 @@ impl Executor {
     }
 
     /// One transaction for every read of a statement
-    fn new_statement_snapshot(
+    pub(super) fn new_statement_snapshot(
         &self,
         isolation: crate::core::IsolationLevel,
     ) -> Result<StatementSnapshot> {

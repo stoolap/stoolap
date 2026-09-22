@@ -632,6 +632,22 @@ pub trait Table: Send + Sync {
     /// protocol needs to be executed.
     fn has_local_changes(&self) -> bool;
 
+    /// Appends the `column` value and the id of every uncommitted row of
+    /// this transaction that holds a value there, and adds the id of every
+    /// row the transaction wrote, deleted ones included, to `written`. The
+    /// transaction's version of a row is the truth about it, whatever key
+    /// the shared index holds it under: a probe of the index inside the
+    /// transaction takes these once, drops the written rows from what the
+    /// index names, and adds the ones under the probed key.
+    fn local_column_values(
+        &self,
+        column: usize,
+        out: &mut Vec<(Value, i64)>,
+        written: &mut crate::common::I64Set,
+    ) {
+        let _ = (column, out, written);
+    }
+
     /// The publish epoch of the shared indexes, when this statement may read
     /// them as the whole truth of what it sees: no local changes (they join
     /// the indexes at commit), no snapshot older than the keys they hold (a
