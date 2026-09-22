@@ -2089,9 +2089,23 @@ impl SegmentedTable {
         Ok(None)
     }
 
-    /// The row at `idx` of a located volume, read through its mapping
-    fn cold_row_of(cold: &super::manifest::ColdSegment, idx: usize) -> Result<Row> {
-        super::writer::RowReader::new(Arc::clone(&cold.volume))
+    /// The row at `idx` of a located volume, read through its mapping by a
+    /// reader kept across the rows of one volume, so its pins keep the
+    /// groups decoded
+    fn cold_row_of(
+        reader: &mut Option<super::writer::RowReader>,
+        cold: &super::manifest::ColdSegment,
+        idx: usize,
+    ) -> Result<Row> {
+        if !reader
+            .as_ref()
+            .is_some_and(|r| Arc::ptr_eq(r.volume(), &cold.volume))
+        {
+            *reader = Some(super::writer::RowReader::new(Arc::clone(&cold.volume)));
+        }
+        reader
+            .as_mut()
+            .expect("reader just set")
             .row(idx, &cold.mapping)
             .map_err(|e| crate::core::Error::internal(format!("cold row read failed: {e}")))
     }
@@ -2479,6 +2493,7 @@ impl Table for SegmentedTable {
             .columns
             .iter()
             .any(|c| c.primary_key && c.data_type == DataType::Integer);
+        let mut old_rows: Option<super::writer::RowReader> = None;
 
         for &row_id in row_ids {
             let located = match &cold_snapshot {
@@ -2488,7 +2503,7 @@ impl Table for SegmentedTable {
             if let Some((_, cold, idx)) = located {
                 let txn_id = self.txn_id();
                 let old_row = if has_int_pk {
-                    Some(Self::cold_row_of(&cold, idx)?)
+                    Some(Self::cold_row_of(&mut old_rows, &cold, idx)?)
                 } else {
                     None
                 };
@@ -2566,10 +2581,11 @@ impl Table for SegmentedTable {
                     .columns
                     .iter()
                     .any(|c| c.primary_key && c.data_type == DataType::Integer);
+                let mut old_rows: Option<super::writer::RowReader> = None;
                 if let Some((_, cold, idx)) = self.find_segment_row_in(snap, pk)? {
                     let txn_id = self.txn_id();
                     let old_row = if has_int_pk {
-                        Some(Self::cold_row_of(&cold, idx)?)
+                        Some(Self::cold_row_of(&mut old_rows, &cold, idx)?)
                     } else {
                         None
                     };
@@ -2681,6 +2697,9 @@ impl Table for SegmentedTable {
             };
 
             let mapping = cs.mapping.clone();
+            // One reader for the volume's deleted rows: its pins keep the
+            // groups decoded across the rows
+            let mut old_rows: Option<super::writer::RowReader> = None;
 
             for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
                 if !cs.is_visible(i) {
@@ -2758,14 +2777,13 @@ impl Table for SegmentedTable {
                     // The volume's copy is what the delete takes away: an
                     // index that keeps sealed rows drops its keys at commit
                     // and takes them back if the commit fails
-                    {
-                        let old_row = super::writer::RowReader::new(Arc::clone(vol))
-                            .row(i, &mapping)
-                            .map_err(|e| {
-                                crate::core::Error::internal(format!("cold row read failed: {e}"))
-                            })?;
-                        self.hot.mark_sealed_original(row_id, old_row)?;
-                    }
+                    let old_row = old_rows
+                        .get_or_insert_with(|| super::writer::RowReader::new(Arc::clone(vol)))
+                        .row(i, &mapping)
+                        .map_err(|e| {
+                            crate::core::Error::internal(format!("cold row read failed: {e}"))
+                        })?;
+                    self.hot.mark_sealed_original(row_id, old_row)?;
                 }
                 deleted_cold_ids.push(row_id);
                 count += 1;

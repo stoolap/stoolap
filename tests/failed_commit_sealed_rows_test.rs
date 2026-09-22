@@ -438,3 +438,55 @@ fn a_commit_that_fails_on_a_later_table_leaves_the_earlier_ones_as_they_were() {
     let db = Database::open(&dsn(&dir)).unwrap();
     check(&db, "after reopen");
 }
+
+/// Deleting sealed rows keeps their old copies for the undo without
+/// decoding a volume's groups again for every row: one reader serves the
+/// volume's rows, so a cache that holds nothing sees one decode per group
+#[test]
+fn a_sealed_delete_decodes_each_group_once() {
+    let _guard = test_failpoints::FailpointGuard::new();
+    for statement in ["DELETE FROM t", "DELETE FROM t WHERE id >= 1"] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dsn(&dir)).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+            .unwrap();
+        let insert = db.prepare("INSERT INTO t VALUES (?, ?)").unwrap();
+        for id in 1..=256 {
+            insert.execute((id, id * 10)).unwrap();
+        }
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        db.close().unwrap();
+        drop(db);
+
+        let db = Database::open(&dsn(&dir)).unwrap();
+        // A cache that holds nothing: a group decoded stays only while pinned
+        use stoolap::storage::volume::group_cache::DECODED_GROUPS;
+        struct Budget(usize);
+        impl Drop for Budget {
+            fn drop(&mut self) {
+                DECODED_GROUPS.set_budget_bytes(self.0);
+            }
+        }
+        let _budget = Budget(DECODED_GROUPS.budget_bytes());
+        DECODED_GROUPS.set_budget_bytes(1);
+        let misses = |db: &Database| -> i64 {
+            let rows = db.query("PRAGMA GROUP_CACHE_STATS", ()).unwrap();
+            let at = rows.columns().iter().position(|c| c == "misses").unwrap();
+            rows.into_iter()
+                .next()
+                .unwrap()
+                .unwrap()
+                .get::<i64>(at)
+                .unwrap()
+        };
+        let before = misses(&db);
+        db.execute(statement, ()).unwrap();
+        let decoded = misses(&db) - before;
+        assert!(
+            decoded <= 4,
+            "{statement}: {decoded} groups decoded for 256 rows of two columns"
+        );
+        assert_eq!(pairs(&db, "SELECT id, v FROM t"), vec![]);
+        db.close().unwrap();
+    }
+}
