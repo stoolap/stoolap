@@ -233,10 +233,15 @@ impl MVCCTable {
         // Use get_local_version to distinguish "no local version" from "locally deleted"
         let mut local_deletes = RowVec::with_capacity(row_ids.len() / 4);
         let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(row_ids.len());
+        // An id named twice is one row
+        let mut seen = I64Set::new();
 
         {
             let txn_versions = self.txn_versions.read().unwrap();
             for &row_id in row_ids {
+                if !seen.insert(row_id) {
+                    continue;
+                }
                 if let Some(local) = txn_versions.get_local_version(row_id) {
                     if !local.is_deleted() {
                         let row = self.normalize_row_to_schema(local.data.clone(), schema);

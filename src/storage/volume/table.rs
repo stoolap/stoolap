@@ -2145,6 +2145,8 @@ impl SegmentedTable {
             }
         }
         located.sort_by_key(|&(seg_id, idx, _)| (seg_id, idx));
+        // An id named twice is one row
+        located.dedup_by_key(|&mut (_, _, row_id)| row_id);
         let txn_id = self.txn_id();
         let mut old_rows: Option<super::writer::RowReader> = None;
         for &(seg_id, idx, row_id) in &located {

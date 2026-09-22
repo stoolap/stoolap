@@ -614,3 +614,24 @@ fn a_scanned_delete_leaves_out_a_row_another_transaction_deleted_meanwhile() {
         assert_eq!(pairs(&db, "SELECT id, v FROM t"), vec![], "{name}");
     }
 }
+
+/// A row id named twice in a delete is one row: deleted once, counted once
+#[test]
+fn a_row_named_twice_is_deleted_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dsn(&dir)).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 20)", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (3, 30)", ()).unwrap();
+    use stoolap::storage::traits::Engine;
+    let mut tx = db.engine().begin_transaction().unwrap();
+    let mut table = tx.get_table("t").unwrap();
+    assert_eq!(table.delete_by_row_ids(&[1, 1]).unwrap(), 1, "a sealed row");
+    assert_eq!(table.delete_by_row_ids(&[3, 3]).unwrap(), 1, "a hot row");
+    drop(table);
+    tx.commit().unwrap();
+    assert_eq!(pairs(&db, "SELECT id, v FROM t"), vec![(2, 20)]);
+}
