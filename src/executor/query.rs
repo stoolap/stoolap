@@ -205,6 +205,14 @@ fn partition_where_for_join(
     )
 }
 
+/// The index join operator a statement's join runs on, for EXPLAIN
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JoinIndexUse {
+    None,
+    Streaming { bounded: bool },
+    Grouped,
+}
+
 /// A GROUP BY + LIMIT join whose left side is fetched in a limited chunk
 struct SemijoinReduction {
     cap: usize,
@@ -4388,6 +4396,7 @@ impl Executor {
             // This optimization avoids materializing the right side entirely
             // NOTE: Don't use Index NL for aggregation/window queries - they need full results
             // and the current implementation falls through to standard path, causing double execution
+            let pushed_limit = self.pushed_join_limit(stmt, ctx, classification, &join_type);
             let index_nl_info = if has_agg || has_window || correlated_where {
                 None
             } else {
@@ -4397,6 +4406,7 @@ impl Executor {
                     &join_type,
                     left_alias.as_deref(),
                     right_alias.as_deref(),
+                    pushed_limit.is_some(),
                 )
             };
 
@@ -4423,6 +4433,7 @@ impl Executor {
                     &join_type,
                     right_alias.as_deref(), // Swap aliases for the check
                     left_alias.as_deref(),
+                    pushed_limit.is_some(),
                 );
                 if left_as_inner.is_some() {
                     (left_as_inner, true) // Force swap
@@ -4461,6 +4472,7 @@ impl Executor {
                     &join_type,
                     right_alias.as_deref(), // Swap aliases
                     left_alias.as_deref(),
+                    pushed_limit.is_some(),
                 );
 
                 // Prefer swapped if it gives PK lookup (most efficient)
@@ -4494,7 +4506,13 @@ impl Executor {
                 )
             };
 
-            if let Some((table_name, lookup_strategy, inner_col, outer_col)) = index_nl_info {
+            // A join the inner table stops answering leaves through the label
+            // to the hash join below
+            'index_nl: {
+                let Some((table_name, lookup_strategy, inner_col, outer_col)) = index_nl_info
+                else {
+                    break 'index_nl;
+                };
                 // Index Nested Loop path: stream outer side for early termination
                 // When swapped, execute right side as outer (with original right filter, now in nl_left_filter)
                 let outer_expr = if swapped {
@@ -4542,40 +4560,8 @@ impl Executor {
                     nl_left_filter
                 };
 
-                // Compute join limit EARLY so we can use it for outer table optimization
-                let can_push_limit = !join_type.contains("FULL")
-                    && !classification.has_order_by
-                    && !classification.has_group_by
-                    && !classification.has_aggregation;
-
-                let join_limit = if can_push_limit {
-                    let limit = stmt.limit.as_ref().and_then(|limit_expr| {
-                        ExpressionEval::compile(limit_expr, &[])
-                            .ok()
-                            .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                            .and_then(|v| match v {
-                                Value::Integer(n) if n >= 0 => Some(n as u64),
-                                _ => None,
-                            })
-                    });
-                    // OFFSET rows are skipped after collection, so early
-                    // termination must gather LIMIT + OFFSET rows; a
-                    // non-evaluable OFFSET disables the pushdown
-                    match &stmt.offset {
-                        None => limit,
-                        Some(off_expr) => limit.and_then(|l| {
-                            ExpressionEval::compile(off_expr, &[])
-                                .ok()
-                                .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                                .and_then(|v| match v {
-                                    Value::Integer(n) if n >= 0 => Some(l.saturating_add(n as u64)),
-                                    _ => None,
-                                })
-                        }),
-                    }
-                } else {
-                    None
-                };
+                // The limit the join is bounded by, decided with the strategy
+                let join_limit = pushed_limit;
 
                 // The outer side is fetched in chunks: the first one is the limit
                 // plus an eighth of slack, so the odd outer row without a match
@@ -4832,6 +4818,12 @@ impl Executor {
                                 cross_row_filter.as_ref(),
                                 &mut result_rows,
                             )?;
+                            // A probe the inner table could not answer: the rows
+                            // joined so far are dropped, and the whole join runs
+                            // once more on the hash path
+                            if op.needs_fallback() {
+                                break 'index_nl;
+                            }
                             let lim = join_limit.unwrap_or(0) as usize;
                             let cap = match outer_limit {
                                 Some(cap) if op.outer_rows_seen() == cap => cap,
@@ -7232,52 +7224,31 @@ impl Executor {
         cross_filter: Option<&Expression>,
         plan: &SemijoinReduction,
     ) -> Result<Option<SelectOutput>> {
-        // A right-side filter on a LEFT JOIN changes what an unmatched left row
-        // means; the reduction handles that shape
-        if join_type != "INNER" && right_filter.is_some() {
+        let filters_have_subquery = [left_filter, right_filter, cross_filter]
+            .into_iter()
+            .flatten()
+            .any(Self::filter_has_subquery);
+        let Some((aggregations, group_names)) = self.grouped_index_join_applies(
+            stmt,
+            join_type,
+            right_filter.is_some(),
+            filters_have_subquery,
+        )?
+        else {
             return Ok(None);
-        }
-        let Some((table_name, lookup_strategy, _inner_key_col, outer_key_col)) = self
+        };
+        let Some((table_name, lookup_strategy, inner_key_col, outer_key_col)) = self
             .check_index_nested_loop_opportunity(
                 &join_source.right,
                 join_source.condition.as_deref(),
                 join_type,
                 left_alias,
                 right_alias,
+                true,
             )
         else {
             return Ok(None);
         };
-        let (aggregations, _) = self.parse_aggregations(stmt)?;
-        if aggregations.iter().any(|agg| {
-            agg.expression.is_some()
-                || agg.filter.is_some()
-                || !agg.order_by.is_empty()
-                || agg.hidden
-                || self.function_registry.get_aggregate(&agg.name).is_none()
-        }) {
-            return Ok(None);
-        }
-        if stmt.group_by.modifier != crate::parser::ast::GroupByModifier::None {
-            return Ok(None);
-        }
-        if [left_filter, right_filter, cross_filter]
-            .into_iter()
-            .flatten()
-            .any(Self::filter_has_subquery)
-        {
-            return Ok(None);
-        }
-        let group_by = self.parse_group_by(stmt, &[])?;
-        let mut group_names = Vec::with_capacity(group_by.len());
-        for item in &group_by {
-            match item {
-                crate::executor::aggregation::GroupByItem::Column(name) => {
-                    group_names.push(name.clone())
-                }
-                _ => return Ok(None),
-            }
-        }
 
         // One transaction for the outer fetches and the inner probes; inside an
         // explicit transaction the outer side is read whole
@@ -7325,6 +7296,13 @@ impl Executor {
             .iter()
             .map(|col| format!("{}.{}", inner_alias, col.name))
             .collect();
+        // The inner key column, checked on each fetched row: the ids name the
+        // rows the index held for the key, not the rows' keys now
+        let inner_key_idx = inner_cols.iter().position(|c| {
+            c.rsplit('.')
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case(&inner_key_col))
+        });
         let all_columns: Vec<String> = outer_cols
             .iter()
             .chain(inner_cols.iter())
@@ -7389,16 +7367,6 @@ impl Executor {
                     .clone()
                     .unwrap_or_else(|| agg.get_expression_name()),
             );
-        }
-        // A HAVING that reads the group it is asked about has to be run once
-        // per group with that group as the outer row, which the general
-        // aggregation does and this streaming path does not
-        if stmt
-            .having
-            .as_deref()
-            .is_some_and(Self::has_correlated_subqueries)
-        {
-            return Ok(None);
         }
         let having = match &stmt.having {
             Some(having) => {
@@ -7504,7 +7472,8 @@ impl Executor {
                 outer_key_idx,
                 lookup_strategy.clone(),
                 build_residual_filter(),
-            );
+            )
+            .with_inner_key(inner_key_idx);
             if let Some(filter) = &inner_filter {
                 op = op.with_inner_filter(filter.clone());
             }
@@ -7555,6 +7524,11 @@ impl Executor {
                 }
             }
             op.close()?;
+            // A probe the inner table could not answer: the groups so far are
+            // no answer, and the caller reduces and hashes instead
+            if op.needs_fallback() {
+                return Ok(None);
+            }
             if enough || groups.len() >= want {
                 break;
             }
@@ -11035,6 +11009,161 @@ impl Executor {
     ///
     /// The outer_key_idx will be determined after materializing the outer side.
     #[allow(clippy::type_complexity)]
+    /// The limit the executor pushes into a join of `stmt`: the statement's
+    /// LIMIT plus OFFSET when nothing orders, groups or aggregates the joined
+    /// rows and both evaluate; None when the join runs unbounded
+    pub(crate) fn pushed_join_limit(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        classification: &QueryClassification,
+        join_type: &str,
+    ) -> Option<u64> {
+        if join_type.contains("FULL")
+            || classification.has_order_by
+            || classification.has_group_by
+            || classification.has_aggregation
+        {
+            return None;
+        }
+        let evaluate = |expr: &Expression| {
+            ExpressionEval::compile(expr, &[])
+                .ok()
+                .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
+                .and_then(|v| match v {
+                    Value::Integer(n) if n >= 0 => Some(n as u64),
+                    _ => None,
+                })
+        };
+        let limit = evaluate(stmt.limit.as_ref()?)?;
+        // OFFSET rows are skipped after collection, so early termination
+        // must gather LIMIT + OFFSET rows; a non-evaluable OFFSET disables
+        // the pushdown
+        match &stmt.offset {
+            None => Some(limit),
+            Some(offset) => Some(limit.saturating_add(evaluate(offset)?)),
+        }
+    }
+
+    /// Whether the grouped index join takes the statement's shape: an INNER
+    /// join, or one whose right side carries no filter; plain aggregates the
+    /// registry knows, without expressions, FILTER, ORDER BY or hidden
+    /// ones; a plain GROUP BY over columns; no subquery in the filters.
+    /// The executor and EXPLAIN ask the same question.
+    fn grouped_index_join_applies(
+        &self,
+        stmt: &SelectStatement,
+        join_type: &str,
+        right_filter_present: bool,
+        filters_have_subquery: bool,
+    ) -> Result<
+        Option<(
+            Vec<crate::executor::aggregation::SqlAggregateFunction>,
+            Vec<String>,
+        )>,
+    > {
+        // A right-side filter on a LEFT JOIN changes what an unmatched left row
+        // means; the reduction handles that shape
+        if join_type != "INNER" && right_filter_present {
+            return Ok(None);
+        }
+        // A HAVING that reads the group it is asked about has to be run once
+        // per group with that group as the outer row, which the general
+        // aggregation does and this streaming path does not
+        if stmt.group_by.modifier != crate::parser::ast::GroupByModifier::None
+            || filters_have_subquery
+            || stmt
+                .having
+                .as_deref()
+                .is_some_and(Self::has_correlated_subqueries)
+        {
+            return Ok(None);
+        }
+        let (aggregations, _) = self.parse_aggregations(stmt)?;
+        if aggregations.iter().any(|agg| {
+            agg.expression.is_some()
+                || agg.filter.is_some()
+                || !agg.order_by.is_empty()
+                || agg.hidden
+                || self.function_registry.get_aggregate(&agg.name).is_none()
+        }) {
+            return Ok(None);
+        }
+        // The group columns, which the operator then groups by: parsed once
+        // here for both the shape and the run
+        let mut group_names = Vec::new();
+        for item in self.parse_group_by(stmt, &[])? {
+            match item {
+                crate::executor::aggregation::GroupByItem::Column(name) => group_names.push(name),
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some((aggregations, group_names)))
+    }
+
+    /// Which index join operator, if any, a join in the FROM clause of
+    /// `stmt` runs on: the streaming or batch index join when nothing
+    /// aggregates or windows the rows, bounded when the executor pushes the
+    /// limit; the grouped index join when the reduction plan bounds it and
+    /// its shape is the grouped operator's. EXPLAIN asks this so it reports
+    /// the strategy execution would choose.
+    pub(crate) fn join_index_use(&self, stmt: &SelectStatement) -> JoinIndexUse {
+        let Some(Expression::JoinSource(join)) = stmt.table_expr.as_deref() else {
+            return JoinIndexUse::None;
+        };
+        let classification = get_classification(stmt);
+        let join_type = join.join_type.to_uppercase();
+        // A WHERE that reaches into the outer query keeps both operators out
+        if classification.where_has_correlated_subqueries {
+            return JoinIndexUse::None;
+        }
+        if !classification.has_aggregation && !classification.has_window_functions {
+            let bounded = self
+                .pushed_join_limit(stmt, &ExecutionContext::new(), &classification, &join_type)
+                .is_some();
+            return JoinIndexUse::Streaming { bounded };
+        }
+        let left_table = match join.left.as_ref() {
+            Expression::TableSource(ts) => Some(ts.name.value.as_str()),
+            _ => None,
+        };
+        if self
+            .get_semijoin_reduction_limit(
+                &join_type,
+                stmt,
+                get_table_alias_from_expr(&join.left).as_deref(),
+                left_table,
+                &join.condition,
+                &classification,
+            )
+            .is_none()
+        {
+            return JoinIndexUse::None;
+        }
+        let (right_filter_present, filters_have_subquery) = match &stmt.where_clause {
+            Some(where_clause) => {
+                let (_, right, _) = super::explain::partition_where_for_explain(
+                    where_clause,
+                    &join.left,
+                    &join.right,
+                    &join.join_type,
+                    self.engine.as_ref(),
+                );
+                (right.is_some(), Self::filter_has_subquery(where_clause))
+            }
+            None => (false, false),
+        };
+        match self.grouped_index_join_applies(
+            stmt,
+            &join_type,
+            right_filter_present,
+            filters_have_subquery,
+        ) {
+            Ok(Some(_)) => JoinIndexUse::Grouped,
+            _ => JoinIndexUse::None,
+        }
+    }
+
     pub(crate) fn check_index_nested_loop_opportunity(
         &self,
         right_expr: &Expression,
@@ -11042,6 +11171,7 @@ impl Executor {
         join_type: &str,
         left_alias: Option<&str>,
         right_alias: Option<&str>,
+        bounded: bool,
     ) -> Option<(
         String,              // table_name
         IndexLookupStrategy, // lookup strategy (index or PK)
@@ -11176,6 +11306,24 @@ impl Executor {
             return Some((
                 table_name,
                 IndexLookupStrategy::SecondaryIndex(index),
+                inner_col_unqualified,
+                outer_col,
+            ));
+        }
+
+        // A table that keeps rows outside its index still answers a bounded
+        // probe from it while it can, deciding per probe; only a join the
+        // executor bounds with a limit asks it, at execution and in EXPLAIN
+        if bounded
+            && table
+                .get_index_on_column(&inner_col_unqualified)
+                .is_some_and(|index| index.index_type() == crate::core::IndexType::BTree)
+        {
+            return Some((
+                table_name,
+                IndexLookupStrategy::TableEquality {
+                    column: inner_col_unqualified.clone(),
+                },
                 inner_col_unqualified,
                 outer_col,
             ));

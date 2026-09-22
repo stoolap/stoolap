@@ -3604,6 +3604,20 @@ impl Table for MVCCTable {
         self.version_store.get_index_by_column(column_name)
     }
 
+    fn equality_candidates(
+        &self,
+        column: &str,
+        key: &Value,
+        max: usize,
+        out: &mut Vec<i64>,
+    ) -> Option<crate::storage::traits::CappedEqual> {
+        let index = self.version_store.get_index_by_column(column)?;
+        if index.index_type() != IndexType::BTree {
+            return None;
+        }
+        index.get_row_ids_equal_capped_into(std::slice::from_ref(key), max, out)
+    }
+
     fn secondary_index_identities(&self) -> Vec<(usize, u64)> {
         self.version_store.secondary_index_identities()
     }

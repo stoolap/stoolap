@@ -29,6 +29,7 @@ use super::operators::index_nested_loop::IndexLookupStrategy;
 use super::parallel;
 use super::planner::RuntimeJoinAlgorithm;
 use super::pushdown;
+use super::query::JoinIndexUse;
 use super::result::ExecutorResult;
 use super::utils::{collect_table_qualifiers, combine_predicates_with_and, flatten_and_predicates};
 use super::Executor;
@@ -216,6 +217,7 @@ impl Executor {
                         lines,
                         indent + 1,
                         row_count,
+                        self.join_index_use(select),
                     );
                 }
 
@@ -322,6 +324,7 @@ impl Executor {
         lines: &mut Vec<String>,
         indent: usize,
         row_count: usize,
+        index_use: JoinIndexUse,
     ) {
         let prefix = "  ".repeat(indent);
 
@@ -436,6 +439,7 @@ impl Executor {
                     join.condition.as_deref(),
                     join.join_type.as_ref(),
                     &join.using_columns,
+                    index_use,
                 );
 
                 lines.push(format!(
@@ -470,12 +474,14 @@ impl Executor {
                     left_where.as_ref(),
                     lines,
                     indent + 1,
+                    index_use,
                 );
                 self.explain_table_expr_plan_only(
                     &join.right,
                     right_where.as_ref(),
                     lines,
                     indent + 1,
+                    index_use,
                 );
             }
             Expression::CteReference(cte_ref) => {
@@ -630,6 +636,7 @@ impl Executor {
                 select.where_clause.as_deref(),
                 lines,
                 indent + 1,
+                self.join_index_use(select),
             );
         }
 
@@ -677,8 +684,9 @@ impl Executor {
         where_clause: Option<&Expression>,
         lines: &mut Vec<String>,
         indent: usize,
+        index_use: JoinIndexUse,
     ) {
-        self.explain_table_expr_inner(expr, where_clause, lines, indent, false)
+        self.explain_table_expr_inner(expr, where_clause, lines, indent, false, index_use)
     }
 
     fn explain_table_expr_with_where(
@@ -687,8 +695,9 @@ impl Executor {
         where_clause: Option<&Expression>,
         lines: &mut Vec<String>,
         indent: usize,
+        index_use: JoinIndexUse,
     ) {
-        self.explain_table_expr_inner(expr, where_clause, lines, indent, true)
+        self.explain_table_expr_inner(expr, where_clause, lines, indent, true, index_use)
     }
 
     fn explain_table_expr_inner(
@@ -698,6 +707,7 @@ impl Executor {
         lines: &mut Vec<String>,
         indent: usize,
         show_join_cost: bool,
+        index_use: JoinIndexUse,
     ) {
         let prefix = "  ".repeat(indent);
 
@@ -777,6 +787,7 @@ impl Executor {
                     join.condition.as_deref(),
                     join.join_type.as_ref(),
                     &join.using_columns,
+                    index_use,
                 );
 
                 if show_join_cost {
@@ -873,6 +884,7 @@ impl Executor {
                     lines,
                     indent + 1,
                     show_join_cost,
+                    index_use,
                 );
                 self.explain_table_expr_inner(
                     &join.right,
@@ -880,6 +892,7 @@ impl Executor {
                     lines,
                     indent + 1,
                     show_join_cost,
+                    index_use,
                 );
             }
             Expression::CteReference(cte_ref) => {
@@ -924,9 +937,18 @@ impl Executor {
         join_condition: Option<&Expression>,
         join_type: &str,
         using_columns: &[Identifier],
+        index_use: JoinIndexUse,
     ) -> (String, Option<IndexLookupStrategy>) {
+        // The index join is reported only where execution takes it: never
+        // under an aggregate or window the operators turn away, and for the
+        // grouped operator on the right side only
+        let bounded = match index_use {
+            JoinIndexUse::None => None,
+            JoinIndexUse::Streaming { bounded } => Some(bounded),
+            JoinIndexUse::Grouped => Some(true),
+        };
         // Check for INLJ opportunity on right side (default check)
-        if let Some(cond) = join_condition {
+        if let (Some(cond), Some(bounded)) = (join_condition, bounded) {
             // Get aliases for the check
             let left_alias = extract_table_alias(join_left);
             let right_alias = extract_table_alias(join_right);
@@ -939,29 +961,37 @@ impl Executor {
                 &join_type_upper,
                 left_alias.as_deref(),
                 right_alias.as_deref(),
+                bounded,
             );
 
             if let Some((_, strategy, _, _)) = inlj_info {
                 let algo_name = match &strategy {
                     IndexLookupStrategy::PrimaryKey => "Index Nested Loop (PK)".to_string(),
-                    IndexLookupStrategy::SecondaryIndex(_) => "Index Nested Loop".to_string(),
+                    IndexLookupStrategy::SecondaryIndex(_)
+                    | IndexLookupStrategy::TableEquality { .. } => "Index Nested Loop".to_string(),
                 };
                 return (algo_name, Some(strategy));
             }
 
             // Check swapped direction for INLJ (left side has index/PK)
-            let swapped_info = self.check_index_nested_loop_opportunity(
-                join_left,
-                Some(cond),
-                &join_type_upper,
-                right_alias.as_deref(),
-                left_alias.as_deref(),
-            );
+            let swapped_info = if index_use == JoinIndexUse::Grouped {
+                None
+            } else {
+                self.check_index_nested_loop_opportunity(
+                    join_left,
+                    Some(cond),
+                    &join_type_upper,
+                    right_alias.as_deref(),
+                    left_alias.as_deref(),
+                    bounded,
+                )
+            };
 
             if let Some((_, strategy, _, _)) = swapped_info {
                 let algo_name = match &strategy {
                     IndexLookupStrategy::PrimaryKey => "Index Nested Loop (PK)".to_string(),
-                    IndexLookupStrategy::SecondaryIndex(_) => "Index Nested Loop".to_string(),
+                    IndexLookupStrategy::SecondaryIndex(_)
+                    | IndexLookupStrategy::TableEquality { .. } => "Index Nested Loop".to_string(),
                 };
                 return (algo_name, Some(strategy));
             }
@@ -1440,7 +1470,7 @@ fn collect_unqualified_columns(expr: &Expression, columns: &mut rustc_hash::FxHa
 /// (they test NULL-padded rows), so they are shown at join level, not under
 /// the child scan. LEFT JOIN: right side is nullable. RIGHT JOIN: left side.
 /// FULL JOIN: both sides.
-fn partition_where_for_explain(
+pub(crate) fn partition_where_for_explain(
     where_clause: &Expression,
     left_expr: &Expression,
     right_expr: &Expression,

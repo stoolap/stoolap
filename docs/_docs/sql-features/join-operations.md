@@ -288,3 +288,5 @@ Stoolap automatically selects the optimal join algorithm based on data character
 | **Nested Loop** | Non-equality conditions, CROSS JOIN, small tables | O(N*M) |
 
 The query optimizer considers table sizes, available indexes, and sort order when choosing algorithms. Index Nested Loop is preferred when one side can use an index lookup, and a batch variant is used when no LIMIT is present.
+
+On a persistent database, a join with a LIMIT also probes the index of a table whose rows have not been sealed into a volume yet. Each probe takes at most 1024 row ids for one key, and the table refuses a probe once a volume holds rows, a key has more ids than that, or a seal, commit or TRUNCATE lands across the probe. A refused probe sends the whole join to the hash path once, so the result is the same either way.

@@ -833,6 +833,31 @@ impl Index for BTreeIndex {
         }
     }
 
+    fn get_row_ids_equal_capped_into(
+        &self,
+        values: &[Value],
+        max: usize,
+        buffer: &mut Vec<i64>,
+    ) -> Option<crate::storage::traits::CappedEqual> {
+        use crate::storage::traits::CappedEqual;
+        if values.is_empty() {
+            return Some(CappedEqual::Copied);
+        }
+
+        let value = &values[0];
+        let sorted_values = self.sorted_values.read();
+        // The length is read before anything is appended, so an over-cap
+        // bucket costs one lookup and no copy
+        let Some(rows) = sorted_values.get(value) else {
+            return Some(CappedEqual::Copied);
+        };
+        if rows.len() > max {
+            return Some(CappedEqual::OverCap);
+        }
+        buffer.extend_from_slice(rows.as_slice());
+        Some(CappedEqual::Copied)
+    }
+
     fn get_row_ids_in_range_into(
         &self,
         min_value: &[Value],
@@ -1308,6 +1333,51 @@ mod tests {
             false,
             0, // expected_rows: 0 for tests (will grow as needed)
         )
+    }
+
+    /// The cap is checked against the bucket length before anything is
+    /// copied, so an over-cap key costs one lookup and leaves the buffer
+    /// untouched. The buffer's length is the evidence that nothing was copied.
+    #[test]
+    fn a_capped_equal_probe_copies_only_under_the_cap() {
+        use crate::storage::traits::CappedEqual;
+
+        let index = create_test_index();
+        for i in 1..=4096i64 {
+            index.add(&[Value::Integer(1)], i, i).unwrap();
+        }
+        index.add(&[Value::Integer(2)], 9001, 9001).unwrap();
+        index.add(&[Value::Integer(3)], 9002, 9002).unwrap();
+
+        let at_cap = [Value::Integer(1)];
+        let mut buffer = Vec::new();
+        assert_eq!(
+            index.get_row_ids_equal_capped_into(&at_cap, 4095, &mut buffer),
+            Some(CappedEqual::OverCap)
+        );
+        assert!(buffer.is_empty(), "one over the cap copies nothing");
+
+        assert_eq!(
+            index.get_row_ids_equal_capped_into(&at_cap, 4096, &mut buffer),
+            Some(CappedEqual::Copied)
+        );
+        assert_eq!(buffer.len(), 4096, "the cap is inclusive");
+
+        // A key the index does not hold is a complete answer, not a refusal
+        buffer.clear();
+        assert_eq!(
+            index.get_row_ids_equal_capped_into(&[Value::Integer(99)], 4096, &mut buffer),
+            Some(CappedEqual::Copied)
+        );
+        assert!(buffer.is_empty());
+
+        // One under the cap copies all of it
+        buffer.clear();
+        assert_eq!(
+            index.get_row_ids_equal_capped_into(&[Value::Integer(2)], 1, &mut buffer),
+            Some(CappedEqual::Copied)
+        );
+        assert_eq!(buffer, vec![9001]);
     }
 
     #[test]

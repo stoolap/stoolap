@@ -218,6 +218,24 @@ pub(crate) fn hot_rows_taken() {
 }
 
 thread_local! {
+    static JOIN_PROBE_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next join probe has passed the checks
+/// that admit it to the hot index, before the index is read: the window a
+/// seal, a commit or a truncate must not slip into unnoticed
+pub fn after_join_probe_admitted(hook: impl FnOnce() + 'static) {
+    JOIN_PROBE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn join_probe_admitted() {
+    let hook = JOIN_PROBE_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static RENAME_MOVED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
