@@ -285,6 +285,13 @@ fn explain_reports_the_grouped_index_join_only_for_the_shape_it_takes() {
         "a correlated WHERE keeps the index join out: {}",
         plan(correlated)
     );
+    let having = "SELECT u.id, SUM(o.amount) FROM users u INNER JOIN orders o ON u.id = o.user_id \
+        GROUP BY u.id HAVING EXISTS (SELECT 1 FROM flags f WHERE f.uid = u.id) LIMIT 1";
+    assert!(
+        !plan(having).contains("Index Nested Loop"),
+        "a correlated HAVING keeps the grouped index join out: {}",
+        plan(having)
+    );
 }
 #[cfg(feature = "test-failpoints")]
 mod hot_index {
