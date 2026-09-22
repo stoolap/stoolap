@@ -445,7 +445,11 @@ fn a_commit_that_fails_on_a_later_table_leaves_the_earlier_ones_as_they_were() {
 #[test]
 fn a_sealed_delete_decodes_each_group_once() {
     let _guard = test_failpoints::FailpointGuard::new();
-    for statement in ["DELETE FROM t", "DELETE FROM t WHERE id >= 1"] {
+    for statement in [
+        "DELETE FROM t",
+        "DELETE FROM t WHERE id >= 1",
+        "DELETE FROM t WHERE id >= 1 RETURNING id",
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(&dsn(&dir)).unwrap();
         db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
@@ -480,13 +484,84 @@ fn a_sealed_delete_decodes_each_group_once() {
                 .unwrap()
         };
         let before = misses(&db);
-        db.execute(statement, ()).unwrap();
+        let deleted = if statement.contains("RETURNING") {
+            db.query(statement, ()).unwrap().count()
+        } else {
+            db.execute(statement, ()).unwrap() as usize
+        };
+        assert_eq!(deleted, 256, "{statement}");
         let decoded = misses(&db) - before;
+        // RETURNING scans the rows before it deletes them, so its groups
+        // are decoded once by the scan and once more for the originals
+        let bound = if statement.contains("RETURNING") {
+            6
+        } else {
+            4
+        };
         assert!(
-            decoded <= 4,
+            decoded <= bound,
             "{statement}: {decoded} groups decoded for 256 rows of two columns"
         );
         assert_eq!(pairs(&db, "SELECT id, v FROM t"), vec![]);
         db.close().unwrap();
     }
+}
+
+/// Rows deleted by id in an order that alternates between two volumes are
+/// read through one reader per volume, so each volume's groups are decoded
+/// once for the statement
+#[test]
+fn a_delete_across_two_volumes_decodes_each_volume_once() {
+    let _guard = test_failpoints::FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dsn(&dir)).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    let insert = db.prepare("INSERT INTO t VALUES (?, ?)").unwrap();
+    for parity in 0..2 {
+        for i in 0..128 {
+            let id = 2 * i + parity + 1;
+            insert.execute((id, id * 10)).unwrap();
+        }
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    }
+    db.close().unwrap();
+    drop(db);
+
+    let db = Database::open(&dsn(&dir)).unwrap();
+    use stoolap::storage::traits::Engine;
+    assert_eq!(db.engine().cold_volumes_for_test("t"), (2, 2));
+    use stoolap::storage::volume::group_cache::DECODED_GROUPS;
+    struct Budget(usize);
+    impl Drop for Budget {
+        fn drop(&mut self) {
+            DECODED_GROUPS.set_budget_bytes(self.0);
+        }
+    }
+    let _budget = Budget(DECODED_GROUPS.budget_bytes());
+    DECODED_GROUPS.set_budget_bytes(1);
+    let misses = |db: &Database| -> i64 {
+        let rows = db.query("PRAGMA GROUP_CACHE_STATS", ()).unwrap();
+        let at = rows.columns().iter().position(|c| c == "misses").unwrap();
+        rows.into_iter()
+            .next()
+            .unwrap()
+            .unwrap()
+            .get::<i64>(at)
+            .unwrap()
+    };
+    let before = misses(&db);
+    let ids: Vec<i64> = (1..=256).collect();
+    let mut tx = db.engine().begin_transaction().unwrap();
+    let mut table = tx.get_table("t").unwrap();
+    assert_eq!(table.delete_by_row_ids(&ids).unwrap(), 256);
+    drop(table);
+    tx.commit().unwrap();
+    let decoded = misses(&db) - before;
+    assert!(
+        decoded <= 4,
+        "{decoded} groups decoded for 256 rows of two columns in two volumes"
+    );
+    assert_eq!(pairs(&db, "SELECT id, v FROM t"), vec![]);
+    db.close().unwrap();
 }

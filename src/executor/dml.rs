@@ -3141,7 +3141,24 @@ impl Executor {
 
             // Delete matching rows by primary key
             let mut delete_count = 0;
-            if let Some(ref pk_name) = pk_col_name {
+            let integer_pk =
+                pk_col_idx.is_some_and(|idx| schema.columns[idx].data_type == DataType::Integer);
+            if integer_pk && !rows_to_delete.is_empty() {
+                // An integer key is the row id, so the rows go in one call,
+                // read once from the volumes they sit in, as the rows named
+                // by id below do
+                let row_ids: Vec<i64> = rows_to_delete
+                    .iter()
+                    .map(|(pk, _)| match pk {
+                        Value::Integer(id) => *id,
+                        _ => 0,
+                    })
+                    .collect();
+                delete_count = table.delete_by_row_ids(&row_ids)?;
+                if has_returning {
+                    returning_rows.extend(rows_to_delete.into_iter().filter_map(|(_, row)| row));
+                }
+            } else if let Some(ref pk_name) = pk_col_name {
                 for (pk_value, row_data) in rows_to_delete {
                     let mut pk_expr =
                         ComparisonExpr::new(pk_name, crate::core::Operator::Eq, pk_value);

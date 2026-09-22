@@ -2092,20 +2092,25 @@ impl SegmentedTable {
     /// The row at `idx` of a located volume, read through its mapping by a
     /// reader kept across the rows of one volume, so its pins keep the
     /// groups decoded
+    /// Reads a sealed row through the statement's reader of its volume,
+    /// opened on the first row read from that volume: rows spread over
+    /// several volumes keep every volume's groups pinned
     fn cold_row_of(
-        reader: &mut Option<super::writer::RowReader>,
+        readers: &mut Vec<super::writer::RowReader>,
         cold: &super::manifest::ColdSegment,
         idx: usize,
     ) -> Result<Row> {
-        if !reader
-            .as_ref()
-            .is_some_and(|r| Arc::ptr_eq(r.volume(), &cold.volume))
+        let at = match readers
+            .iter()
+            .position(|r| Arc::ptr_eq(r.volume(), &cold.volume))
         {
-            *reader = Some(super::writer::RowReader::new(Arc::clone(&cold.volume)));
-        }
-        reader
-            .as_mut()
-            .expect("reader just set")
+            Some(at) => at,
+            None => {
+                readers.push(super::writer::RowReader::new(Arc::clone(&cold.volume)));
+                readers.len() - 1
+            }
+        };
+        readers[at]
             .row(idx, &cold.mapping)
             .map_err(|e| crate::core::Error::internal(format!("cold row read failed: {e}")))
     }
@@ -2493,7 +2498,7 @@ impl Table for SegmentedTable {
             .columns
             .iter()
             .any(|c| c.primary_key && c.data_type == DataType::Integer);
-        let mut old_rows: Option<super::writer::RowReader> = None;
+        let mut old_rows: Vec<super::writer::RowReader> = Vec::new();
 
         for &row_id in row_ids {
             let located = match &cold_snapshot {
@@ -2581,7 +2586,7 @@ impl Table for SegmentedTable {
                     .columns
                     .iter()
                     .any(|c| c.primary_key && c.data_type == DataType::Integer);
-                let mut old_rows: Option<super::writer::RowReader> = None;
+                let mut old_rows: Vec<super::writer::RowReader> = Vec::new();
                 if let Some((_, cold, idx)) = self.find_segment_row_in(snap, pk)? {
                     let txn_id = self.txn_id();
                     let old_row = if has_int_pk {
