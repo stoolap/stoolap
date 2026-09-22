@@ -24,7 +24,7 @@
 
 use std::sync::Arc;
 
-use crate::common::{CompactVec, I64Map};
+use crate::common::{CompactVec, I64Map, I64Set};
 use crate::core::value::NULL_VALUE;
 use crate::core::ValueMap;
 use crate::core::{Result, Row, RowVec, Value};
@@ -145,37 +145,52 @@ pub struct IndexNestedLoopJoinOperator {
     ended_on: Option<Row>,
     // What a table probe keeps between probes
     probe_scratch: ProbeScratch,
-    // This transaction's uncommitted inner rows by key, which the shared
-    // index does not name under their keys yet; taken once at open
-    local_keys: Option<ValueMap<SmallVec<[i64; 2]>>>,
+    // This transaction's uncommitted inner rows, whose keys the shared
+    // index may not hold yet; taken once at open
+    local_rows: Option<LocalRows>,
 }
 
-/// The transaction's uncommitted rows of `table` by their value in
-/// `column`, when it has any and the strategy probes a shared index; a
-/// primary key names its row directly and the fetch sees the local version
-fn local_keys_of(
-    table: &dyn Table,
-    strategy: &IndexLookupStrategy,
-    column: Option<usize>,
-) -> Option<ValueMap<SmallVec<[i64; 2]>>> {
-    let column = column?;
-    if !matches!(strategy, IndexLookupStrategy::SecondaryIndex(_)) || !table.has_local_changes() {
-        return None;
-    }
-    let mut pairs = Vec::new();
-    table.local_column_values(column, &mut pairs);
-    let mut keys: ValueMap<SmallVec<[i64; 2]>> = ValueMap::default();
-    for (value, row_id) in pairs {
-        keys.entry(value).or_default().push(row_id);
-    }
-    Some(keys)
+/// The transaction's uncommitted rows of the inner table: every row it
+/// wrote, and the live ones by their value in the key column. A probe
+/// drops the written rows from what the shared index names, since the
+/// index may hold them under a key the transaction changed or another
+/// transaction moved, and adds the live ones under the probed key.
+struct LocalRows {
+    written: I64Set,
+    by_key: ValueMap<SmallVec<[i64; 2]>>,
 }
 
-/// Appends the local rows under `key`: the table hands over only the rows
-/// the index does not name under their key, so none is in the buffer yet
-fn append_local_rows(keys: &ValueMap<SmallVec<[i64; 2]>>, key: &Value, buffer: &mut Vec<i64>) {
-    if let Some(ids) = keys.get(key) {
-        buffer.extend_from_slice(ids);
+impl LocalRows {
+    /// Taken when the table has local changes and the strategy probes a
+    /// shared index; a primary key names its row directly and the fetch
+    /// sees the local version
+    fn of(
+        table: &dyn Table,
+        strategy: &IndexLookupStrategy,
+        column: Option<usize>,
+    ) -> Option<Self> {
+        let column = column?;
+        if !matches!(strategy, IndexLookupStrategy::SecondaryIndex(_)) || !table.has_local_changes()
+        {
+            return None;
+        }
+        let mut pairs = Vec::new();
+        let mut written = I64Set::new();
+        table.local_column_values(column, &mut pairs, &mut written);
+        let mut by_key: ValueMap<SmallVec<[i64; 2]>> = ValueMap::default();
+        for (value, row_id) in pairs {
+            by_key.entry(value).or_default().push(row_id);
+        }
+        Some(Self { written, by_key })
+    }
+
+    /// Replaces the index's answer for the transaction's rows with the
+    /// transaction's own
+    fn apply(&self, key: &Value, buffer: &mut Vec<i64>) {
+        buffer.retain(|id| !self.written.contains(*id));
+        if let Some(ids) = self.by_key.get(key) {
+            buffer.extend_from_slice(ids);
+        }
     }
 }
 
@@ -242,7 +257,7 @@ impl IndexNestedLoopJoinOperator {
             needs_fallback: false,
             ended_on: None,
             probe_scratch: ProbeScratch::default(),
-            local_keys: None,
+            local_rows: None,
         }
     }
 
@@ -434,10 +449,9 @@ impl IndexNestedLoopJoinOperator {
             }
         }
 
-        // The rows this transaction moved under the key or inserted with it
-        // are not in the shared index yet
-        if let Some(keys) = &self.local_keys {
-            append_local_rows(keys, key_value, &mut self.row_id_buffer);
+        // The transaction's own rows answer for themselves
+        if let Some(local) = &self.local_rows {
+            local.apply(key_value, &mut self.row_id_buffer);
         }
 
         if self.row_id_buffer.is_empty() {
@@ -513,7 +527,7 @@ impl IndexNestedLoopJoinOperator {
 impl Operator for IndexNestedLoopJoinOperator {
     fn open(&mut self) -> Result<()> {
         self.outer.open()?;
-        self.local_keys = local_keys_of(
+        self.local_rows = LocalRows::of(
             &*self.inner_table,
             &self.lookup_strategy,
             self.inner_key_idx,
@@ -802,7 +816,7 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
 
         let is_left_join = matches!(self.join_type, JoinType::Left | JoinType::Full);
         let true_expr = ConstBoolExpr::true_expr();
-        let local_keys = local_keys_of(
+        let local_rows = LocalRows::of(
             &*self.inner_table,
             &self.lookup_strategy,
             self.inner_key_idx,
@@ -857,10 +871,9 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
                 },
             }
 
-            // The rows this transaction moved under the key or inserted
-            // with it are not in the shared index yet
-            if let Some(keys) = &local_keys {
-                append_local_rows(keys, &key_value, &mut self.row_id_buffer);
+            // The transaction's own rows answer for themselves
+            if let Some(local) = &local_rows {
+                local.apply(&key_value, &mut self.row_id_buffer);
             }
 
             // Map row IDs to outer row indices

@@ -4902,8 +4902,13 @@ impl Table for SegmentedTable {
         self.hot.has_local_changes() || self.segment_mgr.has_pending_tombstones(self.txn_id())
     }
 
-    fn local_column_values(&self, column: usize, out: &mut Vec<(Value, i64)>) {
-        self.hot.local_column_values(column, out);
+    fn local_column_values(
+        &self,
+        column: usize,
+        out: &mut Vec<(Value, i64)>,
+        written: &mut crate::common::I64Set,
+    ) {
+        self.hot.local_column_values(column, out, written);
     }
 
     fn index_view_epoch(&self) -> Option<u64> {

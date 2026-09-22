@@ -3206,11 +3206,16 @@ impl Table for MVCCTable {
         Ok(Some(()))
     }
 
-    fn local_column_values(&self, column: usize, out: &mut Vec<(Value, i64)>) {
+    fn local_column_values(
+        &self,
+        column: usize,
+        out: &mut Vec<(Value, i64)>,
+        written: &mut crate::common::I64Set,
+    ) {
         self.txn_versions
             .read()
             .unwrap()
-            .local_values_new_to_index(column, out);
+            .local_values(column, out, written);
     }
 
     fn get_pending_versions(&self) -> Vec<(i64, Row, bool, i64)> {

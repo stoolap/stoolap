@@ -209,3 +209,74 @@ fn a_join_finds_each_row_once_when_a_transaction_updates_a_whole_key() {
     assert_eq!(distinct.len(), 40);
     db.execute("ROLLBACK", ()).unwrap();
 }
+
+/// Under snapshot isolation the shared index may hold a row under a key
+/// another transaction gave it after the snapshot: the transaction's own
+/// version of the row answers for it, once, under its own key, whether it
+/// took that key from the other transaction or kept the one it read
+#[test]
+fn a_snapshot_transaction_joins_its_own_version_of_a_row_another_one_moved() {
+    use stoolap::core::IsolationLevel;
+    for (name, own) in [
+        (
+            "join_own_updates_snapshot_moved",
+            "UPDATE orders SET user_id = 2, amount = 1000 WHERE id = 1",
+        ),
+        (
+            "join_own_updates_snapshot_kept",
+            "UPDATE orders SET amount = 1000 WHERE id = 1",
+        ),
+    ] {
+        let db = Database::open(&format!("memory://{name}")).unwrap();
+        orders_in(&db);
+        let mut a = db
+            .begin_with_isolation(IsolationLevel::SnapshotIsolation)
+            .unwrap();
+        let seen: Vec<i64> = a
+            .query("SELECT user_id FROM orders WHERE id = 1", ())
+            .unwrap()
+            .map(|r| r.unwrap().get::<i64>(0).unwrap())
+            .collect();
+        assert_eq!(seen, vec![1]);
+        db.execute("UPDATE orders SET user_id = 2 WHERE id = 1", ())
+            .unwrap();
+        a.execute(own, ()).unwrap();
+        let user = if own.contains("user_id = 2") { 2 } else { 1 };
+        for sql in [
+            format!(
+                "SELECT o.id, o.user_id, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id \
+                 WHERE u.id = {user} AND o.id = 1"
+            ),
+            format!(
+                "WITH x(uid) AS (SELECT {user}) SELECT o.id, o.user_id, o.amount FROM x \
+                 INNER JOIN orders o ON x.uid = o.user_id WHERE o.id = 1"
+            ),
+        ] {
+            let mut rows: Vec<(i64, i64, i64)> = a
+                .query(&sql, ())
+                .unwrap()
+                .map(|r| {
+                    let r = r.unwrap();
+                    (
+                        r.get::<i64>(0).unwrap(),
+                        r.get::<i64>(1).unwrap(),
+                        r.get::<i64>(2).unwrap(),
+                    )
+                })
+                .collect();
+            rows.sort_unstable();
+            assert_eq!(rows, vec![(1, user, 1000)], "{own}: {sql}");
+        }
+        let other = if user == 2 { 1 } else { 2 };
+        let stale: Vec<i64> = a
+            .query(
+                &format!("SELECT o.id FROM users u INNER JOIN orders o ON u.id = o.user_id WHERE u.id = {other} AND o.id = 1"),
+                (),
+            )
+            .unwrap()
+            .map(|r| r.unwrap().get::<i64>(0).unwrap())
+            .collect();
+        assert_eq!(stale, Vec::<i64>::new(), "{own}: not under the other key");
+        a.rollback().unwrap();
+    }
+}
