@@ -618,6 +618,7 @@ fn a_scanned_delete_leaves_out_a_row_another_transaction_deleted_meanwhile() {
 /// A row id named twice in a delete is one row: deleted once, counted once
 #[test]
 fn a_row_named_twice_is_deleted_once() {
+    let _guard = test_failpoints::FailpointGuard::new();
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(&dsn(&dir)).unwrap();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
