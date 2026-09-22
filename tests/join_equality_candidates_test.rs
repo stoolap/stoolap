@@ -19,7 +19,18 @@
 //! than the cap, and nothing moved its index across the probe; a join it
 //! stops answering runs once more on the hash path.
 
+use std::sync::Mutex;
+
 use stoolap::Database;
+
+/// The index page ledger is process-wide, so the tests that read side
+/// files run one at a time, and a budget a test lowers is restored when
+/// the test ends, however it ends
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 const SELF_JOIN: &str = "SELECT u1.id, u2.id, u1.age FROM users u1 \
     INNER JOIN users u2 ON u1.age = u2.age AND u1.id < u2.id LIMIT 100";
@@ -306,6 +317,7 @@ fn explain_reports_the_grouped_index_join_only_for_the_shape_it_takes() {
 /// the probes and the rows it served, and the pairs are the memory engine's
 #[test]
 fn a_sealed_table_answers_the_limited_join_from_its_side_file() {
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let db = file_db(&dir);
     users_in(&db, 2000);
@@ -333,6 +345,7 @@ fn a_sealed_table_answers_the_limited_join_from_its_side_file() {
 /// beside the sealed ones
 #[test]
 fn sealed_and_hot_rows_join_together_once_each() {
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let db = file_db(&dir);
     let oracle = Database::open("memory://join_eq_oracle_mixed").unwrap();
@@ -379,6 +392,7 @@ fn sealed_and_hot_rows_join_together_once_each() {
 /// probe is refused and the join runs on the hash path
 #[test]
 fn a_key_holding_a_large_share_of_a_volume_sends_the_join_to_the_hash_path() {
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let db = file_db(&dir);
     users_in(&db, 600);
@@ -406,6 +420,7 @@ fn a_key_holding_a_large_share_of_a_volume_sends_the_join_to_the_hash_path() {
 /// path
 #[test]
 fn a_sealed_key_past_the_cap_sends_the_join_to_the_hash_path() {
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let db = file_db(&dir);
     users_in(&db, 24_000);
@@ -456,6 +471,7 @@ fn a_sealed_order_moved_to_another_user_counts_there_only() {
 /// as if the index were absent
 #[test]
 fn a_side_file_that_fails_to_read_fails_the_join() {
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let db = file_db(&dir);
     users_in(&db, 2000);
@@ -492,6 +508,7 @@ fn a_side_file_that_fails_to_read_fails_the_join() {
 /// the sealed rows included
 #[test]
 fn a_volume_without_a_side_file_sends_the_join_to_the_hash_path() {
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let db = file_db(&dir);
     db.execute(
@@ -652,6 +669,7 @@ mod hot_index {
     /// a budget with room for one reader, every key of the join is served
     #[test]
     fn a_second_key_is_admitted_beside_the_space_the_first_one_holds() {
+        let _serial = super::serial();
         use stoolap::storage::volume::secondary::INDEX_PAGES;
         let dir = tempfile::tempdir().unwrap();
         let db = file_db(&dir);
@@ -661,14 +679,20 @@ mod hot_index {
 
         let sql = "SELECT p.id, u.id, p.age FROM people p \
             INNER JOIN users u ON p.age = u.age LIMIT 1000";
-        // One reader's space plus the pages it reads, and no more
-        let budget = INDEX_PAGES.stats().budget_bytes;
+        // One reader's space plus the pages it reads, and no more; the
+        // budget goes back when the test ends, however it ends
+        struct Budget(u64);
+        impl Drop for Budget {
+            fn drop(&mut self) {
+                INDEX_PAGES.set_budget_bytes(self.0);
+            }
+        }
+        let _budget = Budget(INDEX_PAGES.stats().budget_bytes);
         INDEX_PAGES.clear();
         INDEX_PAGES.set_budget_bytes((INDEX_PAGES.stats().charged_bytes + 200_000) as u64);
         let before = super::reads(&db);
         let got = triples(&db, sql);
         let after = super::reads(&db);
-        INDEX_PAGES.set_budget_bytes(budget);
         assert_eq!(got.len(), 4 * 34, "every key of the join");
         assert_eq!(after["refused"], before["refused"], "no key was refused");
         assert_eq!(
@@ -683,6 +707,7 @@ mod hot_index {
     /// it, so the probe is not an answer and the join takes the hash path
     #[test]
     fn a_seal_inside_a_probe_over_volumes_sends_the_join_to_the_hash_path() {
+        let _serial = super::serial();
         let dir = tempfile::tempdir().unwrap();
         let db = file_db(&dir);
         users_in(&db, 2000);
