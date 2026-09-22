@@ -254,6 +254,24 @@ pub(crate) fn row_ids_classified() {
 }
 
 thread_local! {
+    static DELETE_ROWS_SCANNED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next DELETE that scans its rows first
+/// has them and has not yet deleted them: the window another transaction's
+/// commit slips into
+pub fn after_delete_rows_scanned(hook: impl FnOnce() + 'static) {
+    DELETE_ROWS_SCANNED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn delete_rows_scanned() {
+    let hook = DELETE_ROWS_SCANNED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static RENAME_MOVED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 

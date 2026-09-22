@@ -134,6 +134,19 @@ pub trait TransactionEngineOperations: Send + Sync {
     /// This cleans up the transaction's entries in txn_version_stores
     fn rollback_all_tables(&self, txn_id: i64);
 
+    /// Makes the transaction's pending cold tombstones visible under its
+    /// commit sequence, once its commit marker is durable; a commit whose
+    /// marker fails discards them instead, so the rows they name stay visible
+    fn publish_pending_tombstones(&self, txn_id: i64, commit_seq: u64) {
+        let _ = (txn_id, commit_seq);
+    }
+
+    /// Drops the transaction's pending cold tombstones after its commit
+    /// marker failed
+    fn discard_pending_tombstones(&self, txn_id: i64) {
+        let _ = txn_id;
+    }
+
     /// Marks every table the transaction writes as publishing, from before
     /// its index updates until the transaction is visible or undone
     fn begin_publish(&self, txn_id: i64) -> super::version_store::PublishHold {
@@ -471,30 +484,24 @@ impl Transaction for MvccTransaction {
             // Phase 2: Commit all tables - apply local changes to global store
             // This now includes WAL recording internally (before each table commit)
             if let Some(ops) = &self.engine_operations {
-                let (any_committed, error) = ops.commit_all_tables(self.id);
+                let (_, error) = ops.commit_all_tables(self.id);
                 if let Some(e) = error {
-                    if any_committed {
-                        // Partial commit: some tables already committed.
-                        // We MUST complete the commit to avoid orphaning those rows.
-                        self.registry.complete_commit(self.id);
-                        if let Some(hold) = &publish {
-                            ops.request_seal_if_over(hold);
-                        }
-                        // Record commit marker so WAL recovery sees committed state
-                        ops.record_commit(self.id)?;
-                        self.state = TransactionState::Committed;
-                        self.cleanup();
-                        return Err(e);
-                    } else {
-                        // Nothing committed yet - safe to abort cleanly.
-                        // Release uncommitted_writes claims and remove from
-                        // txn_version_stores to prevent permanent row blocking.
-                        self.registry.abort_transaction(self.id);
-                        ops.rollback_all_tables(self.id);
-                        self.state = TransactionState::RolledBack;
-                        self.cleanup();
-                        return Err(e);
+                    // A table that failed leaves the transaction unfinished, and
+                    // nothing of it is visible yet: the tables that applied
+                    // their versions and index updates take them back, the
+                    // cold tombstones are dropped, and the transaction aborts
+                    // as if no table had committed, its row claims released.
+                    // The WAL records written so far carry no marker, so
+                    // recovery drops them too.
+                    if let Some(hold) = &publish {
+                        hold.undo_publication();
                     }
+                    ops.discard_pending_tombstones(self.id);
+                    self.registry.abort_transaction(self.id);
+                    ops.rollback_all_tables(self.id);
+                    self.state = TransactionState::RolledBack;
+                    self.cleanup();
+                    return Err(e);
                 }
             }
 
@@ -508,15 +515,23 @@ impl Transaction for MvccTransaction {
                     // but not yet visible (complete_commit hasn't run). Abort so GC
                     // can reclaim the orphaned entries and active_txn_count is correct.
                     // On recovery, WAL has no COMMIT marker → entries are discarded.
-                    // The indexes already describe the aborted rows: take that back
+                    // The store and its indexes already describe the aborted
+                    // rows: take that back
                     if let Some(hold) = &publish {
-                        hold.undo_index_updates();
+                        hold.undo_publication();
                     }
+                    // The cold rows the commit deleted or replaced stay: their
+                    // tombstones were held back for this marker
+                    ops.discard_pending_tombstones(self.id);
                     self.registry.abort_transaction(self.id);
                     self.state = TransactionState::RolledBack;
                     self.cleanup();
                     return Err(e);
                 }
+                // The marker is durable: the cold rows it deleted or replaced
+                // go out of sight with the hot rows it made visible
+                let commit_seq = self.registry.get_committing_sequence(self.id) as u64;
+                ops.publish_pending_tombstones(self.id, commit_seq);
             }
 
             // Phase 4: Complete commit - make changes visible in registry

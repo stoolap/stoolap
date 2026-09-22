@@ -429,6 +429,14 @@ pub trait Table: Send + Sync {
     /// The number of rows deleted
     fn delete_by_row_ids(&mut self, row_ids: &[i64]) -> Result<i32>;
 
+    /// Deletes the rows of `row_ids` a scan of this table found, and only
+    /// those still there: a row another transaction deleted since the scan
+    /// is neither deleted nor counted. On return `row_ids` holds the ids
+    /// deleted, in the order given.
+    fn delete_scanned_rows(&mut self, row_ids: &mut Vec<i64>) -> Result<i32> {
+        self.delete_by_row_ids(row_ids)
+    }
+
     /// Returns all active row IDs visible to the current transaction.
     /// Used for NOT IN (anti-join) optimization.
     fn get_active_row_ids(&self) -> Result<Vec<i64>>;
@@ -843,6 +851,17 @@ pub trait Table: Send + Sync {
     /// The same identities, into a buffer the caller keeps
     fn secondary_index_identities_into(&self, out: &mut Vec<(usize, u64)>) {
         out.clear();
+    }
+
+    /// Gives this transaction's local version of `row_id` a volume's copy
+    /// of the row as the version it replaces, so the commit removes the old
+    /// keys from the indexes that keep sealed rows and a failed commit puts
+    /// them back. A table that holds volumes asks its hot store; a store
+    /// that keeps no original takes the copy and drops it, and the undo of
+    /// its commits has none to put back.
+    fn mark_sealed_original(&mut self, row_id: i64, old_row: Row) -> Result<()> {
+        let _ = (row_id, old_row);
+        Ok(())
     }
 
     /// An index on `column_name` whose row ids cover every visible row of
