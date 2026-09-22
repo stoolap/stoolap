@@ -6197,6 +6197,32 @@ impl TransactionVersionStore {
     }
 
     /// Iterate over local versions (returns most recent version per row)
+    /// The `column` value and id of every uncommitted row whose value there
+    /// is not the one the shared index holds for it: a row inserted, or moved
+    /// under the value; a row that kept its value is the index's already
+    pub fn local_values_new_to_index(&self, column: usize, out: &mut Vec<(Value, i64)>) {
+        for (row_id, version) in self.iter_local() {
+            if version.is_deleted() {
+                continue;
+            }
+            let Some(value) = version.data.get(column) else {
+                continue;
+            };
+            if value.is_null() {
+                continue;
+            }
+            let indexed = self
+                .write_set
+                .as_ref()
+                .and_then(|ws| ws.get(row_id))
+                .and_then(|entry| entry.read_version.as_ref())
+                .and_then(|original| original.data.get(column));
+            if indexed != Some(value) {
+                out.push((value.clone(), row_id));
+            }
+        }
+    }
+
     pub fn iter_local(&self) -> impl Iterator<Item = (i64, &RowVersion)> {
         self.local_versions
             .iter()

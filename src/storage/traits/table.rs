@@ -633,10 +633,11 @@ pub trait Table: Send + Sync {
     fn has_local_changes(&self) -> bool;
 
     /// Appends the `column` value and the id of every uncommitted row of
-    /// this transaction that holds a value there. The shared index takes a
-    /// row's new key at commit, so a probe of it inside the transaction
-    /// takes these once and asks them for the rows the transaction moved
-    /// under a key or inserted with it.
+    /// this transaction whose value there is not the one the shared index
+    /// holds for it: a row inserted, or moved under the value. The index
+    /// takes a row's new key at commit, so a probe of it inside the
+    /// transaction takes these once and asks them for the rows under a key
+    /// the index does not name yet; a row that kept its key is the index's.
     fn local_column_values(&self, column: usize, out: &mut Vec<(Value, i64)>) {
         let _ = (column, out);
     }

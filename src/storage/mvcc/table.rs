@@ -3207,17 +3207,10 @@ impl Table for MVCCTable {
     }
 
     fn local_column_values(&self, column: usize, out: &mut Vec<(Value, i64)>) {
-        let txn_versions = self.txn_versions.read().unwrap();
-        for (row_id, version) in txn_versions.iter_local() {
-            if version.is_deleted() {
-                continue;
-            }
-            if let Some(value) = version.data.get(column) {
-                if !value.is_null() {
-                    out.push((value.clone(), row_id));
-                }
-            }
-        }
+        self.txn_versions
+            .read()
+            .unwrap()
+            .local_values_new_to_index(column, out);
     }
 
     fn get_pending_versions(&self) -> Vec<(i64, Row, bool, i64)> {

@@ -185,3 +185,27 @@ fn a_join_finds_every_row_a_transaction_moved_under_one_key() {
     db.execute("ROLLBACK", ()).unwrap();
     assert_eq!(ids(&db, sql).len(), 40);
 }
+
+/// A transaction that updates the payload of every row under one key
+/// leaves those rows to the index: the join finds each once, with the
+/// new payload
+#[test]
+fn a_join_finds_each_row_once_when_a_transaction_updates_a_whole_key() {
+    let db = Database::open("memory://join_own_updates_payload").unwrap();
+    orders_in(&db);
+    db.execute("BEGIN", ()).unwrap();
+    db.execute("UPDATE orders SET amount = 99 WHERE user_id = 7", ())
+        .unwrap();
+    let sql =
+        "SELECT o.id, o.amount, o.user_id FROM users u INNER JOIN orders o ON u.id = o.user_id \
+        WHERE u.id = 7";
+    let found = triples(&db, sql);
+    assert_eq!(found.len(), 40, "each row once");
+    assert!(found
+        .iter()
+        .all(|(_, amount, user)| *amount == 99 && *user == 7));
+    let mut distinct = found.clone();
+    distinct.dedup();
+    assert_eq!(distinct.len(), 40);
+    db.execute("ROLLBACK", ()).unwrap();
+}

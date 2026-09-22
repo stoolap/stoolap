@@ -171,16 +171,11 @@ fn local_keys_of(
     Some(keys)
 }
 
-/// Appends the local rows under `key` the index did not name
+/// Appends the local rows under `key`: the table hands over only the rows
+/// the index does not name under their key, so none is in the buffer yet
 fn append_local_rows(keys: &ValueMap<SmallVec<[i64; 2]>>, key: &Value, buffer: &mut Vec<i64>) {
-    let Some(ids) = keys.get(key) else {
-        return;
-    };
-    let from_index = buffer.len();
-    for id in ids {
-        if !buffer[..from_index].contains(id) {
-            buffer.push(*id);
-        }
+    if let Some(ids) = keys.get(key) {
+        buffer.extend_from_slice(ids);
     }
 }
 
