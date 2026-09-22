@@ -632,13 +632,13 @@ pub trait Table: Send + Sync {
     /// protocol needs to be executed.
     fn has_local_changes(&self) -> bool;
 
-    /// Appends the ids of this transaction's uncommitted rows whose
-    /// `column` holds `value` and that are not in `out` yet. The shared
-    /// index takes a row's new key at commit, so a probe of it inside the
-    /// transaction asks here for the rows the transaction moved under the
-    /// key or inserted with it.
-    fn local_row_ids_with_value(&self, column: usize, value: &Value, out: &mut Vec<i64>) {
-        let _ = (column, value, out);
+    /// Appends the `column` value and the id of every uncommitted row of
+    /// this transaction that holds a value there. The shared index takes a
+    /// row's new key at commit, so a probe of it inside the transaction
+    /// takes these once and asks them for the rows the transaction moved
+    /// under a key or inserted with it.
+    fn local_column_values(&self, column: usize, out: &mut Vec<(Value, i64)>) {
+        let _ = (column, out);
     }
 
     /// The publish epoch of the shared indexes, when this statement may read

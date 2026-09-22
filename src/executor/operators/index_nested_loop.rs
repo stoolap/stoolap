@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use crate::common::{CompactVec, I64Map};
 use crate::core::value::NULL_VALUE;
+use crate::core::ValueMap;
 use crate::core::{Result, Row, RowVec, Value};
 use crate::executor::expression::JoinFilter;
 use crate::executor::operator::{ColumnInfo, Operator, RowRef};
@@ -144,9 +145,43 @@ pub struct IndexNestedLoopJoinOperator {
     ended_on: Option<Row>,
     // What a table probe keeps between probes
     probe_scratch: ProbeScratch,
-    // Whether the inner table holds this transaction's uncommitted rows,
-    // which the shared index does not name under their keys yet
-    inner_local: bool,
+    // This transaction's uncommitted inner rows by key, which the shared
+    // index does not name under their keys yet; taken once at open
+    local_keys: Option<ValueMap<SmallVec<[i64; 2]>>>,
+}
+
+/// The transaction's uncommitted rows of `table` by their value in
+/// `column`, when it has any and the strategy probes a shared index; a
+/// primary key names its row directly and the fetch sees the local version
+fn local_keys_of(
+    table: &dyn Table,
+    strategy: &IndexLookupStrategy,
+    column: Option<usize>,
+) -> Option<ValueMap<SmallVec<[i64; 2]>>> {
+    let column = column?;
+    if !matches!(strategy, IndexLookupStrategy::SecondaryIndex(_)) || !table.has_local_changes() {
+        return None;
+    }
+    let mut pairs = Vec::new();
+    table.local_column_values(column, &mut pairs);
+    let mut keys: ValueMap<SmallVec<[i64; 2]>> = ValueMap::default();
+    for (value, row_id) in pairs {
+        keys.entry(value).or_default().push(row_id);
+    }
+    Some(keys)
+}
+
+/// Appends the local rows under `key` the index did not name
+fn append_local_rows(keys: &ValueMap<SmallVec<[i64; 2]>>, key: &Value, buffer: &mut Vec<i64>) {
+    let Some(ids) = keys.get(key) else {
+        return;
+    };
+    let from_index = buffer.len();
+    for id in ids {
+        if !buffer[..from_index].contains(id) {
+            buffer.push(*id);
+        }
+    }
 }
 
 impl IndexNestedLoopJoinOperator {
@@ -212,7 +247,7 @@ impl IndexNestedLoopJoinOperator {
             needs_fallback: false,
             ended_on: None,
             probe_scratch: ProbeScratch::default(),
-            inner_local: false,
+            local_keys: None,
         }
     }
 
@@ -406,11 +441,8 @@ impl IndexNestedLoopJoinOperator {
 
         // The rows this transaction moved under the key or inserted with it
         // are not in the shared index yet
-        if self.inner_local {
-            if let Some(idx) = self.inner_key_idx {
-                self.inner_table
-                    .local_row_ids_with_value(idx, key_value, &mut self.row_id_buffer);
-            }
+        if let Some(keys) = &self.local_keys {
+            append_local_rows(keys, key_value, &mut self.row_id_buffer);
         }
 
         if self.row_id_buffer.is_empty() {
@@ -486,7 +518,11 @@ impl IndexNestedLoopJoinOperator {
 impl Operator for IndexNestedLoopJoinOperator {
     fn open(&mut self) -> Result<()> {
         self.outer.open()?;
-        self.inner_local = self.inner_table.has_local_changes();
+        self.local_keys = local_keys_of(
+            &*self.inner_table,
+            &self.lookup_strategy,
+            self.inner_key_idx,
+        );
 
         // Get first outer row
         self.advance_outer()?;
@@ -771,7 +807,11 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
 
         let is_left_join = matches!(self.join_type, JoinType::Left | JoinType::Full);
         let true_expr = ConstBoolExpr::true_expr();
-        let inner_local = self.inner_table.has_local_changes();
+        let local_keys = local_keys_of(
+            &*self.inner_table,
+            &self.lookup_strategy,
+            self.inner_key_idx,
+        );
 
         // Step 1: Collect all outer rows and their join keys
         let mut outer_rows: Vec<Row> = Vec::new();
@@ -824,14 +864,8 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
 
             // The rows this transaction moved under the key or inserted
             // with it are not in the shared index yet
-            if inner_local {
-                if let Some(idx) = self.inner_key_idx {
-                    self.inner_table.local_row_ids_with_value(
-                        idx,
-                        &key_value,
-                        &mut self.row_id_buffer,
-                    );
-                }
+            if let Some(keys) = &local_keys {
+                append_local_rows(keys, &key_value, &mut self.row_id_buffer);
             }
 
             // Map row IDs to outer row indices

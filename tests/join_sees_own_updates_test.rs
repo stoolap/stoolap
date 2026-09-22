@@ -130,8 +130,58 @@ fn an_index_join_sees_the_rows_its_transaction_moved_inserted_and_deleted() {
             ids(&db, USER_3_ALL).contains(&2401),
             "{when}: the inserted order is joined"
         );
+        // A materialized CTE joined to the table, on the index and on the key
+        let by_user = "WITH x(uid) AS (SELECT 2) SELECT o.id, o.amount, x.uid FROM x \
+            INNER JOIN orders o ON x.uid = o.user_id";
+        let cte = triples(&db, by_user);
+        assert!(
+            cte.contains(&(1, 1000, 2)),
+            "{when}: the CTE join finds the moved order"
+        );
+        assert!(
+            !cte.contains(&(2, 20, 2)),
+            "{when}: the CTE join drops the deleted order"
+        );
+        assert_eq!(cte.len(), 40);
+        let by_key = "WITH x(oid) AS (SELECT 1) SELECT o.id, o.amount, x.oid FROM x \
+            INNER JOIN orders o ON x.oid = o.id";
+        assert_eq!(
+            triples(&db, by_key),
+            vec![(1, 1000, 1)],
+            "{when}: the CTE key join"
+        );
+        let deleted = "WITH x(oid) AS (SELECT 2) SELECT o.id, o.amount, x.oid FROM x \
+            INNER JOIN orders o ON x.oid = o.id";
+        assert_eq!(
+            triples(&db, deleted),
+            vec![],
+            "{when}: the CTE key join drops the deleted"
+        );
     };
     check("inside the transaction");
     db.execute("COMMIT", ()).unwrap();
     check("after commit");
+}
+
+/// A transaction that moves many rows under one key: the join finds every
+/// one of them, once, beside the rows the index already held
+#[test]
+fn a_join_finds_every_row_a_transaction_moved_under_one_key() {
+    let db = Database::open("memory://join_own_updates_many").unwrap();
+    orders_in(&db);
+    db.execute("BEGIN", ()).unwrap();
+    db.execute("UPDATE orders SET user_id = 7 WHERE id > 400", ())
+        .unwrap();
+    let sql = "SELECT o.id FROM users u INNER JOIN orders o ON u.id = o.user_id WHERE u.id = 7";
+    let found = ids(&db, sql);
+    assert_eq!(
+        found.len(),
+        2000 + 7,
+        "the moved rows and the seven the index held"
+    );
+    let mut distinct = found.clone();
+    distinct.dedup();
+    assert_eq!(distinct.len(), found.len(), "each once");
+    db.execute("ROLLBACK", ()).unwrap();
+    assert_eq!(ids(&db, sql).len(), 40);
 }

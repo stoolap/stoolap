@@ -36,7 +36,7 @@ use crate::common::{CompactArc, CompactVec, StringMap};
 use crate::core::{Error, Result, Row, RowVec, Value, ValueSet};
 use crate::parser::ast::*;
 use crate::parser::token::{Position, Token, TokenType};
-use crate::storage::traits::{Engine, QueryResult, Table, Transaction};
+use crate::storage::traits::{QueryResult, Table};
 
 use super::context::ExecutionContext;
 use super::expression::ExpressionEval;
@@ -2343,9 +2343,13 @@ impl Executor {
             table_col.clone()
         };
 
-        // Try to get the table and check for index or PK
-        let txn: Box<dyn Transaction> = self.engine.begin_transaction()?;
-        let table: Box<dyn Table> = match txn.get_table(&table_name) {
+        // The table is read through the statement's own transaction, so the
+        // join sees the rows that transaction moved or inserted
+        let snapshot = match ctx.statement_snapshot() {
+            Some(snapshot) => snapshot.clone(),
+            None => self.new_statement_snapshot(crate::core::IsolationLevel::ReadCommitted)?,
+        };
+        let table: Box<dyn Table> = match self.join_table(&snapshot, &table_name) {
             Ok(t) => t,
             Err(_) => return Ok(None),
         };
@@ -2439,20 +2443,30 @@ impl Executor {
 
         // Build inner schema info
         let inner_schema_info: Vec<ColumnInfo> = inner_cols.iter().map(ColumnInfo::new).collect();
+        // The inner key column, checked on each fetched row: the ids name the
+        // rows the index held for the key, not the rows' keys now
+        let inner_key_idx = inner_cols.iter().position(|c| {
+            c.rsplit('.')
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case(&table_col_unqualified))
+        });
 
         // Parse join type
         let op_join_type = OperatorJoinType::parse(&join_type);
 
         // Create the Index Nested Loop Join operator
-        let mut join_op: Box<dyn Operator> = Box::new(IndexNestedLoopJoinOperator::new(
-            outer_op,
-            table,
-            inner_schema_info,
-            op_join_type,
-            outer_key_idx,
-            lookup_strategy,
-            None, // No residual filter for now (handled later if needed)
-        ));
+        let mut join_op: Box<dyn Operator> = Box::new(
+            IndexNestedLoopJoinOperator::new(
+                outer_op,
+                table,
+                inner_schema_info,
+                op_join_type,
+                outer_key_idx,
+                lookup_strategy,
+                None, // No residual filter for now (handled later if needed)
+            )
+            .with_inner_key(inner_key_idx),
+        );
 
         // Execute and collect results with synthetic row IDs
         join_op.open()?;
