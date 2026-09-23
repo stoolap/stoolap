@@ -7349,6 +7349,9 @@ impl Engine for MVCCEngine {
             ));
         }
 
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::transaction_begun();
+
         // Create transaction
         let mut txn = MvccTransaction::new(txn_id, begin_seq, Arc::clone(&self.registry));
 

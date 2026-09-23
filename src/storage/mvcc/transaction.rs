@@ -535,6 +535,8 @@ impl Transaction for MvccTransaction {
             }
 
             // Phase 4: Complete commit - make changes visible in registry
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::commit_becoming_visible();
             self.registry.complete_commit(self.id);
             if let (Some(ops), Some(hold)) = (&self.engine_operations, &publish) {
                 // Nothing of the commit will be taken back now

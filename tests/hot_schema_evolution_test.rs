@@ -789,10 +789,11 @@ mod failpoints {
             vec![(1, "b10".to_string())]
         );
         // A commit taken back: the undo takes the version with it
-        for n in 11..=19 {
+        for n in 11..=18 {
             db.execute(&format!("UPDATE t SET b = 'b{n}' WHERE id = 1"), ())
                 .unwrap();
         }
+        assert_eq!(store.chain_entries(), 9, "the next commit prunes");
         let other = db.clone();
         test_failpoints::after_indexes_published(move || {
             other
@@ -800,7 +801,7 @@ mod failpoints {
                 .unwrap();
         });
         let mut tx = db.begin().unwrap();
-        tx.execute("UPDATE t SET b = 'b20' WHERE id = 1", ())
+        tx.execute("UPDATE t SET b = 'b19' WHERE id = 1", ())
             .unwrap();
         assert!(matches!(
             tx.commit(),
@@ -809,7 +810,7 @@ mod failpoints {
         assert_eq!(store.displaced_in_flight(), 0, "after an undo");
         assert_eq!(
             pairs(&db, "SELECT id, b FROM t"),
-            vec![(1, "b19".to_string())]
+            vec![(1, "b18".to_string())]
         );
     }
 
@@ -845,11 +846,16 @@ mod failpoints {
         })
         .unwrap();
         older.commit().unwrap();
-        for n in 11..=19 {
+        for n in 11..=18 {
             db.execute(&format!("UPDATE a SET b = 'b{n}' WHERE id = 1"), ())
                 .unwrap();
         }
-        // The later commit publishes a (displacing b19), then at z's
+        assert_eq!(
+            db.engine().get_version_store("a").unwrap().chain_entries(),
+            9,
+            "the next commit prunes"
+        );
+        // The later commit publishes a (displacing b18), then at z's
         // commit the kept handle goes and z's columns change
         let other = db.clone();
         let mut kept = Some(kept);
@@ -862,7 +868,7 @@ mod failpoints {
             });
         });
         let mut tx = db.begin().unwrap();
-        tx.execute("UPDATE a SET b = 'b20' WHERE id = 1", ())
+        tx.execute("UPDATE a SET b = 'b19' WHERE id = 1", ())
             .unwrap();
         tx.execute("INSERT INTO z VALUES (2, 'zb')", ()).unwrap();
         assert!(matches!(
@@ -871,7 +877,7 @@ mod failpoints {
         ));
         assert_eq!(
             pairs(&db, "SELECT id, b FROM a"),
-            vec![(1, "b19".to_string())],
+            vec![(1, "b18".to_string())],
             "the later commit's undo found its displaced version"
         );
         assert_eq!(ids(&db, "SELECT id FROM z"), Vec::<i64>::new());

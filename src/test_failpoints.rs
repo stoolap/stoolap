@@ -82,6 +82,40 @@ pub(crate) fn trim_lock_starting() {
 }
 
 thread_local! {
+    static TRANSACTION_BEGUN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next transaction has its begin sequence
+/// in the registry, before the transaction is built.
+pub fn after_transaction_begun(hook: impl FnOnce() + 'static) {
+    TRANSACTION_BEGUN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn transaction_begun() {
+    let hook = TRANSACTION_BEGUN_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static COMMIT_VISIBLE_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next commit has published its versions,
+/// before it makes them visible.
+pub fn before_commit_visible(hook: impl FnOnce() + 'static) {
+    COMMIT_VISIBLE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn commit_becoming_visible() {
+    let hook = COMMIT_VISIBLE_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static WAL_SYNC_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
