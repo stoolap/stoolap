@@ -48,6 +48,9 @@ use super::query_classification::QueryClassification;
 use super::result::ExecutorResult;
 use super::Executor;
 
+/// The most rows a LIMIT's fetch by primary key reads in one batch
+const FETCH_BATCH_ROWS: usize = 1024;
+
 /// Pre-compiled projection slot for vector search results.
 /// Built once, applied per row — avoids per-row expression compilation.
 enum VectorProjectionSlot {
@@ -996,7 +999,6 @@ impl Executor {
         filter: &dyn crate::storage::expression::Expression,
         needed: usize,
     ) -> Result<RowVec> {
-        const FETCH_BATCH_ROWS: usize = 1024;
         if needed == usize::MAX || row_ids.len() <= needed {
             return table.fetch_rows_by_ids(row_ids, filter);
         }
@@ -1007,6 +1009,34 @@ impl Executor {
             let end = at.saturating_add(batch).min(row_ids.len());
             rows.extend(table.fetch_rows_by_ids(&row_ids[at..end], filter)?);
             at = end;
+            batch = batch.saturating_mul(2).min(FETCH_BATCH_ROWS);
+        }
+        Ok(rows)
+    }
+
+    /// Takes a set's members, distinct keys, a batch at a time, each batch
+    /// sorted and fetched, until `needed` rows are found or the members are
+    /// spent: a member with no row counts for nothing, and a small LIMIT
+    /// takes a few members of a large set. The ids taken go to `taken`
+    fn fetch_members_up_to(
+        table: &dyn Table,
+        members: &mut impl Iterator<Item = i64>,
+        needed: usize,
+        taken: &mut Vec<i64>,
+    ) -> Result<RowVec> {
+        use crate::storage::expression::logical::ConstBoolExpr;
+        let filter = ConstBoolExpr::true_expr();
+        let mut rows = RowVec::with_capacity(needed.min(FETCH_BATCH_ROWS));
+        let mut batch = needed.clamp(16, FETCH_BATCH_ROWS);
+        while rows.len() < needed {
+            let start = taken.len();
+            taken.extend(members.by_ref().take(batch));
+            if taken.len() == start {
+                break;
+            }
+            let chunk = &mut taken[start..];
+            chunk.sort_unstable();
+            rows.extend(table.fetch_rows_by_ids(chunk, &filter)?);
             batch = batch.saturating_mul(2).min(FETCH_BATCH_ROWS);
         }
         Ok(rows)
@@ -1850,6 +1880,8 @@ impl Executor {
             values.len()
         };
         let mut all_row_ids = Vec::with_capacity(estimated_capacity);
+        // The rows of a LIMIT's members, fetched as the members were taken
+        let mut prefetched: Option<RowVec> = None;
         if is_pk_column {
             if is_negated {
                 // NOT IN optimization for INTEGER PRIMARY KEY (from NOT EXISTS semi-join):
@@ -1874,17 +1906,21 @@ impl Executor {
             } else {
                 // IN: PRIMARY KEY - the value is the row id, a float read as
                 // the comparison reads it; a member with no row must not
-                // count toward the limit, so every member is taken
-                for value in values.iter() {
-                    match value {
-                        Value::Integer(id) => all_row_ids.push(*id),
-                        Value::Float(f) => {
-                            if let Some(id) = Self::lossless_float_key(*f) {
-                                all_row_ids.push(id);
-                            }
-                        }
-                        _ => {}
-                    }
+                // count toward the limit
+                let mut members = values.iter().filter_map(|value| match value {
+                    Value::Integer(id) => Some(*id),
+                    Value::Float(f) => Self::lossless_float_key(*f),
+                    _ => None,
+                });
+                if let Some(target) = early_termination_target {
+                    prefetched = Some(Self::fetch_members_up_to(
+                        table,
+                        &mut members,
+                        target,
+                        &mut all_row_ids,
+                    )?);
+                } else {
+                    all_row_ids.extend(members);
                 }
             }
         } else if let Some(ref idx) = index {
@@ -1918,8 +1954,10 @@ impl Executor {
 
         // Sort row_ids for better cache locality during version lookup
         // and deduplicate. More efficient than HashSet when sorted output is needed anyway.
-        all_row_ids.sort_unstable();
-        all_row_ids.dedup();
+        if prefetched.is_none() {
+            all_row_ids.sort_unstable();
+            all_row_ids.dedup();
+        }
 
         // EARLY LIMIT OPTIMIZATION: When there's no ORDER BY and no remaining predicate,
         // we can apply LIMIT early to avoid fetching unnecessary rows
@@ -1967,7 +2005,10 @@ impl Executor {
         } else {
             usize::MAX
         };
-        let mut rows = Self::fetch_rows_up_to(table, &all_row_ids, filter.as_ref(), needed)?;
+        let mut rows = match prefetched {
+            Some(rows) => rows,
+            None => Self::fetch_rows_up_to(table, &all_row_ids, filter.as_ref(), needed)?,
+        };
 
         // Apply remaining predicate if any
         if let Some(ref remaining) = remaining_predicate {
