@@ -2658,11 +2658,14 @@ impl Table for SegmentedTable {
         let tombstones_arc = stmt_tombstones
             .clone()
             .unwrap_or_else(|| self.segment_mgr.tombstone_set_arc());
-        let mut hot_skip: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-        self.hot.collect_hot_row_ids_into(&mut hot_skip);
-        self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+        // Only the volumes read it: without one, gathering every hot row id is waste
+        let mut hot_skip: FxHashSet<i64> = FxHashSet::default();
+        if !volumes.is_empty() {
+            hot_skip.reserve(10_000);
+            self.hot.collect_hot_row_ids_into(&mut hot_skip);
+            self.segment_mgr
+                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+        }
         let schema_clone = self.hot.schema().clone();
 
         // Pre-compute a column-level bitmask from the WHERE expression so that
