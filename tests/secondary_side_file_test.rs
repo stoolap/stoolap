@@ -437,11 +437,9 @@ fn index_ddl_during_the_preparation_discards_the_prepared_side_file() {
             files(dir.path(), "t", "sidx").is_empty(),
             "the side file built under the dropped index was discarded, compaction={compaction}"
         );
-        // The DROP itself discards the inputs' files, the compaction its
-        // prepared output's
         assert_eq!(
             index_stat(&db, "index_builds", "sides_discarded"),
-            discarded_before + if compaction { 4 } else { 1 },
+            discarded_before + 1,
             "compaction={compaction}"
         );
         let count: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
@@ -461,7 +459,8 @@ fn identity(db: &Database, index: &str) -> u64 {
 /// reopen keep it, and the old side file, attached at reopen, does not
 /// cover the column for it.
 #[test]
-fn an_index_recreated_with_the_same_definition_gets_a_new_identity_and_the_old_side_file_goes() {
+fn an_index_recreated_with_the_same_definition_gets_a_new_identity_and_the_old_side_file_is_not_eligible(
+) {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path(), "");
@@ -472,10 +471,6 @@ fn an_index_recreated_with_the_same_definition_gets_a_new_identity_and_the_old_s
     assert!(side_of(dir.path(), "t", &stem).covers(1, old));
     db.execute("DROP INDEX idx_t_k ON t", ()).unwrap();
     assert!(db.engine().index_identity("t", "idx_t_k").is_none());
-    assert!(
-        files(dir.path(), "t", "sidx").is_empty(),
-        "the old file goes with the index it stood for"
-    );
     db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
     let new = identity(&db, "idx_t_k");
     assert!(new > old, "the identity only grows: {old} then {new}");
@@ -487,12 +482,17 @@ fn an_index_recreated_with_the_same_definition_gets_a_new_identity_and_the_old_s
     drop(db);
     let db = open(dir.path(), "");
     assert_eq!(identity(&db, "idx_t_k"), new, "the reopen reads the copy");
+    let side = side_of(dir.path(), "t", &stem);
     assert!(
-        files(dir.path(), "t", "sidx").is_empty(),
-        "the reopen attaches no file to the old volume"
+        side.covers(1, old),
+        "the old file still stands for the old index"
     );
-    // The next seal covers the new index; a backfill pass or a compaction
-    // covers the old volume for it
+    assert!(
+        !side.covers(1, new),
+        "the old file is not eligible for the recreated index"
+    );
+    // The next seal covers the new index; a compaction rewrites the old
+    // volume for it too
     seal_rows(&db, 2_001, 2_000);
     let covered = files(dir.path(), "t", "vol")
         .into_iter()
@@ -698,12 +698,15 @@ fn index_ddl_between_the_comparison_and_the_binding_does_not_bind_stale_coverage
         assert!(new > old, "compaction={compaction}");
         let volumes = files(dir.path(), "t", "vol");
         assert_eq!(volumes.len(), 1, "compaction={compaction}");
-        // The file bound for the index it was compared against stood for
-        // that index alone, so the DROP that waited for the guard took it
-        // out: the recreated index has no file to bind to
+        let stem = volumes.into_iter().next().unwrap();
+        let side = side_of(dir.path(), "t", &stem);
         assert!(
-            files(dir.path(), "t", "sidx").is_empty(),
-            "the recreated index does not bind to the file, compaction={compaction}"
+            side.covers(1, old),
+            "the side file matched the index it was compared against, compaction={compaction}"
+        );
+        assert!(
+            !side.covers(1, new),
+            "the recreated index does not bind to it, compaction={compaction}"
         );
         let count: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
         assert_eq!(count, if compaction { 6_000 } else { 1 });
@@ -903,235 +906,4 @@ fn closing_a_scanner_releases_its_side_reader() {
         "close let the reservation go"
     );
     drop(scanner);
-}
-
-fn count_where(db: &Database, sql: &str) -> i64 {
-    db.query(sql, ())
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .get(0)
-        .unwrap()
-}
-
-/// Dropping the only index a volume's side file serves removes the file
-/// from the segment and from the disk, and the queries go on without it
-#[test]
-fn dropping_the_last_index_a_side_file_serves_removes_the_file() {
-    let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let db = open(dir.path(), "");
-    create(&db);
-    seal_rows(&db, 1, 700);
-    assert_eq!(files(dir.path(), "t", "sidx").len(), 1);
-
-    db.execute("DROP INDEX idx_t_k ON t", ()).unwrap();
-    assert!(
-        files(dir.path(), "t", "sidx").is_empty(),
-        "the side file goes with its last index"
-    );
-    assert_eq!(count_where(&db, "SELECT COUNT(*) FROM t WHERE k = 3"), 100);
-    assert_eq!(
-        count_where(&db, "SELECT COUNT(*) FROM t WHERE name = 'n1'"),
-        234
-    );
-    db.close().unwrap();
-    drop(db);
-
-    let db = open(dir.path(), "");
-    assert!(files(dir.path(), "t", "sidx").is_empty());
-    assert_eq!(count_where(&db, "SELECT COUNT(*) FROM t WHERE k = 3"), 100);
-    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
-    seal_rows(&db, 701, 7);
-    assert_eq!(files(dir.path(), "t", "sidx").len(), 1);
-}
-
-/// A side file serving two indexes stays while either stands, and goes
-/// with the second drop
-#[test]
-fn a_side_file_serving_two_indexes_goes_with_the_second_drop() {
-    let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let db = open(dir.path(), "");
-    db.execute(
-        "CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER, m INTEGER)",
-        (),
-    )
-    .unwrap();
-    db.execute("CREATE INDEX idx_u_k ON u(k)", ()).unwrap();
-    db.execute("CREATE INDEX idx_u_m ON u(m)", ()).unwrap();
-    let mut values = String::new();
-    for id in 1..=700 {
-        values.push_str(&format!("({id},{},{}),", id % 7, id % 5));
-    }
-    values.pop();
-    db.execute(&format!("INSERT INTO u VALUES {values}"), ())
-        .unwrap();
-    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
-    assert_eq!(files(dir.path(), "u", "sidx").len(), 1);
-
-    db.execute("DROP INDEX idx_u_k ON u", ()).unwrap();
-    assert_eq!(
-        files(dir.path(), "u", "sidx").len(),
-        1,
-        "the file still serves the index on m"
-    );
-    assert_eq!(count_where(&db, "SELECT COUNT(*) FROM u WHERE m = 2"), 140);
-    assert_eq!(count_where(&db, "SELECT COUNT(*) FROM u WHERE k = 2"), 100);
-
-    db.execute("DROP INDEX idx_u_m ON u", ()).unwrap();
-    assert!(files(dir.path(), "u", "sidx").is_empty());
-    assert_eq!(count_where(&db, "SELECT COUNT(*) FROM u WHERE m = 2"), 140);
-}
-
-/// A side file the drop did not reach before the process ended is
-/// discarded when the log replays the drop at reopen
-#[test]
-fn a_replayed_drop_discards_the_side_file_it_left_behind() {
-    let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let db = open(dir.path(), "");
-    create(&db);
-    seal_rows(&db, 1, 700);
-    let stem = files(dir.path(), "t", "sidx").into_iter().next().unwrap();
-    let path = dir
-        .path()
-        .join("volumes")
-        .join("t")
-        .join(format!("{stem}.sidx"));
-    let kept = std::fs::read(&path).unwrap();
-
-    db.execute("DROP INDEX idx_t_k ON t", ()).unwrap();
-    assert!(!path.exists());
-    db.close().unwrap();
-    drop(db);
-    // The file as it was before the drop, back where the reopen looks
-    std::fs::write(&path, kept).unwrap();
-
-    let db = open(dir.path(), "");
-    assert!(
-        files(dir.path(), "t", "sidx").is_empty(),
-        "the replayed drop discards the file"
-    );
-    assert_eq!(count_where(&db, "SELECT COUNT(*) FROM t WHERE k = 3"), 100);
-}
-
-/// A DROP the log replays at reopen is not the catalog's last word: the
-/// side file a later CREATE and backfill gave the volume stays, and the
-/// reopened index probes it
-#[test]
-fn a_replayed_drop_leaves_the_file_of_the_index_created_after_it() {
-    let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let db = open(dir.path(), "");
-    create(&db);
-    seal_rows(&db, 1, 700);
-    db.execute("DROP INDEX idx_t_k ON t", ()).unwrap();
-    assert!(files(dir.path(), "t", "sidx").is_empty());
-    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
-    db.execute("PRAGMA INDEX_BACKFILL", ()).unwrap();
-    let new = identity(&db, "idx_t_k");
-    // The backfill writes the file under its generation's name
-    let sides = files(dir.path(), "t", "sidx");
-    assert_eq!(sides.len(), 1);
-    let side = sides.into_iter().next().unwrap();
-    assert!(side_of(dir.path(), "t", &side).covers(1, new));
-    db.close().unwrap();
-    drop(db);
-
-    let db = open(dir.path(), "");
-    assert_eq!(identity(&db, "idx_t_k"), new);
-    assert_eq!(
-        files(dir.path(), "t", "sidx")
-            .into_iter()
-            .collect::<Vec<_>>(),
-        vec![side.clone()],
-        "the file survives the replay"
-    );
-    assert!(side_of(dir.path(), "t", &side).covers(1, new));
-    assert_eq!(count_where(&db, "SELECT COUNT(*) FROM t WHERE k = 3"), 100);
-    db.close().unwrap();
-}
-
-/// Whether a file still serves an index is decided at the position the
-/// volume holds the column, so a column dropped before it does not make
-/// the file look uncovered
-#[test]
-fn dropping_an_index_after_a_column_drop_keeps_the_file_of_the_other_index() {
-    let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let db = open(dir.path(), "");
-    db.execute(
-        "CREATE TABLE u (id INTEGER PRIMARY KEY, padding INTEGER, k INTEGER, m INTEGER)",
-        (),
-    )
-    .unwrap();
-    db.execute("CREATE INDEX idx_u_k ON u(k)", ()).unwrap();
-    db.execute("CREATE INDEX idx_u_m ON u(m)", ()).unwrap();
-    let mut values = String::new();
-    for id in 1..=700 {
-        values.push_str(&format!("({id},0,{},{}),", id % 7, id % 5));
-    }
-    values.pop();
-    db.execute(&format!("INSERT INTO u VALUES {values}"), ())
-        .unwrap();
-    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
-    let k = db.engine().index_identity("u", "idx_u_k").unwrap();
-    let stem = files(dir.path(), "u", "vol").into_iter().next().unwrap();
-    db.execute("ALTER TABLE u DROP COLUMN padding", ()).unwrap();
-    // k is the schema's first column now and the volume's second
-    assert!(side_of(dir.path(), "u", &stem).covers(2, k));
-    db.execute("DROP INDEX idx_u_m ON u", ()).unwrap();
-    assert_eq!(
-        files(dir.path(), "u", "sidx").len(),
-        1,
-        "the file still serves k"
-    );
-    assert!(side_of(dir.path(), "u", &stem).covers(2, k));
-    assert_eq!(count_where(&db, "SELECT COUNT(*) FROM u WHERE k = 3"), 100);
-    db.execute("DROP INDEX idx_u_k ON u", ()).unwrap();
-    assert!(files(dir.path(), "u", "sidx").is_empty());
-    db.close().unwrap();
-}
-
-/// A column dropped and checkpointed before a reopen moves the indexed
-/// column's schema position: the reopen judges the file through the
-/// mappings it restores, and keeps it
-#[test]
-fn a_reopen_after_a_checkpointed_column_drop_keeps_the_side_file() {
-    let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let db = open(dir.path(), "");
-    db.execute(
-        "CREATE TABLE u (id INTEGER PRIMARY KEY, padding INTEGER, k INTEGER, m INTEGER)",
-        (),
-    )
-    .unwrap();
-    db.execute("CREATE INDEX idx_u_k ON u(k)", ()).unwrap();
-    let mut values = String::new();
-    for id in 1..=700 {
-        values.push_str(&format!("({id},0,{},{}),", id % 7, id % 5));
-    }
-    values.pop();
-    db.execute(&format!("INSERT INTO u VALUES {values}"), ())
-        .unwrap();
-    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
-    let k = db.engine().index_identity("u", "idx_u_k").unwrap();
-    db.execute("ALTER TABLE u DROP COLUMN padding", ()).unwrap();
-    // The checkpoint takes the drop into the catalog copy, so the reopen
-    // restores the final schema without replaying the ALTER
-    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
-    assert_eq!(files(dir.path(), "u", "sidx").len(), 1);
-    db.close().unwrap();
-    drop(db);
-
-    let db = open(dir.path(), "");
-    assert_eq!(db.engine().index_identity("u", "idx_u_k"), Some(k));
-    let sides = files(dir.path(), "u", "sidx");
-    assert_eq!(sides.len(), 1, "the file survives the reopen");
-    let side = sides.into_iter().next().unwrap();
-    assert!(side_of(dir.path(), "u", &side).covers(2, k));
-    assert_eq!(count_where(&db, "SELECT COUNT(*) FROM u WHERE k = 3"), 100);
-    db.close().unwrap();
 }

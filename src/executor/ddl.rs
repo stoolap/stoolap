@@ -945,7 +945,6 @@ impl Executor {
         let tx = self.engine.begin_transaction()?;
         let table = tx.get_table(&table_name)?;
         table.drop_index(index_name)?;
-        self.engine.discard_uncovered_side_files(&table_name);
 
         Ok(Box::new(ExecResult::empty()))
     }
@@ -1005,13 +1004,20 @@ impl Executor {
 
                     let mut change = self.engine.begin_column_change(table_name)?;
                     let previous_schema = self.engine.get_table_schema(table_name)?;
-                    table.create_column_with_default_value(
-                        &col_def.name.value,
+                    // The schema takes the column now; the rows follow once
+                    // the change is recorded
+                    let column = crate::core::SchemaColumn::with_default_value(
+                        previous_schema.columns.len(),
+                        col_def.name.value.as_str(),
                         data_type,
                         nullable,
+                        false,
+                        false,
                         default_expr.clone(),
                         default_value,
-                    )?;
+                        None,
+                    );
+                    self.engine.add_column_schema(table_name, column)?;
                     change.mark_changed();
 
                     // Refresh engine's schema cache from version store
@@ -1037,6 +1043,8 @@ impl Executor {
                         change.finish();
                         return Err(error);
                     }
+                    // The rows follow the recorded change
+                    self.engine.lay_out_rows(table_name)?;
                     change.finish();
                 } else {
                     return Err(Error::InvalidArgument(
@@ -1048,7 +1056,8 @@ impl Executor {
                 if let Some(ref col_name) = stmt.column_name {
                     let mut change = self.engine.begin_column_change(table_name)?;
                     let previous_schema = self.engine.get_table_schema(table_name)?;
-                    table.drop_column(&col_name.value)?;
+                    self.engine
+                        .drop_column_schema(table_name, &col_name.value)?;
                     change.mark_changed();
 
                     // Refresh schema cache FIRST so invalidate_mappings sees the post-drop schema
@@ -1066,6 +1075,8 @@ impl Executor {
                         return Err(error);
                     }
 
+                    // The rows lose the column's cells once the drop is recorded
+                    self.engine.lay_out_rows(table_name)?;
                     // Record column drop in manifest and recompute cold volume mappings
                     self.engine
                         .propagate_column_drop(table_name, &col_name.value);

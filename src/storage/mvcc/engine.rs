@@ -754,10 +754,6 @@ impl MVCCEngine {
                 // before the checkpoint resolves to its volume column
                 self.populate_hnsw_from_segments()?;
 
-                // Whether a side file still stands for an index is decided
-                // through the same mappings, once the catalog is final
-                self.discard_uncovered_side_files_everywhere();
-
                 // Sync auto-increment counters from segment data so the next
                 // generated row_id doesn't collide with cold rows.
                 self.sync_auto_increment_from_segments()?;
@@ -3068,16 +3064,15 @@ impl MVCCEngine {
         {
             let stores = self.version_stores.read().unwrap();
             if let Some(store) = stores.get(&table_name_lower) {
-                let mut vs_schema_guard = store.schema_mut();
-                let vs_schema = CompactArc::make_mut(&mut *vs_schema_guard);
                 let col = crate::core::SchemaColumn::new(
-                    vs_schema.columns.len(),
+                    store.schema().columns.len(),
                     column_name,
                     data_type,
                     nullable,
                     false,
                 );
-                vs_schema.add_column(col)?;
+                store.add_column(col)?;
+                store.lay_out_rows();
             }
         }
         change.mark_changed();
@@ -3135,18 +3130,21 @@ impl MVCCEngine {
         {
             let stores = self.version_stores.read().unwrap();
             if let Some(store) = stores.get(&table_name_lower) {
-                let mut vs_schema_guard = store.schema_mut();
-                let vs_schema = CompactArc::make_mut(&mut *vs_schema_guard);
                 let mut col = crate::core::SchemaColumn::new(
-                    vs_schema.columns.len(),
+                    store.schema().columns.len(),
                     column_name,
                     data_type,
                     nullable,
                     false,
                 );
+                // The rows the column is added to take its default now
+                col.default_value = default_expr
+                    .as_deref()
+                    .and_then(|expr| try_parse_default_literal(expr, data_type));
                 col.default_expr = default_expr;
                 col.vector_dimensions = vector_dimensions;
-                vs_schema.add_column(col)?;
+                store.add_column(col)?;
+                store.lay_out_rows();
             }
         }
         change.mark_changed();
@@ -3666,8 +3664,8 @@ impl MVCCEngine {
         {
             let stores = self.version_stores.read().unwrap();
             if let Some(store) = stores.get(&table_name_lower) {
-                let mut vs_schema_guard = store.schema_mut();
-                CompactArc::make_mut(&mut *vs_schema_guard).remove_column(column_name)?;
+                store.remove_column(column_name)?;
+                store.lay_out_rows();
             }
         }
         change.mark_changed();
@@ -3797,51 +3795,6 @@ impl MVCCEngine {
         self.ddl_serial.lock()
     }
 
-    /// After an index of `table_name` is dropped: the side file of every
-    /// volume none of whose columns still stands for a current index is
-    /// taken out of its segment and discarded, its disk space with it. A
-    /// file that still serves another index stays whole until the
-    /// volume's next compaction builds it anew
-    pub(crate) fn discard_uncovered_side_files(&self, table_name: &str) {
-        let name = to_lowercase_cow(table_name);
-        let mgr = self
-            .segment_managers
-            .read()
-            .ok()
-            .and_then(|mgrs| mgrs.get(name.as_ref()).cloned());
-        let Some(mgr) = mgr else {
-            return;
-        };
-        let Ok(store) = self.get_version_store(name.as_ref()) else {
-            return;
-        };
-        let current = store.secondary_index_identities();
-        // A segment's file covers a column at the position the volume
-        // holds it, through the segment's mapping, not the schema's
-        for side in mgr.uncover_where(|segment| {
-            !current
-                .iter()
-                .any(|&(column, identity)| segment.side_for(column, identity).is_some())
-        }) {
-            crate::storage::volume::secondary::discard_side(side);
-        }
-    }
-
-    /// The side files no current index stands for, in every table: what
-    /// a reopen removes once the log is replayed, the catalog is final and
-    /// the volumes' column mappings follow it, since a file a replayed
-    /// DROP leaves may be a later CREATE's, and a column dropped before
-    /// the checkpoint moves the indexed column's schema position
-    fn discard_uncovered_side_files_everywhere(&self) {
-        let tables: Vec<String> = match self.segment_managers.read() {
-            Ok(mgrs) => mgrs.keys().cloned().collect(),
-            Err(_) => return,
-        };
-        for table in tables {
-            self.discard_uncovered_side_files(&table);
-        }
-    }
-
     pub(crate) fn begin_column_change(
         &self,
         table_name: &str,
@@ -3879,8 +3832,34 @@ impl MVCCEngine {
     ) -> Result<()> {
         let store = self.get_version_store(table_name)?;
         *store.schema_mut() = schema;
+        store.discard_pending_cut();
         self.refresh_schema_cache(table_name)?;
         self.refresh_column_mappings(table_name);
+        Ok(())
+    }
+
+    /// Moves a table's hot rows to its schema's layout, once a column
+    /// added or dropped is recorded
+    pub(crate) fn lay_out_rows(&self, table_name: &str) -> Result<()> {
+        self.get_version_store(table_name)?.lay_out_rows();
+        Ok(())
+    }
+
+    /// Adds `column` to a table's schema, the rows to follow at
+    /// `lay_out_rows` once the change is recorded
+    pub(crate) fn add_column_schema(
+        &self,
+        table_name: &str,
+        column: crate::core::SchemaColumn,
+    ) -> Result<()> {
+        self.get_version_store(table_name)?.add_column(column)
+    }
+
+    /// Removes a column from a table's schema, the rows to follow at
+    /// `lay_out_rows` once the change is recorded
+    pub(crate) fn drop_column_schema(&self, table_name: &str, column_name: &str) -> Result<()> {
+        self.get_version_store(table_name)?
+            .remove_column(column_name)?;
         Ok(())
     }
 

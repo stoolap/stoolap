@@ -33,6 +33,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::common::CompactArc;
 use crate::core::{Row, Value};
 
+/// Given a row's values, the row in a new layout, or None when the row
+/// keeps the layout it has
+pub type Relayout<'a> = &'a dyn Fn(&[Value]) -> Option<CompactArc<[Value]>>;
+
 /// Bytes a row holds: the values in place plus what text and extension
 /// values keep on the heap
 pub fn row_bytes(values: &[Value]) -> usize {
@@ -397,6 +401,24 @@ impl RowArena {
             true
         } else {
             false
+        }
+    }
+
+    /// Replaces every row `relayout` returns a new layout for, the bytes
+    /// held following each replaced row
+    pub fn relayout(&self, relayout: Relayout<'_>) {
+        let mut inner = self.inner.write();
+        let ArenaInner { data, meta } = &mut *inner;
+        for (slot, meta) in data.iter_mut().zip(meta.iter()) {
+            // A cleared slot holds no row: its empty data is not a row to move
+            if meta.txn_id == 0 {
+                continue;
+            }
+            if let Some(moved) = relayout(slot) {
+                self.bytes.fetch_sub(row_bytes(slot), Ordering::Relaxed);
+                self.bytes.fetch_add(row_bytes(&moved), Ordering::Relaxed);
+                *slot = moved;
+            }
         }
     }
 

@@ -537,6 +537,8 @@ impl Transaction for MvccTransaction {
             // Phase 4: Complete commit - make changes visible in registry
             self.registry.complete_commit(self.id);
             if let (Some(ops), Some(hold)) = (&self.engine_operations, &publish) {
+                // Nothing of the commit will be taken back now
+                hold.release_publication();
                 ops.request_seal_if_over(hold);
             }
         } else {
