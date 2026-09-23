@@ -1409,14 +1409,25 @@ mod tests {
 
     #[test]
     fn the_committed_cache_keys_a_slot_by_registry_and_id() {
-        let mut cache = CommittedCache::new();
-        cache.insert(1, 5);
-        assert!(cache.contains(1, 5));
-        // A registry whose id 5 lands in the same slot
-        let other = (2..)
-            .find(|&r| CommittedCache::cache_index(r, 5) == CommittedCache::cache_index(1, 5))
+        with_own_cache(|cache| {
+            cache.insert(1, 5);
+            assert!(cache.contains(1, 5));
+            // A registry whose id 5 lands in the same slot
+            let other = (2..)
+                .find(|&r| CommittedCache::cache_index(r, 5) == CommittedCache::cache_index(1, 5))
+                .unwrap();
+            assert!(!cache.contains(other, 5), "another registry's id 5 matched");
+        });
+    }
+
+    /// Runs `check` on a cache of its own, on a thread whose stack holds it
+    fn with_own_cache(check: fn(&mut CommittedCache)) {
+        std::thread::Builder::new()
+            .stack_size(16 << 20)
+            .spawn(move || check(&mut CommittedCache::new()))
+            .unwrap()
+            .join()
             .unwrap();
-        assert!(!cache.contains(other, 5), "another registry's id 5 matched");
     }
 
     #[test]
@@ -1426,18 +1437,19 @@ mod tests {
 
     #[test]
     fn two_registries_same_ids_keep_their_own_slots() {
-        let mut cache = CommittedCache::new();
-        for id in 1..=1000 {
-            cache.insert(1, id);
-            cache.insert(2, id);
-        }
-        let kept = (1..=1000)
-            .filter(|&id| cache.contains(1, id) && cache.contains(2, id))
-            .count();
-        assert!(
-            kept >= 990,
-            "only {kept} of 1000 ids kept by both registries"
-        );
+        with_own_cache(|cache| {
+            for id in 1..=1000 {
+                cache.insert(1, id);
+                cache.insert(2, id);
+            }
+            let kept = (1..=1000)
+                .filter(|&id| cache.contains(1, id) && cache.contains(2, id))
+                .count();
+            assert!(
+                kept >= 990,
+                "only {kept} of 1000 ids kept by both registries"
+            );
+        });
     }
 
     // === is_directly_visible: line 523 ===
