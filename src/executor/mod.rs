@@ -1104,11 +1104,13 @@ mod tests {
     fn test_query_cache_whitespace_normalization() {
         let executor = create_test_executor();
 
-        executor.execute("SELECT  1").unwrap();
+        executor.execute("SELECT 1").unwrap();
         let size = executor.cache_stats().size;
 
-        // Same query with different whitespace should hit cache
-        executor.execute("SELECT 1").unwrap();
+        // Whitespace around the query shares its plan; whitespace inside does not
+        executor.execute("  SELECT 1\n").unwrap();
         assert_eq!(executor.cache_stats().size, size);
+        executor.execute("SELECT  1").unwrap();
+        assert_eq!(executor.cache_stats().size, size + 1);
     }
 }
