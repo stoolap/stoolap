@@ -145,20 +145,21 @@ const CACHE_SHIFT: u32 = CACHE_SIZE.trailing_zeros();
 static NEXT_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
-    static COMMITTED_CACHE: RefCell<CommittedCache> = const { RefCell::new(CommittedCache::new()) };
+    /// Built on the heap at the thread's first insert: a static TLS block
+    /// of this size would come out of every thread's stack (glibc)
+    static COMMITTED_CACHE: RefCell<Option<CommittedCache>> = const { RefCell::new(None) };
 }
 
 /// Direct-mapped cache of committed transactions, keyed by registry and id:
 /// every database numbers its transactions from one.
 struct CommittedCache {
-    entries: [(u64, i64); CACHE_SIZE],
+    entries: Box<[(u64, i64)]>,
 }
 
 impl CommittedCache {
-    #[inline]
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
-            entries: [(0, 0); CACHE_SIZE],
+            entries: vec![(0, 0); CACHE_SIZE].into_boxed_slice(),
         }
     }
 
@@ -583,7 +584,11 @@ impl TransactionRegistry {
     #[inline(always)]
     fn check_committed(&self, txn_id: i64) -> bool {
         // Cache check first (no lock)
-        if COMMITTED_CACHE.with(|c| c.borrow().contains(self.cache_id, txn_id)) {
+        if COMMITTED_CACHE.with(|c| {
+            c.borrow()
+                .as_ref()
+                .is_some_and(|cache| cache.contains(self.cache_id, txn_id))
+        }) {
             return true;
         }
 
@@ -596,7 +601,11 @@ impl TransactionRegistry {
         // Not in map - committed if valid txn_id
         let next = self.next_txn_id.load(Ordering::Acquire);
         if txn_id > 0 && txn_id <= next {
-            COMMITTED_CACHE.with(|c| c.borrow_mut().insert(self.cache_id, txn_id));
+            COMMITTED_CACHE.with(|c| {
+                c.borrow_mut()
+                    .get_or_insert_with(CommittedCache::new)
+                    .insert(self.cache_id, txn_id)
+            });
             return true;
         }
 
@@ -1409,47 +1418,40 @@ mod tests {
 
     #[test]
     fn the_committed_cache_keys_a_slot_by_registry_and_id() {
-        with_own_cache(|cache| {
-            cache.insert(1, 5);
-            assert!(cache.contains(1, 5));
-            // A registry whose id 5 lands in the same slot
-            let other = (2..)
-                .find(|&r| CommittedCache::cache_index(r, 5) == CommittedCache::cache_index(1, 5))
-                .unwrap();
-            assert!(!cache.contains(other, 5), "another registry's id 5 matched");
-        });
-    }
-
-    /// Runs `check` on a cache of its own, on a thread whose stack holds it
-    fn with_own_cache(check: fn(&mut CommittedCache)) {
-        std::thread::Builder::new()
-            .stack_size(16 << 20)
-            .spawn(move || check(&mut CommittedCache::new()))
-            .unwrap()
-            .join()
+        let mut cache = CommittedCache::new();
+        cache.insert(1, 5);
+        assert!(cache.contains(1, 5));
+        // A registry whose id 5 lands in the same slot
+        let other = (2..)
+            .find(|&r| CommittedCache::cache_index(r, 5) == CommittedCache::cache_index(1, 5))
             .unwrap();
+        assert!(!cache.contains(other, 5), "another registry's id 5 matched");
     }
 
     #[test]
-    fn the_committed_cache_is_one_mebibyte_per_thread() {
-        assert_eq!(std::mem::size_of::<CommittedCache>(), 1 << 20);
+    fn the_committed_cache_is_one_mebibyte_on_the_heap() {
+        let cache = CommittedCache::new();
+        assert_eq!(std::mem::size_of_val(&*cache.entries), 1 << 20);
+        assert!(
+            std::mem::size_of::<RefCell<Option<CommittedCache>>>() <= 32,
+            "the thread-local holds the table itself"
+        );
     }
 
     #[test]
     fn two_registries_same_ids_keep_their_own_slots() {
-        with_own_cache(|cache| {
-            for id in 1..=1000 {
-                cache.insert(1, id);
-                cache.insert(2, id);
-            }
-            let kept = (1..=1000)
-                .filter(|&id| cache.contains(1, id) && cache.contains(2, id))
-                .count();
-            assert!(
-                kept >= 990,
-                "only {kept} of 1000 ids kept by both registries"
-            );
-        });
+        let mut cache = CommittedCache::new();
+        for id in 1..=1000 {
+            cache.insert(1, id);
+            cache.insert(2, id);
+        }
+        let kept = (1..=1000)
+            .filter(|&id| cache.contains(1, id) && cache.contains(2, id))
+            .count();
+        assert!(
+            kept >= 990,
+            "only {kept} of 1000 ids kept by both registries"
+        );
     }
 
     // === is_directly_visible: line 523 ===
