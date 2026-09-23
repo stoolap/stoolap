@@ -205,29 +205,87 @@ struct VersionChainEntry {
     arena_idx: Option<NonZeroU64>,
 }
 
+impl Drop for VersionChainEntry {
+    /// Unlinks the history one entry at a time: an open snapshot can keep
+    /// a chain longer than the stack a nested drop would need
+    fn drop(&mut self) {
+        let mut next = self.prev.take();
+        while let Some(entry) = next {
+            next = match Arc::try_unwrap(entry) {
+                Ok(mut entry) => entry.prev.take(),
+                Err(_) => None,
+            };
+        }
+    }
+}
+
 /// A copy of the history from `entry` back with every row `relayout`
-/// changes rewritten, or None when it changes none of them
+/// changes rewritten, or None when it changes none of them. The entries
+/// below the deepest rewritten one are shared, not copied
 fn relayout_history(
     entry: &Arc<VersionChainEntry>,
     relayout: Relayout<'_>,
 ) -> Option<Arc<VersionChainEntry>> {
-    let data = relayout(entry.version.data.as_slice());
-    let prev = entry
-        .prev
-        .as_ref()
-        .and_then(|p| relayout_history(p, relayout));
-    if data.is_none() && prev.is_none() {
-        return None;
+    type Moved<'a> = (&'a Arc<VersionChainEntry>, Option<CompactArc<[Value]>>);
+    let mut chain: Vec<Moved<'_>> = Vec::new();
+    let mut current = Some(entry);
+    while let Some(node) = current {
+        chain.push((node, relayout(node.version.data.as_slice())));
+        current = node.prev.as_ref();
     }
-    let mut version = entry.version.clone();
-    if let Some(data) = data {
-        version.data = Row::from_arc(data);
+    let deepest = chain.iter().rposition(|(_, moved)| moved.is_some())?;
+    let mut below = chain[deepest].0.prev.clone();
+    for (node, moved) in chain.into_iter().take(deepest + 1).rev() {
+        let mut version = node.version.clone();
+        if let Some(data) = moved {
+            version.data = Row::from_arc(data);
+        }
+        below = Some(Arc::new(VersionChainEntry {
+            version,
+            prev: below,
+            arena_idx: node.arena_idx,
+        }));
     }
-    Some(Arc::new(VersionChainEntry {
-        version,
-        prev: prev.or_else(|| entry.prev.clone()),
-        arena_idx: entry.arena_idx,
-    }))
+    below
+}
+
+/// Whether the chain from `entry` back holds at least `depth` versions,
+/// counting no further than that
+#[inline]
+fn chain_reaches(entry: &VersionChainEntry, depth: usize) -> bool {
+    let mut count = 1;
+    let mut current = &entry.prev;
+    while count < depth {
+        let Some(prev) = current else {
+            return false;
+        };
+        count += 1;
+        current = &prev.prev;
+    }
+    true
+}
+
+/// A copy of the first `keep` versions of the chain from `entry` back,
+/// the last of them with no history behind it
+fn chain_prefix(entry: &VersionChainEntry, keep: usize) -> Option<Arc<VersionChainEntry>> {
+    let mut kept: SmallVec<[&VersionChainEntry; 16]> = SmallVec::new();
+    let mut current = Some(entry);
+    while let Some(node) = current {
+        if kept.len() == keep {
+            break;
+        }
+        kept.push(node);
+        current = node.prev.as_deref();
+    }
+    let mut below = None;
+    for node in kept.into_iter().rev() {
+        below = Some(Arc::new(VersionChainEntry {
+            version: node.version.clone(),
+            prev: below,
+            arena_idx: None,
+        }));
+    }
+    below
 }
 
 /// Count the depth of a version chain by traversing prev pointers.
@@ -432,6 +490,24 @@ pub trait VisibilityChecker: Send + Sync {
     fn needs_snapshot_isolation(&self, _txn_id: i64) -> bool {
         false // Default: ReadCommitted (arena fast path is safe)
     }
+
+    /// The begin sequence of the oldest open snapshot transaction, None
+    /// when no snapshot is open
+    fn oldest_snapshot_begin_seq(&self) -> Option<i64> {
+        None
+    }
+}
+
+/// What a new head keeps of the chain it replaces
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeptHistory {
+    /// The replaced head and the history behind it
+    Whole,
+    /// The first versions of the chain, the replaced head counted: the
+    /// last of them is one every open snapshot reaches first
+    Prefix(usize),
+    /// Nothing: the head is displaced
+    Nothing,
 }
 
 /// Opaque snapshot of the version store at extraction time.
@@ -706,6 +782,50 @@ impl VersionStore {
         self.max_version_history
     }
 
+    /// What a new head keeps of `existing`'s chain. Past the history limit
+    /// the chain goes, except what an open snapshot still reads: cut below
+    /// a version the oldest snapshot sees within the first `limit`
+    /// versions, since every snapshot walking from the head stops there;
+    /// kept whole when the oldest snapshot reads further back. Both walks
+    /// stop at the limit, so a write does not traverse a long chain
+    fn history_kept(&self, existing: &VersionChainEntry) -> KeptHistory {
+        let limit = self.max_version_history;
+        if limit == 0 || !chain_reaches(existing, limit) {
+            return KeptHistory::Whole;
+        }
+        let Some(checker) = self.visibility_checker.as_ref() else {
+            return KeptHistory::Nothing;
+        };
+        let Some(begin_seq) = checker.oldest_snapshot_begin_seq() else {
+            return KeptHistory::Nothing;
+        };
+        let mut walked: SmallVec<[&VersionChainEntry; 16]> = SmallVec::new();
+        let mut current = Some(existing);
+        while let Some(node) = current {
+            if walked.len() == limit {
+                break;
+            }
+            walked.push(node);
+            current = node.prev.as_deref();
+        }
+        let sees =
+            |node: &VersionChainEntry| checker.is_committed_before(node.version.txn_id, begin_seq);
+        // Any version it sees will do: the cut keeps every version above it
+        let (mut low, mut high) = (0, walked.len() - 1);
+        if !sees(walked[high]) {
+            return KeptHistory::Whole;
+        }
+        while low < high {
+            let mid = (low + high) / 2;
+            if sees(walked[mid]) {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+        KeptHistory::Prefix(high + 1)
+    }
+
     /// Creates a new version store with a visibility checker (production)
     #[cfg(not(test))]
     pub fn with_visibility_checker(
@@ -971,10 +1091,8 @@ impl VersionStore {
 
                 // O(k) chain management - depth computed by traversal
                 // When limit exceeded: drop old chain AND reuse arena slot
-                let existing_depth = count_chain_depth(existing);
-                let new_depth = existing_depth + 1;
-                let can_reuse_arena =
-                    self.max_version_history > 0 && new_depth > self.max_version_history;
+                let kept = self.history_kept(existing);
+                let can_reuse_arena = kept == KeptHistory::Nothing;
 
                 // Only clone existing version data when needed:
                 // 1. For delete operations that need to preserve data
@@ -1032,7 +1150,13 @@ impl VersionStore {
                 } else {
                     // Under limit - clone existing version and create chain
                     let existing_version = existing.version.clone();
-                    let existing_prev = existing.prev.clone();
+                    let existing_prev = match kept {
+                        KeptHistory::Prefix(keep) => existing
+                            .prev
+                            .as_deref()
+                            .and_then(|p| chain_prefix(p, keep - 1)),
+                        _ => existing.prev.clone(),
+                    };
                     Some(Arc::new(VersionChainEntry {
                         version: existing_version,
                         prev: existing_prev,
@@ -1129,10 +1253,8 @@ impl VersionStore {
 
                     // O(k) chain management - depth computed by traversal
                     // When limit exceeded: drop old chain AND reuse arena slot
-                    let existing_depth = count_chain_depth(existing);
-                    let new_depth = existing_depth + 1;
-                    let can_reuse_arena =
-                        self.max_version_history > 0 && new_depth > self.max_version_history;
+                    let kept = self.history_kept(existing);
+                    let can_reuse_arena = kept == KeptHistory::Nothing;
 
                     // Only clone existing version data when needed:
                     // 1. For delete operations that need to preserve data
@@ -1195,7 +1317,13 @@ impl VersionStore {
                     } else {
                         // Under limit - clone existing version and create chain
                         let existing_version = existing.version.clone();
-                        let existing_prev = existing.prev.clone();
+                        let existing_prev = match kept {
+                            KeptHistory::Prefix(keep) => existing
+                                .prev
+                                .as_deref()
+                                .and_then(|p| chain_prefix(p, keep - 1)),
+                            _ => existing.prev.clone(),
+                        };
                         Some(Arc::new(VersionChainEntry {
                             version: existing_version,
                             prev: existing_prev,
@@ -1323,10 +1451,8 @@ impl VersionStore {
 
                 // O(k) chain management - depth computed by traversal
                 // When limit exceeded: drop old chain AND reuse arena slot
-                let existing_depth = count_chain_depth(existing);
-                let new_depth = existing_depth + 1;
-                let can_reuse_arena =
-                    self.max_version_history > 0 && new_depth > self.max_version_history;
+                let kept = self.history_kept(existing);
+                let can_reuse_arena = kept == KeptHistory::Nothing;
 
                 // Only clone existing version data when needed:
                 // 1. For delete operations that need to preserve data
@@ -1388,7 +1514,13 @@ impl VersionStore {
                 } else {
                     // Under limit - clone existing version and create chain
                     let existing_version = existing.version.clone();
-                    let existing_prev = existing.prev.clone();
+                    let existing_prev = match kept {
+                        KeptHistory::Prefix(keep) => existing
+                            .prev
+                            .as_deref()
+                            .and_then(|p| chain_prefix(p, keep - 1)),
+                        _ => existing.prev.clone(),
+                    };
                     Some(Arc::new(VersionChainEntry {
                         version: existing_version,
                         prev: existing_prev,
@@ -5387,10 +5519,80 @@ impl VersionStore {
     /// 1. Needed by active transactions
     /// 2. Within the retention period (for AS OF TIMESTAMP queries)
     pub fn cleanup_old_previous_versions(&self) -> i32 {
+        let trimmed = self.trim_history_past_limit();
         // Default 24-hour retention for background cleanup
-        self.cleanup_old_previous_versions_with_retention(std::time::Duration::from_secs(
-            24 * 60 * 60,
-        ))
+        trimmed as i32
+            + self.cleanup_old_previous_versions_with_retention(std::time::Duration::from_secs(
+                24 * 60 * 60,
+            ))
+    }
+
+    /// Cuts every chain longer than the history limit whose head is
+    /// committed: below the first version the oldest open snapshot sees,
+    /// however deep, keeping at least the limit; to the limit when no
+    /// snapshot is open. A publication looks no further than the limit, so
+    /// this pass reclaims what it leaves. Returns the versions dropped
+    pub fn trim_history_past_limit(&self) -> usize {
+        let limit = self.max_version_history;
+        if limit == 0 || self.closed.load(Ordering::Acquire) {
+            return 0;
+        }
+        let Some(checker) = self.visibility_checker.as_ref() else {
+            return 0;
+        };
+        let candidates: Vec<i64> = {
+            let versions = self.versions.read().clone();
+            versions
+                .iter()
+                .filter(|(_, entry)| chain_reaches(entry, limit + 1))
+                .map(|(&row_id, _)| row_id)
+                .collect()
+        };
+        if candidates.is_empty() {
+            return 0;
+        }
+        let begin_seq = checker.oldest_snapshot_begin_seq();
+        let mut dropped = 0;
+        let mut versions = self.versions.write();
+        for row_id in candidates {
+            let Some(entry) = versions.get(row_id) else {
+                continue;
+            };
+            // A head not yet committed may be taken back onto its history
+            if !checker.is_committed_before(entry.version.txn_id, i64::MAX) {
+                continue;
+            }
+            let mut depth = 0;
+            let mut seen_at = None;
+            let mut current = Some(entry);
+            while let Some(node) = current {
+                if seen_at.is_none()
+                    && begin_seq
+                        .is_some_and(|seq| checker.is_committed_before(node.version.txn_id, seq))
+                {
+                    seen_at = Some(depth);
+                }
+                depth += 1;
+                current = node.prev.as_deref();
+            }
+            let keep = match (begin_seq, seen_at) {
+                (None, _) => limit,
+                (Some(_), Some(at)) => limit.max(at + 1),
+                (Some(_), None) => depth,
+            };
+            if keep >= depth {
+                continue;
+            }
+            let prefix = entry
+                .prev
+                .as_deref()
+                .and_then(|p| chain_prefix(p, keep - 1));
+            if let Some(entry) = versions.get_mut(row_id) {
+                entry.prev = prefix;
+                dropped += depth - keep;
+            }
+        }
+        dropped
     }
 
     pub fn cleanup_old_previous_versions_with_retention(
