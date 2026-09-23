@@ -5551,9 +5551,12 @@ impl VersionStore {
         if candidates.is_empty() {
             return 0;
         }
-        let begin_seq = checker.oldest_snapshot_begin_seq();
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::trim_lock_starting();
         let mut dropped = 0;
         let mut versions = self.versions.write();
+        // Read under the lock, so no commit can replace a head a newer snapshot reads
+        let begin_seq = checker.oldest_snapshot_begin_seq();
         for row_id in candidates {
             let Some(entry) = versions.get(row_id) else {
                 continue;

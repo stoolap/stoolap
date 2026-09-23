@@ -66,6 +66,22 @@ pub(crate) fn version_root_captured() {
 }
 
 thread_local! {
+    static TRIM_LOCK_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread after a history trim picks its rows, before it locks the versions.
+pub fn before_trim_lock(hook: impl FnOnce() + 'static) {
+    TRIM_LOCK_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn trim_lock_starting() {
+    let hook = TRIM_LOCK_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static WAL_SYNC_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 

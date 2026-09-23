@@ -290,3 +290,47 @@ fn the_background_trim_cuts_below_a_deep_version() {
     store.trim_history_past_limit();
     assert!(chain_entries(&db) <= 10, "{}", chain_entries(&db));
 }
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_snapshot_taken_while_the_trim_waits_keeps_its_row() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let db = Database::open("memory://snapshot_history_trim_waits").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 0)", ()).unwrap();
+    let mut old = db
+        .begin_with_isolation(IsolationLevel::SnapshotIsolation)
+        .unwrap();
+    for n in 1..=30 {
+        db.execute("UPDATE t SET v = $1 WHERE id = 1", (n,))
+            .unwrap();
+    }
+    old.rollback().unwrap();
+    let store = db.engine().get_version_store("t").unwrap();
+    let reader = Rc::new(RefCell::new(None));
+    let slot = Rc::clone(&reader);
+    let writer = db.clone();
+    stoolap::test_failpoints::before_trim_lock(move || {
+        let mut tx = writer
+            .begin_with_isolation(IsolationLevel::SnapshotIsolation)
+            .unwrap();
+        assert_eq!(values(&mut tx, "SELECT v FROM t WHERE id = 1"), vec![30]);
+        for n in 31..=50 {
+            writer
+                .execute("UPDATE t SET v = $1 WHERE id = 1", (n,))
+                .unwrap();
+        }
+        *slot.borrow_mut() = Some(tx);
+    });
+    store.trim_history_past_limit();
+    let mut tx = reader.borrow_mut().take().expect("the trim hook ran");
+    assert_eq!(
+        values(&mut tx, "SELECT v FROM t WHERE id = 1"),
+        vec![30],
+        "a snapshot taken before the trim locked the versions lost its row"
+    );
+    tx.rollback().unwrap();
+}
