@@ -385,12 +385,9 @@ impl QueryCache {
     /// OPTIMIZATION: Only uses read lock for cache hits (no write lock for stats).
     /// Stats are only updated on cache misses via put().
     pub fn get(&self, query: &str) -> Option<CachedPlanRef> {
-        let normalized = normalize_query(query);
-
         // Only use read lock - skip stats update for performance
         let plans = self.plans.read().ok()?;
-        // Use the Cow<str> as a key lookup without allocating SmartString
-        let plan = plans.get(normalized.as_ref())?;
+        let plan = plans.get(normalize_query(query))?;
 
         // Only clone the Arc (cheap) and copy the small fields
         Some(CachedPlanRef {
@@ -414,12 +411,7 @@ impl QueryCache {
         has_params: bool,
         param_count: usize,
     ) -> CachedPlanRef {
-        let normalized = normalize_query(query);
-        // Convert Cow to SmartString for storage
-        let normalized_key: SmartString = match normalized {
-            Cow::Borrowed(s) => SmartString::new(s),
-            Cow::Owned(s) => SmartString::new(&s),
-        };
+        let normalized_key = SmartString::new(normalize_query(query));
 
         // Create the compiled state upfront - shared between stored plan and returned ref
         let compiled = Arc::new(RwLock::new(CompiledExecution::Unknown));
@@ -593,75 +585,11 @@ pub struct CacheStats {
     pub avg_usage: f64,
 }
 
-/// Normalize a query for caching
-///
-/// This handles irrelevant whitespace differences to improve cache hits.
-/// OPTIMIZATION: Single-pass check + Cow to avoid allocation when already normalized.
+/// The cache key of a query: its text without leading and trailing whitespace.
+/// Whitespace inside is kept, since in a literal or a comment it changes the query.
 #[inline]
-fn normalize_query(query: &str) -> std::borrow::Cow<'_, str> {
-    use std::borrow::Cow;
-
-    let bytes = query.as_bytes();
-    let len = bytes.len();
-
-    // Find start (skip leading whitespace)
-    let start = bytes
-        .iter()
-        .position(|&b| !b.is_ascii_whitespace())
-        .unwrap_or(len);
-    if start == len {
-        return Cow::Borrowed("");
-    }
-
-    // Find end (skip trailing whitespace)
-    let end = bytes
-        .iter()
-        .rposition(|&b| !b.is_ascii_whitespace())
-        .map(|p| p + 1)
-        .unwrap_or(start);
-
-    // Single pass: check if normalization needed (consecutive whitespace or non-space whitespace)
-    let trimmed = &bytes[start..end];
-    let mut prev_ws = false;
-    let mut needs_normalization = false;
-
-    for &b in trimmed {
-        let is_ws = b.is_ascii_whitespace();
-        if is_ws {
-            // Check for consecutive whitespace or non-space whitespace chars
-            if prev_ws || b != b' ' {
-                needs_normalization = true;
-                break;
-            }
-        }
-        prev_ws = is_ws;
-    }
-
-    if !needs_normalization {
-        // SAFETY: trimmed is valid UTF-8 since it's a slice of a UTF-8 string
-        return Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(trimmed) });
-    }
-
-    // Slow path: normalize whitespace (rarely hit for well-formed queries)
-    // SAFETY: trimmed is valid UTF-8 since it's a slice of a UTF-8 string
-    // at ASCII whitespace boundaries (ASCII chars are single-byte in UTF-8)
-    let trimmed_str = unsafe { std::str::from_utf8_unchecked(trimmed) };
-    let mut result = String::with_capacity(trimmed.len());
-    let mut last_was_space = false;
-
-    for c in trimmed_str.chars() {
-        if c.is_ascii_whitespace() {
-            if !last_was_space {
-                result.push(' ');
-                last_was_space = true;
-            }
-        } else {
-            result.push(c);
-            last_was_space = false;
-        }
-    }
-
-    Cow::Owned(result)
+fn normalize_query(query: &str) -> &str {
+    query.trim_matches(|c: char| c.is_ascii_whitespace())
 }
 
 #[cfg(test)]
@@ -773,43 +701,22 @@ mod tests {
     #[test]
     fn test_normalize_query() {
         assert_eq!(
-            normalize_query("  SELECT  *  FROM  users  "),
+            normalize_query(" \n SELECT * FROM users\t "),
             "SELECT * FROM users"
         );
+        assert_eq!(normalize_query("SELECT 'a  b'"), "SELECT 'a  b'");
         assert_eq!(
-            normalize_query("SELECT\n*\nFROM\nusers"),
-            "SELECT * FROM users"
+            normalize_query("SELECT 1 -- note\n+ 1"),
+            "SELECT 1 -- note\n+ 1"
         );
-        assert_eq!(
-            normalize_query("SELECT\t*\t\tFROM users"),
-            "SELECT * FROM users"
-        );
+        assert_eq!(normalize_query(" \t\n"), "");
     }
 
     #[test]
     fn test_normalize_query_utf8() {
-        // UTF-8 characters should be preserved in fast path (no normalization needed)
         assert_eq!(
-            normalize_query("SELECT * FROM t WHERE name = '日本語'"),
-            "SELECT * FROM t WHERE name = '日本語'"
-        );
-
-        // UTF-8 characters should be preserved in slow path (normalization needed)
-        assert_eq!(
-            normalize_query("SELECT  *  FROM t WHERE name = '日本語'"),
-            "SELECT * FROM t WHERE name = '日本語'"
-        );
-
-        // Mixed ASCII and UTF-8 with tabs/newlines
-        assert_eq!(
-            normalize_query("SELECT\t*\tFROM t WHERE city = '東京' AND country = '中国'"),
-            "SELECT * FROM t WHERE city = '東京' AND country = '中国'"
-        );
-
-        // Emoji should also be preserved
-        assert_eq!(
-            normalize_query("SELECT  *  FROM t WHERE emoji = '🎉'"),
-            "SELECT * FROM t WHERE emoji = '🎉'"
+            normalize_query("  SELECT * FROM t WHERE city = '東京' AND emoji = '🎉'\n"),
+            "SELECT * FROM t WHERE city = '東京' AND emoji = '🎉'"
         );
     }
 
@@ -818,12 +725,13 @@ mod tests {
         let cache = QueryCache::new(100);
         let stmt = create_test_statement();
 
-        // Put with one formatting
         cache.put("SELECT * FROM users", stmt, false, 0);
 
-        // Get with different formatting should still hit
-        let plan = cache.get("  SELECT  *  FROM  users  ");
-        assert!(plan.is_some());
+        assert!(cache.get("  SELECT * FROM users\n").is_some());
+        assert!(
+            cache.get("SELECT  * FROM users").is_none(),
+            "whitespace inside the query is part of the key"
+        );
     }
 
     #[test]
