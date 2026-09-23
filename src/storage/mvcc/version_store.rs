@@ -321,15 +321,11 @@ fn unpack_arena_idx(packed: Option<NonZeroU64>) -> Option<usize> {
 
 #[derive(Clone, Debug)]
 /// What a commit's application of one version leaves for its undo: the
-/// row, whether the row did not exist before, and the version the head
-/// displaced when the chain's history was dropped with it
+/// row and whether it did not exist before. The version the head replaced
+/// stays as its previous version until the commit is visible
 pub struct Applied {
     pub row_id: i64,
     pub created: bool,
-    /// Whether the head displaced a version out of a pruned chain: the
-    /// store holds it, under the row id, until the undo takes it back or
-    /// the transaction lets it go, and moves it with the rows meanwhile
-    pub displaced: bool,
 }
 
 #[derive(Clone)]
@@ -681,11 +677,6 @@ pub struct VersionStore {
     /// The position of a column dropped from the schema whose cells the
     /// rows still carry, until the drop is durable and the rows follow
     pending_cut: Mutex<Option<usize>>,
-    /// The versions in-flight commits displaced out of pruned chains, by
-    /// row id with the committing transaction, held for their undo and
-    /// moved with the rows; a commit lets its own go when it is visible.
-    /// Touched only under the versions write lock
-    displaced: Mutex<FxHashMap<i64, (i64, RowVersion)>>,
 }
 
 impl VersionStore {
@@ -726,7 +717,6 @@ impl VersionStore {
             publish_epoch: AtomicU64::new(0),
             layout: AtomicU64::new(0),
             pending_cut: Mutex::new(None),
-            displaced: Mutex::new(FxHashMap::default()),
         }
     }
 
@@ -759,7 +749,6 @@ impl VersionStore {
             publish_epoch: AtomicU64::new(0),
             layout: AtomicU64::new(0),
             pending_cut: Mutex::new(None),
-            displaced: Mutex::new(FxHashMap::default()),
         }
     }
 
@@ -956,41 +945,11 @@ impl VersionStore {
         });
     }
 
-    /// The versions in-flight commits displaced and the store still holds
-    #[cfg(any(test, feature = "test-failpoints"))]
-    pub fn displaced_in_flight(&self) -> usize {
-        let _versions = self.versions.read();
-        self.displaced.lock().len()
-    }
-
-    /// Lets go of the versions `txn_id`'s commit displaced from the chains
-    /// of `row_ids`, once the commit is visible: nothing will take them
-    /// back. A version a later commit displaced from the same row is that
-    /// commit's, and stays
-    fn forget_displaced(&self, txn_id: i64, row_ids: &[i64]) {
-        let _versions = self.versions.write();
-        let mut displaced = self.displaced.lock();
-        for row_id in row_ids {
-            if displaced
-                .get(row_id)
-                .is_some_and(|(owner, _)| *owner == txn_id)
-            {
-                displaced.remove(row_id);
-            }
-        }
-    }
-
     /// Rewrites every row `relayout` returns a new layout for: the heads
-    /// in the arena, the history behind them, and the versions in-flight
-    /// commits displaced, all under the one versions lock
+    /// in the arena and the history behind them, under the one versions lock
     fn relayout_rows(&self, relayout: Relayout<'_>) {
         let mut versions = self.versions.write();
         self.arena.relayout(relayout);
-        for (_, version) in self.displaced.lock().values_mut() {
-            if let Some(moved) = relayout(version.data.as_slice()) {
-                version.data = Row::from_arc(moved);
-            }
-        }
         let row_ids: Vec<i64> = versions.keys().collect();
         for row_id in row_ids {
             let Some(entry) = versions.get_mut(row_id) else {
@@ -1252,9 +1211,8 @@ impl VersionStore {
                     }
 
                     // O(k) chain management - depth computed by traversal
-                    // When limit exceeded: drop old chain AND reuse arena slot
+                    // When limit exceeded: drop the chain below the displaced version
                     let kept = self.history_kept(existing);
-                    let can_reuse_arena = kept == KeptHistory::Nothing;
 
                     // Only clone existing version data when needed:
                     // 1. For delete operations that need to preserve data
@@ -1303,12 +1261,6 @@ impl VersionStore {
                         existing_arena_idx
                     };
 
-                    // Build version chain entry
-                    if can_reuse_arena {
-                        self.displaced
-                            .lock()
-                            .insert(row_id, (new_version.txn_id, existing.version.clone()));
-                    }
                     // The displaced version stays as prev until the new head's
                     // commit completes; history below it goes past the limit
                     let existing_prev = match kept {
@@ -1337,7 +1289,6 @@ impl VersionStore {
                     applied.push(Applied {
                         row_id,
                         created: false,
-                        displaced: can_reuse_arena,
                     });
                 }
                 crate::common::cow_btree::Entry::Vacant(vacant) => {
@@ -1372,7 +1323,6 @@ impl VersionStore {
                     applied.push(Applied {
                         row_id,
                         created: true,
-                        displaced: false,
                     });
                 }
             }
@@ -1419,7 +1369,6 @@ impl VersionStore {
             return Ok(Applied {
                 row_id,
                 created: false,
-                displaced: false,
             });
         }
 
@@ -1444,9 +1393,8 @@ impl VersionStore {
                 }
 
                 // O(k) chain management - depth computed by traversal
-                // When limit exceeded: drop old chain AND reuse arena slot
+                // When limit exceeded: drop the chain below the displaced version
                 let kept = self.history_kept(existing);
-                let can_reuse_arena = kept == KeptHistory::Nothing;
 
                 // Only clone existing version data when needed:
                 // 1. For delete operations that need to preserve data
@@ -1492,14 +1440,6 @@ impl VersionStore {
                     existing_arena_idx
                 };
 
-                // Build version chain entry
-                // The version the head displaces is kept for the undo when
-                // the chain will not keep its history
-                if can_reuse_arena {
-                    self.displaced
-                        .lock()
-                        .insert(row_id, (new_version.txn_id, existing.version.clone()));
-                }
                 // The displaced version stays as prev until the new head's
                 // commit completes; history below it goes past the limit
                 let existing_prev = match kept {
@@ -1527,7 +1467,6 @@ impl VersionStore {
                 Applied {
                     row_id,
                     created: false,
-                    displaced: can_reuse_arena,
                 }
             }
             crate::common::cow_btree::Entry::Vacant(vacant) => {
@@ -1556,7 +1495,6 @@ impl VersionStore {
                 Applied {
                     row_id,
                     created: true,
-                    displaced: false,
                 }
             }
         };
@@ -1566,30 +1504,13 @@ impl VersionStore {
     /// Takes back the version `txn_id` put at the head of `row_id`'s chain
     /// when its commit failed after the version was applied: the version
     /// before it is the head again, in the arena too, a row the commit
-    /// created leaves, and the committed row count is what it was; a chain
-    /// whose history the application dropped is restored from the version
-    /// the head displaced.
+    /// created leaves, and the committed row count is what it was.
     pub fn unpublish_version(&self, applied: &Applied, txn_id: i64) {
         if self.closed.load(Ordering::Acquire) {
             return;
         }
-        let Applied {
-            row_id,
-            created,
-            displaced,
-        } = applied;
-        let (row_id, created) = (*row_id, *created);
+        let Applied { row_id, created } = *applied;
         let mut versions = self.versions.write();
-        // The version the head displaced is this transaction's whatever
-        // became of the row since (a TRUNCATE, another head): taken now,
-        // so nothing of the undo stays behind
-        let displaced = displaced.then(|| {
-            let mut displaced = self.displaced.lock();
-            match displaced.get(&row_id) {
-                Some((owner, _)) if *owner == txn_id => displaced.remove(&row_id).map(|(_, v)| v),
-                _ => None,
-            }
-        });
         let Some(head) = versions.get(row_id) else {
             return;
         };
@@ -1608,16 +1529,11 @@ impl VersionStore {
             }
             return;
         }
-        // The version before: the chain's, or the one the head displaced
-        // when the history was dropped with it
-        // The version before: the chain's, or the one the head displaced
-        // when the history was dropped with it, held by the store and moved
-        // with the rows since
-        let (prev_version, prev_prev) = match (head.prev.clone(), displaced) {
-            (Some(prev), _) => (prev.version.clone(), prev.prev.clone()),
-            (None, Some(Some(displaced))) => (displaced, None),
-            (None, _) => return,
+        // The version before, which the chain keeps until the commit is visible
+        let Some(prev) = head.prev.clone() else {
+            return;
         };
+        let (prev_version, prev_prev) = (prev.version.clone(), prev.prev.clone());
         let prev_deleted = prev_version.deleted_at_txn_id != 0;
         if let Some(idx) = arena_idx {
             self.arena.update_at(
@@ -5671,6 +5587,12 @@ impl VersionStore {
                     keep_count = i + 1;
                 }
             }
+            // A head whose commit is not visible yet keeps the version before it:
+            // its readers read it, and a failed commit's undo restores it
+            if keep_count == 0 && !checker.is_committed_before(chain_entry.version.txn_id, i64::MAX)
+            {
+                keep_count = 1;
+            }
 
             // If we need to prune some versions, modify the live entry
             if keep_count < prev_versions.len() {
@@ -6327,18 +6249,9 @@ impl TransactionVersionStore {
     /// Takes back everything this transaction's commit applied before its
     /// marker failed: the index updates in reverse, then the versions, so
     /// the store describes the rows that stayed visible
-    /// Lets go of what the commit kept for its undo, once it is visible:
-    /// the index undo, and the versions the store held for it
+    /// Lets go of what the commit kept for its undo, once it is visible
     pub fn release_applied(&self) {
-        let applied: SmallVec<[Applied; 2]> = std::mem::take(&mut *self.applied.lock());
-        let displaced: SmallVec<[i64; 4]> = applied
-            .iter()
-            .filter(|entry| entry.displaced)
-            .map(|entry| entry.row_id)
-            .collect();
-        if !displaced.is_empty() {
-            self.parent_store.forget_displaced(self.txn_id, &displaced);
-        }
+        drop(std::mem::take(&mut *self.applied.lock()));
         self.index_undo.lock().clear();
     }
 
