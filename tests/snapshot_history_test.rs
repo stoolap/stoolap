@@ -498,3 +498,28 @@ fn a_snapshot_keeps_its_row_through_commits_as_it_begins() {
         "commits between the snapshot's sequence and its protection cut its row"
     );
 }
+
+#[test]
+fn a_snapshot_keeps_its_isolation_when_the_default_changes() {
+    let db = Database::open("memory://snapshot_history_default_changes").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 100)", ()).unwrap();
+    db.execute("SET isolation_level = 'SNAPSHOT'", ()).unwrap();
+    let mut reader = db
+        .begin_with_isolation(IsolationLevel::SnapshotIsolation)
+        .unwrap();
+    assert_eq!(
+        values(&mut reader, "SELECT v FROM t WHERE id = 1"),
+        vec![100]
+    );
+    db.execute("SET isolation_level = 'READ COMMITTED'", ())
+        .unwrap();
+    db.execute("UPDATE t SET v = 200 WHERE id = 1", ()).unwrap();
+    assert_eq!(
+        values(&mut reader, "SELECT v FROM t WHERE id = 1"),
+        vec![100],
+        "the snapshot took the default's later change"
+    );
+    reader.rollback().unwrap();
+}

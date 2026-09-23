@@ -394,7 +394,10 @@ impl TransactionRegistry {
         let txn_id = self.next_txn_id.fetch_add(1, Ordering::AcqRel) + 1;
         let begin_seq = {
             let mut txns = self.transactions.lock();
-            if level != self.get_global_isolation_level() {
+            // A snapshot keeps its level whatever the default becomes later
+            if level == IsolationLevel::SnapshotIsolation
+                || level != self.get_global_isolation_level()
+            {
                 let mut map = self.isolation_overrides.lock();
                 map.insert(txn_id, Self::isolation_to_u8(level));
                 self.override_count.fetch_add(1, Ordering::AcqRel);
