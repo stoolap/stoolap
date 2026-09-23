@@ -22,7 +22,7 @@
 //! Memory: O(active_transactions + aborted_transactions)
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 
@@ -133,47 +133,54 @@ impl TxnState {
     }
 }
 
-/// Thread-local cache size (512KB per thread).
+/// Thread-local cache size (1 MiB per thread: a registry and a transaction id per slot).
 const CACHE_SIZE: usize = 65536;
 
 /// Cache index shift for XOR mixing (log2 of CACHE_SIZE).
 /// XOR mixing prevents 0% hit rate when txn_ids are strided by CACHE_SIZE.
 const CACHE_SHIFT: u32 = CACHE_SIZE.trailing_zeros();
 
+/// The identity of the next registry; never reused in the process, so a
+/// reopened database does not share cache slots with the one it replaced.
+static NEXT_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
+
 thread_local! {
-    static COMMITTED_CACHE: RefCell<CommittedCache> = const { RefCell::new(CommittedCache::new()) };
+    /// Built on the heap at the thread's first insert: a static TLS block
+    /// of this size would come out of every thread's stack (glibc)
+    static COMMITTED_CACHE: RefCell<Option<CommittedCache>> = const { RefCell::new(None) };
 }
 
-/// Direct-mapped cache for committed transaction IDs.
+/// Direct-mapped cache of committed transactions, keyed by registry and id:
+/// every database numbers its transactions from one.
 struct CommittedCache {
-    entries: [i64; CACHE_SIZE],
+    entries: Box<[(u64, i64)]>,
 }
 
 impl CommittedCache {
-    #[inline]
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
-            entries: [0; CACHE_SIZE],
+            entries: vec![(0, 0); CACHE_SIZE].into_boxed_slice(),
         }
     }
 
-    /// Compute cache index with XOR mixing to avoid collisions on strided IDs.
+    /// Compute cache index with XOR mixing to avoid collisions on strided IDs,
+    /// the registry mixed in so two databases' same ids take different slots.
     #[inline(always)]
-    fn cache_index(txn_id: i64) -> usize {
-        let x = txn_id as u64;
+    fn cache_index(registry: u64, txn_id: i64) -> usize {
+        let x = (txn_id as u64) ^ registry.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         ((x ^ (x >> CACHE_SHIFT)) as usize) & (CACHE_SIZE - 1)
     }
 
     #[inline(always)]
-    fn contains(&self, txn_id: i64) -> bool {
-        let idx = Self::cache_index(txn_id);
-        self.entries[idx] == txn_id
+    fn contains(&self, registry: u64, txn_id: i64) -> bool {
+        let idx = Self::cache_index(registry, txn_id);
+        self.entries[idx] == (registry, txn_id)
     }
 
     #[inline(always)]
-    fn insert(&mut self, txn_id: i64) {
-        let idx = Self::cache_index(txn_id);
-        self.entries[idx] = txn_id;
+    fn insert(&mut self, registry: u64, txn_id: i64) {
+        let idx = Self::cache_index(registry, txn_id);
+        self.entries[idx] = (registry, txn_id);
     }
 }
 
@@ -214,6 +221,9 @@ pub struct TransactionRegistry {
 
     /// Whether new transactions are being accepted.
     accepting: AtomicBool,
+
+    /// This registry's key in the thread-local committed cache.
+    cache_id: u64,
 }
 
 impl TransactionRegistry {
@@ -234,6 +244,7 @@ impl TransactionRegistry {
             override_count: AtomicUsize::new(0),
             active_txn_count: AtomicUsize::new(0),
             accepting: AtomicBool::new(true),
+            cache_id: NEXT_REGISTRY_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -589,7 +600,15 @@ impl TransactionRegistry {
     #[inline(always)]
     fn check_committed(&self, txn_id: i64) -> bool {
         // Cache check first (no lock)
-        if COMMITTED_CACHE.with(|c| c.borrow().contains(txn_id)) {
+        // A cache already destroyed at thread exit is a miss
+        if COMMITTED_CACHE
+            .try_with(|c| {
+                c.borrow()
+                    .as_ref()
+                    .is_some_and(|cache| cache.contains(self.cache_id, txn_id))
+            })
+            .unwrap_or(false)
+        {
             return true;
         }
 
@@ -602,7 +621,12 @@ impl TransactionRegistry {
         // Not in map - committed if valid txn_id
         let next = self.next_txn_id.load(Ordering::Acquire);
         if txn_id > 0 && txn_id <= next {
-            COMMITTED_CACHE.with(|c| c.borrow_mut().insert(txn_id));
+            // Nothing is cached once the thread's cache is destroyed
+            let _ = COMMITTED_CACHE.try_with(|c| {
+                c.borrow_mut()
+                    .get_or_insert_with(CommittedCache::new)
+                    .insert(self.cache_id, txn_id)
+            });
             return true;
         }
 
@@ -1411,6 +1435,44 @@ mod tests {
         assert!(registry.check_committed(txn_id));
         // txn_id + 1 > next_txn_id should NOT be committed
         assert!(!registry.check_committed(txn_id + 1));
+    }
+
+    #[test]
+    fn the_committed_cache_keys_a_slot_by_registry_and_id() {
+        let mut cache = CommittedCache::new();
+        cache.insert(1, 5);
+        assert!(cache.contains(1, 5));
+        // A registry whose id 5 lands in the same slot
+        let other = (2..)
+            .find(|&r| CommittedCache::cache_index(r, 5) == CommittedCache::cache_index(1, 5))
+            .unwrap();
+        assert!(!cache.contains(other, 5), "another registry's id 5 matched");
+    }
+
+    #[test]
+    fn the_committed_cache_is_one_mebibyte_on_the_heap() {
+        let cache = CommittedCache::new();
+        assert_eq!(std::mem::size_of_val(&*cache.entries), 1 << 20);
+        assert!(
+            std::mem::size_of::<RefCell<Option<CommittedCache>>>() <= 32,
+            "the thread-local holds the table itself"
+        );
+    }
+
+    #[test]
+    fn two_registries_same_ids_keep_their_own_slots() {
+        let mut cache = CommittedCache::new();
+        for id in 1..=1000 {
+            cache.insert(1, id);
+            cache.insert(2, id);
+        }
+        let kept = (1..=1000)
+            .filter(|&id| cache.contains(1, id) && cache.contains(2, id))
+            .count();
+        assert!(
+            kept >= 990,
+            "only {kept} of 1000 ids kept by both registries"
+        );
     }
 
     // === is_directly_visible: line 523 ===
