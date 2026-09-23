@@ -448,3 +448,78 @@ fn a_snapshot_begun_while_an_update_commits_keeps_its_row() {
         "the snapshot lost its row to an update committing as it began"
     );
 }
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_snapshot_keeps_its_row_through_commits_as_it_begins() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let db = Database::open("memory://snapshot_history_begin_window").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 0)", ()).unwrap();
+    for n in 1..=9 {
+        db.execute("UPDATE t SET v = $1 WHERE id = 1", (n,))
+            .unwrap();
+    }
+    let (published_tx, published_rx) = mpsc::channel();
+    let (finish_tx, finish_rx) = mpsc::channel::<()>();
+    let (start_tx, start_rx) = mpsc::channel::<()>();
+    let writer = db.clone();
+    let commits = std::thread::spawn(move || {
+        start_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+        writer
+            .execute("UPDATE t SET v = 10 WHERE id = 1", ())
+            .unwrap();
+        let mut tx = writer.begin().unwrap();
+        tx.execute("UPDATE t SET v = 11 WHERE id = 1", ()).unwrap();
+        stoolap::test_failpoints::before_commit_visible(move || {
+            published_tx.send(()).unwrap();
+            finish_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+        });
+        tx.commit().unwrap();
+    });
+    stoolap::test_failpoints::after_transaction_begun(move || {
+        start_tx.send(()).unwrap();
+        published_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+    });
+    let mut reader = db
+        .begin_with_isolation(IsolationLevel::SnapshotIsolation)
+        .unwrap();
+    let before = values(&mut reader, "SELECT v FROM t WHERE id = 1");
+    finish_tx.send(()).unwrap();
+    commits.join().unwrap();
+    let after = values(&mut reader, "SELECT v FROM t WHERE id = 1");
+    reader.rollback().unwrap();
+    assert_eq!(
+        (before, after),
+        (vec![9], vec![9]),
+        "commits between the snapshot's sequence and its protection cut its row"
+    );
+}
+
+#[test]
+fn a_snapshot_keeps_its_isolation_when_the_default_changes() {
+    let db = Database::open("memory://snapshot_history_default_changes").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 100)", ()).unwrap();
+    db.execute("SET isolation_level = 'SNAPSHOT'", ()).unwrap();
+    let mut reader = db
+        .begin_with_isolation(IsolationLevel::SnapshotIsolation)
+        .unwrap();
+    assert_eq!(
+        values(&mut reader, "SELECT v FROM t WHERE id = 1"),
+        vec![100]
+    );
+    db.execute("SET isolation_level = 'READ COMMITTED'", ())
+        .unwrap();
+    db.execute("UPDATE t SET v = 200 WHERE id = 1", ()).unwrap();
+    assert_eq!(
+        values(&mut reader, "SELECT v FROM t WHERE id = 1"),
+        vec![100],
+        "the snapshot took the default's later change"
+    );
+    reader.rollback().unwrap();
+}

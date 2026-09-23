@@ -7341,8 +7341,8 @@ impl Engine for MVCCEngine {
             return Err(Error::EngineNotOpen);
         }
 
-        // Begin transaction in registry
-        let (txn_id, begin_seq) = self.registry.begin_transaction();
+        // Begin transaction in registry, a snapshot protected with its sequence
+        let (txn_id, begin_seq) = self.registry.begin_transaction_at(level);
         if txn_id == INVALID_TRANSACTION_ID {
             return Err(Error::internal(
                 "transaction registry is not accepting new transactions",
@@ -7354,11 +7354,7 @@ impl Engine for MVCCEngine {
 
         // Create transaction
         let mut txn = MvccTransaction::new(txn_id, begin_seq, Arc::clone(&self.registry));
-
-        // Set isolation level if different from default
-        if level != IsolationLevel::ReadCommitted {
-            txn.set_isolation_level(level)?;
-        }
+        txn.begun_at(level);
 
         // Set engine operations
         let engine_ops = self.create_engine_operations();

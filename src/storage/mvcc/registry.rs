@@ -380,16 +380,32 @@ impl TransactionRegistry {
 
     /// Begins a new transaction.
     pub fn begin_transaction(&self) -> (i64, i64) {
+        self.begin_transaction_at(IsolationLevel::ReadCommitted)
+    }
+
+    /// Begins a transaction at `level`. A snapshot is protected under the same
+    /// lock its sequence is taken in, the lock the oldest-snapshot query reads
+    /// under, so every publication after that sequence keeps what it reads.
+    pub fn begin_transaction_at(&self, level: IsolationLevel) -> (i64, i64) {
         if !self.accepting.load(Ordering::Acquire) {
             return (INVALID_TRANSACTION_ID, 0);
         }
 
         let txn_id = self.next_txn_id.fetch_add(1, Ordering::AcqRel) + 1;
-        let begin_seq = self.next_sequence.fetch_add(1, Ordering::AcqRel) + 1;
-
-        self.transactions
-            .lock()
-            .insert(txn_id, TxnState::new_active(begin_seq));
+        let begin_seq = {
+            let mut txns = self.transactions.lock();
+            // A snapshot keeps its level whatever the default becomes later
+            if level == IsolationLevel::SnapshotIsolation
+                || level != self.get_global_isolation_level()
+            {
+                let mut map = self.isolation_overrides.lock();
+                map.insert(txn_id, Self::isolation_to_u8(level));
+                self.override_count.fetch_add(1, Ordering::AcqRel);
+            }
+            let begin_seq = self.next_sequence.fetch_add(1, Ordering::AcqRel) + 1;
+            txns.insert(txn_id, TxnState::new_active(begin_seq));
+            begin_seq
+        };
         self.active_txn_count.fetch_add(1, Ordering::Relaxed);
 
         (txn_id, begin_seq)

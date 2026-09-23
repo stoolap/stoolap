@@ -7121,10 +7121,7 @@ impl Executor {
         &self,
         isolation: crate::core::IsolationLevel,
     ) -> Result<StatementSnapshot> {
-        let mut transaction = self.engine.begin_transaction()?;
-        if isolation != crate::core::IsolationLevel::ReadCommitted {
-            transaction.set_isolation_level(isolation)?;
-        }
+        let transaction = self.engine.begin_transaction_with_level(isolation)?;
         Ok(StatementSnapshot::new(transaction))
     }
 
@@ -12006,5 +12003,38 @@ mod tests {
             }
         }
         assert!(found);
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[test]
+    fn a_statement_snapshot_is_protected_with_its_sequence() {
+        let engine = Arc::new(MVCCEngine::in_memory());
+        engine.open_engine().unwrap();
+        let executor = Executor::new(Arc::clone(&engine));
+        executor
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
+        executor.execute("INSERT INTO t VALUES (1, 0)").unwrap();
+        let writer = Executor::new(Arc::clone(&engine));
+        crate::test_failpoints::after_transaction_begun(move || {
+            writer.execute("UPDATE t SET v = 10 WHERE id = 1").unwrap();
+        });
+        let snapshot = executor
+            .new_statement_snapshot(crate::core::IsolationLevel::SnapshotIsolation)
+            .unwrap();
+        let rows = snapshot
+            .get_table("t")
+            .unwrap()
+            .collect_rows_by_ids(&[1])
+            .unwrap();
+        let seen: Vec<Value> = rows
+            .iter()
+            .map(|(_, row)| row.get(1).cloned().unwrap())
+            .collect();
+        assert_eq!(
+            seen,
+            vec![Value::Integer(0)],
+            "the statement snapshot saw a commit made after its sequence"
+        );
     }
 }
