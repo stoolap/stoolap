@@ -1033,11 +1033,6 @@ impl SegmentedTable {
             // back if the commit fails
             hot.mark_sealed_original(row_id, old_keys)?;
         } else {
-            // The new row takes a row id of its own, so the old one is
-            // deleted under its id: the marker carries the volume's copy for
-            // the indexes that keep sealed rows, and the log records it
-            hot.delete_by_row_ids(&[row_id])?;
-            hot.mark_sealed_original(row_id, old_row)?;
             hot.insert_discard(new_row)?;
         }
         // Add tombstone so row_count() doesn't double-count. The hot
@@ -2128,6 +2123,12 @@ impl SegmentedTable {
         row_ids: &[i64],
         hot_ids: &mut Vec<i64>,
     ) -> Result<i32> {
+        let has_int_pk = self
+            .hot
+            .schema()
+            .columns
+            .iter()
+            .any(|c| c.primary_key && c.data_type == DataType::Integer);
         let mut located: Vec<(u64, usize, i64)> = Vec::new();
         let mut segments: FxHashMap<u64, super::manifest::ColdSegment> = FxHashMap::default();
         for &row_id in row_ids {
@@ -2150,12 +2151,17 @@ impl SegmentedTable {
         let mut old_rows: Option<super::writer::RowReader> = None;
         for &(seg_id, idx, row_id) in &located {
             let cold = &segments[&seg_id];
-            let old_row = Self::cold_row_of(&mut old_rows, cold, idx)?;
+            let old_row = if has_int_pk {
+                Some(Self::cold_row_of(&mut old_rows, cold, idx)?)
+            } else {
+                None
+            };
             Self::delete_located_cold_row(
                 &mut self.hot,
                 &self.segment_mgr,
                 txn_id,
                 row_id,
+                has_int_pk,
                 old_row,
             )?;
         }
@@ -2170,17 +2176,22 @@ impl SegmentedTable {
         segment_mgr: &super::manifest::SegmentManager,
         txn_id: i64,
         row_id: i64,
-        old_row: Row,
+        has_int_pk: bool,
+        old_row: Option<Row>,
     ) -> Result<()> {
         // Claim the cold row to prevent concurrent lost deletes.
         hot.try_claim_row(row_id)?;
-        // A swallowed failure here tombstones the cold row while its hot
-        // index entries survive, wedging a key value
-        hot.delete_by_row_ids(&[row_id])?;
-        // The volume's copy is what the delete takes away: an index that
-        // keeps sealed rows drops its keys at commit and takes them back
-        // if the commit fails
-        hot.mark_sealed_original(row_id, old_row)?;
+        if has_int_pk {
+            // A swallowed failure here tombstones the cold row while
+            // its hot PK index entry survives, wedging that PK value.
+            hot.delete_by_row_ids(&[row_id])?;
+            // The volume's copy is what the delete takes away: an index that
+            // keeps sealed rows drops its keys at commit and takes them back
+            // if the commit fails
+            if let Some(old_row) = old_row {
+                hot.mark_sealed_original(row_id, old_row)?;
+            }
+        }
         // Track tombstone for commit. Pending tombstones are applied on commit
         // and discarded on rollback to prevent isolation violations.
         segment_mgr.add_pending_tombstone(txn_id, row_id);
@@ -2618,15 +2629,26 @@ impl Table for SegmentedTable {
             };
             let mut count = self.hot.delete(where_expr)?;
             if let Some(snap) = &cold_snapshot {
+                let has_int_pk = self
+                    .hot
+                    .schema()
+                    .columns
+                    .iter()
+                    .any(|c| c.primary_key && c.data_type == DataType::Integer);
                 let mut old_rows: Option<super::writer::RowReader> = None;
                 if let Some((_, cold, idx)) = self.find_segment_row_in(snap, pk)? {
                     let txn_id = self.txn_id();
-                    let old_row = Self::cold_row_of(&mut old_rows, &cold, idx)?;
+                    let old_row = if has_int_pk {
+                        Some(Self::cold_row_of(&mut old_rows, &cold, idx)?)
+                    } else {
+                        None
+                    };
                     Self::delete_located_cold_row(
                         &mut self.hot,
                         &self.segment_mgr,
                         txn_id,
                         pk,
+                        has_int_pk,
                         old_row,
                     )?;
                     count += 1;
@@ -2647,6 +2669,12 @@ impl Table for SegmentedTable {
         };
         let stmt_tombstones = cold_snapshot.as_ref().map(|s| Arc::clone(&s.tombstones));
         let mut count = self.hot.delete(where_expr)?;
+        let has_int_pk = self
+            .hot
+            .schema()
+            .columns
+            .iter()
+            .any(|c| c.primary_key && c.data_type == DataType::Integer);
 
         // Build hot_skip from hot row_ids + pending tombstones.
         // Committed tombstones are kept as a shared Arc (no clone).
@@ -2796,19 +2824,21 @@ impl Table for SegmentedTable {
                 }
                 // Claim the cold row to prevent concurrent lost deletes.
                 self.hot.try_claim_row(row_id)?;
-                // A swallowed failure here tombstones the cold row while
-                // its hot index entries survive, wedging a key value
-                self.hot.delete_by_row_ids(&[row_id])?;
-                // The volume's copy is what the delete takes away: an
-                // index that keeps sealed rows drops its keys at commit
-                // and takes them back if the commit fails
-                let old_row = old_rows
-                    .get_or_insert_with(|| super::writer::RowReader::new(Arc::clone(vol)))
-                    .row(i, &mapping)
-                    .map_err(|e| {
-                        crate::core::Error::internal(format!("cold row read failed: {e}"))
-                    })?;
-                self.hot.mark_sealed_original(row_id, old_row)?;
+                if has_int_pk {
+                    // A swallowed failure here tombstones the cold row while
+                    // its hot PK index entry survives, wedging that PK value.
+                    self.hot.delete_by_row_ids(&[row_id])?;
+                    // The volume's copy is what the delete takes away: an
+                    // index that keeps sealed rows drops its keys at commit
+                    // and takes them back if the commit fails
+                    let old_row = old_rows
+                        .get_or_insert_with(|| super::writer::RowReader::new(Arc::clone(vol)))
+                        .row(i, &mapping)
+                        .map_err(|e| {
+                            crate::core::Error::internal(format!("cold row read failed: {e}"))
+                        })?;
+                    self.hot.mark_sealed_original(row_id, old_row)?;
+                }
                 deleted_cold_ids.push(row_id);
                 count += 1;
             }

@@ -42,7 +42,7 @@ use crate::common::{
 use crate::core::types::DataType;
 use crate::core::{Error, Row, RowVec, Schema, Value};
 use crate::storage::expression::CompiledFilter;
-use crate::storage::mvcc::arena::RowArena;
+use crate::storage::mvcc::arena::{Relayout, RowArena};
 use crate::storage::mvcc::get_fast_timestamp;
 #[cfg(not(test))]
 use crate::storage::mvcc::registry::TransactionRegistry;
@@ -205,6 +205,31 @@ struct VersionChainEntry {
     arena_idx: Option<NonZeroU64>,
 }
 
+/// A copy of the history from `entry` back with every row `relayout`
+/// changes rewritten, or None when it changes none of them
+fn relayout_history(
+    entry: &Arc<VersionChainEntry>,
+    relayout: Relayout<'_>,
+) -> Option<Arc<VersionChainEntry>> {
+    let data = relayout(entry.version.data.as_slice());
+    let prev = entry
+        .prev
+        .as_ref()
+        .and_then(|p| relayout_history(p, relayout));
+    if data.is_none() && prev.is_none() {
+        return None;
+    }
+    let mut version = entry.version.clone();
+    if let Some(data) = data {
+        version.data = Row::from_arc(data);
+    }
+    Some(Arc::new(VersionChainEntry {
+        version,
+        prev: prev.or_else(|| entry.prev.clone()),
+        arena_idx: entry.arena_idx,
+    }))
+}
+
 /// Count the depth of a version chain by traversing prev pointers.
 /// O(k) where k is the chain length (typically <= max_version_history).
 #[inline]
@@ -243,7 +268,10 @@ fn unpack_arena_idx(packed: Option<NonZeroU64>) -> Option<usize> {
 pub struct Applied {
     pub row_id: i64,
     pub created: bool,
-    pub displaced: Option<RowVersion>,
+    /// Whether the head displaced a version out of a pruned chain: the
+    /// store holds it, under the row id, until the undo takes it back or
+    /// the transaction lets it go, and moves it with the rows meanwhile
+    pub displaced: bool,
 }
 
 #[derive(Clone)]
@@ -477,6 +505,16 @@ impl PublishHold {
             }
         }
     }
+
+    /// The commit is visible: nothing of it will be taken back, so what
+    /// each store kept for the undo goes
+    pub fn release_publication(&self) {
+        for store in &self.stores {
+            if let Ok(store) = store.read() {
+                store.release_applied();
+            }
+        }
+    }
 }
 
 /// One index call a single-row commit has made: index position, whether it
@@ -560,6 +598,18 @@ pub struct VersionStore {
     publishing: AtomicUsize,
     /// Publishes completed
     publish_epoch: AtomicU64,
+    /// Moved by every column added or dropped: the rows are laid out as
+    /// the schema says from then on, and a transaction that wrote under
+    /// the layout before cannot commit its rows
+    layout: AtomicU64,
+    /// The position of a column dropped from the schema whose cells the
+    /// rows still carry, until the drop is durable and the rows follow
+    pending_cut: Mutex<Option<usize>>,
+    /// The versions in-flight commits displaced out of pruned chains, by
+    /// row id with the committing transaction, held for their undo and
+    /// moved with the rows; a commit lets its own go when it is visible.
+    /// Touched only under the versions write lock
+    displaced: Mutex<FxHashMap<i64, (i64, RowVersion)>>,
 }
 
 impl VersionStore {
@@ -598,6 +648,9 @@ impl VersionStore {
             upsert_mutex: Arc::new(parking_lot::Mutex::new(())),
             publishing: AtomicUsize::new(0),
             publish_epoch: AtomicU64::new(0),
+            layout: AtomicU64::new(0),
+            pending_cut: Mutex::new(None),
+            displaced: Mutex::new(FxHashMap::default()),
         }
     }
 
@@ -628,6 +681,9 @@ impl VersionStore {
             upsert_mutex: Arc::new(parking_lot::Mutex::new(())),
             publishing: AtomicUsize::new(0),
             publish_epoch: AtomicU64::new(0),
+            layout: AtomicU64::new(0),
+            pending_cut: Mutex::new(None),
+            displaced: Mutex::new(FxHashMap::default()),
         }
     }
 
@@ -700,10 +756,139 @@ impl VersionStore {
         self.schema.read().clone()
     }
 
+    /// The schema and the rows' layout that goes with it, read together:
+    /// a column change moves the layout while it holds the schema
+    pub fn schema_and_layout(&self) -> (CompactArc<Schema>, u64) {
+        let schema = self.schema.read();
+        (schema.clone(), self.layout.load(Ordering::Acquire))
+    }
+
     /// Returns a mutable reference to the schema (for modifications)
     /// Callers must use CompactArc::make_mut() to get &mut Schema
     pub fn schema_mut(&self) -> parking_lot::RwLockWriteGuard<'_, CompactArc<Schema>> {
         self.schema.write()
+    }
+
+    /// The layout the rows are held in, moved by every column added or dropped
+    pub fn layout(&self) -> u64 {
+        self.layout.load(Ordering::Acquire)
+    }
+
+    /// Adds `column` to the schema. The rows follow at `lay_out_rows`, once
+    /// the change is durable: a change that fails to record leaves the
+    /// rows as they were under the schema put back
+    pub fn add_column(&self, column: crate::core::SchemaColumn) -> Result<(), Error> {
+        let mut schema = self.schema.write();
+        CompactArc::make_mut(&mut *schema).add_column(column)?;
+        self.layout.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Removes `name` from the schema. The rows keep its cells until
+    /// `lay_out_rows` cuts them, once the change is durable
+    pub fn remove_column(&self, name: &str) -> Result<crate::core::SchemaColumn, Error> {
+        let mut schema = self.schema.write();
+        let at = schema
+            .get_column_index(name)
+            .ok_or_else(|| Error::ColumnNotFound(name.to_string()))?;
+        let column = CompactArc::make_mut(&mut *schema).remove_column(name)?;
+        *self.pending_cut.lock() = Some(at);
+        self.layout.fetch_add(1, Ordering::AcqRel);
+        Ok(column)
+    }
+
+    /// Forgets a column removal the rows were never cut for: the schema
+    /// went back to holding the column
+    pub fn discard_pending_cut(&self) {
+        *self.pending_cut.lock() = None;
+    }
+
+    /// Moves every row to the schema's layout: a row narrower than the
+    /// schema takes the missing columns' defaults, or NULL; a row wider
+    /// loses the cell of the column last dropped. A row is read by
+    /// position, so the rows take the layout here rather than each read
+    /// knowing the layout a row was written under
+    pub fn lay_out_rows(&self) {
+        let schema = self.schema();
+        let width = schema.columns.len();
+        let cut = self.pending_cut.lock().take();
+        self.relayout_rows(&|values| {
+            if values.len() < width {
+                let mut moved = Vec::with_capacity(width);
+                moved.extend_from_slice(values);
+                moved.extend(schema.columns[values.len()..].iter().map(|column| {
+                    column
+                        .default_value
+                        .clone()
+                        .unwrap_or_else(|| Value::null(column.data_type))
+                }));
+                return Some(CompactArc::from(moved));
+            }
+            match cut {
+                Some(at) if values.len() > width && at < values.len() => {
+                    let mut moved = Vec::with_capacity(width);
+                    moved.extend_from_slice(&values[..at]);
+                    moved.extend_from_slice(&values[at + 1..]);
+                    Some(CompactArc::from(moved))
+                }
+                _ => None,
+            }
+        });
+    }
+
+    /// The versions in-flight commits displaced and the store still holds
+    #[cfg(any(test, feature = "test-failpoints"))]
+    pub fn displaced_in_flight(&self) -> usize {
+        let _versions = self.versions.read();
+        self.displaced.lock().len()
+    }
+
+    /// Lets go of the versions `txn_id`'s commit displaced from the chains
+    /// of `row_ids`, once the commit is visible: nothing will take them
+    /// back. A version a later commit displaced from the same row is that
+    /// commit's, and stays
+    fn forget_displaced(&self, txn_id: i64, row_ids: &[i64]) {
+        let _versions = self.versions.write();
+        let mut displaced = self.displaced.lock();
+        for row_id in row_ids {
+            if displaced
+                .get(row_id)
+                .is_some_and(|(owner, _)| *owner == txn_id)
+            {
+                displaced.remove(row_id);
+            }
+        }
+    }
+
+    /// Rewrites every row `relayout` returns a new layout for: the heads
+    /// in the arena, the history behind them, and the versions in-flight
+    /// commits displaced, all under the one versions lock
+    fn relayout_rows(&self, relayout: Relayout<'_>) {
+        let mut versions = self.versions.write();
+        self.arena.relayout(relayout);
+        for (_, version) in self.displaced.lock().values_mut() {
+            if let Some(moved) = relayout(version.data.as_slice()) {
+                version.data = Row::from_arc(moved);
+            }
+        }
+        let row_ids: Vec<i64> = versions.keys().collect();
+        for row_id in row_ids {
+            let Some(entry) = versions.get_mut(row_id) else {
+                continue;
+            };
+            let head = entry
+                .arena_idx
+                .and_then(|idx| self.arena.get_arc(idx.get() as usize - 1))
+                .or_else(|| relayout(entry.version.data.as_slice()));
+            if let Some(head) = head {
+                entry.version.data = Row::from_arc(head);
+            }
+            if let Some(prev) = &entry.prev {
+                if let Some(moved) = relayout_history(prev, relayout) {
+                    entry.prev = Some(moved);
+                }
+            }
+        }
     }
 
     /// Returns the current auto-increment counter value
@@ -907,14 +1092,19 @@ impl VersionStore {
     #[inline]
     /// Applies committed versions at the heads of their rows' chains; the
     /// rows that did not exist before come back, for an undo to remove
-    pub fn add_versions_batch(&self, batch: Vec<(i64, RowVersion)>) -> Vec<Applied> {
+    pub fn add_versions_batch(
+        &self,
+        batch: Vec<(i64, RowVersion)>,
+        layout: Option<u64>,
+    ) -> Result<Vec<Applied>, Error> {
         let mut applied = Vec::with_capacity(batch.len());
         if self.closed.load(Ordering::Acquire) || batch.is_empty() {
-            return applied;
+            return Ok(applied);
         }
 
         // Use write lock for the entire batch operation (MVCC single-writer semantics)
         let mut versions = self.versions.write();
+        self.check_layout(layout)?;
 
         // Track row count delta: positive for inserts, negative for deletes
         let mut count_delta: isize = 0;
@@ -994,7 +1184,11 @@ impl VersionStore {
                     // Build version chain entry
                     // When limit exceeded: drop entire history (no prev_chain allocation)
                     // When under limit: create prev_chain with existing version
-                    let displaced = can_reuse_arena.then(|| existing.version.clone());
+                    if can_reuse_arena {
+                        self.displaced
+                            .lock()
+                            .insert(row_id, (new_version.txn_id, existing.version.clone()));
+                    }
                     let final_prev = if can_reuse_arena {
                         // Exceeded limit - drop all history, no allocation
                         None
@@ -1021,7 +1215,7 @@ impl VersionStore {
                     applied.push(Applied {
                         row_id,
                         created: false,
-                        displaced,
+                        displaced: can_reuse_arena,
                     });
                 }
                 crate::common::cow_btree::Entry::Vacant(vacant) => {
@@ -1056,7 +1250,7 @@ impl VersionStore {
                     applied.push(Applied {
                         row_id,
                         created: true,
-                        displaced: None,
+                        displaced: false,
                     });
                 }
             }
@@ -1070,7 +1264,21 @@ impl VersionStore {
             self.committed_row_count
                 .fetch_sub((-count_delta) as usize, Ordering::Relaxed);
         }
-        applied
+        Ok(applied)
+    }
+
+    /// Rows written under `layout` are published only while it is the
+    /// rows' layout still; a column change since would read them at the
+    /// wrong positions. Checked under the versions lock the change holds
+    /// while it moves the rows, so no change slips between the check and
+    /// the publication
+    fn check_layout(&self, layout: Option<u64>) -> Result<(), Error> {
+        if layout.is_some_and(|seen| seen != self.layout()) {
+            return Err(Error::SchemaChanged {
+                table: self.table_name.to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Add a single version to the store (optimized for auto-commit single-row inserts)
@@ -1079,19 +1287,25 @@ impl VersionStore {
     /// True when the row did not exist before, so an undo removes it rather
     /// than restoring the version before
     #[inline]
-    pub fn add_version_single(&self, row_id: i64, version: RowVersion) -> Applied {
+    pub fn add_version_single(
+        &self,
+        row_id: i64,
+        version: RowVersion,
+        layout: Option<u64>,
+    ) -> Result<Applied, Error> {
         if self.closed.load(Ordering::Acquire) {
-            return Applied {
+            return Ok(Applied {
                 row_id,
                 created: false,
-                displaced: None,
-            };
+                displaced: false,
+            });
         }
 
         let is_new_version_deleted = version.deleted_at_txn_id != 0;
         let mut versions = self.versions.write();
+        self.check_layout(layout)?;
 
-        match versions.entry(row_id) {
+        let applied = match versions.entry(row_id) {
             crate::common::cow_btree::Entry::Occupied(mut occupied) => {
                 // Extract existing data from the entry
                 let existing = occupied.get();
@@ -1163,7 +1377,11 @@ impl VersionStore {
                 // When under limit: create prev_chain with existing version
                 // The version the head displaces is kept for the undo when
                 // the chain will not keep it
-                let displaced = can_reuse_arena.then(|| existing.version.clone());
+                if can_reuse_arena {
+                    self.displaced
+                        .lock()
+                        .insert(row_id, (new_version.txn_id, existing.version.clone()));
+                }
                 let final_prev = if can_reuse_arena {
                     // Exceeded limit - drop all history, no allocation
                     None
@@ -1189,7 +1407,7 @@ impl VersionStore {
                 Applied {
                     row_id,
                     created: false,
-                    displaced,
+                    displaced: can_reuse_arena,
                 }
             }
             crate::common::cow_btree::Entry::Vacant(vacant) => {
@@ -1218,10 +1436,11 @@ impl VersionStore {
                 Applied {
                     row_id,
                     created: true,
-                    displaced: None,
+                    displaced: false,
                 }
             }
-        }
+        };
+        Ok(applied)
     }
 
     /// Takes back the version `txn_id` put at the head of `row_id`'s chain
@@ -1241,6 +1460,16 @@ impl VersionStore {
         } = applied;
         let (row_id, created) = (*row_id, *created);
         let mut versions = self.versions.write();
+        // The version the head displaced is this transaction's whatever
+        // became of the row since (a TRUNCATE, another head): taken now,
+        // so nothing of the undo stays behind
+        let displaced = displaced.then(|| {
+            let mut displaced = self.displaced.lock();
+            match displaced.get(&row_id) {
+                Some((owner, _)) if *owner == txn_id => displaced.remove(&row_id).map(|(_, v)| v),
+                _ => None,
+            }
+        });
         let Some(head) = versions.get(row_id) else {
             return;
         };
@@ -1261,10 +1490,13 @@ impl VersionStore {
         }
         // The version before: the chain's, or the one the head displaced
         // when the history was dropped with it
+        // The version before: the chain's, or the one the head displaced
+        // when the history was dropped with it, held by the store and moved
+        // with the rows since
         let (prev_version, prev_prev) = match (head.prev.clone(), displaced) {
             (Some(prev), _) => (prev.version.clone(), prev.prev.clone()),
-            (None, Some(displaced)) => (displaced.clone(), None),
-            (None, None) => return,
+            (None, Some(Some(displaced))) => (displaced, None),
+            (None, _) => return,
         };
         let prev_deleted = prev_version.deleted_at_txn_id != 0;
         if let Some(idx) = arena_idx {
@@ -5871,6 +6103,12 @@ pub struct TransactionVersionStore {
     /// What commit's application of each version left for its undo, until
     /// the commit is visible or undone
     applied: Mutex<SmallVec<[Applied; 2]>>,
+    /// The layouts the transaction's handles wrote rows under, each with
+    /// the time of its first row, so a rollback to a savepoint keeps the
+    /// layouts of the rows that survive it
+    bound: SmallVec<[(u64, i64); 2]>,
+    /// The layout of the handle about to write, for the row it writes
+    writing: Option<u64>,
 }
 
 impl TransactionVersionStore {
@@ -5888,12 +6126,29 @@ impl TransactionVersionStore {
             write_set: None,
             index_undo: Mutex::new(SmallVec::new()),
             applied: Mutex::new(SmallVec::new()),
+            bound: SmallVec::new(),
+            writing: None,
         }
     }
 
     /// Takes back everything this transaction's commit applied before its
     /// marker failed: the index updates in reverse, then the versions, so
     /// the store describes the rows that stayed visible
+    /// Lets go of what the commit kept for its undo, once it is visible:
+    /// the index undo, and the versions the store held for it
+    pub fn release_applied(&self) {
+        let applied: SmallVec<[Applied; 2]> = std::mem::take(&mut *self.applied.lock());
+        let displaced: SmallVec<[i64; 4]> = applied
+            .iter()
+            .filter(|entry| entry.displaced)
+            .map(|entry| entry.row_id)
+            .collect();
+        if !displaced.is_empty() {
+            self.parent_store.forget_displaced(self.txn_id, &displaced);
+        }
+        self.index_undo.lock().clear();
+    }
+
     pub fn undo_publication(&self) {
         self.undo_index_updates();
         let applied: SmallVec<[Applied; 2]> = std::mem::take(&mut *self.applied.lock());
@@ -5980,6 +6235,28 @@ impl TransactionVersionStore {
     }
 
     /// Put adds or updates a row in the transaction's local store
+    /// The layout of the handle about to write: the rows it writes derive
+    /// from what it read under that layout
+    pub fn writing_under(&mut self, layout: u64) {
+        self.writing = Some(layout);
+    }
+
+    /// A row written at `at`: the transaction is bound to the writing
+    /// handle's layout, and to the oldest of them when handles under two
+    /// layouts wrote, which the commit refuses if a change came between
+    fn note_layout(&mut self, at: i64) {
+        let seen = self.writing.unwrap_or_else(|| self.parent_store.layout());
+        match self.bound.iter_mut().find(|(layout, _)| *layout == seen) {
+            Some((_, first)) => *first = (*first).min(at),
+            None => self.bound.push((seen, at)),
+        }
+    }
+
+    /// The oldest layout the transaction's surviving rows were written under
+    fn layout_bound(&self) -> Option<u64> {
+        self.bound.iter().map(|(layout, _)| *layout).min()
+    }
+
     pub fn put(&mut self, row_id: i64, data: Row, is_delete: bool) -> Result<(), Error> {
         // Convert to Shared (Arc) storage immediately for efficient Arc sharing:
         // - get_arc() will return cheap Arc clones (no value cloning)
@@ -5988,6 +6265,7 @@ impl TransactionVersionStore {
 
         // Get timestamp once at the start (avoids calling SystemTime::now() inside RowVersion::new)
         let timestamp = get_fast_timestamp();
+        self.note_layout(timestamp);
 
         // Create the row version with pre-computed timestamp
         let mut rv = RowVersion::new_with_timestamp(self.txn_id, data, timestamp);
@@ -6092,6 +6370,7 @@ impl TransactionVersionStore {
 
         // Get timestamp once at the start (avoids calling SystemTime::now() inside RowVersion::new)
         let timestamp = get_fast_timestamp();
+        self.note_layout(timestamp);
 
         // Create the new row version with pre-computed timestamp
         let mut rv = RowVersion::new_with_timestamp(self.txn_id, data, timestamp);
@@ -6155,7 +6434,12 @@ impl TransactionVersionStore {
         &mut self,
         rows: Vec<(i64, Row, RowVersion)>,
     ) -> Result<(), Error> {
+        // A batch with no row binds nothing
+        if rows.is_empty() {
+            return Ok(());
+        }
         let now = get_fast_timestamp();
+        self.note_layout(now);
 
         for (row_id, data, original_version) in rows {
             // Convert to Shared (Arc) storage immediately for efficient Arc sharing
@@ -6215,8 +6499,12 @@ impl TransactionVersionStore {
     /// Parameters:
     /// - rows: RowVec of (row_id, row_data) to mark as deleted
     pub fn put_batch_deleted(&mut self, rows: RowVec) -> Result<(), Error> {
+        if rows.is_empty() {
+            return Ok(());
+        }
         // Get timestamp once for all rows in the batch
         let timestamp = get_fast_timestamp();
+        self.note_layout(timestamp);
 
         for (row_id, data) in rows {
             // Check if we already have a local version
@@ -6283,8 +6571,12 @@ impl TransactionVersionStore {
         &mut self,
         rows: Vec<(i64, Row, RowVersion)>,
     ) -> Result<(), Error> {
+        if rows.is_empty() {
+            return Ok(());
+        }
         // Get timestamp once for all rows in the batch
         let timestamp = get_fast_timestamp();
+        self.note_layout(timestamp);
 
         for (row_id, data, original_version) in rows {
             // Create deleted row version with pre-computed timestamp
@@ -6525,6 +6817,12 @@ impl TransactionVersionStore {
     /// RowVersion values, avoiding expensive clones. The transaction is
     /// consumed after commit anyway, so this is safe.
     pub fn commit(&mut self) -> Result<(), Error> {
+        // Rows written under a layout a column change has since replaced
+        // would be read at the wrong positions: refused here before the
+        // indexes take them, and again under the versions lock as they
+        // are published
+        let layout = self.layout_bound();
+        self.parent_store.check_layout(layout)?;
         // OCC validation: detect concurrent write conflicts.
         // Rows removed by seal (missing from hot B-tree) are not conflicts —
         // they were moved to cold segments, not modified by another transaction.
@@ -6539,10 +6837,20 @@ impl TransactionVersionStore {
         if let Some(local_versions) = self.local_versions.as_mut() {
             if local_versions.len() == 1 {
                 // Single-row fast path: avoid Vec allocation
-                if let Some((row_id, mut versions)) = local_versions.drain().next() {
-                    if let Some(version) = versions.pop() {
-                        let applied = self.parent_store.add_version_single(row_id, version);
-                        self.applied.lock().push(applied);
+                let single = local_versions
+                    .drain()
+                    .next()
+                    .and_then(|(row_id, mut versions)| versions.pop().map(|v| (row_id, v)));
+                if let Some((row_id, version)) = single {
+                    match self
+                        .parent_store
+                        .add_version_single(row_id, version, layout)
+                    {
+                        Ok(applied) => self.applied.lock().push(applied),
+                        Err(error) => {
+                            self.undo_index_updates();
+                            return Err(error);
+                        }
                     }
                 }
             } else {
@@ -6555,9 +6863,13 @@ impl TransactionVersionStore {
                 // Sort by row_id to ensure deterministic locking order
                 batch.sort_by_key(|(row_id, _)| *row_id);
 
-                self.applied
-                    .lock()
-                    .extend(self.parent_store.add_versions_batch(batch));
+                match self.parent_store.add_versions_batch(batch, layout) {
+                    Ok(applied) => self.applied.lock().extend(applied),
+                    Err(error) => {
+                        self.undo_index_updates();
+                        return Err(error);
+                    }
+                }
             }
         }
 
@@ -6653,13 +6965,8 @@ impl TransactionVersionStore {
                     continue;
                 }
                 // A volume's copy was never in a hot index: to those the row
-                // is new, its old keys are removed only where they are, and
-                // its deletion takes nothing out
-                let kept_sealed = index.index_type() == crate::core::IndexType::Hnsw;
-                if sealed && !kept_sealed && is_deleted {
-                    continue;
-                }
-                let old_row = if sealed && !kept_sealed {
+                // is new, and its old keys are removed only where they are
+                let old_row = if sealed && index.index_type() != crate::core::IndexType::Hnsw {
                     None
                 } else {
                     old_row
@@ -6940,13 +7247,8 @@ impl TransactionVersionStore {
                 continue;
             }
             // A volume's copy was never in a hot index: to those the row is
-            // new, its old keys are removed only where they are, and its
-            // deletion takes nothing out
-            let kept_sealed = index.index_type() == crate::core::IndexType::Hnsw;
-            if sealed && !kept_sealed && is_deleted {
-                continue;
-            }
-            let old_row = if sealed && !kept_sealed {
+            // new, and its old keys are removed only where they are
+            let old_row = if sealed && index.index_type() != crate::core::IndexType::Hnsw {
                 None
             } else {
                 old_row
@@ -7086,6 +7388,9 @@ impl TransactionVersionStore {
                 !versions.is_empty()
             });
         }
+        // A layout no surviving row was written under is not the
+        // transaction's any more
+        self.bound.retain(|(_, first)| *first <= timestamp);
         let Some(write_set) = self.write_set.as_mut() else {
             return;
         };
@@ -7145,6 +7450,9 @@ impl TransactionVersionStore {
 
 impl Drop for TransactionVersionStore {
     fn drop(&mut self) {
+        // A store dropped with its commit's records still held lets them
+        // go; a commit that became visible let them go already
+        self.release_applied();
         // Release any row claims still held by this transaction.
         // This is a safety net for cases where drop happens without explicit
         // commit/rollback (e.g., transaction panics, implicit drop on scope exit).
@@ -7736,7 +8044,7 @@ mod tests {
             })
             .collect();
 
-        store.add_versions_batch(batch);
+        store.add_versions_batch(batch, None).unwrap();
 
         // Verify chain is bounded (at most limit+1)
         // Chain can be as short as 1 right after pruning (when new_depth > limit)

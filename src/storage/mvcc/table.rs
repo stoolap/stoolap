@@ -42,6 +42,9 @@ pub struct MVCCTable {
     txn_versions: Arc<RwLock<TransactionVersionStore>>,
     /// Cached schema for returning references (Arc clone from version_store - O(1) instead of cloning)
     cached_schema: CompactArc<Schema>,
+    /// The rows' layout when the cached schema was taken: what the rows
+    /// this handle writes are laid out under
+    layout: u64,
     /// Scans that fell through to the full visible-row walk
     #[cfg(test)]
     full_scans: std::sync::atomic::AtomicU64,
@@ -104,7 +107,7 @@ impl MVCCTable {
         txn_versions: TransactionVersionStore,
     ) -> Self {
         // CompactArc clone - O(1) reference count increment, not full schema clone
-        let cached_schema = version_store.schema().clone();
+        let (cached_schema, layout) = version_store.schema_and_layout();
         Self {
             txn_id,
             version_store,
@@ -112,6 +115,7 @@ impl MVCCTable {
             #[cfg(test)]
             full_scans: std::sync::atomic::AtomicU64::new(0),
             cached_schema,
+            layout,
         }
     }
 
@@ -123,7 +127,7 @@ impl MVCCTable {
         txn_versions: Arc<RwLock<TransactionVersionStore>>,
     ) -> Self {
         // CompactArc clone - O(1) reference count increment, not full schema clone
-        let cached_schema = version_store.schema().clone();
+        let (cached_schema, layout) = version_store.schema_and_layout();
         Self {
             txn_id,
             version_store,
@@ -131,12 +135,27 @@ impl MVCCTable {
             #[cfg(test)]
             full_scans: std::sync::atomic::AtomicU64::new(0),
             cached_schema,
+            layout,
         }
     }
 
     /// Returns the transaction ID
     pub fn txn_id(&self) -> i64 {
         self.txn_id
+    }
+
+    /// The schema as the store holds it now, and the layout that goes with
+    /// it: what a handle takes after changing the columns itself
+    fn take_schema(&mut self) {
+        (self.cached_schema, self.layout) = self.version_store.schema_and_layout();
+    }
+
+    /// The transaction's local store for a write: the rows it writes now
+    /// are laid out as this handle's schema says
+    fn writes(&self) -> std::sync::RwLockWriteGuard<'_, TransactionVersionStore> {
+        let mut store = self.txn_versions.write().unwrap();
+        store.writing_under(self.layout);
+        store
     }
 
     /// Returns a reference to the version store
@@ -300,7 +319,7 @@ impl MVCCTable {
             (local_deletes.len() + rows_with_originals.len() + cold_only_ids.len()) as i32;
         if !local_deletes.is_empty() || !rows_with_originals.is_empty() || !cold_only_ids.is_empty()
         {
-            let mut txn_versions = self.txn_versions.write().unwrap();
+            let mut txn_versions = self.writes();
             for (row_id, row) in local_deletes {
                 txn_versions.put(row_id, row, true)?;
             }
@@ -1639,7 +1658,7 @@ impl MVCCTable {
         };
 
         // Commit versions to the version store (this also updates indexes)
-        self.txn_versions.write().unwrap().commit()?;
+        self.writes().commit()?;
 
         // Mark zone maps as stale if we had any data changes
         // This ensures the optimizer won't use outdated pruning info
@@ -1652,7 +1671,7 @@ impl MVCCTable {
 
     /// Rolls back the transaction's local changes
     pub fn rollback(&mut self) {
-        self.txn_versions.write().unwrap().rollback();
+        self.writes().rollback();
     }
 
     /// Returns the row count visible to this transaction
@@ -2175,8 +2194,7 @@ impl Table for MVCCTable {
     ) -> Result<()> {
         // The version store's schema is the truth: the new column's id
         // comes from it, and the cached copy follows it whole
-        let mut schema_guard = self.version_store.schema_mut();
-        let next_id = schema_guard.columns.len();
+        let next_id = self.version_store.schema().columns.len();
         let column = SchemaColumn::with_default_value(
             next_id,
             name,
@@ -2188,28 +2206,31 @@ impl Table for MVCCTable {
             default_value,
             None, // check_expr
         );
-        CompactArc::make_mut(&mut *schema_guard).add_column(column)?;
-        self.cached_schema = CompactArc::clone(&schema_guard);
+        // A handle's change is whole at once; the statement path records
+        // the change first and lays the rows out after
+        self.version_store.add_column(column)?;
+        self.version_store.lay_out_rows();
+        self.take_schema();
         Ok(())
     }
 
     fn drop_column(&mut self, name: &str) -> Result<()> {
-        let mut schema_guard = self.version_store.schema_mut();
-        CompactArc::make_mut(&mut *schema_guard).remove_column(name)?;
-        self.cached_schema = CompactArc::clone(&schema_guard);
+        self.version_store.remove_column(name)?;
+        self.version_store.lay_out_rows();
+        self.take_schema();
         Ok(())
     }
 
     fn insert(&mut self, mut row: Row) -> Result<Row> {
         let row_id = self.prepare_insert(&mut row)?;
         let inserted_row = row.clone();
-        self.txn_versions.write().unwrap().put(row_id, row, false)?;
+        self.writes().put(row_id, row, false)?;
         Ok(inserted_row)
     }
 
     fn insert_discard(&mut self, mut row: Row) -> Result<()> {
         let row_id = self.prepare_insert(&mut row)?;
-        self.txn_versions.write().unwrap().put(row_id, row, false)?;
+        self.writes().put(row_id, row, false)?;
         Ok(())
     }
 
@@ -2268,18 +2289,11 @@ impl Table for MVCCTable {
                     }
                     if let Some(orig) = original_version {
                         // Use optimized put that skips redundant get_visible_version
-                        self.txn_versions.write().unwrap().put_with_original(
-                            pk_id,
-                            updated_row,
-                            orig,
-                            false,
-                        )?;
+                        self.writes()
+                            .put_with_original(pk_id, updated_row, orig, false)?;
                     } else {
                         // Local version - use regular put
-                        self.txn_versions
-                            .write()
-                            .unwrap()
-                            .put(pk_id, updated_row, false)?;
+                        self.writes().put(pk_id, updated_row, false)?;
                     }
                     return Ok(1);
                 }
@@ -2330,7 +2344,7 @@ impl Table for MVCCTable {
 
                 let update_count = (local_rows.len() + rows_with_originals.len()) as i32;
                 if !local_rows.is_empty() || !rows_with_originals.is_empty() {
-                    let mut txn_versions = self.txn_versions.write().unwrap();
+                    let mut txn_versions = self.writes();
                     if !local_rows.is_empty() {
                         txn_versions.put_batch_for_update(local_rows)?;
                     }
@@ -2434,7 +2448,7 @@ impl Table for MVCCTable {
 
                 // Batch put - first the local rows (use regular put)
                 {
-                    let mut txn_versions = self.txn_versions.write().unwrap();
+                    let mut txn_versions = self.writes();
                     txn_versions.put_batch_for_update(local_rows_to_update)?;
                     // Then the rows with originals (use optimized put)
                     txn_versions.put_batch_with_originals(rows_with_originals)?;
@@ -2563,7 +2577,7 @@ impl Table for MVCCTable {
         // Batch update all rows at once
         let update_count = rows_with_originals.len() + local_updated.len();
         {
-            let mut txn_versions = self.txn_versions.write().unwrap();
+            let mut txn_versions = self.writes();
             // Use optimized put for rows from version store (avoids O(N) get_visible_version calls)
             txn_versions.put_batch_with_originals(rows_with_originals)?;
             // Use regular put for local rows (already tracked in local store)
@@ -2622,7 +2636,7 @@ impl Table for MVCCTable {
         // Step 3: Batch put all updates
         let update_count = (local_rows.len() + rows_with_originals.len()) as i32;
         if !local_rows.is_empty() || !rows_with_originals.is_empty() {
-            let mut txn_versions = self.txn_versions.write().unwrap();
+            let mut txn_versions = self.writes();
             if !local_rows.is_empty() {
                 txn_versions.put_batch_for_update(local_rows)?;
             }
@@ -2711,10 +2725,7 @@ impl Table for MVCCTable {
         // commit/rollback releases it. Without this, claims made directly
         // on VersionStore (for cold row UPDATE/DELETE) are never released
         // because TransactionVersionStore::commit() only drains write_set.
-        self.txn_versions
-            .write()
-            .unwrap()
-            .track_external_claim(row_id);
+        self.writes().track_external_claim(row_id);
         Ok(())
     }
 
@@ -2755,13 +2766,10 @@ impl Table for MVCCTable {
                 if let Some((row, original_version)) = row_with_original {
                     if let Some(orig) = original_version {
                         // Use optimized put that skips redundant get_visible_version
-                        self.txn_versions
-                            .write()
-                            .unwrap()
-                            .put_with_original(pk_id, row, orig, true)?;
+                        self.writes().put_with_original(pk_id, row, orig, true)?;
                     } else {
                         // Local version - use regular put
-                        self.txn_versions.write().unwrap().put(pk_id, row, true)?;
+                        self.writes().put(pk_id, row, true)?;
                     }
                     return Ok(1);
                 }
@@ -2805,7 +2813,7 @@ impl Table for MVCCTable {
 
                 let delete_count = (local_rows.len() + rows_with_originals.len()) as i32;
                 if !local_rows.is_empty() || !rows_with_originals.is_empty() {
-                    let mut txn_versions = self.txn_versions.write().unwrap();
+                    let mut txn_versions = self.writes();
                     if !local_rows.is_empty() {
                         txn_versions.put_batch_deleted(local_rows)?;
                     }
@@ -2860,10 +2868,7 @@ impl Table for MVCCTable {
                 // Single batch write for all deletes
                 let delete_count = rows_to_delete.len() as i32;
                 if !rows_to_delete.is_empty() {
-                    self.txn_versions
-                        .write()
-                        .unwrap()
-                        .put_batch_deleted(rows_to_delete)?;
+                    self.writes().put_batch_deleted(rows_to_delete)?;
                 }
                 return Ok(delete_count);
             }
@@ -2901,7 +2906,7 @@ impl Table for MVCCTable {
                     }
                 }
                 // Mark as deleted
-                self.txn_versions.write().unwrap().put(row_id, row, true)?;
+                self.writes().put(row_id, row, true)?;
                 delete_count += 1;
             } else if let Some(version) =
                 self.version_store.get_visible_version(row_id, self.txn_id)
@@ -2920,10 +2925,7 @@ impl Table for MVCCTable {
                 }
 
                 // Only clone AFTER filter passes
-                self.txn_versions
-                    .write()
-                    .unwrap()
-                    .put(row_id, version.data.clone(), true)?;
+                self.writes().put(row_id, version.data.clone(), true)?;
                 delete_count += 1;
             }
         }
@@ -2954,7 +2956,7 @@ impl Table for MVCCTable {
                 }
 
                 // Row is already owned from txn_versions.get(), no extra clone needed
-                self.txn_versions.write().unwrap().put(row_id, row, true)?;
+                self.writes().put(row_id, row, true)?;
                 delete_count += 1;
             }
         }
@@ -3173,7 +3175,7 @@ impl Table for MVCCTable {
 
     fn close(&mut self) -> Result<()> {
         // Rollback any uncommitted changes
-        self.txn_versions.write().unwrap().rollback();
+        self.writes().rollback();
         Ok(())
     }
 
@@ -3183,13 +3185,11 @@ impl Table for MVCCTable {
     }
 
     fn rollback(&mut self) {
-        self.txn_versions.write().unwrap().rollback();
+        self.writes().rollback();
     }
 
     fn rollback_to_timestamp_with_pending(&self, timestamp: i64, pending: &[i64]) {
-        self.txn_versions
-            .write()
-            .unwrap()
+        self.writes()
             .rollback_to_timestamp_with_pending(timestamp, pending);
     }
 
@@ -3673,10 +3673,7 @@ impl Table for MVCCTable {
     }
 
     fn mark_sealed_original(&mut self, row_id: i64, old_row: Row) -> Result<()> {
-        self.txn_versions
-            .write()
-            .unwrap()
-            .mark_sealed_original(row_id, old_row)
+        self.writes().mark_sealed_original(row_id, old_row)
     }
 
     fn get_index(&self, name: &str) -> Option<std::sync::Arc<dyn Index>> {
@@ -4298,20 +4295,24 @@ impl Table for MVCCTable {
     fn rename_column(&mut self, old_name: &str, new_name: &str) -> Result<()> {
         // The version store's schema is the truth; the cached copy follows
         // it whole, since another statement may have changed it meanwhile
-        let mut schema_guard = self.version_store.schema_mut();
-        CompactArc::make_mut(&mut *schema_guard).rename_column(old_name, new_name)?;
-        self.cached_schema = CompactArc::clone(&schema_guard);
+        {
+            let mut schema_guard = self.version_store.schema_mut();
+            CompactArc::make_mut(&mut *schema_guard).rename_column(old_name, new_name)?;
+        }
+        self.take_schema();
         Ok(())
     }
 
     fn modify_column(&mut self, name: &str, column_type: DataType, nullable: bool) -> Result<()> {
-        let mut schema_guard = self.version_store.schema_mut();
-        CompactArc::make_mut(&mut *schema_guard).modify_column(
-            name,
-            Some(column_type),
-            Some(nullable),
-        )?;
-        self.cached_schema = CompactArc::clone(&schema_guard);
+        {
+            let mut schema_guard = self.version_store.schema_mut();
+            CompactArc::make_mut(&mut *schema_guard).modify_column(
+                name,
+                Some(column_type),
+                Some(nullable),
+            )?;
+        }
+        self.take_schema();
         Ok(())
     }
 

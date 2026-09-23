@@ -18,7 +18,7 @@ ALTER TABLE users ADD COLUMN last_login TIMESTAMP;
 ALTER TABLE users ADD COLUMN score INTEGER;
 ```
 
-Existing rows receive NULL for the new column. Subsequent inserts can provide values for the new column:
+Existing rows receive the column's DEFAULT, or NULL without one, whether they are still in memory or already in a frozen volume. Subsequent inserts can provide values for the new column:
 
 ```sql
 INSERT INTO users (id, name, score) VALUES (1, 'Alice', 100);
@@ -32,7 +32,7 @@ Remove a column from a table:
 ALTER TABLE users DROP COLUMN last_login;
 ```
 
-The column data is physically removed. Queries referencing the dropped column will return an error.
+The column data is physically removed from the rows in memory at once; a frozen volume drops it at its next compaction. Queries referencing the dropped column will return an error.
 
 ## RENAME COLUMN
 
@@ -82,6 +82,8 @@ If recording an ADD, DROP, RENAME, or MODIFY COLUMN operation in the WAL fails, 
 ## Concurrent statements
 
 In a file database, a statement can return `SchemaChanged` if column DDL overlaps its capture of the schema and frozen-volume mappings. The engine rejects the mixed view instead of waiting for the ALTER to finish. A new statement can proceed after the ALTER completes.
+
+A transaction that wrote rows to a table before another connection added or dropped one of its columns cannot commit those rows: its COMMIT returns `SchemaChanged` and the transaction rolls back. The rows were written with the columns as they were, and the table now lays its rows out as the columns are.
 
 `SchemaChanged` is a public Rust error variant. The C API and drivers report it as a database error and do not automatically retry statements. Applications should coordinate column DDL with concurrent work and handle this error explicitly.
 

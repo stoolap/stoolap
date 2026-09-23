@@ -1580,3 +1580,80 @@ fn a_lookup_during_a_commit_s_publish_window_still_sees_the_old_key() {
     assert_eq!(ids(&db, 70), Vec::<i64>::new());
     assert_eq!(ids(&db, 555), vec![7]);
 }
+
+fn column_pairs(db: &Database, sql: &str) -> Vec<(i64, String)> {
+    db.query(sql, ())
+        .unwrap()
+        .map(|r| {
+            let r = r.unwrap();
+            (r.get(0).unwrap(), r.get::<String>(1).unwrap_or_default())
+        })
+        .collect()
+}
+
+fn column_ids(db: &Database, sql: &str) -> Vec<i64> {
+    db.query(sql, ())
+        .unwrap()
+        .map(|r| r.unwrap().get(0).unwrap())
+        .collect()
+}
+
+/// A column change whose log record fails leaves the rows as they
+/// were under the schema put back: the cells of a column not dropped
+/// stay, and a column not added leaves no cell to be read as the next
+/// column's value
+#[test]
+fn a_column_change_that_fails_to_record_leaves_the_rows_as_they_were() {
+    let _guard = failpoint_guard();
+    for ddl in [
+        "ALTER TABLE t DROP COLUMN a",
+        "ALTER TABLE t ADD COLUMN c TEXT DEFAULT 'stale'",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        // A synced log, so the failing write is the statement's own
+        let dsn = format!(
+            "file://{}?sync_mode=full&checkpoint_on_close=off&checkpoint_interval=0",
+            dir.path().display()
+        );
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT)",
+            (),
+        )
+        .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a1', 'b1')", ())
+            .unwrap();
+        test_failpoints::WAL_WRITE_FAIL.store(true, Ordering::Release);
+        let altered = db.execute(ddl, ());
+        test_failpoints::WAL_WRITE_FAIL.store(false, Ordering::Release);
+        assert!(altered.is_err(), "{ddl}");
+        assert_eq!(
+            column_pairs(&db, "SELECT id, a FROM t"),
+            vec![(1, "a1".to_string())],
+            "{ddl}: the row as it was"
+        );
+        assert_eq!(
+            column_pairs(&db, "SELECT id, b FROM t"),
+            vec![(1, "b1".to_string())]
+        );
+        // The failed write poisons the log until reopen
+        db.close().unwrap();
+        drop(db);
+        let db = Database::open(&dsn).unwrap();
+        assert_eq!(
+            column_pairs(&db, "SELECT id, a FROM t"),
+            vec![(1, "a1".to_string())]
+        );
+        db.execute("ALTER TABLE t ADD COLUMN c TEXT DEFAULT 'fresh'", ())
+            .unwrap();
+        assert_eq!(
+            column_pairs(&db, "SELECT id, c FROM t"),
+            vec![(1, "fresh".to_string())],
+            "{ddl}: the column added reads its default"
+        );
+        assert_eq!(
+            column_ids(&db, "SELECT id FROM t WHERE c = 'fresh'"),
+            vec![1]
+        );
+    }
+}
