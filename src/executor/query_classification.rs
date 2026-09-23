@@ -1533,7 +1533,15 @@ pub fn get_classification(stmt: &SelectStatement) -> Arc<QueryClassification> {
     let cache = guard.get_or_insert_with(|| {
         LruCache::new(NonZeroUsize::new(CLASSIFICATION_CACHE_SIZE).unwrap())
     });
+    classification_in(cache, cache_key, stmt)
+}
 
+/// Return the cached classification under `cache_key`, or compute and cache it
+fn classification_in(
+    cache: &mut LruCache<ClassificationKey, Arc<QueryClassification>>,
+    cache_key: ClassificationKey,
+    stmt: &SelectStatement,
+) -> Arc<QueryClassification> {
     // Return cached if available, otherwise compute and cache
     if let Some(classification) = cache.get(&cache_key) {
         return classification.clone();
@@ -1612,16 +1620,16 @@ mod tests {
 
     #[test]
     fn test_classification_caching() {
-        clear_cache();
-
+        let mut cache = LruCache::new(NonZeroUsize::new(CLASSIFICATION_CACHE_SIZE).unwrap());
         let stmt = create_select_star();
+        let key = compute_classification_key(&stmt);
 
         // First call - should compute
-        let class1 = get_classification(&stmt);
+        let class1 = classification_in(&mut cache, key, &stmt);
         assert!(class1.is_select_star);
 
         // Second call - should hit cache (same Arc)
-        let class2 = get_classification(&stmt);
+        let class2 = classification_in(&mut cache, key, &stmt);
         assert!(Arc::ptr_eq(&class1, &class2));
     }
 
