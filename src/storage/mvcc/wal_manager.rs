@@ -609,6 +609,8 @@ pub struct TwoPhaseRecoveryInfo {
     pub applied_entries: u64,
     /// Number of WAL entries skipped (from aborted/in-doubt transactions)
     pub skipped_entries: u64,
+    /// The highest transaction id of any whole record replayed or not
+    pub max_txn_id: i64,
 }
 
 impl CheckpointMetadata {
@@ -1167,9 +1169,10 @@ impl WALManager {
                     }
                 }
 
-                if let Ok(file) = OpenOptions::new().read(true).append(true).open(&wal_path) {
-                    // Find last LSN in file
-                    if let Ok(last_lsn) = find_last_lsn(&path.join(newest)) {
+                if let Ok(mut file) = OpenOptions::new().read(true).append(true).open(&wal_path) {
+                    // Read only: another process may own the file until the
+                    // engine's lock is taken, and `cut_torn_tail` runs then
+                    if let Ok((last_lsn, _)) = find_valid_end(&mut file) {
                         if last_lsn > initial_lsn {
                             initial_lsn = last_lsn;
                         }
@@ -1665,78 +1668,28 @@ impl WALManager {
         // =====================================================
         let mut applied_count = 0u64;
         let mut skipped_count = 0u64;
+        // Every transaction id a whole record carries, committed or not: a
+        // new transaction taking one would commit the old one's records too
+        let mut max_txn_id = 0i64;
 
         for wal_path in &wal_files {
             let mut file = match File::open(wal_path) {
                 Ok(f) => f,
                 Err(_) => continue,
             };
-
-            loop {
-                // Read 32-byte header
-                let mut header_buf = [0u8; 32];
-                match file.read_exact(&mut header_buf) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                    Err(_) => break,
-                }
-
-                // Check magic marker
-                let magic = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
-                if magic != WAL_ENTRY_MAGIC {
-                    let _ = file.seek(SeekFrom::Current(-32));
-                    if !Self::scan_for_magic(&mut file) {
-                        break;
-                    }
-                    continue;
-                }
-
-                // Parse header
-                let flags = WalFlags::from_byte(header_buf[5]);
-                let header_size = u16::from_le_bytes(header_buf[6..8].try_into().unwrap()) as usize;
-                let lsn = u64::from_le_bytes(header_buf[8..16].try_into().unwrap());
-                let previous_lsn = u64::from_le_bytes(header_buf[16..24].try_into().unwrap());
-                let entry_size =
-                    u32::from_le_bytes(header_buf[24..28].try_into().unwrap()) as usize;
-
-                // Skip any additional header bytes
-                if header_size > 32 {
-                    let extra = header_size - 32;
-                    if file.seek(SeekFrom::Current(extra as i64)).is_err() {
-                        break;
-                    }
-                }
-
-                // Sanity check on size
-                let total_data_size = entry_size + 4;
-                if entry_size > 64 * 1024 * 1024 {
-                    if !Self::scan_for_magic(&mut file) {
-                        break;
-                    }
-                    continue;
-                }
-
+            let read_error = |e: io::Error| {
+                Error::internal(format!("failed to read WAL file {:?}: {}", wal_path, e))
+            };
+            let mut records = WalRecords::new(&mut file).map_err(read_error)?;
+            while let Some(record) = records.next().map_err(read_error)? {
                 // Skip entries at or before from_lsn
-                if lsn <= from_lsn {
-                    if file
-                        .seek(SeekFrom::Current(total_data_size as i64))
-                        .is_err()
-                    {
-                        break;
-                    }
+                if record.lsn <= from_lsn {
                     continue;
                 }
-
-                // Read entry data + CRC
-                let mut data = vec![0u8; total_data_size];
-                match file.read_exact(&mut data) {
-                    Ok(()) => {}
-                    Err(_) => break,
-                }
-
-                // Decode entry
-                match WALEntry::decode(lsn, previous_lsn, flags, &data) {
+                match WALEntry::decode(record.lsn, record.previous_lsn, record.flags, &records.body)
+                {
                     Ok(entry) => {
+                        max_txn_id = max_txn_id.max(entry.txn_id);
                         // Skip rotation/snapshot markers (internal WAL management)
                         if entry.is_marker_entry() {
                             continue;
@@ -1767,16 +1720,19 @@ impl WALManager {
                         }
                     }
                     Err(e) => {
-                        // Log decode errors (including CRC failures) during recovery
-                        // These could indicate WAL corruption or incomplete writes
                         eprintln!(
                             "Warning: WAL entry decode failed at LSN {}: {} (entry skipped)",
-                            lsn, e
+                            record.lsn, e
                         );
                         skipped_count += 1;
-                        continue;
                     }
                 }
+            }
+            if records.damaged > 0 {
+                eprintln!(
+                    "Warning: WAL file {:?} held {} damaged records; recovery read on past them",
+                    wal_path, records.damaged
+                );
             }
         }
 
@@ -1791,6 +1747,7 @@ impl WALManager {
             aborted_transactions: aborted_txns.len(),
             applied_entries: applied_count,
             skipped_entries: skipped_count,
+            max_txn_id,
         })
     }
 
@@ -1810,148 +1767,87 @@ impl WALManager {
             Ok(f) => f,
             Err(_) => return Ok(()), // Skip files we can't open
         };
-
-        loop {
-            // Read 32-byte header
-            let mut header_buf = [0u8; 32];
-            match file.read_exact(&mut header_buf) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(_) => break,
-            }
-
-            // Check magic marker
-            let magic = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
-            if magic != WAL_ENTRY_MAGIC {
-                let _ = file.seek(SeekFrom::Current(-32));
-                if !Self::scan_for_magic(&mut file) {
-                    break;
-                }
+        let read_error = |e: io::Error| {
+            Error::internal(format!("failed to read WAL file {:?}: {}", wal_path, e))
+        };
+        let mut records = WalRecords::new(&mut file).map_err(read_error)?;
+        while let Some(record) = records.next().map_err(read_error)? {
+            if record.lsn <= from_lsn {
                 continue;
             }
-
-            // Parse header - only need flags, header_size, lsn, entry_size
-            let flags = WalFlags::from_byte(header_buf[5]);
-            let header_size = u16::from_le_bytes(header_buf[6..8].try_into().unwrap()) as usize;
-            let lsn = u64::from_le_bytes(header_buf[8..16].try_into().unwrap());
-            let entry_size = u32::from_le_bytes(header_buf[24..28].try_into().unwrap()) as usize;
-
-            // Skip any additional header bytes
-            if header_size > 32 {
-                let extra = header_size - 32;
-                if file.seek(SeekFrom::Current(extra as i64)).is_err() {
-                    break;
+            let is_commit = record.flags.contains(WalFlags::COMMIT_MARKER);
+            if (is_commit || record.flags.contains(WalFlags::ABORT_MARKER))
+                && records.body.len() >= 12
+            {
+                let mut txn_id = [0u8; 8];
+                txn_id.copy_from_slice(&records.body[..8]);
+                let txn_id = i64::from_le_bytes(txn_id);
+                if is_commit {
+                    committed_txns.insert(txn_id);
+                } else {
+                    aborted_txns.insert(txn_id);
                 }
             }
-
-            // Sanity check on size
-            let total_data_size = entry_size + 4;
-            if entry_size > 64 * 1024 * 1024 {
-                if !Self::scan_for_magic(&mut file) {
-                    break;
-                }
-                continue;
-            }
-
-            // Skip entries at or before from_lsn
-            if lsn <= from_lsn {
-                if file
-                    .seek(SeekFrom::Current(total_data_size as i64))
-                    .is_err()
-                {
-                    break;
-                }
-                continue;
-            }
-
-            // For commit/abort markers, we can identify them from flags without full decode
-            // This is the fast path - only read txn_id (first 8 bytes of data)
-            if flags.contains(WalFlags::COMMIT_MARKER) || flags.contains(WalFlags::ABORT_MARKER) {
-                // Read just the txn_id (first 8 bytes of data portion)
-                let mut txn_id_buf = [0u8; 8];
-                match file.read_exact(&mut txn_id_buf) {
-                    Ok(()) => {
-                        let txn_id = i64::from_le_bytes(txn_id_buf);
-                        if flags.contains(WalFlags::COMMIT_MARKER) {
-                            committed_txns.insert(txn_id);
-                        } else {
-                            aborted_txns.insert(txn_id);
-                        }
-                        // Skip rest of entry (entry_size - 8 + CRC 4)
-                        let remaining = total_data_size.saturating_sub(8);
-                        if file.seek(SeekFrom::Current(remaining as i64)).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            } else {
-                // Not a commit/abort marker, skip the entire entry
-                if file
-                    .seek(SeekFrom::Current(total_data_size as i64))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-
-            // Track last LSN
-            if lsn > *last_lsn {
-                *last_lsn = lsn;
+            if record.lsn > *last_lsn {
+                *last_lsn = record.lsn;
             }
         }
 
         Ok(())
     }
 
-    /// Scan forward in the file looking for the next valid magic marker
-    ///
-    /// The magic marker is stored in little-endian format on disk, so we build
-    /// the window by shifting right and inserting new bytes at the high position.
-    ///
-    /// Uses buffered reads (8KB chunks) for efficiency instead of byte-by-byte syscalls.
-    fn scan_for_magic(file: &mut File) -> bool {
-        const BUFFER_SIZE: usize = 8192; // 8KB buffer for efficient I/O
-        let mut buffer = [0u8; BUFFER_SIZE];
-        let mut window: u32 = 0;
-        let mut total_scanned: usize = 0;
-        const MAX_SCAN: usize = 1024 * 1024; // 1MB limit
-
-        loop {
-            // Read a chunk into buffer
-            let bytes_read = match file.read(&mut buffer) {
-                Ok(0) => return false, // EOF
-                Ok(n) => n,
-                Err(_) => return false,
-            };
-
-            // Scan through the buffer
-            for (i, &byte) in buffer[..bytes_read].iter().enumerate() {
-                // Build little-endian u32: new byte goes to high position,
-                // existing bytes shift down. After reading 4 bytes [b0,b1,b2,b3],
-                // window = (b3 << 24) | (b2 << 16) | (b1 << 8) | b0
-                // which matches how u32::from_le_bytes works.
-                window = (window >> 8) | ((byte as u32) << 24);
-
-                total_scanned += 1;
-                if total_scanned > MAX_SCAN {
-                    return false;
-                }
-
-                if window == WAL_ENTRY_MAGIC {
-                    // Found magic. Calculate how far back to seek:
-                    // We're at position i+1 in the current buffer read
-                    // The magic marker started 4 bytes ago
-                    // We need to seek back (bytes_read - i - 1) to end of buffer,
-                    // plus 4 for the magic marker itself, minus 1 because i is 0-indexed
-                    let seek_back = (bytes_read - i - 1 + 4) as i64;
-                    if file.seek(SeekFrom::Current(-seek_back)).is_ok() {
-                        return true;
-                    }
-                    return false;
-                }
-            }
+    /// Drops the bytes after the last record of the current file that reads
+    /// whole: a write a crash cut, which records appended after it would be
+    /// read from inside. Run once the engine holds the database lock, before
+    /// the WAL is replayed or written. A file that cannot be read through
+    /// is an error, and nothing is cut then
+    pub fn cut_torn_tail(&self) -> Result<()> {
+        let name = self
+            .current_wal_file
+            .lock()
+            .map_err(|_| Error::internal("WAL file name lock poisoned"))?
+            .clone();
+        let mut guard = self
+            .wal_file
+            .lock()
+            .map_err(|_| Error::internal("WAL file lock poisoned"))?;
+        let Some(file) = guard.as_mut() else {
+            return Ok(());
+        };
+        let check_error =
+            |e: io::Error| Error::internal(format!("failed to check WAL file {}: {}", name, e));
+        let (last_lsn, valid_end) = find_valid_end(file).map_err(check_error)?;
+        let len = file.metadata().map_err(check_error)?.len();
+        if len > valid_end {
+            // A handle opened to append may not shorten the file (Windows),
+            // so the cut goes through one opened to write; the append handle
+            // goes on at the new end
+            OpenOptions::new()
+                .write(true)
+                .open(self.path.join(&name))
+                .and_then(|cutter| {
+                    cutter.set_len(valid_end)?;
+                    cutter.sync_all()
+                })
+                .map_err(|e| {
+                    Error::internal(format!(
+                        "failed to cut the torn tail of WAL file {}: {}",
+                        name, e
+                    ))
+                })?;
+            eprintln!(
+                "Warning: WAL file {} ended in {} bytes no whole record holds; they were cut",
+                name,
+                len - valid_end
+            );
+            // The file ends there now: a failed write goes back to it, not
+            // to the length the cut bytes gave the file
+            self.current_file_position
+                .store(valid_end, Ordering::Release);
+            self.synced_position.store(valid_end, Ordering::Release);
         }
+        self.current_lsn.fetch_max(last_lsn, Ordering::AcqRel);
+        Ok(())
     }
 
     /// Create a checkpoint and return the LSN at the checkpoint point
@@ -2380,55 +2276,131 @@ impl Drop for WALManager {
 }
 
 /// Find the last LSN in a WAL file (32-byte header format)
-fn find_last_lsn(path: &Path) -> Result<u64> {
-    let mut file =
-        File::open(path).map_err(|e| Error::internal(format!("failed to open WAL file: {}", e)))?;
+/// Whether a record's data portion, read with its trailing CRC, matches it
+fn record_checksum_holds(data: &[u8]) -> bool {
+    let Some(crc_offset) = data.len().checked_sub(4) else {
+        return false;
+    };
+    let mut stored = [0u8; 4];
+    stored.copy_from_slice(&data[crc_offset..]);
+    u32::from_le_bytes(stored) == crc32fast::hash(&data[..crc_offset])
+}
 
-    let mut last_lsn: u64 = 0;
-    // 32-byte header: magic(4) + version(1) + flags(1) + header_size(2) + LSN(8) + prev_lsn(8) + entry_size(4) + reserved(4)
-    let mut header_buf = [0u8; 32];
+/// Fills `buf` from the file; false when the file ends first
+fn read_whole(file: &mut File, buf: &mut [u8]) -> io::Result<bool> {
+    match file.read_exact(buf) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e),
+    }
+}
 
+/// Moves to the next record magic, however far on; false at the end of the
+/// file. The window is built little-endian, as the magic is stored
+fn scan_to_magic(file: &mut File) -> io::Result<bool> {
+    let mut buffer = [0u8; 8192];
+    let mut window: u32 = 0;
     loop {
-        match file.read_exact(&mut header_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(_) => break,
+        #[cfg(any(test, feature = "test-failpoints"))]
+        if crate::test_failpoints::WAL_SCAN_READ_FAIL.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(io::Error::other("failpoint: WAL scan read"));
         }
-
-        // Verify magic marker
-        let magic = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
-        if magic != WAL_ENTRY_MAGIC {
-            break; // Corrupted or end of valid data
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(false);
         }
-
-        // Parse header fields
-        let header_size = u16::from_le_bytes(header_buf[6..8].try_into().unwrap()) as usize;
-        let lsn = u64::from_le_bytes(header_buf[8..16].try_into().unwrap());
-        let entry_size = u32::from_le_bytes(header_buf[24..28].try_into().unwrap()) as usize;
-
-        if lsn > last_lsn {
-            last_lsn = lsn;
-        }
-
-        // Skip any additional header bytes (for future extensibility)
-        if header_size > 32 {
-            let extra = header_size - 32;
-            if file.seek(SeekFrom::Current(extra as i64)).is_err() {
-                break;
+        for (i, &byte) in buffer[..read].iter().enumerate() {
+            window = (window >> 8) | ((byte as u32) << 24);
+            if window == WAL_ENTRY_MAGIC {
+                file.seek(SeekFrom::Current(-((read - i - 1 + 4) as i64)))?;
+                return Ok(true);
             }
         }
+    }
+}
 
-        // Skip to next entry (data + CRC)
-        let total_entry_size = entry_size + 4;
-        if file
-            .seek(SeekFrom::Current(total_entry_size as i64))
-            .is_err()
-        {
-            break;
-        }
+/// Where a WAL record read whole lies and what its header says; its body
+/// is the reader's
+struct WalRecordHead {
+    flags: WalFlags,
+    lsn: u64,
+    previous_lsn: u64,
+    end: u64,
+}
+
+/// Reads a WAL file's records in order, each whole with its checksum. A
+/// record that does not read whole (a bad magic or size, cut short, a
+/// checksum that fails) is passed over by resuming at the next magic after
+/// its start, however far on, since its claimed size may reach into the
+/// records after it. An I/O error other than the end of the file is an error
+struct WalRecords<'a> {
+    file: &'a mut File,
+    /// The data portion and CRC of the record last read
+    body: Vec<u8>,
+    /// Records passed over
+    damaged: u64,
+}
+
+impl<'a> WalRecords<'a> {
+    fn new(file: &'a mut File) -> io::Result<Self> {
+        file.seek(SeekFrom::Start(0))?;
+        Ok(Self {
+            file,
+            body: Vec::new(),
+            damaged: 0,
+        })
     }
 
-    Ok(last_lsn)
+    fn next(&mut self) -> io::Result<Option<WalRecordHead>> {
+        loop {
+            let start = self.file.stream_position()?;
+            let mut header = [0u8; 32];
+            if !read_whole(self.file, &mut header)? {
+                return Ok(None);
+            }
+            let magic = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+            let header_size = u16::from_le_bytes([header[6], header[7]]) as usize;
+            let entry_size =
+                u32::from_le_bytes([header[24], header[25], header[26], header[27]]) as usize;
+            if magic == WAL_ENTRY_MAGIC && header_size >= 32 && entry_size <= 64 * 1024 * 1024 {
+                self.file
+                    .seek(SeekFrom::Current((header_size - 32) as i64))?;
+                self.body.resize(entry_size + 4, 0);
+                if read_whole(self.file, &mut self.body)? && record_checksum_holds(&self.body) {
+                    let mut word = [0u8; 8];
+                    word.copy_from_slice(&header[8..16]);
+                    let lsn = u64::from_le_bytes(word);
+                    word.copy_from_slice(&header[16..24]);
+                    let previous_lsn = u64::from_le_bytes(word);
+                    return Ok(Some(WalRecordHead {
+                        flags: WalFlags::from_byte(header[5]),
+                        lsn,
+                        previous_lsn,
+                        end: self.file.stream_position()?,
+                    }));
+                }
+            }
+            self.damaged += 1;
+            self.file.seek(SeekFrom::Start(start + 1))?;
+            if !scan_to_magic(self.file)? {
+                return Ok(None);
+            }
+        }
+    }
+}
+
+/// The last LSN of the records that read whole, and the offset just past
+/// the last of them: bytes after it are a write a crash cut, and a reopen
+/// appends at that offset rather than after them
+fn find_valid_end(file: &mut File) -> io::Result<(u64, u64)> {
+    let mut records = WalRecords::new(file)?;
+    let mut last_lsn = 0u64;
+    let mut valid_end = 0u64;
+    while let Some(record) = records.next()? {
+        last_lsn = last_lsn.max(record.lsn);
+        valid_end = record.end;
+    }
+    Ok((last_lsn, valid_end))
 }
 
 #[cfg(test)]
@@ -3072,7 +3044,7 @@ mod tests {
     }
 
     #[test]
-    fn test_find_last_lsn() {
+    fn test_find_valid_end() {
         let dir = tempdir().unwrap();
         let wal_path = dir.path().join("wal");
 
@@ -3107,8 +3079,10 @@ mod tests {
         assert!(!wal_files.is_empty());
         wal_files.sort_by_key(|e| e.file_name());
 
-        let last_lsn = find_last_lsn(&wal_files.last().unwrap().path()).unwrap();
+        let path = wal_files.last().unwrap().path();
+        let (last_lsn, valid_end) = find_valid_end(&mut File::open(&path).unwrap()).unwrap();
         assert_eq!(last_lsn, 10);
+        assert_eq!(valid_end, fs::metadata(&path).unwrap().len());
     }
 
     fn wal_file_names(wal_path: &Path) -> Vec<String> {
