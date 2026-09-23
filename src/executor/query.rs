@@ -7121,10 +7121,7 @@ impl Executor {
         &self,
         isolation: crate::core::IsolationLevel,
     ) -> Result<StatementSnapshot> {
-        let mut transaction = self.engine.begin_transaction()?;
-        if isolation != crate::core::IsolationLevel::ReadCommitted {
-            transaction.set_isolation_level(isolation)?;
-        }
+        let transaction = self.engine.begin_transaction_with_level(isolation)?;
         Ok(StatementSnapshot::new(transaction))
     }
 

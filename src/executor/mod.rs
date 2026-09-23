@@ -715,9 +715,7 @@ impl Executor {
         &self,
         isolation: crate::core::IsolationLevel,
     ) -> Result<Box<dyn Transaction>> {
-        let mut tx = self.engine.begin_transaction()?;
-        let _ = tx.set_isolation_level(isolation);
-        Ok(tx)
+        self.engine.begin_transaction_with_level(isolation)
     }
 
     /// Get or create a cached plan for a SQL statement.

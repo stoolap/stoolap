@@ -242,6 +242,11 @@ impl MvccTransaction {
         }
     }
 
+    /// Records the level the registry took for this transaction at its begin
+    pub(crate) fn begun_at(&mut self, level: IsolationLevel) {
+        self.isolation_level = Some(level);
+    }
+
     /// Sets the engine operations callback
     pub fn set_engine_operations(&mut self, ops: Arc<dyn TransactionEngineOperations>) {
         self.engine_operations = Some(ops);
