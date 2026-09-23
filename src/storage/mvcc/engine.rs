@@ -754,6 +754,10 @@ impl MVCCEngine {
                 // before the checkpoint resolves to its volume column
                 self.populate_hnsw_from_segments()?;
 
+                // Whether a side file still stands for an index is decided
+                // through the same mappings, once the catalog is final
+                self.discard_uncovered_side_files_everywhere();
+
                 // Sync auto-increment counters from segment data so the next
                 // generated row_id doesn't collide with cold rows.
                 self.sync_auto_increment_from_segments()?;
@@ -3793,6 +3797,51 @@ impl MVCCEngine {
     /// catalog, so replay applies the changes in the order they were made
     pub fn ddl_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
         self.ddl_serial.lock()
+    }
+
+    /// After an index of `table_name` is dropped: the side file of every
+    /// volume none of whose columns still stands for a current index is
+    /// taken out of its segment and discarded, its disk space with it. A
+    /// file that still serves another index stays whole until the
+    /// volume's next compaction builds it anew
+    pub(crate) fn discard_uncovered_side_files(&self, table_name: &str) {
+        let name = to_lowercase_cow(table_name);
+        let mgr = self
+            .segment_managers
+            .read()
+            .ok()
+            .and_then(|mgrs| mgrs.get(name.as_ref()).cloned());
+        let Some(mgr) = mgr else {
+            return;
+        };
+        let Ok(store) = self.get_version_store(name.as_ref()) else {
+            return;
+        };
+        let current = store.secondary_index_identities();
+        // A segment's file covers a column at the position the volume
+        // holds it, through the segment's mapping, not the schema's
+        for side in mgr.uncover_where(|segment| {
+            !current
+                .iter()
+                .any(|&(column, identity)| segment.side_for(column, identity).is_some())
+        }) {
+            crate::storage::volume::secondary::discard_side(side);
+        }
+    }
+
+    /// The side files no current index stands for, in every table: what
+    /// a reopen removes once the log is replayed, the catalog is final and
+    /// the volumes' column mappings follow it, since a file a replayed
+    /// DROP leaves may be a later CREATE's, and a column dropped before
+    /// the checkpoint moves the indexed column's schema position
+    fn discard_uncovered_side_files_everywhere(&self) {
+        let tables: Vec<String> = match self.segment_managers.read() {
+            Ok(mgrs) => mgrs.keys().cloned().collect(),
+            Err(_) => return,
+        };
+        for table in tables {
+            self.discard_uncovered_side_files(&table);
+        }
     }
 
     pub(crate) fn begin_column_change(

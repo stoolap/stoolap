@@ -945,6 +945,7 @@ impl Executor {
         let tx = self.engine.begin_transaction()?;
         let table = tx.get_table(&table_name)?;
         table.drop_index(index_name)?;
+        self.engine.discard_uncovered_side_files(&table_name);
 
         Ok(Box::new(ExecResult::empty()))
     }
