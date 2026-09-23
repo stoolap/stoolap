@@ -32,7 +32,10 @@
 //! tx.commit()?;
 //! ```
 
+use std::hash::Hasher;
 use std::sync::Arc;
+
+use rustc_hash::{FxHashMap, FxHasher};
 
 use crate::api::params::{NamedParams, ParamVec};
 use crate::core::{Error, Result, Row, Schema, Value};
@@ -58,7 +61,20 @@ pub struct Transaction {
     engine: Arc<MVCCEngine>,
     committed: bool,
     rolled_back: bool,
+    /// Statements parsed from single-statement SQL, keyed by the SQL without
+    /// surrounding whitespace; dropped when the transaction ends
+    plans: Option<FxHashMap<Box<str>, Arc<Statement>>>,
+    /// Hashes of the latest SQL parsed once; SQL is kept parsed on its
+    /// second run, and the hash only admits it, never selects a statement
+    seen: [u64; SEEN_RING],
+    seen_next: usize,
 }
+
+/// Distinct SQL texts a transaction keeps parsed; SQL past them is parsed each time
+const TX_PLAN_CACHE_SIZE: usize = 64;
+
+/// SQL runs a transaction remembers when deciding what to keep parsed
+const SEEN_RING: usize = 16;
 
 impl Transaction {
     /// Create a new transaction wrapper
@@ -68,7 +84,23 @@ impl Transaction {
             engine,
             committed: false,
             rolled_back: false,
+            plans: None,
+            seen: [0; SEEN_RING],
+            seen_next: 0,
         }
+    }
+
+    /// Whether SQL with this key ran before in the transaction; records it when not
+    fn seen_before(&mut self, key: &str) -> bool {
+        let mut hasher = FxHasher::default();
+        hasher.write(key.as_bytes());
+        let hash = hasher.finish();
+        if self.seen.contains(&hash) {
+            return true;
+        }
+        self.seen[self.seen_next] = hash;
+        self.seen_next = (self.seen_next + 1) % SEEN_RING;
+        false
     }
 
     /// Check if the transaction is still active
@@ -281,10 +313,29 @@ impl Transaction {
         sql: &str,
         ctx: ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        let key = sql.trim_matches(|c: char| c.is_ascii_whitespace());
+        if let Some(statement) = self.plans.as_ref().and_then(|plans| plans.get(key)) {
+            let statement = Arc::clone(statement);
+            return self.execute_statement(&statement, &ctx);
+        }
         let mut parser = Parser::new(sql);
-        let program = parser
+        let mut program = parser
             .parse_program()
             .map_err(|e| Error::parse(e.to_string()))?;
+
+        if program.statements.len() == 1
+            && self
+                .plans
+                .as_ref()
+                .is_none_or(|plans| plans.len() < TX_PLAN_CACHE_SIZE)
+            && self.seen_before(key)
+        {
+            let statement = Arc::new(program.statements.remove(0));
+            self.plans
+                .get_or_insert_with(FxHashMap::default)
+                .insert(Box::from(key), Arc::clone(&statement));
+            return self.execute_statement(&statement, &ctx);
+        }
 
         let mut last_result: Option<Box<dyn QueryResult>> = None;
         for statement in &program.statements {
@@ -540,6 +591,7 @@ impl Transaction {
             match tx.commit() {
                 Ok(()) => {
                     self.committed = true;
+                    self.plans = None;
                 }
                 Err(e) => {
                     // Restore the transaction so rollback is still possible
@@ -567,6 +619,7 @@ impl Transaction {
         if let Some(mut tx) = self.tx.take() {
             tx.rollback()?;
             self.rolled_back = true;
+            self.plans = None;
         }
 
         Ok(())
@@ -890,5 +943,87 @@ mod tests {
         // Verify committed data
         let final_count: i64 = db.query_one("SELECT COUNT(*) FROM test", ()).unwrap();
         assert_eq!(final_count, 3);
+    }
+
+    fn cached(tx: &super::Transaction, sql: &str) -> std::sync::Arc<super::Statement> {
+        tx.plans
+            .as_ref()
+            .and_then(|plans| plans.get(sql))
+            .cloned()
+            .expect("statement cached")
+    }
+
+    #[test]
+    fn repeated_sql_reuses_the_statement_parsed_on_its_second_run() {
+        let db = Database::open_in_memory().unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+            .unwrap();
+        let mut tx = db.begin().unwrap();
+        let sql = "SELECT COUNT(*) FROM t WHERE id > $1";
+        let _: i64 = tx.query_one(sql, (0,)).unwrap();
+        assert!(tx.plans.is_none(), "SQL run once was kept");
+        let _: i64 = tx.query_one(&format!("  {sql}\n"), (1,)).unwrap();
+        let second = cached(&tx, sql);
+        let _: i64 = tx.query_one(sql, (2,)).unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&second, &cached(&tx, sql)),
+            "the third call parsed the SQL again"
+        );
+        let both = "UPDATE t SET v = 1 WHERE id = 1; UPDATE t SET v = 2 WHERE id = 2";
+        tx.execute(both, ()).unwrap();
+        tx.execute(both, ()).unwrap();
+        assert_eq!(tx.plans.as_ref().map(|p| p.len()), Some(1));
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn the_parsed_statements_are_bounded_and_go_with_the_transaction() {
+        let db = Database::open_in_memory().unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        let mut tx = db.begin().unwrap();
+        for n in 0..(super::TX_PLAN_CACHE_SIZE * 2) {
+            let sql = format!("SELECT COUNT(*) FROM t WHERE id > {n}");
+            for _ in 0..2 {
+                let count: i64 = tx.query_one(&sql, ()).unwrap();
+                assert_eq!(count, 0);
+            }
+        }
+        let kept = tx.plans.as_ref().map_or(0, |p| p.len());
+        assert_eq!(kept, super::TX_PLAN_CACHE_SIZE);
+        tx.commit().unwrap();
+        assert!(tx.plans.is_none(), "commit kept the parsed statements");
+
+        let mut tx = db.begin().unwrap();
+        let _: i64 = tx.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
+        let _: i64 = tx.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
+        tx.rollback().unwrap();
+        assert!(tx.plans.is_none(), "rollback kept the parsed statements");
+    }
+
+    #[test]
+    fn an_admission_hash_collision_keeps_each_sql_to_its_own_statement() {
+        use std::hash::Hasher;
+        let db = Database::open_in_memory().unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10), (2, 20)", ())
+            .unwrap();
+        let mut tx = db.begin().unwrap();
+        let a = "SELECT v FROM t WHERE id = 1";
+        let b = "SELECT v FROM t WHERE id = 2";
+        let _: i64 = tx.query_one(b, ()).unwrap();
+        // Another SQL recorded under a's hash, as if it collided with a
+        let mut hasher = rustc_hash::FxHasher::default();
+        hasher.write(a.as_bytes());
+        tx.seen[tx.seen_next] = hasher.finish();
+        assert_eq!(tx.query_one::<i64, _>(a, ()).unwrap(), 10);
+        assert!(tx.plans.as_ref().is_some_and(|p| p.contains_key(a)));
+        for _ in 0..2 {
+            assert_eq!(tx.query_one::<i64, _>(b, ()).unwrap(), 20);
+            assert_eq!(tx.query_one::<i64, _>(a, ()).unwrap(), 10);
+        }
+        assert!(!std::sync::Arc::ptr_eq(&cached(&tx, a), &cached(&tx, b)));
+        tx.commit().unwrap();
     }
 }
