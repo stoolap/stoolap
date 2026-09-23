@@ -105,6 +105,24 @@ static RESERVED_KEYWORDS: LazyLock<FxHashSet<&'static str>> = LazyLock::new(|| {
     .collect()
 });
 
+/// The lexer's next token that is not a comment. An unterminated block
+/// comment is recorded as an error, so the program is not run.
+fn next_significant_token(lexer: &mut Lexer, errors: &mut Vec<ParseError>) -> Token {
+    loop {
+        let token = lexer.next_token();
+        if token.token_type != TokenType::Comment {
+            return token;
+        }
+        let text = token.literal.as_str();
+        if text.starts_with("/*") && !(text.len() >= 4 && text.ends_with("*/")) {
+            errors.push(ParseError::new(
+                "unterminated block comment".to_string(),
+                token.position,
+            ));
+        }
+    }
+}
+
 /// SQL Parser using Pratt parsing algorithm
 pub struct Parser {
     /// The lexer providing tokens
@@ -127,14 +145,15 @@ impl Parser {
     /// Create a new parser for the given input
     pub fn new(input: &str) -> Self {
         let mut lexer = Lexer::new(input);
-        let cur_token = lexer.next_token();
-        let peek_token = lexer.next_token();
+        let mut errors = Vec::new();
+        let cur_token = next_significant_token(&mut lexer, &mut errors);
+        let peek_token = next_significant_token(&mut lexer, &mut errors);
 
         Parser {
             lexer,
             cur_token,
             peek_token,
-            errors: Vec::new(),
+            errors,
             current_clause: String::new(),
             current_statement_id: 0,
             parameter_counter: 1,
@@ -147,12 +166,6 @@ impl Parser {
         let mut statements = Vec::with_capacity(1);
 
         while !self.cur_token_is(TokenType::Eof) {
-            // Skip comments
-            if self.cur_token_is(TokenType::Comment) {
-                self.next_token();
-                continue;
-            }
-
             if let Some(stmt) = self.parse_statement() {
                 statements.push(stmt);
             }
@@ -176,7 +189,8 @@ impl Parser {
 
     /// Advance to the next token
     pub(crate) fn next_token(&mut self) {
-        self.cur_token = std::mem::replace(&mut self.peek_token, self.lexer.next_token());
+        let next = next_significant_token(&mut self.lexer, &mut self.errors);
+        self.cur_token = std::mem::replace(&mut self.peek_token, next);
     }
 
     /// Check if the current token is of the given type
