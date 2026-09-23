@@ -584,11 +584,15 @@ impl TransactionRegistry {
     #[inline(always)]
     fn check_committed(&self, txn_id: i64) -> bool {
         // Cache check first (no lock)
-        if COMMITTED_CACHE.with(|c| {
-            c.borrow()
-                .as_ref()
-                .is_some_and(|cache| cache.contains(self.cache_id, txn_id))
-        }) {
+        // A cache already destroyed at thread exit is a miss
+        if COMMITTED_CACHE
+            .try_with(|c| {
+                c.borrow()
+                    .as_ref()
+                    .is_some_and(|cache| cache.contains(self.cache_id, txn_id))
+            })
+            .unwrap_or(false)
+        {
             return true;
         }
 
@@ -601,7 +605,8 @@ impl TransactionRegistry {
         // Not in map - committed if valid txn_id
         let next = self.next_txn_id.load(Ordering::Acquire);
         if txn_id > 0 && txn_id <= next {
-            COMMITTED_CACHE.with(|c| {
+            // Nothing is cached once the thread's cache is destroyed
+            let _ = COMMITTED_CACHE.try_with(|c| {
                 c.borrow_mut()
                     .get_or_insert_with(CommittedCache::new)
                     .insert(self.cache_id, txn_id)

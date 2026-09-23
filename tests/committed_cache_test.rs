@@ -117,3 +117,55 @@ fn a_reopened_database_does_not_take_its_old_commits_for_new_ones() {
         "the closed database's committed id showed an uncommitted update"
     );
 }
+
+struct CheckOnThreadExit {
+    registry: std::sync::Arc<TransactionRegistry>,
+    id: i64,
+    seen: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for CheckOnThreadExit {
+    fn drop(&mut self) {
+        let seen = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.registry.is_directly_visible(self.id)
+        }));
+        self.seen.store(
+            matches!(seen, Ok(true)),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+}
+
+thread_local! {
+    static CHECK_ON_EXIT: std::cell::RefCell<Option<CheckOnThreadExit>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[test]
+fn a_thread_local_destructor_can_check_a_committed_transaction() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let seen = Arc::new(AtomicBool::new(false));
+    let slot = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        let registry = Arc::new(TransactionRegistry::new());
+        let (id, _) = registry.begin_transaction();
+        registry.commit_transaction(id);
+        // Registered before the cache exists, so it is destroyed after it
+        CHECK_ON_EXIT.with(|check| {
+            *check.borrow_mut() = Some(CheckOnThreadExit {
+                registry: Arc::clone(&registry),
+                id,
+                seen: slot,
+            });
+        });
+        assert!(registry.is_directly_visible(id));
+    })
+    .join()
+    .unwrap();
+    assert!(
+        seen.load(Ordering::SeqCst),
+        "the check at thread exit did not see the committed transaction"
+    );
+}
