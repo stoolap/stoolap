@@ -329,3 +329,105 @@ fn a_run_of_absent_members_does_not_make_the_next_fetch_read_everything() {
         "the first volume's groups alone: {decoded} decoded"
     );
 }
+
+/// A float member of a subquery's set names the key it equals in every
+/// statement, IN and NOT IN alike: the UPDATE and DELETE candidate paths
+/// and the negated SELECT read it as the comparison does
+#[test]
+fn a_float_member_names_the_key_in_every_statement() {
+    for (name, statement, expected) in [
+        (
+            "select_in",
+            "SELECT id FROM t WHERE id IN (SELECT k FROM keys) ORDER BY id",
+            vec![1],
+        ),
+        (
+            "update_in",
+            "UPDATE t SET k = 1 WHERE id IN (SELECT k FROM keys) RETURNING id",
+            vec![1],
+        ),
+        (
+            "delete_in",
+            "DELETE FROM t WHERE id IN (SELECT k FROM keys) RETURNING id",
+            vec![1],
+        ),
+        (
+            "select_not_in",
+            "SELECT id FROM t WHERE id NOT IN (SELECT k FROM keys) ORDER BY id",
+            vec![2, 3],
+        ),
+        (
+            "update_not_in",
+            "UPDATE t SET k = 1 WHERE id NOT IN (SELECT k FROM keys) RETURNING id",
+            vec![2, 3],
+        ),
+        (
+            "delete_not_in",
+            "DELETE FROM t WHERE id NOT IN (SELECT k FROM keys) RETURNING id",
+            vec![2, 3],
+        ),
+    ] {
+        let db = fixture(&format!("subquery_{name}"));
+        db.execute("CREATE TABLE keys (k FLOAT)", ()).unwrap();
+        db.execute("INSERT INTO keys VALUES (1.0), (2.5)", ())
+            .unwrap();
+        let mut got = ids(&db, statement);
+        got.sort_unstable();
+        assert_eq!(got, expected, "{statement}");
+        if statement.starts_with("UPDATE") {
+            assert_eq!(
+                ids(&db, "SELECT id FROM t WHERE k = 1 ORDER BY id"),
+                expected,
+                "{statement}: the rows updated"
+            );
+        }
+    }
+}
+
+/// NOT IN on the key walks the keys the transaction sees, whatever they
+/// are: sparse, negative, with a member gone since, under LIMIT and
+/// OFFSET, and inside a transaction with keys of its own
+#[test]
+fn a_negated_key_set_walks_the_keys_that_are() {
+    let db = Database::open("memory://pk_in_lookup_negated_keys").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO t VALUES (10, 1), (20, 2), (30, 3), (-5, 4)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE TABLE keys (k FLOAT)", ()).unwrap();
+    db.execute("INSERT INTO keys VALUES (10.0), (20.5)", ())
+        .unwrap();
+    let sql = "SELECT id FROM t WHERE id NOT IN (SELECT k FROM keys) ORDER BY id";
+    assert_eq!(ids(&db, sql), vec![-5, 20, 30]);
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT id FROM t WHERE id NOT IN (SELECT k FROM keys) ORDER BY id LIMIT 1 OFFSET 1"
+        ),
+        vec![20]
+    );
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT id FROM t WHERE id NOT IN (SELECT k FROM keys) LIMIT 2"
+        ),
+        vec![-5, 20]
+    );
+    db.execute("DELETE FROM t WHERE id = 20", ()).unwrap();
+    assert_eq!(ids(&db, sql), vec![-5, 30]);
+    let mut tx = db.begin().unwrap();
+    tx.execute("INSERT INTO t VALUES (40, 5)", ()).unwrap();
+    tx.execute("DELETE FROM t WHERE id = -5", ()).unwrap();
+    let mut seen: Vec<i64> = tx
+        .query(sql, ())
+        .unwrap()
+        .map(|r| r.unwrap().get(0).unwrap())
+        .collect();
+    seen.sort_unstable();
+    assert_eq!(seen, vec![30, 40], "the transaction's own keys");
+    tx.rollback().unwrap();
+    assert_eq!(ids(&db, sql), vec![-5, 30]);
+}
