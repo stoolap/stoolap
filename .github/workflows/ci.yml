@@ -82,6 +82,10 @@ jobs:
     - name: Run tests
       run: cargo test
 
+    - name: WAL failpoint tests (Windows)
+      if: runner.os == 'Windows'
+      run: cargo test --test failpoint_io_test --test wal_torn_tail_test --features test-failpoints -- --test-threads=1
+
   feature-gated-tests:
     name: Feature-Gated Tests
     runs-on: ubuntu-latest
