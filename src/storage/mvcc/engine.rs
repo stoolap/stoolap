@@ -475,6 +475,9 @@ pub struct MVCCEngine {
     views: RwLock<FxHashMap<String, Arc<ViewDefinition>>>,
     /// Persistence manager for WAL and snapshot operations (Arc-wrapped for safe sharing)
     persistence: Arc<Option<PersistenceManager>>,
+    /// Why a file database's persistence could not start: the open fails
+    /// with it rather than go on without the WAL
+    persistence_error: Option<Error>,
     /// Flag to indicate we're loading from disk to avoid triggering redundant WAL writes
     /// (Arc-wrapped for safe sharing with transactions)
     loading_from_disk: Arc<AtomicBool>,
@@ -599,11 +602,12 @@ impl MVCCEngine {
         let hot_limits = Arc::new(HotLimits::new(&config.persistence));
 
         // Initialize persistence manager if path is provided and persistence is enabled
+        let mut persistence_error = None;
         let persistence = if !path.is_empty() && config.persistence.enabled {
             match PersistenceManager::new(Some(Path::new(&path)), &config.persistence) {
                 Ok(pm) => Some(pm),
                 Err(e) => {
-                    eprintln!("Warning: Failed to initialize persistence: {}", e);
+                    persistence_error = Some(e);
                     None
                 }
             }
@@ -625,6 +629,7 @@ impl MVCCEngine {
             txn_version_stores: Arc::new(RwLock::new(I64Map::new())),
             views: RwLock::new(FxHashMap::default()),
             persistence: Arc::new(persistence),
+            persistence_error,
             loading_from_disk: Arc::new(AtomicBool::new(false)),
             file_lock: Mutex::new(None),
             schema_epoch: AtomicU64::new(0),
@@ -654,6 +659,10 @@ impl MVCCEngine {
 
     /// Opens the engine (inherent method)
     pub fn open_engine(&self) -> Result<()> {
+        // A file database whose WAL could not start would lose every write
+        if let Some(error) = &self.persistence_error {
+            return Err(error.clone());
+        }
         // Use atomic swap to check and set open flag atomically
         if self.open.swap(true, Ordering::AcqRel) {
             return Ok(()); // Already open
