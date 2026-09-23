@@ -475,6 +475,12 @@ impl TransactionRegistry {
         }
     }
 
+    /// Makes the next transaction id greater than `txn_id`, without marking
+    /// anything committed
+    pub fn reserve_txn_ids_through(&self, txn_id: i64) {
+        self.next_txn_id.fetch_max(txn_id, Ordering::AcqRel);
+    }
+
     /// Recovers a committed transaction during startup recovery.
     pub fn recover_committed_transaction(&self, txn_id: i64, commit_seq: i64) {
         // Store in snapshot_seqs for visibility checks

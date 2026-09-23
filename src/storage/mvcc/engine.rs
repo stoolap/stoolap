@@ -1455,6 +1455,9 @@ impl MVCCEngine {
                         info.skipped_entries
                     );
                 }
+                // No new transaction takes an id a retained record carries,
+                // or its commit would commit that record's writes too
+                self.registry.reserve_txn_ids_through(info.max_txn_id);
 
                 // After WAL replay completes, populate all indexes in a single pass
                 // This is O(N + M) instead of O(N * M) when populating each index separately

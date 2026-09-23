@@ -401,6 +401,10 @@ impl PersistenceManager {
         if !self.is_enabled() {
             return Ok(());
         }
+        // The engine holds the database lock here: the WAL is this process's
+        if let Some(wal) = &self.wal {
+            wal.cut_torn_tail()?;
+        }
 
         self.running.store(true, Ordering::Release);
         Ok(())

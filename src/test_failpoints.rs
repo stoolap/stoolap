@@ -26,6 +26,9 @@ pub static WAL_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
 /// Fail WAL `sync_locked()` (fsync) with an I/O error
 pub static WAL_SYNC_FAIL: AtomicBool = AtomicBool::new(false);
 
+/// Fail the search for the next WAL record past a damaged one with an I/O error
+pub static WAL_SCAN_READ_FAIL: AtomicBool = AtomicBool::new(false);
+
 /// Fail snapshot `append_row()` write with an I/O error
 pub static SNAPSHOT_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
 
@@ -391,6 +394,7 @@ pub fn reset_all() {
     use std::sync::atomic::Ordering::Release;
     WAL_WRITE_FAIL.store(false, Release);
     WAL_SYNC_FAIL.store(false, Release);
+    WAL_SCAN_READ_FAIL.store(false, Release);
     SNAPSHOT_WRITE_FAIL.store(false, Release);
     SNAPSHOT_SYNC_FAIL.store(false, Release);
     SNAPSHOT_RENAME_FAIL.store(false, Release);
