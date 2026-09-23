@@ -766,6 +766,54 @@ mod failpoints {
         assert_eq!(ids(&db, "SELECT id FROM z"), Vec::<i64>::new());
     }
 
+    /// A VACUUM between a commit's publication and its refusal leaves the
+    /// version the head displaced, so the undo restores it
+    #[test]
+    fn a_vacuum_during_a_commit_keeps_the_version_its_undo_restores() {
+        let _guard = test_failpoints::FailpointGuard::new();
+        let db = Database::open("memory://hot_schema_vacuum_pending_undo").unwrap();
+        for table in ["a", "z"] {
+            db.execute(
+                &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, x TEXT, b TEXT)"),
+                (),
+            )
+            .unwrap();
+        }
+        db.execute("INSERT INTO a VALUES (1, 'x', 'b0')", ())
+            .unwrap();
+        for n in 1..=9 {
+            db.execute(&format!("UPDATE a SET b = 'b{n}' WHERE id = 1"), ())
+                .unwrap();
+        }
+        let other = db.clone();
+        test_failpoints::after_indexes_published(move || {
+            test_failpoints::after_indexes_published(move || {
+                let store = other.engine().get_version_store("a").unwrap();
+                assert_eq!(store.chain_entries(), 1, "a published with its predecessor");
+                other.execute("VACUUM a", ()).unwrap();
+                other.execute("ALTER TABLE z DROP COLUMN x", ()).unwrap();
+            });
+        });
+        let mut tx = db.begin().unwrap();
+        tx.execute("UPDATE a SET b = 'new-b' WHERE id = 1", ())
+            .unwrap();
+        tx.execute("INSERT INTO z VALUES (2, 'x', 'zb')", ())
+            .unwrap();
+        assert!(matches!(
+            tx.commit(),
+            Err(stoolap::Error::SchemaChanged { .. })
+        ));
+        assert_eq!(
+            pairs(&db, "SELECT id, b FROM a"),
+            vec![(1, "b9".to_string())],
+            "the VACUUM took the version the undo restores"
+        );
+        assert_eq!(
+            db.engine().get_version_store("a").unwrap().chain_entries(),
+            0
+        );
+    }
+
     /// A commit at the history limit keeps the version it displaced only
     /// as the head's previous version, and one refused before publishing
     /// leaves the chain as it was

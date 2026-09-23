@@ -5587,6 +5587,12 @@ impl VersionStore {
                     keep_count = i + 1;
                 }
             }
+            // A head whose commit is not visible yet keeps the version before it:
+            // its readers read it, and a failed commit's undo restores it
+            if keep_count == 0 && !checker.is_committed_before(chain_entry.version.txn_id, i64::MAX)
+            {
+                keep_count = 1;
+            }
 
             // If we need to prune some versions, modify the live entry
             if keep_count < prev_versions.len() {
@@ -6245,7 +6251,7 @@ impl TransactionVersionStore {
     /// the store describes the rows that stayed visible
     /// Lets go of what the commit kept for its undo, once it is visible
     pub fn release_applied(&self) {
-        self.applied.lock().clear();
+        drop(std::mem::take(&mut *self.applied.lock()));
         self.index_undo.lock().clear();
     }
 
