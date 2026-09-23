@@ -72,11 +72,6 @@ fn is_reserved_alias_keyword(upper: &str) -> bool {
 impl Parser {
     /// Parse a statement
     pub fn parse_statement(&mut self) -> Option<Statement> {
-        // Skip comments
-        while self.cur_token_is(TokenType::Comment) {
-            self.next_token();
-        }
-
         if self.cur_token_is(TokenType::Eof) {
             return None;
         }
