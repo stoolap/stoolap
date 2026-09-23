@@ -111,7 +111,7 @@ fn a_failed_commit_leaves_the_sealed_row_visible() {
 }
 
 /// A row updated past the chain's history limit: the version the failed
-/// commit displaced is restored although the chain no longer held it
+/// commit displaced is restored from the chain, which kept only that one
 #[test]
 fn a_failed_commit_restores_a_row_past_its_history_limit() {
     let _guard = test_failpoints::FailpointGuard::new();

@@ -713,9 +713,9 @@ mod failpoints {
     use stoolap::test_failpoints;
 
     /// A commit that publishes one table and is refused on the next takes
-    /// the first back: a version the publication displaced from a pruned
-    /// chain comes back in the layout the rows have now, not the one it
-    /// was displaced in
+    /// the first back: the version the publication displaced at the
+    /// history limit comes back in the layout the rows have now, not the
+    /// one it was displaced in
     #[test]
     fn an_undo_restores_a_displaced_version_in_the_current_layout() {
         let _guard = test_failpoints::FailpointGuard::new();
@@ -730,7 +730,7 @@ mod failpoints {
         db.execute("INSERT INTO a VALUES (1, 'wrong-x', 'b0')", ())
             .unwrap();
         // The chain at its history limit, so the next publication drops the
-        // history and displaces the version before it out of the chain
+        // history below the version it displaces
         for n in 1..=9 {
             db.execute(&format!("UPDATE a SET b = 'b{n}' WHERE id = 1"), ())
                 .unwrap();
@@ -758,14 +758,19 @@ mod failpoints {
             vec![(1, "b9".to_string())],
             "the displaced version came back in the new layout"
         );
+        assert_eq!(
+            db.engine().get_version_store("a").unwrap().chain_entries(),
+            0,
+            "the undo put the displaced version back at the head"
+        );
         assert_eq!(ids(&db, "SELECT id FROM z"), Vec::<i64>::new());
     }
 
-    /// A version a commit displaced out of a pruned chain is the store's
-    /// to hold only until the commit is visible or undone: none is left
-    /// behind by a commit that went through, nor by one taken back
+    /// A commit at the history limit keeps the version it displaced only
+    /// as the head's previous version, and one refused before publishing
+    /// leaves the chain as it was
     #[test]
-    fn a_displaced_version_is_let_go_when_the_commit_is_over() {
+    fn a_pruning_commit_keeps_only_the_version_it_displaced() {
         let _guard = test_failpoints::FailpointGuard::new();
         let db = Database::open("memory://hot_schema_displaced_released").unwrap();
         db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, b TEXT)", ())
@@ -783,12 +788,12 @@ mod failpoints {
                 .unwrap();
             tx.commit().unwrap();
         }
-        assert_eq!(store.displaced_in_flight(), 0, "after a commit");
+        assert_eq!(store.chain_entries(), 1, "after a commit");
         assert_eq!(
             pairs(&db, "SELECT id, b FROM t"),
             vec![(1, "b10".to_string())]
         );
-        // A commit taken back: the undo takes the version with it
+        // A commit taken back: its previous version is the head again
         for n in 11..=18 {
             db.execute(&format!("UPDATE t SET b = 'b{n}' WHERE id = 1"), ())
                 .unwrap();
@@ -807,7 +812,11 @@ mod failpoints {
             tx.commit(),
             Err(stoolap::Error::SchemaChanged { .. })
         ));
-        assert_eq!(store.displaced_in_flight(), 0, "after an undo");
+        assert_eq!(
+            store.chain_entries(),
+            9,
+            "a commit refused before publishing leaves the history as it was"
+        );
         assert_eq!(
             pairs(&db, "SELECT id, b FROM t"),
             vec![(1, "b18".to_string())]
@@ -884,10 +893,9 @@ mod failpoints {
     }
 
     /// A commit taken back after its table was truncated has no row to
-    /// put the displaced version under, and lets the version go all the
-    /// same
+    /// restore, and leaves no version behind
     #[test]
-    fn an_undo_after_a_truncate_lets_the_displaced_version_go() {
+    fn an_undo_after_a_truncate_leaves_no_version() {
         let _guard = test_failpoints::FailpointGuard::new();
         let db = Database::open("memory://hot_schema_undo_after_truncate").unwrap();
         for table in ["a", "z"] {
@@ -923,7 +931,7 @@ mod failpoints {
             Err(stoolap::Error::SchemaChanged { .. })
         ));
         drop(tx);
-        assert_eq!(store.displaced_in_flight(), 0, "nothing of the undo stays");
+        assert_eq!(store.chain_entries(), 0, "nothing of the undo stays");
         assert_eq!(ids(&db, "SELECT id FROM a"), Vec::<i64>::new());
         assert_eq!(ids(&db, "SELECT id FROM z"), Vec::<i64>::new());
     }
