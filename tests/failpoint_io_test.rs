@@ -405,6 +405,46 @@ fn test_sync_fail_commit_not_durable_after_close() {
     assert_eq!(count, 0, "aborted commit resurrected after close+reopen");
 }
 
+#[cfg(unix)]
+fn set_wal_files_mode(dir: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    for entry in std::fs::read_dir(dir.join("wal")).unwrap() {
+        let path = entry.unwrap().path();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_refused_commit_is_cut_when_the_wal_cannot_be_opened_again() {
+    let _guard = failpoint_guard();
+    let dir = tempdir().unwrap();
+    let path = format!("file://{}?sync_mode=full", dir.path().display());
+
+    {
+        let db = Database::open(&path).expect("open");
+        db.execute("CREATE TABLE fp_no_reopen (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.execute("INSERT INTO fp_no_reopen VALUES (1)", ())
+            .unwrap();
+        set_wal_files_mode(dir.path(), 0o444);
+        test_failpoints::WAL_SYNC_FAIL.store(true, Ordering::Release);
+        let result = db.execute("INSERT INTO fp_no_reopen VALUES (10)", ());
+        test_failpoints::WAL_SYNC_FAIL.store(false, Ordering::Release);
+        set_wal_files_mode(dir.path(), 0o644);
+        assert!(result.is_err(), "commit must fail when its fsync fails");
+        let _ = db.close();
+    }
+
+    let db = Database::open(&path).expect("reopen");
+    let ids: Vec<i64> = db
+        .query("SELECT id FROM fp_no_reopen ORDER BY id", ())
+        .unwrap()
+        .map(|r| r.unwrap().get(0).unwrap())
+        .collect();
+    assert_eq!(ids, vec![1], "the refused commit replayed");
+}
+
 // ============================================================================
 // Snapshot Write Failpoint Tests
 // ============================================================================

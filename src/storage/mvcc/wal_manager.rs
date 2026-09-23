@@ -1438,8 +1438,8 @@ impl WALManager {
     fn poison_and_truncate(&self, wal_file: &Option<File>, name: &str, e: Error) -> Error {
         self.poisoned.store(true, Ordering::Release);
         let floor = self.synced_position.load(Ordering::Acquire);
-        if wal_file.is_some() {
-            if let Err(cut) = shorten_wal_file(&self.path.join(name), floor) {
+        if let Some(file) = wal_file.as_ref() {
+            if let Err(cut) = shorten_wal_file(file, &self.path.join(name), floor) {
                 eprintln!(
                     "Warning: WAL file {} was not cut back to {} bytes after a failed write: {}",
                     name, floor, cut
@@ -1827,7 +1827,7 @@ impl WALManager {
         let len = file.metadata().map_err(check_error)?.len();
         if len > valid_end {
             // The append handle goes on at the new end
-            shorten_wal_file(&self.path.join(&name), valid_end).map_err(|e| {
+            shorten_wal_file(file, &self.path.join(&name), valid_end).map_err(|e| {
                 Error::internal(format!(
                     "failed to cut the torn tail of WAL file {}: {}",
                     name, e
@@ -2237,8 +2237,8 @@ impl WALManager {
             // acknowledged for, and a failed one's marker must not
             // persist and replay
             self.poisoned.store(true, Ordering::Release);
-            if file.is_some() {
-                if let Err(cut) = shorten_wal_file(&path, durable_len) {
+            if let Some(file) = file.as_ref() {
+                if let Err(cut) = shorten_wal_file(file, &path, durable_len) {
                     eprintln!(
                         "Warning: WAL file {} was not cut back to {} bytes after a failed sync: {}",
                         path.display(),
@@ -2296,9 +2296,18 @@ fn record_checksum_holds(data: &[u8]) -> bool {
     u32::from_le_bytes(stored) == crc32fast::hash(&data[..crc_offset])
 }
 
-/// Cuts a WAL file to `len` and syncs it, through a handle opened to write:
-/// one opened to append may not change the length (Windows)
-fn shorten_wal_file(path: &Path, len: u64) -> io::Result<()> {
+/// Cuts the open WAL file at `path` to `len` and syncs it, through that
+/// handle, so the cut needs no new descriptor
+#[cfg(not(windows))]
+fn shorten_wal_file(file: &File, _path: &Path, len: u64) -> io::Result<()> {
+    file.set_len(len)?;
+    file.sync_all()
+}
+
+/// Cuts the open WAL file at `path` to `len` and syncs it, through a handle
+/// opened to write: one opened to append may not change the length
+#[cfg(windows)]
+fn shorten_wal_file(_file: &File, path: &Path, len: u64) -> io::Result<()> {
     let file = OpenOptions::new().write(true).open(path)?;
     file.set_len(len)?;
     file.sync_all()
