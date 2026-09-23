@@ -6965,8 +6965,13 @@ impl TransactionVersionStore {
                     continue;
                 }
                 // A volume's copy was never in a hot index: to those the row
-                // is new, and its old keys are removed only where they are
-                let old_row = if sealed && index.index_type() != crate::core::IndexType::Hnsw {
+                // is new, its old keys are removed only where they are, and
+                // its deletion takes nothing out
+                let kept_sealed = index.index_type() == crate::core::IndexType::Hnsw;
+                if sealed && !kept_sealed && is_deleted {
+                    continue;
+                }
+                let old_row = if sealed && !kept_sealed {
                     None
                 } else {
                     old_row
@@ -7247,8 +7252,13 @@ impl TransactionVersionStore {
                 continue;
             }
             // A volume's copy was never in a hot index: to those the row is
-            // new, and its old keys are removed only where they are
-            let old_row = if sealed && index.index_type() != crate::core::IndexType::Hnsw {
+            // new, its old keys are removed only where they are, and its
+            // deletion takes nothing out
+            let kept_sealed = index.index_type() == crate::core::IndexType::Hnsw;
+            if sealed && !kept_sealed && is_deleted {
+                continue;
+            }
+            let old_row = if sealed && !kept_sealed {
                 None
             } else {
                 old_row
