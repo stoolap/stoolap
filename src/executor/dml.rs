@@ -391,16 +391,18 @@ impl Executor {
         if let Expression::InHashSet(in_expr) = where_clause {
             if let Expression::Identifier(id) = in_expr.column.as_ref() {
                 if id.value_lower == pk_column_lower {
+                    // A member is the key it equals, read as the comparison
+                    // reads it: an integral float names a row, another names
+                    // none
+                    let member_key = |v: &Value| match v {
+                        Value::Integer(i) => Some(*i),
+                        Value::Float(f) => Self::lossless_float_key(*f),
+                        _ => None,
+                    };
                     if in_expr.not {
                         // NOT IN: get all active row_ids and exclude the ones in the set
-                        let excluded: I64Set = in_expr
-                            .values
-                            .iter()
-                            .filter_map(|v| match v {
-                                Value::Integer(i) => Some(*i),
-                                _ => None,
-                            })
-                            .collect();
+                        let excluded: I64Set =
+                            in_expr.values.iter().filter_map(member_key).collect();
 
                         let mut row_ids: Vec<i64> = table
                             .get_active_row_ids()?
@@ -410,15 +412,9 @@ impl Executor {
                         row_ids.sort_unstable();
                         return Ok(Some(row_ids));
                     } else {
-                        // IN: extract integer values directly from the HashSet
-                        let mut row_ids: Vec<i64> = in_expr
-                            .values
-                            .iter()
-                            .filter_map(|v| match v {
-                                Value::Integer(i) => Some(*i),
-                                _ => None,
-                            })
-                            .collect();
+                        // IN: the keys the members name
+                        let mut row_ids: Vec<i64> =
+                            in_expr.values.iter().filter_map(member_key).collect();
                         row_ids.sort_unstable();
                         return Ok(Some(row_ids));
                     }

@@ -1147,14 +1147,14 @@ impl Executor {
                 // Instead of scanning the table, iterate through row_ids and exclude
                 // This is O(row_count) but with O(1) hashset lookup, which is faster
                 // than table scan because we only touch row_ids, not full rows
+                // A member is the key it equals, a float read as the
+                // comparison reads it
                 let exclusion_set: I64Set = values
                     .iter()
-                    .filter_map(|v| {
-                        if let Value::Integer(id) = v {
-                            Some(*id)
-                        } else {
-                            None
-                        }
+                    .filter_map(|v| match v {
+                        Value::Integer(id) => Some(*id),
+                        Value::Float(f) => Self::lossless_float_key(*f),
+                        _ => None,
                     })
                     .collect();
 
@@ -1202,17 +1202,9 @@ impl Executor {
                     offset.saturating_add(limit)
                 };
 
-                // Iterate through row_ids and collect non-excluded ones
-                // Row IDs are typically 1-based and sequential
-                let row_count = table.row_count()?;
-                for row_id in 1..=(row_count as i64) {
-                    if !exclusion_set.contains(row_id) {
-                        all_row_ids.push(row_id);
-                        if all_row_ids.len() >= target {
-                            break;
-                        }
-                    }
-                }
+                // The keys the transaction sees, in key order, the members
+                // left out: keys are the rows' ids, not a count of them
+                all_row_ids = table.visible_row_ids_excluding(&exclusion_set, target)?;
             } else {
                 // IN: PRIMARY KEY - the value is the row id, a float read as
                 // the comparison reads it
