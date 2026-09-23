@@ -999,6 +999,15 @@ impl VisibilityChecker for TransactionRegistry {
     fn needs_snapshot_isolation(&self, txn_id: i64) -> bool {
         TransactionRegistry::needs_snapshot_isolation(self, txn_id)
     }
+
+    fn oldest_snapshot_begin_seq(&self) -> Option<i64> {
+        if self.global_isolation_level.load(Ordering::Relaxed) != 1
+            && self.override_count.load(Ordering::Relaxed) == 0
+        {
+            return None;
+        }
+        self.get_min_snapshot_begin_seq()
+    }
 }
 
 #[cfg(test)]
