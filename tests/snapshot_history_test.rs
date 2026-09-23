@@ -334,3 +334,117 @@ fn a_snapshot_taken_while_the_trim_waits_keeps_its_row() {
     );
     tx.rollback().unwrap();
 }
+
+#[cfg(feature = "test-failpoints")]
+fn read_while_an_update_commits(
+    name: &str,
+    updates: i64,
+    commit_sql: &'static str,
+) -> (Vec<i64>, Vec<i64>) {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let db = Database::open(&format!("memory://{name}")).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 0), (2, 0)", ())
+        .unwrap();
+    for n in 1..=updates {
+        db.execute("UPDATE t SET v = $1 WHERE id = 1", (n,))
+            .unwrap();
+    }
+    let (published_tx, published_rx) = mpsc::channel();
+    let (finish_tx, finish_rx) = mpsc::channel::<()>();
+    let writer = db.clone();
+    let commit = std::thread::spawn(move || {
+        let mut tx = writer.begin().unwrap();
+        tx.execute(commit_sql, ()).unwrap();
+        stoolap::test_failpoints::before_commit_visible(move || {
+            published_tx.send(()).unwrap();
+            finish_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+        });
+        tx.commit().unwrap();
+    });
+    published_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+    let autocommit: Vec<i64> = db
+        .query("SELECT v FROM t WHERE id = 1", ())
+        .unwrap()
+        .map(|r| r.unwrap().get(0).unwrap())
+        .collect();
+    let mut tx = db.begin().unwrap();
+    let in_tx = values(&mut tx, "SELECT v FROM t WHERE id = 1");
+    tx.rollback().unwrap();
+    finish_tx.send(()).unwrap();
+    commit.join().unwrap();
+    (autocommit, in_tx)
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_row_at_its_history_limit_stays_readable_while_an_update_commits() {
+    for (shape, sql) in [
+        ("one", "UPDATE t SET v = 100 WHERE id = 1"),
+        ("two", "UPDATE t SET v = 100 WHERE id IN (1, 2)"),
+    ] {
+        for updates in [3, 9, 10, 25] {
+            // Each database reads on its own thread: the committed-id cache is per thread
+            let name = format!("snapshot_history_commit_window_{shape}_{updates}");
+            let seen =
+                std::thread::spawn(move || read_while_an_update_commits(&name, updates, sql))
+                    .join()
+                    .unwrap();
+            assert_eq!(
+                seen,
+                (vec![updates], vec![updates]),
+                "{updates} updates, {shape} row commit: the row vanished while it committed"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_snapshot_begun_while_an_update_commits_keeps_its_row() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let db = Database::open("memory://snapshot_history_begun_while_committing").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 0)", ()).unwrap();
+    for n in 1..=9 {
+        db.execute("UPDATE t SET v = $1 WHERE id = 1", (n,))
+            .unwrap();
+    }
+    let (start_tx, start_rx) = mpsc::channel::<()>();
+    let (published_tx, published_rx) = mpsc::channel();
+    let (finish_tx, finish_rx) = mpsc::channel::<()>();
+    let writer = db.clone();
+    let commit = std::thread::spawn(move || {
+        start_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+        let mut tx = writer.begin().unwrap();
+        tx.execute("UPDATE t SET v = 10 WHERE id = 1", ()).unwrap();
+        stoolap::test_failpoints::before_commit_visible(move || {
+            published_tx.send(()).unwrap();
+            finish_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+        });
+        tx.commit().unwrap();
+    });
+    stoolap::test_failpoints::after_transaction_begun(move || {
+        start_tx.send(()).unwrap();
+        published_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+    });
+    let mut reader = db
+        .begin_with_isolation(IsolationLevel::SnapshotIsolation)
+        .unwrap();
+    let before = values(&mut reader, "SELECT v FROM t WHERE id = 1");
+    finish_tx.send(()).unwrap();
+    commit.join().unwrap();
+    let after = values(&mut reader, "SELECT v FROM t WHERE id = 1");
+    reader.rollback().unwrap();
+    assert_eq!(
+        (before, after),
+        (vec![9], vec![9]),
+        "the snapshot lost its row to an update committing as it began"
+    );
+}

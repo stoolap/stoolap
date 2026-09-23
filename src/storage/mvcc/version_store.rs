@@ -1304,33 +1304,27 @@ impl VersionStore {
                     };
 
                     // Build version chain entry
-                    // When limit exceeded: drop entire history (no prev_chain allocation)
-                    // When under limit: create prev_chain with existing version
                     if can_reuse_arena {
                         self.displaced
                             .lock()
                             .insert(row_id, (new_version.txn_id, existing.version.clone()));
                     }
-                    let final_prev = if can_reuse_arena {
-                        // Exceeded limit - drop all history, no allocation
-                        None
-                    } else {
-                        // Under limit - clone existing version and create chain
-                        let existing_version = existing.version.clone();
-                        let existing_prev = match kept {
-                            KeptHistory::Prefix(keep) => existing
-                                .prev
-                                .as_deref()
-                                .and_then(|p| chain_prefix(p, keep - 1)),
-                            _ => existing.prev.clone(),
-                        };
-                        Some(Arc::new(VersionChainEntry {
-                            version: existing_version,
-                            prev: existing_prev,
-                            // Historical versions don't use arena (slot reused by new HEAD)
-                            arena_idx: None,
-                        }))
+                    // The displaced version stays as prev until the new head's
+                    // commit completes; history below it goes past the limit
+                    let existing_prev = match kept {
+                        KeptHistory::Whole => existing.prev.clone(),
+                        KeptHistory::Prefix(keep) => existing
+                            .prev
+                            .as_deref()
+                            .and_then(|p| chain_prefix(p, keep - 1)),
+                        KeptHistory::Nothing => None,
                     };
+                    let final_prev = Some(Arc::new(VersionChainEntry {
+                        version: existing.version.clone(),
+                        prev: existing_prev,
+                        // Historical versions don't use arena (slot reused by new HEAD)
+                        arena_idx: None,
+                    }));
 
                     let new_entry = VersionChainEntry {
                         version: new_version,
@@ -1499,35 +1493,29 @@ impl VersionStore {
                 };
 
                 // Build version chain entry
-                // When limit exceeded: drop entire history (no prev_chain allocation)
-                // When under limit: create prev_chain with existing version
                 // The version the head displaces is kept for the undo when
-                // the chain will not keep it
+                // the chain will not keep its history
                 if can_reuse_arena {
                     self.displaced
                         .lock()
                         .insert(row_id, (new_version.txn_id, existing.version.clone()));
                 }
-                let final_prev = if can_reuse_arena {
-                    // Exceeded limit - drop all history, no allocation
-                    None
-                } else {
-                    // Under limit - clone existing version and create chain
-                    let existing_version = existing.version.clone();
-                    let existing_prev = match kept {
-                        KeptHistory::Prefix(keep) => existing
-                            .prev
-                            .as_deref()
-                            .and_then(|p| chain_prefix(p, keep - 1)),
-                        _ => existing.prev.clone(),
-                    };
-                    Some(Arc::new(VersionChainEntry {
-                        version: existing_version,
-                        prev: existing_prev,
-                        // Historical versions don't use arena (slot reused by new HEAD)
-                        arena_idx: None,
-                    }))
+                // The displaced version stays as prev until the new head's
+                // commit completes; history below it goes past the limit
+                let existing_prev = match kept {
+                    KeptHistory::Whole => existing.prev.clone(),
+                    KeptHistory::Prefix(keep) => existing
+                        .prev
+                        .as_deref()
+                        .and_then(|p| chain_prefix(p, keep - 1)),
+                    KeptHistory::Nothing => None,
                 };
+                let final_prev = Some(Arc::new(VersionChainEntry {
+                    version: existing.version.clone(),
+                    prev: existing_prev,
+                    // Historical versions don't use arena (slot reused by new HEAD)
+                    arena_idx: None,
+                }));
 
                 let new_entry = VersionChainEntry {
                     version: new_version,
