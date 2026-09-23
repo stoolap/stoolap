@@ -58,7 +58,9 @@ fn a_limit_over_a_large_exists_set_takes_a_few_members() {
     db.execute("CREATE INDEX idx_orders_user ON orders(user_id)", ())
         .unwrap();
     let users = db.prepare("INSERT INTO users VALUES ($1, 0)").unwrap();
-    let orders = db.prepare("INSERT INTO orders VALUES ($1, $1, 600)").unwrap();
+    let orders = db
+        .prepare("INSERT INTO orders VALUES ($1, $1, 600)")
+        .unwrap();
     db.execute("BEGIN", ()).unwrap();
     for id in 1..=50_000i64 {
         users.execute((id,)).unwrap();
