@@ -7216,56 +7216,64 @@ impl MVCCEngine {
             }
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::side_files_compared();
-            // The rows of older segments the new volumes hold again, decided
-            // before the fence; the publication checks they still stand
-            let prepared = mgr.prepare_registration(
-                &sealed_volumes
+            // The rows of older segments the new volumes hold again, and the
+            // entries to publish, decided before the fence; under it only the
+            // seal sequence is stamped
+            let new_volumes: Vec<Arc<crate::storage::volume::writer::FrozenVolume>> =
+                sealed_volumes
                     .iter()
                     .map(|(volume, _, _)| Arc::clone(volume))
-                    .collect::<Vec<_>>(),
-            );
+                    .collect();
+            let mut prepared = mgr.prepare_registration(&new_volumes);
+            let mut entries: Vec<crate::storage::volume::manifest::SealedEntry> = sealed_volumes
+                .iter()
+                .zip(sealed_files.iter_mut())
+                .zip(sealed_sides.iter_mut())
+                .map(|(((volume, _path, volume_id), file), side)| {
+                    let (min_row_id, max_row_id) = volume.id_bounds().unwrap_or((0, 0));
+                    let meta = crate::storage::volume::manifest::SegmentMeta {
+                        segment_id: *volume_id,
+                        file_path: std::path::PathBuf::new(),
+                        row_count: volume.meta.row_count,
+                        min_row_id,
+                        max_row_id,
+                        creation_lsn: 0,
+                        seal_seq: 0,
+                        schema_version: sealed_schema_version,
+                    };
+                    (
+                        *volume_id,
+                        Arc::clone(volume),
+                        meta,
+                        file.take(),
+                        side.take(),
+                    )
+                })
+                .collect();
             // Seal critical section under exclusive fence: register cold
             // segments + remove hot rows + remove hot index entries.
             // DML operations hold the shared fence, so they cannot race
             // between cold constraint checks and hot publication.
             {
-                let _seal_guard = mgr.acquire_seal_write();
+                // A preparation the segments moved past publishes nothing:
+                // the fence is let go and the preparation made again outside
+                // it, and a third round settles under the locks
+                let mut rounds = 0;
+                let _seal_guard = loop {
+                    let guard = mgr.acquire_seal_write();
 
-                mgr.set_seal_overlap(total_rows);
+                    mgr.set_seal_overlap(total_rows);
 
-                // Stamp seal_seq to reflect what data the volume contains:
-                // - With cutoff: volume has rows committed before cutoff, so use cutoff
-                // - Without cutoff: all committed rows, use current sequence
-                // Compaction skips volumes with seal_seq >= min_snap_begin_seq.
-                let current_seal_seq = per_table_cutoff
-                    .map(|s| s as u64)
-                    .unwrap_or_else(|| self.registry.get_current_sequence() as u64);
-                let entries: Vec<crate::storage::volume::manifest::SealedEntry> = sealed_volumes
-                    .iter()
-                    .zip(sealed_files.iter_mut())
-                    .zip(sealed_sides.iter_mut())
-                    .map(|(((volume, _path, volume_id), file), side)| {
-                        let (min_row_id, max_row_id) = volume.id_bounds().unwrap_or((0, 0));
-                        let meta = crate::storage::volume::manifest::SegmentMeta {
-                            segment_id: *volume_id,
-                            file_path: std::path::PathBuf::new(),
-                            row_count: volume.meta.row_count,
-                            min_row_id,
-                            max_row_id,
-                            creation_lsn: 0,
-                            seal_seq: current_seal_seq,
-                            schema_version: sealed_schema_version,
-                        };
-                        (
-                            *volume_id,
-                            Arc::clone(volume),
-                            meta,
-                            file.take(),
-                            side.take(),
-                        )
-                    })
-                    .collect();
-                {
+                    // Stamp seal_seq to reflect what data the volume contains:
+                    // - With cutoff: volume has rows committed before cutoff, so use cutoff
+                    // - Without cutoff: all committed rows, use current sequence
+                    // Compaction skips volumes with seal_seq >= min_snap_begin_seq.
+                    let current_seal_seq = per_table_cutoff
+                        .map(|s| s as u64)
+                        .unwrap_or_else(|| self.registry.get_current_sequence() as u64);
+                    for entry in entries.iter_mut() {
+                        entry.2.seal_seq = current_seal_seq;
+                    }
                     // The mapping is computed against the schema current now,
                     // under the schema cache's read lock held until the
                     // segments are visible, as a single registration does
@@ -7274,8 +7282,23 @@ impl MVCCEngine {
                         .read()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let schema = schemas.get(&table_name).map(|s| &**s);
-                    mgr.register_sealed(entries, prepared, schema);
-                }
+                    match mgr.register_sealed(
+                        std::mem::take(&mut entries),
+                        prepared,
+                        schema,
+                        rounds == 2,
+                    ) {
+                        Ok(_) => break guard,
+                        Err(back) => {
+                            entries = back;
+                            mgr.clear_seal_overlap();
+                            drop(schemas);
+                            drop(guard);
+                            rounds += 1;
+                            prepared = mgr.prepare_registration(&new_volumes);
+                        }
+                    }
+                };
 
                 let mut index_cleanups = Vec::new();
                 let mut all_skipped_inner: Vec<i64> = Vec::new();
