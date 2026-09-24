@@ -18,6 +18,7 @@
 use crate::common::I64Map;
 use crate::core::{DataType, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
+use crate::storage::index::id_list::GroupIds;
 
 /// What a capped equality probe found.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -396,7 +397,7 @@ pub trait Index: Send + Sync {
     /// - Only a few groups pass filtering (HAVING)
     ///
     /// # Arguments
-    /// * `callback` - Called for each group with (value, row_ids). Return:
+    /// * `callback` - Called once per whole group with (value, row_ids). Return:
     ///   - `Ok(true)` to continue to next group
     ///   - `Ok(false)` to stop iteration early
     ///   - `Err(e)` to stop and propagate the error
@@ -407,7 +408,7 @@ pub trait Index: Send + Sync {
     /// - `None` if the index doesn't support ordered group access
     fn for_each_group(
         &self,
-        _callback: &mut dyn FnMut(&Value, &[i64]) -> Result<bool>,
+        _callback: &mut dyn FnMut(&Value, GroupIds<'_>) -> Result<bool>,
     ) -> Option<Result<()>> {
         None // Default implementation - only B-tree indexes support this
     }
