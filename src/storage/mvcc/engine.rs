@@ -7258,6 +7258,8 @@ impl MVCCEngine {
                     index_cleanups.push(cleanup);
                     all_skipped_inner.extend(skipped);
                 }
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::seal_rows_removed();
 
                 if !all_skipped_inner.is_empty() {
                     let seal_seq = self.registry.get_current_sequence() as u64;
@@ -7276,6 +7278,8 @@ impl MVCCEngine {
                 for cleanup in index_cleanups {
                     store.remove_sealed_index_entries(cleanup, &all_rows);
                 }
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::seal_indexes_cleaned();
 
                 // Clear tombstones for sealed row_ids INSIDE the fence.
                 {

@@ -2039,14 +2039,16 @@ impl SegmentManager {
             let mut new_map = (**segments).clone();
             new_map.insert(segment_id, cold);
             compute_visibility_bitmaps(&seg_ids, &mut new_map, &mut self.visibility_seen.lock());
+            // Before the segment is visible, so a reader that sees the volume
+            // sees the generation that published it
+            self.seal_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
             *segments = Arc::new(new_map);
         }
         self.cached_deduped_count
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         self.has_segments_flag
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        self.seal_generation
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// Load a volume into the segments map for an existing manifest entry.

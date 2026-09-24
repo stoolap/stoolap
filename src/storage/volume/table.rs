@@ -329,6 +329,24 @@ impl SegmentedTable {
         }
     }
 
+    /// Runs `read` with the generation of a settled state until the read
+    /// reports, as Some, that its cold view came from that generation. A
+    /// seal moves it before its volume is visible and removes hot rows only
+    /// after, so a read whose hot rows and cold view straddle a seal sees it
+    /// move; a seal that starts once the view is taken leaves the read alone
+    fn across_seals<T>(&self, mut read: impl FnMut(u64) -> Result<Option<T>>) -> Result<T> {
+        loop {
+            if let Some(out) = read(Self::settled_generation(&self.segment_mgr))? {
+                return Ok(out);
+            }
+        }
+    }
+
+    /// Whether a seal published a volume since `generation` was read
+    fn seal_moved(&self, generation: u64) -> bool {
+        self.segment_mgr.seal_generation() != generation
+    }
+
     /// Reload through the captured file owner even after segment retirement.
     fn load_volume_of_view(
         &self,
@@ -1649,33 +1667,47 @@ impl SegmentedTable {
         if let Some(result) = self.unsealed(|hot| hot.scan(column_indices, where_expr)) {
             return result;
         }
+        self.across_seals(|generation| {
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::merged_read_began();
 
-        // Collect hot rows FIRST to get a consistent snapshot of hot row_ids.
-        // The skip set for cold scanners is derived from these actual results,
-        // preventing the race where remove_sealed_rows runs between building
-        // the skip set and hot scanner execution (which would lose rows).
-        let hot_rows = self.hot.collect_all_rows(where_expr)?;
+            // Collect hot rows FIRST to get a consistent snapshot of hot row_ids.
+            // The skip set for cold scanners is derived from these actual results,
+            // preventing the race where remove_sealed_rows runs between building
+            // the skip set and hot scanner execution (which would lose rows).
+            let hot_rows = self.hot.collect_all_rows(where_expr)?;
 
-        let mut skip: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
-        for &(id, _) in &hot_rows {
-            skip.insert(id);
-        }
-        self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut skip);
+            let mut skip: FxHashSet<i64> =
+                FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
+            for &(id, _) in &hot_rows {
+                skip.insert(id);
+            }
+            self.segment_mgr
+                .insert_pending_tombstones_into(self.txn_id(), &mut skip);
 
-        // Create lazy cold scanners with the skip set (no eager collection).
-        // This avoids O(total_cold_rows) memory allocation that was making
-        // ALL queries slow during checkpoint.
-        let cold_scanners =
-            self.create_segment_scanners_filtered(column_indices, needed, where_expr, skip)?;
+            // Create lazy cold scanners with the skip set (no eager collection).
+            // This avoids O(total_cold_rows) memory allocation that was making
+            // ALL queries slow during checkpoint.
+            let Some(cold_scanners) = self.create_segment_scanners_filtered(
+                column_indices,
+                needed,
+                where_expr,
+                skip,
+                generation,
+            )?
+            else {
+                return Ok(None);
+            };
 
-        // Chain: cold scanners (lazy, streamed) + hot rows (already collected)
-        let hot_scanner = Box::new(RowVecScanner::new(hot_rows)) as Box<dyn Scanner>;
-        let mut sources: Vec<Box<dyn Scanner>> = cold_scanners;
-        sources.push(hot_scanner);
+            // Chain: cold scanners (lazy, streamed) + hot rows (already collected)
+            let hot_scanner = Box::new(RowVecScanner::new(hot_rows)) as Box<dyn Scanner>;
+            let mut sources: Vec<Box<dyn Scanner>> = cold_scanners;
+            sources.push(hot_scanner);
 
-        Ok(Box::new(super::scanner::MergingScanner::new(sources)))
+            Ok(Some(
+                Box::new(super::scanner::MergingScanner::new(sources)) as Box<dyn Scanner>
+            ))
+        })
     }
 
     fn create_segment_scanners_filtered(
@@ -1684,7 +1716,8 @@ impl SegmentedTable {
         needed: Option<&[bool]>,
         where_expr: Option<&dyn Expression>,
         hot_skip: FxHashSet<i64>,
-    ) -> Result<Vec<Box<dyn Scanner>>> {
+        generation: u64,
+    ) -> Result<Option<Vec<Box<dyn Scanner>>>> {
         let comparisons = where_expr
             .map(|e| e.collect_comparisons())
             .unwrap_or_default();
@@ -1696,9 +1729,14 @@ impl SegmentedTable {
         self.segment_mgr
             .check_schema_generation(self.schema_generation)?;
         #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::merged_read_collected();
+        if self.seal_moved(generation) {
+            return Ok(None);
+        }
+        #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::cold_volumes_taken();
         if view.seg_ids.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         }
 
         // Committed tombstones are kept as a shared Arc (no clone).
@@ -1796,7 +1834,7 @@ impl SegmentedTable {
 
         // Reverse so oldest segments come first (consistent iteration order)
         scanners_reverse.reverse();
-        Ok(scanners_reverse)
+        Ok(Some(scanners_reverse))
     }
 
     /// Collect rows from segments into a RowVec, with zone map pruning
@@ -1812,7 +1850,8 @@ impl SegmentedTable {
         &self,
         where_expr: Option<&dyn Expression>,
         hot_skip: FxHashSet<i64>,
-    ) -> Result<RowVec> {
+        generation: u64,
+    ) -> Result<Option<RowVec>> {
         self.segment_mgr
             .check_schema_generation(self.schema_generation)?;
         // A filter evaluates by column position and rejects every row until
@@ -1831,6 +1870,11 @@ impl SegmentedTable {
         let view = self.segment_mgr.cold_snapshot();
         self.segment_mgr
             .check_schema_generation(self.schema_generation)?;
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::merged_read_collected();
+        if self.seal_moved(generation) {
+            return Ok(None);
+        }
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::cold_volumes_taken();
 
@@ -2058,7 +2102,7 @@ impl SegmentedTable {
                 rows.push(entry);
             }
         }
-        Ok(rows)
+        Ok(Some(rows))
     }
 
     /// Find a non-tombstoned, non-hot-shadowed row in the statement's segments.
@@ -2570,38 +2614,50 @@ impl Table for SegmentedTable {
     }
 
     fn get_active_row_ids(&self) -> Result<Vec<i64>> {
-        let hot_ids = self.hot.get_active_row_ids()?;
-
-        if !self.segment_mgr.has_segments() {
-            return Ok(hot_ids);
+        if let Some(result) = self.unsealed(|hot| hot.get_active_row_ids()) {
+            return result;
         }
+        self.across_seals(|generation| {
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::merged_read_began();
+            let hot_ids = self.hot.get_active_row_ids()?;
 
-        // Build hot_skip from hot row_ids + pending tombstones.
-        // Committed tombstones are kept as a shared Arc (no clone).
-        let volumes = self.segment_mgr.get_volumes_newest_first()?;
-        let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-        let mut hot_skip: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-        for id in &hot_ids {
-            hot_skip.insert(*id);
-        }
-        self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+            if !self.segment_mgr.has_segments() {
+                return Ok(Some(hot_ids));
+            }
 
-        let mut ids = Vec::new();
-        for (_, cs) in volumes.iter() {
-            let vol = &cs.volume;
-            for (i, &id) in vol.row_ids()?.iter().enumerate() {
-                if !cs.is_visible(i) {
-                    continue;
-                }
-                if !self.is_row_tombstoned(&tombstones_arc, id) && !hot_skip.contains(&id) {
-                    ids.push(id);
+            // Build hot_skip from hot row_ids + pending tombstones.
+            // Committed tombstones are kept as a shared Arc (no clone).
+            let volumes = self.segment_mgr.get_volumes_newest_first()?;
+            let tombstones_arc = self.segment_mgr.tombstone_set_arc();
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::merged_read_collected();
+            if self.seal_moved(generation) {
+                return Ok(None);
+            }
+            let mut hot_skip: FxHashSet<i64> =
+                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+            for id in &hot_ids {
+                hot_skip.insert(*id);
+            }
+            self.segment_mgr
+                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+
+            let mut ids = Vec::new();
+            for (_, cs) in volumes.iter() {
+                let vol = &cs.volume;
+                for (i, &id) in vol.row_ids()?.iter().enumerate() {
+                    if !cs.is_visible(i) {
+                        continue;
+                    }
+                    if !self.is_row_tombstoned(&tombstones_arc, id) && !hot_skip.contains(&id) {
+                        ids.push(id);
+                    }
                 }
             }
-        }
-        ids.extend(hot_ids);
-        Ok(ids)
+            ids.extend(hot_ids);
+            Ok(Some(ids))
+        })
     }
 
     fn delete(&mut self, where_expr: Option<&dyn Expression>) -> Result<i32> {
@@ -2865,25 +2921,31 @@ impl Table for SegmentedTable {
             return result;
         }
 
-        // Scan hot FIRST to get a consistent snapshot. The skip set is
-        // derived from actual hot results, not a separate B-tree read.
-        // This prevents the race where remove_sealed_rows runs between
-        // building the skip set and scanning hot.
-        let hot_rows = self.hot.collect_all_rows(where_expr)?;
+        self.across_seals(|generation| {
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::merged_read_began();
+            // Scan hot FIRST to get a consistent snapshot. The skip set is
+            // derived from actual hot results, not a separate B-tree read.
+            // This prevents the race where remove_sealed_rows runs between
+            // building the skip set and scanning hot.
+            let hot_rows = self.hot.collect_all_rows(where_expr)?;
 
-        let mut skip: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
-        for &(id, _) in &hot_rows {
-            skip.insert(id);
-        }
-        self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut skip);
+            let mut skip: FxHashSet<i64> =
+                FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
+            for &(id, _) in &hot_rows {
+                skip.insert(id);
+            }
+            self.segment_mgr
+                .insert_pending_tombstones_into(self.txn_id(), &mut skip);
 
-        let mut all_rows = self.collect_cold_rows(where_expr, skip)?;
-        for entry in hot_rows {
-            all_rows.push(entry);
-        }
-        Ok(all_rows)
+            let Some(mut all_rows) = self.collect_cold_rows(where_expr, skip, generation)? else {
+                return Ok(None);
+            };
+            for entry in hot_rows {
+                all_rows.push(entry);
+            }
+            Ok(Some(all_rows))
+        })
     }
 
     fn collect_all_rows_unsorted(&self) -> Result<RowVec> {
@@ -2891,21 +2953,27 @@ impl Table for SegmentedTable {
             return result;
         }
 
-        let hot_rows = self.hot.collect_all_rows_unsorted()?;
+        self.across_seals(|generation| {
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::merged_read_began();
+            let hot_rows = self.hot.collect_all_rows_unsorted()?;
 
-        let mut skip: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
-        for &(id, _) in &hot_rows {
-            skip.insert(id);
-        }
-        self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut skip);
+            let mut skip: FxHashSet<i64> =
+                FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
+            for &(id, _) in &hot_rows {
+                skip.insert(id);
+            }
+            self.segment_mgr
+                .insert_pending_tombstones_into(self.txn_id(), &mut skip);
 
-        let mut all_rows = self.collect_cold_rows(None, skip)?;
-        for entry in hot_rows {
-            all_rows.push(entry);
-        }
-        Ok(all_rows)
+            let Some(mut all_rows) = self.collect_cold_rows(None, skip, generation)? else {
+                return Ok(None);
+            };
+            for entry in hot_rows {
+                all_rows.push(entry);
+            }
+            Ok(Some(all_rows))
+        })
     }
 
     fn collect_rows_by_ids(&self, row_ids: &[i64]) -> Result<RowVec> {
@@ -4320,71 +4388,80 @@ impl Table for SegmentedTable {
         if self.segment_mgr.seal_overlap() > 0 {
             return Ok(None);
         }
+        self.across_seals(|generation| {
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::merged_read_began();
 
-        let schema = self.hot.schema();
-        let Some(&col_idx) = schema.column_index_map().get(&column_name.to_lowercase()) else {
-            return Ok(None);
-        };
-
-        // Bail if hot has no index on this column — can't enumerate hot values
-        // without a full scan. Returning Some with only cold values would be wrong.
-        let mut distinct: ValueSet = ValueSet::default();
-        let Some(hot_values) = self.hot.get_partition_values(column_name)? else {
-            return Ok(None);
-        };
-        for v in hot_values {
-            distinct.insert(v);
-        }
-
-        let volumes = self.segment_mgr.get_volumes_newest_first()?;
-        let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-        let mut hot_skip: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-        self.hot.collect_hot_row_ids_into(&mut hot_skip);
-        self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
-
-        // Column resolution uses mapping (handles renames/drops) not col_name.
-        let default_val = self.column_default(col_idx);
-        let has_non_null_default = !default_val.is_null();
-        for (seg_id, cs) in volumes.iter() {
-            let vol = &cs.volume;
-            let row_ids = vol.row_ids()?;
-            let Some(start) = (0..vol.meta.row_count).find(|&i| {
-                cs.is_visible(i)
-                    && !self.is_row_tombstoned(&tombstones_arc, row_ids[i])
-                    && !hot_skip.contains(&row_ids[i])
-            }) else {
-                continue;
+            let schema = self.hot.schema();
+            let Some(&col_idx) = schema.column_index_map().get(&column_name.to_lowercase()) else {
+                return Ok(Some(None));
             };
-            let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
-            let phys = if col_idx < mapping.sources.len() {
-                match &mapping.sources[col_idx] {
-                    super::writer::ColSource::Volume(vi) => Some(*vi),
-                    super::writer::ColSource::Default(_) => None,
-                }
-            } else {
-                None
+
+            // Bail if hot has no index on this column — can't enumerate hot values
+            // without a full scan. Returning Some with only cold values would be wrong.
+            let mut distinct: ValueSet = ValueSet::default();
+            let Some(hot_values) = self.hot.get_partition_values(column_name)? else {
+                return Ok(Some(None));
             };
-            let column = phys.map(|pi| vol.columns.get(pi)).transpose()?;
-            for (i, &rid) in row_ids.iter().enumerate().skip(start) {
-                if !cs.is_visible(i) {
+            for v in hot_values {
+                distinct.insert(v);
+            }
+
+            let volumes = self.segment_mgr.get_volumes_newest_first()?;
+            let tombstones_arc = self.segment_mgr.tombstone_set_arc();
+            let mut hot_skip: FxHashSet<i64> =
+                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+            self.hot.collect_hot_row_ids_into(&mut hot_skip);
+            self.segment_mgr
+                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::merged_read_collected();
+            if self.seal_moved(generation) {
+                return Ok(None);
+            }
+
+            // Column resolution uses mapping (handles renames/drops) not col_name.
+            let default_val = self.column_default(col_idx);
+            let has_non_null_default = !default_val.is_null();
+            for (seg_id, cs) in volumes.iter() {
+                let vol = &cs.volume;
+                let row_ids = vol.row_ids()?;
+                let Some(start) = (0..vol.meta.row_count).find(|&i| {
+                    cs.is_visible(i)
+                        && !self.is_row_tombstoned(&tombstones_arc, row_ids[i])
+                        && !hot_skip.contains(&row_ids[i])
+                }) else {
                     continue;
-                }
-                if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
-                    continue;
-                }
-                if let Some(col) = column {
-                    if !col.is_null(i) {
-                        distinct.insert(col.get_value(i));
+                };
+                let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
+                let phys = if col_idx < mapping.sources.len() {
+                    match &mapping.sources[col_idx] {
+                        super::writer::ColSource::Volume(vi) => Some(*vi),
+                        super::writer::ColSource::Default(_) => None,
                     }
-                } else if has_non_null_default {
-                    distinct.insert(default_val.clone());
+                } else {
+                    None
+                };
+                let column = phys.map(|pi| vol.columns.get(pi)).transpose()?;
+                for (i, &rid) in row_ids.iter().enumerate().skip(start) {
+                    if !cs.is_visible(i) {
+                        continue;
+                    }
+                    if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
+                        continue;
+                    }
+                    if let Some(col) = column {
+                        if !col.is_null(i) {
+                            distinct.insert(col.get_value(i));
+                        }
+                    } else if has_non_null_default {
+                        distinct.insert(default_val.clone());
+                    }
                 }
             }
-        }
 
-        Ok(Some(distinct.into_iter().collect()))
+            Ok(Some(Some(distinct.into_iter().collect())))
+        })
     }
 
     fn compute_distinct_values(&self, col_idx: usize) -> Result<Option<Vec<Value>>> {
@@ -4396,125 +4473,135 @@ impl Table for SegmentedTable {
         if self.segment_mgr.seal_overlap() > 0 {
             return Ok(None);
         }
+        self.across_seals(|generation| {
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::merged_read_began();
 
-        let schema = self.hot.schema();
-        if col_idx >= schema.columns.len() {
-            return Ok(None);
-        }
-        let col_name = &schema.columns[col_idx].name;
-
-        // Collect hot distinct values via index (same requirement as get_partition_values)
-        let mut distinct: ValueSet = ValueSet::default();
-        if let Some(hot_values) = self.hot.get_partition_values(col_name)? {
-            for v in hot_values {
-                distinct.insert(v);
+            let schema = self.hot.schema();
+            if col_idx >= schema.columns.len() {
+                return Ok(Some(None));
             }
-        } else if self.hot.row_count()? > 0 {
-            // Hot has rows but no index on this column — cannot enumerate without full scan
-            return Ok(None);
-        }
+            let col_name = &schema.columns[col_idx].name;
 
-        if !self.segment_mgr.has_segments() {
-            return Ok(Some(distinct.into_iter().collect()));
-        }
-
-        let no_tombstones = self.segment_mgr.is_tombstone_set_empty()
-            && !self.segment_mgr.has_pending_tombstones(self.txn_id());
-
-        let volumes = self.segment_mgr.get_volumes_newest_first()?;
-        let tombstones_arc = if no_tombstones {
-            // Avoid cloning the Arc when we know the set is empty
-            Arc::new(FxHashMap::default())
-        } else {
-            self.segment_mgr.tombstone_set_arc()
-        };
-        let mut hot_skip: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(1024, Default::default());
-        self.hot.collect_hot_row_ids_into(&mut hot_skip);
-        if !no_tombstones {
-            self.segment_mgr
-                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
-        }
-
-        let schema = self.hot.schema();
-        let default_val = self.column_default(col_idx);
-        let has_non_null_default = !default_val.is_null();
-
-        for (seg_id, cs) in volumes.iter() {
-            let vol = &cs.volume;
-            let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
-            let phys = if col_idx < mapping.sources.len() {
-                match &mapping.sources[col_idx] {
-                    super::writer::ColSource::Volume(vi) => Some(*vi),
-                    super::writer::ColSource::Default(_) => None,
+            // Collect hot distinct values via index (same requirement as get_partition_values)
+            let mut distinct: ValueSet = ValueSet::default();
+            if let Some(hot_values) = self.hot.get_partition_values(col_name)? {
+                for v in hot_values {
+                    distinct.insert(v);
                 }
+            } else if self.hot.row_count()? > 0 {
+                // Hot has rows but no index on this column — cannot enumerate without full scan
+                return Ok(Some(None));
+            }
+
+            if !self.segment_mgr.has_segments() {
+                return Ok(Some(Some(distinct.into_iter().collect())));
+            }
+
+            let no_tombstones = self.segment_mgr.is_tombstone_set_empty()
+                && !self.segment_mgr.has_pending_tombstones(self.txn_id());
+
+            let volumes = self.segment_mgr.get_volumes_newest_first()?;
+            let tombstones_arc = if no_tombstones {
+                // Avoid cloning the Arc when we know the set is empty
+                Arc::new(FxHashMap::default())
             } else {
-                None
+                self.segment_mgr.tombstone_set_arc()
             };
+            let mut hot_skip: FxHashSet<i64> =
+                FxHashSet::with_capacity_and_hasher(1024, Default::default());
+            self.hot.collect_hot_row_ids_into(&mut hot_skip);
+            if !no_tombstones {
+                self.segment_mgr
+                    .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+            }
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::merged_read_collected();
+            if self.seal_moved(generation) {
+                return Ok(None);
+            }
 
-            if let Some(pi) = phys {
-                // Dictionary fast path: no tombstones and all rows visible means
-                // the dictionary itself IS the distinct value set for this volume
-                let can_use_dict = no_tombstones && cs.visible.is_none() && hot_skip.is_empty();
+            let schema = self.hot.schema();
+            let default_val = self.column_default(col_idx);
+            let has_non_null_default = !default_val.is_null();
 
-                if can_use_dict {
-                    if let Some(dict_arc) = vol.get_column_dictionary(pi)? {
-                        for entry in dict_arc.iter() {
-                            distinct.insert(Value::text(entry.as_str()));
-                        }
-                        // Check for NULLs via zone map null_count
-                        // (dictionary values are non-null, but the column may have null rows)
-                        continue;
+            for (seg_id, cs) in volumes.iter() {
+                let vol = &cs.volume;
+                let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
+                let phys = if col_idx < mapping.sources.len() {
+                    match &mapping.sources[col_idx] {
+                        super::writer::ColSource::Volume(vi) => Some(*vi),
+                        super::writer::ColSource::Default(_) => None,
                     }
-                }
-
-                // Fallback: row-by-row scan on this volume's column
-                let row_ids = vol.row_ids()?;
-                let Some(start) = (0..vol.meta.row_count).find(|&i| {
-                    cs.is_visible(i)
-                        && !hot_skip.contains(&row_ids[i])
-                        && (no_tombstones || !self.is_row_tombstoned(&tombstones_arc, row_ids[i]))
-                }) else {
-                    continue;
+                } else {
+                    None
                 };
-                let col = vol.columns.get(pi)?;
-                for (i, &rid) in row_ids.iter().enumerate().skip(start) {
-                    if !cs.is_visible(i) {
+
+                if let Some(pi) = phys {
+                    // Dictionary fast path: no tombstones and all rows visible means
+                    // the dictionary itself IS the distinct value set for this volume
+                    let can_use_dict = no_tombstones && cs.visible.is_none() && hot_skip.is_empty();
+
+                    if can_use_dict {
+                        if let Some(dict_arc) = vol.get_column_dictionary(pi)? {
+                            for entry in dict_arc.iter() {
+                                distinct.insert(Value::text(entry.as_str()));
+                            }
+                            // Check for NULLs via zone map null_count
+                            // (dictionary values are non-null, but the column may have null rows)
+                            continue;
+                        }
+                    }
+
+                    // Fallback: row-by-row scan on this volume's column
+                    let row_ids = vol.row_ids()?;
+                    let Some(start) = (0..vol.meta.row_count).find(|&i| {
+                        cs.is_visible(i)
+                            && !hot_skip.contains(&row_ids[i])
+                            && (no_tombstones
+                                || !self.is_row_tombstoned(&tombstones_arc, row_ids[i]))
+                    }) else {
                         continue;
+                    };
+                    let col = vol.columns.get(pi)?;
+                    for (i, &rid) in row_ids.iter().enumerate().skip(start) {
+                        if !cs.is_visible(i) {
+                            continue;
+                        }
+                        if hot_skip.contains(&rid) {
+                            continue;
+                        }
+                        if !no_tombstones && self.is_row_tombstoned(&tombstones_arc, rid) {
+                            continue;
+                        }
+                        if !col.is_null(i) {
+                            distinct.insert(col.get_value(i));
+                        }
                     }
-                    if hot_skip.contains(&rid) {
-                        continue;
+                } else if has_non_null_default {
+                    // Column was added after this volume was sealed — use default
+                    let row_ids = vol.row_ids()?;
+                    let has_visible = (0..vol.meta.row_count).any(|i| {
+                        if !cs.is_visible(i) {
+                            return false;
+                        }
+                        let rid = row_ids[i];
+                        if hot_skip.contains(&rid) {
+                            return false;
+                        }
+                        if !no_tombstones && self.is_row_tombstoned(&tombstones_arc, rid) {
+                            return false;
+                        }
+                        true
+                    });
+                    if has_visible {
+                        distinct.insert(default_val.clone());
                     }
-                    if !no_tombstones && self.is_row_tombstoned(&tombstones_arc, rid) {
-                        continue;
-                    }
-                    if !col.is_null(i) {
-                        distinct.insert(col.get_value(i));
-                    }
-                }
-            } else if has_non_null_default {
-                // Column was added after this volume was sealed — use default
-                let row_ids = vol.row_ids()?;
-                let has_visible = (0..vol.meta.row_count).any(|i| {
-                    if !cs.is_visible(i) {
-                        return false;
-                    }
-                    let rid = row_ids[i];
-                    if hot_skip.contains(&rid) {
-                        return false;
-                    }
-                    if !no_tombstones && self.is_row_tombstoned(&tombstones_arc, rid) {
-                        return false;
-                    }
-                    true
-                });
-                if has_visible {
-                    distinct.insert(default_val.clone());
                 }
             }
-        }
 
-        Ok(Some(distinct.into_iter().collect()))
+            Ok(Some(Some(distinct.into_iter().collect())))
+        })
     }
 
     fn collect_rows_grouped_by_partition(
@@ -4757,191 +4844,200 @@ impl Table for SegmentedTable {
             return Ok(Some(RowVec::new()));
         }
 
-        // 1. Collect hot rows in PK order. Only materialize `needed` rows
-        //    (not all hot rows). The skip set uses row IDs only (no materialization).
-        let hot_rows =
-            match self
-                .hot
-                .collect_rows_ordered_by_index(column_name, ascending, needed, 0)?
-            {
-                Some(rows) => rows,
-                None => {
-                    // Local changes prevent ordered iteration — fall back to collect + sort.
-                    let mut rows = self.hot.collect_all_rows(None)?;
-                    if ascending {
-                        rows.sort_unstable_by_key(|&(id, _)| id);
-                    } else {
-                        rows.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
+        self.across_seals(|generation| {
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::merged_read_began();
+            // 1. Collect hot rows in PK order. Only materialize `needed` rows
+            //    (not all hot rows). The skip set uses row IDs only (no materialization).
+            let hot_rows =
+                match self
+                    .hot
+                    .collect_rows_ordered_by_index(column_name, ascending, needed, 0)?
+                {
+                    Some(rows) => rows,
+                    None => {
+                        // Local changes prevent ordered iteration — fall back to collect + sort.
+                        let mut rows = self.hot.collect_all_rows(None)?;
+                        if ascending {
+                            rows.sort_unstable_by_key(|&(id, _)| id);
+                        } else {
+                            rows.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
+                        }
+                        rows.truncate(needed);
+                        rows
                     }
-                    rows.truncate(needed);
-                    rows
-                }
-            };
-
-        // 2. Build skip set from ALL hot row IDs (no Row materialization).
-        //    Hot rows shadow cold rows regardless of whether they're in the merge set.
-        let mut skip: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-        self.hot.collect_hot_row_ids_into(&mut skip);
-        self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut skip);
-        let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-
-        // 3. Get volumes (oldest first — segment_id ascending order).
-        //    We need column data for materialization, so use ensure_columns path.
-        let volumes = self.segment_mgr.get_volumes_newest_first()?;
-        // volumes is oldest-first after the reverse inside get_volumes_newest_first.
-
-        // 4. K-way merge using per-source cursors.
-        //    Sources: hot_rows (already sorted) + each volume's row_ids (sorted ascending).
-        //    For DESC, we iterate each source from the end.
-
-        // Pre-compute column mappings for each volume.
-        struct VolSource<'a> {
-            row_ids: &'a [i64],
-            /// Positions in id order when the ids themselves are not
-            order: Option<&'a [u32]>,
-            cursor: usize,
-            mapping: super::writer::ColumnMapping,
-            visible: Option<Arc<Vec<u64>>>,
-            /// Holds the groups the merge reads from this volume
-            reader: super::writer::RowReader,
-        }
-
-        impl VolSource<'_> {
-            /// The physical position of the k-th row in id order
-            fn position(&self, k: usize) -> usize {
-                self.order.map_or(k, |order| order[k] as usize)
-            }
-        }
-
-        let mut vol_sources: Vec<VolSource> = Vec::with_capacity(volumes.len());
-        for (seg_id, cs) in volumes.iter() {
-            // Filter out empty or fully-skipped volumes early via zone-map on row_id range.
-            let vol = &cs.volume;
-            if vol.meta.row_count == 0 {
-                continue;
-            }
-            let mapping = self.segment_mgr.get_volume_mapping(*seg_id, &schema);
-            vol_sources.push(VolSource {
-                row_ids: vol.row_ids()?,
-                order: vol.row_order(),
-                cursor: if ascending { 0 } else { vol.meta.row_count },
-                mapping,
-                visible: cs.visible.clone(),
-                reader: super::writer::RowReader::new(Arc::clone(&cs.volume)),
-            });
-        }
-
-        let mut result = RowVec::with_capacity(needed.min(1024));
-        let mut skipped = 0usize;
-        let mut hot_cursor: usize = 0;
-
-        loop {
-            if result.len() >= limit {
-                break;
-            }
-
-            // Find the source with the next row_id to emit.
-            // For ASC: smallest row_id. For DESC: largest row_id.
-            let mut best_row_id: Option<i64> = None;
-            // 0 = hot, 1..=num_vol = vol_sources[idx-1]
-            let mut best_source: usize = usize::MAX;
-
-            // Check hot source
-            if hot_cursor < hot_rows.len() {
-                let (rid, _) = &hot_rows[hot_cursor];
-                best_row_id = Some(*rid);
-                best_source = 0;
-            }
-
-            // Check each volume source
-            for (vi, vs) in vol_sources.iter().enumerate() {
-                let rid = if ascending {
-                    if vs.cursor >= vs.row_ids.len() {
-                        continue;
-                    }
-                    vs.row_ids[vs.position(vs.cursor)]
-                } else {
-                    if vs.cursor == 0 {
-                        continue;
-                    }
-                    vs.row_ids[vs.position(vs.cursor - 1)]
                 };
 
-                let dominated = match best_row_id {
-                    None => false,
-                    Some(best) => {
-                        if ascending {
-                            best <= rid
-                        } else {
-                            best >= rid
+            // 2. Build skip set from ALL hot row IDs (no Row materialization).
+            //    Hot rows shadow cold rows regardless of whether they're in the merge set.
+            let mut skip: FxHashSet<i64> =
+                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+            self.hot.collect_hot_row_ids_into(&mut skip);
+            self.segment_mgr
+                .insert_pending_tombstones_into(self.txn_id(), &mut skip);
+            let tombstones_arc = self.segment_mgr.tombstone_set_arc();
+
+            // 3. Get volumes (oldest first — segment_id ascending order).
+            //    We need column data for materialization, so use ensure_columns path.
+            let volumes = self.segment_mgr.get_volumes_newest_first()?;
+            // volumes is oldest-first after the reverse inside get_volumes_newest_first.
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::merged_read_collected();
+            if self.seal_moved(generation) {
+                return Ok(None);
+            }
+
+            // 4. K-way merge using per-source cursors.
+            //    Sources: hot_rows (already sorted) + each volume's row_ids (sorted ascending).
+            //    For DESC, we iterate each source from the end.
+
+            // Pre-compute column mappings for each volume.
+            struct VolSource<'a> {
+                row_ids: &'a [i64],
+                /// Positions in id order when the ids themselves are not
+                order: Option<&'a [u32]>,
+                cursor: usize,
+                mapping: super::writer::ColumnMapping,
+                visible: Option<Arc<Vec<u64>>>,
+                /// Holds the groups the merge reads from this volume
+                reader: super::writer::RowReader,
+            }
+
+            impl VolSource<'_> {
+                /// The physical position of the k-th row in id order
+                fn position(&self, k: usize) -> usize {
+                    self.order.map_or(k, |order| order[k] as usize)
+                }
+            }
+
+            let mut vol_sources: Vec<VolSource> = Vec::with_capacity(volumes.len());
+            for (seg_id, cs) in volumes.iter() {
+                // Filter out empty or fully-skipped volumes early via zone-map on row_id range.
+                let vol = &cs.volume;
+                if vol.meta.row_count == 0 {
+                    continue;
+                }
+                let mapping = self.segment_mgr.get_volume_mapping(*seg_id, &schema);
+                vol_sources.push(VolSource {
+                    row_ids: vol.row_ids()?,
+                    order: vol.row_order(),
+                    cursor: if ascending { 0 } else { vol.meta.row_count },
+                    mapping,
+                    visible: cs.visible.clone(),
+                    reader: super::writer::RowReader::new(Arc::clone(&cs.volume)),
+                });
+            }
+
+            let mut result = RowVec::with_capacity(needed.min(1024));
+            let mut skipped = 0usize;
+            let mut hot_cursor: usize = 0;
+
+            loop {
+                if result.len() >= limit {
+                    break;
+                }
+
+                // Find the source with the next row_id to emit.
+                // For ASC: smallest row_id. For DESC: largest row_id.
+                let mut best_row_id: Option<i64> = None;
+                // 0 = hot, 1..=num_vol = vol_sources[idx-1]
+                let mut best_source: usize = usize::MAX;
+
+                // Check hot source
+                if hot_cursor < hot_rows.len() {
+                    let (rid, _) = &hot_rows[hot_cursor];
+                    best_row_id = Some(*rid);
+                    best_source = 0;
+                }
+
+                // Check each volume source
+                for (vi, vs) in vol_sources.iter().enumerate() {
+                    let rid = if ascending {
+                        if vs.cursor >= vs.row_ids.len() {
+                            continue;
+                        }
+                        vs.row_ids[vs.position(vs.cursor)]
+                    } else {
+                        if vs.cursor == 0 {
+                            continue;
+                        }
+                        vs.row_ids[vs.position(vs.cursor - 1)]
+                    };
+
+                    let dominated = match best_row_id {
+                        None => false,
+                        Some(best) => {
+                            if ascending {
+                                best <= rid
+                            } else {
+                                best >= rid
+                            }
+                        }
+                    };
+                    if !dominated {
+                        best_row_id = Some(rid);
+                        best_source = vi + 1;
+                    }
+                }
+
+                // No more rows from any source.
+                if best_source == usize::MAX {
+                    break;
+                }
+
+                if best_source == 0 {
+                    // Hot source — row is already materialized and visible.
+                    let (rid, row) = hot_rows[hot_cursor].clone();
+                    hot_cursor += 1;
+                    // Hot rows don't need tombstone/skip checks — they ARE the authoritative version.
+                    if skipped < offset {
+                        skipped += 1;
+                    } else {
+                        result.push((rid, row));
+                    }
+                } else {
+                    // Volume source
+                    let vs = &mut vol_sources[best_source - 1];
+                    let k = if ascending {
+                        let i = vs.cursor;
+                        vs.cursor += 1;
+                        i
+                    } else {
+                        vs.cursor -= 1;
+                        vs.cursor
+                    };
+                    let idx = vs.position(k);
+
+                    let rid = vs.row_ids[idx];
+
+                    // Visibility check: inter-volume dedup bitmap
+                    if let Some(ref bits) = vs.visible {
+                        if (bits[idx >> 6] >> (idx & 63)) & 1 == 0 {
+                            continue;
                         }
                     }
-                };
-                if !dominated {
-                    best_row_id = Some(rid);
-                    best_source = vi + 1;
-                }
-            }
 
-            // No more rows from any source.
-            if best_source == usize::MAX {
-                break;
-            }
-
-            if best_source == 0 {
-                // Hot source — row is already materialized and visible.
-                let (rid, row) = hot_rows[hot_cursor].clone();
-                hot_cursor += 1;
-                // Hot rows don't need tombstone/skip checks — they ARE the authoritative version.
-                if skipped < offset {
-                    skipped += 1;
-                } else {
-                    result.push((rid, row));
-                }
-            } else {
-                // Volume source
-                let vs = &mut vol_sources[best_source - 1];
-                let k = if ascending {
-                    let i = vs.cursor;
-                    vs.cursor += 1;
-                    i
-                } else {
-                    vs.cursor -= 1;
-                    vs.cursor
-                };
-                let idx = vs.position(k);
-
-                let rid = vs.row_ids[idx];
-
-                // Visibility check: inter-volume dedup bitmap
-                if let Some(ref bits) = vs.visible {
-                    if (bits[idx >> 6] >> (idx & 63)) & 1 == 0 {
+                    // Skip if hot shadows this row or if tombstoned
+                    if skip.contains(&rid) {
                         continue;
                     }
-                }
+                    if self.is_row_tombstoned(&tombstones_arc, rid) {
+                        continue;
+                    }
 
-                // Skip if hot shadows this row or if tombstoned
-                if skip.contains(&rid) {
-                    continue;
-                }
-                if self.is_row_tombstoned(&tombstones_arc, rid) {
-                    continue;
-                }
+                    // Materialize the row
+                    let row = vs.reader.row(idx, &vs.mapping)?;
 
-                // Materialize the row
-                let row = vs.reader.row(idx, &vs.mapping)?;
-
-                if skipped < offset {
-                    skipped += 1;
-                } else {
-                    result.push((rid, row));
+                    if skipped < offset {
+                        skipped += 1;
+                    } else {
+                        result.push((rid, row));
+                    }
                 }
             }
-        }
 
-        Ok(Some(result))
+            Ok(Some(Some(result)))
+        })
     }
 
     fn collect_rows_pk_keyset(
@@ -5075,178 +5171,191 @@ impl Table for SegmentedTable {
             return Ok(None);
         }
 
-        // The hot store answers from an index when it can; then only its
-        // best rows are read, and a sealed copy of a hot row is recognised
-        // per candidate instead of through a set of every matching hot row
-        let hot_top = self
-            .hot
-            .scan_top_k(where_expr, column_name, ascending, needed, 0)?;
-        let sealed_copies_checked = hot_top.is_some();
-        let hot_rows = match hot_top {
-            Some(rows) => rows,
-            None => self.hot.collect_all_rows(where_expr)?,
-        };
-        let mut hot_skip: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
-        let mut keep = TopK::new(needed, col_idx, ascending);
-        for (row_id, row) in hot_rows {
-            hot_skip.insert(row_id);
-            keep.offer(row_id, row);
-        }
-        // Cold rows this transaction deleted or updated are not in the volumes'
-        // committed tombstones yet
-        self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
-
-        let volumes = self.segment_mgr.get_volumes_newest_first_lazy();
-        // Every volume must carry the column and a zone map without NULLs
-        let mut ordered: Vec<(usize, usize, Value)> = Vec::with_capacity(volumes.len());
-        for (i, (_, cs)) in volumes.iter().enumerate() {
-            let vol = &cs.volume;
-            // Through the mapping, so a renamed column's bounds and stop
-            // key come from the column the schema means
-            let Some(vcol) = cs.mapping.volume_column(vol, &col_lower) else {
-                return Ok(None);
+        self.across_seals(|generation| {
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::merged_read_began();
+            // The hot store answers from an index when it can; then only its
+            // best rows are read, and a sealed copy of a hot row is recognised
+            // per candidate instead of through a set of every matching hot row
+            let hot_top = self
+                .hot
+                .scan_top_k(where_expr, column_name, ascending, needed, 0)?;
+            let sealed_copies_checked = hot_top.is_some();
+            let hot_rows = match hot_top {
+                Some(rows) => rows,
+                None => self.hot.collect_all_rows(where_expr)?,
             };
-            let Some(zm) = vol.meta.zone_maps.get(vcol) else {
-                return Ok(None);
-            };
-            if zm.null_count > 0 {
-                return Ok(None);
+            let mut hot_skip: FxHashSet<i64> =
+                FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
+            let mut keep = TopK::new(needed, col_idx, ascending);
+            for (row_id, row) in hot_rows {
+                hot_skip.insert(row_id);
+                keep.offer(row_id, row);
             }
-            let bound = if ascending {
-                zm.min.clone()
-            } else {
-                zm.max.clone()
-            };
-            ordered.push((i, vcol, bound));
-        }
-        if ascending {
-            ordered.sort_by(|a, b| a.2.cmp(&b.2));
-        } else {
-            ordered.sort_by(|a, b| b.2.cmp(&a.2));
-        }
+            // Cold rows this transaction deleted or updated are not in the volumes'
+            // committed tombstones yet
+            self.segment_mgr
+                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
 
-        let comparisons = where_expr
-            .map(|e| e.collect_comparisons())
-            .unwrap_or_default();
-        let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
-        let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-        let hot_skip_arc = Arc::new(hot_skip);
-        let current_schema = self.hot.schema();
-        let all_cols: Vec<usize> = (0..current_schema.columns.len()).collect();
-        let prepared_filter = where_expr.map(|expr| {
-            let mut filter = expr.with_aliases(&Default::default());
-            filter.prepare_for_schema(current_schema);
-            filter
-        });
-
-        for (i, vcol, bound) in ordered {
-            if keep.cannot_improve(&bound) {
-                break;
-            }
-            let (seg_id, cs) = &volumes[i];
-            let (should_skip, mut narrow_start, mut narrow_end) =
-                Self::prune_volume(&cs.volume, &cs.mapping, &comparisons, &bloom_hashes)?;
-            if should_skip {
-                continue;
-            }
-            let loaded;
-            let vol: &Arc<FrozenVolume> = if cs.volume.is_cold() {
-                loaded = match self.segment_mgr.ensure_volume(*seg_id)? {
-                    Some(v) => v,
-                    None => continue,
+            let volumes = self.segment_mgr.get_volumes_newest_first_lazy();
+            // Every volume must carry the column and a zone map without NULLs
+            let mut ordered: Vec<(usize, usize, Value)> = Vec::with_capacity(volumes.len());
+            for (i, (_, cs)) in volumes.iter().enumerate() {
+                let vol = &cs.volume;
+                // Through the mapping, so a renamed column's bounds and stop
+                // key come from the column the schema means
+                let Some(vcol) = cs.mapping.volume_column(vol, &col_lower) else {
+                    return Ok(Some(None));
                 };
-                // Only a loaded volume can narrow the range through the sorted
-                // columns' binary search; a warm one already did above
-                (_, narrow_start, narrow_end) =
-                    Self::prune_volume(&loaded, &cs.mapping, &comparisons, &bloom_hashes)?;
-                &loaded
-            } else {
-                &cs.volume
-            };
-            let sorted = vol.is_sorted(vcol);
-            // Row groups in bound order, clipped to the narrowed range; a
-            // volume without group metadata is one group
-            let mut groups: Vec<(usize, usize, Option<&Value>)> = vol
-                .meta
-                .row_groups
-                .iter()
-                .map(|rg| {
-                    let bound =
-                        rg.zone_maps
-                            .get(vcol)
-                            .map(|zm| if ascending { &zm.min } else { &zm.max });
-                    (rg.start_idx as usize, rg.end_idx as usize, bound)
-                })
-                .collect();
-            if groups.is_empty() {
-                groups.push((0, vol.meta.row_count, None));
-            }
-            for group in &mut groups {
-                group.0 = group.0.max(narrow_start);
-                group.1 = group.1.min(narrow_end);
-            }
-            groups.retain(|g| g.0 < g.1);
-            // Bound order, not physical order: a volume written out of time order
-            // has its best group anywhere. A group without a bound goes first.
-            groups.sort_by(|a, b| match (&a.2, &b.2) {
-                (None, None) => std::cmp::Ordering::Equal,
-                (None, Some(_)) => std::cmp::Ordering::Less,
-                (Some(_), None) => std::cmp::Ordering::Greater,
-                (Some(x), Some(y)) => {
-                    if ascending {
-                        x.cmp(y)
-                    } else {
-                        y.cmp(x)
-                    }
+                let Some(zm) = vol.meta.zone_maps.get(vcol) else {
+                    return Ok(Some(None));
+                };
+                if zm.null_count > 0 {
+                    return Ok(Some(None));
                 }
+                let bound = if ascending {
+                    zm.min.clone()
+                } else {
+                    zm.max.clone()
+                };
+                ordered.push((i, vcol, bound));
+            }
+            if ascending {
+                ordered.sort_by(|a, b| a.2.cmp(&b.2));
+            } else {
+                ordered.sort_by(|a, b| b.2.cmp(&a.2));
+            }
+
+            let comparisons = where_expr
+                .map(|e| e.collect_comparisons())
+                .unwrap_or_default();
+            let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
+            let tombstones_arc = self.segment_mgr.tombstone_set_arc();
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::merged_read_collected();
+            if self.seal_moved(generation) {
+                return Ok(None);
+            }
+            let hot_skip_arc = Arc::new(hot_skip);
+            let current_schema = self.hot.schema();
+            let all_cols: Vec<usize> = (0..current_schema.columns.len()).collect();
+            let prepared_filter = where_expr.map(|expr| {
+                let mut filter = expr.with_aliases(&Default::default());
+                filter.prepare_for_schema(current_schema);
+                filter
             });
 
-            for (start, end, group_bound) in groups {
-                if let Some(bound) = group_bound {
-                    if keep.cannot_improve(bound) {
-                        break;
-                    }
+            for (i, vcol, bound) in ordered {
+                if keep.cannot_improve(&bound) {
+                    break;
                 }
-                let mut scanner =
-                    VolumeScanner::with_range(Arc::clone(vol), all_cols.clone(), start, end, None)?;
-                scanner.set_skip_sets(Arc::clone(&tombstones_arc), Arc::clone(&hot_skip_arc));
-                scanner.set_visibility_bitmap(cs.visible.clone());
-                scanner.snapshot_seq = self.snapshot_seq;
-                scanner.set_column_mapping(
-                    self.segment_mgr.get_volume_mapping(*seg_id, current_schema),
-                );
-                // In a sorted volume the rows come in key order: walk from the
-                // best end and stop at the first key the heap cannot use
-                if sorted {
-                    scanner.set_ordered_walk(ascending);
-                    if let Some(worst) = keep.worst_key() {
-                        scanner.set_stop_key(vcol, worst, ascending);
-                    }
+                let (seg_id, cs) = &volumes[i];
+                let (should_skip, mut narrow_start, mut narrow_end) =
+                    Self::prune_volume(&cs.volume, &cs.mapping, &comparisons, &bloom_hashes)?;
+                if should_skip {
+                    continue;
                 }
-                if let Some(filter) = &prepared_filter {
-                    scanner.set_filter(filter.clone_box());
+                let loaded;
+                let vol: &Arc<FrozenVolume> = if cs.volume.is_cold() {
+                    loaded = match self.segment_mgr.ensure_volume(*seg_id)? {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    // Only a loaded volume can narrow the range through the sorted
+                    // columns' binary search; a warm one already did above
+                    (_, narrow_start, narrow_end) =
+                        Self::prune_volume(&loaded, &cs.mapping, &comparisons, &bloom_hashes)?;
+                    &loaded
+                } else {
+                    &cs.volume
+                };
+                let sorted = vol.is_sorted(vcol);
+                // Row groups in bound order, clipped to the narrowed range; a
+                // volume without group metadata is one group
+                let mut groups: Vec<(usize, usize, Option<&Value>)> = vol
+                    .meta
+                    .row_groups
+                    .iter()
+                    .map(|rg| {
+                        let bound =
+                            rg.zone_maps
+                                .get(vcol)
+                                .map(|zm| if ascending { &zm.min } else { &zm.max });
+                        (rg.start_idx as usize, rg.end_idx as usize, bound)
+                    })
+                    .collect();
+                if groups.is_empty() {
+                    groups.push((0, vol.meta.row_count, None));
                 }
-                while scanner.next() {
-                    let (row_id, row) = scanner.take_row_with_id();
-                    if sealed_copies_checked && self.hot.has_row_id(row_id)? {
-                        continue;
+                for group in &mut groups {
+                    group.0 = group.0.max(narrow_start);
+                    group.1 = group.1.min(narrow_end);
+                }
+                groups.retain(|g| g.0 < g.1);
+                // Bound order, not physical order: a volume written out of time order
+                // has its best group anywhere. A group without a bound goes first.
+                groups.sort_by(|a, b| match (&a.2, &b.2) {
+                    (None, None) => std::cmp::Ordering::Equal,
+                    (None, Some(_)) => std::cmp::Ordering::Less,
+                    (Some(_), None) => std::cmp::Ordering::Greater,
+                    (Some(x), Some(y)) => {
+                        if ascending {
+                            x.cmp(y)
+                        } else {
+                            y.cmp(x)
+                        }
                     }
-                    keep.offer(row_id, row);
+                });
+
+                for (start, end, group_bound) in groups {
+                    if let Some(bound) = group_bound {
+                        if keep.cannot_improve(bound) {
+                            break;
+                        }
+                    }
+                    let mut scanner = VolumeScanner::with_range(
+                        Arc::clone(vol),
+                        all_cols.clone(),
+                        start,
+                        end,
+                        None,
+                    )?;
+                    scanner.set_skip_sets(Arc::clone(&tombstones_arc), Arc::clone(&hot_skip_arc));
+                    scanner.set_visibility_bitmap(cs.visible.clone());
+                    scanner.snapshot_seq = self.snapshot_seq;
+                    scanner.set_column_mapping(
+                        self.segment_mgr.get_volume_mapping(*seg_id, current_schema),
+                    );
+                    // In a sorted volume the rows come in key order: walk from the
+                    // best end and stop at the first key the heap cannot use
                     if sorted {
+                        scanner.set_ordered_walk(ascending);
                         if let Some(worst) = keep.worst_key() {
                             scanner.set_stop_key(vcol, worst, ascending);
                         }
                     }
-                }
-                if let Some(e) = scanner.err() {
-                    return Err(crate::core::Error::internal(format!("scan error: {}", e)));
+                    if let Some(filter) = &prepared_filter {
+                        scanner.set_filter(filter.clone_box());
+                    }
+                    while scanner.next() {
+                        let (row_id, row) = scanner.take_row_with_id();
+                        if sealed_copies_checked && self.hot.has_row_id(row_id)? {
+                            continue;
+                        }
+                        keep.offer(row_id, row);
+                        if sorted {
+                            if let Some(worst) = keep.worst_key() {
+                                scanner.set_stop_key(vcol, worst, ascending);
+                            }
+                        }
+                    }
+                    if let Some(e) = scanner.err() {
+                        return Err(crate::core::Error::internal(format!("scan error: {}", e)));
+                    }
                 }
             }
-        }
-
-        Ok(Some(keep.into_rows(offset)))
+            Ok(Some(Some(keep.into_rows(offset))))
+        })
     }
 
     // Index operations
@@ -5702,98 +5811,108 @@ impl Table for SegmentedTable {
             ));
         }
 
-        // Hot buffer handles temporal filtering via version chains.
-        let mut hot_result = self
-            .hot
-            .select_as_of(columns, expr, temporal_type, temporal_value)?;
+        self.across_seals(|generation| {
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::merged_read_began();
+            // Hot buffer handles temporal filtering via version chains.
+            let mut hot_result =
+                self.hot
+                    .select_as_of(columns, expr, temporal_type, temporal_value)?;
 
-        let schema = self.hot.schema().clone();
-        let pk_idx = schema.columns.iter().position(|c| c.primary_key);
-        let mut hot_pks: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-        let mut all_rows = RowVec::new();
-
-        while hot_result.next() {
-            let row = hot_result.take_row();
-            if let Some(pi) = pk_idx {
-                if let Some(Value::Integer(pk)) = row.get(pi) {
-                    hot_pks.insert(*pk);
-                }
-            }
-            all_rows.push((0, row));
-        }
-
-        // Cold rows in segments have no version chain and no create_time,
-        // so they cannot participate in SYSTEM_TIME temporal queries.
-        // Cold segments store raw data without version chains, so they're valid
-        // only for "CURRENT" temporal queries. Historical queries return early above.
-        if is_current_query {
-            // Build hot_skip from hot row_ids + pending tombstones.
-            // Committed tombstones are kept as a shared Arc (no clone).
-            let volumes = self.segment_mgr.get_volumes_newest_first()?;
-            let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-            let mut hot_skip: FxHashSet<i64> =
+            let schema = self.hot.schema().clone();
+            let pk_idx = schema.columns.iter().position(|c| c.primary_key);
+            let mut hot_pks: FxHashSet<i64> =
                 FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-            self.hot.collect_hot_row_ids_into(&mut hot_skip);
-            self.segment_mgr
-                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+            let mut all_rows = RowVec::new();
 
-            for (seg_id, cs) in volumes.iter() {
-                let vol = &cs.volume;
-                let mapping = self.segment_mgr.get_volume_mapping(*seg_id, &schema);
-                let mut reader = super::writer::RowReader::new(Arc::clone(vol));
-                for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
-                    if !cs.is_visible(i) {
-                        continue;
+            while hot_result.next() {
+                let row = hot_result.take_row();
+                if let Some(pi) = pk_idx {
+                    if let Some(Value::Integer(pk)) = row.get(pi) {
+                        hot_pks.insert(*pk);
                     }
-                    if self.is_row_tombstoned(&tombstones_arc, row_id) || hot_skip.contains(&row_id)
-                    {
-                        continue;
-                    }
-                    if let Some(si) = pk_idx {
-                        // Resolve PK schema index to physical volume index via mapping
-                        let phys_pk = if si < mapping.sources.len() {
-                            match &mapping.sources[si] {
-                                super::writer::ColSource::Volume(vi) => Some(*vi),
-                                super::writer::ColSource::Default(_) => None,
-                            }
-                        } else {
-                            None
-                        };
-                        if let Some(pi) = phys_pk {
-                            if pi < vol.meta.column_types.len()
-                                && matches!(
-                                    vol.meta.column_types[pi],
-                                    DataType::Integer | DataType::Timestamp
-                                )
-                                && pi < vol.columns.len()
-                                && !vol.columns.get(pi)?.is_null(i)
-                            {
-                                let pk_val = vol.columns.get(pi)?.get_i64(i);
-                                if hot_pks.contains(&pk_val) {
-                                    continue;
+                }
+                all_rows.push((0, row));
+            }
+
+            // Cold rows in segments have no version chain and no create_time,
+            // so they cannot participate in SYSTEM_TIME temporal queries.
+            // Cold segments store raw data without version chains, so they're valid
+            // only for "CURRENT" temporal queries. Historical queries return early above.
+            if is_current_query {
+                // Build hot_skip from hot row_ids + pending tombstones.
+                // Committed tombstones are kept as a shared Arc (no clone).
+                let volumes = self.segment_mgr.get_volumes_newest_first()?;
+                let tombstones_arc = self.segment_mgr.tombstone_set_arc();
+                let mut hot_skip: FxHashSet<i64> =
+                    FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+                self.hot.collect_hot_row_ids_into(&mut hot_skip);
+                self.segment_mgr
+                    .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+                #[cfg(any(test, feature = "test-failpoints"))]
+                crate::test_failpoints::merged_read_collected();
+                if self.seal_moved(generation) {
+                    return Ok(None);
+                }
+
+                for (seg_id, cs) in volumes.iter() {
+                    let vol = &cs.volume;
+                    let mapping = self.segment_mgr.get_volume_mapping(*seg_id, &schema);
+                    let mut reader = super::writer::RowReader::new(Arc::clone(vol));
+                    for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
+                        if !cs.is_visible(i) {
+                            continue;
+                        }
+                        if self.is_row_tombstoned(&tombstones_arc, row_id)
+                            || hot_skip.contains(&row_id)
+                        {
+                            continue;
+                        }
+                        if let Some(si) = pk_idx {
+                            // Resolve PK schema index to physical volume index via mapping
+                            let phys_pk = if si < mapping.sources.len() {
+                                match &mapping.sources[si] {
+                                    super::writer::ColSource::Volume(vi) => Some(*vi),
+                                    super::writer::ColSource::Default(_) => None,
+                                }
+                            } else {
+                                None
+                            };
+                            if let Some(pi) = phys_pk {
+                                if pi < vol.meta.column_types.len()
+                                    && matches!(
+                                        vol.meta.column_types[pi],
+                                        DataType::Integer | DataType::Timestamp
+                                    )
+                                    && pi < vol.columns.len()
+                                    && !vol.columns.get(pi)?.is_null(i)
+                                {
+                                    let pk_val = vol.columns.get(pi)?.get_i64(i);
+                                    if hot_pks.contains(&pk_val) {
+                                        continue;
+                                    }
                                 }
                             }
                         }
-                    }
-                    let row = reader.row(i, &mapping)?;
-                    if let Some(e) = expr {
-                        if !e.evaluate_fast(&row) {
-                            continue;
+                        let row = reader.row(i, &mapping)?;
+                        if let Some(e) = expr {
+                            if !e.evaluate_fast(&row) {
+                                continue;
+                            }
                         }
+                        all_rows.push((row_id, row));
                     }
-                    all_rows.push((row_id, row));
                 }
             }
-        }
-        // For historical temporal queries (SYSTEM_TIME AS OF <timestamp>),
-        // cold rows are excluded since they lack version history.
-        // The hot buffer's AS OF result is the authoritative source.
+            // For historical temporal queries (SYSTEM_TIME AS OF <timestamp>),
+            // cold rows are excluded since they lack version history.
+            // The hot buffer's AS OF result is the authoritative source.
 
-        let col_names: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
-        Ok(Box::new(crate::executor::result::ExecutorResult::new(
-            col_names, all_rows,
-        )))
+            let col_names: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
+            Ok(Some(Box::new(crate::executor::result::ExecutorResult::new(
+                col_names, all_rows,
+            )) as Box<dyn QueryResult>))
+        })
     }
 
     fn explain_scan(&self, where_expr: Option<&dyn Expression>) -> ScanPlan {
