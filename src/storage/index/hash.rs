@@ -61,7 +61,8 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use rustc_hash::FxHashMap;
 
-use crate::common::{CompactArc, CompactVec, I64Map};
+use super::id_list::IdList;
+use crate::common::{CompactArc, I64Map};
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::{ComparisonExpr, Expression, InListExpr};
 use crate::storage::traits::Index;
@@ -119,7 +120,7 @@ pub struct HashIndex {
     /// Maps hash -> (values as CompactArc<Value>, row_ids) for collision resolution
     /// Uses CompactArc<Value> to share references with ValueArena (8 bytes per value)
     #[allow(clippy::type_complexity)]
-    hash_to_values: RwLock<FxHashMap<u64, Vec<(Vec<CompactArc<Value>>, CompactVec<i64>)>>>,
+    hash_to_values: RwLock<FxHashMap<u64, Vec<(Vec<CompactArc<Value>>, IdList)>>>,
 }
 
 impl std::fmt::Debug for HashIndex {
@@ -178,7 +179,7 @@ impl HashIndex {
         values: &[Value],
         row_id: i64,
         hash: u64,
-        hash_to_values: &FxHashMap<u64, Vec<(Vec<CompactArc<Value>>, CompactVec<i64>)>>,
+        hash_to_values: &FxHashMap<u64, Vec<(Vec<CompactArc<Value>>, IdList)>>,
     ) -> Result<()> {
         if !self.is_unique {
             return Ok(());
@@ -196,7 +197,7 @@ impl HashIndex {
                 // Compare CompactArc<Value> contents with input values using optimized helper
                 if Self::values_match(stored_values, values) && !row_ids.is_empty() {
                     // Check if any row_id is different (would be a duplicate)
-                    if row_ids.iter().any(|&id| id != row_id) {
+                    if row_ids.iter().any(|id| id != row_id) {
                         let values_str: Vec<String> =
                             values.iter().map(|v| format!("{:?}", v)).collect();
                         return Err(Error::unique_constraint(
@@ -281,7 +282,7 @@ impl Index for HashIndex {
                 // Must compare actual values to determine if this is a no-op
                 if let Some(entries) = hash_to_values.get(&old_hash) {
                     let old_values_match = entries.iter().any(|(stored_values, row_ids)| {
-                        row_ids.contains(&row_id) && Self::values_match(stored_values, values)
+                        row_ids.contains(row_id) && Self::values_match(stored_values, values)
                     });
                     if old_values_match {
                         // Truly the same values - no update needed
@@ -296,7 +297,7 @@ impl Index for HashIndex {
             // Remove from values storage
             if let Some(entries) = hash_to_values.get_mut(&old_hash) {
                 for (_, row_ids) in entries.iter_mut() {
-                    row_ids.retain(|id| *id != row_id);
+                    row_ids.remove(row_id);
                 }
                 entries.retain(|(_, row_ids)| !row_ids.is_empty());
                 if entries.is_empty() {
@@ -319,9 +320,7 @@ impl Index for HashIndex {
             // Compare CompactArc<Value> contents with input values
             if Self::values_match(stored_values, values) {
                 // Insert sorted for O(N+M) merge operations
-                if let Err(pos) = row_ids.binary_search(&row_id) {
-                    row_ids.insert(pos, row_id);
-                }
+                row_ids.insert(row_id);
                 found = true;
                 break;
             }
@@ -330,8 +329,8 @@ impl Index for HashIndex {
             // Wrap values in Arc for O(1) cloning
             let arc_values: Vec<CompactArc<Value>> =
                 values.iter().map(|v| CompactArc::new(v.clone())).collect();
-            let mut row_ids = CompactVec::new();
-            row_ids.push(row_id); // First element, already sorted
+            let mut row_ids = IdList::new();
+            row_ids.insert(row_id);
             entries.push((arc_values, row_ids));
         }
 
@@ -363,9 +362,7 @@ impl Index for HashIndex {
             for (stored_values, row_ids) in entries.iter_mut() {
                 // Compare CompactArc<Value> contents with input values
                 if Self::values_match(stored_values, values) {
-                    if let Ok(pos) = row_ids.binary_search(&row_id) {
-                        row_ids.remove(pos);
-                    }
+                    row_ids.remove(row_id);
                     break;
                 }
             }
@@ -466,7 +463,7 @@ impl Index for HashIndex {
                     // Must compare actual values to determine if this is a no-op
                     let old_values_match = if let Some(entries) = hash_to_values.get(&old_hash) {
                         entries.iter().any(|(stored_values, row_ids)| {
-                            row_ids.contains(&row_id) && Self::values_match(stored_values, values)
+                            row_ids.contains(row_id) && Self::values_match(stored_values, values)
                         })
                     } else {
                         false
@@ -480,7 +477,7 @@ impl Index for HashIndex {
                 // Different hash (or same hash with different values) - remove old entry
                 if let Some(val_entries) = hash_to_values.get_mut(&old_hash) {
                     for (_, row_ids) in val_entries.iter_mut() {
-                        row_ids.retain(|id| *id != row_id);
+                        row_ids.remove(row_id);
                     }
                     val_entries.retain(|(_, row_ids)| !row_ids.is_empty());
                     if val_entries.is_empty() {
@@ -497,9 +494,7 @@ impl Index for HashIndex {
             let mut found = false;
             for (stored_values, row_ids) in val_entries.iter_mut() {
                 if Self::values_match(stored_values, values) {
-                    if let Err(pos) = row_ids.binary_search(&row_id) {
-                        row_ids.insert(pos, row_id);
-                    }
+                    row_ids.insert(row_id);
                     found = true;
                     break;
                 }
@@ -507,8 +502,8 @@ impl Index for HashIndex {
             if !found {
                 let arc_values: Vec<CompactArc<Value>> =
                     values.iter().map(|v| CompactArc::new(v.clone())).collect();
-                let mut row_ids = CompactVec::new();
-                row_ids.push(row_id);
+                let mut row_ids = IdList::new();
+                row_ids.insert(row_id);
                 val_entries.push((arc_values, row_ids));
             }
         }
@@ -542,9 +537,7 @@ impl Index for HashIndex {
             if let Some(val_entries) = hash_to_values.get_mut(&hash) {
                 for (stored_values, row_ids) in val_entries.iter_mut() {
                     if Self::values_match(stored_values, values) {
-                        if let Ok(pos) = row_ids.binary_search(&row_id) {
-                            row_ids.remove(pos);
-                        }
+                        row_ids.remove(row_id);
                         break;
                     }
                 }
@@ -564,19 +557,23 @@ impl Index for HashIndex {
         }
         let mut row_to_hash = self.row_to_hash.write();
         let mut hash_to_values = self.hash_to_values.write();
-        // Group the rows by hash, then subtract each group from its bucket
+        // The rows sorted by hash and id: each hash's ids leave its bucket
         // in one pass per value
-        let mut by_hash: FxHashMap<u64, Vec<i64>> = FxHashMap::default();
+        let mut removed: Vec<(u64, i64)> = Vec::with_capacity(row_ids.len());
         for &row_id in row_ids {
             if let Some(hash) = row_to_hash.remove(row_id) {
-                by_hash.entry(hash).or_default().push(row_id);
+                removed.push((hash, row_id));
             }
         }
-        for (hash, mut ids) in by_hash {
-            ids.sort_unstable();
+        removed.sort_unstable();
+        let mut ids: Vec<i64> = Vec::with_capacity(removed.len());
+        for run in removed.chunk_by(|a, b| a.0 == b.0) {
+            let hash = run[0].0;
+            ids.clear();
+            ids.extend(run.iter().map(|(_, row_id)| *row_id));
             if let Some(val_entries) = hash_to_values.get_mut(&hash) {
                 for (_, bucket) in val_entries.iter_mut() {
-                    super::subtract_sorted(bucket, &ids);
+                    bucket.remove_sorted(&ids);
                 }
                 val_entries.retain(|(_, bucket)| !bucket.is_empty());
                 if val_entries.is_empty() {
@@ -629,7 +626,7 @@ impl Index for HashIndex {
                 if Self::values_match(stored_values, values) {
                     return Ok(row_ids
                         .iter()
-                        .map(|&row_id| IndexEntry { row_id, ref_id: 0 })
+                        .map(|row_id| IndexEntry { row_id, ref_id: 0 })
                         .collect());
                 }
             }
@@ -679,8 +676,8 @@ impl Index for HashIndex {
             // Handle hash collisions by checking actual values (CompactArc<Value>)
             for (stored_values, row_ids) in entries {
                 if Self::values_match(stored_values, values) {
-                    // Use extend_from_slice for memcpy instead of iterator
-                    buffer.extend_from_slice(row_ids.as_slice());
+                    // A memcpy per page instead of an iterator
+                    row_ids.copy_into(buffer);
                     return;
                 }
             }
@@ -703,7 +700,7 @@ impl Index for HashIndex {
                 for (stored_values, row_ids) in entries {
                     // Compare CompactArc<Value> with input value
                     if stored_values.len() == 1 && stored_values[0].as_ref() == value {
-                        buffer.extend_from_slice(row_ids.as_slice());
+                        row_ids.copy_into(buffer);
                         break;
                     }
                 }
@@ -754,7 +751,9 @@ impl Index for HashIndex {
 
         for entries in hash_to_values.values() {
             for (_values, row_ids) in entries {
-                results.extend_from_slice(row_ids.as_slice());
+                for page in row_ids.pages() {
+                    results.extend_from_slice(page);
+                }
             }
         }
 

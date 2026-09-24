@@ -60,7 +60,9 @@ fn a_group_walk_a_truncate_outran_is_not_an_answer() {
                 }
             }
             let mut rows = stoolap::core::RowVec::new();
-            table.fetch_rows_by_ids_into(ids, &ConstBoolExpr::true_expr(), &mut rows)?;
+            for page in ids.pages() {
+                table.fetch_rows_by_ids_into(page, &ConstBoolExpr::true_expr(), &mut rows)?;
+            }
             assert!(rows.is_empty(), "the truncated rows are gone");
             Ok(true)
         })

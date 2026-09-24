@@ -20,6 +20,7 @@ use std::fmt;
 
 use crate::core::{DataType, Error, IndexType, Result, Row, RowVec, Schema, Value};
 use crate::storage::expression::Expression;
+use crate::storage::index::id_list::GroupIds;
 use crate::storage::mvcc::version_store::{AggregateOp, GroupedAggregateResult};
 use crate::storage::traits::{CappedEqual, Index, QueryResult, Scanner};
 
@@ -687,7 +688,7 @@ pub trait Table: Send + Sync {
         column: &str,
         max_rows: usize,
         max_bytes: usize,
-        f: &mut dyn FnMut(&Value, &[i64]) -> Result<bool>,
+        f: &mut dyn FnMut(&Value, GroupIds<'_>) -> Result<bool>,
     ) -> Result<Option<()>> {
         let _ = (column, max_rows, max_bytes, f);
         Ok(None)

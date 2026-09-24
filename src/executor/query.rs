@@ -35,6 +35,7 @@ use crate::core::{Error, Result, Row, RowVec, Value};
 use crate::optimizer::ExpressionSimplifier;
 use crate::parser::ast::*;
 use crate::parser::token::{Position, Token, TokenType};
+use crate::storage::index::id_list::GroupIds;
 use crate::storage::mvcc::engine::ViewDefinition;
 use crate::storage::traits::{Engine, QueryResult};
 
@@ -11771,7 +11772,7 @@ impl Executor {
         use crate::storage::expression::logical::ConstBoolExpr;
         let true_expr = ConstBoolExpr::true_expr();
 
-        let mut aggregate = |group_value: &Value, row_ids: &[i64]| -> Result<bool> {
+        let mut aggregate = |group_value: &Value, row_ids: GroupIds<'_>| -> Result<bool> {
             // Aggregate state: sums for SUM/AVG, min/max values, counts
             let mut agg_sums = vec![0.0f64; num_aggs];
             let mut agg_mins = vec![f64::MAX; num_aggs];
@@ -11783,60 +11784,62 @@ impl Executor {
             let row_count = row_ids.len() as i64;
 
             if needs_row_fetch {
-                // Use the reusable buffer for row fetching
-                row_buffer.clear();
-                table.fetch_rows_by_ids_into(row_ids, &true_expr, &mut row_buffer)?;
-
-                for (_row_id, row) in &row_buffer {
-                    for (i, agg) in simple_aggs.iter().enumerate() {
-                        match agg {
-                            StreamingAgg::Count => {
-                                counts[i] += 1;
-                            }
-                            StreamingAgg::Sum(col_idx) | StreamingAgg::Avg(col_idx) => {
-                                if let Some(value) = row.get(*col_idx) {
-                                    // A boolean counts as one or nought,
-                                    // as the aggregate itself reads it
-                                    let numeric = match value {
-                                        Value::Integer(v) => Some(*v as f64),
-                                        Value::Float(v) => Some(*v),
-                                        Value::Boolean(b) => Some(*b as i64 as f64),
-                                        _ => None,
-                                    };
-                                    if let Some(v) = numeric {
-                                        agg_sums[i] += v;
-                                        counts[i] += 1;
-                                        agg_has_value[i] = true;
+                // A page of ids at a time through the one row buffer; the
+                // aggregate state carries across the group's pages
+                for page in row_ids.pages() {
+                    row_buffer.clear();
+                    table.fetch_rows_by_ids_into(page, &true_expr, &mut row_buffer)?;
+                    for (_row_id, row) in &row_buffer {
+                        for (i, agg) in simple_aggs.iter().enumerate() {
+                            match agg {
+                                StreamingAgg::Count => {
+                                    counts[i] += 1;
+                                }
+                                StreamingAgg::Sum(col_idx) | StreamingAgg::Avg(col_idx) => {
+                                    if let Some(value) = row.get(*col_idx) {
+                                        // A boolean counts as one or nought,
+                                        // as the aggregate itself reads it
+                                        let numeric = match value {
+                                            Value::Integer(v) => Some(*v as f64),
+                                            Value::Float(v) => Some(*v),
+                                            Value::Boolean(b) => Some(*b as i64 as f64),
+                                            _ => None,
+                                        };
+                                        if let Some(v) = numeric {
+                                            agg_sums[i] += v;
+                                            counts[i] += 1;
+                                            agg_has_value[i] = true;
+                                        }
                                     }
                                 }
-                            }
-                            StreamingAgg::Min(col_idx) => {
-                                if let Some(value) = row.get(*col_idx) {
-                                    let v = match value {
-                                        Value::Integer(v) => Some(*v as f64),
-                                        Value::Float(v) => Some(*v),
-                                        _ => None,
-                                    };
-                                    if let Some(v) = v {
-                                        if v < agg_mins[i] {
-                                            agg_mins[i] = v;
+                                StreamingAgg::Min(col_idx) => {
+                                    if let Some(value) = row.get(*col_idx) {
+                                        let v = match value {
+                                            Value::Integer(v) => Some(*v as f64),
+                                            Value::Float(v) => Some(*v),
+                                            _ => None,
+                                        };
+                                        if let Some(v) = v {
+                                            if v < agg_mins[i] {
+                                                agg_mins[i] = v;
+                                            }
+                                            agg_has_value[i] = true;
                                         }
-                                        agg_has_value[i] = true;
                                     }
                                 }
-                            }
-                            StreamingAgg::Max(col_idx) => {
-                                if let Some(value) = row.get(*col_idx) {
-                                    let v = match value {
-                                        Value::Integer(v) => Some(*v as f64),
-                                        Value::Float(v) => Some(*v),
-                                        _ => None,
-                                    };
-                                    if let Some(v) = v {
-                                        if v > agg_maxs[i] {
-                                            agg_maxs[i] = v;
+                                StreamingAgg::Max(col_idx) => {
+                                    if let Some(value) = row.get(*col_idx) {
+                                        let v = match value {
+                                            Value::Integer(v) => Some(*v as f64),
+                                            Value::Float(v) => Some(*v),
+                                            _ => None,
+                                        };
+                                        if let Some(v) = v {
+                                            if v > agg_maxs[i] {
+                                                agg_maxs[i] = v;
+                                            }
+                                            agg_has_value[i] = true;
                                         }
-                                        agg_has_value[i] = true;
                                     }
                                 }
                             }

@@ -33,6 +33,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::common::{I64Map, I64Set};
 use crate::core::{DataType, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
+use crate::storage::index::id_list::GroupIds;
 use crate::storage::Index;
 
 /// Row IDs in `[0, BITSET_MAX_BITS)` use the fast bitset path (~156 KB max).
@@ -843,7 +844,7 @@ impl Index for PkIndex {
 
     fn for_each_group(
         &self,
-        callback: &mut dyn FnMut(&Value, &[i64]) -> Result<bool>,
+        callback: &mut dyn FnMut(&Value, GroupIds<'_>) -> Result<bool>,
     ) -> Option<Result<()>> {
         let inner = self.data.read();
 
@@ -852,7 +853,7 @@ impl Index for PkIndex {
             let mut err: Option<crate::core::Error> = None;
             for_each_set_bit(&inner.words, |rid| {
                 let val = Value::Integer(rid);
-                match callback(&val, &[rid]) {
+                match callback(&val, GroupIds::Slice(&[rid])) {
                     Ok(true) => true,
                     Ok(false) => false,
                     Err(e) => {
@@ -878,7 +879,7 @@ impl Index for PkIndex {
                 break;
             }
             let val = Value::Integer(id);
-            match callback(&val, &[id]) {
+            match callback(&val, GroupIds::Slice(&[id])) {
                 Ok(true) => continue,
                 Ok(false) => return Some(Ok(())),
                 Err(e) => return Some(Err(e)),
@@ -890,7 +891,7 @@ impl Index for PkIndex {
         let mut err: Option<crate::core::Error> = None;
         for_each_set_bit(&inner.words, |rid| {
             let val = Value::Integer(rid);
-            match callback(&val, &[rid]) {
+            match callback(&val, GroupIds::Slice(&[rid])) {
                 Ok(true) => true,
                 Ok(false) => {
                     early_exit = true;
@@ -915,7 +916,7 @@ impl Index for PkIndex {
                 continue;
             }
             let val = Value::Integer(id);
-            match callback(&val, &[id]) {
+            match callback(&val, GroupIds::Slice(&[id])) {
                 Ok(true) => continue,
                 Ok(false) => return Some(Ok(())),
                 Err(e) => return Some(Err(e)),
@@ -1409,8 +1410,7 @@ mod tests {
         idx.for_each_group(&mut |val, row_ids| {
             if let Value::Integer(id) = val {
                 collected.push(*id);
-                assert_eq!(row_ids.len(), 1);
-                assert_eq!(row_ids[0], *id);
+                assert_eq!(row_ids.iter().collect::<Vec<_>>(), vec![*id]);
             }
             Ok(true)
         })

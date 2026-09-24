@@ -33,6 +33,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::core::{DataType, IndexType, Result, Row, RowVec, Schema, Value, ValueMap, ValueSet};
 use crate::storage::expression::Expression;
+use crate::storage::index::id_list::GroupIds;
 use crate::storage::mvcc::version_store::{AggregateOp, GroupedAggregateResult};
 use crate::storage::traits::table::ScanPlan;
 use crate::storage::traits::{CapturedGroups, Index, QueryResult, Scanner, Table};
@@ -372,14 +373,18 @@ impl SegmentedTable {
         let mut ranges: Vec<(usize, usize)> = Vec::new();
         let mut bytes = 0usize;
         let mut full = false;
-        let walked = index.for_each_group(&mut |key: &Value, row_ids: &[i64]| {
+        let walked = index.for_each_group(&mut |key: &Value, row_ids: GroupIds<'_>| {
+            // Sized before anything is copied: a group that does not fit
+            // leaves the capture whole
             let cost = Self::capture_cost(key, row_ids.len());
             if ids.len() + row_ids.len() > max_rows || bytes + cost > max_bytes {
                 full = true;
                 return Ok(false);
             }
             let start = ids.len();
-            ids.extend_from_slice(row_ids);
+            for page in row_ids.pages() {
+                ids.extend_from_slice(page);
+            }
             ranges.push((start, ids.len()));
             keys.push(key.clone());
             bytes += cost;
@@ -5533,7 +5538,7 @@ impl Table for SegmentedTable {
         column: &str,
         max_rows: usize,
         max_bytes: usize,
-        f: &mut dyn FnMut(&Value, &[i64]) -> Result<bool>,
+        f: &mut dyn FnMut(&Value, GroupIds<'_>) -> Result<bool>,
     ) -> Result<Option<()>> {
         if self.snapshot_seq.is_some() {
             return Ok(None);
@@ -5577,7 +5582,7 @@ impl Table for SegmentedTable {
         // walk waits on no seal and the seal waits on no walk
         let mut stopped = false;
         for (key, ids) in capture.groups() {
-            if !f(key, ids)? {
+            if !f(key, GroupIds::Slice(ids))? {
                 stopped = true;
                 break;
             }

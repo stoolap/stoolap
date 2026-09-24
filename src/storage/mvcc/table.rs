@@ -26,6 +26,7 @@ use crate::core::{
 };
 use crate::storage::expression::logical::OrExpr;
 use crate::storage::expression::Expression;
+use crate::storage::index::id_list::GroupIds;
 use crate::storage::index::{BTreeIndex, BitmapIndex, HashIndex, HnswIndex, MultiColumnIndex};
 use crate::storage::mvcc::scanner::MVCCScanner;
 use crate::storage::mvcc::{TransactionVersionStore, VersionStore};
@@ -2129,34 +2130,41 @@ impl Table for MVCCTable {
         let txn_versions = self.txn_versions.read().unwrap();
         let schema = &self.cached_schema;
 
-        // Don't pre-allocate based on row_ids.len() — for volume-backed tables,
-        // indexes may contain row_ids that exist in frozen volumes but not in
-        // the version store. Most lookups will be misses, so pre-allocating
-        // for all of them wastes memory.
-        let mut global_row_ids = Vec::with_capacity(row_ids.len().min(4096));
+        // Without local changes every id reads the global store, as given
+        let mut global_row_ids = Vec::new();
+        let global_ids: &[i64] = if txn_versions.has_local_changes() {
+            // Don't pre-allocate based on row_ids.len() — for volume-backed tables,
+            // indexes may contain row_ids that exist in frozen volumes but not in
+            // the version store. Most lookups will be misses, so pre-allocating
+            // for all of them wastes memory.
+            global_row_ids.reserve(row_ids.len().min(4096));
 
-        // Step 1: Check local versions first (uncommitted changes in this transaction)
-        for &row_id in row_ids {
-            if let Some(version) = txn_versions.get_local_version(row_id) {
-                if !version.is_deleted() {
-                    // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
-                    let row = self.normalize_row_to_schema(version.data.clone(), schema);
-                    if filter.evaluate_fast(&row) {
-                        rows.push((row_id, row));
+            // Step 1: Check local versions first (uncommitted changes in this transaction)
+            for &row_id in row_ids {
+                if let Some(version) = txn_versions.get_local_version(row_id) {
+                    if !version.is_deleted() {
+                        // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
+                        let row = self.normalize_row_to_schema(version.data.clone(), schema);
+                        if filter.evaluate_fast(&row) {
+                            rows.push((row_id, row));
+                        }
                     }
+                    // Skip global lookup - local version takes precedence
+                } else {
+                    // Need to fetch from global store
+                    global_row_ids.push(row_id);
                 }
-                // Skip global lookup - local version takes precedence
-            } else {
-                // Need to fetch from global store
-                global_row_ids.push(row_id);
             }
-        }
+            &global_row_ids
+        } else {
+            row_ids
+        };
 
         // Step 2: Batch fetch from global store (single lock acquisition)
-        if !global_row_ids.is_empty() {
+        if !global_ids.is_empty() {
             let global_rows = self
                 .version_store
-                .get_visible_versions_batch(&global_row_ids, self.txn_id);
+                .get_visible_versions_batch(global_ids, self.txn_id);
 
             // Apply filter to fetched rows
             for (row_id, row) in global_rows {
@@ -3211,7 +3219,7 @@ impl Table for MVCCTable {
         column: &str,
         _max_rows: usize,
         _max_bytes: usize,
-        f: &mut dyn FnMut(&Value, &[i64]) -> Result<bool>,
+        f: &mut dyn FnMut(&Value, GroupIds<'_>) -> Result<bool>,
     ) -> Result<Option<()>> {
         let Some(epoch) = self.index_view_epoch() else {
             return Ok(None);
