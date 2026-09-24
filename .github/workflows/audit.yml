@@ -20,8 +20,6 @@ on:
 
 permissions:
   contents: read
-  issues: write
-  checks: write
 
 jobs:
   audit:
@@ -30,7 +28,11 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Install cargo-audit
+      uses: taiki-e/install-action@cargo-audit
+
+    # Fails on vulnerabilities; informational advisories (unmaintained, unsound)
+    # are reported in the log but do not fail the job or open issues.
+    # Accepted advisories live in .cargo/audit.toml with a reason.
     - name: Audit Cargo.lock against the RustSec database
-      uses: rustsec/audit-check@v2
-      with:
-        token: ${{ secrets.GITHUB_TOKEN }}
+      run: cargo audit
