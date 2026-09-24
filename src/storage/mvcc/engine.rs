@@ -7216,6 +7216,14 @@ impl MVCCEngine {
             }
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::side_files_compared();
+            // The rows of older segments the new volumes hold again, decided
+            // before the fence; the publication checks they still stand
+            let prepared = mgr.prepare_registration(
+                &sealed_volumes
+                    .iter()
+                    .map(|(volume, _, _)| Arc::clone(volume))
+                    .collect::<Vec<_>>(),
+            );
             // Seal critical section under exclusive fence: register cold
             // segments + remove hot rows + remove hot index entries.
             // DML operations hold the shared fence, so they cannot race
@@ -7232,20 +7240,41 @@ impl MVCCEngine {
                 let current_seal_seq = per_table_cutoff
                     .map(|s| s as u64)
                     .unwrap_or_else(|| self.registry.get_current_sequence() as u64);
-                for (((volume, _path, volume_id), file), side) in sealed_volumes
+                let entries: Vec<crate::storage::volume::manifest::SealedEntry> = sealed_volumes
                     .iter()
                     .zip(sealed_files.iter_mut())
                     .zip(sealed_sides.iter_mut())
+                    .map(|(((volume, _path, volume_id), file), side)| {
+                        let (min_row_id, max_row_id) = volume.id_bounds().unwrap_or((0, 0));
+                        let meta = crate::storage::volume::manifest::SegmentMeta {
+                            segment_id: *volume_id,
+                            file_path: std::path::PathBuf::new(),
+                            row_count: volume.meta.row_count,
+                            min_row_id,
+                            max_row_id,
+                            creation_lsn: 0,
+                            seal_seq: current_seal_seq,
+                            schema_version: sealed_schema_version,
+                        };
+                        (
+                            *volume_id,
+                            Arc::clone(volume),
+                            meta,
+                            file.take(),
+                            side.take(),
+                        )
+                    })
+                    .collect();
                 {
-                    self.register_volume_with_id_and_seal_seq(
-                        &table_name,
-                        Arc::clone(volume),
-                        *volume_id,
-                        current_seal_seq,
-                        sealed_schema_version,
-                        file.take(),
-                        side.take(),
-                    );
+                    // The mapping is computed against the schema current now,
+                    // under the schema cache's read lock held until the
+                    // segments are visible, as a single registration does
+                    let schemas = self
+                        .schemas
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let schema = schemas.get(&table_name).map(|s| &**s);
+                    mgr.register_sealed(entries, prepared, schema);
                 }
 
                 let mut index_cleanups = Vec::new();
