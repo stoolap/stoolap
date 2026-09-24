@@ -7256,10 +7256,11 @@ impl MVCCEngine {
             // between cold constraint checks and hot publication.
             {
                 // A preparation the segments moved past publishes nothing:
-                // the fence is let go and the preparation made again outside
-                // it, and a third round settles under the locks
+                // the fence is let go before the preparation is, and it is
+                // made again outside the fence; after three rounds the table
+                // waits for the next cycle with its rows still hot
                 let mut rounds = 0;
-                let _seal_guard = loop {
+                let Some(_seal_guard) = (loop {
                     let guard = mgr.acquire_seal_write();
 
                     mgr.set_seal_overlap(total_rows);
@@ -7282,22 +7283,32 @@ impl MVCCEngine {
                         .read()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let schema = schemas.get(&table_name).map(|s| &**s);
-                    match mgr.register_sealed(
-                        std::mem::take(&mut entries),
-                        prepared,
-                        schema,
-                        rounds == 2,
-                    ) {
-                        Ok(_) => break guard,
-                        Err(back) => {
+                    match mgr.register_sealed(std::mem::take(&mut entries), prepared, schema) {
+                        Ok(()) => break Some(guard),
+                        Err((back, stale)) => {
                             entries = back;
                             mgr.clear_seal_overlap();
                             drop(schemas);
                             drop(guard);
+                            drop(stale);
                             rounds += 1;
+                            if rounds == 3 {
+                                break None;
+                            }
                             prepared = mgr.prepare_registration(&new_volumes);
                         }
                     }
+                }) else {
+                    drop(entries);
+                    for (_, path, _) in &sealed_volumes {
+                        let _ = std::fs::remove_file(path);
+                        crate::storage::volume::secondary::retire_side_of(path);
+                    }
+                    drop(ddl);
+                    for side in stale_sides {
+                        crate::storage::volume::secondary::discard_side(side);
+                    }
+                    continue;
                 };
 
                 let mut index_cleanups = Vec::new();

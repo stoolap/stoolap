@@ -605,9 +605,9 @@ fn compute_visibility_bitmaps(
 }
 
 /// Clears, in `bits` (made from `base` on the first clear), the rows of
-/// `old` whose ids `new` holds again, within the range both span. With
-/// `old`'s order decided the smaller side is walked and the other located;
-/// otherwise `old` is walked against a set of `new`'s ids
+/// `old` whose ids `new` holds again, within the range both span. The
+/// smaller side is walked and the other located, except that an `old`
+/// whose order is not decided is walked against a set of `new`'s ids
 fn mask_shared_ids(
     old: &FrozenVolume,
     (old_lo, old_hi): (i64, i64),
@@ -636,7 +636,13 @@ fn mask_shared_ids(
         });
         bits[pos >> 6] &= !(1u64 << (pos & 63));
     };
-    if old.meta.row_order.get().is_none() {
+    if row_count < new.meta.row_count {
+        for (pos, &id) in old.meta.row_ids.iter().enumerate() {
+            if (lo..=hi).contains(&id) && new.locate(id).is_some() {
+                clear(pos);
+            }
+        }
+    } else if old.meta.row_order.get().is_none() {
         // Locating in a volume whose order is not decided yet would sort it
         // and keep the permutation, so its ids are walked against a set
         let shared: rustc_hash::FxHashSet<i64> = new
@@ -654,18 +660,12 @@ fn mask_shared_ids(
                 clear(pos);
             }
         }
-    } else if new.meta.row_count <= row_count {
+    } else {
         for &id in &new.meta.row_ids {
             if (lo..=hi).contains(&id) {
                 if let Some(pos) = old.locate(id) {
                     clear(pos);
                 }
-            }
-        }
-    } else {
-        for (pos, &id) in old.meta.row_ids.iter().enumerate() {
-            if (lo..=hi).contains(&id) && new.locate(id).is_some() {
-                clear(pos);
             }
         }
     }
@@ -2181,18 +2181,16 @@ impl SegmentManager {
 
     /// Publishes a seal's volumes in one step with the visibility `prepared`
     /// decided, when the segment order and every bitmap it replaces still
-    /// stand. Otherwise nothing is published and the volumes come back, for
-    /// the caller to prepare again outside its locks; with `settle_here`
-    /// the changes are worked out under the locks instead, from the same
-    /// ranges the preparation reads. True when `prepared` was used
+    /// stand. Otherwise nothing is published and the volumes and the
+    /// preparation come back, for the caller to let the preparation go and
+    /// prepare again outside its locks
     pub(crate) fn register_sealed(
         &self,
         volumes: Vec<SealedEntry>,
         prepared: PreparedRegistration,
         schema: Option<&crate::core::Schema>,
-        settle_here: bool,
-    ) -> std::result::Result<bool, Vec<SealedEntry>> {
-        let fresh = {
+    ) -> std::result::Result<(), (Vec<SealedEntry>, PreparedRegistration)> {
+        {
             let mut manifest = self.manifest.write();
             let mut segments = self.segments.write();
             let fresh = manifest.segments.len() == prepared.order.len()
@@ -2206,23 +2204,9 @@ impl SegmentManager {
                         .get(id)
                         .is_some_and(|cs| same_visible(&cs.visible, base))
                 });
-            if !fresh && !settle_here {
-                return Err(volumes);
+            if !fresh {
+                return Err((volumes, prepared));
             }
-            let changes = if fresh {
-                prepared.changes
-            } else {
-                let new: Vec<Arc<FrozenVolume>> =
-                    volumes.iter().map(|v| Arc::clone(&v.1)).collect();
-                visibility_changes(
-                    manifest
-                        .segments
-                        .iter()
-                        .map(|m| (m.segment_id, m.min_row_id, m.max_row_id)),
-                    &segments,
-                    &new,
-                )
-            };
             let mut new_map = (**segments).clone();
             for (segment_id, volume, meta, file, side) in volumes {
                 if segment_id >= manifest.next_segment_id {
@@ -2243,7 +2227,7 @@ impl SegmentManager {
                     },
                 );
             }
-            for (id, _, bits) in changes {
+            for (id, _, bits) in prepared.changes {
                 if let Some(cs) = new_map.get_mut(&id) {
                     cs.visible = Some(bits);
                 }
@@ -2253,13 +2237,12 @@ impl SegmentManager {
             self.seal_generation
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
             *segments = Arc::new(new_map);
-            fresh
-        };
+        }
         self.cached_deduped_count
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         self.has_segments_flag
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        Ok(fresh)
+        Ok(())
     }
 
     /// Load a volume into the segments map for an existing manifest entry.
@@ -4393,9 +4376,8 @@ mod tests {
             vec![(id, volume, meta_for_ids(id, ids), None, None)],
             prepared,
             None,
-            false,
         )
-        .is_ok_and(|fresh| fresh)
+        .is_ok()
     }
 
     #[test]
@@ -4422,6 +4404,14 @@ mod tests {
         let mut expected = before;
         expected.push((6, None));
         assert_eq!(published_visibility(&mgr), expected);
+        // An older volume smaller than the new one, spanning its range with
+        // none of its ids, is walked itself
+        let g: Vec<i64> = vec![20_000, 1_000_000];
+        mgr.register_segment(7, volume_of(&g), meta_for_ids(7, &g), None);
+        let h: Vec<i64> = (20_001..=120_000).collect();
+        assert!(register_prepared(&mgr, 8, &h));
+        assert_eq!(published_visibility(&mgr), reference_visibility(&mgr));
+        assert!(mgr.segments_raw()[&7].visible.is_none(), "nothing shared");
     }
 
     #[test]
@@ -4506,27 +4496,20 @@ mod tests {
     fn a_stale_seal_registration_publishes_nothing_and_is_prepared_again() {
         let (mgr, entries, prepared) = stale_registration("register_prepared_stale");
         let before = published_visibility(&mgr);
-        let Err(entries) = mgr.register_sealed(entries, prepared, None, false) else {
+        let Err((entries, stale)) = mgr.register_sealed(entries, prepared, None) else {
             panic!("a stale preparation is not published");
         };
         assert_eq!(published_visibility(&mgr), before, "nothing published");
+        assert!(
+            !stale.changes.is_empty(),
+            "the preparation comes back with its bitmaps"
+        );
+        drop(stale);
         let volumes: Vec<Arc<FrozenVolume>> = entries.iter().map(|e| Arc::clone(&e.1)).collect();
         let prepared = mgr.prepare_registration(&volumes);
         assert!(
-            mgr.register_sealed(entries, prepared, None, false)
-                .is_ok_and(|fresh| fresh),
+            mgr.register_sealed(entries, prepared, None).is_ok(),
             "prepared again, it stands"
-        );
-        assert_eq!(published_visibility(&mgr), reference_visibility(&mgr));
-    }
-
-    #[test]
-    fn a_stale_seal_registration_settled_under_the_locks_is_the_full_computation() {
-        let (mgr, entries, prepared) = stale_registration("register_settled_stale");
-        assert!(
-            mgr.register_sealed(entries, prepared, None, true)
-                .is_ok_and(|fresh| !fresh),
-            "settled under the locks"
         );
         assert_eq!(published_visibility(&mgr), reference_visibility(&mgr));
     }
