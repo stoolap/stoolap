@@ -278,11 +278,12 @@ fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (file, buf, offset);
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "positional volume reads are not supported on this platform",
-        ))
+        // WASI has no stable positional read; every caller reads through a
+        // handle it opened itself, so moving its cursor moves no one else's
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = file;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(buf)
     }
 }
 
