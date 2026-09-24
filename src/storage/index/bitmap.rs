@@ -73,9 +73,9 @@ const HIGH_CARDINALITY_WARNING_THRESHOLD: usize = 1000;
 /// - Bitmap: ~500KB - 2.5MB (30-160x savings)
 ///
 /// ## Row ID Support:
-/// Uses RoaringTreemap which supports full i64 row IDs (up to u64::MAX).
-/// This is implemented as a BTreeMap of RoaringBitmaps for efficient
-/// storage while supporting the full 64-bit range.
+/// Uses RoaringTreemap, a BTreeMap of RoaringBitmaps over u64. A row id is
+/// kept with its sign bit flipped (`bit_of`), so every i64 fits and the
+/// bits iterate in row id order, negative ids first.
 pub struct BitmapIndex {
     name: String,
     table_name: String,
@@ -97,6 +97,27 @@ pub struct BitmapIndex {
 
     /// Track cardinality for warnings
     distinct_count: AtomicUsize,
+}
+
+/// The bit a row id is kept at: its sign bit flipped, which orders the bits
+/// as the ids
+#[inline]
+fn bit_of(row_id: i64) -> u64 {
+    (row_id as u64) ^ (1 << 63)
+}
+
+#[inline]
+fn row_of(bit: u64) -> i64 {
+    (bit ^ (1 << 63)) as i64
+}
+
+/// The row ids of `bits`, each as `row_id as u64`: what the public set
+/// operations hand out. The flip only touches the partition number.
+fn row_ids_of(bits: &RoaringTreemap) -> RoaringTreemap {
+    RoaringTreemap::from_bitmaps(
+        bits.bitmaps()
+            .map(|(partition, bitmap)| (partition ^ (1 << 31), bitmap.clone())),
+    )
 }
 
 impl std::fmt::Debug for BitmapIndex {
@@ -164,7 +185,7 @@ impl BitmapIndex {
         // Intern value to get Arc for lookup
         let arc_key = self.value_to_arc_key(std::slice::from_ref(value));
         let bitmaps = self.bitmaps.read();
-        bitmaps.get(&arc_key).cloned()
+        bitmaps.get(&arc_key).map(row_ids_of)
     }
 
     /// Perform AND operation on multiple values (for multi-predicate queries)
@@ -186,7 +207,7 @@ impl BitmapIndex {
             }
         }
 
-        result.unwrap_or_default()
+        result.as_ref().map(row_ids_of).unwrap_or_default()
     }
 
     /// Perform OR operation on multiple values
@@ -202,13 +223,18 @@ impl BitmapIndex {
             }
         }
 
-        result
+        row_ids_of(&result)
     }
 
     /// Perform NOT operation on a value
     /// Returns row IDs that do NOT match the value
     /// Note: Requires knowing all row IDs in the table
     pub fn not_value(&self, value: &Value) -> RoaringTreemap {
+        row_ids_of(&self.not_bits(value))
+    }
+
+    /// The bits of the rows that do not hold `value`
+    fn not_bits(&self, value: &Value) -> RoaringTreemap {
         let arc_key = self.value_to_arc_key(std::slice::from_ref(value));
         let bitmaps = self.bitmaps.read();
 
@@ -331,14 +357,7 @@ impl Index for BitmapIndex {
             return Err(Error::IndexClosed);
         }
 
-        // Validate row_id is non-negative (can be safely converted to u64)
-        if row_id < 0 {
-            return Err(Error::internal(format!(
-                "bitmap index: row_id must be non-negative, got {}",
-                row_id
-            )));
-        }
-        let row_id_u64 = row_id as u64;
+        let row_id_u64 = bit_of(row_id);
 
         let num_cols = self.column_ids.len();
         if values.len() != num_cols {
@@ -434,14 +453,7 @@ impl Index for BitmapIndex {
             return Err(Error::IndexClosed);
         }
 
-        // Validate row_id is non-negative
-        if row_id < 0 {
-            return Err(Error::internal(format!(
-                "bitmap index: row_id must be non-negative, got {}",
-                row_id
-            )));
-        }
-        let row_id_u64 = row_id as u64;
+        let row_id_u64 = bit_of(row_id);
 
         // Intern value to get Arc key for lookup
         let arc_key = self.value_to_arc_key(values);
@@ -498,7 +510,7 @@ impl Index for BitmapIndex {
                 AHashMap::with_capacity(entries.len());
 
             for &(row_id, values) in entries {
-                if row_id < 0 || values.len() != num_cols {
+                if values.len() != num_cols {
                     continue;
                 }
 
@@ -507,7 +519,7 @@ impl Index for BitmapIndex {
                     continue;
                 }
 
-                let row_id_u64 = row_id as u64;
+                let row_id_u64 = bit_of(row_id);
                 let arc_key = self.value_to_arc_key(values);
 
                 // Check intra-batch duplicates
@@ -543,10 +555,7 @@ impl Index for BitmapIndex {
 
         // MODIFICATION PHASE: All constraints checked, now safe to modify
         for &(row_id, values) in entries {
-            if row_id < 0 {
-                continue; // Skip invalid row IDs
-            }
-            let row_id_u64 = row_id as u64;
+            let row_id_u64 = bit_of(row_id);
 
             if values.len() != num_cols {
                 continue;
@@ -607,10 +616,7 @@ impl Index for BitmapIndex {
         let mut row_to_value = self.row_to_value.write();
 
         for &(row_id, values) in entries {
-            if row_id < 0 {
-                continue;
-            }
-            let row_id_u64 = row_id as u64;
+            let row_id_u64 = bit_of(row_id);
 
             let arc_key = self.value_to_arc_key(values);
 
@@ -637,12 +643,9 @@ impl Index for BitmapIndex {
         let mut bitmaps = self.bitmaps.write();
         let mut row_to_value = self.row_to_value.write();
         for &row_id in row_ids {
-            if row_id < 0 {
-                continue;
-            }
             if let Some(arc_key) = row_to_value.remove(row_id) {
                 if let Some(bitmap) = bitmaps.get_mut(&arc_key) {
-                    bitmap.remove(row_id as u64);
+                    bitmap.remove(bit_of(row_id));
                     if bitmap.is_empty() {
                         bitmaps.remove(&arc_key);
                         self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
@@ -691,8 +694,8 @@ impl Index for BitmapIndex {
         if let Some(bitmap) = bitmaps.get(&arc_key) {
             Ok(bitmap
                 .iter()
-                .map(|row_id| IndexEntry {
-                    row_id: row_id as i64,
+                .map(|bit| IndexEntry {
+                    row_id: row_of(bit),
                     ref_id: 0,
                 })
                 .collect())
@@ -725,10 +728,10 @@ impl Index for BitmapIndex {
                         "bitmap index requires exact match on all columns",
                     ));
                 }
-                // not_value() takes &Value, not the key directly
+                // not_bits() takes &Value, not the key directly
                 // For single column, pass the value; for multi, create composite
                 let result = if values.len() == 1 {
-                    self.not_value(&values[0])
+                    self.not_bits(&values[0])
                 } else {
                     let composite = Value::Text(
                         values
@@ -738,12 +741,12 @@ impl Index for BitmapIndex {
                             .join("||")
                             .into(),
                     );
-                    self.not_value(&composite)
+                    self.not_bits(&composite)
                 };
                 Ok(result
                     .iter()
-                    .map(|row_id| IndexEntry {
-                        row_id: row_id as i64,
+                    .map(|bit| IndexEntry {
+                        row_id: row_of(bit),
                         ref_id: 0,
                     })
                     .collect())
@@ -770,7 +773,7 @@ impl Index for BitmapIndex {
 
         if let Some(bitmap) = bitmaps.get(&arc_key) {
             // RoaringTreemap iteration is efficient
-            buffer.extend(bitmap.iter().map(|row_id| row_id as i64));
+            buffer.extend(bitmap.iter().map(row_of));
         }
     }
 
@@ -793,7 +796,7 @@ impl Index for BitmapIndex {
             all_rows |= bitmap;
         }
         let _ = expr;
-        let collected: Vec<i64> = all_rows.iter().map(|id| id as i64).collect();
+        let collected: Vec<i64> = all_rows.iter().map(row_of).collect();
         RowIdVec::from_vec(collected)
     }
 
@@ -907,6 +910,8 @@ mod tests {
         let result =
             index.and_values(&[Value::Text("pending".into()), Value::Text("shipped".into())]);
         assert!(result.is_empty());
+        let result = index.and_values(&[Value::Text("shipped".into())]);
+        assert_eq!(result.iter().collect::<Vec<u64>>(), vec![2]);
     }
 
     #[test]
@@ -929,7 +934,9 @@ mod tests {
         // OR of pending and shipped
         let result =
             index.or_values(&[Value::Text("pending".into()), Value::Text("shipped".into())]);
-        assert_eq!(result.len(), 3); // rows 1, 2, 3
+        assert_eq!(result.iter().collect::<Vec<u64>>(), vec![1, 2, 3]);
+        let bitmap = index.get_bitmap(&Value::Text("pending".into())).unwrap();
+        assert_eq!(bitmap.iter().collect::<Vec<u64>>(), vec![1, 2]);
     }
 
     #[test]
@@ -951,7 +958,7 @@ mod tests {
 
         // NOT pending = shipped + delivered
         let result = index.not_value(&Value::Text("pending".into()));
-        assert_eq!(result.len(), 2); // rows 3, 4
+        assert_eq!(result.iter().collect::<Vec<u64>>(), vec![3, 4]);
     }
 
     #[test]
@@ -1152,7 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bitmap_index_rejects_negative_row_ids() {
+    fn test_bitmap_index_keeps_negative_row_ids_in_order() {
         let index = BitmapIndex::new(
             "idx_status".to_string(),
             "orders".to_string(),
@@ -1162,17 +1169,31 @@ mod tests {
             false,
             0,
         );
+        let pending = [Value::Text("pending".into())];
+        for id in [5, -1, i64::MAX, 0, -7, i64::MIN + 1] {
+            index.add(&pending, id, 0).unwrap();
+        }
+        let entries: Vec<i64> = index
+            .find(&pending)
+            .unwrap()
+            .iter()
+            .map(|e| e.row_id)
+            .collect();
+        assert_eq!(entries, vec![i64::MIN + 1, -7, -1, 0, 5, i64::MAX]);
 
-        // Negative row IDs should be rejected
-        let result = index.add(&[Value::Text("pending".into())], -1, 0);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("non-negative"));
+        index.remove(&pending, -1, 0).unwrap();
+        index.remove_batch_ids(&[-7, 5]).unwrap().unwrap();
+        let mut left = Vec::new();
+        index.get_row_ids_equal_into(&pending, &mut left);
+        assert_eq!(left, vec![i64::MIN + 1, 0, i64::MAX]);
 
-        let result = index.add(&[Value::Text("pending".into())], i64::MIN, 0);
-        assert!(result.is_err());
-
-        // Removal of negative row ID should also be rejected
-        let result = index.remove(&[Value::Text("pending".into())], -1, 0);
-        assert!(result.is_err());
+        // The set operations hand out each id as `row_id as u64`
+        let expected: Vec<u64> = vec![0, i64::MAX as u64, (i64::MIN + 1) as u64];
+        let got = |bits: RoaringTreemap| bits.iter().collect::<Vec<u64>>();
+        assert_eq!(got(index.get_bitmap(&pending[0]).unwrap()), expected);
+        assert_eq!(got(index.and_values(&pending)), expected);
+        assert_eq!(got(index.or_values(&pending)), expected);
+        index.add(&[Value::Text("done".into())], -3, 0).unwrap();
+        assert_eq!(got(index.not_value(&pending[0])), vec![-3i64 as u64]);
     }
 }
