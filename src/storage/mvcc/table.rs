@@ -985,8 +985,12 @@ impl MVCCTable {
                         if all_row_ids.len() == 1 {
                             return Some(all_row_ids.into_iter().next().unwrap());
                         }
-                        // Row IDs are already sorted by index (sorted insertion)
+                        // An index's equality ids come in id order; a range on
+                        // the multi-column index gives its ids in key order
                         let mut result = all_row_ids.swap_remove(0);
+                        if trailing_range.is_some() {
+                            result.sort_unstable();
+                        }
                         for other in &all_row_ids {
                             result = intersect_sorted_ids(&result, other);
                             if result.is_empty() {
