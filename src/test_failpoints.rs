@@ -271,6 +271,76 @@ pub(crate) fn hot_rows_taken() {
 }
 
 thread_local! {
+    static MERGED_READ_BEGAN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next read that merges the hot rows of
+/// a sealed table with its volumes is about to read the hot rows, so a
+/// test can hold a seal inside the window that follows
+pub fn after_merged_read_began(hook: impl FnOnce() + 'static) {
+    MERGED_READ_BEGAN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn merged_read_began() {
+    let hook = MERGED_READ_BEGAN_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static MERGED_READ_COLLECTED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next merged read has taken its hot rows
+/// and its cold view and not yet returned them
+pub fn after_merged_read_collected(hook: impl FnOnce() + 'static) {
+    MERGED_READ_COLLECTED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn merged_read_collected() {
+    let hook = MERGED_READ_COLLECTED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static SEAL_ROWS_REMOVED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next seal, under the table's fence, has
+/// removed the hot rows it sealed and not yet tombstoned the ones it skipped
+pub fn in_seal_after_rows_removed(hook: impl FnOnce() + 'static) {
+    SEAL_ROWS_REMOVED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn seal_rows_removed() {
+    let hook = SEAL_ROWS_REMOVED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static SEAL_INDEXES_CLEANED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next seal, under the table's fence, has
+/// cleaned the hot indexes and not yet cleared the tombstones of the rows
+/// it sealed
+pub fn in_seal_after_indexes_cleaned(hook: impl FnOnce() + 'static) {
+    SEAL_INDEXES_CLEANED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn seal_indexes_cleaned() {
+    let hook = SEAL_INDEXES_CLEANED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static JOIN_PROBE_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
