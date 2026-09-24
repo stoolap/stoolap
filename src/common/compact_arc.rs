@@ -211,11 +211,15 @@ impl<T: ?Sized + CompactArcDrop> Drop for CompactArc<T> {
         let old_count = unsafe { (*header).count.fetch_sub(1, AtomicOrdering::Release) };
 
         if old_count == 1 {
-            std::sync::atomic::fence(AtomicOrdering::Acquire);
-            // SAFETY: old_count == 1 means we had the last reference. The Acquire fence
-            // synchronizes with Release in other drops, ensuring we see all their writes.
+            // SAFETY: old_count == 1 means we had the last reference. The Acquire load
+            // synchronizes with the Release decrements of the other holders, so every
+            // write they made through the pointer is visible to the drop below. A load
+            // is used rather than a fence: ThreadSanitizer does not model fences, and
+            // with the fence form it reports the final free as a race against the other
+            // holders' decrements (the same reason std's Arc uses a load under TSan).
             // T::drop_and_dealloc is resolved at compile time via monomorphization.
             unsafe {
+                (*header).count.load(AtomicOrdering::Acquire);
                 T::drop_and_dealloc(header as *mut u8);
             }
         }
@@ -987,6 +991,36 @@ impl<T> AsRef<[T]> for CompactArc<[T]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The last drop may run on a thread other than the ones that dropped the
+    /// earlier clones. Each of those threads decrements with Release; the last
+    /// drop must acquire before it frees, and it must do so in a form
+    /// ThreadSanitizer can follow (see `Drop`).
+    #[test]
+    fn test_concurrent_clone_and_drop_frees_once() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        for _ in 0..50 {
+            let shared = CompactArc::new(vec![7u64; 64]);
+            let barrier = Arc::new(Barrier::new(8));
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let mine = shared.clone();
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        assert_eq!(mine[0], 7);
+                        drop(mine);
+                    })
+                })
+                .collect();
+            drop(shared);
+            for h in handles {
+                h.join().unwrap();
+            }
+        }
+    }
 
     #[test]
     fn test_new_and_deref() {
