@@ -561,7 +561,6 @@ impl TableManifest {
 fn compute_visibility_bitmaps(
     seg_order: &[u64],
     segments: &mut rustc_hash::FxHashMap<u64, ColdSegment>,
-    reusable_seen: &mut rustc_hash::FxHashSet<i64>,
 ) {
     if segments.len() <= 1 {
         for cs in segments.values_mut() {
@@ -569,12 +568,10 @@ fn compute_visibility_bitmaps(
         }
         return;
     }
-    // Reuse the caller's seen set — clear and resize, but keep the allocation.
-    reusable_seen.clear();
+    // Sized to the table and let go on return, so no table-sized set is kept
     let total: usize = segments.values().map(|cs| cs.volume.meta.row_count).sum();
-    if reusable_seen.capacity() < total {
-        reusable_seen.reserve(total * 8 / 7 + 16 - reusable_seen.capacity());
-    }
+    let mut seen: rustc_hash::FxHashSet<i64> =
+        rustc_hash::FxHashSet::with_capacity_and_hasher(total, Default::default());
     // Process newest-first (seg_order is ascending, so iterate reversed)
     for &seg_id in seg_order.iter().rev() {
         if let Some(cs) = segments.get_mut(&seg_id) {
@@ -592,7 +589,7 @@ fn compute_visibility_bitmaps(
             }
             let mut has_overlap = false;
             for i in 0..rc {
-                if !reusable_seen.insert(cs.volume.meta.row_ids[i]) {
+                if !seen.insert(cs.volume.meta.row_ids[i]) {
                     bits[i >> 6] &= !(1u64 << (i & 63));
                     has_overlap = true;
                 }
@@ -605,13 +602,127 @@ fn compute_visibility_bitmaps(
             };
         }
     }
-    // Shrink if capacity far exceeds what was needed. After compaction
-    // merges volumes, the total row count drops but the set stays at its
-    // high-water mark. Replace with a right-sized set to free the excess.
-    if reusable_seen.capacity() > total * 2 + 1024 {
-        *reusable_seen = rustc_hash::FxHashSet::with_capacity_and_hasher(total, Default::default());
+}
+
+/// Clears, in `bits` (made from `base` on the first clear), the rows of
+/// `old` whose ids `new` holds again, within the range both span. The
+/// smaller side is walked and the other located, except that an `old`
+/// whose order is not decided is walked against a set of `new`'s ids
+fn mask_shared_ids(
+    old: &FrozenVolume,
+    (old_lo, old_hi): (i64, i64),
+    new: &FrozenVolume,
+    base: &Option<Arc<Vec<u64>>>,
+    bits: &mut Option<Vec<u64>>,
+) {
+    let Some((new_lo, new_hi)) = new.id_bounds() else {
+        return;
+    };
+    if old_hi < new_lo || new_hi < old_lo {
+        return;
+    }
+    let (lo, hi) = (old_lo.max(new_lo), old_hi.min(new_hi));
+    let row_count = old.meta.row_count;
+    let mut clear = |pos: usize| {
+        let bits = bits.get_or_insert_with(|| match base {
+            Some(visible) => (**visible).clone(),
+            None => {
+                let mut all = vec![!0u64; row_count.div_ceil(64)];
+                if !row_count.is_multiple_of(64) {
+                    all[row_count / 64] = (1u64 << (row_count % 64)) - 1;
+                }
+                all
+            }
+        });
+        bits[pos >> 6] &= !(1u64 << (pos & 63));
+    };
+    if row_count < new.meta.row_count {
+        for (pos, &id) in old.meta.row_ids.iter().enumerate() {
+            if (lo..=hi).contains(&id) && new.locate(id).is_some() {
+                clear(pos);
+            }
+        }
+    } else if old.meta.row_order.get().is_none() {
+        // Locating in a volume whose order is not decided yet would sort it
+        // and keep the permutation, so its ids are walked against a set
+        let shared: rustc_hash::FxHashSet<i64> = new
+            .meta
+            .row_ids
+            .iter()
+            .copied()
+            .filter(|id| (lo..=hi).contains(id))
+            .collect();
+        if shared.is_empty() {
+            return;
+        }
+        for (pos, id) in old.meta.row_ids.iter().enumerate() {
+            if shared.contains(id) {
+                clear(pos);
+            }
+        }
     } else {
-        reusable_seen.clear();
+        for &id in &new.meta.row_ids {
+            if (lo..=hi).contains(&id) {
+                if let Some(pos) = old.locate(id) {
+                    clear(pos);
+                }
+            }
+        }
+    }
+}
+
+/// The bitmap each segment of `order` (id and manifest id bounds, so an
+/// older segment's ids are read only where a new volume's range meets
+/// them) gets when `volumes`, newer than all of them, are registered,
+/// with the bitmap it replaces
+fn visibility_changes(
+    order: impl Iterator<Item = (u64, i64, i64)>,
+    segments: &rustc_hash::FxHashMap<u64, ColdSegment>,
+    volumes: &[Arc<FrozenVolume>],
+) -> Vec<VisibilityChange> {
+    let mut changes = Vec::new();
+    for (seg_id, lo, hi) in order {
+        let Some(cs) = segments.get(&seg_id) else {
+            continue;
+        };
+        let mut bits = None;
+        for volume in volumes {
+            mask_shared_ids(&cs.volume, (lo, hi), volume, &cs.visible, &mut bits);
+        }
+        if let Some(bits) = bits {
+            changes.push((seg_id, cs.visible.clone(), Arc::new(bits)));
+        }
+    }
+    changes
+}
+
+/// A sealed volume to publish: its segment id, the volume, its manifest
+/// entry, its file's handle and its side file
+pub(crate) type SealedEntry = (
+    u64,
+    Arc<FrozenVolume>,
+    SegmentMeta,
+    Option<Arc<super::writer::VolumeFile>>,
+    Option<Arc<super::secondary::IndexFile>>,
+);
+
+/// What a seal's registration changes in the older segments, decided
+/// outside the locks: each segment whose rows the new volumes hold again,
+/// with the bitmap it had and the one it gets
+pub struct PreparedRegistration {
+    order: Vec<u64>,
+    changes: Vec<VisibilityChange>,
+}
+
+/// A segment, the bitmap it had and the one a registration gives it
+type VisibilityChange = (u64, Option<Arc<Vec<u64>>>, Arc<Vec<u64>>);
+
+/// Whether two visibility bitmaps are the same published one
+fn same_visible(a: &Option<Arc<Vec<u64>>>, b: &Option<Arc<Vec<u64>>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        _ => false,
     }
 }
 
@@ -861,11 +972,6 @@ pub struct SegmentManager {
     /// INSERTs take a shared guard while checking cold constraints and
     /// publishing into hot; seal takes the exclusive guard while moving rows.
     seal_fence: RwLock<()>,
-    /// Reusable scratch set for compute_visibility_bitmaps. Kept alive across
-    /// calls to avoid re-allocating 200 MB on every seal/compact. Protected by
-    /// Mutex since visibility computation is always single-threaded (under
-    /// segments write lock).
-    visibility_seen: parking_lot::Mutex<rustc_hash::FxHashSet<i64>>,
     /// Monotonic counter incremented on every register_segment. Used at
     /// commit time to detect whether a seal happened since statement time.
     /// If unchanged, the commit-time cold recheck is skipped (fast path).
@@ -905,7 +1011,6 @@ impl SegmentManager {
             pending_txn_tombstones: RwLock::new(FxHashMap::default()),
             cached_deduped_count: std::sync::atomic::AtomicU64::new(u64::MAX),
             seal_fence: RwLock::new(()),
-            visibility_seen: parking_lot::Mutex::new(rustc_hash::FxHashSet::default()),
             seal_generation: std::sync::atomic::AtomicU64::new(0),
             txn_seal_gens: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
             seal_overlap_count: std::sync::atomic::AtomicUsize::new(0),
@@ -934,7 +1039,6 @@ impl SegmentManager {
             pending_txn_tombstones: RwLock::new(FxHashMap::default()),
             cached_deduped_count: std::sync::atomic::AtomicU64::new(u64::MAX),
             seal_fence: RwLock::new(()),
-            visibility_seen: parking_lot::Mutex::new(rustc_hash::FxHashSet::default()),
             seal_generation: std::sync::atomic::AtomicU64::new(0),
             txn_seal_gens: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
             seal_overlap_count: std::sync::atomic::AtomicUsize::new(0),
@@ -2038,7 +2142,7 @@ impl SegmentManager {
             let mut segments = self.segments.write();
             let mut new_map = (**segments).clone();
             new_map.insert(segment_id, cold);
-            compute_visibility_bitmaps(&seg_ids, &mut new_map, &mut self.visibility_seen.lock());
+            compute_visibility_bitmaps(&seg_ids, &mut new_map);
             // Before the segment is visible, so a reader that sees the volume
             // sees the generation that published it
             self.seal_generation
@@ -2049,6 +2153,95 @@ impl SegmentManager {
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         self.has_segments_flag
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The visibility a seal's registration of `volumes` changes in the
+    /// segments as they stand, decided without holding the publication
+    /// locks. Each volume is newer than every segment and holds ids the
+    /// others do not, so only the older segments' rows are masked
+    pub fn prepare_registration(&self, volumes: &[Arc<FrozenVolume>]) -> PreparedRegistration {
+        let (order, segments) = {
+            let manifest = self.manifest.read();
+            let order: Vec<(u64, i64, i64)> = manifest
+                .segments
+                .iter()
+                .map(|m| (m.segment_id, m.min_row_id, m.max_row_id))
+                .collect();
+            (order, Arc::clone(&*self.segments.read()))
+        };
+        let changes = visibility_changes(order.iter().copied(), &segments, volumes);
+        PreparedRegistration {
+            order: order.into_iter().map(|(seg_id, _, _)| seg_id).collect(),
+            changes,
+        }
+    }
+
+    /// Publishes a seal's volumes in one step with the visibility `prepared`
+    /// decided, when the segment order and every bitmap it replaces still
+    /// stand. Otherwise nothing is published and the volumes and the
+    /// preparation come back, for the caller to let the preparation go and
+    /// prepare again outside its locks
+    pub(crate) fn register_sealed(
+        &self,
+        volumes: Vec<SealedEntry>,
+        prepared: PreparedRegistration,
+        schema: Option<&crate::core::Schema>,
+    ) -> std::result::Result<(), (Vec<SealedEntry>, PreparedRegistration)> {
+        {
+            let mut manifest = self.manifest.write();
+            let mut segments = self.segments.write();
+            let fresh = manifest.segments.len() == prepared.order.len()
+                && manifest
+                    .segments
+                    .iter()
+                    .zip(&prepared.order)
+                    .all(|(m, id)| m.segment_id == *id)
+                && prepared.changes.iter().all(|(id, base, _)| {
+                    segments
+                        .get(id)
+                        .is_some_and(|cs| same_visible(&cs.visible, base))
+                });
+            #[cfg(feature = "test-failpoints")]
+            let fresh = fresh && !crate::test_failpoints::seal_registration_forced_stale();
+            if !fresh {
+                return Err((volumes, prepared));
+            }
+            let mut new_map = (**segments).clone();
+            for (segment_id, volume, meta, file, side) in volumes {
+                if segment_id >= manifest.next_segment_id {
+                    manifest.next_segment_id = segment_id + 1;
+                }
+                let seg_schema_version = meta.schema_version;
+                manifest.add_segment(meta);
+                let mapping = mapping_for(&manifest, &volume, seg_schema_version, schema);
+                new_map.insert(
+                    segment_id,
+                    ColdSegment {
+                        volume,
+                        mapping,
+                        schema_version: seg_schema_version,
+                        visible: None,
+                        file,
+                        side,
+                    },
+                );
+            }
+            for (id, _, bits) in prepared.changes {
+                if let Some(cs) = new_map.get_mut(&id) {
+                    cs.visible = Some(bits);
+                }
+            }
+            // Before the segments are visible, so a reader that sees a volume
+            // sees the generation that published it
+            self.seal_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            *segments = Arc::new(new_map);
+        }
+        self.cached_deduped_count
+            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        self.has_segments_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     /// Load a volume into the segments map for an existing manifest entry.
@@ -2977,7 +3170,7 @@ impl SegmentManager {
             for &id in segment_ids {
                 new_map.remove(&id);
             }
-            compute_visibility_bitmaps(&seg_ids, &mut new_map, &mut self.visibility_seen.lock());
+            compute_visibility_bitmaps(&seg_ids, &mut new_map);
             if self.has_cold.load(std::sync::atomic::Ordering::Relaxed)
                 && !new_map.values().any(|cs| cs.volume.is_cold())
             {
@@ -3172,7 +3365,7 @@ impl SegmentManager {
             (Arc::clone(&*segments), order, map)
         };
         let new_order = published_order(&order, new_volumes, old_segment_ids);
-        compute_visibility_bitmaps(&new_order, &mut map, &mut self.visibility_seen.lock());
+        compute_visibility_bitmaps(&new_order, &mut map);
         PreparedPublication {
             snapshot,
             order,
@@ -3247,7 +3440,7 @@ impl SegmentManager {
         }
         if !fresh {
             let seg_ids: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
-            compute_visibility_bitmaps(&seg_ids, &mut map, &mut self.visibility_seen.lock());
+            compute_visibility_bitmaps(&seg_ids, &mut map);
         }
         if self.has_cold.load(std::sync::atomic::Ordering::Relaxed)
             && !map.values().any(|cs| cs.volume.is_cold())
@@ -3490,7 +3683,7 @@ impl SegmentManager {
         drop(manifest);
         let mut segments = self.segments.write();
         let mut new_map = (**segments).clone();
-        compute_visibility_bitmaps(&seg_ids, &mut new_map, &mut self.visibility_seen.lock());
+        compute_visibility_bitmaps(&seg_ids, &mut new_map);
         *segments = Arc::new(new_map);
     }
 }
@@ -4109,8 +4302,7 @@ mod tests {
             .map(|m| m.segment_id)
             .collect();
         let mut map = (*mgr.segments_raw()).clone();
-        let mut seen = FxHashSet::default();
-        compute_visibility_bitmaps(&order, &mut map, &mut seen);
+        compute_visibility_bitmaps(&order, &mut map);
         order
             .iter()
             .map(|id| (*id, map[id].visible.as_ref().map(|v| (**v).clone())))
@@ -4166,6 +4358,159 @@ mod tests {
             .filter(|i| c_visible[i >> 6] & (1u64 << (i & 63)) == 0)
             .count();
         assert_eq!(masked, 21, "ids 50 to 70 are B's");
+    }
+
+    /// `volume_of(ids)` written out and read back, its order undecided as a
+    /// reopen leaves it until a lookup
+    fn reopened_volume_of(dir: &std::path::Path, id: u64, ids: &[i64]) -> Arc<FrozenVolume> {
+        let path = crate::storage::volume::io::write_volume_to_disk(dir, "t", id, &volume_of(ids))
+            .unwrap();
+        Arc::new(crate::storage::volume::io::read_volume_from_disk(&path).unwrap())
+    }
+
+    fn register_prepared(mgr: &SegmentManager, id: u64, ids: &[i64]) -> bool {
+        let volume = volume_of(ids);
+        let prepared = mgr.prepare_registration(std::slice::from_ref(&volume));
+        mgr.register_sealed(
+            vec![(id, volume, meta_for_ids(id, ids), None, None)],
+            prepared,
+            None,
+        )
+        .is_ok()
+    }
+
+    #[test]
+    fn a_seal_registration_prepared_outside_the_locks_is_the_full_computation() {
+        let mgr = SegmentManager::new("register_prepared", None);
+        let a: Vec<i64> = (1..=200).collect();
+        let b: Vec<i64> = (150..=300).collect();
+        let c: Vec<i64> = (1000..=1100).collect();
+        mgr.register_segment(1, volume_of(&a), meta_for_ids(1, &a), None);
+        mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None);
+        mgr.register_segment(3, volume_of(&c), meta_for_ids(3, &c), None);
+        // Masks rows of A that B masked already, rows of B, and one of C
+        let d: Vec<i64> = (100..=160).chain([1050, 5000]).collect();
+        assert!(register_prepared(&mgr, 4, &d), "nothing moved in between");
+        assert_eq!(published_visibility(&mgr), reference_visibility(&mgr));
+        // A volume in key order holds its ids out of id order
+        let e: Vec<i64> = vec![1099, 7, 250, 3, 1001];
+        assert!(register_prepared(&mgr, 5, &e));
+        assert_eq!(published_visibility(&mgr), reference_visibility(&mgr));
+        // Ids no older segment holds change no bitmap
+        let f: Vec<i64> = (9000..=9100).collect();
+        let before = published_visibility(&mgr);
+        assert!(register_prepared(&mgr, 6, &f));
+        let mut expected = before;
+        expected.push((6, None));
+        assert_eq!(published_visibility(&mgr), expected);
+        // An older volume smaller than the new one, spanning its range with
+        // none of its ids, is walked itself
+        let g: Vec<i64> = vec![20_000, 1_000_000];
+        mgr.register_segment(7, volume_of(&g), meta_for_ids(7, &g), None);
+        let h: Vec<i64> = (20_001..=120_000).collect();
+        assert!(register_prepared(&mgr, 8, &h));
+        assert_eq!(published_visibility(&mgr), reference_visibility(&mgr));
+        assert!(mgr.segments_raw()[&7].visible.is_none(), "nothing shared");
+    }
+
+    #[test]
+    fn many_seal_registrations_prepared_outside_the_locks_track_the_full_computation() {
+        let mgr = SegmentManager::new("register_prepared_many", None);
+        let dir = tempfile::tempdir().unwrap();
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for id in 1..=12u64 {
+            let start = (next() % 400) as i64;
+            let len = 1 + (next() % 150) as i64;
+            let mut ids: Vec<i64> = (start..start + len).filter(|_| next() % 3 != 0).collect();
+            if ids.is_empty() {
+                ids.push(start);
+            }
+            if id % 2 == 0 {
+                ids.reverse();
+            }
+            // Some volumes are read back with their order undecided, and every
+            // third round the older segments have theirs decided, as a lookup
+            // decides it, so both ways of masking are compared
+            if id % 3 == 0 {
+                for cs in mgr.segments_raw().values() {
+                    let _ = cs.volume.row_order();
+                }
+            }
+            if id % 4 == 1 {
+                // Loaded as a reopen loads it, so it is older with its order
+                // undecided when the next seals register
+                let volume = reopened_volume_of(dir.path(), id, &ids);
+                mgr.register_segment(id, volume, meta_for_ids(id, &ids), None);
+            } else {
+                assert!(register_prepared(&mgr, id, &ids));
+            }
+            assert_eq!(
+                published_visibility(&mgr),
+                reference_visibility(&mgr),
+                "after registration {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_seal_registration_sorts_no_permutation_for_an_older_volume() {
+        let mgr = SegmentManager::new("register_no_permutation", None);
+        // A volume in key order holds its ids out of id order, and one read
+        // back from its file has its order undecided until a lookup
+        let a: Vec<i64> = (1..=300).rev().collect();
+        let dir = tempfile::tempdir().unwrap();
+        let reopened = reopened_volume_of(dir.path(), 1, &a);
+        mgr.register_segment(1, reopened, meta_for_ids(1, &a), None);
+        let d: Vec<i64> = (100..=110).collect();
+        assert!(register_prepared(&mgr, 2, &d));
+        assert_eq!(published_visibility(&mgr), reference_visibility(&mgr));
+        assert!(
+            mgr.segments_raw()[&1].volume.meta.row_order.get().is_none(),
+            "the older volume's order is left undecided"
+        );
+    }
+
+    /// Two segments, and a preparation for ids 50 to 60 made before the
+    /// second one masked rows it never saw
+    fn stale_registration(name: &str) -> (SegmentManager, Vec<SealedEntry>, PreparedRegistration) {
+        let mgr = SegmentManager::new(name, None);
+        let a: Vec<i64> = (1..=100).collect();
+        mgr.register_segment(1, volume_of(&a), meta_for_ids(1, &a), None);
+        let d: Vec<i64> = (50..=60).collect();
+        let volume = volume_of(&d);
+        let prepared = mgr.prepare_registration(std::slice::from_ref(&volume));
+        let b: Vec<i64> = vec![55, 70, 200];
+        mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None);
+        let entries = vec![(3, volume, meta_for_ids(3, &d), None, None)];
+        (mgr, entries, prepared)
+    }
+
+    #[test]
+    fn a_stale_seal_registration_publishes_nothing_and_is_prepared_again() {
+        let (mgr, entries, prepared) = stale_registration("register_prepared_stale");
+        let before = published_visibility(&mgr);
+        let Err((entries, stale)) = mgr.register_sealed(entries, prepared, None) else {
+            panic!("a stale preparation is not published");
+        };
+        assert_eq!(published_visibility(&mgr), before, "nothing published");
+        assert!(
+            !stale.changes.is_empty(),
+            "the preparation comes back with its bitmaps"
+        );
+        drop(stale);
+        let volumes: Vec<Arc<FrozenVolume>> = entries.iter().map(|e| Arc::clone(&e.1)).collect();
+        let prepared = mgr.prepare_registration(&volumes);
+        assert!(
+            mgr.register_sealed(entries, prepared, None).is_ok(),
+            "prepared again, it stands"
+        );
+        assert_eq!(published_visibility(&mgr), reference_visibility(&mgr));
     }
 
     #[test]
