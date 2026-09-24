@@ -44,6 +44,20 @@ pub static CHECKPOINT_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
 /// The sync of a WAL file retired by a file start fails.
 pub static RETIRED_WAL_SYNC_FAIL: AtomicBool = AtomicBool::new(false);
 
+/// The next this many seal registrations find their preparation stale
+pub static SEAL_REGISTRATION_STALE_ROUNDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn seal_registration_forced_stale() -> bool {
+    SEAL_REGISTRATION_STALE_ROUNDS
+        .fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |left| left.checked_sub(1),
+        )
+        .is_ok()
+}
+
 /// Serializes failpoint tests so that only one can run at a time.
 /// Global AtomicBool flags are process-wide; concurrent tests would
 /// interfere with each other without this lock.
@@ -520,6 +534,7 @@ pub fn reset_all() {
     SNAPSHOT_RENAME_FAIL.store(false, Release);
     CHECKPOINT_WRITE_FAIL.store(false, Release);
     RETIRED_WAL_SYNC_FAIL.store(false, Release);
+    SEAL_REGISTRATION_STALE_ROUNDS.store(0, Release);
     VERSION_ROOT_HOOK.with(|slot| *slot.borrow_mut() = None);
     WAL_SYNC_HOOK.with(|slot| *slot.borrow_mut() = None);
     WAL_SWAP_HOOK.with(|slot| *slot.borrow_mut() = None);

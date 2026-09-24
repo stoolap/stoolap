@@ -709,7 +709,7 @@ pub(crate) type SealedEntry = (
 /// What a seal's registration changes in the older segments, decided
 /// outside the locks: each segment whose rows the new volumes hold again,
 /// with the bitmap it had and the one it gets
-pub(crate) struct PreparedRegistration {
+pub struct PreparedRegistration {
     order: Vec<u64>,
     changes: Vec<VisibilityChange>,
 }
@@ -2159,10 +2159,7 @@ impl SegmentManager {
     /// segments as they stand, decided without holding the publication
     /// locks. Each volume is newer than every segment and holds ids the
     /// others do not, so only the older segments' rows are masked
-    pub(crate) fn prepare_registration(
-        &self,
-        volumes: &[Arc<FrozenVolume>],
-    ) -> PreparedRegistration {
+    pub fn prepare_registration(&self, volumes: &[Arc<FrozenVolume>]) -> PreparedRegistration {
         let (order, segments) = {
             let manifest = self.manifest.read();
             let order: Vec<(u64, i64, i64)> = manifest
@@ -2204,6 +2201,8 @@ impl SegmentManager {
                         .get(id)
                         .is_some_and(|cs| same_visible(&cs.visible, base))
                 });
+            #[cfg(feature = "test-failpoints")]
+            let fresh = fresh && !crate::test_failpoints::seal_registration_forced_stale();
             if !fresh {
                 return Err((volumes, prepared));
             }
