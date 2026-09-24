@@ -1768,6 +1768,15 @@ fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::
         }
         Ok(())
     }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // WASI has no stable positional read; every caller reads through a
+        // handle it opened itself, so moving its cursor moves no one else's
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = file;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(buf)
+    }
 }
 
 /// Positions of one key or one range, a bounded window at a time, the
