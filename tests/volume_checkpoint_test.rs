@@ -88,7 +88,7 @@ fn list_volume_files(db_path: &Path, table: &str) -> Vec<PathBuf> {
 
 fn read_manifest(db_path: &Path, table: &str) -> TableManifest {
     let path = db_path.join("volumes").join(table).join("manifest.bin");
-    TableManifest::read_from_disk(&path).unwrap()
+    TableManifest::read_from_disk(&path).unwrap().manifest
 }
 
 // ---------------------------------------------------------------------------
