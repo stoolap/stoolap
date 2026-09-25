@@ -178,6 +178,25 @@ pub(crate) fn maintenance_schema_taken() {
     }
 }
 
+type CountHook = Box<dyn FnOnce(usize)>;
+
+thread_local! {
+    static COMPACTION_DEDUP_HOOK: RefCell<Option<CountHook>> = RefCell::new(None);
+}
+
+/// Run once after a compaction on this thread decided which rows it keeps,
+/// before it writes any output, with the number of tombstone pairs it took.
+pub fn after_compaction_dedup(hook: impl FnOnce(usize) + 'static) {
+    COMPACTION_DEDUP_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn compaction_deduped(applied_pairs: usize) {
+    let hook = COMPACTION_DEDUP_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(applied_pairs);
+    }
+}
+
 thread_local! {
     static SIDE_FILES_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }

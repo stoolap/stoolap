@@ -6319,6 +6319,9 @@ impl MVCCEngine {
                         size_only.push(sub_target && !oversized && !tombstoned);
                     }
                 }
+                // Let go before any volume is loaded, so a commit meanwhile
+                // does not copy the map because of this reference
+                drop(ts);
 
                 // A clustered table rewrites the volumes not in its key
                 // order. A volume is decided once, a cold one loaded to
@@ -6503,20 +6506,9 @@ impl MVCCEngine {
             let mut seen = FxHashSet::default();
             let mut live_refs: Vec<(i64, usize, usize)> = Vec::new(); // (row_id, vol_idx, row_idx)
 
-            // When snapshots are active, build a filtered tombstone set containing
-            // only tombstones that were actually applied (commit_seq < limit).
-            // Post-snapshot tombstones are preserved so snapshot reads stay correct.
-            let applied_tombstones: Arc<FxHashMap<i64, u64>> =
-                if let Some(limit) = compact_seal_seq_limit {
-                    let filtered: FxHashMap<i64, u64> = tombstones
-                        .iter()
-                        .filter(|(_, &seq)| seq < limit)
-                        .map(|(&rid, &seq)| (rid, seq))
-                        .collect();
-                    Arc::new(filtered)
-                } else {
-                    Arc::clone(&tombstones)
-                };
+            // The tombstones this compaction applies, as (row_id, commit_seq):
+            // the cleanup removes those whose sequence is still current
+            let mut applied_tombstones: Vec<(i64, u64)> = Vec::new();
 
             for (vol_idx, (_seg_id, vol)) in volumes.iter().enumerate() {
                 for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
@@ -6524,14 +6516,14 @@ impl MVCCEngine {
                     // snapshot (safe to physically remove). Tombstones created after
                     // are preserved — the row stays in the merged volume so snapshots
                     // can still see it via versioned tombstone filtering.
-                    let is_tombstoned = if let Some(limit) = compact_seal_seq_limit {
-                        tombstones
-                            .get(&row_id)
-                            .is_some_and(|&commit_seq| commit_seq < limit)
-                    } else {
-                        tombstones.contains_key(&row_id)
-                    };
-                    if is_tombstoned && !seen.contains(&row_id) {
+                    // A tombstone names the row id, so every copy of it goes and
+                    // its pair is taken once
+                    if let Some(commit_seq) =
+                        applied_commit_seq(&tombstones, row_id, compact_seal_seq_limit)
+                    {
+                        if seen.insert(row_id) {
+                            applied_tombstones.push((row_id, commit_seq));
+                        }
                         continue;
                     }
                     if seen.insert(row_id) {
@@ -6539,19 +6531,19 @@ impl MVCCEngine {
                     }
                 }
             }
+            // Let go of the full map: from here to the cleanup only the
+            // applied pairs are needed
+            drop(tombstones);
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::compaction_deduped(applied_tombstones.len());
 
             if live_refs.is_empty() {
                 // All rows in merged volumes are tombstoned. Remove those
                 // volumes and their tombstones, but keep unmerged volumes intact.
-                for (_, vol) in volumes.iter() {
-                    for &row_id in vol.row_ids()? {
-                        seen.insert(row_id);
-                    }
-                }
                 mgr.replace_segments_atomic_remove_only(&old_ids);
                 // Only clear tombstones that were actually applied during compaction.
                 // Post-snapshot tombstones are preserved for snapshot visibility.
-                mgr.remove_tombstones_matching_snapshot(&applied_tombstones, &seen);
+                mgr.remove_applied_tombstones(&applied_tombstones);
 
                 // Persist manifest BEFORE deleting files (same safety as non-empty path).
                 // Written out under the DDL guard, so the manifest never shows a
@@ -6782,21 +6774,6 @@ impl MVCCEngine {
             }
 
             let _ = key_held_peak;
-            if prepare_error.is_none() && !new_volumes.is_empty() {
-                for (_, vol) in volumes.iter() {
-                    match vol.row_ids() {
-                        Ok(ids) => {
-                            for &row_id in ids {
-                                seen.insert(row_id);
-                            }
-                        }
-                        Err(error) => {
-                            prepare_error = Some(error.into());
-                            break;
-                        }
-                    }
-                }
-            }
 
             if prepare_error.is_some() || new_volumes.is_empty() {
                 // Clean up any volumes we did write before failure, and
@@ -6881,7 +6858,7 @@ impl MVCCEngine {
 
             // Clear only tombstones that existed at snapshot time for
             // row_ids in the merged volumes.
-            mgr.remove_tombstones_matching_snapshot(&applied_tombstones, &seen);
+            mgr.remove_applied_tombstones(&applied_tombstones);
 
             // CRITICAL: Persist manifest BEFORE deleting old files.
             // Written out under the DDL guard, so the manifest never shows a
@@ -9239,6 +9216,19 @@ fn compaction_chunk_rows(target_volume_rows: usize) -> usize {
     (target_volume_rows / row_group_size).max(1) * row_group_size
 }
 
+/// The commit_seq of a row's tombstone when a compaction may apply it: one
+/// committed before the earliest snapshot began, or any when none is open
+fn applied_commit_seq(
+    tombstones: &FxHashMap<i64, u64>,
+    row_id: i64,
+    snapshot_limit: Option<u64>,
+) -> Option<u64> {
+    tombstones
+        .get(&row_id)
+        .copied()
+        .filter(|&commit_seq| snapshot_limit.is_none_or(|limit| commit_seq < limit))
+}
+
 /// Settles a compaction batch's membership: the members that size alone
 /// put in the base are dropped while the batch does not accept them, the
 /// batch is closed over overlap, and the size-only members are judged
@@ -9452,6 +9442,20 @@ fn close_batch_over_overlap<'a>(
 mod tests {
     use super::*;
     use crate::core::{DataType, IndexType, Row, SchemaBuilder, Value};
+
+    #[test]
+    fn a_compaction_applies_a_tombstone_only_below_the_snapshot_limit() {
+        let tombstones: FxHashMap<i64, u64> = [(1, 9), (2, 10), (3, 11)].into_iter().collect();
+        assert_eq!(applied_commit_seq(&tombstones, 1, Some(10)), Some(9));
+        assert_eq!(
+            applied_commit_seq(&tombstones, 2, Some(10)),
+            None,
+            "at the limit"
+        );
+        assert_eq!(applied_commit_seq(&tombstones, 3, Some(10)), None);
+        assert_eq!(applied_commit_seq(&tombstones, 3, None), Some(11));
+        assert_eq!(applied_commit_seq(&tombstones, 4, None), None);
+    }
 
     /// Volumes at positions 0..n with the given row ids; none base, none
     /// deferred unless said

@@ -1339,6 +1339,9 @@ fn late_compaction_failure_removes_output_and_preserves_original_volumes() {
             Some(&schema),
         );
     }
+    // Two rows of the volume that splits are deleted: the failed cycles
+    // must keep their tombstones, the successful one applies them
+    manager.add_tombstones(&[5, 7], 1);
     manager.persist().unwrap();
     let original_files = volume_files(&table_dir);
     let manifest_path = table_dir.join("manifest.bin");
@@ -1360,17 +1363,19 @@ fn late_compaction_failure_removes_output_and_preserves_original_volumes() {
             [(1, 131_071), (2, 1)].into()
         );
         assert_eq!(volume_files(&table_dir), original_files);
-        let manifest = TableManifest::read_from_disk(&manifest_path)
-            .unwrap()
-            .manifest;
+        let stored = TableManifest::read_from_disk(&manifest_path).unwrap();
         assert_eq!(
-            manifest
+            stored
+                .manifest
                 .segments
                 .iter()
                 .map(|seg| seg.segment_id)
                 .collect::<Vec<_>>(),
             vec![1, 2]
         );
+        let mut tombstones = stored.tombstones;
+        tombstones.sort_unstable();
+        assert_eq!(tombstones, vec![(5, 1), (7, 1)], "a failed cycle kept them");
     }
     engine.close_engine().unwrap();
     drop(engine);
@@ -1381,10 +1386,17 @@ fn late_compaction_failure_removes_output_and_preserves_original_volumes() {
     let mut tx = engine.begin_transaction().unwrap();
     assert_eq!(
         tx.get_table("group_access").unwrap().row_count().unwrap(),
-        131_072
+        131_070
     );
     tx.rollback().unwrap();
     engine.close_engine().unwrap();
+    assert_eq!(
+        TableManifest::read_from_disk(&manifest_path)
+            .unwrap()
+            .tombstones,
+        vec![],
+        "the successful cycle applied them"
+    );
 }
 
 fn hot_maintenance_engine(path: &std::path::Path) -> stoolap::storage::mvcc::MVCCEngine {

@@ -21,7 +21,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use stoolap::storage::volume::manifest::SegmentManager;
 use stoolap::Database;
 
@@ -29,13 +29,15 @@ struct ThreadCounting;
 
 thread_local! {
     static LIVE: Cell<isize> = const { Cell::new(0) };
+    static ALLOCATED: Cell<usize> = const { Cell::new(0) };
 }
 
 unsafe impl GlobalAlloc for ThreadCounting {
-    // SAFETY: forwards to the system allocator; the counter is a const
-    // thread-local Cell, which never allocates
+    // SAFETY: forwards to the system allocator; the counters are const
+    // thread-local Cells, which never allocate
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         LIVE.with(|l| l.set(l.get() + layout.size() as isize));
+        ALLOCATED.with(|a| a.set(a.get() + layout.size()));
         System.alloc(layout)
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -44,6 +46,7 @@ unsafe impl GlobalAlloc for ThreadCounting {
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         LIVE.with(|l| l.set(l.get() + new_size as isize - layout.size() as isize));
+        ALLOCATED.with(|a| a.set(a.get() + new_size));
         System.realloc(ptr, layout, new_size)
     }
 }
@@ -139,10 +142,12 @@ fn cleanup_by_an_old_snapshot_keeps_a_newer_stamp_on_disk() {
     let dir = tempfile::tempdir().unwrap();
     let mgr = SegmentManager::new("t", Some(dir.path().to_path_buf()));
     mgr.add_tombstones(&[1, 2, 3], 1);
-    let snapshot = mgr.tombstone_set_arc();
+    let applied: Vec<(i64, u64)> = [1, 2, 3]
+        .iter()
+        .map(|rid| (*rid, mgr.tombstone_set_arc()[rid]))
+        .collect();
     mgr.add_tombstones(&[2], 7);
-    let compacted: FxHashSet<i64> = [1, 2, 3].into_iter().collect();
-    mgr.remove_tombstones_matching_snapshot(&snapshot, &compacted);
+    mgr.remove_applied_tombstones(&applied);
     mgr.persist_manifest_only().unwrap();
     assert_eq!(reopened(dir.path()), vec![(2, 7)]);
 }
@@ -251,4 +256,182 @@ fn an_older_persist_never_lands_after_a_newer_one() {
         vec![(1, 2)],
         "the older capture was written last"
     );
+}
+
+fn open_file(dir: &std::path::Path, extra: &str) -> Database {
+    Database::open(&format!(
+        "file://{}?sync_mode=none&checkpoint_on_close=off&checkpoint_interval=0{extra}",
+        dir.display()
+    ))
+    .unwrap()
+}
+
+/// Inserts `rows` rows with ids from `from` and seals them into a volume
+fn seal_rows(db: &Database, from: i64, rows: i64) {
+    for start in (from..from + rows).step_by(10_000) {
+        let end = (start + 10_000).min(from + rows);
+        let values: Vec<String> = (start..end).map(|id| format!("({id},{id})")).collect();
+        db.execute(&format!("INSERT INTO t VALUES {}", values.join(",")), ())
+            .unwrap();
+    }
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+}
+
+fn count(db: &Database) -> i64 {
+    db.query_one("SELECT COUNT(*) FROM t", ()).unwrap()
+}
+
+/// The committed tombstones the table's manifest holds on disk
+fn tombstones_on_disk(dir: &std::path::Path) -> Vec<(i64, u64)> {
+    let path = dir.join("volumes").join("t").join("manifest.bin");
+    let mut on_disk = stoolap::storage::volume::manifest::TableManifest::read_from_disk(&path)
+        .unwrap()
+        .tombstones;
+    on_disk.sort_unstable();
+    on_disk
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_commit_during_a_compaction_does_not_copy_the_map() {
+    use std::sync::mpsc;
+
+    fn delete_one(db: &Database, id: i64) -> usize {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let before = ALLOCATED.with(Cell::get);
+            db.execute("DELETE FROM t WHERE id = $1", (id,)).unwrap();
+            ALLOCATED.with(Cell::get) - before
+        })
+        .join()
+        .unwrap()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_file(dir.path(), "");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    seal_rows(&db, 1, 100_000);
+    seal_rows(&db, 100_001, 100_000);
+    // 100,000 tombstones: a copy of the map is over 2 MB
+    db.execute("DELETE FROM t WHERE id % 2 = 0", ()).unwrap();
+    let alone = delete_one(&db, 1);
+    assert!(alone < 1 << 20, "a lone commit allocated {alone} bytes");
+
+    let (sent, received) = mpsc::channel();
+    let other = db.clone();
+    stoolap::test_failpoints::after_compaction_dedup(move |_| {
+        sent.send(delete_one(&other, 3)).unwrap();
+    });
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let during = received
+        .try_recv()
+        .expect("the compaction reached its dedup");
+    assert!(
+        during < alone + (1 << 20),
+        "a commit during the compaction allocated {during} bytes, {alone} alone"
+    );
+    assert_eq!(count(&db), 200_000 - 100_000 - 2);
+}
+
+#[test]
+fn a_compaction_under_a_snapshot_keeps_later_tombstones_and_unselected_volumes() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = open_file(dir.path(), "&target_volume_rows=100000");
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+            .unwrap();
+        seal_rows(&db, 1, 50_000);
+        seal_rows(&db, 50_001, 50_000);
+        seal_rows(&db, 100_001, 100_000);
+        db.execute("DELETE FROM t WHERE id = 10", ()).unwrap();
+        db.execute("DELETE FROM t WHERE id = 60010", ()).unwrap();
+
+        let snapshot = db.clone();
+        snapshot
+            .execute("BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT", ())
+            .unwrap();
+        assert_eq!(count(&snapshot), 199_998);
+        // After the snapshot began: one in a volume the compaction merges,
+        // one in the at-target volume it leaves alone
+        db.execute("DELETE FROM t WHERE id = 20", ()).unwrap();
+        db.execute("DELETE FROM t WHERE id = 150000", ()).unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+
+        let kept: Vec<i64> = tombstones_on_disk(dir.path())
+            .into_iter()
+            .map(|(rid, _)| rid)
+            .collect();
+        assert_eq!(kept, vec![20, 150_000], "the applied tombstones went");
+        assert_eq!(
+            count(&snapshot),
+            199_998,
+            "the snapshot still sees its rows"
+        );
+        assert_eq!(count(&db), 199_996);
+        snapshot.execute("COMMIT", ()).unwrap();
+        db.close().unwrap();
+    }
+    let db = open_file(dir.path(), "&target_volume_rows=100000");
+    assert_eq!(count(&db), 199_996);
+    let gone: i64 = db
+        .query_one(
+            "SELECT COUNT(*) FROM t WHERE id IN (10, 20, 60010, 150000)",
+            (),
+        )
+        .unwrap();
+    assert_eq!(gone, 0);
+}
+
+#[test]
+fn a_compaction_that_empties_its_volumes_clears_their_tombstones() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = open_file(dir.path(), "");
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+            .unwrap();
+        seal_rows(&db, 1, 1_000);
+        seal_rows(&db, 1_001, 1_000);
+        db.execute("DELETE FROM t", ()).unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        assert_eq!(tombstones_on_disk(dir.path()), vec![]);
+        assert_eq!(count(&db), 0);
+        db.close().unwrap();
+    }
+    let db = open_file(dir.path(), "");
+    assert_eq!(count(&db), 0);
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_compaction_takes_one_pair_per_deleted_row_over_overlapping_volumes() {
+    use std::sync::mpsc;
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_file(dir.path(), "&compact_threshold=100");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    seal_rows(&db, 1, 1_000);
+    for _ in 0..4 {
+        db.execute("UPDATE t SET v = v + 1", ()).unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    }
+    assert_eq!(
+        db.engine().volume_stats().len(),
+        5,
+        "every round sealed another copy of the same ids"
+    );
+    db.execute("DELETE FROM t", ()).unwrap();
+    db.execute("PRAGMA COMPACT_THRESHOLD = 2", ()).unwrap();
+    let (sent, received) = mpsc::channel();
+    stoolap::test_failpoints::after_compaction_dedup(move |pairs| sent.send(pairs).unwrap());
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    assert_eq!(
+        received
+            .try_recv()
+            .expect("the compaction reached its dedup"),
+        1_000,
+        "one pair per deleted row, not per copy"
+    );
+    assert_eq!(count(&db), 0);
+    assert_eq!(tombstones_on_disk(dir.path()), vec![]);
 }
