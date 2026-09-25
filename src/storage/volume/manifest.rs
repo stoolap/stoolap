@@ -2464,40 +2464,30 @@ impl SegmentManager {
         }
     }
 
-    /// Remove only tombstones that match both row_id AND commit_seq from a
-    /// prior snapshot. Tombstones added after the snapshot (e.g., by a
-    /// concurrent seal) are preserved.
-    pub fn remove_tombstones_matching_snapshot(
-        &self,
-        snapshot: &FxHashMap<i64, u64>,
-        row_ids: &FxHashSet<i64>,
-    ) {
-        if row_ids.is_empty() || snapshot.is_empty() {
+    /// Remove the tombstones a compaction applied, given as (row_id,
+    /// commit_seq): each goes only while its commit_seq is still that one,
+    /// so a newer stamp stays. A shared map is copied only when one goes.
+    pub fn remove_applied_tombstones(&self, applied: &[(i64, u64)]) {
+        if applied.is_empty() {
             return;
         }
         let _manifest = self.manifest.write();
         let mut ts_guard = self.tombstones.write();
-        // Only a tombstone in the merged volumes whose commit_seq is still
-        // the snapshot's goes; a newer stamp stays
-        let doomed = |rid: i64, seq: u64| {
-            row_ids.contains(&rid) && snapshot.get(&rid).is_some_and(|&snap| snap == seq)
+        let current = |map: &FxHashMap<i64, u64>, &(rid, seq): &(i64, u64)| {
+            count_cleanup_visit();
+            map.get(&rid) == Some(&seq)
         };
-        let removed = if snapshot.capacity() < row_ids.capacity() {
-            remove_tombstones_where(
-                &mut ts_guard,
-                snapshot.capacity(),
-                || snapshot.keys().copied(),
-                doomed,
-            )
-        } else {
-            remove_tombstones_where(
-                &mut ts_guard,
-                row_ids.capacity(),
-                || row_ids.iter().copied(),
-                doomed,
-            )
-        };
-        if removed {
+        if Arc::get_mut(&mut ts_guard).is_none() && !applied.iter().any(|p| current(&ts_guard, p)) {
+            return;
+        }
+        let map = Arc::make_mut(&mut ts_guard);
+        let before = map.len();
+        for pair in applied {
+            if current(map, pair) {
+                map.remove(&pair.0);
+            }
+        }
+        if map.len() != before {
             self.cached_deduped_count
                 .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         }
@@ -4108,8 +4098,8 @@ mod tests {
 
         mgr.add_tombstones(&ids, 2);
         let restamped = mgr.tombstone_set_arc();
-        let all: FxHashSet<i64> = ids.iter().copied().collect();
-        mgr.remove_tombstones_matching_snapshot(&snapshot, &all);
+        let applied: Vec<(i64, u64)> = snapshot.iter().map(|(&r, &s)| (r, s)).collect();
+        mgr.remove_applied_tombstones(&applied);
         assert!(
             Arc::ptr_eq(&restamped, &mgr.tombstone_set_arc()),
             "a cleanup whose sequences all changed copied the map"
@@ -4129,10 +4119,9 @@ mod tests {
         mgr.remove_tombstones_for_rows(&batch);
         assert!(visits() - before <= 20, "visited {}", visits() - before);
 
-        let snapshot: FxHashMap<i64, u64> = (10..20).map(|rid| (rid, 1)).collect();
-        let merged: FxHashSet<i64> = (0..50_000).collect();
+        let applied: Vec<(i64, u64)> = (10..20).map(|rid| (rid, 1)).collect();
         let before = visits();
-        mgr.remove_tombstones_matching_snapshot(&snapshot, &merged);
+        mgr.remove_applied_tombstones(&applied);
         assert!(visits() - before <= 20, "visited {}", visits() - before);
         assert_eq!(mgr.tombstone_count(), 100_000 - 20);
     }
@@ -4181,8 +4170,8 @@ mod tests {
             let snapshot = mgr.tombstone_set_arc();
             mgr.add_tombstones(&[3], 5);
 
-            let merged: FxHashSet<i64> = (1..=4).chain(100..100 + extra).collect();
-            mgr.remove_tombstones_matching_snapshot(&snapshot, &merged);
+            let applied: Vec<(i64, u64)> = (1..=4).map(|rid| (rid, snapshot[&rid])).collect();
+            mgr.remove_applied_tombstones(&applied);
             let rows: FxHashSet<i64> = [5, 99].into_iter().chain(200..200 + extra).collect();
             mgr.remove_tombstones_for_rows(&rows);
 
