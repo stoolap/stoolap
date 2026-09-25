@@ -3914,6 +3914,24 @@ mod tests {
     }
 
     #[test]
+    fn test_persist_holds_its_mutex_from_capture_to_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = Arc::new(SegmentManager::new("t", Some(dir.path().to_path_buf())));
+        mgr.add_tombstones(&[1], 1);
+        let held = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (hook_mgr, hook_held) = (Arc::clone(&mgr), Arc::clone(&held));
+        crate::test_failpoints::after_manifest_captured(move || {
+            let locked = hook_mgr.persisting.try_lock().is_none();
+            hook_held.store(locked, std::sync::atomic::Ordering::SeqCst);
+        });
+        mgr.persist_manifest_only().unwrap();
+        assert!(
+            held.load(std::sync::atomic::Ordering::SeqCst),
+            "the persist mutex was free between the capture and the write"
+        );
+    }
+
+    #[test]
     fn test_manifest_disk_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manifest.bin");
