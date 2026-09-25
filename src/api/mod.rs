@@ -82,6 +82,7 @@
 
 pub mod database;
 pub mod params;
+pub mod row_deserializer;
 pub mod rows;
 pub mod statement;
 pub mod transaction;
