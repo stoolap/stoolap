@@ -567,6 +567,63 @@ pub struct StoredManifest {
     pub tombstones: Vec<(i64, u64)>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Entries a tombstone cleanup looked at on this thread
+    static CLEANUP_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn count_cleanup_visit() {
+    #[cfg(test)]
+    CLEANUP_VISITS.with(|v| v.set(v.get() + 1));
+}
+
+/// Removes the tombstones `doomed` accepts. The candidates are walked when
+/// they have fewer buckets than the map, else the map is. A shared map is
+/// first searched and copied only when something goes; a map held alone is
+/// walked once. Returns whether anything went.
+fn remove_tombstones_where<I: Iterator<Item = i64>>(
+    ts: &mut Arc<FxHashMap<i64, u64>>,
+    candidates_capacity: usize,
+    candidates: impl Fn() -> I,
+    doomed: impl Fn(i64, u64) -> bool,
+) -> bool {
+    let hit = |map: &FxHashMap<i64, u64>, rid: i64| {
+        count_cleanup_visit();
+        map.get(&rid).is_some_and(|&seq| doomed(rid, seq))
+    };
+    let walk_candidates = candidates_capacity < ts.capacity();
+    if Arc::get_mut(ts).is_none() {
+        let any = if walk_candidates {
+            candidates().any(|rid| hit(ts, rid))
+        } else {
+            ts.iter().any(|(&rid, &seq)| {
+                count_cleanup_visit();
+                doomed(rid, seq)
+            })
+        };
+        if !any {
+            return false;
+        }
+    }
+    let map = Arc::make_mut(ts);
+    let before = map.len();
+    if walk_candidates {
+        for rid in candidates() {
+            if hit(map, rid) {
+                map.remove(&rid);
+            }
+        }
+    } else {
+        map.retain(|&rid, &mut seq| {
+            count_cleanup_visit();
+            !doomed(rid, seq)
+        });
+    }
+    map.len() != before
+}
+
 /// Recompute the visibility bitmaps for all segments in `segments`.
 ///
 /// `seg_order` lists segment IDs in ascending (oldest-first) order.
@@ -2395,10 +2452,13 @@ impl SegmentManager {
         }
         let _manifest = self.manifest.write();
         let mut ts_guard = self.tombstones.write();
-        let ts = Arc::make_mut(&mut *ts_guard);
-        let before = ts.len();
-        ts.retain(|rid, _| !row_ids.contains(rid));
-        if ts.len() != before {
+        let removed = remove_tombstones_where(
+            &mut ts_guard,
+            row_ids.capacity(),
+            || row_ids.iter().copied(),
+            |rid, _| row_ids.contains(&rid),
+        );
+        if removed {
             self.cached_deduped_count
                 .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         }
@@ -2417,17 +2477,27 @@ impl SegmentManager {
         }
         let _manifest = self.manifest.write();
         let mut ts_guard = self.tombstones.write();
-        let ts = Arc::make_mut(&mut *ts_guard);
-        let before = ts.len();
-        ts.retain(|rid, seq| {
-            if !row_ids.contains(rid) {
-                return true; // not in merged volumes, keep
-            }
-            // Only remove if the commit_seq matches the snapshot.
-            // If a newer tombstone was added (different seq), keep it.
-            !matches!(snapshot.get(rid), Some(snap_seq) if *snap_seq == *seq)
-        });
-        if ts.len() != before {
+        // Only a tombstone in the merged volumes whose commit_seq is still
+        // the snapshot's goes; a newer stamp stays
+        let doomed = |rid: i64, seq: u64| {
+            row_ids.contains(&rid) && snapshot.get(&rid).is_some_and(|&snap| snap == seq)
+        };
+        let removed = if snapshot.capacity() < row_ids.capacity() {
+            remove_tombstones_where(
+                &mut ts_guard,
+                snapshot.capacity(),
+                || snapshot.keys().copied(),
+                doomed,
+            )
+        } else {
+            remove_tombstones_where(
+                &mut ts_guard,
+                row_ids.capacity(),
+                || row_ids.iter().copied(),
+                doomed,
+            )
+        };
+        if removed {
             self.cached_deduped_count
                 .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         }
@@ -4010,6 +4080,119 @@ mod tests {
         assert_eq!(mgr.total_row_count(), 10);
         assert!(mgr.row_exists(5).unwrap());
         assert!(!mgr.row_exists(11).unwrap());
+    }
+
+    fn tombstones_of(mgr: &SegmentManager) -> Vec<(i64, u64)> {
+        let mut all: Vec<(i64, u64)> = mgr
+            .tombstone_set_arc()
+            .iter()
+            .map(|(&rid, &seq)| (rid, seq))
+            .collect();
+        all.sort_unstable();
+        all
+    }
+
+    #[test]
+    fn a_cleanup_that_removes_nothing_leaves_the_shared_map_in_place() {
+        let mgr = SegmentManager::new("t", None);
+        let ids: Vec<i64> = (1..=1_000).collect();
+        mgr.add_tombstones(&ids, 1);
+        let snapshot = mgr.tombstone_set_arc();
+
+        let absent: FxHashSet<i64> = [5_000, 5_001].into_iter().collect();
+        mgr.remove_tombstones_for_rows(&absent);
+        assert!(
+            Arc::ptr_eq(&snapshot, &mgr.tombstone_set_arc()),
+            "removing absent ids copied the map"
+        );
+
+        mgr.add_tombstones(&ids, 2);
+        let restamped = mgr.tombstone_set_arc();
+        let all: FxHashSet<i64> = ids.iter().copied().collect();
+        mgr.remove_tombstones_matching_snapshot(&snapshot, &all);
+        assert!(
+            Arc::ptr_eq(&restamped, &mgr.tombstone_set_arc()),
+            "a cleanup whose sequences all changed copied the map"
+        );
+        assert_eq!(mgr.tombstone_count(), 1_000);
+    }
+
+    #[test]
+    fn a_small_cleanup_visits_its_batch_not_the_map() {
+        let mgr = SegmentManager::new("t", None);
+        let ids: Vec<i64> = (0..100_000).collect();
+        mgr.add_tombstones(&ids, 1);
+        let visits = || CLEANUP_VISITS.with(|v| v.get());
+
+        let batch: FxHashSet<i64> = (0..10).collect();
+        let before = visits();
+        mgr.remove_tombstones_for_rows(&batch);
+        assert!(visits() - before <= 20, "visited {}", visits() - before);
+
+        let snapshot: FxHashMap<i64, u64> = (10..20).map(|rid| (rid, 1)).collect();
+        let merged: FxHashSet<i64> = (0..50_000).collect();
+        let before = visits();
+        mgr.remove_tombstones_matching_snapshot(&snapshot, &merged);
+        assert!(visits() - before <= 20, "visited {}", visits() - before);
+        assert_eq!(mgr.tombstone_count(), 100_000 - 20);
+    }
+
+    #[test]
+    fn a_map_held_alone_is_walked_once() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mgr = SegmentManager::new("t", None);
+        let ids: Vec<i64> = (0..100_000).collect();
+        mgr.add_tombstones(&ids, 1);
+        let (last, capacity) = {
+            let ts = mgr.tombstone_set_arc();
+            (ts.keys().copied().last().unwrap(), ts.capacity())
+        };
+        let mut targets: FxHashSet<i64> =
+            FxHashSet::with_capacity_and_hasher(capacity, Default::default());
+        targets.insert(last);
+        targets.insert(-1);
+        let visits = || CLEANUP_VISITS.with(|v| v.get());
+
+        let before = visits();
+        mgr.remove_tombstones_for_rows(&targets);
+        assert!(
+            visits() - before <= 100_000,
+            "visited {}",
+            visits() - before
+        );
+        assert_eq!(mgr.tombstone_count(), 99_999);
+
+        mgr.cached_deduped_count.store(7, Relaxed);
+        mgr.remove_tombstones_for_rows(&targets);
+        assert_eq!(
+            mgr.cached_deduped_count.load(Relaxed),
+            7,
+            "a cleanup that removed nothing reset the count"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_keeps_old_views_newer_stamps_and_other_ids() {
+        // A small target set walks the targets; a large one walks the map
+        for extra in [0_i64, 1_000] {
+            let mgr = SegmentManager::new("t", None);
+            let ids: Vec<i64> = (1..=10).collect();
+            mgr.add_tombstones(&ids, 1);
+            let snapshot = mgr.tombstone_set_arc();
+            mgr.add_tombstones(&[3], 5);
+
+            let merged: FxHashSet<i64> = (1..=4).chain(100..100 + extra).collect();
+            mgr.remove_tombstones_matching_snapshot(&snapshot, &merged);
+            let rows: FxHashSet<i64> = [5, 99].into_iter().chain(200..200 + extra).collect();
+            mgr.remove_tombstones_for_rows(&rows);
+
+            let mut expected = vec![(3, 5)];
+            expected.extend((6..=10).map(|rid| (rid, 1)));
+            assert_eq!(tombstones_of(&mgr), expected, "with {extra} extra targets");
+            let mut old: Vec<(i64, u64)> = snapshot.iter().map(|(&r, &s)| (r, s)).collect();
+            old.sort_unstable();
+            assert_eq!(old, ids.iter().map(|&r| (r, 1)).collect::<Vec<_>>());
+        }
     }
 
     #[test]

@@ -7347,19 +7347,24 @@ impl MVCCEngine {
                 // Clear tombstones for sealed row_ids INSIDE the fence.
                 {
                     let skip_set: FxHashSet<i64> = all_skipped_inner.iter().copied().collect();
-                    let ts = mgr.tombstone_set_arc();
-                    if !ts.is_empty() {
+                    // The map is let go before the removal, so this reference
+                    // alone never makes it copy the map
+                    let sealed_ids = {
+                        let ts = mgr.tombstone_set_arc();
                         let mut sealed_ids: FxHashSet<i64> = FxHashSet::default();
-                        for (vol, _, _) in &sealed_volumes {
-                            for &rid in &vol.meta.row_ids {
-                                if ts.contains_key(&rid) && !skip_set.contains(&rid) {
-                                    sealed_ids.insert(rid);
+                        if !ts.is_empty() {
+                            for (vol, _, _) in &sealed_volumes {
+                                for &rid in &vol.meta.row_ids {
+                                    if ts.contains_key(&rid) && !skip_set.contains(&rid) {
+                                        sealed_ids.insert(rid);
+                                    }
                                 }
                             }
                         }
-                        if !sealed_ids.is_empty() {
-                            mgr.remove_tombstones_for_rows(&sealed_ids);
-                        }
+                        sealed_ids
+                    };
+                    if !sealed_ids.is_empty() {
+                        mgr.remove_tombstones_for_rows(&sealed_ids);
                     }
                 }
 
