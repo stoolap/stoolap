@@ -1360,7 +1360,9 @@ fn late_compaction_failure_removes_output_and_preserves_original_volumes() {
             [(1, 131_071), (2, 1)].into()
         );
         assert_eq!(volume_files(&table_dir), original_files);
-        let manifest = TableManifest::read_from_disk(&manifest_path).unwrap();
+        let manifest = TableManifest::read_from_disk(&manifest_path)
+            .unwrap()
+            .manifest;
         assert_eq!(
             manifest
                 .segments

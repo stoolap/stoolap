@@ -196,6 +196,23 @@ pub(crate) fn side_files_built() {
 }
 
 thread_local! {
+    static MANIFEST_CAPTURED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next manifest persist has captured the
+/// manifest and tombstones, before it writes them.
+pub fn after_manifest_captured(hook: impl FnOnce() + 'static) {
+    MANIFEST_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn manifest_captured() {
+    let hook = MANIFEST_CAPTURED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static SIDE_FILES_COMPARED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 

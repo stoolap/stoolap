@@ -143,10 +143,11 @@ pub struct SegmentMeta {
     pub schema_version: u64,
 }
 
-/// The manifest for a single table: tracks all live segments and tombstones.
+/// The manifest for a single table: tracks its live segments.
 ///
-/// This is the source of truth for what segments exist and which cold
-/// row_ids have been deleted or superseded.
+/// This is the source of truth for what segments exist. The committed
+/// tombstones live in the segment manager's map alone and are written with
+/// the manifest; they are not a field here.
 #[derive(Debug, Clone)]
 pub struct TableManifest {
     /// Table name.
@@ -157,12 +158,6 @@ pub struct TableManifest {
     pub next_segment_id: u64,
     /// WAL LSN of the last checkpoint that included this manifest.
     pub checkpoint_lsn: u64,
-    /// Tombstone entries: (row_id, commit_seq) pairs for cold rows that have
-    /// been deleted or superseded. The commit_seq records when the tombstone
-    /// was created, enabling snapshot isolation: a snapshot transaction at
-    /// begin_seq=N only sees tombstones with commit_seq <= N.
-    /// Cleared after compaction processes them.
-    pub tombstones: Vec<(i64, u64)>,
     /// Column rename history: (old_name, new_name) pairs.
     /// Applied as aliases to cold volumes on load so pre-rename data
     /// is visible through the new schema column name.
@@ -182,7 +177,6 @@ impl TableManifest {
             segments: Vec::new(),
             next_segment_id: 1,
             checkpoint_lsn: 0,
-            tombstones: Vec::new(),
             column_renames: Vec::new(),
             dropped_columns: Vec::new(),
         }
@@ -219,8 +213,9 @@ impl TableManifest {
         None
     }
 
-    /// Serialize the manifest to bytes (V6 format).
-    pub fn serialize(&self) -> io::Result<Vec<u8>> {
+    /// Serialize the manifest with the table's committed tombstones, as
+    /// (row_id, commit_seq), to bytes (V6 format).
+    pub fn serialize(&self, tombstones: &FxHashMap<i64, u64>) -> io::Result<Vec<u8>> {
         let mut buf = Vec::with_capacity(256);
 
         // Header
@@ -252,9 +247,18 @@ impl TableManifest {
             buf.write_all(path_bytes)?;
         }
 
-        // Tombstones: (row_id, commit_seq) pairs
-        buf.write_all(&(self.tombstones.len() as u64).to_le_bytes())?;
-        for &(row_id, commit_seq) in &self.tombstones {
+        // The rest in one reservation: tombstones, renames, drops and the CRC
+        let renames: usize = self
+            .column_renames
+            .iter()
+            .map(|(o, n)| 4 + o.len() + n.len())
+            .sum();
+        let drops: usize = self.dropped_columns.iter().map(|(n, _)| 10 + n.len()).sum();
+        buf.reserve(8 + tombstones.len() * 16 + 4 + renames + 4 + drops + 4);
+
+        // Tombstones: (row_id, commit_seq) pairs, in no set order
+        buf.write_all(&(tombstones.len() as u64).to_le_bytes())?;
+        for (&row_id, &commit_seq) in tombstones {
             buf.write_all(&row_id.to_le_bytes())?;
             buf.write_all(&commit_seq.to_le_bytes())?;
         }
@@ -286,8 +290,9 @@ impl TableManifest {
         Ok(buf)
     }
 
-    /// Deserialize a manifest from bytes. Only V6 format is supported.
-    pub fn deserialize(data: &[u8]) -> io::Result<Self> {
+    /// Deserialize a manifest and its tombstones from bytes. Only V6 format
+    /// is supported.
+    pub fn deserialize(data: &[u8]) -> io::Result<StoredManifest> {
         if data.len() < 28 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -485,20 +490,23 @@ impl TableManifest {
             }
         }
 
-        Ok(Self {
-            table_name: SmartString::from(table_name),
-            segments,
-            next_segment_id,
-            checkpoint_lsn,
+        Ok(StoredManifest {
+            manifest: Self {
+                table_name: SmartString::from(table_name),
+                segments,
+                next_segment_id,
+                checkpoint_lsn,
+                column_renames,
+                dropped_columns,
+            },
             tombstones,
-            column_renames,
-            dropped_columns,
         })
     }
 
-    /// Write manifest to disk atomically.
-    pub fn write_to_disk(&self, path: &Path) -> Result<()> {
-        let data = self.serialize().map_err(|e| {
+    /// Write the manifest with the table's committed tombstones to disk
+    /// atomically.
+    pub fn write_to_disk(&self, path: &Path, tombstones: &FxHashMap<i64, u64>) -> Result<()> {
+        let data = self.serialize(tombstones).map_err(|e| {
             crate::core::Error::internal(format!("failed to serialize manifest: {}", e))
         })?;
 
@@ -541,14 +549,22 @@ impl TableManifest {
         Ok(())
     }
 
-    /// Read manifest from disk.
-    pub fn read_from_disk(path: &Path) -> Result<Self> {
+    /// Read a manifest and its tombstones from disk.
+    pub fn read_from_disk(path: &Path) -> Result<StoredManifest> {
         let data = std::fs::read(path)
             .map_err(|e| crate::core::Error::internal(format!("failed to read manifest: {}", e)))?;
         Self::deserialize(&data).map_err(|e| {
             crate::core::Error::internal(format!("failed to deserialize manifest: {}", e))
         })
     }
+}
+
+/// A manifest as read from disk, with the tombstones stored beside it as
+/// (row_id, commit_seq). The list is for building the tombstone map at open.
+#[derive(Debug)]
+pub struct StoredManifest {
+    pub manifest: TableManifest,
+    pub tombstones: Vec<(i64, u64)>,
 }
 
 /// Recompute the visibility bitmaps for all segments in `segments`.
@@ -946,6 +962,9 @@ pub struct SegmentManager {
     /// Serializes reload attempts. Concurrent callers block on this mutex
     /// instead of spinning, preventing CPU waste during disk I/O.
     reloading: parking_lot::Mutex<()>,
+    /// Held by a persist from its capture to its write, so an older
+    /// capture never lands on disk after a newer one
+    persisting: parking_lot::Mutex<()>,
     /// Committed tombstone map: cold row_id → commit_seq (when the tombstone was created).
     /// Built from manifest tombstones on startup, updated at commit time.
     /// Wrapped in Arc for cheap O(1) reads — most callers only need to check
@@ -1006,6 +1025,7 @@ impl SegmentManager {
             key_order_verdicts: parking_lot::Mutex::new(FxHashMap::default()),
             current_eviction_epoch: std::sync::atomic::AtomicU64::new(0),
             reloading: parking_lot::Mutex::new(()),
+            persisting: parking_lot::Mutex::new(()),
             tombstones: RwLock::new(Arc::new(FxHashMap::default())),
             schema_generation: std::sync::atomic::AtomicU64::new(0),
             pending_txn_tombstones: RwLock::new(FxHashMap::default()),
@@ -1018,10 +1038,15 @@ impl SegmentManager {
         }
     }
 
-    /// Create from an existing manifest loaded from disk.
-    pub fn from_manifest(manifest: TableManifest, volume_dir: Option<PathBuf>) -> Self {
+    /// Create from a manifest loaded from disk. Its tombstone list becomes
+    /// the tombstone map and is let go.
+    pub fn from_manifest(stored: StoredManifest, volume_dir: Option<PathBuf>) -> Self {
+        let StoredManifest {
+            manifest,
+            tombstones,
+        } = stored;
         let table_name = manifest.table_name.clone();
-        let tombstone_map: FxHashMap<i64, u64> = manifest.tombstones.iter().copied().collect();
+        let tombstone_map: FxHashMap<i64, u64> = tombstones.into_iter().collect();
         Self {
             table_name: RwLock::new(table_name),
             manifest: RwLock::new(manifest),
@@ -1034,6 +1059,7 @@ impl SegmentManager {
             key_order_verdicts: parking_lot::Mutex::new(FxHashMap::default()),
             current_eviction_epoch: std::sync::atomic::AtomicU64::new(0),
             reloading: parking_lot::Mutex::new(()),
+            persisting: parking_lot::Mutex::new(()),
             tombstones: RwLock::new(Arc::new(tombstone_map)),
             schema_generation: std::sync::atomic::AtomicU64::new(0),
             pending_txn_tombstones: RwLock::new(FxHashMap::default()),
@@ -2333,37 +2359,16 @@ impl SegmentManager {
         if row_ids.is_empty() {
             return;
         }
-        let mut manifest = self.manifest.write();
+        let _manifest = self.manifest.write();
         let mut ts_guard = self.tombstones.write();
         let ts = Arc::make_mut(&mut *ts_guard);
         let mut changed = false;
         for &rid in row_ids {
-            use std::collections::hash_map::Entry;
-            match ts.entry(rid) {
-                Entry::Vacant(e) => {
-                    e.insert(commit_seq);
-                    manifest.tombstones.push((rid, commit_seq));
-                    changed = true;
-                }
-                Entry::Occupied(mut e) => {
-                    // Update existing tombstone if the new commit_seq is
-                    // different. This ensures repeated seal-skip tombstones
-                    // get a fresh sequence that won't match an older
-                    // compaction snapshot.
-                    if *e.get() != commit_seq {
-                        let old_seq = *e.get();
-                        e.insert(commit_seq);
-                        // Update the manifest entry in-place.
-                        if let Some(entry) = manifest
-                            .tombstones
-                            .iter_mut()
-                            .find(|(r, s)| *r == rid && *s == old_seq)
-                        {
-                            entry.1 = commit_seq;
-                        }
-                        changed = true;
-                    }
-                }
+            // An existing tombstone takes the new commit_seq when it differs,
+            // so repeated seal-skip tombstones get a fresh sequence that
+            // won't match an older compaction snapshot
+            if ts.insert(rid, commit_seq) != Some(commit_seq) {
+                changed = true;
             }
         }
         if changed {
@@ -2375,7 +2380,7 @@ impl SegmentManager {
     /// Clear all tombstones (after compaction has resolved them).
     /// Lock order: manifest FIRST, then tombstones.
     pub fn clear_tombstones(&self) {
-        self.manifest.write().tombstones.clear();
+        let _manifest = self.manifest.write();
         *self.tombstones.write() = Arc::new(FxHashMap::default());
         self.cached_deduped_count
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
@@ -2388,15 +2393,12 @@ impl SegmentManager {
         if row_ids.is_empty() {
             return;
         }
-        let mut manifest = self.manifest.write();
+        let _manifest = self.manifest.write();
         let mut ts_guard = self.tombstones.write();
         let ts = Arc::make_mut(&mut *ts_guard);
         let before = ts.len();
         ts.retain(|rid, _| !row_ids.contains(rid));
         if ts.len() != before {
-            manifest
-                .tombstones
-                .retain(|&(rid, _)| !row_ids.contains(&rid));
             self.cached_deduped_count
                 .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         }
@@ -2413,7 +2415,7 @@ impl SegmentManager {
         if row_ids.is_empty() || snapshot.is_empty() {
             return;
         }
-        let mut manifest = self.manifest.write();
+        let _manifest = self.manifest.write();
         let mut ts_guard = self.tombstones.write();
         let ts = Arc::make_mut(&mut *ts_guard);
         let before = ts.len();
@@ -2426,12 +2428,6 @@ impl SegmentManager {
             !matches!(snapshot.get(rid), Some(snap_seq) if *snap_seq == *seq)
         });
         if ts.len() != before {
-            manifest.tombstones.retain(|&(rid, seq)| {
-                if !row_ids.contains(&rid) {
-                    return true;
-                }
-                !matches!(snapshot.get(&rid), Some(snap_seq) if *snap_seq == seq)
-            });
             self.cached_deduped_count
                 .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         }
@@ -3056,14 +3052,23 @@ impl SegmentManager {
             return Ok(());
         };
 
-        let persist_name = self.manifest.read().table_name.clone();
-        let table_dir = vol_dir.join(persist_name.as_str());
+        // The manifest and the tombstones are taken together, manifest first;
+        // the list is built and written outside both locks
+        let _persisting = self.persisting.lock();
+        let (manifest, tombstones) = {
+            let manifest = self.manifest.read();
+            let tombstones = Arc::clone(&*self.tombstones.read());
+            (manifest.clone(), tombstones)
+        };
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::manifest_captured();
+        let table_dir = vol_dir.join(manifest.table_name.as_str());
         std::fs::create_dir_all(&table_dir).map_err(|e| {
             crate::core::Error::internal(format!("failed to create table dir: {}", e))
         })?;
 
         let manifest_path = table_dir.join("manifest.bin");
-        self.manifest.read().write_to_disk(&manifest_path)?;
+        manifest.write_to_disk(&manifest_path, &tombstones)?;
 
         Ok(())
     }
@@ -3119,8 +3124,8 @@ impl SegmentManager {
             return Ok(None);
         }
 
-        let manifest = TableManifest::read_from_disk(&manifest_path)?;
-        let manager = Self::from_manifest(manifest, Some(volume_dir.to_path_buf()));
+        let stored = TableManifest::read_from_disk(&manifest_path)?;
+        let manager = Self::from_manifest(stored, Some(volume_dir.to_path_buf()));
 
         Ok(Some(manager))
     }
@@ -3129,12 +3134,13 @@ impl SegmentManager {
     pub fn clear(&self) {
         let _destruction = self.begin_destruction();
         {
+            // The tombstones go while the manifest is held, so a persist
+            // never takes the emptied segments with the old tombstones
             let mut manifest = self.manifest.write();
             manifest.segments.clear();
-            manifest.tombstones.clear();
+            *self.tombstones.write() = Arc::new(FxHashMap::default());
         }
         *self.segments.write() = Arc::new(FxHashMap::default());
-        *self.tombstones.write() = Arc::new(FxHashMap::default());
         self.key_order_verdicts.lock().clear();
         self.cached_deduped_count
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
@@ -3772,7 +3778,6 @@ mod tests {
         assert!(m.segments.is_empty());
         assert_eq!(m.next_segment_id, 1);
         assert_eq!(m.checkpoint_lsn, 0);
-        assert!(m.tombstones.is_empty());
     }
 
     #[test]
@@ -3848,7 +3853,7 @@ mod tests {
         let mut m = TableManifest::new("my_table");
         m.next_segment_id = 5;
         m.checkpoint_lsn = 42;
-        m.tombstones = vec![(10, 0), (20, 0), (30, 0)];
+        let tombstones: FxHashMap<i64, u64> = [(10, 0), (20, 3), (30, 0)].into_iter().collect();
         m.add_segment(SegmentMeta {
             segment_id: 1,
             file_path: PathBuf::from("seg_0001.vol"),
@@ -3870,8 +3875,11 @@ mod tests {
             schema_version: 5,
         });
 
-        let data = m.serialize().unwrap();
-        let loaded = TableManifest::deserialize(&data).unwrap();
+        let data = m.serialize(&tombstones).unwrap();
+        let StoredManifest {
+            manifest: loaded,
+            tombstones: mut loaded_tombstones,
+        } = TableManifest::deserialize(&data).unwrap();
 
         assert_eq!(loaded.table_name.as_str(), "my_table");
         assert_eq!(loaded.next_segment_id, 5);
@@ -3886,7 +3894,41 @@ mod tests {
         assert_eq!(loaded.segments[1].creation_lsn, 30);
         assert_eq!(loaded.segments[0].schema_version, 3);
         assert_eq!(loaded.segments[1].schema_version, 5);
-        assert_eq!(loaded.tombstones, vec![(10, 0), (20, 0), (30, 0)]);
+        loaded_tombstones.sort_unstable();
+        assert_eq!(loaded_tombstones, vec![(10, 0), (20, 3), (30, 0)]);
+    }
+
+    #[test]
+    fn test_manifest_serialize_reserves_once() {
+        let mut m = TableManifest::new("t");
+        m.column_renames
+            .push((SmartString::from("a"), SmartString::from("b")));
+        m.dropped_columns.push((SmartString::from("c"), 2));
+        let tombstones: FxHashMap<i64, u64> = (0..10_000).map(|id| (id, 1)).collect();
+        let data = m.serialize(&tombstones).unwrap();
+        assert_eq!(
+            data.capacity(),
+            data.len(),
+            "the buffer grew past its reservation"
+        );
+    }
+
+    #[test]
+    fn test_persist_holds_its_mutex_from_capture_to_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = Arc::new(SegmentManager::new("t", Some(dir.path().to_path_buf())));
+        mgr.add_tombstones(&[1], 1);
+        let held = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (hook_mgr, hook_held) = (Arc::clone(&mgr), Arc::clone(&held));
+        crate::test_failpoints::after_manifest_captured(move || {
+            let locked = hook_mgr.persisting.try_lock().is_none();
+            hook_held.store(locked, std::sync::atomic::Ordering::SeqCst);
+        });
+        mgr.persist_manifest_only().unwrap();
+        assert!(
+            held.load(std::sync::atomic::Ordering::SeqCst),
+            "the persist mutex was free between the capture and the write"
+        );
     }
 
     #[test]
@@ -3895,7 +3937,7 @@ mod tests {
         let path = dir.path().join("manifest.bin");
 
         let mut m = TableManifest::new("disk_test");
-        m.tombstones = vec![(5, 0), (10, 0)];
+        let tombstones: FxHashMap<i64, u64> = [(5, 0), (10, 0)].into_iter().collect();
         m.add_segment(SegmentMeta {
             segment_id: 1,
             file_path: PathBuf::from("vol.vol"),
@@ -3907,11 +3949,12 @@ mod tests {
             schema_version: 0,
         });
 
-        m.write_to_disk(&path).unwrap();
-        let loaded = TableManifest::read_from_disk(&path).unwrap();
+        m.write_to_disk(&path, &tombstones).unwrap();
+        let mut loaded = TableManifest::read_from_disk(&path).unwrap();
 
-        assert_eq!(loaded.table_name.as_str(), "disk_test");
-        assert_eq!(loaded.segments.len(), 1);
+        assert_eq!(loaded.manifest.table_name.as_str(), "disk_test");
+        assert_eq!(loaded.manifest.segments.len(), 1);
+        loaded.tombstones.sort_unstable();
         assert_eq!(loaded.tombstones, vec![(5, 0), (10, 0)]);
     }
 

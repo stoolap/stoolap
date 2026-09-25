@@ -373,7 +373,9 @@ fn dropping_a_pinned_table_persists_an_empty_manifest() {
             .unwrap();
         other.execute("PRAGMA CHECKPOINT", ()).unwrap();
         assert!(old_names.is_subset(&vol_files(&root)));
-        let manifest = TableManifest::read_from_disk(&root.join("volumes/t/manifest.bin")).unwrap();
+        let manifest = TableManifest::read_from_disk(&root.join("volumes/t/manifest.bin"))
+            .unwrap()
+            .manifest;
         assert!(
             manifest.segments.is_empty(),
             "recovery must not discover pinned, dropped rows"
