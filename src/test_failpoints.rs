@@ -178,6 +178,42 @@ pub(crate) fn maintenance_schema_taken() {
     }
 }
 
+thread_local! {
+    static SEAL_CUTOFF_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once after a seal on this thread read the oldest snapshot for its
+/// cutoff, before it captures the version root.
+pub fn after_seal_cutoff_read(hook: impl FnOnce() + 'static) {
+    SEAL_CUTOFF_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn seal_cutoff_read() {
+    let hook = SEAL_CUTOFF_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+type FlagHook = Box<dyn FnOnce(bool)>;
+
+thread_local! {
+    static COMPACTION_TOMBSTONES_HOOK: RefCell<Option<FlagHook>> = RefCell::new(None);
+}
+
+/// Run once after a compaction on this thread took the tombstones it
+/// applies, with whether the DDL guard was held at that point.
+pub fn after_compaction_tombstones_taken(hook: impl FnOnce(bool) + 'static) {
+    COMPACTION_TOMBSTONES_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn compaction_tombstones_taken(ddl_held: bool) {
+    let hook = COMPACTION_TOMBSTONES_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(ddl_held);
+    }
+}
+
 type CountHook = Box<dyn FnOnce(usize)>;
 
 thread_local! {

@@ -506,14 +506,56 @@ enum KeptHistory {
     Nothing,
 }
 
-/// Opaque snapshot of the version store at extraction time.
-/// Used by `remove_sealed_rows` to detect concurrent commits.
+/// Opaque snapshot of the version store at extraction time, the root the
+/// copied heads were read from. Used by `classify_sealed_rows`.
 pub struct ExtractionSnapshot {
     inner: crate::common::CowBTree<VersionChainEntry>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Entries a seal's classification walked past, and walks it began, on this thread
+    static SEAL_WALK_SKIPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SEAL_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Walks a seal's classification began on this thread
+#[cfg(test)]
+pub(crate) fn seal_walks() -> usize {
+    SEAL_WALKS.with(|w| w.get())
+}
+
+/// The value at `key` in an ascending walk, moving the walk past smaller
+/// keys and spending a step of `budget` for each; None once it runs out
+fn seek<'a, V: 'a>(
+    walk: &mut std::iter::Peekable<impl Iterator<Item = (&'a i64, &'a V)>>,
+    key: i64,
+    budget: &mut usize,
+) -> Option<Option<&'a V>> {
+    while walk.next_if(|&(&k, _)| k < key).is_some() {
+        #[cfg(test)]
+        SEAL_WALK_SKIPS.with(|s| s.set(s.get() + 1));
+        *budget = budget.checked_sub(1)?;
+    }
+    Some(walk.next_if(|&(&k, _)| k == key).map(|(_, v)| v))
+}
+
+/// What a seal does with each row it extracted, decided under its fence
+#[derive(Default)]
+pub struct SealOutcome {
+    /// Committed head still the extracted version and unclaimed: its copy
+    /// gets authority and the row leaves the hot store
+    pub moved: Vec<i64>,
+    /// A newer head committed, or no hot head is left: its copy never gets
+    /// authority and the hot state stays
+    pub dead: Vec<i64>,
+    /// Claimed by an open transaction, or committed after an open snapshot
+    /// began: like a dead copy, and tried again by the next seal
+    pub deferred: Vec<i64>,
+}
+
 /// Token holding pre-removal snapshot data needed for deferred index cleanup.
-/// Created by `remove_sealed_rows`, consumed by `remove_sealed_index_entries`.
+/// Created by `remove_moved_rows`, consumed by `remove_sealed_index_entries`.
 #[derive(Default)]
 pub struct SealedIndexCleanup {
     /// Row IDs that were removed from the version store.
@@ -2552,13 +2594,17 @@ impl VersionStore {
         self.get_all_visible_rows_internal(txn_id)
     }
 
-    /// Extract visible rows AND the CowBTree snapshot at extraction time.
-    /// Used by seal: the snapshot records each row's `txn_id` so that
-    /// `remove_sealed_rows` can detect concurrent commits and skip them.
+    /// Extract the rows whose head is visible to `txn_id` and live, AND the
+    /// root they were read from. Used by seal: `classify_sealed_rows`
+    /// compares each copied head's `txn_id` with the current head's.
     pub fn extract_for_seal(&self, txn_id: i64) -> (RowVec, ExtractionSnapshot) {
-        let snapshot = self.versions.read().clone();
-        let rows = self.get_all_visible_rows_internal(txn_id);
-        (rows, ExtractionSnapshot { inner: snapshot })
+        let Some(checker) = self.visibility_checker.as_ref() else {
+            return self.extract_heads(Some(0), |_| false);
+        };
+        self.extract_heads(None, |v| {
+            checker.is_visible(v.txn_id, txn_id)
+                && (v.deleted_at_txn_id == 0 || !checker.is_visible(v.deleted_at_txn_id, txn_id))
+        })
     }
 
     /// Extract committed rows for seal, filtered by commit_seq cutoff.
@@ -2569,16 +2615,41 @@ impl VersionStore {
         &self,
         commit_seq_cutoff: i64,
     ) -> (RowVec, ExtractionSnapshot) {
-        let snapshot = self.versions.read().clone();
-        let mut rows = RowVec::with_capacity(self.committed_row_count());
-        self.for_each_committed_version_with_cutoff(
-            |row_id, version| {
-                rows.push((row_id, version.data.clone()));
-                true
-            },
-            commit_seq_cutoff,
-        );
-        (rows, ExtractionSnapshot { inner: snapshot })
+        let Some(checker) = self.visibility_checker.as_ref() else {
+            return self.extract_heads(Some(0), |_| false);
+        };
+        let use_cutoff = commit_seq_cutoff > 0;
+        // The live rows, not the deleted heads the root also keeps
+        self.extract_heads(Some(self.committed_row_count()), |v| {
+            checker.is_visible(v.txn_id, i64::MAX)
+                && (!use_cutoff || checker.is_committed_before(v.txn_id, commit_seq_cutoff))
+                && !(v.deleted_at_txn_id != 0
+                    && checker.is_visible(v.deleted_at_txn_id, i64::MAX)
+                    && (!use_cutoff
+                        || checker.is_committed_before(v.deleted_at_txn_id, commit_seq_cutoff)))
+        })
+    }
+
+    /// The rows of one captured root whose head `copies` accepts, and the
+    /// root, room reserved for `reserve` rows or else one per head. Only heads
+    /// are copied, never an older version behind a head that is not yet
+    /// visible: such a row stays hot for a later seal
+    fn extract_heads(
+        &self,
+        reserve: Option<usize>,
+        copies: impl Fn(&RowVersion) -> bool,
+    ) -> (RowVec, ExtractionSnapshot) {
+        let root = self.snapshot_versions();
+        let mut rows = RowVec::new();
+        if !self.closed.load(Ordering::Acquire) {
+            rows.reserve(reserve.unwrap_or(root.len()));
+            for (&row_id, chain) in root.iter() {
+                if copies(&chain.version) {
+                    rows.push((row_id, chain.version.data.clone()));
+                }
+            }
+        }
+        (rows, ExtractionSnapshot { inner: root })
     }
 
     /// Internal implementation for getting all visible rows
@@ -5125,6 +5196,89 @@ impl VersionStore {
     // Cleanup Functions
     // =========================================================================
 
+    /// Sorts the rows a seal extracted into moved, dead and deferred without
+    /// changing anything. Every copy is its root's head, so the same head txn
+    /// now proves the copy current. Called under the table's seal fence: every
+    /// claim is taken under its read side, so a moved row stays movable.
+    /// With `snapshot_begin`, a head not committed before it is deferred.
+    pub fn classify_sealed_rows(
+        &self,
+        row_ids: &[i64],
+        extraction_snapshot: &ExtractionSnapshot,
+        snapshot_begin: Option<i64>,
+    ) -> SealOutcome {
+        const SUB_BATCH_SIZE: usize = 2_000;
+        let mut outcome = SealOutcome {
+            moved: Vec::with_capacity(row_ids.len()),
+            ..SealOutcome::default()
+        };
+        let recheck = snapshot_begin.zip(self.visibility_checker.as_ref());
+        // Answers by the id's low bits; a txn found in its slot is not asked again
+        const SLOTS: usize = 256;
+        let mut answers = [(i64::MIN, false); SLOTS];
+        // Ascending ids walk the root once for the call and the hot store once
+        // per chunk, under its lock, while the entries passed over stay within
+        // four per candidate; others are looked up one by one
+        let mut skip_budget = row_ids.len() * 4;
+        let mut roots = row_ids
+            .first()
+            .zip(row_ids.last())
+            .filter(|_| row_ids.windows(2).all(|w| w[0] < w[1]))
+            .map(|(&lo, &hi)| extraction_snapshot.inner.range(lo..=hi).peekable());
+        for chunk in row_ids.chunks(SUB_BATCH_SIZE) {
+            let uncommitted = self.uncommitted_writes.read();
+            let versions = self.versions.read();
+            let mut walks = match (roots.as_mut(), chunk.first(), chunk.last()) {
+                (Some(roots), Some(&lo), Some(&hi)) => {
+                    #[cfg(test)]
+                    SEAL_WALKS.with(|w| w.set(w.get() + 1));
+                    Some((roots, versions.range(lo..=hi).peekable()))
+                }
+                _ => None,
+            };
+            for &row_id in chunk {
+                if uncommitted.contains_key(row_id) {
+                    outcome.deferred.push(row_id);
+                    continue;
+                }
+                let walked = walks.as_mut().and_then(|(roots, heads)| {
+                    let extracted = seek(roots, row_id, &mut skip_budget)?;
+                    Some((extracted, seek(heads, row_id, &mut skip_budget)?))
+                });
+                let (extracted, head) = match walked {
+                    Some(found) => found,
+                    None => {
+                        walks = None;
+                        (extraction_snapshot.inner.get(row_id), versions.get(row_id))
+                    }
+                };
+                let extracted = extracted.map(|e| e.version.txn_id);
+                match head {
+                    Some(entry) if Some(entry.version.txn_id) == extracted => {
+                        let txn_id = entry.version.txn_id;
+                        let visible = recheck.is_none_or(|(begin, checker)| {
+                            let slot = &mut answers[txn_id as usize & (SLOTS - 1)];
+                            if slot.0 != txn_id {
+                                *slot = (txn_id, checker.is_committed_before(txn_id, begin));
+                            }
+                            slot.1
+                        });
+                        if visible {
+                            outcome.moved.push(row_id)
+                        } else {
+                            outcome.deferred.push(row_id)
+                        }
+                    }
+                    _ => outcome.dead.push(row_id),
+                }
+            }
+            if walks.is_none() {
+                roots = None;
+            }
+        }
+        outcome
+    }
+
     /// Remove sealed rows from the hot version store (phase 1 of seal).
     /// Removes version data and arena slots but KEEPS hot index entries.
     /// The stale index entries act as a safety net: unique constraint checks
@@ -5135,23 +5289,12 @@ impl VersionStore {
     /// Callers MUST also call `subtract_committed_row_count(n)` with the
     /// returned count to keep the committed row count accurate.
     ///
-    /// `extraction_snapshot` is an O(1) CowBTree clone taken at the moment
-    /// rows were extracted. For each row_id, the removal compares the
-    /// current head version's `txn_id` against the extraction snapshot's
-    /// `txn_id`. If they differ, a concurrent commit published a newer
-    /// version after extraction — that row is skipped (stays in hot,
-    /// sealed next cycle). This prevents discarding concurrent updates
-    /// that the sealed volume doesn't contain.
-    /// Returns `(removed_count, index_cleanup, skipped_row_ids)`.
-    /// Skipped row_ids are rows that were modified after extraction — the
-    /// caller must tombstone them so recovery and row_count are correct.
-    pub fn remove_sealed_rows(
-        &self,
-        row_ids: &[i64],
-        extraction_snapshot: &ExtractionSnapshot,
-    ) -> (usize, SealedIndexCleanup, Vec<i64>) {
+    /// Takes the rows `classify_sealed_rows` found moved, under the same
+    /// fence, so they are removed without being checked again.
+    /// Returns `(removed_count, index_cleanup)`.
+    pub fn remove_moved_rows(&self, row_ids: &[i64]) -> (usize, SealedIndexCleanup) {
         if row_ids.is_empty() {
-            return (0, SealedIndexCleanup::default(), Vec::new());
+            return (0, SealedIndexCleanup::default());
         }
 
         // Remove rows in small sub-batches to reduce write lock hold time.
@@ -5161,35 +5304,15 @@ impl VersionStore {
         // entire removal, blocking all commits on this table for ~100ms+.
         const SUB_BATCH_SIZE: usize = 2_000;
         let mut removed_ids: Vec<i64> = Vec::with_capacity(row_ids.len());
-        let mut skipped_ids: Vec<i64> = Vec::new();
         let mut arena_indices_to_clear: Vec<usize> = Vec::new();
 
         for chunk in row_ids.chunks(SUB_BATCH_SIZE) {
-            let uncommitted = self.uncommitted_writes.read();
             let mut versions = self.versions.write();
             for &row_id in chunk {
-                if uncommitted.contains_key(row_id) {
-                    skipped_ids.push(row_id);
-                    continue;
-                }
-                if let Some(entry) = versions.get(row_id) {
-                    // Compare current txn_id against extraction-time txn_id.
-                    // If they differ, a concurrent commit changed this row
-                    // after we extracted it — the sealed volume has stale data
-                    // for this row. Keep the newer version in hot.
-                    let extracted_txn_id = extraction_snapshot
-                        .inner
-                        .get(row_id)
-                        .map(|e| e.version.txn_id)
-                        .unwrap_or(0);
-                    if entry.version.txn_id != extracted_txn_id {
-                        skipped_ids.push(row_id);
-                        continue;
-                    }
+                if let Some(entry) = versions.remove(row_id) {
                     if let Some(idx) = unpack_arena_idx(entry.arena_idx) {
                         arena_indices_to_clear.push(idx);
                     }
-                    versions.remove(row_id);
                     removed_ids.push(row_id);
                 }
             }
@@ -5203,7 +5326,7 @@ impl VersionStore {
         }
 
         let count = removed_ids.len();
-        (count, SealedIndexCleanup { removed_ids }, skipped_ids)
+        (count, SealedIndexCleanup { removed_ids })
     }
 
     /// Remove stale hot index entries for sealed rows (phase 2 of seal).
@@ -5683,7 +5806,7 @@ impl VersionStore {
                     // When cutoff is specified, only include versions from transactions
                     // that committed before the cutoff to ensure snapshot consistency.
                     // CRITICAL: Do NOT walk the prev chain. The extraction snapshot
-                    // captures the HEAD txn_id, and remove_sealed_rows compares against
+                    // captures the HEAD txn_id, and classify_sealed_rows compares against
                     // it. If we extract an older version but the HEAD txn_id matches,
                     // the HEAD is removed from hot, permanently losing the newer version.
                     // The row stays entirely in hot where MVCC handles visibility.
@@ -7660,6 +7783,163 @@ mod tests {
         fn needs_snapshot_isolation(&self, _txn_id: i64) -> bool {
             false
         }
+    }
+
+    /// Every txn committed; odd txns below 200 committed before any
+    /// snapshot, and each such question is counted
+    struct CountingChecker {
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    impl VisibilityChecker for CountingChecker {
+        fn is_visible(&self, _version_txn_id: i64, _viewing_txn_id: i64) -> bool {
+            true
+        }
+
+        fn get_current_sequence(&self) -> i64 {
+            0
+        }
+
+        fn get_active_transaction_ids(&self) -> Vec<i64> {
+            Vec::new()
+        }
+
+        fn is_committed_before(&self, txn_id: i64, _cutoff_commit_seq: i64) -> bool {
+            self.asked.fetch_add(1, Ordering::Relaxed);
+            txn_id % 2 == 1 && txn_id < 200
+        }
+    }
+
+    /// Rows 1.. written by `txns` in order, classified under a snapshot:
+    /// (moved, deferred, questions asked)
+    fn recheck(txns: &[i64]) -> (Vec<i64>, Vec<i64>, usize) {
+        let checker = Arc::new(CountingChecker {
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let store = VersionStore::with_visibility_checker(
+            "t".to_string(),
+            test_schema(),
+            Arc::clone(&checker) as Arc<dyn VisibilityChecker>,
+        );
+        for (row_id, &txn_id) in (1i64..).zip(txns) {
+            store.add_version(
+                row_id,
+                RowVersion::new(txn_id, Row::from(vec![Value::from(row_id)])),
+            );
+        }
+        let (rows, root) = store.extract_for_seal(i64::MAX);
+        let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+        let outcome = store.classify_sealed_rows(&ids, &root, Some(10));
+        let asked = checker.asked.load(Ordering::Relaxed);
+        (outcome.moved, outcome.deferred, asked)
+    }
+
+    #[test]
+    fn a_seal_classifies_the_same_in_id_order_and_out_of_it() {
+        let store = VersionStore::with_visibility_checker(
+            "t".to_string(),
+            test_schema(),
+            Arc::new(TestVisibilityChecker::new()) as Arc<dyn VisibilityChecker>,
+        );
+        for row_id in (1..=10_000).filter(|id| matches!(id % 5, 1..=3)) {
+            store.add_version(
+                row_id,
+                RowVersion::new(1, Row::from(vec![Value::from(row_id)])),
+            );
+        }
+        let (rows, root) = store.extract_for_seal(i64::MAX);
+        // Newer heads, a head gone, and two rows the extraction never saw
+        for row_id in [3, 4, 5, 17, 7_001] {
+            store.add_version(row_id, RowVersion::new(2, Row::from(vec![Value::from(0)])));
+        }
+        store.remove_moved_rows(&[8]);
+        let mut ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+        ids.push(20_000);
+        let expected_dead = vec![3, 8, 17, 7_001, 20_000];
+        let expected_moved: Vec<i64> = ids
+            .iter()
+            .copied()
+            .filter(|id| !expected_dead.contains(id))
+            .collect();
+        let walks = || SEAL_WALKS.with(|w| w.get());
+        let before = walks();
+        let sorted = store.classify_sealed_rows(&ids, &root, None);
+        assert_eq!(
+            walks() - before,
+            ids.len().div_ceil(2_000),
+            "one walk per chunk in id order"
+        );
+        assert_eq!(
+            (&sorted.moved, &sorted.dead),
+            (&expected_moved, &expected_dead),
+            "in id order"
+        );
+        ids.reverse();
+        let before = walks();
+        let reversed = store.classify_sealed_rows(&ids, &root, None);
+        assert_eq!(walks() - before, 0, "no walk out of id order");
+        let (mut moved, mut dead) = (reversed.moved, reversed.dead);
+        moved.sort_unstable();
+        dead.sort_unstable();
+        assert_eq!(
+            (moved, dead),
+            (expected_moved, expected_dead),
+            "out of id order"
+        );
+    }
+
+    #[test]
+    fn a_seal_walks_past_a_bounded_number_of_entries_between_sparse_candidates() {
+        let store = VersionStore::with_visibility_checker(
+            "t".to_string(),
+            test_schema(),
+            Arc::new(TestVisibilityChecker::new()) as Arc<dyn VisibilityChecker>,
+        );
+        for row_id in (100..=200_000).step_by(100) {
+            store.add_version(
+                row_id,
+                RowVersion::new(1, Row::from(vec![Value::from(row_id)])),
+            );
+        }
+        let (rows, root) = store.extract_for_seal(i64::MAX);
+        for row_id in (1..=200_000).filter(|id| id % 100 != 0) {
+            store.add_version(
+                row_id,
+                RowVersion::new(2, Row::from(vec![Value::from(row_id)])),
+            );
+        }
+        let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+        let skips = || SEAL_WALK_SKIPS.with(|s| s.get());
+        let before = skips();
+        let outcome = store.classify_sealed_rows(&ids, &root, None);
+        assert_eq!((outcome.moved, outcome.dead), (ids.clone(), vec![]));
+        let skipped = skips() - before;
+        assert!(
+            skipped <= ids.len() * 4 + 1,
+            "walked past {skipped} entries"
+        );
+    }
+
+    #[test]
+    fn a_seal_recheck_asks_each_txn_once() {
+        assert_eq!(recheck(&[1, 1, 2, 2, 1]), (vec![1, 2, 5], vec![3, 4], 2));
+    }
+
+    #[test]
+    fn a_seal_recheck_remembers_interleaved_txns() {
+        let txns: Vec<i64> = (0..100).map(|row| row % 10 + 1).collect();
+        let (moved, deferred, asked) = recheck(&txns);
+        assert_eq!((moved.len(), deferred.len()), (50, 50));
+        assert!(moved.iter().all(|&row| txns[row as usize - 1] % 2 == 1));
+        assert_eq!(asked, 10, "one question per txn");
+    }
+
+    #[test]
+    fn a_seal_recheck_asks_again_when_a_slot_is_taken() {
+        assert_eq!(
+            recheck(&[3, 259, 4, 260, 3, 259]),
+            (vec![1, 5], vec![2, 3, 4, 6], 6)
+        );
     }
 
     /// A commit that applied its versions and then failed its marker takes
