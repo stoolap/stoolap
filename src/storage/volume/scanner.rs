@@ -1587,7 +1587,7 @@ impl Scanner for MergingScanner {
 ///
 /// Used by SegmentedTable::scan() to wrap eagerly-collected hot rows.
 /// This enables scan() to derive the cold skip set from actual hot results,
-/// preventing the race where remove_sealed_rows runs between skip set
+/// preventing the race where remove_moved_rows runs between skip set
 /// construction and hot scanner execution.
 pub struct RowVecScanner {
     rows: crate::core::RowVec,

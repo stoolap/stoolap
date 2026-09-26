@@ -53,6 +53,10 @@ pub struct ColdSegment {
     /// only segment (all rows visible) or when there is no overlap.
     /// Arc so ColdSegment::clone() is O(1) — scanners share the same bitmap.
     pub visible: Option<Arc<Vec<u64>>>,
+    /// Sorted positions of copies a seal built that never got authority, the
+    /// manifest's entry for this segment, their bits always clear in
+    /// `visible`; None when every copy has authority
+    pub dead: Option<Arc<[u32]>>,
     /// Keeps the file alive for captured readers and follows table renames.
     /// Acquired before registration; absent for a database without files.
     pub file: Option<Arc<super::writer::VolumeFile>>,
@@ -92,6 +96,38 @@ impl ColdSegment {
             Some(bits) => (bits[idx >> 6] >> (idx & 63)) & 1 == 1,
         }
     }
+
+    /// Whether the copy at `idx` is one a seal built that never got authority
+    #[inline]
+    pub fn is_dead(&self, idx: usize) -> bool {
+        self.dead
+            .as_ref()
+            .is_some_and(|dead| dead.binary_search(&(idx as u32)).is_ok())
+    }
+
+    /// The position of `row_id`'s copy in this volume, when that copy has
+    /// authority
+    #[inline]
+    pub fn locate_authoritative(&self, row_id: i64) -> Option<usize> {
+        self.volume.locate(row_id).filter(|&idx| !self.is_dead(idx))
+    }
+}
+
+/// A bitmap over `row_count` rows with every bit set but `dead`'s
+fn bits_without(row_count: usize, dead: &[u32]) -> Vec<u64> {
+    let mut bits = vec![!0u64; row_count.div_ceil(64)];
+    if !row_count.is_multiple_of(64) {
+        bits[row_count / 64] = (1u64 << (row_count % 64)) - 1;
+    }
+    clear_dead(&mut bits, dead);
+    bits
+}
+
+fn clear_dead(bits: &mut [u64], dead: &[u32]) {
+    for &pos in dead {
+        let pos = pos as usize;
+        bits[pos >> 6] &= !(1u64 << (pos & 63));
+    }
 }
 
 /// Consistent segment order, visibility and tombstones for cold reads.
@@ -117,7 +153,9 @@ impl ColdSnapshot {
 
 // Manifest file magic: "STMF" (SToolap ManiFest)
 const MANIFEST_MAGIC: [u8; 4] = *b"STMF";
-const MANIFEST_VERSION: u32 = 6;
+const MANIFEST_VERSION: u32 = 7;
+/// The last version without dead copies, still read
+const MANIFEST_VERSION_V6: u32 = 6;
 
 /// Metadata for a single immutable segment (frozen volume).
 #[derive(Debug, Clone)]
@@ -167,6 +205,10 @@ pub struct TableManifest {
     /// before the drop (schema_version <= drop_version) have stale data masked.
     /// Cleared during compaction (new volumes don't have stale data).
     pub dropped_columns: Vec<(SmartString, u64)>,
+    /// Per segment, the sorted positions of copies a seal built that never
+    /// got authority: no reader sees them. Absent for a fully authoritative
+    /// segment, and gone with the segment.
+    pub dead_copies: FxHashMap<u64, Arc<[u32]>>,
 }
 
 impl TableManifest {
@@ -179,6 +221,7 @@ impl TableManifest {
             checkpoint_lsn: 0,
             column_renames: Vec::new(),
             dropped_columns: Vec::new(),
+            dead_copies: FxHashMap::default(),
         }
     }
 
@@ -198,6 +241,7 @@ impl TableManifest {
     pub fn remove_segments(&mut self, ids: &[u64]) {
         let id_set: FxHashSet<u64> = ids.iter().copied().collect();
         self.segments.retain(|s| !id_set.contains(&s.segment_id));
+        self.dead_copies.retain(|id, _| !id_set.contains(id));
     }
 
     /// Find which segment contains a given row_id.
@@ -254,7 +298,8 @@ impl TableManifest {
             .map(|(o, n)| 4 + o.len() + n.len())
             .sum();
         let drops: usize = self.dropped_columns.iter().map(|(n, _)| 10 + n.len()).sum();
-        buf.reserve(8 + tombstones.len() * 16 + 4 + renames + 4 + drops + 4);
+        let dead: usize = self.dead_copies.values().map(|p| 12 + p.len() * 4).sum();
+        buf.reserve(8 + tombstones.len() * 16 + 4 + renames + 4 + drops + 4 + dead + 4);
 
         // Tombstones: (row_id, commit_seq) pairs, in no set order
         buf.write_all(&(tombstones.len() as u64).to_le_bytes())?;
@@ -283,6 +328,16 @@ impl TableManifest {
             buf.write_all(&version.to_le_bytes())?;
         }
 
+        // Dead copies (V7): per segment, the positions that never got authority
+        buf.write_all(&(self.dead_copies.len() as u32).to_le_bytes())?;
+        for (seg_id, positions) in &self.dead_copies {
+            buf.write_all(&seg_id.to_le_bytes())?;
+            buf.write_all(&(positions.len() as u32).to_le_bytes())?;
+            for pos in positions.iter() {
+                buf.write_all(&pos.to_le_bytes())?;
+            }
+        }
+
         // Trailing CRC32 over the entire payload
         let crc = crc32fast::hash(&buf);
         buf.write_all(&crc.to_le_bytes())?;
@@ -308,12 +363,12 @@ impl TableManifest {
         let mut pos = 4;
 
         let version = read_u32(data, &mut pos)?;
-        if version != MANIFEST_VERSION {
+        if version != MANIFEST_VERSION && version != MANIFEST_VERSION_V6 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "unsupported manifest version {} (expected {})",
-                    version, MANIFEST_VERSION
+                    "unsupported manifest version {} (expected {} or {})",
+                    version, MANIFEST_VERSION_V6, MANIFEST_VERSION
                 ),
             ));
         }
@@ -490,6 +545,30 @@ impl TableManifest {
             }
         }
 
+        // Dead copies: V7 only; a V6 manifest's segments are fully authoritative
+        let mut dead_copies: FxHashMap<u64, Arc<[u32]>> = FxHashMap::default();
+        if version >= MANIFEST_VERSION {
+            let count = read_u32(data, &mut pos)? as usize;
+            for _ in 0..count {
+                let seg_id = read_u64(data, &mut pos)?;
+                let n = read_u32(data, &mut pos)? as usize;
+                if pos + n * 4 > data_end {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "manifest truncated at dead copies",
+                    ));
+                }
+                let positions: Arc<[u32]> = (0..n)
+                    .map(|i| {
+                        let at = pos + i * 4;
+                        u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]])
+                    })
+                    .collect();
+                pos += n * 4;
+                dead_copies.insert(seg_id, positions);
+            }
+        }
+
         Ok(StoredManifest {
             manifest: Self {
                 table_name: SmartString::from(table_name),
@@ -498,6 +577,7 @@ impl TableManifest {
                 checkpoint_lsn,
                 column_renames,
                 dropped_columns,
+                dead_copies,
             },
             tombstones,
         })
@@ -627,8 +707,9 @@ fn remove_tombstones_where<I: Iterator<Item = i64>>(
 /// Recompute the visibility bitmaps for all segments in `segments`.
 ///
 /// `seg_order` lists segment IDs in ascending (oldest-first) order.
-/// Segments are processed newest-first: the first time a row_id is seen it is
-/// marked visible; subsequent occurrences (in older volumes) are masked out.
+/// Segments are processed newest-first: the first time a row_id is seen at
+/// an authoritative position it is marked visible; subsequent occurrences
+/// (in older volumes) are masked out.
 /// When there is at most one segment every row is authoritative, so all
 /// `visible` fields are set to `None` (fast path for the common case).
 fn compute_visibility_bitmaps(
@@ -637,7 +718,11 @@ fn compute_visibility_bitmaps(
 ) {
     if segments.len() <= 1 {
         for cs in segments.values_mut() {
-            cs.visible = None;
+            let rc = cs.volume.meta.row_count;
+            cs.visible = cs
+                .dead
+                .as_ref()
+                .map(|dead| Arc::new(bits_without(rc, dead)));
         }
         return;
     }
@@ -661,14 +746,18 @@ fn compute_visibility_bitmaps(
                 bits[num_words - 1] &= (1u64 << trailing) - 1;
             }
             let mut has_overlap = false;
+            // A copy that never got authority takes no part in precedence
+            let mut dead = cs.dead.as_deref().unwrap_or(&[]).iter().peekable();
             for i in 0..rc {
-                if !seen.insert(cs.volume.meta.row_ids[i]) {
+                if dead.next_if_eq(&&(i as u32)).is_some() {
+                    bits[i >> 6] &= !(1u64 << (i & 63));
+                } else if !seen.insert(cs.volume.meta.row_ids[i]) {
                     bits[i >> 6] &= !(1u64 << (i & 63));
                     has_overlap = true;
                 }
             }
             // No overlap with newer volumes: None = all visible (zero memory, no per-row check)
-            cs.visible = if has_overlap {
+            cs.visible = if has_overlap || cs.dead.is_some() {
                 Some(Arc::new(bits))
             } else {
                 None
@@ -678,8 +767,9 @@ fn compute_visibility_bitmaps(
 }
 
 /// Clears, in `bits` (made from `base` on the first clear), the rows of
-/// `old` whose ids `new` holds again, within the range both span. The
-/// smaller side is walked and the other located, except that an `old`
+/// `old` whose ids `new` holds again, within the range both span, and
+/// records in `hidden` each (id, position) that was visible in `base`.
+/// The smaller side is walked and the other located, except that an `old`
 /// whose order is not decided is walked against a set of `new`'s ids
 fn mask_shared_ids(
     old: &FrozenVolume,
@@ -687,6 +777,7 @@ fn mask_shared_ids(
     new: &FrozenVolume,
     base: &Option<Arc<Vec<u64>>>,
     bits: &mut Option<Vec<u64>>,
+    hidden: &mut Vec<(i64, u32)>,
 ) {
     let Some((new_lo, new_hi)) = new.id_bounds() else {
         return;
@@ -696,7 +787,13 @@ fn mask_shared_ids(
     }
     let (lo, hi) = (old_lo.max(new_lo), old_hi.min(new_hi));
     let row_count = old.meta.row_count;
-    let mut clear = |pos: usize| {
+    let mut clear = |pos: usize, id: i64| {
+        if base
+            .as_ref()
+            .is_none_or(|visible| visible[pos >> 6] & (1u64 << (pos & 63)) != 0)
+        {
+            hidden.push((id, pos as u32));
+        }
         let bits = bits.get_or_insert_with(|| match base {
             Some(visible) => (**visible).clone(),
             None => {
@@ -712,7 +809,7 @@ fn mask_shared_ids(
     if row_count < new.meta.row_count {
         for (pos, &id) in old.meta.row_ids.iter().enumerate() {
             if (lo..=hi).contains(&id) && new.locate(id).is_some() {
-                clear(pos);
+                clear(pos, id);
             }
         }
     } else if old.meta.row_order.get().is_none() {
@@ -728,18 +825,29 @@ fn mask_shared_ids(
         if shared.is_empty() {
             return;
         }
-        for (pos, id) in old.meta.row_ids.iter().enumerate() {
-            if shared.contains(id) {
-                clear(pos);
+        for (pos, &id) in old.meta.row_ids.iter().enumerate() {
+            if shared.contains(&id) {
+                clear(pos, id);
             }
         }
     } else {
         for &id in &new.meta.row_ids {
             if (lo..=hi).contains(&id) {
                 if let Some(pos) = old.locate(id) {
-                    clear(pos);
+                    clear(pos, id);
                 }
             }
+        }
+    }
+}
+
+/// Sets back, in `bits`, the positions of `hidden` (sorted by id) whose ids
+/// are in `dead_ids`: a new copy that got no authority masks none
+fn unmask_dead_ids(hidden: &[(i64, u32)], bits: &mut [u64], dead_ids: &[i64]) {
+    for &id in dead_ids {
+        if let Ok(at) = hidden.binary_search_by_key(&id, |&(id, _)| id) {
+            let pos = hidden[at].1 as usize;
+            bits[pos >> 6] |= 1u64 << (pos & 63);
         }
     }
 }
@@ -759,24 +867,35 @@ fn visibility_changes(
             continue;
         };
         let mut bits = None;
+        let mut hidden = Vec::new();
         for volume in volumes {
-            mask_shared_ids(&cs.volume, (lo, hi), volume, &cs.visible, &mut bits);
+            mask_shared_ids(
+                &cs.volume,
+                (lo, hi),
+                volume,
+                &cs.visible,
+                &mut bits,
+                &mut hidden,
+            );
         }
         if let Some(bits) = bits {
-            changes.push((seg_id, cs.visible.clone(), Arc::new(bits)));
+            hidden.sort_unstable_by_key(|&(id, _)| id);
+            changes.push((seg_id, cs.visible.clone(), Arc::new(bits), hidden));
         }
     }
     changes
 }
 
 /// A sealed volume to publish: its segment id, the volume, its manifest
-/// entry, its file's handle and its side file
+/// entry, its file's handle, its side file and the sorted positions of its
+/// copies that get no authority
 pub(crate) type SealedEntry = (
     u64,
     Arc<FrozenVolume>,
     SegmentMeta,
     Option<Arc<super::writer::VolumeFile>>,
     Option<Arc<super::secondary::IndexFile>>,
+    Option<Arc<[u32]>>,
 );
 
 /// What a seal's registration changes in the older segments, decided
@@ -787,8 +906,9 @@ pub struct PreparedRegistration {
     changes: Vec<VisibilityChange>,
 }
 
-/// A segment, the bitmap it had and the one a registration gives it
-type VisibilityChange = (u64, Option<Arc<Vec<u64>>>, Arc<Vec<u64>>);
+/// A segment, the bitmap it had, the one a registration gives it and the
+/// (id, position) of each row it hides, sorted by id
+type VisibilityChange = (u64, Option<Arc<Vec<u64>>>, Arc<Vec<u64>>, Vec<(i64, u32)>);
 
 /// Whether two visibility bitmaps are the same published one
 fn same_visible(a: &Option<Arc<Vec<u64>>>, b: &Option<Arc<Vec<u64>>>) -> bool {
@@ -1056,7 +1176,7 @@ pub struct SegmentManager {
     /// transactions with pending inserts on this table.
     txn_seal_gens: parking_lot::Mutex<rustc_hash::FxHashMap<i64, u64>>,
     /// Number of rows currently being sealed (exist in both hot and cold).
-    /// Set to N before register_segment, cleared after remove_sealed_rows.
+    /// Set to N before register_segment, cleared after remove_moved_rows.
     /// Subtracted from row_count() to prevent double-counting during the seal window.
     seal_overlap_count: std::sync::atomic::AtomicUsize,
     /// Destructive publications in flight. Unlike the overlap count, this
@@ -1432,7 +1552,7 @@ impl SegmentManager {
     ) -> crate::core::Result<Option<crate::core::Value>> {
         for seg_id in seg_ids {
             if let Some(cold) = segments.get(seg_id) {
-                if let Some(idx) = cold.volume.locate(row_id) {
+                if let Some(idx) = cold.locate_authoritative(row_id) {
                     let pi = if cold.mapping.is_identity {
                         col_idx
                     } else if col_idx < cold.mapping.sources.len() {
@@ -1529,7 +1649,7 @@ impl SegmentManager {
                             return Ok(false);
                         }
                         let rid = row_ids[global];
-                        if !seen.insert(rid) {
+                        if cold.is_dead(global) || !seen.insert(rid) {
                             continue;
                         }
                         if !col.is_null(i) && col.get_i64(i) == target && !ts.contains_key(&rid) {
@@ -1714,7 +1834,7 @@ impl SegmentManager {
                 // Common path: no schema evolution, pass values directly (zero alloc)
                 vol.unique_lookup_all(&vol_col_indices, values, |row_idx| {
                     let rid = row_ids[row_idx as usize];
-                    if ts.contains_key(&rid) {
+                    if cold.is_dead(row_idx as usize) || ts.contains_key(&rid) {
                         false
                     } else if seen.insert(rid) {
                         vol_result = Some(rid);
@@ -1734,7 +1854,7 @@ impl SegmentManager {
                     .map(|(i, &vi)| (i, vi))
                     .collect();
                 for (i, &rid) in row_ids.iter().enumerate() {
-                    if ts.contains_key(&rid) || !seen.insert(rid) {
+                    if cold.is_dead(i) || ts.contains_key(&rid) || !seen.insert(rid) {
                         continue;
                     }
                     let mut matches = true;
@@ -2218,6 +2338,7 @@ impl SegmentManager {
                 mapping,
                 schema_version: seg_schema_version,
                 visible: None,
+                dead: None,
                 file,
                 side,
             };
@@ -2263,13 +2384,14 @@ impl SegmentManager {
     /// decided, when the segment order and every bitmap it replaces still
     /// stand. Otherwise nothing is published and the volumes and the
     /// preparation come back, for the caller to let the preparation go and
-    /// prepare again outside its locks
+    /// prepare again outside its locks. A published preparation comes back
+    /// too, for the caller to let its buffers go outside its locks
     pub(crate) fn register_sealed(
         &self,
         volumes: Vec<SealedEntry>,
-        prepared: PreparedRegistration,
+        mut prepared: PreparedRegistration,
         schema: Option<&crate::core::Schema>,
-    ) -> std::result::Result<(), (Vec<SealedEntry>, PreparedRegistration)> {
+    ) -> std::result::Result<PreparedRegistration, (Vec<SealedEntry>, PreparedRegistration)> {
         {
             let mut manifest = self.manifest.write();
             let mut segments = self.segments.write();
@@ -2279,7 +2401,7 @@ impl SegmentManager {
                     .iter()
                     .zip(&prepared.order)
                     .all(|(m, id)| m.segment_id == *id)
-                && prepared.changes.iter().all(|(id, base, _)| {
+                && prepared.changes.iter().all(|(id, base, _, _)| {
                     segments
                         .get(id)
                         .is_some_and(|cs| same_visible(&cs.visible, base))
@@ -2289,29 +2411,48 @@ impl SegmentManager {
             if !fresh {
                 return Err((volumes, prepared));
             }
+            let mut dead_ids: Vec<i64> = volumes
+                .iter()
+                .flat_map(|(_, volume, _, _, _, dead)| {
+                    let ids = &volume.meta.row_ids;
+                    dead.iter()
+                        .flat_map(|dead| dead.iter().map(|&pos| ids[pos as usize]))
+                })
+                .collect();
+            dead_ids.sort_unstable();
             let mut new_map = (**segments).clone();
-            for (segment_id, volume, meta, file, side) in volumes {
+            for (segment_id, volume, meta, file, side, dead) in volumes {
                 if segment_id >= manifest.next_segment_id {
                     manifest.next_segment_id = segment_id + 1;
                 }
                 let seg_schema_version = meta.schema_version;
                 manifest.add_segment(meta);
+                if let Some(dead) = &dead {
+                    manifest.dead_copies.insert(segment_id, Arc::clone(dead));
+                }
                 let mapping = mapping_for(&manifest, &volume, seg_schema_version, schema);
+                let visible = dead
+                    .as_ref()
+                    .map(|dead| Arc::new(bits_without(volume.meta.row_count, dead)));
                 new_map.insert(
                     segment_id,
                     ColdSegment {
                         volume,
                         mapping,
                         schema_version: seg_schema_version,
-                        visible: None,
+                        visible,
+                        dead,
                         file,
                         side,
                     },
                 );
             }
-            for (id, _, bits) in prepared.changes {
-                if let Some(cs) = new_map.get_mut(&id) {
-                    cs.visible = Some(bits);
+            for (id, _, bits, hidden) in prepared.changes.iter_mut() {
+                if let Some(cs) = new_map.get_mut(id) {
+                    if !dead_ids.is_empty() && !hidden.is_empty() {
+                        unmask_dead_ids(hidden, Arc::make_mut(bits).as_mut_slice(), &dead_ids);
+                    }
+                    cs.visible = Some(Arc::clone(bits));
                 }
             }
             // Before the segments are visible, so a reader that sees a volume
@@ -2324,7 +2465,7 @@ impl SegmentManager {
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         self.has_segments_flag
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
+        Ok(prepared)
     }
 
     /// Load a volume into the segments map for an existing manifest entry.
@@ -2344,6 +2485,8 @@ impl SegmentManager {
             .iter()
             .find(|s| s.segment_id == segment_id)
             .map(|s| s.schema_version);
+        // Loaded with the segment, before any visibility is computed
+        let dead = manifest.dead_copies.get(&segment_id).cloned();
         // Column renames are already merged into column_name_map before Arc
         // wrapping in load_standalone_volumes.
         drop(manifest);
@@ -2366,6 +2509,7 @@ impl SegmentManager {
                 volume,
                 schema_version,
                 visible: None,
+                dead,
                 file,
                 side,
             };
@@ -2634,7 +2778,7 @@ impl SegmentManager {
                 continue;
             }
             if let Some(cold) = segments.get(seg_id) {
-                if cold.volume.locate(row_id).is_some() {
+                if cold.locate_authoritative(row_id).is_some() {
                     return Ok(true);
                 }
             }
@@ -2666,7 +2810,7 @@ impl SegmentManager {
                 continue;
             }
             if let Some(cold) = segments.get(seg_id) {
-                if let Some(idx) = cold.volume.locate(row_id) {
+                if let Some(idx) = cold.locate_authoritative(row_id) {
                     if cold.volume.is_cold() {
                         if let Some(vol) = self.ensure_volume(*seg_id)? {
                             return Ok(Some(vol.get_row(idx)?));
@@ -2698,7 +2842,7 @@ impl SegmentManager {
         };
         for seg_id in &seg_ids {
             if let Some(cold) = segments.get(seg_id) {
-                if let Some(idx) = cold.volume.locate(row_id) {
+                if let Some(idx) = cold.locate_authoritative(row_id) {
                     if cold.volume.is_cold() {
                         return Err(crate::core::Error::Internal {
                             message: format!(
@@ -2747,7 +2891,7 @@ impl SegmentManager {
                 continue;
             }
             if let Some(cold) = segments.get(seg_id) {
-                if let Some(idx) = cold.volume.locate(row_id) {
+                if let Some(idx) = cold.locate_authoritative(row_id) {
                     let vol = if cold.volume.is_cold() {
                         match self.ensure_volume(*seg_id)? {
                             Some(v) => v,
@@ -2791,7 +2935,7 @@ impl SegmentManager {
         };
         for seg_id in &seg_ids {
             if let Some(cold) = segments.get(seg_id) {
-                if let Some(idx) = cold.volume.locate(row_id) {
+                if let Some(idx) = cold.locate_authoritative(row_id) {
                     if cold.volume.is_cold() {
                         return Err(crate::core::Error::Internal {
                             message: format!(
@@ -2833,7 +2977,7 @@ impl SegmentManager {
                 continue;
             }
             if let Some(cold) = segments.get(seg_id) {
-                if cold.volume.locate(row_id).is_some() {
+                if cold.locate_authoritative(row_id).is_some() {
                     return Ok(true);
                 }
             }
@@ -2848,7 +2992,14 @@ impl SegmentManager {
         let manifest = self.manifest.read();
         let ts_count = self.tombstones.read().len();
         let total: usize = manifest.segments.iter().map(|s| s.row_count).sum();
-        total.saturating_sub(ts_count)
+        let dead: usize = manifest.dead_copies.values().map(|d| d.len()).sum();
+        total.saturating_sub(ts_count).saturating_sub(dead)
+    }
+
+    /// Whether any segment holds copies that never got authority: volume
+    /// statistics count them, so a stats shortcut must not be taken
+    pub fn has_dead_copies(&self) -> bool {
+        !self.manifest.read().dead_copies.is_empty()
     }
 
     /// Get the exact deduplicated row count across all segments.
@@ -2926,7 +3077,8 @@ impl SegmentManager {
             return Ok(0);
         }
         let tombstones = Arc::clone(&*self.tombstones.read());
-        if segments.len() == 1 {
+        // A segment with dead copies is counted through its bitmap below
+        if segments.len() == 1 && segments.values().all(|cs| cs.dead.is_none()) {
             let mut total = 0;
             for cs in segments.values() {
                 total += cs.volume.row_ids()?.len();
@@ -3072,7 +3224,7 @@ impl SegmentManager {
             .store(count, std::sync::atomic::Ordering::Release);
     }
 
-    /// Clear the seal overlap count. Called AFTER remove_sealed_rows completes.
+    /// Clear the seal overlap count. Called AFTER remove_moved_rows completes.
     pub fn clear_seal_overlap(&self) {
         self.seal_overlap_count
             .store(0, std::sync::atomic::Ordering::Release);
@@ -3198,6 +3350,7 @@ impl SegmentManager {
             // never takes the emptied segments with the old tombstones
             let mut manifest = self.manifest.write();
             manifest.segments.clear();
+            manifest.dead_copies.clear();
             *self.tombstones.write() = Arc::new(FxHashMap::default());
         }
         *self.segments.write() = Arc::new(FxHashMap::default());
@@ -3423,6 +3576,7 @@ impl SegmentManager {
                         volume: Arc::clone(vol),
                         schema_version: meta.schema_version,
                         visible: None,
+                        dead: None,
                         file: owner.0.clone(),
                         side: owner.1.clone(),
                     },
@@ -3497,6 +3651,7 @@ impl SegmentManager {
                             volume: Arc::clone(vol),
                             schema_version: seg_schema_version,
                             visible: None,
+                            dead: None,
                             file: owners[i].0.clone(),
                             side: owners[i].1.clone(),
                         },
@@ -4506,6 +4661,126 @@ mod tests {
         }
     }
 
+    fn register_with_dead(mgr: &SegmentManager, id: u64, ids: &[i64], dead: &[u32]) {
+        let volume = volume_of(ids);
+        let prepared = mgr.prepare_registration(std::slice::from_ref(&volume));
+        let dead = (!dead.is_empty()).then(|| Arc::<[u32]>::from(dead));
+        let entry = (id, volume, meta_for_ids(id, ids), None, None, dead);
+        assert!(mgr.register_sealed(vec![entry], prepared, None).is_ok());
+    }
+
+    fn visible_positions(mgr: &SegmentManager, id: u64) -> Vec<usize> {
+        let segs = mgr.segments_raw();
+        let cs = &segs[&id];
+        (0..cs.volume.meta.row_count)
+            .filter(|&i| cs.is_visible(i))
+            .collect()
+    }
+
+    #[test]
+    fn a_dead_copy_stays_folded_through_every_recompute() {
+        let mgr = SegmentManager::new("t", None);
+        register_with_dead(&mgr, 1, &[1, 2, 3, 4], &[1]);
+        assert_eq!(visible_positions(&mgr, 1), vec![0, 2, 3], "registered");
+        assert_eq!(mgr.segments_raw()[&1].locate_authoritative(2), None);
+        assert_eq!(mgr.segments_raw()[&1].locate_authoritative(3), Some(2));
+        mgr.recompute_visibility();
+        assert_eq!(visible_positions(&mgr, 1), vec![0, 2, 3], "one segment");
+        register_with_dead(&mgr, 2, &[10, 11], &[]);
+        mgr.recompute_visibility();
+        assert_eq!(visible_positions(&mgr, 1), vec![0, 2, 3], "two segments");
+        assert_eq!(visible_positions(&mgr, 2), vec![0, 1]);
+    }
+
+    #[test]
+    fn a_dead_copy_hides_no_older_copy() {
+        let mgr = SegmentManager::new("t", None);
+        register_with_dead(&mgr, 1, &[1, 2], &[]);
+        register_with_dead(&mgr, 2, &[1, 3], &[0]);
+        for stage in ["registered", "recomputed"] {
+            assert_eq!(visible_positions(&mgr, 1), vec![0, 1], "{stage}");
+            assert_eq!(visible_positions(&mgr, 2), vec![1], "{stage}");
+            let point = mgr.get_cold_row(1).unwrap().is_some();
+            assert_eq!(
+                (point, mgr.deduped_row_count().unwrap()),
+                (true, 3),
+                "{stage}"
+            );
+            mgr.recompute_visibility();
+        }
+    }
+
+    #[test]
+    fn a_published_registration_hands_its_hidden_rows_back() {
+        let mgr = SegmentManager::new("t", None);
+        register_with_dead(&mgr, 1, &[1, 2, 3], &[]);
+        let volume = volume_of(&[2, 3, 4]);
+        let prepared = mgr.prepare_registration(std::slice::from_ref(&volume));
+        let entry = (2, volume, meta_for_ids(2, &[2, 3, 4]), None, None, None);
+        let Ok(published) = mgr.register_sealed(vec![entry], prepared, None) else {
+            panic!("the registration was stale");
+        };
+        let hidden: Vec<&Vec<(i64, u32)>> = published.changes.iter().map(|c| &c.3).collect();
+        assert_eq!(
+            hidden,
+            vec![&vec![(2, 1), (3, 2)]],
+            "the buffers stay with the caller"
+        );
+        assert_eq!(visible_positions(&mgr, 1), vec![0]);
+    }
+
+    #[test]
+    fn a_dead_copy_brings_back_no_copy_that_was_already_hidden() {
+        let mgr = SegmentManager::new("t", None);
+        register_with_dead(&mgr, 1, &[1, 2], &[0]);
+        register_with_dead(&mgr, 2, &[1, 3], &[0]);
+        for stage in ["registered", "recomputed"] {
+            assert_eq!(visible_positions(&mgr, 1), vec![1], "{stage}");
+            assert_eq!(mgr.deduped_row_count().unwrap(), 2, "{stage}");
+            mgr.recompute_visibility();
+        }
+    }
+
+    #[test]
+    fn a_removed_segment_takes_its_dead_copies() {
+        let mgr = SegmentManager::new("t", None);
+        register_with_dead(&mgr, 1, &[1, 2], &[0]);
+        assert_eq!(mgr.manifest().dead_copies.len(), 1);
+        mgr.remove_segments(&[1]);
+        assert!(mgr.manifest().dead_copies.is_empty());
+    }
+
+    #[test]
+    fn a_v7_manifest_keeps_its_dead_copies_and_a_v6_one_has_none() {
+        let with_version = |bytes: &[u8], version: u32| {
+            let mut out = bytes[..bytes.len() - 4].to_vec();
+            out[4..8].copy_from_slice(&version.to_le_bytes());
+            let crc = crc32fast::hash(&out);
+            out.extend_from_slice(&crc.to_le_bytes());
+            out
+        };
+        let mut m = TableManifest::new("t");
+        m.add_segment(meta_for_ids(1, &[1, 2, 3]));
+        m.dead_copies.insert(1, Arc::from(vec![0u32, 2]));
+        let v7 = m.serialize(&FxHashMap::default()).unwrap();
+        let back = TableManifest::deserialize(&v7).unwrap().manifest;
+        assert_eq!(
+            back.dead_copies.get(&1).map(|d| d.to_vec()),
+            Some(vec![0, 2])
+        );
+
+        // The layout main writes: no dead-copy section after the dropped columns
+        m.dead_copies.clear();
+        let bare = m.serialize(&FxHashMap::default()).unwrap();
+        let mut v6 = bare[..bare.len() - 8].to_vec();
+        v6.extend_from_slice(&[0; 4]);
+        let v6 = with_version(&v6, 6);
+        let read = TableManifest::deserialize(&v6).unwrap().manifest;
+        assert_eq!((read.segments.len(), read.dead_copies.len()), (1, 0));
+
+        assert!(TableManifest::deserialize(&with_version(&v7, 8)).is_err());
+    }
+
     /// The visibility every segment would get from a computation over the
     /// manager's segments as they stand
     fn reference_visibility(mgr: &SegmentManager) -> Vec<(u64, Option<Vec<u64>>)> {
@@ -4587,7 +4862,7 @@ mod tests {
         let volume = volume_of(ids);
         let prepared = mgr.prepare_registration(std::slice::from_ref(&volume));
         mgr.register_sealed(
-            vec![(id, volume, meta_for_ids(id, ids), None, None)],
+            vec![(id, volume, meta_for_ids(id, ids), None, None, None)],
             prepared,
             None,
         )
@@ -4702,7 +4977,7 @@ mod tests {
         let prepared = mgr.prepare_registration(std::slice::from_ref(&volume));
         let b: Vec<i64> = vec![55, 70, 200];
         mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None);
-        let entries = vec![(3, volume, meta_for_ids(3, &d), None, None)];
+        let entries = vec![(3, volume, meta_for_ids(3, &d), None, None, None)];
         (mgr, entries, prepared)
     }
 

@@ -506,14 +506,28 @@ enum KeptHistory {
     Nothing,
 }
 
-/// Opaque snapshot of the version store at extraction time.
-/// Used by `remove_sealed_rows` to detect concurrent commits.
+/// Opaque snapshot of the version store at extraction time, the root the
+/// copied heads were read from. Used by `classify_sealed_rows`.
 pub struct ExtractionSnapshot {
     inner: crate::common::CowBTree<VersionChainEntry>,
 }
 
+/// What a seal does with each row it extracted, decided under its fence
+#[derive(Default)]
+pub struct SealOutcome {
+    /// Committed head still the extracted version and unclaimed: its copy
+    /// gets authority and the row leaves the hot store
+    pub moved: Vec<i64>,
+    /// A newer head committed, or no hot head is left: its copy never gets
+    /// authority and the hot state stays
+    pub dead: Vec<i64>,
+    /// Claimed by an open transaction, or committed after an open snapshot
+    /// began: like a dead copy, and tried again by the next seal
+    pub deferred: Vec<i64>,
+}
+
 /// Token holding pre-removal snapshot data needed for deferred index cleanup.
-/// Created by `remove_sealed_rows`, consumed by `remove_sealed_index_entries`.
+/// Created by `remove_moved_rows`, consumed by `remove_sealed_index_entries`.
 #[derive(Default)]
 pub struct SealedIndexCleanup {
     /// Row IDs that were removed from the version store.
@@ -2552,13 +2566,17 @@ impl VersionStore {
         self.get_all_visible_rows_internal(txn_id)
     }
 
-    /// Extract visible rows AND the CowBTree snapshot at extraction time.
-    /// Used by seal: the snapshot records each row's `txn_id` so that
-    /// `remove_sealed_rows` can detect concurrent commits and skip them.
+    /// Extract the rows whose head is visible to `txn_id` and live, AND the
+    /// root they were read from. Used by seal: `classify_sealed_rows`
+    /// compares each copied head's `txn_id` with the current head's.
     pub fn extract_for_seal(&self, txn_id: i64) -> (RowVec, ExtractionSnapshot) {
-        let snapshot = self.versions.read().clone();
-        let rows = self.get_all_visible_rows_internal(txn_id);
-        (rows, ExtractionSnapshot { inner: snapshot })
+        let Some(checker) = self.visibility_checker.as_ref() else {
+            return self.extract_heads(Some(0), |_| false);
+        };
+        self.extract_heads(None, |v| {
+            checker.is_visible(v.txn_id, txn_id)
+                && (v.deleted_at_txn_id == 0 || !checker.is_visible(v.deleted_at_txn_id, txn_id))
+        })
     }
 
     /// Extract committed rows for seal, filtered by commit_seq cutoff.
@@ -2569,16 +2587,41 @@ impl VersionStore {
         &self,
         commit_seq_cutoff: i64,
     ) -> (RowVec, ExtractionSnapshot) {
-        let snapshot = self.versions.read().clone();
-        let mut rows = RowVec::with_capacity(self.committed_row_count());
-        self.for_each_committed_version_with_cutoff(
-            |row_id, version| {
-                rows.push((row_id, version.data.clone()));
-                true
-            },
-            commit_seq_cutoff,
-        );
-        (rows, ExtractionSnapshot { inner: snapshot })
+        let Some(checker) = self.visibility_checker.as_ref() else {
+            return self.extract_heads(Some(0), |_| false);
+        };
+        let use_cutoff = commit_seq_cutoff > 0;
+        // The live rows, not the deleted heads the root also keeps
+        self.extract_heads(Some(self.committed_row_count()), |v| {
+            checker.is_visible(v.txn_id, i64::MAX)
+                && (!use_cutoff || checker.is_committed_before(v.txn_id, commit_seq_cutoff))
+                && !(v.deleted_at_txn_id != 0
+                    && checker.is_visible(v.deleted_at_txn_id, i64::MAX)
+                    && (!use_cutoff
+                        || checker.is_committed_before(v.deleted_at_txn_id, commit_seq_cutoff)))
+        })
+    }
+
+    /// The rows of one captured root whose head `copies` accepts, and the
+    /// root, room reserved for `reserve` rows or else one per head. Only heads
+    /// are copied, never an older version behind a head that is not yet
+    /// visible: such a row stays hot for a later seal
+    fn extract_heads(
+        &self,
+        reserve: Option<usize>,
+        copies: impl Fn(&RowVersion) -> bool,
+    ) -> (RowVec, ExtractionSnapshot) {
+        let root = self.snapshot_versions();
+        let mut rows = RowVec::new();
+        if !self.closed.load(Ordering::Acquire) {
+            rows.reserve(reserve.unwrap_or(root.len()));
+            for (&row_id, chain) in root.iter() {
+                if copies(&chain.version) {
+                    rows.push((row_id, chain.version.data.clone()));
+                }
+            }
+        }
+        (rows, ExtractionSnapshot { inner: root })
     }
 
     /// Internal implementation for getting all visible rows
@@ -5125,6 +5168,57 @@ impl VersionStore {
     // Cleanup Functions
     // =========================================================================
 
+    /// Sorts the rows a seal extracted into moved, dead and deferred without
+    /// changing anything. Every copy is its root's head, so the same head txn
+    /// now proves the copy current. Called under the table's seal fence: every
+    /// claim is taken under its read side, so a moved row stays movable.
+    /// With `snapshot_begin`, a head not committed before it is deferred.
+    pub fn classify_sealed_rows(
+        &self,
+        row_ids: &[i64],
+        extraction_snapshot: &ExtractionSnapshot,
+        snapshot_begin: Option<i64>,
+    ) -> SealOutcome {
+        const SUB_BATCH_SIZE: usize = 2_000;
+        let mut outcome = SealOutcome {
+            moved: Vec::with_capacity(row_ids.len()),
+            ..SealOutcome::default()
+        };
+        for chunk in row_ids.chunks(SUB_BATCH_SIZE) {
+            let uncommitted = self.uncommitted_writes.read();
+            let versions = self.versions.read();
+            for &row_id in chunk {
+                if uncommitted.contains_key(row_id) {
+                    outcome.deferred.push(row_id);
+                    continue;
+                }
+                let extracted = extraction_snapshot
+                    .inner
+                    .get(row_id)
+                    .map(|e| e.version.txn_id);
+                match versions.get(row_id) {
+                    Some(entry) if Some(entry.version.txn_id) == extracted => {
+                        outcome.moved.push(row_id)
+                    }
+                    _ => outcome.dead.push(row_id),
+                }
+            }
+        }
+        if let (Some(begin), Some(checker)) = (snapshot_begin, self.visibility_checker.as_ref()) {
+            outcome.moved.retain(|&row_id| {
+                let visible = extraction_snapshot
+                    .inner
+                    .get(row_id)
+                    .is_some_and(|e| checker.is_committed_before(e.version.txn_id, begin));
+                if !visible {
+                    outcome.deferred.push(row_id);
+                }
+                visible
+            });
+        }
+        outcome
+    }
+
     /// Remove sealed rows from the hot version store (phase 1 of seal).
     /// Removes version data and arena slots but KEEPS hot index entries.
     /// The stale index entries act as a safety net: unique constraint checks
@@ -5135,23 +5229,12 @@ impl VersionStore {
     /// Callers MUST also call `subtract_committed_row_count(n)` with the
     /// returned count to keep the committed row count accurate.
     ///
-    /// `extraction_snapshot` is an O(1) CowBTree clone taken at the moment
-    /// rows were extracted. For each row_id, the removal compares the
-    /// current head version's `txn_id` against the extraction snapshot's
-    /// `txn_id`. If they differ, a concurrent commit published a newer
-    /// version after extraction — that row is skipped (stays in hot,
-    /// sealed next cycle). This prevents discarding concurrent updates
-    /// that the sealed volume doesn't contain.
-    /// Returns `(removed_count, index_cleanup, skipped_row_ids)`.
-    /// Skipped row_ids are rows that were modified after extraction — the
-    /// caller must tombstone them so recovery and row_count are correct.
-    pub fn remove_sealed_rows(
-        &self,
-        row_ids: &[i64],
-        extraction_snapshot: &ExtractionSnapshot,
-    ) -> (usize, SealedIndexCleanup, Vec<i64>) {
+    /// Takes the rows `classify_sealed_rows` found moved, under the same
+    /// fence, so they are removed without being checked again.
+    /// Returns `(removed_count, index_cleanup)`.
+    pub fn remove_moved_rows(&self, row_ids: &[i64]) -> (usize, SealedIndexCleanup) {
         if row_ids.is_empty() {
-            return (0, SealedIndexCleanup::default(), Vec::new());
+            return (0, SealedIndexCleanup::default());
         }
 
         // Remove rows in small sub-batches to reduce write lock hold time.
@@ -5161,35 +5244,15 @@ impl VersionStore {
         // entire removal, blocking all commits on this table for ~100ms+.
         const SUB_BATCH_SIZE: usize = 2_000;
         let mut removed_ids: Vec<i64> = Vec::with_capacity(row_ids.len());
-        let mut skipped_ids: Vec<i64> = Vec::new();
         let mut arena_indices_to_clear: Vec<usize> = Vec::new();
 
         for chunk in row_ids.chunks(SUB_BATCH_SIZE) {
-            let uncommitted = self.uncommitted_writes.read();
             let mut versions = self.versions.write();
             for &row_id in chunk {
-                if uncommitted.contains_key(row_id) {
-                    skipped_ids.push(row_id);
-                    continue;
-                }
-                if let Some(entry) = versions.get(row_id) {
-                    // Compare current txn_id against extraction-time txn_id.
-                    // If they differ, a concurrent commit changed this row
-                    // after we extracted it — the sealed volume has stale data
-                    // for this row. Keep the newer version in hot.
-                    let extracted_txn_id = extraction_snapshot
-                        .inner
-                        .get(row_id)
-                        .map(|e| e.version.txn_id)
-                        .unwrap_or(0);
-                    if entry.version.txn_id != extracted_txn_id {
-                        skipped_ids.push(row_id);
-                        continue;
-                    }
+                if let Some(entry) = versions.remove(row_id) {
                     if let Some(idx) = unpack_arena_idx(entry.arena_idx) {
                         arena_indices_to_clear.push(idx);
                     }
-                    versions.remove(row_id);
                     removed_ids.push(row_id);
                 }
             }
@@ -5203,7 +5266,7 @@ impl VersionStore {
         }
 
         let count = removed_ids.len();
-        (count, SealedIndexCleanup { removed_ids }, skipped_ids)
+        (count, SealedIndexCleanup { removed_ids })
     }
 
     /// Remove stale hot index entries for sealed rows (phase 2 of seal).
@@ -5683,7 +5746,7 @@ impl VersionStore {
                     // When cutoff is specified, only include versions from transactions
                     // that committed before the cutoff to ensure snapshot consistency.
                     // CRITICAL: Do NOT walk the prev chain. The extraction snapshot
-                    // captures the HEAD txn_id, and remove_sealed_rows compares against
+                    // captures the HEAD txn_id, and classify_sealed_rows compares against
                     // it. If we extract an older version but the HEAD txn_id matches,
                     // the HEAD is removed from hot, permanently losing the newer version.
                     // The row stays entirely in hot where MVCC handles visibility.

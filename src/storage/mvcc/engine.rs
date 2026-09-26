@@ -1557,7 +1557,9 @@ impl MVCCEngine {
                     let row_ids = vol.row_ids()?;
                     let Some(start) = (0..vol.meta.row_count).find(|&i| {
                         let row_id = row_ids[i];
-                        !tombstones.contains_key(&row_id) && !seen.contains(&row_id)
+                        !cs.is_dead(i)
+                            && !tombstones.contains_key(&row_id)
+                            && !seen.contains(&row_id)
                     }) else {
                         continue;
                     };
@@ -1582,7 +1584,8 @@ impl MVCCEngine {
                         }
                     }
                     for (i, &row_id) in row_ids.iter().enumerate().skip(start) {
-                        if tombstones.contains_key(&row_id) || !seen.insert(row_id) {
+                        if cs.is_dead(i) || tombstones.contains_key(&row_id) || !seen.insert(row_id)
+                        {
                             continue;
                         }
                         for (batch_idx, _) in hnsw_infos.iter().enumerate() {
@@ -4645,6 +4648,10 @@ impl MVCCEngine {
                         }
                     };
                     for (i, &row_id) in row_ids.iter().enumerate() {
+                        // A copy that never got authority is not backed up
+                        if cs.is_dead(i) {
+                            continue;
+                        }
                         // Skip tombstoned rows not already in hot snapshot.
                         // For int-PK tables, pre-cutoff deletes are in `seen`.
                         // For non-int-PK tables, tombstones are the only signal.
@@ -6204,6 +6211,10 @@ impl MVCCEngine {
                     if sub_target >= 2 && !mgr.is_tombstone_set_empty() {
                         return true;
                     }
+                    // Copies a seal left without authority are dropped by a rewrite
+                    if mgr.has_dead_copies() {
+                        return true;
+                    }
                     // Tombstones exist even without sub-target volumes (pure DELETE).
                     // At-target volumes with tombstoned rows need cleanup.
                     if sub_target == 0 && !mgr.is_tombstone_set_empty() && mgr.segment_count() >= 1
@@ -6262,7 +6273,7 @@ impl MVCCEngine {
             // - Sub-target (< target_volume_rows): small volumes to merge together
             // - Oversized (> target * 3/2): large volumes to split
             // - At-target: properly sized, never rewrite
-            let (old_ids, volumes, tombstones) = {
+            let (old_ids, volumes, dead, tombstones) = {
                 // Planning reads the manifest for metadata only and lets it
                 // go before any volume is read: a seal holds the table's
                 // fence while it waits for the manifest, and DML waits on
@@ -6309,14 +6320,17 @@ impl MVCCEngine {
                                     }
                                 })
                             });
+                        // Copies that never got authority are dropped by a
+                        // rewrite whatever the snapshots, since no one sees them
+                        let shed_dead = manifest.dead_copies.contains_key(&seg.segment_id);
                         // Sub-target: merge together to reach target size.
                         // Oversized: needs splitting. At-target: only with
                         // tombstones to shed
                         let sub_target = seg.row_count < target_volume_rows;
                         let oversized = seg.row_count > oversized_threshold;
-                        let rewrite = sub_target || oversized || tombstoned;
+                        let rewrite = sub_target || oversized || tombstoned || shed_dead;
                         planned.push((seg.segment_id, seg.row_count, rewrite, false));
-                        size_only.push(sub_target && !oversized && !tombstoned);
+                        size_only.push(sub_target && !oversized && !tombstoned && !shed_dead);
                     }
                 }
                 // Let go before any volume is loaded, so a commit meanwhile
@@ -6444,6 +6458,11 @@ impl MVCCEngine {
                         .iter()
                         .filter_map(|id| segs.get(id).map(|cs| (*id, Arc::clone(&cs.volume))))
                         .collect();
+                // From the same capture as the volumes, in the same order
+                let mut dead: Vec<Option<Arc<[u32]>>> = old_ids
+                    .iter()
+                    .filter_map(|id| segs.get(id).map(|cs| cs.dead.clone()))
+                    .collect();
                 drop(segs);
 
                 // Every manifest entry must have a loaded volume.
@@ -6468,8 +6487,18 @@ impl MVCCEngine {
                 // Newest first for the dedup: precedence is manifest
                 // position, and old_ids holds the batch in manifest order
                 vols.reverse();
-                let ts = mgr.tombstone_set_arc();
-                (old_ids, Arc::new(vols), ts)
+                dead.reverse();
+                // Under the DDL guard, so no seal's transfer is halfway
+                let ts = {
+                    let _ddl = self.ddl_guard();
+                    let ts = mgr.tombstone_set_arc();
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::compaction_tombstones_taken(
+                        self.ddl_serial.is_locked(),
+                    );
+                    ts
+                };
+                (old_ids, Arc::new(vols), dead, ts)
             };
 
             let vol_mappings: Vec<_> = volumes
@@ -6511,7 +6540,12 @@ impl MVCCEngine {
             let mut applied_tombstones: Vec<(i64, u64)> = Vec::new();
 
             for (vol_idx, (_seg_id, vol)) in volumes.iter().enumerate() {
+                let dead = dead[vol_idx].as_deref().unwrap_or(&[]);
                 for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
+                    // A copy that never got authority is no row at all
+                    if !dead.is_empty() && dead.binary_search(&(i as u32)).is_ok() {
+                        continue;
+                    }
                     // Apply tombstone only if it was committed before the earliest
                     // snapshot (safe to physically remove). Tombstones created after
                     // are preserved — the row stays in the merged volume so snapshots
@@ -6538,6 +6572,8 @@ impl MVCCEngine {
             crate::test_failpoints::compaction_deduped(applied_tombstones.len());
 
             if live_refs.is_empty() {
+                // Under the DDL guard, so no seal's transfer is halfway
+                let _ddl = self.ddl_guard();
                 // All rows in merged volumes are tombstoned. Remove those
                 // volumes and their tombstones, but keep unmerged volumes intact.
                 mgr.replace_segments_atomic_remove_only(&old_ids);
@@ -6549,7 +6585,6 @@ impl MVCCEngine {
                 // Written out under the DDL guard, so the manifest never shows a
                 // statement halfway: its schema change, its log record and its
                 // manifest record go out together or not at all
-                let _ddl = self.ddl_guard();
                 if let Err(e) = mgr.persist_manifest_only() {
                     eprintln!(
                         "Warning: Failed to persist manifest after compaction for {}: {}",
@@ -6856,6 +6891,8 @@ impl MVCCEngine {
                 }
             }
 
+            // Under the DDL guard, so no seal's transfer is halfway
+            let _ddl = self.ddl_guard();
             // Clear only tombstones that existed at snapshot time for
             // row_ids in the merged volumes.
             mgr.remove_applied_tombstones(&applied_tombstones);
@@ -6864,7 +6901,6 @@ impl MVCCEngine {
             // Written out under the DDL guard, so the manifest never shows a
             // statement halfway: its schema change, its log record and its
             // manifest record go out together or not at all
-            let _ddl = self.ddl_guard();
             if let Err(e) = mgr.persist_manifest_only() {
                 eprintln!(
                     "Warning: Failed to persist manifest after compaction for {}: {}",
@@ -7037,12 +7073,14 @@ impl MVCCEngine {
 
             // Extract rows AND a CowBTree snapshot (O(1) Arc clone).
             // The snapshot records each row's txn_id at extraction time.
-            // remove_sealed_rows compares against it to detect concurrent
+            // classify_sealed_rows compares against it to detect concurrent
             // commits that modified a row after extraction.
             // Re-check snapshot state per-table to close the TOCTOU window
             // between the top-of-function check and extraction. A snapshot that
             // starts between those points would otherwise cause phantom reads.
             let per_table_cutoff = self.registry.get_min_snapshot_begin_seq();
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::seal_cutoff_read();
             let (mut all_rows, extraction_snapshot) = if let Some(cutoff) = per_table_cutoff {
                 store.extract_for_seal_with_cutoff(cutoff)
             } else {
@@ -7073,8 +7111,6 @@ impl MVCCEngine {
             if all_rows.is_empty() {
                 continue;
             }
-
-            let total_rows = all_rows.len();
 
             // Normalize rows to current schema before sealing.
             // After ALTER TABLE ADD COLUMN ... DEFAULT ..., old rows have
@@ -7224,23 +7260,35 @@ impl MVCCEngine {
                         meta,
                         file.take(),
                         side.take(),
+                        None,
                     )
                 })
                 .collect();
+            let all_row_ids: Vec<i64> = all_rows.iter().map(|(id, _)| *id).collect();
             // Seal critical section under exclusive fence: register cold
             // segments + remove hot rows + remove hot index entries.
             // DML operations hold the shared fence, so they cannot race
             // between cold constraint checks and hot publication.
-            {
+            let published = {
                 // A preparation the segments moved past publishes nothing:
                 // the fence is let go before the preparation is, and it is
                 // made again outside the fence; after three rounds the table
                 // waits for the next cycle with its rows still hot
                 let mut rounds = 0;
-                let Some(_seal_guard) = (loop {
+                let Some((_seal_guard, outcome, published)) = (loop {
                     let guard = mgr.acquire_seal_write();
-
-                    mgr.set_seal_overlap(total_rows);
+                    // A snapshot that began after the cutoff was read keeps its versions hot
+                    let begun_since = self
+                        .registry
+                        .get_min_snapshot_begin_seq()
+                        .filter(|&begin| per_table_cutoff.is_none_or(|cutoff| begin < cutoff));
+                    // Decided under the fence, before anything is published:
+                    // only moved rows get authority and leave the hot store
+                    let outcome =
+                        store.classify_sealed_rows(&all_row_ids, &extraction_snapshot, begun_since);
+                    mark_dead_copies(&mut entries, &outcome);
+                    // Counted by both hot and cold until they leave the hot store
+                    mgr.set_seal_overlap(outcome.moved.len());
 
                     // Stamp seal_seq to reflect what data the volume contains:
                     // - With cutoff: volume has rows committed before cutoff, so use cutoff
@@ -7261,7 +7309,7 @@ impl MVCCEngine {
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let schema = schemas.get(&table_name).map(|s| &**s);
                     match mgr.register_sealed(std::mem::take(&mut entries), prepared, schema) {
-                        Ok(()) => break Some(guard),
+                        Ok(published) => break Some((guard, outcome, published)),
                         Err((back, stale)) => {
                             entries = back;
                             mgr.clear_seal_overlap();
@@ -7289,22 +7337,14 @@ impl MVCCEngine {
                 };
 
                 let mut index_cleanups = Vec::new();
-                let mut all_skipped_inner: Vec<i64> = Vec::new();
-                let all_row_ids: Vec<i64> = all_rows.iter().map(|(id, _)| *id).collect();
-                for batch in all_row_ids.chunks(REMOVE_BATCH_SIZE) {
-                    let (removed, cleanup, skipped) =
-                        store.remove_sealed_rows(batch, &extraction_snapshot);
+                for batch in outcome.moved.chunks(REMOVE_BATCH_SIZE) {
+                    let (removed, cleanup) = store.remove_moved_rows(batch);
+                    debug_assert_eq!(removed, batch.len(), "a moved row left under the fence");
                     store.subtract_committed_row_count(removed);
                     index_cleanups.push(cleanup);
-                    all_skipped_inner.extend(skipped);
                 }
                 #[cfg(feature = "test-failpoints")]
                 crate::test_failpoints::seal_rows_removed();
-
-                if !all_skipped_inner.is_empty() {
-                    let seal_seq = self.registry.get_current_sequence() as u64;
-                    mgr.add_tombstones(&all_skipped_inner, seal_seq);
-                }
 
                 if let Some(max_id) = all_rows.iter().map(|(id, _)| *id).max() {
                     let current = store.get_auto_increment_counter();
@@ -7323,7 +7363,12 @@ impl MVCCEngine {
 
                 // Clear tombstones for sealed row_ids INSIDE the fence.
                 {
-                    let skip_set: FxHashSet<i64> = all_skipped_inner.iter().copied().collect();
+                    let skip_set: FxHashSet<i64> = outcome
+                        .dead
+                        .iter()
+                        .chain(&outcome.deferred)
+                        .copied()
+                        .collect();
                     // The map is let go before the removal, so this reference
                     // alone never makes it copy the map
                     let sealed_ids = {
@@ -7346,8 +7391,11 @@ impl MVCCEngine {
                 }
 
                 // _seal_guard dropped here — DML unblocked
-            }
+                published
+            };
             drop(ddl);
+            // Its buffers go with the fence and the guard let go
+            drop(published);
             for side in stale_sides {
                 crate::storage::volume::secondary::discard_side(side);
             }
@@ -9206,6 +9254,38 @@ fn batch_within_proportion(planned: &[(u64, usize, bool, bool)]) -> bool {
     let largest = rows.iter().copied().max().unwrap_or(0);
     let total: usize = rows.iter().sum();
     rows.len() < 2 || largest <= REWRITE_ACCEPTANCE_RATIO * (total - largest)
+}
+
+/// Gives each sealed entry the sorted positions of its copies that get no
+/// authority: the dead and deferred rows'. No walk when every row moved
+fn mark_dead_copies(
+    entries: &mut [crate::storage::volume::manifest::SealedEntry],
+    outcome: &super::version_store::SealOutcome,
+) {
+    let unauthorized: FxHashSet<i64> = outcome
+        .dead
+        .iter()
+        .chain(&outcome.deferred)
+        .copied()
+        .collect();
+    for entry in entries.iter_mut() {
+        entry.5 = None;
+        if unauthorized.is_empty() {
+            continue;
+        }
+        let dead: Vec<u32> = entry
+            .1
+            .meta
+            .row_ids
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| unauthorized.contains(id))
+            .map(|(pos, _)| pos as u32)
+            .collect();
+        if !dead.is_empty() {
+            entry.5 = Some(dead.into());
+        }
+    }
 }
 
 /// The rows a compaction output holds: the target rounded down to whole

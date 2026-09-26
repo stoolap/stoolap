@@ -1678,7 +1678,7 @@ impl SegmentedTable {
 
             // Collect hot rows FIRST to get a consistent snapshot of hot row_ids.
             // The skip set for cold scanners is derived from these actual results,
-            // preventing the race where remove_sealed_rows runs between building
+            // preventing the race where remove_moved_rows runs between building
             // the skip set and hot scanner execution (which would lose rows).
             let hot_rows = self.hot.collect_all_rows(where_expr)?;
 
@@ -1850,7 +1850,7 @@ impl SegmentedTable {
     /// filters rows that are shadowed by the hot buffer.
     ///
     /// The `hot_skip` MUST be derived from actual hot scan results (not a separate
-    /// B-tree read) to avoid races with concurrent `remove_sealed_rows`.
+    /// B-tree read) to avoid races with concurrent `remove_moved_rows`.
     fn collect_cold_rows(
         &self,
         where_expr: Option<&dyn Expression>,
@@ -2136,7 +2136,7 @@ impl SegmentedTable {
                 continue;
             };
             let vol = &cold.volume;
-            if let Some(idx) = vol.locate(row_id) {
+            if let Some(idx) = cold.locate_authoritative(row_id) {
                 vol.mark_accessed();
                 return Ok(Some((seg_id, cold.clone(), idx)));
             }
@@ -2273,7 +2273,7 @@ impl SegmentedTable {
                 continue;
             };
             let vol = &cold.volume;
-            if let Some(idx) = vol.locate(row_id) {
+            if let Some(idx) = cold.locate_authoritative(row_id) {
                 if vol.is_cold() {
                     drop(segs);
                     if let Some(loaded) = self.segment_mgr.ensure_volume(seg_id)? {
@@ -2314,7 +2314,7 @@ impl SegmentedTable {
                 continue;
             };
             let vol = &cold.volume;
-            if let Some(idx) = vol.locate(row_id) {
+            if let Some(idx) = cold.locate_authoritative(row_id) {
                 // segments_snapshot fails closed, so vol is never cold here.
                 vol.mark_accessed();
                 return Ok(Some((seg_id, Arc::clone(vol), idx)));
@@ -2931,7 +2931,7 @@ impl Table for SegmentedTable {
             crate::test_failpoints::merged_read_began();
             // Scan hot FIRST to get a consistent snapshot. The skip set is
             // derived from actual hot results, not a separate B-tree read.
-            // This prevents the race where remove_sealed_rows runs between
+            // This prevents the race where remove_moved_rows runs between
             // building the skip set and scanning hot.
             let hot_rows = self.hot.collect_all_rows(where_expr)?;
 
@@ -3126,7 +3126,7 @@ impl Table for SegmentedTable {
             // Phase 1: Build authority map (row_id → volume index).
             // Iterates cold row_ids newest-first so newer volumes win dedup.
             // Collect hot row_ids from actual hot scan results to prevent the
-            // seal race (remove_sealed_rows between check and hot scan).
+            // seal race (remove_moved_rows between check and hot scan).
             let tombstones_arc = &view.ts;
             let mut hot_skip: FxHashSet<i64> =
                 FxHashSet::with_capacity_and_hasher(10_000, Default::default());
@@ -3144,8 +3144,11 @@ impl Table for SegmentedTable {
                 let Some(cs) = view.segs.get(seg_id) else {
                     continue;
                 };
-                for &rid in cs.volume.row_ids()? {
-                    if hot_skip.contains(&rid) || self.is_row_tombstoned(tombstones_arc, rid) {
+                for (pos, &rid) in cs.volume.row_ids()?.iter().enumerate() {
+                    if cs.is_dead(pos)
+                        || hot_skip.contains(&rid)
+                        || self.is_row_tombstoned(tombstones_arc, rid)
+                    {
                         continue;
                     }
                     authority.entry(rid).or_insert(nf_idx);
@@ -3583,6 +3586,7 @@ impl Table for SegmentedTable {
             .is_some_and(|c| c.data_type == crate::core::DataType::Boolean);
         let can_use_stats = !is_boolean_column
             && self.segment_mgr.is_tombstone_set_empty()
+            && !self.segment_mgr.has_dead_copies()
             && !self.segment_mgr.has_pending_tombstones(self.txn_id())
             && self.segment_mgr.total_row_count() == self.segment_mgr.deduped_row_count()?;
 
@@ -3715,6 +3719,7 @@ impl Table for SegmentedTable {
         let has_non_null_default = !default_val.is_null();
 
         let can_use_stats = self.segment_mgr.is_tombstone_set_empty()
+            && !self.segment_mgr.has_dead_copies()
             && !self.segment_mgr.has_pending_tombstones(self.txn_id())
             && self.segment_mgr.total_row_count() == self.segment_mgr.deduped_row_count()?;
 
@@ -4023,6 +4028,7 @@ impl Table for SegmentedTable {
         let has_non_null_default = !default_val.is_null();
 
         let can_use_stats = self.segment_mgr.is_tombstone_set_empty()
+            && !self.segment_mgr.has_dead_copies()
             && !self.segment_mgr.has_pending_tombstones(self.txn_id())
             && self.segment_mgr.total_row_count() == self.segment_mgr.deduped_row_count()?;
 
