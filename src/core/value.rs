@@ -345,26 +345,24 @@ impl Value {
         }
     }
 
-    /// Extract vector as Vec<f32> (reads packed LE f32 bytes from Extension payload)
-    pub fn as_vector_f32(&self) -> Option<Vec<f32>> {
+    /// Iterate over a vector's f32 values, decoding the packed LE bytes as the
+    /// iterator advances, so a caller that streams them needs no buffer
+    pub fn vector_f32_iter(&self) -> Option<impl ExactSizeIterator<Item = f32> + '_> {
         match self {
-            Value::Extension(data) if data.first() == Some(&(DataType::Vector as u8)) => {
-                let payload = &data[1..];
-                let len = payload.len() / 4;
-                let mut result = Vec::with_capacity(len);
-                for i in 0..len {
-                    let bytes = [
-                        payload[i * 4],
-                        payload[i * 4 + 1],
-                        payload[i * 4 + 2],
-                        payload[i * 4 + 3],
-                    ];
-                    result.push(f32::from_le_bytes(bytes));
-                }
-                Some(result)
-            }
+            Value::Extension(data) if data.first() == Some(&(DataType::Vector as u8)) => Some(
+                data[1..]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|bytes| f32::from_le_bytes(*bytes)),
+            ),
             _ => None,
         }
+    }
+
+    /// Extract vector as Vec<f32> (reads packed LE f32 bytes from Extension payload)
+    pub fn as_vector_f32(&self) -> Option<Vec<f32>> {
+        self.vector_f32_iter().map(Iterator::collect)
     }
 
     // =========================================================================
