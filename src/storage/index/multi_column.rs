@@ -54,6 +54,12 @@ use crate::storage::traits::Index;
 /// A row's key taken out of the row map on removal, with the row's id
 type RemovedRow = (Vec<CompactArc<Value>>, i64);
 
+#[cfg(test)]
+thread_local! {
+    /// Walk orders built on this thread
+    static ORDER_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Composite key for BTreeMap ordering
 /// Wraps Vec<Value> with proper Ord implementation
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,8 +139,8 @@ pub struct MultiColumnIndex {
     row_to_key: RwLock<I64Map<Vec<CompactArc<Value>>>>,
 
     /// Per prefix group, its rows ordered by the column after the prefix:
-    /// built when a walk first asks for the group, kept up to date by single
-    /// adds and removes, dropped by a large batch and rebuilt on the next walk.
+    /// built when a walk first asks for the group, kept up to date by adds and
+    /// removes of any size, dropped by a large batch add and rebuilt on a walk.
     /// Writers touch it last, after the prefix indexes a build reads, and a
     /// build holds its write lock from that read to the insert, so a row is
     /// either in the group when it is built or added to it afterwards.
@@ -202,8 +208,8 @@ impl MultiColumnIndex {
         }
     }
 
-    /// A batch this large drops the built walk orders; they come back on the
-    /// next walk, cheaper than updating them row by row
+    /// An add batch this large drops the built walk orders; they come back on
+    /// the next walk, cheaper than updating them row by row
     const WALK_ORDER_BATCH_DROP: usize = 1024;
 
     /// Rows removed per lock acquisition in a batch removal
@@ -430,13 +436,21 @@ impl MultiColumnIndex {
             }
         }
 
+        // The built orders stay: each prefix's order is looked up once for the
+        // rows of that prefix, which `removed` holds together
         if self.orders_built() {
             let mut orders = self.walk_orders.write();
-            if removed.len() >= Self::WALK_ORDER_BATCH_DROP {
-                orders.clear();
-            } else {
-                for (key, row_id) in &removed {
-                    Self::order_remove_in(&mut orders, &mut scratch, key, *row_id);
+            for prefix_len in 1..num_cols {
+                let same_prefix = |a: &RemovedRow, b: &RemovedRow| {
+                    Self::cmp_arcs(&a.0[..prefix_len], &b.0[..prefix_len]).is_eq()
+                };
+                for run in removed.chunk_by(same_prefix) {
+                    Self::fill_key(&mut scratch, &run[0].0[..prefix_len]);
+                    if let Some(order) = orders.get_mut(&scratch) {
+                        for (key, row_id) in run {
+                            order.remove(&((*key[prefix_len]).clone(), *row_id));
+                        }
+                    }
                 }
             }
         }
@@ -1112,6 +1126,8 @@ impl Index for MultiColumnIndex {
                 drop(orders);
                 let mut orders = self.walk_orders.write();
                 if !orders.contains_key(&group) {
+                    #[cfg(test)]
+                    ORDER_BUILDS.with(|b| b.set(b.get() + 1));
                     let ids = self.get_row_ids_equal(prefix);
                     let row_to_key = self.row_to_key.read();
                     let mut entries: Vec<(Value, i64)> = Vec::with_capacity(ids.len());
@@ -1235,6 +1251,75 @@ impl Index for MultiColumnIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_seal_sized_removal_keeps_the_built_walk_orders() {
+        let index = MultiColumnIndex::new(
+            "g_h_t".to_string(),
+            "t".to_string(),
+            vec!["g".to_string(), "h".to_string(), "t".to_string()],
+            vec![0, 1, 2],
+            vec![DataType::Integer, DataType::Text, DataType::Integer],
+            false,
+            0,
+        );
+        let h = |id: i64| format!("a group name longer than inline {:02}", id % 2);
+        for id in 1..=6_000i64 {
+            let key = [
+                Value::Integer(id % 3),
+                Value::text(h(id)),
+                Value::Integer(id),
+            ];
+            index.add(&key, id, id).unwrap();
+        }
+        let prefixes: Vec<Vec<Value>> = (0..3i64)
+            .flat_map(|g| {
+                let one = vec![Value::Integer(g)];
+                let two = (0..2i64).map(move |k| vec![Value::Integer(g), Value::text(h(k))]);
+                std::iter::once(one).chain(two)
+            })
+            .collect();
+        let walk = |prefix: &[Value]| {
+            let mut ids = Vec::new();
+            assert!(
+                index.walk_prefix_ordered(prefix, None, None, true, &mut |id, _| {
+                    ids.push(id);
+                    true
+                })
+            );
+            ids
+        };
+        for prefix in &prefixes {
+            walk(prefix);
+        }
+        let builds = || ORDER_BUILDS.with(|b| b.get());
+        let before = builds();
+        let removed: Vec<i64> = (1..=2_000).collect();
+        index.remove_batch_ids(&removed).unwrap().unwrap();
+        for prefix in &prefixes {
+            let g = match prefix[0] {
+                Value::Integer(g) => g,
+                _ => unreachable!(),
+            };
+            let mut expected: Vec<(String, i64)> = (2_001..=6_000i64)
+                .filter(|id| id % 3 == g && (prefix.len() == 1 || Value::text(h(*id)) == prefix[1]))
+                .map(|id| {
+                    (
+                        if prefix.len() == 1 {
+                            h(id)
+                        } else {
+                            String::new()
+                        },
+                        id,
+                    )
+                })
+                .collect();
+            expected.sort();
+            let expected: Vec<i64> = expected.into_iter().map(|(_, id)| id).collect();
+            assert_eq!(walk(prefix), expected, "prefix of {} columns", prefix.len());
+        }
+        assert_eq!(builds() - before, 0, "the removal dropped the built orders");
+    }
 
     #[test]
     fn test_multi_column_index_basic() {
