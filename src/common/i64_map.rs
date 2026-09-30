@@ -36,6 +36,29 @@ const MIN_SHRINK_CAPACITY: usize = 64;
 // whole i64 range.
 const EMPTY: i64 = i64::MIN;
 
+#[cfg(test)]
+thread_local! {
+    /// Slots a shrink or a drop walked on this thread, past minimum tables
+    static SLOT_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Slots shrinks and drops walked on this thread in tables larger than the
+/// minimum
+#[cfg(test)]
+pub(crate) fn slot_visits() -> usize {
+    SLOT_VISITS.with(|v| v.get())
+}
+
+#[inline]
+fn count_slot_visits(slots: usize) {
+    #[cfg(test)]
+    if slots > MIN_CAPACITY {
+        SLOT_VISITS.with(|v| v.set(v.get() + slots));
+    }
+    #[cfg(not(test))]
+    let _ = slots;
+}
+
 /// Slot with key and value. key == EMPTY means slot is empty.
 #[repr(C)]
 struct Slot<V> {
@@ -367,7 +390,36 @@ impl<V> I64Map<V> {
         if key == EMPTY {
             return self.sentinel_remove();
         }
+        let value = self.take_slot(key)?;
 
+        // Check if we should shrink after removal
+        if self.should_shrink() {
+            self.shrink();
+        }
+
+        Some(value)
+    }
+
+    /// Removes `key` and keeps the capacity: the table is never rehashed
+    /// here, for a caller that replaces the map whole once it is empty
+    pub fn remove_keeping_capacity(&mut self, key: i64) -> Option<V> {
+        if key == EMPTY {
+            return self.sentinel_remove();
+        }
+        self.take_slot(key)
+    }
+
+    /// When the map is empty and larger than `fresh`, swaps the two tables:
+    /// `fresh` then holds the old one, for the caller to drop later
+    pub fn swap_if_empty(&mut self, fresh: &mut Self) -> bool {
+        let swap = self.is_empty() && self.capacity() > fresh.capacity();
+        if swap {
+            std::mem::swap(self, fresh);
+        }
+        swap
+    }
+
+    fn take_slot(&mut self, key: i64) -> Option<V> {
         let mask = self.mask;
         let mut idx = Self::hash(key) & mask;
 
@@ -393,11 +445,6 @@ impl<V> I64Map<V> {
         self.len -= 1;
 
         self.shift_back(idx);
-
-        // Check if we should shrink after removal
-        if self.should_shrink() {
-            self.shrink();
-        }
 
         Some(value)
     }
@@ -453,6 +500,7 @@ impl<V> I64Map<V> {
         if new_cap >= self.slots.len() {
             return; // No need to shrink
         }
+        count_slot_visits(self.slots.len());
 
         let new_mask = new_cap - 1;
 
@@ -674,6 +722,7 @@ impl<V> I64Map<V> {
 
 impl<V> Drop for I64Map<V> {
     fn drop(&mut self) {
+        count_slot_visits(self.slots.len());
         for slot in self.slots.iter_mut() {
             if slot.key != EMPTY {
                 // SAFETY: slot.key != EMPTY means the value is initialized.
@@ -1224,7 +1273,40 @@ impl I64Set {
             self.has_min = false;
             return removed;
         }
+        if !self.take_slot(key) {
+            return false;
+        }
 
+        // Check if we should shrink after removal
+        if self.should_shrink() {
+            self.shrink();
+        }
+
+        true
+    }
+
+    /// Removes `key` and keeps the capacity: the table is never rehashed
+    /// here, for a caller that replaces the set whole once it is empty
+    pub fn remove_keeping_capacity(&mut self, key: i64) -> bool {
+        if key == EMPTY {
+            let removed = self.has_min;
+            self.has_min = false;
+            return removed;
+        }
+        self.take_slot(key)
+    }
+
+    /// When the set is empty and larger than `fresh`, swaps the two tables:
+    /// `fresh` then holds the old one, for the caller to drop later
+    pub fn swap_if_empty(&mut self, fresh: &mut Self) -> bool {
+        let swap = self.is_empty() && self.capacity() > fresh.capacity();
+        if swap {
+            std::mem::swap(self, fresh);
+        }
+        swap
+    }
+
+    fn take_slot(&mut self, key: i64) -> bool {
         let mask = self.mask;
         let mut idx = Self::hash(key) & mask;
 
@@ -1285,11 +1367,6 @@ impl I64Set {
             *self.slots.get_unchecked_mut(empty_idx) = EMPTY;
         }
 
-        // Check if we should shrink after removal
-        if self.should_shrink() {
-            self.shrink();
-        }
-
         true
     }
 
@@ -1336,6 +1413,7 @@ impl I64Set {
         if new_cap >= self.slots.len() {
             return; // No need to shrink
         }
+        count_slot_visits(self.slots.len());
 
         let new_mask = new_cap - 1;
 
@@ -1525,6 +1603,99 @@ impl<V> Drop for Drain<'_, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LARGE: i64 = 1_000_000;
+
+    #[test]
+    fn removing_while_keeping_capacity_never_walks_the_map() {
+        let mut map: I64Map<i64> = I64Map::with_capacity(LARGE as usize);
+        for key in 0..LARGE {
+            map.insert(key, key);
+        }
+        let capacity = map.capacity();
+        let before = slot_visits();
+        let mut next = 0;
+        for left in [4_096, 1, 0] {
+            while map.len() > left {
+                assert_eq!(map.remove_keeping_capacity(next), Some(next));
+                next += 1;
+            }
+            assert_eq!(
+                (slot_visits() - before, map.capacity()),
+                (0, capacity),
+                "{left} left"
+            );
+        }
+        let mut old = I64Map::new();
+        assert!(map.swap_if_empty(&mut old), "an empty large map is swapped");
+        assert_eq!((old.capacity(), map.capacity()), (capacity, MIN_CAPACITY));
+        assert_eq!(slot_visits() - before, 0, "the swap walks nothing");
+        drop(old);
+        assert_eq!(
+            slot_visits() - before,
+            capacity,
+            "the old map is walked when dropped"
+        );
+    }
+
+    #[test]
+    fn a_map_with_rows_left_is_not_swapped() {
+        let mut map: I64Map<i64> = I64Map::with_capacity(LARGE as usize);
+        map.insert(1, 1);
+        assert!(!map.swap_if_empty(&mut I64Map::new()));
+        assert_eq!(map.get(1), Some(&1));
+    }
+
+    #[test]
+    fn a_plain_remove_still_shrinks() {
+        let mut map: I64Map<i64> = I64Map::with_capacity(LARGE as usize);
+        for key in 0..LARGE {
+            map.insert(key, key);
+        }
+        let (capacity, before) = (map.capacity(), slot_visits());
+        for key in 1..LARGE {
+            map.remove(key);
+        }
+        assert!(map.capacity() < capacity);
+        assert!(slot_visits() - before > 0, "the old shrink policy stays");
+    }
+
+    #[test]
+    fn a_set_removes_while_keeping_capacity_and_swaps_when_empty() {
+        let mut set = I64Set::with_capacity(LARGE as usize);
+        for key in 0..LARGE {
+            set.insert(key);
+        }
+        let capacity = set.capacity();
+        let before = slot_visits();
+        let mut next = 0;
+        for left in [4_096, 1, 0] {
+            while set.len() > left {
+                assert!(set.remove_keeping_capacity(next));
+                next += 1;
+            }
+            assert_eq!(
+                (slot_visits() - before, set.capacity()),
+                (0, capacity),
+                "{left} left"
+            );
+        }
+        let mut old = I64Set::new();
+        assert!(set.swap_if_empty(&mut old), "an empty large set is swapped");
+        assert_eq!(old.capacity(), capacity);
+        let mut plain = I64Set::with_capacity(LARGE as usize);
+        for key in 0..LARGE {
+            plain.insert(key);
+        }
+        let before = slot_visits();
+        for key in 1..LARGE {
+            plain.remove(key);
+        }
+        assert!(
+            slot_visits() - before > 0,
+            "the set's plain remove still shrinks"
+        );
+    }
     use std::cell::RefCell;
     use std::rc::Rc;
 

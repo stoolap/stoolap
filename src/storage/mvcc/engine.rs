@@ -7273,6 +7273,7 @@ impl MVCCEngine {
             // segments + remove hot rows + remove hot index entries.
             // DML operations hold the shared fence, so they cannot race
             // between cold constraint checks and hot publication.
+            let mut cleaners = store.seal_index_cleaners(all_row_ids.len().min(REMOVE_BATCH_SIZE));
             let published = {
                 // A preparation the segments moved past publishes nothing:
                 // the fence is let go before the preparation is, and it is
@@ -7360,7 +7361,7 @@ impl MVCCEngine {
                 mgr.clear_seal_overlap();
 
                 for cleanup in index_cleanups {
-                    store.remove_sealed_index_entries(cleanup, &all_rows);
+                    store.remove_sealed_index_entries(cleanup, &all_rows, &mut cleaners);
                 }
                 #[cfg(feature = "test-failpoints")]
                 crate::test_failpoints::seal_indexes_cleaned();
@@ -7400,6 +7401,7 @@ impl MVCCEngine {
             drop(ddl);
             // Its buffers go with the fence and the guard let go
             drop(published);
+            drop(cleaners);
             for side in stale_sides {
                 crate::storage::volume::secondary::discard_side(side);
             }

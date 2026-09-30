@@ -34,6 +34,7 @@ use crate::common::{I64Map, I64Set};
 use crate::core::{DataType, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
 use crate::storage::index::id_list::GroupIds;
+use crate::storage::traits::RemovalBuffers;
 use crate::storage::Index;
 
 /// Row IDs in `[0, BITSET_MAX_BITS)` use the fast bitset path (~156 KB max).
@@ -111,6 +112,18 @@ impl PkIndexInner {
                 false
             }
         } else if self.overflow.remove(id) {
+            self.count -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `remove`, with the overflow set keeping its capacity
+    fn remove_keeping_capacity(&mut self, id: i64) -> bool {
+        if to_word_bit(id).is_some() {
+            self.remove(id)
+        } else if self.overflow.remove_keeping_capacity(id) {
             self.count -= 1;
             true
         } else {
@@ -398,11 +411,21 @@ impl Index for PkIndex {
         Ok(())
     }
 
-    fn remove_batch_ids(&self, row_ids: &[i64]) -> Option<Result<()>> {
+    fn removal_buffers(&self, _batch_rows: usize) -> Option<RemovalBuffers> {
+        Some(Box::new(I64Set::new()))
+    }
+
+    fn remove_batch_ids(
+        &self,
+        row_ids: &[i64],
+        buffers: &mut RemovalBuffers,
+    ) -> Option<Result<()>> {
+        let fresh = buffers.downcast_mut::<I64Set>()?;
         let mut inner = self.data.write();
         for &row_id in row_ids {
-            inner.remove(row_id);
+            inner.remove_keeping_capacity(row_id);
         }
+        inner.overflow.swap_if_empty(fresh);
         Some(Ok(()))
     }
 

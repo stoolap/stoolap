@@ -51,7 +51,7 @@ use roaring::RoaringTreemap;
 use crate::common::{CompactArc, I64Map};
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
-use crate::storage::traits::Index;
+use crate::storage::traits::{Index, RemovalBuffers};
 
 /// Warning threshold for cardinality
 const HIGH_CARDINALITY_WARNING_THRESHOLD: usize = 1000;
@@ -109,6 +109,13 @@ fn bit_of(row_id: i64) -> u64 {
 #[inline]
 fn row_of(bit: u64) -> i64 {
     (bit ^ (1 << 63)) as i64
+}
+
+/// A seal cleanup's buffers: the small row map swapped in for an emptied one,
+/// and the removed rows' keys, reused across the seal's calls
+struct SealBuffers {
+    fresh: I64Map<CompactArc<Value>>,
+    removed: Vec<(CompactArc<Value>, i64)>,
 }
 
 /// The row ids of `bits`, each as `row_id as u64`: what the public set
@@ -636,20 +643,41 @@ impl Index for BitmapIndex {
         Ok(())
     }
 
-    fn remove_batch_ids(&self, row_ids: &[i64]) -> Option<Result<()>> {
+    fn removal_buffers(&self, batch_rows: usize) -> Option<RemovalBuffers> {
+        Some(Box::new(SealBuffers {
+            fresh: I64Map::new(),
+            removed: Vec::with_capacity(batch_rows),
+        }))
+    }
+
+    fn remove_batch_ids(
+        &self,
+        row_ids: &[i64],
+        buffers: &mut RemovalBuffers,
+    ) -> Option<Result<()>> {
+        let SealBuffers { fresh, removed } = buffers.downcast_mut::<SealBuffers>()?;
         if self.closed.load(AtomicOrdering::Acquire) {
             return Some(Err(Error::IndexClosed));
         }
+        removed.clear();
         let mut bitmaps = self.bitmaps.write();
         let mut row_to_value = self.row_to_value.write();
         for &row_id in row_ids {
-            if let Some(arc_key) = row_to_value.remove(row_id) {
-                if let Some(bitmap) = bitmaps.get_mut(&arc_key) {
+            if let Some(arc_key) = row_to_value.remove_keeping_capacity(row_id) {
+                removed.push((arc_key, row_id));
+            }
+        }
+        row_to_value.swap_if_empty(fresh);
+        // Each key's bitmap is looked up once and its bits leave in order
+        removed.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        for run in removed.chunk_by(|a, b| a.0 == b.0) {
+            if let Some(bitmap) = bitmaps.get_mut(&run[0].0) {
+                for &(_, row_id) in run {
                     bitmap.remove(bit_of(row_id));
-                    if bitmap.is_empty() {
-                        bitmaps.remove(&arc_key);
-                        self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
-                    }
+                }
+                if bitmap.is_empty() {
+                    bitmaps.remove(&run[0].0);
+                    self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
                 }
             }
         }
@@ -1182,7 +1210,11 @@ mod tests {
         assert_eq!(entries, vec![i64::MIN + 1, -7, -1, 0, 5, i64::MAX]);
 
         index.remove(&pending, -1, 0).unwrap();
-        index.remove_batch_ids(&[-7, 5]).unwrap().unwrap();
+        let mut buffers = index.removal_buffers(2).unwrap();
+        index
+            .remove_batch_ids(&[-7, 5], &mut buffers)
+            .unwrap()
+            .unwrap();
         let mut left = Vec::new();
         index.get_row_ids_equal_into(&pending, &mut left);
         assert_eq!(left, vec![i64::MIN + 1, 0, i64::MAX]);

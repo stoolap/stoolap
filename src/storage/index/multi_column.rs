@@ -45,7 +45,7 @@ use super::id_list::IdList;
 use crate::common::{CompactArc, I64Map};
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
-use crate::storage::traits::Index;
+use crate::storage::traits::{Index, RemovalBuffers};
 
 // ============================================================================
 // CompositeKey - Ordered key for BTreeMap
@@ -353,7 +353,11 @@ impl MultiColumnIndex {
     /// Removes `row_ids` from every structure a key at a time. The keys move
     /// out of the row map, are sorted with the ids, and are looked up through
     /// one reused key: nothing is allocated per row.
-    fn remove_ids(&self, row_ids: &[i64]) -> Result<()> {
+    fn remove_ids(
+        &self,
+        row_ids: &[i64],
+        mut fresh: Option<&mut I64Map<Vec<CompactArc<Value>>>>,
+    ) -> Result<()> {
         if row_ids.is_empty() {
             return Ok(());
         }
@@ -374,9 +378,18 @@ impl MultiColumnIndex {
             let mut value_to_rows = self.value_to_rows.write();
             let mut row_to_key = self.row_to_key.write();
             for &row_id in chunk {
-                if let Some(key) = row_to_key.remove(row_id) {
+                // A seal's cleanup keeps the row map's capacity
+                let taken = if fresh.is_some() {
+                    row_to_key.remove_keeping_capacity(row_id)
+                } else {
+                    row_to_key.remove(row_id)
+                };
+                if let Some(key) = taken {
                     removed.push((key, row_id));
                 }
+            }
+            if let Some(fresh) = fresh.as_deref_mut() {
+                row_to_key.swap_if_empty(fresh);
             }
             let part = &mut removed[start..];
             part.sort_unstable_by(by_key);
@@ -935,11 +948,20 @@ impl Index for MultiColumnIndex {
     fn remove_batch_slice(&self, entries: &[(i64, &[Value])]) -> Result<()> {
         // The values are not needed: the row map knows each row's key
         let row_ids: Vec<i64> = entries.iter().map(|(row_id, _)| *row_id).collect();
-        self.remove_ids(&row_ids)
+        self.remove_ids(&row_ids, None)
     }
 
-    fn remove_batch_ids(&self, row_ids: &[i64]) -> Option<Result<()>> {
-        Some(self.remove_ids(row_ids))
+    fn removal_buffers(&self, _batch_rows: usize) -> Option<RemovalBuffers> {
+        Some(Box::new(I64Map::<Vec<CompactArc<Value>>>::new()))
+    }
+
+    fn remove_batch_ids(
+        &self,
+        row_ids: &[i64],
+        buffers: &mut RemovalBuffers,
+    ) -> Option<Result<()>> {
+        let fresh = buffers.downcast_mut::<I64Map<Vec<CompactArc<Value>>>>()?;
+        Some(self.remove_ids(row_ids, Some(fresh)))
     }
 
     fn column_ids(&self) -> &[i32] {

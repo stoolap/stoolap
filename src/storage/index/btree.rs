@@ -42,7 +42,7 @@ use crate::common::{CompactArc, I64Map};
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
 use crate::storage::index::id_list::GroupIds;
-use crate::storage::traits::Index;
+use crate::storage::traits::{Index, RemovalBuffers};
 
 /// Threshold for parallel filtering (number of unique values)
 #[cfg(feature = "parallel")]
@@ -120,7 +120,11 @@ impl BTreeIndex {
     /// Removes `row_ids` a key at a time: the rows' keys are taken from the
     /// row map, sorted with the ids, and each key's ids leave its list in one
     /// pass
-    fn remove_ids(&self, row_ids: &[i64]) -> Result<()> {
+    fn remove_ids(
+        &self,
+        row_ids: &[i64],
+        fresh: Option<&mut I64Map<CompactArc<Value>>>,
+    ) -> Result<()> {
         if row_ids.is_empty() {
             return Ok(());
         }
@@ -131,9 +135,18 @@ impl BTreeIndex {
 
         let mut removed: Vec<(CompactArc<Value>, i64)> = Vec::with_capacity(row_ids.len());
         for &row_id in row_ids {
-            if let Some(arc_value) = row_to_value.remove(row_id) {
+            // A seal's cleanup keeps the row map's capacity
+            let taken = if fresh.is_some() {
+                row_to_value.remove_keeping_capacity(row_id)
+            } else {
+                row_to_value.remove(row_id)
+            };
+            if let Some(arc_value) = taken {
                 removed.push((arc_value, row_id));
             }
+        }
+        if let Some(fresh) = fresh {
+            row_to_value.swap_if_empty(fresh);
         }
         removed.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
         let mut ids: Vec<i64> = Vec::with_capacity(removed.len());
@@ -688,11 +701,20 @@ impl Index for BTreeIndex {
     fn remove_batch_slice(&self, entries: &[(i64, &[Value])]) -> Result<()> {
         // The values are not needed: the row map knows each row's key
         let row_ids: Vec<i64> = entries.iter().map(|(row_id, _)| *row_id).collect();
-        self.remove_ids(&row_ids)
+        self.remove_ids(&row_ids, None)
     }
 
-    fn remove_batch_ids(&self, row_ids: &[i64]) -> Option<Result<()>> {
-        Some(self.remove_ids(row_ids))
+    fn removal_buffers(&self, _batch_rows: usize) -> Option<RemovalBuffers> {
+        Some(Box::new(I64Map::<CompactArc<Value>>::new()))
+    }
+
+    fn remove_batch_ids(
+        &self,
+        row_ids: &[i64],
+        buffers: &mut RemovalBuffers,
+    ) -> Option<Result<()>> {
+        let fresh = buffers.downcast_mut::<I64Map<CompactArc<Value>>>()?;
+        Some(self.remove_ids(row_ids, Some(fresh)))
     }
 
     fn column_ids(&self) -> &[i32] {
