@@ -1298,7 +1298,8 @@ mod tests {
                 index.add(&key, id, id).unwrap();
                 assert!(index.walk_prefix_ordered(&key[..1], None, None, true, &mut |_, _| false));
             }
-            index.remove_batch_ids(&ids).unwrap().unwrap();
+            let mut buffers = index.removal_buffers(ids.len()).unwrap();
+            index.remove_batch_ids(&ids, &mut buffers).unwrap().unwrap();
         }
         assert!(index.row_to_key.read().is_empty());
         assert_eq!(
@@ -1351,7 +1352,11 @@ mod tests {
         let builds = || ORDER_BUILDS.with(|b| b.get());
         let before = builds();
         let removed: Vec<i64> = (1..=2_000).collect();
-        index.remove_batch_ids(&removed).unwrap().unwrap();
+        let mut buffers = index.removal_buffers(removed.len()).unwrap();
+        index
+            .remove_batch_ids(&removed, &mut buffers)
+            .unwrap()
+            .unwrap();
         for prefix in &prefixes {
             let g = match prefix[0] {
                 Value::Integer(g) => g,
