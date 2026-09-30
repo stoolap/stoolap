@@ -61,6 +61,7 @@ Stoolap currently supports the following PRAGMA commands:
 | `index_read_stats` | Show what the reads through side files did: probes, candidates, rows, refusals, scans | - |
 | `index_backfill` | Build side files for volumes the query path cannot serve yet, all or up to a number | - |
 | `memory_stats` | Show per-table hot and cold memory figures | - |
+| `heap_profile` | Write a heap profile in pprof format to a file (Linux builds with the `jemalloc-prof` feature) | - |
 
 #### checkpoint_interval
 
@@ -234,6 +235,16 @@ Returns one row per table and a final `*` row with the totals.
 ```sql
 PRAGMA memory_stats;
 ```
+
+#### heap_profile
+
+Writes the process's live heap, as sampled by jemalloc, to the file named, in pprof format, and returns the file's size in bytes. It shows where the memory Stoolap allocated was allocated, by call stack, including what `memory_stats` does not count. Only a Linux build with the `jemalloc-prof` Cargo feature has it; that feature makes jemalloc the allocator, with a sample taken every 512 KiB allocated on average. Other builds return an error.
+
+```sql
+PRAGMA heap_profile = '/tmp/stoolap-heap.pb.gz';
+```
+
+Read the file with `go tool pprof`, for example `go tool pprof -top /tmp/stoolap-heap.pb.gz`, or compare two with `-diff_base`. Loaded into another process, such as a Node.js module, the profile covers Stoolap's own allocations only.
 
 ### Manual Snapshot and Checkpoint Control
 

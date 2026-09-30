@@ -65,15 +65,32 @@
 
 // Use mimalloc as global allocator when feature is enabled
 // (but not when dhat-heap is enabled, as it needs its own allocator)
-#[cfg(all(feature = "mimalloc", not(feature = "dhat-heap")))]
+#[cfg(all(
+    feature = "mimalloc",
+    not(feature = "jemalloc-prof"),
+    not(feature = "dhat-heap")
+))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+// jemalloc with its sampling heap profiler, for PRAGMA HEAP_PROFILE
+#[cfg(all(feature = "jemalloc-prof", not(feature = "dhat-heap")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// jemalloc's startup options: profiling on, a sample every 512 KiB
+/// allocated on average. The symbol carries the crate's `_rjem_` prefix.
+#[cfg(all(feature = "jemalloc-prof", not(feature = "dhat-heap")))]
+#[allow(non_upper_case_globals)]
+#[export_name = "_rjem_malloc_conf"]
+pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
 
 pub mod api;
 pub mod common;
 pub mod core;
 pub mod executor;
 pub mod functions;
+mod heap_profile;
 pub mod optimizer;
 pub mod parser;
 pub mod storage;

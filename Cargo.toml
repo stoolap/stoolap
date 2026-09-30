@@ -95,6 +95,7 @@ flate2 = { version = "1", optional = true }
 
 # Optional allocators
 mimalloc = { version = "0.1", default-features = false, optional = true }
+tikv-jemallocator = { version = "0.7", features = ["profiling", "disable_initial_exec_tls"], optional = true }
 
 # Semantic embedding (optional — enables EMBED() SQL function)
 candle-core = { version = "0.9", optional = true }
@@ -106,6 +107,10 @@ hf-hub = { version = "0.4", optional = true }
 # Platform-specific file locking
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Heap profiles in pprof format, for the jemalloc-prof feature
+[target.'cfg(target_os = "linux")'.dependencies]
+jemalloc_pprof = { version = "0.9", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
@@ -136,6 +141,7 @@ dhat-heap = []
 sqlite = ["dep:rusqlite"]
 duckdb = ["dep:duckdb"]
 mimalloc = ["dep:mimalloc"]
+jemalloc-prof = ["dep:tikv-jemallocator", "dep:jemalloc_pprof"]
 semantic = ["candle-core", "candle-nn", "candle-transformers", "tokenizers", "hf-hub"]
 ann-benchmark = ["dep:ureq", "dep:flate2"]
 test-failpoints = []
