@@ -450,6 +450,9 @@ impl MultiColumnIndex {
                         for (key, row_id) in run {
                             order.remove(&((*key[prefix_len]).clone(), *row_id));
                         }
+                        if order.is_empty() {
+                            orders.remove(&scratch);
+                        }
                     }
                 }
             }
@@ -1251,6 +1254,37 @@ impl Index for MultiColumnIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_removal_that_empties_a_group_drops_its_walk_order() {
+        let index = MultiColumnIndex::new(
+            "idx".into(),
+            "t".into(),
+            vec!["g".into(), "v".into()],
+            vec![0, 1],
+            vec![DataType::Text, DataType::Integer],
+            false,
+            0,
+        );
+        for cycle in 0..5i64 {
+            let ids: Vec<i64> = (cycle * 2_000 + 1..=(cycle + 1) * 2_000).collect();
+            for &id in &ids {
+                let key = [
+                    Value::text(format!("a distinct long text prefix for row {id:08}")),
+                    Value::Integer(id),
+                ];
+                index.add(&key, id, id).unwrap();
+                assert!(index.walk_prefix_ordered(&key[..1], None, None, true, &mut |_, _| false));
+            }
+            index.remove_batch_ids(&ids).unwrap().unwrap();
+        }
+        assert!(index.row_to_key.read().is_empty());
+        assert_eq!(
+            index.walk_orders.read().len(),
+            0,
+            "an emptied group keeps no walk order"
+        );
+    }
 
     #[test]
     fn a_seal_sized_removal_keeps_the_built_walk_orders() {
