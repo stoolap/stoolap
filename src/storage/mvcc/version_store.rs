@@ -5333,8 +5333,14 @@ impl VersionStore {
     /// Called while the table's seal fence is still held so INSERT cannot race
     /// between cold constraint checks and hot-index cleanup.
     /// Indexes that keep a row-to-key map remove by row id; the others get
-    /// their values from `rows`, the sealed rows.
-    pub fn remove_sealed_index_entries(&self, cleanup: SealedIndexCleanup, rows: &RowVec) {
+    /// their values from `rows`, the sealed rows. What the indexes release
+    /// goes into `released`, for the caller to drop once its fence is let go.
+    pub fn remove_sealed_index_entries(
+        &self,
+        cleanup: SealedIndexCleanup,
+        rows: &RowVec,
+        released: &mut crate::storage::traits::Released,
+    ) {
         if cleanup.removed_ids.is_empty() {
             return;
         }
@@ -5353,7 +5359,10 @@ impl VersionStore {
 
         let mut by_id: Option<I64Map<usize>> = None;
         for index in &hot_only_indexes {
-            if index.remove_batch_ids(&cleanup.removed_ids).is_some() {
+            if index
+                .remove_batch_ids(&cleanup.removed_ids, released)
+                .is_some()
+            {
                 continue;
             }
             let positions = by_id.get_or_insert_with(|| {

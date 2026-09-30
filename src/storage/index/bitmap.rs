@@ -51,7 +51,7 @@ use roaring::RoaringTreemap;
 use crate::common::{CompactArc, I64Map};
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
-use crate::storage::traits::Index;
+use crate::storage::traits::{Index, Released};
 
 /// Warning threshold for cardinality
 const HIGH_CARDINALITY_WARNING_THRESHOLD: usize = 1000;
@@ -636,22 +636,37 @@ impl Index for BitmapIndex {
         Ok(())
     }
 
-    fn remove_batch_ids(&self, row_ids: &[i64]) -> Option<Result<()>> {
+    fn remove_batch_ids(&self, row_ids: &[i64], released: &mut Released) -> Option<Result<()>> {
         if self.closed.load(AtomicOrdering::Acquire) {
             return Some(Err(Error::IndexClosed));
         }
+        let mut fresh = I64Map::new();
+        let mut removed: Vec<(CompactArc<Value>, i64)> = Vec::with_capacity(row_ids.len());
         let mut bitmaps = self.bitmaps.write();
         let mut row_to_value = self.row_to_value.write();
         for &row_id in row_ids {
-            if let Some(arc_key) = row_to_value.remove(row_id) {
-                if let Some(bitmap) = bitmaps.get_mut(&arc_key) {
+            if let Some(arc_key) = row_to_value.remove_keeping_capacity(row_id) {
+                removed.push((arc_key, row_id));
+            }
+        }
+        let emptied = row_to_value.swap_if_empty(&mut fresh);
+        // Each key's bitmap is looked up once and its bits leave in order
+        removed.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        for run in removed.chunk_by(|a, b| a.0 == b.0) {
+            if let Some(bitmap) = bitmaps.get_mut(&run[0].0) {
+                for &(_, row_id) in run {
                     bitmap.remove(bit_of(row_id));
-                    if bitmap.is_empty() {
-                        bitmaps.remove(&arc_key);
-                        self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
-                    }
+                }
+                if bitmap.is_empty() {
+                    bitmaps.remove(&run[0].0);
+                    self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
                 }
             }
+        }
+        drop(row_to_value);
+        drop(bitmaps);
+        if emptied {
+            released.push(Box::new(fresh));
         }
         Some(Ok(()))
     }
@@ -1182,7 +1197,10 @@ mod tests {
         assert_eq!(entries, vec![i64::MIN + 1, -7, -1, 0, 5, i64::MAX]);
 
         index.remove(&pending, -1, 0).unwrap();
-        index.remove_batch_ids(&[-7, 5]).unwrap().unwrap();
+        index
+            .remove_batch_ids(&[-7, 5], &mut Vec::new())
+            .unwrap()
+            .unwrap();
         let mut left = Vec::new();
         index.get_row_ids_equal_into(&pending, &mut left);
         assert_eq!(left, vec![i64::MIN + 1, 0, i64::MAX]);

@@ -65,7 +65,7 @@ use super::id_list::IdList;
 use crate::common::{CompactArc, I64Map};
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::{ComparisonExpr, Expression, InListExpr};
-use crate::storage::traits::Index;
+use crate::storage::traits::{Index, Released};
 
 /// Fixed seeds for deterministic hashing across add/find operations
 const HASH_SEEDS: [u64; 4] = [
@@ -551,20 +551,22 @@ impl Index for HashIndex {
         Ok(())
     }
 
-    fn remove_batch_ids(&self, row_ids: &[i64]) -> Option<Result<()>> {
+    fn remove_batch_ids(&self, row_ids: &[i64], released: &mut Released) -> Option<Result<()>> {
         if self.closed.load(AtomicOrdering::Acquire) {
             return Some(Err(Error::IndexClosed));
         }
+        let mut fresh = I64Map::new();
         let mut row_to_hash = self.row_to_hash.write();
         let mut hash_to_values = self.hash_to_values.write();
         // The rows sorted by hash and id: each hash's ids leave its bucket
         // in one pass per value
         let mut removed: Vec<(u64, i64)> = Vec::with_capacity(row_ids.len());
         for &row_id in row_ids {
-            if let Some(hash) = row_to_hash.remove(row_id) {
+            if let Some(hash) = row_to_hash.remove_keeping_capacity(row_id) {
                 removed.push((hash, row_id));
             }
         }
+        let emptied = row_to_hash.swap_if_empty(&mut fresh);
         removed.sort_unstable();
         let mut ids: Vec<i64> = Vec::with_capacity(removed.len());
         for run in removed.chunk_by(|a, b| a.0 == b.0) {
@@ -580,6 +582,11 @@ impl Index for HashIndex {
                     hash_to_values.remove(&hash);
                 }
             }
+        }
+        drop(hash_to_values);
+        drop(row_to_hash);
+        if emptied {
+            released.push(Box::new(fresh));
         }
         Some(Ok(()))
     }

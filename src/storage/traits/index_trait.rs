@@ -20,6 +20,9 @@ use crate::core::{DataType, IndexEntry, IndexType, Operator, Result, RowIdVec, V
 use crate::storage::expression::Expression;
 use crate::storage::index::id_list::GroupIds;
 
+/// What a seal's index cleanup leaves to drop once its locks are let go
+pub type Released = Vec<Box<dyn std::any::Any>>;
+
 /// What a capped equality probe found.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CappedEqual {
@@ -179,9 +182,11 @@ pub trait Index: Send + Sync {
     fn find_with_operator(&self, op: Operator, values: &[Value]) -> Result<Vec<IndexEntry>>;
 
     /// Removes the entries of `row_ids` using the index's own row-to-key map,
-    /// so the caller needs no row values. None when the index cannot.
-    fn remove_batch_ids(&self, row_ids: &[i64]) -> Option<Result<()>> {
-        let _ = row_ids;
+    /// so the caller needs no row values; a seal's cleanup. The row map keeps
+    /// its capacity, and a map left empty goes into `released` for the caller
+    /// to drop once its locks are let go. None when the index cannot.
+    fn remove_batch_ids(&self, row_ids: &[i64], released: &mut Released) -> Option<Result<()>> {
+        let _ = (row_ids, released);
         None
     }
 

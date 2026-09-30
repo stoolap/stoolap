@@ -77,7 +77,10 @@ fn allocations_of_removals(index: &dyn Index) -> (usize, usize) {
     for (i, range) in [(1..=2_000i64), (2_001..=12_000)].into_iter().enumerate() {
         let ids: Vec<i64> = range.rev().collect();
         let before = ALLOCATIONS.with(Cell::get);
-        index.remove_batch_ids(&ids).unwrap().unwrap();
+        index
+            .remove_batch_ids(&ids, &mut Vec::new())
+            .unwrap()
+            .unwrap();
         counts[i] = ALLOCATIONS.with(Cell::get) - before;
     }
     (counts[0], counts[1])
