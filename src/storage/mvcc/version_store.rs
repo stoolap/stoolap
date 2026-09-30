@@ -562,6 +562,12 @@ pub struct SealedIndexCleanup {
     pub removed_ids: Vec<i64>,
 }
 
+/// A seal's hot indexes, each with its removal buffers when it has them
+pub type SealIndexCleaners = Vec<(
+    Arc<dyn Index>,
+    Option<crate::storage::traits::RemovalBuffers>,
+)>;
+
 /// Held for a table from the first index update of a commit until the
 /// commit is visible or undone; see VersionStore::begin_publish
 pub struct PublishGuard {
@@ -5329,41 +5335,51 @@ impl VersionStore {
         (count, SealedIndexCleanup { removed_ids })
     }
 
-    /// Remove stale hot index entries for sealed rows (phase 2 of seal).
-    /// Called while the table's seal fence is still held so INSERT cannot race
-    /// between cold constraint checks and hot-index cleanup.
-    /// Indexes that keep a row-to-key map remove by row id; the others get
-    /// their values from `rows`, the sealed rows. What the indexes release
-    /// goes into `released`, for the caller to drop once its fence is let go.
-    pub fn remove_sealed_index_entries(
-        &self,
-        cleanup: SealedIndexCleanup,
-        rows: &RowVec,
-        released: &mut crate::storage::traits::Released,
-    ) {
-        if cleanup.removed_ids.is_empty() {
-            return;
-        }
-
-        let indexes = self.indexes.read();
-        let hot_only_indexes: Vec<_> = indexes
+    /// The hot indexes a seal cleans, every index but HNSW, each with the
+    /// buffers its cleanup uses for calls of up to `batch_rows` rows. Taken
+    /// under the DDL guard before the fence, so nothing is made under it.
+    pub fn seal_index_cleaners(&self, batch_rows: usize) -> SealIndexCleaners {
+        let indexes: Vec<Arc<dyn Index>> = self
+            .indexes
+            .read()
             .values()
             .filter(|idx| idx.index_type() != crate::core::IndexType::Hnsw)
             .cloned()
             .collect();
-        drop(indexes);
+        indexes
+            .into_iter()
+            .map(|index| {
+                let buffers = index.removal_buffers(batch_rows);
+                (index, buffers)
+            })
+            .collect()
+    }
 
-        if hot_only_indexes.is_empty() {
+    /// Remove stale hot index entries for sealed rows (phase 2 of seal).
+    /// Called while the table's seal fence is still held so INSERT cannot race
+    /// between cold constraint checks and hot-index cleanup.
+    /// Indexes with removal buffers remove by row id; the others get their
+    /// values from `rows`, the sealed rows. `cleaners` comes from
+    /// `seal_index_cleaners`, and what the indexes release stays in it.
+    pub fn remove_sealed_index_entries(
+        &self,
+        cleanup: SealedIndexCleanup,
+        rows: &RowVec,
+        cleaners: &mut SealIndexCleaners,
+    ) {
+        if cleanup.removed_ids.is_empty() || cleaners.is_empty() {
             return;
         }
 
         let mut by_id: Option<I64Map<usize>> = None;
-        for index in &hot_only_indexes {
-            if index
-                .remove_batch_ids(&cleanup.removed_ids, released)
-                .is_some()
-            {
-                continue;
+        for (index, buffers) in cleaners.iter_mut() {
+            if let Some(buffers) = buffers {
+                if index
+                    .remove_batch_ids(&cleanup.removed_ids, buffers)
+                    .is_some()
+                {
+                    continue;
+                }
             }
             let positions = by_id.get_or_insert_with(|| {
                 let mut map = I64Map::with_capacity(rows.len());

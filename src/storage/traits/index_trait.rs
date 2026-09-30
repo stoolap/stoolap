@@ -20,8 +20,9 @@ use crate::core::{DataType, IndexEntry, IndexType, Operator, Result, RowIdVec, V
 use crate::storage::expression::Expression;
 use crate::storage::index::id_list::GroupIds;
 
-/// What a seal's index cleanup leaves to drop once its locks are let go
-pub type Released = Vec<Box<dyn std::any::Any>>;
+/// What a seal's cleanup of one index uses under the fence, made by the index
+/// before it; it then holds what the cleanup releases until the seal drops it
+pub type RemovalBuffers = Box<dyn std::any::Any>;
 
 /// What a capped equality probe found.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -181,12 +182,25 @@ pub trait Index: Send + Sync {
     /// Vector of matching index entries
     fn find_with_operator(&self, op: Operator, values: &[Value]) -> Result<Vec<IndexEntry>>;
 
+    /// The buffers `remove_batch_ids` uses for calls of up to `batch_rows`
+    /// rows, made before the seal's fence. None when the index cannot remove
+    /// by row id.
+    fn removal_buffers(&self, batch_rows: usize) -> Option<RemovalBuffers> {
+        let _ = batch_rows;
+        None
+    }
+
     /// Removes the entries of `row_ids` using the index's own row-to-key map,
-    /// so the caller needs no row values; a seal's cleanup. The row map keeps
-    /// its capacity, and a map left empty goes into `released` for the caller
-    /// to drop once its locks are let go. None when the index cannot.
-    fn remove_batch_ids(&self, row_ids: &[i64], released: &mut Released) -> Option<Result<()>> {
-        let _ = (row_ids, released);
+    /// so the caller needs no row values; a seal's cleanup, with the buffers
+    /// from `removal_buffers`. The row map keeps its capacity, and a map left
+    /// empty is swapped for the buffers' small one, the old table staying in
+    /// the buffers. None when the index cannot.
+    fn remove_batch_ids(
+        &self,
+        row_ids: &[i64],
+        buffers: &mut RemovalBuffers,
+    ) -> Option<Result<()>> {
+        let _ = (row_ids, buffers);
         None
     }
 

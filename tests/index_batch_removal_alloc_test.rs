@@ -22,7 +22,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
 use stoolap::core::{DataType, Value};
-use stoolap::storage::index::{BTreeIndex, HashIndex, MultiColumnIndex};
+use stoolap::storage::index::{BTreeIndex, BitmapIndex, HashIndex, MultiColumnIndex, PkIndex};
 use stoolap::storage::Index;
 
 struct ThreadCounting;
@@ -73,14 +73,26 @@ fn fill(index: &dyn Index, rows: &[(i64, Vec<Value>)]) {
 /// Allocations of two batch removals, 2,000 rows then 10,000, each given in
 /// descending id order as a clustered seal can give them
 fn allocations_of_removals(index: &dyn Index) -> (usize, usize) {
+    let mut buffers = index.removal_buffers(10_000).unwrap();
     let mut counts = [0; 2];
     for (i, range) in [(1..=2_000i64), (2_001..=12_000)].into_iter().enumerate() {
         let ids: Vec<i64> = range.rev().collect();
         let before = ALLOCATIONS.with(Cell::get);
-        index
-            .remove_batch_ids(&ids, &mut Vec::new())
-            .unwrap()
-            .unwrap();
+        index.remove_batch_ids(&ids, &mut buffers).unwrap().unwrap();
+        counts[i] = ALLOCATIONS.with(Cell::get) - before;
+    }
+    (counts[0], counts[1])
+}
+
+/// Allocations of a seal's two 10,000-row cleanup calls over rows `first`
+/// onwards, the second emptying the index, with the buffers made before
+fn allocations_of_a_seal_cleanup(index: &dyn Index, first: i64) -> (usize, usize) {
+    let mut buffers = index.removal_buffers(10_000).unwrap();
+    let mut counts = [0; 2];
+    for (i, start) in [first, first + 10_000].into_iter().enumerate() {
+        let ids: Vec<i64> = (start..start + 10_000).collect();
+        let before = ALLOCATIONS.with(Cell::get);
+        index.remove_batch_ids(&ids, &mut buffers).unwrap().unwrap();
         counts[i] = ALLOCATIONS.with(Cell::get) - before;
     }
     (counts[0], counts[1])
@@ -153,4 +165,67 @@ fn a_multi_column_batch_removal_allocates_a_fixed_number_of_times() {
     assert_eq!(index.find(&key).unwrap().len(), 800);
     assert_eq!(index.find(&key[..1]).unwrap().len(), 800);
     assert_eq!(index.find(&key[..2]).unwrap().len(), 800);
+}
+
+#[test]
+fn a_seal_cleanup_that_empties_an_index_allocates_nothing_more() {
+    let btree = BTreeIndex::new(
+        "idx".into(),
+        "t".into(),
+        1,
+        "k".into(),
+        DataType::Integer,
+        false,
+        0,
+    );
+    let hash = HashIndex::new(
+        "idx".into(),
+        "t".into(),
+        vec!["k".into()],
+        vec![1],
+        vec![DataType::Integer],
+        false,
+        0,
+    );
+    let multi = MultiColumnIndex::new(
+        "idx".into(),
+        "t".into(),
+        vec!["a".into(), "b".into(), "c".into()],
+        vec![1, 2, 3],
+        vec![DataType::Integer; 3],
+        false,
+        0,
+    );
+    for (name, index, columns) in [
+        ("btree", &btree as &dyn Index, 1),
+        ("hash", &hash, 1),
+        ("multi-column", &multi, 3),
+    ] {
+        fill(index, &rows(columns));
+        let (first, emptying) = allocations_of_a_seal_cleanup(index, 1);
+        assert_eq!(first, emptying, "{name}: the emptying call allocated more");
+    }
+}
+
+#[test]
+fn a_seal_cleanup_of_a_bitmap_or_pk_index_allocates_nothing() {
+    let bitmap = BitmapIndex::new(
+        "idx".into(),
+        "t".into(),
+        vec!["k".into()],
+        vec![1],
+        vec![DataType::Integer],
+        false,
+        0,
+    );
+    fill(&bitmap, &rows(1));
+    assert_eq!(allocations_of_a_seal_cleanup(&bitmap, 1), (0, 0), "bitmap");
+
+    let pk = PkIndex::new("pk".into(), "t".into(), 0, "id".into());
+    // Past the bitset, in the overflow set
+    let first = 10_000_000;
+    for id in first..first + ROWS {
+        pk.add(&[Value::Integer(id)], id, id).unwrap();
+    }
+    assert_eq!(allocations_of_a_seal_cleanup(&pk, first), (0, 0), "pk");
 }

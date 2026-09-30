@@ -45,7 +45,7 @@ use super::id_list::IdList;
 use crate::common::{CompactArc, I64Map};
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
-use crate::storage::traits::{Index, Released};
+use crate::storage::traits::{Index, RemovalBuffers};
 
 // ============================================================================
 // CompositeKey - Ordered key for BTreeMap
@@ -347,17 +347,17 @@ impl MultiColumnIndex {
     /// Removes `row_ids` from every structure a key at a time. The keys move
     /// out of the row map, are sorted with the ids, and are looked up through
     /// one reused key: nothing is allocated per row.
-    fn remove_ids(&self, row_ids: &[i64], released: Option<&mut Released>) -> Result<()> {
+    fn remove_ids(
+        &self,
+        row_ids: &[i64],
+        mut fresh: Option<&mut I64Map<Vec<CompactArc<Value>>>>,
+    ) -> Result<()> {
         if row_ids.is_empty() {
             return Ok(());
         }
         if self.closed.load(AtomicOrdering::Acquire) {
             return Err(Error::IndexClosed);
         }
-        // A seal's cleanup keeps the row map's capacity; a map it empties is
-        // swapped for a small one made before the locks
-        let mut fresh = released.is_some().then(I64Map::new);
-        let mut emptied = None;
         let num_cols = self.column_ids.len();
         let by_key =
             |a: &RemovedRow, b: &RemovedRow| Self::cmp_arcs(&a.0, &b.0).then(a.1.cmp(&b.1));
@@ -372,6 +372,7 @@ impl MultiColumnIndex {
             let mut value_to_rows = self.value_to_rows.write();
             let mut row_to_key = self.row_to_key.write();
             for &row_id in chunk {
+                // A seal's cleanup keeps the row map's capacity
                 let taken = if fresh.is_some() {
                     row_to_key.remove_keeping_capacity(row_id)
                 } else {
@@ -381,8 +382,8 @@ impl MultiColumnIndex {
                     removed.push((key, row_id));
                 }
             }
-            if let Some(old) = fresh.take_if(|map| row_to_key.swap_if_empty(map)) {
-                emptied = Some(old);
+            if let Some(fresh) = fresh.as_deref_mut() {
+                row_to_key.swap_if_empty(fresh);
             }
             let part = &mut removed[start..];
             part.sort_unstable_by(by_key);
@@ -397,9 +398,6 @@ impl MultiColumnIndex {
                     }
                 }
             }
-        }
-        if let (Some(released), Some(old)) = (released, emptied) {
-            released.push(Box::new(old));
         }
         if removed.is_empty() {
             return Ok(());
@@ -936,8 +934,17 @@ impl Index for MultiColumnIndex {
         self.remove_ids(&row_ids, None)
     }
 
-    fn remove_batch_ids(&self, row_ids: &[i64], released: &mut Released) -> Option<Result<()>> {
-        Some(self.remove_ids(row_ids, Some(released)))
+    fn removal_buffers(&self, _batch_rows: usize) -> Option<RemovalBuffers> {
+        Some(Box::new(I64Map::<Vec<CompactArc<Value>>>::new()))
+    }
+
+    fn remove_batch_ids(
+        &self,
+        row_ids: &[i64],
+        buffers: &mut RemovalBuffers,
+    ) -> Option<Result<()>> {
+        let fresh = buffers.downcast_mut::<I64Map<Vec<CompactArc<Value>>>>()?;
+        Some(self.remove_ids(row_ids, Some(fresh)))
     }
 
     fn column_ids(&self) -> &[i32] {

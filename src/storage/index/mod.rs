@@ -49,7 +49,7 @@ mod seal_removal_tests {
     use super::*;
     use crate::common::i64_map::slot_visits;
     use crate::core::{DataType, Value};
-    use crate::storage::traits::{Index, Released};
+    use crate::storage::traits::Index;
 
     /// Past the PK index's bitset, so its rows sit in the overflow set
     const FIRST: i64 = 10_000_000;
@@ -122,35 +122,30 @@ mod seal_removal_tests {
                 index.add(&key(name, id), id, id).unwrap();
             }
             let ids: Vec<i64> = (FIRST..FIRST + ROWS).collect();
-            let mut released: Released = Vec::new();
+            let mut buffers = index.removal_buffers(2_000).unwrap();
             let before = slot_visits();
             let mut next = 0usize;
             for left in [4_096usize, 1, 0] {
                 let upto = ids.len() - left;
                 for chunk in ids[next..upto].chunks(2_000) {
                     index
-                        .remove_batch_ids(chunk, &mut released)
+                        .remove_batch_ids(chunk, &mut buffers)
                         .unwrap()
                         .unwrap();
                 }
                 next = upto;
-                let expected_released = usize::from(left == 0);
-                assert_eq!(
-                    (slot_visits() - before, released.len()),
-                    (0, expected_released),
-                    "{name}: {left} rows left"
-                );
+                assert_eq!(slot_visits() - before, 0, "{name}: {left} rows left");
             }
-            if let Some(set) = released[0].downcast_ref::<crate::common::I64Set>() {
+            if let Some(set) = buffers.downcast_ref::<crate::common::I64Set>() {
                 assert!(
                     set.capacity() >= ROWS as usize,
-                    "pk: the old set is released"
+                    "pk: the buffers hold the old set"
                 );
             } else {
-                drop(released);
+                drop(buffers);
                 assert!(
                     slot_visits() - before > 0,
-                    "{name}: the old map is walked when dropped"
+                    "{name}: the buffers hold the old map, walked when dropped"
                 );
             }
             let id = FIRST + ROWS;
