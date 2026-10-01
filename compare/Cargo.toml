@@ -1,0 +1,56 @@
+[package]
+name = "stoolap-compare"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+description = "Comparison benchmarks and the differential oracle against SQLite and DuckDB"
+publish = false
+
+[features]
+default = ["sqlite"]
+# The criterion benches measure Stoolap alone without it
+sqlite = ["dep:rusqlite"]
+duckdb = ["dep:duckdb"]
+
+[dependencies]
+stoolap = { path = ".." }
+rusqlite = { version = "0.40", features = ["bundled"], optional = true }
+duckdb = { version = "1.10501", features = ["bundled"], optional = true }
+rand = "0.9"
+tempfile = "3.9"
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[[bin]]
+name = "benchmark_sqlite"
+required-features = ["sqlite"]
+
+[[bin]]
+name = "benchmark_duckdb"
+required-features = ["duckdb"]
+
+[[bench]]
+name = "select_by_id"
+harness = false
+
+[[bench]]
+name = "update_by_id"
+harness = false
+
+[[bench]]
+name = "delete_by_id"
+harness = false
+
+[[bench]]
+name = "select_complex"
+harness = false
+
+[[bench]]
+name = "update_complex"
+harness = false
+
+[[bench]]
+name = "delete_complex"
+harness = false

@@ -14,8 +14,8 @@
 
 //! Fair benchmark comparison: Stoolap vs SQLite for complex DELETE queries
 //!
-//! Run with: cargo bench --bench delete_complex
-//! Run with SQLite comparison: cargo bench --bench delete_complex --features sqlite
+//! Run with SQLite comparison: cargo bench -p stoolap-compare --bench delete_complex
+//! Run without: cargo bench -p stoolap-compare --no-default-features --bench delete_complex
 //!
 //! This benchmark compares complex DELETE patterns:
 //! - DELETE with WHERE + multiple conditions (range + boolean)

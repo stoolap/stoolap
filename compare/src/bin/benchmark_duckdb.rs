@@ -14,7 +14,7 @@
 
 //! DuckDB benchmark matching the Stoolap benchmark format
 //!
-//! Run with: cargo run --release --example benchmark_duckdb
+//! Run with: cargo run --release -p stoolap-compare --features duckdb --bin benchmark_duckdb
 
 use duckdb::{params, Connection};
 use rand::Rng;

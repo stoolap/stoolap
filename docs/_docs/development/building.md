@@ -56,12 +56,12 @@ Stoolap uses Cargo features to enable optional functionality. The default featur
 
 | Feature | Description |
 |---------|-------------|
-| `sqlite` | Enable SQLite comparison (differential oracle tests and benchmarks) |
-| `duckdb` | Enable DuckDB comparison benchmarks |
 | `stress-tests` | Enable stress tests: crash soak, metamorphic, concurrency |
 | `test-failpoints` | Enable I/O fault injection testing |
 | `dhat-heap` | Enable heap allocation profiling via dhat |
 | `ann-benchmark` | Enable ANN (vector search) benchmarks with dataset downloading |
+
+The SQLite and DuckDB comparisons (benchmarks and the differential oracle) are a separate, unpublished crate, `stoolap-compare` in `compare/`, so `--all-features` on the library never builds either database. See `BENCHMARKS.md` for its commands.
 
 ### Advanced Features
 
@@ -83,9 +83,6 @@ cargo build --release --features mimalloc
 
 # With jemalloc and heap profiles (PRAGMA heap_profile, Linux)
 cargo build --release --features jemalloc-prof
-
-# With SQLite comparison support
-cargo build --release --features sqlite
 
 # C FFI shared library (libstoolap.so / .dylib / .dll)
 cargo build --release --features ffi

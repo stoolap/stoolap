@@ -54,8 +54,8 @@ cargo nextest run --features stress-tests --test crash_soak_test
 cargo nextest run --features stress-tests --test metamorphic_test
 cargo nextest run --features stress-tests --test concurrency_history_test
 
-# Differential oracle (compares against SQLite)
-cargo nextest run --features sqlite --test differential_oracle_test
+# Differential oracle (compares against SQLite, in the stoolap-compare crate)
+cargo nextest run -p stoolap-compare --test differential_oracle_test
 
 # I/O fault injection (must run single-threaded)
 cargo nextest run --features test-failpoints --test failpoint_io_test -- --test-threads=1
@@ -67,14 +67,14 @@ cargo nextest run --features ffi --test ffi_test
 ### Benchmarks
 
 ```bash
-# Run all benchmarks
+# Run the Stoolap-only benchmarks
 cargo bench
 
-# Run a specific benchmark
-cargo bench --bench select_by_id
+# Run a comparison benchmark against SQLite (stoolap-compare crate)
+cargo bench -p stoolap-compare --bench select_by_id
 ```
 
-Available benchmarks: `select_by_id`, `select_complex`, `update_by_id`, `update_complex`, `delete_by_id`, `delete_complex`.
+Comparison benchmarks in `compare/`: `select_by_id`, `select_complex`, `update_by_id`, `update_complex`, `delete_by_id`, `delete_complex`. Add `--no-default-features` to measure Stoolap alone.
 
 A C FFI benchmark is also available for comparing overhead:
 
@@ -187,7 +187,7 @@ SQLLogicTest files provide a database-agnostic specification format, making it p
 |-----|-------------|
 | **Lint** | `cargo fmt --check` + `cargo clippy -D warnings` |
 | **Test** | Full test suite on Linux, macOS, Windows |
-| **Feature-Gated** | Differential oracle (SQLite), failpoint I/O tests |
+| **Feature-Gated** | Heap profile (jemalloc-prof), failpoint I/O tests |
 | **Coverage** | `cargo llvm-cov` uploaded to Codecov |
 | **License** | Verifies Apache 2.0 headers in all `.rs` files |
 | **Build** | Cross-platform binaries (Linux x86/ARM64, macOS x86/ARM64, Windows) |
@@ -214,7 +214,7 @@ Stoolap uses [proptest](https://github.com/proptest-rs/proptest) for metamorphic
 
 ## Differential Oracle Testing
 
-**`differential_oracle_test.rs`** runs queries against both Stoolap and SQLite, comparing results to detect behavioral divergences. Requires the `sqlite` feature flag.
+**`differential_oracle_test.rs`** runs queries against both Stoolap and SQLite, comparing results to detect behavioral divergences. It lives in the `stoolap-compare` crate (`compare/`), which CI does not build; run it locally.
 
 ## Writing New Tests
 

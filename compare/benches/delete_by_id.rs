@@ -14,8 +14,8 @@
 
 //! Fair benchmark comparison: Stoolap vs SQLite for DELETE by ID
 //!
-//! Run with: cargo bench --bench delete_by_id
-//! Run with SQLite comparison: cargo bench --bench delete_by_id --features sqlite
+//! Run with SQLite comparison: cargo bench -p stoolap-compare --bench delete_by_id
+//! Run without: cargo bench -p stoolap-compare --no-default-features --bench delete_by_id
 //!
 //! This benchmark ensures fair comparison by:
 //! 1. Using prepared statements for both databases

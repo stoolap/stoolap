@@ -253,16 +253,17 @@ DuckDB Strengths:
 cargo build --release --example benchmark
 ./target/release/examples/benchmark
 
-# SQLite benchmark (requires sqlite feature)
-cargo build --release --example benchmark_sqlite --features sqlite
-./target/release/examples/benchmark_sqlite
+# SQLite benchmark (the stoolap-compare crate in compare/)
+cargo build --release -p stoolap-compare --bin benchmark_sqlite
+./target/release/benchmark_sqlite
 
-# DuckDB benchmark (requires duckdb feature)
-cargo build --release --example benchmark_duckdb --features duckdb
-./target/release/examples/benchmark_duckdb
+# DuckDB benchmark (the same crate, with its duckdb feature)
+cargo build --release -p stoolap-compare --features duckdb --bin benchmark_duckdb
+./target/release/benchmark_duckdb
 
 # Build all benchmarks at once
-cargo build --release --example benchmark --example benchmark_sqlite --example benchmark_duckdb --features "sqlite duckdb"
+cargo build --release --example benchmark
+cargo build --release -p stoolap-compare --features duckdb
 ```
 
 ---

@@ -14,8 +14,8 @@
 
 //! Fair benchmark comparison: Stoolap vs SQLite for complex UPDATE queries
 //!
-//! Run with: cargo bench --bench update_complex
-//! Run with SQLite comparison: cargo bench --bench update_complex --features sqlite
+//! Run with SQLite comparison: cargo bench -p stoolap-compare --bench update_complex
+//! Run without: cargo bench -p stoolap-compare --no-default-features --bench update_complex
 //!
 //! This benchmark compares complex UPDATE patterns:
 //! - UPDATE with WHERE + multiple conditions (range + boolean)
