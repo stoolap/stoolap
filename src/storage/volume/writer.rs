@@ -4234,19 +4234,26 @@ mod tests {
     fn a_volume_counts_the_capacity_of_its_unique_indexes() {
         let schema = SchemaBuilder::new("t")
             .column("id", DataType::Integer, false, true)
-            .column("code", DataType::Integer, false, false)
+            .column("code", DataType::Integer, true, false)
             .build();
         let mut builder = VolumeBuilder::new(&schema);
         for i in 0..10_000i64 {
-            builder.add_row(
-                i,
-                &Row::from_values(vec![Value::Integer(i), Value::Integer(i * 7)]),
-            );
+            let code = if i % 4 == 0 {
+                Value::Null(DataType::Integer)
+            } else {
+                Value::Integer(i * 7)
+            };
+            builder.add_row(i, &Row::from_values(vec![Value::Integer(i), code]));
         }
         let volume = builder.finish().unwrap();
         let before = volume.memory_size();
         volume.prebuild_unique_index(&[1]).unwrap();
-        let capacity = volume.unique_indices.read()[&vec![1]].capacity();
+        let (len, capacity) = {
+            let indices = volume.unique_indices.read();
+            (indices[&vec![1]].len(), indices[&vec![1]].capacity())
+        };
+        assert_eq!(len, 7_500, "null codes are left out of the index");
+        assert!(capacity > len, "capacity {capacity} above length {len}");
         assert_eq!(
             volume.memory_size() - before,
             capacity * std::mem::size_of::<(u64, u32)>(),
