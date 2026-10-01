@@ -3643,9 +3643,16 @@ impl FrozenVolume {
     }
 
     /// Estimate the in-memory size of this volume in bytes.
-    /// Counts metadata + compressed store + loaded (decompressed) columns.
+    /// Counts metadata + compressed store + loaded (decompressed) columns
+    /// + the reserved capacity of the built unique indexes.
     pub fn memory_size(&self) -> usize {
-        self.meta.memory_size() + self.columns.memory_size()
+        let unique: usize = self
+            .unique_indices
+            .read()
+            .values()
+            .map(|entries| entries.capacity() * std::mem::size_of::<(u64, u32)>())
+            .sum();
+        self.meta.memory_size() + self.columns.memory_size() + unique
     }
 
     /// Mark this volume as recently accessed. Stores u64::MAX as a sentinel
@@ -4221,5 +4228,29 @@ mod tests {
         assert_eq!(row.len(), 2);
         assert_eq!(row.get(0), Some(&Value::Integer(1)));
         assert_eq!(row.get(1), Some(&Value::Float(100.0)));
+    }
+
+    #[test]
+    fn a_volume_counts_the_capacity_of_its_unique_indexes() {
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("code", DataType::Integer, false, false)
+            .build();
+        let mut builder = VolumeBuilder::new(&schema);
+        for i in 0..10_000i64 {
+            builder.add_row(
+                i,
+                &Row::from_values(vec![Value::Integer(i), Value::Integer(i * 7)]),
+            );
+        }
+        let volume = builder.finish().unwrap();
+        let before = volume.memory_size();
+        volume.prebuild_unique_index(&[1]).unwrap();
+        let capacity = volume.unique_indices.read()[&vec![1]].capacity();
+        assert_eq!(
+            volume.memory_size() - before,
+            capacity * std::mem::size_of::<(u64, u32)>(),
+            "the built index is counted by its capacity"
+        );
     }
 }
