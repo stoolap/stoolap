@@ -66,6 +66,8 @@ pub struct VolumeFileWriter {
     index: Vec<Vec<(u64, usize, usize)>>,
     packed: Vec<u8>,
     finished: bool,
+    /// Rows the writer was sized for; caps a unique set's capacity
+    expected_rows: usize,
     /// The unique column sets indexed as the rows pass
     unique: Vec<UniqueIndexing>,
 }
@@ -123,6 +125,7 @@ impl VolumeFileWriter {
             block_pos: 0,
             packed: Vec::new(),
             finished: false,
+            expected_rows,
             unique: Vec::new(),
         })
     }
@@ -209,6 +212,50 @@ impl VolumeFileWriter {
             entries,
         } in &mut self.unique
         {
+            if entries.capacity() - entries.len() < rows {
+                let nulls_of = |col: usize| {
+                    columns
+                        .get(col)
+                        .map(TypedCells::nulls)
+                        .ok_or_else(|| Error::internal("unique column beyond the batch"))
+                };
+                let indexed = match set.as_slice() {
+                    &[one] => nulls_of(one)?.iter().filter(|&&null| !null).count(),
+                    &[a, b] => {
+                        let (a, b) = (nulls_of(a)?, nulls_of(b)?);
+                        a.iter().zip(b).filter(|&(&a, &b)| !(a | b)).count()
+                    }
+                    wide => {
+                        // Nulls merged a stack chunk at a time, column by column
+                        let mut any = [false; 256];
+                        let mut indexed = 0;
+                        for start in (0..rows).step_by(any.len()) {
+                            let end = (start + any.len()).min(rows);
+                            let any = &mut any[..end - start];
+                            any.fill(false);
+                            for &col in wide {
+                                for (any, &null) in any.iter_mut().zip(&nulls_of(col)?[start..end])
+                                {
+                                    *any |= null;
+                                }
+                            }
+                            indexed += any.iter().filter(|&&any| !any).count();
+                        }
+                        indexed
+                    }
+                };
+                let needed = entries.len() + indexed;
+                if needed > entries.capacity() {
+                    // Doubling from 4 as push would, never past the rows expected
+                    let target = needed.next_power_of_two().max(4);
+                    let target = if needed <= self.expected_rows {
+                        target.min(self.expected_rows)
+                    } else {
+                        target
+                    };
+                    entries.reserve_exact(target - entries.len());
+                }
+            }
             'rows: for row in 0..rows {
                 let mut hasher = ahash::AHasher::default();
                 for &col in set.iter() {
@@ -986,5 +1033,95 @@ mod tests {
         assert!(!blocks.exists());
         assert!(!final_path.exists());
         assert!(!final_path.with_extension("vol.tmp").exists());
+    }
+
+    const UNIQUE_ROWS: usize = 100_000;
+
+    /// The published (len, capacity) of the unique set `set` over columns
+    /// `a` and `b`, each null where its rule says, and every capacity the
+    /// entries grew to, batch by batch
+    fn unique_entries(
+        a_null: fn(usize) -> bool,
+        b_null: fn(usize) -> bool,
+        set: Vec<usize>,
+    ) -> (usize, usize, Vec<usize>) {
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("a", DataType::Integer, true, false)
+            .column("b", DataType::Integer, true, false)
+            .build();
+        let ids: Vec<i64> = (0..UNIQUE_ROWS as i64).collect();
+        let values: Vec<i64> = ids.iter().map(|i| i * 3).collect();
+        let no_nulls = vec![false; UNIQUE_ROWS];
+        let a_nulls: Vec<bool> = (0..UNIQUE_ROWS).map(a_null).collect();
+        let b_nulls: Vec<bool> = (0..UNIQUE_ROWS).map(b_null).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer =
+            VolumeFileWriter::new(dir.path(), "t", 15, &schema, UNIQUE_ROWS, true).unwrap();
+        writer.index_unique_sets(vec![set.clone()]);
+        let mut grown = Vec::new();
+        for start in (0..UNIQUE_ROWS).step_by(4_096) {
+            let end = (start + 4_096).min(UNIQUE_ROWS);
+            let columns = [
+                TypedCells::Int64 {
+                    values: &ids[start..end],
+                    nulls: &no_nulls[start..end],
+                },
+                TypedCells::Int64 {
+                    values: &values[start..end],
+                    nulls: &a_nulls[start..end],
+                },
+                TypedCells::Int64 {
+                    values: &values[start..end],
+                    nulls: &b_nulls[start..end],
+                },
+            ];
+            writer.append_typed(&ids[start..end], &columns).unwrap();
+            let capacity = writer.unique[0].entries.capacity();
+            if grown.last().copied().unwrap_or(0) != capacity {
+                grown.push(capacity);
+            }
+        }
+        let (volume, _) = writer.finish().unwrap();
+        let indices = volume.unique_indices.read();
+        let entries = indices.get(&set).unwrap();
+        (entries.len(), entries.capacity(), grown)
+    }
+
+    #[test]
+    fn a_full_unique_index_is_published_without_growth_slack() {
+        let (len, capacity, grown) = unique_entries(|_| false, |_| false, vec![1]);
+        assert_eq!(len, UNIQUE_ROWS);
+        assert_eq!(capacity, UNIQUE_ROWS, "entries hold no growth slack");
+        assert_eq!(grown, [4_096, 8_192, 16_384, 32_768, 65_536, UNIQUE_ROWS]);
+    }
+
+    #[test]
+    fn an_all_null_unique_index_reserves_nothing() {
+        let (len, capacity, grown) = unique_entries(|_| true, |_| false, vec![1]);
+        assert_eq!((len, capacity), (0, 0));
+        assert!(grown.is_empty());
+    }
+
+    #[test]
+    fn a_mostly_null_unique_index_grows_as_push_would() {
+        let (len, capacity, grown) = unique_entries(|row| row % 10_000 != 0, |_| false, vec![1]);
+        assert_eq!((len, capacity), (10, 16));
+        assert_eq!(grown, [4, 8, 16], "the first growth takes 4 entries");
+    }
+
+    #[test]
+    fn a_composite_set_with_a_null_column_reserves_nothing() {
+        let (len, capacity, grown) = unique_entries(|_| false, |_| true, vec![1, 2]);
+        assert_eq!((len, capacity), (0, 0));
+        assert!(grown.is_empty());
+    }
+
+    #[test]
+    fn a_three_column_set_counts_only_rows_without_nulls() {
+        let (len, capacity, grown) =
+            unique_entries(|_| false, |row| row % 10_000 != 0, vec![0, 1, 2]);
+        assert_eq!((len, capacity), (10, 16));
+        assert_eq!(grown, [4, 8, 16]);
     }
 }

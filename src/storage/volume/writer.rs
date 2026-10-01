@@ -1786,6 +1786,17 @@ impl<'a> TypedCells<'a> {
         self.len() == 0
     }
 
+    pub fn nulls(&self) -> &'a [bool] {
+        match self {
+            TypedCells::Int64 { nulls, .. }
+            | TypedCells::Float64 { nulls, .. }
+            | TypedCells::TimestampNanos { nulls, .. }
+            | TypedCells::Boolean { nulls, .. }
+            | TypedCells::Dictionary { nulls, .. }
+            | TypedCells::Bytes { nulls, .. } => nulls,
+        }
+    }
+
     /// The cells at `range`; a bytes column keeps its whole payload with
     /// the offsets of the range, which every consumer reads by offset
     pub fn slice(&self, range: std::ops::Range<usize>) -> TypedCells<'a> {
