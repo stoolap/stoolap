@@ -13,6 +13,12 @@ readme = "README.md"
 keywords = ["database", "sql", "embedded", "mvcc", "acid"]
 categories = ["database", "database-implementations"]
 
+# The SQLite and DuckDB comparisons are their own crate, built only on
+# request, so `--all-features` here never compiles either database
+[workspace]
+members = [".", "compare"]
+default-members = ["."]
+
 [lib]
 name = "stoolap"
 path = "src/lib.rs"
@@ -85,10 +91,6 @@ hashbrown = "0.16"  # HashMap with raw_entry API for efficient group-by
 roaring = "0.11"  # Compressed bitmap indexes (used by Lucene, Druid, Spark)
 lru = "0.18"  # O(1) LRU cache for compiled expression programs
 
-# Optional benchmark dependencies (for comparison benchmarks)
-rusqlite = { version = "0.40", features = ["bundled"], optional = true }
-duckdb = { version = "1.10501", features = ["bundled"], optional = true }
-
 # Optional ANN benchmark dependencies (download + decompress datasets)
 ureq = { version = "2", optional = true }
 flate2 = { version = "1", optional = true }
@@ -138,8 +140,6 @@ wasm = []  # Excludes parallel + persistence; for wasm32 builds
 ffi = []   # C FFI layer - enables extern "C" functions for language bindings
 cli = ["clap", "rustyline", "comfy-table", "dirs"]
 dhat-heap = []
-sqlite = ["dep:rusqlite"]
-duckdb = ["dep:duckdb"]
 mimalloc = ["dep:mimalloc"]
 jemalloc-prof = ["dep:tikv-jemallocator", "dep:jemalloc_pprof"]
 semantic = ["candle-core", "candle-nn", "candle-transformers", "tokenizers", "hf-hub"]
@@ -147,14 +147,6 @@ ann-benchmark = ["dep:ureq", "dep:flate2"]
 test-failpoints = []
 stress-tests = []
 test-filedb = ["dep:tempfile"]  # Routes memory:// databases to temp file-backed databases for testing volume storage
-
-[[example]]
-name = "benchmark_sqlite"
-required-features = ["sqlite"]
-
-[[example]]
-name = "benchmark_duckdb"
-required-features = ["duckdb"]
 
 [[example]]
 name = "semantic_search"
@@ -180,30 +172,6 @@ debug = "line-tables-only"  # Backtraces with file:line, skip variable info
 inherits = "release"
 lto = true            # Fat LTO for maximum runtime performance
 debug = false
-
-[[bench]]
-name = "select_by_id"
-harness = false
-
-[[bench]]
-name = "update_by_id"
-harness = false
-
-[[bench]]
-name = "delete_by_id"
-harness = false
-
-[[bench]]
-name = "select_complex"
-harness = false
-
-[[bench]]
-name = "update_complex"
-harness = false
-
-[[bench]]
-name = "delete_complex"
-harness = false
 
 [[bench]]
 name = "group_by_keys"

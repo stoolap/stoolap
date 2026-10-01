@@ -4,9 +4,9 @@
 
 [advisories]
 ignore = [
-    # rkyv 0.7 is pulled in only by the optional `duckdb` feature (rust_decimal
-    # -> rkyv), used for the comparison benchmarks. It is not part of the
-    # library or CLI build. The fix is rkyv 0.8, which rust_decimal has not
+    # rkyv 0.7 is pulled in only by duckdb (rust_decimal -> rkyv), which the
+    # unpublished stoolap-compare crate uses for its comparison benchmark. It
+    # is not part of the library or CLI build. The fix is rkyv 0.8, which rust_decimal has not
     # moved to yet. Reviewed 2026-09-11.
     "RUSTSEC-2026-0235",
 ]

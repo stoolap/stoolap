@@ -14,8 +14,8 @@
 
 //! Fair benchmark comparison: Stoolap vs SQLite for complex SELECT queries
 //!
-//! Run with: cargo bench --bench select_complex
-//! Run with SQLite comparison: cargo bench --bench select_complex --features sqlite
+//! Run with SQLite comparison: cargo bench -p stoolap-compare --bench select_complex
+//! Run without: cargo bench -p stoolap-compare --no-default-features --bench select_complex
 //!
 //! This benchmark compares complex query patterns:
 //! - SELECT with WHERE + ORDER BY + LIMIT

@@ -14,7 +14,7 @@
 
 //! SQLite benchmark matching the Stoolap benchmark format
 //!
-//! Run with: cargo run --release --example benchmark_sqlite
+//! Run with: cargo run --release -p stoolap-compare --bin benchmark_sqlite
 
 use rand::Rng;
 use rusqlite::{params, Connection};
