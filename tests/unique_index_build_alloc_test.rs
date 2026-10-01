@@ -15,8 +15,8 @@
 //! A volume writer's unique set that indexes no row allocates nothing per
 //! batch, however many columns it spans
 
-// The mimalloc feature sets the library's own global allocator
-#![cfg(not(feature = "mimalloc"))]
+// The mimalloc and jemalloc-prof features set the library's own global allocator
+#![cfg(not(any(feature = "mimalloc", feature = "jemalloc-prof")))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;

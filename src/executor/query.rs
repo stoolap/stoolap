@@ -9981,6 +9981,21 @@ impl Executor {
                     Ok(Box::new(ExecutorResult::new(columns, rows)))
                 }
             }
+            "HEAP_PROFILE" => {
+                // Writes jemalloc's heap profile, in pprof format, to the file
+                // named; a Linux build with the jemalloc-prof feature only
+                let Some(ref value) = stmt.value else {
+                    return Err(Error::internal("PRAGMA HEAP_PROFILE needs a file path"));
+                };
+                let path = self.extract_pragma_string_value(value)?;
+                let bytes = crate::heap_profile::write_heap_profile(&path)?;
+                let mut rows = RowVec::with_capacity(1);
+                rows.push((0, Row::from_values(vec![Value::Integer(bytes as i64)])));
+                Ok(Box::new(ExecutorResult::new(
+                    vec!["heap_profile_bytes".to_string()],
+                    rows,
+                )))
+            }
             "GROUP_CACHE_MB" => {
                 // Budget of the decoded row-group column cache, in megabytes;
                 // zero disables it

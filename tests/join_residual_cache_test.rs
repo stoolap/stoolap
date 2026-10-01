@@ -17,7 +17,12 @@
 //!
 //! Under `test-filedb` a memory DSN opens a file database, whose join
 //! reads through the volume path and allocates differently.
-#![cfg(not(feature = "test-filedb"))]
+
+// The mimalloc and jemalloc-prof features set the library's own global allocator
+#![cfg(all(
+    not(any(feature = "mimalloc", feature = "jemalloc-prof")),
+    not(feature = "test-filedb")
+))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};

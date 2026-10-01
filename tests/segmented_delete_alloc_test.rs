@@ -16,8 +16,8 @@
 //! row ids to skip in volumes it will not read, counted in the bytes the
 //! statement allocates on its thread
 
-// The mimalloc feature sets the library's own global allocator
-#![cfg(not(feature = "mimalloc"))]
+// The mimalloc and jemalloc-prof features set the library's own global allocator
+#![cfg(not(any(feature = "mimalloc", feature = "jemalloc-prof")))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;

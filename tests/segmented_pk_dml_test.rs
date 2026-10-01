@@ -15,6 +15,9 @@
 //! UPDATE and DELETE by primary key on a table whose rows are sealed into
 //! volumes must resolve the one row by id, not walk the volume.
 
+// The mimalloc and jemalloc-prof features set the library's own global allocator
+#![cfg(not(any(feature = "mimalloc", feature = "jemalloc-prof")))]
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};

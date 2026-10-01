@@ -15,10 +15,13 @@
 //! The index walk aggregates a group a page of row ids at a time; the
 //! allocations of the query do not grow with the pages of its groups
 
-// The mimalloc feature sets the library's own global allocator. The file
-// engine walks captured groups and leaves the walk past its capture bound,
-// so the fixed count holds for the memory engine only
-#![cfg(all(not(feature = "mimalloc"), not(feature = "test-filedb")))]
+// The mimalloc and jemalloc-prof features set the library's own global
+// allocator. The file engine walks captured groups and leaves the walk past
+// its capture bound, so the fixed count holds for the memory engine only
+#![cfg(all(
+    not(any(feature = "mimalloc", feature = "jemalloc-prof")),
+    not(feature = "test-filedb")
+))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
