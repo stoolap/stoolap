@@ -15,8 +15,8 @@
 //! A seal's preparation against a small older volume walks the older side,
 //! counted in the bytes it allocates on its thread
 
-// The mimalloc feature sets the library's own global allocator
-#![cfg(not(feature = "mimalloc"))]
+// The mimalloc and jemalloc-prof features set the library's own global allocator
+#![cfg(not(any(feature = "mimalloc", feature = "jemalloc-prof")))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;

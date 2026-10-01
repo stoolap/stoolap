@@ -15,8 +15,8 @@
 //! A seal over a large sealed table keeps no memory sized to the rows
 //! already sealed, counted in the live bytes of the whole process
 
-// The mimalloc feature sets the library's own global allocator
-#![cfg(not(feature = "mimalloc"))]
+// The mimalloc and jemalloc-prof features set the library's own global allocator
+#![cfg(not(any(feature = "mimalloc", feature = "jemalloc-prof")))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicI64, Ordering};

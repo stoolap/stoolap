@@ -63,8 +63,9 @@
 //! - [`optimizer`] - Cost-based query optimizer with cardinality feedback
 //! - [`common`] - Utilities (BufferPool, I64Map, version)
 
-// Use mimalloc as global allocator when feature is enabled
-// (but not when dhat-heap is enabled, as it needs its own allocator)
+// Use mimalloc as global allocator when feature is enabled (but not with
+// jemalloc-prof, which takes precedence, nor with dhat-heap, which needs
+// its own allocator)
 #[cfg(all(
     feature = "mimalloc",
     not(feature = "jemalloc-prof"),

@@ -50,6 +50,7 @@ Stoolap uses Cargo features to enable optional functionality. The default featur
 | `wasm` | No | WebAssembly build mode. Excludes parallel execution and file persistence |
 | `ffi` | No | C FFI layer for language bindings. Produces `libstoolap.{so,dylib,dll}` with `include/stoolap.h` |
 | `mimalloc` | No | Use Microsoft's mimalloc allocator instead of the system allocator |
+| `jemalloc-prof` | No | Use jemalloc with its sampling heap profiler as the allocator, for `PRAGMA heap_profile`. Profiles are written on Linux only. Takes precedence over `mimalloc` |
 
 ### Testing and Benchmarking Features
 
@@ -79,6 +80,9 @@ cargo build --release --no-default-features --features parallel
 
 # With mimalloc allocator
 cargo build --release --features mimalloc
+
+# With jemalloc and heap profiles (PRAGMA heap_profile, Linux)
+cargo build --release --features jemalloc-prof
 
 # With SQLite comparison support
 cargo build --release --features sqlite
