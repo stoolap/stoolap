@@ -6007,7 +6007,7 @@ impl MVCCEngine {
         // A tier falls per call, and a volume has to be idle for three local
         // cycles before it moves, so the epochs step by that much
         for epoch in [0_u64, 3, 6, 9, 12] {
-            mgr.evict_idle_volumes(epoch);
+            mgr.evict_idle_volumes(epoch, true);
         }
         let segs = mgr.segments_raw();
         (
@@ -6026,7 +6026,7 @@ impl MVCCEngine {
         crate::storage::volume::writer::GLOBAL_EVICTION_EPOCH.fetch_max(epoch, Ordering::Relaxed);
         let mgrs = self.segment_managers.read().unwrap();
         for mgr in mgrs.values() {
-            mgr.evict_idle_volumes(epoch);
+            mgr.evict_idle_volumes(epoch, false);
         }
     }
 

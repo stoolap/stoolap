@@ -321,12 +321,12 @@ fn a_cold_reload_can_reuse_a_readers_unique_index() {
             },
             Some(&schema),
         );
-        mgr.evict_idle_volumes(0);
-        mgr.evict_idle_volumes(3);
+        mgr.evict_idle_volumes(0, false);
+        mgr.evict_idle_volumes(3, false);
         let held = Arc::clone(&mgr.segments_raw()[&id].volume);
         assert!(held.is_warm());
-        mgr.evict_idle_volumes(6);
-        mgr.evict_idle_volumes(9);
+        mgr.evict_idle_volumes(6, false);
+        mgr.evict_idle_volumes(9, false);
         assert!(mgr.segments_raw()[&id].volume.is_cold());
         let (done, done_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {

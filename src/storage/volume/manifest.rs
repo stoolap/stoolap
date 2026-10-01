@@ -1968,7 +1968,9 @@ impl SegmentManager {
     ///
     /// Volumes must be idle for MIN_IDLE_CYCLES before each transition.
     /// Metadata is shared via Arc, zero allocation for hot→warm and warm→cold.
-    pub fn evict_idle_volumes(&self, current_epoch: u64) {
+    /// A file-backed volume stops at warm unless `file_backed_to_cold`, which
+    /// only tests set to reach the reload path.
+    pub fn evict_idle_volumes(&self, current_epoch: u64, file_backed_to_cold: bool) {
         const MIN_IDLE_CYCLES: u64 = 3;
 
         // Publish current epoch so scanners can stamp volumes correctly.
@@ -1997,7 +1999,14 @@ impl SegmentManager {
                         return None;
                     }
                     let is_hot = cs.volume.columns.is_eager();
-                    let is_warm = cs.volume.is_warm();
+                    // A file-backed store holds no blocks; cold would only force a reload
+                    let is_warm = cs.volume.is_warm()
+                        && (file_backed_to_cold
+                            || !cs
+                                .volume
+                                .columns
+                                .compressed_store()
+                                .is_some_and(|store| store.is_file_backed()));
                     if is_hot || is_warm {
                         has_targets = true;
                         Some((seg_id, is_hot, is_warm))
@@ -5137,7 +5146,7 @@ mod tests {
         let run_eviction = |mgr: &SegmentManager, epoch: u64| {
             super::super::writer::GLOBAL_EVICTION_EPOCH
                 .fetch_max(base + epoch, std::sync::atomic::Ordering::Relaxed);
-            mgr.evict_idle_volumes(base + epoch);
+            mgr.evict_idle_volumes(base + epoch, false);
         };
 
         // ── Eviction cycle 0..2: not enough idle cycles, no eviction ──
@@ -5391,7 +5400,7 @@ mod tests {
         let run_eviction = |mgr: &SegmentManager, epoch: u64| {
             super::super::writer::GLOBAL_EVICTION_EPOCH
                 .fetch_max(base + epoch, std::sync::atomic::Ordering::Relaxed);
-            mgr.evict_idle_volumes(base + epoch);
+            mgr.evict_idle_volumes(base + epoch, false);
         };
         for epoch in 0..=10u64 {
             run_eviction(&mgr, epoch);
@@ -5523,7 +5532,7 @@ mod tests {
         for e in 0..=10u64 {
             super::super::writer::GLOBAL_EVICTION_EPOCH
                 .fetch_max(base + e, std::sync::atomic::Ordering::Relaxed);
-            mgr.evict_idle_volumes(base + e);
+            mgr.evict_idle_volumes(base + e, false);
         }
         assert!(
             mgr.segments_raw().get(&1).unwrap().volume.is_cold(),
