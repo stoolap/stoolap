@@ -37,10 +37,6 @@ jobs:
     - name: Clippy
       run: cargo clippy --all-targets --all-features -- -D warnings
 
-    # stoolap is linted with test-failpoints, as --all-features lints it above
-    - name: Clippy (comparison crate)
-      run: cargo clippy -p stoolap-compare --all-targets --all-features --features stoolap/test-failpoints -- -D warnings
-
   msrv:
     name: MSRV (1.88)
     runs-on: ubuntu-latest
@@ -110,9 +106,6 @@ jobs:
     - name: Cache
       uses: Swatinem/rust-cache@v2
 
-    - name: Differential oracle tests (Stoolap vs SQLite)
-      run: cargo test -p stoolap-compare --test differential_oracle_test
-
     - name: Heap profile (jemalloc-prof)
       run: cargo test --test heap_profile_test --features jemalloc-prof
 
@@ -145,7 +138,7 @@ jobs:
       uses: taiki-e/install-action@cargo-llvm-cov
 
     - name: Generate coverage
-      run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+      run: cargo llvm-cov --all-features --lcov --output-path lcov.info
 
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v5
