@@ -213,20 +213,36 @@ impl VolumeFileWriter {
         } in &mut self.unique
         {
             if entries.capacity() - entries.len() < rows {
-                let nulls = set
-                    .iter()
-                    .map(|&col| columns.get(col).map(TypedCells::nulls))
-                    .collect::<Option<smallvec::SmallVec<[&[bool]; 4]>>>()
-                    .ok_or_else(|| Error::internal("unique column beyond the batch"))?;
-                let indexed = match nulls.as_slice() {
-                    [one] => one.iter().filter(|&&null| !null).count(),
-                    [a, b] => a.iter().zip(*b).filter(|&(&a, &b)| !(a | b)).count(),
-                    [first, rest @ ..] => first
-                        .iter()
-                        .enumerate()
-                        .filter(|&(row, &null)| !null && rest.iter().all(|other| !other[row]))
-                        .count(),
-                    [] => rows,
+                let nulls_of = |col: usize| {
+                    columns
+                        .get(col)
+                        .map(TypedCells::nulls)
+                        .ok_or_else(|| Error::internal("unique column beyond the batch"))
+                };
+                let indexed = match set.as_slice() {
+                    &[one] => nulls_of(one)?.iter().filter(|&&null| !null).count(),
+                    &[a, b] => {
+                        let (a, b) = (nulls_of(a)?, nulls_of(b)?);
+                        a.iter().zip(b).filter(|&(&a, &b)| !(a | b)).count()
+                    }
+                    wide => {
+                        // Nulls merged a stack chunk at a time, column by column
+                        let mut any = [false; 256];
+                        let mut indexed = 0;
+                        for start in (0..rows).step_by(any.len()) {
+                            let end = (start + any.len()).min(rows);
+                            let any = &mut any[..end - start];
+                            any.fill(false);
+                            for &col in wide {
+                                for (any, &null) in any.iter_mut().zip(&nulls_of(col)?[start..end])
+                                {
+                                    *any |= null;
+                                }
+                            }
+                            indexed += any.iter().filter(|&&any| !any).count();
+                        }
+                        indexed
+                    }
                 };
                 let needed = entries.len() + indexed;
                 if needed > entries.capacity() {
