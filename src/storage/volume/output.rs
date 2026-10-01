@@ -213,12 +213,21 @@ impl VolumeFileWriter {
         } in &mut self.unique
         {
             if entries.capacity() - entries.len() < rows {
-                let indexed = (0..rows)
-                    .filter(|&row| {
-                        set.iter()
-                            .all(|&col| columns.get(col).is_some_and(|cells| !cells.nulls()[row]))
-                    })
-                    .count();
+                let nulls = set
+                    .iter()
+                    .map(|&col| columns.get(col).map(TypedCells::nulls))
+                    .collect::<Option<smallvec::SmallVec<[&[bool]; 4]>>>()
+                    .ok_or_else(|| Error::internal("unique column beyond the batch"))?;
+                let indexed = match nulls.as_slice() {
+                    [one] => one.iter().filter(|&&null| !null).count(),
+                    [a, b] => a.iter().zip(*b).filter(|&(&a, &b)| !(a | b)).count(),
+                    [first, rest @ ..] => first
+                        .iter()
+                        .enumerate()
+                        .filter(|&(row, &null)| !null && rest.iter().all(|other| !other[row]))
+                        .count(),
+                    [] => rows,
+                };
                 let needed = entries.len() + indexed;
                 if needed > entries.capacity() {
                     // Doubling from 4 as push would, never past the rows expected
@@ -1090,5 +1099,13 @@ mod tests {
         let (len, capacity, grown) = unique_entries(|_| false, |_| true, vec![1, 2]);
         assert_eq!((len, capacity), (0, 0));
         assert!(grown.is_empty());
+    }
+
+    #[test]
+    fn a_three_column_set_counts_only_rows_without_nulls() {
+        let (len, capacity, grown) =
+            unique_entries(|_| false, |row| row % 10_000 != 0, vec![0, 1, 2]);
+        assert_eq!((len, capacity), (10, 16));
+        assert_eq!(grown, [4, 8, 16]);
     }
 }
