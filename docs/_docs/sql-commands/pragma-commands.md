@@ -228,7 +228,7 @@ Returns one row per table and a final `*` row with the totals.
 | `arena_slots` | Arena slots in use, deleted and cleared ones included |
 | `arena_capacity_bytes` | Bytes the arena's slot vectors reserve |
 | `chain_entries` | Previous row versions kept alive by version chains |
-| `volume_bytes` | Memory of the table's loaded cold volumes |
+| `volume_bytes` | Memory of the table's current cold volumes: metadata, loaded columns and blocks, and the reserved capacity of built unique indexes. A volume that a compaction replaced is not counted, even while a running query still holds it |
 | `admission_waits` | On the `*` row: commits that waited for a seal under `hot_max_bytes` |
 
 ```sql
