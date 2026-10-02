@@ -105,3 +105,21 @@ fn a_file_volume_drops_a_decoded_column_when_idle() {
     );
     assert!(volume.columns.compressed_store().unwrap().is_file_backed());
 }
+
+#[test]
+fn a_file_volume_forgets_a_failed_read_when_idle() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, path, schema) = built(dir.path());
+    let volume = read_volume_from_disk(&path).unwrap();
+    let away = path.with_extension("away");
+    std::fs::rename(&path, &away).unwrap();
+    assert!(volume.columns.get(1).is_err());
+    std::fs::rename(&away, &path).unwrap();
+    assert!(volume.columns.get(1).is_err(), "the failure is cached");
+    let volume = evicted(volume, dir.path(), &schema);
+    assert!(
+        volume.columns.get(1).is_ok(),
+        "eviction clears the cached failure"
+    );
+    assert!(volume.columns.compressed_store().unwrap().is_file_backed());
+}

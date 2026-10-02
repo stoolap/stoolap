@@ -2005,11 +2005,8 @@ impl SegmentManager {
                         .is_some_and(|store| store.is_file_backed());
                     // A file-backed store holds no blocks; cold would only force a reload
                     let is_warm = cs.volume.is_warm() && (file_backed_to_cold || !file_backed);
-                    // A file-backed volume drops its decoded columns and keeps its store
-                    let rewarm = !is_hot
-                        && !is_warm
-                        && file_backed
-                        && (0..columns.len()).any(|col| columns.resident(col).is_some());
+                    // A file-backed volume drops its cached reads and keeps its store
+                    let rewarm = !is_hot && !is_warm && file_backed && columns.holds_reads();
                     if is_hot || is_warm || rewarm {
                         has_targets = true;
                         Some((seg_id, is_hot || rewarm, is_warm))
