@@ -48,7 +48,7 @@ pub static RETIRED_WAL_SYNC_FAIL: AtomicBool = AtomicBool::new(false);
 pub static SEAL_REGISTRATION_STALE_ROUNDS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-// try_update replaces fetch_update only from Rust 1.99, above the MSRV
+// fetch_update is deprecated in 1.99; try_update is stable only from 1.95, above the 1.88 MSRV
 #[allow(deprecated)]
 pub(crate) fn seal_registration_forced_stale() -> bool {
     SEAL_REGISTRATION_STALE_ROUNDS
