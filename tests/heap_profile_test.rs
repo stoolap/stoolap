@@ -13,11 +13,16 @@
 // limitations under the License.
 
 //! PRAGMA heap_profile writes a pprof heap profile with jemalloc-prof on
-//! Linux and refuses in every other build
+//! Linux, unless dhat-heap takes the allocator, and refuses in every other
+//! build
 
 use stoolap::Database;
 
-#[cfg(all(feature = "jemalloc-prof", target_os = "linux"))]
+#[cfg(all(
+    feature = "jemalloc-prof",
+    target_os = "linux",
+    not(feature = "dhat-heap")
+))]
 #[test]
 fn a_heap_profile_is_written_in_pprof_format() {
     let db = Database::open("memory://heap_profile_written").unwrap();
@@ -36,7 +41,11 @@ fn a_heap_profile_is_written_in_pprof_format() {
     assert_eq!(&file[..2], &[0x1f, 0x8b], "a gzipped profile");
 }
 
-#[cfg(not(all(feature = "jemalloc-prof", target_os = "linux")))]
+#[cfg(not(all(
+    feature = "jemalloc-prof",
+    target_os = "linux",
+    not(feature = "dhat-heap")
+)))]
 #[test]
 fn a_heap_profile_needs_jemalloc_prof_on_linux() {
     let db = Database::open("memory://heap_profile_refused").unwrap();

@@ -192,6 +192,8 @@ static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// A generation no earlier side file of this process carries, and none of
 /// an earlier process with a probability the clock gives.
+// fetch_update is deprecated in 1.99; try_update is stable only from 1.95, above the 1.88 MSRV
+#[allow(deprecated)]
 pub fn next_generation() -> u64 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
