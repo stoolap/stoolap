@@ -123,6 +123,30 @@ fn bits_without(row_count: usize, dead: &[u32]) -> Vec<u64> {
     bits
 }
 
+/// One built unique index of a volume: its column set and its entries
+type BuiltUniqueIndex = (Vec<usize>, Arc<Vec<(u64, u32)>>);
+
+/// Gives `into` every unique index `from` has built that `into` has not,
+/// sharing the entries; the guards are never held together
+fn merge_unique_indices(into: &FrozenVolume, from: &FrozenVolume) {
+    if Arc::ptr_eq(&into.unique_indices, &from.unique_indices) {
+        return;
+    }
+    let built: smallvec::SmallVec<[BuiltUniqueIndex; 2]> = from
+        .unique_indices
+        .read()
+        .iter()
+        .map(|(key, entries)| (key.clone(), Arc::clone(entries)))
+        .collect();
+    if built.is_empty() {
+        return;
+    }
+    let mut own = into.unique_indices.write();
+    for (key, entries) in built {
+        own.entry(key).or_insert(entries);
+    }
+}
+
 fn clear_dead(bits: &mut [u64], dead: &[u32]) {
     for &pos in dead {
         let pos = pos as usize;
@@ -1051,15 +1075,133 @@ pub struct StatementSnapshot {
     pub segs: Arc<FxHashMap<u64, ColdSegment>>,
     /// Committed tombstones as of capture.
     pub tombstones: Arc<FxHashMap<i64, u64>>,
+    /// Whether a captured volume is cold, read with `segs` under one guard
+    pub has_cold: bool,
+    loads: std::cell::RefCell<StatementLoads>,
 }
 
+/// The cold volumes a statement read through their captured file owners
+#[derive(Default)]
+struct StatementLoads {
+    /// False while the statement holds the seal fence: no file is read then
+    deferred: bool,
+    loaded: Vec<LoadedVolume>,
+    /// Segments a deferred read needed, loaded once the fence is released
+    missing: Vec<u64>,
+}
+
+/// A cold volume read through the owner its statement captured
+pub(crate) struct LoadedVolume {
+    seg_id: u64,
+    file: Option<Arc<super::writer::VolumeFile>>,
+    volume: Arc<FrozenVolume>,
+}
+
+/// The message of the error a deferred cold read returns; the statement
+/// releases the fence, loads what it recorded, and prepares again
+const COLD_READ_DEFERRED: &str = "cold volume read deferred under the seal fence";
+
 impl StatementSnapshot {
-    /// Newest-first (id, segment) list from the snapshot alone.
+    /// Newest-first (id, segment) list from the snapshot alone, cold
+    /// volumes as captured; `volume` gives a cold one's columns.
     pub fn volumes_newest_first(&self) -> Vec<(u64, ColdSegment)> {
         self.seg_ids_newest_first
             .iter()
             .filter_map(|&id| self.segs.get(&id).map(|cs| (id, cs.clone())))
             .collect()
+    }
+
+    /// The captured volume of `seg_id` with its columns: a cold one is read
+    /// through its captured owner, once per statement. While reads are
+    /// deferred, a cold volume not read yet is recorded and the call fails
+    /// with the error `is_deferred` recognises.
+    pub fn volume(
+        &self,
+        mgr: &SegmentManager,
+        seg_id: u64,
+        cs: &ColdSegment,
+    ) -> crate::core::Result<Arc<FrozenVolume>> {
+        if !cs.volume.is_cold() {
+            cs.volume.mark_accessed();
+            return Ok(Arc::clone(&cs.volume));
+        }
+        let mut loads = self.loads.borrow_mut();
+        if let Some(loaded) = loads.loaded.iter().find(|l| l.seg_id == seg_id) {
+            return Ok(Arc::clone(&loaded.volume));
+        }
+        if loads.deferred {
+            if !loads.missing.contains(&seg_id) {
+                loads.missing.push(seg_id);
+            }
+            return Err(crate::core::Error::internal(COLD_READ_DEFERRED));
+        }
+        let volume = mgr.load_captured(seg_id, cs)?;
+        loads.loaded.push(LoadedVolume {
+            seg_id,
+            file: cs.file.clone(),
+            volume: Arc::clone(&volume),
+        });
+        Ok(volume)
+    }
+
+    /// Whether `error` is a cold read this snapshot deferred
+    pub(crate) fn is_deferred(&self, error: &crate::core::Error) -> bool {
+        !self.loads.borrow().missing.is_empty()
+            && matches!(error, crate::core::Error::Internal { message } if message == COLD_READ_DEFERRED)
+    }
+
+    /// Defers every cold read not done yet, for a statement holding the fence
+    pub(crate) fn defer_reads(&self) {
+        self.loads.borrow_mut().deferred = true;
+    }
+
+    /// Takes the volumes an earlier snapshot of the statement read whose
+    /// segment this one captured with the same file owner
+    pub(crate) fn adopt(&self, earlier: Vec<LoadedVolume>) {
+        #[cfg(any(test, feature = "test-failpoints"))]
+        if crate::test_failpoints::COLD_READS_FORGET.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let mut loads = self.loads.borrow_mut();
+        for loaded in earlier {
+            let same = self.segs.get(&loaded.seg_id).is_some_and(|cs| {
+                cs.volume.is_cold()
+                    && match (&cs.file, &loaded.file) {
+                        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                        (None, None) => true,
+                        _ => false,
+                    }
+            });
+            if same {
+                loads.loaded.push(loaded);
+            }
+        }
+    }
+
+    /// Reads the deferred volumes, outside the fence, and hands over every
+    /// volume the statement read
+    pub(crate) fn into_loaded(
+        self,
+        mgr: &SegmentManager,
+    ) -> crate::core::Result<Vec<LoadedVolume>> {
+        let loads = self.loads.into_inner();
+        let mut loaded = loads.loaded;
+        for seg_id in loads.missing {
+            let Some(cs) = self.segs.get(&seg_id) else {
+                continue;
+            };
+            loaded.push(LoadedVolume {
+                seg_id,
+                file: cs.file.clone(),
+                volume: mgr.load_captured(seg_id, cs)?,
+            });
+        }
+        Ok(loaded)
+    }
+
+    /// Every volume the statement read, for `SegmentManager::publish_loaded`
+    pub(crate) fn take_loaded(&self) -> Vec<LoadedVolume> {
+        std::mem::take(&mut self.loads.borrow_mut().loaded)
     }
 }
 
@@ -1415,59 +1557,122 @@ impl SegmentManager {
     /// for the whole statement and never re-reads live manager state after
     /// mutating the hot buffer: eviction and compaction copy-on-write new
     /// maps/Arcs, so nothing in the snapshot can go cold or disappear.
-    /// Statement-snapshot variant of `find_row_id_by_values`: runs
-    /// entirely against the given captured parts, so it can neither
-    /// observe concurrent compaction nor need a live cold reload.
+    /// Statement-snapshot variant of `find_row_id_by_values`: runs entirely
+    /// against the statement's captured view, a cold candidate read through
+    /// its captured owner, so it neither observes concurrent compaction nor
+    /// skips a segment the live map dropped.
     pub fn find_row_id_by_values_in(
         &self,
-        seg_ids: &[u64],
-        segs: &FxHashMap<u64, ColdSegment>,
-        ts: &FxHashMap<i64, u64>,
+        snap: &StatementSnapshot,
         col_indices: &[usize],
         values: &[&Value],
         column_defaults: &[Value],
     ) -> crate::core::Result<Option<i64>> {
-        self.find_row_id_by_values_impl(seg_ids, segs, ts, col_indices, values, column_defaults)
+        self.find_row_id_by_values_impl(
+            &snap.seg_ids_newest_first,
+            &snap.segs,
+            &snap.tombstones,
+            col_indices,
+            values,
+            column_defaults,
+            Some(snap),
+        )
     }
 
-    pub fn statement_snapshot(&self) -> crate::core::Result<StatementSnapshot> {
-        let capture = || {
-            let manifest = self.manifest.read();
-            let mut seg_ids_newest_first: Vec<u64> =
-                manifest.segments.iter().map(|m| m.segment_id).collect();
-            seg_ids_newest_first.reverse();
-            let segs = Arc::clone(&*self.segments.read());
-            let tombstones = Arc::clone(&*self.tombstones.read());
-            StatementSnapshot {
-                seg_ids_newest_first,
+    /// Segment order, segment map and tombstones of one moment, cold volumes
+    /// left cold: a statement reads a cold one through `StatementSnapshot::volume`
+    pub fn statement_snapshot(&self) -> StatementSnapshot {
+        let manifest = self.manifest.read();
+        let mut seg_ids_newest_first: Vec<u64> =
+            manifest.segments.iter().map(|m| m.segment_id).collect();
+        seg_ids_newest_first.reverse();
+        // The flag is written with the map under the write guard, so read
+        // under one read guard it describes this map
+        let (segs, has_cold) = {
+            let segments = self.segments.read();
+            let segs = Arc::clone(&*segments);
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::cold_map_captured();
+            (
                 segs,
-                tombstones,
-            }
+                self.has_cold.load(std::sync::atomic::Ordering::Relaxed),
+            )
         };
-        self.ensure_columns();
-        let mut snap = capture();
-        if snap.segs.values().any(|cs| cs.volume.is_cold()) {
-            // Race with eviction: retry once, then fail closed.
-            self.ensure_columns();
-            snap = capture();
-            let cold: Vec<u64> = snap
-                .segs
-                .iter()
-                .filter(|(_, cs)| cs.volume.is_cold())
-                .map(|(&id, _)| id)
-                .collect();
-            if !cold.is_empty() {
-                return Err(crate::core::Error::Internal {
-                    message: format!(
-                        "table '{}': cold volume reload failed for segment(s) {:?}; \
-                         refusing to serve partial data",
-                        self.table_name.read(),
-                        cold
-                    ),
-                });
+        let tombstones = Arc::clone(&*self.tombstones.read());
+        drop(manifest);
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::statement_captured();
+        StatementSnapshot {
+            seg_ids_newest_first,
+            segs,
+            tombstones,
+            has_cold,
+            loads: std::cell::RefCell::default(),
+        }
+    }
+
+    /// Reads a captured cold volume through the owner its segment captured,
+    /// outside every lock, without publishing it
+    pub(crate) fn load_captured(
+        &self,
+        seg_id: u64,
+        cs: &ColdSegment,
+    ) -> crate::core::Result<Arc<FrozenVolume>> {
+        let volume = self
+            .read_volume_for(seg_id, cs.file.as_ref())
+            .map_err(|e| self.reload_error(seg_id, e))?;
+        debug_assert_eq!(volume.meta.row_count, cs.volume.meta.row_count);
+        debug_assert_eq!(volume.meta.row_ids.first(), cs.volume.meta.row_ids.first());
+        debug_assert_eq!(volume.meta.row_ids.last(), cs.volume.meta.row_ids.last());
+        // The unique indexes and row order the cold entry kept serve the
+        // statement's first lookup instead of being built again
+        merge_unique_indices(&volume, &cs.volume);
+        volume.inherit_row_order(&cs.volume);
+        volume.mark_accessed();
+        Ok(volume)
+    }
+
+    /// Puts the volumes a statement read in the map, with one copy of it: an
+    /// entry is replaced only while it still holds the same file owner and
+    /// is still cold, so a view published meanwhile stays
+    pub(crate) fn publish_loaded(&self, loaded: Vec<LoadedVolume>) {
+        if loaded.is_empty() {
+            return;
+        }
+        let mut segments = self.segments.write();
+        let replaceable = |map: &FxHashMap<u64, ColdSegment>, l: &LoadedVolume| {
+            map.get(&l.seg_id).is_some_and(|cs| {
+                cs.volume.is_cold()
+                    && match (&cs.file, &l.file) {
+                        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                        (None, None) => true,
+                        _ => false,
+                    }
+            })
+        };
+        if !loaded.iter().any(|l| replaceable(&segments, l)) {
+            return;
+        }
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::segment_map_cloned();
+        let mut new_map = (**segments).clone();
+        for l in loaded {
+            if !replaceable(&new_map, &l) {
+                continue;
+            }
+            if let Some(cs) = new_map.get_mut(&l.seg_id) {
+                // Sets the statement built stay; the entry's others join them
+                merge_unique_indices(&l.volume, &cs.volume);
+                l.volume.inherit_row_order(&cs.volume);
+                cs.volume = l.volume;
             }
         }
-        Ok(snap)
+        let still_cold = new_map.values().any(|cs| cs.volume.is_cold());
+        *segments = Arc::new(new_map);
+        if !still_cold {
+            self.has_cold
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Check if there are any segments. O(1) atomic read, no lock.
@@ -1543,12 +1748,15 @@ impl SegmentManager {
     /// UPDATE changes a PK value + seal (schema-evolution safe).
     /// Resolve against the CALLER'S segment view (newest-first ids + map)
     /// so statement-snapshot flows never re-read live state here.
+    /// With `stmt` a cold volume is read through the owner the statement
+    /// captured; without it, through the live map
     fn get_authoritative_value(
         &self,
         seg_ids: &[u64],
         segments: &FxHashMap<u64, ColdSegment>,
         row_id: i64,
         col_idx: usize,
+        stmt: Option<&StatementSnapshot>,
     ) -> crate::core::Result<Option<crate::core::Value>> {
         for seg_id in seg_ids {
             if let Some(cold) = segments.get(seg_id) {
@@ -1564,10 +1772,14 @@ impl SegmentManager {
                         return Ok(None);
                     };
                     if cold.volume.is_cold() {
-                        if let Some(vol) = self.ensure_volume(*seg_id)? {
-                            return Ok(Some(vol.cell(pi, idx)?));
-                        }
-                        return Ok(None);
+                        let vol = match stmt {
+                            Some(snap) => snap.volume(self, *seg_id, cold)?,
+                            None => match self.ensure_volume(*seg_id)? {
+                                Some(vol) => vol,
+                                None => return Ok(None),
+                            },
+                        };
+                        return Ok(Some(vol.cell(pi, idx)?));
                     }
                     cold.volume.mark_accessed();
                     return Ok(Some(cold.volume.cell(pi, idx)?));
@@ -1655,7 +1867,7 @@ impl SegmentManager {
                         if !col.is_null(i) && col.get_i64(i) == target && !ts.contains_key(&rid) {
                             if seg_ids.len() > 1 {
                                 if let Some(current_val) =
-                                    self.get_authoritative_value(seg_ids, segs, rid, col_idx)?
+                                    self.get_authoritative_value(seg_ids, segs, rid, col_idx, None)?
                                 {
                                     if &current_val != value {
                                         continue;
@@ -1699,6 +1911,7 @@ impl SegmentManager {
             col_indices,
             values,
             column_defaults,
+            None,
         )
     }
 
@@ -1716,9 +1929,13 @@ impl SegmentManager {
             col_indices,
             values,
             column_defaults,
+            None,
         )
     }
 
+    /// With `stmt` a cold candidate is read through the owner the statement
+    /// captured, so none is skipped; without it, through the live map
+    #[allow(clippy::too_many_arguments)]
     fn find_row_id_by_values_impl(
         &self,
         seg_ids: &[u64],
@@ -1727,6 +1944,7 @@ impl SegmentManager {
         col_indices: &[usize],
         values: &[&Value],
         column_defaults: &[Value],
+        stmt: Option<&StatementSnapshot>,
     ) -> crate::core::Result<Option<i64>> {
         if col_indices.is_empty() || col_indices.len() != values.len() {
             return Ok(None);
@@ -1818,9 +2036,12 @@ impl SegmentManager {
             // Zone map + bloom passed — need column data. Load cold on demand.
             let loaded: Arc<FrozenVolume>;
             let vol = if vol.is_cold() {
-                loaded = match self.ensure_volume(seg_id)? {
-                    Some(v) => v,
-                    None => continue,
+                loaded = match stmt {
+                    Some(snap) => snap.volume(self, seg_id, cold)?,
+                    None => match self.ensure_volume(seg_id)? {
+                        Some(v) => v,
+                        None => continue,
+                    },
                 };
                 &*loaded
             } else {
@@ -1881,7 +2102,7 @@ impl SegmentManager {
                 if seg_ids.len() > 1 {
                     let mut still_matches = true;
                     for (i, &ci) in col_indices.iter().enumerate() {
-                        let ok = match self.get_authoritative_value(seg_ids, segs, rid, ci)? {
+                        let ok = match self.get_authoritative_value(seg_ids, segs, rid, ci, stmt)? {
                             Some(v) => !v.is_null() && v == *values[i],
                             None => column_defaults[i] == *values[i],
                         };
@@ -2105,6 +2326,8 @@ impl SegmentManager {
             return;
         }
         let mut segments = self.segments.write();
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::segment_map_cloned();
         let mut new_map = (**segments).clone();
         for (id, volume) in reloaded {
             if let Some(cs) = new_map.get_mut(&id) {
@@ -3362,13 +3585,17 @@ impl SegmentManager {
             manifest.dead_copies.clear();
             *self.tombstones.write() = Arc::new(FxHashMap::default());
         }
-        *self.segments.write() = Arc::new(FxHashMap::default());
+        {
+            // The cold flag is written with the map it describes
+            let mut segments = self.segments.write();
+            *segments = Arc::new(FxHashMap::default());
+            self.has_cold
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
         self.key_order_verdicts.lock().clear();
         self.cached_deduped_count
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         self.has_segments_flag
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        self.has_cold
             .store(false, std::sync::atomic::Ordering::Relaxed);
         // Clearing takes rows away as much as a seal does, so a reader that
         // took the generation before it must see the change after
@@ -3764,6 +3991,8 @@ impl SegmentManager {
         seg_id: u64,
         pinned: Option<&Arc<super::writer::VolumeFile>>,
     ) -> crate::core::Result<Arc<FrozenVolume>> {
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::volume_load_requested();
         match pinned {
             Some(handle) => handle.load(),
             None => {
@@ -3866,6 +4095,8 @@ impl SegmentManager {
             .map_err(|e| self.reload_error(seg_id, e))?;
         volume.mark_accessed();
         let mut segments = self.segments.write();
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::segment_map_cloned();
         let mut new_map = (**segments).clone();
         // A segment that left the manifest while the file was read: a pinned
         // reader keeps what it read, and without one the caller is told, since
@@ -5422,9 +5653,30 @@ mod tests {
             mgr.segments_snapshot().is_err(),
             "the DML statement snapshot must fail before any mutation"
         );
+        let snap = mgr.statement_snapshot();
+        assert!(snap.has_cold);
         assert!(
-            mgr.statement_snapshot().is_err(),
-            "statement_snapshot must fail closed too"
+            snap.volume(&mgr, 1, &snap.segs[&1]).is_err(),
+            "a statement's read of the cold volume must fail closed too"
+        );
+    }
+
+    #[test]
+    fn a_statement_snapshot_reads_the_cold_flag_with_its_map() {
+        let mgr = Arc::new(SegmentManager::new("cold_flag", None));
+        let writer = Arc::clone(&mgr);
+        let blocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::clone(&blocked);
+        // Between the map and the flag, a publication only attempts the
+        // write lock: waiting for it under the read guard would deadlock
+        crate::test_failpoints::on_cold_map_captured(move || {
+            let attempt = std::thread::spawn(move || writer.segments.try_write().is_none());
+            seen.store(attempt.join().unwrap(), std::sync::atomic::Ordering::SeqCst);
+        });
+        let _snap = mgr.statement_snapshot();
+        assert!(
+            blocked.load(std::sync::atomic::Ordering::SeqCst),
+            "no publication lands between the captured map and its cold flag"
         );
     }
 
@@ -5461,7 +5713,7 @@ mod tests {
             None,
         );
 
-        let snap = mgr.statement_snapshot().unwrap();
+        let snap = mgr.statement_snapshot();
 
         // Background compaction replaces segment 1 with segment 2 while the
         // statement snapshot is live.
@@ -5522,7 +5774,7 @@ mod tests {
             None,
         );
 
-        let snap = mgr.statement_snapshot().unwrap();
+        let snap = mgr.statement_snapshot();
 
         let _epoch_guard = EVICTION_EPOCH_LOCK
             .lock()
@@ -5549,14 +5801,7 @@ mod tests {
         );
         // ...while the statement-snapshot lookup keeps serving its view.
         let found = mgr
-            .find_row_id_by_values_in(
-                &snap.seg_ids_newest_first,
-                &snap.segs,
-                &snap.tombstones,
-                &[0],
-                &[&target],
-                &defaults,
-            )
+            .find_row_id_by_values_in(&snap, &[0], &[&target], &defaults)
             .unwrap();
         assert_eq!(found, Some(5), "snapshot lookup must succeed");
     }

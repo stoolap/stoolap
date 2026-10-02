@@ -62,6 +62,10 @@ enum SideAdmission {
 /// of its rows: one in twenty to start, to be measured
 const SIDE_SCAN_SHARE: u64 = 20;
 
+/// Times a statement releases the seal fence to read cold volumes a seal,
+/// compaction or eviction left unread before it gives up
+const COLD_READ_RETRIES: usize = 3;
+
 /// A side file read that failed is the statement's error
 fn side_error(error: std::io::Error) -> crate::core::Error {
     crate::core::Error::internal(format!("side index read failed: {error}"))
@@ -235,6 +239,9 @@ struct ColdPrepare {
     changes: Vec<ColdChange>,
     /// The ids named by the statement that no cold volume holds
     hot_ids: Vec<i64>,
+    /// Old and new row of rows the setter ran on whose unique check waits
+    /// for a cold volume read once the fence is released
+    set_rows: FxHashMap<i64, (Row, Row)>,
 }
 
 pub struct SegmentedTable {
@@ -671,17 +678,14 @@ impl SegmentedTable {
             .iter()
             .map(|&ci| self.column_default(ci))
             .collect();
-        let rid = match self.segment_mgr.find_row_id_by_values_in(
-            &snap.seg_ids_newest_first,
-            &snap.segs,
-            &snap.tombstones,
-            col_indices,
-            values,
-            &defaults,
-        )? {
-            Some(rid) => rid,
-            None => return Ok(None),
-        };
+        let rid =
+            match self
+                .segment_mgr
+                .find_row_id_by_values_in(snap, col_indices, values, &defaults)?
+            {
+                Some(rid) => rid,
+                None => return Ok(None),
+            };
         if self.segment_mgr.is_pending_tombstone(self.txn_id(), rid) {
             return Ok(None);
         }
@@ -804,6 +808,9 @@ impl SegmentedTable {
             .unwrap_or_default();
         let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
         let mut prep = ColdPrepare::default();
+        // The cold volumes read so far, carried from round to round
+        let mut carried = Vec::new();
+        let mut deferrals = 0;
         loop {
             let under_fence = prep.round == 3;
             let held = under_fence.then(|| mgr.acquire_seal_read());
@@ -812,30 +819,56 @@ impl SegmentedTable {
             } else {
                 Self::settled_state(mgr)
             };
-            let snap = mgr.statement_snapshot()?;
-            prep.hot_ids.clear();
-            if prep.round > 0 {
-                self.revalidate_prepared(&snap, &mut prep)?;
+            let snap = mgr.statement_snapshot();
+            snap.adopt(std::mem::take(&mut carried));
+            if under_fence {
+                snap.defer_reads();
             }
-            match ids {
-                Some(ids) => self.prepare_cold_rows_by_id(&snap, ids, setter, &mut prep)?,
-                None => self.prepare_cold_rows_where(
-                    &snap,
-                    where_expr,
-                    &comparisons,
-                    &bloom_hashes,
-                    setter,
-                    &mut prep,
-                )?,
+            prep.hot_ids.clear();
+            let prepared = (|| {
+                if prep.round > 0 || !prep.set_rows.is_empty() {
+                    self.revalidate_prepared(&snap, &mut prep)?;
+                }
+                match ids {
+                    Some(ids) => self.prepare_cold_rows_by_id(&snap, ids, setter, &mut prep),
+                    None => self.prepare_cold_rows_where(
+                        &snap,
+                        where_expr,
+                        &comparisons,
+                        &bloom_hashes,
+                        setter,
+                        &mut prep,
+                    ),
+                }
+            })();
+            if let Err(e) = prepared {
+                // A read deferred under the fence: read it with the fence
+                // released and prepare this round again
+                if !snap.is_deferred(&e) {
+                    return Err(e);
+                }
+                deferrals += 1;
+                if deferrals > COLD_READ_RETRIES {
+                    return Err(Self::cold_reads_unsettled(mgr));
+                }
+                drop(held);
+                carried = snap.into_loaded(mgr)?;
+                continue;
             }
             // A volume registered at a settled generation is walked whole;
             // one a seal added meanwhile may have hidden rows still hot
             prep.seen_segments.extend(settled);
+            #[cfg(any(test, feature = "test-failpoints"))]
+            if held.is_none() {
+                crate::test_failpoints::cold_round_prepared();
+            }
             let guard = held.unwrap_or_else(|| mgr.acquire_seal_read());
             if under_fence || mgr.seal_generation() == generation {
+                mgr.publish_loaded(snap.take_loaded());
                 return Ok((guard, prep.changes, prep.hot_ids));
             }
             drop(guard);
+            carried = snap.take_loaded();
             prep.round += 1;
         }
     }
@@ -862,6 +895,17 @@ impl SegmentedTable {
                 return Err(Self::write_conflict(change.row_id));
             }
             prep.visited.insert(change.row_id, seg_id);
+        }
+        // A row whose unique check waited is still the sealed row its setter
+        // saw, or the statement conflicts rather than set it again hot
+        for (&row_id, (old_row, _)) in &prep.set_rows {
+            let Some((_, cs, idx)) = self.find_segment_row_in(snap, row_id)? else {
+                return Err(Self::write_conflict(row_id));
+            };
+            let mut reader = super::writer::RowReader::new(Arc::clone(&cs.volume));
+            if reader.row(idx, &cs.mapping)? != *old_row {
+                return Err(Self::write_conflict(row_id));
+            }
         }
         Ok(())
     }
@@ -933,18 +977,8 @@ impl SegmentedTable {
             if should_skip {
                 continue;
             }
-            // Load cold volume on demand after pruning.
-            let loaded;
-            let vol = if vol.is_cold() {
-                loaded = match self.segment_mgr.ensure_volume(*seg_id)? {
-                    Some(v) => v,
-                    None => continue,
-                };
-                &loaded
-            } else {
-                vol.mark_accessed();
-                vol
-            };
+            // A cold volume pruning kept is read through its captured owner
+            let vol = &snap.volume(&self.segment_mgr, *seg_id, cs)?;
             let mapping = cs.mapping.clone();
             let mut reader = super::writer::RowReader::new(Arc::clone(vol));
             for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
@@ -979,21 +1013,39 @@ impl SegmentedTable {
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
         prep: &mut ColdPrepare,
     ) -> Result<()> {
-        prep.visited.insert(row_id, seg_id);
-        let old_row = row.clone();
-        let (new_row, changed) = setter(row)?;
-        if !changed {
-            return Ok(());
-        }
+        // The setter runs once: a row whose unique check waited keeps its result
+        let (old_row, new_row) = match prep.set_rows.remove(&row_id) {
+            Some((old_row, new_row)) => {
+                if old_row != row {
+                    return Err(Self::write_conflict(row_id));
+                }
+                (old_row, new_row)
+            }
+            None => {
+                let old_row = row.clone();
+                let (new_row, changed) = setter(row)?;
+                if !changed {
+                    prep.visited.insert(row_id, seg_id);
+                    return Ok(());
+                }
+                (old_row, new_row)
+            }
+        };
         if self.hot.has_unique_non_pk_indexes() {
-            self.check_cold_unique_for_update(
+            if let Err(e) = self.check_cold_unique_for_update(
                 &new_row,
                 row_id,
                 Some(snap),
                 &prep.shadowed,
                 &mut prep.unique_indexes,
-            )?;
+            ) {
+                if snap.is_deferred(&e) {
+                    prep.set_rows.insert(row_id, (old_row, new_row));
+                }
+                return Err(e);
+            }
         }
+        prep.visited.insert(row_id, seg_id);
         prep.shadowed.insert(row_id);
         prep.changes.push(ColdChange {
             row_id,
@@ -2135,13 +2187,89 @@ impl SegmentedTable {
             let Some(cold) = snap.segs.get(&seg_id) else {
                 continue;
             };
-            let vol = &cold.volume;
             if let Some(idx) = cold.locate_authoritative(row_id) {
-                vol.mark_accessed();
-                return Ok(Some((seg_id, cold.clone(), idx)));
+                let mut located = cold.clone();
+                located.volume = snap.volume(&self.segment_mgr, seg_id, cold)?;
+                return Ok(Some((seg_id, located, idx)));
             }
         }
         Ok(None)
+    }
+
+    /// Reads, through `snap`, every cold volume holding a row `row_ids`
+    /// names, whether or not a hot version shadows it: the statement may
+    /// reach the sealed copy after it changes the hot store
+    fn read_cold_volumes_of(
+        &self,
+        snap: &super::manifest::StatementSnapshot,
+        row_ids: &[i64],
+    ) -> Result<()> {
+        for &row_id in row_ids {
+            for &seg_id in &snap.seg_ids_newest_first {
+                let Some(cold) = snap.segs.get(&seg_id) else {
+                    continue;
+                };
+                if cold.locate_authoritative(row_id).is_some() {
+                    snap.volume(&self.segment_mgr, seg_id, cold)?;
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The seal fence and a statement snapshot whose cold volumes `read`
+    /// reaches are read, none of them under the fence: when nothing is cold
+    /// the fence is taken first as before; otherwise `read` runs without the
+    /// fence, then again under it, deferring what is still unread, which is
+    /// loaded with the fence released, at most three times
+    fn fenced_snapshot<'m>(
+        &self,
+        mgr: &'m super::manifest::SegmentManager,
+        read: &mut dyn FnMut(&super::manifest::StatementSnapshot) -> Result<()>,
+    ) -> Result<(
+        parking_lot::RwLockReadGuard<'m, ()>,
+        Option<super::manifest::StatementSnapshot>,
+    )> {
+        let guard = mgr.acquire_seal_read();
+        if !mgr.has_segments() {
+            return Ok((guard, None));
+        }
+        let snap = mgr.statement_snapshot();
+        if !snap.has_cold {
+            return Ok((guard, Some(snap)));
+        }
+        drop(guard);
+        drop(snap);
+        let warm = mgr.statement_snapshot();
+        read(&warm)?;
+        let mut carried = warm.take_loaded();
+        let mut releases = 0;
+        loop {
+            let guard = mgr.acquire_seal_read();
+            let snap = mgr.statement_snapshot();
+            snap.adopt(carried);
+            snap.defer_reads();
+            match read(&snap) {
+                Ok(()) => return Ok((guard, Some(snap))),
+                Err(e) if snap.is_deferred(&e) => {
+                    releases += 1;
+                    if releases > COLD_READ_RETRIES {
+                        return Err(Self::cold_reads_unsettled(mgr));
+                    }
+                    drop(guard);
+                    carried = snap.into_loaded(mgr)?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn cold_reads_unsettled(mgr: &super::manifest::SegmentManager) -> crate::core::Error {
+        crate::core::Error::internal(format!(
+            "write conflict: the sealed volumes of table '{}' kept changing while the statement read them",
+            mgr.table_name()
+        ))
     }
 
     /// The row at `idx` of a located volume, read through its mapping by a
@@ -2571,33 +2699,25 @@ impl Table for SegmentedTable {
 
     fn delete_by_row_ids(&mut self, row_ids: &[i64]) -> Result<i32> {
         let mgr = Arc::clone(&self.segment_mgr);
-        let _seal_guard = mgr.acquire_seal_read();
-        // Capture a verified all-warm segment snapshot BEFORE mutating the
-        // hot buffer and use it for the entire statement: eviction CoWs
-        // new maps and new volume Arcs, so this snapshot's volumes keep
-        // their column data for the statement's duration and no
-        // mid-statement reload (or reload failure) is possible.
-        let cold_snapshot = if self.segment_mgr.has_segments() {
-            Some(self.segment_mgr.statement_snapshot()?)
-        } else {
-            None
-        };
+        // The snapshot's cold volumes the ids reach are read before the hot
+        // store changes, and none under the fence
+        let (_seal_guard, cold_snapshot) =
+            self.fenced_snapshot(&mgr, &mut |snap| self.read_cold_volumes_of(snap, row_ids))?;
         let mut hot_ids = Vec::new();
         let mut count = self.delete_cold_rows(cold_snapshot.as_ref(), row_ids, &mut hot_ids)?;
         if !hot_ids.is_empty() {
             count += self.hot.delete_by_row_ids(&hot_ids)?;
+        }
+        if let Some(snap) = cold_snapshot {
+            mgr.publish_loaded(snap.take_loaded());
         }
         Ok(count)
     }
 
     fn delete_scanned_rows(&mut self, row_ids: &mut Vec<i64>) -> Result<i32> {
         let mgr = Arc::clone(&self.segment_mgr);
-        let _seal_guard = mgr.acquire_seal_read();
-        let cold_snapshot = if self.segment_mgr.has_segments() {
-            Some(self.segment_mgr.statement_snapshot()?)
-        } else {
-            None
-        };
+        let (_seal_guard, cold_snapshot) =
+            self.fenced_snapshot(&mgr, &mut |snap| self.read_cold_volumes_of(snap, row_ids))?;
         // A sealed row the snapshot still holds is there to delete; a row
         // it does not is the hot store's, deleted if still visible
         let mut hot_ids = Vec::new();
@@ -2614,6 +2734,9 @@ impl Table for SegmentedTable {
                     .collect();
                 row_ids.retain(|id| !gone.contains(*id));
             }
+        }
+        if let Some(snap) = cold_snapshot {
+            mgr.publish_loaded(snap.take_loaded());
         }
         Ok(count)
     }
@@ -2671,12 +2794,9 @@ impl Table for SegmentedTable {
         if let Some(pk) = where_expr
             .and_then(|e| crate::storage::mvcc::table::pk_equality_id(e, self.hot.schema()))
         {
-            let _seal_guard = self.segment_mgr.acquire_seal_read();
-            let cold_snapshot = if self.segment_mgr.has_segments() {
-                Some(self.segment_mgr.statement_snapshot()?)
-            } else {
-                None
-            };
+            let mgr = Arc::clone(&self.segment_mgr);
+            let (_seal_guard, cold_snapshot) =
+                self.fenced_snapshot(&mgr, &mut |snap| self.read_cold_volumes_of(snap, &[pk]))?;
             let mut count = self.hot.delete(where_expr)?;
             if let Some(snap) = &cold_snapshot {
                 let mut old_rows: Option<super::writer::RowReader> = None;
@@ -2693,19 +2813,34 @@ impl Table for SegmentedTable {
                     count += 1;
                 }
             }
+            if let Some(snap) = cold_snapshot {
+                mgr.publish_loaded(snap.take_loaded());
+            }
             return Ok(count);
         }
-        let _seal_guard = self.segment_mgr.acquire_seal_read();
-        // Capture a verified all-warm segment snapshot BEFORE mutating the
-        // hot buffer and use it for the entire statement: eviction CoWs
-        // new maps and new volume Arcs, so this snapshot's volumes keep
-        // their column data for the statement's duration and no
-        // mid-statement reload (or reload failure) is possible.
-        let cold_snapshot = if self.segment_mgr.has_segments() {
-            Some(self.segment_mgr.statement_snapshot()?)
-        } else {
-            None
-        };
+        // Zone-map / bloom pruning from WHERE clause.
+        let comparisons = where_expr
+            .map(|e| e.collect_comparisons())
+            .unwrap_or_default();
+        let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
+        // The cold volumes pruning keeps are read before the hot store
+        // changes, and none under the fence
+        let mgr = Arc::clone(&self.segment_mgr);
+        let (_seal_guard, cold_snapshot) = self.fenced_snapshot(&mgr, &mut |snap| {
+            for &seg_id in &snap.seg_ids_newest_first {
+                let Some(cs) = snap.segs.get(&seg_id) else {
+                    continue;
+                };
+                if cs.volume.is_cold() {
+                    let (skip, _, _) =
+                        Self::prune_volume(&cs.volume, &cs.mapping, &comparisons, &bloom_hashes)?;
+                    if !skip {
+                        snap.volume(&mgr, seg_id, cs)?;
+                    }
+                }
+            }
+            Ok(())
+        })?;
         let stmt_tombstones = cold_snapshot.as_ref().map(|s| Arc::clone(&s.tombstones));
         let mut count = self.hot.delete(where_expr)?;
 
@@ -2753,12 +2888,6 @@ impl Table for SegmentedTable {
             }
         });
 
-        // Zone-map / bloom pruning from WHERE clause.
-        let comparisons = where_expr
-            .map(|e| e.collect_comparisons())
-            .unwrap_or_default();
-        let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
-
         let mut deleted_cold_ids: Vec<i64> = Vec::new();
         // Reusable row for WHERE evaluation — avoids Vec/Arc allocation per row.
         // The CompactVec capacity is set once, then clear+push reuses the buffer.
@@ -2773,18 +2902,12 @@ impl Table for SegmentedTable {
                 continue;
             }
 
-            // Load cold volume on demand after pruning.
-            let loaded;
-            let vol = if vol.is_cold() {
-                loaded = match self.segment_mgr.ensure_volume(*seg_id)? {
-                    Some(v) => v,
-                    None => continue,
-                };
-                &loaded
-            } else {
-                vol.mark_accessed();
-                vol
+            // A cold volume pruning kept was read before the fence
+            let vol = match &cold_snapshot {
+                Some(snap) => snap.volume(&self.segment_mgr, *seg_id, cs)?,
+                None => Arc::clone(vol),
             };
+            let vol = &vol;
 
             let mapping = cs.mapping.clone();
             // One reader for the volume's deleted rows: its pins keep the
@@ -2880,6 +3003,9 @@ impl Table for SegmentedTable {
         // Track tombstones for commit
         for rid in deleted_cold_ids {
             self.segment_mgr.add_pending_tombstone(self.txn_id(), rid);
+        }
+        if let Some(snap) = cold_snapshot {
+            mgr.publish_loaded(snap.take_loaded());
         }
         Ok(count)
     }
