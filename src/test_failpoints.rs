@@ -601,6 +601,7 @@ thread_local! {
     static VOLUME_LOAD_REQUESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static VOLUME_FILE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SEGMENT_MAP_CLONES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ROW_ID_ORDER_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static COLD_MAP_CAPTURED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
@@ -646,6 +647,15 @@ pub fn segment_map_clones() -> usize {
 
 pub(crate) fn segment_map_cloned() {
     SEGMENT_MAP_CLONES.with(|n| n.set(n.get() + 1));
+}
+
+/// Volumes whose row ids this thread scanned to learn their order
+pub fn row_id_order_scans() -> usize {
+    ROW_ID_ORDER_SCANS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn row_id_order_scanned() {
+    ROW_ID_ORDER_SCANS.with(|n| n.set(n.get() + 1));
 }
 
 /// Run once on this thread when its next statement snapshot has read the

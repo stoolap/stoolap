@@ -1281,3 +1281,60 @@ fn a_column_named_cluster_can_still_be_dropped() {
         "the key did not follow the drop"
     );
 }
+
+/// Row id order scans per checkpoint after a reopen, four at-target
+/// volumes and a threshold of two
+#[cfg(feature = "test-failpoints")]
+fn row_id_order_scans_after_reopen(create: &str, drop_key: bool) -> Vec<usize> {
+    use stoolap::test_failpoints::row_id_order_scans;
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!(
+        "file://{}?target_volume_rows=65536&compact_threshold=2&checkpoint_interval=3600",
+        dir.path().display()
+    );
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(create, ()).unwrap();
+        for round in 0..4i64 {
+            insert_series(&db, round * 65_536, 65_536);
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        if drop_key {
+            db.execute("ALTER TABLE ticks DROP CLUSTER BY", ()).unwrap();
+        }
+    }
+    let db = Database::open(&dsn).unwrap();
+    assert_eq!(volume_files(dir.path(), "ticks").len(), 4);
+    let mut scans = Vec::new();
+    for _ in 0..3 {
+        let before = row_id_order_scans();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        scans.push(row_id_order_scans() - before);
+    }
+    assert!(sealed_volumes(dir.path(), "ticks", &[1, 2, 3])
+        .iter()
+        .all(|v| row_ids_ascend(v)));
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM ticks", ()).unwrap();
+    assert_eq!(count, 4 * 65_536);
+    scans
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_dropped_key_scans_each_volume_once_within_the_threshold() {
+    assert_eq!(
+        row_id_order_scans_after_reopen(CREATE, true),
+        vec![2, 2, 0],
+        "row id order scans per cycle"
+    );
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn an_unclustered_table_scans_each_volume_once_within_the_threshold() {
+    assert_eq!(
+        row_id_order_scans_after_reopen(UNCLUSTERED, false),
+        vec![2, 2, 0],
+        "row id order scans per cycle"
+    );
+}

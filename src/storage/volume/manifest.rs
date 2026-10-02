@@ -1252,6 +1252,10 @@ impl Drop for ColumnSchemaChange {
     }
 }
 
+/// The verdict key for a volume's row id order, which no key's physical
+/// columns can equal
+const ROW_ID_ORDER: [usize; 1] = [usize::MAX];
+
 pub struct SegmentManager {
     /// Table name; a rename changes it under every open handle
     table_name: RwLock<SmartString>,
@@ -2406,28 +2410,36 @@ impl SegmentManager {
     /// The verdict decided earlier for the volume of `seg_id` under `key`
     pub fn known_key_order(&self, seg_id: u64, key: &[usize]) -> Option<bool> {
         if key.is_empty() {
-            return Some(self.row_ids_ascend(seg_id));
+            // Without a key the order is the row id order; the writer records it
+            let known = self
+                .segments
+                .read()
+                .get(&seg_id)
+                .map(|cs| cs.volume.meta.row_order.get().map(Option::is_none));
+            return match known {
+                None => Some(true),
+                Some(Some(ascending)) => Some(ascending),
+                Some(None) => self.cached_key_order(seg_id, &ROW_ID_ORDER),
+            };
         }
         let columns = self.volume_key(seg_id, key)?;
+        self.cached_key_order(seg_id, &columns)
+    }
+
+    fn cached_key_order(&self, seg_id: u64, columns: &[usize]) -> Option<bool> {
         self.key_order_verdicts
             .lock()
             .get(&seg_id)
-            .and_then(|(checked, verdict)| (*checked == columns).then_some(*verdict))
-    }
-
-    /// Without a key the order is the row id order, which the metadata of
-    /// even a cold volume holds; a segment no longer registered is in order
-    fn row_ids_ascend(&self, seg_id: u64) -> bool {
-        self.segments
-            .read()
-            .get(&seg_id)
-            .is_none_or(|cs| cs.volume.meta.row_ids.windows(2).all(|w| w[0] < w[1]))
+            .and_then(|(checked, verdict)| (checked[..] == *columns).then_some(*verdict))
     }
 
     /// Decide whether the volume of `seg_id` holds its rows in `key` order,
     /// loading a cold volume to do it, and keep the verdict; a segment no
     /// longer registered is in order
     pub fn decide_key_order(&self, seg_id: u64, key: &[usize]) -> crate::core::Result<bool> {
+        if key.is_empty() {
+            return Ok(self.decide_row_id_order(seg_id));
+        }
         let Some(columns) = self.volume_key(seg_id, key) else {
             return Ok(true);
         };
@@ -2448,6 +2460,27 @@ impl SegmentManager {
             .lock()
             .insert(seg_id, (columns, verdict));
         Ok(verdict)
+    }
+
+    /// Scan the row ids of a volume read from disk once, outside the
+    /// segments lock, and keep whether they ascend; a segment no longer
+    /// registered is in order
+    fn decide_row_id_order(&self, seg_id: u64) -> bool {
+        let volume = self
+            .segments
+            .read()
+            .get(&seg_id)
+            .map(|cs| Arc::clone(&cs.volume));
+        let Some(volume) = volume else {
+            return true;
+        };
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::row_id_order_scanned();
+        let verdict = volume.meta.row_ids.windows(2).all(|w| w[0] < w[1]);
+        self.key_order_verdicts
+            .lock()
+            .insert(seg_id, (ROW_ID_ORDER.to_vec(), verdict));
+        verdict
     }
 
     /// Keep that the volume of `seg_id` was written in the order of its own
