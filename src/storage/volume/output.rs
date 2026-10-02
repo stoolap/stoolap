@@ -115,6 +115,7 @@ impl VolumeFileWriter {
             .map_err(|e| io_error("failed to create volume block file", e))?;
         let mut builder = VolumeBuilder::new(schema);
         builder.feed_bloom_filters(expected_rows);
+        builder.reserve_rows(expected_rows);
         Ok(Self {
             index: vec![Vec::new(); schema.columns.len()],
             builder: Some(builder),
@@ -965,6 +966,16 @@ mod tests {
         let mut builder = VolumeBuilder::new(&schema);
         builder.add_row(1, &row(1));
         assert!(!builder.finish().unwrap().retire_file());
+    }
+
+    #[test]
+    fn a_written_volume_holds_its_row_ids_without_spare_capacity() {
+        let (_, volume, _, _dir) = written(&schema(), 3000, 128);
+        assert_eq!(
+            volume.meta.row_ids.capacity(),
+            volume.meta.row_ids.len(),
+            "the row ids kept the growth of their batches"
+        );
     }
 
     #[test]
