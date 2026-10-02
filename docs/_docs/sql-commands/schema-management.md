@@ -80,6 +80,14 @@ ALTER TABLE ticks CLUSTER BY (exchange, symbol, time);
 
 The volumes sealed before the change stay readable as they are; rows sealed from then on take the key order, and the checkpoint cycles that follow rewrite the older volumes into key order through compaction, at most `compact_threshold` of them per cycle so a large table is reclustered in bounded steps. Until a volume's turn comes, queries on its rows answer as before, without the locality the key gives.
 
+A table drops its key with `DROP CLUSTER BY`:
+
+```sql
+ALTER TABLE ticks DROP CLUSTER BY;
+```
+
+Rows sealed from then on are kept in row id order again, and the checkpoint cycles that follow rewrite the volumes sealed under the key back into row id order, in the same bounded steps. This works for a table without a primary key too, whose row ids are internal and cannot be named in a key. A column named `cluster` is still dropped with `ALTER TABLE ... DROP cluster`.
+
 ### Altering Tables
 
 Tables can be modified after creation using `ALTER TABLE` statements:

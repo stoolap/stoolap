@@ -2405,11 +2405,23 @@ impl SegmentManager {
 
     /// The verdict decided earlier for the volume of `seg_id` under `key`
     pub fn known_key_order(&self, seg_id: u64, key: &[usize]) -> Option<bool> {
+        if key.is_empty() {
+            return Some(self.row_ids_ascend(seg_id));
+        }
         let columns = self.volume_key(seg_id, key)?;
         self.key_order_verdicts
             .lock()
             .get(&seg_id)
             .and_then(|(checked, verdict)| (*checked == columns).then_some(*verdict))
+    }
+
+    /// Without a key the order is the row id order, which the metadata of
+    /// even a cold volume holds; a segment no longer registered is in order
+    fn row_ids_ascend(&self, seg_id: u64) -> bool {
+        self.segments
+            .read()
+            .get(&seg_id)
+            .is_none_or(|cs| cs.volume.meta.row_ids.windows(2).all(|w| w[0] < w[1]))
     }
 
     /// Decide whether the volume of `seg_id` holds its rows in `key` order,

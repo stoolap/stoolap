@@ -2560,21 +2560,31 @@ impl Parser {
                 }
                 "DROP" => {
                     // Check for optional COLUMN keyword
-                    if self.peek_token_is_keyword("COLUMN") {
+                    let column_keyword = self.peek_token_is_keyword("COLUMN");
+                    if column_keyword {
                         self.next_token();
                     }
                     if !self.expect_peek_identifier_like() {
                         return None;
                     }
-                    let col_name =
-                        Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
-                    (
-                        AlterTableOperation::DropColumn,
-                        None,
-                        Some(col_name),
-                        None,
-                        None,
-                    )
+                    // DROP CLUSTER BY; without BY, CLUSTER names a column
+                    if !column_keyword
+                        && self.cur_token.literal.eq_ignore_ascii_case("CLUSTER")
+                        && self.peek_token_is_keyword("BY")
+                    {
+                        self.next_token();
+                        (AlterTableOperation::DropClusterBy, None, None, None, None)
+                    } else {
+                        let col_name =
+                            Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
+                        (
+                            AlterTableOperation::DropColumn,
+                            None,
+                            Some(col_name),
+                            None,
+                            None,
+                        )
+                    }
                 }
                 "RENAME" => {
                     if !self.expect_peek(TokenType::Keyword) {

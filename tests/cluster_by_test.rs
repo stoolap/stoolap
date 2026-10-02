@@ -1160,3 +1160,124 @@ fn a_selection_tied_to_distant_dirty_work_is_reclustered_on_its_own() {
         .unwrap();
     assert_eq!(time, 1);
 }
+
+fn shown_create(db: &Database, table: &str) -> String {
+    db.query(&format!("SHOW CREATE TABLE {table}"), ())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .get::<String>(1)
+        .unwrap()
+}
+
+fn row_ids_ascend(rows: &[(i64, Vec<Value>)]) -> bool {
+    rows.windows(2).all(|w| w[0].0 < w[1].0)
+}
+
+#[test]
+fn alter_table_drop_cluster_by_clears_the_key_across_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}?checkpoint_on_close=off", dir.path().display());
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(CREATE, ()).unwrap();
+        db.execute("ALTER TABLE ticks DROP CLUSTER BY", ()).unwrap();
+        assert!(db
+            .engine()
+            .get_table_schema("ticks")
+            .unwrap()
+            .cluster_key
+            .is_empty());
+        let shown = shown_create(&db, "ticks");
+        assert!(!shown.contains("CLUSTER BY"), "{shown}");
+    }
+    let db = Database::open(&dsn).unwrap();
+    let shown = shown_create(&db, "ticks");
+    assert!(!shown.contains("CLUSTER BY"), "the key came back: {shown}");
+}
+
+#[test]
+fn drop_cluster_by_returns_a_clustered_volume_to_row_id_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?target_volume_rows=1000&compact_threshold=100",
+        dir.path().display()
+    ))
+    .unwrap();
+    db.execute(CREATE, ()).unwrap();
+    insert_ticks(&db, 1_000);
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    assert!(!row_ids_ascend(
+        &sealed_volumes(dir.path(), "ticks", &[1, 2, 3])[0]
+    ));
+
+    db.execute("ALTER TABLE ticks DROP CLUSTER BY", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let volumes = sealed_volumes(dir.path(), "ticks", &[1, 2, 3]);
+    assert_eq!(volumes.len(), 1);
+    assert_eq!(volumes[0].len(), 1_000);
+    assert!(
+        row_ids_ascend(&volumes[0]),
+        "the volume kept the dropped key's order"
+    );
+    let after = volume_files(dir.path(), "ticks");
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    assert_eq!(volume_files(dir.path(), "ticks"), after);
+    assert_eq!(ids(&db, "SELECT id FROM ticks WHERE id = 500"), vec![500]);
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM ticks", ()).unwrap();
+    assert_eq!(count, 1_000);
+}
+
+#[test]
+fn drop_cluster_by_returns_a_keyless_volume_to_row_id_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?target_volume_rows=1000&compact_threshold=100",
+        dir.path().display()
+    ))
+    .unwrap();
+    db.execute(
+        "CREATE TABLE ticks (exchange TEXT NOT NULL, symbol TEXT NOT NULL, time INTEGER NOT NULL) CLUSTER BY (exchange, symbol, time)",
+        (),
+    )
+    .unwrap();
+    let insert = db.prepare("INSERT INTO ticks VALUES (?, ?, ?)").unwrap();
+    for i in 1..=1_000i64 {
+        let exchange = if i % 2 == 0 { "b" } else { "a" };
+        insert.execute((exchange, "x", 1_000 - i)).unwrap();
+    }
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    assert!(!row_ids_ascend(
+        &sealed_volumes(dir.path(), "ticks", &[0, 1, 2])[0]
+    ));
+
+    db.execute("ALTER TABLE ticks DROP CLUSTER BY", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let volumes = sealed_volumes(dir.path(), "ticks", &[0, 1, 2]);
+    assert_eq!(volumes.len(), 1);
+    assert!(
+        row_ids_ascend(&volumes[0]),
+        "the keyless volume kept the dropped key's order"
+    );
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM ticks", ()).unwrap();
+    assert_eq!(count, 1_000);
+}
+
+#[test]
+fn a_column_named_cluster_can_still_be_dropped() {
+    let db = Database::open("memory://drop_column_named_cluster").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, cluster INTEGER, other INTEGER) CLUSTER BY (other)",
+        (),
+    )
+    .unwrap();
+    db.execute("ALTER TABLE t DROP cluster", ()).unwrap();
+    let schema = db.engine().get_table_schema("t").unwrap();
+    assert!(schema.get_column_index("cluster").is_none());
+    assert_eq!(
+        schema.cluster_key,
+        vec![1],
+        "the key did not follow the drop"
+    );
+}
