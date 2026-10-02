@@ -2128,6 +2128,12 @@ impl VolumeBuilder {
         }
     }
 
+    /// Size the row ids for `rows`, the count a producer knows up front,
+    /// so the volume keeps them without the growth of their batches
+    pub fn reserve_rows(&mut self, rows: usize) {
+        self.row_ids.reserve_exact(rows);
+    }
+
     /// Feed the bloom filters as cells arrive, from `add_row` and
     /// `append_typed` alike, instead of building them over the columns at
     /// the end; a streaming producer, whose columns leave the
