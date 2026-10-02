@@ -3313,7 +3313,8 @@ impl FrozenVolume {
     /// this one, so a reload does not decide it again
     pub fn inherit_row_order(&self, from: &FrozenVolume) {
         if let Some(order) = from.meta.row_order.get() {
-            let _ = self.meta.row_order.set(order.clone());
+            // The copy is made only when this volume has no order yet
+            self.meta.row_order.get_or_init(|| order.clone());
         }
     }
 
