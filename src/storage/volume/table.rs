@@ -826,7 +826,7 @@ impl SegmentedTable {
             }
             prep.hot_ids.clear();
             let prepared = (|| {
-                if prep.round > 0 {
+                if prep.round > 0 || !prep.set_rows.is_empty() {
                     self.revalidate_prepared(&snap, &mut prep)?;
                 }
                 match ids {
@@ -847,12 +847,12 @@ impl SegmentedTable {
                 if !snap.is_deferred(&e) {
                     return Err(e);
                 }
-                drop(held);
-                carried = snap.into_loaded(mgr)?;
                 deferrals += 1;
                 if deferrals > COLD_READ_RETRIES {
                     return Err(Self::cold_reads_unsettled(mgr));
                 }
+                drop(held);
+                carried = snap.into_loaded(mgr)?;
                 continue;
             }
             // A volume registered at a settled generation is walked whole;
@@ -895,6 +895,17 @@ impl SegmentedTable {
                 return Err(Self::write_conflict(change.row_id));
             }
             prep.visited.insert(change.row_id, seg_id);
+        }
+        // A row whose unique check waited is still the sealed row its setter
+        // saw, or the statement conflicts rather than set it again hot
+        for (&row_id, (old_row, _)) in &prep.set_rows {
+            let Some((_, cs, idx)) = self.find_segment_row_in(snap, row_id)? else {
+                return Err(Self::write_conflict(row_id));
+            };
+            let mut reader = super::writer::RowReader::new(Arc::clone(&cs.volume));
+            if reader.row(idx, &cs.mapping)? != *old_row {
+                return Err(Self::write_conflict(row_id));
+            }
         }
         Ok(())
     }
@@ -2233,7 +2244,8 @@ impl SegmentedTable {
         let warm = mgr.statement_snapshot();
         read(&warm)?;
         let mut carried = warm.take_loaded();
-        for _ in 0..=COLD_READ_RETRIES {
+        let mut releases = 0;
+        loop {
             let guard = mgr.acquire_seal_read();
             let snap = mgr.statement_snapshot();
             snap.adopt(carried);
@@ -2241,13 +2253,16 @@ impl SegmentedTable {
             match read(&snap) {
                 Ok(()) => return Ok((guard, Some(snap))),
                 Err(e) if snap.is_deferred(&e) => {
+                    releases += 1;
+                    if releases > COLD_READ_RETRIES {
+                        return Err(Self::cold_reads_unsettled(mgr));
+                    }
                     drop(guard);
                     carried = snap.into_loaded(mgr)?;
                 }
                 Err(e) => return Err(e),
             }
         }
-        Err(Self::cold_reads_unsettled(mgr))
     }
 
     fn cold_reads_unsettled(mgr: &super::manifest::SegmentManager) -> crate::core::Error {

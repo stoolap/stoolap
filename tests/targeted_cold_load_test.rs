@@ -244,19 +244,142 @@ fn publication_keeps_a_view_another_reader_published_meanwhile() {
 }
 
 #[test]
-fn many_unique_candidates_publish_with_one_map_copy() {
+fn unique_candidates_in_seven_volumes_load_and_publish_with_one_map_copy() {
     let _guard = FailpointGuard::new();
     let dir = tempfile::tempdir().unwrap();
-    let db = cold_table(dir.path(), 64);
-    // Rows 1..64 live in the oldest volume; each new k falls inside another
-    // volume's k range and is present nowhere
+    let db = cold_table(dir.path(), 8);
+    let mut tx = db.begin().unwrap();
+    // The first row of volumes 1..7 goes; their keys stay in the blooms
+    tx.execute(
+        "DELETE FROM t WHERE id IN (1001, 2001, 3001, 4001, 5001, 6001, 7001)",
+        (),
+    )
+    .unwrap();
+    db.engine().cold_volumes_for_test("t");
+    // Rows 2..8 of the oldest volume take those keys: each check loads the
+    // volume the bloom points to and finds the row deleted
+    let before = volume_loads();
     let clones = stoolap::test_failpoints::segment_map_clones();
-    let loads = loads_of(&db, "UPDATE t SET k = id * 10000 + 505 WHERE id <= 64");
+    tx.execute(
+        "UPDATE t SET k = ((id - 1) * 1000 + 1) * 10 WHERE id BETWEEN 2 AND 8",
+        (),
+    )
+    .unwrap();
+    let after = volume_loads();
     let clones = stoolap::test_failpoints::segment_map_clones() - clones;
-    assert!(clones <= 1, "{clones} map copies");
-    assert!(loads.0 <= 4, "loads {loads:?}");
+    assert_eq!(
+        (after.0 - before.0, after.1 - before.1),
+        (8, 8),
+        "the source volume and seven unique candidates"
+    );
+    assert_eq!(clones, 1, "one map copy for the eight volumes");
+    tx.commit().unwrap();
     let moved: i64 = db
-        .query_one("SELECT COUNT(*) FROM t WHERE k % 10 = 5", ())
+        .query_one(
+            "SELECT COUNT(*) FROM t WHERE id BETWEEN 2 AND 8 AND k % 10000 = 10",
+            (),
+        )
         .unwrap();
-    assert_eq!(moved, 64);
+    assert_eq!(moved, 7);
+}
+
+#[test]
+fn a_captured_load_keeps_the_unique_index_the_cold_entry_built() {
+    use std::sync::Arc;
+    use stoolap::storage::volume::{io, manifest::SegmentManager};
+    let _guard = FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let _db = cold_table(dir.path(), 1);
+    let volume_dir = dir.path().join("volumes");
+    let mgr = SegmentManager::load_from_disk("t", &volume_dir)
+        .unwrap()
+        .unwrap();
+    let vol = io::read_volume_from_disk(&io::list_volumes(&volume_dir, "t")[0]).unwrap();
+    vol.prebuild_unique_index(&[1]).unwrap();
+    let built = Arc::clone(vol.unique_indices.read().get(&vec![1]).unwrap());
+    let seg_id = mgr.manifest().segments[0].segment_id;
+    assert!(mgr.load_volume_for_existing_segment(seg_id, Arc::new(vol.to_cold()), None));
+    drop(vol);
+    let snap = mgr.statement_snapshot();
+    let cs = snap.segs.get(&seg_id).unwrap();
+    assert!(cs.volume.is_cold());
+    let loaded = snap.volume(&mgr, seg_id, cs).unwrap();
+    assert!(
+        loaded
+            .unique_indices
+            .read()
+            .get(&vec![1])
+            .is_some_and(|i| Arc::ptr_eq(i, &built)),
+        "the loaded volume serves its first lookup from the index already built"
+    );
+}
+
+#[test]
+fn a_waiting_row_whose_sealed_copy_changed_conflicts_and_is_set_once() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use stoolap::core::Value;
+    use stoolap::storage::traits::Engine;
+    use stoolap::test_failpoints as fp;
+
+    fn insert_rows(db: &Database, first: i64) {
+        let rows: Vec<_> = (first..first + ROWS)
+            .map(|id| format!("({id},{},0)", id * 10))
+            .collect();
+        db.execute(&format!("INSERT INTO t VALUES {}", rows.join(",")), ())
+            .unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    }
+    // The third capture under the fence commits a change to the waiting row
+    fn on_capture(db: Database, remaining: usize, observed: Rc<Cell<usize>>) {
+        fp::after_statement_captured(move || {
+            observed.set(observed.get() + 1);
+            if remaining == 0 {
+                db.execute("UPDATE t SET v = 77 WHERE id = 9001", ())
+                    .unwrap();
+            } else {
+                on_capture(db, remaining - 1, observed);
+            }
+        });
+    }
+    // Three seals push the UPDATE into round 3, its rows cold again
+    fn force_rounds(db: Database, remaining: usize, observed: Rc<Cell<usize>>) {
+        fp::after_cold_round_prepared(move || {
+            insert_rows(
+                &db,
+                match remaining {
+                    3 => 3001,
+                    2 => 5001,
+                    _ => 9001,
+                },
+            );
+            if remaining > 1 {
+                force_rounds(db, remaining - 1, observed);
+            } else {
+                db.engine().cold_volumes_for_test("t");
+                on_capture(db, 2, observed);
+            }
+        });
+    }
+
+    let _guard = FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db = cold_table(dir.path(), 2);
+    let mut tx = db.engine().begin_transaction().unwrap();
+    let mut table = tx.get_table("t").unwrap();
+    let captures = Rc::new(Cell::new(0));
+    force_rounds(db.clone(), 3, Rc::clone(&captures));
+    let mut calls = 0;
+    let result = table.update_by_row_ids(&[5, 9001], &mut |mut row| {
+        if row.get(0) != Some(&Value::Integer(9001)) {
+            return Ok((row, false));
+        }
+        calls += 1;
+        row.set(1, Value::Integer(10010))?;
+        Ok((row, true))
+    });
+    tx.rollback().unwrap();
+    assert_eq!(captures.get(), 3, "the concurrent change ran");
+    assert_eq!(calls, 1, "the setter ran once");
+    assert!(result.is_err(), "a changed waiting row conflicts");
 }

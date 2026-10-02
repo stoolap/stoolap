@@ -123,6 +123,30 @@ fn bits_without(row_count: usize, dead: &[u32]) -> Vec<u64> {
     bits
 }
 
+/// One built unique index of a volume: its column set and its entries
+type BuiltUniqueIndex = (Vec<usize>, Arc<Vec<(u64, u32)>>);
+
+/// Gives `into` every unique index `from` has built that `into` has not,
+/// sharing the entries; the guards are never held together
+fn merge_unique_indices(into: &FrozenVolume, from: &FrozenVolume) {
+    if Arc::ptr_eq(&into.unique_indices, &from.unique_indices) {
+        return;
+    }
+    let built: smallvec::SmallVec<[BuiltUniqueIndex; 2]> = from
+        .unique_indices
+        .read()
+        .iter()
+        .map(|(key, entries)| (key.clone(), Arc::clone(entries)))
+        .collect();
+    if built.is_empty() {
+        return;
+    }
+    let mut own = into.unique_indices.write();
+    for (key, entries) in built {
+        own.entry(key).or_insert(entries);
+    }
+}
+
 fn clear_dead(bits: &mut [u64], dead: &[u32]) {
     for &pos in dead {
         let pos = pos as usize;
@@ -1600,6 +1624,10 @@ impl SegmentManager {
         debug_assert_eq!(volume.meta.row_count, cs.volume.meta.row_count);
         debug_assert_eq!(volume.meta.row_ids.first(), cs.volume.meta.row_ids.first());
         debug_assert_eq!(volume.meta.row_ids.last(), cs.volume.meta.row_ids.last());
+        // The unique indexes and row order the cold entry kept serve the
+        // statement's first lookup instead of being built again
+        merge_unique_indices(&volume, &cs.volume);
+        volume.inherit_row_order(&cs.volume);
         volume.mark_accessed();
         Ok(volume)
     }
@@ -1633,12 +1661,8 @@ impl SegmentManager {
                 continue;
             }
             if let Some(cs) = new_map.get_mut(&l.seg_id) {
-                if !Arc::ptr_eq(&l.volume.unique_indices, &cs.volume.unique_indices)
-                    && !cs.volume.unique_indices.read().is_empty()
-                {
-                    *l.volume.unique_indices.write() =
-                        std::mem::take(&mut *cs.volume.unique_indices.write());
-                }
+                // Sets the statement built stay; the entry's others join them
+                merge_unique_indices(&l.volume, &cs.volume);
                 l.volume.inherit_row_order(&cs.volume);
                 cs.volume = l.volume;
             }
