@@ -2205,10 +2205,17 @@ impl SegmentManager {
         // Identify targets under read lock. Reset accessed volumes' epochs
         // so their idle counter starts from this cycle.
         let mut has_targets = false;
+        let mut idle_indexes = Vec::new();
         let targets: Vec<(u64, bool, bool)> = {
             let segs = self.segments.read();
             segs.iter()
                 .filter_map(|(&seg_id, cs)| {
+                    // Unique indexes no lookup used, through any form of the
+                    // volume, go; a lookup builds them again
+                    let indexes = &cs.volume.unique_indices;
+                    if indexes.idle_for(current_epoch, MIN_IDLE_CYCLES) {
+                        idle_indexes.push(Arc::clone(indexes));
+                    }
                     let vol_epoch = cs
                         .volume
                         .last_access_epoch
@@ -2241,6 +2248,9 @@ impl SegmentManager {
                 })
                 .collect()
         };
+        for indexes in idle_indexes {
+            indexes.release_if_unused(current_epoch, MIN_IDLE_CYCLES);
+        }
 
         if !has_targets {
             return;

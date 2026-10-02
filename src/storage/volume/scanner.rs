@@ -514,7 +514,7 @@ impl VolumeScanner {
                     column_name_map: ahash::AHashMap::new(),
                     row_groups: Vec::new(),
                 }),
-                unique_indices: std::sync::Arc::new(parking_lot::RwLock::new(
+                unique_indices: std::sync::Arc::new(super::writer::UniqueIndexes::new(
                     rustc_hash::FxHashMap::default(),
                 )),
                 last_access_epoch: std::sync::atomic::AtomicU64::new(0),
