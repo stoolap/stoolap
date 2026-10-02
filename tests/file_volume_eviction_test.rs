@@ -164,7 +164,10 @@ fn a_volume_a_lookup_reaches_keeps_its_unique_index() {
         Some(&schema),
     );
     for epoch in [0, 3, 6, 9, 12] {
-        manager.segments_raw()[&1].volume.mark_accessed();
+        manager.segments_raw()[&1]
+            .volume
+            .unique_lookup_all(&[1], &[&Value::Integer(20)], |_| true)
+            .unwrap();
         manager.evict_idle_volumes(epoch, false);
     }
     assert_eq!(
@@ -172,6 +175,57 @@ fn a_volume_a_lookup_reaches_keeps_its_unique_index() {
         1,
         "a volume in use lost its index"
     );
+}
+
+#[test]
+fn a_lookup_through_a_captured_view_keeps_the_shared_index() {
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let (_, path, schema) = built(dir.path());
+    let volume = Arc::new(read_volume_from_disk(&path).unwrap());
+    volume.prebuild_unique_index(&[1]).unwrap();
+    let manager = SegmentManager::new("t", Some(dir.path().to_path_buf()));
+    manager.register_segment(
+        1,
+        Arc::clone(&volume),
+        SegmentMeta {
+            segment_id: 1,
+            file_path: PathBuf::from("vol_0000000000000001.vol"),
+            row_count: 2,
+            min_row_id: 1,
+            max_row_id: 2,
+            creation_lsn: 0,
+            seal_seq: 0,
+            schema_version: 0,
+        },
+        Some(&schema),
+    );
+    let snapshot = manager.statement_snapshot();
+    let epoch = volume.last_access_epoch.load(Ordering::Relaxed) + 3;
+    manager.evict_idle_volumes(epoch, false);
+    let replacement = Arc::clone(&manager.segments_raw()[&1].volume);
+    assert!(
+        !Arc::ptr_eq(&volume, &replacement),
+        "the volume was not rewarmed"
+    );
+    assert!(Arc::ptr_eq(
+        &volume.unique_indices,
+        &replacement.unique_indices
+    ));
+    for epoch in epoch + 3..epoch + 9 {
+        assert_eq!(
+            manager
+                .find_row_id_by_values_in(&snapshot, &[1], &[&Value::Integer(20)], &[])
+                .unwrap(),
+            Some(2)
+        );
+        manager.evict_idle_volumes(epoch, false);
+        assert_eq!(
+            unique_indexes(&replacement),
+            1,
+            "eviction dropped an index a captured view is using"
+        );
+    }
 }
 
 #[test]

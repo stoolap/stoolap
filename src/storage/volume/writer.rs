@@ -1687,6 +1687,68 @@ impl VolumeMeta {
     }
 }
 
+type UniqueIndexMap = rustc_hash::FxHashMap<Vec<usize>, Arc<Vec<(u64, u32)>>>;
+
+/// A volume's unique indexes and the last eviction pass a lookup used
+/// them in, shared by every form of the volume
+pub struct UniqueIndexes {
+    entries: parking_lot::RwLock<UniqueIndexMap>,
+    /// u64::MAX when used since the last pass, else that pass's epoch
+    last_use_epoch: std::sync::atomic::AtomicU64,
+}
+
+impl UniqueIndexes {
+    pub fn new(entries: UniqueIndexMap) -> Self {
+        Self {
+            entries: parking_lot::RwLock::new(entries),
+            last_use_epoch: std::sync::atomic::AtomicU64::new(
+                GLOBAL_EVICTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        }
+    }
+
+    pub fn read(&self) -> parking_lot::RwLockReadGuard<'_, UniqueIndexMap> {
+        self.entries.read()
+    }
+
+    pub fn write(&self) -> parking_lot::RwLockWriteGuard<'_, UniqueIndexMap> {
+        self.entries.write()
+    }
+
+    pub fn try_write(&self) -> Option<parking_lot::RwLockWriteGuard<'_, UniqueIndexMap>> {
+        self.entries.try_write()
+    }
+
+    fn mark_used(&self) {
+        self.last_use_epoch
+            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether built indexes went unused for `cycles` passes up to `epoch`;
+    /// a use since the last pass starts the count again from this one
+    pub(crate) fn idle_for(&self, epoch: u64, cycles: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let last = self.last_use_epoch.load(Relaxed);
+        if last == u64::MAX {
+            self.last_use_epoch.store(epoch, Relaxed);
+            return false;
+        }
+        epoch.saturating_sub(last) >= cycles && !self.read().is_empty()
+    }
+
+    /// Drop the indexes unless a lookup used them since `idle_for` said idle
+    pub(crate) fn release_if_unused(&self) {
+        let mut entries = self.entries.write();
+        if self
+            .last_use_epoch
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != u64::MAX
+        {
+            entries.clear();
+        }
+    }
+}
+
 /// A frozen volume ready for queries.
 ///
 /// This is the in-memory representation. Serialization to/from disk
@@ -1699,9 +1761,7 @@ pub struct FrozenVolume {
     /// Per-volume unique index: lazily built, never invalidated (volume is immutable).
     /// Key: sorted column indices for a UNIQUE constraint.
     /// Value: shared sorted (hash, row_idx) pairs, 16 bytes per entry.
-    #[allow(clippy::type_complexity)]
-    pub unique_indices:
-        Arc<parking_lot::RwLock<rustc_hash::FxHashMap<Vec<usize>, Arc<Vec<(u64, u32)>>>>>,
+    pub unique_indices: Arc<UniqueIndexes>,
     /// Access epoch counter. Bumped per scan for eviction tracking.
     pub last_access_epoch: std::sync::atomic::AtomicU64,
 }
@@ -2971,7 +3031,7 @@ impl VolumeBuilder {
                 column_name_map,
                 row_groups,
             }),
-            unique_indices: Arc::new(parking_lot::RwLock::new(rustc_hash::FxHashMap::default())),
+            unique_indices: Arc::new(UniqueIndexes::new(rustc_hash::FxHashMap::default())),
             last_access_epoch: std::sync::atomic::AtomicU64::new(
                 GLOBAL_EVICTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed),
             ),
@@ -3466,6 +3526,7 @@ impl FrozenVolume {
         mut f: impl FnMut(u32) -> bool, // return true to stop early
     ) -> std::io::Result<()> {
         use std::hash::{Hash, Hasher};
+        self.unique_indices.mark_used();
 
         // Compute hash of query values
         let mut hasher = ahash::AHasher::default();

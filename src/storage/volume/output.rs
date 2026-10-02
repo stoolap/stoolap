@@ -546,7 +546,7 @@ impl VolumeFileWriter {
         Ok(FrozenVolume {
             columns: LazyColumns::deferred(store, column_types),
             meta: Arc::new(meta),
-            unique_indices: Arc::new(parking_lot::RwLock::new(unique_indices)),
+            unique_indices: Arc::new(super::writer::UniqueIndexes::new(unique_indices)),
             last_access_epoch: std::sync::atomic::AtomicU64::new(
                 super::writer::GLOBAL_EVICTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed),
             ),

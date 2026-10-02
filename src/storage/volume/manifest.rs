@@ -2206,6 +2206,12 @@ impl SegmentManager {
             let segs = self.segments.read();
             segs.iter()
                 .filter_map(|(&seg_id, cs)| {
+                    // Unique indexes no lookup used, through any form of the
+                    // volume, go; a lookup builds them again
+                    let indexes = &cs.volume.unique_indices;
+                    if indexes.idle_for(current_epoch, MIN_IDLE_CYCLES) {
+                        idle_indexes.push(Arc::clone(indexes));
+                    }
                     let vol_epoch = cs
                         .volume
                         .last_access_epoch
@@ -2219,10 +2225,6 @@ impl SegmentManager {
                     let delta = current_epoch.saturating_sub(vol_epoch);
                     if delta < MIN_IDLE_CYCLES {
                         return None;
-                    }
-                    // An idle volume lets go of its unique indexes; a lookup builds them again
-                    if !cs.volume.unique_indices.read().is_empty() {
-                        idle_indexes.push(Arc::clone(&cs.volume.unique_indices));
                     }
                     let columns = &cs.volume.columns;
                     let is_hot = columns.is_eager();
@@ -2243,7 +2245,7 @@ impl SegmentManager {
                 .collect()
         };
         for indexes in idle_indexes {
-            indexes.write().clear();
+            indexes.release_if_unused();
         }
 
         if !has_targets {
