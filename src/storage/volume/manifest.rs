@@ -1998,18 +1998,21 @@ impl SegmentManager {
                     if delta < MIN_IDLE_CYCLES {
                         return None;
                     }
-                    let is_hot = cs.volume.columns.is_eager();
+                    let columns = &cs.volume.columns;
+                    let is_hot = columns.is_eager();
+                    let file_backed = columns
+                        .compressed_store()
+                        .is_some_and(|store| store.is_file_backed());
                     // A file-backed store holds no blocks; cold would only force a reload
-                    let is_warm = cs.volume.is_warm()
-                        && (file_backed_to_cold
-                            || !cs
-                                .volume
-                                .columns
-                                .compressed_store()
-                                .is_some_and(|store| store.is_file_backed()));
-                    if is_hot || is_warm {
+                    let is_warm = cs.volume.is_warm() && (file_backed_to_cold || !file_backed);
+                    // A file-backed volume drops its decoded columns and keeps its store
+                    let rewarm = !is_hot
+                        && !is_warm
+                        && file_backed
+                        && (0..columns.len()).any(|col| columns.resident(col).is_some());
+                    if is_hot || is_warm || rewarm {
                         has_targets = true;
-                        Some((seg_id, is_hot, is_warm))
+                        Some((seg_id, is_hot || rewarm, is_warm))
                     } else {
                         None // already cold
                     }

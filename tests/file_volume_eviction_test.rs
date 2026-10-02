@@ -89,3 +89,19 @@ fn a_volume_reading_its_file_stops_at_warm() {
     assert!(!volume.is_cold(), "a file-backed volume is never made cold");
     assert!(volume.is_warm());
 }
+
+#[test]
+fn a_file_volume_drops_a_decoded_column_when_idle() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, path, schema) = built(dir.path());
+    let volume = read_volume_from_disk(&path).unwrap();
+    volume.columns.get(1).unwrap();
+    assert!(volume.columns.resident(1).is_some());
+    assert!(volume.is_warm(), "one decoded column of two leaves it warm");
+    let volume = evicted(volume, dir.path(), &schema);
+    assert!(
+        volume.columns.resident(1).is_none(),
+        "the idle decoded column is dropped"
+    );
+    assert!(volume.columns.compressed_store().unwrap().is_file_backed());
+}
