@@ -1205,6 +1205,10 @@ impl Executor {
                 self.engine
                     .record_alter_table_cluster_by(table_name, &key)?;
             }
+            AlterTableOperation::DropClusterBy => {
+                self.engine.set_cluster_key(table_name, Vec::new())?;
+                self.engine.record_alter_table_cluster_by(table_name, &[])?;
+            }
             AlterTableOperation::RenameTable => {
                 if let Some(ref new_name) = stmt.new_table_name {
                     tx.rename_table(table_name, &new_name.value)?;

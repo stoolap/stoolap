@@ -2013,6 +2013,8 @@ pub enum AlterTableOperation {
     RenameTable,
     /// CLUSTER BY (cols): the order the sealed rows are kept in
     ClusterBy,
+    /// DROP CLUSTER BY: the sealed rows return to row id order
+    DropClusterBy,
 }
 
 /// ALTER TABLE statement
@@ -2062,6 +2064,7 @@ impl fmt::Display for AlterTableStatement {
                 let columns: Vec<String> = self.cluster_by.iter().map(|c| c.to_string()).collect();
                 result.push_str(&format!("CLUSTER BY ({})", columns.join(", ")));
             }
+            AlterTableOperation::DropClusterBy => result.push_str("DROP CLUSTER BY"),
         }
         write!(f, "{}", result)
     }

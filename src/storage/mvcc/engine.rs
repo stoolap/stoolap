@@ -6337,9 +6337,10 @@ impl MVCCEngine {
                 // does not copy the map because of this reference
                 drop(ts);
 
-                // A clustered table rewrites the volumes not in its key
-                // order. A volume is decided once, a cold one loaded to
-                // decide, and a cycle decides at most compact_threshold of
+                // A table rewrites the volumes not in its key order, row id
+                // order without a key, which the metadata answers. A key's
+                // verdict is decided once, a cold volume loaded to decide,
+                // and a cycle decides at most compact_threshold of
                 // them and rewrites at most as many beyond the volumes
                 // size or tombstones call for, the ones the closure below
                 // pulls in included, so what a cycle loads and rewrites
@@ -6349,37 +6350,32 @@ impl MVCCEngine {
                 let mut base: Vec<bool> = planned.iter().map(|entry| entry.2).collect();
                 let mut selected: Vec<usize> = Vec::new();
                 let mut all_checked = !deferred;
-                if let Some(request) = recluster_request {
+                if recluster_request.is_some() {
                     let key = &schema.cluster_key;
-                    if !key.is_empty() {
-                        let mut decided = 0usize;
-                        for (position, entry) in planned.iter().enumerate() {
-                            if entry.3 {
-                                continue;
+                    let mut decided = 0usize;
+                    for (position, entry) in planned.iter().enumerate() {
+                        if entry.3 {
+                            continue;
+                        }
+                        let in_order = match mgr.known_key_order(entry.0, key) {
+                            Some(in_order) => in_order,
+                            None if decided < compact_threshold => {
+                                decided += 1;
+                                mgr.decide_key_order(entry.0, key)?
                             }
-                            let in_order = match mgr.known_key_order(entry.0, key) {
-                                Some(in_order) => in_order,
-                                None if decided < compact_threshold => {
-                                    decided += 1;
-                                    mgr.decide_key_order(entry.0, key)?
-                                }
-                                None => {
-                                    all_checked = false;
-                                    continue;
-                                }
-                            };
-                            if in_order {
-                                continue;
-                            }
-                            if selected.len() >= compact_threshold {
+                            None => {
                                 all_checked = false;
                                 continue;
                             }
-                            selected.push(position);
+                        };
+                        if in_order {
+                            continue;
                         }
-                    }
-                    if key.is_empty() {
-                        mgr.recluster_done(request);
+                        if selected.len() >= compact_threshold {
+                            all_checked = false;
+                            continue;
+                        }
+                        selected.push(position);
                     }
                 }
 
@@ -6420,7 +6416,7 @@ impl MVCCEngine {
                 };
                 let reclustering = !selected.is_empty();
                 if let Some(request) = recluster_request {
-                    if !schema.cluster_key.is_empty() && all_checked && !reduced && !reclustering {
+                    if all_checked && !reduced && !reclustering {
                         mgr.recluster_done(request);
                     }
                 }
