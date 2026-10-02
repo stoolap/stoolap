@@ -597,6 +597,87 @@ pub(crate) fn indexes_published() {
     }
 }
 
+thread_local! {
+    static VOLUME_LOAD_REQUESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static VOLUME_FILE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SEGMENT_MAP_CLONES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static COLD_MAP_CAPTURED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+thread_local! {
+    static STATEMENT_CAPTURED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static COLD_ROUND_PREPARED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// A statement takes over none of the cold volumes it read earlier, so
+/// every read under the fence is deferred
+pub static COLD_READS_FORGET: AtomicBool = AtomicBool::new(false);
+
+/// Run once on this thread when its next statement snapshot is captured
+/// and every guard of the capture is released
+pub fn after_statement_captured(hook: impl FnOnce() + 'static) {
+    STATEMENT_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn statement_captured() {
+    let hook = STATEMENT_CAPTURED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when an UPDATE has prepared a round of cold
+/// rows and not yet taken the seal fence
+pub fn after_cold_round_prepared(hook: impl FnOnce() + 'static) {
+    COLD_ROUND_PREPARED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn cold_round_prepared() {
+    let hook = COLD_ROUND_PREPARED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Segment maps this thread copied to publish reloaded volumes
+pub fn segment_map_clones() -> usize {
+    SEGMENT_MAP_CLONES.with(std::cell::Cell::get)
+}
+
+pub(crate) fn segment_map_cloned() {
+    SEGMENT_MAP_CLONES.with(|n| n.set(n.get() + 1));
+}
+
+/// Run once on this thread when its next statement snapshot has read the
+/// segment map and not yet the cold flag
+pub fn on_cold_map_captured(hook: impl FnOnce() + 'static) {
+    COLD_MAP_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn cold_map_captured() {
+    let hook = COLD_MAP_CAPTURED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Volume loads this thread asked for and the volume files it read for
+/// them, since the last reset; a load the file owner's cache answers reads none
+pub fn volume_loads() -> (usize, usize) {
+    (
+        VOLUME_LOAD_REQUESTS.with(std::cell::Cell::get),
+        VOLUME_FILE_READS.with(std::cell::Cell::get),
+    )
+}
+
+pub(crate) fn volume_load_requested() {
+    VOLUME_LOAD_REQUESTS.with(|n| n.set(n.get() + 1));
+}
+
+pub(crate) fn volume_file_read() {
+    VOLUME_FILE_READS.with(|n| n.set(n.get() + 1));
+}
+
 /// Reset all failpoints to disabled state
 pub fn reset_all() {
     use std::sync::atomic::Ordering::Release;
@@ -617,6 +698,13 @@ pub fn reset_all() {
     RETIRED_AWAITED_HOOK.with(|slot| *slot.borrow_mut() = None);
     WAL_DIRECTORY_SYNC_HOOK.with(|slot| *slot.borrow_mut() = None);
     INDEXES_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    VOLUME_LOAD_REQUESTS.with(|n| n.set(0));
+    VOLUME_FILE_READS.with(|n| n.set(0));
+    SEGMENT_MAP_CLONES.with(|n| n.set(0));
+    COLD_MAP_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    STATEMENT_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COLD_ROUND_PREPARED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COLD_READS_FORGET.store(false, Release);
 }
 
 /// RAII guard that serializes failpoint tests and resets all failpoints on drop.

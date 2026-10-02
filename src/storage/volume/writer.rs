@@ -131,6 +131,8 @@ impl VolumeFile {
         if let Some(volume) = loaded.upgrade() {
             return Ok(volume);
         }
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::volume_file_read();
         let volume = Arc::new(super::io::read_volume_from_handle(self)?);
         *loaded = Arc::downgrade(&volume);
         Ok(volume)
