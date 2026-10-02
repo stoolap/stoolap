@@ -1533,6 +1533,11 @@ impl LazyColumns {
         Ok(result)
     }
 
+    /// Whether any column holds a cached read, a decoded column or a failure
+    pub fn holds_reads(&self) -> bool {
+        self.slots.iter().any(|slot| slot.get().is_some())
+    }
+
     /// A column already decoded here, without decoding it: None while the
     /// column is still in its compressed form or was never loaded
     pub fn resident(&self, idx: usize) -> Option<&ColumnData> {

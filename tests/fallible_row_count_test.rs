@@ -71,8 +71,8 @@ fn cold_table_with_index(dir: &Path, snapshot: bool, indexed: bool) -> (Segmente
         },
         Some(&schema),
     );
-    manager.evict_idle_volumes(0);
-    manager.evict_idle_volumes(3);
+    manager.evict_idle_volumes(0, true);
+    manager.evict_idle_volumes(3, true);
     assert!(manager.segments_raw()[&1].volume.is_cold());
     let store = Arc::new(VersionStore::new(schema.table_name.clone(), schema));
     let mut local = TransactionVersionStore::new(Arc::clone(&store), 1);
