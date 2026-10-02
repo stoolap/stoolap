@@ -106,6 +106,74 @@ fn a_file_volume_drops_a_decoded_column_when_idle() {
     assert!(volume.columns.compressed_store().unwrap().is_file_backed());
 }
 
+fn unique_indexes(volume: &FrozenVolume) -> usize {
+    volume.unique_indices.read().len()
+}
+
+#[test]
+fn an_idle_volume_lets_go_of_its_unique_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let (volume, _, schema) = built(dir.path());
+    volume.prebuild_unique_index(&[1]).unwrap();
+    assert_eq!(unique_indexes(&volume), 1);
+    let volume = evicted(volume, dir.path(), &schema);
+    assert_eq!(unique_indexes(&volume), 0, "the idle volume kept its index");
+    let mut found = Vec::new();
+    volume
+        .unique_lookup_all(&[1], &[&Value::Integer(20)], |row| {
+            found.push(row);
+            false
+        })
+        .unwrap();
+    assert_eq!(found, vec![1], "the index built again answers");
+}
+
+#[test]
+fn an_idle_file_volume_lets_go_of_its_unique_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, path, schema) = built(dir.path());
+    let volume = read_volume_from_disk(&path).unwrap();
+    volume.prebuild_unique_index(&[1]).unwrap();
+    let volume = evicted(volume, dir.path(), &schema);
+    assert_eq!(
+        unique_indexes(&volume),
+        0,
+        "the idle file volume kept its index"
+    );
+}
+
+#[test]
+fn a_volume_a_lookup_reaches_keeps_its_unique_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let (volume, _, schema) = built(dir.path());
+    volume.prebuild_unique_index(&[1]).unwrap();
+    let manager = SegmentManager::new("t", Some(dir.path().to_path_buf()));
+    manager.register_segment(
+        1,
+        Arc::new(volume),
+        SegmentMeta {
+            segment_id: 1,
+            file_path: PathBuf::from("vol_0000000000000001.vol"),
+            row_count: 2,
+            min_row_id: 1,
+            max_row_id: 2,
+            creation_lsn: 0,
+            seal_seq: 0,
+            schema_version: 0,
+        },
+        Some(&schema),
+    );
+    for epoch in [0, 3, 6, 9, 12] {
+        manager.segments_raw()[&1].volume.mark_accessed();
+        manager.evict_idle_volumes(epoch, false);
+    }
+    assert_eq!(
+        unique_indexes(&manager.segments_raw()[&1].volume),
+        1,
+        "a volume in use lost its index"
+    );
+}
+
 #[test]
 fn a_file_volume_forgets_a_failed_read_when_idle() {
     let dir = tempfile::tempdir().unwrap();
