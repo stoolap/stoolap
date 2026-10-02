@@ -2245,7 +2245,7 @@ impl SegmentManager {
                 .collect()
         };
         for indexes in idle_indexes {
-            indexes.release_if_unused();
+            indexes.release_if_unused(current_epoch, MIN_IDLE_CYCLES);
         }
 
         if !has_targets {

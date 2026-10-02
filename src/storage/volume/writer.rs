@@ -1693,7 +1693,8 @@ type UniqueIndexMap = rustc_hash::FxHashMap<Vec<usize>, Arc<Vec<(u64, u32)>>>;
 /// them in, shared by every form of the volume
 pub struct UniqueIndexes {
     entries: parking_lot::RwLock<UniqueIndexMap>,
-    /// u64::MAX when used since the last pass, else that pass's epoch
+    /// u64::MAX when used since the last pass, and at first, so the first
+    /// pass binds it to its own database's epochs; else that pass's epoch
     last_use_epoch: std::sync::atomic::AtomicU64,
 }
 
@@ -1701,9 +1702,7 @@ impl UniqueIndexes {
     pub fn new(entries: UniqueIndexMap) -> Self {
         Self {
             entries: parking_lot::RwLock::new(entries),
-            last_use_epoch: std::sync::atomic::AtomicU64::new(
-                GLOBAL_EVICTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed),
-            ),
+            last_use_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
 
@@ -1736,16 +1735,21 @@ impl UniqueIndexes {
         epoch.saturating_sub(last) >= cycles && !self.read().is_empty()
     }
 
-    /// Drop the indexes unless a lookup used them since `idle_for` said idle
-    pub(crate) fn release_if_unused(&self) {
-        let mut entries = self.entries.write();
-        if self
-            .last_use_epoch
-            .load(std::sync::atomic::Ordering::Relaxed)
-            != u64::MAX
-        {
-            entries.clear();
-        }
+    /// Drop the indexes if they are still idle for the pass at `epoch`: a
+    /// lookup, or a later pass restarting the count, keeps them. The map
+    /// is freed after the write guard is released
+    pub(crate) fn release_if_unused(&self, epoch: u64, cycles: u64) {
+        let released = {
+            let mut entries = self.entries.write();
+            let last = self
+                .last_use_epoch
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if last == u64::MAX || epoch.saturating_sub(last) < cycles {
+                return;
+            }
+            std::mem::take(&mut *entries)
+        };
+        drop(released);
     }
 }
 
