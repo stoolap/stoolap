@@ -8571,9 +8571,10 @@ mod tests {
             let debug = format!("{:?}", op);
             assert!(!debug.is_empty());
 
-            // Test Clone and Copy (use Clone::clone to avoid clone_on_copy warning)
+            // Test Clone and Copy
             let copied = op;
-            let cloned = Clone::clone(&op);
+            #[allow(clippy::clone_on_copy)]
+            let cloned = op.clone();
             assert_eq!(copied, cloned);
         }
     }

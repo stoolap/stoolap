@@ -973,8 +973,8 @@ impl Executor {
         let tables = Self::collect_subquery_table_columns(subquery);
         let reads = |expr: &Expression| Self::references_outer_columns(expr, &tables);
         subquery.columns.iter().any(&reads)
-            || subquery.having.as_deref().is_some_and(&reads)
-            || beside_correlation.is_some_and(&reads)
+            || subquery.having.as_deref().is_some_and(reads)
+            || beside_correlation.is_some_and(reads)
     }
 
     /// A COUNT one probe of an index answers: the probe counts rows, so it
@@ -3415,7 +3415,7 @@ impl Executor {
             super::utils::substitute_outer_references_in_scope(expr, outer_row, &scope)
         };
         let columns: Vec<Expression> = subquery.columns.iter().map(&bind).collect();
-        let having = subquery.having.as_deref().map(&bind);
+        let having = subquery.having.as_deref().map(bind);
         if columns == subquery.columns && having.as_ref() == subquery.having.as_deref() {
             return None;
         }
