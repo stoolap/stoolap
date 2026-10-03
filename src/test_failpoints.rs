@@ -678,6 +678,23 @@ pub(crate) fn block_decoded() {
     BLOCK_DECODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+thread_local! {
+    static UNIQUE_INDEX_TAKEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next read has taken a built unique
+/// index for its candidates and not yet searched it
+pub fn on_unique_index_taken(hook: impl FnOnce() + 'static) {
+    UNIQUE_INDEX_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn unique_index_taken() {
+    let hook = UNIQUE_INDEX_TAKEN_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// Volumes whose row ids this thread scanned to learn their order
 pub fn row_id_order_scans() -> usize {
     ROW_ID_ORDER_SCANS.with(std::cell::Cell::get)
@@ -741,6 +758,7 @@ pub fn reset_all() {
     VOLUME_FILE_READS.with(|n| n.set(0));
     SEGMENT_MAP_CLONES.with(|n| n.set(0));
     COLD_MAP_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    UNIQUE_INDEX_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     STATEMENT_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_ROUND_PREPARED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_READS_FORGET.store(false, Release);

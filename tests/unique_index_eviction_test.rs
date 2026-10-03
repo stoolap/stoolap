@@ -123,3 +123,28 @@ fn an_older_pass_keeps_an_index_a_newer_pass_saw_in_use() {
         "the older pass released an index used since it decided"
     );
 }
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_release_after_a_read_took_the_index_keeps_it() {
+    use stoolap::storage::volume::writer::UniqueCandidates;
+    let _serial = GLOBAL_EPOCH.lock().unwrap();
+    let _restore = RestoreEpoch(GLOBAL_EVICTION_EPOCH.swap(0, Ordering::Relaxed));
+    let manager = manager_with_indexes(1);
+    manager.evict_idle_volumes(1, false);
+    let volume = Arc::clone(&manager.segments_raw()[&1].volume);
+    let evicting = Arc::clone(&manager);
+    stoolap::test_failpoints::on_unique_index_taken(move || {
+        evicting.evict_idle_volumes(4, false);
+    });
+    let found = volume.built_unique_candidates(&[1], &[&Value::Integer(20)], 10);
+    assert!(
+        matches!(found, UniqueCandidates::Positions(ref positions) if positions == &[1]),
+        "the read did not find its row"
+    );
+    assert_eq!(
+        volume.unique_indices.read().len(),
+        1,
+        "a release after the read took the index dropped it"
+    );
+}

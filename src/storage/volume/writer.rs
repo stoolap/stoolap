@@ -3528,9 +3528,10 @@ impl FrozenVolume {
     }
 
     /// The rows a built unique index over `col_indices` names for `values`,
-    /// in position order, without building one: the index is taken under
-    /// one lock and searched after it. A hash names candidates only, and
-    /// more than `max` of them are not listed
+    /// in position order, without building one: the index is taken and
+    /// marked used under one read guard, which a release waits for, and
+    /// searched after it. A hash names candidates only, and more than
+    /// `max` of them are not listed
     pub fn built_unique_candidates(
         &self,
         col_indices: &[usize],
@@ -3538,10 +3539,16 @@ impl FrozenVolume {
         max: usize,
     ) -> UniqueCandidates {
         use std::hash::{Hash, Hasher};
-        let Some(entries) = self.unique_indices.read().get(col_indices).cloned() else {
-            return UniqueCandidates::NotBuilt;
+        let entries = {
+            let indexes = self.unique_indices.read();
+            let Some(entries) = indexes.get(col_indices) else {
+                return UniqueCandidates::NotBuilt;
+            };
+            self.unique_indices.mark_used();
+            Arc::clone(entries)
         };
-        self.unique_indices.mark_used();
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::unique_index_taken();
         let mut hasher = ahash::AHasher::default();
         for &val in values {
             val.hash(&mut hasher);

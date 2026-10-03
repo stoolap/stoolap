@@ -15,7 +15,18 @@
 //! An equality on every column of a unique key reads the cold rows a
 //! built per-volume unique index names, and answers as the scan does
 
+use std::sync::{Mutex, MutexGuard};
 use stoolap::Database;
+
+// The unique read counters are process-wide: every test that builds an
+// index or decodes a block takes its turn
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 const ROWS: i64 = 200_000;
 
@@ -78,6 +89,7 @@ fn shape(template: &str, filter: &str) -> String {
 
 #[test]
 fn unique_key_equalities_answer_the_same_with_and_without_a_built_index() {
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     sealed_table(dir.path());
     let db = Database::open(&dsn(dir.path())).unwrap();
@@ -101,6 +113,7 @@ fn unique_key_equalities_answer_the_same_with_and_without_a_built_index() {
 
 #[test]
 fn an_older_copy_a_hot_version_and_a_delete_hide_the_candidate() {
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     sealed_table(dir.path());
     let db = Database::open(&dsn(dir.path())).unwrap();
@@ -132,6 +145,7 @@ fn an_older_copy_a_hot_version_and_a_delete_hide_the_candidate() {
 
 #[test]
 fn a_value_of_another_type_answers_as_sql_equality_does() {
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     sealed_table(dir.path());
     let db = Database::open(&dsn(dir.path())).unwrap();
@@ -172,6 +186,7 @@ fn a_value_of_another_type_answers_as_sql_equality_does() {
 
 #[test]
 fn a_key_column_added_after_the_seal_answers_from_its_default() {
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     sealed_table(dir.path());
     let db = Database::open(&dsn(dir.path())).unwrap();
@@ -189,11 +204,7 @@ fn a_key_column_added_after_the_seal_answers_from_its_default() {
 #[cfg(feature = "test-failpoints")]
 mod counted {
     use super::*;
-    use std::sync::Mutex;
     use stoolap::test_failpoints::unique_read_counts;
-
-    // The counters are process-wide
-    static SERIAL: Mutex<()> = Mutex::new(());
 
     /// Index builds, candidates and block decodes one statement caused
     fn counted(db: &Database, sql: &str) -> (Vec<i64>, (usize, usize, usize)) {
@@ -208,7 +219,7 @@ mod counted {
 
     #[test]
     fn a_built_index_names_the_one_candidate_and_decodes_its_group_only() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         sealed_table(dir.path());
         let db = Database::open(&dsn(dir.path())).unwrap();
@@ -224,7 +235,7 @@ mod counted {
 
     #[test]
     fn a_missing_key_on_a_built_index_decodes_nothing() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         sealed_table(dir.path());
         let db = Database::open(&dsn(dir.path())).unwrap();
@@ -238,7 +249,7 @@ mod counted {
 
     #[test]
     fn a_read_never_builds_a_unique_index() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         sealed_table(dir.path());
         let db = Database::open(&dsn(dir.path())).unwrap();
@@ -252,7 +263,7 @@ mod counted {
 
     #[test]
     fn a_snapshot_reads_without_the_unique_index() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         sealed_table(dir.path());
         let db = Database::open(&dsn(dir.path())).unwrap();
