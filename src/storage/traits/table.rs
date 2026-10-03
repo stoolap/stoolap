@@ -873,6 +873,11 @@ pub trait Table: Send + Sync {
         self.get_index_on_column(column_name)
     }
 
+    /// Whether the table holds rows sealed out of its hot store
+    fn has_sealed_rows(&self) -> bool {
+        false
+    }
+
     /// The row ids the B-tree index on `column` holds for `key`, appended to
     /// `out` when the index covers every visible row and holds at most `max`
     /// of them for the key; an absent key is `Copied` with nothing appended.

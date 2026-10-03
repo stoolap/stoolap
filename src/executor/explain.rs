@@ -953,6 +953,19 @@ impl Executor {
             let left_alias = extract_table_alias(join_left);
             let right_alias = extract_table_alias(join_right);
             let join_type_upper = join_type.to_uppercase();
+            // An INNER join without a limit narrows the inner side by a
+            // table's candidates only when its outer side turns out small,
+            // which EXPLAIN cannot run
+            let small_outer = !bounded && join_type_upper == "INNER";
+            let name = |strategy: &IndexLookupStrategy| match strategy {
+                IndexLookupStrategy::PrimaryKey => "Index Nested Loop (PK)".to_string(),
+                IndexLookupStrategy::TableEquality { .. } if small_outer => {
+                    "Standard Join (conditional: a small outer narrows the inner side by its index)"
+                        .to_string()
+                }
+                IndexLookupStrategy::SecondaryIndex(_)
+                | IndexLookupStrategy::TableEquality { .. } => "Index Nested Loop".to_string(),
+            };
 
             // Check if INLJ is possible (right side has index/PK for join column)
             let inlj_info = self.check_index_nested_loop_opportunity(
@@ -962,15 +975,11 @@ impl Executor {
                 left_alias.as_deref(),
                 right_alias.as_deref(),
                 bounded,
+                small_outer,
             );
 
             if let Some((_, strategy, _, _)) = inlj_info {
-                let algo_name = match &strategy {
-                    IndexLookupStrategy::PrimaryKey => "Index Nested Loop (PK)".to_string(),
-                    IndexLookupStrategy::SecondaryIndex(_)
-                    | IndexLookupStrategy::TableEquality { .. } => "Index Nested Loop".to_string(),
-                };
-                return (algo_name, Some(strategy));
+                return (name(&strategy), Some(strategy));
             }
 
             // Check swapped direction for INLJ (left side has index/PK)
@@ -984,16 +993,12 @@ impl Executor {
                     right_alias.as_deref(),
                     left_alias.as_deref(),
                     bounded,
+                    small_outer,
                 )
             };
 
             if let Some((_, strategy, _, _)) = swapped_info {
-                let algo_name = match &strategy {
-                    IndexLookupStrategy::PrimaryKey => "Index Nested Loop (PK)".to_string(),
-                    IndexLookupStrategy::SecondaryIndex(_)
-                    | IndexLookupStrategy::TableEquality { .. } => "Index Nested Loop".to_string(),
-                };
-                return (algo_name, Some(strategy));
+                return (name(&strategy), Some(strategy));
             }
         }
 

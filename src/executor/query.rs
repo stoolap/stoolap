@@ -31,7 +31,7 @@ use crate::common::SmartString;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::common::{CompactArc, CompactVec, StringMap};
-use crate::core::{Error, Result, Row, RowVec, Value};
+use crate::core::{Error, Result, Row, RowVec, Value, ValueSet};
 use crate::optimizer::ExpressionSimplifier;
 use crate::parser::ast::*;
 use crate::parser::token::{Position, Token, TokenType};
@@ -231,6 +231,72 @@ struct ReductionPass {
     cap: usize,
     chunk_full: bool,
     limit: usize,
+}
+
+/// The most rows an outer side may hold for a join without a LIMIT to
+/// narrow its inner side by the inner table's candidates
+const SMALL_OUTER_ROWS: usize = 1024;
+
+/// A small outer side the join ran and handed on to the standard join
+struct PreparedSide {
+    rows: PreparedRows,
+    columns: Vec<String>,
+    /// The side is the join's right side
+    is_right: bool,
+}
+
+/// A prepared side's rows: unread, read in part with the rest still in
+/// its result, or held for more than one reader
+enum PreparedRows {
+    Unread(Box<dyn QueryResult>),
+    Partial(Vec<Row>, Box<dyn QueryResult>),
+    Shared(CompactArc<Vec<Row>>),
+}
+
+impl PreparedRows {
+    /// The rows of `result` held when there are at most `SMALL_OUTER_ROWS`,
+    /// else the result as far as it was read. A result that knows its length
+    /// is taken whole or not at all; any other is read one row past the cap
+    fn read_small(mut result: Box<dyn QueryResult>) -> Result<Self> {
+        match result.exact_len() {
+            Some(len) if len > SMALL_OUTER_ROWS => return Ok(PreparedRows::Unread(result)),
+            Some(_) => {
+                if let Some(rows) = result.try_into_arc_rows() {
+                    return Ok(PreparedRows::Shared(rows));
+                }
+                return Ok(PreparedRows::Unread(result));
+            }
+            None => {}
+        }
+        let mut head = Vec::new();
+        while head.len() <= SMALL_OUTER_ROWS && result.next() {
+            head.push(result.take_row());
+        }
+        if let Some(error) = result.last_error() {
+            return Err(error);
+        }
+        if head.len() <= SMALL_OUTER_ROWS {
+            Ok(PreparedRows::Shared(CompactArc::new(head)))
+        } else {
+            Ok(PreparedRows::Partial(head, result))
+        }
+    }
+
+    fn into_rows(self) -> Result<CompactArc<Vec<Row>>> {
+        match self {
+            PreparedRows::Unread(result) => Executor::materialize_result_arc(result),
+            PreparedRows::Partial(mut rows, mut rest) => {
+                while rest.next() {
+                    rows.push(rest.take_row());
+                }
+                if let Some(error) = rest.last_error() {
+                    return Err(error);
+                }
+                Ok(CompactArc::new(rows))
+            }
+            PreparedRows::Shared(rows) => Ok(rows),
+        }
+    }
 }
 
 impl Executor {
@@ -4398,6 +4464,9 @@ impl Executor {
             // NOTE: Don't use Index NL for aggregation/window queries - they need full results
             // and the current implementation falls through to standard path, causing double execution
             let pushed_limit = self.pushed_join_limit(stmt, ctx, classification, &join_type);
+            // An INNER join without a limit narrows its inner side by a table's
+            // candidates only for an outer side found small once it runs
+            let small_outer = pushed_limit.is_none() && join_type == "INNER";
             let index_nl_info = if has_agg || has_window || correlated_where {
                 None
             } else {
@@ -4408,6 +4477,7 @@ impl Executor {
                     left_alias.as_deref(),
                     right_alias.as_deref(),
                     pushed_limit.is_some(),
+                    small_outer,
                 )
             };
 
@@ -4435,6 +4505,7 @@ impl Executor {
                     right_alias.as_deref(), // Swap aliases for the check
                     left_alias.as_deref(),
                     pushed_limit.is_some(),
+                    small_outer,
                 );
                 if left_as_inner.is_some() {
                     (left_as_inner, true) // Force swap
@@ -4474,6 +4545,7 @@ impl Executor {
                     right_alias.as_deref(), // Swap aliases
                     left_alias.as_deref(),
                     pushed_limit.is_some(),
+                    small_outer,
                 );
 
                 // Prefer swapped if it gives PK lookup (most efficient)
@@ -4508,12 +4580,17 @@ impl Executor {
             };
 
             // A join the inner table stops answering leaves through the label
-            // to the hash join below
+            // to the hash join below, with the side it ran and its context
+            let mut prepared_side: Option<PreparedSide> = None;
+            let mut prepared_ctx: Option<ExecutionContext> = None;
+            let mut reduced_inner: Option<Expression> = None;
             'index_nl: {
                 let Some((table_name, lookup_strategy, inner_col, outer_col)) = index_nl_info
                 else {
                     break 'index_nl;
                 };
+                let small_outer = small_outer
+                    && matches!(lookup_strategy, IndexLookupStrategy::TableEquality { .. });
                 // Index Nested Loop path: stream outer side for early termination
                 // When swapped, execute right side as outer (with original right filter, now in nl_left_filter)
                 let outer_expr = if swapped {
@@ -4533,7 +4610,10 @@ impl Executor {
                 //
                 // The join condition u.id = o.user_id means:
                 //   Filter "o.user_id IN (1,2,3)" is equivalent to "u.id IN (1,2,3)" for join results
-                let nl_left_filter = if let Some(ref right_f) = nl_right_filter {
+                // A small outer keeps the filter the standard join gives it
+                let nl_left_filter = if small_outer {
+                    nl_left_filter
+                } else if let Some(ref right_f) = nl_right_filter {
                     // Check if right filter references the inner join key column
                     let references = filter_references_column(right_f, &inner_col);
                     if references {
@@ -4580,6 +4660,72 @@ impl Executor {
                     }
                 };
                 let mut ctx_join = ctx.with_statement_snapshot(snapshot.clone());
+                if small_outer {
+                    #[cfg(any(test, feature = "test-failpoints"))]
+                    crate::test_failpoints::join_side_ran();
+                    let (result, columns) = self.execute_table_expression_with_filter(
+                        outer_expr,
+                        &ctx_join,
+                        nl_left_filter.as_ref(),
+                    )?;
+                    // A small outer's keys narrow the inner side to the rows
+                    // its candidates name; the standard join runs either way
+                    let rows = match PreparedRows::read_small(result)? {
+                        PreparedRows::Shared(rows) => {
+                            let inner_alias = if swapped {
+                                left_alias.as_deref().unwrap_or(&table_name)
+                            } else {
+                                right_alias.as_deref().unwrap_or(&table_name)
+                            };
+                            // A literal list, which the IN list path reads before
+                            // a large table's scan streams; integer keys only, the
+                            // literals the list builder writes exactly
+                            let keys = Self::find_column_index_by_name(&outer_col, &columns)
+                                .and_then(|idx| {
+                                    let mut seen = ValueSet::default();
+                                    let mut keys = Vec::new();
+                                    for key in rows.iter().filter_map(|row| row.get(idx)) {
+                                        match key {
+                                            Value::Integer(_) => {
+                                                if seen.insert(key.clone()) {
+                                                    keys.push(key.clone());
+                                                }
+                                            }
+                                            Value::Null(_) => {}
+                                            _ => return None,
+                                        }
+                                    }
+                                    Some(keys)
+                                });
+                            let members = keys.and_then(|keys| {
+                                self.build_in_filter_expression(
+                                    &format!("{inner_alias}.{inner_col}"),
+                                    &keys,
+                                )
+                            });
+                            if let Some(members) = members {
+                                reduced_inner = combine_predicates_with_and(
+                                    nl_right_filter
+                                        .clone()
+                                        .into_iter()
+                                        .chain([members])
+                                        .collect(),
+                                );
+                                #[cfg(any(test, feature = "test-failpoints"))]
+                                crate::test_failpoints::small_outer_joined();
+                            }
+                            PreparedRows::Shared(rows)
+                        }
+                        rows => rows,
+                    };
+                    prepared_side = Some(PreparedSide {
+                        rows,
+                        columns,
+                        is_right: swapped,
+                    });
+                    prepared_ctx = Some(ctx_join);
+                    break 'index_nl;
+                }
                 // An explicit transaction reads through its own transaction, whose
                 // isolation may let a commit move rows between two fetches, so
                 // the outer side is fetched whole there
@@ -5314,23 +5460,42 @@ impl Executor {
             // STANDARD PATH: Materialize both sides
             // =================================================================
 
-            // Execute both sides
-            let (left_result, left_cols) = self.execute_table_expression_with_filter(
-                &join_source.left,
-                ctx,
-                left_filter.as_ref(),
-            )?;
-
-            let (right_result, right_cols) = self.execute_table_expression_with_filter(
-                &join_source.right,
-                ctx,
-                right_filter.as_ref(),
-            )?;
-
-            let left_rows = Self::materialize_result_arc(left_result)?;
-            let right_rows = Self::materialize_result_arc(right_result)?;
-
-            (left_rows, left_cols, right_rows, right_cols)
+            // Execute both sides; a side the index join already ran is taken
+            // as it left it, and the other side is read in the same context
+            let side_ctx = prepared_ctx.as_ref().unwrap_or(ctx);
+            let run_side = |expr: &Expression, filter: Option<&Expression>| {
+                #[cfg(any(test, feature = "test-failpoints"))]
+                crate::test_failpoints::join_side_ran();
+                let (result, columns) =
+                    self.execute_table_expression_with_filter(expr, side_ctx, filter)?;
+                Ok::<_, Error>((Self::materialize_result_arc(result)?, columns))
+            };
+            match prepared_side.take() {
+                Some(PreparedSide {
+                    rows,
+                    columns,
+                    is_right: true,
+                }) => {
+                    let filter = reduced_inner.as_ref().or(left_filter.as_ref());
+                    let (left_rows, left_cols) = run_side(&join_source.left, filter)?;
+                    (left_rows, left_cols, rows.into_rows()?, columns)
+                }
+                Some(PreparedSide {
+                    rows,
+                    columns,
+                    is_right: false,
+                }) => {
+                    let filter = reduced_inner.as_ref().or(right_filter.as_ref());
+                    let (right_rows, right_cols) = run_side(&join_source.right, filter)?;
+                    (rows.into_rows()?, columns, right_rows, right_cols)
+                }
+                None => {
+                    let (left_rows, left_cols) = run_side(&join_source.left, left_filter.as_ref())?;
+                    let (right_rows, right_cols) =
+                        run_side(&join_source.right, right_filter.as_ref())?;
+                    (left_rows, left_cols, right_rows, right_cols)
+                }
+            }
         };
 
         // Combine column names (qualified with table aliases)
@@ -7243,6 +7408,7 @@ impl Executor {
                 left_alias,
                 right_alias,
                 true,
+                false,
             )
         else {
             return Ok(None);
@@ -11177,6 +11343,7 @@ impl Executor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn check_index_nested_loop_opportunity(
         &self,
         right_expr: &Expression,
@@ -11185,6 +11352,7 @@ impl Executor {
         left_alias: Option<&str>,
         right_alias: Option<&str>,
         bounded: bool,
+        small_outer: bool,
     ) -> Option<(
         String,              // table_name
         IndexLookupStrategy, // lookup strategy (index or PK)
@@ -11326,8 +11494,9 @@ impl Executor {
 
         // A table that keeps rows outside its index still answers a bounded
         // probe from it while it can, deciding per probe; only a join the
-        // executor bounds with a limit asks it, at execution and in EXPLAIN
-        if bounded
+        // executor bounds with a limit asks it, at execution and in EXPLAIN,
+        // or one whose outer side may be small, on a table with sealed rows
+        if (bounded || (small_outer && table.has_sealed_rows()))
             && table
                 .get_index_on_column(&inner_col_unqualified)
                 .is_some_and(|index| index.index_type() == crate::core::IndexType::BTree)

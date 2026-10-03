@@ -764,6 +764,29 @@ pub(crate) fn row_id_order_scanned() {
     ROW_ID_ORDER_SCANS.with(|n| n.set(n.get() + 1));
 }
 
+thread_local! {
+    static SMALL_OUTER_JOINS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static JOIN_SIDE_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Joins this thread ran by a table's candidates for a small outer side
+pub fn small_outer_joins() -> usize {
+    SMALL_OUTER_JOINS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn small_outer_joined() {
+    SMALL_OUTER_JOINS.with(|n| n.set(n.get() + 1));
+}
+
+/// Sides this thread's two-table joins executed, so far
+pub fn join_side_runs() -> usize {
+    JOIN_SIDE_RUNS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn join_side_ran() {
+    JOIN_SIDE_RUNS.with(|n| n.set(n.get() + 1));
+}
+
 /// Run once on this thread when its next statement snapshot has read the
 /// segment map and not yet the cold flag
 pub fn on_cold_map_captured(hook: impl FnOnce() + 'static) {
