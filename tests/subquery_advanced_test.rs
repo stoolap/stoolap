@@ -683,3 +683,33 @@ fn test_subquery_with_limit() {
     // Top 2 orders by amount: 1000 (user 3 - Charlie), 750 (user 1 - Alice)
     assert_eq!(names, vec!["Alice", "Charlie"], "Expected top order users");
 }
+
+#[test]
+fn test_in_subquery_keeps_every_nested_conjunct() {
+    let db = Database::open("memory://in_subquery_nested_conjunct").expect("Failed to open");
+    db.execute(
+        "CREATE TABLE n (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        (),
+    )
+    .expect("Failed to create table");
+    db.execute("CREATE INDEX n_k ON n(k)", ())
+        .expect("Failed to create index");
+    db.execute("INSERT INTO n VALUES (1, 1, 7), (2, 1, 0), (3, 2, 0)", ())
+        .expect("Failed to insert");
+    db.execute("CREATE TABLE s (k INTEGER)", ())
+        .expect("Failed to create table");
+    db.execute("INSERT INTO s VALUES (1)", ())
+        .expect("Failed to insert");
+
+    for sql in [
+        "SELECT id FROM n WHERE (k IN (SELECT k FROM s) AND v = 0) AND id > 0",
+        "SELECT id FROM n WHERE id > 0 AND (v = 0 AND k IN (SELECT k FROM s))",
+    ] {
+        let ids: Vec<i64> = db
+            .query(sql, ())
+            .expect("Failed to query")
+            .map(|row| row.expect("Failed to get row").get::<i64>(0).unwrap())
+            .collect();
+        assert_eq!(ids, vec![2], "a nested conjunct was lost: {sql}");
+    }
+}

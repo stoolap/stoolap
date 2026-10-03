@@ -1767,13 +1767,20 @@ impl Executor {
 
             // IN subquery with AND: column IN (SELECT ...) AND other_condition
             Expression::Infix(infix) if infix.op_type == InfixOperator::And => {
+                // A side that is itself an AND around the subquery brings its
+                // own remaining predicate, which the sibling joins
+                let keep_both = |rest: Option<Expression>, sibling: &Expression| {
+                    crate::executor::utils::combine_predicates_with_and(
+                        rest.into_iter().chain([sibling.clone()]).collect(),
+                    )
+                };
                 // Try left side as IN subquery
-                if let Some((col, sq, neg, _)) = Self::extract_in_subquery_info(&infix.left) {
-                    return Some((col, sq, neg, Some((*infix.right).clone())));
+                if let Some((col, sq, neg, rest)) = Self::extract_in_subquery_info(&infix.left) {
+                    return Some((col, sq, neg, keep_both(rest, &infix.right)));
                 }
                 // Try right side as IN subquery
-                if let Some((col, sq, neg, _)) = Self::extract_in_subquery_info(&infix.right) {
-                    return Some((col, sq, neg, Some((*infix.left).clone())));
+                if let Some((col, sq, neg, rest)) = Self::extract_in_subquery_info(&infix.right) {
+                    return Some((col, sq, neg, keep_both(rest, &infix.left)));
                 }
                 None
             }
