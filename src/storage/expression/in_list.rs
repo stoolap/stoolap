@@ -23,6 +23,7 @@
 
 use std::any::Any;
 
+use chrono::{DateTime, Utc};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{find_column_index, resolve_alias, Expression};
@@ -40,6 +41,8 @@ enum HashedValues {
     Strings(FxHashSet<String>),
     /// Boolean set (only 2 possible values)
     Booleans { has_true: bool, has_false: bool },
+    /// Timestamp hash set for O(1) lookup
+    Timestamps(FxHashSet<DateTime<Utc>>),
     /// Mixed types - fall back to linear search
     Mixed,
 }
@@ -137,15 +140,21 @@ impl InListExpr {
             return;
         }
 
-        // Detect the type from the first non-null value
-        let first_type = self.values.iter().find_map(|v| match v {
-            Value::Integer(_) => Some("int"),
-            Value::Float(_) => Some("float"),
-            Value::Text(_) => Some("text"),
-            Value::Boolean(_) => Some("bool"),
-            Value::Null(_) => None,
-            _ => Some("other"),
-        });
+        // Detect the type from the first non-null value; a timestamp
+        // anywhere in the list hashes the timestamps it holds
+        let has_timestamp = self.values.iter().any(|v| matches!(v, Value::Timestamp(_)));
+        let first_type = if has_timestamp {
+            Some("timestamp")
+        } else {
+            self.values.iter().find_map(|v| match v {
+                Value::Integer(_) => Some("int"),
+                Value::Float(_) => Some("float"),
+                Value::Text(_) => Some("text"),
+                Value::Boolean(_) => Some("bool"),
+                Value::Null(_) => None,
+                _ => Some("other"),
+            })
+        };
 
         match first_type {
             Some("int") => {
@@ -218,6 +227,19 @@ impl InListExpr {
                     has_true,
                     has_false,
                 };
+            }
+            Some("timestamp") => {
+                // A member of another type never equals a timestamp cell, and
+                // the other checks search the list itself for this variant
+                let set = self
+                    .values
+                    .iter()
+                    .filter_map(|v| match v {
+                        Value::Timestamp(t) => Some(*t),
+                        _ => None,
+                    })
+                    .collect();
+                self.hashed = HashedValues::Timestamps(set);
             }
             _ => {
                 self.hashed = HashedValues::Mixed;
@@ -343,6 +365,16 @@ impl InListExpr {
             }
         }
     }
+
+    /// Check if timestamp is in list - O(1) with hash set; a list without
+    /// a timestamp holds none
+    #[inline]
+    fn check_timestamp(&self, val: &DateTime<Utc>) -> bool {
+        match &self.hashed {
+            HashedValues::Timestamps(set) => set.contains(val),
+            _ => false,
+        }
+    }
 }
 
 impl Expression for InListExpr {
@@ -373,6 +405,7 @@ impl Expression for InListExpr {
             Value::Float(val) => self.check_float(*val),
             Value::Text(val) => self.check_string(val),
             Value::Boolean(val) => self.check_boolean(*val),
+            Value::Timestamp(val) => self.check_timestamp(val),
             _ => false,
         };
 
@@ -408,6 +441,7 @@ impl Expression for InListExpr {
             Value::Float(val) => self.check_float(*val),
             Value::Text(val) => self.check_string(val),
             Value::Boolean(val) => self.check_boolean(*val),
+            Value::Timestamp(val) => self.check_timestamp(val),
             _ => false,
         };
 
@@ -777,5 +811,46 @@ mod tests {
 
         assert!(expr.evaluate(&row).unwrap());
         assert!(expr.evaluate_fast(&row));
+    }
+
+    #[test]
+    fn test_timestamp_in() {
+        let schema = SchemaBuilder::new("test")
+            .add_primary_key("id", DataType::Integer)
+            .add("ts", DataType::Timestamp)
+            .build();
+        let day = |d: u32| {
+            Value::Timestamp(
+                chrono::NaiveDate::from_ymd_opt(2024, 1, d)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap()
+                    .and_utc(),
+            )
+        };
+        let row = Row::from_values(vec![Value::integer(1), day(2)]);
+        for values in [
+            vec![day(1), day(2)],
+            vec![day(1), Value::integer(7), day(2)],
+            vec![Value::integer(1), day(2)],
+        ] {
+            let mut expr = InListExpr::new("ts", values.clone());
+            expr.prepare_for_schema(&schema);
+            assert!(expr.evaluate(&row).unwrap(), "{values:?}");
+            assert!(expr.evaluate_fast(&row), "{values:?}");
+            let mut expr = InListExpr::not_in("ts", values.clone());
+            expr.prepare_for_schema(&schema);
+            assert!(!expr.evaluate(&row).unwrap(), "{values:?}");
+        }
+        let mut expr = InListExpr::new("ts", vec![day(1), day(3)]);
+        expr.prepare_for_schema(&schema);
+        assert!(!expr.evaluate(&row).unwrap());
+        assert!(!expr.evaluate_fast(&row));
+        let mut expr = InListExpr::new("id", vec![day(2), Value::integer(1)]);
+        expr.prepare_for_schema(&schema);
+        assert!(
+            expr.evaluate(&row).unwrap(),
+            "an integer member of a list holding a timestamp"
+        );
     }
 }
