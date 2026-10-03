@@ -977,6 +977,8 @@ impl CompressedBlockStore {
         dict: Option<Arc<[SmartString]>>,
         ext_type: DataType,
     ) -> std::io::Result<ColumnData> {
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::block_decoded();
         let (decomp_len, group_rows) = self.block_layout(col_idx, gi, type_tag, num_groups)?;
         let raw_bytes = if block.len() == decomp_len {
             return deserialize_column_block(block, type_tag, group_rows, dict, ext_type);
@@ -1026,6 +1028,8 @@ impl CompressedBlockStore {
         bytes_data_out: Option<&mut Vec<u8>>,
         bytes_offsets_out: Option<&mut Vec<(u64, u64)>>,
     ) -> std::io::Result<()> {
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::block_decoded();
         let (decomp_len, group_rows) = self.block_layout(col_idx, gi, type_tag, num_groups)?;
         if block.len() == decomp_len {
             return deserialize_column_block_into(
@@ -1751,6 +1755,14 @@ impl UniqueIndexes {
         };
         drop(released);
     }
+}
+
+/// What a built unique index answers for a read, see
+/// `FrozenVolume::built_unique_candidates`
+pub enum UniqueCandidates {
+    NotBuilt,
+    TooMany,
+    Positions(Vec<usize>),
 }
 
 /// A frozen volume ready for queries.
@@ -3515,6 +3527,39 @@ impl FrozenVolume {
         self.meta.sorted_columns[col_idx]
     }
 
+    /// The rows a built unique index over `col_indices` names for `values`,
+    /// in position order, without building one: the index is taken under
+    /// one lock and searched after it. A hash names candidates only, and
+    /// more than `max` of them are not listed
+    pub fn built_unique_candidates(
+        &self,
+        col_indices: &[usize],
+        values: &[&Value],
+        max: usize,
+    ) -> UniqueCandidates {
+        use std::hash::{Hash, Hasher};
+        let Some(entries) = self.unique_indices.read().get(col_indices).cloned() else {
+            return UniqueCandidates::NotBuilt;
+        };
+        self.unique_indices.mark_used();
+        let mut hasher = ahash::AHasher::default();
+        for &val in values {
+            val.hash(&mut hasher);
+        }
+        let hash = hasher.finish();
+        let start = entries.partition_point(|&(h, _)| h < hash);
+        let count = entries[start..].partition_point(|&(h, _)| h == hash);
+        if count > max {
+            return UniqueCandidates::TooMany;
+        }
+        let mut positions: Vec<usize> = entries[start..start + count]
+            .iter()
+            .map(|&(_, row)| row as usize)
+            .collect();
+        positions.sort_unstable();
+        UniqueCandidates::Positions(positions)
+    }
+
     /// Look up a composite unique key in this volume's per-volume hash index.
     /// Calls `f` for each matching row index. Supports volumes with duplicate values
     /// (pre-existing dupes not yet cleaned). The caller decides which match to accept
@@ -3670,6 +3715,8 @@ impl FrozenVolume {
         if let Some(entries) = cached {
             return Ok(entries);
         }
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::unique_index_built();
         let columns = col_indices
             .iter()
             .map(|&ci| self.columns.get(ci))
