@@ -1722,7 +1722,12 @@ impl UniqueIndexes {
         self.entries.try_write()
     }
 
+    /// Called under a guard of `entries`, which a release waits for
     fn mark_used(&self) {
+        debug_assert!(
+            self.entries.is_locked(),
+            "a unique index use is marked outside its guard"
+        );
         self.last_use_epoch
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
     }
@@ -3582,7 +3587,6 @@ impl FrozenVolume {
         mut f: impl FnMut(u32) -> bool, // return true to stop early
     ) -> std::io::Result<()> {
         use std::hash::{Hash, Hasher};
-        self.unique_indices.mark_used();
 
         // Compute hash of query values
         let mut hasher = ahash::AHasher::default();
@@ -3593,6 +3597,7 @@ impl FrozenVolume {
 
         let cached = {
             let indices = self.unique_indices.read();
+            self.unique_indices.mark_used();
             if let Some(entries) = indices.get(col_indices) {
                 let pos = entries.partition_point(|&(h, _)| h < hash);
                 if entries.get(pos).is_none_or(|&(h, _)| h != hash) {
