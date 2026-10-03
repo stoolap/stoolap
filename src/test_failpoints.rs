@@ -649,6 +649,52 @@ pub(crate) fn segment_map_cloned() {
     SEGMENT_MAP_CLONES.with(|n| n.set(n.get() + 1));
 }
 
+/// Process-wide: a cold read may run on another thread. Unique indexes
+/// built, candidates a built unique index named for a read, blocks decoded
+static UNIQUE_INDEX_BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static UNIQUE_READ_CANDIDATES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static BLOCK_DECODES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Unique indexes built, read candidates named, blocks decoded, so far
+pub fn unique_read_counts() -> (usize, usize, usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        UNIQUE_INDEX_BUILDS.load(Relaxed),
+        UNIQUE_READ_CANDIDATES.load(Relaxed),
+        BLOCK_DECODES.load(Relaxed),
+    )
+}
+
+pub(crate) fn unique_index_built() {
+    UNIQUE_INDEX_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn unique_read_candidates(count: usize) {
+    UNIQUE_READ_CANDIDATES.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn block_decoded() {
+    BLOCK_DECODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+thread_local! {
+    static UNIQUE_INDEX_TAKEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next read has taken a built unique
+/// index for its candidates and not yet searched it
+pub fn on_unique_index_taken(hook: impl FnOnce() + 'static) {
+    UNIQUE_INDEX_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn unique_index_taken() {
+    let hook = UNIQUE_INDEX_TAKEN_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// Volumes whose row ids this thread scanned to learn their order
 pub fn row_id_order_scans() -> usize {
     ROW_ID_ORDER_SCANS.with(std::cell::Cell::get)
@@ -712,6 +758,7 @@ pub fn reset_all() {
     VOLUME_FILE_READS.with(|n| n.set(0));
     SEGMENT_MAP_CLONES.with(|n| n.set(0));
     COLD_MAP_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    UNIQUE_INDEX_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     STATEMENT_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_ROUND_PREPARED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_READS_FORGET.store(false, Release);

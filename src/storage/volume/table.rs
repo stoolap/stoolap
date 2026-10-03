@@ -50,6 +50,21 @@ enum SideDecision {
     Walk(Box<super::secondary::SidePlan>),
 }
 
+/// What a volume's built unique index decided for a read: nothing, and the
+/// side file decides; no candidate; or the candidates' positions, ascending
+enum UniqueDecision {
+    Pass,
+    Empty,
+    Positions(Vec<usize>),
+}
+
+/// A unique key a read sets in full: its schema columns and their values,
+/// in key order
+struct UniqueKey<'a> {
+    columns: smallvec::SmallVec<[usize; 4]>,
+    values: smallvec::SmallVec<[&'a Value; 4]>,
+}
+
 /// Whether a volume's side file is asked for a key range at all, decided
 /// from the directory before any page is read
 enum SideAdmission {
@@ -1356,6 +1371,83 @@ impl SegmentedTable {
         ))))
     }
 
+    /// The non-PK unique keys whose every column the comparisons set by an
+    /// equality to a value of the column's own type, with those values in
+    /// key order. None under a snapshot; nothing is allocated for a key the
+    /// comparisons leave incomplete
+    fn unique_keys_for<'a>(
+        &self,
+        comparisons: &[(&str, crate::core::Operator, &'a Value)],
+    ) -> Result<Vec<UniqueKey<'a>>> {
+        use crate::core::DataType;
+        if comparisons.is_empty()
+            || self.snapshot_seq.is_some()
+            || !self.hot.has_unique_non_pk_indexes()
+        {
+            return Ok(Vec::new());
+        }
+        let schema = self.hot.schema();
+        let set_value = |name: &str| -> Option<(usize, &'a Value)> {
+            let col = schema.get_column_index(name)?;
+            let column = &schema.columns[col];
+            let &(_, _, value) = comparisons.iter().find(|(compared, op, _)| {
+                *op == crate::core::Operator::Eq && compared.eq_ignore_ascii_case(&column.name)
+            })?;
+            matches!(
+                (column.data_type, value),
+                (DataType::Integer, Value::Integer(_))
+                    | (DataType::Text, Value::Text(_))
+                    | (DataType::Timestamp, Value::Timestamp(_))
+                    | (DataType::Boolean, Value::Boolean(_))
+            )
+            .then_some((col, value))
+        };
+        let mut keys = Vec::new();
+        self.hot.for_each_unique_non_pk_index(&mut |_, columns| {
+            if columns.iter().all(|name| set_value(name).is_some()) {
+                let (columns, values) = columns.iter().filter_map(|name| set_value(name)).unzip();
+                keys.push(UniqueKey { columns, values });
+            }
+            Ok(())
+        })?;
+        Ok(keys)
+    }
+
+    /// The rows of `cs` a built unique index names for one of `keys`; Pass
+    /// when a key column comes from a default or no such index is built
+    fn unique_decision(
+        &self,
+        cs: &super::manifest::ColdSegment,
+        keys: &[UniqueKey<'_>],
+    ) -> UniqueDecision {
+        use super::writer::{ColSource, UniqueCandidates};
+        'keys: for key in keys {
+            let mut physical: smallvec::SmallVec<[usize; 4]> = smallvec::SmallVec::new();
+            for &col in &key.columns {
+                let Some(ColSource::Volume(source)) = cs.mapping.sources.get(col) else {
+                    continue 'keys;
+                };
+                physical.push(*source);
+            }
+            let max = (cs.volume.meta.row_count / SIDE_SCAN_SHARE as usize).max(1);
+            match cs
+                .volume
+                .built_unique_candidates(&physical, &key.values, max)
+            {
+                UniqueCandidates::NotBuilt | UniqueCandidates::TooMany => continue,
+                UniqueCandidates::Positions(positions) if positions.is_empty() => {
+                    return UniqueDecision::Empty;
+                }
+                UniqueCandidates::Positions(positions) => {
+                    #[cfg(any(test, feature = "test-failpoints"))]
+                    crate::test_failpoints::unique_read_candidates(positions.len());
+                    return UniqueDecision::Positions(positions);
+                }
+            }
+        }
+        UniqueDecision::Pass
+    }
+
     /// The indexed column the comparisons bound, with its index identity
     /// and the key range: one equality, or a lower and an upper bound. None
     /// when they bound no indexed column, or a bound has no exact key (a
@@ -1808,6 +1900,7 @@ impl SegmentedTable {
         } else {
             self.side_identities()
         };
+        let unique_keys = self.unique_keys_for(&comparisons)?;
         let mut scanners_reverse: Vec<Box<dyn Scanner>> = Vec::with_capacity(view.seg_ids.len());
 
         for (seg_id, cs) in view.volumes() {
@@ -1817,14 +1910,19 @@ impl SegmentedTable {
             if should_skip {
                 continue;
             }
-            // The side file is probed before the volume's data is touched:
-            // an empty answer skips the volume without a reload
-            let plan = match self.side_decision(cs, &comparisons, &identities)? {
-                SideDecision::Empty => continue,
-                SideDecision::Walk(plan) => Some(plan),
-                SideDecision::Scan => None,
+            // A built unique index, then the side file, are probed before the
+            // volume's data is touched: an empty answer skips the volume
+            let (plan, positions) = match self.unique_decision(cs, &unique_keys) {
+                UniqueDecision::Empty => continue,
+                UniqueDecision::Positions(positions) => (None, Some(positions)),
+                UniqueDecision::Pass => match self.side_decision(cs, &comparisons, &identities)? {
+                    SideDecision::Empty => continue,
+                    SideDecision::Walk(plan) => (Some(plan), None),
+                    SideDecision::Scan => (None, None),
+                },
             };
             let walk = &plan;
+            let positioned = walk.is_some() || positions.is_some();
             // Load cold volume on demand after zone-map/bloom pruning.
             // Re-prune to get binary-search range narrowing on sorted columns.
             let loaded;
@@ -1836,7 +1934,7 @@ impl SegmentedTable {
                     Some(v) => v,
                     None => continue,
                 };
-                if walk.is_some() {
+                if positioned {
                     (&loaded, 0, loaded.meta.row_count)
                 } else {
                     let (_, s, e) =
@@ -1848,7 +1946,7 @@ impl SegmentedTable {
             };
 
             // VolumeScanner constructor calls mark_accessed.
-            let mut scanner = if walk.is_none() && (start > 0 || end < vol.meta.row_count) {
+            let mut scanner = if !positioned && (start > 0 || end < vol.meta.row_count) {
                 VolumeScanner::with_range(
                     Arc::clone(vol),
                     column_indices.to_vec(),
@@ -1878,6 +1976,9 @@ impl SegmentedTable {
             // itself still runs on every row
             if let Some(plan) = plan {
                 scanner.set_side_plan(*plan);
+            }
+            if let Some(positions) = positions {
+                scanner.set_positions(positions);
             }
 
             if let Some(expr) = where_expr {
@@ -1966,6 +2067,7 @@ impl SegmentedTable {
         } else {
             self.side_identities()
         };
+        let unique_keys = self.unique_keys_for(&comparisons)?;
         let process_volume =
             |(seg_id, cs): &(u64, &super::manifest::ColdSegment)| -> Result<Option<RowVec>> {
                 let vol = &cs.volume;
@@ -1974,12 +2076,20 @@ impl SegmentedTable {
                 if should_skip {
                     return Ok(None);
                 }
-                // The side file is probed before the volume's data is touched
-                let mut walk = match self.side_decision(cs, &comparisons, &identities)? {
-                    SideDecision::Empty => return Ok(None),
-                    SideDecision::Walk(plan) => start_walk(&plan)?,
-                    SideDecision::Scan => None,
+                // A built unique index, then the side file, are probed before
+                // the volume's data is touched
+                let (mut walk, positions) = match self.unique_decision(cs, &unique_keys) {
+                    UniqueDecision::Empty => return Ok(None),
+                    UniqueDecision::Positions(positions) => (None, Some(positions)),
+                    UniqueDecision::Pass => {
+                        match self.side_decision(cs, &comparisons, &identities)? {
+                            SideDecision::Empty => return Ok(None),
+                            SideDecision::Walk(plan) => (start_walk(&plan)?, None),
+                            SideDecision::Scan => (None, None),
+                        }
+                    }
                 };
+                let positioned = walk.is_some() || positions.is_some();
                 // Load cold volume on demand after zone-map/bloom pruning.
                 let loaded;
                 let (vol, start, end) = if vol.is_cold() {
@@ -1990,7 +2100,7 @@ impl SegmentedTable {
                         Some(v) => v,
                         None => return Ok(None),
                     };
-                    if walk.is_some() {
+                    if positioned {
                         (&loaded, 0, loaded.meta.row_count)
                     } else {
                         let (_, s, e) =
@@ -2039,20 +2149,21 @@ impl SegmentedTable {
                 // The rows that pass the dictionary filters, found in one pass
                 // over the raw ids; None walks the whole range
                 let mut candidates: Vec<usize> = Vec::new();
-                // The walk names the rows; the dictionary filters, which would
-                // load their columns whole, are left to the row filter then
-                let filters: smallvec::SmallVec<[super::column::DictFilter<'_>; 4]> =
-                    if walk.is_some() {
-                        smallvec::SmallVec::new()
-                    } else {
-                        dict_filters
-                            .iter()
-                            .map(|&(col_idx, expected)| {
-                                vol.columns.get(col_idx).map(|col| (col, start, expected))
-                            })
-                            .collect::<std::io::Result<_>>()?
-                    };
-                let prefiltered = walk.is_none()
+                // The walk or the positions name the rows; the dictionary
+                // filters, which would load their columns whole, are left to
+                // the row filter then
+                let filters: smallvec::SmallVec<[super::column::DictFilter<'_>; 4]> = if positioned
+                {
+                    smallvec::SmallVec::new()
+                } else {
+                    dict_filters
+                        .iter()
+                        .map(|&(col_idx, expected)| {
+                            vol.columns.get(col_idx).map(|col| (col, start, expected))
+                        })
+                        .collect::<std::io::Result<_>>()?
+                };
+                let prefiltered = !positioned
                     && !filters.is_empty()
                     && super::column::ColumnData::dict_matching_offsets(
                         &filters,
@@ -2072,6 +2183,10 @@ impl SegmentedTable {
                                     "side index read failed: {error}"
                                 ))
                             })
+                        } else if let Some(positions) = positions.as_ref() {
+                            let next = positions.get(pos).copied();
+                            pos += 1;
+                            Ok(next)
                         } else if prefiltered {
                             let Some(offset) = candidates.get(pos) else {
                                 return Ok(None);
@@ -3294,6 +3409,7 @@ impl Table for SegmentedTable {
             } else {
                 self.side_identities()
             };
+            let unique_keys = self.unique_keys_for(&comparisons)?;
 
             'done: for (nf_idx, seg_id) in view.seg_ids.iter().enumerate().rev() {
                 let Some(cs) = view.segs.get(seg_id) else {
@@ -3311,10 +3427,19 @@ impl Table for SegmentedTable {
                 // the authority map keeps deciding which copy of a row is read.
                 // The executor calls again with a larger offset, so the walk's
                 // positions are sorted first: the order is the scan's whatever
-                // the admission decides per call
-                let candidates: Option<(Vec<u32>, super::secondary::Reservation)> = match self
-                    .side_decision(cs, &comparisons, &identities)?
-                {
+                // the admission decides per call. A built unique index answers
+                // first, its positions sorted already
+                let unique = match self.unique_decision(cs, &unique_keys) {
+                    UniqueDecision::Empty => continue,
+                    UniqueDecision::Positions(positions) => Some(positions),
+                    UniqueDecision::Pass => None,
+                };
+                let side = if unique.is_some() {
+                    SideDecision::Scan
+                } else {
+                    self.side_decision(cs, &comparisons, &identities)?
+                };
+                let candidates: Option<(Vec<u32>, super::secondary::Reservation)> = match side {
                     SideDecision::Empty => continue,
                     SideDecision::Walk(plan) => match start_walk(&plan)? {
                         // The positions are admitted beside the reader and
@@ -3367,9 +3492,10 @@ impl Table for SegmentedTable {
                 let mut served = 0u64;
                 let mut at = 0usize;
                 let mut next_position = move || -> Option<usize> {
-                    let position = match candidates.as_ref() {
-                        Some((positions, _)) => positions.get(at).map(|&p| p as usize),
-                        None => (at < row_ids.len()).then_some(at),
+                    let position = match (unique.as_ref(), candidates.as_ref()) {
+                        (Some(positions), _) => positions.get(at).copied(),
+                        (None, Some((positions, _))) => positions.get(at).map(|&p| p as usize),
+                        (None, None) => (at < row_ids.len()).then_some(at),
                     };
                     at += 1;
                     position
@@ -3478,6 +3604,7 @@ impl Table for SegmentedTable {
             } else {
                 self.side_identities()
             };
+            let unique_keys = self.unique_keys_for(&comparisons)?;
 
             'outer: for (seg_id, cs) in view.volumes() {
                 let vol = &cs.volume;
@@ -3493,11 +3620,18 @@ impl Table for SegmentedTable {
                 if pruned {
                     continue;
                 }
-                // The side file is probed before the volume's data is touched
-                let mut walk = match self.side_decision(cs, &comparisons, &identities)? {
-                    SideDecision::Empty => continue,
-                    SideDecision::Walk(plan) => start_walk(&plan)?,
-                    SideDecision::Scan => None,
+                // A built unique index, then the side file, are probed before
+                // the volume's data is touched
+                let (mut walk, positions) = match self.unique_decision(cs, &unique_keys) {
+                    UniqueDecision::Empty => continue,
+                    UniqueDecision::Positions(positions) => (None, Some(positions)),
+                    UniqueDecision::Pass => {
+                        match self.side_decision(cs, &comparisons, &identities)? {
+                            SideDecision::Empty => continue,
+                            SideDecision::Walk(plan) => (start_walk(&plan)?, None),
+                            SideDecision::Scan => (None, None),
+                        }
+                    }
                 };
 
                 // Load cold volume on demand after pruning.
@@ -3521,12 +3655,16 @@ impl Table for SegmentedTable {
                 let indexed = walk.is_some();
                 let mut served = 0u64;
                 let mut plain = 0usize;
-                // The walk names the positions; else every position in turn
+                // The walk or the positions name the rows; else every position in turn
                 let mut next_position = move || -> Result<Option<usize>> {
                     if let Some(walk) = walk.as_mut() {
                         walk.next_position().map_err(|error| {
                             crate::core::Error::internal(format!("side index read failed: {error}"))
                         })
+                    } else if let Some(positions) = positions.as_ref() {
+                        let next = positions.get(plain).copied();
+                        plain += 1;
+                        Ok(next)
                     } else if plain < row_ids.len() {
                         plain += 1;
                         Ok(Some(plain - 1))

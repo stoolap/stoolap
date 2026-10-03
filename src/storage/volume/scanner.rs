@@ -642,7 +642,11 @@ impl VolumeScanner {
         // large Vec allocation — use streaming dict filter in the slow path instead.
         // An ordered walk may stop after a few rows, so it never pays for the
         // whole range up front.
-        if !self.dict_filters.is_empty() && !self.ordered_walk && self.side.is_none() {
+        if !self.dict_filters.is_empty()
+            && !self.ordered_walk
+            && self.side.is_none()
+            && self.matching_indices.is_none()
+        {
             let scan_range = self.end_idx - self.current_idx;
             let selectivity_cap = scan_range / 10; // 10% threshold
             let matches = if let Some(st) = store {
@@ -982,6 +986,15 @@ impl VolumeScanner {
             done: false,
         });
         self.matching_indices = None;
+    }
+
+    /// Reads only these positions, ascending, with every skip rule and the
+    /// filter applied to each. Set before the filter, so the filter's
+    /// dictionary pre-scan does not replace them
+    pub fn set_positions(&mut self, positions: Vec<usize>) {
+        self.side = None;
+        self.matching_indices = Some(positions);
+        self.match_idx = 0;
     }
 
     pub fn set_needed_cols(&mut self, needed: &[bool]) {
