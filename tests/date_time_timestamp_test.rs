@@ -315,3 +315,54 @@ fn test_timestamp_null() {
 
     assert_eq!(null_count, 1, "Expected 1 null timestamp");
 }
+
+fn timestamp_ids(db: &Database, sql: &str) -> Vec<i64> {
+    let mut ids: Vec<i64> = db
+        .query(sql, ())
+        .expect("Failed to query")
+        .map(|row| row.expect("Failed to read row").get::<i64>(0).unwrap())
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+#[test]
+fn test_timestamp_in_list() {
+    let db = Database::open("memory://dt_ts_in_list").expect("Failed to create database");
+    db.execute("CREATE TABLE events (id INTEGER, ts TIMESTAMP)", ())
+        .expect("Failed to create table");
+    db.execute(
+        "INSERT INTO events VALUES (1, TIMESTAMP '2024-01-01 00:00:00'), \
+         (2, TIMESTAMP '2024-01-02 00:00:00'), (3, TIMESTAMP '2024-01-03 00:00:00'), (4, NULL)",
+        (),
+    )
+    .expect("Failed to insert data");
+
+    let in_list = "TIMESTAMP '2024-01-01 00:00:00', TIMESTAMP '2024-01-03 00:00:00'";
+    assert_eq!(
+        timestamp_ids(
+            &db,
+            &format!("SELECT id FROM events WHERE ts IN ({in_list})")
+        ),
+        vec![1, 3]
+    );
+    assert_eq!(
+        timestamp_ids(
+            &db,
+            &format!("SELECT id FROM events WHERE ts NOT IN ({in_list})")
+        ),
+        vec![2]
+    );
+    assert_eq!(
+        timestamp_ids(
+            &db,
+            "SELECT id FROM events WHERE ts IN (TIMESTAMP '2024-01-02 00:00:00', NULL)"
+        ),
+        vec![2]
+    );
+    assert!(timestamp_ids(
+        &db,
+        "SELECT id FROM events WHERE ts NOT IN (TIMESTAMP '2024-01-02 00:00:00', NULL)"
+    )
+    .is_empty());
+}
