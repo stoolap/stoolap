@@ -1982,6 +1982,8 @@ impl Executor {
 
         // Execute the subquery with incremented depth to avoid creating new TimeoutGuard
         let subquery_ctx = ctx.with_incremented_query_depth();
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::in_subquery_ran();
         let mut result = self.execute_select(subquery, &subquery_ctx)?;
 
         // Collect all values from the first column - use take_row() to avoid cloning
