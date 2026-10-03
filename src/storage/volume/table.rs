@@ -1566,15 +1566,16 @@ impl SegmentedTable {
         self.hot.secondary_index_identities()
     }
 
-    /// One key's ids from every volume's side file, newest volume first,
-    /// each volume admitted as the scan admits it and read through one
-    /// reader on the caller's own space, its window the cap left. A volume
-    /// the side file cannot serve, or a reader the ledger refuses, leaves
-    /// the probe unanswered; a page that fails to read is the statement's
-    /// error. The ids come from the resident row id column, so no volume is
-    /// reloaded here; the fetch reloads what it reads.
+    /// One key's ids from every volume's side file in `view`, newest volume
+    /// first, under the index identities in `scratch`; each volume admitted
+    /// as the scan admits it and read through one reader on the caller's
+    /// own space, its window the cap left. A volume the side file cannot
+    /// serve, or a reader the ledger refuses, leaves the probe unanswered;
+    /// a page that fails to read is the statement's error. The ids come
+    /// from the resident row id column, so no volume is reloaded here.
     fn cold_equality_candidates(
         &self,
+        view: &super::manifest::ColdSnapshot,
         column: &str,
         key: &Value,
         max: usize,
@@ -1583,8 +1584,6 @@ impl SegmentedTable {
     ) -> Result<Option<crate::storage::traits::CappedEqual>> {
         use super::secondary::{is_refused, READS};
         use crate::storage::traits::CappedEqual;
-        self.hot
-            .secondary_index_identities_into(&mut scratch.identities);
         let comparisons = [(column, crate::core::Operator::Eq, key)];
         let Some((column, identity, low, high)) =
             self.side_bounds(&comparisons, &scratch.identities)
@@ -1594,13 +1593,6 @@ impl SegmentedTable {
         let bloom = [Some(super::column::ColumnBloomFilter::hash_value_static(
             key,
         ))];
-        self.segment_mgr
-            .check_schema_generation(self.schema_generation)?;
-        let view = self.segment_mgr.cold_snapshot();
-        self.segment_mgr
-            .check_schema_generation(self.schema_generation)?;
-        #[cfg(any(test, feature = "test-failpoints"))]
-        crate::test_failpoints::join_probe_admitted();
         let start = out.len();
         for (_, cs) in view.volumes() {
             let (skip, _, _) = Self::prune_volume(&cs.volume, &cs.mapping, &comparisons, &bloom)?;
@@ -5741,15 +5733,26 @@ impl Table for SegmentedTable {
         None
     }
 
-    /// One key's ids from the volumes' side files and the hot index, under
-    /// the checks of `walk_btree_groups`: a seal, a destructive publication
-    /// or a commit landing across the probe drops its ids. The cold view is
-    /// taken before the hot index is read, so a seal between them moves the
-    /// generation and the probe is not an answer.
     fn equality_candidates(
         &self,
         column: &str,
         key: &Value,
+        max: usize,
+        out: &mut Vec<i64>,
+        scratch: &mut crate::storage::traits::ProbeScratch,
+    ) -> Result<Option<crate::storage::traits::CappedEqual>> {
+        self.equality_candidates_in(column, std::slice::from_ref(key), max, out, scratch)
+    }
+
+    /// The keys' ids from the volumes' side files and the hot index, under
+    /// the checks of `walk_btree_groups` taken once for every key: a seal,
+    /// a destructive publication or a commit landing anywhere across the
+    /// probes drops all their ids. The cold view is taken before the hot
+    /// index is read, so a seal between them moves the generation.
+    fn equality_candidates_in(
+        &self,
+        column: &str,
+        keys: &[Value],
         max: usize,
         out: &mut Vec<i64>,
         scratch: &mut crate::storage::traits::ProbeScratch,
@@ -5766,26 +5769,45 @@ impl Table for SegmentedTable {
             return Ok(None);
         };
         let start = out.len();
-        if self.segment_mgr.has_segments() {
-            match self.cold_equality_candidates(column, key, max, out, scratch)? {
+        let view = if self.segment_mgr.has_segments() {
+            self.hot
+                .secondary_index_identities_into(&mut scratch.identities);
+            self.segment_mgr
+                .check_schema_generation(self.schema_generation)?;
+            let view = self.segment_mgr.cold_snapshot();
+            self.segment_mgr
+                .check_schema_generation(self.schema_generation)?;
+            Some(view)
+        } else {
+            None
+        };
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::join_probe_admitted();
+        for key in keys.iter().filter(|key| !key.is_null()) {
+            if let Some(view) = &view {
+                let left = max.saturating_sub(out.len() - start);
+                match self.cold_equality_candidates(view, column, key, left, out, scratch)? {
+                    Some(CappedEqual::Copied) => {}
+                    other => {
+                        out.truncate(start);
+                        return Ok(other);
+                    }
+                }
+            }
+            let left = max.saturating_sub(out.len() - start);
+            match self
+                .hot
+                .equality_candidates(column, key, left, out, scratch)?
+            {
                 Some(CappedEqual::Copied) => {}
                 other => {
                     out.truncate(start);
                     return Ok(other);
                 }
             }
-        } else {
             #[cfg(any(test, feature = "test-failpoints"))]
-            crate::test_failpoints::join_probe_admitted();
+            crate::test_failpoints::equality_key_probed();
         }
-        let taken = out.len() - start;
-        let Some(found) =
-            self.hot
-                .equality_candidates(column, key, max.saturating_sub(taken), out, scratch)?
-        else {
-            out.truncate(start);
-            return Ok(None);
-        };
         if self.segment_mgr.is_destruction_in_progress()
             || self.segment_mgr.seal_generation() != generation
             || self.hot.index_view_epoch() != Some(epoch)
@@ -5793,14 +5815,10 @@ impl Table for SegmentedTable {
             out.truncate(start);
             return Ok(None);
         }
-        if found == CappedEqual::OverCap {
-            out.truncate(start);
-            return Ok(Some(found));
-        }
         // An updated row keeps its old copy in a volume until compaction, so
         // its id can come from two places; the fetch reads the newest copy
         Self::dedup_from(out, start);
-        Ok(Some(found))
+        Ok(Some(CappedEqual::Copied))
     }
 
     fn walk_btree_groups(

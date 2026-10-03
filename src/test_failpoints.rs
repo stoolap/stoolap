@@ -446,6 +446,66 @@ pub(crate) fn join_probe_admitted() {
     }
 }
 
+/// Process-wide: IN subqueries run to take their members
+static IN_SUBQUERY_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// IN subqueries run to take their members, so far
+pub fn in_subquery_runs() -> usize {
+    IN_SUBQUERY_RUNS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn in_subquery_ran() {
+    IN_SUBQUERY_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Process-wide: IN members read by a table's candidates, and by a scan
+static IN_MEMBER_READS: [std::sync::atomic::AtomicUsize; 2] = [
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
+
+/// IN member reads by candidates and by a scan of the members, so far
+pub fn in_member_reads() -> (usize, usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        IN_MEMBER_READS[0].load(Relaxed),
+        IN_MEMBER_READS[1].load(Relaxed),
+    )
+}
+
+pub(crate) fn in_members_read(by_scan: bool) {
+    IN_MEMBER_READS[by_scan as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Process-wide: IN members asked of a table's candidates
+static IN_MEMBER_PROBES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// IN members asked of a table's candidates, so far
+pub fn in_member_probes() -> usize {
+    IN_MEMBER_PROBES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn in_members_probed() {
+    IN_MEMBER_PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+thread_local! {
+    static EQUALITY_KEY_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next multi-key equality probe has
+/// taken one key's ids and not yet the next key's
+pub fn after_equality_key_probed(hook: impl FnOnce() + 'static) {
+    EQUALITY_KEY_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn equality_key_probed() {
+    let hook = EQUALITY_KEY_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 thread_local! {
     static ROW_IDS_CLASSIFIED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }

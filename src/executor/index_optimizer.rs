@@ -51,6 +51,10 @@ use super::Executor;
 /// The most rows a LIMIT's fetch by primary key reads in one batch
 const FETCH_BATCH_ROWS: usize = 1024;
 
+/// The most candidate ids an IN list's members may name in all, 512 KiB
+/// of ids, before the members are read by a scan instead
+const IN_CANDIDATE_CAP: usize = 65_536;
+
 /// Pre-compiled projection slot for vector search results.
 /// Built once, applied per row — avoids per-row expression compilation.
 enum VectorProjectionSlot {
@@ -987,6 +991,116 @@ impl Executor {
         }
     }
 
+    /// Whether an IN on `column` may be read by `in_member_rows`: a table
+    /// that keeps rows outside its index, a B-tree on the column, and no
+    /// change of the transaction's own the index would miss
+    fn in_members_eligible(table: &dyn Table, column: &str) -> bool {
+        table.lookup_index_on_column(column).is_none()
+            && !table.has_local_changes()
+            && table
+                .get_index_on_column(column)
+                .is_some_and(|index| index.index_type() == crate::core::IndexType::BTree)
+    }
+
+    /// The filter of the conjuncts beside an IN, its subqueries run
+    fn remaining_row_filter(
+        &self,
+        remaining: Option<&Expression>,
+        all_columns: &[String],
+        ctx: &ExecutionContext,
+    ) -> Result<Option<RowFilter>> {
+        let Some(remaining) = remaining else {
+            return Ok(None);
+        };
+        let processed = if Self::has_subqueries(remaining) {
+            self.process_where_subqueries(remaining, ctx)?
+        } else {
+            remaining.clone()
+        };
+        Ok(Some(
+            RowFilter::new(&processed, all_columns)?.with_context(ctx),
+        ))
+    }
+
+    /// Whether a LIMIT applies to the rows read here: nothing that needs
+    /// every row runs between this path and the result, and the LIMIT
+    /// evaluates to a count
+    fn limit_applies(stmt: &SelectStatement, ctx: &ExecutionContext) -> bool {
+        let limit_here = stmt.order_by.is_empty() && !stmt.distinct && stmt.distinct_on.is_empty();
+        limit_here
+            && stmt.limit.as_deref().is_some_and(|limit| {
+                ExpressionEval::compile(limit, &[])
+                    .ok()
+                    .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
+                    .is_some_and(|value| matches!(value, Value::Integer(n) if n >= 0))
+            })
+    }
+
+    /// The rows whose `column` is one of `members`, on a table
+    /// `in_members_eligible` admits and with no LIMIT applying here: the
+    /// B-tree's candidates under one capture, each row read and checked
+    /// against the members, else with `scan` a scan with the same check,
+    /// else None. The filter `remaining` gives is asked for only when the
+    /// rows are read here
+    fn in_member_rows(
+        table: &dyn Table,
+        column: &str,
+        members: Vec<Value>,
+        remaining: impl FnOnce() -> Result<Option<RowFilter>>,
+        scan: bool,
+    ) -> Result<Option<RowVec>> {
+        use crate::storage::expression::{Expression as _, InListExpr};
+        use crate::storage::traits::{CappedEqual, ProbeScratch};
+        let mut membership = InListExpr::new(column, members);
+        membership.prepare_for_schema(table.schema());
+        let mut ids = Vec::new();
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::in_members_probed();
+        let found = table.equality_candidates_in(
+            column,
+            membership.values(),
+            IN_CANDIDATE_CAP,
+            &mut ids,
+            &mut ProbeScratch::default(),
+        )?;
+        if found == Some(CappedEqual::Copied) {
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::in_members_read(false);
+            let remaining = remaining()?;
+            let mut rows = table.fetch_rows_by_ids(&ids, &membership)?;
+            if let Some(filter) = remaining {
+                filter.retain_checked(&mut rows)?;
+            }
+            return Ok(Some(rows));
+        }
+        if !scan {
+            return Ok(None);
+        }
+        let remaining = remaining()?;
+        let keep = |row: &Row| {
+            remaining
+                .as_ref()
+                .map_or(Ok(true), |filter| filter.matches_checked(row))
+        };
+        let columns: Vec<usize> = (0..table.schema().columns.len()).collect();
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::in_members_read(true);
+        let mut scanner = table.scan(&columns, Some(&membership))?;
+        let mut rows = RowVec::new();
+        while scanner.next() {
+            let row_id = scanner.current_row_id();
+            let row = scanner.take_row();
+            if keep(&row)? {
+                rows.push((row_id, row));
+            }
+        }
+        if let Some(error) = scanner.err() {
+            return Err(error.clone());
+        }
+        scanner.close()?;
+        Ok(Some(rows))
+    }
+
     /// Fetches the rows of `row_ids` a batch at a time until `needed`
     /// rows are found or the ids are spent: a member with no row, or with
     /// a row not visible, costs its own fetch and nothing more. A batch
@@ -1088,10 +1202,18 @@ impl Executor {
             schema.columns[pk_col_idx].name_lower == column_name
         };
 
-        // If not PK, check for index
+        // If not PK, check for index; a table that keeps rows outside its
+        // index reads the members by its candidates, or by a scan of them,
+        // when no LIMIT applies here
         let index = if !is_pk_column {
             match table.lookup_index_on_column(&column_name) {
                 Some(idx) => Some(idx),
+                None if !is_negated
+                    && Self::in_members_eligible(table, &column_name)
+                    && !Self::limit_applies(stmt, ctx) =>
+                {
+                    None
+                }
                 None => return Ok(None), // No PK, no index, can't optimize
             }
         } else {
@@ -1108,10 +1230,12 @@ impl Executor {
             None
         };
         let cached = cache_key.as_deref().and_then(get_cached_in_subquery);
-        let values = if let Some(cached) = cached {
+        let mut values = if let Some(cached) = cached {
             cached
         } else {
             let subquery_ctx = ctx.with_incremented_query_depth();
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::in_subquery_ran();
             let mut result = self.execute_select(&subquery.subquery, &subquery_ctx)?;
 
             // Collect all values from the first column
@@ -1167,6 +1291,21 @@ impl Executor {
                 return Ok(Some((Box::new(result), output_columns, true)));
             }
         }
+
+        // A table that keeps rows outside its index: the members' rows by
+        // its candidates, else by a scan of the members already taken, so
+        // the subquery does not run again
+        let member_rows = if !is_pk_column && index.is_none() {
+            Self::in_member_rows(
+                table,
+                &column_name,
+                std::mem::take(&mut values),
+                || self.remaining_row_filter(remaining_predicate.as_ref(), all_columns, ctx),
+                true,
+            )?
+        } else {
+            None
+        };
 
         // Collect row_ids: either from PK (direct) or from index probe
         // Pre-allocate based on expected size to avoid reallocations
@@ -1275,7 +1414,7 @@ impl Executor {
         // EARLY LIMIT OPTIMIZATION: When there's no ORDER BY and no remaining predicate,
         // we can apply LIMIT early to avoid fetching unnecessary rows
         let (early_limit_applied, early_limit, early_offset) =
-            if limit_here && remaining_predicate.is_none() {
+            if limit_here && remaining_predicate.is_none() && member_rows.is_none() {
                 let offset = if let Some(ref offset_expr) = stmt.offset {
                     match ExpressionEval::compile(offset_expr, &[])
                         .ok()
@@ -1318,10 +1457,14 @@ impl Executor {
         } else {
             usize::MAX
         };
-        let mut rows = Self::fetch_rows_up_to(table, &all_row_ids, filter.as_ref(), needed)?;
+        let member_read = member_rows.is_some();
+        let mut rows = match member_rows {
+            Some(rows) => rows,
+            None => Self::fetch_rows_up_to(table, &all_row_ids, filter.as_ref(), needed)?,
+        };
 
-        // Apply remaining predicate if any
-        if let Some(ref remaining) = remaining_predicate {
+        // Apply remaining predicate if any; the members' read applied it
+        if let Some(remaining) = remaining_predicate.as_ref().filter(|_| !member_read) {
             // Process any subqueries in the remaining predicate
             let processed_remaining = if Self::has_subqueries(remaining) {
                 self.process_where_subqueries(remaining, ctx)?
@@ -1429,9 +1572,17 @@ impl Executor {
         } else {
             None
         };
-        let (column_name, values, is_negated, remaining_predicate) =
+        // A list under a LIMIT is left to the scan, which stops at its first
+        // rows, before its literals are evaluated; the LIMIT is read once,
+        // and only for a column whose members could be read here
+        let limited = std::cell::OnceCell::new();
+        let members_here = |column: &str| {
+            Self::in_members_eligible(table, column)
+                && !*limited.get_or_init(|| Self::limit_applies(stmt, ctx))
+        };
+        let (column_name, mut values, is_negated, remaining_predicate) =
             match Self::extract_in_list_info(where_expr, ctx, &|column| {
-                probe_secondary_index || pk_name == Some(column)
+                probe_secondary_index || pk_name == Some(column) || members_here(column)
             }) {
                 Some(info) => info,
                 None => return Ok(None),
@@ -1447,10 +1598,13 @@ impl Executor {
         // A secondary index probe collects every matching row id for every
         // value before fetching, while the pushed-down range scan streams
         // and stops at LIMIT; so it is only taken when a memory filter is
-        // needed anyway. Primary key values are the row ids themselves.
+        // needed anyway. Primary key values are the row ids themselves. A
+        // table that keeps rows outside its index reads the members by its
+        // candidates when no LIMIT applies here
         let index = if !is_pk_column {
             match table.lookup_index_on_column(&column_name) {
                 Some(idx) => Some(idx),
+                None if !is_negated && members_here(&column_name) => None,
                 None => return Ok(None), // No PK, no index, can't optimize
             }
         } else {
@@ -1482,6 +1636,23 @@ impl Executor {
         if is_negated {
             return Ok(None);
         }
+
+        // A table that keeps rows outside its index: the members' rows by
+        // its candidates, else the normal scan of the literals
+        let member_rows = if !is_pk_column && index.is_none() {
+            match Self::in_member_rows(
+                table,
+                &column_name,
+                std::mem::take(&mut values),
+                || self.remaining_row_filter(remaining_predicate.as_ref(), all_columns, ctx),
+                false,
+            )? {
+                Some(rows) => Some(rows),
+                None => return Ok(None),
+            }
+        } else {
+            None
+        };
 
         // Collect row_ids: either from PK (direct) or from index probe
         // Pre-allocate based on expected size to avoid reallocations
@@ -1525,7 +1696,7 @@ impl Executor {
         // otherwise see already-truncated rows.
         let limit_here = stmt.order_by.is_empty() && !stmt.distinct && stmt.distinct_on.is_empty();
         let (early_limit_applied, early_limit, early_offset) =
-            if limit_here && remaining_predicate.is_none() {
+            if limit_here && remaining_predicate.is_none() && member_rows.is_none() {
                 let offset = if let Some(ref offset_expr) = stmt.offset {
                     match ExpressionEval::compile(offset_expr, &[])
                         .ok()
@@ -1568,10 +1739,14 @@ impl Executor {
         } else {
             usize::MAX
         };
-        let mut rows = Self::fetch_rows_up_to(table, &all_row_ids, filter.as_ref(), needed)?;
+        let member_read = member_rows.is_some();
+        let mut rows = match member_rows {
+            Some(rows) => rows,
+            None => Self::fetch_rows_up_to(table, &all_row_ids, filter.as_ref(), needed)?,
+        };
 
-        // Apply remaining predicate if any
-        if let Some(ref remaining) = remaining_predicate {
+        // Apply remaining predicate if any; the members' read applied it
+        if let Some(remaining) = remaining_predicate.as_ref().filter(|_| !member_read) {
             // Process any subqueries in the remaining predicate
             let processed_remaining = if Self::has_subqueries(remaining) {
                 self.process_where_subqueries(remaining, ctx)?
@@ -1830,10 +2005,17 @@ impl Executor {
             return Ok(None);
         }
 
-        // If not PK, check for index (only for non-negated IN)
+        // If not PK, check for index (only for non-negated IN); a table that
+        // keeps rows outside its index reads the members by its candidates,
+        // or by a scan of them, when no LIMIT applies here
         let index = if !is_pk_column {
             match table.lookup_index_on_column(&column_name) {
                 Some(idx) => Some(idx),
+                None if Self::in_members_eligible(table, &column_name)
+                    && !Self::limit_applies(stmt, ctx) =>
+                {
+                    None
+                }
                 None => return Ok(None), // No PK, no index, can't optimize
             }
         } else {
@@ -1947,8 +2129,22 @@ impl Executor {
             }
         }
 
+        // A table that keeps rows outside its index: the members' rows by
+        // its candidates, else by a scan of the set's members
+        let member_rows = if !is_pk_column && index.is_none() {
+            Self::in_member_rows(
+                table,
+                &column_name,
+                values.iter().cloned().collect(),
+                || self.remaining_row_filter(remaining_predicate.as_ref(), all_columns, ctx),
+                true,
+            )?
+        } else {
+            None
+        };
+
         // If no row_ids found, return empty result
-        if all_row_ids.is_empty() {
+        if all_row_ids.is_empty() && member_rows.is_none() {
             let output_columns = CompactArc::new(self.get_output_column_names(
                 &stmt.columns,
                 all_columns,
@@ -1969,7 +2165,7 @@ impl Executor {
         // EARLY LIMIT OPTIMIZATION: When there's no ORDER BY and no remaining predicate,
         // we can apply LIMIT early to avoid fetching unnecessary rows
         let (early_limit_applied, early_limit, early_offset) =
-            if limit_here && remaining_predicate.is_none() {
+            if limit_here && remaining_predicate.is_none() && member_rows.is_none() {
                 let offset = if let Some(ref offset_expr) = stmt.offset {
                     match ExpressionEval::compile(offset_expr, &[])
                         .ok()
@@ -2012,13 +2208,14 @@ impl Executor {
         } else {
             usize::MAX
         };
-        let mut rows = match prefetched {
-            Some(rows) => rows,
-            None => Self::fetch_rows_up_to(table, &all_row_ids, filter.as_ref(), needed)?,
+        let member_read = member_rows.is_some();
+        let mut rows = match (member_rows, prefetched) {
+            (Some(rows), _) | (None, Some(rows)) => rows,
+            (None, None) => Self::fetch_rows_up_to(table, &all_row_ids, filter.as_ref(), needed)?,
         };
 
-        // Apply remaining predicate if any
-        if let Some(ref remaining) = remaining_predicate {
+        // Apply remaining predicate if any; the members' read applied it
+        if let Some(remaining) = remaining_predicate.as_ref().filter(|_| !member_read) {
             // Compile the filter using RowFilter (with params for $1 etc.)
             let columns_slice: Vec<String> = all_columns.to_vec();
             let row_filter = RowFilter::new(remaining, &columns_slice)?.with_context(ctx);

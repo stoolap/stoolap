@@ -895,6 +895,22 @@ pub trait Table: Send + Sync {
         Ok(None)
     }
 
+    /// `equality_candidates` for every key of `keys` under one capture of
+    /// the table: at most `max` ids in all, sorted and distinct, or None
+    /// and `out` as it was. A NULL key equals nothing and adds no id. The
+    /// ids are candidates: a caller reads each row and checks its value
+    fn equality_candidates_in(
+        &self,
+        column: &str,
+        keys: &[Value],
+        max: usize,
+        out: &mut Vec<i64>,
+        scratch: &mut ProbeScratch,
+    ) -> Result<Option<CappedEqual>> {
+        let _ = (column, keys, max, out, scratch);
+        Ok(None)
+    }
+
     /// Gets all unique indexes on the table (for constraint checking).
     ///
     /// Returns a list of (index_name, column_names) for each unique index.
