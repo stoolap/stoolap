@@ -5783,6 +5783,10 @@ impl Table for SegmentedTable {
         None
     }
 
+    fn has_sealed_rows(&self) -> bool {
+        self.segment_mgr.has_segments()
+    }
+
     fn equality_candidates(
         &self,
         column: &str,
