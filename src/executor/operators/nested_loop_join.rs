@@ -121,6 +121,12 @@ impl NestedLoopJoinOperator {
         }
     }
 
+    /// Use a filter compiled for the condition, carrying the query's parameters.
+    pub fn with_filter(mut self, filter: JoinFilter) -> Self {
+        self.filter = Some(filter);
+        self
+    }
+
     /// Create a NULL row for the left side (uses cached values).
     #[inline]
     fn null_left_row(&self) -> Row {
@@ -180,7 +186,7 @@ impl Operator for NestedLoopJoinOperator {
         let right_cols: Vec<String> = self.right.schema().iter().map(|c| c.name.clone()).collect();
 
         // Compile join filter if condition exists
-        if let Some(ref cond) = self.condition {
+        if let (None, Some(cond)) = (&self.filter, &self.condition) {
             self.filter = Some(JoinFilter::new(
                 cond,
                 &left_cols,

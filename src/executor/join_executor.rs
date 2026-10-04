@@ -95,7 +95,7 @@
 use crate::common::CompactArc;
 use crate::core::{Result, Row, RowVec};
 use crate::executor::context::ExecutionContext;
-use crate::executor::expression::RowFilter;
+use crate::executor::expression::{JoinFilter, RowFilter};
 use crate::executor::hash_table::JoinHashTable;
 use crate::executor::operator::{ColumnInfo, MaterializedOperator, Operator};
 use crate::executor::operators::hash_join::{HashJoinOperator, JoinSide, JoinType};
@@ -106,6 +106,7 @@ use crate::executor::parallel::{
 };
 use crate::executor::planner::{RuntimeJoinAlgorithm, RuntimeJoinDecision};
 use crate::executor::utils::{extract_join_keys_and_residual, is_sorted_on_keys};
+use crate::functions::registry::global_registry;
 use crate::optimizer::bloom::RuntimeBloomFilter;
 use crate::parser::ast::Expression;
 
@@ -300,6 +301,7 @@ impl JoinExecutor {
                 request.right_columns,
                 &analysis.join_type_str,
                 request.limit,
+                request.ctx,
             )?,
         };
 
@@ -838,6 +840,7 @@ impl JoinExecutor {
         right_columns: &[String],
         join_type_str: &str,
         limit: Option<u64>,
+        ctx: &ExecutionContext,
     ) -> Result<RowVec> {
         // Build schema for operators
         let left_schema: Vec<ColumnInfo> = left_columns.iter().map(ColumnInfo::new).collect();
@@ -867,6 +870,11 @@ impl JoinExecutor {
         // Create nested loop join operator
         let mut nl_op =
             NestedLoopJoinOperator::new(left_op, right_op, join_type, condition.cloned());
+        if let Some(cond) = condition {
+            let filter = JoinFilter::new(cond, left_columns, right_columns, global_registry())?
+                .with_context(ctx);
+            nl_op = nl_op.with_filter(filter);
+        }
 
         // Execute with Volcano model
         self.execute_operator_with_filter(&mut nl_op, limit, &[])

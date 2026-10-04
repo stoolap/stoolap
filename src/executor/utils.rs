@@ -2064,8 +2064,8 @@ fn extract_join_keys_recursive(
             ) {
                 // Case 1: left.col = right.col
                 if let (Some(left_idx), Some(right_idx)) = (
-                    find_column_index(&left_col, left_columns),
-                    find_column_index(&right_col, right_columns),
+                    find_join_side_index(&left_col, left_columns, right_columns),
+                    find_join_side_index(&right_col, right_columns, left_columns),
                 ) {
                     left_indices.push(left_idx);
                     right_indices.push(right_idx);
@@ -2074,8 +2074,8 @@ fn extract_join_keys_recursive(
 
                 // Case 2: right.col = left.col (swapped)
                 if let (Some(left_idx), Some(right_idx)) = (
-                    find_column_index(&right_col, left_columns),
-                    find_column_index(&left_col, right_columns),
+                    find_join_side_index(&right_col, left_columns, right_columns),
+                    find_join_side_index(&left_col, right_columns, left_columns),
                 ) {
                     left_indices.push(left_idx);
                     right_indices.push(right_idx);
@@ -2090,6 +2090,25 @@ fn extract_join_keys_recursive(
             residual.push(condition.clone());
         }
     }
+}
+
+/// A qualified column the other side names exactly belongs to that side, even
+/// when this side holds a bare column of the same name, such as a USING column.
+fn find_join_side_index(
+    col_info: &(Option<String>, String),
+    columns: &[String],
+    other_columns: &[String],
+) -> Option<usize> {
+    if let (Some(qualifier), col_name) = col_info {
+        let qualified = format!("{}.{}", qualifier, col_name);
+        if other_columns
+            .iter()
+            .any(|column| column.to_lowercase() == qualified)
+        {
+            return None;
+        }
+    }
+    find_column_index(col_info, columns)
 }
 
 // ============================================================================
