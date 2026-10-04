@@ -904,7 +904,8 @@ pub trait Table: Send + Sync {
         false
     }
 
-    /// The row ids the B-tree index on `column` holds for `key`, appended to
+    /// The row ids the B-tree index on `column` holds for `key` (an in-memory
+    /// table also answers from a hash, bitmap or primary-key index), appended to
     /// `out` when the index covers every visible row and holds at most `max`
     /// of them for the key; an absent key is `Copied` with nothing appended.
     /// None when the table cannot answer this way for this statement: no

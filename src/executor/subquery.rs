@@ -60,6 +60,9 @@ use super::Executor;
 /// A value of 10 provides reasonable tradeoff for typical workloads.
 const VISIBILITY_CHECK_BATCH_SIZE: usize = 10;
 
+/// Ids a probe's buffer keeps between outer rows; a heavy key's are freed
+const PROBE_IDS_KEPT: usize = 4096;
+
 /// Buffers a correlated probe reuses across the outer rows
 #[derive(Default)]
 struct ProbeBuffers {
@@ -669,7 +672,8 @@ impl Executor {
     fn extract_index_nested_loop_info(subquery: &SelectStatement) -> Option<IndexNestedLoopInfo> {
         // Must have a simple table source
         let (inner_table, inner_alias) = match subquery.table_expr.as_ref().map(|b| b.as_ref()) {
-            Some(Expression::TableSource(ts)) => {
+            // A probe reads the current rows, not those AS OF a point
+            Some(Expression::TableSource(ts)) if ts.as_of.is_none() => {
                 let alias = ts.alias.as_ref().map(|a| a.value.clone());
                 (ts.name.value.clone(), alias)
             }
@@ -725,12 +729,24 @@ impl Executor {
             }
 
             Expression::Infix(infix) if infix.operator.eq_ignore_ascii_case("AND") => {
+                // The other side joins whatever the correlated side kept
+                let keep = |info: &mut IndexNestedLoopInfo, other: &Expression| {
+                    info.additional_predicate = Some(match info.additional_predicate.take() {
+                        None => other.clone(),
+                        Some(kept) => Expression::Infix(InfixExpression {
+                            token: dummy_token_clone(),
+                            left: Box::new(kept),
+                            operator: "AND".into(),
+                            op_type: InfixOperator::And,
+                            right: Box::new(other.clone()),
+                        }),
+                    });
+                };
                 // Try left side for correlation
                 if let Some(mut info) =
                     Self::extract_correlation_for_index(&infix.left, inner_tables, inner_table_name)
                 {
-                    // Right side becomes additional predicate
-                    info.additional_predicate = Some((*infix.right).clone());
+                    keep(&mut info, &infix.right);
                     return Some(info);
                 }
                 // Try right side for correlation
@@ -739,8 +755,7 @@ impl Executor {
                     inner_tables,
                     inner_table_name,
                 ) {
-                    // Left side becomes additional predicate
-                    info.additional_predicate = Some((*infix.left).clone());
+                    keep(&mut info, &infix.left);
                     return Some(info);
                 }
                 None
@@ -783,6 +798,14 @@ impl Executor {
 
         // Must not have GROUP BY (scalar COUNT must return single value)
         if !subquery.group_by.columns.is_empty() {
+            return Ok(None);
+        }
+        // A HAVING, a row count or a set operation decides more than the count
+        if subquery.having.is_some()
+            || subquery.limit.is_some()
+            || subquery.offset.is_some()
+            || !subquery.set_operations.is_empty()
+        {
             return Ok(None);
         }
 
@@ -1159,6 +1182,10 @@ impl Executor {
         name: &str,
         f: impl FnOnce(&dyn Table) -> Result<Option<T>>,
     ) -> Result<Option<T>> {
+        // A CTE of that name hides the table
+        if ctx.has_cte(name) {
+            return Ok(None);
+        }
         // A statement inside an explicit transaction carries its id
         if ctx.transaction_id().is_none() {
             if let Some(snapshot) = ctx.statement_snapshot() {
@@ -1254,18 +1281,33 @@ impl Executor {
                     Err(_) => &mut fresh,
                 };
                 buffers.ids.clear();
+                // The cap bounds sealed reads; hot ids cost only their visibility
+                let cap = if table.has_sealed_rows() {
+                    EQUALITY_CANDIDATE_CAP
+                } else {
+                    usize::MAX
+                };
                 let found = table.equality_candidates(
                     &correlation.inner_column,
                     key,
-                    EQUALITY_CANDIDATE_CAP,
+                    cap,
                     &mut buffers.ids,
                     &mut buffers.scratch,
                 )?;
-                if found != Some(CappedEqual::Copied) {
-                    return Ok(None);
+                let answered = match found {
+                    Some(CappedEqual::Copied) => Some(answer(
+                        table,
+                        &buffers.ids,
+                        key_idx,
+                        epoch,
+                        &mut buffers.rows,
+                    )?),
+                    _ => None,
+                };
+                if buffers.ids.capacity() > PROBE_IDS_KEPT {
+                    buffers.ids = Vec::new();
                 }
-                let answered = answer(table, &buffers.ids, key_idx, epoch, &mut buffers.rows)?;
-                Ok((table.index_view_epoch() == Some(epoch)).then_some(answered))
+                Ok(answered.filter(|_| table.index_view_epoch() == Some(epoch)))
             })
         })
     }

@@ -142,3 +142,103 @@ fn a_sealed_row_whose_key_moved_is_not_counted_under_its_old_key() {
         "EXISTS per row"
     );
 }
+
+fn counts(db: &Database, sql: &str) -> Vec<Option<i64>> {
+    db.query(sql, ())
+        .unwrap()
+        .map(|r| r.unwrap().get::<Option<i64>>(1).unwrap())
+        .collect()
+}
+
+fn keyed(name: &str) -> Database {
+    let db = Database::open(&format!("memory://{name}")).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE INDEX t_k ON t(k)", ()).unwrap();
+    db.execute(
+        "INSERT INTO t SELECT value, value FROM generate_series(1, 1000)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE TABLE o (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO o VALUES (1, 1), (2, 2000)", ())
+        .unwrap();
+    db
+}
+
+#[test]
+fn a_count_with_having_limit_or_offset_runs_the_subquery() {
+    let db = keyed("probe_count_tail");
+    for tail in ["HAVING COUNT(*) > 1", "LIMIT 0", "LIMIT 1 OFFSET 1"] {
+        assert_eq!(
+            counts(
+                &db,
+                &format!(
+                    "SELECT o.id, (SELECT COUNT(*) FROM t WHERE t.k = o.k {tail}) \
+                     FROM o ORDER BY o.id"
+                )
+            ),
+            [None, None],
+            "{tail}"
+        );
+    }
+}
+
+#[test]
+fn a_cte_named_like_the_table_hides_it() {
+    let db = keyed("probe_cte_shadow");
+    assert_eq!(
+        counts(
+            &db,
+            "WITH t AS (SELECT 2000 AS k) \
+             SELECT o.id, (SELECT COUNT(*) FROM t WHERE t.k = o.k) FROM o ORDER BY o.id"
+        ),
+        [Some(0), Some(1)]
+    );
+}
+
+#[test]
+fn every_conjunct_beside_the_correlation_is_checked() {
+    let db = keyed("probe_every_conjunct");
+    assert_eq!(
+        counts(
+            &db,
+            "SELECT o.id, CASE WHEN EXISTS \
+             (SELECT 1 FROM t WHERE t.k = o.k AND t.id > 10 AND t.id > 0) THEN 1 ELSE 0 END \
+             FROM o ORDER BY o.id"
+        ),
+        [Some(0), Some(0)]
+    );
+    assert_eq!(
+        counts(
+            &db,
+            "SELECT o.id, (SELECT COUNT(*) FROM t WHERE t.k = o.k AND t.id > 10 AND t.id > 0) \
+             FROM o ORDER BY o.id"
+        ),
+        [Some(0), Some(0)]
+    );
+}
+
+#[test]
+fn an_as_of_subquery_reads_its_point() {
+    let db = Database::open("memory://probe_as_of").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE INDEX t_k ON t(k)", ()).unwrap();
+    db.execute("CREATE TABLE o (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO o VALUES (1, 10)", ()).unwrap();
+    db.execute("BEGIN", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10)", ()).unwrap();
+    let tx: i64 = db.query_one("SELECT CURRENT_TRANSACTION_ID()", ()).unwrap();
+    db.execute("COMMIT", ()).unwrap();
+    db.execute("UPDATE t SET k = 20 WHERE id = 1", ()).unwrap();
+    assert_eq!(
+        counts(
+            &db,
+            &format!("SELECT o.id, (SELECT COUNT(*) FROM t AS OF TRANSACTION {tx} WHERE t.k = o.k) FROM o")
+        ),
+        [Some(1)]
+    );
+}

@@ -3670,10 +3670,20 @@ impl Table for MVCCTable {
         let Some(index) = self.version_store.get_index_by_column(column) else {
             return Ok(None);
         };
-        if index.index_type() != IndexType::BTree {
-            return Ok(None);
+        let key = std::slice::from_ref(key);
+        match index.index_type() {
+            IndexType::BTree => Ok(index.get_row_ids_equal_capped_into(key, max, out)),
+            IndexType::Hash | IndexType::Bitmap | IndexType::PrimaryKey => {
+                let start = out.len();
+                index.get_row_ids_equal_into(key, out);
+                if out.len() - start > max {
+                    out.truncate(start);
+                    return Ok(Some(crate::storage::traits::CappedEqual::OverCap));
+                }
+                Ok(Some(crate::storage::traits::CappedEqual::Copied))
+            }
+            _ => Ok(None),
         }
-        Ok(index.get_row_ids_equal_capped_into(std::slice::from_ref(key), max, out))
     }
 
     fn count_equal_candidates(
