@@ -7552,15 +7552,6 @@ impl Engine for MVCCEngine {
         Ok(store.get_all_indexes().into_vec())
     }
 
-    fn get_lookup_indexes(&self, table_name: &str) -> Result<Vec<std::sync::Arc<dyn Index>>> {
-        // A persistent database may seal rows at any moment, so a hot index
-        // handed out now could lose them before the caller probes it.
-        if self.persistence.is_some() {
-            return Ok(Vec::new());
-        }
-        self.get_all_indexes(table_name)
-    }
-
     fn get_isolation_level(&self) -> IsolationLevel {
         self.registry.get_global_isolation_level()
     }
@@ -7911,63 +7902,6 @@ impl Engine for MVCCEngine {
             }
         }
         Ok(result)
-    }
-
-    fn get_row_fetcher(
-        &self,
-        table_name: &str,
-    ) -> Result<Box<dyn Fn(&[i64]) -> Result<crate::core::RowVec> + Send + Sync>> {
-        if !self.is_open() {
-            return Err(Error::EngineNotOpen);
-        }
-
-        let store = self.get_version_store(table_name)?;
-        let mgr = self.get_or_create_segment_manager(table_name);
-        let schema = store.schema().clone();
-        let read_txn_id = INVALID_TRANSACTION_ID + 1;
-
-        Ok(Box::new(move |row_ids: &[i64]| {
-            let mut result = store.get_visible_versions_batch(row_ids, read_txn_id);
-            if result.len() < row_ids.len() && mgr.has_segments() {
-                let found_ids: rustc_hash::FxHashSet<i64> =
-                    result.iter().map(|(id, _)| *id).collect();
-                for &rid in row_ids {
-                    if !found_ids.contains(&rid) {
-                        if let Some(row) = mgr.get_cold_row_normalized(rid, &schema)? {
-                            result.push((rid, row));
-                        }
-                    }
-                }
-            }
-            Ok(result)
-        }))
-    }
-
-    /// Get a count-only function for counting visible rows by their IDs.
-    /// This is optimized for COUNT(*) subqueries where we don't need the actual row data.
-    fn get_row_counter(
-        &self,
-        table_name: &str,
-    ) -> Result<Option<Box<dyn Fn(&[i64]) -> Result<usize> + Send + Sync>>> {
-        if !self.is_open() {
-            return Err(Error::EngineNotOpen);
-        }
-
-        let store = self.get_version_store(table_name)?;
-        let mgr = self.get_or_create_segment_manager(table_name);
-        let read_txn_id = INVALID_TRANSACTION_ID + 1;
-
-        Ok(Some(Box::new(move |row_ids: &[i64]| {
-            let mut count = store.count_visible_versions_batch(row_ids, read_txn_id);
-            if count < row_ids.len() && mgr.has_segments() {
-                for &rid in row_ids {
-                    if !store.has_committed_row(rid) && mgr.row_exists(rid)? {
-                        count += 1;
-                    }
-                }
-            }
-            Ok(count)
-        })))
     }
 }
 

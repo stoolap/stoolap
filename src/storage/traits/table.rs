@@ -222,6 +222,32 @@ pub struct ProbeScratch {
     pub(crate) reader: crate::storage::volume::secondary::ReaderSpace,
 }
 
+/// `Table::count_equal_candidates` by reading each row and checking its key
+pub(crate) fn count_equal_by_reading<T: Table + ?Sized>(
+    table: &T,
+    row_ids: &[i64],
+    column: usize,
+    key: &Value,
+    limit: usize,
+) -> Result<usize> {
+    const CHUNK: usize = 16;
+    let all = crate::storage::expression::ConstBoolExpr::true_expr();
+    let mut rows = RowVec::new();
+    let mut count = 0;
+    for ids in row_ids.chunks(CHUNK) {
+        rows.clear();
+        table.fetch_rows_by_ids_into(ids, &all, &mut rows)?;
+        count += rows
+            .iter()
+            .filter(|(_, row)| row.get(column) == Some(key))
+            .count();
+        if count >= limit {
+            return Ok(limit);
+        }
+    }
+    Ok(count)
+}
+
 /// Table represents a database table
 ///
 /// This trait defines the interface for interacting with a table,
@@ -914,6 +940,23 @@ pub trait Table: Send + Sync {
     ) -> Result<Option<CappedEqual>> {
         let _ = (column, keys, max, out, scratch);
         Ok(None)
+    }
+
+    /// How many of `row_ids`, candidates `equality_candidates` gave for
+    /// `key`, are rows this statement sees holding `key` in column `column`,
+    /// counted up to `limit`. `epoch` is the `index_view_epoch` the caller
+    /// read before taking the candidates and checks again after this call;
+    /// with it the indexes are the whole truth and need not be read past
+    fn count_equal_candidates(
+        &self,
+        row_ids: &[i64],
+        column: usize,
+        key: &Value,
+        limit: usize,
+        epoch: Option<u64>,
+    ) -> Result<usize> {
+        let _ = epoch;
+        count_equal_by_reading(self, row_ids, column, key, limit)
     }
 
     /// Gets all unique indexes on the table (for constraint checking).

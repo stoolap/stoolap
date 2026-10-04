@@ -66,8 +66,7 @@ type SelectOutput = (
 type SelectResult = Result<SelectOutput>;
 
 use super::context::{
-    clear_batch_aggregate_cache, clear_batch_aggregate_info_cache, clear_count_counter_cache,
-    clear_exists_correlation_cache, clear_exists_fetcher_cache, clear_exists_index_cache,
+    clear_batch_aggregate_cache, clear_batch_aggregate_info_cache, clear_exists_correlation_cache,
     clear_exists_pred_key_cache, clear_exists_predicate_cache, clear_exists_schema_cache,
     ExecutionContext, StatementSnapshot, TimeoutGuard,
 };
@@ -376,9 +375,6 @@ impl Executor {
             // invalidated per-table when data changes (INSERT, UPDATE, DELETE, TRUNCATE)
             // to enable cross-query caching for repeated subqueries.
             clear_exists_predicate_cache();
-            clear_exists_index_cache();
-            clear_exists_fetcher_cache();
-            clear_count_counter_cache();
             clear_exists_schema_cache();
             clear_exists_pred_key_cache();
             clear_exists_correlation_cache();
@@ -413,6 +409,21 @@ impl Executor {
         let classification = match plan_classification {
             Some(slot) => slot.get_or_init(|| get_classification(stmt)).clone(),
             None => get_classification(stmt),
+        };
+
+        // Correlated probes read the statement's tables through one transaction
+        let snapshot_ctx;
+        let ctx = if (classification.where_has_correlated_subqueries
+            || classification.select_has_correlated_subqueries
+            || classification.order_by_has_correlated_subqueries)
+            && ctx.statement_snapshot().is_none()
+            && self.active_transaction.lock().unwrap().is_none()
+        {
+            let snapshot = StatementSnapshot::new(self.engine.begin_transaction()?);
+            snapshot_ctx = ctx.with_statement_snapshot(snapshot);
+            &snapshot_ctx
+        } else {
+            ctx
         };
 
         // An uncorrelated subquery inside an aggregate's FILTER or argument

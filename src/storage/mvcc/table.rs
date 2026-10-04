@@ -3676,6 +3676,38 @@ impl Table for MVCCTable {
         Ok(index.get_row_ids_equal_capped_into(std::slice::from_ref(key), max, out))
     }
 
+    fn count_equal_candidates(
+        &self,
+        row_ids: &[i64],
+        column: usize,
+        key: &Value,
+        limit: usize,
+        epoch: Option<u64>,
+    ) -> Result<usize> {
+        if epoch.is_none() {
+            return crate::storage::traits::table::count_equal_by_reading(
+                self, row_ids, column, key, limit,
+            );
+        }
+        // An id the whole-truth indexes give for the key is a row holding
+        // it, so only its visibility is read
+        let chunk = if limit < row_ids.len() {
+            16
+        } else {
+            row_ids.len().max(1)
+        };
+        let mut count = 0;
+        for ids in row_ids.chunks(chunk) {
+            count += self
+                .version_store
+                .count_visible_versions_batch(ids, self.txn_id);
+            if count >= limit {
+                break;
+            }
+        }
+        Ok(count.min(limit))
+    }
+
     fn secondary_index_identities(&self) -> Vec<(usize, u64)> {
         self.version_store.secondary_index_identities()
     }
