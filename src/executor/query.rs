@@ -11464,6 +11464,14 @@ impl Executor {
                 // Can't determine which column is from which table
                 return None;
             };
+        // An equality between two columns of the inner table joins nothing
+        if starts_with_alias(
+            &outer_col.to_lowercase(),
+            &right_alias_lower,
+            right_alias_len,
+        ) {
+            return None;
+        }
 
         // Verify outer column is from left table (if we have left alias)
         if let Some(left_a) = left_alias {
@@ -11516,7 +11524,14 @@ impl Executor {
         // probe from it while it can, deciding per probe; only a join the
         // executor bounds with a limit asks it, at execution and in EXPLAIN,
         // or one whose outer side may be small, on a table with sealed rows
-        if (bounded || (small_outer && table.has_sealed_rows()))
+        // A narrowing key must be the outer side's; an inner column's name is unsure
+        let outer_is_sure = left_alias.is_some()
+            || outer_col.contains('.')
+            || !schema
+                .columns
+                .iter()
+                .any(|c| c.name_lower.eq_ignore_ascii_case(&outer_col));
+        if (bounded || (small_outer && outer_is_sure && table.has_sealed_rows()))
             && table
                 .get_index_on_column(&inner_col_unqualified)
                 .is_some_and(|index| index.index_type() == crate::core::IndexType::BTree)
