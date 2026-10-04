@@ -247,13 +247,62 @@ mod probed {
         let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let db = sealed(&dir);
-        let expected = by_or(&db, &[1, 2, 777]);
+        // Left hot, past the candidate cap, so only the reads refuse it
+        db.execute(
+            "INSERT INTO t SELECT 100000 + g.value, 4242, 0 FROM generate_series(1, 70000) g",
+            (),
+        )
+        .unwrap();
+        let expected = by_or(&db, &[1, 2, 4242]);
         let probed = after_first_key(|| {});
-        let found = ids(&db, "SELECT id FROM t WHERE k IN (1, 2, 777)");
+        let found = ids(&db, "SELECT id FROM t WHERE k IN (1, 2, 4242)");
         assert!(
             probed.load(Ordering::SeqCst),
             "the list did not read candidates"
         );
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn null_rows_leave_a_sparse_key_to_its_candidates() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&format!(
+            "file://{}?sync_mode=none&checkpoint_on_close=off&checkpoint_interval=0",
+            dir.path().display()
+        ))
+        .unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)", ())
+            .unwrap();
+        db.execute("CREATE INDEX t_k ON t(k)", ()).unwrap();
+        // 600 rows of 777 are more than a twentieth of the 10,000 keyed rows,
+        // not of the volume's 100,000
+        db.execute(
+            "INSERT INTO t SELECT g.value, CASE WHEN g.value <= 600 THEN 777 \
+             WHEN g.value = 601 THEN 0 WHEN g.value <= 10000 THEN 1 + g.value % 776 \
+             ELSE NULL END FROM generate_series(1, 100000) g",
+            (),
+        )
+        .unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        let (found, reads) = read(&db, "SELECT id FROM t WHERE k IN (0, 777)");
+        assert_eq!(found.len(), 601);
+        assert_eq!(reads, (1, 0), "a sparse key of the volume was refused");
+    }
+
+    #[test]
+    fn a_heavy_key_refuses_the_list_before_any_key_is_read() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let db = sealed(&dir);
+        let expected = by_or(&db, &[1, 2, 777]);
+        let probed = after_first_key(|| {});
+        let (found, reads) = read(&db, "SELECT id FROM t WHERE k IN (1, 2, 777)");
+        assert!(
+            !probed.load(Ordering::SeqCst),
+            "a key was read before the heavy key refused the list"
+        );
+        assert_eq!(reads, (0, 0), "the list did not fall back");
         assert_eq!(found, expected);
     }
 
@@ -442,19 +491,15 @@ mod probed {
         db.execute("CREATE TABLE s (v INTEGER)", ()).unwrap();
         db.execute("INSERT INTO s VALUES (1), (2), (10)", ())
             .unwrap();
-        let probed = after_first_key(|| {});
         db.execute("BEGIN", ()).unwrap();
-        let before = in_subquery_runs();
+        let (before, asked) = (in_subquery_runs(), in_member_probes());
         let (found, reads) = read(
             &db,
             "SELECT id FROM t WHERE k IN (1, 2, 777) AND v IN (SELECT v FROM s)",
         );
-        let runs = in_subquery_runs() - before;
+        let (runs, asked) = (in_subquery_runs() - before, in_member_probes() - asked);
         db.execute("COMMIT", ()).unwrap();
-        assert!(
-            probed.load(Ordering::SeqCst),
-            "the list did not read candidates"
-        );
+        assert_eq!(asked, 1, "the list did not ask the candidates");
         assert_eq!(reads, (0, 0), "the list did not fall back");
         assert_eq!(found, vec![1, 2, 10]);
         assert_eq!(
