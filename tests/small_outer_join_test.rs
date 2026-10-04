@@ -286,4 +286,41 @@ mod counted {
             "{plan:#?}"
         );
     }
+
+    #[test]
+    fn a_dotted_inner_alias_keeps_its_identity() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let db = sealed(&dir);
+        let control = rows(
+            &db,
+            "SELECT \"i.n\".id FROM s JOIN u AS \"i.n\" ON \"i.n\".k = s.k",
+        );
+        let (found, counts) = run(
+            &db,
+            "SELECT \"i.n\".id FROM s JOIN t AS \"i.n\" ON \"i.n\".k = s.k",
+        );
+        assert_eq!(counts.narrowed, 1, "the small outer did not narrow");
+        assert_eq!(found, control);
+    }
+
+    #[test]
+    fn explain_names_the_strategy_only_where_it_runs() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let db = sealed(&dir);
+        // The plain table on the right is never taken as the outer side
+        let sql = "SELECT t.id FROM t JOIN s ON t.k = s.k";
+        let plan: Vec<String> = db
+            .query(&format!("EXPLAIN {sql}"), ())
+            .unwrap()
+            .map(|r| r.unwrap().get::<String>(0).unwrap())
+            .collect();
+        let (found, counts) = run(&db, sql);
+        let named = plan
+            .iter()
+            .any(|line| line.contains("conditional: a small outer"));
+        assert_eq!(named, counts.narrowed == 1, "{plan:#?}");
+        assert_eq!(found, same_as_control(&db, sql));
+    }
 }

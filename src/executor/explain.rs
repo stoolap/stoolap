@@ -982,7 +982,16 @@ impl Executor {
                 return (name(&strategy), Some(strategy));
             }
 
-            // Check swapped direction for INLJ (left side has index/PK)
+            // Check swapped direction for INLJ (left side has index/PK). The
+            // executor swaps a small outer in only from a right side that is
+            // not a table
+            let right_is_table = match join_right {
+                Expression::TableSource(_) => true,
+                Expression::Aliased(aliased) => {
+                    matches!(aliased.expression.as_ref(), Expression::TableSource(_))
+                }
+                _ => false,
+            };
             let swapped_info = if index_use == JoinIndexUse::Grouped {
                 None
             } else {
@@ -993,7 +1002,7 @@ impl Executor {
                     right_alias.as_deref(),
                     left_alias.as_deref(),
                     bounded,
-                    small_outer,
+                    small_outer && !right_is_table,
                 )
             };
 

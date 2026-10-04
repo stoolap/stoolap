@@ -4697,12 +4697,32 @@ impl Executor {
                                     }
                                     Some(keys)
                                 });
-                            let members = keys.and_then(|keys| {
-                                self.build_in_filter_expression(
-                                    &format!("{inner_alias}.{inner_col}"),
-                                    &keys,
-                                )
+                            // The alias and the column stay apart: either may hold a dot
+                            let column = Expression::QualifiedIdentifier(QualifiedIdentifier {
+                                token: Token::new(
+                                    TokenType::Identifier,
+                                    inner_alias,
+                                    Position::default(),
+                                ),
+                                qualifier: Box::new(Identifier::new(
+                                    Token::new(
+                                        TokenType::Identifier,
+                                        inner_alias,
+                                        Position::default(),
+                                    ),
+                                    inner_alias.to_string(),
+                                )),
+                                name: Box::new(Identifier::new(
+                                    Token::new(
+                                        TokenType::Identifier,
+                                        &inner_col,
+                                        Position::default(),
+                                    ),
+                                    inner_col.clone(),
+                                )),
                             });
+                            let members =
+                                keys.and_then(|keys| Self::in_list_expression(column, &keys));
                             if let Some(members) = members {
                                 reduced_inner = combine_predicates_with_and(
                                     nl_right_filter
@@ -11618,6 +11638,15 @@ impl Executor {
                 column_name.to_string(),
             ))
         };
+        Self::in_list_expression(col_expr, values)
+    }
+
+    /// `col_expr IN (values...)`, the values written as literals; None for
+    /// no values
+    fn in_list_expression(col_expr: Expression, values: &[Value]) -> Option<Expression> {
+        if values.is_empty() {
+            return None;
+        }
 
         // Build list of value literals.
         // IntegerLiteral uses "0" token (Display uses self.value, not token.literal).
