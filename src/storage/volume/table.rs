@@ -1652,7 +1652,9 @@ impl SegmentedTable {
             // The reader is built on the space the caller keeps, so the pages
             // are admitted beside what that space does not hold yet
             let left = max - (out.len() - start);
-            let reserve = super::secondary::reader_bytes(left)
+            // The walk reads in windows, so a large `max` needs no larger window
+            let window = left.min(super::secondary::SIDE_WINDOW);
+            let reserve = super::secondary::reader_bytes(window)
                 .saturating_sub(scratch.reader.reserved_bytes());
             let (side, physical) =
                 match self.side_admits(cs, column, identity, low, high, reserve)? {
@@ -1660,7 +1662,7 @@ impl SegmentedTable {
                     SideAdmission::Scan => return Ok(None),
                     SideAdmission::Probe(side, physical) => (side, physical),
                 };
-            let mut reader = match side.reader_in(physical, left, &mut scratch.reader) {
+            let mut reader = match side.reader_in(physical, window, &mut scratch.reader) {
                 Ok(reader) => reader,
                 Err(error) if is_refused(&error) => {
                     READS.count(&READS.refused, 1);

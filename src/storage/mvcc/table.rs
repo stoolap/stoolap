@@ -3670,12 +3670,34 @@ impl Table for MVCCTable {
         let Some(index) = self.version_store.get_index_by_column(column) else {
             return Ok(None);
         };
-        let key = std::slice::from_ref(key);
         match index.index_type() {
-            IndexType::BTree => Ok(index.get_row_ids_equal_capped_into(key, max, out)),
+            IndexType::BTree => {
+                Ok(index.get_row_ids_equal_capped_into(std::slice::from_ref(key), max, out))
+            }
             IndexType::Hash | IndexType::Bitmap | IndexType::PrimaryKey => {
+                // These match the stored value exactly, so the key takes the column's type
+                let Some(data_type) = self
+                    .cached_schema
+                    .columns
+                    .iter()
+                    .find(|c| c.name_lower.eq_ignore_ascii_case(column))
+                    .map(|c| c.data_type)
+                else {
+                    return Ok(None);
+                };
+                let stored = match (data_type, key) {
+                    (DataType::Integer, Value::Float(f)) => {
+                        match crate::executor::Executor::lossless_float_key(*f) {
+                            Some(i) => Value::Integer(i),
+                            None => return Ok(Some(crate::storage::traits::CappedEqual::Copied)),
+                        }
+                    }
+                    (DataType::Float, Value::Integer(i)) => Value::Float(*i as f64),
+                    (data_type, key) if key.data_type() == data_type => key.clone(),
+                    _ => return Ok(None),
+                };
                 let start = out.len();
-                index.get_row_ids_equal_into(key, out);
+                index.get_row_ids_equal_into(std::slice::from_ref(&stored), out);
                 if out.len() - start > max {
                     out.truncate(start);
                     return Ok(Some(crate::storage::traits::CappedEqual::OverCap));

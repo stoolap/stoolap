@@ -242,3 +242,82 @@ fn an_as_of_subquery_reads_its_point() {
         [Some(1)]
     );
 }
+
+#[test]
+fn an_exact_float_key_matches_an_integer_key_of_every_index_kind() {
+    for kind in ["pk", "hash", "bitmap", "btree"] {
+        let db = Database::open(&format!("memory://probe_float_key_{kind}")).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)", ())
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (42, 42), (43, 43)", ())
+            .unwrap();
+        let column = if kind == "pk" {
+            "id"
+        } else {
+            db.execute(&format!("CREATE INDEX t_k ON t(k) USING {kind}"), ())
+                .unwrap();
+            "k"
+        };
+        db.execute("CREATE TABLE o (id INTEGER PRIMARY KEY, k FLOAT)", ())
+            .unwrap();
+        db.execute("INSERT INTO o VALUES (1, 42.0), (2, 42.5)", ())
+            .unwrap();
+        assert_eq!(
+            counts(
+                &db,
+                &format!(
+                    "SELECT o.id, (SELECT COUNT(*) FROM t WHERE t.{column} = o.k) \
+                     FROM o ORDER BY o.id"
+                )
+            ),
+            [Some(1), Some(0)],
+            "{kind}"
+        );
+    }
+}
+
+#[test]
+fn a_rollup_inside_exists_keeps_its_total_row() {
+    let db = keyed("probe_rollup");
+    assert_eq!(
+        counts(
+            &db,
+            "SELECT o.id, CASE WHEN EXISTS \
+             (SELECT COUNT(*) FROM t WHERE t.k = o.k GROUP BY ROLLUP(t.k)) THEN 1 ELSE 0 END \
+             FROM o ORDER BY o.id"
+        ),
+        [Some(1), Some(1)]
+    );
+}
+
+#[test]
+fn a_first_seal_after_an_uncapped_probe_starts_is_answered() {
+    use stoolap::storage::traits::{CappedEqual, Engine, ProbeScratch};
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE INDEX t_k ON t(k)", ()).unwrap();
+    db.execute(
+        "INSERT INTO t SELECT value, value FROM generate_series(1, 1000)",
+        (),
+    )
+    .unwrap();
+    let tx = db.engine().begin_transaction().unwrap();
+    let table = tx.get_table("t").unwrap();
+    assert!(!table.has_sealed_rows());
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    assert!(table.has_sealed_rows());
+    let mut ids = Vec::new();
+    let found = table
+        .equality_candidates(
+            "k",
+            &stoolap::core::Value::Integer(42),
+            usize::MAX,
+            &mut ids,
+            &mut ProbeScratch::default(),
+        )
+        .unwrap();
+    assert_eq!(found, Some(CappedEqual::Copied));
+    assert_eq!(ids, [42]);
+}

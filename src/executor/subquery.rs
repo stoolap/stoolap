@@ -651,10 +651,12 @@ impl Executor {
     /// returns its one row whether or not anything matched. Grouping on its
     /// own is not among them, since a group is there exactly where a row is.
     fn exists_subquery_is_more_than_its_where(subquery: &SelectStatement) -> bool {
+        // ROLLUP, CUBE and grouping sets add total rows that need no row
         if subquery.having.is_some()
             || subquery.limit.is_some()
             || subquery.offset.is_some()
             || !subquery.set_operations.is_empty()
+            || subquery.group_by.modifier != GroupByModifier::None
         {
             return true;
         }
@@ -800,11 +802,12 @@ impl Executor {
         if !subquery.group_by.columns.is_empty() {
             return Ok(None);
         }
-        // A HAVING, a row count or a set operation decides more than the count
+        // A HAVING, a row count, a set operation or grouping sets decide more than the count
         if subquery.having.is_some()
             || subquery.limit.is_some()
             || subquery.offset.is_some()
             || !subquery.set_operations.is_empty()
+            || subquery.group_by.modifier != GroupByModifier::None
         {
             return Ok(None);
         }
