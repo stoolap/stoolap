@@ -41,6 +41,7 @@
 //!   [col u32][key tag u8][n_keys u64][n_positions u64][key pages u32][pos pages u32]
 //!   key pages: [first_key i64][last_key i64][offset u64][len u32][key_start u64][pos_start u64]
 //!   pos pages: [offset u64][len u32][pos_start u64]
+//!   heavy keys (version 5): [count u8] then [key i64] ascending
 //! footer: [directory offset u64][directory len u32][directory crc32 u32][magic]
 //! ```
 //!
@@ -56,8 +57,17 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use super::writer::VolumeFile;
 const MAGIC: [u8; 4] = *b"STSX";
-const VERSION: u32 = 4;
+/// Version 5 adds each column's heavy keys to the directory; version 4
+/// files are still read, without them
+const VERSION: u32 = 5;
+const VERSION_WITHOUT_HEAVY_KEYS: u32 = 4;
 const KEY_I64: u8 = 1;
+/// A key holding more than one in this many of a volume's rows is read by
+/// a scan rather than its side file
+pub const SCAN_SHARE: u64 = 20;
+/// The heavy keys a column lists at most: more than one in `SCAN_SHARE`
+/// of its positions each, so fewer than `SCAN_SHARE` of them fit
+const HEAVY_SLOTS: usize = SCAN_SHARE as usize;
 const HEADER_LEN: u64 = 16;
 const FOOTER_LEN: u64 = 20;
 const KEY_DIR_ENTRY: usize = 44;
@@ -826,6 +836,9 @@ pub struct ColumnDirectory {
     pub n_positions: u64,
     pub key_pages: Vec<KeyPageMeta>,
     pub pos_pages: Vec<PosPageMeta>,
+    /// The keys holding more than one in `SCAN_SHARE` of the positions,
+    /// ascending; None in a version 4 file, which predates the list
+    pub heavy_keys: Option<Vec<i64>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -862,6 +875,7 @@ impl Directory {
             .map(|c| {
                 c.key_pages.capacity() * std::mem::size_of::<KeyPageMeta>()
                     + c.pos_pages.capacity() * std::mem::size_of::<PosPageMeta>()
+                    + c.heavy_keys.as_ref().map_or(0, |keys| keys.capacity() * 8)
             })
             .sum::<usize>()
             + self.columns.capacity() * std::mem::size_of::<ColumnDirectory>()
@@ -872,7 +886,11 @@ impl Directory {
             .columns
             .iter()
             .map(|c| {
-                COLUMN_ENTRY + c.key_pages.len() * KEY_DIR_ENTRY + c.pos_pages.len() * POS_DIR_ENTRY
+                COLUMN_ENTRY
+                    + c.key_pages.len() * KEY_DIR_ENTRY
+                    + c.pos_pages.len() * POS_DIR_ENTRY
+                    + 1
+                    + c.heavy_keys.as_ref().map_or(0, Vec::len) * 8
             })
             .sum::<usize>()
     }
@@ -900,13 +918,28 @@ impl Directory {
                 out.extend_from_slice(&p.len.to_le_bytes());
                 out.extend_from_slice(&p.pos_start.to_le_bytes());
             }
+            // Only a build encodes, and a build always lists them
+            debug_assert!(
+                c.heavy_keys.is_some(),
+                "a built column lists its heavy keys"
+            );
+            let heavy = c.heavy_keys.as_deref().unwrap_or_default();
+            out.push(heavy.len() as u8);
+            for key in heavy {
+                out.extend_from_slice(&key.to_le_bytes());
+            }
         }
     }
 
     /// Decodes the directory, charging each column's vectors at their
     /// capacity to the directories ledger before they are allocated; the
     /// charges come back with it.
-    fn decode(generation: u64, data: &[u8], file_len: u64) -> std::io::Result<(Self, Vec<Held>)> {
+    fn decode(
+        version: u32,
+        generation: u64,
+        data: &[u8],
+        file_len: u64,
+    ) -> std::io::Result<(Self, Vec<Held>)> {
         let mut pos = 0usize;
         let count = read_u32(data, &mut pos)? as usize;
         if count > 4096 {
@@ -981,6 +1014,27 @@ impl Directory {
             {
                 return Err(invalid("directory pages are not in order"));
             }
+            let heavy_keys = if version == VERSION_WITHOUT_HEAVY_KEYS {
+                None
+            } else {
+                let count = *data
+                    .get(pos)
+                    .ok_or_else(|| invalid("directory truncated"))?
+                    as usize;
+                pos += 1;
+                if count > HEAVY_SLOTS || data.len() < pos + count * 8 {
+                    return Err(invalid("heavy keys out of bounds"));
+                }
+                charges.push(INDEX_DIRECTORIES.charge(count * 8));
+                let mut keys = Vec::with_capacity(count);
+                for _ in 0..count {
+                    keys.push(read_u64(data, &mut pos)? as i64);
+                }
+                if keys.windows(2).any(|w| w[0] >= w[1]) {
+                    return Err(invalid("heavy keys are not in order"));
+                }
+                Some(keys)
+            };
             columns.push(ColumnDirectory {
                 column,
                 identity,
@@ -988,6 +1042,7 @@ impl Directory {
                 n_positions,
                 key_pages: kp,
                 pos_pages: pp,
+                heavy_keys,
             });
         }
         if pos != data.len() {
@@ -1064,7 +1119,7 @@ impl IndexFile {
             return Err(invalid("bad magic"));
         }
         let version = u32::from_le_bytes(header[4..8].try_into().expect("4 bytes"));
-        if version != VERSION {
+        if version != VERSION && version != VERSION_WITHOUT_HEAVY_KEYS {
             return Err(invalid("version unsupported"));
         }
         let generation = u64::from_le_bytes(header[8..16].try_into().expect("8 bytes"));
@@ -1086,7 +1141,7 @@ impl IndexFile {
         if crc32fast::hash(&dir) != dir_crc {
             return Err(invalid("directory checksum mismatch"));
         }
-        let (directory, charges) = Directory::decode(generation, &dir, dir_offset)?;
+        let (directory, charges) = Directory::decode(version, generation, &dir, dir_offset)?;
         drop(dir);
         drop(raw_charge);
         Ok(Self {
@@ -2503,6 +2558,12 @@ struct PageWriter<'a, 'b, W: Write> {
     current: Option<i64>,
     n_keys: u64,
     n_positions: u64,
+    /// The position index the last closed key ended at
+    closed_end: u64,
+    /// The keys with the most positions so far and their counts, at most
+    /// `HEAVY_SLOTS`, from which the heavy keys are kept at the end
+    heaviest: Vec<(i64, u64)>,
+    heaviest_charge: Charge<'b>,
 }
 
 impl<'a, 'b, W: Write> PageWriter<'a, 'b, W> {
@@ -2524,6 +2585,9 @@ impl<'a, 'b, W: Write> PageWriter<'a, 'b, W> {
             current: None,
             n_keys: 0,
             n_positions: 0,
+            closed_end: 0,
+            heaviest: Vec::new(),
+            heaviest_charge: Charge { bytes: 0, budget },
         }
     }
 
@@ -2556,6 +2620,22 @@ impl<'a, 'b, W: Write> PageWriter<'a, 'b, W> {
         }
         self.key_page.push((key, self.n_positions));
         self.n_keys += 1;
+        let count = self.n_positions - self.closed_end;
+        self.closed_end = self.n_positions;
+        if self.heaviest.capacity() == 0 {
+            self.heaviest_charge.grow(
+                HEAVY_SLOTS * std::mem::size_of::<(i64, u64)>(),
+                "heavy keys",
+            )?;
+            self.heaviest.reserve_exact(HEAVY_SLOTS);
+        }
+        if self.heaviest.len() < HEAVY_SLOTS {
+            self.heaviest.push((key, count));
+        } else if let Some(lightest) = self.heaviest.iter_mut().min_by_key(|(_, c)| *c) {
+            if count > lightest.1 {
+                *lightest = (key, count);
+            }
+        }
         Ok(())
     }
 
@@ -2643,6 +2723,14 @@ impl<'a, 'b, W: Write> PageWriter<'a, 'b, W> {
         }
         self.flush_pos_page()?;
         self.flush_key_page()?;
+        let n_positions = self.n_positions;
+        let heavy = self
+            .heaviest
+            .iter()
+            .filter(|(_, count)| count * SCAN_SHARE > n_positions);
+        self.metas.grow(heavy.clone().count() * 8, "heavy keys")?;
+        let mut heavy_keys: Vec<i64> = heavy.map(|(key, _)| *key).collect();
+        heavy_keys.sort_unstable();
         let column = ColumnDirectory {
             column: self.column,
             identity: self.identity,
@@ -2650,6 +2738,7 @@ impl<'a, 'b, W: Write> PageWriter<'a, 'b, W> {
             n_positions: self.n_positions,
             key_pages: std::mem::take(&mut self.key_pages),
             pos_pages: std::mem::take(&mut self.pos_pages),
+            heavy_keys: Some(heavy_keys),
         };
         let budget = self.metas.budget;
         let metas = std::mem::replace(&mut self.metas, Charge { bytes: 0, budget });
@@ -3340,6 +3429,52 @@ mod tests {
         assert!(file.candidate_bound(1, 100, 103).unwrap() >= want.len() as u64);
         assert_eq!(file.range(1, 2000, 3000).unwrap(), (0, 0));
         assert_eq!(file.candidate_bound(1, 2000, 3000).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_column_lists_the_keys_past_the_scan_share() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("heavy.sidx");
+        // 50,000 rows: 5,000 of key 5000, after every lighter key, and
+        // 2,500 of key 7777, exactly one in twenty, which is not past it
+        let pairs: Vec<(u32, i64)> = (0..50_000u32)
+            .map(|p| match p % 20 {
+                0 | 1 => (p, 5000),
+                2 => (p, 7777),
+                _ => (p, (p % 977) as i64),
+            })
+            .collect();
+        build(&path, pairs, WORKSPACE);
+        let file = IndexFile::open(&path, 1).unwrap();
+        let column = file.directory().column(1).unwrap();
+        assert_eq!(column.heavy_keys.as_deref(), Some(&[5000i64][..]));
+    }
+
+    #[test]
+    fn a_version_4_directory_reads_without_heavy_keys() {
+        let directory = Directory {
+            generation: 7,
+            columns: vec![ColumnDirectory {
+                column: 1,
+                identity: 3,
+                n_keys: 0,
+                n_positions: 0,
+                key_pages: Vec::new(),
+                pos_pages: Vec::new(),
+                heavy_keys: Some(Vec::new()),
+            }],
+        };
+        let mut current = Vec::new();
+        directory.encode_into(&mut current);
+        // Version 4 wrote the same entry without the heavy key count
+        let older = &current[..current.len() - 1];
+        let (read, _) = Directory::decode(VERSION_WITHOUT_HEAVY_KEYS, 7, older, 1 << 20).unwrap();
+        assert_eq!(read.columns[0].heavy_keys, None);
+        let (read, _) = Directory::decode(VERSION, 7, &current, 1 << 20).unwrap();
+        assert_eq!(read.columns[0].heavy_keys, Some(Vec::new()));
+        assert!(Directory::decode(VERSION, 7, older, 1 << 20).is_err());
+        assert!(Directory::decode(VERSION_WITHOUT_HEAVY_KEYS, 7, &current, 1 << 20).is_err());
     }
 
     #[test]

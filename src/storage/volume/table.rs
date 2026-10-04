@@ -75,7 +75,7 @@ enum SideAdmission {
 
 /// The index serves a volume when the candidates are at most this share
 /// of its rows: one in twenty to start, to be measured
-const SIDE_SCAN_SHARE: u64 = 20;
+const SIDE_SCAN_SHARE: u64 = super::secondary::SCAN_SHARE;
 
 /// Times a statement releases the seal fence to read cold volumes a seal,
 /// compaction or eviction left unread before it gives up
@@ -1564,6 +1564,52 @@ impl SegmentedTable {
     /// per read with the cold view
     fn side_identities(&self) -> Vec<(usize, u64)> {
         self.hot.secondary_index_identities()
+    }
+
+    /// Whether none of `keys` is among the heavy keys a volume's side file in
+    /// `view` lists: those hold every key the reads refuse by count, so a
+    /// heavy key is a refusal found before any page is read. A volume
+    /// without a side file or a list (version 4) is left to the reads
+    fn cold_keys_admitted(
+        &self,
+        view: &super::manifest::ColdSnapshot,
+        column: &str,
+        keys: &[Value],
+        identities: &[(usize, u64)],
+    ) -> Result<bool> {
+        let Some(first) = keys.iter().find(|key| !key.is_null()) else {
+            return Ok(true);
+        };
+        let comparisons = [(column, crate::core::Operator::Eq, first)];
+        let Some((physical_column, identity, _, _)) = self.side_bounds(&comparisons, identities)
+        else {
+            return Ok(true);
+        };
+        for (_, cs) in view.volumes() {
+            let Some((side, physical)) = cs.side_for(physical_column, identity) else {
+                continue;
+            };
+            let heavy = side
+                .directory()
+                .column(physical)
+                .and_then(|column| column.heavy_keys.as_deref())
+                .unwrap_or_default();
+            if heavy.is_empty() {
+                continue;
+            }
+            let listed = keys.iter().any(|key| {
+                let key = match key {
+                    Value::Integer(i) => Some(*i),
+                    Value::Timestamp(ts) => ts.timestamp_nanos_opt(),
+                    _ => None,
+                };
+                key.is_some_and(|key| heavy.binary_search(&key).is_ok())
+            });
+            if listed {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// One key's ids from every volume's side file in `view`, newest volume
@@ -5783,6 +5829,13 @@ impl Table for SegmentedTable {
         };
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::join_probe_admitted();
+        // A key the directories already refuse is found before any key's
+        // pages are read
+        if let Some(view) = view.as_ref().filter(|_| keys.len() > 1) {
+            if !self.cold_keys_admitted(view, column, keys, &scratch.identities)? {
+                return Ok(None);
+            }
+        }
         for key in keys.iter().filter(|key| !key.is_null()) {
             if let Some(view) = &view {
                 let left = max.saturating_sub(out.len() - start);

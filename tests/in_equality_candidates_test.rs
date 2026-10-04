@@ -247,13 +247,35 @@ mod probed {
         let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let db = sealed(&dir);
-        let expected = by_or(&db, &[1, 2, 777]);
+        // Left hot, past the candidate cap, so only the reads refuse it
+        db.execute(
+            "INSERT INTO t SELECT 100000 + g.value, 4242, 0 FROM generate_series(1, 70000) g",
+            (),
+        )
+        .unwrap();
+        let expected = by_or(&db, &[1, 2, 4242]);
         let probed = after_first_key(|| {});
-        let found = ids(&db, "SELECT id FROM t WHERE k IN (1, 2, 777)");
+        let found = ids(&db, "SELECT id FROM t WHERE k IN (1, 2, 4242)");
         assert!(
             probed.load(Ordering::SeqCst),
             "the list did not read candidates"
         );
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn a_heavy_key_refuses_the_list_before_any_key_is_read() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let db = sealed(&dir);
+        let expected = by_or(&db, &[1, 2, 777]);
+        let probed = after_first_key(|| {});
+        let (found, reads) = read(&db, "SELECT id FROM t WHERE k IN (1, 2, 777)");
+        assert!(
+            !probed.load(Ordering::SeqCst),
+            "a key was read before the heavy key refused the list"
+        );
+        assert_eq!(reads, (0, 0), "the list did not fall back");
         assert_eq!(found, expected);
     }
 
@@ -442,19 +464,15 @@ mod probed {
         db.execute("CREATE TABLE s (v INTEGER)", ()).unwrap();
         db.execute("INSERT INTO s VALUES (1), (2), (10)", ())
             .unwrap();
-        let probed = after_first_key(|| {});
         db.execute("BEGIN", ()).unwrap();
-        let before = in_subquery_runs();
+        let (before, asked) = (in_subquery_runs(), in_member_probes());
         let (found, reads) = read(
             &db,
             "SELECT id FROM t WHERE k IN (1, 2, 777) AND v IN (SELECT v FROM s)",
         );
-        let runs = in_subquery_runs() - before;
+        let (runs, asked) = (in_subquery_runs() - before, in_member_probes() - asked);
         db.execute("COMMIT", ()).unwrap();
-        assert!(
-            probed.load(Ordering::SeqCst),
-            "the list did not read candidates"
-        );
+        assert_eq!(asked, 1, "the list did not ask the candidates");
         assert_eq!(reads, (0, 0), "the list did not fall back");
         assert_eq!(found, vec![1, 2, 10]);
         assert_eq!(
