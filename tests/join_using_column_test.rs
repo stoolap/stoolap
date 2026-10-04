@@ -145,3 +145,22 @@ fn test_an_equality_inside_the_next_table_is_not_a_join_key() {
         expected
     );
 }
+
+#[test]
+fn test_a_parameter_beside_an_equality_inside_the_next_table_is_bound() {
+    let db = setup("using_next_table_parameter");
+    db.execute("CREATE TABLE uz (id INTEGER PRIMARY KEY, a INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO uz VALUES (2, 2), (3, 7), (5, 5)", ())
+        .unwrap();
+    let ids: Vec<i64> = db
+        .query(
+            "SELECT uz.id FROM ux JOIN uy USING (a) \
+             JOIN uz ON uz.id = uz.a AND uy.id = $1 ORDER BY uz.id",
+            (3,),
+        )
+        .unwrap()
+        .map(|r| r.unwrap().get(0).unwrap())
+        .collect();
+    assert_eq!(ids, [2, 5]);
+}

@@ -491,3 +491,20 @@ fn test_an_index_probe_checks_the_key_of_the_row_it_fetches() {
     );
     db.execute("ROLLBACK", ()).unwrap();
 }
+
+#[test]
+fn a_join_without_an_equality_key_binds_its_parameters() {
+    let db = setup("keyless_join_parameters");
+    let pairs: Vec<(i64, i64)> = db
+        .query(
+            "SELECT t.id, u.id FROM t JOIN u ON t.id < u.t_id AND u.w = $1 ORDER BY t.id",
+            (300,),
+        )
+        .unwrap()
+        .map(|r| {
+            let r = r.unwrap();
+            (r.get(0).unwrap(), r.get(1).unwrap())
+        })
+        .collect();
+    assert_eq!(pairs, [(1, 3)]);
+}
