@@ -11667,35 +11667,33 @@ impl Executor {
         // Build list of value literals.
         // IntegerLiteral uses "0" token (Display uses self.value, not token.literal).
         // FloatLiteral must use f.to_string() (Display uses token.literal).
-        let value_exprs: Vec<Expression> = values
-            .iter()
-            .map(|v| {
-                Some(match v {
-                    Value::Integer(i) => Expression::IntegerLiteral(IntegerLiteral {
-                        token: Token::new(TokenType::Integer, "0", Position::default()),
-                        value: *i,
-                    }),
-                    Value::Float(f) => Expression::FloatLiteral(FloatLiteral {
-                        token: Token::new(TokenType::Float, f.to_string(), Position::default()),
-                        value: *f,
-                    }),
-                    Value::Text(s) => Expression::StringLiteral(StringLiteral {
-                        token: Token::new(TokenType::String, s.as_str(), Position::default()),
-                        value: s.as_str().into(),
-                        type_hint: None,
-                    }),
-                    Value::Boolean(b) => Expression::BooleanLiteral(BooleanLiteral {
-                        token: Token::new(
-                            TokenType::Keyword,
-                            if *b { "true" } else { "false" },
-                            Position::default(),
-                        ),
-                        value: *b,
-                    }),
-                    _ => return None,
-                })
-            })
-            .collect::<Option<_>>()?;
+        let mut value_exprs: Vec<Expression> = Vec::with_capacity(values.len());
+        for v in values {
+            value_exprs.push(match v {
+                Value::Integer(i) => Expression::IntegerLiteral(IntegerLiteral {
+                    token: Token::new(TokenType::Integer, "0", Position::default()),
+                    value: *i,
+                }),
+                Value::Float(f) => Expression::FloatLiteral(FloatLiteral {
+                    token: Token::new(TokenType::Float, f.to_string(), Position::default()),
+                    value: *f,
+                }),
+                Value::Text(s) => Expression::StringLiteral(StringLiteral {
+                    token: Token::new(TokenType::String, s.as_str(), Position::default()),
+                    value: s.as_str().into(),
+                    type_hint: None,
+                }),
+                Value::Boolean(b) => Expression::BooleanLiteral(BooleanLiteral {
+                    token: Token::new(
+                        TokenType::Keyword,
+                        if *b { "true" } else { "false" },
+                        Position::default(),
+                    ),
+                    value: *b,
+                }),
+                _ => return None,
+            });
+        }
 
         // Create IN expression
         Some(Expression::In(InExpression {
