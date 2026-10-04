@@ -119,3 +119,29 @@ fn test_a_qualified_star_keeps_the_using_column() {
 fn rows_of(db: &Database, sql: &str) -> Vec<String> {
     rows(db, sql)
 }
+
+#[test]
+fn test_an_equality_inside_the_next_table_is_not_a_join_key() {
+    let db = setup("using_next_table_equality");
+    db.execute("CREATE TABLE uz (id INTEGER PRIMARY KEY, a INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO uz VALUES (2, 2), (3, 7), (5, 5)", ())
+        .unwrap();
+    let expected = ["3,3,2", "3,3,5"];
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT ux.id, uy.id, uz.id FROM ux JOIN uy USING (a) \
+             JOIN uz ON uz.id = uz.a AND uy.id = 3 ORDER BY ux.id, uz.id"
+        ),
+        expected
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT ux.id, uy.id, uz.id FROM ux JOIN uy USING (a) \
+             JOIN uz ON uz.a = uz.id AND uy.id = 3 ORDER BY ux.id, uz.id"
+        ),
+        expected
+    );
+}
