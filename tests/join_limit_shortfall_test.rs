@@ -308,3 +308,48 @@ fn test_inl_join_limit_inside_an_explicit_transaction() {
     db.execute("ROLLBACK", ()).unwrap();
     assert_eq!(count(&db, joined), 50);
 }
+
+fn pairs(db: &Database, sql: &str) -> Vec<(i64, i64)> {
+    let mut rows: Vec<(i64, i64)> = db
+        .query(sql, ())
+        .unwrap()
+        .map(|r| {
+            let r = r.unwrap();
+            (r.get::<i64>(0).unwrap(), r.get::<i64>(1).unwrap())
+        })
+        .collect();
+    rows.sort_unstable();
+    rows
+}
+
+#[test]
+fn a_timestamp_join_key_survives_the_grouped_reduction() {
+    let db = Database::open("memory://timestamp_join_key_grouped_reduction").unwrap();
+    db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, ts TIMESTAMP)", ())
+        .unwrap();
+    db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, ts TIMESTAMP)", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO a VALUES (1, TIMESTAMP '2024-01-01 00:00:00'), \
+         (2, TIMESTAMP '2024-01-02 00:00:00'), (3, TIMESTAMP '2024-01-03 00:00:00')",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO b VALUES (1, TIMESTAMP '2024-01-01 00:00:00'), \
+         (2, TIMESTAMP '2024-01-01 00:00:00'), (3, TIMESTAMP '2024-01-02 00:00:00')",
+        (),
+    )
+    .unwrap();
+    for join in ["JOIN", "LEFT JOIN"] {
+        let grouped =
+            format!("SELECT a.id, COUNT(b.id) FROM a {join} b ON b.ts = a.ts GROUP BY a.id");
+        let expected = pairs(&db, &grouped);
+        assert!(expected.contains(&(1, 2)), "{join}: {expected:?}");
+        assert_eq!(
+            pairs(&db, &format!("{grouped} LIMIT 10")),
+            expected,
+            "{join}: the LIMIT lost the timestamp matches"
+        );
+    }
+}

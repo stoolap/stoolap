@@ -11657,7 +11657,8 @@ impl Executor {
     }
 
     /// `col_expr IN (values...)`, the values written as literals; None for
-    /// no values
+    /// no values, or for a value no literal here writes exactly, such as a
+    /// timestamp, which would otherwise match nothing
     fn in_list_expression(col_expr: Expression, values: &[Value]) -> Option<Expression> {
         if values.is_empty() {
             return None;
@@ -11666,9 +11667,9 @@ impl Executor {
         // Build list of value literals.
         // IntegerLiteral uses "0" token (Display uses self.value, not token.literal).
         // FloatLiteral must use f.to_string() (Display uses token.literal).
-        let value_exprs: Vec<Expression> = values
-            .iter()
-            .map(|v| match v {
+        let mut value_exprs: Vec<Expression> = Vec::with_capacity(values.len());
+        for v in values {
+            value_exprs.push(match v {
                 Value::Integer(i) => Expression::IntegerLiteral(IntegerLiteral {
                     token: Token::new(TokenType::Integer, "0", Position::default()),
                     value: *i,
@@ -11690,11 +11691,9 @@ impl Executor {
                     ),
                     value: *b,
                 }),
-                _ => Expression::NullLiteral(NullLiteral {
-                    token: Token::new(TokenType::Keyword, "NULL", Position::default()),
-                }),
-            })
-            .collect();
+                _ => return None,
+            });
+        }
 
         // Create IN expression
         Some(Expression::In(InExpression {
