@@ -1566,10 +1566,11 @@ impl SegmentedTable {
         self.hot.secondary_index_identities()
     }
 
-    /// Whether none of `keys` is among the heavy keys a volume's side file in
-    /// `view` lists: those hold every key the reads refuse by count, so a
-    /// heavy key is a refusal found before any page is read. A volume
-    /// without a side file or a list (version 4) is left to the reads
+    /// Whether no key of `keys` holds more than the scan share of a volume's
+    /// rows in `view` by the counts its side file lists, which name every
+    /// key the reads refuse by count, so the refusal is found before any
+    /// page is read. A volume without a side file or a list (version 4) is
+    /// left to the reads
     fn cold_keys_admitted(
         &self,
         view: &super::manifest::ColdSnapshot,
@@ -1597,15 +1598,18 @@ impl SegmentedTable {
             if heavy.is_empty() {
                 continue;
             }
-            let listed = keys.iter().any(|key| {
+            // The share the reads refuse by: of the volume's rows, NULLs too
+            let rows = cs.volume.meta.row_count as u64;
+            let refused = keys.iter().any(|key| {
                 let key = match key {
                     Value::Integer(i) => Some(*i),
                     Value::Timestamp(ts) => ts.timestamp_nanos_opt(),
                     _ => None,
                 };
-                key.is_some_and(|key| heavy.binary_search(&key).is_ok())
+                key.and_then(|key| heavy.binary_search_by_key(&key, |(k, _)| *k).ok())
+                    .is_some_and(|at| heavy[at].1 * SIDE_SCAN_SHARE > rows.max(1))
             });
-            if listed {
+            if refused {
                 return Ok(false);
             }
         }

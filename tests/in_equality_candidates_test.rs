@@ -264,6 +264,33 @@ mod probed {
     }
 
     #[test]
+    fn null_rows_leave_a_sparse_key_to_its_candidates() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&format!(
+            "file://{}?sync_mode=none&checkpoint_on_close=off&checkpoint_interval=0",
+            dir.path().display()
+        ))
+        .unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)", ())
+            .unwrap();
+        db.execute("CREATE INDEX t_k ON t(k)", ()).unwrap();
+        // 600 rows of 777 are more than a twentieth of the 10,000 keyed rows,
+        // not of the volume's 100,000
+        db.execute(
+            "INSERT INTO t SELECT g.value, CASE WHEN g.value <= 600 THEN 777 \
+             WHEN g.value = 601 THEN 0 WHEN g.value <= 10000 THEN 1 + g.value % 776 \
+             ELSE NULL END FROM generate_series(1, 100000) g",
+            (),
+        )
+        .unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        let (found, reads) = read(&db, "SELECT id FROM t WHERE k IN (0, 777)");
+        assert_eq!(found.len(), 601);
+        assert_eq!(reads, (1, 0), "a sparse key of the volume was refused");
+    }
+
+    #[test]
     fn a_heavy_key_refuses_the_list_before_any_key_is_read() {
         let _serial = serial();
         let dir = tempfile::tempdir().unwrap();

@@ -41,7 +41,7 @@
 //!   [col u32][key tag u8][n_keys u64][n_positions u64][key pages u32][pos pages u32]
 //!   key pages: [first_key i64][last_key i64][offset u64][len u32][key_start u64][pos_start u64]
 //!   pos pages: [offset u64][len u32][pos_start u64]
-//!   heavy keys (version 5): [count u8] then [key i64] ascending
+//!   heavy keys (version 5): [count u8] then [key i64][positions u64] by key
 //! footer: [directory offset u64][directory len u32][directory crc32 u32][magic]
 //! ```
 //!
@@ -68,6 +68,8 @@ pub const SCAN_SHARE: u64 = 20;
 /// The heavy keys a column lists at most: more than one in `SCAN_SHARE`
 /// of its positions each, so fewer than `SCAN_SHARE` of them fit
 const HEAVY_SLOTS: usize = SCAN_SHARE as usize;
+/// A heavy key and its count in the directory
+const HEAVY_ENTRY: usize = 16;
 const HEADER_LEN: u64 = 16;
 const FOOTER_LEN: u64 = 20;
 const KEY_DIR_ENTRY: usize = 44;
@@ -836,9 +838,10 @@ pub struct ColumnDirectory {
     pub n_positions: u64,
     pub key_pages: Vec<KeyPageMeta>,
     pub pos_pages: Vec<PosPageMeta>,
-    /// The keys holding more than one in `SCAN_SHARE` of the positions,
-    /// ascending; None in a version 4 file, which predates the list
-    pub heavy_keys: Option<Vec<i64>>,
+    /// The keys holding more than one in `SCAN_SHARE` of the positions, with
+    /// their counts, by key ascending: every key past that share of the
+    /// volume's rows is among them. None in a version 4 file
+    pub heavy_keys: Option<Vec<(i64, u64)>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -875,7 +878,9 @@ impl Directory {
             .map(|c| {
                 c.key_pages.capacity() * std::mem::size_of::<KeyPageMeta>()
                     + c.pos_pages.capacity() * std::mem::size_of::<PosPageMeta>()
-                    + c.heavy_keys.as_ref().map_or(0, |keys| keys.capacity() * 8)
+                    + c.heavy_keys
+                        .as_ref()
+                        .map_or(0, |keys| keys.capacity() * HEAVY_ENTRY)
             })
             .sum::<usize>()
             + self.columns.capacity() * std::mem::size_of::<ColumnDirectory>()
@@ -890,7 +895,7 @@ impl Directory {
                     + c.key_pages.len() * KEY_DIR_ENTRY
                     + c.pos_pages.len() * POS_DIR_ENTRY
                     + 1
-                    + c.heavy_keys.as_ref().map_or(0, Vec::len) * 8
+                    + c.heavy_keys.as_ref().map_or(0, Vec::len) * HEAVY_ENTRY
             })
             .sum::<usize>()
     }
@@ -925,8 +930,9 @@ impl Directory {
             );
             let heavy = c.heavy_keys.as_deref().unwrap_or_default();
             out.push(heavy.len() as u8);
-            for key in heavy {
+            for (key, count) in heavy {
                 out.extend_from_slice(&key.to_le_bytes());
+                out.extend_from_slice(&count.to_le_bytes());
             }
         }
     }
@@ -1022,15 +1028,16 @@ impl Directory {
                     .ok_or_else(|| invalid("directory truncated"))?
                     as usize;
                 pos += 1;
-                if count > HEAVY_SLOTS || data.len() < pos + count * 8 {
+                if count > HEAVY_SLOTS || data.len() < pos + count * HEAVY_ENTRY {
                     return Err(invalid("heavy keys out of bounds"));
                 }
-                charges.push(INDEX_DIRECTORIES.charge(count * 8));
+                charges.push(INDEX_DIRECTORIES.charge(count * HEAVY_ENTRY));
                 let mut keys = Vec::with_capacity(count);
                 for _ in 0..count {
-                    keys.push(read_u64(data, &mut pos)? as i64);
+                    let key = read_u64(data, &mut pos)? as i64;
+                    keys.push((key, read_u64(data, &mut pos)?));
                 }
-                if keys.windows(2).any(|w| w[0] >= w[1]) {
+                if keys.windows(2).any(|w| w[0].0 >= w[1].0) {
                     return Err(invalid("heavy keys are not in order"));
                 }
                 Some(keys)
@@ -2564,6 +2571,9 @@ struct PageWriter<'a, 'b, W: Write> {
     /// `HEAVY_SLOTS`, from which the heavy keys are kept at the end
     heaviest: Vec<(i64, u64)>,
     heaviest_charge: Charge<'b>,
+    /// The smallest count in `heaviest` once it is full: a key with no
+    /// more is passed by without a look at the list
+    lightest: u64,
 }
 
 impl<'a, 'b, W: Write> PageWriter<'a, 'b, W> {
@@ -2588,6 +2598,7 @@ impl<'a, 'b, W: Write> PageWriter<'a, 'b, W> {
             closed_end: 0,
             heaviest: Vec::new(),
             heaviest_charge: Charge { bytes: 0, budget },
+            lightest: 0,
         }
     }
 
@@ -2631,10 +2642,14 @@ impl<'a, 'b, W: Write> PageWriter<'a, 'b, W> {
         }
         if self.heaviest.len() < HEAVY_SLOTS {
             self.heaviest.push((key, count));
-        } else if let Some(lightest) = self.heaviest.iter_mut().min_by_key(|(_, c)| *c) {
-            if count > lightest.1 {
-                *lightest = (key, count);
+            if self.heaviest.len() == HEAVY_SLOTS {
+                self.lightest = self.heaviest.iter().map(|(_, c)| *c).min().unwrap_or(0);
             }
+        } else if count > self.lightest {
+            if let Some(slot) = self.heaviest.iter_mut().find(|(_, c)| *c == self.lightest) {
+                *slot = (key, count);
+            }
+            self.lightest = self.heaviest.iter().map(|(_, c)| *c).min().unwrap_or(0);
         }
         Ok(())
     }
@@ -2724,13 +2739,13 @@ impl<'a, 'b, W: Write> PageWriter<'a, 'b, W> {
         self.flush_pos_page()?;
         self.flush_key_page()?;
         let n_positions = self.n_positions;
-        let heavy = self
-            .heaviest
-            .iter()
-            .filter(|(_, count)| count * SCAN_SHARE > n_positions);
-        self.metas.grow(heavy.clone().count() * 8, "heavy keys")?;
-        let mut heavy_keys: Vec<i64> = heavy.map(|(key, _)| *key).collect();
-        heavy_keys.sort_unstable();
+        let heavy = |(_, count): &&(i64, u64)| count * SCAN_SHARE > n_positions;
+        let count = self.heaviest.iter().filter(heavy).count();
+        self.metas
+            .grow(count * std::mem::size_of::<(i64, u64)>(), "heavy keys")?;
+        let mut heavy_keys = Vec::with_capacity(count);
+        heavy_keys.extend(self.heaviest.iter().filter(heavy).copied());
+        heavy_keys.sort_unstable_by_key(|(key, _)| *key);
         let column = ColumnDirectory {
             column: self.column,
             identity: self.identity,
@@ -3448,7 +3463,10 @@ mod tests {
         build(&path, pairs, WORKSPACE);
         let file = IndexFile::open(&path, 1).unwrap();
         let column = file.directory().column(1).unwrap();
-        assert_eq!(column.heavy_keys.as_deref(), Some(&[5000i64][..]));
+        assert_eq!(
+            column.heavy_keys.as_deref(),
+            Some(&[(5000i64, 5000u64)][..])
+        );
     }
 
     #[test]
