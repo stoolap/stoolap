@@ -34,7 +34,7 @@ const IN_SUBQUERY_CACHE_SIZE: usize = 128;
 const SEMI_JOIN_CACHE_SIZE: usize = 256;
 
 use crate::api::params::ParamVec;
-use crate::common::{CompactArc, StringMap};
+use crate::common::{CompactArc, SmartString, StringMap};
 use crate::core::{Result, Row, Value, ValueMap, ValueSet};
 
 // Static defaults for ExecutionContext to avoid allocations for empty values.
@@ -323,89 +323,6 @@ pub fn cache_exists_predicate(key: String, filter: RowFilter) {
     });
 }
 
-// Cache for EXISTS index lookups to avoid re-fetching per row.
-// The key is "table_name:column_name", the value is the index reference.
-use crate::storage::traits::Index;
-thread_local! {
-    static EXISTS_INDEX_CACHE: RefCell<FxHashMap<String, std::sync::Arc<dyn Index>>> = RefCell::new(FxHashMap::default());
-}
-
-/// Clear the EXISTS index cache. Should be called at the start of each top-level query.
-pub fn clear_exists_index_cache() {
-    EXISTS_INDEX_CACHE.with(|cache| {
-        cache.borrow_mut().clear();
-    });
-}
-
-/// Get a cached EXISTS index by key.
-pub fn get_cached_exists_index(key: &str) -> Option<std::sync::Arc<dyn Index>> {
-    EXISTS_INDEX_CACHE.with(|cache| cache.borrow().get(key).cloned())
-}
-
-/// Cache an EXISTS index.
-pub fn cache_exists_index(key: String, index: std::sync::Arc<dyn Index>) {
-    EXISTS_INDEX_CACHE.with(|cache| {
-        cache.borrow_mut().insert(key, index);
-    });
-}
-
-/// Type alias for row fetcher function used in EXISTS/COUNT optimization.
-pub type RowFetcher = Box<dyn Fn(&[i64]) -> crate::core::Result<crate::core::RowVec> + Send + Sync>;
-
-/// Type alias for row counter function used in COUNT(*) optimization.
-/// This only counts visible rows without cloning their data.
-pub type RowCounter = Box<dyn Fn(&[i64]) -> crate::core::Result<usize> + Send + Sync>;
-
-// Cache for EXISTS row fetchers to avoid repeated version store lookups.
-// The key is the table name, the value is the row fetcher function.
-thread_local! {
-    static EXISTS_FETCHER_CACHE: RefCell<FxHashMap<String, std::sync::Arc<RowFetcher>>> = RefCell::new(FxHashMap::default());
-}
-
-// Cache for COUNT row counters to avoid repeated version store lookups.
-// The key is the table name, the value is the row counter function.
-thread_local! {
-    static COUNT_COUNTER_CACHE: RefCell<FxHashMap<String, std::sync::Arc<RowCounter>>> = RefCell::new(FxHashMap::default());
-}
-
-/// Clear the EXISTS row fetcher cache. Should be called at the start of each top-level query.
-pub fn clear_exists_fetcher_cache() {
-    EXISTS_FETCHER_CACHE.with(|cache| {
-        cache.borrow_mut().clear();
-    });
-}
-
-/// Clear the COUNT row counter cache. Should be called at the start of each top-level query.
-pub fn clear_count_counter_cache() {
-    COUNT_COUNTER_CACHE.with(|cache| {
-        cache.borrow_mut().clear();
-    });
-}
-
-/// Get a cached EXISTS row fetcher by table name.
-pub fn get_cached_exists_fetcher(key: &str) -> Option<std::sync::Arc<RowFetcher>> {
-    EXISTS_FETCHER_CACHE.with(|cache| cache.borrow().get(key).cloned())
-}
-
-/// Get a cached COUNT row counter by table name.
-pub fn get_cached_count_counter(key: &str) -> Option<std::sync::Arc<RowCounter>> {
-    COUNT_COUNTER_CACHE.with(|cache| cache.borrow().get(key).cloned())
-}
-
-/// Cache an EXISTS row fetcher.
-pub fn cache_exists_fetcher(key: String, fetcher: RowFetcher) {
-    EXISTS_FETCHER_CACHE.with(|cache| {
-        cache.borrow_mut().insert(key, std::sync::Arc::new(fetcher));
-    });
-}
-
-/// Cache a COUNT row counter.
-pub fn cache_count_counter(key: String, counter: RowCounter) {
-    COUNT_COUNTER_CACHE.with(|cache| {
-        cache.borrow_mut().insert(key, std::sync::Arc::new(counter));
-    });
-}
-
 // Cache for table schema column names to avoid repeated get_table_schema() calls.
 // The key is the table name, the value is the list of column names.
 thread_local! {
@@ -557,8 +474,6 @@ pub struct ExistsCorrelationInfo {
     pub outer_qualified_lower: Option<String>,
     /// The additional predicate beyond the correlation (if any)
     pub additional_predicate: Option<Expression>,
-    /// Pre-computed index cache key ("table:column") to avoid per-probe format! allocation
-    pub index_cache_key: String,
 }
 
 // Cache for EXISTS correlation info to avoid per-row extraction.
@@ -591,21 +506,6 @@ pub fn clear_all_thread_local_caches() {
     });
     // Clear and shrink unbounded caches
     EXISTS_PREDICATE_CACHE.with(|cache| {
-        let mut c = cache.borrow_mut();
-        c.clear();
-        c.shrink_to_fit();
-    });
-    EXISTS_INDEX_CACHE.with(|cache| {
-        let mut c = cache.borrow_mut();
-        c.clear();
-        c.shrink_to_fit();
-    });
-    EXISTS_FETCHER_CACHE.with(|cache| {
-        let mut c = cache.borrow_mut();
-        c.clear();
-        c.shrink_to_fit();
-    });
-    COUNT_COUNTER_CACHE.with(|cache| {
         let mut c = cache.borrow_mut();
         c.clear();
         c.shrink_to_fit();
@@ -685,11 +585,25 @@ pub fn cache_exists_correlation(
 /// during correlated subquery processing where context is cloned per row.
 /// A transaction shared by every read of one statement
 #[derive(Clone)]
-pub struct StatementSnapshot(Arc<Mutex<Box<dyn crate::storage::traits::Transaction>>>);
+pub struct StatementSnapshot(Arc<SnapshotState>);
+
+struct SnapshotState {
+    transaction: Mutex<Box<dyn crate::storage::traits::Transaction>>,
+    /// The first table the statement's correlated probes read, read without a lock
+    first_probe_table: std::sync::OnceLock<ProbeTable>,
+    /// Any further tables they read, taken once each
+    probe_tables: Mutex<SmallVec<[ProbeTable; 1]>>,
+}
+
+type ProbeTable = (SmartString, Box<dyn crate::storage::traits::Table>);
 
 impl StatementSnapshot {
     pub fn new(transaction: Box<dyn crate::storage::traits::Transaction>) -> Self {
-        Self(Arc::new(Mutex::new(transaction)))
+        Self(Arc::new(SnapshotState {
+            transaction: Mutex::new(transaction),
+            first_probe_table: std::sync::OnceLock::new(),
+            probe_tables: Mutex::new(SmallVec::new()),
+        }))
     }
 
     pub fn get_table(
@@ -697,9 +611,53 @@ impl StatementSnapshot {
         name: &str,
     ) -> crate::core::Result<Box<dyn crate::storage::traits::Table>> {
         self.0
+            .transaction
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get_table(name)
+    }
+
+    /// Runs `f` on the table every correlated probe of the statement reads,
+    /// taken on the first. None when there is no such table, as for a view
+    pub fn with_probe_table<T>(
+        &self,
+        name: &str,
+        f: impl FnOnce(&dyn crate::storage::traits::Table) -> crate::core::Result<T>,
+    ) -> crate::core::Result<Option<T>> {
+        let first = &self.0.first_probe_table;
+        if first.get().is_none() {
+            let table = match self.get_table(name) {
+                Err(crate::core::Error::TableNotFound(_)) => return Ok(None),
+                table => table?,
+            };
+            // A probe on another thread may have set it first; either serves
+            let _ = first.set((SmartString::from(name), table));
+        }
+        if let Some((n, table)) = first.get() {
+            if n.eq_ignore_ascii_case(name) {
+                return f(&**table).map(Some);
+            }
+        }
+        let mut tables = self
+            .0
+            .probe_tables
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let at = match tables
+            .iter()
+            .position(|(n, _)| n.eq_ignore_ascii_case(name))
+        {
+            Some(at) => at,
+            None => {
+                let table = match self.get_table(name) {
+                    Err(crate::core::Error::TableNotFound(_)) => return Ok(None),
+                    table => table?,
+                };
+                tables.push((SmartString::from(name), table));
+                tables.len() - 1
+            }
+        };
+        f(&*tables[at].1).map(Some)
     }
 }
 

@@ -24,26 +24,27 @@ use std::sync::Arc;
 use crate::common::CompactArc;
 use crate::common::SmartString;
 
-use crate::core::{Error, Result, Value, ValueMap, ValueSet};
+use crate::core::{Error, Result, Row, RowVec, Value, ValueMap, ValueSet};
 use crate::parser::ast::*;
 use crate::parser::token::TokenType;
-use crate::storage::traits::Engine;
+use crate::storage::expression::ConstBoolExpr;
+use crate::storage::traits::{CappedEqual, Engine, ProbeScratch, Table};
 
 use super::context::{
-    cache_batch_aggregate, cache_batch_aggregate_info, cache_count_counter,
-    cache_exists_correlation, cache_exists_fetcher, cache_exists_index, cache_exists_pred_key,
-    cache_exists_predicate, cache_exists_schema, cache_in_subquery, cache_scalar_subquery,
-    cache_semi_join_arc, compute_semi_join_cache_key, extract_table_names_for_cache,
-    get_cached_batch_aggregate, get_cached_batch_aggregate_info, get_cached_count_counter,
-    get_cached_exists_correlation, get_cached_exists_fetcher, get_cached_exists_index,
-    get_cached_exists_pred_key, get_cached_exists_predicate, get_cached_exists_schema,
-    get_cached_in_subquery, get_cached_in_subquery_set, get_cached_scalar_subquery,
-    get_cached_semi_join, BatchAggregateLookupInfo, ExecutionContext, ExistsCorrelationInfo,
+    cache_batch_aggregate, cache_batch_aggregate_info, cache_exists_correlation,
+    cache_exists_pred_key, cache_exists_predicate, cache_exists_schema, cache_in_subquery,
+    cache_scalar_subquery, cache_semi_join_arc, compute_semi_join_cache_key,
+    extract_table_names_for_cache, get_cached_batch_aggregate, get_cached_batch_aggregate_info,
+    get_cached_exists_correlation, get_cached_exists_pred_key, get_cached_exists_predicate,
+    get_cached_exists_schema, get_cached_in_subquery, get_cached_in_subquery_set,
+    get_cached_scalar_subquery, get_cached_semi_join, BatchAggregateLookupInfo, ExecutionContext,
+    ExistsCorrelationInfo,
 };
 use super::expr_converter::convert_ast_to_storage_expr;
 use super::expression::compute_expression_hash;
 use super::operator::{ColumnInfo, MaterializedOperator, Operator};
 use super::operators::hash_join::{HashJoinOperator, JoinSide, JoinType};
+use super::operators::index_nested_loop::EQUALITY_CANDIDATE_CAP;
 use super::utils::{dummy_token, dummy_token_clone, value_to_expression};
 use super::Executor;
 
@@ -58,6 +59,22 @@ use super::Executor;
 ///
 /// A value of 10 provides reasonable tradeoff for typical workloads.
 const VISIBILITY_CHECK_BATCH_SIZE: usize = 10;
+
+/// Ids a probe's buffer keeps between outer rows; a heavy key's are freed
+const PROBE_IDS_KEPT: usize = 4096;
+
+/// Buffers a correlated probe reuses across the outer rows
+#[derive(Default)]
+struct ProbeBuffers {
+    ids: Vec<i64>,
+    rows: RowVec,
+    scratch: ProbeScratch,
+}
+
+thread_local! {
+    static PROBE_BUFFERS: std::cell::RefCell<ProbeBuffers> =
+        std::cell::RefCell::new(ProbeBuffers::default());
+}
 
 // ============================================================================
 // Semi-Join Optimization for EXISTS Subqueries
@@ -491,21 +508,16 @@ impl Executor {
             None => {
                 // First probe for this subquery - extract and cache
                 let info = Self::extract_index_nested_loop_info(subquery);
-                let cached_info = info.map(|i| {
-                    // Pre-compute index cache key once to avoid per-probe format! allocation
-                    let index_cache_key = format!("{}:{}", i.inner_table, i.inner_column);
-                    ExistsCorrelationInfo {
-                        outer_column: i.outer_column.clone(),
-                        outer_table: i.outer_table.clone(),
-                        inner_column: i.inner_column.clone(),
-                        inner_table: i.inner_table.clone(),
-                        outer_column_lower: i.outer_column.to_lowercase(),
-                        outer_qualified_lower: i.outer_table.as_ref().map(|tbl| {
-                            format!("{}.{}", tbl.to_lowercase(), i.outer_column.to_lowercase())
-                        }),
-                        additional_predicate: i.additional_predicate.clone(),
-                        index_cache_key,
-                    }
+                let cached_info = info.map(|i| ExistsCorrelationInfo {
+                    outer_column: i.outer_column.clone(),
+                    outer_table: i.outer_table.clone(),
+                    inner_column: i.inner_column.clone(),
+                    inner_table: i.inner_table.clone(),
+                    outer_column_lower: i.outer_column.to_lowercase(),
+                    outer_qualified_lower: i.outer_table.as_ref().map(|tbl| {
+                        format!("{}.{}", tbl.to_lowercase(), i.outer_column.to_lowercase())
+                    }),
+                    additional_predicate: i.additional_predicate.clone(),
                 });
                 // cache_exists_correlation returns the Arc-wrapped version
                 match cache_exists_correlation(subquery_ptr, cached_info) {
@@ -533,62 +545,12 @@ impl Executor {
                 return Ok(None); // Column not found, fall back
             }
         };
-        // OPTIMIZATION: Cache index reference to avoid repeated lookups
-        // This reduces the ~2-5μs overhead per EXISTS probe to nearly zero for subsequent probes
-        // Uses pre-computed index_cache_key from ExistsCorrelationInfo to avoid per-probe format!
-        let index = match get_cached_exists_index(&correlation.index_cache_key) {
-            Some(idx) => idx,
-            None => {
-                // First time: get index from engine and cache it
-                let indexes = match self.engine.get_lookup_indexes(&correlation.inner_table) {
-                    Ok(idxs) => idxs,
-                    Err(_) => return Ok(None), // Table not found, fall back
-                };
-
-                // Find the index on the correlation column
-                let idx = indexes
-                    .into_iter()
-                    .find(|idx| idx.column_names().contains(&correlation.inner_column));
-
-                match idx {
-                    Some(idx) => {
-                        cache_exists_index(correlation.index_cache_key.clone(), idx.clone());
-                        idx
-                    }
-                    None => return Ok(None), // No index, fall back to full query
-                }
-            }
+        // Without an additional predicate, one visible row holding the key answers
+        let Some(additional_pred) = correlation.additional_predicate.as_ref() else {
+            return Ok(self
+                .count_correlated_rows(ctx, &correlation, &outer_value, 1)?
+                .map(|found| found > 0));
         };
-
-        // Probe the index for matching row IDs
-        let row_ids = index.get_row_ids_equal(std::slice::from_ref(&outer_value));
-
-        if row_ids.is_empty() {
-            return Ok(Some(false)); // No matches from index
-        }
-
-        // If there's no additional predicate, check if at least one row is visible
-        // Note: Index may contain row_ids for deleted rows, so we must verify visibility
-        if correlation.additional_predicate.is_none() {
-            let row_fetcher = match self.get_or_create_row_fetcher(&correlation.inner_table) {
-                Some(f) => f,
-                None => return Ok(None), // Fall back if fetcher creation fails
-            };
-            // Check batches until we find a visible row or exhaust all row_ids
-            // We can't stop after first batch because deleted rows may precede visible ones
-            for chunk in row_ids.chunks(VISIBILITY_CHECK_BATCH_SIZE) {
-                let visible = row_fetcher(chunk)?;
-                if !visible.is_empty() {
-                    return Ok(Some(true)); // Found at least one visible row
-                }
-            }
-            return Ok(Some(false)); // No visible rows in any batch
-        }
-
-        // With additional predicate, we need to check each matching row
-        // OPTIMIZATION: Directly fetch rows by row_ids and evaluate the predicate
-        // This avoids the overhead of building and executing a full SELECT query
-        let additional_pred = correlation.additional_predicate.as_ref().unwrap();
 
         // SAFETY: If the additional predicate has references to tables other than
         // the inner table (outer column references) or contains subqueries (EXISTS, etc.),
@@ -677,27 +639,9 @@ impl Executor {
         // The filter is cached without context, so we clone and apply per-probe.
         let predicate_filter = predicate_filter.with_context(ctx);
 
-        // Get or create a cached row fetcher for this table
-        let row_fetcher = match self.get_or_create_row_fetcher(&correlation.inner_table) {
-            Some(f) => f,
-            None => return Ok(None), // Fall back if fetcher creation fails
-        };
-
-        // Fetch rows by their IDs using the cached row fetcher
-        const BATCH_SIZE: usize = 100;
-        for batch in row_ids.chunks(BATCH_SIZE) {
-            let fetched = row_fetcher(batch)?;
-
-            // Check each row against the predicate
-            for (_row_id, row) in fetched {
-                if predicate_filter.matches_checked(&row)? {
-                    return Ok(Some(true));
-                }
-            }
-        }
-
-        // No rows matched the predicate
-        Ok(Some(false))
+        self.visit_correlated_rows(ctx, &correlation, &outer_value, |row| {
+            predicate_filter.matches_checked(row)
+        })
     }
 
     /// True when the rows an EXISTS subquery returns are not decided by its
@@ -707,10 +651,12 @@ impl Executor {
     /// returns its one row whether or not anything matched. Grouping on its
     /// own is not among them, since a group is there exactly where a row is.
     fn exists_subquery_is_more_than_its_where(subquery: &SelectStatement) -> bool {
+        // ROLLUP, CUBE and grouping sets add total rows that need no row
         if subquery.having.is_some()
             || subquery.limit.is_some()
             || subquery.offset.is_some()
             || !subquery.set_operations.is_empty()
+            || subquery.group_by.modifier != GroupByModifier::None
         {
             return true;
         }
@@ -728,7 +674,8 @@ impl Executor {
     fn extract_index_nested_loop_info(subquery: &SelectStatement) -> Option<IndexNestedLoopInfo> {
         // Must have a simple table source
         let (inner_table, inner_alias) = match subquery.table_expr.as_ref().map(|b| b.as_ref()) {
-            Some(Expression::TableSource(ts)) => {
+            // A probe reads the current rows, not those AS OF a point
+            Some(Expression::TableSource(ts)) if ts.as_of.is_none() => {
                 let alias = ts.alias.as_ref().map(|a| a.value.clone());
                 (ts.name.value.clone(), alias)
             }
@@ -784,12 +731,24 @@ impl Executor {
             }
 
             Expression::Infix(infix) if infix.operator.eq_ignore_ascii_case("AND") => {
+                // The other side joins whatever the correlated side kept
+                let keep = |info: &mut IndexNestedLoopInfo, other: &Expression| {
+                    info.additional_predicate = Some(match info.additional_predicate.take() {
+                        None => other.clone(),
+                        Some(kept) => Expression::Infix(InfixExpression {
+                            token: dummy_token_clone(),
+                            left: Box::new(kept),
+                            operator: "AND".into(),
+                            op_type: InfixOperator::And,
+                            right: Box::new(other.clone()),
+                        }),
+                    });
+                };
                 // Try left side for correlation
                 if let Some(mut info) =
                     Self::extract_correlation_for_index(&infix.left, inner_tables, inner_table_name)
                 {
-                    // Right side becomes additional predicate
-                    info.additional_predicate = Some((*infix.right).clone());
+                    keep(&mut info, &infix.right);
                     return Some(info);
                 }
                 // Try right side for correlation
@@ -798,8 +757,7 @@ impl Executor {
                     inner_tables,
                     inner_table_name,
                 ) {
-                    // Left side becomes additional predicate
-                    info.additional_predicate = Some((*infix.left).clone());
+                    keep(&mut info, &infix.left);
                     return Some(info);
                 }
                 None
@@ -844,6 +802,15 @@ impl Executor {
         if !subquery.group_by.columns.is_empty() {
             return Ok(None);
         }
+        // A HAVING, a row count, a set operation or grouping sets decide more than the count
+        if subquery.having.is_some()
+            || subquery.limit.is_some()
+            || subquery.offset.is_some()
+            || !subquery.set_operations.is_empty()
+            || subquery.group_by.modifier != GroupByModifier::None
+        {
+            return Ok(None);
+        }
 
         // OPTIMIZATION: Use the same ExistsCorrelationInfo caching as EXISTS optimization
         // This avoids per-probe format! allocations for qualified names and index cache keys
@@ -855,21 +822,16 @@ impl Executor {
             None => {
                 // First probe for this subquery - extract and cache
                 let info = Self::extract_index_nested_loop_info(subquery);
-                let cached_info = info.map(|i| {
-                    // Pre-compute index cache key once to avoid per-probe format! allocation
-                    let index_cache_key = format!("{}:{}", i.inner_table, i.inner_column);
-                    ExistsCorrelationInfo {
-                        outer_column: i.outer_column.clone(),
-                        outer_table: i.outer_table.clone(),
-                        inner_column: i.inner_column.clone(),
-                        inner_table: i.inner_table.clone(),
-                        outer_column_lower: i.outer_column.to_lowercase(),
-                        outer_qualified_lower: i.outer_table.as_ref().map(|tbl| {
-                            format!("{}.{}", tbl.to_lowercase(), i.outer_column.to_lowercase())
-                        }),
-                        additional_predicate: i.additional_predicate.clone(),
-                        index_cache_key,
-                    }
+                let cached_info = info.map(|i| ExistsCorrelationInfo {
+                    outer_column: i.outer_column.clone(),
+                    outer_table: i.outer_table.clone(),
+                    inner_column: i.inner_column.clone(),
+                    inner_table: i.inner_table.clone(),
+                    outer_column_lower: i.outer_column.to_lowercase(),
+                    outer_qualified_lower: i.outer_table.as_ref().map(|tbl| {
+                        format!("{}.{}", tbl.to_lowercase(), i.outer_column.to_lowercase())
+                    }),
+                    additional_predicate: i.additional_predicate.clone(),
                 });
                 // cache_exists_correlation returns the Arc-wrapped version
                 match cache_exists_correlation(subquery_ptr, cached_info) {
@@ -896,70 +858,13 @@ impl Executor {
             None => return Ok(None),       // Column not found, fall back
         };
 
-        // Use cached index lookup with pre-computed index_cache_key
-        let index = match get_cached_exists_index(&correlation.index_cache_key) {
-            Some(idx) => idx,
-            None => {
-                // First time: get index from engine and cache it
-                let indexes = match self.engine.get_lookup_indexes(&correlation.inner_table) {
-                    Ok(idxs) => idxs,
-                    Err(_) => return Ok(None), // Table not found, fall back
-                };
-
-                // Find the index on the correlation column
-                let idx = indexes
-                    .into_iter()
-                    .find(|idx| idx.column_names().contains(&correlation.inner_column));
-
-                match idx {
-                    Some(idx) => {
-                        cache_exists_index(correlation.index_cache_key.clone(), idx.clone());
-                        idx
-                    }
-                    None => return Ok(None), // No index, fall back to full query
-                }
-            }
-        };
-
-        // Probe the index for matching row IDs
-        let row_ids = index.get_row_ids_equal(std::slice::from_ref(&outer_value));
-
-        // If there's no additional predicate, count only visible rows
-        // Note: Index may contain row_ids for deleted rows, so we must verify visibility
-        if correlation.additional_predicate.is_none() {
-            if row_ids.is_empty() {
-                return Ok(Some(0));
-            }
-            // Use row_counter for COUNT (avoids cloning row data)
-            let row_counter = match get_cached_count_counter(&correlation.inner_table) {
-                Some(c) => c,
-                None => match self.get_or_create_row_counter(&correlation.inner_table)? {
-                    Some(c) => c,
-                    None => {
-                        // Fall back to row_fetcher if counter not available
-                        let row_fetcher = match get_cached_exists_fetcher(&correlation.inner_table)
-                        {
-                            Some(f) => f,
-                            None => {
-                                match self.get_or_create_row_fetcher(&correlation.inner_table) {
-                                    Some(f) => f,
-                                    None => return Ok(None),
-                                }
-                            }
-                        };
-                        let visible_rows = row_fetcher(&row_ids)?;
-                        return Ok(Some(visible_rows.len() as i64));
-                    }
-                },
-            };
-            // Count visible rows without cloning
-            let count = row_counter(&row_ids)?;
-            return Ok(Some(count as i64));
+        // An additional predicate runs the subquery
+        if correlation.additional_predicate.is_some() {
+            return Ok(None);
         }
-
-        // With additional predicate, we need to filter the matching rows
-        // Fall back to full query execution for complex cases
-        Ok(None)
+        Ok(self
+            .count_correlated_rows(ctx, &correlation, &outer_value, usize::MAX)?
+            .map(|count| count as i64))
     }
 
     /// Whether the parent row is read anywhere but the correlation
@@ -1271,45 +1176,143 @@ impl Executor {
         Ok(get_cached_batch_aggregate(&cache_key))
     }
 
-    /// Get or create a cached row fetcher for the given table.
-    ///
-    /// This helper reduces code duplication for the pattern of:
-    /// 1. Check cache for existing fetcher
-    /// 2. If not found, create from engine and cache it
-    /// 3. Return the fetcher or None if creation fails
-    fn get_or_create_row_fetcher(
+    /// Runs `f` on the inner table as the probing statement sees it: the
+    /// explicit transaction's, or the statement snapshot's. None without
+    /// either, or for a name that is not a table
+    fn with_correlated_probe_table<T>(
         &self,
-        table_name: &str,
-    ) -> Option<std::sync::Arc<super::context::RowFetcher>> {
-        if let Some(f) = get_cached_exists_fetcher(table_name) {
-            return Some(f);
+        ctx: &ExecutionContext,
+        name: &str,
+        f: impl FnOnce(&dyn Table) -> Result<Option<T>>,
+    ) -> Result<Option<T>> {
+        // A CTE of that name hides the table
+        if ctx.has_cte(name) {
+            return Ok(None);
         }
-
-        let fetcher = match self.engine.get_row_fetcher(table_name) {
-            Ok(f) => f,
-            Err(_) => return None, // Fall back if fetcher creation fails
+        // A statement inside an explicit transaction carries its id
+        if ctx.transaction_id().is_none() {
+            if let Some(snapshot) = ctx.statement_snapshot() {
+                return Ok(snapshot.with_probe_table(name, f)?.flatten());
+            }
+        }
+        let active = self.active_transaction.lock().unwrap();
+        let table = match active.as_ref() {
+            Some(tx) => tx.transaction.get_table(name),
+            None => {
+                drop(active);
+                return match ctx.statement_snapshot() {
+                    Some(snapshot) => Ok(snapshot.with_probe_table(name, f)?.flatten()),
+                    None => Ok(None),
+                };
+            }
         };
-        cache_exists_fetcher(table_name.to_string(), fetcher);
-        get_cached_exists_fetcher(table_name)
+        drop(active);
+        // A view is not a table to probe
+        match table {
+            Err(Error::TableNotFound(_)) => Ok(None),
+            table => f(&*table?),
+        }
     }
 
-    /// Get or create a cached row counter for a table.
-    ///
-    /// This is similar to get_or_create_row_fetcher but for COUNT operations.
-    /// It returns a function that counts visible rows without cloning row data.
-    fn get_or_create_row_counter(
+    /// Visits the inner rows whose correlation column holds `key`, found by
+    /// the inner table's index through the statement's view, until `visit`
+    /// returns true. None when the table cannot answer that way, and the
+    /// caller runs the subquery
+    fn visit_correlated_rows(
         &self,
-        table_name: &str,
-    ) -> Result<Option<std::sync::Arc<super::context::RowCounter>>> {
-        if let Some(c) = get_cached_count_counter(table_name) {
-            return Ok(Some(c));
-        }
+        ctx: &ExecutionContext,
+        correlation: &ExistsCorrelationInfo,
+        key: &Value,
+        mut visit: impl FnMut(&Row) -> Result<bool>,
+    ) -> Result<Option<bool>> {
+        self.with_correlated_candidates(ctx, correlation, key, |table, ids, key_idx, _, rows| {
+            let all = ConstBoolExpr::true_expr();
+            for chunk in ids.chunks(VISIBILITY_CHECK_BATCH_SIZE) {
+                rows.clear();
+                table.fetch_rows_by_ids_into(chunk, &all, rows)?;
+                for (_, row) in rows.iter() {
+                    if row.get(key_idx) == Some(key) && visit(row)? {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        })
+    }
 
-        let Some(counter) = self.engine.get_row_counter(table_name)? else {
-            return Ok(None);
-        };
-        cache_count_counter(table_name.to_string(), counter);
-        Ok(get_cached_count_counter(table_name))
+    /// How many inner rows hold `key`, up to `limit`, counted as
+    /// `visit_correlated_rows` would find them
+    fn count_correlated_rows(
+        &self,
+        ctx: &ExecutionContext,
+        correlation: &ExistsCorrelationInfo,
+        key: &Value,
+        limit: usize,
+    ) -> Result<Option<usize>> {
+        self.with_correlated_candidates(ctx, correlation, key, |table, ids, key_idx, epoch, _| {
+            table.count_equal_candidates(ids, key_idx, key, limit, Some(epoch))
+        })
+    }
+
+    /// Runs `answer` over the inner table, the ids its index holds for `key`,
+    /// the key's column and the index epoch, read through the statement's
+    /// view. None when the table cannot answer that way or the epoch moved
+    fn with_correlated_candidates<T>(
+        &self,
+        ctx: &ExecutionContext,
+        correlation: &ExistsCorrelationInfo,
+        key: &Value,
+        answer: impl FnOnce(&dyn Table, &[i64], usize, u64, &mut RowVec) -> Result<T>,
+    ) -> Result<Option<T>> {
+        self.with_correlated_probe_table(ctx, &correlation.inner_table, |table| {
+            let Some(epoch) = table.index_view_epoch() else {
+                return Ok(None);
+            };
+            let Some(key_idx) = table
+                .schema()
+                .columns
+                .iter()
+                .position(|c| c.name_lower.eq_ignore_ascii_case(&correlation.inner_column))
+            else {
+                return Ok(None);
+            };
+            PROBE_BUFFERS.with(|cell| {
+                let mut fresh = ProbeBuffers::default();
+                let mut held = cell.try_borrow_mut();
+                let buffers = match held.as_deref_mut() {
+                    Ok(buffers) => buffers,
+                    Err(_) => &mut fresh,
+                };
+                buffers.ids.clear();
+                // The cap bounds sealed reads; hot ids cost only their visibility
+                let cap = if table.has_sealed_rows() {
+                    EQUALITY_CANDIDATE_CAP
+                } else {
+                    usize::MAX
+                };
+                let found = table.equality_candidates(
+                    &correlation.inner_column,
+                    key,
+                    cap,
+                    &mut buffers.ids,
+                    &mut buffers.scratch,
+                )?;
+                let answered = match found {
+                    Some(CappedEqual::Copied) => Some(answer(
+                        table,
+                        &buffers.ids,
+                        key_idx,
+                        epoch,
+                        &mut buffers.rows,
+                    )?),
+                    _ => None,
+                };
+                if buffers.ids.capacity() > PROBE_IDS_KEPT {
+                    buffers.ids = Vec::new();
+                }
+                Ok(answered.filter(|_| table.index_view_epoch() == Some(epoch)))
+            })
+        })
     }
 
     /// Extract correlation pair from two expressions.

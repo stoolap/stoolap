@@ -99,12 +99,6 @@ pub trait Engine: Send + Sync {
     /// Gets all index objects for a table
     fn get_all_indexes(&self, table_name: &str) -> Result<Vec<std::sync::Arc<dyn Index>>>;
 
-    /// Indexes the executor may probe directly: every visible row of the
-    /// table is in them. Empty for a table with rows outside its indexes.
-    fn get_lookup_indexes(&self, table_name: &str) -> Result<Vec<std::sync::Arc<dyn Index>>> {
-        self.get_all_indexes(table_name)
-    }
-
     /// Gets the current default isolation level
     fn get_isolation_level(&self) -> IsolationLevel;
 
@@ -285,34 +279,6 @@ pub trait Engine: Send + Sync {
         Err(crate::core::Error::internal(
             "fetch_rows_by_ids not supported by this engine",
         ))
-    }
-
-    /// Get a cached row fetcher for a table.
-    ///
-    /// This returns a function that can be called repeatedly to fetch rows without
-    /// the overhead of looking up the table each time. This is useful for EXISTS
-    /// subquery evaluation where we probe the same table many times.
-    #[allow(clippy::type_complexity)]
-    fn get_row_fetcher(
-        &self,
-        table_name: &str,
-    ) -> Result<Box<dyn Fn(&[i64]) -> Result<RowVec> + Send + Sync>> {
-        // Default implementation: fall back to fetch_rows_by_ids
-        let _ = table_name;
-        Err(crate::core::Error::internal(
-            "get_row_fetcher not supported by this engine",
-        ))
-    }
-
-    /// Get a count-only function for counting visible rows by their IDs.
-    /// This is optimized for COUNT(*) subqueries where we don't need the actual row data.
-    #[allow(clippy::type_complexity)]
-    fn get_row_counter(
-        &self,
-        table_name: &str,
-    ) -> Result<Option<Box<dyn Fn(&[i64]) -> Result<usize> + Send + Sync>>> {
-        let _ = table_name;
-        Ok(None)
     }
 }
 
