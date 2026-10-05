@@ -619,6 +619,10 @@ impl Executor {
         >,
         compiled: Option<&std::sync::RwLock<query_cache::CompiledExecution>>,
     ) -> Result<Box<dyn QueryResult>> {
+        // A SELECT clears them where its top level starts
+        if !matches!(statement, Statement::Select(_)) {
+            context::clear_statement_caches();
+        }
         // If there's an active transaction, inject the transaction ID into the context
         // This enables CURRENT_TRANSACTION_ID() function to return the correct value
         let ctx_with_txn;

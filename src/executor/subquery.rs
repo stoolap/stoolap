@@ -32,13 +32,13 @@ use crate::storage::traits::{CappedEqual, Engine, ProbeScratch, Table};
 
 use super::context::{
     cache_batch_aggregate, cache_batch_aggregate_info, cache_exists_correlation,
-    cache_exists_pred_key, cache_exists_predicate, cache_exists_schema, cache_in_subquery,
-    cache_scalar_subquery, cache_semi_join_arc, compute_semi_join_cache_key,
-    extract_table_names_for_cache, get_cached_batch_aggregate, get_cached_batch_aggregate_info,
-    get_cached_exists_correlation, get_cached_exists_pred_key, get_cached_exists_predicate,
-    get_cached_exists_schema, get_cached_in_subquery, get_cached_in_subquery_set,
-    get_cached_scalar_subquery, get_cached_semi_join, BatchAggregateLookupInfo, ExecutionContext,
-    ExistsCorrelationInfo,
+    cache_exists_pred_key, cache_exists_predicate, cache_exists_probe_fallback,
+    cache_exists_schema, cache_in_subquery, cache_scalar_subquery, cache_semi_join_arc,
+    compute_semi_join_cache_key, extract_table_names_for_cache, get_cached_batch_aggregate,
+    get_cached_batch_aggregate_info, get_cached_exists_correlation, get_cached_exists_pred_key,
+    get_cached_exists_predicate, get_cached_exists_schema, get_cached_in_subquery,
+    get_cached_in_subquery_set, get_cached_scalar_subquery, get_cached_semi_join,
+    get_exists_probe_fallback, BatchAggregateLookupInfo, ExecutionContext, ExistsCorrelationInfo,
 };
 use super::expr_converter::convert_ast_to_storage_expr;
 use super::expression::compute_expression_hash;
@@ -456,6 +456,8 @@ impl Executor {
 
         // Fall back to full subquery execution
         let subquery_ctx = ctx.with_incremented_query_depth();
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::exists_subquery_ran();
         let mut result = self.execute_select(subquery, &subquery_ctx)?;
 
         // Check if there's at least one row
@@ -547,9 +549,10 @@ impl Executor {
         };
         // Without an additional predicate, one visible row holding the key answers
         let Some(additional_pred) = correlation.additional_predicate.as_ref() else {
-            return Ok(self
-                .count_correlated_rows(ctx, &correlation, &outer_value, 1)?
-                .map(|found| found > 0));
+            if let Some(found) = self.count_correlated_rows(ctx, &correlation, &outer_value, 1)? {
+                return Ok(Some(found > 0));
+            }
+            return self.exists_by_probe_fallback(subquery, &correlation, &outer_value, ctx);
         };
 
         // SAFETY: If the additional predicate has references to tables other than
@@ -642,6 +645,49 @@ impl Executor {
         self.visit_correlated_rows(ctx, &correlation, &outer_value, |row| {
             predicate_filter.matches_checked(row)
         })
+    }
+
+    /// Whether the inner rows of an EXISTS on the bare correlation hold `key`,
+    /// for a probe the table refused: a table with sealed rows answers from
+    /// the semi-join set, built once per statement, since running the
+    /// subquery would scan its volumes. None for any other table
+    fn exists_by_probe_fallback(
+        &self,
+        subquery: &SelectStatement,
+        correlation: &ExistsCorrelationInfo,
+        key: &Value,
+        ctx: &ExecutionContext,
+    ) -> Result<Option<bool>> {
+        let subquery_ptr = subquery as *const SelectStatement as usize;
+        if let Some(known) = get_exists_probe_fallback(subquery_ptr) {
+            return Ok(known.map(|set| set.contains(key)));
+        }
+        let sealed = self
+            .with_correlated_probe_table(ctx, &correlation.inner_table, |table| {
+                Ok(Some(table.has_sealed_rows()))
+            })?
+            .unwrap_or(false);
+        if !sealed {
+            cache_exists_probe_fallback(subquery_ptr, None);
+            return Ok(None);
+        }
+        let inner_alias = match subquery.table_expr.as_deref() {
+            Some(Expression::TableSource(ts)) => ts.alias.as_ref().map(|a| a.value.to_string()),
+            _ => None,
+        };
+        let info = SemiJoinInfo {
+            outer_column: correlation.outer_column.clone(),
+            outer_table: correlation.outer_table.clone(),
+            inner_column: correlation.inner_column.clone(),
+            inner_table: correlation.inner_table.clone(),
+            inner_alias,
+            non_correlated_where: None,
+            is_negated: false,
+        };
+        let set = self.execute_semi_join_optimization(&info, ctx)?;
+        let found = set.contains(key);
+        cache_exists_probe_fallback(subquery_ptr, Some(set));
+        Ok(Some(found))
     }
 
     /// True when the rows an EXISTS subquery returns are not decided by its
@@ -4039,7 +4085,12 @@ impl Executor {
     /// - Index lookup gets candidate row_ids for correlation
     /// - Rows are fetched in batches and predicate is evaluated with early exit
     /// - This is O(LIMIT × avg_rows_per_key × predicate_selectivity) which is still efficient
-    fn should_use_index_nested_loop(&self, info: &SemiJoinInfo, outer_limit: Option<i64>) -> bool {
+    fn should_use_index_nested_loop(
+        &self,
+        info: &SemiJoinInfo,
+        outer_limit: Option<i64>,
+        ctx: &ExecutionContext,
+    ) -> bool {
         // Use index-nested-loop for small LIMIT queries WITHOUT additional predicates.
         //
         // IMPORTANT: If there's a non-correlated predicate (e.g., status = 'cancelled'),
@@ -4066,29 +4117,43 @@ impl Executor {
         // For pure correlation (no additional predicate), check if index NL is worth it
         if let Some(limit) = outer_limit {
             if limit > 0 && limit <= SMALL_LIMIT_THRESHOLD {
-                // Check if inner table has an index on correlation column
-                // Without index, per-row evaluation would be slow
-                let txn = match self.engine.begin_transaction() {
-                    Ok(t) => t,
-                    Err(_) => return false,
-                };
-                let inner_table = match txn.get_table(&info.inner_table) {
-                    Ok(t) => t,
-                    Err(_) => return false,
-                };
-
-                // Check for index on correlation column
-                if inner_table
-                    .lookup_index_on_column(&info.inner_column)
-                    .is_some()
-                {
-                    return true;
-                }
+                return self
+                    .with_correlated_probe_table(ctx, &info.inner_table, |table| {
+                        Ok(Some(Self::exists_probes(table, &info.inner_column)))
+                    })
+                    .ok()
+                    .flatten()
+                    .unwrap_or(false);
             }
         }
 
         // For larger queries or no index, use semi-join
         false
+    }
+
+    /// Whether an EXISTS on `column` probes the table the statement sees
+    fn exists_probes(table: &dyn Table, column: &str) -> bool {
+        // An index the table keeps whole
+        if table.lookup_index_on_column(column).is_some() {
+            return true;
+        }
+        // Sealed rows answer through side files, while the table vouches for
+        // its indexes; one with local changes or an older snapshot refuses all
+        if table.index_view_epoch().is_none() {
+            return false;
+        }
+        let Some(at) = table
+            .schema()
+            .columns
+            .iter()
+            .position(|c| c.name_lower.eq_ignore_ascii_case(column))
+        else {
+            return false;
+        };
+        table
+            .secondary_index_identities()
+            .iter()
+            .any(|&(indexed, _)| indexed == at)
     }
 
     /// Check if index-nested-loop should be preferred over anti-join for NOT EXISTS.
@@ -4485,7 +4550,7 @@ impl Executor {
                 if let Some(info) = Self::try_extract_semi_join_info(exists, false, outer_tables) {
                     // Check if index-nested-loop would be more efficient
                     // (index exists + no additional predicates, OR index exists + small LIMIT)
-                    if self.should_use_index_nested_loop(&info, outer_limit) {
+                    if self.should_use_index_nested_loop(&info, outer_limit, ctx) {
                         return Ok(None); // Skip semi-join, use index probing per row
                     }
                     // Semi-join optimization: execute inner query once, collect into hash set
@@ -4501,7 +4566,7 @@ impl Executor {
                     if let Some(info) = Self::try_extract_semi_join_info(exists, true, outer_tables)
                     {
                         // Check if index-nested-loop would be more efficient
-                        if self.should_use_index_nested_loop(&info, outer_limit) {
+                        if self.should_use_index_nested_loop(&info, outer_limit, ctx) {
                             return Ok(None); // Skip semi-join, use index probing per row
                         }
                         let hash_set = self.execute_semi_join_optimization(&info, ctx)?;

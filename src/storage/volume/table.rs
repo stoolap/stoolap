@@ -5789,6 +5789,14 @@ impl Table for SegmentedTable {
         self.segment_mgr.has_segments()
     }
 
+    fn secondary_index_identities(&self) -> Vec<(usize, u64)> {
+        self.hot.secondary_index_identities()
+    }
+
+    fn secondary_index_identities_into(&self, out: &mut Vec<(usize, u64)>) {
+        self.hot.secondary_index_identities_into(out)
+    }
+
     fn equality_candidates(
         &self,
         column: &str,
