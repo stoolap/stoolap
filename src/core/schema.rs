@@ -716,6 +716,9 @@ impl Schema {
         let idx = self
             .get_column_index(name)
             .ok_or_else(|| Error::ColumnNotFound(name.to_string()))?;
+        if self.columns[idx].primary_key {
+            return Err(Error::CannotDropPrimaryKey);
+        }
         // The clustering key names columns by position: a key column
         // cannot go, and the columns after a removed one move down
         if self.cluster_key.contains(&idx) {
