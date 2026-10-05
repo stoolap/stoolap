@@ -378,6 +378,7 @@ impl Executor {
             clear_exists_schema_cache();
             clear_exists_pred_key_cache();
             clear_exists_correlation_cache();
+            super::subquery::clear_exists_probe_fallbacks();
             clear_batch_aggregate_cache();
             clear_batch_aggregate_info_cache();
             TimeoutGuard::new(ctx)

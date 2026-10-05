@@ -458,6 +458,19 @@ pub(crate) fn in_subquery_ran() {
     IN_SUBQUERY_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Process-wide: EXISTS subqueries run whole for one outer row
+static EXISTS_SUBQUERY_RUNS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// EXISTS subqueries run whole for one outer row, so far
+pub fn exists_subquery_runs() -> usize {
+    EXISTS_SUBQUERY_RUNS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn exists_subquery_ran() {
+    EXISTS_SUBQUERY_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Process-wide: IN members read by a table's candidates, and by a scan
 static IN_MEMBER_READS: [std::sync::atomic::AtomicUsize; 2] = [
     std::sync::atomic::AtomicUsize::new(0),
