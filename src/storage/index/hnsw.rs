@@ -23,6 +23,7 @@
 
 use parking_lot::RwLock;
 use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use crate::common::{I64Map, I64Set};
@@ -2588,7 +2589,8 @@ pub struct HnswIndex {
     ef_search: usize,
     ml: f64,
     metric: HnswDistanceMetric,
-    is_unique: bool,
+    /// Shared with the graph's other objects; changed under the graph's write lock
+    is_unique: Arc<AtomicBool>,
 }
 
 impl HnswIndex {
@@ -2633,19 +2635,24 @@ impl HnswIndex {
             ef_search,
             ml,
             metric,
-            is_unique: false,
+            is_unique: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Set the uniqueness constraint for this HNSW index.
     /// When enabling uniqueness, builds the O(1) byte-hash lookup map.
     pub fn set_unique(&mut self, unique: bool) {
-        self.is_unique = unique;
+        let mut inner = self.inner.write();
         if unique {
-            self.inner.write().build_unique_map();
+            inner.build_unique_map();
         } else {
-            self.inner.write().unique_map = None;
+            inner.unique_map = None;
         }
+        self.is_unique.store(unique, AtomicOrdering::Release);
+    }
+
+    fn unique(&self) -> bool {
+        self.is_unique.load(AtomicOrdering::Acquire)
     }
 
     /// Get the distance metric used by this index
@@ -2850,7 +2857,7 @@ impl HnswIndex {
                     ef_search,
                     ml,
                     metric,
-                    is_unique: false,
+                    is_unique: Arc::new(AtomicBool::new(false)),
                 }))
             }
             Err(e) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
@@ -2898,7 +2905,7 @@ impl Index for HnswIndex {
         };
         let mut inner = self.inner.write();
         // Enforce uniqueness using exact byte equality (metric-independent).
-        if self.is_unique
+        if self.unique()
             && Self::find_exact_duplicate_in_inner(&inner, vec_bytes, row_id, None).is_some()
         {
             return Err(crate::core::Error::unique_constraint(
@@ -2943,8 +2950,8 @@ impl Index for HnswIndex {
         // The rows the batch takes out no longer stand in a newcomer's way;
         // the set is built only for a unique index with rows leaving
         let departing: Option<I64Set> =
-            (self.is_unique && !leaving.is_empty()).then(|| leaving.iter().copied().collect());
-        if self.is_unique {
+            (self.unique() && !leaving.is_empty()).then(|| leaving.iter().copied().collect());
+        if self.unique() {
             // Pre-validate full batch before mutating the graph so add_batch is atomic.
             let mut seen: ahash::AHashMap<&[u8], i64> =
                 ahash::AHashMap::with_capacity(prepared.len());
@@ -3031,8 +3038,8 @@ impl Index for HnswIndex {
         // The rows the batch takes out no longer stand in a newcomer's way;
         // the set is built only for a unique index with rows leaving
         let departing: Option<I64Set> =
-            (self.is_unique && !leaving.is_empty()).then(|| leaving.iter().copied().collect());
-        if self.is_unique {
+            (self.unique() && !leaving.is_empty()).then(|| leaving.iter().copied().collect());
+        if self.unique() {
             // Pre-validate full batch before mutating the graph so add_batch_slice is atomic.
             let mut seen: ahash::AHashMap<&[u8], i64> =
                 ahash::AHashMap::with_capacity(prepared.len());
@@ -3116,7 +3123,7 @@ impl Index for HnswIndex {
             ef_search: self.ef_search,
             ml: self.ml,
             metric: self.metric,
-            is_unique: self.is_unique,
+            is_unique: Arc::clone(&self.is_unique),
         })
     }
 
@@ -3125,7 +3132,7 @@ impl Index for HnswIndex {
     }
 
     fn is_unique(&self) -> bool {
-        self.is_unique
+        self.unique()
     }
 
     fn find(&self, _values: &[Value]) -> Result<Vec<IndexEntry>> {
@@ -3181,7 +3188,7 @@ impl Index for HnswIndex {
     fn clear(&self) -> Result<()> {
         let mut inner = self.inner.write();
         *inner = HnswInner::new(self.dims, self.metric);
-        if self.is_unique {
+        if self.unique() {
             inner.unique_map = Some(ahash::AHashMap::new());
         }
         Ok(())
@@ -3259,7 +3266,7 @@ impl Index for HnswIndex {
             }
         }
 
-        if self.is_unique {
+        if self.unique() {
             fresh.build_unique_map();
         }
 

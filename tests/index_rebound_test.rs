@@ -137,3 +137,28 @@ fn a_rebound_primary_key_shares_its_rows() {
     assert_eq!(&*rebound.get_row_ids_equal(&[int(8)]), &[8]);
     assert_eq!(&*rebound.get_row_ids_equal(&[int(7)]), &[7]);
 }
+
+#[test]
+fn a_rebound_vector_index_follows_the_unique_rule_of_its_graph() {
+    use stoolap::storage::index::hnsw::{HnswDistanceMetric, HnswIndex};
+    let mut old = HnswIndex::new(
+        "iv".into(),
+        "t".into(),
+        "v".into(),
+        1,
+        2,
+        8,
+        32,
+        32,
+        HnswDistanceMetric::L2,
+    );
+    let rebound = old.rebound(&["w".into()], &[1]);
+    old.set_unique(true);
+    assert!(rebound.is_unique());
+    let value = Value::vector(vec![1.0, 2.0]);
+    old.add(std::slice::from_ref(&value), 1, 1).unwrap();
+    assert!(
+        rebound.add(std::slice::from_ref(&value), 2, 2).is_err(),
+        "the rebound object keeps the shared graph unique"
+    );
+}

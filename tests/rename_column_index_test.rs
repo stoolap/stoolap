@@ -17,7 +17,18 @@
 //! writes and unique checks keep to the column, across seal, reopen and log
 //! replay. Every query is compared with `c`, the same table without indexes.
 
+use std::sync::{Mutex, MutexGuard};
+
 use stoolap::Database;
+
+// A test below fails the log process-wide, so every test here takes turns
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn ids(db: &Database, sql: &str) -> Vec<i64> {
     let mut ids: Vec<i64> = db
@@ -121,6 +132,7 @@ fn assert_renamed_unique_follows_its_column(db: &Database, stage: &str) {
 
 #[test]
 fn a_renamed_index_answers_for_its_column() {
+    let _serial = serial();
     let db = Database::open("memory://alter_rename_index").unwrap();
     rename_setup(&db);
     rename_and_write(&db);
@@ -137,6 +149,7 @@ fn a_renamed_index_answers_for_its_column() {
 
 #[test]
 fn a_renamed_index_answers_across_seal_and_reopen() {
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let dsn = format!("file://{}", dir.path().display());
     {
@@ -156,6 +169,7 @@ fn a_renamed_index_answers_across_seal_and_reopen() {
 
 #[test]
 fn a_renamed_index_answers_after_log_replay() {
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let dsn = format!(
         "file://{}?checkpoint_on_close=off&checkpoint_interval=0",
@@ -174,6 +188,7 @@ fn a_renamed_index_answers_after_log_replay() {
 
 #[test]
 fn a_renamed_primary_key_answers_by_its_new_name() {
+    let _serial = serial();
     let db = Database::open("memory://alter_rename_pk").unwrap();
     rename_setup(&db);
     both(
@@ -195,14 +210,10 @@ fn a_renamed_primary_key_answers_by_its_new_name() {
 
 // --- With failpoints -------------------------------------------------------
 
-// The failpoints and their counters are process-wide
-#[cfg(feature = "test-failpoints")]
-static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn a_renamed_vector_index_keeps_its_graph_over_sealed_rows() {
-    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v VECTOR(2))", ())
@@ -241,7 +252,7 @@ fn a_renamed_vector_index_keeps_its_graph_over_sealed_rows() {
 #[test]
 fn a_rename_the_log_refused_keeps_the_index_bindings() {
     use std::sync::atomic::Ordering;
-    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let _serial = serial();
     let _guard = stoolap::test_failpoints::FailpointGuard::new();
     let dir = tempfile::tempdir().unwrap();
     let dsn = format!(
@@ -277,4 +288,30 @@ fn a_rename_the_log_refused_keeps_the_index_bindings() {
     db.execute("INSERT INTO t VALUES (9, 10, 900)", ()).unwrap();
     assert_eq!(ids(&db, "SELECT id FROM t WHERE a = 10"), [1, 3, 9]);
     assert!(db.execute("INSERT INTO t VALUES (10, 1, 900)", ()).is_err());
+}
+
+#[test]
+fn a_renamed_unicode_column_takes_its_index_along() {
+    let _serial = serial();
+    let db = Database::open("memory://rename_unicode_column").unwrap();
+    for table in ["t", "c"] {
+        for sql in [
+            "CREATE TABLE {t} (id INTEGER PRIMARY KEY, \"ä\" INTEGER)",
+            "INSERT INTO {t} VALUES (1, 10)",
+        ] {
+            db.execute(&sql.replace("{t}", table), ()).unwrap();
+        }
+    }
+    db.execute("CREATE INDEX ia ON t(\"ä\")", ()).unwrap();
+    for table in ["t", "c"] {
+        for sql in [
+            "ALTER TABLE {t} RENAME COLUMN \"Ä\" TO b",
+            "ALTER TABLE {t} ADD COLUMN \"ä\" INTEGER DEFAULT 99",
+        ] {
+            db.execute(&sql.replace("{t}", table), ()).unwrap();
+        }
+    }
+    let filters = ["\"ä\" = 99", "b = 10"];
+    assert_answers_as_unindexed(&db, &filters, "after a rename by another case");
+    assert_eq!(indexes(&db), [("ia".to_string(), "b".to_string())]);
 }
