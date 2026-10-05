@@ -321,3 +321,31 @@ fn a_first_seal_after_an_uncapped_probe_starts_is_answered() {
     assert_eq!(found, Some(CappedEqual::Copied));
     assert_eq!(ids, [42]);
 }
+
+#[test]
+fn an_integer_no_float_holds_matches_no_float_key() {
+    for kind in ["hash", "bitmap", "btree"] {
+        let db = Database::open(&format!("memory://probe_inexact_integer_{kind}")).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k FLOAT)", ())
+            .unwrap();
+        db.execute(&format!("CREATE INDEX t_k ON t(k) USING {kind}"), ())
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 9007199254740992.0)", ())
+            .unwrap();
+        db.execute("CREATE TABLE o (id INTEGER PRIMARY KEY, k INTEGER)", ())
+            .unwrap();
+        db.execute(
+            "INSERT INTO o VALUES (1, 9007199254740993), (2, 9007199254740992)",
+            (),
+        )
+        .unwrap();
+        assert_eq!(
+            counts(
+                &db,
+                "SELECT o.id, (SELECT COUNT(*) FROM t WHERE t.k = o.k) FROM o ORDER BY o.id"
+            ),
+            [Some(0), Some(1)],
+            "{kind}"
+        );
+    }
+}

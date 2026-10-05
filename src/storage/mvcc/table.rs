@@ -3692,7 +3692,12 @@ impl Table for MVCCTable {
                             None => return Ok(Some(crate::storage::traits::CappedEqual::Copied)),
                         }
                     }
-                    (DataType::Float, Value::Integer(i)) => Value::Float(*i as f64),
+                    (DataType::Float, Value::Integer(i)) => {
+                        match crate::core::value::lossless_f64_from_i64(*i) {
+                            Some(f) => Value::Float(f),
+                            None => return Ok(Some(crate::storage::traits::CappedEqual::Copied)),
+                        }
+                    }
                     (data_type, key) if key.data_type() == data_type => key.clone(),
                     _ => return Ok(None),
                 };
