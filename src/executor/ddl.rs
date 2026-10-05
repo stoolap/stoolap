@@ -1110,6 +1110,14 @@ impl Executor {
                         change.finish();
                         return Err(error);
                     }
+                    if let Err(error) = self.engine.rename_index_column(
+                        table_name,
+                        &old_name.value,
+                        &new_name.value,
+                    ) {
+                        change.finish();
+                        return Err(error);
+                    }
 
                     // Propagate rename alias to cold volumes
                     self.engine.propagate_column_alias(

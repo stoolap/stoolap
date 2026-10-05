@@ -440,6 +440,9 @@ impl Index for StopAfterIndexAdd {
     fn data_types(&self) -> &[DataType] {
         self.inner.data_types()
     }
+    fn rebound(&self, column_names: &[String], column_ids: &[i32]) -> Arc<dyn Index> {
+        self.inner.rebound(column_names, column_ids)
+    }
     fn index_type(&self) -> IndexType {
         self.inner.index_type()
     }

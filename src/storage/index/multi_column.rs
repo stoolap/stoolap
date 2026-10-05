@@ -38,6 +38,7 @@ use parking_lot::RwLock;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 
@@ -120,6 +121,12 @@ pub struct MultiColumnIndex {
     column_ids: Vec<i32>,
     data_types: Vec<DataType>,
     is_unique: bool,
+    /// What the index holds, shared with every object bound to its columns
+    data: Arc<MultiColumnData>,
+}
+
+/// A multi-column index's data and the state that changes with it
+pub struct MultiColumnData {
     closed: AtomicBool,
 
     /// Main BTree index for range queries - LAZY built on first range query
@@ -145,6 +152,14 @@ pub struct MultiColumnIndex {
     /// build holds its write lock from that read to the insert, so a row is
     /// either in the group when it is built or added to it afterwards.
     walk_orders: RwLock<FxHashMap<CompositeKey, BTreeSet<(Value, i64)>>>,
+}
+
+impl std::ops::Deref for MultiColumnIndex {
+    type Target = MultiColumnData;
+
+    fn deref(&self) -> &MultiColumnData {
+        &self.data
+    }
 }
 
 impl std::fmt::Debug for MultiColumnIndex {
@@ -189,22 +204,24 @@ impl MultiColumnIndex {
             column_ids,
             data_types,
             is_unique,
-            closed: AtomicBool::new(false),
-            sorted_values: RwLock::new(BTreeMap::new()),
-            btree_built: AtomicBool::new(false),
-            value_to_rows: RwLock::new(if expected_rows > 0 {
-                FxHashMap::with_capacity_and_hasher(expected_rows, Default::default())
-            } else {
-                FxHashMap::default()
+            data: Arc::new(MultiColumnData {
+                closed: AtomicBool::new(false),
+                sorted_values: RwLock::new(BTreeMap::new()),
+                btree_built: AtomicBool::new(false),
+                value_to_rows: RwLock::new(if expected_rows > 0 {
+                    FxHashMap::with_capacity_and_hasher(expected_rows, Default::default())
+                } else {
+                    FxHashMap::default()
+                }),
+                prefix_indexes,
+                prefix_built,
+                row_to_key: RwLock::new(if expected_rows > 0 {
+                    I64Map::with_capacity(expected_rows)
+                } else {
+                    I64Map::new()
+                }),
+                walk_orders: RwLock::new(FxHashMap::default()),
             }),
-            prefix_indexes,
-            prefix_built,
-            row_to_key: RwLock::new(if expected_rows > 0 {
-                I64Map::with_capacity(expected_rows)
-            } else {
-                I64Map::new()
-            }),
-            walk_orders: RwLock::new(FxHashMap::default()),
         }
     }
 
@@ -974,6 +991,18 @@ impl Index for MultiColumnIndex {
 
     fn data_types(&self) -> &[DataType] {
         &self.data_types
+    }
+
+    fn rebound(&self, column_names: &[String], column_ids: &[i32]) -> Arc<dyn Index> {
+        Arc::new(Self {
+            name: self.name.clone(),
+            table_name: self.table_name.clone(),
+            column_names: column_names.to_vec(),
+            column_ids: column_ids.to_vec(),
+            data_types: self.data_types.clone(),
+            is_unique: self.is_unique,
+            data: Arc::clone(&self.data),
+        })
     }
 
     fn index_type(&self) -> IndexType {

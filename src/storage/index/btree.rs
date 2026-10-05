@@ -34,6 +34,7 @@ use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::Arc;
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -91,6 +92,12 @@ pub struct BTreeIndex {
     data_type: DataType,
     /// Whether this is a unique index
     unique: bool,
+    /// What the index holds, shared with every object bound to its column
+    data: Arc<BTreeData>,
+}
+
+/// A B-tree index's data and the state that changes with it
+pub struct BTreeData {
     /// Whether the index is closed
     closed: AtomicBool,
 
@@ -114,6 +121,14 @@ pub struct BTreeIndex {
 
     /// Reference ID counter
     next_ref_id: RwLock<i64>,
+}
+
+impl std::ops::Deref for BTreeIndex {
+    type Target = BTreeData;
+
+    fn deref(&self) -> &BTreeData {
+        &self.data
+    }
 }
 
 impl BTreeIndex {
@@ -192,17 +207,19 @@ impl BTreeIndex {
             column_name,
             data_type,
             unique,
-            closed: AtomicBool::new(false),
-            sorted_values: RwLock::new(BTreeMap::new()),
-            row_to_value: RwLock::new(if expected_rows > 0 {
-                I64Map::with_capacity(expected_rows)
-            } else {
-                I64Map::new()
+            data: Arc::new(BTreeData {
+                closed: AtomicBool::new(false),
+                sorted_values: RwLock::new(BTreeMap::new()),
+                row_to_value: RwLock::new(if expected_rows > 0 {
+                    I64Map::with_capacity(expected_rows)
+                } else {
+                    I64Map::new()
+                }),
+                cached_min: RwLock::new(None),
+                cached_max: RwLock::new(None),
+                cache_valid: AtomicBool::new(true),
+                next_ref_id: RwLock::new(0),
             }),
-            cached_min: RwLock::new(None),
-            cached_max: RwLock::new(None),
-            cache_valid: AtomicBool::new(true),
-            next_ref_id: RwLock::new(0),
         }
     }
 
@@ -727,6 +744,18 @@ impl Index for BTreeIndex {
 
     fn data_types(&self) -> &[DataType] {
         std::slice::from_ref(&self.data_type)
+    }
+
+    fn rebound(&self, column_names: &[String], column_ids: &[i32]) -> Arc<dyn Index> {
+        Arc::new(Self {
+            name: self.name.clone(),
+            table_name: self.table_name.clone(),
+            column_id: column_ids[0],
+            column_name: column_names[0].clone(),
+            data_type: self.data_type,
+            unique: self.unique,
+            data: Arc::clone(&self.data),
+        })
     }
 
     fn index_type(&self) -> IndexType {

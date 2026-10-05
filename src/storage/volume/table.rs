@@ -599,6 +599,8 @@ impl SegmentedTable {
             Some(idx) => idx,
             None => return Ok(()),
         };
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::index_filled_from_cold();
         let schema = self.hot.schema();
         let col_indices: Vec<usize> = columns
             .iter()

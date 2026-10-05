@@ -3761,8 +3761,12 @@ impl MVCCEngine {
         {
             let stores = self.version_stores.read().unwrap();
             if let Some(store) = stores.get(&table_name_lower) {
-                let mut vs_schema_guard = store.schema_mut();
-                CompactArc::make_mut(&mut *vs_schema_guard).rename_column(old_name, new_name)?;
+                {
+                    let mut vs_schema_guard = store.schema_mut();
+                    CompactArc::make_mut(&mut *vs_schema_guard)
+                        .rename_column(old_name, new_name)?;
+                }
+                store.rename_index_column(old_name, new_name);
             }
         }
         change.mark_changed();
@@ -3887,6 +3891,14 @@ impl MVCCEngine {
                 mgr.invalidate_mappings(&schema);
             }
         }
+    }
+
+    /// Binds a table's indexes on column `old` to its new name, once the
+    /// rename is recorded
+    pub(crate) fn rename_index_column(&self, table_name: &str, old: &str, new: &str) -> Result<()> {
+        self.get_version_store(table_name)?
+            .rename_index_column(old, new);
+        Ok(())
     }
 
     pub(crate) fn restore_column_schema(

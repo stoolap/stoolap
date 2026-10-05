@@ -44,6 +44,7 @@
 
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::Arc;
 
 use ahash::AHashMap;
 use roaring::RoaringTreemap;
@@ -83,6 +84,12 @@ pub struct BitmapIndex {
     column_ids: Vec<i32>,
     data_types: Vec<DataType>,
     is_unique: bool,
+    /// What the index holds, shared with every object bound to its columns
+    data: Arc<BitmapData>,
+}
+
+/// A bitmap index's data and the state that changes with it
+pub struct BitmapData {
     closed: AtomicBool,
 
     /// One bitmap per distinct value
@@ -97,6 +104,14 @@ pub struct BitmapIndex {
 
     /// Track cardinality for warnings
     distinct_count: AtomicUsize,
+}
+
+impl std::ops::Deref for BitmapIndex {
+    type Target = BitmapData;
+
+    fn deref(&self) -> &BitmapData {
+        &self.data
+    }
 }
 
 /// The bit a row id is kept at: its sign bit flipped, which orders the bits
@@ -166,14 +181,16 @@ impl BitmapIndex {
             column_ids,
             data_types,
             is_unique,
-            closed: AtomicBool::new(false),
-            bitmaps: RwLock::new(AHashMap::default()),
-            row_to_value: RwLock::new(if expected_rows > 0 {
-                I64Map::with_capacity(expected_rows)
-            } else {
-                I64Map::new()
+            data: Arc::new(BitmapData {
+                closed: AtomicBool::new(false),
+                bitmaps: RwLock::new(AHashMap::default()),
+                row_to_value: RwLock::new(if expected_rows > 0 {
+                    I64Map::with_capacity(expected_rows)
+                } else {
+                    I64Map::new()
+                }),
+                distinct_count: AtomicUsize::new(0),
             }),
-            distinct_count: AtomicUsize::new(0),
         }
     }
 
@@ -694,6 +711,18 @@ impl Index for BitmapIndex {
 
     fn data_types(&self) -> &[DataType] {
         &self.data_types
+    }
+
+    fn rebound(&self, column_names: &[String], column_ids: &[i32]) -> Arc<dyn Index> {
+        Arc::new(Self {
+            name: self.name.clone(),
+            table_name: self.table_name.clone(),
+            column_names: column_names.to_vec(),
+            column_ids: column_ids.to_vec(),
+            data_types: self.data_types.clone(),
+            is_unique: self.is_unique,
+            data: Arc::clone(&self.data),
+        })
     }
 
     fn index_type(&self) -> IndexType {
