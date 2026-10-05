@@ -154,3 +154,44 @@ fn a_refused_probe_reads_one_semi_join_set() {
         "no outer row ran the subquery over the volumes"
     );
 }
+
+#[test]
+fn a_refused_probe_set_is_not_read_by_the_next_statement() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO t SELECT value, 1 FROM generate_series(1, 1000)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX t_k ON t(k)", ()).unwrap();
+    db.execute(
+        "CREATE TABLE o (id INTEGER PRIMARY KEY, k INTEGER, flag INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO o VALUES (1, 2, 0)", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("BEGIN", ()).unwrap();
+    for round in 0..6 {
+        let key = 1 + round % 2;
+        db.execute("UPDATE t SET k = $1", (key,)).unwrap();
+        let flag: i64 = db
+            .query(
+                "UPDATE o SET flag = CASE WHEN EXISTS (SELECT 1 FROM t WHERE t.k = o.k) \
+                 THEN 1 ELSE 0 END RETURNING flag",
+                (),
+            )
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(flag, i64::from(key == 2), "round {round}, inner key {key}");
+    }
+    db.execute("ROLLBACK", ()).unwrap();
+}

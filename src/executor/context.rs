@@ -490,6 +490,38 @@ pub fn clear_exists_correlation_cache() {
     });
 }
 
+// The semi-join set an EXISTS over sealed rows answers a refused probe from,
+// built on its first refusal in the statement, by subquery address; None for
+// an inner table without sealed rows.
+thread_local! {
+    static EXISTS_PROBE_FALLBACKS: RefCell<FxHashMap<usize, Option<CompactArc<ValueSet>>>> = RefCell::new(FxHashMap::default());
+}
+
+/// Get the probe fallback kept for a subquery address.
+pub fn get_exists_probe_fallback(subquery_ptr: usize) -> Option<Option<CompactArc<ValueSet>>> {
+    EXISTS_PROBE_FALLBACKS.with(|cache| cache.borrow().get(&subquery_ptr).cloned())
+}
+
+/// Keep the probe fallback for a subquery address.
+pub fn cache_exists_probe_fallback(subquery_ptr: usize, set: Option<CompactArc<ValueSet>>) {
+    EXISTS_PROBE_FALLBACKS.with(|cache| {
+        cache.borrow_mut().insert(subquery_ptr, set);
+    });
+}
+
+/// Clear the caches one statement keeps by subquery address or for its own
+/// reads. Called when a statement starts, since a later statement may reuse
+/// an address and must not read an earlier statement's results.
+pub fn clear_statement_caches() {
+    clear_exists_predicate_cache();
+    clear_exists_schema_cache();
+    clear_exists_pred_key_cache();
+    clear_exists_correlation_cache();
+    EXISTS_PROBE_FALLBACKS.with(|cache| cache.borrow_mut().clear());
+    clear_batch_aggregate_cache();
+    clear_batch_aggregate_info_cache();
+}
+
 /// Clear ALL thread-local caches to release memory.
 /// Call this when a database is dropped to prevent memory leaks.
 /// This also shrinks all cache capacities to zero where applicable.
@@ -531,6 +563,11 @@ pub fn clear_all_thread_local_caches() {
         c.shrink_to_fit();
     });
     EXISTS_CORRELATION_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        c.clear();
+        c.shrink_to_fit();
+    });
+    EXISTS_PROBE_FALLBACKS.with(|cache| {
         let mut c = cache.borrow_mut();
         c.clear();
         c.shrink_to_fit();

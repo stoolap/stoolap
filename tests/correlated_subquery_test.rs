@@ -1647,3 +1647,36 @@ fn aggregates_whose_predicates_print_alike_read_their_own_rows() {
         (Some(1), Some(0))
     );
 }
+
+#[test]
+fn an_aggregate_reads_the_rows_of_its_own_statement() {
+    let db = Database::open("memory://batch_aggregate_across_statements").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1, 10), (2, 1, 20)", ())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE o (id INTEGER PRIMARY KEY, k INTEGER, s INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO o VALUES (1, 1, 0)", ()).unwrap();
+    for expected in [32, 34, 36] {
+        db.execute("UPDATE t SET v = v + 1", ()).unwrap();
+        let s: i64 = db
+            .query(
+                "UPDATE o SET s = (SELECT SUM(v) FROM t WHERE t.k = o.k AND t.v > 0) RETURNING s",
+                (),
+            )
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(s, expected);
+    }
+}

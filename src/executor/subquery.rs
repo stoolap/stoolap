@@ -32,13 +32,13 @@ use crate::storage::traits::{CappedEqual, Engine, ProbeScratch, Table};
 
 use super::context::{
     cache_batch_aggregate, cache_batch_aggregate_info, cache_exists_correlation,
-    cache_exists_pred_key, cache_exists_predicate, cache_exists_schema, cache_in_subquery,
-    cache_scalar_subquery, cache_semi_join_arc, compute_semi_join_cache_key,
-    extract_table_names_for_cache, get_cached_batch_aggregate, get_cached_batch_aggregate_info,
-    get_cached_exists_correlation, get_cached_exists_pred_key, get_cached_exists_predicate,
-    get_cached_exists_schema, get_cached_in_subquery, get_cached_in_subquery_set,
-    get_cached_scalar_subquery, get_cached_semi_join, BatchAggregateLookupInfo, ExecutionContext,
-    ExistsCorrelationInfo,
+    cache_exists_pred_key, cache_exists_predicate, cache_exists_probe_fallback,
+    cache_exists_schema, cache_in_subquery, cache_scalar_subquery, cache_semi_join_arc,
+    compute_semi_join_cache_key, extract_table_names_for_cache, get_cached_batch_aggregate,
+    get_cached_batch_aggregate_info, get_cached_exists_correlation, get_cached_exists_pred_key,
+    get_cached_exists_predicate, get_cached_exists_schema, get_cached_in_subquery,
+    get_cached_in_subquery_set, get_cached_scalar_subquery, get_cached_semi_join,
+    get_exists_probe_fallback, BatchAggregateLookupInfo, ExecutionContext, ExistsCorrelationInfo,
 };
 use super::expr_converter::convert_ast_to_storage_expr;
 use super::expression::compute_expression_hash;
@@ -69,19 +69,6 @@ struct ProbeBuffers {
     ids: Vec<i64>,
     rows: RowVec,
     scratch: ProbeScratch,
-}
-
-thread_local! {
-    /// The semi-join set an EXISTS over sealed rows answers a refused probe
-    /// from, built on its first refusal in the statement, by subquery address;
-    /// None for an inner table without sealed rows
-    static PROBE_FALLBACKS: std::cell::RefCell<rustc_hash::FxHashMap<usize, Option<CompactArc<ValueSet>>>> =
-        std::cell::RefCell::new(rustc_hash::FxHashMap::default());
-}
-
-/// Clear the EXISTS probe fallbacks. Called at the start of each top-level query.
-pub(crate) fn clear_exists_probe_fallbacks() {
-    PROBE_FALLBACKS.with(|cache| cache.borrow_mut().clear());
 }
 
 thread_local! {
@@ -672,9 +659,7 @@ impl Executor {
         ctx: &ExecutionContext,
     ) -> Result<Option<bool>> {
         let subquery_ptr = subquery as *const SelectStatement as usize;
-        if let Some(known) =
-            PROBE_FALLBACKS.with(|cache| cache.borrow().get(&subquery_ptr).cloned())
-        {
+        if let Some(known) = get_exists_probe_fallback(subquery_ptr) {
             return Ok(known.map(|set| set.contains(key)));
         }
         let sealed = self
@@ -683,7 +668,7 @@ impl Executor {
             })?
             .unwrap_or(false);
         if !sealed {
-            PROBE_FALLBACKS.with(|cache| cache.borrow_mut().insert(subquery_ptr, None));
+            cache_exists_probe_fallback(subquery_ptr, None);
             return Ok(None);
         }
         let inner_alias = match subquery.table_expr.as_deref() {
@@ -701,7 +686,7 @@ impl Executor {
         };
         let set = self.execute_semi_join_optimization(&info, ctx)?;
         let found = set.contains(key);
-        PROBE_FALLBACKS.with(|cache| cache.borrow_mut().insert(subquery_ptr, Some(set)));
+        cache_exists_probe_fallback(subquery_ptr, Some(set));
         Ok(Some(found))
     }
 

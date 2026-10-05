@@ -65,11 +65,7 @@ type SelectOutput = (
 );
 type SelectResult = Result<SelectOutput>;
 
-use super::context::{
-    clear_batch_aggregate_cache, clear_batch_aggregate_info_cache, clear_exists_correlation_cache,
-    clear_exists_pred_key_cache, clear_exists_predicate_cache, clear_exists_schema_cache,
-    ExecutionContext, StatementSnapshot, TimeoutGuard,
-};
+use super::context::{clear_statement_caches, ExecutionContext, StatementSnapshot, TimeoutGuard};
 use super::expression::{
     compile_expression, CompiledEvaluator, ExecuteContext, ExprVM, ExpressionEval, JoinFilter,
     RowFilter, SharedProgram,
@@ -374,13 +370,7 @@ impl Executor {
             // NOTE: scalar, IN, and semi-join caches are NOT cleared here - they're
             // invalidated per-table when data changes (INSERT, UPDATE, DELETE, TRUNCATE)
             // to enable cross-query caching for repeated subqueries.
-            clear_exists_predicate_cache();
-            clear_exists_schema_cache();
-            clear_exists_pred_key_cache();
-            clear_exists_correlation_cache();
-            super::subquery::clear_exists_probe_fallbacks();
-            clear_batch_aggregate_cache();
-            clear_batch_aggregate_info_cache();
+            clear_statement_caches();
             TimeoutGuard::new(ctx)
         } else {
             None
