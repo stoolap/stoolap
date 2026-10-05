@@ -1536,3 +1536,46 @@ fn test_correlated_inner_scope_shadows_outer_names() {
         1
     );
 }
+
+#[test]
+fn two_aggregates_with_different_predicates_read_their_own_rows() {
+    let db = Database::open("memory://batch_aggregate_predicates").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE TABLE o (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO o VALUES (1, 1), (2, 2)", ())
+        .unwrap();
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(i64, Option<i64>, Option<i64>, i64, i64)> = db
+        .query(
+            "SELECT o.id, \
+             (SELECT SUM(v) FROM t WHERE t.k = o.k AND v = 10), \
+             (SELECT SUM(v) FROM t WHERE t.k = o.k AND v = 20), \
+             (SELECT COUNT(*) FROM t WHERE t.k = o.k AND v > 15), \
+             (SELECT COUNT(*) FROM t WHERE t.k = o.k) \
+             FROM o ORDER BY o.id",
+            (),
+        )
+        .unwrap()
+        .map(|r| {
+            let r = r.unwrap();
+            (
+                r.get(0).unwrap(),
+                r.get(1).unwrap(),
+                r.get(2).unwrap(),
+                r.get(3).unwrap(),
+                r.get(4).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(rows, [(1, Some(10), Some(20), 1, 2), (2, None, None, 1, 1)]);
+}

@@ -1126,14 +1126,20 @@ impl Executor {
         // Extract correlation column
         let correlation = Self::extract_index_nested_loop_info(subquery)?;
 
-        // The aggregate's own text, since two aggregates of one name over
-        // one table and one correlation column read different columns
+        // The aggregate's own text and the predicate beside the correlation,
+        // since aggregates over one table and correlation column can differ in either
+        let predicate = correlation
+            .additional_predicate
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
         Some(format!(
-            "batch_agg:{}:{}:{}:{}",
+            "batch_agg:{}:{}:{}:{}:{}",
             table_name.to_lowercase(),
             correlation.inner_column.to_lowercase(),
             agg_func,
-            subquery.columns[0]
+            subquery.columns[0],
+            predicate
         ))
     }
 
