@@ -460,9 +460,9 @@ pub fn cache_exists_pred_key(subquery_ptr: usize, pred_key: String) {
 
 // Cache for batch aggregate subquery results (e.g., COUNT(*) GROUP BY user_id).
 // Thread-local to avoid synchronization overhead.
-// The key is a stable identifier for the subquery, the value is a map from group key to aggregate value.
+// The key is the subquery's address, as for the lookup info; the value maps a group key to its aggregate.
 thread_local! {
-    static BATCH_AGGREGATE_CACHE: RefCell<FxHashMap<String, CompactArc<ValueMap<Value>>>> = RefCell::new(FxHashMap::default());
+    static BATCH_AGGREGATE_CACHE: RefCell<FxHashMap<usize, CompactArc<ValueMap<Value>>>> = RefCell::new(FxHashMap::default());
 }
 
 /// Clear the batch aggregate cache. Should be called at the start of each top-level query.
@@ -474,23 +474,23 @@ pub fn clear_batch_aggregate_cache() {
     });
 }
 
-/// Get a cached batch aggregate result map by subquery identifier.
-pub fn get_cached_batch_aggregate(key: &str) -> Option<CompactArc<ValueMap<Value>>> {
-    BATCH_AGGREGATE_CACHE.with(|cache| cache.borrow().get(key).cloned())
+/// Get a cached batch aggregate result map by subquery address.
+pub fn get_cached_batch_aggregate(subquery_ptr: usize) -> Option<CompactArc<ValueMap<Value>>> {
+    BATCH_AGGREGATE_CACHE.with(|cache| cache.borrow().get(&subquery_ptr).cloned())
 }
 
 /// Cache a batch aggregate result map.
-pub fn cache_batch_aggregate(key: String, values: ValueMap<Value>) {
+pub fn cache_batch_aggregate(subquery_ptr: usize, values: ValueMap<Value>) {
     BATCH_AGGREGATE_CACHE.with(|cache| {
-        cache.borrow_mut().insert(key, CompactArc::new(values));
+        cache
+            .borrow_mut()
+            .insert(subquery_ptr, CompactArc::new(values));
     });
 }
 
 /// Pre-computed info for batch aggregate lookups to avoid per-row allocations.
 #[derive(Clone)]
 pub struct BatchAggregateLookupInfo {
-    /// The cache key for the batch aggregate results
-    pub cache_key: String,
     /// The outer column name (lowercase) to look up in outer_row
     pub outer_column_lower: String,
     /// Optional qualified outer column name (e.g., "u.id")

@@ -1065,7 +1065,7 @@ impl Executor {
         };
 
         // Look up in cache
-        let cache = get_cached_batch_aggregate(&lookup_info.cache_key)?;
+        let cache = get_cached_batch_aggregate(subquery_ptr)?;
         let result = cache.get(&outer_value).cloned();
 
         // Return 0 for COUNT if key not found (no matching rows)
@@ -1081,8 +1081,12 @@ impl Executor {
     fn compute_batch_aggregate_info(
         subquery: &SelectStatement,
     ) -> Option<BatchAggregateLookupInfo> {
-        // Build cache key - returns None if not a batchable aggregate
-        let cache_key = Self::build_batch_aggregate_key(subquery)?;
+        // A single aggregate over one table
+        if subquery.columns.len() != 1
+            || Self::extract_aggregate_function(&subquery.columns[0]).is_none()
+        {
+            return None;
+        }
 
         // Extract correlation info
         let correlation = Self::extract_index_nested_loop_info(subquery)?;
@@ -1101,46 +1105,10 @@ impl Executor {
         let is_count = Self::is_count_expression(&subquery.columns[0]);
 
         Some(BatchAggregateLookupInfo {
-            cache_key,
             outer_column_lower,
             outer_qualified_lower,
             is_count,
         })
-    }
-
-    /// Build a cache key for batch aggregate based on subquery structure.
-    /// The key identifies the subquery pattern (table, correlation column, aggregate function).
-    fn build_batch_aggregate_key(subquery: &SelectStatement) -> Option<String> {
-        // Extract table name
-        let table_name = match subquery.table_expr.as_ref().map(|b| b.as_ref()) {
-            Some(Expression::TableSource(ts)) => ts.name.value.clone(),
-            _ => return None,
-        };
-
-        // Extract aggregate function
-        if subquery.columns.len() != 1 {
-            return None;
-        }
-        let agg_func = Self::extract_aggregate_function(&subquery.columns[0])?;
-
-        // Extract correlation column
-        let correlation = Self::extract_index_nested_loop_info(subquery)?;
-
-        // The aggregate's own text and the predicate beside the correlation,
-        // since aggregates over one table and correlation column can differ in either
-        let predicate = correlation
-            .additional_predicate
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_default();
-        Some(format!(
-            "batch_agg:{}:{}:{}:{}:{}",
-            table_name.to_lowercase(),
-            correlation.inner_column.to_lowercase(),
-            agg_func,
-            subquery.columns[0],
-            predicate
-        ))
     }
 
     /// Try to execute and cache a batch aggregate query.
@@ -1151,6 +1119,12 @@ impl Executor {
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<Option<CompactArc<ValueMap<Value>>>> {
+        // Keyed by the subquery's address, read before any per-row work
+        let subquery_ptr = subquery as *const SelectStatement as usize;
+        if let Some(cached) = get_cached_batch_aggregate(subquery_ptr) {
+            return Ok(Some(cached));
+        }
+
         // Must have single aggregate column
         if subquery.columns.len() != 1 {
             return Ok(None);
@@ -1179,17 +1153,6 @@ impl Executor {
 
         if Self::aggregate_reads_parent_row(subquery, correlation.additional_predicate.as_ref()) {
             return Ok(None);
-        }
-
-        // Build cache key (includes additional predicate in key for uniqueness)
-        let cache_key = match Self::build_batch_aggregate_key(subquery) {
-            Some(k) => k,
-            None => return Ok(None),
-        };
-
-        // Check if already cached
-        if let Some(cached) = get_cached_batch_aggregate(&cache_key) {
-            return Ok(Some(cached));
         }
 
         // Build the batch aggregate query:
@@ -1271,10 +1234,10 @@ impl Executor {
         }
 
         // Cache the results
-        cache_batch_aggregate(cache_key.clone(), result_map);
+        cache_batch_aggregate(subquery_ptr, result_map);
 
         // Return the cached Arc
-        Ok(get_cached_batch_aggregate(&cache_key))
+        Ok(get_cached_batch_aggregate(subquery_ptr))
     }
 
     /// Get or create a cached row fetcher for the given table.

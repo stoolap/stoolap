@@ -1579,3 +1579,71 @@ fn two_aggregates_with_different_predicates_read_their_own_rows() {
         .collect();
     assert_eq!(rows, [(1, Some(10), Some(20), 1, 2), (2, None, None, 1, 1)]);
 }
+
+fn two_values(
+    db: &Database,
+    sql: &str,
+    params: impl stoolap::Params,
+) -> (Option<i64>, Option<i64>) {
+    let row = db.query(sql, params).unwrap().next().unwrap().unwrap();
+    (row.get(0).unwrap(), row.get(1).unwrap())
+}
+
+#[test]
+fn aggregates_whose_predicates_differ_only_in_parameters_read_their_own_rows() {
+    let db = Database::open("memory://batch_aggregate_parameters").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 1, 20)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE TABLE o (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO o VALUES (1, 1)", ()).unwrap();
+    assert_eq!(
+        two_values(
+            &db,
+            "SELECT (SELECT SUM(v) FROM t WHERE t.k = o.k AND v = ?), \
+             (SELECT SUM(v) FROM t WHERE v = ? AND t.k = o.k) FROM o",
+            (10, 20)
+        ),
+        (Some(10), Some(40))
+    );
+    assert_eq!(
+        two_values(
+            &db,
+            "SELECT (SELECT SUM(v) FROM t WHERE t.k = o.k AND v = $1), \
+             (SELECT SUM(v) FROM t WHERE v = $2 AND t.k = o.k) FROM o",
+            (10, 20)
+        ),
+        (Some(10), Some(40))
+    );
+}
+
+#[test]
+fn aggregates_whose_predicates_print_alike_read_their_own_rows() {
+    let db = Database::open("memory://batch_aggregate_escaped_strings").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v TEXT)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1, 'a')", ()).unwrap();
+    db.execute("CREATE TABLE o (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO o VALUES (1, 1)", ()).unwrap();
+    assert_eq!(
+        two_values(
+            &db,
+            "SELECT (SELECT COUNT(*) FROM t WHERE t.k = o.k AND v IN ('a', 'b')), \
+             (SELECT COUNT(*) FROM t WHERE v IN ('a'', ''b') AND t.k = o.k) FROM o",
+            ()
+        ),
+        (Some(1), Some(0))
+    );
+}
