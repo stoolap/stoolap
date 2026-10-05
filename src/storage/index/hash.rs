@@ -58,6 +58,7 @@
 use parking_lot::RwLock;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 
@@ -110,6 +111,12 @@ pub struct HashIndex {
     column_ids: Vec<i32>,
     data_types: Vec<DataType>,
     is_unique: bool,
+    /// What the index holds, shared with every object bound to its columns
+    data: Arc<HashData>,
+}
+
+/// A hash index's data and the state that changes with it
+pub struct HashData {
     closed: AtomicBool,
 
     /// Row ID -> hash mapping for efficient removal
@@ -121,6 +128,14 @@ pub struct HashIndex {
     /// Uses CompactArc<Value> to share references with ValueArena (8 bytes per value)
     #[allow(clippy::type_complexity)]
     hash_to_values: RwLock<FxHashMap<u64, Vec<(Vec<CompactArc<Value>>, IdList)>>>,
+}
+
+impl std::ops::Deref for HashIndex {
+    type Target = HashData;
+
+    fn deref(&self) -> &HashData {
+        &self.data
+    }
 }
 
 impl std::fmt::Debug for HashIndex {
@@ -158,16 +173,18 @@ impl HashIndex {
             column_ids,
             data_types,
             is_unique,
-            closed: AtomicBool::new(false),
-            row_to_hash: RwLock::new(if expected_rows > 0 {
-                I64Map::with_capacity(expected_rows)
-            } else {
-                I64Map::new()
-            }),
-            hash_to_values: RwLock::new(if expected_rows > 0 {
-                FxHashMap::with_capacity_and_hasher(expected_rows, Default::default())
-            } else {
-                FxHashMap::default()
+            data: Arc::new(HashData {
+                closed: AtomicBool::new(false),
+                row_to_hash: RwLock::new(if expected_rows > 0 {
+                    I64Map::with_capacity(expected_rows)
+                } else {
+                    I64Map::new()
+                }),
+                hash_to_values: RwLock::new(if expected_rows > 0 {
+                    FxHashMap::with_capacity_and_hasher(expected_rows, Default::default())
+                } else {
+                    FxHashMap::default()
+                }),
             }),
         }
     }
@@ -604,6 +621,18 @@ impl Index for HashIndex {
 
     fn data_types(&self) -> &[DataType] {
         &self.data_types
+    }
+
+    fn rebound(&self, column_names: &[String], column_ids: &[i32]) -> Arc<dyn Index> {
+        Arc::new(Self {
+            name: self.name.clone(),
+            table_name: self.table_name.clone(),
+            column_names: column_names.to_vec(),
+            column_ids: column_ids.to_vec(),
+            data_types: self.data_types.clone(),
+            is_unique: self.is_unique,
+            data: Arc::clone(&self.data),
+        })
     }
 
     fn index_type(&self) -> IndexType {

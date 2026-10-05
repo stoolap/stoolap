@@ -446,6 +446,19 @@ pub(crate) fn join_probe_admitted() {
     }
 }
 
+/// Process-wide: indexes filled from the sealed rows' volumes
+static INDEXES_FILLED_FROM_COLD: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Indexes filled from the sealed rows' volumes, so far
+pub fn indexes_filled_from_cold() -> usize {
+    INDEXES_FILLED_FROM_COLD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn index_filled_from_cold() {
+    INDEXES_FILLED_FROM_COLD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Process-wide: IN subqueries run to take their members
 static IN_SUBQUERY_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 

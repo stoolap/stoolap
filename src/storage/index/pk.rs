@@ -29,6 +29,7 @@
 
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::common::{I64Map, I64Set};
 use crate::core::{DataType, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
@@ -302,8 +303,22 @@ pub struct PkIndex {
     table_name: String,
     column_id: i32,
     column_name: String,
+    /// What the index holds, shared with every object bound to its column
+    shared: Arc<PkData>,
+}
+
+/// A primary key index's data and the state that changes with it
+pub struct PkData {
     data: RwLock<PkIndexInner>,
     closed: AtomicBool,
+}
+
+impl std::ops::Deref for PkIndex {
+    type Target = PkData;
+
+    fn deref(&self) -> &PkData {
+        &self.shared
+    }
 }
 
 impl PkIndex {
@@ -313,8 +328,10 @@ impl PkIndex {
             table_name,
             column_id,
             column_name,
-            data: RwLock::new(PkIndexInner::new()),
-            closed: AtomicBool::new(false),
+            shared: Arc::new(PkData {
+                data: RwLock::new(PkIndexInner::new()),
+                closed: AtomicBool::new(false),
+            }),
         }
     }
 
@@ -439,6 +456,16 @@ impl Index for PkIndex {
 
     fn data_types(&self) -> &[DataType] {
         &[DataType::Integer]
+    }
+
+    fn rebound(&self, column_names: &[String], column_ids: &[i32]) -> Arc<dyn Index> {
+        Arc::new(Self {
+            name: self.name.clone(),
+            table_name: self.table_name.clone(),
+            column_id: column_ids[0],
+            column_name: column_names[0].clone(),
+            shared: Arc::clone(&self.shared),
+        })
     }
 
     fn index_type(&self) -> IndexType {

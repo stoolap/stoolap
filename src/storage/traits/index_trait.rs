@@ -139,6 +139,10 @@ pub trait Index: Send + Sync {
     /// Returns the data types for the indexed columns
     fn data_types(&self) -> &[DataType];
 
+    /// This index bound to the columns `column_names` names at `column_ids`,
+    /// sharing its data: a write through either object reaches both
+    fn rebound(&self, column_names: &[String], column_ids: &[i32]) -> std::sync::Arc<dyn Index>;
+
     /// Returns the type of index (BTree, Bitmap, Hash)
     fn index_type(&self) -> IndexType;
 

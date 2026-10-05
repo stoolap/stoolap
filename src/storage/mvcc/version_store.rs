@@ -4405,6 +4405,45 @@ impl VersionStore {
         self.index_identities.read().get(name).copied()
     }
 
+    /// Binds every index on column `old` to its new name `new`, each keeping
+    /// its data, position and identity. A reader that trusts an index's
+    /// order stands down across the swap, as across a commit's publication
+    pub fn rename_index_column(&self, old: &str, new: &str) {
+        let mut indexes = self.indexes.write();
+        let renamed: Vec<(String, Arc<dyn Index>)> = indexes
+            .iter()
+            .filter(|(_, index)| {
+                index
+                    .column_names()
+                    .iter()
+                    .any(|column| column.eq_ignore_ascii_case(old))
+            })
+            .map(|(name, index)| {
+                let columns: Vec<String> = index
+                    .column_names()
+                    .iter()
+                    .map(|column| {
+                        if column.eq_ignore_ascii_case(old) {
+                            new.to_string()
+                        } else {
+                            column.clone()
+                        }
+                    })
+                    .collect();
+                (name.clone(), index.rebound(&columns, index.column_ids()))
+            })
+            .collect();
+        if renamed.is_empty() {
+            return;
+        }
+        self.publishing.fetch_add(1, Ordering::SeqCst);
+        for (name, index) in renamed {
+            indexes.insert(name, index);
+        }
+        self.publish_epoch.fetch_add(1, Ordering::SeqCst);
+        self.publishing.fetch_sub(1, Ordering::SeqCst);
+    }
+
     /// Get an index by name
     pub fn get_index(&self, name: &str) -> Option<Arc<dyn Index>> {
         let indexes = self.indexes.read();

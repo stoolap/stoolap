@@ -23,6 +23,7 @@
 
 use parking_lot::RwLock;
 use std::collections::BinaryHeap;
+use std::sync::Arc;
 
 use crate::common::{I64Map, I64Set};
 use crate::core::{DataType, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
@@ -2573,7 +2574,8 @@ fn select_neighbors_shared(
 // ─────────────────────────────────────────────────────────────
 
 pub struct HnswIndex {
-    inner: RwLock<HnswInner>,
+    /// The graph, shared with every object bound to its column
+    inner: Arc<RwLock<HnswInner>>,
     name: String,
     table_name: String,
     column_ids: Vec<i32>,
@@ -2618,7 +2620,7 @@ impl HnswIndex {
         let m = if m < 2 { 2 } else { m };
         let ml = 1.0 / (m as f64).ln();
         Self {
-            inner: RwLock::new(HnswInner::new(dims, metric)),
+            inner: Arc::new(RwLock::new(HnswInner::new(dims, metric))),
             name,
             table_name,
             column_ids: vec![column_id],
@@ -2835,7 +2837,7 @@ impl HnswIndex {
                 let metric = inner.metric;
                 let ml = 1.0 / (m as f64).ln();
                 Ok(Some(Self {
-                    inner: RwLock::new(inner),
+                    inner: Arc::new(RwLock::new(inner)),
                     name,
                     table_name,
                     column_ids: vec![column_id],
@@ -3097,6 +3099,25 @@ impl Index for HnswIndex {
 
     fn data_types(&self) -> &[DataType] {
         &self.data_types
+    }
+
+    fn rebound(&self, column_names: &[String], column_ids: &[i32]) -> Arc<dyn Index> {
+        Arc::new(Self {
+            inner: Arc::clone(&self.inner),
+            name: self.name.clone(),
+            table_name: self.table_name.clone(),
+            column_ids: column_ids.to_vec(),
+            column_names: column_names.to_vec(),
+            data_types: self.data_types.clone(),
+            dims: self.dims,
+            m: self.m,
+            m0: self.m0,
+            ef_construction: self.ef_construction,
+            ef_search: self.ef_search,
+            ml: self.ml,
+            metric: self.metric,
+            is_unique: self.is_unique,
+        })
     }
 
     fn index_type(&self) -> IndexType {
