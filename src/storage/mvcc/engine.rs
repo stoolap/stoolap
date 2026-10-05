@@ -3670,11 +3670,7 @@ impl MVCCEngine {
             let schema_arc = schemas
                 .get(&table_name_lower)
                 .ok_or_else(|| Error::TableNotFound(table_name_lower.to_string()))?;
-            if let Some((_, col)) = schema_arc.find_column(column_name) {
-                if col.primary_key {
-                    return Err(Error::CannotDropPrimaryKey);
-                }
-            } else {
+            if schema_arc.find_column(column_name).is_none() {
                 return Err(Error::ColumnNotFound(column_name.to_string()));
             }
         }
