@@ -502,31 +502,6 @@ fn an_index_recreated_with_the_same_definition_gets_a_new_identity_and_the_old_s
     db.close().unwrap();
 }
 
-/// Index names are keyed as the catalog keys them: two indexes whose names
-/// differ in case are two definitions with two identities, and dropping
-/// one leaves the other's.
-#[test]
-fn index_names_that_differ_in_case_keep_their_own_identities() {
-    let db = Database::open("memory://secondary_side_file_test_name_case").unwrap();
-    db.execute(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
-        (),
-    )
-    .unwrap();
-    db.execute("CREATE INDEX Mixed ON t(k)", ()).unwrap();
-    db.execute("CREATE INDEX mixed ON t(v)", ()).unwrap();
-    let upper = identity(&db, "Mixed");
-    let lower = identity(&db, "mixed");
-    assert_ne!(upper, lower, "two definitions, two identities");
-    db.execute("DROP INDEX Mixed ON t", ()).unwrap();
-    assert!(db.engine().index_identity("t", "Mixed").is_none());
-    assert_eq!(
-        identity(&db, "mixed"),
-        lower,
-        "the other index keeps its identity"
-    );
-}
-
 /// A memory engine issues distinct identities from its own counter.
 #[test]
 fn a_memory_engine_issues_distinct_identities() {

@@ -4324,6 +4324,28 @@ impl VersionStore {
         indexes.contains_key(index_name)
     }
 
+    /// The stored name a statement's `name` refers to: the exact name, else
+    /// the one name equal to it under the schema's case fold. Two such names,
+    /// left by a release that accepted both, are ambiguous
+    pub fn resolve_index_name(&self, name: &str) -> Result<Option<String>, Error> {
+        let indexes = self.indexes.read();
+        if indexes.contains_key(name) {
+            return Ok(Some(name.to_string()));
+        }
+        let folded = name.to_lowercase();
+        let mut found = indexes
+            .keys()
+            .filter(|stored| stored.to_lowercase() == folded);
+        match (found.next(), found.next()) {
+            (None, _) => Ok(None),
+            (Some(stored), None) => Ok(Some(stored.clone())),
+            (Some(_), Some(_)) => Err(Error::InvalidArgument(format!(
+                "index name '{}' matches more than one index; name it exactly",
+                name
+            ))),
+        }
+    }
+
     /// List all indexes
     pub fn list_indexes(&self) -> Vec<String> {
         let indexes = self.indexes.read();
