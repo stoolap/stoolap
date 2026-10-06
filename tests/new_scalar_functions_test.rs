@@ -169,6 +169,17 @@ fn test_to_char_day_names() {
         .expect("Failed to execute TO_CHAR");
     assert_eq!(result, "FRI");
 
+    // Capitalized and lowercase day names
+    let result: String = db
+        .query_one("SELECT TO_CHAR('2024-03-15', 'Day')", ())
+        .expect("Failed to execute TO_CHAR");
+    assert_eq!(result, "Friday");
+
+    let result: String = db
+        .query_one("SELECT TO_CHAR('2024-03-15', 'day')", ())
+        .expect("Failed to execute TO_CHAR");
+    assert_eq!(result, "friday");
+
     // Full month name
     let result: String = db
         .query_one("SELECT TO_CHAR('2024-03-15', 'MONTH')", ())

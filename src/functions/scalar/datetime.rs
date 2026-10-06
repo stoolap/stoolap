@@ -1386,9 +1386,10 @@ fn format_timestamp(ts: DateTime<Utc>, format: &str) -> String {
     result = result.replace("MM", &format!("{:02}", month));
 
     // Day patterns (do DAY before DY, DD)
+    // "day" before "Day", or it rewrites the tail of "Tuesday"
     result = result.replace("DAY", day_names[weekday]);
-    result = result.replace("Day", &capitalize_first(day_names[weekday]));
     result = result.replace("day", &day_names[weekday].to_lowercase());
+    result = result.replace("Day", &capitalize_first(day_names[weekday]));
     result = result.replace("DY", day_abbr[weekday]);
     result = result.replace("Dy", &capitalize_first(day_abbr[weekday]));
     result = result.replace("dy", &day_abbr[weekday].to_lowercase());
