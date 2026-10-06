@@ -667,6 +667,37 @@ pub(crate) fn wal_directory_syncing() {
 }
 
 thread_local! {
+    static UNIQUE_FOUND_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static COMMIT_CAPTURE_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next unique check has looked a value
+/// up in a unique index and has not yet read the transaction's own rows
+pub fn after_unique_index_found(hook: impl FnOnce() + 'static) {
+    UNIQUE_FOUND_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn unique_index_found() {
+    let hook = UNIQUE_FOUND_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next table commit holds the
+/// transaction's local store and has not yet taken the index set
+pub fn before_commit_index_capture(hook: impl FnOnce() + 'static) {
+    COMMIT_CAPTURE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn commit_index_capture_next() {
+    let hook = COMMIT_CAPTURE_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static INDEXES_PUBLISHED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 

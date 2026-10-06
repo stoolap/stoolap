@@ -7297,6 +7297,8 @@ impl TransactionVersionStore {
         // Rows removed by seal (missing from hot B-tree) are not conflicts —
         // they were moved to cold segments, not modified by another transaction.
         self.detect_conflicts_safe()?;
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::commit_index_capture_next();
 
         // Update indexes BEFORE committing versions
         self.update_indexes_on_commit()?;
