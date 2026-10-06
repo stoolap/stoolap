@@ -526,9 +526,8 @@ fn a_write_through_an_older_handle_cannot_commit_after_a_column_drop() {
         Value::text("right-b"),
     ]));
     drop(older);
-    let refused = |result: &stoolap::Result<()>| {
-        matches!(result, Err(stoolap::Error::SchemaChanged { .. }))
-    };
+    let refused =
+        |result: &stoolap::Result<()>| matches!(result, Err(stoolap::Error::SchemaChanged { .. }));
     let committed = tx.commit();
     assert!(
         refused(&written.map(|_| ())) || refused(&committed),

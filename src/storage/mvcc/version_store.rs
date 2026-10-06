@@ -588,15 +588,11 @@ impl Drop for PublishGuard {
 #[derive(Default)]
 pub struct PublishHold {
     guards: SmallVec<[PublishGuard; 4]>,
-    stores: SmallVec<[Arc<std::sync::RwLock<TransactionVersionStore>>; 4]>,
+    stores: SmallVec<[Arc<TxnTableStore>; 4]>,
 }
 
 impl PublishHold {
-    pub fn add(
-        &mut self,
-        version_store: &Arc<VersionStore>,
-        txn_store: Arc<std::sync::RwLock<TransactionVersionStore>>,
-    ) {
+    pub fn add(&mut self, version_store: &Arc<VersionStore>, txn_store: Arc<TxnTableStore>) {
         self.guards.push(version_store.begin_publish());
         self.stores.push(txn_store);
     }
@@ -6469,10 +6465,111 @@ pub struct TransactionVersionStore {
     /// the time of its first row, so a rollback to a savepoint keeps the
     /// layouts of the rows that survive it
     bound: SmallVec<[(u64, i64); 2]>,
-    /// The layout of the handle about to write, for the row it writes
-    writing: Option<u64>,
-    /// The newest layout a handle of the transaction was admitted under
-    newest_handle: u64,
+    /// The layout of the handle about to write, for the row it writes, and
+    /// whether that handle is older than one admitted since
+    writing: Option<(u64, bool)>,
+}
+
+/// No row of the transaction is held yet
+const NO_ROWS: u64 = u64::MAX;
+
+/// A transaction's local store for one table, with the admission of the
+/// handles that read it, which takes no lock of the store
+pub struct TxnTableStore {
+    store: std::sync::RwLock<TransactionVersionStore>,
+    /// The newest layout a handle was admitted under
+    newest: AtomicU64,
+    /// The layout the transaction's rows are written under, or `NO_ROWS`
+    rows: AtomicU64,
+    parent: u64,
+}
+
+impl TxnTableStore {
+    pub fn new(store: TransactionVersionStore) -> Self {
+        Self::admitted_at(store, 0)
+    }
+
+    /// A store whose first handle reads under `layout`, admitted before any
+    /// other handle of the transaction can reach the store
+    pub fn admitted_at(store: TransactionVersionStore, layout: u64) -> Self {
+        Self {
+            parent: store.parent_store.store_id,
+            store: std::sync::RwLock::new(store),
+            newest: AtomicU64::new(layout),
+            rows: AtomicU64::new(NO_ROWS),
+        }
+    }
+
+    /// Admits a handle that reads `store` under `layout`: the transaction's
+    /// rows must be held in that layout, and from now on no handle under an
+    /// older layout writes here
+    pub fn admit(&self, store: &VersionStore, layout: u64) -> Result<(), Error> {
+        // Raised before the rows are read; `admits_write` stores before it reads
+        self.newest.fetch_max(layout, Ordering::SeqCst);
+        let rows = self.rows.load(Ordering::SeqCst);
+        if store.store_id != self.parent || (rows != NO_ROWS && rows != layout) {
+            return Err(Error::SchemaChanged {
+                table: store.table_name.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The store held for writing; the layout of the rows it holds is
+    /// published to the admission when it is let go
+    pub fn write_store(&self) -> TxnStoreWrite<'_> {
+        TxnStoreWrite {
+            guard: self
+                .store
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            rows: &self.rows,
+        }
+    }
+
+    /// Whether a handle under `layout` may write, called with the store
+    /// held for writing: not once a newer handle was admitted. The rows
+    /// count as written under `layout` until the store is let go
+    pub fn admits_write(&self, layout: u64) -> bool {
+        // Stored before `newest` is read; `admit` raises it before it reads
+        self.rows.store(layout, Ordering::SeqCst);
+        self.newest.load(Ordering::SeqCst) <= layout
+    }
+}
+
+/// A transaction's store held for writing through `TxnTableStore`
+pub struct TxnStoreWrite<'a> {
+    guard: std::sync::RwLockWriteGuard<'a, TransactionVersionStore>,
+    rows: &'a AtomicU64,
+}
+
+impl std::ops::Deref for TxnStoreWrite<'_> {
+    type Target = TransactionVersionStore;
+
+    fn deref(&self) -> &TransactionVersionStore {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for TxnStoreWrite<'_> {
+    fn deref_mut(&mut self) -> &mut TransactionVersionStore {
+        &mut self.guard
+    }
+}
+
+impl Drop for TxnStoreWrite<'_> {
+    fn drop(&mut self) {
+        let held = self.guard.layout_bound().unwrap_or(NO_ROWS);
+        self.rows.store(held, Ordering::SeqCst);
+    }
+}
+
+impl std::ops::Deref for TxnTableStore {
+    type Target = std::sync::RwLock<TransactionVersionStore>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.store
+    }
 }
 
 impl TransactionVersionStore {
@@ -6492,7 +6589,6 @@ impl TransactionVersionStore {
             applied: Mutex::new(SmallVec::new()),
             bound: SmallVec::new(),
             writing: None,
-            newest_handle: 0,
         }
     }
 
@@ -6593,40 +6689,28 @@ impl TransactionVersionStore {
     /// Put adds or updates a row in the transaction's local store
     /// The layout of the handle about to write: the rows it writes derive
     /// from what it read under that layout
-    pub fn writing_under(&mut self, layout: u64) {
-        self.writing = Some(layout);
+    pub fn writing_under(&mut self, layout: u64, refused: bool) {
+        self.writing = Some((layout, refused));
     }
 
     /// A row written at `at`: the transaction is bound to the writing
     /// handle's layout, and to the oldest of them when handles under two
     /// layouts wrote, which the commit refuses if a change came between
     fn note_layout(&mut self, at: i64) -> Result<(), Error> {
-        let seen = self.writing.unwrap_or_else(|| self.parent_store.layout());
-        // A handle under a newer layout reads these rows as its own
-        if seen < self.newest_handle {
-            return Err(Error::SchemaChanged {
-                table: self.parent_store.table_name.to_string(),
-            });
-        }
+        let seen = match self.writing {
+            // A handle under a newer layout reads these rows as its own
+            Some((_, true)) => {
+                return Err(Error::SchemaChanged {
+                    table: self.parent_store.table_name.to_string(),
+                })
+            }
+            Some((layout, false)) => layout,
+            None => self.parent_store.layout(),
+        };
         match self.bound.iter_mut().find(|(layout, _)| *layout == seen) {
             Some((_, first)) => *first = (*first).min(at),
             None => self.bound.push((seen, at)),
         }
-        Ok(())
-    }
-
-    /// Admits a handle of this transaction that reads `store` under
-    /// `layout`: the transaction's rows must be held in that layout, and
-    /// from now on no handle under an older layout writes here
-    pub fn admit_handle(&mut self, store: &Arc<VersionStore>, layout: u64) -> Result<(), Error> {
-        if !Arc::ptr_eq(&self.parent_store, store)
-            || self.bound.iter().any(|(bound, _)| *bound != layout)
-        {
-            return Err(Error::SchemaChanged {
-                table: store.table_name.to_string(),
-            });
-        }
-        self.newest_handle = self.newest_handle.max(layout);
         Ok(())
     }
 

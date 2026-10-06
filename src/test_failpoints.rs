@@ -684,6 +684,23 @@ pub(crate) fn indexes_published() {
 }
 
 thread_local! {
+    static TXN_STORE_PUBLISHED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next table open has published a new
+/// transaction-local store and has not yet taken its handle's schema
+pub fn after_txn_store_published(hook: impl FnOnce() + 'static) {
+    TXN_STORE_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn txn_store_published() {
+    let hook = TXN_STORE_PUBLISHED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static COMPILE_SCHEMA_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 

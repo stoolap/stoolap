@@ -435,6 +435,81 @@ fn an_older_handle_of_a_transaction_does_not_write_under_a_newer_one() {
     }
 }
 
+/// A handle opened inside an update's setter, while the update reads the
+/// transaction's own rows, is admitted without waiting for that read
+#[test]
+fn a_handle_opened_inside_an_update_setter_does_not_wait_for_the_update() {
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use stoolap::storage::traits::Engine;
+        use stoolap::{Row, Value};
+        let db = Database::open("memory://compiled_positions_setter_open").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)", ())
+            .unwrap();
+        let tx = db.engine().begin_transaction().unwrap();
+        let mut table = tx.get_table("t").unwrap();
+        table
+            .insert(Row::from_values(vec![
+                Value::Integer(1),
+                Value::Integer(10),
+            ]))
+            .unwrap();
+        let updated = table.update_by_row_ids(&[1], &mut |row| {
+            tx.get_table("t")?;
+            Ok((row, true))
+        });
+        done.send(updated.map(|_| ())).unwrap();
+    });
+    let updated = finished
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the update finished");
+    updated.unwrap();
+}
+
+/// A transaction's first handle on a table takes its schema after the
+/// transaction's store is published: an older handle opened through that
+/// store meanwhile, then a column drop, leave the first handle newer
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_first_handle_newer_than_its_published_store_is_admitted() {
+    use std::cell::RefCell;
+    use stoolap::storage::traits::{Engine, Table};
+    use stoolap::{Row, Value};
+    let db = Database::open("memory://compiled_positions_first_handle").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, a INTEGER)",
+        (),
+    )
+    .unwrap();
+    let tx = Rc::new(db.engine().begin_transaction().unwrap());
+    let older: Rc<RefCell<Option<Box<dyn Table>>>> = Rc::new(RefCell::new(None));
+    let (hook_tx, hook_older, other) = (Rc::clone(&tx), Rc::clone(&older), db.clone());
+    stoolap::test_failpoints::after_txn_store_published(move || {
+        *hook_older.borrow_mut() = Some(hook_tx.get_table("t").unwrap());
+        other.execute("ALTER TABLE t DROP COLUMN x", ()).unwrap();
+    });
+    let newer = tx.get_table("t").unwrap();
+    let mut older = older.borrow_mut().take().expect("the older handle opened");
+    let wide = Row::from_values(vec![
+        Value::Integer(1),
+        Value::Integer(10),
+        Value::Integer(100),
+    ]);
+    match older.insert(wide) {
+        Err(Error::SchemaChanged { .. }) => {}
+        written => {
+            written.unwrap();
+            let rows: Vec<Vec<Value>> = newer
+                .collect_all_rows(None)
+                .unwrap()
+                .into_iter()
+                .map(|(_, row)| row.iter().cloned().collect())
+                .collect();
+            assert_eq!(rows, [vec![Value::Integer(1), Value::Integer(100)]]);
+        }
+    }
+}
+
 // --- A transaction's own rows after another session's column change -----
 
 fn local_rows_after_drop(dsn: &str) {
@@ -469,6 +544,26 @@ fn local_rows_after_drop(dsn: &str) {
             other => assert_eq!(other.unwrap(), expected, "{sql}"),
         }
     }
+}
+
+#[test]
+fn a_foreign_key_check_on_a_changed_parent_reports_the_change() {
+    let db = Database::open("memory://compiled_positions_fk_parent").unwrap();
+    for sql in [
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, x INTEGER)",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id))",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let other = db.clone();
+    let mut txn = other.begin().unwrap();
+    txn.execute("INSERT INTO p VALUES (1, 10)", ()).unwrap();
+    db.execute("ALTER TABLE p DROP COLUMN x", ()).unwrap();
+    let inserted = txn.execute("INSERT INTO c VALUES (1, 1)", ());
+    assert!(
+        matches!(inserted, Err(Error::SchemaChanged { .. })),
+        "{inserted:?}"
+    );
 }
 
 #[cfg(not(feature = "test-filedb"))]

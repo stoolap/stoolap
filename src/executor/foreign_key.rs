@@ -126,11 +126,12 @@ fn parent_row_exists(
 ) -> Result<bool> {
     let parent = engine
         .get_table_for_txn(txn_id, parent_table)
-        .map_err(|_| {
-            Error::internal(format!(
+        .map_err(|e| match e {
+            Error::TableNotFound(_) => Error::internal(format!(
                 "foreign key references non-existent table '{}'",
                 parent_table
-            ))
+            )),
+            e => e,
         })?;
     // The filter's positions come from the handle that reads the rows
     let parent_schema = parent.schema_arc();

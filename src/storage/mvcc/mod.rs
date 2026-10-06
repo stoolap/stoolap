@@ -74,7 +74,7 @@ pub use transaction::{
 };
 pub use version_store::{
     clear_version_map_pools, AggregateOp, AggregateResult, RowVersion, SealedIndexCleanup,
-    TransactionVersionStore, VersionStore, VisibilityChecker, WriteSetEntry,
+    TransactionVersionStore, TxnTableStore, VersionStore, VisibilityChecker, WriteSetEntry,
 };
 pub use wal_manager::{
     CheckpointMetadata, WALEntry, WALManager, WALOperationType, DEFAULT_WAL_BUFFER_SIZE,
