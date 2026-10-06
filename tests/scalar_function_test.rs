@@ -327,6 +327,36 @@ fn test_mod_function() {
     assert_eq!(result, 1, "MOD function failed");
 }
 
+#[test]
+fn test_mod_function_float() {
+    let db = Database::open("memory://scalar_mod_float").expect("Failed to create database");
+
+    db.execute("CREATE TABLE mod_float (id INTEGER, a FLOAT)", ())
+        .expect("Failed to create table");
+    db.execute("INSERT INTO mod_float VALUES (1, -7.5)", ())
+        .expect("Failed to insert");
+
+    // Same result as the % operator, not the remainder of truncated operands
+    let result: f64 = db
+        .query_one("SELECT MOD(a, 2) FROM mod_float WHERE id = 1", ())
+        .expect("Failed to query");
+    assert_eq!(result, -1.5, "MOD lost the fractional part");
+
+    let result: f64 = db
+        .query_one("SELECT MOD(7, 2.5) FROM mod_float WHERE id = 1", ())
+        .expect("Failed to query");
+    assert_eq!(result, 2.0, "MOD truncated a float divisor");
+
+    // Integers keep the exact integer path
+    let result: i64 = db
+        .query_one(
+            "SELECT MOD(9007199254740993, 10) FROM mod_float WHERE id = 1",
+            (),
+        )
+        .expect("Failed to query");
+    assert_eq!(result, 3, "MOD went through f64 for integers");
+}
+
 // IFNULL / NULLIF functions
 
 #[test]
