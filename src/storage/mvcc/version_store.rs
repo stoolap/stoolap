@@ -588,15 +588,11 @@ impl Drop for PublishGuard {
 #[derive(Default)]
 pub struct PublishHold {
     guards: SmallVec<[PublishGuard; 4]>,
-    stores: SmallVec<[Arc<std::sync::RwLock<TransactionVersionStore>>; 4]>,
+    stores: SmallVec<[Arc<TxnTableStore>; 4]>,
 }
 
 impl PublishHold {
-    pub fn add(
-        &mut self,
-        version_store: &Arc<VersionStore>,
-        txn_store: Arc<std::sync::RwLock<TransactionVersionStore>>,
-    ) {
+    pub fn add(&mut self, version_store: &Arc<VersionStore>, txn_store: Arc<TxnTableStore>) {
         self.guards.push(version_store.begin_publish());
         self.stores.push(txn_store);
     }
@@ -725,7 +721,20 @@ pub struct VersionStore {
     /// The position of a column dropped from the schema whose cells the
     /// rows still carry, until the drop is durable and the rows follow
     pending_cut: Mutex<Option<usize>>,
+    /// This store's number, from `NEXT_STORE_ID`
+    store_id: u64,
 }
+
+/// The table instance and row layout a column position was resolved for:
+/// valid only while both are still what the rows are held in
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayoutToken {
+    store: u64,
+    layout: u64,
+}
+
+/// Issues each version store a number no other store in the process takes
+static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
 
 impl VersionStore {
     /// Creates a new version store
@@ -765,6 +774,7 @@ impl VersionStore {
             publish_epoch: AtomicU64::new(0),
             layout: AtomicU64::new(0),
             pending_cut: Mutex::new(None),
+            store_id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -797,6 +807,7 @@ impl VersionStore {
             publish_epoch: AtomicU64::new(0),
             layout: AtomicU64::new(0),
             pending_cut: Mutex::new(None),
+            store_id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -929,6 +940,31 @@ impl VersionStore {
     /// The layout the rows are held in, moved by every column added or dropped
     pub fn layout(&self) -> u64 {
         self.layout.load(Ordering::Acquire)
+    }
+
+    /// The schema and the token its positions are valid against, read together
+    pub fn schema_and_token(&self) -> (CompactArc<Schema>, LayoutToken) {
+        let (schema, layout) = self.schema_and_layout();
+        (schema, self.token_for(layout))
+    }
+
+    /// The token for `layout` of this store
+    pub fn token_for(&self, layout: u64) -> LayoutToken {
+        LayoutToken {
+            store: self.store_id,
+            layout,
+        }
+    }
+
+    /// Positions resolved under `token` read this store's rows only while
+    /// the store is open and its rows are still in that layout
+    pub fn check_token(&self, token: LayoutToken) -> Result<(), Error> {
+        if self.closed.load(Ordering::Acquire) || token != self.token_for(self.layout()) {
+            return Err(Error::SchemaChanged {
+                table: self.table_name.to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Adds `column` to the schema. The rows follow at `lay_out_rows`, once
@@ -6429,8 +6465,119 @@ pub struct TransactionVersionStore {
     /// the time of its first row, so a rollback to a savepoint keeps the
     /// layouts of the rows that survive it
     bound: SmallVec<[(u64, i64); 2]>,
-    /// The layout of the handle about to write, for the row it writes
-    writing: Option<u64>,
+    /// The layout of the handle about to write, for the row it writes, and
+    /// whether that handle is older than one admitted since
+    writing: Option<(u64, bool)>,
+}
+
+/// No row of the transaction is held yet
+const NO_ROWS: u64 = u64::MAX;
+
+/// A transaction's local store for one table, with the admission of the
+/// handles that read it, which takes no lock of the store
+pub struct TxnTableStore {
+    store: std::sync::RwLock<TransactionVersionStore>,
+    /// The newest layout a handle was admitted under
+    newest: AtomicU64,
+    /// The layout the transaction's rows are written under, or `NO_ROWS`
+    rows: AtomicU64,
+    parent: u64,
+}
+
+impl TxnTableStore {
+    pub fn new(store: TransactionVersionStore) -> Self {
+        Self::admitted_at(store, 0)
+    }
+
+    /// A store whose first handle reads under `layout`, admitted before any
+    /// other handle of the transaction can reach the store
+    pub fn admitted_at(store: TransactionVersionStore, layout: u64) -> Self {
+        Self {
+            parent: store.parent_store.store_id,
+            rows: AtomicU64::new(store.layout_bound().unwrap_or(NO_ROWS)),
+            store: std::sync::RwLock::new(store),
+            newest: AtomicU64::new(layout),
+        }
+    }
+
+    /// The store held for reading
+    pub fn read(
+        &self,
+    ) -> std::sync::LockResult<std::sync::RwLockReadGuard<'_, TransactionVersionStore>> {
+        self.store.read()
+    }
+
+    /// Admits a handle that reads `store` under `layout`: the transaction's
+    /// rows must be held in that layout, and from now on no handle under an
+    /// older layout writes here
+    pub fn admit(&self, store: &VersionStore, layout: u64) -> Result<(), Error> {
+        // Raised before the rows are read; `admits_write` stores before it reads
+        self.newest.fetch_max(layout, Ordering::SeqCst);
+        let rows = self.rows.load(Ordering::SeqCst);
+        if store.store_id != self.parent || (rows != NO_ROWS && rows != layout) {
+            return Err(Error::SchemaChanged {
+                table: store.table_name.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The store held for work that writes no row, as a commit or a
+    /// rollback; the layout of the rows it holds is published when let go
+    pub fn write_store(&self) -> TxnStoreWrite<'_> {
+        TxnStoreWrite {
+            guard: self
+                .store
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            rows: &self.rows,
+        }
+    }
+
+    /// The store held for a handle under `layout` to write rows: refused
+    /// when the store holds rows under another layout, or once a newer
+    /// handle was admitted. Accepted rows count as written under `layout`
+    /// until the store is let go
+    pub fn write_for(&self, layout: u64) -> TxnStoreWrite<'_> {
+        let mut store = self.write_store();
+        let refused = match store.layout_bound() {
+            Some(held) if held != layout => true,
+            _ => {
+                // Stored before `newest` is read; `admit` raises it before it reads
+                self.rows.store(layout, Ordering::SeqCst);
+                self.newest.load(Ordering::SeqCst) > layout
+            }
+        };
+        store.writing_under(layout, refused);
+        store
+    }
+}
+
+/// A transaction's store held for writing through `TxnTableStore`
+pub struct TxnStoreWrite<'a> {
+    guard: std::sync::RwLockWriteGuard<'a, TransactionVersionStore>,
+    rows: &'a AtomicU64,
+}
+
+impl std::ops::Deref for TxnStoreWrite<'_> {
+    type Target = TransactionVersionStore;
+
+    fn deref(&self) -> &TransactionVersionStore {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for TxnStoreWrite<'_> {
+    fn deref_mut(&mut self) -> &mut TransactionVersionStore {
+        &mut self.guard
+    }
+}
+
+impl Drop for TxnStoreWrite<'_> {
+    fn drop(&mut self) {
+        let held = self.guard.layout_bound().unwrap_or(NO_ROWS);
+        self.rows.store(held, Ordering::SeqCst);
+    }
 }
 
 impl TransactionVersionStore {
@@ -6550,19 +6697,29 @@ impl TransactionVersionStore {
     /// Put adds or updates a row in the transaction's local store
     /// The layout of the handle about to write: the rows it writes derive
     /// from what it read under that layout
-    pub fn writing_under(&mut self, layout: u64) {
-        self.writing = Some(layout);
+    pub fn writing_under(&mut self, layout: u64, refused: bool) {
+        self.writing = Some((layout, refused));
     }
 
     /// A row written at `at`: the transaction is bound to the writing
     /// handle's layout, and to the oldest of them when handles under two
     /// layouts wrote, which the commit refuses if a change came between
-    fn note_layout(&mut self, at: i64) {
-        let seen = self.writing.unwrap_or_else(|| self.parent_store.layout());
+    fn note_layout(&mut self, at: i64) -> Result<(), Error> {
+        let seen = match self.writing {
+            // A handle under a newer layout reads these rows as its own
+            Some((_, true)) => {
+                return Err(Error::SchemaChanged {
+                    table: self.parent_store.table_name.to_string(),
+                })
+            }
+            Some((layout, false)) => layout,
+            None => self.parent_store.layout(),
+        };
         match self.bound.iter_mut().find(|(layout, _)| *layout == seen) {
             Some((_, first)) => *first = (*first).min(at),
             None => self.bound.push((seen, at)),
         }
+        Ok(())
     }
 
     /// The oldest layout the transaction's surviving rows were written under
@@ -6578,7 +6735,7 @@ impl TransactionVersionStore {
 
         // Get timestamp once at the start (avoids calling SystemTime::now() inside RowVersion::new)
         let timestamp = get_fast_timestamp();
-        self.note_layout(timestamp);
+        self.note_layout(timestamp)?;
 
         // Create the row version with pre-computed timestamp
         let mut rv = RowVersion::new_with_timestamp(self.txn_id, data, timestamp);
@@ -6683,7 +6840,7 @@ impl TransactionVersionStore {
 
         // Get timestamp once at the start (avoids calling SystemTime::now() inside RowVersion::new)
         let timestamp = get_fast_timestamp();
-        self.note_layout(timestamp);
+        self.note_layout(timestamp)?;
 
         // Create the new row version with pre-computed timestamp
         let mut rv = RowVersion::new_with_timestamp(self.txn_id, data, timestamp);
@@ -6752,7 +6909,7 @@ impl TransactionVersionStore {
             return Ok(());
         }
         let now = get_fast_timestamp();
-        self.note_layout(now);
+        self.note_layout(now)?;
 
         for (row_id, data, original_version) in rows {
             // Convert to Shared (Arc) storage immediately for efficient Arc sharing
@@ -6817,7 +6974,7 @@ impl TransactionVersionStore {
         }
         // Get timestamp once for all rows in the batch
         let timestamp = get_fast_timestamp();
-        self.note_layout(timestamp);
+        self.note_layout(timestamp)?;
 
         for (row_id, data) in rows {
             // Check if we already have a local version
@@ -6889,7 +7046,7 @@ impl TransactionVersionStore {
         }
         // Get timestamp once for all rows in the batch
         let timestamp = get_fast_timestamp();
-        self.note_layout(timestamp);
+        self.note_layout(timestamp)?;
 
         for (row_id, data, original_version) in rows {
             // Create deleted row version with pre-computed timestamp
@@ -8193,6 +8350,34 @@ mod tests {
 
     fn test_schema() -> Schema {
         SchemaBuilder::new("test_table").build()
+    }
+
+    /// The layout admission sees is the one the transaction's rows are held
+    /// in, whatever handle holds the store: a handle under another layout
+    /// that takes it, as a commit does, and a store filled before its cell
+    #[test]
+    fn admission_sees_the_layout_the_rows_are_held_in() {
+        let store = Arc::new(VersionStore::new("t".to_string(), test_schema()));
+        let cell = TxnTableStore::new(TransactionVersionStore::new(Arc::clone(&store), 1));
+        cell.write_for(0)
+            .put(1, Row::from(vec![Value::from(1i64)]), false)
+            .unwrap();
+        let newer = cell.write_for(1);
+        assert!(cell.admit(&store, 1).is_err(), "held by a newer handle");
+        drop(newer);
+        let settling = cell.write_store();
+        assert!(
+            cell.admit(&store, 1).is_err(),
+            "held to commit or roll back"
+        );
+        drop(settling);
+
+        let mut filled = TransactionVersionStore::new(Arc::clone(&store), 2);
+        filled
+            .put(2, Row::from(vec![Value::from(2i64)]), false)
+            .unwrap();
+        let cell = TxnTableStore::new(filled);
+        assert!(cell.admit(&store, 1).is_err(), "filled before its cell");
     }
 
     #[test]

@@ -18,7 +18,7 @@
 //!
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use crate::common::{CompactArc, I64Set};
 use crate::core::{
@@ -29,7 +29,9 @@ use crate::storage::expression::Expression;
 use crate::storage::index::id_list::GroupIds;
 use crate::storage::index::{BTreeIndex, BitmapIndex, HashIndex, HnswIndex, MultiColumnIndex};
 use crate::storage::mvcc::scanner::MVCCScanner;
-use crate::storage::mvcc::{TransactionVersionStore, VersionStore};
+use crate::storage::mvcc::version_store::LayoutToken;
+use crate::storage::mvcc::version_store::TxnStoreWrite;
+use crate::storage::mvcc::{TransactionVersionStore, TxnTableStore, VersionStore};
 use crate::storage::traits::{Index, QueryResult, ScanPlan, Scanner, Table};
 use crate::storage::MemoryResult;
 
@@ -40,7 +42,7 @@ pub struct MVCCTable {
     /// Reference to the version store
     version_store: Arc<VersionStore>,
     /// Transaction-local version store (shared between multiple MVCCTable instances for same txn+table)
-    txn_versions: Arc<RwLock<TransactionVersionStore>>,
+    txn_versions: Arc<TxnTableStore>,
     /// Cached schema for returning references (Arc clone from version_store - O(1) instead of cloning)
     cached_schema: CompactArc<Schema>,
     /// The rows' layout when the cached schema was taken: what the rows
@@ -101,7 +103,7 @@ pub(crate) fn pk_equality_id(expr: &dyn Expression, schema: &Schema) -> Option<i
 
 impl MVCCTable {
     /// Creates a new MVCC table with an owned transaction version store
-    /// (wraps it in Arc<RwLock> internally)
+    /// (wraps it in a shared `TxnTableStore` internally)
     pub fn new(
         txn_id: i64,
         version_store: Arc<VersionStore>,
@@ -112,7 +114,7 @@ impl MVCCTable {
         Self {
             txn_id,
             version_store,
-            txn_versions: Arc::new(RwLock::new(txn_versions)),
+            txn_versions: Arc::new(TxnTableStore::new(txn_versions)),
             #[cfg(test)]
             full_scans: std::sync::atomic::AtomicU64::new(0),
             cached_schema,
@@ -125,7 +127,7 @@ impl MVCCTable {
     pub fn new_with_shared_store(
         txn_id: i64,
         version_store: Arc<VersionStore>,
-        txn_versions: Arc<RwLock<TransactionVersionStore>>,
+        txn_versions: Arc<TxnTableStore>,
     ) -> Self {
         // CompactArc clone - O(1) reference count increment, not full schema clone
         let (cached_schema, layout) = version_store.schema_and_layout();
@@ -145,6 +147,17 @@ impl MVCCTable {
         self.txn_id
     }
 
+    /// Admits this handle to the transaction's rows it shares with earlier
+    /// handles: they must be held in the layout this handle reads with
+    pub(crate) fn admit_local_rows(&self) -> Result<()> {
+        self.txn_versions.admit(&self.version_store, self.layout)
+    }
+
+    /// The layout this handle reads with
+    pub(crate) fn layout(&self) -> u64 {
+        self.layout
+    }
+
     /// The schema as the store holds it now, and the layout that goes with
     /// it: what a handle takes after changing the columns itself
     fn take_schema(&mut self) {
@@ -153,10 +166,8 @@ impl MVCCTable {
 
     /// The transaction's local store for a write: the rows it writes now
     /// are laid out as this handle's schema says
-    fn writes(&self) -> std::sync::RwLockWriteGuard<'_, TransactionVersionStore> {
-        let mut store = self.txn_versions.write().unwrap();
-        store.writing_under(self.layout);
-        store
+    fn writes(&self) -> TxnStoreWrite<'_> {
+        self.txn_versions.write_for(self.layout)
     }
 
     /// Returns a reference to the version store
@@ -165,7 +176,7 @@ impl MVCCTable {
     }
 
     /// Returns a reference to the shared transaction version store
-    pub fn txn_versions(&self) -> &Arc<RwLock<TransactionVersionStore>> {
+    pub fn txn_versions(&self) -> &Arc<TxnTableStore> {
         &self.txn_versions
     }
 
@@ -1663,7 +1674,7 @@ impl MVCCTable {
         };
 
         // Commit versions to the version store (this also updates indexes)
-        self.writes().commit()?;
+        self.txn_versions.write_store().commit()?;
 
         // Mark zone maps as stale if we had any data changes
         // This ensures the optimizer won't use outdated pruning info
@@ -1676,7 +1687,7 @@ impl MVCCTable {
 
     /// Rolls back the transaction's local changes
     pub fn rollback(&mut self) {
-        self.writes().rollback();
+        self.txn_versions.write_store().rollback();
     }
 
     /// Returns the row count visible to this transaction
@@ -2118,6 +2129,14 @@ impl Table for MVCCTable {
 
     fn txn_id(&self) -> i64 {
         self.txn_id
+    }
+
+    fn layout_token(&self) -> LayoutToken {
+        self.version_store.token_for(self.layout)
+    }
+
+    fn schema_arc(&self) -> CompactArc<Schema> {
+        self.cached_schema.clone()
     }
 
     /// Fetch rows by their IDs, applying filter
@@ -3187,7 +3206,7 @@ impl Table for MVCCTable {
 
     fn close(&mut self) -> Result<()> {
         // Rollback any uncommitted changes
-        self.writes().rollback();
+        self.txn_versions.write_store().rollback();
         Ok(())
     }
 
@@ -3197,11 +3216,12 @@ impl Table for MVCCTable {
     }
 
     fn rollback(&mut self) {
-        self.writes().rollback();
+        self.txn_versions.write_store().rollback();
     }
 
     fn rollback_to_timestamp_with_pending(&self, timestamp: i64, pending: &[i64]) {
-        self.writes()
+        self.txn_versions
+            .write_store()
             .rollback_to_timestamp_with_pending(timestamp, pending);
     }
 

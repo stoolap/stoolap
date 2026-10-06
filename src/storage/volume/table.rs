@@ -28,13 +28,13 @@
 
 use std::sync::Arc;
 
-use crate::common::I64Set;
+use crate::common::{CompactArc, I64Set};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::core::{DataType, IndexType, Result, Row, RowVec, Schema, Value, ValueMap, ValueSet};
 use crate::storage::expression::Expression;
 use crate::storage::index::id_list::GroupIds;
-use crate::storage::mvcc::version_store::{AggregateOp, GroupedAggregateResult};
+use crate::storage::mvcc::version_store::{AggregateOp, GroupedAggregateResult, LayoutToken};
 use crate::storage::traits::table::ScanPlan;
 use crate::storage::traits::{CapturedGroups, Index, QueryResult, Scanner, Table};
 
@@ -2694,6 +2694,14 @@ impl Table for SegmentedTable {
 
     fn schema(&self) -> &Schema {
         self.hot.schema()
+    }
+
+    fn layout_token(&self) -> LayoutToken {
+        self.hot.layout_token()
+    }
+
+    fn schema_arc(&self) -> CompactArc<Schema> {
+        self.hot.schema_arc()
     }
 
     fn txn_id(&self) -> i64 {
@@ -8064,6 +8072,12 @@ mod tests {
         }
         fn txn_id(&self) -> i64 {
             1
+        }
+        fn layout_token(&self) -> LayoutToken {
+            unreachable!("the mock hot table is read directly")
+        }
+        fn schema_arc(&self) -> CompactArc<Schema> {
+            unreachable!("the mock hot table is read directly")
         }
         fn create_column(&mut self, _: &str, _: DataType, _: bool) -> Result<()> {
             Ok(())

@@ -28,6 +28,7 @@ use crate::common::{CompactArc, SmartString};
 use crate::core::{Result, Row, Schema, Value};
 use crate::parser::ast::{DeleteStatement, Expression, UpdateStatement};
 use crate::storage::expression::{ComparisonExpr, Expression as StorageExpression};
+use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::traits::{Engine, QueryResult};
 
 use super::context::{
@@ -35,8 +36,8 @@ use super::context::{
     invalidate_semi_join_cache_for_table, ExecutionContext,
 };
 use super::query_cache::{
-    CompiledExecution, CompiledPkDelete, CompiledPkUpdate, CompiledUpdateColumn, PkValueSource,
-    UpdateValueSource,
+    check_compiled_token, or_normal_path, CompiledExecution, CompiledPkDelete, CompiledPkUpdate,
+    CompiledUpdateColumn, PkValueSource, UpdateValueSource,
 };
 use super::result::ExecResult;
 use super::Executor;
@@ -70,7 +71,11 @@ impl Executor {
                         // Fast path: extract PK value and execute
                         let pk_value =
                             self.extract_pk_value_from_source(&update.pk_value_source, ctx)?;
-                        return Some(self.execute_compiled_pk_update(update, pk_value, ctx));
+                        #[cfg(feature = "test-failpoints")]
+                        crate::test_failpoints::compiled_epoch_checked();
+                        return or_normal_path(
+                            self.execute_compiled_pk_update(update, pk_value, ctx),
+                        );
                     }
                     // Epoch changed - fall through to recompile
                 }
@@ -111,7 +116,9 @@ impl Executor {
                         // Fast path: extract PK value and execute
                         let pk_value =
                             self.extract_pk_value_from_source(&delete.pk_value_source, ctx)?;
-                        return Some(self.execute_compiled_pk_delete(delete, pk_value));
+                        #[cfg(feature = "test-failpoints")]
+                        crate::test_failpoints::compiled_epoch_checked();
+                        return or_normal_path(self.execute_compiled_pk_delete(delete, pk_value));
                     }
                     // Epoch changed - fall through to recompile
                 }
@@ -316,13 +323,15 @@ impl Executor {
                     let table_name = update.table_name.clone();
                     let pk_column_name = update.pk_column_name.clone();
                     let schema = update.schema.clone();
+                    let token = update.token;
                     drop(compiled_guard);
                     // Expression sources bail above, so no row programs
                     // and no parameters are needed here
-                    return Some(self.execute_pk_update_minimal(
+                    return or_normal_path(self.execute_pk_update_minimal(
                         &table_name,
                         &pk_column_name,
                         &schema,
+                        token,
                         pk_value,
                         updates,
                         &[],
@@ -356,11 +365,13 @@ impl Executor {
                     let table_name = delete.table_name.clone();
                     let pk_column_name = delete.pk_column_name.clone();
                     let schema = delete.schema.clone();
+                    let token = delete.token;
                     drop(compiled_guard);
-                    return Some(self.execute_pk_delete_minimal(
+                    return or_normal_path(self.execute_pk_delete_minimal(
                         &table_name,
                         &pk_column_name,
                         &schema,
+                        token,
                         pk_value,
                     ));
                 }
@@ -378,6 +389,7 @@ impl Executor {
         table_name: &str,
         pk_column_name: &str,
         schema: &CompactArc<Schema>,
+        token: LayoutToken,
         pk_value: i64,
         updates: Vec<(usize, Value)>,
         expr_updates: &[(
@@ -391,6 +403,7 @@ impl Executor {
         // Create auto-commit transaction
         let tx = self.engine.begin_transaction()?;
         let mut table = tx.get_table(table_name)?;
+        check_compiled_token(table.as_ref(), token)?;
 
         // Build WHERE expression for PK lookup
         let mut pk_expr = ComparisonExpr::new(
@@ -465,11 +478,13 @@ impl Executor {
         table_name: &str,
         pk_column_name: &str,
         schema: &CompactArc<Schema>,
+        token: LayoutToken,
         pk_value: i64,
     ) -> Result<Box<dyn QueryResult>> {
         // Create auto-commit transaction
         let tx = self.engine.begin_transaction()?;
         let mut table = tx.get_table(table_name)?;
+        check_compiled_token(table.as_ref(), token)?;
 
         // Build WHERE expression for PK lookup
         let mut pk_expr = ComparisonExpr::new(
@@ -559,6 +574,7 @@ impl Executor {
             &compiled.table_name,
             &compiled.pk_column_name,
             &compiled.schema,
+            compiled.token,
             pk_value,
             updates,
             &expr_updates,
@@ -576,6 +592,7 @@ impl Executor {
             &compiled.table_name,
             &compiled.pk_column_name,
             &compiled.schema,
+            compiled.token,
             pk_value,
         )
     }
@@ -602,11 +619,15 @@ impl Executor {
             CompiledExecution::NotOptimizable(epoch) if self.engine.schema_epoch() == *epoch => {
                 return None
             }
-            CompiledExecution::PkUpdate(update) => {
+            CompiledExecution::PkUpdate(update)
+                if self.engine.schema_epoch() == update.cached_epoch =>
+            {
                 let pk_value = self.extract_pk_value_from_source(&update.pk_value_source, ctx)?;
-                return Some(self.execute_compiled_pk_update(update, pk_value, ctx));
+                return or_normal_path(self.execute_compiled_pk_update(update, pk_value, ctx));
             }
-            CompiledExecution::NotOptimizable(_) | CompiledExecution::Unknown => {} // Epoch changed or first run - recompile
+            CompiledExecution::PkUpdate(_)
+            | CompiledExecution::NotOptimizable(_)
+            | CompiledExecution::Unknown => {} // Epoch changed or first run - recompile
             _ => return None,
         }
 
@@ -618,13 +639,17 @@ impl Executor {
         }
 
         let table_name = &stmt.table_name.value_lower;
-        let schema = match self.engine.get_table_schema(table_name) {
-            Ok(s) => s,
+        // Read before the schema: a change in between leaves this epoch behind
+        let cached_epoch = self.engine.schema_epoch();
+        let (schema, token) = match self.engine.get_version_store(table_name) {
+            Ok(store) => store.schema_and_token(),
             Err(_) => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
                 return None;
             }
         };
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::compile_schema_read();
 
         let pk_indices = schema.primary_key_indices();
         if pk_indices.len() != 1 {
@@ -720,14 +745,15 @@ impl Executor {
             pk_column_name: SmartString::new(pk_column),
             pk_value_source: pk_source,
             updates: compiled_updates,
-            cached_epoch: self.engine.schema_epoch(),
+            cached_epoch,
+            token,
         };
 
         *compiled_guard = CompiledExecution::PkUpdate(compiled_update.clone());
         drop(compiled_guard);
 
         // Execute
-        Some(self.execute_compiled_pk_update(&compiled_update, pk_value, ctx))
+        or_normal_path(self.execute_compiled_pk_update(&compiled_update, pk_value, ctx))
     }
 
     /// Compile and execute a PK delete, caching the compiled state
@@ -748,11 +774,15 @@ impl Executor {
             CompiledExecution::NotOptimizable(epoch) if self.engine.schema_epoch() == *epoch => {
                 return None
             }
-            CompiledExecution::PkDelete(delete) => {
+            CompiledExecution::PkDelete(delete)
+                if self.engine.schema_epoch() == delete.cached_epoch =>
+            {
                 let pk_value = self.extract_pk_value_from_source(&delete.pk_value_source, ctx)?;
-                return Some(self.execute_compiled_pk_delete(delete, pk_value));
+                return or_normal_path(self.execute_compiled_pk_delete(delete, pk_value));
             }
-            CompiledExecution::NotOptimizable(_) | CompiledExecution::Unknown => {} // Epoch changed or first run - recompile
+            CompiledExecution::PkDelete(_)
+            | CompiledExecution::NotOptimizable(_)
+            | CompiledExecution::Unknown => {} // Epoch changed or first run - recompile
             _ => return None,
         }
 
@@ -764,8 +794,10 @@ impl Executor {
         }
 
         let table_name = &stmt.table_name.value_lower;
-        let schema = match self.engine.get_table_schema(table_name) {
-            Ok(s) => s,
+        // Read before the schema: a change in between leaves this epoch behind
+        let cached_epoch = self.engine.schema_epoch();
+        let (schema, token) = match self.engine.get_version_store(table_name) {
+            Ok(store) => store.schema_and_token(),
             Err(_) => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
                 return None;
@@ -802,14 +834,15 @@ impl Executor {
             schema: CompactArc::new((*schema).clone()),
             pk_column_name: SmartString::new(pk_column),
             pk_value_source: pk_source,
-            cached_epoch: self.engine.schema_epoch(),
+            cached_epoch,
+            token,
         };
 
         *compiled_guard = CompiledExecution::PkDelete(compiled_delete.clone());
         drop(compiled_guard);
 
         // Execute
-        Some(self.execute_compiled_pk_delete(&compiled_delete, pk_value))
+        or_normal_path(self.execute_compiled_pk_delete(&compiled_delete, pk_value))
     }
 
     /// Extract value source (literal or parameter) from expression

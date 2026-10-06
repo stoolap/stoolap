@@ -50,13 +50,13 @@ use crate::storage::mvcc::wal_manager::WALOperationType;
 use crate::storage::mvcc::VisibilityChecker;
 use crate::storage::mvcc::{
     MVCCTable, MvccTransaction, PersistenceManager, PkIndex, RowVersion, SealFenceGuard,
-    TransactionEngineOperations, TransactionRegistry, TransactionVersionStore, VersionStore,
-    INVALID_TRANSACTION_ID,
+    TransactionEngineOperations, TransactionRegistry, TransactionVersionStore, TxnTableStore,
+    VersionStore, INVALID_TRANSACTION_ID,
 };
 use crate::storage::traits::{Engine, Index, Table, Transaction};
 
 /// Type alias for a single table entry in the transaction version store
-type TxnTableEntry = (SmartString, Arc<RwLock<TransactionVersionStore>>);
+type TxnTableEntry = (SmartString, Arc<TxnTableStore>);
 
 /// Type alias for the transaction version store map
 /// Structured as txn_id -> [(table_name, store)] for efficient lookup per transaction
@@ -7884,7 +7884,12 @@ impl Engine for MVCCEngine {
         Ok(())
     }
 
-    fn fetch_rows_by_ids(&self, table_name: &str, row_ids: &[i64]) -> Result<crate::core::RowVec> {
+    fn fetch_rows_by_ids(
+        &self,
+        table_name: &str,
+        row_ids: &[i64],
+        token: crate::storage::mvcc::version_store::LayoutToken,
+    ) -> Result<crate::core::RowVec> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -7895,9 +7900,11 @@ impl Engine for MVCCEngine {
 
         // Fall back to cold segments for rows not found in hot
         if result.len() < row_ids.len() {
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::pk_hot_rows_fetched();
+            let schema = store.schema();
             let mgr = self.get_or_create_segment_manager(table_name);
             if mgr.has_segments() {
-                let schema = store.schema().clone();
                 let found_ids: rustc_hash::FxHashSet<i64> =
                     result.iter().map(|(id, _)| *id).collect();
                 for &rid in row_ids {
@@ -7908,7 +7915,16 @@ impl Engine for MVCCEngine {
                     }
                 }
             }
+            // The manager was found by name: the table under it must still
+            // be the store the schema came from
+            if !Arc::ptr_eq(&self.get_version_store(table_name)?, &store) {
+                return Err(Error::SchemaChanged {
+                    table: table_name.to_string(),
+                });
+            }
         }
+        // The rows were captured in the layout the caller resolved for
+        store.check_token(token)?;
         Ok(result)
     }
 }
@@ -8149,7 +8165,7 @@ impl EngineOperations {
     fn validate_pending_against_cold(
         &self,
         txn_id: i64,
-        txn_store: &Arc<RwLock<TransactionVersionStore>>,
+        txn_store: &Arc<TxnTableStore>,
         version_store: &Arc<VersionStore>,
         mgr: &Arc<crate::storage::volume::manifest::SegmentManager>,
     ) -> Result<()> {
@@ -8371,8 +8387,10 @@ impl TransactionEngineOperations for EngineOperations {
             .ok_or_else(|| Error::TableNotFound(table_name_lower.to_string()))?;
         drop(stores);
 
-        // Check if we have a cached transaction version store for this (txn_id, table_name)
-        let txn_versions = {
+        // Check if we have a cached transaction version store for this
+        // (txn_id, table_name); a new one comes admitted at the layout read
+        // before any other handle of the transaction can reach it
+        let (txn_versions, admitted) = {
             let cache = self.txn_version_stores().read().unwrap();
             let found = if let Some(txn_tables) = cache.get(txn_id) {
                 // Linear search on SmallVec (fast for 1-2 tables)
@@ -8386,7 +8404,7 @@ impl TransactionEngineOperations for EngineOperations {
             drop(cache);
 
             if let Some(cached) = found {
-                cached
+                (cached, None)
             } else {
                 // Upgrade to write lock and re-check (another thread may have inserted)
                 let mut cache = self.txn_version_stores().write().unwrap();
@@ -8395,19 +8413,29 @@ impl TransactionEngineOperations for EngineOperations {
                     .iter()
                     .find(|(name, _)| name == &*table_name_lower)
                 {
-                    Arc::clone(cached)
+                    (Arc::clone(cached), None)
                 } else {
-                    let new_store = Arc::new(RwLock::new(TransactionVersionStore::new(
-                        Arc::clone(&version_store),
-                        txn_id,
-                    )));
+                    let layout = version_store.layout();
+                    let new_store = Arc::new(TxnTableStore::admitted_at(
+                        TransactionVersionStore::new(Arc::clone(&version_store), txn_id),
+                        layout,
+                    ));
                     txn_tables.push((
                         table_name_lower.clone().into_owned().into(),
                         Arc::clone(&new_store),
                     ));
-                    new_store
+                    (new_store, Some(layout))
                 }
             }
+        };
+        #[cfg(feature = "test-failpoints")]
+        if admitted.is_some() {
+            crate::test_failpoints::txn_store_published();
+        }
+        // A handle under the admitted layout needs no admission of its own
+        let admit = |table: &MVCCTable| match admitted {
+            Some(layout) if layout == table.layout() => Ok(()),
+            _ => table.admit_local_rows(),
         };
 
         // A persistent database may seal rows at any moment, so its tables
@@ -8427,16 +8455,17 @@ impl TransactionEngineOperations for EngineOperations {
             match mgrs.get(&*table_name_lower) {
                 Some(mgr) if mgr.has_segments() => Arc::clone(mgr),
                 _ => {
-                    return Ok(Box::new(MVCCTable::new_with_shared_store(
-                        txn_id,
-                        version_store,
-                        txn_versions,
-                    )))
+                    drop(mgrs);
+                    let table =
+                        MVCCTable::new_with_shared_store(txn_id, version_store, txn_versions);
+                    admit(&table)?;
+                    return Ok(Box::new(table));
                 }
             }
         };
         let schema_generation = mgr.schema_generation();
         let table = MVCCTable::new_with_shared_store(txn_id, version_store, txn_versions);
+        admit(&table)?;
         mgr.check_schema_generation(schema_generation)?;
         let snapshot_seq = (self.registry.get_isolation_level(txn_id)
             == crate::IsolationLevel::SnapshotIsolation)
@@ -8795,7 +8824,7 @@ impl TransactionEngineOperations for EngineOperations {
         // a write lock on txn_version_stores) during potentially slow WAL writes.
         let tables_to_commit: Vec<(
             crate::common::SmartString,
-            Arc<RwLock<TransactionVersionStore>>,
+            Arc<TxnTableStore>,
             Arc<VersionStore>,
         )>;
         {
@@ -9080,20 +9109,16 @@ impl TransactionEngineOperations for EngineOperations {
 
     fn rollback_dml_after(&self, txn_id: i64, timestamp: i64) {
         let cache = self.txn_version_stores().read().unwrap();
-        let touched: smallvec::SmallVec<
-            [(
-                crate::common::SmartString,
-                Arc<RwLock<TransactionVersionStore>>,
-            ); 4],
-        > = cache
-            .get(txn_id)
-            .map(|tables| {
-                tables
-                    .iter()
-                    .map(|(name, store)| (name.clone(), Arc::clone(store)))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let touched: smallvec::SmallVec<[(crate::common::SmartString, Arc<TxnTableStore>); 4]> =
+            cache
+                .get(txn_id)
+                .map(|tables| {
+                    tables
+                        .iter()
+                        .map(|(name, store)| (name.clone(), Arc::clone(store)))
+                        .collect()
+                })
+                .unwrap_or_default();
         drop(cache);
 
         for (name, txn_store) in &touched {
@@ -9111,8 +9136,7 @@ impl TransactionEngineOperations for EngineOperations {
             };
             pending.sort_unstable();
             txn_store
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .write_store()
                 .rollback_to_timestamp_with_pending(timestamp, &pending);
         }
     }

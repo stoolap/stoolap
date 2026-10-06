@@ -4845,6 +4845,8 @@ impl Executor {
                             && !classification.where_has_subqueries
                             && ctx.outer_row().is_none()
                     });
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::join_inner_opened();
                     let epoch = self.engine.schema_epoch();
                     let build_residual_filter = || {
                         if let Some(guard) = residual_slot.and_then(|slot| slot.read().ok()) {
@@ -4854,6 +4856,7 @@ impl Executor {
                                     && kept.outer_col == outer_col
                                     && kept.inner_col == inner_col
                                     && kept.outer_cols == outer_cols
+                                    && kept.inner_cols == inner_cols
                                 {
                                     return kept.program.as_ref().map(|program| {
                                         JoinFilter::from_program(CompactArc::clone(program))
@@ -4907,6 +4910,7 @@ impl Executor {
                                 *guard = CompiledExecution::JoinResidual(CompiledJoinResidual {
                                     swapped,
                                     outer_cols: outer_cols.clone(),
+                                    inner_cols: inner_cols.clone(),
                                     outer_col: outer_col.clone(),
                                     inner_col: inner_col.clone(),
                                     program: filter

@@ -124,12 +124,17 @@ fn parent_row_exists(
     parent_column: &str,
     value: &Value,
 ) -> Result<bool> {
-    let parent_schema = engine.get_table_schema(parent_table).map_err(|_| {
-        Error::internal(format!(
-            "foreign key references non-existent table '{}'",
-            parent_table
-        ))
-    })?;
+    let parent = engine
+        .get_table_for_txn(txn_id, parent_table)
+        .map_err(|e| match e {
+            Error::TableNotFound(_) => Error::internal(format!(
+                "foreign key references non-existent table '{}'",
+                parent_table
+            )),
+            e => e,
+        })?;
+    // The filter's positions come from the handle that reads the rows
+    let parent_schema = parent.schema_arc();
 
     let (_, ref_col) = parent_schema.find_column(parent_column).ok_or_else(|| {
         Error::internal(format!(
@@ -147,7 +152,6 @@ fn parent_row_exists(
     );
     expr.prepare_for_schema(&parent_schema);
 
-    let parent = engine.get_table_for_txn(txn_id, parent_table)?;
     let rows = parent.collect_rows_with_limit_unordered(Some(&expr), 1, 0)?;
     Ok(!rows.is_empty())
 }
@@ -285,8 +289,8 @@ fn pre_check_delete_recursive(
                 // Each key beneath the child names the column it points at,
                 // and the child rows that would go are read through that
                 // column, whether or not it is the child's primary key
-                let child_schema = engine.get_table_schema(child_table_name)?;
                 let child_handle = engine.get_table_for_txn(txn_id, child_table_name)?;
+                let child_schema = child_handle.schema_arc();
                 let col_name = &child_schema.columns[fk.column_index].name;
                 let mut filter = crate::storage::expression::ComparisonExpr::new(
                     col_name.as_str(),
@@ -592,8 +596,8 @@ fn cascade_delete_recursive(
     let mut deleted_child_keys: Vec<(usize, Vec<Value>)> = Vec::new();
 
     if !grandchild_fks.is_empty() {
-        let child_schema = engine.get_table_schema(child_table)?;
         let child_handle = engine.get_table_for_txn(txn_id, child_table)?;
+        let child_schema = child_handle.schema_arc();
         // Use filtered scan instead of full table scan
         let col_name = &child_schema.columns[fk.column_index].name;
         let mut filter = crate::storage::expression::ComparisonExpr::new(
@@ -906,23 +910,23 @@ pub(crate) fn check_no_referencing_rows(
     for (child_table, fk) in referencing.iter() {
         // Build IS NOT NULL filter on the FK column — pushed down to storage layer
         // so indexes can be used and we stop after the first match (limit=1)
-        let child_schema = engine.get_table_schema(child_table)?;
-        let col_name = &child_schema.columns[fk.column_index].name;
-        let mut not_null_expr =
-            crate::storage::expression::NullCheckExpr::is_not_null(col_name.as_str());
-        not_null_expr.prepare_for_schema(&child_schema);
+        // The filter's positions come from the handle that reads the rows
+        let references = |child: &dyn crate::storage::traits::Table| -> Result<bool> {
+            let child_schema = child.schema();
+            let col_name = &child_schema.columns[fk.column_index].name;
+            let mut not_null_expr =
+                crate::storage::expression::NullCheckExpr::is_not_null(col_name.as_str());
+            not_null_expr.prepare_for_schema(child_schema);
+            Ok(!child
+                .collect_rows_with_limit_unordered(Some(&not_null_expr), 1, 0)?
+                .is_empty())
+        };
 
         let has_ref = if let Some(tid) = txn_id {
-            let child = engine.get_table_for_txn(tid, child_table)?;
-            !child
-                .collect_rows_with_limit_unordered(Some(&not_null_expr), 1, 0)?
-                .is_empty()
+            references(&*engine.get_table_for_txn(tid, child_table)?)?
         } else {
             let tx = engine.begin_transaction()?;
-            let child = tx.get_table(child_table)?;
-            !child
-                .collect_rows_with_limit_unordered(Some(&not_null_expr), 1, 0)?
-                .is_empty()
+            references(&*tx.get_table(child_table)?)?
         };
 
         if has_ref {

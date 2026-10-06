@@ -175,7 +175,7 @@ impl Executor {
 
         // Pre-compute FK info
         let fk_schema: Option<CompactArc<Schema>> = if !table.schema().foreign_keys.is_empty() {
-            Some(self.engine.get_table_schema(table_name)?)
+            Some(table.schema_arc())
         } else {
             None
         };

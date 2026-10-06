@@ -18,10 +18,11 @@
 use rustc_hash::FxHashMap;
 use std::fmt;
 
+use crate::common::CompactArc;
 use crate::core::{DataType, Error, IndexType, Result, Row, RowVec, Schema, Value};
 use crate::storage::expression::Expression;
 use crate::storage::index::id_list::GroupIds;
-use crate::storage::mvcc::version_store::{AggregateOp, GroupedAggregateResult};
+use crate::storage::mvcc::version_store::{AggregateOp, GroupedAggregateResult, LayoutToken};
 use crate::storage::traits::{CappedEqual, Index, QueryResult, Scanner};
 
 /// Describes the access method that will be used for a table scan
@@ -329,6 +330,13 @@ pub trait Table: Send + Sync {
     /// Returns the transaction ID this table handle belongs to.
     /// Used by FK enforcement to participate in the caller's transaction.
     fn txn_id(&self) -> i64;
+
+    /// The table instance and row layout this handle's schema describes:
+    /// positions resolved from `schema()` are valid against this token only
+    fn layout_token(&self) -> LayoutToken;
+
+    /// The schema this handle reads with, as a shared reference
+    fn schema_arc(&self) -> CompactArc<Schema>;
 
     /// Creates a new column in the table
     ///

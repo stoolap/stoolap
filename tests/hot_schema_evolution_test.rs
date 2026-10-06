@@ -520,16 +520,17 @@ fn a_write_through_an_older_handle_cannot_commit_after_a_column_drop() {
     let newer = tx.get_table("t").unwrap();
     assert_eq!(newer.schema().columns.len(), 2);
     drop(newer);
-    older
-        .insert(Row::from_values(vec![
-            Value::Integer(2),
-            Value::text("wrong-a"),
-            Value::text("right-b"),
-        ]))
-        .unwrap();
+    let written = older.insert(Row::from_values(vec![
+        Value::Integer(2),
+        Value::text("wrong-a"),
+        Value::text("right-b"),
+    ]));
     drop(older);
+    let refused =
+        |result: &stoolap::Result<()>| matches!(result, Err(stoolap::Error::SchemaChanged { .. }));
+    let committed = tx.commit();
     assert!(
-        matches!(tx.commit(), Err(stoolap::Error::SchemaChanged { .. })),
+        refused(&written.map(|_| ())) || refused(&committed),
         "the row was written under the older handle's columns"
     );
     assert_eq!(
@@ -589,7 +590,7 @@ fn every_write_through_an_older_handle_carries_its_layout() {
         let mut tx = db.engine().begin_transaction().unwrap();
         let mut older = tx.get_table("t").unwrap();
         db.execute("ALTER TABLE t DROP COLUMN a", ()).unwrap();
-        if write == "update" {
+        let written = if write == "update" {
             // A row the transaction wrote under the new columns, updated
             // through the older handle
             let mut newer = tx.get_table("t").unwrap();
@@ -611,24 +612,29 @@ fn every_write_through_an_older_handle_carries_its_layout() {
                         true,
                     ))
                 })
-                .unwrap();
+                .map(|_| ())
         } else {
             // Bound to the old columns, the predicate reads b where a was:
             // it matches the row now and must not delete it
             let mut predicate = ComparisonExpr::new("a", Operator::Eq, Value::text("old-b"));
             predicate.prepare_for_schema(older.schema());
-            older.delete(Some(&predicate)).unwrap();
-        }
+            older.delete(Some(&predicate)).map(|_| ())
+        };
         drop(older);
+        let refused = |result: &stoolap::Result<()>| {
+            matches!(result, Err(stoolap::Error::SchemaChanged { .. }))
+        };
+        let committed = tx.commit();
         assert!(
-            matches!(tx.commit(), Err(stoolap::Error::SchemaChanged { .. })),
+            refused(&written) || refused(&committed),
             "{write}: written under the older handle's columns"
         );
-        assert_eq!(
-            pairs(&db, "SELECT id, b FROM t"),
-            vec![(1, "old-b".to_string())],
-            "{write}"
-        );
+        // Only the rows the newer handle wrote commit, if the older write was refused
+        let mut expected = vec![(1, "old-b".to_string())];
+        if committed.is_ok() && write == "update" {
+            expected.push((2, "new-b".to_string()));
+        }
+        assert_eq!(pairs(&db, "SELECT id, b FROM t"), expected, "{write}");
     }
 }
 
@@ -691,13 +697,12 @@ fn a_savepoint_rollback_takes_the_discarded_rows_layout_with_them() {
         .unwrap();
     drop(newer);
     tx.create_savepoint("s").unwrap();
-    older
-        .insert(Row::from_values(vec![
-            Value::Integer(3),
-            Value::text("wrong-a"),
-            Value::text("wrong-b"),
-        ]))
-        .unwrap();
+    // Refused at once since the newer handle is open, or discarded below
+    let _ = older.insert(Row::from_values(vec![
+        Value::Integer(3),
+        Value::text("wrong-a"),
+        Value::text("wrong-b"),
+    ]));
     drop(older);
     tx.rollback_to_savepoint("s").unwrap();
     tx.commit().unwrap();
