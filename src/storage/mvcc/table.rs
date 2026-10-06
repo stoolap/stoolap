@@ -167,10 +167,7 @@ impl MVCCTable {
     /// The transaction's local store for a write: the rows it writes now
     /// are laid out as this handle's schema says
     fn writes(&self) -> TxnStoreWrite<'_> {
-        let mut store = self.txn_versions.write_store();
-        let refused = !self.txn_versions.admits_write(self.layout);
-        store.writing_under(self.layout, refused);
-        store
+        self.txn_versions.write_for(self.layout)
     }
 
     /// Returns a reference to the version store
@@ -1677,7 +1674,7 @@ impl MVCCTable {
         };
 
         // Commit versions to the version store (this also updates indexes)
-        self.writes().commit()?;
+        self.txn_versions.write_store().commit()?;
 
         // Mark zone maps as stale if we had any data changes
         // This ensures the optimizer won't use outdated pruning info
@@ -1690,7 +1687,7 @@ impl MVCCTable {
 
     /// Rolls back the transaction's local changes
     pub fn rollback(&mut self) {
-        self.writes().rollback();
+        self.txn_versions.write_store().rollback();
     }
 
     /// Returns the row count visible to this transaction
@@ -3209,7 +3206,7 @@ impl Table for MVCCTable {
 
     fn close(&mut self) -> Result<()> {
         // Rollback any uncommitted changes
-        self.writes().rollback();
+        self.txn_versions.write_store().rollback();
         Ok(())
     }
 
@@ -3219,11 +3216,12 @@ impl Table for MVCCTable {
     }
 
     fn rollback(&mut self) {
-        self.writes().rollback();
+        self.txn_versions.write_store().rollback();
     }
 
     fn rollback_to_timestamp_with_pending(&self, timestamp: i64, pending: &[i64]) {
-        self.writes()
+        self.txn_versions
+            .write_store()
             .rollback_to_timestamp_with_pending(timestamp, pending);
     }
 

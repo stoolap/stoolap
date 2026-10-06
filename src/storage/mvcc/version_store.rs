@@ -6494,10 +6494,17 @@ impl TxnTableStore {
     pub fn admitted_at(store: TransactionVersionStore, layout: u64) -> Self {
         Self {
             parent: store.parent_store.store_id,
+            rows: AtomicU64::new(store.layout_bound().unwrap_or(NO_ROWS)),
             store: std::sync::RwLock::new(store),
             newest: AtomicU64::new(layout),
-            rows: AtomicU64::new(NO_ROWS),
         }
+    }
+
+    /// The store held for reading
+    pub fn read(
+        &self,
+    ) -> std::sync::LockResult<std::sync::RwLockReadGuard<'_, TransactionVersionStore>> {
+        self.store.read()
     }
 
     /// Admits a handle that reads `store` under `layout`: the transaction's
@@ -6515,8 +6522,8 @@ impl TxnTableStore {
         Ok(())
     }
 
-    /// The store held for writing; the layout of the rows it holds is
-    /// published to the admission when it is let go
+    /// The store held for work that writes no row, as a commit or a
+    /// rollback; the layout of the rows it holds is published when let go
     pub fn write_store(&self) -> TxnStoreWrite<'_> {
         TxnStoreWrite {
             guard: self
@@ -6527,13 +6534,22 @@ impl TxnTableStore {
         }
     }
 
-    /// Whether a handle under `layout` may write, called with the store
-    /// held for writing: not once a newer handle was admitted. The rows
-    /// count as written under `layout` until the store is let go
-    pub fn admits_write(&self, layout: u64) -> bool {
-        // Stored before `newest` is read; `admit` raises it before it reads
-        self.rows.store(layout, Ordering::SeqCst);
-        self.newest.load(Ordering::SeqCst) <= layout
+    /// The store held for a handle under `layout` to write rows: refused
+    /// when the store holds rows under another layout, or once a newer
+    /// handle was admitted. Accepted rows count as written under `layout`
+    /// until the store is let go
+    pub fn write_for(&self, layout: u64) -> TxnStoreWrite<'_> {
+        let mut store = self.write_store();
+        let refused = match store.layout_bound() {
+            Some(held) if held != layout => true,
+            _ => {
+                // Stored before `newest` is read; `admit` raises it before it reads
+                self.rows.store(layout, Ordering::SeqCst);
+                self.newest.load(Ordering::SeqCst) > layout
+            }
+        };
+        store.writing_under(layout, refused);
+        store
     }
 }
 
@@ -6561,14 +6577,6 @@ impl Drop for TxnStoreWrite<'_> {
     fn drop(&mut self) {
         let held = self.guard.layout_bound().unwrap_or(NO_ROWS);
         self.rows.store(held, Ordering::SeqCst);
-    }
-}
-
-impl std::ops::Deref for TxnTableStore {
-    type Target = std::sync::RwLock<TransactionVersionStore>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.store
     }
 }
 
@@ -8342,6 +8350,34 @@ mod tests {
 
     fn test_schema() -> Schema {
         SchemaBuilder::new("test_table").build()
+    }
+
+    /// The layout admission sees is the one the transaction's rows are held
+    /// in, whatever handle holds the store: a handle under another layout
+    /// that takes it, as a commit does, and a store filled before its cell
+    #[test]
+    fn admission_sees_the_layout_the_rows_are_held_in() {
+        let store = Arc::new(VersionStore::new("t".to_string(), test_schema()));
+        let cell = TxnTableStore::new(TransactionVersionStore::new(Arc::clone(&store), 1));
+        cell.write_for(0)
+            .put(1, Row::from(vec![Value::from(1i64)]), false)
+            .unwrap();
+        let newer = cell.write_for(1);
+        assert!(cell.admit(&store, 1).is_err(), "held by a newer handle");
+        drop(newer);
+        let settling = cell.write_store();
+        assert!(
+            cell.admit(&store, 1).is_err(),
+            "held to commit or roll back"
+        );
+        drop(settling);
+
+        let mut filled = TransactionVersionStore::new(Arc::clone(&store), 2);
+        filled
+            .put(2, Row::from(vec![Value::from(2i64)]), false)
+            .unwrap();
+        let cell = TxnTableStore::new(filled);
+        assert!(cell.admit(&store, 1).is_err(), "filled before its cell");
     }
 
     #[test]
