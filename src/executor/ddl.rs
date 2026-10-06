@@ -689,8 +689,13 @@ impl Executor {
             return Err(Error::TableNotFound(table_name.to_string()));
         }
 
-        // Check if index already exists
-        if self.engine.index_exists(index_name, table_name)? {
+        // Check if index already exists, under any spelling of its name
+        if self
+            .engine
+            .get_version_store(table_name)?
+            .resolve_index_name(index_name)?
+            .is_some()
+        {
             if stmt.if_not_exists {
                 return Ok(Box::new(ExecResult::empty()));
             }
@@ -928,23 +933,27 @@ impl Executor {
             return Err(Error::TableNotFound(table_name));
         }
 
-        // Check if index exists
-        if !self.engine.index_exists(index_name, &table_name)? {
+        // The index the name refers to, by its stored name
+        let Some(index_name) = self
+            .engine
+            .get_version_store(&table_name)?
+            .resolve_index_name(index_name)?
+        else {
             if stmt.if_exists {
                 return Ok(Box::new(ExecResult::empty()));
             }
             return Err(Error::IndexNotFound(index_name.to_string()));
-        }
+        };
 
         // Record index drop to WAL BEFORE applying in-memory change.
         // This prevents ghost state where the index is removed from memory
         // but still exists in WAL (would reappear after crash recovery).
-        self.engine.record_drop_index(&table_name, index_name)?;
+        self.engine.record_drop_index(&table_name, &index_name)?;
 
         // Now apply the in-memory change
         let tx = self.engine.begin_transaction()?;
         let table = tx.get_table(&table_name)?;
-        table.drop_index(index_name)?;
+        table.drop_index(&index_name)?;
         self.engine.discard_uncovered_side_files(&table_name);
 
         Ok(Box::new(ExecResult::empty()))

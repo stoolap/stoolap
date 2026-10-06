@@ -817,6 +817,8 @@ DROP INDEX idx_user_email ON users;
 DROP INDEX IF EXISTS idx_old ON products;
 ```
 
+Index names are matched without regard to case: `DROP INDEX IDX_OLD ON products` drops `idx_old`, and `CREATE INDEX` refuses a name already taken in the table under another spelling. A database created before this rule may hold two names that differ only in case; both are kept, `DROP INDEX` removes the one whose name is given exactly, and any other spelling is refused as ambiguous, with or without `IF EXISTS`.
+
 ## Transaction Control
 
 ### BEGIN TRANSACTION
