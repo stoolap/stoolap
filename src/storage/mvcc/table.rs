@@ -1506,67 +1506,76 @@ impl MVCCTable {
     /// Check unique index constraints for a row being inserted.
     fn check_unique_constraints(&self, row: &Row, _row_id: i64) -> Result<()> {
         let schema = &self.cached_schema;
-        self.version_store
-            .for_each_unique_index(|index_name, index| {
-                let column_ids = index.column_ids();
-                if column_ids.is_empty() {
-                    return Ok(());
-                }
-                let values: Vec<Value> = column_ids
-                    .iter()
-                    .filter_map(|&col_id| row.get(col_id as usize).cloned())
-                    .collect();
-                if values.len() != column_ids.len() {
-                    return Ok(());
-                }
-                if values.iter().any(|v| v.is_null()) {
-                    return Ok(());
-                }
-                let entries = index.find(&values)?;
-                // The index holds the committed rows. A row this transaction
-                // has deleted no longer holds the value against it, and one
-                // it has rewritten holds only what its latest version says
-                let taken = {
-                    let txn_versions = self.txn_versions.read().unwrap();
-                    entries.iter().find(|entry| {
-                        let local = txn_versions
-                            .local_versions_ref()
-                            .and_then(|versions| versions.get(entry.row_id))
-                            .and_then(|versions| versions.last());
-                        match local {
-                            None => true,
-                            Some(version) if version.is_deleted() => false,
-                            Some(version) => {
-                                column_ids
-                                    .iter()
-                                    .zip(values.iter())
-                                    .all(|(&col_id, value)| {
-                                        version.data.get(col_id as usize) == Some(value)
-                                    })
-                            }
+        // Taken out of the index map before the transaction's rows are read:
+        // a commit of the same transaction holds those rows while it takes the map
+        let mut unique = smallvec::SmallVec::<[Arc<dyn Index>; 8]>::new();
+        self.version_store.for_each_unique_index(|_, index| {
+            unique.push(Arc::clone(index));
+            Ok(())
+        })?;
+        for index in &unique {
+            let index_name = index.name();
+            let column_ids = index.column_ids();
+            if column_ids.is_empty() {
+                continue;
+            }
+            let values: Vec<Value> = column_ids
+                .iter()
+                .filter_map(|&col_id| row.get(col_id as usize).cloned())
+                .collect();
+            if values.len() != column_ids.len() {
+                continue;
+            }
+            if values.iter().any(|v| v.is_null()) {
+                continue;
+            }
+            let entries = index.find(&values)?;
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::unique_index_found();
+            // The index holds the committed rows. A row this transaction
+            // has deleted no longer holds the value against it, and one
+            // it has rewritten holds only what its latest version says
+            let taken = {
+                let txn_versions = self.txn_versions.read().unwrap();
+                entries.iter().find(|entry| {
+                    let local = txn_versions
+                        .local_versions_ref()
+                        .and_then(|versions| versions.get(entry.row_id))
+                        .and_then(|versions| versions.last());
+                    match local {
+                        None => true,
+                        Some(version) if version.is_deleted() => false,
+                        Some(version) => {
+                            column_ids
+                                .iter()
+                                .zip(values.iter())
+                                .all(|(&col_id, value)| {
+                                    version.data.get(col_id as usize) == Some(value)
+                                })
                         }
+                    }
+                })
+            };
+            if let Some(entry) = taken {
+                let col_names: Vec<&str> = column_ids
+                    .iter()
+                    .map(|&col_id| {
+                        schema
+                            .columns
+                            .get(col_id as usize)
+                            .map(|c| c.name.as_str())
+                            .unwrap_or("unknown")
                     })
-                };
-                if let Some(entry) = taken {
-                    let col_names: Vec<&str> = column_ids
-                        .iter()
-                        .map(|&col_id| {
-                            schema
-                                .columns
-                                .get(col_id as usize)
-                                .map(|c| c.name.as_str())
-                                .unwrap_or("unknown")
-                        })
-                        .collect();
-                    return Err(Error::UniqueConstraint {
-                        index: index_name.to_string(),
-                        column: col_names.join(", "),
-                        value: format!("{:?}", values),
-                        row_id: entry.row_id,
-                    });
-                }
-                Ok(())
-            })
+                    .collect();
+                return Err(Error::UniqueConstraint {
+                    index: index_name.to_string(),
+                    column: col_names.join(", "),
+                    value: format!("{:?}", values),
+                    row_id: entry.row_id,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Prepares a row for insertion: handles auto-increment, validates, and checks constraints.
