@@ -31,10 +31,11 @@ use std::sync::RwLock;
 use crate::common::{CompactArc, SmartString};
 use crate::core::{Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::{Expression, SelectStatement};
+use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::traits::{Engine, QueryResult};
 
 use super::context::ExecutionContext;
-use super::query_cache::{CompiledExecution, CompiledPkLookup, PkValueSource};
+use super::query_cache::{or_normal_path, CompiledExecution, CompiledPkLookup, PkValueSource};
 use super::result::ExecutorResult;
 use super::Executor;
 
@@ -53,6 +54,8 @@ struct PkLookupInfo {
     column_names: CompactArc<Vec<String>>,
     /// Schema column indices to return; None for `SELECT *`
     projection: Option<CompactArc<[usize]>>,
+    /// The table instance and layout `schema` and `projection` describe
+    token: LayoutToken,
 }
 
 impl Executor {
@@ -121,7 +124,7 @@ impl Executor {
             self.extract_pk_lookup_info(table_name, where_clause, &stmt.columns, ctx)?;
 
         // Execute the fast-path lookup
-        Some(self.execute_pk_lookup(lookup_info))
+        or_normal_path(self.execute_pk_lookup(lookup_info))
     }
 
     /// True for `SELECT *` or a list of plain column names; anything else
@@ -175,7 +178,7 @@ impl Executor {
         columns: &[Expression],
         ctx: &ExecutionContext,
     ) -> Option<PkLookupInfo> {
-        let (pk_value_source, schema) =
+        let (pk_value_source, schema, token) =
             self.extract_pk_lookup_structure(table_name, where_clause)?;
         let (projection, column_names) = Self::pk_projection(columns, &schema)?;
         let pk_value = self.extract_pk_value_fast(&pk_value_source, ctx)?;
@@ -185,6 +188,7 @@ impl Executor {
             schema,
             column_names,
             projection,
+            token,
         })
     }
 
@@ -194,9 +198,13 @@ impl Executor {
         &self,
         table_name: &str,
         where_clause: &Expression,
-    ) -> Option<(PkValueSource, CompactArc<Schema>)> {
-        // Get table schema to find PK column
-        let schema = self.engine.get_table_schema(table_name).ok()?;
+    ) -> Option<(PkValueSource, CompactArc<Schema>, LayoutToken)> {
+        // The schema and the token its positions are valid against, together
+        let (schema, token) = self
+            .engine
+            .get_version_store(table_name)
+            .ok()?
+            .schema_and_token();
         let pk_indices = schema.primary_key_indices();
 
         // Only support single-column PK for now
@@ -220,7 +228,7 @@ impl Executor {
             return None;
         }
 
-        Some((pk_value_source, schema))
+        Some((pk_value_source, schema, token))
     }
 
     /// The PK fast path returns at most one row, so a literal LIMIT >= 1
@@ -329,7 +337,7 @@ impl Executor {
         // Note: table_name is already lowercased, so storage layer won't call to_lowercase again
         let rows = self
             .engine
-            .fetch_rows_by_ids(&info.table_name, &[info.pk_value])?;
+            .fetch_rows_by_ids(&info.table_name, &[info.pk_value], info.token)?;
 
         // Extract Row values and normalize to current schema (handles ADD/DROP COLUMN)
         let result_rows: RowVec = rows
@@ -385,7 +393,9 @@ impl Executor {
                     if self.engine.schema_epoch() == lookup.cached_epoch {
                         // Fast path: extract value and execute
                         let pk_value = self.extract_pk_value_fast(&lookup.pk_value_source, ctx)?;
-                        return Some(self.execute_compiled_pk_lookup(lookup, pk_value));
+                        #[cfg(feature = "test-failpoints")]
+                        crate::test_failpoints::compiled_epoch_checked();
+                        return or_normal_path(self.execute_compiled_pk_lookup(lookup, pk_value));
                     }
                     // Epoch changed - some DDL occurred, need to recompile
                     // Fall through to recompile path
@@ -471,7 +481,7 @@ impl Executor {
                     // Fast path: extract value from slice directly
                     let pk_value =
                         Self::extract_pk_value_from_slice(&lookup.pk_value_source, params)?;
-                    Some(self.execute_compiled_pk_lookup(lookup, pk_value))
+                    or_normal_path(self.execute_compiled_pk_lookup(lookup, pk_value))
                 } else {
                     // Epoch changed - need recompile, use normal path
                     None
@@ -490,7 +500,7 @@ impl Executor {
     ) -> Result<Box<dyn QueryResult>> {
         let rows = self
             .engine
-            .fetch_rows_by_ids(&lookup.table_name, &[pk_value])?;
+            .fetch_rows_by_ids(&lookup.table_name, &[pk_value], lookup.token)?;
         // Normalize rows to current schema (handles ADD/DROP COLUMN)
         // Pre-allocate with capacity 1 for single PK lookup (avoids realloc)
         let mut result_rows = RowVec::with_capacity(1);
@@ -531,7 +541,7 @@ impl Executor {
                 // Re-validate epoch: another thread may have compiled before DDL
                 if self.engine.schema_epoch() == lookup.cached_epoch {
                     let pk_value = self.extract_pk_value_fast(&lookup.pk_value_source, ctx)?;
-                    return Some(self.execute_compiled_pk_lookup(lookup, pk_value));
+                    return or_normal_path(self.execute_compiled_pk_lookup(lookup, pk_value));
                 }
                 // Epoch changed since last compilation - fall through to recompile
             }
@@ -591,11 +601,15 @@ impl Executor {
         // NULL parameter this execution) must leave the compiled lookup in
         // place so later executions with an integer parameter still
         // fast-path.
-        match self.extract_pk_lookup_structure(table_name, where_clause) {
-            Some((pk_value_source, schema)) => {
+        // Read before the schema: a change in between leaves this epoch behind
+        let cached_epoch = self.engine.schema_epoch();
+        let structure = self.extract_pk_lookup_structure(table_name, where_clause);
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::compile_schema_read();
+        match structure {
+            Some((pk_value_source, schema, token)) => {
                 // Build and cache compiled lookup
                 let (projection, column_names) = Self::pk_projection(&stmt.columns, &schema)?;
-                let cached_epoch = self.engine.schema_epoch();
                 let compiled_lookup = CompiledPkLookup {
                     table_name: SmartString::new(table_name),
                     schema: schema.clone(),
@@ -603,6 +617,7 @@ impl Executor {
                     projection: projection.clone(),
                     pk_value_source: pk_value_source.clone(),
                     cached_epoch,
+                    token,
                 };
                 *compiled_guard = CompiledExecution::PkLookup(compiled_lookup);
                 drop(compiled_guard);
@@ -610,12 +625,13 @@ impl Executor {
                 // Resolve this execution's value; on failure fall back to
                 // the standard path (the stored PkLookup stays valid).
                 let pk_value = self.extract_pk_value_fast(&pk_value_source, ctx)?;
-                Some(self.execute_pk_lookup(PkLookupInfo {
+                or_normal_path(self.execute_pk_lookup(PkLookupInfo {
                     table_name: table_name.to_string(),
                     pk_value,
                     schema,
                     column_names,
                     projection,
+                    token,
                 }))
             }
             None => {

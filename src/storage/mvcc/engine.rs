@@ -7884,7 +7884,12 @@ impl Engine for MVCCEngine {
         Ok(())
     }
 
-    fn fetch_rows_by_ids(&self, table_name: &str, row_ids: &[i64]) -> Result<crate::core::RowVec> {
+    fn fetch_rows_by_ids(
+        &self,
+        table_name: &str,
+        row_ids: &[i64],
+        token: crate::storage::mvcc::version_store::LayoutToken,
+    ) -> Result<crate::core::RowVec> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -7895,9 +7900,11 @@ impl Engine for MVCCEngine {
 
         // Fall back to cold segments for rows not found in hot
         if result.len() < row_ids.len() {
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::pk_hot_rows_fetched();
+            let schema = store.schema();
             let mgr = self.get_or_create_segment_manager(table_name);
             if mgr.has_segments() {
-                let schema = store.schema().clone();
                 let found_ids: rustc_hash::FxHashSet<i64> =
                     result.iter().map(|(id, _)| *id).collect();
                 for &rid in row_ids {
@@ -7908,7 +7915,16 @@ impl Engine for MVCCEngine {
                     }
                 }
             }
+            // The manager was found by name: the table under it must still
+            // be the store the schema came from
+            if !Arc::ptr_eq(&self.get_version_store(table_name)?, &store) {
+                return Err(Error::SchemaChanged {
+                    table: table_name.to_string(),
+                });
+            }
         }
+        // The rows were captured in the layout the caller resolved for
+        store.check_token(token)?;
         Ok(result)
     }
 }
@@ -8372,7 +8388,7 @@ impl TransactionEngineOperations for EngineOperations {
         drop(stores);
 
         // Check if we have a cached transaction version store for this (txn_id, table_name)
-        let txn_versions = {
+        let (txn_versions, reused) = {
             let cache = self.txn_version_stores().read().unwrap();
             let found = if let Some(txn_tables) = cache.get(txn_id) {
                 // Linear search on SmallVec (fast for 1-2 tables)
@@ -8386,7 +8402,7 @@ impl TransactionEngineOperations for EngineOperations {
             drop(cache);
 
             if let Some(cached) = found {
-                cached
+                (cached, true)
             } else {
                 // Upgrade to write lock and re-check (another thread may have inserted)
                 let mut cache = self.txn_version_stores().write().unwrap();
@@ -8395,7 +8411,7 @@ impl TransactionEngineOperations for EngineOperations {
                     .iter()
                     .find(|(name, _)| name == &*table_name_lower)
                 {
-                    Arc::clone(cached)
+                    (Arc::clone(cached), true)
                 } else {
                     let new_store = Arc::new(RwLock::new(TransactionVersionStore::new(
                         Arc::clone(&version_store),
@@ -8405,7 +8421,7 @@ impl TransactionEngineOperations for EngineOperations {
                         table_name_lower.clone().into_owned().into(),
                         Arc::clone(&new_store),
                     ));
-                    new_store
+                    (new_store, false)
                 }
             }
         };
@@ -8427,16 +8443,21 @@ impl TransactionEngineOperations for EngineOperations {
             match mgrs.get(&*table_name_lower) {
                 Some(mgr) if mgr.has_segments() => Arc::clone(mgr),
                 _ => {
-                    return Ok(Box::new(MVCCTable::new_with_shared_store(
-                        txn_id,
-                        version_store,
-                        txn_versions,
-                    )))
+                    drop(mgrs);
+                    let table =
+                        MVCCTable::new_with_shared_store(txn_id, version_store, txn_versions);
+                    if reused {
+                        table.admit_local_rows()?;
+                    }
+                    return Ok(Box::new(table));
                 }
             }
         };
         let schema_generation = mgr.schema_generation();
         let table = MVCCTable::new_with_shared_store(txn_id, version_store, txn_versions);
+        if reused {
+            table.admit_local_rows()?;
+        }
         mgr.check_schema_generation(schema_generation)?;
         let snapshot_seq = (self.registry.get_isolation_level(txn_id)
             == crate::IsolationLevel::SnapshotIsolation)

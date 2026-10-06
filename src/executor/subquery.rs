@@ -28,6 +28,7 @@ use crate::core::{Error, Result, Row, RowVec, Value, ValueMap, ValueSet};
 use crate::parser::ast::*;
 use crate::parser::token::TokenType;
 use crate::storage::expression::ConstBoolExpr;
+use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::traits::{CappedEqual, Engine, ProbeScratch, Table};
 
 use super::context::{
@@ -45,6 +46,7 @@ use super::expression::compute_expression_hash;
 use super::operator::{ColumnInfo, MaterializedOperator, Operator};
 use super::operators::hash_join::{HashJoinOperator, JoinSide, JoinType};
 use super::operators::index_nested_loop::EQUALITY_CANDIDATE_CAP;
+use super::query_cache::check_compiled_token;
 use super::utils::{dummy_token, dummy_token_clone, value_to_expression};
 use super::Executor;
 
@@ -580,17 +582,22 @@ impl Executor {
 
         // OPTIMIZATION: Cache schema column names to avoid repeated get_table_schema() calls
         // This reduces the ~1μs overhead per EXISTS probe
-        let columns = match get_cached_exists_schema(&correlation.inner_table) {
-            Some(cols) => cols,
+        let (columns, token) = match get_cached_exists_schema(&correlation.inner_table) {
+            Some(cached) => cached,
             None => {
-                let schema = match self.engine.get_table_schema(&correlation.inner_table) {
-                    Ok(s) => s,
-                    Err(_) => return Ok(None), // Fall back if schema not found
+                // The probe table's own schema: its rows are what the filter reads
+                let Some(cached) =
+                    self.with_correlated_probe_table(ctx, &correlation.inner_table, |table| {
+                        Ok(Some((
+                            table.schema().column_names_arc(),
+                            table.layout_token(),
+                        )))
+                    })?
+                else {
+                    return Ok(None); // Fall back if schema not found
                 };
-                // Use schema's cached column names - O(1) Arc clone
-                let cols = schema.column_names_arc();
-                cache_exists_schema(correlation.inner_table.clone(), CompactArc::clone(&cols));
-                cols
+                cache_exists_schema(correlation.inner_table.clone(), cached.clone());
+                cached
             }
         };
 
@@ -642,7 +649,7 @@ impl Executor {
         // The filter is cached without context, so we clone and apply per-probe.
         let predicate_filter = predicate_filter.with_context(ctx);
 
-        self.visit_correlated_rows(ctx, &correlation, &outer_value, |row| {
+        self.visit_correlated_rows(ctx, &correlation, &outer_value, token, |row| {
             predicate_filter.matches_checked(row)
         })
     }
@@ -1238,9 +1245,12 @@ impl Executor {
         ctx: &ExecutionContext,
         correlation: &ExistsCorrelationInfo,
         key: &Value,
+        token: LayoutToken,
         mut visit: impl FnMut(&Row) -> Result<bool>,
     ) -> Result<Option<bool>> {
         self.with_correlated_candidates(ctx, correlation, key, |table, ids, key_idx, _, rows| {
+            // `visit` reads by the positions of the table `token` names
+            check_compiled_token(table, token)?;
             let all = ConstBoolExpr::true_expr();
             for chunk in ids.chunks(VISIBILITY_CHECK_BATCH_SIZE) {
                 rows.clear();

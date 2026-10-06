@@ -684,6 +684,91 @@ pub(crate) fn indexes_published() {
 }
 
 thread_local! {
+    static COMPILE_SCHEMA_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next PK fast path compile has taken
+/// the schema it resolves positions from
+pub fn after_compile_schema_read(hook: impl FnOnce() + 'static) {
+    COMPILE_SCHEMA_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn compile_schema_read() {
+    let hook = COMPILE_SCHEMA_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static JOIN_INNER_OPENED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next index join has opened its inner
+/// table and has not yet looked at its compiled residual program
+pub fn after_join_inner_opened(hook: impl FnOnce() + 'static) {
+    JOIN_INNER_OPENED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn join_inner_opened() {
+    let hook = JOIN_INNER_OPENED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static DML_TABLE_OPENED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next INSERT, UPDATE or DELETE has
+/// opened its table and has not yet resolved a column position
+pub fn after_dml_table_opened(hook: impl FnOnce() + 'static) {
+    DML_TABLE_OPENED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn dml_table_opened() {
+    let hook = DML_TABLE_OPENED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static PK_HOT_FETCHED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next engine fetch by row id has read
+/// the hot rows and is about to read the rows it missed from cold
+pub fn after_pk_hot_rows_fetched(hook: impl FnOnce() + 'static) {
+    PK_HOT_FETCHED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn pk_hot_rows_fetched() {
+    let hook = PK_HOT_FETCHED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static COMPILED_EPOCH_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next compiled PK statement has passed
+/// its schema epoch check and has not yet opened its table
+pub fn after_compiled_epoch_checked(hook: impl FnOnce() + 'static) {
+    COMPILED_EPOCH_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn compiled_epoch_checked() {
+    let hook = COMPILED_EPOCH_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static VOLUME_LOAD_REQUESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static VOLUME_FILE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SEGMENT_MAP_CLONES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

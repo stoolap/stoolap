@@ -520,6 +520,8 @@ impl Executor {
 
         // Drop the lock before doing work
         drop(active_tx);
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::dml_table_opened();
 
         // Acquire per-table upsert mutex for ON CONFLICT DO UPDATE only.
         // Serializes check+insert+commit to prevent TOCTOU races where two
@@ -613,7 +615,7 @@ impl Executor {
 
         // Pre-compute FK info for parent validation (CompactArc ref-count bump, not deep clone)
         let fk_schema = if !table.schema().foreign_keys.is_empty() {
-            Some(self.engine.get_table_schema(table_name)?)
+            Some(table.schema_arc())
         } else {
             None
         };
@@ -650,7 +652,7 @@ impl Executor {
         if let Some(ref select_stmt) = stmt.select {
             // Get schema for conflict handling (needed for duplicate row lookup and target matching)
             let select_schema = if stmt.on_duplicate || stmt.do_nothing {
-                Some(self.engine.get_table_schema(table_name)?)
+                Some(table.schema_arc())
             } else {
                 None
             };
@@ -962,7 +964,7 @@ impl Executor {
         // Process each row of values - use fast path for normal INSERT, slow path for conflict handling
         if stmt.do_nothing || stmt.on_duplicate {
             // ON DUPLICATE KEY UPDATE requires schema (CompactArc ref-count bump, not deep clone)
-            let schema = self.engine.get_table_schema(table_name)?;
+            let schema = table.schema_arc();
 
             // Pre-compile upsert expressions once for all conflicting rows in this batch.
             // Without this, compile_upsert work repeats for every conflict (O(n) cost).
@@ -1362,13 +1364,19 @@ impl Executor {
 
         // Drop the lock before doing work
         drop(active_tx);
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::dml_table_opened();
 
         // Try to get cached compilation, or compile fresh if needed
         let current_epoch = self.engine.schema_epoch();
+        let token = table.layout_token();
         let cached_insert = {
             let cache_read = compiled_cache.read().unwrap();
             if let CompiledExecution::Insert(ref cached) = *cache_read {
-                if cached.cached_epoch == current_epoch && *cached.table_name == *table_name {
+                if cached.cached_epoch == current_epoch
+                    && cached.token == token
+                    && *cached.table_name == *table_name
+                {
                     Some(cached.clone())
                 } else {
                     None // Stale cache
@@ -1470,6 +1478,7 @@ impl Executor {
                 default_row_template: Arc::new(default_row_template.clone()),
                 compiled_checks: Arc::new(compiled_checks.clone()),
                 cached_epoch: current_epoch,
+                token,
             };
 
             // Update the cache
@@ -1490,7 +1499,7 @@ impl Executor {
 
         // Pre-compute FK info for parent validation (CompactArc ref-count bump, not deep clone)
         let fk_schema = if !table.schema().foreign_keys.is_empty() {
-            Some(self.engine.get_table_schema(table_name)?)
+            Some(table.schema_arc())
         } else {
             None
         };
@@ -1816,6 +1825,8 @@ impl Executor {
 
         // Drop the lock before doing work
         drop(active_tx);
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::dml_table_opened();
 
         // Check for RETURNING clause
         let has_returning = !stmt.returning.is_empty();
@@ -1913,9 +1924,9 @@ impl Executor {
                 Arc::new(relevant)
             };
 
-        // Get FK schema via engine (CompactArc ref-count bump, no deep clone)
+        // FK schema of the handle the rows are read through (CompactArc ref-count bump)
         let fk_update_schema = if has_fk_updates {
-            Some(self.engine.get_table_schema(table_name)?)
+            Some(table.schema_arc())
         } else {
             None
         };
@@ -2803,6 +2814,8 @@ impl Executor {
 
         // Drop the lock before doing work
         drop(active_tx);
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::dml_table_opened();
 
         // Check for RETURNING clause
         let has_returning = !stmt.returning.is_empty();
@@ -2907,8 +2920,8 @@ impl Executor {
         let rows_affected = if needs_memory_filter || has_returning || has_referencing_fks {
             // Complex WHERE expression, RETURNING, or FK enforcement - need to scan rows first
             // Scan all rows, filter with evaluator, collect for RETURNING, delete matching ones by primary key
-            // Get schema via engine (CompactArc ref-count bump, no deep clone)
-            let schema_arc = self.engine.get_table_schema(table_name)?;
+            // Schema of the handle the rows are read through (CompactArc ref-count bump)
+            let schema_arc = table.schema_arc();
 
             // Build column names with effective prefix (alias or table name)
             // This allows WHERE clauses to reference columns using the alias

@@ -725,7 +725,20 @@ pub struct VersionStore {
     /// The position of a column dropped from the schema whose cells the
     /// rows still carry, until the drop is durable and the rows follow
     pending_cut: Mutex<Option<usize>>,
+    /// This store's number, from `NEXT_STORE_ID`
+    store_id: u64,
 }
+
+/// The table instance and row layout a column position was resolved for:
+/// valid only while both are still what the rows are held in
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayoutToken {
+    store: u64,
+    layout: u64,
+}
+
+/// Issues each version store a number no other store in the process takes
+static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
 
 impl VersionStore {
     /// Creates a new version store
@@ -765,6 +778,7 @@ impl VersionStore {
             publish_epoch: AtomicU64::new(0),
             layout: AtomicU64::new(0),
             pending_cut: Mutex::new(None),
+            store_id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -797,6 +811,7 @@ impl VersionStore {
             publish_epoch: AtomicU64::new(0),
             layout: AtomicU64::new(0),
             pending_cut: Mutex::new(None),
+            store_id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -929,6 +944,31 @@ impl VersionStore {
     /// The layout the rows are held in, moved by every column added or dropped
     pub fn layout(&self) -> u64 {
         self.layout.load(Ordering::Acquire)
+    }
+
+    /// The schema and the token its positions are valid against, read together
+    pub fn schema_and_token(&self) -> (CompactArc<Schema>, LayoutToken) {
+        let (schema, layout) = self.schema_and_layout();
+        (schema, self.token_for(layout))
+    }
+
+    /// The token for `layout` of this store
+    pub fn token_for(&self, layout: u64) -> LayoutToken {
+        LayoutToken {
+            store: self.store_id,
+            layout,
+        }
+    }
+
+    /// Positions resolved under `token` read this store's rows only while
+    /// the store is open and its rows are still in that layout
+    pub fn check_token(&self, token: LayoutToken) -> Result<(), Error> {
+        if self.closed.load(Ordering::Acquire) || token != self.token_for(self.layout()) {
+            return Err(Error::SchemaChanged {
+                table: self.table_name.to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Adds `column` to the schema. The rows follow at `lay_out_rows`, once
@@ -6431,6 +6471,8 @@ pub struct TransactionVersionStore {
     bound: SmallVec<[(u64, i64); 2]>,
     /// The layout of the handle about to write, for the row it writes
     writing: Option<u64>,
+    /// The newest layout a handle of the transaction was admitted under
+    newest_handle: u64,
 }
 
 impl TransactionVersionStore {
@@ -6450,6 +6492,7 @@ impl TransactionVersionStore {
             applied: Mutex::new(SmallVec::new()),
             bound: SmallVec::new(),
             writing: None,
+            newest_handle: 0,
         }
     }
 
@@ -6557,12 +6600,34 @@ impl TransactionVersionStore {
     /// A row written at `at`: the transaction is bound to the writing
     /// handle's layout, and to the oldest of them when handles under two
     /// layouts wrote, which the commit refuses if a change came between
-    fn note_layout(&mut self, at: i64) {
+    fn note_layout(&mut self, at: i64) -> Result<(), Error> {
         let seen = self.writing.unwrap_or_else(|| self.parent_store.layout());
+        // A handle under a newer layout reads these rows as its own
+        if seen < self.newest_handle {
+            return Err(Error::SchemaChanged {
+                table: self.parent_store.table_name.to_string(),
+            });
+        }
         match self.bound.iter_mut().find(|(layout, _)| *layout == seen) {
             Some((_, first)) => *first = (*first).min(at),
             None => self.bound.push((seen, at)),
         }
+        Ok(())
+    }
+
+    /// Admits a handle of this transaction that reads `store` under
+    /// `layout`: the transaction's rows must be held in that layout, and
+    /// from now on no handle under an older layout writes here
+    pub fn admit_handle(&mut self, store: &Arc<VersionStore>, layout: u64) -> Result<(), Error> {
+        if !Arc::ptr_eq(&self.parent_store, store)
+            || self.bound.iter().any(|(bound, _)| *bound != layout)
+        {
+            return Err(Error::SchemaChanged {
+                table: store.table_name.to_string(),
+            });
+        }
+        self.newest_handle = self.newest_handle.max(layout);
+        Ok(())
     }
 
     /// The oldest layout the transaction's surviving rows were written under
@@ -6578,7 +6643,7 @@ impl TransactionVersionStore {
 
         // Get timestamp once at the start (avoids calling SystemTime::now() inside RowVersion::new)
         let timestamp = get_fast_timestamp();
-        self.note_layout(timestamp);
+        self.note_layout(timestamp)?;
 
         // Create the row version with pre-computed timestamp
         let mut rv = RowVersion::new_with_timestamp(self.txn_id, data, timestamp);
@@ -6683,7 +6748,7 @@ impl TransactionVersionStore {
 
         // Get timestamp once at the start (avoids calling SystemTime::now() inside RowVersion::new)
         let timestamp = get_fast_timestamp();
-        self.note_layout(timestamp);
+        self.note_layout(timestamp)?;
 
         // Create the new row version with pre-computed timestamp
         let mut rv = RowVersion::new_with_timestamp(self.txn_id, data, timestamp);
@@ -6752,7 +6817,7 @@ impl TransactionVersionStore {
             return Ok(());
         }
         let now = get_fast_timestamp();
-        self.note_layout(now);
+        self.note_layout(now)?;
 
         for (row_id, data, original_version) in rows {
             // Convert to Shared (Arc) storage immediately for efficient Arc sharing
@@ -6817,7 +6882,7 @@ impl TransactionVersionStore {
         }
         // Get timestamp once for all rows in the batch
         let timestamp = get_fast_timestamp();
-        self.note_layout(timestamp);
+        self.note_layout(timestamp)?;
 
         for (row_id, data) in rows {
             // Check if we already have a local version
@@ -6889,7 +6954,7 @@ impl TransactionVersionStore {
         }
         // Get timestamp once for all rows in the batch
         let timestamp = get_fast_timestamp();
-        self.note_layout(timestamp);
+        self.note_layout(timestamp)?;
 
         for (row_id, data, original_version) in rows {
             // Create deleted row version with pre-computed timestamp

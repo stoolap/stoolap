@@ -29,6 +29,7 @@ use crate::storage::expression::Expression;
 use crate::storage::index::id_list::GroupIds;
 use crate::storage::index::{BTreeIndex, BitmapIndex, HashIndex, HnswIndex, MultiColumnIndex};
 use crate::storage::mvcc::scanner::MVCCScanner;
+use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::mvcc::{TransactionVersionStore, VersionStore};
 use crate::storage::traits::{Index, QueryResult, ScanPlan, Scanner, Table};
 use crate::storage::MemoryResult;
@@ -143,6 +144,15 @@ impl MVCCTable {
     /// Returns the transaction ID
     pub fn txn_id(&self) -> i64 {
         self.txn_id
+    }
+
+    /// Admits this handle to the transaction's rows it shares with earlier
+    /// handles: they must be held in the layout this handle reads with
+    pub(crate) fn admit_local_rows(&self) -> Result<()> {
+        self.txn_versions
+            .write()
+            .unwrap()
+            .admit_handle(&self.version_store, self.layout)
     }
 
     /// The schema as the store holds it now, and the layout that goes with
@@ -2118,6 +2128,14 @@ impl Table for MVCCTable {
 
     fn txn_id(&self) -> i64 {
         self.txn_id
+    }
+
+    fn layout_token(&self) -> LayoutToken {
+        self.version_store.token_for(self.layout)
+    }
+
+    fn schema_arc(&self) -> CompactArc<Schema> {
+        self.cached_schema.clone()
     }
 
     /// Fetch rows by their IDs, applying filter

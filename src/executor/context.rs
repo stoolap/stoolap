@@ -326,7 +326,7 @@ pub fn cache_exists_predicate(key: String, filter: RowFilter) {
 // Cache for table schema column names to avoid repeated get_table_schema() calls.
 // The key is the table name, the value is the list of column names.
 thread_local! {
-    static EXISTS_SCHEMA_CACHE: RefCell<FxHashMap<String, CompactArc<Vec<String>>>> = RefCell::new(FxHashMap::default());
+    static EXISTS_SCHEMA_CACHE: RefCell<FxHashMap<String, ExistsColumns>> = RefCell::new(FxHashMap::default());
 }
 
 /// Clear the EXISTS schema cache. Should be called at the start of each top-level query.
@@ -336,13 +336,19 @@ pub fn clear_exists_schema_cache() {
     });
 }
 
+/// An EXISTS probe table's column names and the token their positions hold for
+pub type ExistsColumns = (
+    CompactArc<Vec<String>>,
+    crate::storage::mvcc::version_store::LayoutToken,
+);
+
 /// Get cached table column names by table name.
-pub fn get_cached_exists_schema(key: &str) -> Option<CompactArc<Vec<String>>> {
+pub fn get_cached_exists_schema(key: &str) -> Option<ExistsColumns> {
     EXISTS_SCHEMA_CACHE.with(|cache| cache.borrow().get(key).cloned())
 }
 
 /// Cache table column names (takes Arc for zero-copy sharing).
-pub fn cache_exists_schema(key: String, columns: CompactArc<Vec<String>>) {
+pub fn cache_exists_schema(key: String, columns: ExistsColumns) {
     EXISTS_SCHEMA_CACHE.with(|cache| {
         cache.borrow_mut().insert(key, columns);
     });

@@ -20,6 +20,7 @@ use rustc_hash::FxHashMap;
 use crate::common::CompactArc;
 use crate::core::{IsolationLevel, Result, RowVec, Schema};
 use crate::storage::config::Config;
+use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::traits::{Index, Transaction};
 
 /// Engine represents the storage engine
@@ -271,11 +272,17 @@ pub trait Engine: Send + Sync {
     /// to check if rows exist and evaluate predicates. It avoids the ~2-5μs overhead
     /// of creating a new transaction per EXISTS probe.
     ///
-    /// The returned rows represent the latest committed state visible to any reader.
-    fn fetch_rows_by_ids(&self, table_name: &str, row_ids: &[i64]) -> Result<RowVec> {
+    /// The returned rows represent the latest committed state visible to any reader,
+    /// in the layout `token` names, or `SchemaChanged` once the table moved off it.
+    fn fetch_rows_by_ids(
+        &self,
+        table_name: &str,
+        row_ids: &[i64],
+        token: LayoutToken,
+    ) -> Result<RowVec> {
         // Default implementation: fall back to creating a transaction
         // Concrete implementations can override for better performance
-        let _ = (table_name, row_ids);
+        let _ = (table_name, row_ids, token);
         Err(crate::core::Error::internal(
             "fetch_rows_by_ids not supported by this engine",
         ))

@@ -46,6 +46,7 @@ use rustc_hash::FxHashMap;
 use crate::common::CompactArc;
 use crate::core::Schema;
 use crate::parser::ast::Statement;
+use crate::storage::mvcc::version_store::LayoutToken;
 
 use super::expression::SharedProgram;
 use super::query_classification::QueryClassification;
@@ -71,6 +72,31 @@ pub enum PkValueSource {
     NamedParameter(SmartString),
 }
 
+/// Positions compiled under `token` run on `table` only while it still
+/// holds its rows in that layout
+pub(crate) fn check_compiled_token(
+    table: &dyn crate::storage::traits::Table,
+    token: LayoutToken,
+) -> crate::core::Result<()> {
+    if table.layout_token() != token {
+        return Err(crate::core::Error::SchemaChanged {
+            table: table.name().to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// A fast path whose table moved off its compiled layout before it wrote
+/// anything hands the statement to the normal path, which resolves anew
+pub(crate) fn or_normal_path(
+    result: crate::core::Result<Box<dyn crate::storage::traits::QueryResult>>,
+) -> Option<crate::core::Result<Box<dyn crate::storage::traits::QueryResult>>> {
+    match result {
+        Err(crate::core::Error::SchemaChanged { .. }) => None,
+        result => Some(result),
+    }
+}
+
 /// Pre-compiled state for PK lookup queries (SELECT * WHERE pk = value)
 #[derive(Debug, Clone)]
 pub struct CompiledPkLookup {
@@ -86,6 +112,8 @@ pub struct CompiledPkLookup {
     pub pk_value_source: PkValueSource,
     /// Schema epoch at compilation time (for fast cache invalidation)
     pub cached_epoch: u64,
+    /// The table instance and layout `schema` and `projection` describe
+    pub token: LayoutToken,
 }
 
 /// Pre-compiled update column assignment
@@ -144,6 +172,8 @@ pub struct CompiledPkUpdate {
     pub updates: Vec<CompiledUpdateColumn>,
     /// Schema epoch at compilation time (for fast cache invalidation)
     pub cached_epoch: u64,
+    /// The table instance and layout the column indices describe
+    pub token: LayoutToken,
 }
 
 /// Pre-compiled state for PK-based DELETE (DELETE FROM table WHERE pk = value)
@@ -159,6 +189,8 @@ pub struct CompiledPkDelete {
     pub pk_value_source: PkValueSource,
     /// Schema epoch at compilation time (for fast cache invalidation)
     pub cached_epoch: u64,
+    /// The table instance and layout `schema` describes
+    pub token: LayoutToken,
 }
 
 /// Pre-compiled state for INSERT statements
@@ -203,6 +235,8 @@ pub struct CompiledInsert {
     >,
     /// Schema epoch at compilation time (for fast cache invalidation)
     pub cached_epoch: u64,
+    /// The table instance and layout the indices and templates describe
+    pub token: LayoutToken,
 }
 
 impl std::fmt::Debug for CompiledInsert {
@@ -251,6 +285,8 @@ pub struct CompiledJoinResidual {
     /// The outer columns the program reads by position; a nested join
     /// can reorder them without a schema change
     pub outer_cols: Vec<String>,
+    /// The inner columns it reads by position, from the inner handle's schema
+    pub inner_cols: Vec<String>,
     /// The key equality the probe answers, left out of the program
     pub outer_col: String,
     pub inner_col: String,
