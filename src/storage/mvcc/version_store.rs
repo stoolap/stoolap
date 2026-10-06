@@ -4412,6 +4412,13 @@ impl VersionStore {
         Ok(())
     }
 
+    /// Whether a writer holds the index map or waits for it: no new reader
+    /// may take it then
+    #[cfg(feature = "test-failpoints")]
+    pub fn index_map_writer_queued(&self) -> bool {
+        self.indexes.try_read().is_none()
+    }
+
     /// Iterate over unique indexes only, calling the provided function for each
     /// OPTIMIZATION: Avoids collecting index names and allows early exit on error
     pub fn for_each_unique_index<F>(&self, mut f: F) -> crate::core::Result<()>

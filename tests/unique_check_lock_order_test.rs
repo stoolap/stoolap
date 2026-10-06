@@ -44,46 +44,69 @@ fn a_unique_check_a_commit_and_an_index_change_all_finish() {
     tx.get_table("t").unwrap().insert(row(1, 1, 1)).unwrap();
     let mut checking = tx.get_table("t").unwrap();
 
-    let (ready, at_point) = mpsc::channel::<&str>();
-    let (done, finished) = mpsc::channel::<&str>();
+    let limit = Duration::from_secs(10);
+    let (ready, at_point) = mpsc::channel::<()>();
+    let (done, finished) = mpsc::channel::<()>();
     let (go_check, check_go) = mpsc::channel::<()>();
     let (go_commit, commit_go) = mpsc::channel::<()>();
 
     let (ready_check, done_check) = (ready.clone(), done.clone());
     std::thread::spawn(move || {
         stoolap::test_failpoints::after_unique_index_found(move || {
-            ready_check.send("check").unwrap();
+            ready_check.send(()).unwrap();
             check_go.recv().unwrap();
         });
         let _ = checking.insert(row(2, 2, 2));
-        done_check.send("check").unwrap();
+        done_check.send(()).unwrap();
     });
-    let (ready_commit, done_commit) = (ready, done.clone());
+    at_point
+        .recv_timeout(limit)
+        .expect("the check reaches its point");
     std::thread::spawn(move || {
         stoolap::test_failpoints::before_commit_index_capture(move || {
-            ready_commit.send("commit").unwrap();
+            ready.send(()).unwrap();
             commit_go.recv().unwrap();
         });
         let _ = tx.commit();
-        done_commit.send("commit").unwrap();
+        done.send(()).unwrap();
     });
-    for _ in 0..2 {
-        at_point
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the check and the commit reach their points");
-    }
+    at_point
+        .recv_timeout(limit)
+        .expect("the commit reaches its point");
+
+    let store = db.engine().get_version_store("t").unwrap();
+    let (indexed, index_done) = mpsc::channel::<Result<(), String>>();
     let indexing = db.clone();
     std::thread::spawn(move || {
-        let _ = indexing.execute("CREATE INDEX ik ON t(k)", ());
-        done.send("index").unwrap();
+        let created = indexing.execute("CREATE INDEX ik ON t(k)", ());
+        indexed
+            .send(created.map(|_| ()).map_err(|e| format!("{e:?}")))
+            .unwrap();
     });
-    // The index change queues for the index map behind the check
-    std::thread::sleep(Duration::from_millis(300));
+    // The index change either queues for the index map, behind a check
+    // that holds it, or takes the map and is done
+    let deadline = std::time::Instant::now() + limit;
+    let mut created = None;
+    while created.is_none() && !store.index_map_writer_queued() {
+        created = index_done.try_recv().ok();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the index change neither queued nor finished"
+        );
+        std::thread::yield_now();
+    }
     go_check.send(()).unwrap();
     go_commit.send(()).unwrap();
-    for _ in 0..3 {
+    for _ in 0..2 {
         finished
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the check, the commit and the index change finish");
+            .recv_timeout(limit)
+            .expect("the check and the commit finish");
     }
+    let created = match created {
+        Some(created) => created,
+        None => index_done
+            .recv_timeout(limit)
+            .expect("the index change finishes"),
+    };
+    created.unwrap();
 }

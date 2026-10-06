@@ -1508,7 +1508,7 @@ impl MVCCTable {
         let schema = &self.cached_schema;
         // Taken out of the index map before the transaction's rows are read:
         // a commit of the same transaction holds those rows while it takes the map
-        let mut unique = smallvec::SmallVec::<[Arc<dyn Index>; 4]>::new();
+        let mut unique = smallvec::SmallVec::<[Arc<dyn Index>; 8]>::new();
         self.version_store.for_each_unique_index(|_, index| {
             unique.push(Arc::clone(index));
             Ok(())
