@@ -3754,6 +3754,9 @@ impl ExprVM {
             }
             return None;
         }
+        if parts.len() > 2 {
+            return None;
+        }
 
         let value: i64 = parts[0].parse().ok()?;
         let unit = parts[1];

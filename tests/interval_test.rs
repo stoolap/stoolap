@@ -399,3 +399,27 @@ fn test_interval_12_months_equals_1_year() {
     assert_eq!(ts_months, ts_year);
     assert_eq!(ts_months, "2026-06-15T12:00:00Z");
 }
+
+/// A compound interval is refused rather than cut to its first unit,
+/// as generate_series already does
+#[test]
+fn test_interval_compound_not_truncated() {
+    let db = Database::open("memory://interval_compound").expect("Failed to create database");
+
+    for sql in [
+        "SELECT TIMESTAMP '2024-01-15 00:00:00' + INTERVAL '1 month 1 day'",
+        "SELECT TIMESTAMP '2024-01-15 00:00:00' + INTERVAL '2 hours 30 minutes'",
+        "SELECT TIMESTAMP '2024-01-15 00:00:00' - INTERVAL '1 year 2 months'",
+    ] {
+        let result: Result<String, _> = db.query_one(sql, ());
+        assert!(result.is_err(), "{} returned {:?}", sql, result);
+    }
+
+    let ts: Option<String> = db
+        .query_one(
+            "SELECT TIMESTAMP '2024-01-15 00:00:00' + '1 day 2 hours'",
+            (),
+        )
+        .expect("Failed to execute query");
+    assert_eq!(ts, None);
+}
