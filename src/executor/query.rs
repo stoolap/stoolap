@@ -10174,8 +10174,8 @@ impl Executor {
                 }
             }
             "HEAP_PROFILE" => {
-                // Writes jemalloc's heap profile, in pprof format, to the file
-                // named; a Linux build with the jemalloc-prof feature only
+                // Writes the heap profile, in gzipped pprof format, to the
+                // file named; a build with the heap-profile feature only
                 let Some(ref value) = stmt.value else {
                     return Err(Error::internal("PRAGMA HEAP_PROFILE needs a file path"));
                 };

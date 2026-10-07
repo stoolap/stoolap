@@ -19,11 +19,8 @@
 //! Under `test-filedb` a memory DSN opens a file database, whose commit
 //! also writes the WAL, so the count means something else there.
 
-// The mimalloc and jemalloc-prof features set the library's own global allocator
-#![cfg(all(
-    not(any(feature = "mimalloc", feature = "jemalloc-prof")),
-    not(feature = "test-filedb")
-))]
+// The jemalloc feature, on by default, sets the library's own global allocator
+#![cfg(all(not(feature = "jemalloc"), not(feature = "test-filedb")))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};

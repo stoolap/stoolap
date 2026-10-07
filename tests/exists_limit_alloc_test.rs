@@ -15,8 +15,8 @@
 //! A LIMIT over an EXISTS set takes the few members its rows need, not the
 //! whole set, counted in the bytes the query allocates on its thread
 
-// The mimalloc and jemalloc-prof features set the library's own global allocator
-#![cfg(not(any(feature = "mimalloc", feature = "jemalloc-prof")))]
+// The jemalloc feature, on by default, sets the library's own global allocator
+#![cfg(not(feature = "jemalloc"))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;

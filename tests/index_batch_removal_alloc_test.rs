@@ -15,8 +15,8 @@
 //! A seal's batch removal from an index allocates a fixed number of times,
 //! however many rows and keys the batch holds
 
-// The mimalloc and jemalloc-prof features set the library's own global allocator
-#![cfg(not(any(feature = "mimalloc", feature = "jemalloc-prof")))]
+// The jemalloc feature, on by default, sets the library's own global allocator
+#![cfg(not(feature = "jemalloc"))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;

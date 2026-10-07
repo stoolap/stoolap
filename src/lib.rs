@@ -63,28 +63,22 @@
 //! - [`optimizer`] - Cost-based query optimizer with cardinality feedback
 //! - [`common`] - Utilities (BufferPool, I64Map, version)
 
-// Use mimalloc as global allocator when feature is enabled (but not with
-// jemalloc-prof, which takes precedence, nor with dhat-heap, which needs
-// its own allocator)
+// stoolap-jemalloc as the global allocator, on by default, without its
+// profiler unless heap-profile is on; dhat-heap needs its own allocator
 #[cfg(all(
-    feature = "mimalloc",
-    not(feature = "jemalloc-prof"),
+    feature = "jemalloc",
+    not(feature = "heap-profile"),
     not(feature = "dhat-heap")
 ))]
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: stoolap_jemalloc::Jemalloc = stoolap_jemalloc::Jemalloc::new();
 
-// jemalloc with its sampling heap profiler, for PRAGMA HEAP_PROFILE
-#[cfg(all(feature = "jemalloc-prof", not(feature = "dhat-heap")))]
+// stoolap-jemalloc with its sampling heap profiler on from the first
+// allocation, a sample every 512 KiB allocated on average, for PRAGMA
+// HEAP_PROFILE
+#[cfg(all(feature = "heap-profile", not(feature = "dhat-heap")))]
 #[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
-/// jemalloc's startup options: profiling on, a sample every 512 KiB
-/// allocated on average. The symbol carries the crate's `_rjem_` prefix.
-#[cfg(all(feature = "jemalloc-prof", not(feature = "dhat-heap")))]
-#[allow(non_upper_case_globals)]
-#[export_name = "_rjem_malloc_conf"]
-pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
+static GLOBAL: stoolap_jemalloc::Jemalloc = stoolap_jemalloc::Jemalloc::new().with_profiling();
 
 pub mod api;
 pub mod common;

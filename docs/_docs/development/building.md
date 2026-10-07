@@ -49,8 +49,8 @@ Stoolap uses Cargo features to enable optional functionality. The default featur
 | `parallel` | Yes | Multi-threaded query execution via Rayon (filter, join, sort, distinct) |
 | `wasm` | No | WebAssembly build mode. Excludes parallel execution and file persistence |
 | `ffi` | No | C FFI layer for language bindings. Produces `libstoolap.{so,dylib,dll}` with `include/stoolap.h` |
-| `mimalloc` | No | Use Microsoft's mimalloc allocator instead of the system allocator |
-| `jemalloc-prof` | No | Use jemalloc with its sampling heap profiler as the allocator, for `PRAGMA heap_profile`. Profiles are written on Linux only. Takes precedence over `mimalloc` |
+| `jemalloc` | Yes | Use [stoolap-jemalloc](https://github.com/stoolap/stoolap-jemalloc), a jemalloc-style allocator in pure Rust, as the global allocator. Turn it off with `default-features = false` to keep your own allocator |
+| `heap-profile` | No | Turn on stoolap-jemalloc's sampling heap profiler, for `PRAGMA heap_profile`. Includes `jemalloc` |
 
 ### Testing and Benchmarking Features
 
@@ -72,17 +72,14 @@ The SQLite and DuckDB comparisons (benchmarks and the differential oracle) are a
 ### Build Examples
 
 ```bash
-# Default build (CLI + parallel)
+# Default build (CLI + parallel + stoolap-jemalloc)
 cargo build --release
 
-# Library only (no CLI)
+# Library only (no CLI), with the system allocator
 cargo build --release --no-default-features --features parallel
 
-# With mimalloc allocator
-cargo build --release --features mimalloc
-
-# With jemalloc and heap profiles (PRAGMA heap_profile, Linux)
-cargo build --release --features jemalloc-prof
+# With heap profiles (PRAGMA heap_profile)
+cargo build --release --features heap-profile
 
 # C FFI shared library (libstoolap.so / .dylib / .dll)
 cargo build --release --features ffi

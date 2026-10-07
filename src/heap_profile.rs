@@ -12,39 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Heap profiles from jemalloc's sampling profiler, in pprof format, for a
-//! Linux build with the `jemalloc-prof` feature
+//! Heap profiles from stoolap-jemalloc's sampling profiler, in gzipped
+//! pprof format, for a build with the `heap-profile` feature
 
 use crate::core::{Error, Result};
 
 /// Writes the live heap profile to `path`; returns its size in bytes
-#[cfg(all(
-    feature = "jemalloc-prof",
-    target_os = "linux",
-    not(feature = "dhat-heap")
-))]
+#[cfg(all(feature = "heap-profile", not(feature = "dhat-heap")))]
 pub(crate) fn write_heap_profile(path: &str) -> Result<usize> {
-    let ctl = jemalloc_pprof::PROF_CTL
-        .as_ref()
-        .ok_or_else(|| Error::internal("jemalloc heap profiling is not enabled"))?;
-    let mut ctl = ctl
-        .try_lock()
-        .map_err(|_| Error::internal("another heap profile is being written"))?;
-    let profile = ctl
-        .dump_pprof()
+    use std::io::Write;
+
+    let profile = stoolap_jemalloc::prof::dump_pprof()
         .map_err(|e| Error::internal(format!("heap profile: {e}")))?;
-    std::fs::write(path, &profile)
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let gzipped = gzip
+        .write_all(&profile)
+        .and_then(|()| gzip.finish())
+        .map_err(|e| Error::internal(format!("heap profile: {e}")))?;
+    std::fs::write(path, &gzipped)
         .map_err(|e| Error::internal(format!("heap profile {path}: {e}")))?;
-    Ok(profile.len())
+    Ok(gzipped.len())
 }
 
-#[cfg(not(all(
-    feature = "jemalloc-prof",
-    target_os = "linux",
-    not(feature = "dhat-heap")
-)))]
+#[cfg(not(all(feature = "heap-profile", not(feature = "dhat-heap"))))]
 pub(crate) fn write_heap_profile(_path: &str) -> Result<usize> {
     Err(Error::internal(
-        "heap profiles need a Linux build with the jemalloc-prof feature",
+        "heap profiles need a build with the heap-profile feature",
     ))
 }
