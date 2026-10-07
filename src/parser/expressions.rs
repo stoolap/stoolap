@@ -1770,6 +1770,13 @@ impl Parser {
                 ));
                 return None;
             }
+            if parts.len() > 2 {
+                self.add_error(format!(
+                    "compound intervals are not supported: {} at {}",
+                    value_str, self.cur_token.position
+                ));
+                return None;
+            }
 
             let quantity = match parts[0].parse::<i64>() {
                 Ok(q) => q,
