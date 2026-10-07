@@ -3745,6 +3745,9 @@ impl ExprVM {
     /// Parsed interval: either a fixed duration or a calendar-relative month count.
     fn parse_interval(&self, s: &str) -> Option<IntervalValue> {
         let s = s.trim();
+        if let Some(d) = Self::parse_formatted_duration(s) {
+            return Some(IntervalValue::Duration(d));
+        }
         let parts: Vec<&str> = s.split_whitespace().collect();
 
         if parts.len() < 2 {
@@ -3800,6 +3803,42 @@ impl ExprVM {
         } else {
             None
         }
+    }
+
+    /// Parse the "[-]N days HH:MM:SS" and "[-]HH:MM:SS" strings written by
+    /// `format_duration_as_interval`.
+    fn parse_formatted_duration(s: &str) -> Option<chrono::TimeDelta> {
+        let (negative, rest) = match s.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, s),
+        };
+        let (days, hms) = match rest.split_once(' ') {
+            Some((days, tail)) => {
+                let (unit, hms) = tail.trim_start().split_once(' ')?;
+                if !unit.eq_ignore_ascii_case("days") && !unit.eq_ignore_ascii_case("day") {
+                    return None;
+                }
+                (days.parse::<i64>().ok()?, hms.trim_start())
+            }
+            None => (0, rest),
+        };
+        let mut fields = hms.split(':');
+        let hours = fields.next()?.parse::<i64>().ok()?;
+        let minutes = fields.next()?.parse::<i64>().ok()?;
+        let seconds = fields.next()?.parse::<i64>().ok()?;
+        if fields.next().is_some()
+            || days < 0
+            || hours < 0
+            || !(0..60).contains(&minutes)
+            || !(0..60).contains(&seconds)
+        {
+            return None;
+        }
+        let duration = chrono::TimeDelta::try_days(days)?
+            .checked_add(&chrono::TimeDelta::try_hours(hours)?)?
+            .checked_add(&chrono::TimeDelta::try_minutes(minutes)?)?
+            .checked_add(&chrono::TimeDelta::try_seconds(seconds)?)?;
+        Some(if negative { -duration } else { duration })
     }
 
     /// Format chrono Duration as interval string

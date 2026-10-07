@@ -423,3 +423,31 @@ fn test_interval_compound_not_truncated() {
         .expect("Failed to execute query");
     assert_eq!(ts, None);
 }
+
+/// The interval a timestamp difference is formatted as can be added back
+#[test]
+fn test_interval_from_timestamp_difference() {
+    let db = Database::open("memory://interval_difference").expect("Failed to create database");
+
+    for (sql, expected) in [
+        (
+            "SELECT TIMESTAMP '2024-01-01 00:00:00' + (TIMESTAMP '2024-01-03 00:00:00' - TIMESTAMP '2024-01-02 00:00:00')",
+            "2024-01-02T00:00:00Z",
+        ),
+        (
+            "SELECT TIMESTAMP '2024-01-01 00:00:00' + (TIMESTAMP '2024-01-03 02:30:00' - TIMESTAMP '2024-01-02 00:00:00')",
+            "2024-01-02T02:30:00Z",
+        ),
+        (
+            "SELECT TIMESTAMP '2024-01-01 00:00:00' + (TIMESTAMP '2024-01-02 02:30:00' - TIMESTAMP '2024-01-02 00:00:00')",
+            "2024-01-01T02:30:00Z",
+        ),
+        (
+            "SELECT TIMESTAMP '2024-01-05 00:00:00' + (TIMESTAMP '2024-01-02 00:00:00' - TIMESTAMP '2024-01-03 02:30:00')",
+            "2024-01-03T21:30:00Z",
+        ),
+    ] {
+        let ts: String = db.query_one(sql, ()).expect("Failed to execute query");
+        assert_eq!(ts, expected, "{}", sql);
+    }
+}
