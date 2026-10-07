@@ -3880,9 +3880,9 @@ dependencies = [
 
 [[package]]
 name = "stoolap-jemalloc"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "acbf59799e19dd263b513a25ead901686ca7b4208ba044ff891c74daf3409cf6"
+checksum = "6e3d732c0fd051afd47c276467f242168a30d38b8856968ea2b858a7f3354b75"
 dependencies = [
  "backtrace",
  "libc",
