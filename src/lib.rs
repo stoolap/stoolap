@@ -63,16 +63,15 @@
 //! - [`optimizer`] - Cost-based query optimizer with cardinality feedback
 //! - [`common`] - Utilities (BufferPool, I64Map, version)
 
-// Use mimalloc as global allocator when feature is enabled (but not with
-// heap-profile, which takes precedence, nor with dhat-heap, which needs
-// its own allocator)
+// stoolap-jemalloc as the global allocator, on by default, without its
+// profiler unless heap-profile is on; dhat-heap needs its own allocator
 #[cfg(all(
-    feature = "mimalloc",
+    feature = "jemalloc",
     not(feature = "heap-profile"),
     not(feature = "dhat-heap")
 ))]
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: stoolap_jemalloc::Jemalloc = stoolap_jemalloc::Jemalloc::new();
 
 // stoolap-jemalloc with its sampling heap profiler on from the first
 // allocation, a sample every 512 KiB allocated on average, for PRAGMA

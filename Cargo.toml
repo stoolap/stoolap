@@ -95,8 +95,7 @@ lru = "0.18"  # O(1) LRU cache for compiled expression programs
 ureq = { version = "2", optional = true }
 flate2 = { version = "1", optional = true }
 
-# Optional allocators
-mimalloc = { version = "0.1", default-features = false, optional = true }
+# Global allocator
 stoolap-jemalloc = { version = "0.1.5", optional = true }
 
 # Semantic embedding (optional — enables EMBED() SQL function)
@@ -130,14 +129,14 @@ dhat = "0.3"
 sqllogictest = "0.29"
 
 [features]
-default = ["cli", "parallel"]
+default = ["cli", "parallel", "jemalloc"]
 parallel = ["dep:rayon"]
 wasm = []  # Excludes parallel + persistence; for wasm32 builds
 ffi = []   # C FFI layer - enables extern "C" functions for language bindings
 cli = ["clap", "rustyline", "comfy-table", "dirs"]
 dhat-heap = []
-mimalloc = ["dep:mimalloc"]
-heap-profile = ["dep:stoolap-jemalloc", "dep:flate2"]
+jemalloc = ["dep:stoolap-jemalloc"]
+heap-profile = ["jemalloc", "dep:flate2"]
 semantic = ["candle-core", "candle-nn", "candle-transformers", "tokenizers", "hf-hub"]
 ann-benchmark = ["dep:ureq", "dep:flate2"]
 test-failpoints = []

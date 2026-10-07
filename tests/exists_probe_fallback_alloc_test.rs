@@ -16,7 +16,7 @@
 //! EXISTS probe was answered from
 
 // The library's own allocator features set a global allocator of their own
-#![cfg(not(any(feature = "mimalloc", feature = "heap-profile", feature = "dhat-heap")))]
+#![cfg(not(any(feature = "jemalloc", feature = "dhat-heap")))]
 
 use stoolap::Database;
 
