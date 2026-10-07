@@ -86,6 +86,10 @@ jobs:
       if: runner.os == 'Windows'
       run: cargo test --test failpoint_io_test --test wal_torn_tail_test --features test-failpoints -- --test-threads=1
 
+    - name: Heap profile (macOS, Windows)
+      if: runner.os != 'Linux'
+      run: cargo test --test heap_profile_test --features heap-profile
+
   feature-gated-tests:
     name: Feature-Gated Tests
     runs-on: ubuntu-latest
