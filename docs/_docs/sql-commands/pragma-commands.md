@@ -61,7 +61,7 @@ Stoolap currently supports the following PRAGMA commands:
 | `index_read_stats` | Show what the reads through side files did: probes, candidates, rows, refusals, scans | - |
 | `index_backfill` | Build side files for volumes the query path cannot serve yet, all or up to a number | - |
 | `memory_stats` | Show per-table hot and cold memory figures | - |
-| `heap_profile` | Write a heap profile in pprof format to a file (Linux builds with the `jemalloc-prof` feature) | - |
+| `heap_profile` | Write a heap profile in pprof format to a file (builds with the `heap-profile` feature) | - |
 
 #### checkpoint_interval
 
@@ -238,7 +238,7 @@ PRAGMA memory_stats;
 
 #### heap_profile
 
-Writes the process's live heap, as sampled by jemalloc, to the file named, in pprof format, and returns the file's size in bytes. It shows where the memory Stoolap allocated was allocated, by call stack, including what `memory_stats` does not count. Only a Linux build with the `jemalloc-prof` Cargo feature has it; that feature makes jemalloc the allocator, with a sample taken every 512 KiB allocated on average. Other builds return an error.
+Writes the process's live heap, as sampled by the allocator, to the file named, in gzipped pprof format, and returns the file's size in bytes. It shows where the memory Stoolap allocated was allocated, by call stack, including what `memory_stats` does not count. Only a build with the `heap-profile` Cargo feature has it; that feature makes [stoolap-jemalloc](https://github.com/stoolap/stoolap-jemalloc) the allocator, with a sample taken every 512 KiB allocated on average from the process's first allocation. Other builds return an error.
 
 ```sql
 PRAGMA heap_profile = '/tmp/stoolap-heap.pb.gz';

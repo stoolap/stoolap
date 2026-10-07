@@ -19,9 +19,9 @@
 //! Under `test-filedb` a memory DSN opens a file database, whose commit
 //! also writes the WAL, so the count means something else there.
 
-// The mimalloc and jemalloc-prof features set the library's own global allocator
+// The mimalloc and heap-profile features set the library's own global allocator
 #![cfg(all(
-    not(any(feature = "mimalloc", feature = "jemalloc-prof")),
+    not(any(feature = "mimalloc", feature = "heap-profile")),
     not(feature = "test-filedb")
 ))]
 

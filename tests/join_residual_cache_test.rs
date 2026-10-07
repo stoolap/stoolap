@@ -18,9 +18,9 @@
 //! Under `test-filedb` a memory DSN opens a file database, whose join
 //! reads through the volume path and allocates differently.
 
-// The mimalloc and jemalloc-prof features set the library's own global allocator
+// The mimalloc and heap-profile features set the library's own global allocator
 #![cfg(all(
-    not(any(feature = "mimalloc", feature = "jemalloc-prof")),
+    not(any(feature = "mimalloc", feature = "heap-profile")),
     not(feature = "test-filedb")
 ))]
 

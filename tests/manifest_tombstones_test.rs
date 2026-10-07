@@ -15,8 +15,8 @@
 //! A table's committed tombstones live once, in the tombstone map, and a
 //! persist writes the map as it stands with the manifest
 
-// The mimalloc and jemalloc-prof features set the library's own global allocator
-#![cfg(not(any(feature = "mimalloc", feature = "jemalloc-prof")))]
+// The mimalloc and heap-profile features set the library's own global allocator
+#![cfg(not(any(feature = "mimalloc", feature = "heap-profile")))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;

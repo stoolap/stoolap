@@ -15,8 +15,8 @@
 //! A read-only transaction that is committed must release the per-table
 //! stores it opened for its reads, as a rolled back or dropped one does.
 
-// The mimalloc and jemalloc-prof features set the library's own global allocator
-#![cfg(not(any(feature = "mimalloc", feature = "jemalloc-prof")))]
+// The mimalloc and heap-profile features set the library's own global allocator
+#![cfg(not(any(feature = "mimalloc", feature = "heap-profile")))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicI64, Ordering};

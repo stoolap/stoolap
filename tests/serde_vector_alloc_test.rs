@@ -16,8 +16,8 @@
 //! and nothing else, and a TIMESTAMP into a `DateTime` allocates nothing,
 //! counted in the bytes each deserialization allocates on its thread
 
-// The mimalloc and jemalloc-prof features set the library's own global allocator
-#![cfg(not(any(feature = "mimalloc", feature = "jemalloc-prof")))]
+// The mimalloc and heap-profile features set the library's own global allocator
+#![cfg(not(any(feature = "mimalloc", feature = "heap-profile")))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;

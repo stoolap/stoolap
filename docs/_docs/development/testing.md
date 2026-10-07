@@ -187,7 +187,7 @@ SQLLogicTest files provide a database-agnostic specification format, making it p
 |-----|-------------|
 | **Lint** | `cargo fmt --check` + `cargo clippy -D warnings` |
 | **Test** | Full test suite on Linux, macOS, Windows |
-| **Feature-Gated** | Heap profile (jemalloc-prof), failpoint I/O tests |
+| **Feature-Gated** | Heap profile (heap-profile), failpoint I/O tests |
 | **Coverage** | `cargo llvm-cov` uploaded to Codecov |
 | **License** | Verifies Apache 2.0 headers in all `.rs` files |
 | **Build** | Cross-platform binaries (Linux x86/ARM64, macOS x86/ARM64, Windows) |

@@ -3301,7 +3301,7 @@ mod tests {
     /// A counting allocator for the tests of this binary: live and peak
     /// bytes per thread, so a build's or a lookup's allocations are
     /// measured on the thread that makes them, whatever other tests do
-    #[cfg(not(any(feature = "mimalloc", feature = "jemalloc-prof")))]
+    #[cfg(not(any(feature = "mimalloc", feature = "heap-profile")))]
     mod counting {
         use std::alloc::{GlobalAlloc, Layout, System};
         use std::cell::Cell;
@@ -3349,7 +3349,7 @@ mod tests {
 
     /// Bytes a build or a lookup may allocate beyond its ledger: the
     /// strings of file names and open calls, and the iterator's box
-    #[cfg(not(any(feature = "mimalloc", feature = "jemalloc-prof")))]
+    #[cfg(not(any(feature = "mimalloc", feature = "heap-profile")))]
     const ALLOC_SLACK: usize = 32 * 1024;
 
     fn build(path: &Path, pairs: Vec<(u32, i64)>, workspace: usize) -> BuildReport {
@@ -3707,7 +3707,7 @@ mod tests {
         //    than a thousand runs, merged upward as they come
         let path = dir.path().join("many-runs.sidx");
         let workspace = MIN_WORKSPACE_BYTES + metadata_allowance(1_200_000);
-        #[cfg(not(any(feature = "mimalloc", feature = "jemalloc-prof")))]
+        #[cfg(not(any(feature = "mimalloc", feature = "heap-profile")))]
         let mark = counting::mark();
         let report = build_side_file(
             &path,
@@ -3720,7 +3720,7 @@ mod tests {
             workspace,
         )
         .unwrap();
-        #[cfg(not(any(feature = "mimalloc", feature = "jemalloc-prof")))]
+        #[cfg(not(any(feature = "mimalloc", feature = "heap-profile")))]
         {
             let peak = counting::peak_since(mark);
             assert!(
@@ -3748,7 +3748,7 @@ mod tests {
         //    metadata counts against the later ones
         let path = dir.path().join("three.sidx");
         let workspace = 512 * 1024;
-        #[cfg(not(any(feature = "mimalloc", feature = "jemalloc-prof")))]
+        #[cfg(not(any(feature = "mimalloc", feature = "heap-profile")))]
         let mark = counting::mark();
         let report = build_side_file(
             &path,
@@ -3763,7 +3763,7 @@ mod tests {
             workspace,
         )
         .unwrap();
-        #[cfg(not(any(feature = "mimalloc", feature = "jemalloc-prof")))]
+        #[cfg(not(any(feature = "mimalloc", feature = "heap-profile")))]
         {
             let peak = counting::peak_since(mark);
             assert!(
@@ -3788,7 +3788,7 @@ mod tests {
         //    kept for its metadata; the build either fits or refuses, and
         //    never allocates past the workspace
         let path = dir.path().join("unbounded.sidx");
-        #[cfg(not(any(feature = "mimalloc", feature = "jemalloc-prof")))]
+        #[cfg(not(any(feature = "mimalloc", feature = "heap-profile")))]
         let mark = counting::mark();
         let result = build_side_file(
             &path,
@@ -3800,7 +3800,7 @@ mod tests {
             }],
             MIN_WORKSPACE_BYTES,
         );
-        #[cfg(not(any(feature = "mimalloc", feature = "jemalloc-prof")))]
+        #[cfg(not(any(feature = "mimalloc", feature = "heap-profile")))]
         {
             let peak = counting::peak_since(mark);
             assert!(
@@ -3961,12 +3961,12 @@ mod tests {
         };
         // Under the minimum the 2,000 slots do not fit beside the buffers:
         // refused before anything is allocated or created
-        #[cfg(not(any(feature = "mimalloc", feature = "jemalloc-prof")))]
+        #[cfg(not(any(feature = "mimalloc", feature = "heap-profile")))]
         let mark = counting::mark();
         let err =
             build_side_file(&path, next_generation(), empty(), MIN_WORKSPACE_BYTES).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
-        #[cfg(not(any(feature = "mimalloc", feature = "jemalloc-prof")))]
+        #[cfg(not(any(feature = "mimalloc", feature = "heap-profile")))]
         assert!(
             counting::peak_since(mark)
                 <= 2000 * std::mem::size_of::<ColumnInput<'_>>() + ALLOC_SLACK,
@@ -3976,10 +3976,10 @@ mod tests {
         // With room for the slots they build within the budget
         let slots = 2000 * COLUMN_SLOT_BYTES;
         let workspace = MIN_WORKSPACE_BYTES + slots + 2000 * metadata_allowance(0);
-        #[cfg(not(any(feature = "mimalloc", feature = "jemalloc-prof")))]
+        #[cfg(not(any(feature = "mimalloc", feature = "heap-profile")))]
         let mark = counting::mark();
         let report = build_side_file(&path, next_generation(), empty(), workspace).unwrap();
-        #[cfg(not(any(feature = "mimalloc", feature = "jemalloc-prof")))]
+        #[cfg(not(any(feature = "mimalloc", feature = "heap-profile")))]
         {
             let peak = counting::peak_since(mark);
             assert!(
@@ -4574,13 +4574,13 @@ mod tests {
         let share = input + MIN_WORKSPACE_BYTES + metadata_allowance(131_072) + COLUMN_SLOT_BYTES;
         INDEX_BUILDS.set_budget_bytes((baseline.charged_bytes + share) as u64);
         INDEX_BUILDS.reset_peak();
-        #[cfg(not(any(feature = "mimalloc", feature = "jemalloc-prof")))]
+        #[cfg(not(any(feature = "mimalloc", feature = "heap-profile")))]
         let mark = counting::mark();
         let side = build_side_for(&volume, &path, 1, &[(1, identity)])
             .unwrap()
             .expect("built");
         let admitted = INDEX_BUILDS.stats().peak_bytes - baseline.charged_bytes;
-        #[cfg(not(any(feature = "mimalloc", feature = "jemalloc-prof")))]
+        #[cfg(not(any(feature = "mimalloc", feature = "heap-profile")))]
         {
             let peak = counting::peak_since(mark);
             assert!(
