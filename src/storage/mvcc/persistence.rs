@@ -450,7 +450,7 @@ impl PersistenceManager {
 
         // The record and its marker are one unit: every DDL commits under
         // the same id, so a record left without its own marker would replay
-        let lsns = wal.append_unit(vec![entry, WALEntry::commit_marker(DDL_TXN_ID)])?;
+        let lsns = wal.append_unit(vec![entry, WALEntry::commit_marker(DDL_TXN_ID)], false)?;
 
         // Attempt WAL rotation if file exceeds max size.
         // Failure is non-critical: the commit is already persisted.
@@ -475,7 +475,8 @@ impl PersistenceManager {
             entries.push(WALEntry::new(DDL_TXN_ID, name, 0, op, data));
             entries.push(WALEntry::commit_marker(DDL_TXN_ID));
         }
-        let lsns = wal.append_unit(entries)?;
+        // A checkpoint's boundary needs the sync in every mode
+        let lsns = wal.append_unit(entries, true)?;
         let _ = wal.maybe_rotate();
         Ok(lsns.into_iter().step_by(2).collect())
     }
@@ -527,7 +528,7 @@ impl PersistenceManager {
         );
 
         // One unit with its marker, as for any DDL
-        wal.append_unit(vec![entry, WALEntry::commit_marker(DDL_TXN_ID)])?;
+        wal.append_unit(vec![entry, WALEntry::commit_marker(DDL_TXN_ID)], false)?;
 
         // Attempt WAL rotation if file exceeds max size.
         // Failure is non-critical: the commit is already persisted.

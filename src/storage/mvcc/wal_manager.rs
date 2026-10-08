@@ -961,6 +961,9 @@ struct Retired {
 enum Need {
     Written,
     Synced,
+    /// The call's own sync must succeed: an explicit sync, a checkpoint's,
+    /// a close's. A record synced earlier does not stand in for it
+    OwnSync,
 }
 
 /// How a failure cleanup treats the current file in Normal mode; Full mode
@@ -1327,11 +1330,11 @@ impl WALManager {
     }
 
     /// Writes `entries` as one unit with one sync: a schema change's record
-    /// and marker, or a checkpoint's catalog copies. What is buffered goes
-    /// first; no other record lands inside the unit; a failure removes the
-    /// whole unit in Normal mode and keeps what was written before it.
-    /// Returns the entries' LSNs
-    pub fn append_unit(&self, entries: Vec<WALEntry>) -> Result<Vec<u64>> {
+    /// and marker, or a checkpoint's catalog copies (`always_sync`, whatever
+    /// the mode; a schema change under sync_mode=none is only buffered).
+    /// No other record lands inside the unit; a failure removes the whole
+    /// unit in Normal mode and keeps what was written before it
+    pub fn append_unit(&self, entries: Vec<WALEntry>, always_sync: bool) -> Result<Vec<u64>> {
         if !self.running.load(Ordering::Acquire) {
             return Err(Error::WalNotRunning);
         }
@@ -1342,6 +1345,15 @@ impl WALManager {
                 (entry, encoded)
             })
             .collect();
+        if !always_sync && self.sync_mode == SyncMode::None {
+            // Nothing is written or synced at a schema change under
+            // sync_mode=none: the unit only enters the buffer whole
+            if self.poisoned.load(Ordering::Acquire) {
+                return Err(poisoned_error());
+            }
+            let mut buffer = self.buffer.lock().unwrap();
+            return self.stamp_unit(&mut buffer, &mut entries);
+        }
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::wal_sync_starting();
         let mut wal_file = self.wal_file.lock().unwrap();
@@ -1357,22 +1369,7 @@ impl WALManager {
         }
         let start = self.current_file_position.load(Ordering::Relaxed);
         let before = self.written_lsn.load(Ordering::Acquire);
-        let mut lsns = Vec::with_capacity(entries.len());
-        for (entry, encoded) in &mut entries {
-            if self.current_lsn.load(Ordering::Acquire) == u64::MAX {
-                buffer.clear();
-                return Err(Error::internal(
-                    "WAL LSN overflow: maximum sequence number reached. Database requires maintenance.",
-                ));
-            }
-            entry.previous_lsn = self.previous_lsn.load(Ordering::Acquire);
-            entry.lsn = self.current_lsn.fetch_add(1, Ordering::SeqCst) + 1;
-            self.previous_lsn.store(entry.lsn, Ordering::Release);
-            WALEntry::stamp_lsns(encoded, entry.lsn, entry.previous_lsn);
-            buffer.extend_from_slice(encoded);
-            self.buffered_lsn.store(entry.lsn, Ordering::Release);
-            lsns.push(entry.lsn);
-        }
+        let lsns = self.stamp_unit(&mut buffer, &mut entries)?;
         // Written while the buffer lock keeps every other record out of it
         let written = self.drain_locked(&mut wal_file, &mut buffer);
         drop(buffer);
@@ -1388,6 +1385,33 @@ impl WALManager {
         Ok(lsns)
     }
 
+    /// Stamps the unit's records with their LSNs into the held buffer, one
+    /// after another; on an LSN overflow the buffer goes back to before them
+    fn stamp_unit(
+        &self,
+        buffer: &mut Vec<u8>,
+        entries: &mut [(WALEntry, Vec<u8>)],
+    ) -> Result<Vec<u64>> {
+        let mark = buffer.len();
+        let mut lsns = Vec::with_capacity(entries.len());
+        for (entry, encoded) in entries {
+            if self.current_lsn.load(Ordering::Acquire) == u64::MAX {
+                buffer.truncate(mark);
+                return Err(Error::internal(
+                    "WAL LSN overflow: maximum sequence number reached. Database requires maintenance.",
+                ));
+            }
+            entry.previous_lsn = self.previous_lsn.load(Ordering::Acquire);
+            entry.lsn = self.current_lsn.fetch_add(1, Ordering::SeqCst) + 1;
+            self.previous_lsn.store(entry.lsn, Ordering::Release);
+            WALEntry::stamp_lsns(encoded, entry.lsn, entry.previous_lsn);
+            buffer.extend_from_slice(encoded);
+            self.buffered_lsn.store(entry.lsn, Ordering::Release);
+            lsns.push(entry.lsn);
+        }
+        Ok(lsns)
+    }
+
     fn append(&self, mut entry: WALEntry, durable: bool) -> Result<u64> {
         if !self.running.load(Ordering::Acquire) {
             return Err(Error::WalNotRunning);
@@ -1395,6 +1419,14 @@ impl WALManager {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(Error::internal(
                 "WAL is poisoned after a write failure; reopen the database",
+            ));
+        }
+        // Every schema change commits under the one DDL id: a record or a
+        // marker of it written alone could commit a change that failed
+        if entry.operation.is_ddl() || entry.txn_id == crate::storage::mvcc::persistence::DDL_TXN_ID
+        {
+            return Err(Error::internal(
+                "a schema change is written with its marker as one unit",
             ));
         }
 
@@ -1431,23 +1463,17 @@ impl WALManager {
         if do_flush {
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::record_buffered();
-            // A DDL transaction's commit marker must sync like the DDL
-            // entry itself: "schema changes must be durable" is void if a
-            // crash inside the sync interval discards the unsynced marker.
-            let ddl_commit = entry.operation.is_transaction_end()
-                && entry.txn_id == crate::storage::mvcc::persistence::DDL_TXN_ID;
             // A commit needs its marker synced in Full mode, written in
-            // Normal mode; a schema change needs its sync in both
+            // Normal mode
             let need = if durable
-                && (ddl_commit
-                    || entry.operation.is_ddl()
-                    || (self.sync_mode == SyncMode::Full && entry.operation.is_transaction_end()))
+                && self.sync_mode == SyncMode::Full
+                && entry.operation.is_transaction_end()
             {
                 Need::Synced
             } else {
                 Need::Written
             };
-            let sync = durable && (self.should_sync(entry.operation) || ddl_commit);
+            let sync = durable && self.should_sync(entry.operation);
             self.flush_and_maybe_sync(entry.lsn, need, sync)?;
         }
 
@@ -1544,6 +1570,7 @@ impl WALManager {
         let done = match need {
             Need::Written => &self.written_lsn,
             Need::Synced => &self.synced_lsn,
+            Need::OwnSync => return false,
         };
         lsn <= done.load(Ordering::Acquire)
     }
@@ -1701,8 +1728,12 @@ impl WALManager {
             return Err(Error::WalNotRunning);
         }
 
-        // Everything appended so far, written and synced
-        self.flush_and_maybe_sync(self.current_lsn.load(Ordering::Acquire), Need::Synced, true)
+        // Everything appended so far, written and synced by this call
+        self.flush_and_maybe_sync(
+            self.current_lsn.load(Ordering::Acquire),
+            Need::OwnSync,
+            true,
+        )
     }
 
     /// Flush buffer to disk without syncing
@@ -2037,7 +2068,11 @@ impl WALManager {
         if !self.running.load(Ordering::Acquire) {
             return Err(Error::WalNotRunning);
         }
-        self.flush_and_maybe_sync(self.current_lsn.load(Ordering::Acquire), Need::Synced, true)
+        self.flush_and_maybe_sync(
+            self.current_lsn.load(Ordering::Acquire),
+            Need::OwnSync,
+            true,
+        )
     }
 
     /// Publish the cut as the recovery boundary in checkpoint.meta, naming
@@ -2093,7 +2128,11 @@ impl WALManager {
         // then it is only cleaned up, and the close reports the failure
         // after the handle is released
         let closed = self
-            .flush_and_maybe_sync(self.current_lsn.load(Ordering::Acquire), Need::Synced, true)
+            .flush_and_maybe_sync(
+                self.current_lsn.load(Ordering::Acquire),
+                Need::OwnSync,
+                true,
+            )
             .and_then(|()| {
                 if self.poisoned.load(Ordering::Acquire) {
                     Err(self.failure_error(poisoned_error()))
@@ -3056,10 +3095,13 @@ mod tests {
         );
 
         let lsns = wal
-            .append_unit(vec![
-                catalog_record(),
-                WALEntry::commit_marker(crate::storage::mvcc::persistence::DDL_TXN_ID),
-            ])
+            .append_unit(
+                vec![
+                    catalog_record(),
+                    WALEntry::commit_marker(crate::storage::mvcc::persistence::DDL_TXN_ID),
+                ],
+                true,
+            )
             .unwrap();
         assert_eq!(lsns, [2, 3], "the unit follows the buffered row");
         let after = wal.current_file_position.load(Ordering::Relaxed);
@@ -3090,10 +3132,13 @@ mod tests {
 
         wal.append_entry(row(2, 2)).unwrap();
         wal.write_commit_marker(2).unwrap();
-        wal.append_unit(vec![
-            catalog_record(),
-            WALEntry::commit_marker(crate::storage::mvcc::persistence::DDL_TXN_ID),
-        ])
+        wal.append_unit(
+            vec![
+                catalog_record(),
+                WALEntry::commit_marker(crate::storage::mvcc::persistence::DDL_TXN_ID),
+            ],
+            true,
+        )
         .unwrap();
         wal.publish_checkpoint(cut, vec![]).unwrap();
         wal.truncate_wal(cut).unwrap();
@@ -3213,18 +3258,33 @@ mod tests {
 
         let wal = WALManager::new(&wal_path, SyncMode::Normal).unwrap();
 
-        // DDL operations should force sync in Normal mode
-        let create_table = WALEntry::new(
-            1,
-            "new_table".to_string(),
-            0,
-            WALOperationType::CreateTable,
-            vec![],
-        );
-        assert!(create_table.operation.is_ddl());
+        // A schema change goes in as a unit with its marker, synced in
+        // Normal mode; alone it is refused
+        let create_table = || {
+            WALEntry::new(
+                crate::storage::mvcc::persistence::DDL_TXN_ID,
+                "new_table".to_string(),
+                0,
+                WALOperationType::CreateTable,
+                vec![],
+            )
+        };
+        assert!(wal.append_entry(create_table()).is_err());
 
-        let lsn = wal.append_entry(create_table).unwrap();
-        assert_eq!(lsn, 1);
+        let lsns = wal
+            .append_unit(
+                vec![
+                    create_table(),
+                    WALEntry::commit_marker(crate::storage::mvcc::persistence::DDL_TXN_ID),
+                ],
+                false,
+            )
+            .unwrap();
+        assert_eq!(lsns, [1, 2]);
+        assert_eq!(
+            wal.synced_position.load(Ordering::Relaxed),
+            wal.current_file_position.load(Ordering::Relaxed)
+        );
 
         wal.close().unwrap();
     }

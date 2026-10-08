@@ -478,3 +478,112 @@ fn a_close_after_a_failed_log_reports_it_and_releases_the_database() {
     assert_eq!(count(&again), 2);
     drop(db);
 }
+
+// --- Schema records, explicit syncs and sync_mode=none ------------------------
+
+fn ddl_record(op: WALOperationType) -> WALEntry {
+    WALEntry::new(
+        stoolap::storage::mvcc::persistence::DDL_TXN_ID,
+        "t".to_string(),
+        0,
+        op,
+        vec![1, 2, 3],
+    )
+}
+
+fn replayed_operations(dir: &std::path::Path) -> Vec<WALOperationType> {
+    let reopened = WALManager::new(dir, SyncMode::Full).unwrap();
+    let mut operations = Vec::new();
+    reopened
+        .replay_two_phase(0, |entry| {
+            operations.push(entry.operation);
+            Ok(())
+        })
+        .unwrap();
+    operations
+}
+
+/// Every schema change commits under one marker id, so a record or a
+/// marker of it written alone could commit a change that failed
+#[test]
+fn a_schema_record_or_marker_outside_a_unit_is_refused() {
+    use stoolap::storage::mvcc::persistence::DDL_TXN_ID;
+    let _guard = fp::FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let wal = wal(dir.path(), SyncMode::Normal);
+    wal.append_unit(
+        vec![
+            ddl_record(WALOperationType::CreateTable),
+            WALEntry::commit_marker(DDL_TXN_ID),
+        ],
+        false,
+    )
+    .unwrap();
+    assert!(
+        wal.write_commit_marker(DDL_TXN_ID).is_err(),
+        "a schema marker alone is refused"
+    );
+    fp::WAL_SYNC_FAIL.store(true, Ordering::SeqCst);
+    let alone = wal.append_entry(ddl_record(WALOperationType::AlterTable));
+    fp::WAL_SYNC_FAIL.store(false, Ordering::SeqCst);
+    assert!(alone.is_err(), "a schema record alone is refused");
+    drop(wal);
+    let operations = replayed_operations(dir.path());
+    assert!(
+        operations.contains(&WALOperationType::CreateTable)
+            && !operations.contains(&WALOperationType::AlterTable),
+        "{operations:?}"
+    );
+}
+
+/// The commit exception never hides the failure of a sync the caller
+/// asked for
+#[test]
+fn an_explicit_sync_that_fails_is_an_error_with_everything_synced() {
+    let _guard = fp::FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let wal = wal(dir.path(), SyncMode::Full);
+    assert!(commit(&wal, 1));
+    fp::WAL_SYNC_FAIL.store(true, Ordering::SeqCst);
+    let synced = wal.sync();
+    fp::WAL_SYNC_FAIL.store(false, Ordering::SeqCst);
+    assert!(synced.is_err());
+}
+
+#[test]
+fn a_checkpoint_whose_wal_sync_fails_publishes_no_boundary() {
+    let _guard = fp::FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let wal = wal(dir.path(), SyncMode::Full);
+    assert!(commit(&wal, 1));
+    fp::WAL_SYNC_FAIL.store(true, Ordering::SeqCst);
+    let checkpointed = wal.create_checkpoint(vec![]);
+    fp::WAL_SYNC_FAIL.store(false, Ordering::SeqCst);
+    assert!(checkpointed.is_err());
+    assert!(!dir.path().join("checkpoint.meta").exists());
+}
+
+/// sync_mode=none syncs no schema change; a checkpoint still syncs
+#[test]
+fn schema_changes_under_sync_mode_none_do_not_sync() {
+    let _guard = fp::FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dsn(&dir, "&sync_mode=none")).unwrap();
+    fp::WAL_SYNC_FAIL.store(true, Ordering::SeqCst);
+    let changed = [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
+        "ALTER TABLE t ADD COLUMN c INTEGER",
+        "CREATE INDEX ia ON t(a)",
+    ]
+    .map(|sql| (sql, db.execute(sql, ()).is_ok()));
+    fp::WAL_SYNC_FAIL.store(false, Ordering::SeqCst);
+    assert!(changed.iter().all(|(_, ok)| *ok), "{changed:?}");
+    db.execute("INSERT INTO t VALUES (1, 10, 100)", ()).unwrap();
+    fp::WAL_SYNC_FAIL.store(true, Ordering::SeqCst);
+    let checkpointed = db.execute("PRAGMA CHECKPOINT", ());
+    fp::WAL_SYNC_FAIL.store(false, Ordering::SeqCst);
+    assert!(
+        checkpointed.is_err(),
+        "the checkpoint's sync is not optional"
+    );
+}
