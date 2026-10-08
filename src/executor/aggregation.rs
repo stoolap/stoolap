@@ -829,21 +829,34 @@ impl Executor {
         // is named by its alias "total"
         for col_expr in &stmt.columns {
             if let Expression::Aliased(aliased) = col_expr {
-                if let Expression::FunctionCall(func) = aliased.expression.as_ref() {
-                    if is_aggregate_function(&func.function) {
-                        let expr_name: String = self.get_aggregate_column_name(func).to_lowercase();
-                        let alias_lower: String = aliased.alias.value_lower.to_string();
-                        // If the alias exists in the map but the expression doesn't, add the expression
-                        if let Some(&idx) = agg_col_index_map.get(&alias_lower) {
-                            agg_col_index_map.entry(expr_name).or_insert(idx);
-                        }
-                        // If the expression exists in the map but the alias doesn't, add the alias
-                        if let Some(&idx) = agg_col_index_map
-                            .get(&self.get_aggregate_column_name(func).to_lowercase())
-                        {
-                            agg_col_index_map.entry(alias_lower).or_insert(idx);
-                        }
+                let aggregate = match aliased.expression.as_ref() {
+                    Expression::FunctionCall(func) if is_aggregate_function(&func.function) => {
+                        Some(func)
                     }
+                    _ => None,
+                };
+                if let Some(func) = aggregate {
+                    let expr_name: String = self.get_aggregate_column_name(func).to_lowercase();
+                    let alias_lower: String = aliased.alias.value_lower.to_string();
+                    // If the alias exists in the map but the expression doesn't, add the expression
+                    if let Some(&idx) = agg_col_index_map.get(&alias_lower) {
+                        agg_col_index_map.entry(expr_name).or_insert(idx);
+                    }
+                    // If the expression exists in the map but the alias doesn't, add the alias
+                    if let Some(&idx) =
+                        agg_col_index_map.get(&self.get_aggregate_column_name(func).to_lowercase())
+                    {
+                        agg_col_index_map.entry(alias_lower).or_insert(idx);
+                    }
+                } else if let Some(&idx) = agg_col_index_map.get(aliased.alias.value_lower.as_str())
+                {
+                    // A GROUP BY expression selected under an alias names its
+                    // column by the alias; another column built on the same
+                    // expression still finds it by the expression
+                    let expr_name = self
+                        .expression_to_string(aliased.expression.as_ref())
+                        .to_lowercase();
+                    agg_col_index_map.entry(expr_name).or_insert(idx);
                 }
             } else if let Expression::FunctionCall(func) = col_expr {
                 if is_aggregate_function(&func.function) {
