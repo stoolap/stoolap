@@ -514,6 +514,8 @@ impl Transaction for MvccTransaction {
             // This ensures crash recovery sees the COMMIT marker even if we crash
             // before complete_commit(). WAL is only read during recovery, so writing
             // the marker before visibility doesn't affect normal operation.
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::commit_marker_next();
             if let Some(ops) = &self.engine_operations {
                 if let Err(e) = ops.record_commit(self.id) {
                     // WAL commit marker failed. Phase 2 data is in the version store

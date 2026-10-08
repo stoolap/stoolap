@@ -736,6 +736,43 @@ pub struct LayoutToken {
 /// Issues each version store a number no other store in the process takes
 static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// An odd layout is a table closed for a column change: its rows may be
+/// read under the schema of that layout, and nothing is written under it
+fn is_closed(layout: u64) -> bool {
+    layout % 2 == 1
+}
+
+/// A row in the layout of `schema`, `width` columns wide: a narrower row
+/// takes the missing columns' defaults, or NULL; a wider one loses the
+/// cell at `cut`. None when the row is in that layout already
+fn lay_out_values(
+    values: &[Value],
+    width: usize,
+    cut: Option<usize>,
+    schema: &Schema,
+) -> Option<CompactArc<[Value]>> {
+    if values.len() < width {
+        let mut moved = Vec::with_capacity(width);
+        moved.extend_from_slice(values);
+        moved.extend(schema.columns[values.len()..].iter().map(|column| {
+            column
+                .default_value
+                .clone()
+                .unwrap_or_else(|| Value::null(column.data_type))
+        }));
+        return Some(CompactArc::from(moved));
+    }
+    match cut {
+        Some(at) if values.len() > width && at < values.len() => {
+            let mut moved = Vec::with_capacity(width);
+            moved.extend_from_slice(&values[..at]);
+            moved.extend_from_slice(&values[at + 1..]);
+            Some(CompactArc::from(moved))
+        }
+        _ => None,
+    }
+}
+
 impl VersionStore {
     /// Creates a new version store
     pub fn new(table_name: impl Into<SmartString>, schema: Schema) -> Self {
@@ -959,7 +996,10 @@ impl VersionStore {
     /// Positions resolved under `token` read this store's rows only while
     /// the store is open and its rows are still in that layout
     pub fn check_token(&self, token: LayoutToken) -> Result<(), Error> {
-        if self.closed.load(Ordering::Acquire) || token != self.token_for(self.layout()) {
+        if self.closed.load(Ordering::Acquire)
+            || is_closed(token.layout)
+            || token != self.token_for(self.layout())
+        {
             return Err(Error::SchemaChanged {
                 table: self.table_name.to_string(),
             });
@@ -973,27 +1013,121 @@ impl VersionStore {
     pub fn add_column(&self, column: crate::core::SchemaColumn) -> Result<(), Error> {
         let mut schema = self.schema.write();
         CompactArc::make_mut(&mut *schema).add_column(column)?;
-        self.layout.fetch_add(1, Ordering::AcqRel);
+        // By two, so the table stays open
+        self.layout.fetch_add(2, Ordering::AcqRel);
         Ok(())
     }
 
-    /// Removes `name` from the schema. The rows keep its cells until
-    /// `lay_out_rows` cuts them, once the change is durable
-    pub fn remove_column(&self, name: &str) -> Result<crate::core::SchemaColumn, Error> {
-        let mut schema = self.schema.write();
+    /// Closes the table to drop `name`: the drop is checked on a copy of the
+    /// schema, which comes back without the column for `publish_drop`, and
+    /// the column's position is noted. The schema and the rows stay as they
+    /// are, and nothing is written, until the drop is published
+    pub fn close_for_drop(&self, name: &str) -> Result<CompactArc<Schema>, Error> {
+        let schema = self.schema.write();
         let at = schema
             .get_column_index(name)
             .ok_or_else(|| Error::ColumnNotFound(name.to_string()))?;
-        let column = CompactArc::make_mut(&mut *schema).remove_column(name)?;
+        let mut without = Schema::clone(&schema);
+        without.remove_column(name)?;
         *self.pending_cut.lock() = Some(at);
         self.layout.fetch_add(1, Ordering::AcqRel);
-        Ok(column)
+        Ok(CompactArc::new(without))
     }
 
-    /// Forgets a column removal the rows were never cut for: the schema
-    /// went back to holding the column
-    pub fn discard_pending_cut(&self) {
+    /// Opens the table again after a drop whose record the log refused
+    pub fn reopen_after_refused_drop(&self) {
+        let _schema = self.schema.write();
         *self.pending_cut.lock() = None;
+        self.layout.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Takes out the indexes over the column a drop removes and binds the
+    /// indexes after it one position down, each keeping its data and
+    /// identity. A reader that trusts an index's order stands down across
+    /// the swap, as across a commit's publication
+    pub fn rebind_indexes_for_drop(&self) {
+        let Some(at) = *self.pending_cut.lock() else {
+            return;
+        };
+        let at = at as i32;
+        let current: Vec<(String, Arc<dyn Index>)> = self
+            .indexes
+            .read()
+            .iter()
+            .map(|(name, index)| (name.clone(), Arc::clone(index)))
+            .collect();
+        let mut removed = Vec::new();
+        let mut rebound = Vec::new();
+        for (name, index) in current {
+            let ids = index.column_ids();
+            if ids.contains(&at) {
+                removed.push(name);
+            } else if ids.iter().any(|&id| id > at) {
+                let moved: Vec<i32> = ids
+                    .iter()
+                    .map(|&id| if id > at { id - 1 } else { id })
+                    .collect();
+                rebound.push((name, index.rebound(index.column_names(), &moved)));
+            }
+        }
+        if removed.is_empty() && rebound.is_empty() {
+            return;
+        }
+        self.publishing.fetch_add(1, Ordering::SeqCst);
+        let taken: Vec<Arc<dyn Index>> = {
+            let mut indexes = self.indexes.write();
+            let taken = removed
+                .iter()
+                .filter_map(|name| indexes.remove(name))
+                .collect();
+            for (name, index) in rebound {
+                indexes.insert(name, index);
+            }
+            taken
+        };
+        {
+            let mut identities = self.index_identities.write();
+            for name in &removed {
+                identities.remove(name);
+            }
+        }
+        self.publish_epoch.fetch_add(1, Ordering::SeqCst);
+        self.publishing.fetch_sub(1, Ordering::SeqCst);
+        drop(taken);
+    }
+
+    /// Publishes a drop `close_for_drop` prepared to the hot rows: the rows
+    /// lose the column's cells and the schema the column under the one
+    /// versions lock, and the table stays closed for the cold mappings to
+    /// follow. The layout moves on, so no layout stands for two schemas
+    pub fn publish_drop(&self, without: CompactArc<Schema>) {
+        let width = without.columns.len();
+        let cut = self.pending_cut.lock().take();
+        let padded = CompactArc::clone(&without);
+        self.relayout_rows(
+            &|values| lay_out_values(values, width, cut, &padded),
+            || {
+                *self.schema.write() = without;
+                self.layout.fetch_add(2, Ordering::AcqRel);
+            },
+        );
+    }
+
+    /// Opens the table once its schema, hot rows, index bindings and cold
+    /// mappings agree again
+    pub fn open_after_drop(&self) {
+        let _schema = self.schema.write();
+        self.layout.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Drops `name` with no record and no cold rows to follow, as a
+    /// table handle does: close, rebind, publish and open back to back
+    pub fn drop_column_at_once(&self, name: &str) -> Result<(), Error> {
+        let without = self.close_for_drop(name)?;
+        self.rebind_indexes_for_drop();
+        self.publish_drop(without);
+        self.open_after_drop();
+        Ok(())
     }
 
     /// Moves every row to the schema's layout: a row narrower than the
@@ -1005,35 +1139,16 @@ impl VersionStore {
         let schema = self.schema();
         let width = schema.columns.len();
         let cut = self.pending_cut.lock().take();
-        self.relayout_rows(&|values| {
-            if values.len() < width {
-                let mut moved = Vec::with_capacity(width);
-                moved.extend_from_slice(values);
-                moved.extend(schema.columns[values.len()..].iter().map(|column| {
-                    column
-                        .default_value
-                        .clone()
-                        .unwrap_or_else(|| Value::null(column.data_type))
-                }));
-                return Some(CompactArc::from(moved));
-            }
-            match cut {
-                Some(at) if values.len() > width && at < values.len() => {
-                    let mut moved = Vec::with_capacity(width);
-                    moved.extend_from_slice(&values[..at]);
-                    moved.extend_from_slice(&values[at + 1..]);
-                    Some(CompactArc::from(moved))
-                }
-                _ => None,
-            }
-        });
+        self.relayout_rows(&|values| lay_out_values(values, width, cut, &schema), || {});
     }
 
     /// Rewrites every row `relayout` returns a new layout for: the heads
-    /// in the arena and the history behind them, under the one versions lock
-    fn relayout_rows(&self, relayout: Relayout<'_>) {
+    /// in the arena and the history behind them, under the one versions
+    /// lock. `published` runs under that lock once the heads are moved
+    fn relayout_rows(&self, relayout: Relayout<'_>, published: impl FnOnce()) {
         let mut versions = self.versions.write();
         self.arena.relayout(relayout);
+        published();
         let row_ids: Vec<i64> = versions.keys().collect();
         for row_id in row_ids {
             let Some(entry) = versions.get_mut(row_id) else {
@@ -1428,8 +1543,9 @@ impl VersionStore {
     /// wrong positions. Checked under the versions lock the change holds
     /// while it moves the rows, so no change slips between the check and
     /// the publication
-    fn check_layout(&self, layout: Option<u64>) -> Result<(), Error> {
-        if layout.is_some_and(|seen| seen != self.layout()) {
+    pub(crate) fn check_layout(&self, layout: Option<u64>) -> Result<(), Error> {
+        // An odd layout is a table closed for a column change
+        if layout.is_some_and(|seen| seen != self.layout() || is_closed(seen)) {
             return Err(Error::SchemaChanged {
                 table: self.table_name.to_string(),
             });
@@ -6548,6 +6664,7 @@ impl TxnTableStore {
     pub fn write_for(&self, layout: u64) -> TxnStoreWrite<'_> {
         let mut store = self.write_store();
         let refused = match store.layout_bound() {
+            _ if is_closed(layout) => true,
             Some(held) if held != layout => true,
             _ => {
                 // Stored before `newest` is read; `admit` raises it before it reads
@@ -7398,6 +7515,8 @@ impl TransactionVersionStore {
         // Get all indexes - early exit if none
         let indexes: SmallVec<[Arc<dyn Index>; 4]> =
             self.parent_store.get_all_indexes().into_iter().collect();
+        // The set taken binds the positions of the layout the rows are in
+        self.parent_store.check_layout(self.layout_bound())?;
         if indexes.is_empty() {
             return Ok(());
         }

@@ -3675,36 +3675,48 @@ impl MVCCEngine {
             }
         }
 
-        // Update version store schema first (source of truth)
-        {
-            let stores = self.version_stores.read().unwrap();
-            if let Some(store) = stores.get(&table_name_lower) {
-                store.remove_column(column_name)?;
-                store.lay_out_rows();
-            }
-        }
         change.mark_changed();
-
-        // Sync engine schema cache from version store
-        {
-            let vs_schema = {
-                let stores = self.version_stores.read().unwrap();
-                stores
-                    .get(&table_name_lower)
-                    .map(|store| store.schema().clone())
-            };
-            if let Some(schema) = vs_schema {
-                let mut schemas = self.schemas.write().unwrap();
-                schemas.insert(table_name_lower, schema);
-                self.schema_epoch.fetch_add(1, Ordering::Release);
-            }
-        }
-
-        // Record the drop in the segment manifest so cold volume mappings
-        // mask stale data. Same as the live DDL path in ddl.rs. Without this,
-        // crash recovery (WAL replay) loses dropped_columns metadata.
-        self.propagate_column_drop_inner(table_name, column_name, replayed_lsn);
+        let dropped = self.drop_column_transition(table_name, column_name, |_| Ok(replayed_lsn));
         change.finish();
+        dropped
+    }
+
+    /// Drops a column from the hot store, the indexes and the cold mappings
+    /// together. The table closes; `record` logs the change and returns the
+    /// log position the manifest takes it at, and a refused record opens
+    /// the table as it was. Then the indexes are rebound, the hot rows and
+    /// schema published, the cold mappings moved, and the table opens
+    pub(crate) fn drop_column_transition(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        record: impl FnOnce(&Self) -> Result<Option<u64>>,
+    ) -> Result<()> {
+        let store = self.get_version_store(table_name)?;
+        let without = store.close_for_drop(column_name)?;
+        let ddl_lsn = match record(self) {
+            Ok(lsn) => lsn,
+            Err(error) => {
+                store.reopen_after_refused_drop();
+                return Err(error);
+            }
+        };
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::drop_column_recorded();
+        store.rebind_indexes_for_drop();
+        store.publish_drop(without);
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::drop_hot_published();
+        // The cold mappings follow while the table is closed, outside the
+        // row, arena and schema locks
+        let refreshed = self.refresh_schema_cache(table_name);
+        self.propagate_column_drop_inner(table_name, column_name, ddl_lsn);
+        store.open_after_drop();
+        refreshed?;
+        // On replay the catalog is not final yet; the open discards then
+        if !self.should_skip_wal() {
+            self.discard_uncovered_side_files(table_name);
+        }
         Ok(())
     }
 
@@ -3904,7 +3916,6 @@ impl MVCCEngine {
     ) -> Result<()> {
         let store = self.get_version_store(table_name)?;
         *store.schema_mut() = schema;
-        store.discard_pending_cut();
         self.refresh_schema_cache(table_name)?;
         self.refresh_column_mappings(table_name);
         Ok(())
@@ -3925,14 +3936,6 @@ impl MVCCEngine {
         column: crate::core::SchemaColumn,
     ) -> Result<()> {
         self.get_version_store(table_name)?.add_column(column)
-    }
-
-    /// Removes a column from a table's schema, the rows to follow at
-    /// `lay_out_rows` once the change is recorded
-    pub(crate) fn drop_column_schema(&self, table_name: &str, column_name: &str) -> Result<()> {
-        self.get_version_store(table_name)?
-            .remove_column(column_name)?;
-        Ok(())
     }
 
     /// Order a table's sealed rows by `key` from the next seal on; the
@@ -3977,11 +3980,6 @@ impl MVCCEngine {
         Ok(())
     }
 
-    /// Record a column drop so old cold volumes don't leak stale data.
-    pub fn propagate_column_drop(&self, table_name: &str, col_name: &str) {
-        self.propagate_column_drop_inner(table_name, col_name, self.recorded_ddl_lsn());
-    }
-
     /// `ddl_lsn` is the log position of the change's record: a statement's
     /// own, just written, or a replayed one, which the manifest may hold
     /// already and then records nothing for
@@ -4003,7 +4001,7 @@ impl MVCCEngine {
     /// The log position the last record took, when the log is on: a
     /// statement records itself before it propagates, so the manifest
     /// takes the change and the position it reaches in one write
-    fn recorded_ddl_lsn(&self) -> Option<u64> {
+    pub(crate) fn recorded_ddl_lsn(&self) -> Option<u64> {
         match self.persistence.as_ref() {
             Some(pm) if pm.is_enabled() => Some(pm.current_lsn()),
             _ => None,

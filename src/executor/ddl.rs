@@ -1065,32 +1065,18 @@ impl Executor {
             AlterTableOperation::DropColumn => {
                 if let Some(ref col_name) = stmt.column_name {
                     let mut change = self.engine.begin_column_change(table_name)?;
-                    let previous_schema = self.engine.get_table_schema(table_name)?;
-                    self.engine
-                        .drop_column_schema(table_name, &col_name.value)?;
                     change.mark_changed();
-
-                    // Refresh schema cache FIRST so invalidate_mappings sees the post-drop schema
-                    self.engine.refresh_schema_cache(table_name)?;
-
-                    // Record ALTER TABLE DROP COLUMN to WAL for persistence,
-                    // before the manifest takes the drop with its log position
-                    if let Err(error) = self
-                        .engine
-                        .record_alter_table_drop_column(table_name, &col_name.value)
-                    {
+                    let dropped =
                         self.engine
-                            .restore_column_schema(table_name, previous_schema)?;
-                        change.finish();
-                        return Err(error);
-                    }
-
-                    // The rows lose the column's cells once the drop is recorded
-                    self.engine.lay_out_rows(table_name)?;
-                    // Record column drop in manifest and recompute cold volume mappings
-                    self.engine
-                        .propagate_column_drop(table_name, &col_name.value);
+                            .drop_column_transition(table_name, &col_name.value, |engine| {
+                                // Recorded before the manifest takes the drop
+                                // with its log position
+                                engine
+                                    .record_alter_table_drop_column(table_name, &col_name.value)?;
+                                Ok(engine.recorded_ddl_lsn())
+                            });
                     change.finish();
+                    dropped?;
                 } else {
                     return Err(Error::InvalidArgument(
                         "DROP COLUMN requires column name".to_string(),

@@ -733,6 +733,12 @@ impl Schema {
                 *key -= 1;
             }
         }
+        // A foreign key names its column by position too
+        for fk in &mut self.foreign_keys {
+            if fk.column_index > idx {
+                fk.column_index -= 1;
+            }
+        }
 
         // Re-index remaining columns
         for (i, col) in self.columns.iter_mut().enumerate() {
