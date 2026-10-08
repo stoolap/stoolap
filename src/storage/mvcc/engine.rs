@@ -3713,7 +3713,10 @@ impl MVCCEngine {
         self.propagate_column_drop_inner(table_name, column_name, ddl_lsn);
         store.open_after_drop();
         refreshed?;
-        self.discard_uncovered_side_files(table_name);
+        // On replay the catalog is not final yet; the open discards then
+        if !self.should_skip_wal() {
+            self.discard_uncovered_side_files(table_name);
+        }
         Ok(())
     }
 

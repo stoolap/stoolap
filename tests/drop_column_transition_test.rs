@@ -511,6 +511,60 @@ fn a_refused_commit_across_a_drop_leaves_the_indexes_whole_on_file() {
     refused_commit_undone_across_a_drop(&file_dsn(&dir, ""));
 }
 
+// --- Side files across a replayed drop --------------------------------------
+
+fn side_files(dir: &tempfile::TempDir) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir.path().join("volumes").join("t"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".sidx"))
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn a_side_file_built_after_a_drop_survives_its_replay() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let k_rows = |db: &Database| ids(db, "SELECT id FROM t WHERE k = 7");
+    let built = {
+        let db = Database::open(&file_dsn(&dir, REPLAY)).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, padding INTEGER, k INTEGER)",
+            (),
+        )
+        .unwrap();
+        db.execute("CREATE INDEX ip ON t(padding)", ()).unwrap();
+        db.execute(
+            "INSERT INTO t SELECT value, value % 50, value % 100 FROM generate_series(1, 2000)",
+            (),
+        )
+        .unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        assert!(!side_files(&dir).is_empty(), "the seal covered ip");
+        db.execute("ALTER TABLE t DROP COLUMN padding", ()).unwrap();
+        assert!(
+            side_files(&dir).is_empty(),
+            "the file goes with the index over the dropped column"
+        );
+        db.execute("CREATE INDEX ik ON t(k)", ()).unwrap();
+        db.execute("PRAGMA INDEX_BACKFILL", ()).unwrap();
+        assert_eq!(k_rows(&db).len(), 20);
+        db.close().unwrap();
+        side_files(&dir)
+    };
+    assert!(!built.is_empty(), "the backfill built a side file");
+    let db = Database::open(&file_dsn(&dir, REPLAY)).unwrap();
+    assert_eq!(
+        side_files(&dir),
+        built,
+        "the replayed drop keeps the side file of the index created after it"
+    );
+    assert_eq!(k_rows(&db).len(), 20);
+}
+
 // --- A drop the log refuses -------------------------------------------------
 
 #[cfg(feature = "test-failpoints")]
