@@ -952,6 +952,22 @@ struct Retired {
     file: Option<File>,
     path: PathBuf,
     durable_len: u64,
+    /// The LSN of the last record the old file holds
+    last_lsn: u64,
+}
+
+/// What a caller's record needs before its call can succeed
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Need {
+    Written,
+    Synced,
+}
+
+/// How a failure cleanup treats the current file in Normal mode; Full mode
+/// always goes back to its synced floor
+enum Cut {
+    Keep,
+    Back { len: u64, lsn: u64 },
 }
 
 pub struct WALManager {
@@ -986,6 +1002,17 @@ pub struct WALManager {
     /// Set after a WAL write failure; all further appends/flushes fail.
     /// See flush_and_maybe_sync for why retrying is never safe.
     poisoned: AtomicBool,
+    /// The highest LSN wholly written, to whichever file
+    written_lsn: AtomicU64,
+    /// The highest LSN durable: its file and every earlier one synced
+    synced_lsn: AtomicU64,
+    /// The LSN of the last record put in the buffer, read where it drains
+    buffered_lsn: AtomicU64,
+    /// Once the failure that poisoned the log is cleaned up: whether every
+    /// cut it needed held. Taken after `wal_file`, before `retired`
+    failure_cleaned: Mutex<Option<bool>>,
+    /// A failed settlement could not cut the retired file back
+    retired_cut_failed: AtomicBool,
     /// Pending commits (legacy, kept for API compatibility)
     #[allow(dead_code)]
     pending_commits: AtomicI32,
@@ -1249,6 +1276,11 @@ impl WALManager {
             sync_mode,
             running: AtomicBool::new(true),
             poisoned: AtomicBool::new(false),
+            written_lsn: AtomicU64::new(initial_lsn),
+            synced_lsn: AtomicU64::new(initial_lsn),
+            buffered_lsn: AtomicU64::new(initial_lsn),
+            failure_cleaned: Mutex::new(None),
+            retired_cut_failed: AtomicBool::new(false),
             pending_commits: AtomicI32::new(0),
             last_sync_time: AtomicI64::new(now),
             commit_batch_size,
@@ -1294,11 +1326,66 @@ impl WALManager {
         self.append(entry, true)
     }
 
-    /// Append a checkpoint's copy of a catalog record. It gets no flush or
-    /// sync of its own: the checkpoint's `sync_for_checkpoint` makes the
-    /// whole batch durable at once.
-    pub fn append_catalog_entry(&self, entry: WALEntry) -> Result<u64> {
-        self.append(entry, false)
+    /// Writes `entries` as one unit with one sync: a schema change's record
+    /// and marker, or a checkpoint's catalog copies. What is buffered goes
+    /// first; no other record lands inside the unit; a failure removes the
+    /// whole unit in Normal mode and keeps what was written before it.
+    /// Returns the entries' LSNs
+    pub fn append_unit(&self, entries: Vec<WALEntry>) -> Result<Vec<u64>> {
+        if !self.running.load(Ordering::Acquire) {
+            return Err(Error::WalNotRunning);
+        }
+        let mut entries: Vec<(WALEntry, Vec<u8>)> = entries
+            .into_iter()
+            .map(|entry| {
+                let encoded = entry.encode();
+                (entry, encoded)
+            })
+            .collect();
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::wal_sync_starting();
+        let mut wal_file = self.wal_file.lock().unwrap();
+        let name = self.current_wal_file.lock().unwrap().clone();
+        if self.poisoned.load(Ordering::Acquire) {
+            self.clean_failure(&wal_file, &name, Cut::Keep);
+            return Err(self.failure_error(poisoned_error()));
+        }
+        let mut buffer = self.buffer.lock().unwrap();
+        if let Err(e) = self.drain_locked(&mut wal_file, &mut buffer) {
+            self.clean_failure(&wal_file, &name, self.failed_write_cut());
+            return Err(self.failure_error(e));
+        }
+        let start = self.current_file_position.load(Ordering::Relaxed);
+        let before = self.written_lsn.load(Ordering::Acquire);
+        let mut lsns = Vec::with_capacity(entries.len());
+        for (entry, encoded) in &mut entries {
+            if self.current_lsn.load(Ordering::Acquire) == u64::MAX {
+                buffer.clear();
+                return Err(Error::internal(
+                    "WAL LSN overflow: maximum sequence number reached. Database requires maintenance.",
+                ));
+            }
+            entry.previous_lsn = self.previous_lsn.load(Ordering::Acquire);
+            entry.lsn = self.current_lsn.fetch_add(1, Ordering::SeqCst) + 1;
+            self.previous_lsn.store(entry.lsn, Ordering::Release);
+            WALEntry::stamp_lsns(encoded, entry.lsn, entry.previous_lsn);
+            buffer.extend_from_slice(encoded);
+            self.buffered_lsn.store(entry.lsn, Ordering::Release);
+            lsns.push(entry.lsn);
+        }
+        // Written while the buffer lock keeps every other record out of it
+        let written = self.drain_locked(&mut wal_file, &mut buffer);
+        drop(buffer);
+        let unit = Cut::Back {
+            len: start,
+            lsn: before,
+        };
+        let done = written.and_then(|()| self.sync_with_file(&wal_file));
+        if let Err(e) = done {
+            self.clean_failure(&wal_file, &name, unit);
+            return Err(self.failure_error(e));
+        }
+        Ok(lsns)
     }
 
     fn append(&self, mut entry: WALEntry, durable: bool) -> Result<u64> {
@@ -1332,6 +1419,7 @@ impl WALManager {
             self.previous_lsn.store(entry.lsn, Ordering::Release);
             WALEntry::stamp_lsns(&mut encoded, entry.lsn, entry.previous_lsn);
             buffer.extend_from_slice(&encoded);
+            self.buffered_lsn.store(entry.lsn, Ordering::Release);
 
             let needs_flush = buffer.len() >= self.flush_trigger as usize;
             let force_flush = durable
@@ -1341,113 +1429,183 @@ impl WALManager {
         };
 
         if do_flush {
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::record_buffered();
             // A DDL transaction's commit marker must sync like the DDL
             // entry itself: "schema changes must be durable" is void if a
             // crash inside the sync interval discards the unsynced marker.
             let ddl_commit = entry.operation.is_transaction_end()
                 && entry.txn_id == crate::storage::mvcc::persistence::DDL_TXN_ID;
+            // A commit needs its marker synced in Full mode, written in
+            // Normal mode; a schema change needs its sync in both
+            let need = if durable
+                && (ddl_commit
+                    || entry.operation.is_ddl()
+                    || (self.sync_mode == SyncMode::Full && entry.operation.is_transaction_end()))
+            {
+                Need::Synced
+            } else {
+                Need::Written
+            };
             let sync = durable && (self.should_sync(entry.operation) || ddl_commit);
-            self.flush_and_maybe_sync(sync)?;
+            self.flush_and_maybe_sync(entry.lsn, need, sync)?;
         }
 
         Ok(entry.lsn)
     }
 
-    /// Drain the buffer to the file and optionally fsync, all under the
-    /// `wal_file` lock (same `wal_file` -> `buffer` order as `truncate_wal`).
-    /// Serializing drains here is what makes a commit sync cover every
-    /// byte appended before it: no other thread can be holding drained-but-
-    /// unwritten bytes.
-    ///
-    /// A failed write POISONS the WAL: retrying the buffer would re-write
-    /// commit markers of transactions already reported as failed (recovery
-    /// would resurrect them), and re-writing after a partial `write_all`
-    /// would corrupt the entry stream. The partial suffix is best-effort
-    /// truncated back to the last fsynced offset (see
-    /// `poison_and_truncate`); afterwards every append/flush fails until
-    /// the database is reopened.
-    fn flush_and_maybe_sync(&self, sync: bool) -> Result<()> {
+    /// Drains the buffer and, when `sync`, fsyncs, all under the `wal_file`
+    /// lock, so a sync covers every byte appended before it. The call
+    /// succeeds once the record at `lsn` meets `need`, even when a later
+    /// failure poisoned the log; a failure is cleaned up before any other
+    /// outcome is reported. A failed log is never written again
+    fn flush_and_maybe_sync(&self, lsn: u64, need: Need, sync: bool) -> Result<()> {
         #[cfg(any(test, feature = "test-failpoints"))]
         if sync {
             crate::test_failpoints::wal_sync_starting();
         }
-        // Fast-path check; the authoritative one is under the lock below.
-        if self.poisoned.load(Ordering::Acquire) {
-            return Err(Error::internal(
-                "WAL is poisoned after a write failure; reopen the database",
-            ));
-        }
         let mut wal_file = self.wal_file.lock().unwrap();
-        // Re-check under the lock: a concurrent flush may have poisoned
-        // (and truncated) while we waited, and writing the shared buffer
-        // now would re-write a failed transaction's marker.
+        // Read only on a failure: a commit's flush allocates nothing for it
+        let name = || self.current_wal_file.lock().unwrap().clone();
         if self.poisoned.load(Ordering::Acquire) {
-            return Err(Error::internal(
-                "WAL is poisoned after a write failure; reopen the database",
-            ));
+            self.clean_failure(&wal_file, &name(), Cut::Keep);
+            return self.outcome(lsn, need, poisoned_error());
         }
-        {
+        let drained = {
             let mut buffer = self.buffer.lock().unwrap();
-            if !buffer.is_empty() {
-                let write_result = (|| {
-                    #[cfg(any(test, feature = "test-failpoints"))]
-                    if crate::test_failpoints::WAL_WRITE_FAIL
-                        .load(std::sync::atomic::Ordering::Acquire)
-                    {
-                        return Err(Error::internal("failpoint: WAL write"));
-                    }
-                    match wal_file.as_mut() {
-                        Some(file) => file
-                            .write_all(&buffer)
-                            .map_err(|e| Error::internal(format!("failed to write to WAL: {}", e))),
-                        None => Err(Error::WalFileClosed),
-                    }
-                })();
-                if let Err(e) = write_result {
-                    let name = self.current_wal_file.lock().unwrap().clone();
-                    return Err(self.poison_and_truncate(&wal_file, &name, e));
-                }
-
-                self.current_file_position
-                    .fetch_add(buffer.len() as u64, Ordering::Relaxed);
-                // clear() keeps the allocation, so the buffer capacity
-                // survives across flush cycles.
-                buffer.clear();
-            }
+            self.drain_locked(&mut wal_file, &mut buffer)
+        };
+        if let Err(e) = drained {
+            self.clean_failure(&wal_file, &name(), self.failed_write_cut());
+            return self.outcome(lsn, need, e);
         }
-
         if sync {
             if let Err(e) = self.sync_with_file(&wal_file) {
-                // A failed fsync leaves already-written bytes in an
-                // unknowable durability state, and even without another
-                // sync the kernel would eventually write them back.
-                let name = self.current_wal_file.lock().unwrap().clone();
-                return Err(self.poison_and_truncate(&wal_file, &name, e));
+                // Written bytes stay in Normal mode: a sync is a commit's
+                // requirement only in Full mode, which goes to its floor
+                self.clean_failure(&wal_file, &name(), Cut::Keep);
+                return self.outcome(lsn, need, e);
             }
         }
         Ok(())
     }
 
-    /// Poison the WAL and truncate the file back to the last fsynced
-    /// offset, so no unsynced marker of a failed commit can ever become
-    /// durable (via a later sync or plain kernel writeback). In Full mode
-    /// everything above the floor is unacknowledged by construction; in
-    /// Normal mode it is within the documented sync-interval loss window.
-    /// Truncation is best-effort: if it fails too, the torn-tail recovery
-    /// scan is the fallback.
-    fn poison_and_truncate(&self, wal_file: &Option<File>, name: &str, e: Error) -> Error {
-        self.poisoned.store(true, Ordering::Release);
-        let floor = self.synced_position.load(Ordering::Acquire);
-        if let Some(file) = wal_file.as_ref() {
-            if let Err(cut) = shorten_wal_file(file, &self.path.join(name), floor) {
-                eprintln!(
-                    "Warning: WAL file {} was not cut back to {} bytes after a failed write: {}",
-                    name, floor, cut
-                );
-            }
+    /// Writes `buffer` to the current file
+    fn write_buffer(wal_file: &mut Option<File>, buffer: &[u8]) -> Result<()> {
+        #[cfg(any(test, feature = "test-failpoints"))]
+        if crate::test_failpoints::WAL_WRITE_FAIL.load(Ordering::Acquire) {
+            return Err(Error::internal("failpoint: WAL write"));
         }
-        self.current_file_position.store(floor, Ordering::Release);
-        e
+        #[cfg(any(test, feature = "test-failpoints"))]
+        if crate::test_failpoints::WAL_WRITE_PARTIAL.load(Ordering::Acquire) {
+            if let Some(file) = wal_file.as_mut() {
+                let _ = file.write_all(&buffer[..buffer.len().saturating_sub(5)]);
+            }
+            return Err(Error::internal("failpoint: partial WAL write"));
+        }
+        match wal_file.as_mut() {
+            Some(file) => file
+                .write_all(buffer)
+                .map_err(|e| Error::internal(format!("failed to write to WAL: {}", e))),
+            None => Err(Error::WalFileClosed),
+        }
+    }
+
+    /// Writes what the buffer holds under the held `wal_file` lock. A failed
+    /// write leaves the position and the written LSN where it started; see
+    /// `failed_write_cut`
+    fn drain_locked(&self, wal_file: &mut Option<File>, buffer: &mut Vec<u8>) -> Result<()> {
+        if buffer.is_empty() {
+            return Ok(());
+        }
+        let last = self.buffered_lsn.load(Ordering::Acquire);
+        if let Err(e) = Self::write_buffer(wal_file, buffer) {
+            buffer.clear();
+            return Err(e);
+        }
+        self.current_file_position
+            .fetch_add(buffer.len() as u64, Ordering::Relaxed);
+        self.written_lsn.fetch_max(last, Ordering::AcqRel);
+        // clear() keeps the allocation for the next flush
+        buffer.clear();
+        Ok(())
+    }
+
+    /// The cut after a failed write: back to where the write started, since
+    /// every byte before it is a record already written
+    fn failed_write_cut(&self) -> Cut {
+        Cut::Back {
+            len: self.current_file_position.load(Ordering::Relaxed),
+            lsn: self.written_lsn.load(Ordering::Acquire),
+        }
+    }
+
+    fn met(&self, lsn: u64, need: Need) -> bool {
+        let done = match need {
+            Need::Written => &self.written_lsn,
+            Need::Synced => &self.synced_lsn,
+        };
+        lsn <= done.load(Ordering::Acquire)
+    }
+
+    /// After a failure: success when the record at `lsn` meets `need`
+    fn outcome(&self, lsn: u64, need: Need, error: Error) -> Result<()> {
+        if self.met(lsn, need) {
+            return Ok(());
+        }
+        Err(self.failure_error(error))
+    }
+
+    /// `error`, or an unknown outcome when a cut of the cleanup failed
+    fn failure_error(&self, error: Error) -> Error {
+        match *self.failure_cleaned.lock().unwrap() {
+            Some(false) => unknown_outcome(&error),
+            _ => error,
+        }
+    }
+
+    /// Poisons the log and, once, under the held `wal_file` lock, removes
+    /// what no caller may keep: a retired file still owed (waited for while
+    /// its sync runs, cut to its durable length in Full mode), then the
+    /// current file by `cut`, or to its synced floor in Full mode. The cuts
+    /// never move the completion record forward
+    fn clean_failure(&self, wal_file: &Option<File>, name: &str, cut: Cut) {
+        self.poisoned.store(true, Ordering::Release);
+        let mut cleaned = self.failure_cleaned.lock().unwrap();
+        if cleaned.is_some() {
+            return;
+        }
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::wal_failure_cleanup_starting();
+        let full = self.sync_mode == SyncMode::Full;
+        let mut held = true;
+        let owed = self.retired.lock().unwrap().take();
+        if let Some(Retired {
+            file: Some(file),
+            path,
+            durable_len,
+            ..
+        }) = owed.filter(|_| full)
+        {
+            held &= shorten_wal_file(&file, &path, durable_len).is_ok();
+        }
+        let cut = if full {
+            Cut::Back {
+                len: self.synced_position.load(Ordering::Acquire),
+                lsn: self.synced_lsn.load(Ordering::Acquire),
+            }
+        } else {
+            cut
+        };
+        if let Cut::Back { len, lsn } = cut {
+            if let Some(file) = wal_file.as_ref() {
+                held &= shorten_wal_file(file, &self.path.join(name), len).is_ok();
+            }
+            self.current_file_position.store(len, Ordering::Release);
+            self.written_lsn.fetch_min(lsn, Ordering::AcqRel);
+        }
+        held &= !self.retired_cut_failed.load(Ordering::Acquire);
+        *cleaned = Some(held);
     }
 
     /// Get previous LSN (last written entry's LSN)
@@ -1465,12 +1623,6 @@ impl WALManager {
     pub fn write_abort_marker(&self, txn_id: i64) -> Result<u64> {
         let entry = WALEntry::abort_marker(txn_id);
         self.append_entry(entry)
-    }
-
-    /// Sync WAL to disk (acquires the wal_file lock).
-    fn sync_locked(&self) -> Result<()> {
-        let wal_file = self.wal_file.lock().unwrap();
-        self.sync_with_file(&wal_file)
     }
 
     /// Fsync via an already-held `wal_file` guard.
@@ -1491,13 +1643,15 @@ impl WALManager {
             file.sync_all()
                 .map_err(|e| Error::internal(format!("failed to sync WAL: {}", e)))?;
         }
-        // Everything written so far is durable; advance the poison
-        // truncation floor. Callers hold the wal_file lock, so the
-        // position is stable here.
+        // Everything written so far is durable, the retired file settled
+        // above included; callers hold the wal_file lock, so the position
+        // and the written LSN are stable here
         self.synced_position.store(
             self.current_file_position.load(Ordering::Relaxed),
             Ordering::Release,
         );
+        self.synced_lsn
+            .fetch_max(self.written_lsn.load(Ordering::Acquire), Ordering::AcqRel);
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1547,11 +1701,8 @@ impl WALManager {
             return Err(Error::WalNotRunning);
         }
 
-        // First flush buffer
-        self.flush()?;
-
-        // Then sync
-        self.sync_locked()
+        // Everything appended so far, written and synced
+        self.flush_and_maybe_sync(self.current_lsn.load(Ordering::Acquire), Need::Synced, true)
     }
 
     /// Flush buffer to disk without syncing
@@ -1560,7 +1711,11 @@ impl WALManager {
             return Err(Error::WalNotRunning);
         }
 
-        self.flush_and_maybe_sync(false)
+        self.flush_and_maybe_sync(
+            self.current_lsn.load(Ordering::Acquire),
+            Need::Written,
+            false,
+        )
     }
 
     /// Check if we should sync based on operation type
@@ -1845,6 +2000,10 @@ impl WALManager {
             self.synced_position.store(valid_end, Ordering::Release);
         }
         self.current_lsn.fetch_max(last_lsn, Ordering::AcqRel);
+        // What the file holds at open is durable
+        for done in [&self.written_lsn, &self.synced_lsn, &self.buffered_lsn] {
+            done.fetch_max(last_lsn, Ordering::AcqRel);
+        }
         Ok(())
     }
 
@@ -1872,16 +2031,13 @@ impl WALManager {
         Ok(self.current_lsn.load(Ordering::Acquire))
     }
 
-    /// Write out and fsync everything appended so far: the records up to
-    /// the cut and the catalog copies appended after it, in one sync.
+    /// Write out and fsync everything appended so far, the records up to
+    /// the cut included, in one sync that must succeed.
     pub fn sync_for_checkpoint(&self) -> Result<()> {
         if !self.running.load(Ordering::Acquire) {
             return Err(Error::WalNotRunning);
         }
-        // Drain and fsync under the one lock hold: a write failing in
-        // between would cut the copies back out of the file and the sync
-        // would report them durable
-        self.flush_and_maybe_sync(true)
+        self.flush_and_maybe_sync(self.current_lsn.load(Ordering::Acquire), Need::Synced, true)
     }
 
     /// Publish the cut as the recovery boundary in checkpoint.meta, naming
@@ -1933,29 +2089,22 @@ impl WALManager {
             return Ok(()); // Already closed
         }
 
-        // A poisoned WAL must not flush its stale buffer on close, and it
-        // must not fsync either: the file is already truncated to the
-        // durable floor, and a close-time sync could persist an aborted
-        // commit's marker that was written before the poison. Only the
-        // handle release below still runs.
-        if !self.poisoned.load(Ordering::Acquire) {
-            // Flush buffer to file (while still running)
-            self.flush()?;
+        // Everything appended is written and synced, unless the log failed:
+        // then it is only cleaned up, and the close reports the failure
+        // after the handle is released
+        let closed = self
+            .flush_and_maybe_sync(self.current_lsn.load(Ordering::Acquire), Need::Synced, true)
+            .and_then(|()| {
+                if self.poisoned.load(Ordering::Acquire) {
+                    Err(self.failure_error(poisoned_error()))
+                } else {
+                    Ok(())
+                }
+            });
 
-            // Fsync to ensure all WAL data is durable on disk.
-            // Without this, a power failure or kill -9 after close
-            // could lose buffered WAL entries.
-            self.sync_locked()?;
-        }
-
-        // Now mark as not running
         self.running.store(false, Ordering::SeqCst);
-
-        // Close file
-        let mut wal_file = self.wal_file.lock().unwrap();
-        *wal_file = None;
-
-        Ok(())
+        *self.wal_file.lock().unwrap() = None;
+        closed
     }
 
     /// Get the WAL directory path
@@ -2122,9 +2271,8 @@ impl WALManager {
             }
             if self.poisoned.load(Ordering::Acquire) {
                 let _ = fs::remove_file(&prepared_path);
-                return Err(Error::internal(
-                    "WAL is poisoned after a write failure; reopen the database",
-                ));
+                self.clean_failure(&wal_file, &current_name, Cut::Keep);
+                return Err(poisoned_error());
             }
             if !self.running.load(Ordering::Acquire) || wal_file.is_none() {
                 let _ = fs::remove_file(&prepared_path);
@@ -2136,6 +2284,7 @@ impl WALManager {
             // paid here, before the old file it belongs to is replaced
             if let Err(e) = self.settle_retired() {
                 let _ = fs::remove_file(&prepared_path);
+                self.clean_failure(&wal_file, &current_name, Cut::Keep);
                 return Err(e);
             }
 
@@ -2143,20 +2292,10 @@ impl WALManager {
             // the last record the old file holds
             let last_lsn = {
                 let mut buffer = self.buffer.lock().unwrap();
-                if !buffer.is_empty() {
-                    let write_result = match wal_file.as_mut() {
-                        Some(file) => file
-                            .write_all(&buffer)
-                            .map_err(|e| Error::internal(format!("failed to write to WAL: {}", e))),
-                        None => Err(Error::WalFileClosed),
-                    };
-                    if let Err(e) = write_result {
-                        let _ = fs::remove_file(&prepared_path);
-                        return Err(self.poison_and_truncate(&wal_file, &current_name, e));
-                    }
-                    self.current_file_position
-                        .fetch_add(buffer.len() as u64, Ordering::Relaxed);
-                    buffer.clear();
+                if let Err(e) = self.drain_locked(&mut wal_file, &mut buffer) {
+                    let _ = fs::remove_file(&prepared_path);
+                    self.clean_failure(&wal_file, &current_name, self.failed_write_cut());
+                    return Err(self.failure_error(e));
                 }
                 self.current_lsn.load(Ordering::Acquire)
             };
@@ -2178,6 +2317,7 @@ impl WALManager {
                 file: old_file.filter(|_| unsynced),
                 path: self.path.join(old_name),
                 durable_len,
+                last_lsn,
             });
 
             // Reset position counters inside the same critical section:
@@ -2191,7 +2331,12 @@ impl WALManager {
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::wal_swapped();
 
-        self.settle_retired()?;
+        if let Err(e) = self.settle_retired() {
+            let wal_file = self.wal_file.lock().unwrap();
+            let name = self.current_wal_file.lock().unwrap().clone();
+            self.clean_failure(&wal_file, &name, Cut::Keep);
+            return Err(e);
+        }
         Ok(true)
     }
 
@@ -2207,14 +2352,13 @@ impl WALManager {
         // A settlement that failed while this one waited poisoned the WAL
         // and left nothing to take: its failure is this caller's too
         if self.poisoned.load(Ordering::Acquire) {
-            return Err(Error::internal(
-                "WAL is poisoned after a write failure; reopen the database",
-            ));
+            return Err(poisoned_error());
         }
         let Some(Retired {
             file,
             path,
             durable_len,
+            last_lsn,
         }) = retired.take()
         else {
             return Ok(());
@@ -2232,23 +2376,18 @@ impl WALManager {
         #[cfg(not(any(test, feature = "test-failpoints")))]
         let synced = Self::sync_retired(file.as_ref(), &self.path);
         if let Err(e) = synced {
-            // As poison_and_truncate for the current file: the tail above
-            // the durable floor holds only records no commit was
-            // acknowledged for, and a failed one's marker must not
-            // persist and replay
+            // Full mode acknowledged nothing above the durable length, and
+            // a failed commit's marker there must not replay; Normal mode
+            // acknowledged the tail when it was written, so it stays
             self.poisoned.store(true, Ordering::Release);
-            if let Some(file) = file.as_ref() {
-                if let Err(cut) = shorten_wal_file(file, &path, durable_len) {
-                    eprintln!(
-                        "Warning: WAL file {} was not cut back to {} bytes after a failed sync: {}",
-                        path.display(),
-                        durable_len,
-                        cut
-                    );
+            if let Some(file) = file.as_ref().filter(|_| self.sync_mode == SyncMode::Full) {
+                if shorten_wal_file(file, &path, durable_len).is_err() {
+                    self.retired_cut_failed.store(true, Ordering::Release);
                 }
             }
             return Err(e);
         }
+        self.synced_lsn.fetch_max(last_lsn, Ordering::AcqRel);
         Ok(())
     }
 
@@ -2296,10 +2435,27 @@ fn record_checksum_holds(data: &[u8]) -> bool {
     u32::from_le_bytes(stored) == crc32fast::hash(&data[..crc_offset])
 }
 
+fn poisoned_error() -> Error {
+    Error::internal("WAL is poisoned after a write failure; reopen the database")
+}
+
+/// A failure whose cleanup could not cut the log back: what was cut away
+/// in memory may still replay
+fn unknown_outcome(error: &Error) -> Error {
+    Error::internal(format!(
+        "{}; the WAL could not be cut back, so the outcome is unknown until the database reopens",
+        error
+    ))
+}
+
 /// Cuts the open WAL file at `path` to `len` and syncs it, through that
 /// handle, so the cut needs no new descriptor
 #[cfg(not(windows))]
 fn shorten_wal_file(file: &File, _path: &Path, len: u64) -> io::Result<()> {
+    #[cfg(any(test, feature = "test-failpoints"))]
+    if crate::test_failpoints::WAL_CUT_FAIL.load(Ordering::Acquire) {
+        return Err(io::Error::other("failpoint: WAL cut"));
+    }
     file.set_len(len)?;
     file.sync_all()
 }
@@ -2308,6 +2464,10 @@ fn shorten_wal_file(file: &File, _path: &Path, len: u64) -> io::Result<()> {
 /// opened to write: one opened to append may not change the length
 #[cfg(windows)]
 fn shorten_wal_file(_file: &File, path: &Path, len: u64) -> io::Result<()> {
+    #[cfg(any(test, feature = "test-failpoints"))]
+    if crate::test_failpoints::WAL_CUT_FAIL.load(Ordering::Acquire) {
+        return Err(io::Error::other("failpoint: WAL cut"));
+    }
     let file = OpenOptions::new().write(true).open(path)?;
     file.set_len(len)?;
     file.sync_all()
@@ -2877,33 +3037,33 @@ mod tests {
     }
 
     #[test]
-    fn a_catalog_copy_syncs_with_the_checkpoint_while_a_ddl_record_syncs_itself() {
+    fn a_unit_is_written_and_synced_with_what_was_buffered_before_it() {
         let dir = tempdir().unwrap();
         let wal = WALManager::new(dir.path().join("wal"), SyncMode::Normal).unwrap();
 
-        wal.append_entry(catalog_record()).unwrap();
-        let written = wal.current_file_position.load(Ordering::Relaxed);
-        assert!(written > 0);
-        assert_eq!(
-            wal.synced_position.load(Ordering::Relaxed),
-            written,
-            "a DDL record syncs on its own"
-        );
-
-        wal.append_catalog_entry(catalog_record()).unwrap();
-        wal.append_catalog_entry(WALEntry::commit_marker(
-            crate::storage::mvcc::persistence::DDL_TXN_ID,
+        wal.append_entry(WALEntry::new(
+            1,
+            "t".to_string(),
+            1,
+            WALOperationType::Insert,
+            vec![],
         ))
         .unwrap();
         assert_eq!(
             wal.current_file_position.load(Ordering::Relaxed),
-            written,
-            "a catalog copy stays in the buffer"
+            0,
+            "a row stays in the buffer"
         );
 
-        wal.sync_for_checkpoint().unwrap();
+        let lsns = wal
+            .append_unit(vec![
+                catalog_record(),
+                WALEntry::commit_marker(crate::storage::mvcc::persistence::DDL_TXN_ID),
+            ])
+            .unwrap();
+        assert_eq!(lsns, [2, 3], "the unit follows the buffered row");
         let after = wal.current_file_position.load(Ordering::Relaxed);
-        assert!(after > written, "the checkpoint sync writes the copies out");
+        assert!(after > 0, "the row and the unit are written");
         assert_eq!(wal.synced_position.load(Ordering::Relaxed), after);
         wal.close().unwrap();
     }
@@ -2930,12 +3090,11 @@ mod tests {
 
         wal.append_entry(row(2, 2)).unwrap();
         wal.write_commit_marker(2).unwrap();
-        wal.append_catalog_entry(catalog_record()).unwrap();
-        wal.append_catalog_entry(WALEntry::commit_marker(
-            crate::storage::mvcc::persistence::DDL_TXN_ID,
-        ))
+        wal.append_unit(vec![
+            catalog_record(),
+            WALEntry::commit_marker(crate::storage::mvcc::persistence::DDL_TXN_ID),
+        ])
         .unwrap();
-        wal.sync_for_checkpoint().unwrap();
         wal.publish_checkpoint(cut, vec![]).unwrap();
         wal.truncate_wal(cut).unwrap();
         wal.close().unwrap();
