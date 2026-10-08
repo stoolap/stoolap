@@ -1513,6 +1513,8 @@ impl MVCCTable {
             unique.push(Arc::clone(index));
             Ok(())
         })?;
+        // The indexes taken bind the positions of this handle's row
+        self.version_store.check_layout(Some(self.layout))?;
         for index in &unique {
             let index_name = index.name();
             let column_ids = index.column_ids();
@@ -2255,8 +2257,7 @@ impl Table for MVCCTable {
     }
 
     fn drop_column(&mut self, name: &str) -> Result<()> {
-        self.version_store.remove_column(name)?;
-        self.version_store.lay_out_rows();
+        self.version_store.drop_column_at_once(name)?;
         self.take_schema();
         Ok(())
     }

@@ -698,6 +698,57 @@ pub(crate) fn commit_index_capture_next() {
 }
 
 thread_local! {
+    static COMMIT_MARKER_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next commit has published its tables
+/// and has not yet written its commit marker
+pub fn before_commit_marker(hook: impl FnOnce() + 'static) {
+    COMMIT_MARKER_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn commit_marker_next() {
+    let hook = COMMIT_MARKER_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static DROP_HOT_PUBLISHED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next DROP COLUMN has published the hot
+/// rows without the column and has not yet moved the cold mappings
+pub fn after_drop_hot_published(hook: impl FnOnce() + 'static) {
+    DROP_HOT_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn drop_hot_published() {
+    let hook = DROP_HOT_PUBLISHED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static DROP_RECORDED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next DROP COLUMN has recorded the drop
+/// in the log and has not yet published the table without the column
+pub fn after_drop_column_recorded(hook: impl FnOnce() + 'static) {
+    DROP_RECORDED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn drop_column_recorded() {
+    let hook = DROP_RECORDED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static INDEXES_PUBLISHED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
