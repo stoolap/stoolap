@@ -66,6 +66,11 @@ fn engines(dir: &tempfile::TempDir, tag: &str) -> Vec<(&'static str, String)> {
     ]
 }
 
+/// The in-memory engine; under test-filedb a memory DSN opens a file
+fn in_memory(engine: &str) -> bool {
+    engine == "memory" && !cfg!(feature = "test-filedb")
+}
+
 fn seal_if(db: &Database, dsn: &str) {
     if dsn.contains("_sealed") {
         db.execute("PRAGMA CHECKPOINT", ()).unwrap();
@@ -482,7 +487,7 @@ fn a_join_probes_its_inner_table_across_a_drop() {
         let expected = expected_probe(sql);
         let planned = engines(&dir, "join")
             .into_iter()
-            .filter(|(engine, _)| !memory_only || *engine == "memory");
+            .filter(|(engine, _)| !memory_only || in_memory(engine));
         for (engine, dsn) in planned {
             let db = Database::open(&dsn).unwrap();
             probe_setup(&db, &dsn);
@@ -921,7 +926,7 @@ fn a_join_planned_on_an_index_runs_on_the_table_it_opens() {
         // The file engine plans no secondary-index join
         let planned = engines(&dir, "join_index")
             .into_iter()
-            .filter(|(engine, _)| setup != JOIN_SECONDARY || *engine == "memory");
+            .filter(|(engine, _)| setup != JOIN_SECONDARY || in_memory(engine));
         for (engine, dsn) in planned {
             let db = Database::open(&dsn).unwrap();
             join_setup(&db, &dsn, setup);
@@ -1123,6 +1128,180 @@ fn an_expression_read_across_a_drop_does_not_panic() {
                 &format!("{engine}: {statement}"),
                 got,
                 &expected,
+                fired,
+                &paths,
+            ));
+        }
+    }
+    finish(report);
+}
+
+/// A handle of a transaction, opened before a drop, reads or updates rows
+/// the transaction wrote after the drop through a newer handle
+#[test]
+fn an_older_handle_meets_its_transactions_rows_written_after_a_drop() {
+    use stoolap::core::{Operator, Row};
+    use stoolap::storage::expression::{AndExpr, ComparisonExpr, ConstBoolExpr, Expression};
+    use stoolap::storage::traits::{Engine, Table};
+    type Op = fn(&mut dyn Table, &AtomicBool) -> Result<(), Error>;
+    let ops: [(&str, Op); 5] = [
+        ("fetch_rows_by_ids", |table, _| {
+            table
+                .fetch_rows_by_ids(&[5], &ConstBoolExpr::new(true))
+                .map(drop)
+        }),
+        ("collect_all_rows", |table, _| {
+            table.collect_all_rows(None).map(drop)
+        }),
+        ("update_by_row_ids", |table, called| {
+            table
+                .update_by_row_ids(&[5], &mut |row| {
+                    called.store(true, Ordering::SeqCst);
+                    Ok((row, true))
+                })
+                .map(drop)
+        }),
+        ("update by key range", |table, called| {
+            let mut low = ComparisonExpr::new("id", Operator::Gte, Value::Integer(5));
+            low.prepare_for_schema(table.schema());
+            let mut high = ComparisonExpr::new("id", Operator::Lt, Value::Integer(6));
+            high.prepare_for_schema(table.schema());
+            let range = AndExpr::new(vec![Box::new(low), Box::new(high)]);
+            table
+                .update(Some(&range), &mut |row| {
+                    called.store(true, Ordering::SeqCst);
+                    Ok((row, true))
+                })
+                .map(drop)
+        }),
+        ("update by key", |table, called| {
+            let mut key = ComparisonExpr::new("id", Operator::Eq, Value::Integer(5));
+            key.prepare_for_schema(table.schema());
+            table
+                .update(Some(&key), &mut |row| {
+                    called.store(true, Ordering::SeqCst);
+                    Ok((row, true))
+                })
+                .map(drop)
+        }),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let mut report = Vec::new();
+    for (name, op) in ops {
+        for (engine, dsn) in engines(&dir, "local_after_drop") {
+            let db = Database::open(&dsn).unwrap();
+            db.execute(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, a INTEGER, b INTEGER)",
+                (),
+            )
+            .unwrap();
+            let tx = db.engine().begin_transaction().unwrap();
+            let mut older = tx.get_table("t").unwrap();
+            db.execute("ALTER TABLE t DROP COLUMN x", ()).unwrap();
+            let mut newer = tx.get_table("t").unwrap();
+            newer
+                .insert(Row::from_values(vec![
+                    Value::Integer(5),
+                    Value::Integer(10),
+                    Value::Integer(20),
+                ]))
+                .unwrap();
+            let called = AtomicBool::new(false);
+            let got = op(&mut *older, &called);
+            let line = match got {
+                Err(Error::SchemaChanged { .. }) if !called.load(Ordering::SeqCst) => {
+                    format!("ok SchemaChanged [{engine}: {name}]")
+                }
+                Err(Error::SchemaChanged { .. }) => {
+                    format!("WRONG [{engine}: {name}]: the setter ran before the refusal")
+                }
+                got => format!("WRONG [{engine}: {name}]: {got:?}"),
+            };
+            report.push(line);
+        }
+    }
+    finish(report);
+}
+
+/// An index MIN or MAX over hot and sealed rows read its hot bound, then
+/// two renames hand the column's name to another column
+#[test]
+fn an_index_bound_reads_one_column_across_renames() {
+    use stoolap::IsolationLevel;
+    let _guard = fp::FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let renames: &[&str] = &[
+        "ALTER TABLE t RENAME COLUMN a TO old_a",
+        "ALTER TABLE t RENAME COLUMN b TO a",
+    ];
+    // (statement, sealed row, hot row): the mixed answer is neither view
+    type Pair = (i64, i64);
+    let cases: [(&str, Pair, Pair); 2] = [
+        ("SELECT MIN(a) FROM t LIMIT 1", (20, 1), (10, 0)),
+        ("SELECT MAX(a) FROM t LIMIT 1", (20, 1), (10, 30)),
+    ];
+    let setup = |db: &Database, dsn: &str, sealed: (i64, i64), hot: (i64, i64)| {
+        for sql in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)".to_string(),
+            "CREATE INDEX ia ON t(a)".into(),
+            "CREATE INDEX ib ON t(b)".into(),
+            format!("INSERT INTO t VALUES (1, {}, {})", sealed.0, sealed.1),
+        ] {
+            db.execute(&sql, ()).unwrap();
+        }
+        if dsn.starts_with("file") {
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        db.execute(
+            &format!("INSERT INTO t VALUES (2, {}, {})", hot.0, hot.1),
+            (),
+        )
+        .unwrap();
+    };
+    let mut report = Vec::new();
+    for (n, (sql, sealed, hot)) in cases.into_iter().enumerate() {
+        let e = Database::open(&format!("memory://readers_index_bound_expected_{n}")).unwrap();
+        setup(&e, "memory", sealed, hot);
+        let old = rows(&e, sql).unwrap();
+        for sql in renames {
+            e.execute(sql, ()).unwrap();
+        }
+        let new = rows(&e, sql).unwrap();
+        // Only sealed rows take the volume bound
+        for (engine, dsn) in engines(&dir, "index_bound") {
+            if engine != "file sealed" {
+                continue;
+            }
+            let db = Database::open(&dsn).unwrap();
+            setup(&db, &dsn, sealed, hot);
+            let other = db.clone();
+            let reader = db.clone();
+            let (got, fired, paths) = on_thread(
+                fp::after_index_bound_hot,
+                move || {
+                    for sql in renames {
+                        other.execute(sql, ()).unwrap();
+                    }
+                },
+                move || {
+                    let mut tx = reader.begin_with_isolation(IsolationLevel::SnapshotIsolation)?;
+                    tx.query(sql, ())?
+                        .map(|r| {
+                            r.map(|r| {
+                                vec![r
+                                    .get_value(0)
+                                    .cloned()
+                                    .unwrap_or(Value::Null(DataType::Null))]
+                            })
+                        })
+                        .collect()
+                },
+            );
+            report.push(either(
+                &format!("{engine}: {sql}"),
+                got,
+                &old,
+                &new,
                 fired,
                 &paths,
             ));

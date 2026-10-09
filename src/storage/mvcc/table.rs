@@ -159,7 +159,9 @@ impl MVCCTable {
     }
 
     /// Rows captured through this handle were held in its layout when the
-    /// live layout is still the handle's and open: layouts only increase
+    /// live layout is still the handle's and open: layouts only increase.
+    /// The transaction's own rows too: a newer handle wrote them only if the
+    /// layout moved on, and admission refuses rows of an older one
     fn check_read(&self) -> Result<()> {
         self.version_store.check_layout(Some(self.layout))
     }
@@ -300,13 +302,13 @@ impl MVCCTable {
             let batch_rows = self
                 .version_store
                 .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
-            self.check_read()?;
             for (row_id, row, version) in batch_rows {
                 found_ids.insert(row_id);
                 let row = self.normalize_row_to_schema(row, schema);
                 rows_with_originals.push((row_id, row, version));
             }
         }
+        self.check_read()?;
 
         // Cold-only row_ids: not in local versions and not in the hot version store.
         // Create phantom delete markers so the WAL records the deletion, enabling
@@ -2216,8 +2218,9 @@ impl Table for MVCCTable {
                     rows.push((row_id, row));
                 }
             }
+            return Ok(());
         }
-        Ok(())
+        self.check_read()
     }
 
     fn create_column(&mut self, name: &str, column_type: DataType, nullable: bool) -> Result<()> {
@@ -2362,6 +2365,8 @@ impl Table for MVCCTable {
                 let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(pk_range_ids.len());
                 {
                     let txn_versions = self.txn_versions.read().unwrap();
+                    // The setter runs on the transaction's own rows below
+                    self.check_read()?;
                     for row_id in pk_range_ids {
                         if let Some(local) = txn_versions.get_local_version(row_id) {
                             if !local.is_deleted() {
@@ -2654,6 +2659,8 @@ impl Table for MVCCTable {
 
         {
             let txn_versions = self.txn_versions.read().unwrap();
+            // The setter runs on the transaction's own rows below
+            self.check_read()?;
             for &row_id in row_ids {
                 if let Some(local) = txn_versions.get_local_version(row_id) {
                     if !local.is_deleted() {
@@ -2864,8 +2871,8 @@ impl Table for MVCCTable {
                     for (row_id, row, version) in batch_rows {
                         rows_with_originals.push((row_id, row, version));
                     }
-                    self.check_read()?;
                 }
+                self.check_read()?;
 
                 let delete_count = (local_rows.len() + rows_with_originals.len()) as i32;
                 if !local_rows.is_empty() || !rows_with_originals.is_empty() {
@@ -2913,7 +2920,6 @@ impl Table for MVCCTable {
                     let batch_rows = self
                         .version_store
                         .get_visible_versions_batch(&remaining_row_ids, self.txn_id);
-                    self.check_read()?;
                     for (row_id, row) in batch_rows {
                         // Re-apply filter (index may be partial match)
                         if expr.evaluate(&row).unwrap_or(false) {
@@ -2921,6 +2927,7 @@ impl Table for MVCCTable {
                         }
                     }
                 }
+                self.check_read()?;
 
                 // Single batch write for all deletes
                 let delete_count = rows_to_delete.len() as i32;

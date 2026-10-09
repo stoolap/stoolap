@@ -764,6 +764,17 @@ thread_local! {
     static JOIN_INDEX_CHOSEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static JOIN_NEXT_CHUNK_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static ALTER_DDL_GUARD_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static INDEX_BOUND_HOT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next index MIN or MAX over hot and
+/// sealed rows has read the hot bound and is about to read the volumes
+pub fn after_index_bound_hot(hook: impl FnOnce() + 'static) {
+    INDEX_BOUND_HOT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn index_bound_hot_read() {
+    run_hook(&INDEX_BOUND_HOT_HOOK);
 }
 
 /// Run once on this thread when its next ALTER TABLE is about to take the
@@ -1233,6 +1244,7 @@ pub fn reset_all() {
     JOIN_INDEX_CHOSEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     JOIN_NEXT_CHUNK_HOOK.with(|slot| *slot.borrow_mut() = None);
     ALTER_DDL_GUARD_HOOK.with(|slot| *slot.borrow_mut() = None);
+    INDEX_BOUND_HOT_HOOK.with(|slot| *slot.borrow_mut() = None);
     JOIN_INNER_OPENED_HOOK.with(|slot| *slot.borrow_mut() = None);
     DROP_RECORDED_HOOK.with(|slot| *slot.borrow_mut() = None);
     DROP_HOT_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = None);

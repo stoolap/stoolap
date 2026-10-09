@@ -6090,6 +6090,8 @@ impl Table for SegmentedTable {
             return result;
         }
         let hot_min = self.hot.get_index_min_value(column_name);
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::index_bound_hot_read();
         let segments = self.segment_mgr.segments_raw();
         let mut vol_min: Option<Value> = None;
         for cs in segments.values() {
@@ -6112,6 +6114,9 @@ impl Table for SegmentedTable {
                 }
             }
         }
+        // Both bounds name the column as this handle's schema does, or the
+        // regular path answers
+        self.check_cold().ok()?;
         match (hot_min, vol_min) {
             (Some(h), Some(v)) => {
                 if let Ok(std::cmp::Ordering::Less) = v.compare(&h) {
@@ -6131,6 +6136,8 @@ impl Table for SegmentedTable {
             return result;
         }
         let hot_max = self.hot.get_index_max_value(column_name);
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::index_bound_hot_read();
         let segments = self.segment_mgr.segments_raw();
         let mut vol_max: Option<Value> = None;
         for cs in segments.values() {
@@ -6153,6 +6160,9 @@ impl Table for SegmentedTable {
                 }
             }
         }
+        // Both bounds name the column as this handle's schema does, or the
+        // regular path answers
+        self.check_cold().ok()?;
         match (hot_max, vol_max) {
             (Some(h), Some(v)) => {
                 if let Ok(std::cmp::Ordering::Greater) = v.compare(&h) {
