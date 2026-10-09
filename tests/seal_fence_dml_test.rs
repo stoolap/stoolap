@@ -445,6 +445,9 @@ fn a_statement_refused_on_an_unchanged_row_leaves_no_claim() {
     let db = cold_row(dir.path());
     db.execute("INSERT INTO t VALUES (2, 0)", ()).unwrap();
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    // More hot rows than visited cold ones
+    db.execute("INSERT INTO t VALUES (3, 0), (4, 0)", ())
+        .unwrap();
     let mut txn = db.engine().begin_transaction().unwrap();
     let mut table = txn.get_table("t").unwrap();
     let other = db.clone();

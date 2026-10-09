@@ -2644,10 +2644,8 @@ impl VersionStore {
         skip: &rustc_hash::FxHashSet<i64>,
     ) -> Option<i64> {
         let versions = self.versions.read();
-        if versions.len() < rows.len() {
-            versions
-                .keys()
-                .find(|id| rows.contains_key(id) && !skip.contains(id))
+        if versions.len() <= rows.len() {
+            versions.find_key(|id| rows.contains_key(&id) && !skip.contains(&id))
         } else {
             rows.keys()
                 .copied()

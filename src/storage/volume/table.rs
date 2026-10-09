@@ -891,7 +891,10 @@ impl SegmentedTable {
             let guard = held.unwrap_or_else(|| mgr.acquire_seal_read());
             if under_fence || mgr.seal_generation() == generation {
                 mgr.publish_loaded(snap.take_loaded());
-                self.refuse_unchanged_gone_hot(&prep)?;
+                // Only a WHERE update sets the hot store's rows after the cold ones
+                if ids.is_none() {
+                    self.refuse_unchanged_gone_hot(&prep)?;
+                }
                 return Ok((guard, prep.changes, prep.hot_ids));
             }
             drop(guard);
