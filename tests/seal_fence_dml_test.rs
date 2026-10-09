@@ -473,3 +473,45 @@ fn a_statement_refused_on_an_unchanged_row_leaves_no_claim() {
         "the refused statement kept row 1 claimed"
     );
 }
+
+#[test]
+fn a_named_row_left_unchanged_that_went_hot_across_a_seal_is_not_set_again() {
+    use stoolap::storage::traits::Engine;
+    let dir = tempfile::tempdir().unwrap();
+    let db = cold_row(dir.path());
+    db.execute("INSERT INTO t VALUES (3, 0)", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (2, 0)", ()).unwrap();
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let mut table = txn.get_table("t").unwrap();
+    let other = db.clone();
+    let mut calls = Vec::new();
+    let mut setter = |mut row: stoolap::core::Row| {
+        let id = row.get(0).and_then(|v| v.as_int64()).unwrap();
+        calls.push(id);
+        if id == 3 {
+            bump(&mut row);
+            return Ok((row, true));
+        }
+        if calls.len() == 2 {
+            // Row 2 seals, so the statement prepares again with row 1 hot
+            other.execute("PRAGMA CHECKPOINT", ()).unwrap();
+            other
+                .execute("UPDATE t SET v = 10 WHERE id = 1", ())
+                .unwrap();
+        }
+        Ok((row, false))
+    };
+    let updated = table.update_by_row_ids(&[3, 1], &mut setter);
+    drop(table);
+    let freed = db.execute("UPDATE t SET v = 20 WHERE id = 3", ());
+    txn.rollback().unwrap();
+    assert_eq!(calls, vec![3, 1], "the setter ran again: {updated:?}");
+    let conflict = matches!(&updated, Err(e) if e.to_string().contains("write conflict"));
+    assert!(conflict, "another transaction changed row 1: {updated:?}");
+    assert_eq!(
+        freed.unwrap(),
+        1,
+        "the refused statement kept row 3 claimed"
+    );
+}

@@ -968,13 +968,19 @@ impl SegmentedTable {
     ) -> Result<()> {
         let mut cached: Option<(super::writer::RowReader, super::writer::ColumnMapping)> = None;
         for &row_id in ids {
-            let Some((seg_id, cs, idx)) = self.find_segment_row_in(snap, row_id)? else {
+            let found = self.find_segment_row_in(snap, row_id)?;
+            // A row an earlier round set that left the volumes is another
+            // transaction's since, not a hot row to set again
+            if prep.visited.contains_key(&row_id) {
+                if found.is_none() {
+                    return Err(Self::write_conflict(row_id));
+                }
+                continue;
+            }
+            let Some((seg_id, cs, idx)) = found else {
                 prep.hot_ids.push(row_id);
                 continue;
             };
-            if prep.visited.contains_key(&row_id) {
-                continue;
-            }
             // One reader per volume for the statement: the groups it
             // reads stay held across the rows; mapping from the SAME
             // snapshot segment
