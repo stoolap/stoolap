@@ -1140,6 +1140,7 @@ fn an_expression_read_across_a_drop_does_not_panic() {
 /// the transaction wrote after the drop through a newer handle
 #[test]
 fn an_older_handle_meets_its_transactions_rows_written_after_a_drop() {
+    let _guard = fp::FailpointGuard::new();
     use stoolap::core::{Operator, Row};
     use stoolap::storage::expression::{AndExpr, ComparisonExpr, ConstBoolExpr, Expression};
     use stoolap::storage::traits::{Engine, Table};
