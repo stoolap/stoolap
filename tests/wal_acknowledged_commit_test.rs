@@ -587,3 +587,40 @@ fn schema_changes_under_sync_mode_none_do_not_sync() {
         "the checkpoint's sync is not optional"
     );
 }
+
+/// Under sync_mode=none a schema change is buffered whole, and the buffer
+/// is written, never synced, once it reaches the flush trigger
+#[test]
+fn schema_changes_under_sync_mode_none_are_written_at_the_flush_trigger() {
+    use stoolap::storage::mvcc::persistence::DDL_TXN_ID;
+    let _guard = fp::FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let config = PersistenceConfig {
+        wal_flush_trigger: 64,
+        sync_interval_ms: LONG_INTERVAL_MS,
+        ..PersistenceConfig::default()
+    };
+    let wal = WALManager::with_config(dir.path(), SyncMode::None, Some(&config)).unwrap();
+    fp::WAL_SYNC_FAIL.store(true, Ordering::SeqCst);
+    let changed: Vec<bool> = (0..8)
+        .map(|_| {
+            wal.append_unit(
+                vec![
+                    ddl_record(WALOperationType::CreateTable),
+                    WALEntry::commit_marker(DDL_TXN_ID),
+                ],
+                false,
+            )
+            .is_ok()
+        })
+        .collect();
+    fp::WAL_SYNC_FAIL.store(false, Ordering::SeqCst);
+    assert!(
+        changed.iter().all(|ok| *ok),
+        "no sync was attempted: {changed:?}"
+    );
+    assert!(
+        wal.current_file_size() > 0,
+        "the buffer past the trigger was written"
+    );
+}

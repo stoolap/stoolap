@@ -1351,8 +1351,16 @@ impl WALManager {
             if self.poisoned.load(Ordering::Acquire) {
                 return Err(poisoned_error());
             }
-            let mut buffer = self.buffer.lock().unwrap();
-            return self.stamp_unit(&mut buffer, &mut entries);
+            let (lsns, full) = {
+                let mut buffer = self.buffer.lock().unwrap();
+                let lsns = self.stamp_unit(&mut buffer, &mut entries)?;
+                (lsns, buffer.len() >= self.flush_trigger as usize)
+            };
+            // Past the trigger the buffer is written, as any append writes it
+            if let Some(&last) = lsns.last().filter(|_| full) {
+                self.flush_and_maybe_sync(last, Need::Written, false)?;
+            }
+            return Ok(lsns);
         }
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::wal_sync_starting();
