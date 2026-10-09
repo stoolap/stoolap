@@ -37,6 +37,7 @@ use crate::parser::ast::*;
 use crate::parser::token::{Position, Token, TokenType};
 use crate::storage::index::id_list::GroupIds;
 use crate::storage::mvcc::engine::ViewDefinition;
+use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::traits::{Engine, QueryResult};
 
 /// Maximum depth for nested views to prevent stack overflow
@@ -64,6 +65,10 @@ type SelectOutput = (
     Option<DeferredProjection>,
 );
 type SelectResult = Result<SelectOutput>;
+
+/// An outer side fetched for a join: the result, its qualified columns,
+/// whether the limit and offset were applied, and the layout of a table
+type OuterFetch = (Box<dyn QueryResult>, Vec<String>, bool, Option<LayoutToken>);
 
 use super::context::{clear_statement_caches, ExecutionContext, StatementSnapshot, TimeoutGuard};
 use super::expression::{
@@ -136,6 +141,23 @@ impl ColumnKeyMapping {
             })
             .collect()
     }
+}
+
+/// A later outer chunk continues the first only as a bounded fetch of the
+/// same source in the same layout: a table function has no layout and
+/// continues as itself, a table moved to another layout or name does not
+fn same_outer_source(
+    outer: &Expression,
+    first: Option<LayoutToken>,
+    now: Option<LayoutToken>,
+    bounded: bool,
+) -> Result<()> {
+    if bounded && now == first {
+        return Ok(());
+    }
+    Err(Error::SchemaChanged {
+        table: super::explain::extract_table_name(outer).unwrap_or_default(),
+    })
 }
 
 /// Whether a predicate is the equality of the two join keys, in either order
@@ -1361,7 +1383,7 @@ impl Executor {
                 if let Some(view_def) = self.engine.get_view_lowercase(table_name)? {
                     return self.execute_view_query(&view_def, stmt, ctx, classification);
                 }
-                self.execute_simple_table_scan(table_source, stmt, ctx, classification)
+                self.execute_simple_table_scan(table_source, stmt, ctx, classification, None)
             }
             Expression::JoinSource(join_source) => {
                 self.execute_join_source(join_source, stmt, ctx, classification, compiled)
@@ -2294,6 +2316,7 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
+        token_out: Option<&mut Option<LayoutToken>>,
     ) -> SelectResult {
         // OPTIMIZATION: Use pre-computed lowercase name to avoid allocation per query
         let table_name = &table_source.name.value_lower;
@@ -2364,6 +2387,12 @@ impl Executor {
                 (table, Some(tx))
             }
         };
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::select_table_opened();
+        // The layout this handle's reads are checked against
+        if let Some(out) = token_out {
+            *out = Some(table.layout_token());
+        }
 
         // Build column list from schema: refcount bump, not a per-statement
         // deep clone of every column name
@@ -4407,7 +4436,7 @@ impl Executor {
                 ..
             } = plan;
             let left_cap = left_cap_override.unwrap_or(cap);
-            let (left_result, left_cols, left_bounded) = self
+            let (left_result, left_cols, left_bounded, _) = self
                 .execute_table_expression_with_filter_limit(
                     &join_source.left,
                     ctx,
@@ -4762,7 +4791,7 @@ impl Executor {
                 };
 
                 // Execute outer side with limit optimization for true early termination
-                let (outer_result, outer_cols, outer_bounded) = self
+                let (outer_result, outer_cols, outer_bounded, outer_token) = self
                     .execute_table_expression_with_filter_limit(
                         outer_expr,
                         &ctx_join,
@@ -4799,7 +4828,17 @@ impl Executor {
 
                 if let Some(outer_idx) = outer_key_idx {
                     // Get inner table for schema and row fetching
-                    let inner_table = self.join_table(&snapshot, &table_name)?;
+                    let Some(inner_table) = self.index_join_inner(
+                        &snapshot,
+                        &table_name,
+                        &lookup_strategy,
+                        &inner_col,
+                        None,
+                    )?
+                    else {
+                        break 'index_nl;
+                    };
+                    let inner_token = inner_table.layout_token();
                     let inner_schema = inner_table.schema();
 
                     // Build inner columns list (qualified)
@@ -4967,12 +5006,23 @@ impl Executor {
                                 outer_result,
                                 outer_cols.clone(),
                             ));
+                            let table = match inner_table.take() {
+                                Some(table) => table,
+                                None => match self.index_join_inner(
+                                    &snapshot,
+                                    &table_name,
+                                    &lookup_strategy,
+                                    &inner_col,
+                                    Some(inner_token),
+                                )? {
+                                    Some(table) => table,
+                                    // The rows joined so far are dropped too
+                                    None => break 'index_nl,
+                                },
+                            };
                             let mut op = IndexNestedLoopJoinOperator::new(
                                 outer_op,
-                                match inner_table.take() {
-                                    Some(table) => table,
-                                    None => self.join_table(&snapshot, &table_name)?,
-                                },
+                                table,
                                 inner_cols.iter().map(ColumnInfo::new).collect(),
                                 op_join_type,
                                 outer_idx,
@@ -5016,8 +5066,10 @@ impl Executor {
                             };
                             let next = estimate.clamp(32, fetched.saturating_mul(3));
                             outer_limit = Some(next);
+                            #[cfg(feature = "test-failpoints")]
+                            crate::test_failpoints::join_next_chunk();
                             if consistent {
-                                let (more, _, bounded) = self
+                                let (more, _, bounded, token) = self
                                     .execute_table_expression_with_filter_limit(
                                         outer_expr,
                                         &ctx_join,
@@ -5025,7 +5077,7 @@ impl Executor {
                                         Some(next),
                                         fetched,
                                     )?;
-                                debug_assert!(bounded);
+                                same_outer_source(outer_expr, outer_token, token, bounded)?;
                                 outer_result = more;
                                 continue;
                             }
@@ -5034,7 +5086,7 @@ impl Executor {
                             // the row the chunk ended on, the rows after it are the
                             // continuation; otherwise the join restarts on snapshot
                             // isolation, where the chunks line up by construction
-                            let (mut more, _, bounded) = self
+                            let (mut more, _, bounded, token) = self
                                 .execute_table_expression_with_filter_limit(
                                     outer_expr,
                                     &ctx_join,
@@ -5042,7 +5094,7 @@ impl Executor {
                                     Some(next + 1),
                                     fetched - 1,
                                 )?;
-                            debug_assert!(bounded);
+                            same_outer_source(outer_expr, outer_token, token, bounded)?;
                             let unmoved = more.next()
                                 && boundary
                                     .as_ref()
@@ -5059,15 +5111,16 @@ impl Executor {
                             result_rows.clear();
                             outer_limit = Some(fetched.saturating_add(next));
                             fetched = 0;
-                            outer_result = self
+                            let (restarted, _, bounded, token) = self
                                 .execute_table_expression_with_filter_limit(
                                     outer_expr,
                                     &ctx_join,
                                     nl_left_filter.as_ref(),
                                     outer_limit,
                                     0,
-                                )?
-                                .0;
+                                )?;
+                            same_outer_source(outer_expr, outer_token, token, bounded)?;
+                            outer_result = restarted;
                         }
                     } else {
                         // Batch INL for NO LIMIT - single batch fetch, O(1) lock overhead
@@ -7028,7 +7081,7 @@ impl Executor {
                 // Get classification for the synthetic SELECT statement
                 let classification = get_classification(&select_all);
                 let (result, columns, _, _) =
-                    self.execute_simple_table_scan(ts, &select_all, ctx, &classification)?;
+                    self.execute_simple_table_scan(ts, &select_all, ctx, &classification, None)?;
 
                 // Prefix column names with table alias (or table name if no alias)
                 // This is needed for proper qualified identifier resolution in JOINs
@@ -7143,7 +7196,8 @@ impl Executor {
     /// Execute a table expression with optional filter, row limit and row offset.
     /// The flag says whether the limit and offset were applied: only a plain
     /// table takes them; a CTE, a view, a subquery or a table function comes
-    /// back whole and cannot be fetched again from an offset.
+    /// back whole and cannot be fetched again from an offset. A plain table
+    /// also gives the layout its rows were read in.
     pub(crate) fn execute_table_expression_with_filter_limit(
         &self,
         expr: &Expression,
@@ -7151,7 +7205,7 @@ impl Executor {
         filter: Option<&Expression>,
         row_limit: Option<usize>,
         row_offset: usize,
-    ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
+    ) -> Result<OuterFetch> {
         // Handle FunctionTableSource with limit passthrough
         let tvf_source = match expr {
             Expression::FunctionTableSource(fts) => Some(fts.as_ref()),
@@ -7165,7 +7219,8 @@ impl Executor {
             _ => None,
         };
         if let Some(tvf_source) = tvf_source {
-            return Self::execute_tvf_for_join(tvf_source, ctx, filter, row_limit, row_offset);
+            return Self::execute_tvf_for_join(tvf_source, ctx, filter, row_limit, row_offset)
+                .map(|(result, columns, bounded)| (result, columns, bounded, None));
         }
 
         // Extract TableSource from the expression (handles both direct and aliased)
@@ -7178,14 +7233,14 @@ impl Executor {
                     // Not a table source, fall back to standard execution
                     return self
                         .execute_table_expression_with_filter(expr, ctx, filter)
-                        .map(|(result, columns)| (result, columns, false));
+                        .map(|(result, columns)| (result, columns, false, None));
                 }
             }
             _ => {
                 // Not a table source, fall back to standard execution
                 return self
                     .execute_table_expression_with_filter(expr, ctx, filter)
-                    .map(|(result, columns)| (result, columns, false));
+                    .map(|(result, columns)| (result, columns, false, None));
             }
         };
 
@@ -7197,14 +7252,14 @@ impl Executor {
             if ctx.get_cte_by_lower(table_name).is_some() {
                 return self
                     .execute_table_expression_with_filter(expr, ctx, filter)
-                    .map(|(result, columns)| (result, columns, false));
+                    .map(|(result, columns)| (result, columns, false, None));
             }
 
             // Skip if this is a view
             if self.engine.get_view_lowercase(table_name)?.is_some() {
                 return self
                     .execute_table_expression_with_filter(expr, ctx, filter)
-                    .map(|(result, columns)| (result, columns, false));
+                    .map(|(result, columns)| (result, columns, false, None));
             }
 
             // Create a SELECT * statement with WHERE clause AND LIMIT
@@ -7244,8 +7299,14 @@ impl Executor {
             // The scan says whether it applied the synthetic LIMIT and OFFSET. A
             // path that did not may still have stopped early at their sum, so
             // the pair is applied here, as the select layer would
-            let (result, columns, applied, _) =
-                self.execute_simple_table_scan(ts, &select_all, ctx, &classification)?;
+            let mut token = None;
+            let (result, columns, applied, _) = self.execute_simple_table_scan(
+                ts,
+                &select_all,
+                ctx,
+                &classification,
+                Some(&mut token),
+            )?;
             let result: Box<dyn QueryResult> = if applied {
                 result
             } else {
@@ -7266,12 +7327,12 @@ impl Executor {
                 .map(|col| format!("{}.{}", table_alias, col))
                 .collect();
 
-            return Ok((result, qualified_columns, true));
+            return Ok((result, qualified_columns, true, token));
         }
 
         // Fall back to standard execution for other cases
         self.execute_table_expression_with_filter(expr, ctx, filter)
-            .map(|(result, columns)| (result, columns, false))
+            .map(|(result, columns)| (result, columns, false, None))
     }
 
     /// Materialize a result into a RowVec
@@ -7306,6 +7367,46 @@ impl Executor {
             return active.transaction.get_table(name);
         }
         snapshot.get_table(name)
+    }
+
+    /// The inner table of an index join for one pass: a later pass reads it
+    /// in the layout of the first, and the strategy planned on another
+    /// handle must still name its key. None when it does not
+    fn index_join_inner(
+        &self,
+        snapshot: &StatementSnapshot,
+        name: &str,
+        strategy: &IndexLookupStrategy,
+        inner_key_col: &str,
+        first: Option<LayoutToken>,
+    ) -> Result<Option<Box<dyn crate::storage::traits::Table>>> {
+        let table = self.join_table(snapshot, name)?;
+        if first.is_some_and(|token| table.layout_token() != token) {
+            return Err(Error::SchemaChanged {
+                table: name.to_string(),
+            });
+        }
+        let schema = table.schema();
+        let is_pk = schema.pk_column_index().is_some_and(|pk| {
+            schema.columns[pk]
+                .name_lower
+                .eq_ignore_ascii_case(inner_key_col)
+        });
+        let holds = match strategy {
+            IndexLookupStrategy::PrimaryKey => is_pk,
+            // The same object: a recreated index shares no pointer with it
+            IndexLookupStrategy::SecondaryIndex(planned) => {
+                !is_pk
+                    && table
+                        .lookup_index_on_column(inner_key_col)
+                        .is_some_and(|index| {
+                            std::ptr::addr_eq(Arc::as_ptr(&index), Arc::as_ptr(planned))
+                        })
+            }
+            // Resolved by the table on each probe
+            IndexLookupStrategy::TableEquality { .. } => true,
+        };
+        Ok(holds.then_some(table))
     }
 
     /// One transaction for every read of a statement
@@ -7453,7 +7554,7 @@ impl Executor {
         } else {
             Some(plan.cap)
         };
-        let (outer_result, outer_cols, outer_bounded) = self
+        let (outer_result, outer_cols, outer_bounded, outer_token) = self
             .execute_table_expression_with_filter_limit(
                 &join_source.left,
                 &ctx_join,
@@ -7478,7 +7579,17 @@ impl Executor {
         else {
             return Ok(None);
         };
-        let inner_table = self.join_table(&snapshot, &table_name)?;
+        let Some(inner_table) = self.index_join_inner(
+            &snapshot,
+            &table_name,
+            &lookup_strategy,
+            &inner_key_col,
+            None,
+        )?
+        else {
+            return Ok(None);
+        };
+        let inner_token = inner_table.layout_token();
         let inner_alias = right_alias.unwrap_or(&table_name);
         let inner_cols: Vec<String> = inner_table
             .schema()
@@ -7652,7 +7763,16 @@ impl Executor {
                 Box::new(QueryResultOperator::new(outer_result, outer_cols.clone()));
             let table = match inner_table.take() {
                 Some(table) => table,
-                None => self.join_table(&snapshot, &table_name)?,
+                None => match self.index_join_inner(
+                    &snapshot,
+                    &table_name,
+                    &lookup_strategy,
+                    &inner_key_col,
+                    Some(inner_token),
+                )? {
+                    Some(table) => table,
+                    None => return Ok(None),
+                },
             };
             let mut op = IndexNestedLoopJoinOperator::new(
                 outer_op,
@@ -7737,28 +7857,30 @@ impl Executor {
             };
             let next = estimate.clamp(32, fetched.saturating_mul(3).max(32));
             outer_limit = Some(next);
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::join_next_chunk();
             if consistent {
-                let (more, _, bounded) = self.execute_table_expression_with_filter_limit(
+                let (more, _, bounded, token) = self.execute_table_expression_with_filter_limit(
                     &join_source.left,
                     &ctx_join,
                     left_filter,
                     Some(next),
                     fetched,
                 )?;
-                debug_assert!(bounded);
+                same_outer_source(&join_source.left, outer_token, token, bounded)?;
                 outer_result = more;
                 continue;
             }
             // Read committed: one row of overlap tells whether a commit moved the
             // boundary; if it did, restart on snapshot isolation
-            let (mut more, _, bounded) = self.execute_table_expression_with_filter_limit(
+            let (mut more, _, bounded, token) = self.execute_table_expression_with_filter_limit(
                 &join_source.left,
                 &ctx_join,
                 left_filter,
                 Some(next + 1),
                 fetched - 1,
             )?;
-            debug_assert!(bounded);
+            same_outer_source(&join_source.left, outer_token, token, bounded)?;
             let unmoved = more.next()
                 && boundary
                     .as_ref()
@@ -7770,20 +7892,19 @@ impl Executor {
             snapshot =
                 self.new_statement_snapshot(crate::core::IsolationLevel::SnapshotIsolation)?;
             ctx_join = ctx.with_statement_snapshot(snapshot.clone());
-            inner_table = Some(self.join_table(&snapshot, &table_name)?);
             consistent = true;
             groups.clear();
             outer_limit = Some(fetched.saturating_add(next));
             fetched = 0;
-            outer_result = self
-                .execute_table_expression_with_filter_limit(
-                    &join_source.left,
-                    &ctx_join,
-                    left_filter,
-                    outer_limit,
-                    0,
-                )?
-                .0;
+            let (restarted, _, bounded, token) = self.execute_table_expression_with_filter_limit(
+                &join_source.left,
+                &ctx_join,
+                left_filter,
+                outer_limit,
+                0,
+            )?;
+            same_outer_source(&join_source.left, outer_token, token, bounded)?;
+            outer_result = restarted;
         }
 
         let (final_columns, final_rows) =
@@ -11506,6 +11627,8 @@ impl Executor {
         let inner_col_lower = inner_col_unqualified.to_lowercase();
         if let Some(pk_idx) = schema.pk_column_index() {
             if schema.columns[pk_idx].name_lower == inner_col_lower {
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::join_index_chosen();
                 // It's a primary key lookup - most efficient!
                 return Some((
                     table_name,
@@ -11518,6 +11641,8 @@ impl Executor {
 
         // Check if there's a secondary index on the inner column
         if let Some(index) = table.lookup_index_on_column(&inner_col_unqualified) {
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::join_index_chosen();
             return Some((
                 table_name,
                 IndexLookupStrategy::SecondaryIndex(index),

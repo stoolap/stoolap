@@ -974,6 +974,8 @@ impl Executor {
 
         // One ALTER at a time, from its schema change to its WAL record, so
         // the log replays the changes in the order they were made
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::alter_ddl_guard_next();
         let _ddl = self.engine.ddl_guard();
 
         // Get the table for modifications
@@ -1033,6 +1035,8 @@ impl Executor {
                     // Refresh engine's schema cache from version store
                     // The table modified the version_store schema, but engine has a separate cache
                     self.engine.refresh_schema_cache(table_name)?;
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::add_column_published();
 
                     // Record ALTER TABLE ADD COLUMN to WAL for persistence
                     let vector_dimensions = if data_type == DataType::Vector {
@@ -1049,7 +1053,7 @@ impl Executor {
                         vector_dimensions,
                     ) {
                         self.engine
-                            .restore_column_schema(table_name, previous_schema)?;
+                            .reopen_after_refused_add(table_name, previous_schema)?;
                         change.finish();
                         return Err(error);
                     }

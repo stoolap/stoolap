@@ -418,19 +418,17 @@ fn an_update_written_before_a_column_change_cannot_commit() {
         by_key.prepare_for_schema(older.schema());
         db.execute("ALTER TABLE t ADD COLUMN c TEXT DEFAULT 'c'", ())
             .unwrap();
-        let updated = older
-            .update(Some(&by_key), &mut |row| {
-                let mut values: Vec<Value> = row.iter().cloned().collect();
-                values[2] = Value::text("new-b");
-                Ok((Row::from_values(values), true))
-            })
-            .unwrap();
-        assert_eq!(updated, 1);
-        drop(older);
+        let updated = older.update(Some(&by_key), &mut |row| {
+            let mut values: Vec<Value> = row.iter().cloned().collect();
+            values[2] = Value::text("new-b");
+            Ok((Row::from_values(values), true))
+        });
         assert!(
-            matches!(tx.commit(), Err(stoolap::Error::SchemaChanged { .. })),
-            "the key-equality update was written under the old columns"
+            matches!(updated, Err(stoolap::Error::SchemaChanged { .. })),
+            "the key-equality update read its row under the old columns"
         );
+        drop(older);
+        tx.commit().unwrap();
         assert_eq!(
             pairs(&db, "SELECT id, b FROM t"),
             vec![(1, "old-b".to_string())]

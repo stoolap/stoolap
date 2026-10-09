@@ -1290,6 +1290,8 @@ impl Executor {
         answer: impl FnOnce(&dyn Table, &[i64], usize, u64, &mut RowVec) -> Result<T>,
     ) -> Result<Option<T>> {
         self.with_correlated_probe_table(ctx, &correlation.inner_table, |table| {
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::correlated_fetch_next();
             let Some(epoch) = table.index_view_epoch() else {
                 return Ok(None);
             };
