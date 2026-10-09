@@ -708,7 +708,7 @@ fn gather(
             // column's type changed after the input was sealed): the cell
             // goes through its value, cast to the output's type
             (scratch, source) => {
-                let value = source.get_value(local).into_coerce_to_type(data_type);
+                let value = source.get_value(local).coerce_to_type(data_type);
                 scratch.push_value(&value, &mut |text| builder.intern_text(column, text))?;
             }
         }

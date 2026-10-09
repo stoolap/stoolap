@@ -1158,6 +1158,29 @@ impl Executor {
                             if !nulls.is_empty() {
                                 return Err(Error::not_null_constraint(col_name));
                             }
+                            // A value the new type cannot hold would be stored
+                            // as NULL by the next seal or compaction
+                            if let Some(idx) = schema.get_column_index(&col_name) {
+                                if schema.columns[idx].data_type != data_type {
+                                    let mut present =
+                                        crate::storage::expression::NullCheckExpr::is_not_null(
+                                            col_name.clone(),
+                                        );
+                                    present.prepare_for_schema(schema);
+                                    let mut rows = table.scan(&[], Some(&present))?;
+                                    while rows.next() {
+                                        let lost = rows.row().get(idx).is_some_and(|value| {
+                                            value.coerce_to_type(data_type).is_null()
+                                        });
+                                        if lost {
+                                            return Err(Error::not_null_constraint(col_name));
+                                        }
+                                    }
+                                    if let Some(error) = rows.err() {
+                                        return Err(error.clone());
+                                    }
+                                }
+                            }
                         }
                     }
 
