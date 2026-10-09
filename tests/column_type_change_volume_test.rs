@@ -236,3 +236,20 @@ fn a_clustered_key_whose_type_changed_is_ordered_by_its_new_values() {
         vec![vec![text("10"), text("2"), text("5")]]
     );
 }
+
+#[test]
+fn not_null_after_a_change_of_type_checks_the_values_it_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'bad')", ()).unwrap();
+    // The type changes first and leaves 'bad' as it was written
+    db.execute("ALTER TABLE t MODIFY COLUMN x INTEGER", ())
+        .unwrap();
+    let refused = db.execute("ALTER TABLE t MODIFY COLUMN x INTEGER NOT NULL", ());
+    assert!(refused.is_err(), "{refused:?}");
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    // Nullable still: the seal stores the failed cast as NULL
+    assert_eq!(x_of(&db, 1), Value::Null(DataType::Integer));
+}

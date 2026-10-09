@@ -6756,21 +6756,57 @@ impl MVCCEngine {
                     key_defaults.push(defaults);
                     key_retyped.push(retyped);
                 }
+                // A retyped key column's cells, cast once before the sort
+                let key_cast: Vec<Vec<Option<Vec<Value>>>> = key_cells
+                    .iter()
+                    .zip(&key_retyped)
+                    .zip(&schema.cluster_key)
+                    .map(|((cells, retyped), &column)| {
+                        let data_type = schema.columns[column].data_type;
+                        cells
+                            .iter()
+                            .zip(retyped)
+                            .map(|(cell, &retyped)| match cell {
+                                Some(cell) if retyped => Some(
+                                    (0..cell.len())
+                                        .map(|i| cell.get_value(i).coerce_to_type(data_type))
+                                        .collect(),
+                                ),
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .collect();
                 let null = Value::null_unknown();
                 let default_of =
                     |k: usize, vol_idx: usize| key_defaults[k][vol_idx].as_ref().unwrap_or(&null);
-                let value_of = |k: usize, at: (usize, usize)| match key_cells[k][at.0] {
-                    Some(cell) => cell
-                        .get_value(at.1)
-                        .coerce_to_type(schema.columns[schema.cluster_key[k]].data_type),
-                    None => default_of(k, at.0).clone(),
+                let cast_of = |k: usize, at: (usize, usize)| {
+                    key_cast[k][at.0].as_ref().map(|values| &values[at.1])
                 };
                 let compare_key = |k: usize, a: (usize, usize), b: (usize, usize)| {
-                    if key_retyped[k][a.0] || key_retyped[k][b.0] {
-                        return crate::storage::volume::seal::compare_key_values(
-                            &value_of(k, a),
-                            &value_of(k, b),
-                        );
+                    match (cast_of(k, a), cast_of(k, b)) {
+                        (Some(va), Some(vb)) => {
+                            return crate::storage::volume::seal::compare_key_values(va, vb)
+                        }
+                        (Some(va), None) => {
+                            return match key_cells[k][b.0] {
+                                Some(cb) => cb.compare_cell_with_value(b.1, va).reverse(),
+                                None => crate::storage::volume::seal::compare_key_values(
+                                    va,
+                                    default_of(k, b.0),
+                                ),
+                            }
+                        }
+                        (None, Some(vb)) => {
+                            return match key_cells[k][a.0] {
+                                Some(ca) => ca.compare_cell_with_value(a.1, vb),
+                                None => crate::storage::volume::seal::compare_key_values(
+                                    default_of(k, a.0),
+                                    vb,
+                                ),
+                            }
+                        }
+                        (None, None) => {}
                     }
                     match (key_cells[k][a.0], key_cells[k][b.0]) {
                         (Some(ca), Some(cb)) => ca.compare_cells(a.1, cb, b.1),

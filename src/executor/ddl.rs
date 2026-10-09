@@ -1159,9 +1159,12 @@ impl Executor {
                                 return Err(Error::not_null_constraint(col_name));
                             }
                             // A value the new type cannot hold would be stored
-                            // as NULL by the next seal or compaction
+                            // as NULL by the next seal or compaction; a column
+                            // turning NOT NULL may hold values an earlier
+                            // change of type left as they were written
                             if let Some(idx) = schema.get_column_index(&col_name) {
-                                if schema.columns[idx].data_type != data_type {
+                                let column = &schema.columns[idx];
+                                if column.data_type != data_type || column.nullable {
                                     let mut present =
                                         crate::storage::expression::NullCheckExpr::is_not_null(
                                             col_name.clone(),
