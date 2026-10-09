@@ -238,15 +238,6 @@ struct ColdChange {
     new_row: Row,
 }
 
-/// The seal fence, the cold changes, the named ids for the hot store and
-/// the rows the setter left unchanged
-type PreparedCold<'m> = (
-    parking_lot::RwLockReadGuard<'m, ()>,
-    Vec<ColdChange>,
-    Vec<i64>,
-    Vec<i64>,
-);
-
 /// What an UPDATE has prepared so far, across the rounds a landing seal
 /// makes it take
 #[derive(Default)]
@@ -266,9 +257,6 @@ struct ColdPrepare {
     /// Old and new row of rows the setter ran on whose unique check waits
     /// for a cold volume read once the fence is released
     set_rows: FxHashMap<i64, (Row, Row)>,
-    /// The rows the setter left as they were: a hot version of one since
-    /// is another transaction's change, not a row to set again
-    unchanged: Vec<i64>,
 }
 
 pub struct SegmentedTable {
@@ -819,20 +807,23 @@ impl SegmentedTable {
     /// returns the fence once no seal moved rows since: each round walks
     /// only the volumes the snapshot gained, after three rounds under the
     /// fence. With `ids` the rows are the ones named, and the ids no cold
-    /// volume holds come back for the hot store, then the rows the setter
-    /// left unchanged
+    /// volume holds come back for the hot store
     fn prepare_cold_updates<'m>(
         &self,
         mgr: &'m super::manifest::SegmentManager,
         ids: Option<&[i64]>,
         where_expr: Option<&dyn Expression>,
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
-    ) -> Result<PreparedCold<'m>> {
+    ) -> Result<(
+        parking_lot::RwLockReadGuard<'m, ()>,
+        Vec<ColdChange>,
+        Vec<i64>,
+    )> {
         if !mgr.has_segments() {
             let guard = mgr.acquire_seal_read();
             if !mgr.has_segments() {
                 let hot_ids = ids.map(<[i64]>::to_vec).unwrap_or_default();
-                return Ok((guard, Vec::new(), hot_ids, Vec::new()));
+                return Ok((guard, Vec::new(), hot_ids));
             }
             drop(guard);
         }
@@ -900,7 +891,8 @@ impl SegmentedTable {
             let guard = held.unwrap_or_else(|| mgr.acquire_seal_read());
             if under_fence || mgr.seal_generation() == generation {
                 mgr.publish_loaded(snap.take_loaded());
-                return Ok((guard, prep.changes, prep.hot_ids, prep.unchanged));
+                self.refuse_unchanged_gone_hot(&prep)?;
+                return Ok((guard, prep.changes, prep.hot_ids));
             }
             drop(guard);
             carried = snap.take_loaded();
@@ -1079,7 +1071,6 @@ impl SegmentedTable {
                 let (new_row, changed) = setter(row)?;
                 if !changed {
                     prep.visited.insert(row_id, seg_id);
-                    prep.unchanged.push(row_id);
                     return Ok(());
                 }
                 (old_row, new_row)
@@ -1109,21 +1100,28 @@ impl SegmentedTable {
         Ok(())
     }
 
+    /// A row the setter left unchanged with a hot version since is another
+    /// transaction's change, not a row to set again: checked under the
+    /// fence before any claim, only when the setter left a row unchanged
+    fn refuse_unchanged_gone_hot(&self, prep: &ColdPrepare) -> Result<()> {
+        if prep.visited.len() == prep.shadowed.len() {
+            return Ok(());
+        }
+        match self.hot.first_hot_row_in(&prep.visited, &prep.shadowed) {
+            Some(row_id) => Err(Self::write_conflict(row_id)),
+            None => Ok(()),
+        }
+    }
+
     /// Claims every prepared row under the fence before anything is
     /// written, so no other transaction can change one from here on; a
     /// row already claimed by another, or with a hot version since it
-    /// was prepared, is that transaction's, and the statement fails. A
-    /// row the setter left unchanged fails the same way on a hot version
-    fn claim_prepared(hot: &dyn Table, changes: &[ColdChange], unchanged: &[i64]) -> Result<()> {
+    /// was prepared, is that transaction's, and the statement fails
+    fn claim_prepared(hot: &dyn Table, changes: &[ColdChange]) -> Result<()> {
         for change in changes {
             hot.try_claim_row(change.row_id)?;
             if hot.has_row_id(change.row_id)? {
                 return Err(Self::write_conflict(change.row_id));
-            }
-        }
-        for &row_id in unchanged {
-            if hot.has_row_id(row_id)? {
-                return Err(Self::write_conflict(row_id));
             }
         }
         Ok(())
@@ -2871,9 +2869,9 @@ impl Table for SegmentedTable {
         let txn_id = self.txn_id();
         // The cold rows the statement changes are read, filtered, set and
         // checked outside the fence; only the hot moves happen under it
-        let (_seal_guard, changes, _, unchanged) =
+        let (_seal_guard, changes, _) =
             self.prepare_cold_updates(&self.segment_mgr, None, where_expr, setter)?;
-        Self::claim_prepared(self.hot.as_ref(), &changes, &unchanged)?;
+        Self::claim_prepared(self.hot.as_ref(), &changes)?;
         let mut count = self.hot.update(where_expr, setter)?;
         for change in changes {
             Self::apply_cold_update(&mut self.hot, &self.segment_mgr, txn_id, change, has_int_pk)?;
@@ -2899,9 +2897,9 @@ impl Table for SegmentedTable {
         let txn_id = self.txn_id();
         // The cold rows named are read, set and checked outside the fence;
         // the ids no cold volume holds are the hot store's
-        let (_seal_guard, changes, hot_ids, unchanged) =
+        let (_seal_guard, changes, hot_ids) =
             self.prepare_cold_updates(&self.segment_mgr, Some(row_ids), None, setter)?;
-        Self::claim_prepared(self.hot.as_ref(), &changes, &unchanged)?;
+        Self::claim_prepared(self.hot.as_ref(), &changes)?;
         let mut count = 0i32;
         for change in changes {
             Self::apply_cold_update(&mut self.hot, &self.segment_mgr, txn_id, change, has_int_pk)?;

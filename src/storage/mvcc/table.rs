@@ -2778,6 +2778,14 @@ impl Table for MVCCTable {
         Ok(self.version_store.has_committed_row(row_id))
     }
 
+    fn first_hot_row_in(
+        &self,
+        rows: &rustc_hash::FxHashMap<i64, u64>,
+        skip: &rustc_hash::FxHashSet<i64>,
+    ) -> Option<i64> {
+        self.version_store.first_committed_row_in(rows, skip)
+    }
+
     fn try_claim_row(&self, row_id: i64) -> Result<()> {
         self.version_store
             .try_claim_row(row_id, self.txn_id)
