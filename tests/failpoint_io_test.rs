@@ -1076,7 +1076,6 @@ fn the_catalog_copies_are_durable_when_the_truncation_returns_early() {
 
 #[test]
 fn a_write_failing_before_the_checkpoint_sync_fails_the_sync() {
-    use stoolap::storage::mvcc::persistence::DDL_TXN_ID;
     use stoolap::storage::mvcc::wal_manager::{WALEntry, WALManager, WALOperationType};
     use stoolap::storage::SyncMode;
 
@@ -1093,17 +1092,17 @@ fn a_write_failing_before_the_checkpoint_sync_fails_the_sync() {
     ))
     .unwrap();
     wal.write_commit_marker(1).unwrap();
-    wal.append_catalog_entry(WALEntry::new(
-        DDL_TXN_ID,
+    wal.append_entry(WALEntry::new(
+        2,
         "t".to_string(),
-        0,
-        WALOperationType::CreateTable,
+        2,
+        WALOperationType::Insert,
         vec![1, 2, 3],
     ))
     .unwrap();
 
     // A commit fails right before the sync takes the lock: the WAL is
-    // poisoned and cut back to its synced length, the copy with it
+    // poisoned and cut back to its synced length, the buffered row with it
     let poisoner = std::sync::Arc::clone(&wal);
     test_failpoints::before_wal_sync(move || {
         test_failpoints::WAL_WRITE_FAIL.store(true, Ordering::Release);
@@ -1676,8 +1675,11 @@ fn a_column_change_that_fails_to_record_leaves_the_rows_as_they_were() {
             column_pairs(&db, "SELECT id, b FROM t"),
             vec![(1, "b1".to_string())]
         );
-        // The failed write poisons the log until reopen
-        db.close().unwrap();
+        // The failed write poisons the log until reopen, and the close says so
+        assert!(
+            db.close().is_err(),
+            "{ddl}: the failed log is reported at close"
+        );
         drop(db);
         let db = Database::open(&dsn).unwrap();
         assert_eq!(

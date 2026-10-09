@@ -448,42 +448,37 @@ impl PersistenceManager {
             schema_data.to_vec(),
         );
 
-        let lsn = wal.append_entry(entry)?;
-
-        // DDL operations are auto-committed (they don't participate in user transactions)
-        // Write a commit marker so two-phase recovery will apply them
-        wal.write_commit_marker(DDL_TXN_ID)?;
+        // The record and its marker are one unit: every DDL commits under
+        // the same id, so a record left without its own marker would replay
+        let lsns = wal.append_unit(vec![entry, WALEntry::commit_marker(DDL_TXN_ID)], false)?;
 
         // Attempt WAL rotation if file exceeds max size.
         // Failure is non-critical: the commit is already persisted.
         let _ = wal.maybe_rotate();
 
-        Ok(Some(lsn))
+        Ok(lsns.first().copied())
     }
 
-    /// Append a checkpoint's copy of a catalog record with its commit
-    /// marker, without a sync of their own: `sync_wal_for_checkpoint`
-    /// makes the whole batch durable.
-    pub fn record_catalog_copy(
+    /// Writes a checkpoint's copies of the catalog, each record with its
+    /// marker, as one unit whose one sync also covers every record up to
+    /// the cut; then the rotation check. Returns the records' LSNs in order
+    pub fn record_catalog_copies(
         &self,
-        table_name: &str,
-        op: WALOperationType,
-        schema_data: &[u8],
-    ) -> Result<Option<u64>> {
+        copies: Vec<(String, WALOperationType, Vec<u8>)>,
+    ) -> Result<Vec<u64>> {
         if !self.is_enabled() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let wal = self.wal.as_ref().ok_or(Error::WalNotInitialized)?;
-        let entry = WALEntry::new(
-            DDL_TXN_ID,
-            table_name.to_string(),
-            0,
-            op,
-            schema_data.to_vec(),
-        );
-        let lsn = wal.append_catalog_entry(entry)?;
-        wal.append_catalog_entry(WALEntry::commit_marker(DDL_TXN_ID))?;
-        Ok(Some(lsn))
+        let mut entries = Vec::with_capacity(copies.len() * 2);
+        for (name, op, data) in copies {
+            entries.push(WALEntry::new(DDL_TXN_ID, name, 0, op, data));
+            entries.push(WALEntry::commit_marker(DDL_TXN_ID));
+        }
+        // A checkpoint's boundary needs the sync in every mode
+        let lsns = wal.append_unit(entries, true)?;
+        let _ = wal.maybe_rotate();
+        Ok(lsns.into_iter().step_by(2).collect())
     }
 
     /// The LSN a checkpoint cuts at; see `WALManager::checkpoint_cut`.
@@ -493,18 +488,6 @@ impl PersistenceManager {
         }
         let wal = self.wal.as_ref().ok_or(Error::WalNotInitialized)?;
         wal.checkpoint_cut()
-    }
-
-    /// One flush and fsync covering the cut and the catalog copies, then
-    /// the rotation check their appends skipped.
-    pub fn sync_wal_for_checkpoint(&self) -> Result<()> {
-        if !self.is_enabled() {
-            return Ok(());
-        }
-        let wal = self.wal.as_ref().ok_or(Error::WalNotInitialized)?;
-        wal.sync_for_checkpoint()?;
-        let _ = wal.maybe_rotate();
-        Ok(())
     }
 
     /// Publish the cut as the recovery boundary.
@@ -544,11 +527,8 @@ impl PersistenceManager {
             index_data.to_vec(),
         );
 
-        wal.append_entry(entry)?;
-
-        // Index operations are auto-committed (like other DDL)
-        // Write a commit marker so two-phase recovery will apply them
-        wal.write_commit_marker(DDL_TXN_ID)?;
+        // One unit with its marker, as for any DDL
+        wal.append_unit(vec![entry, WALEntry::commit_marker(DDL_TXN_ID)], false)?;
 
         // Attempt WAL rotation if file exceeds max size.
         // Failure is non-critical: the commit is already persisted.

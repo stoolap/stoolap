@@ -23,6 +23,12 @@ use std::sync::{Mutex, MutexGuard};
 /// Fail WAL `write_to_file()` with an I/O error
 pub static WAL_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
 
+/// Write the WAL buffer but its last 5 bytes, then fail the write
+pub static WAL_WRITE_PARTIAL: AtomicBool = AtomicBool::new(false);
+
+/// Fail the cut of a WAL file back to a length after a failure
+pub static WAL_CUT_FAIL: AtomicBool = AtomicBool::new(false);
+
 /// Fail WAL `sync_locked()` (fsync) with an I/O error
 pub static WAL_SYNC_FAIL: AtomicBool = AtomicBool::new(false);
 
@@ -606,6 +612,40 @@ thread_local! {
     static WAL_SWAPPED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
+thread_local! {
+    static FAILURE_CLEANUP_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next WAL failure cleanup has the file
+/// lock and is about to take the retired file
+pub fn before_wal_failure_cleanup(hook: impl FnOnce() + 'static) {
+    FAILURE_CLEANUP_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn wal_failure_cleanup_starting() {
+    let hook = FAILURE_CLEANUP_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static RECORD_BUFFERED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next WAL record that flushes is in the
+/// buffer and the buffer lock is released, before its own flush
+pub fn after_record_buffered(hook: impl FnOnce() + 'static) {
+    RECORD_BUFFERED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn record_buffered() {
+    let hook = RECORD_BUFFERED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// Run once on this thread right after its next WAL file swap releases the
 /// locks, before the retired file is settled.
 pub fn after_wal_swap(hook: impl FnOnce() + 'static) {
@@ -1031,6 +1071,8 @@ pub(crate) fn volume_file_read() {
 pub fn reset_all() {
     use std::sync::atomic::Ordering::Release;
     WAL_WRITE_FAIL.store(false, Release);
+    WAL_WRITE_PARTIAL.store(false, Release);
+    WAL_CUT_FAIL.store(false, Release);
     WAL_SYNC_FAIL.store(false, Release);
     WAL_SCAN_READ_FAIL.store(false, Release);
     SNAPSHOT_WRITE_FAIL.store(false, Release);
@@ -1043,6 +1085,8 @@ pub fn reset_all() {
     WAL_SYNC_HOOK.with(|slot| *slot.borrow_mut() = None);
     WAL_SWAP_HOOK.with(|slot| *slot.borrow_mut() = None);
     WAL_SWAPPED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    RECORD_BUFFERED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    FAILURE_CLEANUP_HOOK.with(|slot| *slot.borrow_mut() = None);
     RETIRED_SETTLING_HOOK.with(|slot| *slot.borrow_mut() = None);
     RETIRED_AWAITED_HOOK.with(|slot| *slot.borrow_mut() = None);
     WAL_DIRECTORY_SYNC_HOOK.with(|slot| *slot.borrow_mut() = None);

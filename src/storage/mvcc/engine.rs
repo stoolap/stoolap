@@ -2244,6 +2244,9 @@ impl MVCCEngine {
 
         // Stop accepting new transactions
         self.registry.stop_accepting_transactions();
+        // The first failure is returned once every step below has run: the
+        // engine is closed already, so a second close would not finish them
+        let mut first_error: Option<Error> = None;
 
         // Run a final checkpoint to seal ALL remaining hot rows into volumes.
         // Use force_seal=true to bypass thresholds — on close, we want all data
@@ -2259,7 +2262,7 @@ impl MVCCEngine {
                     // Retry ensures WAL truncation happens and startup is fast.
                     for attempt in 0..5 {
                         if let Err(e) = self.checkpoint_cycle_inner(true) {
-                            eprintln!("Warning: final checkpoint during close failed: {}", e);
+                            first_error.get_or_insert(e);
                             break;
                         }
                         let all_empty = self
@@ -2276,7 +2279,7 @@ impl MVCCEngine {
                         }
                     }
                     if let Err(e) = self.compact_after_checkpoint_forced() {
-                        eprintln!("Warning: final compaction during close failed: {}", e);
+                        first_error.get_or_insert(e);
                     }
                 }
             }
@@ -2306,7 +2309,7 @@ impl MVCCEngine {
         if let Some(ref pm) = *self.persistence {
             if pm.is_enabled() {
                 if let Err(e) = pm.stop() {
-                    eprintln!("Warning: Error stopping persistence: {}", e);
+                    first_error.get_or_insert(e);
                 }
             }
         }
@@ -2317,7 +2320,7 @@ impl MVCCEngine {
             *file_lock = None;
         }
 
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Returns whether the engine is open
@@ -2727,26 +2730,6 @@ impl MVCCEngine {
         if let Some(ref pm) = *self.persistence {
             if pm.is_enabled() {
                 return pm.record_ddl_operation(table_name, op, schema_data);
-            }
-        }
-        Ok(None)
-    }
-
-    /// A checkpoint's copy of a catalog record: no sync of its own, the
-    /// batch is synced once by `rerecord_ddl_to_wal`. The copy's LSN, or
-    /// None when nothing was written.
-    fn record_catalog_copy(
-        &self,
-        table_name: &str,
-        op: WALOperationType,
-        schema_data: &[u8],
-    ) -> Result<Option<u64>> {
-        if self.should_skip_wal() {
-            return Ok(None);
-        }
-        if let Some(ref pm) = *self.persistence {
-            if pm.is_enabled() {
-                return pm.record_catalog_copy(table_name, op, schema_data);
             }
         }
         Ok(None)
@@ -5672,10 +5655,8 @@ impl MVCCEngine {
         // the cut published as the boundary recovery starts from, so a
         // failure here leaves the boundary where it was.
         if checkpoint_lsn > 0 {
-            if let Err(e) = self.rerecord_ddl_to_wal() {
-                eprintln!("Warning: Failed to re-record DDL to WAL: {}", e);
-                return Ok(());
-            }
+            // The boundary stays where it was, and the caller learns why
+            self.rerecord_ddl_to_wal()?;
             if let Some(ref pm) = *self.persistence {
                 pm.publish_checkpoint(checkpoint_lsn)?;
             }
@@ -6149,38 +6130,51 @@ impl MVCCEngine {
                 .collect()
         };
 
-        // Write CreateTable entries first (schemas must exist before indexes)
-        for (table_name, data) in &table_entries {
-            self.record_catalog_copy(table_name, WALOperationType::CreateTable, data)?;
-        }
-
-        for (table_name, index_name, data) in &index_entries {
-            let lsn = self.record_catalog_copy(table_name, WALOperationType::CreateIndex, data)?;
-            // An index that reached here without an identity (a record or
-            // a restore from before identities) takes its copy's LSN, the
-            // copy being the first record that stands for it
-            if let Some(lsn) = lsn {
-                if let Ok(store) = self.get_version_store(table_name) {
-                    if store.index_identity(index_name).is_none() {
-                        store.set_index_identity(index_name, lsn);
-                    }
-                }
-            }
-        }
-
-        for (view_name, data) in &view_entries {
-            self.record_catalog_copy(view_name, WALOperationType::CreateView, data)?;
-        }
-        drop(ddl);
-
         if self.should_skip_wal() {
             return Ok(());
         }
-        if let Some(ref pm) = *self.persistence {
-            if pm.is_enabled() {
-                pm.sync_wal_for_checkpoint()?;
+        let Some(pm) = self
+            .persistence
+            .as_ref()
+            .as_ref()
+            .filter(|pm| pm.is_enabled())
+        else {
+            return Ok(());
+        };
+
+        // Tables first (schemas must exist before indexes), then indexes,
+        // then views: one unit, one sync
+        let tables = table_entries.len();
+        let mut copies: Vec<(String, WALOperationType, Vec<u8>)> =
+            Vec::with_capacity(tables + index_entries.len() + view_entries.len());
+        copies.extend(
+            table_entries
+                .into_iter()
+                .map(|(name, data)| (name, WALOperationType::CreateTable, data)),
+        );
+        let mut indexes = Vec::with_capacity(index_entries.len());
+        for (table, index, data) in index_entries {
+            copies.push((table.clone(), WALOperationType::CreateIndex, data));
+            indexes.push((table, index));
+        }
+        copies.extend(
+            view_entries
+                .into_iter()
+                .map(|(name, data)| (name, WALOperationType::CreateView, data)),
+        );
+        let lsns = pm.record_catalog_copies(copies)?;
+
+        // An index that reached here without an identity (a record or a
+        // restore from before identities) takes its copy's LSN, the copy
+        // being the first record that stands for it
+        for ((table_name, index_name), &lsn) in indexes.iter().zip(lsns.iter().skip(tables)) {
+            if let Ok(store) = self.get_version_store(table_name) {
+                if store.index_identity(index_name).is_none() {
+                    store.set_index_identity(index_name, lsn);
+                }
             }
         }
+        drop(ddl);
         Ok(())
     }
 

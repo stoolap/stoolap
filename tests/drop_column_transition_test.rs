@@ -51,14 +51,18 @@ fn file_dsn(dir: &tempfile::TempDir, options: &str) -> String {
 
 const REPLAY: &str = "?checkpoint_on_close=off&checkpoint_interval=0";
 
-/// A test below fails the log process-wide, so every test here takes turns
+/// A test below fails the log process-wide, and the side file build ledger
+/// a backfill waits on is process-wide too, so every test here takes turns
 #[cfg(feature = "test-failpoints")]
 fn serial() -> stoolap::test_failpoints::FailpointGuard {
     stoolap::test_failpoints::FailpointGuard::new()
 }
 
 #[cfg(not(feature = "test-failpoints"))]
-fn serial() {}
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 // --- Index bindings --------------------------------------------------------
 
