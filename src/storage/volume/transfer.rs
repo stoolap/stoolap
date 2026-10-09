@@ -194,9 +194,9 @@ impl Scratch {
         }
     }
 
-    /// Pushes a value the way `add_row` stores it: a value of another
-    /// type becomes the column's zero, an extension payload loses its tag.
-    /// Text goes through `text` for its id in the output's dictionary
+    /// Pushes a value of the column's type the way `add_row` stores it: an
+    /// extension payload loses its tag. Text goes through `text` for its
+    /// id in the output's dictionary
     fn push_value(
         &mut self,
         value: &Value,
@@ -283,6 +283,8 @@ pub struct Transfer<'a> {
     /// output's dictionary once interned. Reset per output
     default_ids: Vec<Vec<Option<u32>>>,
     scratch: Vec<Scratch>,
+    /// By output column: its type, which a cell of another type is cast to
+    types: Vec<DataType>,
     row_ids: Vec<i64>,
     held_bytes: usize,
     peak_held_bytes: usize,
@@ -314,9 +316,12 @@ impl<'a> Transfer<'a> {
                 mapping
                     .sources
                     .iter()
-                    .map(|source| match source {
+                    .zip(&schema.columns)
+                    .map(|(source, column)| match source {
                         ColSource::Volume(index) => Source::Column(*index),
-                        ColSource::Default(value) => Source::Default(value.clone()),
+                        ColSource::Default(value) => {
+                            Source::Default(value.coerce_to_type(column.data_type))
+                        }
                     })
                     .collect()
             };
@@ -355,6 +360,11 @@ impl<'a> Transfer<'a> {
                 .columns
                 .iter()
                 .map(|column| Scratch::for_type(column.data_type))
+                .collect(),
+            types: schema
+                .columns
+                .iter()
+                .map(|column| column.data_type)
                 .collect(),
             row_ids: Vec::new(),
             held_bytes: 0,
@@ -407,6 +417,7 @@ impl<'a> Transfer<'a> {
         for column in 0..self.scratch.len() {
             gather(
                 column,
+                self.types[column],
                 refs,
                 &self.ref_handle,
                 &self.handles,
@@ -558,6 +569,7 @@ impl<'a> Transfer<'a> {
 #[allow(clippy::too_many_arguments)]
 fn gather(
     column: usize,
+    data_type: DataType,
     refs: &[(i64, usize, usize)],
     ref_handle: &[u32],
     handles: &[Handle<'_>],
@@ -694,9 +706,9 @@ fn gather(
             }
             // The input's column has another type than the output's (the
             // column's type changed after the input was sealed): the cell
-            // goes through a value, as a row would
+            // goes through its value, cast to the output's type
             (scratch, source) => {
-                let value = source.get_value(local);
+                let value = source.get_value(local).coerce_to_type(data_type);
                 scratch.push_value(&value, &mut |text| builder.intern_text(column, text))?;
             }
         }

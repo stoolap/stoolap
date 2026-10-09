@@ -6680,7 +6680,26 @@ impl MVCCEngine {
             // an input known to be out of order sends the batch to the sort,
             // with the key columns loaded whole
             let mut key_held_peak = 0usize;
+            // A key column an input stores in another type than the key's
+            // now is ordered by its values' casts, which only the sort does
+            let retyped_key = schema.cluster_key.iter().any(|&column| {
+                let data_type = schema.columns[column].data_type;
+                volumes
+                    .iter()
+                    .zip(&vol_mappings)
+                    .any(|((_, vol), mapping)| match mapping.sources.get(column) {
+                        _ if mapping.is_identity => vol.columns.data_type(column) != data_type,
+                        Some(crate::storage::volume::writer::ColSource::Volume(v)) => {
+                            vol.columns.data_type(*v) != data_type
+                        }
+                        Some(crate::storage::volume::writer::ColSource::Default(value)) => {
+                            !value.is_null() && value.data_type() != data_type
+                        }
+                        None => false,
+                    })
+            });
             let merged = if schema.cluster_key.is_empty()
+                || retyped_key
                 || volumes
                     .iter()
                     .any(|(id, _)| mgr.known_key_order(*id, &schema.cluster_key) == Some(false))
@@ -6707,9 +6726,14 @@ impl MVCCEngine {
                 use crate::storage::volume::column::ColumnData;
                 let mut key_cells: Vec<Vec<Option<&ColumnData>>> = Vec::new();
                 let mut key_defaults: Vec<Vec<Option<Value>>> = Vec::new();
+                // By key column, by volume: a column stored in another type
+                // than the key's now, compared by its values' casts
+                let mut key_retyped: Vec<Vec<bool>> = Vec::new();
                 for &column in &schema.cluster_key {
+                    let data_type = schema.columns[column].data_type;
                     let mut cells = Vec::with_capacity(volumes.len());
                     let mut defaults = Vec::with_capacity(volumes.len());
+                    let mut retyped = Vec::with_capacity(volumes.len());
                     for (vol_idx, (_, vol)) in volumes.iter().enumerate() {
                         let mapping = &vol_mappings[vol_idx];
                         let (source, default) = if mapping.is_identity {
@@ -6717,32 +6741,84 @@ impl MVCCEngine {
                         } else {
                             match mapping.sources.get(column) {
                                 Some(ColSource::Volume(v)) => (Some(*v), None),
-                                Some(ColSource::Default(value)) => (None, Some(value.clone())),
+                                Some(ColSource::Default(value)) => {
+                                    (None, Some(value.coerce_to_type(data_type)))
+                                }
                                 None => (None, Some(Value::null_unknown())),
                             }
                         };
-                        cells.push(source.and_then(|v| vol.columns.get(v).ok()));
+                        let cell = source.and_then(|v| vol.columns.get(v).ok());
+                        retyped.push(cell.is_some_and(|c| c.data_type() != data_type));
+                        cells.push(cell);
                         defaults.push(default);
                     }
                     key_cells.push(cells);
                     key_defaults.push(defaults);
+                    key_retyped.push(retyped);
                 }
+                // A retyped key column's cells, cast once before the sort
+                let key_cast: Vec<Vec<Option<Vec<Value>>>> = key_cells
+                    .iter()
+                    .zip(&key_retyped)
+                    .zip(&schema.cluster_key)
+                    .map(|((cells, retyped), &column)| {
+                        let data_type = schema.columns[column].data_type;
+                        cells
+                            .iter()
+                            .zip(retyped)
+                            .map(|(cell, &retyped)| match cell {
+                                Some(cell) if retyped => Some(
+                                    (0..cell.len())
+                                        .map(|i| cell.get_value(i).coerce_to_type(data_type))
+                                        .collect(),
+                                ),
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .collect();
                 let null = Value::null_unknown();
                 let default_of =
                     |k: usize, vol_idx: usize| key_defaults[k][vol_idx].as_ref().unwrap_or(&null);
-                let compare_key = |k: usize, a: (usize, usize), b: (usize, usize)| match (
-                    key_cells[k][a.0],
-                    key_cells[k][b.0],
-                ) {
-                    (Some(ca), Some(cb)) => ca.compare_cells(a.1, cb, b.1),
-                    (Some(ca), None) => ca.compare_cell_with_value(a.1, default_of(k, b.0)),
-                    (None, Some(cb)) => cb
-                        .compare_cell_with_value(b.1, default_of(k, a.0))
-                        .reverse(),
-                    (None, None) => crate::storage::volume::seal::compare_key_values(
-                        default_of(k, a.0),
-                        default_of(k, b.0),
-                    ),
+                let cast_of = |k: usize, at: (usize, usize)| {
+                    key_cast[k][at.0].as_ref().map(|values| &values[at.1])
+                };
+                let compare_key = |k: usize, a: (usize, usize), b: (usize, usize)| {
+                    match (cast_of(k, a), cast_of(k, b)) {
+                        (Some(va), Some(vb)) => {
+                            return crate::storage::volume::seal::compare_key_values(va, vb)
+                        }
+                        (Some(va), None) => {
+                            return match key_cells[k][b.0] {
+                                Some(cb) => cb.compare_cell_with_value(b.1, va).reverse(),
+                                None => crate::storage::volume::seal::compare_key_values(
+                                    va,
+                                    default_of(k, b.0),
+                                ),
+                            }
+                        }
+                        (None, Some(vb)) => {
+                            return match key_cells[k][a.0] {
+                                Some(ca) => ca.compare_cell_with_value(a.1, vb),
+                                None => crate::storage::volume::seal::compare_key_values(
+                                    default_of(k, a.0),
+                                    vb,
+                                ),
+                            }
+                        }
+                        (None, None) => {}
+                    }
+                    match (key_cells[k][a.0], key_cells[k][b.0]) {
+                        (Some(ca), Some(cb)) => ca.compare_cells(a.1, cb, b.1),
+                        (Some(ca), None) => ca.compare_cell_with_value(a.1, default_of(k, b.0)),
+                        (None, Some(cb)) => cb
+                            .compare_cell_with_value(b.1, default_of(k, a.0))
+                            .reverse(),
+                        (None, None) => crate::storage::volume::seal::compare_key_values(
+                            default_of(k, a.0),
+                            default_of(k, b.0),
+                        ),
+                    }
                 };
                 let mut order: Vec<u32> = (0..live_refs.len() as u32).collect();
                 order.sort_unstable_by(|&a, &b| {
@@ -7175,8 +7251,22 @@ impl MVCCEngine {
                 }
             }
 
-            // A clustered table's volumes hold their rows in key order
+            // A clustered table's volumes hold their rows in key order, the
+            // order of the values they store: a key value written before its
+            // column changed type is ordered as its cast
             if !schema.cluster_key.is_empty() {
+                for (_row_id, row) in &mut all_rows {
+                    for &column in &schema.cluster_key {
+                        let data_type = schema.columns[column].data_type;
+                        let cast = match row.get(column) {
+                            Some(value) if !value.is_null() && value.data_type() != data_type => {
+                                value.coerce_to_type(data_type)
+                            }
+                            _ => continue,
+                        };
+                        let _ = row.set(column, cast);
+                    }
+                }
                 all_rows.sort_by(|a, b| crate::storage::volume::seal::cluster_order(&schema, a, b));
             }
 
