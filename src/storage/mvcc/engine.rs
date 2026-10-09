@@ -3904,6 +3904,20 @@ impl MVCCEngine {
         Ok(())
     }
 
+    /// Puts `schema` back and opens the table after an added column whose
+    /// record the log refused
+    pub(crate) fn reopen_after_refused_add(
+        &self,
+        table_name: &str,
+        schema: CompactArc<Schema>,
+    ) -> Result<()> {
+        self.get_version_store(table_name)?
+            .reopen_after_refused_add(schema);
+        self.refresh_schema_cache(table_name)?;
+        self.refresh_column_mappings(table_name);
+        Ok(())
+    }
+
     /// Moves a table's hot rows to its schema's layout, once a column
     /// added or dropped is recorded
     pub(crate) fn lay_out_rows(&self, table_name: &str) -> Result<()> {
@@ -4472,6 +4486,8 @@ impl MVCCEngine {
         // (volumes, tombstones) while we read it, ensuring the backup is
         // a true point-in-time snapshot consistent with snapshot_commit_seq.
         let _checkpoint_guard = self.checkpoint_mutex.lock().unwrap();
+        // No column, index or view change starts until ddl.bin is written
+        let _ddl = self.ddl_guard();
 
         // Wait for all in-flight commits to complete before capturing state.
         // The commit path is: start_commit (alloc seq) → commit_all_tables
@@ -4553,12 +4569,24 @@ impl MVCCEngine {
                 }
             };
 
+            // The rows written below must be in the layout of this schema
+            let token = stores
+                .get(table_name)
+                .map(|store| store.token_for(store.layout()));
+            let generation = self
+                .segment_managers
+                .read()
+                .unwrap()
+                .get(table_name)
+                .map(|mgr| mgr.schema_generation());
             if let Err(e) = writer.write_schema(schema) {
                 eprintln!("Warning: Failed to write schema for {}: {}", table_name, e);
                 writer.fail();
                 all_succeeded = false;
                 break;
             }
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::snapshot_schema_written();
 
             let mut write_error = false;
 
@@ -4702,6 +4730,25 @@ impl MVCCEngine {
                         break;
                     }
                 }
+            }
+
+            let moved = token.is_some_and(|token| {
+                stores
+                    .get(table_name)
+                    .is_some_and(|store| store.check_token(token).is_err())
+            }) || generation.is_some_and(|generation| {
+                self.segment_managers
+                    .read()
+                    .unwrap()
+                    .get(table_name)
+                    .is_some_and(|mgr| mgr.check_schema_generation(generation).is_err())
+            });
+            if moved {
+                eprintln!(
+                    "Warning: table {} changed its columns during the snapshot",
+                    table_name
+                );
+                write_error = true;
             }
 
             if write_error {

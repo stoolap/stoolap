@@ -738,6 +738,131 @@ pub(crate) fn commit_index_capture_next() {
 }
 
 thread_local! {
+    static READ_PATHS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Notes on this thread that the read entry `path` ran
+pub(crate) fn note_read(path: &'static str) {
+    READ_PATHS.with(|paths| {
+        let mut paths = paths.borrow_mut();
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    });
+}
+
+/// The read entries this thread ran since the last call, in first-run order
+pub fn take_read_paths() -> Vec<&'static str> {
+    READ_PATHS.with(|paths| std::mem::take(&mut *paths.borrow_mut()))
+}
+
+thread_local! {
+    static FK_CHILD_PROBE_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static CORRELATED_FETCH_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static ADD_COLUMN_PUBLISHED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static SNAPSHOT_SCHEMA_WRITTEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static JOIN_INDEX_CHOSEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static JOIN_NEXT_CHUNK_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static ALTER_DDL_GUARD_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next ALTER TABLE is about to take the
+/// DDL guard
+pub fn before_alter_ddl_guard(hook: impl FnOnce() + 'static) {
+    ALTER_DDL_GUARD_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn alter_ddl_guard_next() {
+    run_hook(&ALTER_DDL_GUARD_HOOK);
+}
+
+type HookSlot = RefCell<Option<Box<dyn FnOnce()>>>;
+
+fn run_hook(slot: &'static std::thread::LocalKey<HookSlot>) {
+    let hook = slot.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next backup snapshot has written a
+/// table's schema and has not yet taken its rows
+pub fn after_snapshot_schema_written(hook: impl FnOnce() + 'static) {
+    SNAPSHOT_SCHEMA_WRITTEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn snapshot_schema_written() {
+    run_hook(&SNAPSHOT_SCHEMA_WRITTEN_HOOK);
+}
+
+/// Run once on this thread when its next join plan has taken an inner
+/// index from its planning handle, before the join opens a table to run on
+pub fn after_join_index_chosen(hook: impl FnOnce() + 'static) {
+    JOIN_INDEX_CHOSEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn join_index_chosen() {
+    run_hook(&JOIN_INDEX_CHOSEN_HOOK);
+}
+
+/// Run once on this thread when its next streaming index join has joined
+/// one outer chunk and is about to fetch the next one
+pub fn before_join_next_chunk(hook: impl FnOnce() + 'static) {
+    JOIN_NEXT_CHUNK_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn join_next_chunk() {
+    run_hook(&JOIN_NEXT_CHUNK_HOOK);
+}
+
+/// Run once on this thread when its next foreign key check is about to
+/// open a child table, its key positions already taken
+pub fn before_fk_child_probe(hook: impl FnOnce() + 'static) {
+    FK_CHILD_PROBE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn fk_child_probe_next() {
+    run_hook(&FK_CHILD_PROBE_HOOK);
+}
+
+/// Run once on this thread when its next correlated EXISTS probe has
+/// checked its token and has not yet fetched a row
+pub fn before_correlated_fetch(hook: impl FnOnce() + 'static) {
+    CORRELATED_FETCH_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn correlated_fetch_next() {
+    run_hook(&CORRELATED_FETCH_HOOK);
+}
+
+/// Run once on this thread when its next ADD COLUMN has published the
+/// schema and has not yet recorded the change or laid out the rows
+pub fn after_add_column_published(hook: impl FnOnce() + 'static) {
+    ADD_COLUMN_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn add_column_published() {
+    run_hook(&ADD_COLUMN_PUBLISHED_HOOK);
+}
+
+thread_local! {
+    static SELECT_TABLE_OPENED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next table scan SELECT has opened its
+/// table and has not yet read a row
+pub fn after_select_table_opened(hook: impl FnOnce() + 'static) {
+    SELECT_TABLE_OPENED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn select_table_opened() {
+    let hook = SELECT_TABLE_OPENED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static COMMIT_MARKER_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
@@ -1099,6 +1224,18 @@ pub fn reset_all() {
     STATEMENT_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_ROUND_PREPARED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_READS_FORGET.store(false, Release);
+    SELECT_TABLE_OPENED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    READ_PATHS.with(|paths| paths.borrow_mut().clear());
+    FK_CHILD_PROBE_HOOK.with(|slot| *slot.borrow_mut() = None);
+    CORRELATED_FETCH_HOOK.with(|slot| *slot.borrow_mut() = None);
+    ADD_COLUMN_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    SNAPSHOT_SCHEMA_WRITTEN_HOOK.with(|slot| *slot.borrow_mut() = None);
+    JOIN_INDEX_CHOSEN_HOOK.with(|slot| *slot.borrow_mut() = None);
+    JOIN_NEXT_CHUNK_HOOK.with(|slot| *slot.borrow_mut() = None);
+    ALTER_DDL_GUARD_HOOK.with(|slot| *slot.borrow_mut() = None);
+    JOIN_INNER_OPENED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    DROP_RECORDED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    DROP_HOT_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = None);
 }
 
 /// RAII guard that serializes failpoint tests and resets all failpoints on drop.

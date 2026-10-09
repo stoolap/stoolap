@@ -158,6 +158,12 @@ impl MVCCTable {
         self.layout
     }
 
+    /// Rows captured through this handle were held in its layout when the
+    /// live layout is still the handle's and open: layouts only increase
+    fn check_read(&self) -> Result<()> {
+        self.version_store.check_layout(Some(self.layout))
+    }
+
     /// The schema as the store holds it now, and the layout that goes with
     /// it: what a handle takes after changing the columns itself
     fn take_schema(&mut self) {
@@ -294,6 +300,7 @@ impl MVCCTable {
             let batch_rows = self
                 .version_store
                 .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
+            self.check_read()?;
             for (row_id, row, version) in batch_rows {
                 found_ids.insert(row_id);
                 let row = self.normalize_row_to_schema(row, schema);
@@ -2199,6 +2206,7 @@ impl Table for MVCCTable {
             let global_rows = self
                 .version_store
                 .get_visible_versions_batch(global_ids, self.txn_id);
+            self.check_read()?;
 
             // Apply filter to fetched rows
             for (row_id, row) in global_rows {
@@ -2321,6 +2329,7 @@ impl Table for MVCCTable {
                     }
                 };
 
+                self.check_read()?;
                 if let Some((row, original_version)) = row_with_original {
                     // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
                     let row = self.normalize_row_to_schema(row, schema);
@@ -2374,6 +2383,7 @@ impl Table for MVCCTable {
                     let batch_rows = self
                         .version_store
                         .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
+                    self.check_read()?;
                     for (row_id, row, version) in batch_rows {
                         let row = self.normalize_row_to_schema(row, schema);
                         let (updated_row, changed) = setter(row)?;
@@ -2441,6 +2451,7 @@ impl Table for MVCCTable {
                     }
                 }
 
+                self.check_read()?;
                 // Step 3: Apply setter to all rows, filtering out unchanged rows
                 // Setter returns Result — on error, abort BEFORE batch put
                 // to guarantee statement-level atomicity.
@@ -2523,6 +2534,7 @@ impl Table for MVCCTable {
                     })
                     .collect()
             };
+        self.check_read()?;
 
         // Overlay local transaction changes onto the global rows:
         // - Rows locally updated: use local data instead of stale global data
@@ -2665,6 +2677,7 @@ impl Table for MVCCTable {
             let batch_rows = self
                 .version_store
                 .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
+            self.check_read()?;
             for (row_id, row, version) in batch_rows {
                 let row = self.normalize_row_to_schema(row, schema);
                 let (updated_row, changed) = setter(row)?;
@@ -2803,6 +2816,7 @@ impl Table for MVCCTable {
                         None
                     }
                 };
+                self.check_read()?;
 
                 if let Some((row, original_version)) = row_with_original {
                     if let Some(orig) = original_version {
@@ -2850,6 +2864,7 @@ impl Table for MVCCTable {
                     for (row_id, row, version) in batch_rows {
                         rows_with_originals.push((row_id, row, version));
                     }
+                    self.check_read()?;
                 }
 
                 let delete_count = (local_rows.len() + rows_with_originals.len()) as i32;
@@ -2898,6 +2913,7 @@ impl Table for MVCCTable {
                     let batch_rows = self
                         .version_store
                         .get_visible_versions_batch(&remaining_row_ids, self.txn_id);
+                    self.check_read()?;
                     for (row_id, row) in batch_rows {
                         // Re-apply filter (index may be partial match)
                         if expr.evaluate(&row).unwrap_or(false) {
@@ -2970,6 +2986,7 @@ impl Table for MVCCTable {
                 delete_count += 1;
             }
         }
+        self.check_read()?;
 
         // Also check local inserts that might not be in global store
         let local_ids: Vec<i64> = {
@@ -3048,6 +3065,7 @@ impl Table for MVCCTable {
                         None
                     }
                 };
+                self.check_read()?;
 
                 if let Some(row) = row {
                     // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
@@ -3078,6 +3096,7 @@ impl Table for MVCCTable {
         self.full_scans
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let rows = self.collect_visible_rows(where_expr);
+        self.check_read()?;
         let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
         Ok(Box::new(scanner))
     }
@@ -3170,16 +3189,21 @@ impl Table for MVCCTable {
         if !walked || stale || self.version_store.publish_epoch_if_quiet() != Some(epoch) {
             return Ok(None);
         }
+        self.check_read()?;
         Ok(Some(rows.into_iter().skip(offset).take(limit).collect()))
     }
 
     fn collect_all_rows(&self, where_expr: Option<&dyn Expression>) -> Result<RowVec> {
         // Return cached row vector directly - caller iterates (i64, Row) tuples
-        Ok(self.collect_visible_rows(where_expr))
+        let rows = self.collect_visible_rows(where_expr);
+        self.check_read()?;
+        Ok(rows)
     }
 
     fn collect_all_rows_unsorted(&self) -> Result<RowVec> {
-        Ok(self.collect_visible_rows_unsorted())
+        let rows = self.collect_visible_rows_unsorted();
+        self.check_read()?;
+        Ok(rows)
     }
 
     fn collect_rows_by_ids(&self, row_ids: &[i64]) -> Result<RowVec> {
@@ -3191,6 +3215,7 @@ impl Table for MVCCTable {
                 }
             }
         }
+        self.check_read()?;
         Ok(rows)
     }
 
@@ -3201,7 +3226,9 @@ impl Table for MVCCTable {
         offset: usize,
     ) -> Result<RowVec> {
         // Use the optimized version with limit/offset
-        Ok(self.collect_visible_rows_with_limit(where_expr, limit, offset))
+        let rows = self.collect_visible_rows_with_limit(where_expr, limit, offset);
+        self.check_read()?;
+        Ok(rows)
     }
 
     fn collect_rows_with_limit_unordered(
@@ -3211,7 +3238,9 @@ impl Table for MVCCTable {
         offset: usize,
     ) -> Result<RowVec> {
         // Use the optimized unordered version with true early termination
-        Ok(self.collect_visible_rows_with_limit_unordered(where_expr, limit, offset))
+        let rows = self.collect_visible_rows_with_limit_unordered(where_expr, limit, offset);
+        self.check_read()?;
+        Ok(rows)
     }
 
     fn close(&mut self) -> Result<()> {
@@ -4142,12 +4171,14 @@ impl Table for MVCCTable {
         if let Some(pk_idx) = self.cached_schema.pk_column_index() {
             let pk_col = &self.cached_schema.columns[pk_idx];
             if pk_col.name_lower == column_name.to_lowercase() {
-                return Ok(self.version_store.collect_rows_pk_ordered(
+                let rows = self.version_store.collect_rows_pk_ordered(
                     self.txn_id,
                     ascending,
                     limit,
                     offset,
-                ));
+                );
+                self.check_read()?;
+                return Ok(rows);
             }
         }
 
@@ -4188,7 +4219,7 @@ impl Table for MVCCTable {
 
                     // Check if we've reached the limit
                     if rows.len() >= limit {
-                        return Ok(Some(rows));
+                        break;
                     }
                 }
             }
@@ -4196,6 +4227,7 @@ impl Table for MVCCTable {
             // If we got all needed rows, return them
             // If not, we may need to fetch more (rare case with many invisible rows)
             if !rows.is_empty() {
+                self.check_read()?;
                 return Ok(Some(rows));
             }
         }
@@ -4247,12 +4279,14 @@ impl Table for MVCCTable {
 
                     // Check if we've reached the limit
                     if rows.len() >= limit {
+                        self.check_read()?;
                         return Ok(Some(rows));
                     }
                 }
             }
         }
 
+        self.check_read()?;
         Ok(Some(rows))
     }
 
@@ -4276,13 +4310,16 @@ impl Table for MVCCTable {
 
         // Use the efficient keyset iteration from version store
         // Returns RowVec with (row_id, Row) tuples
-        Some(self.version_store.collect_rows_keyset(
+        let rows = self.version_store.collect_rows_keyset(
             self.txn_id,
             start_after,
             start_from,
             ascending,
             limit,
-        ))
+        );
+        // Rows of another layout: the regular path reports the change
+        self.check_read().ok()?;
+        Some(rows)
     }
 
     fn collect_rows_grouped_by_partition(
@@ -4332,6 +4369,7 @@ impl Table for MVCCTable {
             }
         }
 
+        self.check_read()?;
         Ok(Some(result))
     }
 
@@ -4400,6 +4438,7 @@ impl Table for MVCCTable {
             }
         }
 
+        self.check_read()?;
         Ok(Some(rows))
     }
 
@@ -4522,6 +4561,7 @@ impl Table for MVCCTable {
                 }
             }
         }
+        self.check_read()?;
 
         // Create result
         let result_columns: Vec<String> = columns.iter().map(|s| s.to_string()).collect();
@@ -4873,7 +4913,9 @@ impl Table for MVCCTable {
         }
         drop(txn_versions);
 
-        Ok(Some(self.version_store.sum_column(self.txn_id, col_idx)))
+        let sum = self.version_store.sum_column(self.txn_id, col_idx);
+        self.check_read()?;
+        Ok(Some(sum))
     }
 
     fn min_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
@@ -4884,7 +4926,9 @@ impl Table for MVCCTable {
         }
         drop(txn_versions);
 
-        Ok(Some(self.version_store.min_column(self.txn_id, col_idx)))
+        let min = self.version_store.min_column(self.txn_id, col_idx);
+        self.check_read()?;
+        Ok(Some(min))
     }
 
     fn max_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
@@ -4895,7 +4939,9 @@ impl Table for MVCCTable {
         }
         drop(txn_versions);
 
-        Ok(Some(self.version_store.max_column(self.txn_id, col_idx)))
+        let max = self.version_store.max_column(self.txn_id, col_idx);
+        self.check_read()?;
+        Ok(Some(max))
     }
 
     fn compute_grouped_aggregates(
@@ -4910,9 +4956,13 @@ impl Table for MVCCTable {
         }
         drop(txn_versions);
 
-        Ok(self
-            .version_store
-            .compute_grouped_aggregates(self.txn_id, group_by_indices, aggregates))
+        let groups = self.version_store.compute_grouped_aggregates(
+            self.txn_id,
+            group_by_indices,
+            aggregates,
+        );
+        self.check_read()?;
+        Ok(groups)
     }
 }
 

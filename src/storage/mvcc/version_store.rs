@@ -1007,15 +1007,22 @@ impl VersionStore {
         Ok(())
     }
 
-    /// Adds `column` to the schema. The rows follow at `lay_out_rows`, once
-    /// the change is durable: a change that fails to record leaves the
-    /// rows as they were under the schema put back
+    /// Adds `column` to the schema and closes the table: the rows follow at
+    /// `lay_out_rows`, which opens it, once the change is durable; a change
+    /// that fails to record reopens at `reopen_after_refused_add`
     pub fn add_column(&self, column: crate::core::SchemaColumn) -> Result<(), Error> {
         let mut schema = self.schema.write();
         CompactArc::make_mut(&mut *schema).add_column(column)?;
-        // By two, so the table stays open
-        self.layout.fetch_add(2, Ordering::AcqRel);
+        self.layout.fetch_add(1, Ordering::AcqRel);
         Ok(())
+    }
+
+    /// Opens the table again under `schema` after an added column whose
+    /// record the log refused; the rows were never laid out for it
+    pub fn reopen_after_refused_add(&self, schema: CompactArc<Schema>) {
+        let mut current = self.schema.write();
+        *current = schema;
+        self.layout.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Closes the table to drop `name`: the drop is checked on a copy of the
@@ -1139,7 +1146,14 @@ impl VersionStore {
         let schema = self.schema();
         let width = schema.columns.len();
         let cut = self.pending_cut.lock().take();
-        self.relayout_rows(&|values| lay_out_values(values, width, cut, &schema), || {});
+        debug_assert!(is_closed(self.layout()), "rows laid out on an open table");
+        // The layout opens with the rows, under the versions lock
+        self.relayout_rows(
+            &|values| lay_out_values(values, width, cut, &schema),
+            || {
+                self.layout.fetch_add(1, Ordering::AcqRel);
+            },
+        );
     }
 
     /// Rewrites every row `relayout` returns a new layout for: the heads
@@ -1794,6 +1808,8 @@ impl VersionStore {
                         return None;
                     }
                     let data = Row::from_arc(CompactArc::clone(&arena_guard.data()[probe_idx]));
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::note_read("vs.get_visible_version.arena_probe");
                     return Some(RowVersion {
                         txn_id: meta.txn_id,
                         deleted_at_txn_id: meta.deleted_at_txn_id,
@@ -1810,6 +1826,8 @@ impl VersionStore {
         }
 
         // Phase 2: CowBTree fallback (correct lock ordering: versions first, then arena)
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.get_visible_version.chain");
         let versions = self.versions.read();
         let chain = versions.get(row_id)?;
 
@@ -1929,6 +1947,8 @@ impl VersionStore {
     /// Pre-acquires all locks once, then performs per-key CowBTree lookups
     /// with visibility checking and version chain traversal as needed.
     pub fn get_visible_versions_batch(&self, row_ids: &[i64], txn_id: i64) -> RowVec {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.get_visible_versions_batch");
         if self.closed.load(Ordering::Acquire) || row_ids.is_empty() {
             return RowVec::new();
         }
@@ -2033,6 +2053,8 @@ impl VersionStore {
     where
         F: FnMut(i64, Row) -> bool,
     {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.for_each_visible");
         if self.closed.load(Ordering::Acquire) || row_ids.is_empty() {
             return;
         }
@@ -2271,6 +2293,8 @@ impl VersionStore {
         row_ids: &[i64],
         txn_id: i64,
     ) -> Vec<(i64, Row, RowVersion)> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.get_visible_versions_for_update");
         if self.closed.load(Ordering::Acquire) {
             return Vec::new();
         }
@@ -2914,6 +2938,8 @@ impl VersionStore {
     /// The returned `RowVec` auto-returns to cache on drop.
     #[inline]
     pub fn get_all_visible_rows_cached(&self, txn_id: i64) -> RowVec {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.get_all_visible_rows_cached");
         let mut result = RowVec::new();
 
         if self.closed.load(Ordering::Acquire) {
@@ -2978,6 +3004,8 @@ impl VersionStore {
     /// Note: read_version_seq is obtained from visibility_checker, not from create_time.
     #[inline]
     pub fn get_all_visible_rows_for_update(&self, txn_id: i64) -> Vec<(i64, Row, RowVersion)> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.get_all_visible_rows_for_update");
         if self.closed.load(Ordering::Acquire) {
             return Vec::new();
         }
@@ -3043,6 +3071,8 @@ impl VersionStore {
         txn_id: i64,
         filter: &dyn crate::storage::expression::Expression,
     ) -> Vec<(i64, Row, RowVersion)> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.get_all_visible_rows_for_update_filtered");
         if self.closed.load(Ordering::Acquire) {
             return Vec::new();
         }
@@ -3176,6 +3206,8 @@ impl VersionStore {
     /// * `limit` - Maximum number of rows to return
     /// * `offset` - Number of rows to skip before collecting
     pub fn get_visible_rows_with_limit(&self, txn_id: i64, limit: usize, offset: usize) -> RowVec {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.get_visible_rows_with_limit");
         if self.closed.load(Ordering::Acquire) || limit == 0 {
             return RowVec::new();
         }
@@ -3501,6 +3533,8 @@ impl VersionStore {
         limit: usize,
         offset: usize,
     ) -> Option<RowVec> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.collect_rows_pk_ordered");
         if self.closed.load(Ordering::Acquire) || limit == 0 {
             return Some(RowVec::new());
         }
@@ -3594,6 +3628,8 @@ impl VersionStore {
         ascending: bool,
         limit: usize,
     ) -> RowVec {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.collect_rows_keyset");
         if self.closed.load(Ordering::Acquire) || limit == 0 {
             return RowVec::new();
         }
@@ -3679,6 +3715,8 @@ impl VersionStore {
         txn_id: i64,
         filter: &dyn crate::storage::expression::Expression,
     ) -> RowVec {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.get_all_visible_rows_filtered");
         if self.closed.load(Ordering::Acquire) {
             return RowVec::new();
         }
@@ -3745,6 +3783,8 @@ impl VersionStore {
     ) where
         F: FnMut(i64, Row) -> bool,
     {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.for_each_visible_filtered");
         if self.closed.load(Ordering::Acquire) {
             return;
         }
@@ -3808,6 +3848,8 @@ impl VersionStore {
         limit: usize,
         offset: usize,
     ) -> RowVec {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.get_visible_rows_filtered_with_limit");
         if self.closed.load(Ordering::Acquire) || limit == 0 {
             return RowVec::new();
         }
@@ -3902,6 +3944,8 @@ impl VersionStore {
     /// Avoids Vec allocation and second iteration over indices.
     /// Returns (sum, count_non_null) for proper NULL handling.
     pub fn sum_column(&self, txn_id: i64, col_idx: usize) -> (f64, usize) {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.sum_column");
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => c,
             None => return (0.0, 0),
@@ -4027,6 +4071,8 @@ impl VersionStore {
     ///
     /// OPTIMIZATION: Single-pass approach that combines visibility checking with min computation.
     pub fn min_column(&self, txn_id: i64, col_idx: usize) -> Option<Value> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.min_column");
         let checker = self.visibility_checker.as_ref()?;
 
         let mut min_val: Option<Value> = None;
@@ -4134,6 +4180,8 @@ impl VersionStore {
     ///
     /// OPTIMIZATION: Single-pass approach that combines visibility checking with max computation.
     pub fn max_column(&self, txn_id: i64, col_idx: usize) -> Option<Value> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.max_column");
         let checker = self.visibility_checker.as_ref()?;
 
         let mut max_val: Option<Value> = None;
@@ -6151,6 +6199,8 @@ impl VersionStore {
         group_by_indices: &[usize],
         aggregates: &[(AggregateOp, usize)],
     ) -> Option<Vec<GroupedAggregateResult>> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.compute_grouped_aggregates");
         if self.closed.load(Ordering::Acquire) {
             return Some(Vec::new());
         }

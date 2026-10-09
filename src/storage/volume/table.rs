@@ -370,6 +370,13 @@ impl SegmentedTable {
         self.segment_mgr.seal_generation() != generation
     }
 
+    /// Cold rows read through this handle's mappings are in its schema
+    /// when the schema generation is still the handle's and settled
+    fn check_cold(&self) -> Result<()> {
+        self.segment_mgr
+            .check_schema_generation(self.schema_generation)
+    }
+
     /// Reload through the captured file owner even after segment retirement.
     fn load_volume_of_view(
         &self,
@@ -837,6 +844,8 @@ impl SegmentedTable {
                 Self::settled_state(mgr)
             };
             let snap = mgr.statement_snapshot();
+            // The setter runs on rows read through these mappings
+            self.check_cold()?;
             snap.adopt(std::mem::take(&mut carried));
             if under_fence {
                 snap.defer_reads();
@@ -1859,6 +1868,8 @@ impl SegmentedTable {
         needed: Option<&[bool]>,
         where_expr: Option<&dyn Expression>,
     ) -> Result<Box<dyn Scanner>> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("seg.scan_cold_and_hot");
         if let Some(result) = self.unsealed(|hot| hot.scan(column_indices, where_expr)) {
             return result;
         }
@@ -2056,6 +2067,8 @@ impl SegmentedTable {
         hot_skip: FxHashSet<i64>,
         generation: u64,
     ) -> Result<Option<RowVec>> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("seg.collect_cold_rows");
         self.segment_mgr
             .check_schema_generation(self.schema_generation)?;
         // A filter evaluates by column position and rejects every row until
@@ -2398,6 +2411,7 @@ impl SegmentedTable {
         }
         let snap = mgr.statement_snapshot();
         if !snap.has_cold {
+            self.check_cold()?;
             return Ok((guard, Some(snap)));
         }
         drop(guard);
@@ -2412,7 +2426,11 @@ impl SegmentedTable {
             snap.adopt(carried);
             snap.defer_reads();
             match read(&snap) {
-                Ok(()) => return Ok((guard, Some(snap))),
+                Ok(()) => {
+                    // The statement reads its rows through these mappings
+                    self.check_cold()?;
+                    return Ok((guard, Some(snap)));
+                }
                 Err(e) if snap.is_deferred(&e) => {
                     releases += 1;
                     if releases > COLD_READ_RETRIES {
@@ -3277,6 +3295,8 @@ impl Table for SegmentedTable {
     }
 
     fn collect_rows_by_ids(&self, row_ids: &[i64]) -> Result<RowVec> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("seg.collect_rows_by_ids");
         if let Some(result) = self.unsealed(|hot| hot.collect_rows_by_ids(row_ids)) {
             return result;
         }
@@ -3319,6 +3339,7 @@ impl Table for SegmentedTable {
                     result.push((id, row));
                 }
             }
+            self.check_cold()?;
 
             Ok(result)
         })
@@ -3336,6 +3357,8 @@ impl Table for SegmentedTable {
         filter: &dyn Expression,
         buffer: &mut RowVec,
     ) -> Result<()> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("seg.fetch_rows_by_ids_into");
         if let Some(result) =
             self.unsealed(|hot| hot.fetch_rows_by_ids_into(row_ids, filter, buffer))
         {
@@ -3380,7 +3403,7 @@ impl Table for SegmentedTable {
             if !hot_ids.is_empty() {
                 self.hot.fetch_rows_by_ids_into(&hot_ids, filter, buffer)?;
             }
-            Ok(())
+            self.check_cold()
         })
     }
 
@@ -3394,6 +3417,8 @@ impl Table for SegmentedTable {
         limit: usize,
         offset: usize,
     ) -> Result<RowVec> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("seg.collect_rows_with_limit");
         if let Some(result) =
             self.unsealed(|hot| hot.collect_rows_with_limit(where_expr, limit, offset))
         {
@@ -3596,6 +3621,8 @@ impl Table for SegmentedTable {
         limit: usize,
         offset: usize,
     ) -> Result<RowVec> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("seg.collect_rows_with_limit_unordered");
         if let Some(result) =
             self.unsealed(|hot| hot.collect_rows_with_limit_unordered(where_expr, limit, offset))
         {
@@ -3855,6 +3882,8 @@ impl Table for SegmentedTable {
     // =========================================================================
 
     fn sum_column(&self, col_idx: usize) -> Result<Option<(f64, usize)>> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("seg.sum_column");
         // Snapshot isolation: cold aggregation uses tombstones without snapshot
         // filtering. Bail so the executor falls back to full scan.
         if self.snapshot_seq.is_some() {
@@ -3941,6 +3970,7 @@ impl Table for SegmentedTable {
                 }
             }
             let total_sum = hot_sum + cold_sum_int as f64 + cold_sum_float;
+            self.check_cold()?;
             return Ok(Some((total_sum, total_count)));
         }
 
@@ -4009,10 +4039,13 @@ impl Table for SegmentedTable {
                 }
             }
         }
+        self.check_cold()?;
         Ok(Some((total_sum, total_count)))
     }
 
     fn min_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("seg.min_column");
         if self.snapshot_seq.is_some() {
             return Ok(None);
         }
@@ -4083,6 +4116,7 @@ impl Table for SegmentedTable {
                     }
                 }
             }
+            self.check_cold()?;
             return Ok(Some(overall_min));
         }
 
@@ -4318,10 +4352,13 @@ impl Table for SegmentedTable {
                 }
             }
         }
+        self.check_cold()?;
         Ok(Some(overall_min))
     }
 
     fn max_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("seg.max_column");
         if self.snapshot_seq.is_some() {
             return Ok(None);
         }
@@ -4393,6 +4430,7 @@ impl Table for SegmentedTable {
                     }
                 }
             }
+            self.check_cold()?;
             return Ok(Some(overall_max));
         }
 
@@ -4617,6 +4655,7 @@ impl Table for SegmentedTable {
                 }
             }
         }
+        self.check_cold()?;
         Ok(Some(overall_max))
     }
 
@@ -4703,6 +4742,7 @@ impl Table for SegmentedTable {
             }
         }
 
+        self.check_cold()?;
         Ok(Some(distinct.len()))
     }
 
@@ -4789,6 +4829,7 @@ impl Table for SegmentedTable {
                 }
             }
 
+            self.check_cold()?;
             Ok(Some(Some(distinct.into_iter().collect())))
         })
     }
@@ -4929,6 +4970,7 @@ impl Table for SegmentedTable {
                 }
             }
 
+            self.check_cold()?;
             Ok(Some(Some(distinct.into_iter().collect())))
         })
     }
@@ -5018,6 +5060,7 @@ impl Table for SegmentedTable {
             }
         }
 
+        self.check_cold()?;
         Ok(Some(groups.into_iter().collect()))
     }
 
@@ -5135,6 +5178,7 @@ impl Table for SegmentedTable {
             }
         }
 
+        self.check_cold()?;
         Ok(Some(result))
     }
 
@@ -5365,6 +5409,7 @@ impl Table for SegmentedTable {
                 }
             }
 
+            self.check_cold()?;
             Ok(Some(Some(result)))
         })
     }
@@ -5462,6 +5507,8 @@ impl Table for SegmentedTable {
         limit: usize,
         offset: usize,
     ) -> Result<Option<RowVec>> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("seg.scan_top_k");
         if self.snapshot_seq.is_some() {
             return Ok(None);
         }
@@ -5683,6 +5730,7 @@ impl Table for SegmentedTable {
                     }
                 }
             }
+            self.check_cold()?;
             Ok(Some(Some(keep.into_rows(offset))))
         })
     }
@@ -6282,6 +6330,7 @@ impl Table for SegmentedTable {
             // cold rows are excluded since they lack version history.
             // The hot buffer's AS OF result is the authoritative source.
 
+            self.check_cold()?;
             let col_names: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
             Ok(Some(Box::new(crate::executor::result::ExecutorResult::new(
                 col_names, all_rows,
@@ -6314,6 +6363,8 @@ impl Table for SegmentedTable {
         aggregates: &[(AggregateOp, usize)],
         where_expr: &dyn Expression,
     ) -> Result<Option<Vec<Value>>> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("seg.compute_filtered_aggregates");
         // Bail out: snapshot isolation requires tombstone filtering by snapshot_seq
         if self.snapshot_seq.is_some() {
             return Ok(None);
@@ -7200,6 +7251,7 @@ impl Table for SegmentedTable {
             })
             .collect();
 
+        self.check_cold()?;
         Ok(Some(results))
     }
 
@@ -7208,6 +7260,8 @@ impl Table for SegmentedTable {
         group_by_indices: &[usize],
         aggregates: &[(AggregateOp, usize)],
     ) -> Result<Option<Vec<GroupedAggregateResult>>> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("seg.compute_grouped_aggregates");
         if self.snapshot_seq.is_some() {
             return Ok(None);
         }
@@ -7981,6 +8035,7 @@ impl Table for SegmentedTable {
             })
             .collect();
 
+        self.check_cold()?;
         Ok(Some(results))
     }
 }
