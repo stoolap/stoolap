@@ -649,10 +649,28 @@ fn substitute_in_table_expr(
 /// Column names are lowercased for case-insensitive matching.
 /// Also adds unqualified base names as fallbacks for qualified columns
 /// (e.g., "t.val" also registers "val") when the base name is unambiguous.
+/// Lowercase an expression string for use as a lookup key, keeping the case
+/// of single-quoted string literals so `'a'` and `'A'` stay distinct.
+pub fn lower_expr_key(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_literal = false;
+    for c in s.chars() {
+        if c == '\'' {
+            in_literal = !in_literal;
+            out.push(c);
+        } else if in_literal {
+            out.push(c);
+        } else {
+            out.extend(c.to_lowercase());
+        }
+    }
+    out
+}
+
 pub fn build_column_index_map(columns: &[String]) -> StringMap<usize> {
     let mut map: StringMap<usize> = StringMap::with_capacity(columns.len());
     for (i, c) in columns.iter().enumerate() {
-        map.insert(c.to_lowercase(), i);
+        map.insert(lower_expr_key(c), i);
     }
     // Add unqualified fallbacks for qualified column names (e.g., "t.val" → "val")
     // Only add when the base name is unambiguous (appears in exactly one table)

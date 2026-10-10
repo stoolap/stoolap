@@ -35,7 +35,7 @@ use super::ops::{CompareOp, CompiledPattern, Op};
 use super::program::{Program, ProgramBuilder};
 use super::vm::{ExecuteContext, ExprVM};
 use crate::core::{DataType, Row, Value, ValueSet};
-use crate::executor::utils::{expression_to_string, string_to_datatype};
+use crate::executor::utils::{expression_to_string, lower_expr_key, string_to_datatype};
 use crate::functions::{global_registry, FunctionRegistry};
 use crate::parser::ast::*;
 
@@ -277,7 +277,7 @@ impl<'a> CompileContext<'a> {
         if self.expression_aliases.is_empty() {
             return None;
         }
-        let expr_str = expression_to_string(expr).to_lowercase();
+        let expr_str = lower_expr_key(&expression_to_string(expr));
         self.expression_aliases.get(&expr_str).copied()
     }
 }
