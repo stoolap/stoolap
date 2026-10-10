@@ -891,6 +891,10 @@ impl SegmentedTable {
             let guard = held.unwrap_or_else(|| mgr.acquire_seal_read());
             if under_fence || mgr.seal_generation() == generation {
                 mgr.publish_loaded(snap.take_loaded());
+                // Only a WHERE update sets the hot store's rows after the cold ones
+                if ids.is_none() {
+                    self.refuse_unchanged_gone_hot(&prep)?;
+                }
                 return Ok((guard, prep.changes, prep.hot_ids));
             }
             drop(guard);
@@ -903,28 +907,46 @@ impl SegmentedTable {
     /// read from: a hot version or a tombstone since is another
     /// transaction's change; a row moved to another volume is the same
     /// row when it reads the same, as compaction leaves it, and a
-    /// change otherwise
+    /// change otherwise. Their new keys are checked again on `snap`
     fn revalidate_prepared(
         &self,
         snap: &super::manifest::StatementSnapshot,
         prep: &mut ColdPrepare,
     ) -> Result<()> {
-        for change in &prep.changes {
+        let checks_unique = self.hot.has_unique_non_pk_indexes();
+        let ColdPrepare {
+            changes,
+            visited,
+            shadowed,
+            unique_indexes,
+            set_rows,
+            ..
+        } = prep;
+        for change in changes.iter() {
             let Some((seg_id, cs, idx)) = self.find_segment_row_in(snap, change.row_id)? else {
                 return Err(Self::write_conflict(change.row_id));
             };
-            if prep.visited.get(&change.row_id) == Some(&seg_id) {
-                continue;
+            if visited.get(&change.row_id) != Some(&seg_id) {
+                let mut reader = super::writer::RowReader::new(Arc::clone(&cs.volume));
+                if reader.row(idx, &cs.mapping)? != change.old_row {
+                    return Err(Self::write_conflict(change.row_id));
+                }
+                visited.insert(change.row_id, seg_id);
             }
-            let mut reader = super::writer::RowReader::new(Arc::clone(&cs.volume));
-            if reader.row(idx, &cs.mapping)? != change.old_row {
-                return Err(Self::write_conflict(change.row_id));
+            // A row a seal registered since the earlier round may hold the key
+            if checks_unique {
+                self.check_cold_unique_for_update(
+                    &change.new_row,
+                    change.row_id,
+                    Some(snap),
+                    shadowed,
+                    unique_indexes,
+                )?;
             }
-            prep.visited.insert(change.row_id, seg_id);
         }
         // A row whose unique check waited is still the sealed row its setter
         // saw, or the statement conflicts rather than set it again hot
-        for (&row_id, (old_row, _)) in &prep.set_rows {
+        for (&row_id, (old_row, _)) in set_rows.iter() {
             let Some((_, cs, idx)) = self.find_segment_row_in(snap, row_id)? else {
                 return Err(Self::write_conflict(row_id));
             };
@@ -946,13 +968,19 @@ impl SegmentedTable {
     ) -> Result<()> {
         let mut cached: Option<(super::writer::RowReader, super::writer::ColumnMapping)> = None;
         for &row_id in ids {
-            let Some((seg_id, cs, idx)) = self.find_segment_row_in(snap, row_id)? else {
+            let found = self.find_segment_row_in(snap, row_id)?;
+            // A row an earlier round set that left the volumes is another
+            // transaction's since, not a hot row to set again
+            if prep.visited.contains_key(&row_id) {
+                if found.is_none() {
+                    return Err(Self::write_conflict(row_id));
+                }
+                continue;
+            }
+            let Some((seg_id, cs, idx)) = found else {
                 prep.hot_ids.push(row_id);
                 continue;
             };
-            if prep.visited.contains_key(&row_id) {
-                continue;
-            }
             // One reader per volume for the statement: the groups it
             // reads stay held across the rows; mapping from the SAME
             // snapshot segment
@@ -1079,6 +1107,19 @@ impl SegmentedTable {
             new_row,
         });
         Ok(())
+    }
+
+    /// A row the setter left unchanged with a hot version since is another
+    /// transaction's change, not a row to set again: checked under the
+    /// fence before any claim, only when the setter left a row unchanged
+    fn refuse_unchanged_gone_hot(&self, prep: &ColdPrepare) -> Result<()> {
+        if prep.visited.len() == prep.shadowed.len() {
+            return Ok(());
+        }
+        match self.hot.first_hot_row_in(&prep.visited, &prep.shadowed) {
+            Some(row_id) => Err(Self::write_conflict(row_id)),
+            None => Ok(()),
+        }
     }
 
     /// Claims every prepared row under the fence before anything is

@@ -1464,6 +1464,18 @@ impl<V: Clone> CowBTree<V> {
         self.iter().map(|(k, _)| *k)
     }
 
+    /// The first key in sorted order that `pred` holds for, walked without
+    /// the allocation of an iterator's node stack
+    pub fn find_key(&self, mut pred: impl FnMut(i64) -> bool) -> Option<i64> {
+        fn walk<V: Clone>(node: &NodePtr<V>, pred: &mut impl FnMut(i64) -> bool) -> Option<i64> {
+            if node.is_leaf() {
+                return node.keys().iter().copied().find(|&k| pred(k));
+            }
+            node.children().iter().find_map(|child| walk(child, pred))
+        }
+        walk(self.root.as_ref()?, &mut pred)
+    }
+
     /// Iterate over values in sorted order
     pub fn values(&self) -> impl Iterator<Item = &V> {
         self.iter().map(|(_, v)| v)
@@ -3494,6 +3506,19 @@ mod tests {
         for (i, v) in values.iter().enumerate() {
             assert_eq!(**v, i as i64);
         }
+    }
+
+    #[test]
+    fn test_find_key_on_deep_tree() {
+        let mut tree: CowBTree<i64> = CowBTree::new();
+        assert_eq!(tree.find_key(|_| true), None);
+        for i in 0..20_000 {
+            tree.insert(i * 2, i);
+        }
+        assert_eq!(tree.find_key(|_| true), Some(0));
+        assert_eq!(tree.find_key(|k| k > 17_001), Some(17_002));
+        assert_eq!(tree.find_key(|k| k == 39_998), Some(39_998));
+        assert_eq!(tree.find_key(|k| k % 2 == 1), None);
     }
 
     #[test]

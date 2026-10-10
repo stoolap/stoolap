@@ -502,6 +502,15 @@ pub trait Table: Send + Sync {
         Ok(false)
     }
 
+    /// The first row of `rows` outside `skip` with a committed hot version
+    fn first_hot_row_in(
+        &self,
+        _rows: &rustc_hash::FxHashMap<i64, u64>,
+        _skip: &rustc_hash::FxHashSet<i64>,
+    ) -> Option<i64> {
+        None
+    }
+
     /// Claim a row for update to prevent concurrent cold-row modifications.
     /// When two transactions update the same cold row, both mirror it into hot
     /// via insert_discard. Without claiming, neither detects the other because

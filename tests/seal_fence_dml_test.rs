@@ -372,3 +372,146 @@ fn a_prepared_row_another_transaction_holds_fails_before_any_hot_write() {
     let sum: i64 = db.query_one("SELECT SUM(v) FROM t", ()).unwrap();
     assert_eq!(sum, 0);
 }
+
+#[test]
+fn a_prepared_key_another_row_took_while_a_seal_landed_is_refused() {
+    use stoolap::storage::traits::Engine;
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER UNIQUE)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10)", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let mut table = txn.get_table("t").unwrap();
+    let other = db.clone();
+    let mut calls = 0;
+    let mut setter = |mut row: stoolap::core::Row| {
+        calls += 1;
+        row.set(1, stoolap::core::Value::Integer(99)).unwrap();
+        if calls == 1 {
+            // Another row takes the new key and is sealed before the fence
+            other.execute("INSERT INTO t VALUES (2, 99)", ()).unwrap();
+            other.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        Ok((row, true))
+    };
+    let updated = table.update_by_row_ids(&[1], &mut setter);
+    drop(table);
+    let refused = updated.is_err();
+    let committed = updated.and_then(|_| txn.commit());
+    assert!(refused, "the statement kept a taken key: {committed:?}");
+    assert_eq!(calls, 1);
+    let taken: i64 = db
+        .query_one("SELECT COUNT(*) FROM t WHERE k = 99", ())
+        .unwrap();
+    assert_eq!(taken, 1);
+}
+
+#[test]
+fn a_row_the_setter_left_unchanged_is_not_set_again_hot() {
+    use stoolap::storage::traits::Engine;
+    let dir = tempfile::tempdir().unwrap();
+    let db = cold_row(dir.path());
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let mut table = txn.get_table("t").unwrap();
+    let other = db.clone();
+    let mut calls = 0;
+    let mut setter = |row: stoolap::core::Row| {
+        calls += 1;
+        if calls == 1 {
+            // The row moves to the hot store before the fence
+            other
+                .execute("UPDATE t SET v = 10 WHERE id = 1", ())
+                .unwrap();
+        }
+        Ok((row, false))
+    };
+    let updated = table.update(None, &mut setter);
+    drop(table);
+    txn.rollback().unwrap();
+    assert_eq!(calls, 1, "the setter ran again: {updated:?}");
+    let conflict = matches!(&updated, Err(e) if e.to_string().contains("write conflict"));
+    assert!(conflict, "another transaction changed the row: {updated:?}");
+}
+
+#[test]
+fn a_statement_refused_on_an_unchanged_row_leaves_no_claim() {
+    use stoolap::storage::traits::Engine;
+    let dir = tempfile::tempdir().unwrap();
+    let db = cold_row(dir.path());
+    db.execute("INSERT INTO t VALUES (2, 0)", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    // More hot rows than visited cold ones
+    db.execute("INSERT INTO t VALUES (3, 0), (4, 0)", ())
+        .unwrap();
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let mut table = txn.get_table("t").unwrap();
+    let other = db.clone();
+    let mut setter = |mut row: stoolap::core::Row| {
+        if row.get(0).and_then(|v| v.as_int64()) == Some(1) {
+            bump(&mut row);
+            return Ok((row, true));
+        }
+        other
+            .execute("UPDATE t SET v = 10 WHERE id = 2", ())
+            .unwrap();
+        Ok((row, false))
+    };
+    let updated = table.update(None, &mut setter);
+    drop(table);
+    let conflict = matches!(&updated, Err(e) if e.to_string().contains("write conflict"));
+    assert!(conflict, "another transaction changed row 2: {updated:?}");
+    let freed = db.execute("UPDATE t SET v = 20 WHERE id = 1", ());
+    txn.rollback().unwrap();
+    assert_eq!(
+        freed.unwrap(),
+        1,
+        "the refused statement kept row 1 claimed"
+    );
+}
+
+#[test]
+fn a_named_row_left_unchanged_that_went_hot_across_a_seal_is_not_set_again() {
+    use stoolap::storage::traits::Engine;
+    let dir = tempfile::tempdir().unwrap();
+    let db = cold_row(dir.path());
+    db.execute("INSERT INTO t VALUES (3, 0)", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (2, 0)", ()).unwrap();
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let mut table = txn.get_table("t").unwrap();
+    let other = db.clone();
+    let mut calls = Vec::new();
+    let mut setter = |mut row: stoolap::core::Row| {
+        let id = row.get(0).and_then(|v| v.as_int64()).unwrap();
+        calls.push(id);
+        if id == 3 {
+            bump(&mut row);
+            return Ok((row, true));
+        }
+        if calls.len() == 2 {
+            // Row 2 seals, so the statement prepares again with row 1 hot
+            other.execute("PRAGMA CHECKPOINT", ()).unwrap();
+            other
+                .execute("UPDATE t SET v = 10 WHERE id = 1", ())
+                .unwrap();
+        }
+        Ok((row, false))
+    };
+    let updated = table.update_by_row_ids(&[3, 1], &mut setter);
+    drop(table);
+    let freed = db.execute("UPDATE t SET v = 20 WHERE id = 3", ());
+    txn.rollback().unwrap();
+    assert_eq!(calls, vec![3, 1], "the setter ran again: {updated:?}");
+    let conflict = matches!(&updated, Err(e) if e.to_string().contains("write conflict"));
+    assert!(conflict, "another transaction changed row 1: {updated:?}");
+    assert_eq!(
+        freed.unwrap(),
+        1,
+        "the refused statement kept row 3 claimed"
+    );
+}
