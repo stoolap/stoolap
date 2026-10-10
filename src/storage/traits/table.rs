@@ -515,14 +515,13 @@ pub trait Table: Send + Sync {
     /// When two transactions update the same cold row, both mirror it into hot
     /// via insert_discard. Without claiming, neither detects the other because
     /// the row starts absent from hot. This method uses the VersionStore's
-    /// uncommitted_writes map to serialize access. True when this call took
-    /// the claim, false when the transaction already held it.
-    fn try_claim_row(&self, _row_id: i64) -> Result<bool> {
-        Ok(false)
+    /// uncommitted_writes map to serialize access.
+    fn try_claim_row(&self, _row_id: i64) -> Result<()> {
+        Ok(())
     }
 
-    /// Lets go of a claim `try_claim_row` took while nothing was written for
-    /// the row since
+    /// Lets go of a claim `try_claim_row` took, unless another claim of the
+    /// transaction met it or the row was written since
     fn release_claim(&self, _row_id: i64) {}
 
     /// Deletes rows matching the given expression

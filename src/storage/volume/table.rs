@@ -236,8 +236,6 @@ struct ColdChange {
     row_id: i64,
     old_row: Row,
     new_row: Row,
-    /// The statement took the row's claim, rather than holding it before
-    new_claim: bool,
 }
 
 /// What an UPDATE has prepared so far, across the rounds a landing seal
@@ -1107,7 +1105,6 @@ impl SegmentedTable {
             row_id,
             old_row,
             new_row,
-            new_claim: false,
         });
         Ok(())
     }
@@ -1130,11 +1127,11 @@ impl SegmentedTable {
     /// row already claimed by another, or with a hot version since it
     /// was prepared, is that transaction's, and the statement fails,
     /// letting go of the claims it took
-    fn claim_prepared(hot: &dyn Table, changes: &mut [ColdChange]) -> Result<()> {
+    fn claim_prepared(hot: &dyn Table, changes: &[ColdChange]) -> Result<()> {
         let mut claimed = 0;
         let result = Self::claim_each(hot, changes, &mut claimed);
         if result.is_err() {
-            for change in changes[..claimed].iter().filter(|c| c.new_claim) {
+            for change in &changes[..claimed] {
                 hot.release_claim(change.row_id);
             }
         }
@@ -1143,10 +1140,12 @@ impl SegmentedTable {
 
     /// Claims and checks the rows in order; `claimed` counts the rows
     /// whose claim is held
-    fn claim_each(hot: &dyn Table, changes: &mut [ColdChange], claimed: &mut usize) -> Result<()> {
-        for change in changes.iter_mut() {
-            change.new_claim = hot.try_claim_row(change.row_id)?;
+    fn claim_each(hot: &dyn Table, changes: &[ColdChange], claimed: &mut usize) -> Result<()> {
+        for change in changes {
+            hot.try_claim_row(change.row_id)?;
             *claimed += 1;
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::cold_claim_taken();
             if hot.has_row_id(change.row_id)? {
                 return Err(Self::write_conflict(change.row_id));
             }
@@ -1168,7 +1167,6 @@ impl SegmentedTable {
             row_id,
             old_row,
             new_row,
-            ..
         } = change;
         // Insert the NEW row into hot. For int PK tables, first mirror the
         // old row (so UPDATE can find it), then update. If any step fails,
@@ -2897,9 +2895,9 @@ impl Table for SegmentedTable {
         let txn_id = self.txn_id();
         // The cold rows the statement changes are read, filtered, set and
         // checked outside the fence; only the hot moves happen under it
-        let (_seal_guard, mut changes, _) =
+        let (_seal_guard, changes, _) =
             self.prepare_cold_updates(&self.segment_mgr, None, where_expr, setter)?;
-        Self::claim_prepared(self.hot.as_ref(), &mut changes)?;
+        Self::claim_prepared(self.hot.as_ref(), &changes)?;
         let mut count = self.hot.update(where_expr, setter)?;
         for change in changes {
             Self::apply_cold_update(&mut self.hot, &self.segment_mgr, txn_id, change, has_int_pk)?;
@@ -2925,9 +2923,9 @@ impl Table for SegmentedTable {
         let txn_id = self.txn_id();
         // The cold rows named are read, set and checked outside the fence;
         // the ids no cold volume holds are the hot store's
-        let (_seal_guard, mut changes, hot_ids) =
+        let (_seal_guard, changes, hot_ids) =
             self.prepare_cold_updates(&self.segment_mgr, Some(row_ids), None, setter)?;
-        Self::claim_prepared(self.hot.as_ref(), &mut changes)?;
+        Self::claim_prepared(self.hot.as_ref(), &changes)?;
         let mut count = 0i32;
         for change in changes {
             Self::apply_cold_update(&mut self.hot, &self.segment_mgr, txn_id, change, has_int_pk)?;

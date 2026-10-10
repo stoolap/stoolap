@@ -337,6 +337,9 @@ pub struct WriteSetEntry {
     /// The version read is a volume's copy of the row: the indexes that
     /// keep sealed rows held its keys, the hot indexes never did
     pub sealed: bool,
+    /// Another claim of the transaction met this entry, so a statement that
+    /// fails does not let its claim go
+    pub shared: bool,
 }
 
 // ============================================================================
@@ -4488,9 +4491,8 @@ impl VersionStore {
     pub fn row_count(&self) -> usize {
         self.versions.read().len()
     }
-    /// Tries to claim a row for update (dirty write prevention); true when
-    /// this call took the claim, false when the transaction already held it
-    pub fn try_claim_row(&self, row_id: i64, txn_id: i64) -> Result<bool, Error> {
+    /// Tries to claim a row for update (dirty write prevention)
+    pub fn try_claim_row(&self, row_id: i64, txn_id: i64) -> Result<(), Error> {
         use crate::common::i64_map::Entry;
 
         let mut map = self.uncommitted_writes.write();
@@ -4503,11 +4505,11 @@ impl VersionStore {
                         row_id, existing_txn
                     )));
                 }
-                Ok(false)
+                Ok(())
             }
             Entry::Vacant(e) => {
                 e.insert(txn_id);
-                Ok(true)
+                Ok(())
             }
         }
     }
@@ -6971,6 +6973,7 @@ impl TransactionVersionStore {
                         read_version,
                         read_version_seq,
                         sealed: false,
+                        shared: false,
                     },
                 );
 
@@ -7073,6 +7076,7 @@ impl TransactionVersionStore {
                         read_version: Some(original_version),
                         read_version_seq,
                         sealed: false,
+                        shared: false,
                     },
                 );
 
@@ -7140,6 +7144,7 @@ impl TransactionVersionStore {
                         read_version: Some(original_version),
                         read_version_seq,
                         sealed: false,
+                        shared: false,
                     },
                 );
 
@@ -7199,6 +7204,7 @@ impl TransactionVersionStore {
                             read_version,
                             read_version_seq,
                             sealed: false,
+                            shared: false,
                         },
                     );
 
@@ -7271,6 +7277,7 @@ impl TransactionVersionStore {
                         read_version: Some(original_version),
                         read_version_seq,
                         sealed: false,
+                        shared: false,
                     },
                 );
 
@@ -8100,29 +8107,34 @@ impl TransactionVersionStore {
         // Use empty read_version since this is a cold-only claim — the actual
         // row data lives in cold storage, not in the hot version store.
         use crate::common::i64_map::Entry;
-        if let Entry::Vacant(e) = write_set.entry(row_id) {
-            e.insert(WriteSetEntry {
-                read_version: None,
-                read_version_seq: 0,
-                sealed: false,
-            });
+        match write_set.entry(row_id) {
+            Entry::Vacant(e) => {
+                e.insert(WriteSetEntry {
+                    read_version: None,
+                    read_version_seq: 0,
+                    sealed: false,
+                    shared: false,
+                });
+            }
+            Entry::Occupied(mut e) => e.get_mut().shared = true,
         }
     }
 
     /// Lets go of a claim `track_external_claim` recorded, with its write set
-    /// entry, while no local version of the row was written
+    /// entry, while no other claim of the transaction met it and no local
+    /// version of the row was written
     pub fn release_external_claim(&mut self, row_id: i64) {
-        if self
+        let written = self
             .local_versions
             .as_ref()
-            .is_some_and(|versions| versions.contains_key(row_id))
-        {
+            .is_some_and(|versions| versions.contains_key(row_id));
+        let Some(write_set) = self.write_set.as_mut() else {
             return;
-        }
-        if let Some(write_set) = self.write_set.as_mut() {
+        };
+        if !written && write_set.get(row_id).is_some_and(|e| !e.shared) {
             write_set.remove(row_id);
+            self.parent_store.release_row_claim(row_id, self.txn_id);
         }
-        self.parent_store.release_row_claim(row_id, self.txn_id);
     }
 
     /// Release all row claims held by this transaction
@@ -8992,6 +9004,7 @@ mod tests {
             read_version: Some(version),
             read_version_seq: 42,
             sealed: false,
+            shared: false,
         };
 
         let cloned = entry.clone();
@@ -9003,6 +9016,7 @@ mod tests {
             read_version: None,
             read_version_seq: 0,
             sealed: false,
+            shared: false,
         };
         let cloned_empty = empty_entry.clone();
         assert!(cloned_empty.read_version.is_none());

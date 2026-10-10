@@ -1086,6 +1086,37 @@ pub(crate) fn cold_round_prepared() {
     }
 }
 
+thread_local! {
+    static COLD_CLAIM_TAKEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static COLD_ONLY_CLAIMED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next cold UPDATE has claimed a
+/// prepared row and not yet claimed the next one
+pub fn after_cold_claim_taken(hook: impl FnOnce() + 'static) {
+    COLD_CLAIM_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn cold_claim_taken() {
+    let hook = COLD_CLAIM_TAKEN_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next delete by id has claimed the
+/// rows only a volume holds and not yet written their delete markers
+pub fn after_cold_only_rows_claimed(hook: impl FnOnce() + 'static) {
+    COLD_ONLY_CLAIMED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn cold_only_rows_claimed() {
+    let hook = COLD_ONLY_CLAIMED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// Segment maps this thread copied to publish reloaded volumes
 pub fn segment_map_clones() -> usize {
     SEGMENT_MAP_CLONES.with(std::cell::Cell::get)
@@ -1248,6 +1279,8 @@ pub fn reset_all() {
     JOIN_INNER_OPENED_HOOK.with(|slot| *slot.borrow_mut() = None);
     DROP_RECORDED_HOOK.with(|slot| *slot.borrow_mut() = None);
     DROP_HOT_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COLD_CLAIM_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COLD_ONLY_CLAIMED_HOOK.with(|slot| *slot.borrow_mut() = None);
 }
 
 /// RAII guard that serializes failpoint tests and resets all failpoints on drop.
