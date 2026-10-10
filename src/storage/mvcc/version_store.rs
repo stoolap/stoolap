@@ -4488,8 +4488,9 @@ impl VersionStore {
     pub fn row_count(&self) -> usize {
         self.versions.read().len()
     }
-    /// Tries to claim a row for update (dirty write prevention)
-    pub fn try_claim_row(&self, row_id: i64, txn_id: i64) -> Result<(), Error> {
+    /// Tries to claim a row for update (dirty write prevention); true when
+    /// this call took the claim, false when the transaction already held it
+    pub fn try_claim_row(&self, row_id: i64, txn_id: i64) -> Result<bool, Error> {
         use crate::common::i64_map::Entry;
 
         let mut map = self.uncommitted_writes.write();
@@ -4502,11 +4503,11 @@ impl VersionStore {
                         row_id, existing_txn
                     )));
                 }
-                Ok(())
+                Ok(false)
             }
             Entry::Vacant(e) => {
                 e.insert(txn_id);
-                Ok(())
+                Ok(true)
             }
         }
     }
@@ -8106,6 +8107,22 @@ impl TransactionVersionStore {
                 sealed: false,
             });
         }
+    }
+
+    /// Lets go of a claim `track_external_claim` recorded, with its write set
+    /// entry, while no local version of the row was written
+    pub fn release_external_claim(&mut self, row_id: i64) {
+        if self
+            .local_versions
+            .as_ref()
+            .is_some_and(|versions| versions.contains_key(row_id))
+        {
+            return;
+        }
+        if let Some(write_set) = self.write_set.as_mut() {
+            write_set.remove(row_id);
+        }
+        self.parent_store.release_row_claim(row_id, self.txn_id);
     }
 
     /// Release all row claims held by this transaction

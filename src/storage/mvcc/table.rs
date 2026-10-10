@@ -2786,8 +2786,9 @@ impl Table for MVCCTable {
         self.version_store.first_committed_row_in(rows, skip)
     }
 
-    fn try_claim_row(&self, row_id: i64) -> Result<()> {
-        self.version_store
+    fn try_claim_row(&self, row_id: i64) -> Result<bool> {
+        let taken = self
+            .version_store
             .try_claim_row(row_id, self.txn_id)
             .map_err(|e| Error::internal(e.to_string()))?;
         // Track this claim in TransactionVersionStore's write_set so that
@@ -2795,7 +2796,11 @@ impl Table for MVCCTable {
         // on VersionStore (for cold row UPDATE/DELETE) are never released
         // because TransactionVersionStore::commit() only drains write_set.
         self.writes().track_external_claim(row_id);
-        Ok(())
+        Ok(taken)
+    }
+
+    fn release_claim(&self, row_id: i64) {
+        self.writes().release_external_claim(row_id);
     }
 
     fn delete(&mut self, where_expr: Option<&dyn Expression>) -> Result<i32> {
