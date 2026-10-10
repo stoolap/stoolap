@@ -503,6 +503,11 @@ pub trait Table: Send + Sync {
         Err(Error::NotSupported("plan_update_by_row_ids".to_string()))
     }
 
+    /// Validates and coerces a row an UPDATE set, as an insert stores it
+    fn validate_row(&self, _row: &mut Row) -> Result<()> {
+        Err(Error::NotSupported("validate_row".to_string()))
+    }
+
     /// Writes `plan`, every check done before the first write, so an error
     /// leaves none of it. The rows are taken out; the row ids stay
     fn publish_update(&mut self, plan: &mut PlannedUpdate) -> Result<i32> {

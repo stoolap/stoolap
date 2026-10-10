@@ -2424,15 +2424,12 @@ impl MVCCTable {
     }
 
     /// Writes `plan` under one hold of the transaction's rows: every row is
-    /// checked, every new sealed row validated and its unique keys checked,
-    /// and the committed rows claimed, before the first write
+    /// checked, the unique keys of every new sealed row (validated when it
+    /// was set) checked, and the committed rows claimed, before the first write
     fn publish(&self, plan: &mut PlannedUpdate) -> Result<i32> {
         let count = plan.len() as i32;
         if count == 0 {
             return Ok(0);
-        }
-        for change in &mut plan.cold {
-            self.validate_and_coerce_row(&mut change.new_row)?;
         }
         let unique = if plan.cold.is_empty() {
             smallvec::SmallVec::new()
@@ -2529,17 +2526,21 @@ impl MVCCTable {
                 }
             };
             for run in keys.chunk_by(|a, b| a.0 == b.0) {
-                for (n, &(_, sealed_a, a)) in run.iter().enumerate() {
-                    for &(_, sealed_b, b) in &run[n + 1..] {
-                        if !sealed_a && !sealed_b {
-                            continue;
-                        }
-                        let (_, row_a) = row_at(sealed_a, a);
+                // Hot rows sort first; a run of hot rows only is not compared
+                let first_sealed = run.partition_point(|&(_, sealed, _)| !sealed);
+                for (n, &(_, _, a)) in run[first_sealed..].iter().enumerate() {
+                    let (_, row_a) = row_at(true, a);
+                    let values: smallvec::SmallVec<[Value; 4]> = column_ids
+                        .iter()
+                        .filter_map(|&col_id| row_a.get(col_id as usize).cloned())
+                        .collect();
+                    let others = run[..first_sealed]
+                        .iter()
+                        .chain(&run[first_sealed + n + 1..]);
+                    for &(_, sealed_b, b) in others {
+                        #[cfg(any(test, feature = "test-failpoints"))]
+                        crate::test_failpoints::unique_pair_compared();
                         let (row_id, row_b) = row_at(sealed_b, b);
-                        let values: smallvec::SmallVec<[Value; 4]> = column_ids
-                            .iter()
-                            .filter_map(|&col_id| row_a.get(col_id as usize).cloned())
-                            .collect();
                         if Self::row_holds(row_b, column_ids, &values) {
                             let column = column_ids
                                 .iter()
@@ -2768,6 +2769,10 @@ impl Table for MVCCTable {
         plan: &mut PlannedUpdate,
     ) -> Result<()> {
         self.plan_rows_by_id(row_ids, setter, plan)
+    }
+
+    fn validate_row(&self, row: &mut Row) -> Result<()> {
+        self.validate_and_coerce_row(row)
     }
 
     fn publish_update(&mut self, plan: &mut PlannedUpdate) -> Result<i32> {

@@ -931,3 +931,37 @@ fn rows_of_one_statement_cannot_take_one_unique_key() {
         "a refused update left a change"
     );
 }
+
+#[test]
+fn a_new_sealed_row_is_checked_with_the_key_it_is_published_with() {
+    use stoolap::core::{Row, Value};
+    use stoolap::storage::traits::Engine;
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, j JSON UNIQUE)", ())
+        .unwrap();
+    // JSON contents the storage API takes without parsing them
+    let mut seed = db.engine().begin_transaction().unwrap();
+    let mut table = seed.get_table("t").unwrap();
+    for (id, j) in [(1, "bad"), (2, "other")] {
+        table
+            .insert(Row::from(vec![Value::Integer(id), Value::json(j)]))
+            .unwrap();
+    }
+    drop(table);
+    seed.commit().unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let mut table = txn.get_table("t").unwrap();
+    // Text the publish turns into the JSON row 1 holds
+    let updated = table.update_by_row_ids(&[2], &mut |mut row| {
+        row.set(1, Value::text("bad")).unwrap();
+        Ok((row, true))
+    });
+    drop(table);
+    txn.rollback().unwrap();
+    assert!(
+        matches!(updated, Err(stoolap::core::Error::UniqueConstraint { .. })),
+        "row 2 took row 1's sealed key: {updated:?}"
+    );
+}

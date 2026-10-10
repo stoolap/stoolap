@@ -1079,11 +1079,13 @@ impl SegmentedTable {
             }
             None => {
                 let old_row = row.clone();
-                let (new_row, changed) = setter(row)?;
+                let (mut new_row, changed) = setter(row)?;
                 if !changed {
                     prep.visited.insert(row_id, seg_id);
                     return Ok(());
                 }
+                // The unique keys checked are the ones the publish writes
+                self.hot.validate_row(&mut new_row)?;
                 (old_row, new_row)
             }
         };
