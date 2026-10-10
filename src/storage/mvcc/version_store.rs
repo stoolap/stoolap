@@ -8527,6 +8527,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_publish_keeps_what_an_earlier_claim_left_in_an_entry() {
+        use crate::core::DataType;
+        use crate::storage::traits::ColdChange;
+
+        let schema = crate::core::SchemaBuilder::new("keep")
+            .column("id", DataType::Integer, false, true)
+            .column("v", DataType::Integer, true, false)
+            .build();
+        let store = Arc::new(VersionStore::with_visibility_checker(
+            "keep".to_string(),
+            schema,
+            Arc::new(ReadCommittedChecker),
+        ));
+        let row = |id: i64, v: i64| Row::from(vec![Value::from(id), Value::from(v)]);
+        let mut txn = TransactionVersionStore::new(Arc::clone(&store), 5);
+        // Each row claimed twice, so its entry is shared, with a sequence of its own
+        for id in [1, 2] {
+            txn.track_external_claim(id);
+            txn.track_external_claim(id);
+            txn.write_set
+                .as_mut()
+                .unwrap()
+                .get_mut(id)
+                .unwrap()
+                .read_version_seq = 40 + id;
+        }
+        let mut plan = PlannedUpdate::default();
+        plan.cold.push(ColdChange {
+            row_id: 1,
+            old_row: row(1, 0),
+            new_row: row(1, 7),
+        });
+        plan.hot.push((2, row(2, 8), RowVersion::new(3, row(2, 0))));
+        let layout = txn.check_planned(&plan).unwrap();
+        txn.publish_planned(&mut plan, layout);
+
+        let ws = txn.write_set.as_ref().unwrap();
+        let sealed = ws.get(1).unwrap();
+        assert_eq!(
+            (sealed.read_version_seq, sealed.shared, sealed.sealed),
+            (41, true, true),
+            "the sealed row's entry lost its sequence or sharing"
+        );
+        assert_eq!(
+            sealed.read_version.as_ref().map(|version| &version.data),
+            Some(&row(1, 0)),
+            "the sealed row's entry does not hold the volume's copy"
+        );
+        let hot = ws.get(2).unwrap();
+        assert_eq!(
+            (hot.read_version_seq, hot.shared, hot.sealed),
+            (42, true, false),
+            "the hot row's entry was replaced"
+        );
+        assert!(
+            hot.read_version.is_none(),
+            "the hot row's entry was replaced"
+        );
+    }
+
     /// A commit that applied its versions and then failed its marker takes
     /// them back: a delete leaves the row visible and counted, an update
     /// leaves the version before, a created row leaves the store
