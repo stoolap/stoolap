@@ -46,6 +46,7 @@ use crate::storage::mvcc::arena::{Relayout, RowArena};
 use crate::storage::mvcc::get_fast_timestamp;
 #[cfg(not(test))]
 use crate::storage::mvcc::registry::TransactionRegistry;
+use crate::storage::traits::PlannedUpdate;
 use crate::storage::Index;
 use ahash::AHashMap;
 #[cfg(feature = "parallel")]
@@ -2639,23 +2640,6 @@ impl VersionStore {
         self.versions.read().contains_key(row_id)
     }
 
-    /// The first row of `rows` outside `skip` with a committed version,
-    /// under one read of the map, walking whichever side is smaller
-    pub fn first_committed_row_in(
-        &self,
-        rows: &rustc_hash::FxHashMap<i64, u64>,
-        skip: &rustc_hash::FxHashSet<i64>,
-    ) -> Option<i64> {
-        let versions = self.versions.read();
-        if versions.len() <= rows.len() {
-            versions.find_key(|id| rows.contains_key(&id) && !skip.contains(&id))
-        } else {
-            rows.keys()
-                .copied()
-                .find(|&id| !skip.contains(&id) && versions.contains_key(id))
-        }
-    }
-
     /// Atomically subtract sealed rows from committed_row_count.
     ///
     /// After seal batch-removes rows from the B-tree, committed_row_count must
@@ -4500,10 +4484,7 @@ impl VersionStore {
             Entry::Occupied(e) => {
                 let existing_txn = *e.get();
                 if existing_txn != txn_id {
-                    return Err(Error::internal(format!(
-                        "row {} has uncommitted changes from transaction {}",
-                        row_id, existing_txn
-                    )));
+                    return Err(Self::claim_refused(row_id, existing_txn));
                 }
                 Ok(())
             }
@@ -4536,6 +4517,38 @@ impl VersionStore {
                 }
             }
         }
+    }
+
+    /// Claims every row of `row_ids` for `txn_id` or none: a row another
+    /// transaction holds refuses the set before any claim is taken
+    pub fn claim_rows_all_or_none(
+        &self,
+        row_ids: impl Iterator<Item = i64> + Clone,
+        txn_id: i64,
+    ) -> Result<(), Error> {
+        use crate::common::i64_map::Entry;
+
+        let mut map = self.uncommitted_writes.write();
+        for row_id in row_ids.clone() {
+            if let Some(&holder) = map.get(row_id) {
+                if holder != txn_id {
+                    return Err(Self::claim_refused(row_id, holder));
+                }
+            }
+        }
+        for row_id in row_ids {
+            if let Entry::Vacant(e) = map.entry(row_id) {
+                e.insert(txn_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn claim_refused(row_id: i64, holder: i64) -> Error {
+        Error::internal(format!(
+            "row {} has uncommitted changes from transaction {}",
+            row_id, holder
+        ))
     }
 
     /// Check if an index exists
@@ -6899,21 +6912,28 @@ impl TransactionVersionStore {
     /// handle's layout, and to the oldest of them when handles under two
     /// layouts wrote, which the commit refuses if a change came between
     fn note_layout(&mut self, at: i64) -> Result<(), Error> {
-        let seen = match self.writing {
-            // A handle under a newer layout reads these rows as its own
-            Some((_, true)) => {
-                return Err(Error::SchemaChanged {
-                    table: self.parent_store.table_name.to_string(),
-                })
-            }
-            Some((layout, false)) => layout,
-            None => self.parent_store.layout(),
-        };
+        let seen = self.layout_to_bind()?;
+        self.bind_layout(seen, at);
+        Ok(())
+    }
+
+    /// The layout a write now binds the transaction's rows to, refused while
+    /// a handle under a newer layout reads these rows as its own
+    fn layout_to_bind(&self) -> Result<u64, Error> {
+        match self.writing {
+            Some((_, true)) => Err(Error::SchemaChanged {
+                table: self.parent_store.table_name.to_string(),
+            }),
+            Some((layout, false)) => Ok(layout),
+            None => Ok(self.parent_store.layout()),
+        }
+    }
+
+    fn bind_layout(&mut self, seen: u64, at: i64) {
         match self.bound.iter_mut().find(|(layout, _)| *layout == seen) {
             Some((_, first)) => *first = (*first).min(at),
             None => self.bound.push((seen, at)),
         }
-        Ok(())
     }
 
     /// The oldest layout the transaction's surviving rows were written under
@@ -7156,6 +7176,106 @@ impl TransactionVersionStore {
             self.ensure_local_versions().insert(row_id, smallvec![rv]);
         }
         Ok(())
+    }
+
+    /// Checks a planned UPDATE against the transaction's rows as they are
+    /// now, writing nothing: a sealed row and a row read from the committed
+    /// store have no local version since, and a row read from the
+    /// transaction's own versions still has the version read
+    pub fn check_planned(&self, plan: &PlannedUpdate) -> Result<u64, Error> {
+        let layout = self.layout_to_bind()?;
+        let latest = |row_id: i64| {
+            self.local_versions
+                .as_ref()
+                .and_then(|versions| versions.get(row_id))
+                .and_then(|versions| versions.last())
+                .map(|version| version.create_time)
+        };
+        for change in &plan.cold {
+            if latest(change.row_id).is_some() {
+                return Err(Self::written_since(change.row_id));
+            }
+        }
+        for (row_id, _, read) in &plan.hot {
+            let read = (read.txn_id == self.txn_id).then_some(read.create_time);
+            if latest(*row_id) != read {
+                return Err(Self::written_since(*row_id));
+            }
+        }
+        Ok(layout)
+    }
+
+    fn written_since(row_id: i64) -> Error {
+        Error::internal(format!(
+            "write conflict: row {row_id} was written since the statement read it"
+        ))
+    }
+
+    /// Writes a planned UPDATE `check_planned` passed, under the same hold
+    /// of the store, with its claims already taken. A sealed row's entry
+    /// gets the volume's copy as the version it replaces; an entry already
+    /// there keeps its sequence and sharing
+    pub fn publish_planned(&mut self, plan: &mut PlannedUpdate, layout: u64) {
+        use crate::common::i64_map::Entry;
+
+        if plan.is_empty() {
+            return;
+        }
+        let now = get_fast_timestamp();
+        self.bind_layout(layout, now);
+        let read_version_seq = self
+            .parent_store
+            .visibility_checker
+            .as_ref()
+            .map(|c| c.get_current_sequence())
+            .unwrap_or(0);
+        let txn_id = self.txn_id;
+        for change in &mut plan.cold {
+            let original = RowVersion {
+                txn_id: 0,
+                deleted_at_txn_id: 0,
+                data: std::mem::take(&mut change.old_row),
+                create_time: 0,
+            };
+            match self.ensure_write_set().entry(change.row_id) {
+                Entry::Occupied(mut e) => {
+                    let entry = e.get_mut();
+                    entry.read_version = Some(original);
+                    entry.sealed = true;
+                }
+                Entry::Vacant(e) => {
+                    e.insert(WriteSetEntry {
+                        read_version: Some(original),
+                        read_version_seq,
+                        sealed: true,
+                        shared: false,
+                    });
+                }
+            }
+            let data = Row::from_arc(std::mem::take(&mut change.new_row).into_arc());
+            let rv = RowVersion::new_with_timestamp(txn_id, data, now);
+            self.ensure_local_versions()
+                .insert(change.row_id, smallvec![rv]);
+        }
+        for (row_id, data, read) in plan.hot.drain(..) {
+            let rv = RowVersion::new_with_timestamp(txn_id, Row::from_arc(data.into_arc()), now);
+            // A version of this transaction is never a committed one
+            if read.txn_id == txn_id {
+                if let Some(versions) = self.ensure_local_versions().get_mut(row_id) {
+                    versions.push(rv);
+                }
+                continue;
+            }
+            if let Entry::Vacant(e) = self.ensure_write_set().entry(row_id) {
+                e.insert(WriteSetEntry {
+                    read_version: Some(read),
+                    read_version_seq,
+                    sealed: false,
+                    shared: false,
+                });
+            }
+            self.ensure_local_versions().insert(row_id, smallvec![rv]);
+        }
     }
 
     /// Optimized batch delete for DELETE operations

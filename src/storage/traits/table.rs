@@ -320,6 +320,33 @@ impl CapturedGroups {
     }
 }
 
+/// A sealed row an UPDATE set, with the volume's copy it replaces
+pub struct ColdChange {
+    pub row_id: i64,
+    pub old_row: Row,
+    pub new_row: Row,
+}
+
+/// What one UPDATE statement set and has not written yet
+#[derive(Default)]
+pub struct PlannedUpdate {
+    pub cold: Vec<ColdChange>,
+    /// Hot rows in the order the setter ran on them, with the new row and
+    /// the version read: the committed one, or for a row read from the
+    /// transaction's own versions its txn id and `create_time`, no data
+    pub hot: smallvec::SmallVec<[(i64, Row, crate::storage::mvcc::RowVersion); 1]>,
+}
+
+impl PlannedUpdate {
+    pub fn len(&self) -> usize {
+        self.cold.len() + self.hot.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 pub trait Table: Send + Sync {
     /// Returns the name of the table
     fn name(&self) -> &str;
@@ -453,6 +480,38 @@ pub trait Table: Send + Sync {
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32>;
 
+    /// Runs the setter on the rows `update` sets, except the ids in `skip`,
+    /// and adds what it set to `plan` without writing it
+    fn plan_update(
+        &mut self,
+        _where_expr: Option<&dyn Expression>,
+        _setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        _skip: Option<&FxHashMap<i64, u64>>,
+        _plan: &mut PlannedUpdate,
+    ) -> Result<()> {
+        Err(Error::NotSupported("plan_update".to_string()))
+    }
+
+    /// Runs the setter on the rows `update_by_row_ids` sets and adds what
+    /// it set to `plan` without writing it
+    fn plan_update_by_row_ids(
+        &mut self,
+        _row_ids: &[i64],
+        _setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        _plan: &mut PlannedUpdate,
+    ) -> Result<()> {
+        Err(Error::NotSupported("plan_update_by_row_ids".to_string()))
+    }
+
+    /// Writes `plan`, every check done before the first write, so an error
+    /// leaves none of it. The rows are taken out; the row ids stay
+    fn publish_update(&mut self, plan: &mut PlannedUpdate) -> Result<i32> {
+        if plan.is_empty() {
+            return Ok(0);
+        }
+        Err(Error::NotSupported("publish_update".to_string()))
+    }
+
     /// Deletes rows by their row IDs directly (O(k) lookup instead of O(n) scan).
     ///
     /// This is an optimization for DELETE with IN subquery on INTEGER PRIMARY KEY.
@@ -502,18 +561,9 @@ pub trait Table: Send + Sync {
         Ok(false)
     }
 
-    /// The first row of `rows` outside `skip` with a committed hot version
-    fn first_hot_row_in(
-        &self,
-        _rows: &rustc_hash::FxHashMap<i64, u64>,
-        _skip: &rustc_hash::FxHashSet<i64>,
-    ) -> Option<i64> {
-        None
-    }
-
     /// Claim a row for update to prevent concurrent cold-row modifications.
-    /// When two transactions update the same cold row, both mirror it into hot
-    /// via insert_discard. Without claiming, neither detects the other because
+    /// When two transactions update the same cold row, both write it into hot
+    /// under its id. Without claiming, neither detects the other because
     /// the row starts absent from hot. This method uses the VersionStore's
     /// uncommitted_writes map to serialize access.
     fn try_claim_row(&self, _row_id: i64) -> Result<()> {
