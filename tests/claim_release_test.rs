@@ -75,3 +75,118 @@ fn a_claim_another_handle_relies_on_survives_a_refused_update() {
         "another transaction wrote a row the uncommitted delete holds: {taken:?}"
     );
 }
+
+#[test]
+fn a_prepared_row_another_handle_wrote_is_not_set_again() {
+    let _guard = test_failpoints::FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 0), (2, 0)", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let mut updater = txn.get_table("t").unwrap();
+    let mut writer = txn.get_table("t").unwrap();
+    let reader = txn.get_table("t").unwrap();
+    // After the update claims row 1, the other handle writes it locally
+    test_failpoints::after_cold_claim_taken(move || {
+        let mut set = |mut row: stoolap::core::Row| {
+            row.set(1, stoolap::core::Value::Integer(5)).unwrap();
+            Ok((row, true))
+        };
+        writer.update_by_row_ids(&[1], &mut set).unwrap();
+    });
+    let mut calls = Vec::new();
+    let updated = updater.update(None, &mut |mut row| {
+        calls.push(row.get(0).and_then(|v| v.as_int64()).unwrap());
+        row.set(1, stoolap::core::Value::Integer(7)).unwrap();
+        Ok((row, true))
+    });
+    let mut rows: Vec<(i64, i64)> = reader
+        .collect_all_rows(None)
+        .unwrap()
+        .iter()
+        .map(|(_, row)| {
+            let value = |i: usize| row.get(i).and_then(|v| v.as_int64()).unwrap();
+            (value(0), value(1))
+        })
+        .collect();
+    rows.sort_unstable();
+    drop(updater);
+    drop(reader);
+    txn.rollback().unwrap();
+    calls.sort_unstable();
+    assert_eq!(calls, vec![1, 2], "the setter ran again: {updated:?}");
+    let conflict = matches!(&updated, Err(e) if e.to_string().contains("write conflict"));
+    assert!(
+        conflict,
+        "the other handle wrote row 1 after it was prepared: {updated:?}"
+    );
+    assert_eq!(
+        rows,
+        vec![(1, 5), (2, 0)],
+        "the refused statement overwrote the other handle's write or left part of its own"
+    );
+}
+
+#[test]
+fn a_late_conflict_on_the_second_row_leaves_no_part_of_the_statement() {
+    let _guard = test_failpoints::FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 0), (2, 0)", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let mut updater = txn.get_table("t").unwrap();
+    let mut writer = txn.get_table("t").unwrap();
+    let reader = txn.get_table("t").unwrap();
+    // Row 1 is claimed; the other handle writes row 2 before it is applied
+    test_failpoints::after_cold_claim_taken(move || {
+        let mut set = |mut row: stoolap::core::Row| {
+            row.set(1, stoolap::core::Value::Integer(5)).unwrap();
+            Ok((row, true))
+        };
+        writer.update_by_row_ids(&[2], &mut set).unwrap();
+    });
+    let mut calls = Vec::new();
+    let updated = updater.update(None, &mut |mut row| {
+        calls.push(row.get(0).and_then(|v| v.as_int64()).unwrap());
+        row.set(1, stoolap::core::Value::Integer(7)).unwrap();
+        Ok((row, true))
+    });
+    let rows = rows_of(reader.as_ref());
+    drop(updater);
+    drop(reader);
+    txn.rollback().unwrap();
+    calls.sort_unstable();
+    assert_eq!(calls, vec![1, 2], "the setter ran again: {updated:?}");
+    let conflict = matches!(&updated, Err(e) if e.to_string().contains("write conflict"));
+    assert!(
+        conflict,
+        "the other handle wrote row 2 after it was prepared: {updated:?}"
+    );
+    assert_eq!(
+        rows,
+        vec![(1, 0), (2, 5)],
+        "the refused statement left row 1 changed or overwrote the other handle's write"
+    );
+}
+
+fn rows_of(table: &dyn stoolap::storage::traits::Table) -> Vec<(i64, i64)> {
+    let mut rows: Vec<(i64, i64)> = table
+        .collect_all_rows(None)
+        .unwrap()
+        .iter()
+        .map(|(_, row)| {
+            let value = |i: usize| row.get(i).and_then(|v| v.as_int64()).unwrap();
+            (value(0), value(1))
+        })
+        .collect();
+    rows.sort_unstable();
+    rows
+}

@@ -36,7 +36,9 @@ use crate::storage::expression::Expression;
 use crate::storage::index::id_list::GroupIds;
 use crate::storage::mvcc::version_store::{AggregateOp, GroupedAggregateResult, LayoutToken};
 use crate::storage::traits::table::ScanPlan;
-use crate::storage::traits::{CapturedGroups, Index, QueryResult, Scanner, Table};
+use crate::storage::traits::{
+    CapturedGroups, ColdChange, Index, PlannedUpdate, QueryResult, Scanner, Table,
+};
 
 use super::manifest::SegmentManager;
 use super::scanner::{RowVecScanner, VolumeScanner};
@@ -230,14 +232,7 @@ impl TopK {
 /// Normal secondary indexes exist only for hot rows. Volume rows are never
 /// inserted into hot indexes. Constraint checks (PK/UNIQUE) against cold data
 /// use segment metadata (zone maps, sorted columns, dictionary pre-filters).
-/// A cold row an UPDATE changes: prepared outside the seal fence, applied
-/// under it
-struct ColdChange {
-    row_id: i64,
-    old_row: Row,
-    new_row: Row,
-}
-
+///
 /// What an UPDATE has prepared so far, across the rounds a landing seal
 /// makes it take
 #[derive(Default)]
@@ -257,6 +252,16 @@ struct ColdPrepare {
     /// Old and new row of rows the setter ran on whose unique check waits
     /// for a cold volume read once the fence is released
     set_rows: FxHashMap<i64, (Row, Row)>,
+}
+
+/// What the cold half of an UPDATE prepared, held with the seal fence
+struct PreparedCold<'m> {
+    _guard: parking_lot::RwLockReadGuard<'m, ()>,
+    changes: Vec<ColdChange>,
+    /// The ids named by the statement that no cold volume holds
+    hot_ids: Vec<i64>,
+    /// Every row the setter ran on, changed or not
+    visited: FxHashMap<i64, u64>,
 }
 
 pub struct SegmentedTable {
@@ -814,16 +819,16 @@ impl SegmentedTable {
         ids: Option<&[i64]>,
         where_expr: Option<&dyn Expression>,
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
-    ) -> Result<(
-        parking_lot::RwLockReadGuard<'m, ()>,
-        Vec<ColdChange>,
-        Vec<i64>,
-    )> {
+    ) -> Result<PreparedCold<'m>> {
         if !mgr.has_segments() {
             let guard = mgr.acquire_seal_read();
             if !mgr.has_segments() {
-                let hot_ids = ids.map(<[i64]>::to_vec).unwrap_or_default();
-                return Ok((guard, Vec::new(), hot_ids));
+                return Ok(PreparedCold {
+                    _guard: guard,
+                    changes: Vec::new(),
+                    hot_ids: ids.map(<[i64]>::to_vec).unwrap_or_default(),
+                    visited: FxHashMap::default(),
+                });
             }
             drop(guard);
         }
@@ -891,11 +896,12 @@ impl SegmentedTable {
             let guard = held.unwrap_or_else(|| mgr.acquire_seal_read());
             if under_fence || mgr.seal_generation() == generation {
                 mgr.publish_loaded(snap.take_loaded());
-                // Only a WHERE update sets the hot store's rows after the cold ones
-                if ids.is_none() {
-                    self.refuse_unchanged_gone_hot(&prep)?;
-                }
-                return Ok((guard, prep.changes, prep.hot_ids));
+                return Ok(PreparedCold {
+                    _guard: guard,
+                    changes: prep.changes,
+                    hot_ids: prep.hot_ids,
+                    visited: prep.visited,
+                });
             }
             drop(guard);
             carried = snap.take_loaded();
@@ -968,16 +974,12 @@ impl SegmentedTable {
     ) -> Result<()> {
         let mut cached: Option<(super::writer::RowReader, super::writer::ColumnMapping)> = None;
         for &row_id in ids {
-            let found = self.find_segment_row_in(snap, row_id)?;
-            // A row an earlier round set that left the volumes is another
-            // transaction's since, not a hot row to set again
+            // A row an earlier round ran the setter on is never set again; a
+            // changed one that left the volumes is refused by revalidation
             if prep.visited.contains_key(&row_id) {
-                if found.is_none() {
-                    return Err(Self::write_conflict(row_id));
-                }
                 continue;
             }
-            let Some((seg_id, cs, idx)) = found else {
+            let Some((seg_id, cs, idx)) = self.find_segment_row_in(snap, row_id)? else {
                 prep.hot_ids.push(row_id);
                 continue;
             };
@@ -1077,11 +1079,13 @@ impl SegmentedTable {
             }
             None => {
                 let old_row = row.clone();
-                let (new_row, changed) = setter(row)?;
+                let (mut new_row, changed) = setter(row)?;
                 if !changed {
                     prep.visited.insert(row_id, seg_id);
                     return Ok(());
                 }
+                // The unique keys checked are the ones the publish writes
+                self.hot.validate_row(&mut new_row)?;
                 (old_row, new_row)
             }
         };
@@ -1107,19 +1111,6 @@ impl SegmentedTable {
             new_row,
         });
         Ok(())
-    }
-
-    /// A row the setter left unchanged with a hot version since is another
-    /// transaction's change, not a row to set again: checked under the
-    /// fence before any claim, only when the setter left a row unchanged
-    fn refuse_unchanged_gone_hot(&self, prep: &ColdPrepare) -> Result<()> {
-        if prep.visited.len() == prep.shadowed.len() {
-            return Ok(());
-        }
-        match self.hot.first_hot_row_in(&prep.visited, &prep.shadowed) {
-            Some(row_id) => Err(Self::write_conflict(row_id)),
-            None => Ok(()),
-        }
     }
 
     /// Claims every prepared row under the fence before anything is
@@ -1153,56 +1144,33 @@ impl SegmentedTable {
         Ok(())
     }
 
-    /// Moves a prepared cold change into the hot store under the fence:
-    /// the claim, the mirror of the old row for an integer key, the new
-    /// row, and the tombstone that lets the hot version shadow the cold
-    fn apply_cold_update(
+    /// Writes a plan whose sealed rows are claimed through the hot store,
+    /// each sealed row under its own id. A plan that failed, or a refused
+    /// publish, lets go of the claims the statement took
+    fn publish_prepared(
         hot: &mut Box<dyn Table>,
         segment_mgr: &super::manifest::SegmentManager,
         txn_id: i64,
-        change: ColdChange,
-        has_int_pk: bool,
-    ) -> Result<()> {
-        let ColdChange {
-            row_id,
-            old_row,
-            new_row,
-        } = change;
-        // Insert the NEW row into hot. For int PK tables, first mirror the
-        // old row (so UPDATE can find it), then update. If any step fails,
-        // clean up to avoid phantoms.
-        if has_int_pk {
-            let old_keys = old_row.clone();
-            match hot.insert_discard(old_row) {
-                Ok(())
-                | Err(crate::core::Error::PrimaryKeyConstraint { .. })
-                | Err(crate::core::Error::UniqueConstraint { .. }) => {}
-                Err(e) => return Err(e),
-            }
-            let mut new_row_opt = Some(new_row);
-            let update_result = hot.update_by_row_ids(&[row_id], &mut |_| {
-                Ok((new_row_opt.take().unwrap_or_default(), true))
-            });
-            if let Err(e) = update_result {
-                let _ = hot.delete_by_row_ids(&[row_id]);
+        mut plan: PlannedUpdate,
+        planned: Result<()>,
+    ) -> Result<i32> {
+        let count = match planned.and_then(|()| hot.publish_update(&mut plan)) {
+            Ok(count) => count,
+            Err(e) => {
+                for change in &plan.cold {
+                    hot.release_claim(change.row_id);
+                }
                 return Err(e);
             }
-            // The volume's copy is the version this one replaces: an index
-            // that keeps sealed rows drops its keys at commit and takes them
-            // back if the commit fails
-            hot.mark_sealed_original(row_id, old_keys)?;
-        } else {
-            // The new row takes a row id of its own, so the old one is
-            // deleted under its id: the marker carries the volume's copy for
-            // the indexes that keep sealed rows, and the log records it
-            hot.delete_by_row_ids(&[row_id])?;
-            hot.mark_sealed_original(row_id, old_row)?;
-            hot.insert_discard(new_row)?;
+        };
+        // The hot versions shadow the cold ones from here on
+        for change in &plan.cold {
+            segment_mgr.add_pending_tombstone(txn_id, change.row_id);
         }
-        // Add tombstone so row_count() doesn't double-count. The hot
-        // version now shadows the cold version via skip set.
-        segment_mgr.add_pending_tombstone(txn_id, row_id);
-        Ok(())
+        if count > 0 {
+            segment_mgr.record_txn_seal_generation(txn_id);
+        }
+        Ok(count)
     }
 
     /// `shadowed` are the cold rows this statement already prepared a new
@@ -2886,27 +2854,19 @@ impl Table for SegmentedTable {
         {
             return self.update_by_row_ids(&[pk], setter);
         }
-        let has_int_pk = self
-            .hot
-            .schema()
-            .columns
-            .iter()
-            .any(|c| c.primary_key && c.data_type == DataType::Integer);
         let txn_id = self.txn_id();
         // The cold rows the statement changes are read, filtered, set and
-        // checked outside the fence; only the hot moves happen under it
-        let (_seal_guard, changes, _) =
-            self.prepare_cold_updates(&self.segment_mgr, None, where_expr, setter)?;
-        Self::claim_prepared(self.hot.as_ref(), &changes)?;
-        let mut count = self.hot.update(where_expr, setter)?;
-        for change in changes {
-            Self::apply_cold_update(&mut self.hot, &self.segment_mgr, txn_id, change, has_int_pk)?;
-            count += 1;
-        }
-        if count > 0 {
-            self.segment_mgr.record_txn_seal_generation(txn_id);
-        }
-        Ok(count)
+        // checked outside the fence; under it they are claimed, then the hot
+        // rows are set, skipping every row the cold half ran the setter on
+        let prepared = self.prepare_cold_updates(&self.segment_mgr, None, where_expr, setter)?;
+        let mut plan = PlannedUpdate {
+            cold: prepared.changes,
+            ..PlannedUpdate::default()
+        };
+        Self::claim_prepared(self.hot.as_ref(), &plan.cold)?;
+        let skip = (!prepared.visited.is_empty()).then_some(&prepared.visited);
+        let planned = self.hot.plan_update(where_expr, setter, skip, &mut plan);
+        Self::publish_prepared(&mut self.hot, &self.segment_mgr, txn_id, plan, planned)
     }
 
     fn update_by_row_ids(
@@ -2914,32 +2874,22 @@ impl Table for SegmentedTable {
         row_ids: &[i64],
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
-        let has_int_pk = self
-            .hot
-            .schema()
-            .columns
-            .iter()
-            .any(|c| c.primary_key && c.data_type == DataType::Integer);
         let txn_id = self.txn_id();
         // The cold rows named are read, set and checked outside the fence;
         // the ids no cold volume holds are the hot store's
-        let (_seal_guard, changes, hot_ids) =
-            self.prepare_cold_updates(&self.segment_mgr, Some(row_ids), None, setter)?;
-        Self::claim_prepared(self.hot.as_ref(), &changes)?;
-        let mut count = 0i32;
-        for change in changes {
-            Self::apply_cold_update(&mut self.hot, &self.segment_mgr, txn_id, change, has_int_pk)?;
-            count += 1;
-        }
-        if !hot_ids.is_empty() {
-            // Same reasoning as update(): skip cold unique check for hot path
-            // to avoid false violations during ON CONFLICT DO UPDATE.
-            count += self.hot.update_by_row_ids(&hot_ids, setter)?;
-        }
-        if count > 0 {
-            self.segment_mgr.record_txn_seal_generation(txn_id);
-        }
-        Ok(count)
+        let prepared = self.prepare_cold_updates(&self.segment_mgr, Some(row_ids), None, setter)?;
+        let mut plan = PlannedUpdate {
+            cold: prepared.changes,
+            ..PlannedUpdate::default()
+        };
+        Self::claim_prepared(self.hot.as_ref(), &plan.cold)?;
+        let planned = if prepared.hot_ids.is_empty() {
+            Ok(())
+        } else {
+            self.hot
+                .plan_update_by_row_ids(&prepared.hot_ids, setter, &mut plan)
+        };
+        Self::publish_prepared(&mut self.hot, &self.segment_mgr, txn_id, plan, planned)
     }
 
     fn delete_by_row_ids(&mut self, row_ids: &[i64]) -> Result<i32> {
