@@ -82,3 +82,25 @@ fn test_aliased_function_group_key_reused_by_another_column() {
         .collect();
     assert_eq!(lengths, vec![Some(2), Some(3)]);
 }
+
+#[test]
+fn test_group_key_lookup_keeps_string_literal_case() {
+    let db = Database::open("memory://group_by_literal_case").unwrap();
+    db.execute("CREATE TABLE t (s TEXT)", ()).unwrap();
+    db.execute("INSERT INTO t VALUES ('A')", ()).unwrap();
+
+    for sql in [
+        "SELECT replace(s, 'a', 'b') AS g, replace(s, 'A', 'B') AS h FROM t GROUP BY s, replace(s, 'a', 'b')",
+        "SELECT replace(s, 'a', 'b'), replace(s, 'A', 'B') FROM t GROUP BY s, replace(s, 'a', 'b')",
+    ] {
+        let row: Vec<String> = db
+            .query(sql, ())
+            .unwrap()
+            .map(|row| {
+                let row = row.unwrap();
+                format!("{}{}", row.get::<String>(0).unwrap(), row.get::<String>(1).unwrap())
+            })
+            .collect();
+        assert_eq!(row, vec!["AB".to_string()], "{}", sql);
+    }
+}
