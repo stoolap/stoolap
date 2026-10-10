@@ -337,6 +337,9 @@ pub struct WriteSetEntry {
     /// The version read is a volume's copy of the row: the indexes that
     /// keep sealed rows held its keys, the hot indexes never did
     pub sealed: bool,
+    /// Another claim of the transaction met this entry, so a statement that
+    /// fails does not let its claim go
+    pub shared: bool,
 }
 
 // ============================================================================
@@ -6970,6 +6973,7 @@ impl TransactionVersionStore {
                         read_version,
                         read_version_seq,
                         sealed: false,
+                        shared: false,
                     },
                 );
 
@@ -7072,6 +7076,7 @@ impl TransactionVersionStore {
                         read_version: Some(original_version),
                         read_version_seq,
                         sealed: false,
+                        shared: false,
                     },
                 );
 
@@ -7139,6 +7144,7 @@ impl TransactionVersionStore {
                         read_version: Some(original_version),
                         read_version_seq,
                         sealed: false,
+                        shared: false,
                     },
                 );
 
@@ -7198,6 +7204,7 @@ impl TransactionVersionStore {
                             read_version,
                             read_version_seq,
                             sealed: false,
+                            shared: false,
                         },
                     );
 
@@ -7270,6 +7277,7 @@ impl TransactionVersionStore {
                         read_version: Some(original_version),
                         read_version_seq,
                         sealed: false,
+                        shared: false,
                     },
                 );
 
@@ -8099,12 +8107,33 @@ impl TransactionVersionStore {
         // Use empty read_version since this is a cold-only claim — the actual
         // row data lives in cold storage, not in the hot version store.
         use crate::common::i64_map::Entry;
-        if let Entry::Vacant(e) = write_set.entry(row_id) {
-            e.insert(WriteSetEntry {
-                read_version: None,
-                read_version_seq: 0,
-                sealed: false,
-            });
+        match write_set.entry(row_id) {
+            Entry::Vacant(e) => {
+                e.insert(WriteSetEntry {
+                    read_version: None,
+                    read_version_seq: 0,
+                    sealed: false,
+                    shared: false,
+                });
+            }
+            Entry::Occupied(mut e) => e.get_mut().shared = true,
+        }
+    }
+
+    /// Lets go of a claim `track_external_claim` recorded, with its write set
+    /// entry, while no other claim of the transaction met it and no local
+    /// version of the row was written
+    pub fn release_external_claim(&mut self, row_id: i64) {
+        let written = self
+            .local_versions
+            .as_ref()
+            .is_some_and(|versions| versions.contains_key(row_id));
+        let Some(write_set) = self.write_set.as_mut() else {
+            return;
+        };
+        if !written && write_set.get(row_id).is_some_and(|e| !e.shared) {
+            write_set.remove(row_id);
+            self.parent_store.release_row_claim(row_id, self.txn_id);
         }
     }
 
@@ -8975,6 +9004,7 @@ mod tests {
             read_version: Some(version),
             read_version_seq: 42,
             sealed: false,
+            shared: false,
         };
 
         let cloned = entry.clone();
@@ -8986,6 +9016,7 @@ mod tests {
             read_version: None,
             read_version_seq: 0,
             sealed: false,
+            shared: false,
         };
         let cloned_empty = empty_entry.clone();
         assert!(cloned_empty.read_version.is_none());

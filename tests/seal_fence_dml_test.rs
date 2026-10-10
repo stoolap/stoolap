@@ -515,3 +515,46 @@ fn a_named_row_left_unchanged_that_went_hot_across_a_seal_is_not_set_again() {
         "the refused statement kept row 3 claimed"
     );
 }
+
+#[test]
+fn a_failed_storage_update_lets_go_of_the_claims_it_took() {
+    use stoolap::storage::traits::Engine;
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 0), (2, 0), (3, 0)", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    // Another transaction holds row 2, uncommitted
+    let mut holder = db.begin().unwrap();
+    holder
+        .execute("UPDATE t SET v = 7 WHERE id = 2", ())
+        .unwrap();
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let mut table = txn.get_table("t").unwrap();
+    let mut set = |mut row: stoolap::core::Row| {
+        bump(&mut row);
+        Ok((row, true))
+    };
+    assert_eq!(table.update_by_row_ids(&[3], &mut set).unwrap(), 1);
+    // Row 1 is claimed first, then row 2 refuses the statement
+    assert!(table.update_by_row_ids(&[1, 2], &mut set).is_err());
+    let free = db.execute("UPDATE t SET v = 5 WHERE id = 1", ());
+    let kept = db.execute("UPDATE t SET v = 5 WHERE id = 3", ());
+    // Row 1 is hot now; another transaction holds it, uncommitted
+    let mut other = db.begin().unwrap();
+    let taken = other.execute("UPDATE t SET v = 6 WHERE id = 1", ());
+    let later = table.update_by_row_ids(&[1], &mut set);
+    drop(table);
+    txn.rollback().unwrap();
+    other.rollback().unwrap();
+    holder.rollback().unwrap();
+    assert!(free.is_ok(), "row 1 is still claimed: {free:?}");
+    assert!(kept.is_err(), "the earlier statement's claim on row 3 went");
+    assert!(taken.is_ok(), "row 1 is still claimed: {taken:?}");
+    assert!(
+        later.is_err(),
+        "a later write passed another transaction's claim: {later:?}"
+    );
+}

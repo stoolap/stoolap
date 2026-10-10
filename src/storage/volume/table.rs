@@ -1125,10 +1125,27 @@ impl SegmentedTable {
     /// Claims every prepared row under the fence before anything is
     /// written, so no other transaction can change one from here on; a
     /// row already claimed by another, or with a hot version since it
-    /// was prepared, is that transaction's, and the statement fails
+    /// was prepared, is that transaction's, and the statement fails,
+    /// letting go of the claims it took
     fn claim_prepared(hot: &dyn Table, changes: &[ColdChange]) -> Result<()> {
+        let mut claimed = 0;
+        let result = Self::claim_each(hot, changes, &mut claimed);
+        if result.is_err() {
+            for change in &changes[..claimed] {
+                hot.release_claim(change.row_id);
+            }
+        }
+        result
+    }
+
+    /// Claims and checks the rows in order; `claimed` counts the rows
+    /// whose claim is held
+    fn claim_each(hot: &dyn Table, changes: &[ColdChange], claimed: &mut usize) -> Result<()> {
         for change in changes {
             hot.try_claim_row(change.row_id)?;
+            *claimed += 1;
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::cold_claim_taken();
             if hot.has_row_id(change.row_id)? {
                 return Err(Self::write_conflict(change.row_id));
             }
