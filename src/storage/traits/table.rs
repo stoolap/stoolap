@@ -520,6 +520,10 @@ pub trait Table: Send + Sync {
         Ok(())
     }
 
+    /// Lets go of a claim `try_claim_row` took, unless another claim of the
+    /// transaction met it or the row was written since
+    fn release_claim(&self, _row_id: i64) {}
+
     /// Deletes rows matching the given expression
     ///
     /// # Arguments
