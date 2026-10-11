@@ -1048,6 +1048,9 @@ thread_local! {
     static VOLUME_FILE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SEGMENT_MAP_CLONES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ROW_ID_ORDER_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TOP_K_COLD_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GROUP_CACHE_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GROUP_COLUMN_DECODES: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
     static COLD_MAP_CAPTURED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
@@ -1192,6 +1195,34 @@ pub fn row_id_order_scans() -> usize {
 
 pub(crate) fn row_id_order_scanned() {
     ROW_ID_ORDER_SCANS.with(|n| n.set(n.get() + 1));
+}
+
+/// Sealed rows this thread's ordered top-k scans built, so far
+pub fn top_k_cold_rows() -> usize {
+    TOP_K_COLD_ROWS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn top_k_cold_row_built() {
+    TOP_K_COLD_ROWS.with(|n| n.set(n.get() + 1));
+}
+
+/// Row groups whose needed columns this thread's volume scanners loaded
+pub fn group_cache_loads() -> usize {
+    GROUP_CACHE_LOADS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn group_cache_loaded() {
+    GROUP_CACHE_LOADS.with(|n| n.set(n.get() + 1));
+}
+
+/// The (column, row group) blocks this thread decoded since the last call,
+/// in order; taking them clears the record
+pub fn take_group_column_decodes() -> Vec<(usize, usize)> {
+    GROUP_COLUMN_DECODES.with(|d| std::mem::take(&mut *d.borrow_mut()))
+}
+
+pub(crate) fn group_column_decoded(col: usize, group: usize) {
+    GROUP_COLUMN_DECODES.with(|d| d.borrow_mut().push((col, group)));
 }
 
 thread_local! {
