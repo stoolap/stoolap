@@ -1083,10 +1083,101 @@ pub fn after_cold_round_prepared(hook: impl FnOnce() + 'static) {
 }
 
 pub(crate) fn cold_round_prepared() {
+    COLD_ROUNDS.with(|n| n.set(n.get() + 1));
     let hook = COLD_ROUND_PREPARED_HOOK.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
         hook();
     }
+}
+
+thread_local! {
+    static COLD_ROUND_SETTLED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static COLD_ROUND_SNAPSHOT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when an UPDATE's cold round has read its
+/// settled generation and not yet taken its snapshot
+pub fn before_cold_round_snapshot(hook: impl FnOnce() + 'static) {
+    COLD_ROUND_SNAPSHOT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn cold_round_snapshot_starting() {
+    let hook = COLD_ROUND_SNAPSHOT_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when an UPDATE's cold round stood its checks
+/// under the seal fence, before the rows are claimed
+pub fn after_cold_round_settled(hook: impl FnOnce() + 'static) {
+    COLD_ROUND_SETTLED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn cold_round_settled() {
+    let hook = COLD_ROUND_SETTLED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static COLD_ROUNDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SEAL_FENCE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BLOCK_FILE_READS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    static VOLUME_FILE_READS_BY_DEPTH: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+    static SIDE_FILE_READS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Cold rounds this thread's UPDATEs prepared outside the seal fence
+pub fn cold_rounds() -> usize {
+    COLD_ROUNDS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn seal_fence_entered() {
+    SEAL_FENCE_DEPTH.with(|d| d.set(d.get() + 1));
+}
+
+pub(crate) fn seal_fence_left() {
+    SEAL_FENCE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+}
+
+/// One more read in `counter`, as (outside, under) the seal fence
+fn count_by_fence_depth(counter: &'static std::thread::LocalKey<std::cell::Cell<(usize, usize)>>) {
+    let under = SEAL_FENCE_DEPTH.with(std::cell::Cell::get) > 0;
+    counter.with(|c| {
+        let (outside, inside) = c.get();
+        c.set(if under {
+            (outside, inside + 1)
+        } else {
+            (outside + 1, inside)
+        });
+    });
+}
+
+/// Row group blocks this thread read from volume files, (outside, under)
+/// the seal fence
+pub fn block_file_reads() -> (usize, usize) {
+    BLOCK_FILE_READS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn block_file_read() {
+    count_by_fence_depth(&BLOCK_FILE_READS);
+}
+
+/// Volume files this thread read whole, (outside, under) the seal fence
+pub fn volume_file_reads_by_fence() -> (usize, usize) {
+    VOLUME_FILE_READS_BY_DEPTH.with(std::cell::Cell::get)
+}
+
+/// Side file reads this thread made, (outside, under) the seal fence
+pub fn side_file_reads() -> (usize, usize) {
+    SIDE_FILE_READS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn side_file_read() {
+    count_by_fence_depth(&SIDE_FILE_READS);
 }
 
 thread_local! {
@@ -1289,6 +1380,7 @@ pub(crate) fn volume_load_requested() {
 
 pub(crate) fn volume_file_read() {
     VOLUME_FILE_READS.with(|n| n.set(n.get() + 1));
+    count_by_fence_depth(&VOLUME_FILE_READS_BY_DEPTH);
 }
 
 /// Reset all failpoints to disabled state
@@ -1322,6 +1414,8 @@ pub fn reset_all() {
     UNIQUE_INDEX_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     STATEMENT_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_ROUND_PREPARED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COLD_ROUND_SETTLED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COLD_ROUND_SNAPSHOT_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_READS_FORGET.store(false, Release);
     SELECT_TABLE_OPENED_HOOK.with(|slot| *slot.borrow_mut() = None);
     READ_PATHS.with(|paths| paths.borrow_mut().clear());

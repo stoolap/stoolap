@@ -315,71 +315,45 @@ fn a_captured_load_keeps_the_unique_index_the_cold_entry_built() {
 }
 
 #[test]
-fn a_waiting_row_whose_sealed_copy_changed_conflicts_and_is_set_once() {
-    use std::cell::Cell;
-    use std::rc::Rc;
+fn a_prepared_row_whose_sealed_copy_changed_conflicts_and_is_set_once() {
     use stoolap::core::Value;
     use stoolap::storage::traits::Engine;
     use stoolap::test_failpoints as fp;
 
-    fn insert_rows(db: &Database, first: i64) {
-        let rows: Vec<_> = (first..first + ROWS)
-            .map(|id| format!("({id},{},0)", id * 10))
-            .collect();
-        db.execute(&format!("INSERT INTO t VALUES {}", rows.join(",")), ())
-            .unwrap();
-        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
-    }
-    // The third capture under the fence commits a change to the waiting row
-    fn on_capture(db: Database, remaining: usize, observed: Rc<Cell<usize>>) {
-        fp::after_statement_captured(move || {
-            observed.set(observed.get() + 1);
-            if remaining == 0 {
-                db.execute("UPDATE t SET v = 77 WHERE id = 9001", ())
-                    .unwrap();
-            } else {
-                on_capture(db, remaining - 1, observed);
-            }
-        });
-    }
-    // Three seals push the UPDATE into round 3, its rows cold again
-    fn force_rounds(db: Database, remaining: usize, observed: Rc<Cell<usize>>) {
-        fp::after_cold_round_prepared(move || {
-            insert_rows(
-                &db,
-                match remaining {
-                    3 => 3001,
-                    2 => 5001,
-                    _ => 9001,
-                },
-            );
-            if remaining > 1 {
-                force_rounds(db, remaining - 1, observed);
-            } else {
-                db.engine().cold_volumes_for_test("t");
-                on_capture(db, 2, observed);
-            }
-        });
-    }
-
     let _guard = FailpointGuard::new();
     let dir = tempfile::tempdir().unwrap();
     let db = cold_table(dir.path(), 2);
+    db.execute("INSERT INTO t VALUES (9001, 90010, 0)", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.engine().cold_volumes_for_test("t");
+    let other = db.clone();
+    // After the first round set row 9001, another transaction changes it and
+    // seals the change into a new volume
+    fp::after_cold_round_prepared(move || {
+        other
+            .execute("UPDATE t SET v = 77 WHERE id = 9001", ())
+            .unwrap();
+        other.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    });
     let mut tx = db.engine().begin_transaction().unwrap();
     let mut table = tx.get_table("t").unwrap();
-    let captures = Rc::new(Cell::new(0));
-    force_rounds(db.clone(), 3, Rc::clone(&captures));
     let mut calls = 0;
     let result = table.update_by_row_ids(&[5, 9001], &mut |mut row| {
         if row.get(0) != Some(&Value::Integer(9001)) {
             return Ok((row, false));
         }
         calls += 1;
-        row.set(1, Value::Integer(10010))?;
+        row.set(1, Value::Integer(90011))?;
         Ok((row, true))
     });
+    drop(table);
     tx.rollback().unwrap();
-    assert_eq!(captures.get(), 3, "the concurrent change ran");
     assert_eq!(calls, 1, "the setter ran once");
-    assert!(result.is_err(), "a changed waiting row conflicts");
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("write conflict: row 9001")),
+        "a changed prepared row conflicts: {result:?}"
+    );
 }

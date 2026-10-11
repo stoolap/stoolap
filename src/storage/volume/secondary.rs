@@ -1811,6 +1811,8 @@ fn next_window_with(
 }
 
 fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(any(test, feature = "test-failpoints"))]
+    crate::test_failpoints::side_file_read();
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileExt;

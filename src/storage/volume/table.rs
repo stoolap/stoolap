@@ -260,14 +260,11 @@ struct ColdPrepare {
     changes: Vec<ColdChange>,
     /// The ids named by the statement that no cold volume holds
     hot_ids: Vec<i64>,
-    /// Old and new row of rows the setter ran on whose unique check waits
-    /// for a cold volume read once the fence is released
-    set_rows: FxHashMap<i64, (Row, Row)>,
 }
 
 /// What the cold half of an UPDATE prepared, held with the seal fence
 struct PreparedCold<'m> {
-    _guard: parking_lot::RwLockReadGuard<'m, ()>,
+    _guard: super::manifest::SealRead<'m>,
     changes: Vec<ColdChange>,
     /// The ids named by the statement that no cold volume holds
     hot_ids: Vec<i64>,
@@ -790,7 +787,7 @@ impl SegmentedTable {
     fn fence_after_cold_check<'m, T>(
         mgr: &'m super::manifest::SegmentManager,
         mut check: impl FnMut(&super::manifest::ColdSnapshot) -> Result<T>,
-    ) -> Result<(parking_lot::RwLockReadGuard<'m, ()>, Option<T>)> {
+    ) -> Result<(super::manifest::SealRead<'m>, Option<T>)> {
         if !mgr.has_segments() {
             let guard = mgr.acquire_seal_read();
             if !mgr.has_segments() {
@@ -820,10 +817,11 @@ impl SegmentedTable {
     }
 
     /// Prepares the cold rows an UPDATE changes outside the seal fence and
-    /// returns the fence once no seal moved rows since: each round walks
-    /// only the volumes the snapshot gained, after three rounds under the
-    /// fence. With `ids` the rows are the ones named, and the ids no cold
-    /// volume holds come back for the hot store
+    /// returns the fence once neither a seal nor any publication moved the
+    /// volumes since; each round walks only the volumes the snapshot gained,
+    /// and three that do not stand are a write conflict. With `ids` the rows
+    /// are the ones named, and the ids no cold volume holds come back for
+    /// the hot store
     fn prepare_cold_updates<'m>(
         &self,
         mgr: &'m super::manifest::SegmentManager,
@@ -850,62 +848,41 @@ impl SegmentedTable {
         let mut prep = ColdPrepare::default();
         // The cold volumes read so far, carried from round to round
         let mut carried = Vec::new();
-        let mut deferrals = 0;
         loop {
-            let under_fence = prep.round == 3;
-            let held = under_fence.then(|| mgr.acquire_seal_read());
-            let (generation, settled) = if under_fence {
-                (mgr.seal_generation(), mgr.cold_snapshot().seg_ids)
-            } else {
-                Self::settled_state(mgr)
-            };
+            let (generation, settled) = Self::settled_state(mgr);
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::cold_round_snapshot_starting();
             let snap = mgr.statement_snapshot();
             // The setter runs on rows read through these mappings
             self.check_cold()?;
             snap.adopt(std::mem::take(&mut carried));
-            if under_fence {
-                snap.defer_reads();
-            }
             prep.hot_ids.clear();
-            let prepared = (|| {
-                if prep.round > 0 || !prep.set_rows.is_empty() {
-                    self.revalidate_prepared(&snap, &mut prep)?;
-                }
-                match ids {
-                    Some(ids) => self.prepare_cold_rows_by_id(&snap, ids, setter, &mut prep),
-                    None => self.prepare_cold_rows_where(
-                        &snap,
-                        where_expr,
-                        &comparisons,
-                        &bloom_hashes,
-                        setter,
-                        &mut prep,
-                    ),
-                }
-            })();
-            if let Err(e) = prepared {
-                // A read deferred under the fence: read it with the fence
-                // released and prepare this round again
-                if !snap.is_deferred(&e) {
-                    return Err(e);
-                }
-                deferrals += 1;
-                if deferrals > COLD_READ_RETRIES {
-                    return Err(Self::cold_reads_unsettled(mgr));
-                }
-                drop(held);
-                carried = snap.into_loaded(mgr)?;
-                continue;
+            if prep.round > 0 {
+                self.revalidate_prepared(&snap, &mut prep)?;
+            }
+            match ids {
+                Some(ids) => self.prepare_cold_rows_by_id(&snap, ids, setter, &mut prep)?,
+                None => self.prepare_cold_rows_where(
+                    &snap,
+                    where_expr,
+                    &comparisons,
+                    &bloom_hashes,
+                    setter,
+                    &mut prep,
+                )?,
             }
             // A volume registered at a settled generation is walked whole;
             // one a seal added meanwhile may have hidden rows still hot
             prep.seen_segments.extend(settled);
             #[cfg(any(test, feature = "test-failpoints"))]
-            if held.is_none() {
-                crate::test_failpoints::cold_round_prepared();
-            }
-            let guard = held.unwrap_or_else(|| mgr.acquire_seal_read());
-            if under_fence || mgr.seal_generation() == generation {
+            crate::test_failpoints::cold_round_prepared();
+            // Under the fence only memory is read; a column change comes
+            // first, so a seal landing with it is never taken for the cause
+            let guard = mgr.acquire_seal_read();
+            self.check_cold()?;
+            if mgr.seal_generation() == generation && mgr.segments_are(&snap.segs) {
+                #[cfg(any(test, feature = "test-failpoints"))]
+                crate::test_failpoints::cold_round_settled();
                 mgr.publish_loaded(snap.take_loaded());
                 return Ok(PreparedCold {
                     _guard: guard,
@@ -915,8 +892,11 @@ impl SegmentedTable {
                 });
             }
             drop(guard);
-            carried = snap.take_loaded();
             prep.round += 1;
+            if prep.round as usize == COLD_READ_RETRIES {
+                return Err(Self::cold_reads_unsettled(mgr));
+            }
+            carried = snap.take_loaded();
         }
     }
 
@@ -936,7 +916,6 @@ impl SegmentedTable {
             visited,
             shadowed,
             unique_indexes,
-            set_rows,
             ..
         } = prep;
         for change in changes.iter() {
@@ -959,17 +938,6 @@ impl SegmentedTable {
                     shadowed,
                     unique_indexes,
                 )?;
-            }
-        }
-        // A row whose unique check waited is still the sealed row its setter
-        // saw, or the statement conflicts rather than set it again hot
-        for (&row_id, (old_row, _)) in set_rows.iter() {
-            let Some((_, cs, idx)) = self.find_segment_row_in(snap, row_id)? else {
-                return Err(Self::write_conflict(row_id));
-            };
-            let mut reader = super::writer::RowReader::new(Arc::clone(&cs.volume));
-            if reader.row(idx, &cs.mapping)? != *old_row {
-                return Err(Self::write_conflict(row_id));
             }
         }
         Ok(())
@@ -1080,39 +1048,22 @@ impl SegmentedTable {
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
         prep: &mut ColdPrepare,
     ) -> Result<()> {
-        // The setter runs once: a row whose unique check waited keeps its result
-        let (old_row, new_row) = match prep.set_rows.remove(&row_id) {
-            Some((old_row, new_row)) => {
-                if old_row != row {
-                    return Err(Self::write_conflict(row_id));
-                }
-                (old_row, new_row)
-            }
-            None => {
-                let old_row = row.clone();
-                let (mut new_row, changed) = setter(row)?;
-                if !changed {
-                    prep.visited.insert(row_id, seg_id);
-                    return Ok(());
-                }
-                // The unique keys checked are the ones the publish writes
-                self.hot.validate_row(&mut new_row)?;
-                (old_row, new_row)
-            }
-        };
+        let old_row = row.clone();
+        let (mut new_row, changed) = setter(row)?;
+        if !changed {
+            prep.visited.insert(row_id, seg_id);
+            return Ok(());
+        }
+        // The unique keys checked are the ones the publish writes
+        self.hot.validate_row(&mut new_row)?;
         if self.hot.has_unique_non_pk_indexes() {
-            if let Err(e) = self.check_cold_unique_for_update(
+            self.check_cold_unique_for_update(
                 &new_row,
                 row_id,
                 Some(snap),
                 &prep.shadowed,
                 &mut prep.unique_indexes,
-            ) {
-                if snap.is_deferred(&e) {
-                    prep.set_rows.insert(row_id, (old_row, new_row));
-                }
-                return Err(e);
-            }
+            )?;
         }
         prep.visited.insert(row_id, seg_id);
         prep.shadowed.insert(row_id);
@@ -2443,7 +2394,7 @@ impl SegmentedTable {
         mgr: &'m super::manifest::SegmentManager,
         read: &mut dyn FnMut(&super::manifest::StatementSnapshot) -> Result<()>,
     ) -> Result<(
-        parking_lot::RwLockReadGuard<'m, ()>,
+        super::manifest::SealRead<'m>,
         Option<super::manifest::StatementSnapshot>,
     )> {
         let guard = mgr.acquire_seal_read();
