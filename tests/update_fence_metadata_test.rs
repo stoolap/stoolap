@@ -21,7 +21,7 @@
 use std::sync::{Mutex, MutexGuard};
 
 use stoolap::core::{Operator, Row, Value};
-use stoolap::storage::expression::ComparisonExpr;
+use stoolap::storage::expression::{ComparisonExpr, Expression};
 use stoolap::storage::traits::Engine;
 use stoolap::test_failpoints::{
     after_cold_round_prepared, after_cold_round_settled, block_file_reads, cold_rounds,
@@ -124,6 +124,23 @@ fn other_reads_under_fence() -> (usize, usize) {
     (volume_file_reads_by_fence().1, side_file_reads().1)
 }
 
+/// (id, v) of every row with k < 60, read through the statement's own
+/// transaction, so a write the failed statement left would show
+fn rows_through(table: &dyn stoolap::storage::traits::Table) -> Vec<(i64, i64)> {
+    let filter = ComparisonExpr::new("k", Operator::Lt, Value::Integer(60));
+    let mut rows: Vec<(i64, i64)> = table
+        .collect_all_rows(Some(&filter))
+        .unwrap()
+        .into_iter()
+        .map(|(id, row)| match row.get(2) {
+            Some(Value::Integer(v)) => (id, *v),
+            other => panic!("v of row {id}: {other:?}"),
+        })
+        .collect();
+    rows.sort_unstable();
+    rows
+}
+
 fn set_v(calls: &mut Vec<i64>) -> impl FnMut(Row) -> stoolap::core::Result<(Row, bool)> + '_ {
     move |mut row| {
         if let Some(Value::Integer(id)) = row.get(0) {
@@ -150,6 +167,7 @@ fn three_rounds_a_seal_moved_end_in_a_write_conflict_with_no_read_under_the_fenc
     let result = table.update_by_row_ids(&[5, 9001], &mut set_v(&mut calls));
     let (outside, under) = delta(block_file_reads(), before);
     let other_under = delta(other_reads_under_fence(), other_before);
+    let seen = rows_through(table.as_ref());
     // The claims this statement took are gone: another transaction sets row 5
     let other = db.execute("UPDATE t SET v = 9 WHERE id = 5", ());
     drop(table);
@@ -166,9 +184,11 @@ fn three_rounds_a_seal_moved_end_in_a_write_conflict_with_no_read_under_the_fenc
             .is_err_and(|e| e.to_string().contains("kept changing")),
         "{result:?}"
     );
+    assert!(
+        seen.iter().all(|&(_, v)| v == 0),
+        "the failed statement left a write: {seen:?}"
+    );
     assert!(other.is_ok(), "row 5 stayed claimed: {other:?}");
-    calls.sort_unstable();
-    calls.dedup();
     assert_eq!(calls, [5], "the setter ran once, on row 5 only");
 }
 
@@ -186,10 +206,12 @@ fn three_rounds_a_seal_moved_end_in_a_write_conflict_with_no_read_under_the_fenc
     let other_before = other_reads_under_fence();
     let mut calls = Vec::new();
     // Rows 1..=5 (k 10..50), and 9001 (k 5) once sealed
-    let filter = ComparisonExpr::new("k", Operator::Lt, Value::Integer(60));
+    let mut filter = ComparisonExpr::new("k", Operator::Lt, Value::Integer(60));
+    filter.prepare_for_schema(table.schema());
     let result = table.update(Some(&filter), &mut set_v(&mut calls));
     let (outside, under) = delta(block_file_reads(), before);
     let other_under = delta(other_reads_under_fence(), other_before);
+    let seen = rows_through(table.as_ref());
     drop(table);
     txn.rollback().unwrap();
     assert_eq!(under, 0, "blocks read under the fence ({outside} outside)");
@@ -204,8 +226,13 @@ fn three_rounds_a_seal_moved_end_in_a_write_conflict_with_no_read_under_the_fenc
             .is_err_and(|e| e.to_string().contains("kept changing")),
         "{result:?}"
     );
-    assert!(!calls.contains(&9001), "the setter ran on 9001: {calls:?}");
-    assert_eq!(v_of(&db, 5), Some(0), "row 5 changed");
+    assert_eq!(
+        seen,
+        [(1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (9001, 0)],
+        "the failed statement left a write"
+    );
+    calls.sort_unstable();
+    assert_eq!(calls, [1, 2, 3, 4, 5], "the setter ran once per row");
 }
 
 #[test]
