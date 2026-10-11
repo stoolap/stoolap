@@ -585,6 +585,43 @@ impl Drop for PublishGuard {
     }
 }
 
+/// A table closed for a change of a column's definition, opened again when
+/// this goes, whether the change completed or not
+pub struct ColumnClosure {
+    store: Arc<VersionStore>,
+}
+
+impl ColumnClosure {
+    /// Closes `store`; the caller then waits for what was counted before
+    pub fn close(store: Arc<VersionStore>) -> Self {
+        store.close_for_column_change();
+        Self { store }
+    }
+
+    pub fn store(&self) -> &VersionStore {
+        &self.store
+    }
+}
+
+impl Drop for ColumnClosure {
+    fn drop(&mut self) {
+        self.store.open_after_column_change();
+    }
+}
+
+/// A GC pass, counted as `PublishGuard` counts a commit; see
+/// VersionStore::admit_gc
+pub struct GcAdmission<'a> {
+    store: &'a VersionStore,
+}
+
+impl Drop for GcAdmission<'_> {
+    fn drop(&mut self) {
+        self.store.publish_epoch.fetch_add(1, Ordering::SeqCst);
+        self.store.publishing.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// What a committing transaction holds while it publishes: a guard per
 /// table it writes, and the tables' stores so their index updates can be
 /// undone if the commit fails after they were applied. Four tables fit
@@ -2678,6 +2715,67 @@ impl VersionStore {
         PublishGuard {
             store: Arc::clone(self),
         }
+    }
+
+    /// Admits a GC pass until the guard goes; None once a column change
+    /// closed the table. The count is taken before the layout is read and
+    /// the change closes before it reads the count, so one sees the other
+    pub fn admit_gc(&self) -> Option<GcAdmission<'_>> {
+        self.publishing.fetch_add(1, Ordering::SeqCst);
+        if is_closed(self.layout.load(Ordering::SeqCst)) {
+            self.publishing.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(GcAdmission { store: self })
+    }
+
+    /// Closes the table for a change of a column's definition: GC passes are
+    /// refused from here, commits by the layout checks, and those counted
+    /// before are waited for with `wait_until_quiet`
+    pub fn close_for_column_change(&self) {
+        let _schema = self.schema.write();
+        self.layout.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Opens the table a column change closed
+    pub fn open_after_column_change(&self) {
+        let _schema = self.schema.write();
+        debug_assert!(is_closed(self.layout()), "opened a table not closed");
+        self.layout.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Waits until no publication counted before the close is running;
+    /// false when one still is at `deadline`
+    pub fn wait_until_quiet(&self, deadline: std::time::Instant) -> bool {
+        while self.publishing.load(Ordering::SeqCst) != 0 {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        true
+    }
+
+    /// Whether a version in the store, a head or behind one, was written or
+    /// deleted by a transaction `open` names
+    pub fn holds_versions_of(&self, open: &dyn Fn(i64) -> bool) -> bool {
+        let of_open = |v: &RowVersion| {
+            open(v.txn_id) || (v.deleted_at_txn_id != 0 && open(v.deleted_at_txn_id))
+        };
+        let root = self.snapshot_versions();
+        for (_, chain) in root.iter() {
+            if of_open(&chain.version) {
+                return true;
+            }
+            let mut behind = chain.prev.as_ref();
+            while let Some(node) = behind {
+                if of_open(&node.version) {
+                    return true;
+                }
+                behind = node.prev.as_ref();
+            }
+        }
+        false
     }
 
     /// The publish epoch while no commit is publishing; None while one is.
@@ -5725,6 +5823,10 @@ impl VersionStore {
         if self.closed.load(Ordering::Acquire) {
             return 0;
         }
+        // Held through the index and arena cleanup after the versions lock
+        let Some(_admitted) = self.admit_gc() else {
+            return 0;
+        };
 
         let now = get_fast_timestamp();
         let cutoff_time = now - retention_period.as_nanos() as i64;
@@ -5778,6 +5880,8 @@ impl VersionStore {
         if actually_deleted.is_empty() {
             return 0;
         }
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::gc_rows_removed();
 
         // Third pass: remove from indexes using batch operations (single lock per index)
         // This runs AFTER the version store removal so we use the snapshot data

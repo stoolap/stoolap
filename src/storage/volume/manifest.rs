@@ -1349,6 +1349,10 @@ pub struct SegmentManager {
     destruction_count: std::sync::atomic::AtomicUsize,
     /// Even when column schema and mappings agree, odd during or after failed DDL.
     schema_generation: std::sync::atomic::AtomicU64,
+    /// Advanced, under the DDL guard, by every change of a column's
+    /// definition; never taken back, so work prepared before one never
+    /// publishes after it
+    definition_epoch: std::sync::atomic::AtomicU64,
 }
 
 impl SegmentManager {
@@ -1369,6 +1373,7 @@ impl SegmentManager {
             persisting: parking_lot::Mutex::new(()),
             tombstones: RwLock::new(Arc::new(FxHashMap::default())),
             schema_generation: std::sync::atomic::AtomicU64::new(0),
+            definition_epoch: std::sync::atomic::AtomicU64::new(0),
             pending_txn_tombstones: RwLock::new(FxHashMap::default()),
             cached_deduped_count: std::sync::atomic::AtomicU64::new(u64::MAX),
             seal_fence: RwLock::new(()),
@@ -1403,6 +1408,7 @@ impl SegmentManager {
             persisting: parking_lot::Mutex::new(()),
             tombstones: RwLock::new(Arc::new(tombstone_map)),
             schema_generation: std::sync::atomic::AtomicU64::new(0),
+            definition_epoch: std::sync::atomic::AtomicU64::new(0),
             pending_txn_tombstones: RwLock::new(FxHashMap::default()),
             cached_deduped_count: std::sync::atomic::AtomicU64::new(u64::MAX),
             seal_fence: RwLock::new(()),
@@ -1421,6 +1427,17 @@ impl SegmentManager {
     pub(crate) fn schema_generation(&self) -> u64 {
         self.schema_generation
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn definition_epoch(&self) -> u64 {
+        self.definition_epoch
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Called under the DDL guard, before the change closes the table
+    pub(crate) fn advance_definition_epoch(&self) {
+        self.definition_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     pub(crate) fn begin_column_change(self: &Arc<Self>) -> Result<ColumnSchemaChange> {
