@@ -1209,6 +1209,20 @@ impl StatementSnapshot {
     }
 }
 
+/// The read side of the seal fence; a test build counts how deep the
+/// current thread holds it
+pub struct SealRead<'a> {
+    _guard: parking_lot::RwLockReadGuard<'a, ()>,
+}
+
+impl Drop for SealRead<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::seal_fence_left();
+    }
+}
+
 /// Keeps a destructive publication marked for as long as it runs, including
 /// on the error path.
 pub struct Destruction<'a> {
@@ -3312,8 +3326,11 @@ impl SegmentManager {
     /// Seal takes the exclusive guard so it cannot move rows between the
     /// cold visibility check and hot publication.
     #[inline]
-    pub fn acquire_seal_read(&self) -> parking_lot::RwLockReadGuard<'_, ()> {
-        self.seal_fence.read()
+    pub fn acquire_seal_read(&self) -> SealRead<'_> {
+        let guard = self.seal_fence.read();
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::seal_fence_entered();
+        SealRead { _guard: guard }
     }
 
     /// Acquire the exclusive guard for the seal critical section.
@@ -4029,6 +4046,12 @@ impl SegmentManager {
     /// metadata (row_ids, zone maps) use this to avoid reloading cold volumes.
     pub fn segments_raw(&self) -> Arc<FxHashMap<u64, ColdSegment>> {
         Arc::clone(&*self.segments.read())
+    }
+
+    /// Whether the live segment map is still `segs`, as a snapshot took it:
+    /// no publication replaced it since, at the moment of the call
+    pub(crate) fn segments_are(&self, segs: &Arc<FxHashMap<u64, ColdSegment>>) -> bool {
+        Arc::ptr_eq(&*self.segments.read(), segs)
     }
 
     /// Reload a single cold volume by segment ID. Returns the loaded volume

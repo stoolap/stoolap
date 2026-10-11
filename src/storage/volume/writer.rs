@@ -668,6 +668,8 @@ impl CompressedBlockStore {
                     .try_reserve_exact(len)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::OutOfMemory, e))?;
                 scratch.resize(len, 0);
+                #[cfg(any(test, feature = "test-failpoints"))]
+                crate::test_failpoints::block_file_read();
                 read_exact_at(&file.open()?, scratch, offset)?;
                 Ok(scratch.as_slice())
             }
