@@ -54,6 +54,11 @@ pub enum Error {
     #[error("cannot truncate table: active transactions have uncommitted changes")]
     TableHasActiveTransactions,
 
+    /// A column change waited for a transaction that applied rows to the
+    /// table and is still open, and gave up
+    #[error("cannot change a column of table '{table}': a transaction that applied rows to it is still open")]
+    TableHasOpenTransactionRows { table: String },
+
     // =========================================================================
     // Column errors
     // =========================================================================

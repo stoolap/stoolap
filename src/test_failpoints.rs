@@ -259,6 +259,105 @@ pub(crate) fn side_files_built() {
 }
 
 thread_local! {
+    static SEAL_VOLUMES_BUILT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static COMPACTION_OUTPUTS_BUILT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static GC_ROWS_REMOVED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static COLUMN_CHANGE_WAITING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static SEAL_PASSED_CHANGING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static COMMIT_COUNTED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+static STALE_PUBLICATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Run once on this thread when its next seal built its volumes, before it
+/// takes the DDL guard to publish them
+pub fn after_seal_volumes_built(hook: impl FnOnce() + 'static) {
+    SEAL_VOLUMES_BUILT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn seal_volumes_built() {
+    let hook = SEAL_VOLUMES_BUILT_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next compaction built its outputs,
+/// before it takes the DDL guard to publish them
+pub fn after_compaction_outputs_built(hook: impl FnOnce() + 'static) {
+    COMPACTION_OUTPUTS_BUILT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn compaction_outputs_built() {
+    let hook = COMPACTION_OUTPUTS_BUILT_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next deleted-row cleanup let go of the
+/// versions lock, before it cleans the indexes and the arena
+pub fn after_gc_rows_removed(hook: impl FnOnce() + 'static) {
+    GC_ROWS_REMOVED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn gc_rows_removed() {
+    let hook = GC_ROWS_REMOVED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next column change closed the table and
+/// starts waiting for the publications counted before
+pub fn on_column_change_waiting(hook: impl FnOnce() + 'static) {
+    COLUMN_CHANGE_WAITING_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn column_change_waiting() {
+    let hook = COLUMN_CHANGE_WAITING_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next seal passes a table by because a
+/// column change is in progress on it
+pub fn on_seal_passed_changing_table(hook: impl FnOnce() + 'static) {
+    SEAL_PASSED_CHANGING_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn seal_passed_changing_table() {
+    let hook = SEAL_PASSED_CHANGING_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next commit counted itself in the
+/// tables it publishes into, before it applies any table's versions
+pub fn after_commit_counted(hook: impl FnOnce() + 'static) {
+    COMMIT_COUNTED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn commit_counted() {
+    let hook = COMMIT_COUNTED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Seal, compaction and side file outputs discarded at their publication
+/// because a column change moved the schema since they were prepared
+pub fn stale_publications() -> usize {
+    STALE_PUBLICATIONS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+pub(crate) fn stale_publication_discarded() {
+    STALE_PUBLICATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+thread_local! {
     static MANIFEST_CAPTURED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
@@ -1414,6 +1513,12 @@ pub fn reset_all() {
     UNIQUE_INDEX_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     STATEMENT_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_ROUND_PREPARED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    SEAL_VOLUMES_BUILT_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COMPACTION_OUTPUTS_BUILT_HOOK.with(|slot| *slot.borrow_mut() = None);
+    GC_ROWS_REMOVED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COLUMN_CHANGE_WAITING_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COMMIT_COUNTED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    SEAL_PASSED_CHANGING_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_ROUND_SETTLED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_ROUND_SNAPSHOT_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_READS_FORGET.store(false, Release);

@@ -354,6 +354,35 @@ fn index_ddl_between_the_build_and_the_publication_discards_the_file() {
     assert!(leftovers(dir.path(), "t").is_empty());
 }
 
+/// A column change between the build and the publication: the file was
+/// built under the old schema, so it is discarded and nothing is attached.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_column_change_between_the_build_and_the_publication_discards_the_file() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "");
+    create(&db);
+    seal_volumes(&db, 1);
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    let other = db.clone();
+    stoolap::test_failpoints::after_side_backfilled(move || {
+        other
+            .execute("ALTER TABLE t MODIFY COLUMN v TEXT NOT NULL", ())
+            .unwrap();
+    });
+    let before = stoolap::test_failpoints::stale_publications();
+    let pass = backfill(&db, None);
+    assert_eq!(
+        (pass["examined"], pass["built"], pass["discarded"]),
+        (1, 0, 1),
+        "{pass:?}"
+    );
+    assert_eq!(served(&db, 100, 103), (0, 1), "nothing was attached");
+    assert!(leftovers(dir.path(), "t").is_empty());
+    assert_eq!(stoolap::test_failpoints::stale_publications() - before, 1);
+}
+
 /// A compaction between the build and the publication takes the volume
 /// away: the file goes with it and nothing is left on disk.
 #[cfg(feature = "test-failpoints")]

@@ -169,6 +169,18 @@ pub trait TransactionEngineOperations: Send + Sync {
     /// Discard later DML across all touched tables, including cold claims.
     fn rollback_dml_after(&self, txn_id: i64, timestamp: i64);
 
+    /// Runs `apply`, a change of a column's definition, as a DDL statement
+    /// runs one: under the DDL guard, the table closed, the schema cache
+    /// refreshed after it
+    fn change_column_definition(
+        &self,
+        table_name: &str,
+        apply: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let _ = table_name;
+        apply()
+    }
+
     /// Defer table cleanup to background thread (avoids synchronous deallocation)
     /// Default implementation drops synchronously
     fn defer_table_cleanup(&self, _tables: Vec<Box<dyn Table>>) {
@@ -485,6 +497,9 @@ impl Transaction for MvccTransaction {
                 .engine_operations
                 .as_ref()
                 .map(|ops| ops.begin_publish(self.id));
+
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::commit_counted();
 
             // Phase 2: Commit all tables - apply local changes to global store
             // This now includes WAL recording internally (before each table commit)
@@ -805,7 +820,11 @@ impl Transaction for MvccTransaction {
         self.check_active()?;
 
         let mut table = self.get_table(table_name)?;
-        table.modify_column(&column.name, column.data_type, column.nullable)
+        let mut apply = || table.modify_column(&column.name, column.data_type, column.nullable);
+        match &self.engine_operations {
+            Some(ops) => ops.change_column_definition(table_name, &mut apply),
+            None => apply(),
+        }
     }
 
     fn select(

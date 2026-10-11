@@ -1715,6 +1715,14 @@ impl MVCCTable {
     /// Index updates are handled by TransactionVersionStore::commit() using batch
     /// operations to reduce lock acquisitions from O(rows × indexes) to O(indexes).
     pub fn commit(&mut self) -> Result<()> {
+        // Counted for the call, so a column change waits for it
+        let _publishing = self.version_store.begin_publish();
+        self.commit_published()
+    }
+
+    /// Commits the local changes under a publication the caller counted, as
+    /// a transaction's commit counts its tables in `begin_publish`
+    pub(crate) fn commit_published(&mut self) -> Result<()> {
         // Check if there are local changes before committing
         let has_changes = {
             let txn_versions = self.txn_versions.read().unwrap();

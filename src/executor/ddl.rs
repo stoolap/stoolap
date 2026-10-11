@@ -1188,6 +1188,8 @@ impl Executor {
                     }
 
                     let mut change = self.engine.begin_column_change(table_name)?;
+                    // Closed until the change is recorded, or taken back
+                    let _closed = self.engine.close_for_column_change(table_name)?;
                     let previous_schema = self.engine.get_table_schema(table_name)?;
                     table.modify_column(&col_def.name.value, data_type, nullable)?;
                     change.mark_changed();

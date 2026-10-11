@@ -959,6 +959,15 @@ impl TransactionRegistry {
             .unwrap_or(false)
     }
 
+    /// Whether a transaction is active or committing: its applied versions
+    /// may still become visible, or be taken back
+    pub fn is_open(&self, txn_id: i64) -> bool {
+        self.transactions
+            .lock()
+            .get(txn_id)
+            .is_some_and(|e| matches!(e.status(), TxnStatus::Active | TxnStatus::Committing))
+    }
+
     /// Checks if a transaction is committed.
     pub fn is_committed(&self, txn_id: i64) -> bool {
         // Check if in transactions map
