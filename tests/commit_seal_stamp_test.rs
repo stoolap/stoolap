@@ -111,6 +111,29 @@ fn a_write_before_the_first_seal_is_checked_at_commit_through_insert_batch() {
     first_write_before_a_seal_through_the_storage_api(true);
 }
 
+#[test]
+fn rows_a_failed_batch_left_written_are_checked_at_commit() {
+    use stoolap::core::{Row, Value};
+    use stoolap::storage::traits::Engine;
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    let row = |id: i64, k: i64| Row::from(vec![Value::Integer(id), Value::Integer(k)]);
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let mut table = txn.get_table("t").unwrap();
+    // The second row repeats the first one's id; the first stays written
+    assert!(table.insert_batch(vec![row(1, 7), row(1, 8)]).is_err());
+    db.execute("INSERT INTO t VALUES (2, 7)", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    table.insert(row(3, 9)).unwrap();
+    drop(table);
+    let committed = txn.commit();
+    assert!(
+        committed.is_err(),
+        "the failed batch's first row was not checked against the sealed row"
+    );
+    assert_eq!(holders(&db, 7), 1, "two rows hold one unique key");
+}
+
 #[cfg(feature = "test-failpoints")]
 mod failpoints {
     use std::sync::mpsc;

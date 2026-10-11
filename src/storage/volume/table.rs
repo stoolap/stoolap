@@ -2847,9 +2847,9 @@ impl Table for SegmentedTable {
             }
             Ok(())
         })?;
-        self.hot.insert_batch(rows)?;
+        // Before the hot batch, which keeps the rows written before a failing one
         self.segment_mgr.record_txn_seal_generation(self.txn_id());
-        Ok(())
+        self.hot.insert_batch(rows)
     }
 
     fn update(
