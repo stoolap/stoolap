@@ -154,6 +154,9 @@ struct TopK {
     k: usize,
     col: usize,
     ascending: bool,
+    /// The first k rows, heaped once when the k-th arrives: rows arriving
+    /// worst first would each climb the whole heap
+    filling: Vec<Ranked>,
     heap: std::collections::BinaryHeap<Ranked>,
 }
 
@@ -163,7 +166,8 @@ impl TopK {
             k,
             col,
             ascending,
-            heap: std::collections::BinaryHeap::with_capacity(k.saturating_add(1).min(4096)),
+            filling: Vec::with_capacity(k.saturating_add(1).min(4096)),
+            heap: std::collections::BinaryHeap::new(),
         }
     }
 
@@ -180,8 +184,11 @@ impl TopK {
             row,
             ascending: self.ascending,
         };
-        if self.heap.len() < self.k {
-            self.heap.push(candidate);
+        if self.heap.is_empty() {
+            self.filling.push(candidate);
+            if self.filling.len() == self.k {
+                self.heap = std::mem::take(&mut self.filling).into();
+            }
         } else if let Some(worst) = self.heap.peek() {
             if candidate.cmp(worst) == std::cmp::Ordering::Less {
                 self.heap.pop();
@@ -212,9 +219,13 @@ impl TopK {
 
     /// The rows in order, the first `offset` dropped
     fn into_rows(self, offset: usize) -> RowVec {
-        self.heap
-            .into_sorted_vec()
-            .into_iter()
+        let mut rows = if self.heap.is_empty() {
+            self.filling
+        } else {
+            self.heap.into_vec()
+        };
+        rows.sort_unstable();
+        rows.into_iter()
             .skip(offset)
             .map(|r| (r.row_id, r.row))
             .collect()
@@ -5712,24 +5723,35 @@ impl Table for SegmentedTable {
                     );
                     // In a sorted volume the rows come in key order: walk from the
                     // best end and stop at the first key the heap cannot use
+                    // Otherwise unusable rows pass unbuilt; DESC walks newest first
                     if sorted {
                         scanner.set_ordered_walk(ascending);
-                        if let Some(worst) = keep.worst_key() {
+                    } else if !ascending {
+                        scanner.set_ordered_walk(false);
+                    }
+                    if let Some(worst) = keep.worst_key() {
+                        if sorted {
                             scanner.set_stop_key(vcol, worst, ascending);
+                        } else {
+                            scanner.set_skip_key(vcol, worst, ascending);
                         }
                     }
                     if let Some(filter) = &prepared_filter {
                         scanner.set_filter(filter.clone_box());
                     }
                     while scanner.next() {
+                        #[cfg(feature = "test-failpoints")]
+                        crate::test_failpoints::top_k_cold_row_built();
                         let (row_id, row) = scanner.take_row_with_id();
                         if sealed_copies_checked && self.hot.has_row_id(row_id)? {
                             continue;
                         }
                         keep.offer(row_id, row);
-                        if sorted {
-                            if let Some(worst) = keep.worst_key() {
+                        if let Some(worst) = keep.worst_key() {
+                            if sorted {
                                 scanner.set_stop_key(vcol, worst, ascending);
+                            } else {
+                                scanner.set_skip_key(vcol, worst, ascending);
                             }
                         }
                     }

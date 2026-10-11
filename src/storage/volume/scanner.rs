@@ -188,6 +188,9 @@ pub struct VolumeScanner {
     /// Stop when the raw key of the row under the cursor is past this bound:
     /// (physical column, key, ascending). Only meaningful on a sorted column.
     stop_key: Option<(usize, i64, bool)>,
+    /// Pass over, without building it, a row whose raw key is past this
+    /// bound; the same form as `stop_key`, for a column in any order
+    skip_key: Option<(usize, i64, bool)>,
     /// Rows of the current group that pass the dictionary filters, ascending,
     /// found in one pass over the raw ids; consumed from the back on a
     /// reverse walk
@@ -208,22 +211,46 @@ impl VolumeScanner {
     /// (below it walking backwards, above it walking forwards). The column
     /// must be sorted in the volume; only integer and timestamp keys count.
     pub fn set_stop_key(&mut self, col_idx: usize, bound: &Value, ascending: bool) {
+        if let Some(key) = self.raw_key(col_idx, bound, ascending) {
+            self.stop_key = Some(key);
+        }
+    }
+
+    /// Pass over each row whose key is past `bound`, as `set_stop_key`
+    /// decides it, without building the row; the column may be in any order
+    pub fn set_skip_key(&mut self, col_idx: usize, bound: &Value, ascending: bool) {
+        if let Some(key) = self.raw_key(col_idx, bound, ascending) {
+            self.skip_key = Some(key);
+        }
+    }
+
+    /// `bound` as the raw key of an integer or timestamp column
+    fn raw_key(
+        &self,
+        col_idx: usize,
+        bound: &Value,
+        ascending: bool,
+    ) -> Option<(usize, i64, bool)> {
         let target = match (bound, self.volume.columns.data_type(col_idx)) {
             (Value::Integer(v), crate::core::DataType::Integer) => *v,
-            (Value::Timestamp(dt), crate::core::DataType::Timestamp) => {
-                match dt.timestamp_nanos_opt() {
-                    Some(nanos) => nanos,
-                    None => return,
-                }
-            }
-            _ => return,
+            (Value::Timestamp(dt), crate::core::DataType::Timestamp) => dt.timestamp_nanos_opt()?,
+            _ => return None,
         };
-        self.stop_key = Some((col_idx, target, ascending));
+        Some((col_idx, target, ascending))
     }
 
     /// True when the row at `idx` lies past the stop key
     fn past_stop_key(&self, idx: usize) -> Result<bool> {
-        let Some((col_idx, target, ascending)) = self.stop_key else {
+        self.past_key(self.stop_key, idx)
+    }
+
+    /// True when the row at `idx` lies past the skip key
+    fn past_skip_key(&self, idx: usize) -> Result<bool> {
+        self.past_key(self.skip_key, idx)
+    }
+
+    fn past_key(&self, key: Option<(usize, i64, bool)>, idx: usize) -> Result<bool> {
+        let Some((col_idx, target, ascending)) = key else {
             return Ok(false);
         };
         let (col, local) = self.col_and_idx(col_idx, idx)?;
@@ -321,7 +348,7 @@ impl VolumeScanner {
                 return Ok(false);
             }
             self.end_idx = idx;
-            if self.should_skip_row(idx) {
+            if self.should_skip_row(idx) || self.past_skip_key(idx)? {
                 continue;
             }
             if self.candidates_group != Some(group_idx)
@@ -394,6 +421,7 @@ impl VolumeScanner {
             reverse: false,
             ordered_walk: false,
             stop_key: None,
+            skip_key: None,
             group_candidates: Vec::new(),
             candidates_group: None,
         };
@@ -454,6 +482,7 @@ impl VolumeScanner {
             reverse: false,
             ordered_walk: false,
             stop_key: None,
+            skip_key: None,
             group_candidates: Vec::new(),
             candidates_group: None,
         };
@@ -546,6 +575,7 @@ impl VolumeScanner {
             reverse: false,
             ordered_walk: false,
             stop_key: None,
+            skip_key: None,
             group_candidates: Vec::new(),
             candidates_group: None,
         }
@@ -1372,6 +1402,9 @@ impl VolumeScanner {
                     }
                 }
 
+                if self.past_skip_key(idx)? {
+                    continue;
+                }
                 if !self.typed_predicates.is_empty() && !self.evaluate_typed_predicates(idx)? {
                     continue;
                 }
@@ -1421,7 +1454,7 @@ impl VolumeScanner {
                 return Ok(false);
             }
 
-            if self.should_skip_row(self.current_idx) {
+            if self.should_skip_row(self.current_idx) || self.past_skip_key(self.current_idx)? {
                 self.current_idx += 1;
                 continue;
             }

@@ -252,6 +252,66 @@ fn test_top_k_over_a_volume_written_out_of_time_order() {
     check_all(&db);
 }
 
+/// Each key's whole history before the next key's, as a backfill writes it;
+/// every key shares the timestamps, so rows tie across keys
+fn insert_key_major(db: &Database, from: i64, steps: i64, keys: i64) {
+    for k in 0..keys {
+        let mut stmt = String::from("INSERT INTO c (t, k, v) VALUES ");
+        for s in 0..steps {
+            if s > 0 {
+                stmt.push(',');
+            }
+            stmt.push_str(&format!(
+                "('{}', 'k{k}', {})",
+                ts(from + s * 60),
+                (s * 7 + k) % 100
+            ));
+        }
+        db.execute(&stmt, ()).unwrap();
+    }
+}
+
+fn key_major_table(name: &str) -> (tempfile::TempDir, Database) {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _) = setup(&format!("file://{}/{name}", dir.path().display()));
+    insert_key_major(&db, 1_709_251_200, 4_000, 20);
+    db.execute("DELETE FROM c WHERE v = 13", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    (dir, db)
+}
+
+#[test]
+fn test_top_k_over_a_volume_written_key_by_key() {
+    let (_dir, db) = key_major_table("key_major");
+    check_all(&db);
+    db.execute("DELETE FROM c WHERE v = 77", ()).unwrap();
+    insert_sorted(&db, 1_709_251_200 + 3_990 * 60, 20, 20, 60);
+    check_all(&db);
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_top_k_builds_only_the_rows_that_can_enter_the_heap() {
+    use stoolap::test_failpoints::top_k_cold_rows;
+    let (_dir, db) = key_major_table("key_major_built");
+    for where_clause in ["WHERE k = 'k3'", ""] {
+        for dir in ["DESC", "ASC"] {
+            let before = top_k_cold_rows();
+            let got = ids(
+                &db,
+                &format!("SELECT id FROM c {where_clause} ORDER BY t {dir} LIMIT 50"),
+            );
+            let built = top_k_cold_rows() - before;
+            assert_eq!(got.len(), 50);
+            // At most the LIMIT from each key's run, of 80,000 sealed rows
+            assert!(
+                built <= 20 * 50,
+                "{where_clause} {dir}: built {built} sealed rows for a LIMIT of 50"
+            );
+        }
+    }
+}
+
 #[test]
 fn test_top_k_over_a_float_column_keeps_nan_in_order() {
     // Zone maps leave NaN out, so a float column is never answered from the bounds

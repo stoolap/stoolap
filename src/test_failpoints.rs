@@ -1048,6 +1048,7 @@ thread_local! {
     static VOLUME_FILE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SEGMENT_MAP_CLONES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ROW_ID_ORDER_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TOP_K_COLD_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static COLD_MAP_CAPTURED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
@@ -1192,6 +1193,15 @@ pub fn row_id_order_scans() -> usize {
 
 pub(crate) fn row_id_order_scanned() {
     ROW_ID_ORDER_SCANS.with(|n| n.set(n.get() + 1));
+}
+
+/// Sealed rows this thread's ordered top-k scans built, so far
+pub fn top_k_cold_rows() -> usize {
+    TOP_K_COLD_ROWS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn top_k_cold_row_built() {
+    TOP_K_COLD_ROWS.with(|n| n.set(n.get() + 1));
 }
 
 thread_local! {
