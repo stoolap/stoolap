@@ -718,10 +718,11 @@ pub trait Table: Send + Sync {
     /// Closes the table and releases any resources
     fn close(&mut self) -> Result<()>;
 
-    /// Commits any pending changes in this table's transaction
+    /// Leaves the table's pending changes with its transaction
     ///
-    /// This applies the table's local transaction changes to the global store,
-    /// making them visible to other transactions.
+    /// The transaction's commit publishes them, with their WAL records, and
+    /// makes them visible to other transactions; its rollback, or a rollback
+    /// to an earlier savepoint, drops them.
     fn commit(&mut self) -> Result<()>;
 
     /// Rolls back any pending changes in this table's transaction

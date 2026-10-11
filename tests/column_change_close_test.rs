@@ -21,11 +21,13 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use stoolap::core::{DataType, Row, Value};
-use stoolap::storage::traits::Engine;
+use stoolap::storage::mvcc::version_store::TransactionVersionStore;
+use stoolap::storage::mvcc::MVCCTable;
+use stoolap::storage::traits::{Engine, Table, Transaction};
 use stoolap::test_failpoints::{self as fp, FailpointGuard};
 use stoolap::Database;
 
@@ -69,6 +71,25 @@ fn change_waiting(db: &Database) -> std::thread::JoinHandle<stoolap::core::Resul
         .recv_timeout(Duration::from_secs(5))
         .expect("the change closed the table and waits");
     handle
+}
+
+/// A handle bound to an open transaction, writing straight into the table's
+/// version store
+fn store_handle(db: &Database, txn: &dyn Transaction) -> MVCCTable {
+    let store = db.engine().get_version_store("t").unwrap();
+    let local = TransactionVersionStore::new(Arc::clone(&store), txn.id());
+    MVCCTable::new(txn.id(), store, local)
+}
+
+/// A transaction left open after applying row (`id`, `k`) to the store
+fn applied_and_open(db: &Database, id: i64, k: i64) -> Box<dyn Transaction> {
+    let txn = db.engine().begin_transaction().unwrap();
+    let mut table = store_handle(db, txn.as_ref());
+    table
+        .insert(Row::from(vec![Value::Integer(id), Value::Integer(k)]))
+        .unwrap();
+    table.txn_versions().write_store().commit().unwrap();
+    txn
 }
 
 /// A seal that built its volumes, then `change` before it publishes them
@@ -234,13 +255,7 @@ fn a_change_is_refused_while_a_transaction_that_applied_rows_is_open() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path());
     db.execute("INSERT INTO t VALUES (1, 7)", ()).unwrap();
-    let mut txn = db.engine().begin_transaction().unwrap();
-    let mut table = txn.get_table("t").unwrap();
-    table
-        .insert(Row::from(vec![Value::Integer(2), Value::Integer(8)]))
-        .unwrap();
-    // The table's writes go to the store; the transaction stays open
-    table.commit().unwrap();
+    let mut txn = applied_and_open(&db, 2, 8);
     let changed = db.execute(MODIFY, ());
     assert!(
         matches!(
@@ -250,7 +265,6 @@ fn a_change_is_refused_while_a_transaction_that_applied_rows_is_open() {
         "{changed:?}"
     );
     assert_eq!(k_type(&db), DataType::Integer, "the old schema stays");
-    drop(table);
     txn.commit().unwrap();
     let row: i64 = db.query_one("SELECT k FROM t WHERE id = 2", ()).unwrap();
     assert_eq!(row, 8);
@@ -295,12 +309,7 @@ fn dropping_the_table_waits_for_a_change_in_progress() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path());
     db.execute("INSERT INTO t VALUES (1, 7)", ()).unwrap();
-    let mut txn = db.engine().begin_transaction().unwrap();
-    let mut table = txn.get_table("t").unwrap();
-    table
-        .insert(Row::from(vec![Value::Integer(2), Value::Integer(8)]))
-        .unwrap();
-    table.commit().unwrap();
+    let mut txn = applied_and_open(&db, 2, 8);
     // The change waits on the open transaction, holding the DDL guard
     let changing = change_waiting(&db);
     let other = db.clone();
@@ -308,7 +317,6 @@ fn dropping_the_table_waits_for_a_change_in_progress() {
     std::thread::sleep(Duration::from_millis(200));
     assert!(!dropping.is_finished(), "the drop ran inside the change");
     assert!(changing.join().unwrap().is_err());
-    drop(table);
     txn.rollback().unwrap();
     let _ = dropping.join().unwrap();
 }
@@ -319,11 +327,7 @@ fn a_commit_begun_while_a_change_waits_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path());
     db.execute("INSERT INTO t VALUES (1, 7)", ()).unwrap();
-    let mut holder = db.engine().begin_transaction().unwrap();
-    let mut held = holder.get_table("t").unwrap();
-    held.insert(Row::from(vec![Value::Integer(2), Value::Integer(8)]))
-        .unwrap();
-    held.commit().unwrap();
+    let mut holder = applied_and_open(&db, 2, 8);
     let mut txn = db.engine().begin_transaction().unwrap();
     let mut table = txn.get_table("t").unwrap();
     table
@@ -337,7 +341,6 @@ fn a_commit_begun_while_a_change_waits_is_refused() {
         "{committed:?}"
     );
     assert!(changing.join().unwrap().is_err());
-    drop(held);
     holder.rollback().unwrap();
     let refused: i64 = db
         .query_one("SELECT COUNT(*) FROM t WHERE id = 3", ())
@@ -346,31 +349,25 @@ fn a_commit_begun_while_a_change_waits_is_refused() {
 }
 
 #[test]
-fn a_table_commit_begun_while_a_change_waits_is_refused() {
+fn a_store_commit_begun_while_a_change_waits_is_refused() {
     let _guard = FailpointGuard::new();
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path());
     db.execute("INSERT INTO t VALUES (1, 7)", ()).unwrap();
-    let mut holder = db.engine().begin_transaction().unwrap();
-    let mut held = holder.get_table("t").unwrap();
-    held.insert(Row::from(vec![Value::Integer(2), Value::Integer(8)]))
-        .unwrap();
-    held.commit().unwrap();
+    let mut holder = applied_and_open(&db, 2, 8);
     let mut txn = db.engine().begin_transaction().unwrap();
-    let mut table = txn.get_table("t").unwrap();
+    let mut table = store_handle(&db, txn.as_ref());
     table
         .insert(Row::from(vec![Value::Integer(3), Value::Integer(9)]))
         .unwrap();
     let changing = change_waiting(&db);
-    let committed = table.commit();
+    let committed = table.txn_versions().write_store().commit();
     assert!(
         matches!(committed, Err(stoolap::core::Error::SchemaChanged { .. })),
         "{committed:?}"
     );
     assert!(changing.join().unwrap().is_err());
-    drop(table);
     txn.rollback().unwrap();
-    drop(held);
     holder.rollback().unwrap();
     let refused: i64 = db
         .query_one("SELECT COUNT(*) FROM t WHERE id = 3", ())
@@ -392,11 +389,7 @@ fn a_commit_rolled_back_to_a_savepoint_is_refused_while_a_change_waits() {
     )
     .unwrap();
     db.execute("INSERT INTO t VALUES (1, 7)", ()).unwrap();
-    let mut holder = db.engine().begin_transaction().unwrap();
-    let mut held = holder.get_table("t").unwrap();
-    held.insert(Row::from(vec![Value::Integer(2), Value::Integer(8)]))
-        .unwrap();
-    held.commit().unwrap();
+    let mut holder = applied_and_open(&db, 2, 8);
     let writer = db.clone();
     writer.execute("BEGIN", ()).unwrap();
     writer.execute("INSERT INTO t VALUES (3, 9)", ()).unwrap();
@@ -410,48 +403,11 @@ fn a_commit_rolled_back_to_a_savepoint_is_refused_while_a_change_waits() {
         "{committed:?}"
     );
     assert!(changing.join().unwrap().is_err());
-    drop(held);
     holder.rollback().unwrap();
     let refused: i64 = db
         .query_one("SELECT COUNT(*) FROM t WHERE id = 3", ())
         .unwrap();
     assert_eq!(refused, 0, "the refused commit left nothing");
-}
-
-#[test]
-fn a_change_waits_for_a_table_commit_in_progress() {
-    let _guard = FailpointGuard::new();
-    let dir = tempfile::tempdir().unwrap();
-    let db = open(dir.path());
-    db.execute("INSERT INTO t VALUES (1, 7)", ()).unwrap();
-    let mut txn = db.engine().begin_transaction().unwrap();
-    let mut table = txn.get_table("t").unwrap();
-    table
-        .insert(Row::from(vec![Value::Integer(2), Value::Integer(8)]))
-        .unwrap();
-    let change = Rc::new(RefCell::new(None));
-    let slot = Rc::clone(&change);
-    let other = db.clone();
-    fp::before_commit_index_capture(move || {
-        let handle = change_waiting(&other);
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(
-            !handle.is_finished(),
-            "the change ran past a table commit in progress"
-        );
-        *slot.borrow_mut() = Some(handle);
-    });
-    let committed = table.commit();
-    assert!(
-        matches!(committed, Err(stoolap::core::Error::SchemaChanged { .. })),
-        "{committed:?}"
-    );
-    let changed = change.borrow_mut().take().unwrap().join().unwrap();
-    assert!(changed.is_ok(), "{changed:?}");
-    drop(table);
-    txn.rollback().unwrap();
-    assert_eq!(k_type(&db), DataType::Text);
-    assert_eq!(count(&db), 1, "the refused commit left nothing");
 }
 
 #[test]
