@@ -350,6 +350,8 @@ impl CompressedBlockStore {
             #[cfg(test)]
             self.decoded_groups
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::group_column_decoded(col_idx, group_idx);
             self.decompress_single_group(col_idx, group_idx)
         })
     }

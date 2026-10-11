@@ -1050,6 +1050,7 @@ thread_local! {
     static ROW_ID_ORDER_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TOP_K_COLD_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GROUP_CACHE_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GROUP_COLUMN_DECODES: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
     static COLD_MAP_CAPTURED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
@@ -1212,6 +1213,16 @@ pub fn group_cache_loads() -> usize {
 
 pub(crate) fn group_cache_loaded() {
     GROUP_CACHE_LOADS.with(|n| n.set(n.get() + 1));
+}
+
+/// The (column, row group) blocks this thread decoded since the last call,
+/// in order; taking them clears the record
+pub fn take_group_column_decodes() -> Vec<(usize, usize)> {
+    GROUP_COLUMN_DECODES.with(|d| std::mem::take(&mut *d.borrow_mut()))
+}
+
+pub(crate) fn group_column_decoded(col: usize, group: usize) {
+    GROUP_COLUMN_DECODES.with(|d| d.borrow_mut().push((col, group)));
 }
 
 thread_local! {

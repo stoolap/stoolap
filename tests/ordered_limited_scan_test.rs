@@ -347,6 +347,37 @@ fn test_top_k_loads_no_row_group_without_the_key() {
     );
 }
 
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_top_k_decodes_each_block_of_a_reverse_walk_once() {
+    use stoolap::test_failpoints::take_group_column_decodes;
+    let (dir, db) = key_major_table("key_major_decodes");
+    drop(db);
+    let db = Database::open(&format!(
+        "file://{}/key_major_decodes",
+        dir.path().display()
+    ))
+    .unwrap();
+    // Process-wide: with no budget every block request decodes again
+    let budget: i64 = db.query_one("PRAGMA GROUP_CACHE_MB", ()).unwrap();
+    db.execute("PRAGMA GROUP_CACHE_MB = 0", ()).unwrap();
+    take_group_column_decodes();
+    let got = ids(
+        &db,
+        "SELECT id FROM c WHERE k = 'k17' ORDER BY t DESC LIMIT 50",
+    );
+    let decodes = take_group_column_decodes();
+    db.execute(&format!("PRAGMA GROUP_CACHE_MB = {budget}"), ())
+        .unwrap();
+    assert_eq!(got.len(), 50);
+    let mut seen = std::collections::HashSet::new();
+    let twice: Vec<_> = decodes.iter().filter(|&&b| !seen.insert(b)).collect();
+    assert!(
+        twice.is_empty(),
+        "blocks decoded twice: {twice:?} of {decodes:?}"
+    );
+}
+
 #[test]
 fn test_top_k_over_a_float_column_keeps_nan_in_order() {
     // Zone maps leave NaN out, so a float column is never answered from the bounds
