@@ -127,7 +127,8 @@ fn other_reads_under_fence() -> (usize, usize) {
 /// (id, v) of every row with k < 60, read through the statement's own
 /// transaction, so a write the failed statement left would show
 fn rows_through(table: &dyn stoolap::storage::traits::Table) -> Vec<(i64, i64)> {
-    let filter = ComparisonExpr::new("k", Operator::Lt, Value::Integer(60));
+    let mut filter = ComparisonExpr::new("k", Operator::Lt, Value::Integer(60));
+    filter.prepare_for_schema(table.schema());
     let mut rows: Vec<(i64, i64)> = table
         .collect_all_rows(Some(&filter))
         .unwrap()
@@ -184,9 +185,10 @@ fn three_rounds_a_seal_moved_end_in_a_write_conflict_with_no_read_under_the_fenc
             .is_err_and(|e| e.to_string().contains("kept changing")),
         "{result:?}"
     );
-    assert!(
-        seen.iter().all(|&(_, v)| v == 0),
-        "the failed statement left a write: {seen:?}"
+    assert_eq!(
+        seen,
+        [(1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (9001, 0)],
+        "the failed statement left a write"
     );
     assert!(other.is_ok(), "row 5 stayed claimed: {other:?}");
     assert_eq!(calls, [5], "the setter ran once, on row 5 only");
@@ -233,6 +235,26 @@ fn three_rounds_a_seal_moved_end_in_a_write_conflict_with_no_read_under_the_fenc
     );
     calls.sort_unstable();
     assert_eq!(calls, [1, 2, 3, 4, 5], "the setter ran once per row");
+}
+
+#[test]
+fn the_rows_read_back_through_the_transaction_show_its_own_writes() {
+    let _guard = FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db = sealed_table(dir.path());
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let mut table = txn.get_table("t").unwrap();
+    let mut calls = Vec::new();
+    let mut filter = ComparisonExpr::new("k", Operator::Lt, Value::Integer(30));
+    filter.prepare_for_schema(table.schema());
+    assert_eq!(
+        table.update(Some(&filter), &mut set_v(&mut calls)).unwrap(),
+        2
+    );
+    let seen = rows_through(table.as_ref());
+    drop(table);
+    txn.rollback().unwrap();
+    assert_eq!(seen, [(1, 4), (2, 4), (3, 0), (4, 0), (5, 0)]);
 }
 
 #[test]
