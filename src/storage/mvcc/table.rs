@@ -1710,18 +1710,17 @@ impl MVCCTable {
         Ok(row_id)
     }
 
-    /// Commits the transaction's local changes
-    ///
-    /// Index updates are handled by TransactionVersionStore::commit() using batch
-    /// operations to reduce lock acquisitions from O(rows × indexes) to O(indexes).
+    /// Keeps the handle's changes with its transaction: the transaction's
+    /// commit publishes them with their WAL records, its rollback drops them
     pub fn commit(&mut self) -> Result<()> {
-        // Counted for the call, so a column change waits for it
-        let _publishing = self.version_store.begin_publish();
-        self.commit_published()
+        Ok(())
     }
 
     /// Commits the local changes under a publication the caller counted, as
     /// a transaction's commit counts its tables in `begin_publish`
+    ///
+    /// Index updates are handled by TransactionVersionStore::commit() using batch
+    /// operations to reduce lock acquisitions from O(rows × indexes) to O(indexes).
     pub(crate) fn commit_published(&mut self) -> Result<()> {
         // Check if there are local changes before committing
         let has_changes = {
@@ -3360,7 +3359,6 @@ impl Table for MVCCTable {
     }
 
     fn commit(&mut self) -> Result<()> {
-        // Call inherent method which handles index updates
         MVCCTable::commit(self)
     }
 
@@ -5183,7 +5181,7 @@ mod tests {
                 ]))
                 .unwrap();
         }
-        writer.commit().unwrap();
+        writer.commit_published().unwrap();
         registry.commit_transaction(writer_txn);
         let (reader_txn, _) = registry.begin_transaction();
         let reader = MVCCTable::new(

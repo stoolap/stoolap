@@ -5411,15 +5411,8 @@ impl Table for SegmentedTable {
     }
 
     fn commit(&mut self) -> Result<()> {
-        self.hot.commit()?;
-        // Apply pending tombstones to the shared tombstone set.
-        // commit_seq=0 means "always visible to all snapshots". This is safe because
-        // the main commit path goes through engine.commit_all_tables() which passes
-        // the real commit_seq. This fallback is for direct Table::commit() calls.
-        let txn_id = self.txn_id();
-        self.segment_mgr.commit_pending_tombstones(txn_id, 0);
-        self.segment_mgr.clear_txn_seal_generation(txn_id);
-        Ok(())
+        // The pending tombstones stay with the transaction, as the hot writes do
+        self.hot.commit()
     }
 
     fn rollback(&mut self) {
@@ -8527,8 +8520,8 @@ mod tests {
         assert_eq!(mgr.total_row_count(), 3);
         assert!(!mgr.is_tombstoned(2));
 
-        // After commit, tombstones are applied to the shared segment manager.
-        table.commit().unwrap();
+        // Published as a transaction's commit publishes them
+        mgr.commit_pending_tombstones(table.txn_id(), 0);
         assert_eq!(mgr.total_row_count(), 2);
         assert!(mgr.is_tombstoned(2));
         assert!(mgr.row_exists(1).unwrap());
@@ -8596,7 +8589,7 @@ mod tests {
         assert_eq!(first(false), vec![3, 2, 1]);
 
         assert_eq!(table.delete_by_row_ids(&[2]).unwrap(), 1);
-        table.commit().unwrap();
+        mgr.commit_pending_tombstones(table.txn_id(), 0);
         assert!(!mgr.row_exists(2).unwrap());
         assert!(mgr.row_exists(1).unwrap());
         assert!(mgr.row_exists(3).unwrap());
