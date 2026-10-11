@@ -857,20 +857,23 @@ impl SegmentedTable {
             self.check_cold()?;
             snap.adopt(std::mem::take(&mut carried));
             prep.hot_ids.clear();
-            if prep.round > 0 {
-                self.revalidate_prepared(&snap, &mut prep)?;
-            }
-            match ids {
-                Some(ids) => self.prepare_cold_rows_by_id(&snap, ids, setter, &mut prep)?,
-                None => self.prepare_cold_rows_where(
-                    &snap,
-                    where_expr,
-                    &comparisons,
-                    &bloom_hashes,
-                    setter,
-                    &mut prep,
-                )?,
-            }
+            // A call boundary: inlined into this loop the row walk ran ~2% more instructions
+            (|| {
+                if prep.round > 0 {
+                    self.revalidate_prepared(&snap, &mut prep)?;
+                }
+                match ids {
+                    Some(ids) => self.prepare_cold_rows_by_id(&snap, ids, setter, &mut prep),
+                    None => self.prepare_cold_rows_where(
+                        &snap,
+                        where_expr,
+                        &comparisons,
+                        &bloom_hashes,
+                        setter,
+                        &mut prep,
+                    ),
+                }
+            })()?;
             // A volume registered at a settled generation is walked whole;
             // one a seal added meanwhile may have hidden rows still hot
             prep.seen_segments.extend(settled);
