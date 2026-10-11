@@ -1133,6 +1133,19 @@ pub(crate) fn unique_pair_compared() {
     UNIQUE_PAIRS.with(|n| n.set(n.get() + 1));
 }
 
+thread_local! {
+    static COLD_RECHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Commits on this thread that rechecked a table's keys against its volumes
+pub fn cold_rechecks() -> usize {
+    COLD_RECHECKS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn cold_rechecked() {
+    COLD_RECHECKS.with(|n| n.set(n.get() + 1));
+}
+
 /// Segment maps this thread copied to publish reloaded volumes
 pub fn segment_map_clones() -> usize {
     SEGMENT_MAP_CLONES.with(std::cell::Cell::get)
@@ -1326,6 +1339,7 @@ pub fn reset_all() {
     COLD_CLAIM_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_ONLY_CLAIMED_HOOK.with(|slot| *slot.borrow_mut() = None);
     UNIQUE_PAIRS.with(|n| n.set(0));
+    COLD_RECHECKS.with(|n| n.set(0));
 }
 
 /// RAII guard that serializes failpoint tests and resets all failpoints on drop.

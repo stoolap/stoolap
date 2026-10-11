@@ -1101,6 +1101,10 @@ pub(crate) struct LoadedVolume {
 /// releases the fence, loads what it recorded, and prepares again
 const COLD_READ_DEFERRED: &str = "cold volume read deferred under the seal fence";
 
+/// The recorded seal generation of a transaction with a write whose keys
+/// were not checked against the volumes; never a generation a seal reaches
+const UNCHECKED_WRITES: u64 = u64::MAX;
+
 impl StatementSnapshot {
     /// Newest-first (id, segment) list from the snapshot alone, cold
     /// volumes as captured; `volume` gives a cold one's columns.
@@ -3337,17 +3341,27 @@ impl SegmentManager {
         let mut map = self.txn_seal_gens.lock();
         map.entry(txn_id)
             .and_modify(|existing| {
-                if gen < *existing {
+                if gen < *existing && *existing != UNCHECKED_WRITES {
                     *existing = gen;
                 }
             })
             .or_insert(gen);
     }
 
-    /// Get the seal generation recorded for a transaction.
+    /// A write whose keys were not checked against the volumes: the commit
+    /// rechecks them, whatever any later statement records
     #[inline]
-    pub fn get_txn_seal_generation(&self, txn_id: i64) -> Option<u64> {
-        self.txn_seal_gens.lock().get(&txn_id).copied()
+    pub fn mark_txn_unchecked(&self, txn_id: i64) {
+        self.txn_seal_gens.lock().insert(txn_id, UNCHECKED_WRITES);
+    }
+
+    /// Whether the commit rechecks the transaction's keys against the
+    /// volumes: not every write was checked at the generation it sees
+    pub fn txn_needs_cold_recheck(&self, txn_id: i64) -> bool {
+        match self.txn_seal_gens.lock().get(&txn_id).copied() {
+            Some(gen) => gen != self.seal_generation(),
+            None => self.has_segments(),
+        }
     }
 
     /// Remove the seal generation record for a transaction (on commit/rollback).
