@@ -312,6 +312,41 @@ fn test_top_k_builds_only_the_rows_that_can_enter_the_heap() {
     }
 }
 
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_top_k_loads_no_row_group_without_the_key() {
+    use stoolap::test_failpoints::group_cache_loads;
+    let (dir, db) = key_major_table("key_major_groups");
+    drop(db);
+    // Reopened, the volume is read group by group through the group cache
+    let db = Database::open(&format!("file://{}/key_major_groups", dir.path().display())).unwrap();
+    let resident = |db: &Database| -> i64 {
+        db.query("PRAGMA VOLUME_STATS", ())
+            .unwrap()
+            .map(|r| r.unwrap().get::<i64>(4).unwrap())
+            .sum()
+    };
+    let before_bytes = resident(&db);
+    for dir in ["DESC", "ASC"] {
+        let before = group_cache_loads();
+        let got = ids(
+            &db,
+            &format!("SELECT id FROM c WHERE k = 'k17' ORDER BY t {dir} LIMIT 50"),
+        );
+        assert_eq!(got.len(), 50);
+        assert_eq!(
+            group_cache_loads() - before,
+            1,
+            "{dir}: k17 lies in the second of two row groups"
+        );
+    }
+    assert_eq!(
+        resident(&db),
+        before_bytes,
+        "the scan made a whole column of the volume resident"
+    );
+}
+
 #[test]
 fn test_top_k_over_a_float_column_keeps_nan_in_order() {
     // Zone maps leave NaN out, so a float column is never answered from the bounds

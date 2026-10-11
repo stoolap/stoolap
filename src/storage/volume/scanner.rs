@@ -267,14 +267,41 @@ impl VolumeScanner {
 
     /// The rows in `[lo, hi)` that pass every dictionary filter, in one pass
     /// over the raw ids of the group; None when a filter column is not a
-    /// dictionary column here and the rows must be tested one by one
-    fn dictionary_candidates(&self, lo: usize, hi: usize) -> Result<Option<Vec<usize>>> {
+    /// dictionary column here and the rows must be tested one by one. Read
+    /// group by group, only the filter columns of the group are decoded
+    fn dictionary_candidates(
+        &self,
+        group_idx: usize,
+        lo: usize,
+        hi: usize,
+    ) -> Result<Option<Vec<usize>>> {
+        let store = if self.volume.columns.should_use_group_cache() {
+            self.volume.columns.compressed_store()
+        } else {
+            None
+        };
+        let held: smallvec::SmallVec<[Option<Arc<super::column::ColumnData>>; 4]> = self
+            .dict_filters
+            .iter()
+            .map(|&(col_idx, _)| match store {
+                Some(st) => st
+                    .group_column(col_idx, group_idx)
+                    .map(Some)
+                    .map_err(|e| Error::internal(format!("corrupt V4 block: {}", e))),
+                None => Ok(None),
+            })
+            .collect::<Result<_>>()?;
+        let group_start = group_idx * super::column::ROW_GROUP_SIZE;
         let filters: smallvec::SmallVec<[super::column::DictFilter<'_>; 4]> = self
             .dict_filters
             .iter()
-            .map(|&(col_idx, expected)| {
-                let (col, local_lo) = self.col_and_idx(col_idx, lo)?;
-                Ok((col, local_lo, expected))
+            .zip(&held)
+            .map(|(&(col_idx, expected), held)| match held {
+                Some(col) => Ok((&**col, lo - group_start, expected)),
+                None => {
+                    let (col, local_lo) = self.col_and_idx(col_idx, lo)?;
+                    Ok((col, local_lo, expected))
+                }
             })
             .collect::<Result<_>>()?;
         let mut candidates = Vec::new();
@@ -309,17 +336,10 @@ impl VolumeScanner {
                         continue;
                     }
                 }
-                if use_group_cache {
-                    self.load_group_cache(group_idx);
-                    if self.error.is_some() {
-                        self.has_current = false;
-                        return Ok(false);
-                    }
-                }
             }
             if !self.dict_filters.is_empty() && self.candidates_group != Some(group_idx) {
                 let lo = group_start.max(self.current_idx);
-                match self.dictionary_candidates(lo, self.end_idx)? {
+                match self.dictionary_candidates(group_idx, lo, self.end_idx)? {
                     Some(candidates) => {
                         self.group_candidates = candidates;
                         self.candidates_group = Some(group_idx);
@@ -328,6 +348,16 @@ impl VolumeScanner {
                         self.group_candidates.clear();
                         self.candidates_group = None;
                     }
+                }
+            }
+            if cached != Some(group_idx)
+                && use_group_cache
+                && !(self.candidates_group == Some(group_idx) && self.group_candidates.is_empty())
+            {
+                self.load_group_cache(group_idx);
+                if self.error.is_some() {
+                    self.has_current = false;
+                    return Ok(false);
                 }
             }
             let idx = if self.candidates_group == Some(group_idx) {
@@ -1124,6 +1154,8 @@ impl VolumeScanner {
             }
         }
 
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::group_cache_loaded();
         self.group_cache = Some(GroupColumnCache {
             group_idx,
             columns,
