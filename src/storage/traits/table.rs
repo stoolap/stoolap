@@ -333,8 +333,14 @@ pub struct PlannedUpdate {
     pub cold: Vec<ColdChange>,
     /// Hot rows in the order the setter ran on them, with the new row and
     /// the version read: the committed one, or for a row read from the
-    /// transaction's own versions its txn id and `create_time`, no data
+    /// transaction's own versions its txn id, data and `create_time`
     pub hot: smallvec::SmallVec<[(i64, Row, crate::storage::mvcc::RowVersion); 1]>,
+    /// Set by the caller: the publish compares the hot rows' unique keys
+    /// with the versions read
+    pub compare_hot_keys: bool,
+    /// Set by the publish: a hot row's new unique key, never checked
+    /// against the volumes
+    pub hot_keys_changed: bool,
 }
 
 impl PlannedUpdate {

@@ -1165,6 +1165,8 @@ impl SegmentedTable {
         mut plan: PlannedUpdate,
         planned: Result<()>,
     ) -> Result<i32> {
+        // A hot row's new key is checked against the volumes only at commit
+        plan.compare_hot_keys = segment_mgr.has_segments();
         let count = match planned.and_then(|()| hot.publish_update(&mut plan)) {
             Ok(count) => count,
             Err(e) => {
@@ -1178,7 +1180,9 @@ impl SegmentedTable {
         for change in &plan.cold {
             segment_mgr.add_pending_tombstone(txn_id, change.row_id);
         }
-        if count > 0 {
+        if plan.hot_keys_changed {
+            segment_mgr.mark_txn_unchecked(txn_id);
+        } else if count > 0 {
             segment_mgr.record_txn_seal_generation(txn_id);
         }
         Ok(count)
@@ -2808,29 +2812,26 @@ impl Table for SegmentedTable {
     // =========================================================================
 
     fn insert(&mut self, row: Row) -> Result<Row> {
-        let (_seal_guard, checked) = Self::fence_after_cold_check(&self.segment_mgr, |snapshot| {
+        let (_seal_guard, _) = Self::fence_after_cold_check(&self.segment_mgr, |snapshot| {
             self.check_segment_constraints_with_snapshot(snapshot, &row, None)
         })?;
         let result = self.hot.insert(row)?;
-        if checked.is_some() {
-            self.segment_mgr.record_txn_seal_generation(self.txn_id());
-        }
+        // Checked at this generation, trivially when no volume exists yet
+        self.segment_mgr.record_txn_seal_generation(self.txn_id());
         Ok(result)
     }
 
     fn insert_discard(&mut self, row: Row) -> Result<()> {
-        let (_seal_guard, checked) = Self::fence_after_cold_check(&self.segment_mgr, |snapshot| {
+        let (_seal_guard, _) = Self::fence_after_cold_check(&self.segment_mgr, |snapshot| {
             self.check_segment_constraints_with_snapshot(snapshot, &row, None)
         })?;
         self.hot.insert_discard(row)?;
-        if checked.is_some() {
-            self.segment_mgr.record_txn_seal_generation(self.txn_id());
-        }
+        self.segment_mgr.record_txn_seal_generation(self.txn_id());
         Ok(())
     }
 
     fn insert_batch(&mut self, rows: Vec<Row>) -> Result<()> {
-        let (_seal_guard, checked) = Self::fence_after_cold_check(&self.segment_mgr, |snapshot| {
+        let (_seal_guard, _) = Self::fence_after_cold_check(&self.segment_mgr, |snapshot| {
             // Snapshot once for the entire batch — eliminates 3 lock reads per row.
             let unique_indexes = if rows.len() > 1 && self.hot.has_unique_non_pk_indexes() {
                 Some(self.cold_unique_indexes()?)
@@ -2847,9 +2848,7 @@ impl Table for SegmentedTable {
             Ok(())
         })?;
         self.hot.insert_batch(rows)?;
-        if checked.is_some() {
-            self.segment_mgr.record_txn_seal_generation(self.txn_id());
-        }
+        self.segment_mgr.record_txn_seal_generation(self.txn_id());
         Ok(())
     }
 

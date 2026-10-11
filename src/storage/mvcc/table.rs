@@ -2158,13 +2158,13 @@ impl MVCCTable {
     }
 
     /// The version read for a row read from the transaction's own
-    /// versions: its txn id and `create_time`, no data
-    fn local_read(&self, create_time: i64) -> RowVersion {
+    /// versions: its txn id, its data and its `create_time`
+    fn local_read(&self, local: &RowVersion) -> RowVersion {
         RowVersion {
             txn_id: self.txn_id,
             deleted_at_txn_id: 0,
-            data: Row::default(),
-            create_time,
+            data: local.data.clone(),
+            create_time: local.create_time,
         }
     }
 
@@ -2213,8 +2213,7 @@ impl MVCCTable {
                 let read = {
                     let txn_versions = self.txn_versions.read().unwrap();
                     if let Some(local) = txn_versions.get_local_version(pk_id) {
-                        (!local.is_deleted())
-                            .then(|| (local.data.clone(), self.local_read(local.create_time)))
+                        (!local.is_deleted()).then(|| (local.data.clone(), self.local_read(local)))
                     } else {
                         self.version_store
                             .get_visible_version(pk_id, self.txn_id)
@@ -2245,8 +2244,7 @@ impl MVCCTable {
                         if let Some(local) = txn_versions.get_local_version(row_id) {
                             if !local.is_deleted() {
                                 let row = self.normalize_row_to_schema(local.data.clone(), schema);
-                                plan.hot
-                                    .push((row_id, row, self.local_read(local.create_time)));
+                                plan.hot.push((row_id, row, self.local_read(local)));
                             }
                         } else {
                             remaining_row_ids.push(row_id);
@@ -2285,11 +2283,7 @@ impl MVCCTable {
                                 let row = self.normalize_row_to_schema(local.data.clone(), schema);
                                 // The index may match in part
                                 if expr.evaluate(&row).unwrap_or(false) {
-                                    plan.hot.push((
-                                        row_id,
-                                        row,
-                                        self.local_read(local.create_time),
-                                    ));
+                                    plan.hot.push((row_id, row, self.local_read(local)));
                                 }
                             }
                         } else {
@@ -2355,7 +2349,7 @@ impl MVCCTable {
                             continue;
                         }
                         plan.hot[i].1 = row;
-                        plan.hot[i].2 = self.local_read(local.create_time);
+                        plan.hot[i].2 = self.local_read(local);
                     }
                     plan.hot.swap(kept, i);
                     kept += 1;
@@ -2373,8 +2367,7 @@ impl MVCCTable {
                 if where_expr.is_some_and(|expr| !expr.evaluate(&row).unwrap_or(false)) {
                     continue;
                 }
-                plan.hot
-                    .push((row_id, row, self.local_read(version.create_time)));
+                plan.hot.push((row_id, row, self.local_read(version)));
             }
         }
         Self::set_planned(plan, start, setter)
@@ -2399,8 +2392,7 @@ impl MVCCTable {
                 if let Some(local) = txn_versions.get_local_version(row_id) {
                     if !local.is_deleted() {
                         let row = self.normalize_row_to_schema(local.data.clone(), schema);
-                        plan.hot
-                            .push((row_id, row, self.local_read(local.create_time)));
+                        plan.hot.push((row_id, row, self.local_read(local)));
                     }
                 } else {
                     remaining_row_ids.push(row_id);
@@ -2431,6 +2423,9 @@ impl MVCCTable {
         if count == 0 {
             return Ok(0);
         }
+        if plan.compare_hot_keys && !plan.hot.is_empty() {
+            plan.hot_keys_changed = self.hot_unique_keys_changed(plan);
+        }
         let unique = if plan.cold.is_empty() {
             smallvec::SmallVec::new()
         } else {
@@ -2450,6 +2445,29 @@ impl MVCCTable {
             .map_err(|e| Error::internal(e.to_string()))?;
         txn_versions.publish_planned(plan, layout);
         Ok(count)
+    }
+
+    /// Whether a planned hot row's new row differs from the version read in
+    /// a column of a unique index other than the primary key
+    fn hot_unique_keys_changed(&self, plan: &PlannedUpdate) -> bool {
+        let pk = self.cached_schema.pk_column_index();
+        let indexes = self.version_store.indexes_read();
+        indexes
+            .values()
+            .filter(|index| index.is_unique())
+            .any(|index| {
+                let column_ids = index.column_ids();
+                if let [only] = column_ids {
+                    if pk == Some(*only as usize) {
+                        return false;
+                    }
+                }
+                plan.hot.iter().any(|(_, row, read)| {
+                    column_ids
+                        .iter()
+                        .any(|&col_id| row.get(col_id as usize) != read.data.get(col_id as usize))
+                })
+            })
     }
 
     /// The unique keys of the plan's new sealed rows: free unless a row

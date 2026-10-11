@@ -8298,6 +8298,8 @@ impl EngineOperations {
         version_store: &Arc<VersionStore>,
         mgr: &Arc<crate::storage::volume::manifest::SegmentManager>,
     ) -> Result<()> {
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::cold_rechecked();
         let store = txn_store.read().unwrap();
         let Some(local) = store.local_versions_ref() else {
             return Ok(());
@@ -9069,27 +9071,34 @@ impl TransactionEngineOperations for EngineOperations {
                     .get(table_name.as_str())
                     .cloned()
             });
+            // A column change in progress refuses the commit before the
+            // volumes are read through its half-moved layout
+            let schema_generation = mgr_for_commit.as_ref().map(|mgr| mgr.schema_generation());
+            if let Some((mgr, generation)) = mgr_for_commit.as_ref().zip(schema_generation) {
+                if let Err(e) = mgr.check_schema_generation(generation) {
+                    commit_error = Some(e);
+                    break;
+                }
+            }
+
             // Always take fence if manager exists — even before first seal
             // completes, the manager may exist without has_segments() being
             // true yet (created before register_volume publishes the flag).
             let _seal_guard = mgr_for_commit.as_ref().map(|mgr| mgr.acquire_seal_read());
 
-            // Cold revalidation: only when a seal happened since our INSERT.
-            if let Some(mgr) = mgr_for_commit.as_ref() {
-                let recorded = mgr.get_txn_seal_generation(txn_id);
-                let needs_recheck = match recorded {
-                    Some(gen) => gen != mgr.seal_generation(),
-                    // No recorded generation but segments exist: txn started
-                    // before first seal or used hot-only path. Must recheck.
-                    None => mgr.has_segments(),
-                };
-                if needs_recheck {
-                    if let Err(e) =
+            // Cold revalidation: unless every write was checked at the
+            // generation the commit sees, and no column change came since
+            if let Some((mgr, generation)) = mgr_for_commit.as_ref().zip(schema_generation) {
+                let checked = mgr.check_schema_generation(generation).and_then(|()| {
+                    if mgr.txn_needs_cold_recheck(txn_id) {
                         self.validate_pending_against_cold(txn_id, txn_store, version_store, mgr)
-                    {
-                        commit_error = Some(e);
-                        break;
+                    } else {
+                        Ok(())
                     }
+                });
+                if let Err(e) = checked {
+                    commit_error = Some(e);
+                    break;
                 }
             }
 
