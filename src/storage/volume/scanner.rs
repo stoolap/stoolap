@@ -284,41 +284,37 @@ impl VolumeScanner {
         } else {
             None
         };
-        let held: smallvec::SmallVec<[Option<Arc<super::column::ColumnData>>; 4]> = self
-            .dict_filters
-            .iter()
-            .map(|&(col_idx, _)| match store {
-                Some(st) => st
-                    .group_column(col_idx, group_idx)
-                    .map(Some)
-                    .map_err(|e| Error::internal(format!("corrupt V4 block: {}", e))),
-                None => Ok(None),
-            })
-            .collect::<Result<_>>()?;
+        // One block per column, however many filters name it
+        let mut blocks = GroupBlocks::new();
+        if let Some(st) = store {
+            for &(col_idx, _) in &self.dict_filters {
+                if blocks.iter().all(|&(c, _)| c != col_idx) {
+                    let col = st
+                        .group_column(col_idx, group_idx)
+                        .map_err(|e| Error::internal(format!("corrupt V4 block: {}", e)))?;
+                    blocks.push((col_idx, col));
+                }
+            }
+        }
         let group_start = group_idx * super::column::ROW_GROUP_SIZE;
         let mut candidates = Vec::new();
         let decided = {
             let filters: smallvec::SmallVec<[super::column::DictFilter<'_>; 4]> = self
                 .dict_filters
                 .iter()
-                .zip(&held)
-                .map(|(&(col_idx, expected), held)| match held {
-                    Some(col) => Ok((&**col, lo - group_start, expected)),
-                    None => {
-                        let (col, local_lo) = self.col_and_idx(col_idx, lo)?;
-                        Ok((col, local_lo, expected))
-                    }
-                })
+                .map(
+                    |&(col_idx, expected)| match blocks.iter().find(|&&(c, _)| c == col_idx) {
+                        Some((_, col)) => Ok((&**col, lo - group_start, expected)),
+                        None => {
+                            let (col, local_lo) = self.col_and_idx(col_idx, lo)?;
+                            Ok((col, local_lo, expected))
+                        }
+                    },
+                )
                 .collect::<Result<_>>()?;
             super::column::ColumnData::dict_matching_offsets(&filters, hi - lo, &mut candidates)
                 .is_some()
         };
-        let blocks: GroupBlocks = self
-            .dict_filters
-            .iter()
-            .zip(held)
-            .filter_map(|(&(col_idx, _), held)| held.map(|col| (col_idx, col)))
-            .collect();
         if !decided {
             return Ok((None, blocks));
         }

@@ -358,24 +358,60 @@ fn test_top_k_decodes_each_block_of_a_reverse_walk_once() {
         dir.path().display()
     ))
     .unwrap();
-    // Process-wide: with no budget every block request decodes again
-    let budget: i64 = db.query_one("PRAGMA GROUP_CACHE_MB", ()).unwrap();
-    db.execute("PRAGMA GROUP_CACHE_MB = 0", ()).unwrap();
-    take_group_column_decodes();
-    let got = ids(
-        &db,
-        "SELECT id FROM c WHERE k = 'k17' ORDER BY t DESC LIMIT 50",
-    );
-    let decodes = take_group_column_decodes();
-    db.execute(&format!("PRAGMA GROUP_CACHE_MB = {budget}"), ())
-        .unwrap();
-    assert_eq!(got.len(), 50);
-    let mut seen = std::collections::HashSet::new();
-    let twice: Vec<_> = decodes.iter().filter(|&&b| !seen.insert(b)).collect();
-    assert!(
-        twice.is_empty(),
-        "blocks decoded twice: {twice:?} of {decodes:?}"
-    );
+    // With no budget every block request decodes again
+    let _budget = NoGroupCache::set(&db);
+    for where_clause in ["k = 'k17'", "k = 'k17' AND v >= 0 AND k = 'k17'"] {
+        take_group_column_decodes();
+        let got = ids(
+            &db,
+            &format!("SELECT id FROM c WHERE {where_clause} ORDER BY t DESC LIMIT 50"),
+        );
+        let decodes = take_group_column_decodes();
+        assert_eq!(got.len(), 50);
+        let mut seen = std::collections::HashSet::new();
+        let twice: Vec<_> = decodes.iter().filter(|&&b| !seen.insert(b)).collect();
+        assert!(
+            twice.is_empty(),
+            "{where_clause}: blocks decoded twice: {twice:?} of {decodes:?}"
+        );
+    }
+}
+
+/// The process-wide group cache budget at zero while held, restored on
+/// drop; held one at a time, since tests share the process under cargo test
+#[cfg(feature = "test-failpoints")]
+struct NoGroupCache<'a> {
+    db: &'a Database,
+    budget: i64,
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(feature = "test-failpoints")]
+static GROUP_CACHE_BUDGET: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(feature = "test-failpoints")]
+impl<'a> NoGroupCache<'a> {
+    fn set(db: &'a Database) -> Self {
+        let serial = GROUP_CACHE_BUDGET
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let budget: i64 = db.query_one("PRAGMA GROUP_CACHE_MB", ()).unwrap();
+        db.execute("PRAGMA GROUP_CACHE_MB = 0", ()).unwrap();
+        Self {
+            db,
+            budget,
+            _serial: serial,
+        }
+    }
+}
+
+#[cfg(feature = "test-failpoints")]
+impl Drop for NoGroupCache<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .db
+            .execute(&format!("PRAGMA GROUP_CACHE_MB = {}", self.budget), ());
+    }
 }
 
 #[test]
