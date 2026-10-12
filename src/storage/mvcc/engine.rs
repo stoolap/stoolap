@@ -6399,7 +6399,7 @@ impl MVCCEngine {
             // - Sub-target (< target_volume_rows): small volumes to merge together
             // - Oversized (> target * 3/2): large volumes to split
             // - At-target: properly sized, never rewrite
-            let (old_ids, volumes, dead, tombstones) = {
+            let (old_ids, volumes, dead, tombstones, outside) = {
                 // Planning reads the manifest for metadata only and lets it
                 // go before any volume is read: a seal holds the table's
                 // fence while it waits for the manifest, and DML waits on
@@ -6570,6 +6570,8 @@ impl MVCCEngine {
                     .filter(|entry| entry.2)
                     .map(|entry| (entry.0, entry.1))
                     .collect();
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::compaction_planned();
 
                 // Load only the merge-candidate volumes (not the entire table).
                 // Cold volumes are loaded on demand via ensure_volume.
@@ -6610,17 +6612,35 @@ impl MVCCEngine {
                 // position, and old_ids holds the batch in manifest order
                 vols.reverse();
                 dead.reverse();
-                // Under the DDL guard, so no seal's transfer is halfway
-                let ts = {
+                // Under the DDL guard, so no seal's transfer is halfway; the
+                // segments with them, to find the copies outside the batch
+                let (ts, segs_then) = {
                     let _ddl = self.ddl_guard();
                     let ts = mgr.tombstone_set_arc();
                     #[cfg(feature = "test-failpoints")]
                     crate::test_failpoints::compaction_tombstones_taken(
                         self.ddl.serial.is_locked(),
                     );
-                    ts
+                    (ts, mgr.segments_raw())
                 };
-                (old_ids, Arc::new(vols), dead, ts)
+                // Each with the id range the manifest records for it, when it
+                // still does, so a volume no candidate falls in is not read
+                let outside: Vec<OutsideVolume> = {
+                    let manifest = mgr.manifest();
+                    segs_then
+                        .iter()
+                        .filter(|(id, _)| !old_ids.contains(id))
+                        .map(|(id, cs)| {
+                            let bounds = manifest
+                                .segments
+                                .iter()
+                                .find(|m| m.segment_id == *id)
+                                .map(|m| (m.min_row_id, m.max_row_id));
+                            (Arc::clone(&cs.volume), bounds)
+                        })
+                        .collect()
+                };
+                (old_ids, Arc::new(vols), dead, ts, outside)
             };
 
             let vol_mappings: Vec<_> = volumes
@@ -6660,6 +6680,9 @@ impl MVCCEngine {
             // The tombstones this compaction applies, as (row_id, commit_seq):
             // the cleanup removes those whose sequence is still current
             let mut applied_tombstones: Vec<(i64, u64)> = Vec::new();
+            // The newest copy in the batch of each tombstoned row, until the
+            // copies outside the batch are known
+            let mut tombstoned: Vec<(i64, u64, usize, usize)> = Vec::new();
 
             for (vol_idx, (_seg_id, vol)) in volumes.iter().enumerate() {
                 let dead = dead[vol_idx].as_deref().unwrap_or(&[]);
@@ -6678,7 +6701,7 @@ impl MVCCEngine {
                         applied_commit_seq(&tombstones, row_id, compact_seal_seq_limit)
                     {
                         if seen.insert(row_id) {
-                            applied_tombstones.push((row_id, commit_seq));
+                            tombstoned.push((row_id, commit_seq, vol_idx, i));
                         }
                         continue;
                     }
@@ -6687,6 +6710,33 @@ impl MVCCEngine {
                     }
                 }
             }
+            // A copy outside the batch would outlive the tombstone: the row
+            // stays, newest copy and tombstone, for a batch that holds all
+            let candidates: FxHashSet<i64> = tombstoned.iter().map(|t| t.0).collect();
+            let held = held_outside(&outside, &candidates);
+            let mut kept: Vec<(i64, usize, usize)> = Vec::new();
+            for (row_id, commit_seq, vol_idx, i) in tombstoned {
+                if held.contains(&row_id) {
+                    kept.push((row_id, vol_idx, i));
+                } else {
+                    applied_tombstones.push((row_id, commit_seq));
+                }
+            }
+            if !kept.is_empty() {
+                // Both lists run by volume and position: merged, each volume
+                // stays one run in its physical order, as the key merge reads it
+                let mut kept = kept.into_iter().peekable();
+                let mut merged = Vec::with_capacity(live_refs.len() + kept.len());
+                for entry in live_refs.drain(..) {
+                    while let Some(k) = kept.next_if(|k| (k.1, k.2) < (entry.1, entry.2)) {
+                        merged.push(k);
+                    }
+                    merged.push(entry);
+                }
+                merged.extend(kept);
+                live_refs = merged;
+            }
+            drop(outside);
             // Let go of the full map: from here to the cleanup only the
             // applied pairs are needed
             drop(tombstones);
@@ -6793,6 +6843,8 @@ impl MVCCEngine {
                 )?
             };
             if let Some(merged) = merged {
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::key_order_merged();
                 key_held_peak = merged.peak_held_bytes;
                 live_refs = merged.refs;
             } else if schema.cluster_key.is_empty() {
@@ -9606,6 +9658,47 @@ fn applied_commit_seq(
         .filter(|&commit_seq| snapshot_limit.is_none_or(|limit| commit_seq < limit))
 }
 
+/// A volume outside a compaction's batch, with the id range its manifest
+/// entry records when it still has one
+type OutsideVolume = (
+    Arc<crate::storage::volume::writer::FrozenVolume>,
+    Option<(i64, i64)>,
+);
+
+/// The ids of `candidates` of which a volume in `outside` holds a copy,
+/// dead copies included. Only candidates in a volume's range are looked
+/// for; a volume whose ids ascend is searched, one whose order is not
+/// decided and whose ids do not ascend is walked, so no permutation is
+/// built for it
+fn held_outside(outside: &[OutsideVolume], candidates: &FxHashSet<i64>) -> FxHashSet<i64> {
+    let mut held = FxHashSet::default();
+    for (volume, bounds) in outside {
+        if held.len() == candidates.len() {
+            break;
+        }
+        let in_range: FxHashSet<i64> = candidates
+            .iter()
+            .copied()
+            .filter(|id| !held.contains(id))
+            .filter(|id| bounds.is_none_or(|(lo, hi)| (lo..=hi).contains(id)))
+            .collect();
+        if in_range.is_empty() {
+            continue;
+        }
+        let ids = &volume.meta.row_ids;
+        if volume.meta.row_order.get().is_none() && !ids.is_sorted() {
+            held.extend(ids.iter().copied().filter(|id| in_range.contains(id)));
+        } else {
+            held.extend(
+                in_range
+                    .into_iter()
+                    .filter(|&id| volume.locate(id).is_some()),
+            );
+        }
+    }
+    held
+}
+
 /// Settles a compaction batch's membership: the members that size alone
 /// put in the base are dropped while the batch does not accept them, the
 /// batch is closed over overlap, and the size-only members are judged
@@ -9819,6 +9912,38 @@ fn close_batch_over_overlap<'a>(
 mod tests {
     use super::*;
     use crate::core::{DataType, IndexType, Row, SchemaBuilder, Value};
+
+    fn volume_holding(ids: &[i64]) -> Arc<crate::storage::volume::writer::FrozenVolume> {
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .build();
+        let mut builder = crate::storage::volume::writer::VolumeBuilder::new(&schema);
+        for &id in ids {
+            builder.add_row(id, &Row::from_values(vec![Value::Integer(id)]));
+        }
+        Arc::new(builder.finish().unwrap())
+    }
+
+    #[test]
+    fn a_tombstone_held_by_a_volume_left_out_of_the_batch_is_not_applied() {
+        // The batch is the selection alone; the older volume that holds a
+        // copy of 7 waits outside it, as the base does behind a recluster
+        let waiting = volume_holding(&[1, 3, 7, 9]);
+        let other = volume_holding(&[20, 30]);
+        let candidates: FxHashSet<i64> = [7, 8, 25].into_iter().collect();
+        let held = held_outside(
+            &[
+                (Arc::clone(&other), Some((20, 30))),
+                (Arc::clone(&waiting), None),
+            ],
+            &candidates,
+        );
+        assert_eq!(held, [7].into_iter().collect(), "8 and 25 fall in no copy");
+        assert!(held_outside(&[(other, Some((20, 30)))], &candidates).is_empty());
+        assert!(held_outside(&[], &candidates).is_empty());
+        // The recorded range decides before any id is read
+        assert!(held_outside(&[(waiting, Some((100, 200)))], &candidates).is_empty());
+    }
 
     #[test]
     fn a_clustered_seal_classifies_its_rows_in_id_order() {
