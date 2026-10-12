@@ -3430,7 +3430,14 @@ impl FrozenVolume {
         let ids = &self.meta.row_ids;
         self.meta
             .row_order
-            .get_or_init(|| (!ids.windows(2).all(|w| w[0] < w[1])).then(|| row_order_of(ids)))
+            .get_or_init(|| {
+                let order = (!ids.windows(2).all(|w| w[0] < w[1])).then(|| row_order_of(ids));
+                #[cfg(feature = "test-failpoints")]
+                if order.is_some() {
+                    crate::test_failpoints::row_order_built();
+                }
+                order
+            })
             .as_deref()
     }
 
