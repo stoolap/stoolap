@@ -1609,7 +1609,7 @@ impl MVCCTable {
                 return Err(Error::UniqueConstraint {
                     index: index_name.to_string(),
                     column: col_names.join(", "),
-                    value: format!("{:?}", values),
+                    value: values.into(),
                     row_id,
                 });
             }
@@ -2581,7 +2581,7 @@ impl MVCCTable {
                             return Err(Error::UniqueConstraint {
                                 index: index.name().to_string(),
                                 column,
-                                value: format!("{:?}", values),
+                                value: values.into_vec().into(),
                                 row_id,
                             });
                         }

@@ -8618,11 +8618,7 @@ impl EngineOperations {
                             return Err(crate::core::Error::UniqueConstraint {
                                 index: col_names.join("_"),
                                 column: col_names.join(", "),
-                                value: values
-                                    .iter()
-                                    .map(|v| v.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(", "),
+                                value: coerced.into(),
                                 row_id: cold_rid,
                             });
                         }
@@ -8692,11 +8688,7 @@ impl EngineOperations {
                             return Err(crate::core::Error::UniqueConstraint {
                                 index: col_names.join("_"),
                                 column: col_names.join(", "),
-                                value: values
-                                    .iter()
-                                    .map(|v| v.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(", "),
+                                value: coerced.into(),
                                 row_id: cold_rid,
                             });
                         }

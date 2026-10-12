@@ -18,8 +18,33 @@
 
 use thiserror::Error;
 
+use super::Value;
+
 /// Result type alias for Stoolap operations
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// The key values a unique constraint refused, written out only when the
+/// error is shown: an upsert that resolves the conflict never formats them
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictValues(pub Vec<Value>);
+
+impl std::fmt::Display for ConflictValues {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, value) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{value}")?;
+        }
+        Ok(())
+    }
+}
+
+impl From<Vec<Value>> for ConflictValues {
+    fn from(values: Vec<Value>) -> Self {
+        ConflictValues(values)
+    }
+}
 
 /// Main error type for Stoolap storage operations
 ///
@@ -113,7 +138,7 @@ pub enum Error {
     UniqueConstraint {
         index: String,
         column: String,
-        value: String,
+        value: ConflictValues,
         /// Row ID of the conflicting row (-1 if unknown)
         row_id: i64,
     },
@@ -345,7 +370,7 @@ impl Error {
     pub fn unique_constraint(
         index: impl Into<String>,
         column: impl Into<String>,
-        value: impl Into<String>,
+        value: impl Into<ConflictValues>,
     ) -> Self {
         Error::UniqueConstraint {
             index: index.into(),
@@ -525,7 +550,8 @@ mod tests {
             "primary key constraint failed with 42 already exists in this table"
         );
 
-        let err = Error::unique_constraint("idx_email", "email", "test@example.com");
+        let err =
+            Error::unique_constraint("idx_email", "email", vec![Value::text("test@example.com")]);
         assert_eq!(
             err.to_string(),
             "unique constraint failed for index idx_email on column email with value test@example.com"
@@ -541,7 +567,10 @@ mod tests {
 
         assert!(Error::not_null_constraint("col").is_constraint_violation());
         assert!(Error::primary_key_constraint(1).is_constraint_violation());
-        assert!(Error::unique_constraint("idx", "col", "val").is_constraint_violation());
+        assert!(
+            Error::unique_constraint("idx", "col", vec![Value::text("val")])
+                .is_constraint_violation()
+        );
         assert!(!Error::TableNotFound("t".to_string()).is_constraint_violation());
 
         assert!(Error::TransactionNotStarted.is_transaction_error());

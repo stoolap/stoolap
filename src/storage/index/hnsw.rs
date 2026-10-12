@@ -2911,7 +2911,7 @@ impl Index for HnswIndex {
             return Err(crate::core::Error::unique_constraint(
                 &self.name,
                 self.column_names.join(", "),
-                format!("<vector({} dims)>", self.dims),
+                vec![Value::text(format!("<vector({} dims)>", self.dims))],
             ));
         }
         inner.insert(
@@ -2961,7 +2961,7 @@ impl Index for HnswIndex {
                         return Err(crate::core::Error::unique_constraint(
                             &self.name,
                             self.column_names.join(", "),
-                            format!("<vector({} dims)>", self.dims),
+                            vec![Value::text(format!("<vector({} dims)>", self.dims))],
                         ));
                     }
                 } else {
@@ -2979,7 +2979,7 @@ impl Index for HnswIndex {
                     return Err(crate::core::Error::unique_constraint(
                         &self.name,
                         self.column_names.join(", "),
-                        format!("<vector({} dims)>", self.dims),
+                        vec![Value::text(format!("<vector({} dims)>", self.dims))],
                     ));
                 }
             }
@@ -3049,7 +3049,7 @@ impl Index for HnswIndex {
                         return Err(crate::core::Error::unique_constraint(
                             &self.name,
                             self.column_names.join(", "),
-                            format!("<vector({} dims)>", self.dims),
+                            vec![Value::text(format!("<vector({} dims)>", self.dims))],
                         ));
                     }
                 } else {
@@ -3067,7 +3067,7 @@ impl Index for HnswIndex {
                     return Err(crate::core::Error::unique_constraint(
                         &self.name,
                         self.column_names.join(", "),
-                        format!("<vector({} dims)>", self.dims),
+                        vec![Value::text(format!("<vector({} dims)>", self.dims))],
                     ));
                 }
             }

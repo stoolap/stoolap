@@ -32,7 +32,7 @@ pub mod types;
 pub mod value;
 
 // Re-export main types for convenience
-pub use error::{Error, Result};
+pub use error::{ConflictValues, Error, Result};
 pub use row::Row;
 pub use row_vec::{RowIdVec, RowVec};
 pub use schema::{ForeignKeyConstraint, Schema, SchemaBuilder, SchemaColumn};

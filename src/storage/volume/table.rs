@@ -580,11 +580,7 @@ impl SegmentedTable {
                     return Err(crate::core::Error::UniqueConstraint {
                         index: index_name.to_string(),
                         column: columns.join(", "),
-                        value: values
-                            .iter()
-                            .map(|v| v.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", "),
+                        value: values.into(),
                         row_id: existing_rid,
                     });
                 }
@@ -1186,14 +1182,11 @@ impl SegmentedTable {
             };
             if let Some(found_id) = found {
                 if found_id != exclude_row_id && !shadowed.contains(&found_id) {
+                    drop(values);
                     return Err(crate::core::Error::UniqueConstraint {
                         index: idx_name.to_string(),
                         column: col_names.join(", "),
-                        value: values
-                            .iter()
-                            .map(|v| format!("{}", v))
-                            .collect::<Vec<_>>()
-                            .join(", "),
+                        value: coerced.into_vec().into(),
                         row_id: found_id,
                     });
                 }
@@ -1272,14 +1265,11 @@ impl SegmentedTable {
             if let Some(conflict_row_id) =
                 self.find_segment_row_id_by_values_with_snapshot(snapshot, &col_indices, &values)?
             {
+                drop(values);
                 return Err(crate::core::Error::UniqueConstraint {
                     index: idx_name.to_string(),
                     column: col_names.join(", "),
-                    value: values
-                        .iter()
-                        .map(|v| v.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", "),
+                    value: coerced.into_vec().into(),
                     row_id: conflict_row_id,
                 });
             }
