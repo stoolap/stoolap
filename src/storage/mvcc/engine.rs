@@ -8217,15 +8217,37 @@ impl Engine for MVCCEngine {
             crate::test_failpoints::pk_hot_rows_fetched();
             let schema = store.schema();
             let mgr = self.get_or_create_segment_manager(table_name);
-            if mgr.has_segments() {
-                let found_ids: rustc_hash::FxHashSet<i64> =
-                    result.iter().map(|(id, _)| *id).collect();
-                for &rid in row_ids {
-                    if !found_ids.contains(&rid) {
-                        if let Some(row) = mgr.get_cold_row_normalized(rid, &schema)? {
-                            result.push((rid, row));
+            // Hot rows found before the truncate count are read again after
+            // it, and a truncate around the cold read is waited out and retried
+            let mut stale = !result.is_empty();
+            loop {
+                let begun = mgr.destructions_begun();
+                if mgr.is_destruction_in_progress() {
+                    while mgr.is_destruction_in_progress() {
+                        #[cfg(feature = "test-failpoints")]
+                        crate::test_failpoints::destruction_waited();
+                        std::thread::yield_now();
+                    }
+                    stale = true;
+                    continue;
+                }
+                if stale {
+                    result = store.get_visible_versions_batch(row_ids, read_txn_id);
+                }
+                stale = true;
+                if mgr.has_segments() {
+                    let found_ids: rustc_hash::FxHashSet<i64> =
+                        result.iter().map(|(id, _)| *id).collect();
+                    for &rid in row_ids {
+                        if !found_ids.contains(&rid) {
+                            if let Some(row) = mgr.get_cold_row_normalized(rid, &schema)? {
+                                result.push((rid, row));
+                            }
                         }
                     }
+                }
+                if !mgr.is_destruction_in_progress() && mgr.destructions_begun() == begun {
+                    break;
                 }
             }
             // The manager was found by name: the table under it must still

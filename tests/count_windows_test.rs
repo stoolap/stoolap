@@ -21,6 +21,8 @@
 use std::cell::Cell;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use stoolap::test_failpoints as fp;
 use stoolap::Database;
@@ -235,13 +237,29 @@ fn count_halfway_through_a_truncate_does_not_bring_deleted_rows_back() {
     let db = volumes_of_ten(dir.path(), 2);
     db.execute("DELETE FROM t WHERE id = 5", ()).unwrap();
 
-    let seen = Rc::new(Cell::new(None));
-    let halfway = Rc::clone(&seen);
+    let (seen_tx, seen) = mpsc::channel();
     let other = db.clone();
-    fp::during_segments_clearing(move || halfway.set(Some(count(&other))));
+    let reader = Rc::new(Cell::new(None));
+    let spawned = Rc::clone(&reader);
+    fp::during_segments_clearing(move || {
+        spawned.set(Some(std::thread::spawn(move || {
+            let waiting = seen_tx.clone();
+            fp::on_destruction_wait(move || waiting.send(None).unwrap());
+            let n = count(&other);
+            let _ = seen_tx.send(Some(n));
+            n
+        })));
+        // The reader answers inside the truncate or waits for it to end
+        seen.recv_timeout(Duration::from_secs(60))
+            .expect("the reader answered or began to wait");
+    });
     db.execute("TRUNCATE TABLE t", ()).unwrap();
 
-    let n = seen.get().expect("the truncate cleared the segment set");
+    let n = reader
+        .take()
+        .expect("the truncate cleared the segment set")
+        .join()
+        .unwrap();
     assert!(n == 0 || n == 19, "{n} rows halfway through the truncate");
     assert_eq!(count(&db), 0);
 }

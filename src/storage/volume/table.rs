@@ -333,10 +333,52 @@ impl SegmentedTable {
     /// and cold values hold the fence for their whole body instead.
     fn unsealed<T>(&self, f: impl FnOnce(&dyn Table) -> T) -> Option<T> {
         let _seal_guard = self.segment_mgr.acquire_seal_read();
-        if self.segment_mgr.has_segments() {
+        let begun = self.segment_mgr.destructions_begun();
+        if self.segment_mgr.is_destruction_in_progress() || self.segment_mgr.has_segments() {
             return None;
         }
-        Some(f(&*self.hot))
+        let out = f(&*self.hot);
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::unsealed_read();
+        // A truncate that took volumes away under this call leaves it None
+        (!self.destruction_since(begun)).then_some(out)
+    }
+
+    /// Whether a truncate is taking rows away now or began one since `begun`
+    /// was read
+    fn destruction_since(&self, begun: u64) -> bool {
+        self.segment_mgr.is_destruction_in_progress()
+            || self.segment_mgr.destructions_begun() != begun
+    }
+
+    /// Waits, holding no lock, until no truncate is taking rows away
+    fn wait_out_destruction(&self) {
+        let mut noted = false;
+        while self.segment_mgr.is_destruction_in_progress() {
+            if !noted {
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::destruction_waited();
+                noted = true;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// Runs `read`, which takes the hot and the sealed rows in steps, until
+    /// no truncate took rows away between its first step and its last
+    fn clear_of_destruction<T>(&self, mut read: impl FnMut() -> Result<T>) -> Result<T> {
+        loop {
+            let begun = self.segment_mgr.destructions_begun();
+            if self.segment_mgr.is_destruction_in_progress() {
+                self.wait_out_destruction();
+                continue;
+            }
+            let out = read()?;
+            if !self.destruction_since(begun) {
+                return Ok(out);
+            }
+            self.wait_out_destruction();
+        }
     }
 
     /// Runs `collect` over a hot store and a cold view that no seal moved
@@ -350,18 +392,18 @@ impl SegmentedTable {
     /// keeps collecting until one is clear.
     fn settled_across_seals<T>(&self, mut collect: impl FnMut() -> Result<T>) -> Result<T> {
         loop {
-            let before = {
-                let _fence = self.segment_mgr.acquire_seal_read();
-                self.segment_mgr.seal_generation()
-            };
+            let before = Self::settled_generation(&self.segment_mgr);
+            if self.segment_mgr.is_destruction_in_progress() {
+                self.wait_out_destruction();
+                continue;
+            }
             let collected = collect()?;
-            let after = {
-                let _fence = self.segment_mgr.acquire_seal_read();
-                self.segment_mgr.seal_generation()
-            };
-            if before == after {
+            let destroyed = self.segment_mgr.is_destruction_in_progress();
+            let after = Self::settled_generation(&self.segment_mgr);
+            if !destroyed && before == after {
                 return Ok(collected);
             }
+            self.wait_out_destruction();
         }
     }
 
@@ -372,9 +414,18 @@ impl SegmentedTable {
     /// move; a seal that starts once the view is taken leaves the read alone
     fn across_seals<T>(&self, mut read: impl FnMut(u64) -> Result<Option<T>>) -> Result<T> {
         loop {
-            if let Some(out) = read(Self::settled_generation(&self.segment_mgr))? {
-                return Ok(out);
+            let begun = self.segment_mgr.destructions_begun();
+            let generation = Self::settled_generation(&self.segment_mgr);
+            if self.segment_mgr.is_destruction_in_progress() {
+                self.wait_out_destruction();
+                continue;
             }
+            if let Some(out) = read(generation)? {
+                if !self.destruction_since(begun) {
+                    return Ok(out);
+                }
+            }
+            self.wait_out_destruction();
         }
     }
 
@@ -3164,6 +3215,8 @@ impl Table for SegmentedTable {
         // The hot rows leave after the segment set is cleared, and a reader
         // that starts in between must not be answered: mark the whole interval
         let _destruction = self.segment_mgr.begin_destruction();
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::truncate_marked();
         let seg_rows = self.segment_mgr.total_row_count() as i32;
         let (segment_mgr, txn_id) = (&self.segment_mgr, self.txn_id());
         // The volumes go only once no other transaction's claim refuses the
@@ -3171,6 +3224,8 @@ impl Table for SegmentedTable {
         let hot_rows = self.hot.truncate_after_check(&mut || {
             segment_mgr.rollback_pending_tombstones(txn_id);
             segment_mgr.clear();
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::truncate_cold_cleared();
         })?;
         Ok(hot_rows + seg_rows)
     }
@@ -3325,6 +3380,8 @@ impl Table for SegmentedTable {
     ) -> Result<()> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.fetch_rows_by_ids_into");
+        // Taken before the hot-only attempt, so a refused one's rows go too
+        let start = buffer.len();
         if let Some(result) =
             self.unsealed(|hot| hot.fetch_rows_by_ids_into(row_ids, filter, buffer))
         {
@@ -3332,7 +3389,6 @@ impl Table for SegmentedTable {
         }
 
         let schema = self.hot.schema();
-        let start = buffer.len();
         // An id decided hot before a seal and read after it finds nothing,
         // so the read is settled: a seal landing across it starts it over
         self.settled_across_seals(|| {
@@ -3807,11 +3863,15 @@ impl Table for SegmentedTable {
         // may be off by a few rows during the brief overlap window, but
         // this avoids an O(total_rows) HashSet collection that made ALL
         // queries slow during checkpoint.
-        let _seal_guard = self.segment_mgr.acquire_seal_read();
-        let seg = self.segment_mgr.deduped_row_count()?;
-        let pending = self.segment_mgr.pending_tombstone_count(self.txn_id());
-        let overlap = self.segment_mgr.seal_overlap();
-        Ok(seg.saturating_sub(pending) + self.hot.row_count()?.saturating_sub(overlap))
+        self.clear_of_destruction(|| {
+            let _seal_guard = self.segment_mgr.acquire_seal_read();
+            let seg = self.segment_mgr.deduped_row_count()?;
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::hot_and_cold_reads_split();
+            let pending = self.segment_mgr.pending_tombstone_count(self.txn_id());
+            let overlap = self.segment_mgr.seal_overlap();
+            Ok(seg.saturating_sub(pending) + self.hot.row_count()?.saturating_sub(overlap))
+        })
     }
 
     fn row_count_hint(&self) -> usize {
@@ -3828,19 +3888,23 @@ impl Table for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return Ok(None);
         }
-        let _seal_guard = self.segment_mgr.acquire_seal_read();
-        let Some(hot_count) = self.hot.fast_row_count()? else {
-            return Ok(None);
-        };
-        let seg = self.segment_mgr.deduped_row_count()?;
-        let pending = self.segment_mgr.pending_tombstone_count(self.txn_id());
-        let overlap = self.segment_mgr.seal_overlap();
-        // During seal, rows temporarily exist in both hot and cold.
-        // Subtract overlap to avoid double-counting. May drift by a few rows
-        // during the brief window, but O(1) vs O(N) is worth it.
-        Ok(Some(
-            seg.saturating_sub(pending) + hot_count.saturating_sub(overlap),
-        ))
+        self.clear_of_destruction(|| {
+            let _seal_guard = self.segment_mgr.acquire_seal_read();
+            let Some(hot_count) = self.hot.fast_row_count()? else {
+                return Ok(None);
+            };
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::hot_and_cold_reads_split();
+            let seg = self.segment_mgr.deduped_row_count()?;
+            let pending = self.segment_mgr.pending_tombstone_count(self.txn_id());
+            let overlap = self.segment_mgr.seal_overlap();
+            // During seal, rows temporarily exist in both hot and cold.
+            // Subtract overlap to avoid double-counting. May drift by a few rows
+            // during the brief window, but O(1) vs O(N) is worth it.
+            Ok(Some(
+                seg.saturating_sub(pending) + hot_count.saturating_sub(overlap),
+            ))
+        })
     }
 
     // =========================================================================
@@ -3855,65 +3919,117 @@ impl Table for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return Ok(None);
         }
-        let _seal_guard = self.segment_mgr.acquire_seal_read();
-        let hot_result = self.hot.sum_column(col_idx)?;
+        self.clear_of_destruction(|| {
+            let _seal_guard = self.segment_mgr.acquire_seal_read();
+            let hot_result = self.hot.sum_column(col_idx)?;
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::hot_and_cold_reads_split();
 
-        if !self.segment_mgr.has_segments() {
-            return Ok(hot_result);
-        }
+            if !self.segment_mgr.has_segments() {
+                return Ok(hot_result);
+            }
 
-        // During seal, hot+cold overlap — can't reliably sum
-        if self.segment_mgr.seal_overlap() > 0 {
-            return Ok(None);
-        }
+            // During seal, hot+cold overlap — can't reliably sum
+            if self.segment_mgr.seal_overlap() > 0 {
+                return Ok(None);
+            }
 
-        let Some((hot_sum, hot_count)) = hot_result else {
-            return Ok(None);
-        };
+            let Some((hot_sum, hot_count)) = hot_result else {
+                return Ok(None);
+            };
 
-        // Pre-compute default contribution for schema-evolved volumes
-        // that are missing this column (added via ALTER TABLE ADD COLUMN).
-        let default_val = self.column_default(col_idx);
-        let default_f64 = match &default_val {
-            Value::Integer(v) => Some(*v as f64),
-            Value::Float(v) => Some(*v),
-            // A boolean counts as one or nought, as SUM reads it
-            Value::Boolean(b) => Some(*b as i64 as f64),
-            _ => None, // NULL or non-numeric default → no contribution
-        };
+            // Pre-compute default contribution for schema-evolved volumes
+            // that are missing this column (added via ALTER TABLE ADD COLUMN).
+            let default_val = self.column_default(col_idx);
+            let default_f64 = match &default_val {
+                Value::Integer(v) => Some(*v as f64),
+                Value::Float(v) => Some(*v),
+                // A boolean counts as one or nought, as SUM reads it
+                Value::Boolean(b) => Some(*b as i64 as f64),
+                _ => None, // NULL or non-numeric default → no contribution
+            };
 
-        // Resolve column name for per-volume physical index lookup.
-        let schema = self.hot.schema();
-        // Column resolution uses mapping (handles renames/drops) not col_name.
+            // Resolve column name for per-volume physical index lookup.
+            let schema = self.hot.schema();
+            // Column resolution uses mapping (handles renames/drops) not col_name.
 
-        // Stats fast path is only safe when there are no tombstones AND no
-        // overlapping row_ids between volumes. After UPDATE + seal, tombstones
-        // are cleared but overlap remains (two volumes share the same row_id).
-        // Compare raw vs deduped count to detect this (cached, O(1)).
-        // A boolean column is read by scanning: volumes sealed before
-        // booleans counted as one or nought carry zeros for it in their
-        // stats, and there is no telling them from volumes sealed since
-        let is_boolean_column = schema
-            .columns
-            .get(col_idx)
-            .is_some_and(|c| c.data_type == crate::core::DataType::Boolean);
-        let can_use_stats = !is_boolean_column
-            && self.segment_mgr.is_tombstone_set_empty()
-            && !self.segment_mgr.has_dead_copies()
-            && !self.segment_mgr.has_pending_tombstones(self.txn_id())
-            && self.segment_mgr.total_row_count() == self.segment_mgr.deduped_row_count()?;
+            // Stats fast path is only safe when there are no tombstones AND no
+            // overlapping row_ids between volumes. After UPDATE + seal, tombstones
+            // are cleared but overlap remains (two volumes share the same row_id).
+            // Compare raw vs deduped count to detect this (cached, O(1)).
+            // A boolean column is read by scanning: volumes sealed before
+            // booleans counted as one or nought carry zeros for it in their
+            // stats, and there is no telling them from volumes sealed since
+            let is_boolean_column = schema
+                .columns
+                .get(col_idx)
+                .is_some_and(|c| c.data_type == crate::core::DataType::Boolean);
+            let can_use_stats = !is_boolean_column
+                && self.segment_mgr.is_tombstone_set_empty()
+                && !self.segment_mgr.has_dead_copies()
+                && !self.segment_mgr.has_pending_tombstones(self.txn_id())
+                && self.segment_mgr.total_row_count() == self.segment_mgr.deduped_row_count()?;
 
-        if can_use_stats {
-            // Fast path: use pre-computed volume stats.
-            // Accumulate integer and float parts separately to avoid precision
-            // loss from per-volume i128→f64 conversion. The single final
-            // conversion is exact for sums that fit in 53-bit mantissa.
-            // Use segments_raw (metadata only, no cold volume reload).
-            let segs = self.segment_mgr.segments_raw();
-            let mut cold_sum_int: i128 = 0;
-            let mut cold_sum_float: f64 = 0.0;
+            if can_use_stats {
+                // Fast path: use pre-computed volume stats.
+                // Accumulate integer and float parts separately to avoid precision
+                // loss from per-volume i128→f64 conversion. The single final
+                // conversion is exact for sums that fit in 53-bit mantissa.
+                // Use segments_raw (metadata only, no cold volume reload).
+                let segs = self.segment_mgr.segments_raw();
+                let mut cold_sum_int: i128 = 0;
+                let mut cold_sum_float: f64 = 0.0;
+                let mut total_count = hot_count;
+                for (seg_id, cs) in segs.iter() {
+                    let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
+                    let phys = if col_idx < mapping.sources.len() {
+                        match &mapping.sources[col_idx] {
+                            super::writer::ColSource::Volume(vi) => Some(*vi),
+                            super::writer::ColSource::Default(_) => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(pi) = phys {
+                        if pi < cs.volume.meta.stats.columns.len() {
+                            let (int_part, float_part) =
+                                cs.volume.meta.stats.columns[pi].sum_parts();
+                            cold_sum_int += int_part;
+                            cold_sum_float += float_part;
+                            total_count += cs.volume.meta.stats.columns[pi].numeric_count as usize;
+                        }
+                    } else if let Some(def) = default_f64 {
+                        cold_sum_float += def * cs.volume.meta.row_count as f64;
+                        total_count += cs.volume.meta.row_count;
+                    }
+                }
+                let total_sum = hot_sum + cold_sum_int as f64 + cold_sum_float;
+                self.check_cold()?;
+                return Ok(Some((total_sum, total_count)));
+            }
+
+            // Tombstones exist: scan columnar data with dedup (avoids full Row materialization)
+            let volumes = self.segment_mgr.get_volumes_newest_first()?;
+            let tombstones_arc = self.segment_mgr.tombstone_set_arc();
+            let mut hot_skip: FxHashSet<i64> =
+                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+            self.hot.collect_hot_row_ids_into(&mut hot_skip);
+            self.segment_mgr
+                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+
+            let mut total_sum = hot_sum;
             let mut total_count = hot_count;
-            for (seg_id, cs) in segs.iter() {
+
+            for (seg_id, cs) in volumes.iter() {
+                let vol = &cs.volume;
+                let row_ids = vol.row_ids()?;
+                let Some(start) = (0..vol.meta.row_count).find(|&i| {
+                    cs.is_visible(i)
+                        && !self.is_row_tombstoned(&tombstones_arc, row_ids[i])
+                        && !hot_skip.contains(&row_ids[i])
+                }) else {
+                    continue;
+                };
                 let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
                 let phys = if col_idx < mapping.sources.len() {
                     match &mapping.sources[col_idx] {
@@ -3923,90 +4039,49 @@ impl Table for SegmentedTable {
                 } else {
                     None
                 };
-                if let Some(pi) = phys {
-                    if pi < cs.volume.meta.stats.columns.len() {
-                        let (int_part, float_part) = cs.volume.meta.stats.columns[pi].sum_parts();
-                        cold_sum_int += int_part;
-                        cold_sum_float += float_part;
-                        total_count += cs.volume.meta.stats.columns[pi].numeric_count as usize;
-                    }
-                } else if let Some(def) = default_f64 {
-                    cold_sum_float += def * cs.volume.meta.row_count as f64;
-                    total_count += cs.volume.meta.row_count;
-                }
-            }
-            let total_sum = hot_sum + cold_sum_int as f64 + cold_sum_float;
-            self.check_cold()?;
-            return Ok(Some((total_sum, total_count)));
-        }
-
-        // Tombstones exist: scan columnar data with dedup (avoids full Row materialization)
-        let volumes = self.segment_mgr.get_volumes_newest_first()?;
-        let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-        let mut hot_skip: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-        self.hot.collect_hot_row_ids_into(&mut hot_skip);
-        self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
-
-        let mut total_sum = hot_sum;
-        let mut total_count = hot_count;
-
-        for (seg_id, cs) in volumes.iter() {
-            let vol = &cs.volume;
-            let row_ids = vol.row_ids()?;
-            let Some(start) = (0..vol.meta.row_count).find(|&i| {
-                cs.is_visible(i)
-                    && !self.is_row_tombstoned(&tombstones_arc, row_ids[i])
-                    && !hot_skip.contains(&row_ids[i])
-            }) else {
-                continue;
-            };
-            let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
-            let phys = if col_idx < mapping.sources.len() {
-                match &mapping.sources[col_idx] {
-                    super::writer::ColSource::Volume(vi) => Some(*vi),
-                    super::writer::ColSource::Default(_) => None,
-                }
-            } else {
-                None
-            };
-            let column = phys.map(|pi| vol.columns.get(pi)).transpose()?;
-            for i in start..vol.meta.row_count {
-                if !cs.is_visible(i) {
-                    continue;
-                }
-                let rid = row_ids[i];
-                if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
-                    continue;
-                }
-                if let Some(col) = column {
-                    if col.is_null(i) {
+                let column = phys.map(|pi| vol.columns.get(pi)).transpose()?;
+                for i in start..vol.meta.row_count {
+                    if !cs.is_visible(i) {
                         continue;
                     }
-                    match col {
-                        crate::storage::volume::column::ColumnData::Int64 { values, .. } => {
-                            total_sum += values[i] as f64;
-                            total_count += 1;
-                        }
-                        crate::storage::volume::column::ColumnData::Float64 { values, .. } => {
-                            total_sum += values[i];
-                            total_count += 1;
-                        }
-                        crate::storage::volume::column::ColumnData::Boolean { values, .. } => {
-                            total_sum += if values[i] { 1.0 } else { 0.0 };
-                            total_count += 1;
-                        }
-                        _ => {}
+                    let rid = row_ids[i];
+                    if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
+                        continue;
                     }
-                } else if let Some(def) = default_f64 {
-                    total_sum += def;
-                    total_count += 1;
+                    if let Some(col) = column {
+                        if col.is_null(i) {
+                            continue;
+                        }
+                        match col {
+                            crate::storage::volume::column::ColumnData::Int64 {
+                                values, ..
+                            } => {
+                                total_sum += values[i] as f64;
+                                total_count += 1;
+                            }
+                            crate::storage::volume::column::ColumnData::Float64 {
+                                values, ..
+                            } => {
+                                total_sum += values[i];
+                                total_count += 1;
+                            }
+                            crate::storage::volume::column::ColumnData::Boolean {
+                                values, ..
+                            } => {
+                                total_sum += if values[i] { 1.0 } else { 0.0 };
+                                total_count += 1;
+                            }
+                            _ => {}
+                        }
+                    } else if let Some(def) = default_f64 {
+                        total_sum += def;
+                        total_count += 1;
+                    }
                 }
             }
-        }
-        self.check_cold()?;
-        Ok(Some((total_sum, total_count)))
+            self.check_cold()?;
+            Ok(Some((total_sum, total_count)))
+        })
     }
 
     fn min_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
@@ -4015,36 +4090,109 @@ impl Table for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return Ok(None);
         }
-        let _seal_guard = self.segment_mgr.acquire_seal_read();
-        let hot_result = self.hot.min_column(col_idx)?;
+        self.clear_of_destruction(|| {
+            let _seal_guard = self.segment_mgr.acquire_seal_read();
+            let hot_result = self.hot.min_column(col_idx)?;
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::hot_and_cold_reads_split();
 
-        if !self.segment_mgr.has_segments() {
-            return Ok(hot_result);
-        }
+            if !self.segment_mgr.has_segments() {
+                return Ok(hot_result);
+            }
 
-        if self.segment_mgr.seal_overlap() > 0 {
-            return Ok(None);
-        }
+            if self.segment_mgr.seal_overlap() > 0 {
+                return Ok(None);
+            }
 
-        let Some(hot_min) = hot_result else {
-            return Ok(None);
-        };
+            let Some(hot_min) = hot_result else {
+                return Ok(None);
+            };
 
-        let schema = self.hot.schema();
-        // Column resolution uses mapping (handles renames/drops) not col_name.
-        let default_val = self.column_default(col_idx);
-        let has_non_null_default = !default_val.is_null();
+            let schema = self.hot.schema();
+            // Column resolution uses mapping (handles renames/drops) not col_name.
+            let default_val = self.column_default(col_idx);
+            let has_non_null_default = !default_val.is_null();
 
-        let can_use_stats = self.segment_mgr.is_tombstone_set_empty()
-            && !self.segment_mgr.has_dead_copies()
-            && !self.segment_mgr.has_pending_tombstones(self.txn_id())
-            && self.segment_mgr.total_row_count() == self.segment_mgr.deduped_row_count()?;
+            let can_use_stats = self.segment_mgr.is_tombstone_set_empty()
+                && !self.segment_mgr.has_dead_copies()
+                && !self.segment_mgr.has_pending_tombstones(self.txn_id())
+                && self.segment_mgr.total_row_count() == self.segment_mgr.deduped_row_count()?;
 
-        if can_use_stats {
-            // Fast path: use pre-computed volume stats (zone map min)
-            let segs = self.segment_mgr.segments_raw();
+            if can_use_stats {
+                // Fast path: use pre-computed volume stats (zone map min)
+                let segs = self.segment_mgr.segments_raw();
+                let mut overall_min = hot_min;
+                for (seg_id, cs) in segs.iter() {
+                    let vol = &cs.volume;
+                    let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
+                    let phys = if col_idx < mapping.sources.len() {
+                        match &mapping.sources[col_idx] {
+                            super::writer::ColSource::Volume(vi) => Some(*vi),
+                            super::writer::ColSource::Default(_) => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let vol_min = if let Some(pi) = phys {
+                        if pi < vol.meta.stats.columns.len() {
+                            let m = &vol.meta.stats.columns[pi].min;
+                            if m.is_null() {
+                                None
+                            } else {
+                                Some(m)
+                            }
+                        } else {
+                            None
+                        }
+                    } else if has_non_null_default && vol.meta.row_count > 0 {
+                        Some(&default_val)
+                    } else {
+                        None
+                    };
+                    if let Some(vm) = vol_min {
+                        match &overall_min {
+                            None => overall_min = Some(vm.clone()),
+                            Some(current) => {
+                                if let Ok(std::cmp::Ordering::Less) = vm.compare(current) {
+                                    overall_min = Some(vm.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                self.check_cold()?;
+                return Ok(Some(overall_min));
+            }
+
+            // Zone-map fast path: when there are no tombstones/pending tombstones
+            // but overlap exists (total_row_count != deduped_row_count), the
+            // visibility bitmap correctly deduplicates rows. Zone-map min/max across
+            // all volumes is a lower/upper bound; the actual min visible across all
+            // volumes is >= zone-map-min. We can use zone maps to prune volumes
+            // that cannot contain a better candidate.
+            let no_tombstones = self.segment_mgr.is_tombstone_set_empty()
+                && !self.segment_mgr.has_pending_tombstones(self.txn_id());
+
+            // Scan columnar data with dedup (typed direct access, no Value alloc)
+            let volumes = self.segment_mgr.get_volumes_newest_first()?;
+            let tombstones_arc = if no_tombstones {
+                None
+            } else {
+                Some(self.segment_mgr.tombstone_set_arc())
+            };
+            let mut hot_skip: FxHashSet<i64> =
+                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+            self.hot.collect_hot_row_ids_into(&mut hot_skip);
+            if !no_tombstones {
+                self.segment_mgr
+                    .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+            }
+
+            let empty_tombstones: FxHashMap<i64, u64> = FxHashMap::default();
+            let tombstones_ref = tombstones_arc.as_deref().unwrap_or(&empty_tombstones);
+
             let mut overall_min = hot_min;
-            for (seg_id, cs) in segs.iter() {
+            for (seg_id, cs) in volumes.iter() {
                 let vol = &cs.volume;
                 let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
                 let phys = if col_idx < mapping.sources.len() {
@@ -4055,271 +4203,202 @@ impl Table for SegmentedTable {
                 } else {
                     None
                 };
-                let vol_min = if let Some(pi) = phys {
-                    if pi < vol.meta.stats.columns.len() {
-                        let m = &vol.meta.stats.columns[pi].min;
-                        if m.is_null() {
-                            None
-                        } else {
-                            Some(m)
+
+                // Zone-map pruning: skip this volume if its min cannot beat current best
+                if let Some(ref current_best) = overall_min {
+                    if let Some(pi) = phys {
+                        if pi < vol.meta.zone_maps.len() {
+                            let zm = &vol.meta.zone_maps[pi];
+                            if !zm.min.is_null() {
+                                if let Ok(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal) =
+                                    zm.min.compare(current_best)
+                                {
+                                    // Volume's min >= current best: no row in this volume
+                                    // can improve the result. If column is missing (phys=None)
+                                    // we still need to check default below.
+                                    continue;
+                                }
+                            }
                         }
-                    } else {
-                        None
                     }
-                } else if has_non_null_default && vol.meta.row_count > 0 {
-                    Some(&default_val)
-                } else {
-                    None
-                };
-                if let Some(vm) = vol_min {
-                    match &overall_min {
-                        None => overall_min = Some(vm.clone()),
-                        Some(current) => {
-                            if let Ok(std::cmp::Ordering::Less) = vm.compare(current) {
-                                overall_min = Some(vm.clone());
+                }
+
+                let row_ids = vol.row_ids()?;
+                // Typed direct scan: compare on primitive types to avoid Value alloc
+                if let Some(pi) = phys {
+                    let col = vol.columns.get(pi)?;
+                    match col {
+                        crate::storage::volume::column::ColumnData::Int64 { values, nulls } => {
+                            let mut best_i64 = match &overall_min {
+                                Some(Value::Integer(v)) => Some(*v),
+                                None => None,
+                                _ => {
+                                    // Type mismatch: fall through to generic path
+                                    self.min_column_scan_generic(
+                                        row_ids,
+                                        cs,
+                                        col,
+                                        &mut overall_min,
+                                        tombstones_ref,
+                                        &hot_skip,
+                                        no_tombstones,
+                                    );
+                                    continue;
+                                }
+                            };
+                            for i in 0..vol.meta.row_count {
+                                if nulls[i] || !cs.is_visible(i) {
+                                    continue;
+                                }
+                                let rid = row_ids[i];
+                                if hot_skip.contains(&rid) {
+                                    continue;
+                                }
+                                if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
+                                    continue;
+                                }
+                                let v = values[i];
+                                if best_i64.is_none() || v < best_i64.unwrap_or(i64::MAX) {
+                                    best_i64 = Some(v);
+                                }
+                            }
+                            if let Some(v) = best_i64 {
+                                overall_min = Some(Value::Integer(v));
+                            }
+                        }
+                        crate::storage::volume::column::ColumnData::Float64 { values, nulls } => {
+                            let mut best_f64 = match &overall_min {
+                                Some(Value::Float(v)) => Some(*v),
+                                None => None,
+                                _ => {
+                                    self.min_column_scan_generic(
+                                        row_ids,
+                                        cs,
+                                        col,
+                                        &mut overall_min,
+                                        tombstones_ref,
+                                        &hot_skip,
+                                        no_tombstones,
+                                    );
+                                    continue;
+                                }
+                            };
+                            for i in 0..vol.meta.row_count {
+                                if nulls[i] || !cs.is_visible(i) {
+                                    continue;
+                                }
+                                let rid = row_ids[i];
+                                if hot_skip.contains(&rid) {
+                                    continue;
+                                }
+                                if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
+                                    continue;
+                                }
+                                let v = values[i];
+                                // Skip NaN: engine ordering contract treats NaN as > all finite
+                                if v.is_nan() {
+                                    continue;
+                                }
+                                if best_f64.is_none() || v < best_f64.unwrap_or(f64::INFINITY) {
+                                    best_f64 = Some(v);
+                                }
+                            }
+                            if let Some(v) = best_f64 {
+                                overall_min = Some(Value::Float(v));
+                            }
+                        }
+                        crate::storage::volume::column::ColumnData::TimestampNanos {
+                            values,
+                            nulls,
+                        } => {
+                            let mut best_nanos: Option<i64> = match &overall_min {
+                                Some(Value::Timestamp(dt)) => {
+                                    Some(dt.timestamp_nanos_opt().unwrap_or(i64::MAX))
+                                }
+                                None => None,
+                                _ => {
+                                    self.min_column_scan_generic(
+                                        row_ids,
+                                        cs,
+                                        col,
+                                        &mut overall_min,
+                                        tombstones_ref,
+                                        &hot_skip,
+                                        no_tombstones,
+                                    );
+                                    continue;
+                                }
+                            };
+                            for i in 0..vol.meta.row_count {
+                                if nulls[i] || !cs.is_visible(i) {
+                                    continue;
+                                }
+                                let rid = row_ids[i];
+                                if hot_skip.contains(&rid) {
+                                    continue;
+                                }
+                                if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
+                                    continue;
+                                }
+                                let v = values[i];
+                                if best_nanos.is_none() || v < best_nanos.unwrap_or(i64::MAX) {
+                                    best_nanos = Some(v);
+                                }
+                            }
+                            if let Some(nanos) = best_nanos {
+                                let secs = nanos.div_euclid(1_000_000_000);
+                                let sub_nanos = nanos.rem_euclid(1_000_000_000) as u32;
+                                if let chrono::LocalResult::Single(dt) =
+                                    chrono::TimeZone::timestamp_opt(&chrono::Utc, secs, sub_nanos)
+                                {
+                                    overall_min = Some(Value::Timestamp(dt));
+                                }
+                            }
+                        }
+                        _ => {
+                            // Dictionary, Boolean, Bytes: use generic get_value path
+                            self.min_column_scan_generic(
+                                row_ids,
+                                cs,
+                                col,
+                                &mut overall_min,
+                                tombstones_ref,
+                                &hot_skip,
+                                no_tombstones,
+                            );
+                        }
+                    }
+                } else if has_non_null_default {
+                    // Column missing from this volume (ALTER TABLE ADD COLUMN):
+                    // every visible row has the default value
+                    let has_visible = (0..vol.meta.row_count).any(|i| {
+                        if !cs.is_visible(i) {
+                            return false;
+                        }
+                        let rid = row_ids[i];
+                        if hot_skip.contains(&rid) {
+                            return false;
+                        }
+                        if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
+                            return false;
+                        }
+                        true
+                    });
+                    if has_visible {
+                        match &overall_min {
+                            None => overall_min = Some(default_val.clone()),
+                            Some(current) => {
+                                if let Ok(std::cmp::Ordering::Less) = default_val.compare(current) {
+                                    overall_min = Some(default_val.clone());
+                                }
                             }
                         }
                     }
                 }
             }
             self.check_cold()?;
-            return Ok(Some(overall_min));
-        }
-
-        // Zone-map fast path: when there are no tombstones/pending tombstones
-        // but overlap exists (total_row_count != deduped_row_count), the
-        // visibility bitmap correctly deduplicates rows. Zone-map min/max across
-        // all volumes is a lower/upper bound; the actual min visible across all
-        // volumes is >= zone-map-min. We can use zone maps to prune volumes
-        // that cannot contain a better candidate.
-        let no_tombstones = self.segment_mgr.is_tombstone_set_empty()
-            && !self.segment_mgr.has_pending_tombstones(self.txn_id());
-
-        // Scan columnar data with dedup (typed direct access, no Value alloc)
-        let volumes = self.segment_mgr.get_volumes_newest_first()?;
-        let tombstones_arc = if no_tombstones {
-            None
-        } else {
-            Some(self.segment_mgr.tombstone_set_arc())
-        };
-        let mut hot_skip: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-        self.hot.collect_hot_row_ids_into(&mut hot_skip);
-        if !no_tombstones {
-            self.segment_mgr
-                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
-        }
-
-        let empty_tombstones: FxHashMap<i64, u64> = FxHashMap::default();
-        let tombstones_ref = tombstones_arc.as_deref().unwrap_or(&empty_tombstones);
-
-        let mut overall_min = hot_min;
-        for (seg_id, cs) in volumes.iter() {
-            let vol = &cs.volume;
-            let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
-            let phys = if col_idx < mapping.sources.len() {
-                match &mapping.sources[col_idx] {
-                    super::writer::ColSource::Volume(vi) => Some(*vi),
-                    super::writer::ColSource::Default(_) => None,
-                }
-            } else {
-                None
-            };
-
-            // Zone-map pruning: skip this volume if its min cannot beat current best
-            if let Some(ref current_best) = overall_min {
-                if let Some(pi) = phys {
-                    if pi < vol.meta.zone_maps.len() {
-                        let zm = &vol.meta.zone_maps[pi];
-                        if !zm.min.is_null() {
-                            if let Ok(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal) =
-                                zm.min.compare(current_best)
-                            {
-                                // Volume's min >= current best: no row in this volume
-                                // can improve the result. If column is missing (phys=None)
-                                // we still need to check default below.
-                                continue;
-                            }
-                        }
-                    }
-                }
-            }
-
-            let row_ids = vol.row_ids()?;
-            // Typed direct scan: compare on primitive types to avoid Value alloc
-            if let Some(pi) = phys {
-                let col = vol.columns.get(pi)?;
-                match col {
-                    crate::storage::volume::column::ColumnData::Int64 { values, nulls } => {
-                        let mut best_i64 = match &overall_min {
-                            Some(Value::Integer(v)) => Some(*v),
-                            None => None,
-                            _ => {
-                                // Type mismatch: fall through to generic path
-                                self.min_column_scan_generic(
-                                    row_ids,
-                                    cs,
-                                    col,
-                                    &mut overall_min,
-                                    tombstones_ref,
-                                    &hot_skip,
-                                    no_tombstones,
-                                );
-                                continue;
-                            }
-                        };
-                        for i in 0..vol.meta.row_count {
-                            if nulls[i] || !cs.is_visible(i) {
-                                continue;
-                            }
-                            let rid = row_ids[i];
-                            if hot_skip.contains(&rid) {
-                                continue;
-                            }
-                            if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
-                                continue;
-                            }
-                            let v = values[i];
-                            if best_i64.is_none() || v < best_i64.unwrap_or(i64::MAX) {
-                                best_i64 = Some(v);
-                            }
-                        }
-                        if let Some(v) = best_i64 {
-                            overall_min = Some(Value::Integer(v));
-                        }
-                    }
-                    crate::storage::volume::column::ColumnData::Float64 { values, nulls } => {
-                        let mut best_f64 = match &overall_min {
-                            Some(Value::Float(v)) => Some(*v),
-                            None => None,
-                            _ => {
-                                self.min_column_scan_generic(
-                                    row_ids,
-                                    cs,
-                                    col,
-                                    &mut overall_min,
-                                    tombstones_ref,
-                                    &hot_skip,
-                                    no_tombstones,
-                                );
-                                continue;
-                            }
-                        };
-                        for i in 0..vol.meta.row_count {
-                            if nulls[i] || !cs.is_visible(i) {
-                                continue;
-                            }
-                            let rid = row_ids[i];
-                            if hot_skip.contains(&rid) {
-                                continue;
-                            }
-                            if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
-                                continue;
-                            }
-                            let v = values[i];
-                            // Skip NaN: engine ordering contract treats NaN as > all finite
-                            if v.is_nan() {
-                                continue;
-                            }
-                            if best_f64.is_none() || v < best_f64.unwrap_or(f64::INFINITY) {
-                                best_f64 = Some(v);
-                            }
-                        }
-                        if let Some(v) = best_f64 {
-                            overall_min = Some(Value::Float(v));
-                        }
-                    }
-                    crate::storage::volume::column::ColumnData::TimestampNanos {
-                        values,
-                        nulls,
-                    } => {
-                        let mut best_nanos: Option<i64> = match &overall_min {
-                            Some(Value::Timestamp(dt)) => {
-                                Some(dt.timestamp_nanos_opt().unwrap_or(i64::MAX))
-                            }
-                            None => None,
-                            _ => {
-                                self.min_column_scan_generic(
-                                    row_ids,
-                                    cs,
-                                    col,
-                                    &mut overall_min,
-                                    tombstones_ref,
-                                    &hot_skip,
-                                    no_tombstones,
-                                );
-                                continue;
-                            }
-                        };
-                        for i in 0..vol.meta.row_count {
-                            if nulls[i] || !cs.is_visible(i) {
-                                continue;
-                            }
-                            let rid = row_ids[i];
-                            if hot_skip.contains(&rid) {
-                                continue;
-                            }
-                            if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
-                                continue;
-                            }
-                            let v = values[i];
-                            if best_nanos.is_none() || v < best_nanos.unwrap_or(i64::MAX) {
-                                best_nanos = Some(v);
-                            }
-                        }
-                        if let Some(nanos) = best_nanos {
-                            let secs = nanos.div_euclid(1_000_000_000);
-                            let sub_nanos = nanos.rem_euclid(1_000_000_000) as u32;
-                            if let chrono::LocalResult::Single(dt) =
-                                chrono::TimeZone::timestamp_opt(&chrono::Utc, secs, sub_nanos)
-                            {
-                                overall_min = Some(Value::Timestamp(dt));
-                            }
-                        }
-                    }
-                    _ => {
-                        // Dictionary, Boolean, Bytes: use generic get_value path
-                        self.min_column_scan_generic(
-                            row_ids,
-                            cs,
-                            col,
-                            &mut overall_min,
-                            tombstones_ref,
-                            &hot_skip,
-                            no_tombstones,
-                        );
-                    }
-                }
-            } else if has_non_null_default {
-                // Column missing from this volume (ALTER TABLE ADD COLUMN):
-                // every visible row has the default value
-                let has_visible = (0..vol.meta.row_count).any(|i| {
-                    if !cs.is_visible(i) {
-                        return false;
-                    }
-                    let rid = row_ids[i];
-                    if hot_skip.contains(&rid) {
-                        return false;
-                    }
-                    if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
-                        return false;
-                    }
-                    true
-                });
-                if has_visible {
-                    match &overall_min {
-                        None => overall_min = Some(default_val.clone()),
-                        Some(current) => {
-                            if let Ok(std::cmp::Ordering::Less) = default_val.compare(current) {
-                                overall_min = Some(default_val.clone());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        self.check_cold()?;
-        Ok(Some(overall_min))
+            Ok(Some(overall_min))
+        })
     }
 
     fn max_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
@@ -4328,37 +4407,104 @@ impl Table for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return Ok(None);
         }
-        let _seal_guard = self.segment_mgr.acquire_seal_read();
-        let hot_result = self.hot.max_column(col_idx)?;
+        self.clear_of_destruction(|| {
+            let _seal_guard = self.segment_mgr.acquire_seal_read();
+            let hot_result = self.hot.max_column(col_idx)?;
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::hot_and_cold_reads_split();
 
-        if !self.segment_mgr.has_segments() {
-            return Ok(hot_result);
-        }
+            if !self.segment_mgr.has_segments() {
+                return Ok(hot_result);
+            }
 
-        if self.segment_mgr.seal_overlap() > 0 {
-            return Ok(None);
-        }
+            if self.segment_mgr.seal_overlap() > 0 {
+                return Ok(None);
+            }
 
-        let Some(hot_max) = hot_result else {
-            return Ok(None);
-        };
+            let Some(hot_max) = hot_result else {
+                return Ok(None);
+            };
 
-        let schema = self.hot.schema();
-        // Column resolution uses mapping (handles renames/drops) not col_name.
-        let default_val = self.column_default(col_idx);
-        let has_non_null_default = !default_val.is_null();
+            let schema = self.hot.schema();
+            // Column resolution uses mapping (handles renames/drops) not col_name.
+            let default_val = self.column_default(col_idx);
+            let has_non_null_default = !default_val.is_null();
 
-        let can_use_stats = self.segment_mgr.is_tombstone_set_empty()
-            && !self.segment_mgr.has_dead_copies()
-            && !self.segment_mgr.has_pending_tombstones(self.txn_id())
-            && self.segment_mgr.total_row_count() == self.segment_mgr.deduped_row_count()?;
+            let can_use_stats = self.segment_mgr.is_tombstone_set_empty()
+                && !self.segment_mgr.has_dead_copies()
+                && !self.segment_mgr.has_pending_tombstones(self.txn_id())
+                && self.segment_mgr.total_row_count() == self.segment_mgr.deduped_row_count()?;
 
-        if can_use_stats {
-            // Fast path: use pre-computed volume stats (zone map max)
-            // Use segments_raw (metadata only, no cold volume reload).
-            let segs = self.segment_mgr.segments_raw();
+            if can_use_stats {
+                // Fast path: use pre-computed volume stats (zone map max)
+                // Use segments_raw (metadata only, no cold volume reload).
+                let segs = self.segment_mgr.segments_raw();
+                let mut overall_max = hot_max;
+                for (seg_id, cs) in segs.iter() {
+                    let vol = &cs.volume;
+                    let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
+                    let phys = if col_idx < mapping.sources.len() {
+                        match &mapping.sources[col_idx] {
+                            super::writer::ColSource::Volume(vi) => Some(*vi),
+                            super::writer::ColSource::Default(_) => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let vol_max = if let Some(pi) = phys {
+                        if pi < vol.meta.stats.columns.len() {
+                            let m = &vol.meta.stats.columns[pi].max;
+                            if m.is_null() {
+                                None
+                            } else {
+                                Some(m)
+                            }
+                        } else {
+                            None
+                        }
+                    } else if has_non_null_default && vol.meta.row_count > 0 {
+                        Some(&default_val)
+                    } else {
+                        None
+                    };
+                    if let Some(vm) = vol_max {
+                        match &overall_max {
+                            None => overall_max = Some(vm.clone()),
+                            Some(current) => {
+                                if let Ok(std::cmp::Ordering::Greater) = vm.compare(current) {
+                                    overall_max = Some(vm.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                self.check_cold()?;
+                return Ok(Some(overall_max));
+            }
+
+            // See min_column: same zone-map + typed scan strategy for MAX.
+            let no_tombstones = self.segment_mgr.is_tombstone_set_empty()
+                && !self.segment_mgr.has_pending_tombstones(self.txn_id());
+
+            let volumes = self.segment_mgr.get_volumes_newest_first()?;
+            let tombstones_arc = if no_tombstones {
+                None
+            } else {
+                Some(self.segment_mgr.tombstone_set_arc())
+            };
+            let mut hot_skip: FxHashSet<i64> =
+                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+            self.hot.collect_hot_row_ids_into(&mut hot_skip);
+            if !no_tombstones {
+                self.segment_mgr
+                    .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+            }
+
+            let empty_tombstones: FxHashMap<i64, u64> = FxHashMap::default();
+            let tombstones_ref = tombstones_arc.as_deref().unwrap_or(&empty_tombstones);
+
             let mut overall_max = hot_max;
-            for (seg_id, cs) in segs.iter() {
+            for (seg_id, cs) in volumes.iter() {
                 let vol = &cs.volume;
                 let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
                 let phys = if col_idx < mapping.sources.len() {
@@ -4369,260 +4515,199 @@ impl Table for SegmentedTable {
                 } else {
                     None
                 };
-                let vol_max = if let Some(pi) = phys {
-                    if pi < vol.meta.stats.columns.len() {
-                        let m = &vol.meta.stats.columns[pi].max;
-                        if m.is_null() {
-                            None
-                        } else {
-                            Some(m)
+
+                // Zone-map pruning: skip this volume if its max cannot beat current best
+                if let Some(ref current_best) = overall_max {
+                    if let Some(pi) = phys {
+                        if pi < vol.meta.zone_maps.len() {
+                            let zm = &vol.meta.zone_maps[pi];
+                            if !zm.max.is_null() {
+                                if let Ok(std::cmp::Ordering::Less | std::cmp::Ordering::Equal) =
+                                    zm.max.compare(current_best)
+                                {
+                                    // Volume's max <= current best: no row can improve result
+                                    continue;
+                                }
+                            }
                         }
-                    } else {
-                        None
                     }
-                } else if has_non_null_default && vol.meta.row_count > 0 {
-                    Some(&default_val)
-                } else {
-                    None
-                };
-                if let Some(vm) = vol_max {
-                    match &overall_max {
-                        None => overall_max = Some(vm.clone()),
-                        Some(current) => {
-                            if let Ok(std::cmp::Ordering::Greater) = vm.compare(current) {
-                                overall_max = Some(vm.clone());
+                }
+
+                let row_ids = vol.row_ids()?;
+                // Typed direct scan: compare on primitive types to avoid Value alloc
+                if let Some(pi) = phys {
+                    let col = vol.columns.get(pi)?;
+                    match col {
+                        crate::storage::volume::column::ColumnData::Int64 { values, nulls } => {
+                            let mut best_i64 = match &overall_max {
+                                Some(Value::Integer(v)) => Some(*v),
+                                None => None,
+                                _ => {
+                                    self.max_column_scan_generic(
+                                        row_ids,
+                                        cs,
+                                        col,
+                                        &mut overall_max,
+                                        tombstones_ref,
+                                        &hot_skip,
+                                        no_tombstones,
+                                    );
+                                    continue;
+                                }
+                            };
+                            for i in 0..vol.meta.row_count {
+                                if nulls[i] || !cs.is_visible(i) {
+                                    continue;
+                                }
+                                let rid = row_ids[i];
+                                if hot_skip.contains(&rid) {
+                                    continue;
+                                }
+                                if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
+                                    continue;
+                                }
+                                let v = values[i];
+                                if best_i64.is_none() || v > best_i64.unwrap_or(i64::MIN) {
+                                    best_i64 = Some(v);
+                                }
+                            }
+                            if let Some(v) = best_i64 {
+                                overall_max = Some(Value::Integer(v));
+                            }
+                        }
+                        crate::storage::volume::column::ColumnData::Float64 { values, nulls } => {
+                            let mut best_f64 = match &overall_max {
+                                Some(Value::Float(v)) => Some(*v),
+                                None => None,
+                                _ => {
+                                    self.max_column_scan_generic(
+                                        row_ids,
+                                        cs,
+                                        col,
+                                        &mut overall_max,
+                                        tombstones_ref,
+                                        &hot_skip,
+                                        no_tombstones,
+                                    );
+                                    continue;
+                                }
+                            };
+                            for i in 0..vol.meta.row_count {
+                                if nulls[i] || !cs.is_visible(i) {
+                                    continue;
+                                }
+                                let rid = row_ids[i];
+                                if hot_skip.contains(&rid) {
+                                    continue;
+                                }
+                                if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
+                                    continue;
+                                }
+                                let v = values[i];
+                                // Skip NaN: engine ordering contract treats NaN as > all finite
+                                if v.is_nan() {
+                                    continue;
+                                }
+                                if best_f64.is_none() || v > best_f64.unwrap_or(f64::NEG_INFINITY) {
+                                    best_f64 = Some(v);
+                                }
+                            }
+                            if let Some(v) = best_f64 {
+                                overall_max = Some(Value::Float(v));
+                            }
+                        }
+                        crate::storage::volume::column::ColumnData::TimestampNanos {
+                            values,
+                            nulls,
+                        } => {
+                            let mut best_nanos: Option<i64> = match &overall_max {
+                                Some(Value::Timestamp(dt)) => {
+                                    Some(dt.timestamp_nanos_opt().unwrap_or(i64::MIN))
+                                }
+                                None => None,
+                                _ => {
+                                    self.max_column_scan_generic(
+                                        row_ids,
+                                        cs,
+                                        col,
+                                        &mut overall_max,
+                                        tombstones_ref,
+                                        &hot_skip,
+                                        no_tombstones,
+                                    );
+                                    continue;
+                                }
+                            };
+                            for i in 0..vol.meta.row_count {
+                                if nulls[i] || !cs.is_visible(i) {
+                                    continue;
+                                }
+                                let rid = row_ids[i];
+                                if hot_skip.contains(&rid) {
+                                    continue;
+                                }
+                                if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
+                                    continue;
+                                }
+                                let v = values[i];
+                                if best_nanos.is_none() || v > best_nanos.unwrap_or(i64::MIN) {
+                                    best_nanos = Some(v);
+                                }
+                            }
+                            if let Some(nanos) = best_nanos {
+                                let secs = nanos.div_euclid(1_000_000_000);
+                                let sub_nanos = nanos.rem_euclid(1_000_000_000) as u32;
+                                if let chrono::LocalResult::Single(dt) =
+                                    chrono::TimeZone::timestamp_opt(&chrono::Utc, secs, sub_nanos)
+                                {
+                                    overall_max = Some(Value::Timestamp(dt));
+                                }
+                            }
+                        }
+                        _ => {
+                            // Dictionary, Boolean, Bytes: use generic get_value path
+                            self.max_column_scan_generic(
+                                row_ids,
+                                cs,
+                                col,
+                                &mut overall_max,
+                                tombstones_ref,
+                                &hot_skip,
+                                no_tombstones,
+                            );
+                        }
+                    }
+                } else if has_non_null_default {
+                    let has_visible = (0..vol.meta.row_count).any(|i| {
+                        if !cs.is_visible(i) {
+                            return false;
+                        }
+                        let rid = row_ids[i];
+                        if hot_skip.contains(&rid) {
+                            return false;
+                        }
+                        if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
+                            return false;
+                        }
+                        true
+                    });
+                    if has_visible {
+                        match &overall_max {
+                            None => overall_max = Some(default_val.clone()),
+                            Some(current) => {
+                                if let Ok(std::cmp::Ordering::Greater) =
+                                    default_val.compare(current)
+                                {
+                                    overall_max = Some(default_val.clone());
+                                }
                             }
                         }
                     }
                 }
             }
             self.check_cold()?;
-            return Ok(Some(overall_max));
-        }
-
-        // See min_column: same zone-map + typed scan strategy for MAX.
-        let no_tombstones = self.segment_mgr.is_tombstone_set_empty()
-            && !self.segment_mgr.has_pending_tombstones(self.txn_id());
-
-        let volumes = self.segment_mgr.get_volumes_newest_first()?;
-        let tombstones_arc = if no_tombstones {
-            None
-        } else {
-            Some(self.segment_mgr.tombstone_set_arc())
-        };
-        let mut hot_skip: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-        self.hot.collect_hot_row_ids_into(&mut hot_skip);
-        if !no_tombstones {
-            self.segment_mgr
-                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
-        }
-
-        let empty_tombstones: FxHashMap<i64, u64> = FxHashMap::default();
-        let tombstones_ref = tombstones_arc.as_deref().unwrap_or(&empty_tombstones);
-
-        let mut overall_max = hot_max;
-        for (seg_id, cs) in volumes.iter() {
-            let vol = &cs.volume;
-            let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
-            let phys = if col_idx < mapping.sources.len() {
-                match &mapping.sources[col_idx] {
-                    super::writer::ColSource::Volume(vi) => Some(*vi),
-                    super::writer::ColSource::Default(_) => None,
-                }
-            } else {
-                None
-            };
-
-            // Zone-map pruning: skip this volume if its max cannot beat current best
-            if let Some(ref current_best) = overall_max {
-                if let Some(pi) = phys {
-                    if pi < vol.meta.zone_maps.len() {
-                        let zm = &vol.meta.zone_maps[pi];
-                        if !zm.max.is_null() {
-                            if let Ok(std::cmp::Ordering::Less | std::cmp::Ordering::Equal) =
-                                zm.max.compare(current_best)
-                            {
-                                // Volume's max <= current best: no row can improve result
-                                continue;
-                            }
-                        }
-                    }
-                }
-            }
-
-            let row_ids = vol.row_ids()?;
-            // Typed direct scan: compare on primitive types to avoid Value alloc
-            if let Some(pi) = phys {
-                let col = vol.columns.get(pi)?;
-                match col {
-                    crate::storage::volume::column::ColumnData::Int64 { values, nulls } => {
-                        let mut best_i64 = match &overall_max {
-                            Some(Value::Integer(v)) => Some(*v),
-                            None => None,
-                            _ => {
-                                self.max_column_scan_generic(
-                                    row_ids,
-                                    cs,
-                                    col,
-                                    &mut overall_max,
-                                    tombstones_ref,
-                                    &hot_skip,
-                                    no_tombstones,
-                                );
-                                continue;
-                            }
-                        };
-                        for i in 0..vol.meta.row_count {
-                            if nulls[i] || !cs.is_visible(i) {
-                                continue;
-                            }
-                            let rid = row_ids[i];
-                            if hot_skip.contains(&rid) {
-                                continue;
-                            }
-                            if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
-                                continue;
-                            }
-                            let v = values[i];
-                            if best_i64.is_none() || v > best_i64.unwrap_or(i64::MIN) {
-                                best_i64 = Some(v);
-                            }
-                        }
-                        if let Some(v) = best_i64 {
-                            overall_max = Some(Value::Integer(v));
-                        }
-                    }
-                    crate::storage::volume::column::ColumnData::Float64 { values, nulls } => {
-                        let mut best_f64 = match &overall_max {
-                            Some(Value::Float(v)) => Some(*v),
-                            None => None,
-                            _ => {
-                                self.max_column_scan_generic(
-                                    row_ids,
-                                    cs,
-                                    col,
-                                    &mut overall_max,
-                                    tombstones_ref,
-                                    &hot_skip,
-                                    no_tombstones,
-                                );
-                                continue;
-                            }
-                        };
-                        for i in 0..vol.meta.row_count {
-                            if nulls[i] || !cs.is_visible(i) {
-                                continue;
-                            }
-                            let rid = row_ids[i];
-                            if hot_skip.contains(&rid) {
-                                continue;
-                            }
-                            if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
-                                continue;
-                            }
-                            let v = values[i];
-                            // Skip NaN: engine ordering contract treats NaN as > all finite
-                            if v.is_nan() {
-                                continue;
-                            }
-                            if best_f64.is_none() || v > best_f64.unwrap_or(f64::NEG_INFINITY) {
-                                best_f64 = Some(v);
-                            }
-                        }
-                        if let Some(v) = best_f64 {
-                            overall_max = Some(Value::Float(v));
-                        }
-                    }
-                    crate::storage::volume::column::ColumnData::TimestampNanos {
-                        values,
-                        nulls,
-                    } => {
-                        let mut best_nanos: Option<i64> = match &overall_max {
-                            Some(Value::Timestamp(dt)) => {
-                                Some(dt.timestamp_nanos_opt().unwrap_or(i64::MIN))
-                            }
-                            None => None,
-                            _ => {
-                                self.max_column_scan_generic(
-                                    row_ids,
-                                    cs,
-                                    col,
-                                    &mut overall_max,
-                                    tombstones_ref,
-                                    &hot_skip,
-                                    no_tombstones,
-                                );
-                                continue;
-                            }
-                        };
-                        for i in 0..vol.meta.row_count {
-                            if nulls[i] || !cs.is_visible(i) {
-                                continue;
-                            }
-                            let rid = row_ids[i];
-                            if hot_skip.contains(&rid) {
-                                continue;
-                            }
-                            if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
-                                continue;
-                            }
-                            let v = values[i];
-                            if best_nanos.is_none() || v > best_nanos.unwrap_or(i64::MIN) {
-                                best_nanos = Some(v);
-                            }
-                        }
-                        if let Some(nanos) = best_nanos {
-                            let secs = nanos.div_euclid(1_000_000_000);
-                            let sub_nanos = nanos.rem_euclid(1_000_000_000) as u32;
-                            if let chrono::LocalResult::Single(dt) =
-                                chrono::TimeZone::timestamp_opt(&chrono::Utc, secs, sub_nanos)
-                            {
-                                overall_max = Some(Value::Timestamp(dt));
-                            }
-                        }
-                    }
-                    _ => {
-                        // Dictionary, Boolean, Bytes: use generic get_value path
-                        self.max_column_scan_generic(
-                            row_ids,
-                            cs,
-                            col,
-                            &mut overall_max,
-                            tombstones_ref,
-                            &hot_skip,
-                            no_tombstones,
-                        );
-                    }
-                }
-            } else if has_non_null_default {
-                let has_visible = (0..vol.meta.row_count).any(|i| {
-                    if !cs.is_visible(i) {
-                        return false;
-                    }
-                    let rid = row_ids[i];
-                    if hot_skip.contains(&rid) {
-                        return false;
-                    }
-                    if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
-                        return false;
-                    }
-                    true
-                });
-                if has_visible {
-                    match &overall_max {
-                        None => overall_max = Some(default_val.clone()),
-                        Some(current) => {
-                            if let Ok(std::cmp::Ordering::Greater) = default_val.compare(current) {
-                                overall_max = Some(default_val.clone());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        self.check_cold()?;
-        Ok(Some(overall_max))
+            Ok(Some(overall_max))
+        })
     }
 
     // =========================================================================
@@ -4633,83 +4718,85 @@ impl Table for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return Ok(None);
         }
-        let _seal_guard = self.segment_mgr.acquire_seal_read();
-        if !self.segment_mgr.has_segments() {
-            return self.hot.get_partition_count(column_name);
-        }
+        self.clear_of_destruction(|| {
+            let _seal_guard = self.segment_mgr.acquire_seal_read();
+            if !self.segment_mgr.has_segments() {
+                return self.hot.get_partition_count(column_name);
+            }
 
-        // During seal, hot+cold overlap — can't reliably count
-        if self.segment_mgr.seal_overlap() > 0 {
-            return Ok(None);
-        }
+            // During seal, hot+cold overlap — can't reliably count
+            if self.segment_mgr.seal_overlap() > 0 {
+                return Ok(None);
+            }
 
-        let schema = self.hot.schema();
-        let Some(&col_idx) = schema.column_index_map().get(&column_name.to_lowercase()) else {
-            return Ok(None);
-        };
-
-        // Collect hot distinct values from index. If no index exists on this
-        // column, bail — we can't enumerate hot values without a full scan.
-        let mut distinct: ValueSet = ValueSet::default();
-        let Some(hot_values) = self.hot.get_partition_values(column_name)? else {
-            return Ok(None);
-        };
-        for v in hot_values {
-            distinct.insert(v);
-        }
-
-        // Build skip set: hot row_ids + tombstones + pending tombstones
-        let volumes = self.segment_mgr.get_volumes_newest_first()?;
-        let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-        let mut hot_skip: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-        self.hot.collect_hot_row_ids_into(&mut hot_skip);
-        self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
-
-        // Scan cold volumes columnar-only (no Row materialization)
-        // Column resolution uses mapping (handles renames/drops) not col_name.
-        let default_val = self.column_default(col_idx);
-        let has_non_null_default = !default_val.is_null();
-        for (seg_id, cs) in volumes.iter() {
-            let vol = &cs.volume;
-            let row_ids = vol.row_ids()?;
-            let Some(start) = (0..vol.meta.row_count).find(|&i| {
-                cs.is_visible(i)
-                    && !self.is_row_tombstoned(&tombstones_arc, row_ids[i])
-                    && !hot_skip.contains(&row_ids[i])
-            }) else {
-                continue;
+            let schema = self.hot.schema();
+            let Some(&col_idx) = schema.column_index_map().get(&column_name.to_lowercase()) else {
+                return Ok(None);
             };
-            let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
-            let phys = if col_idx < mapping.sources.len() {
-                match &mapping.sources[col_idx] {
-                    super::writer::ColSource::Volume(vi) => Some(*vi),
-                    super::writer::ColSource::Default(_) => None,
-                }
-            } else {
-                None
+
+            // Collect hot distinct values from index. If no index exists on this
+            // column, bail — we can't enumerate hot values without a full scan.
+            let mut distinct: ValueSet = ValueSet::default();
+            let Some(hot_values) = self.hot.get_partition_values(column_name)? else {
+                return Ok(None);
             };
-            let column = phys.map(|pi| vol.columns.get(pi)).transpose()?;
-            for (i, &rid) in row_ids.iter().enumerate().skip(start) {
-                if !cs.is_visible(i) {
+            for v in hot_values {
+                distinct.insert(v);
+            }
+
+            // Build skip set: hot row_ids + tombstones + pending tombstones
+            let volumes = self.segment_mgr.get_volumes_newest_first()?;
+            let tombstones_arc = self.segment_mgr.tombstone_set_arc();
+            let mut hot_skip: FxHashSet<i64> =
+                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+            self.hot.collect_hot_row_ids_into(&mut hot_skip);
+            self.segment_mgr
+                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+
+            // Scan cold volumes columnar-only (no Row materialization)
+            // Column resolution uses mapping (handles renames/drops) not col_name.
+            let default_val = self.column_default(col_idx);
+            let has_non_null_default = !default_val.is_null();
+            for (seg_id, cs) in volumes.iter() {
+                let vol = &cs.volume;
+                let row_ids = vol.row_ids()?;
+                let Some(start) = (0..vol.meta.row_count).find(|&i| {
+                    cs.is_visible(i)
+                        && !self.is_row_tombstoned(&tombstones_arc, row_ids[i])
+                        && !hot_skip.contains(&row_ids[i])
+                }) else {
                     continue;
-                }
-                if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
-                    continue;
-                }
-                if let Some(col) = column {
-                    if !col.is_null(i) {
-                        distinct.insert(col.get_value(i));
+                };
+                let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
+                let phys = if col_idx < mapping.sources.len() {
+                    match &mapping.sources[col_idx] {
+                        super::writer::ColSource::Volume(vi) => Some(*vi),
+                        super::writer::ColSource::Default(_) => None,
                     }
-                } else if has_non_null_default {
-                    distinct.insert(default_val.clone());
+                } else {
+                    None
+                };
+                let column = phys.map(|pi| vol.columns.get(pi)).transpose()?;
+                for (i, &rid) in row_ids.iter().enumerate().skip(start) {
+                    if !cs.is_visible(i) {
+                        continue;
+                    }
+                    if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
+                        continue;
+                    }
+                    if let Some(col) = column {
+                        if !col.is_null(i) {
+                            distinct.insert(col.get_value(i));
+                        }
+                    } else if has_non_null_default {
+                        distinct.insert(default_val.clone());
+                    }
                 }
             }
-        }
 
-        self.check_cold()?;
-        Ok(Some(distinct.len()))
+            self.check_cold()?;
+            Ok(Some(distinct.len()))
+        })
     }
 
     fn get_partition_values(&self, column_name: &str) -> Result<Option<Vec<Value>>> {
@@ -4948,86 +5035,88 @@ impl Table for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return Ok(None);
         }
-        let _seal_guard = self.segment_mgr.acquire_seal_read();
-        if !self.segment_mgr.has_segments() {
-            return self.hot.collect_rows_grouped_by_partition(column_name);
-        }
-
-        if self.segment_mgr.seal_overlap() > 0 {
-            return Ok(None);
-        }
-
-        let schema = self.hot.schema();
-        let Some(&col_idx) = schema.column_index_map().get(&column_name.to_lowercase()) else {
-            return Ok(None);
-        };
-
-        // Start from hot grouped data
-        let mut groups: ValueMap<RowVec> = ValueMap::default();
-        if let Some(hot_groups) = self.hot.collect_rows_grouped_by_partition(column_name)? {
-            for (val, rows) in hot_groups {
-                groups.insert(val, rows);
+        self.clear_of_destruction(|| {
+            let _seal_guard = self.segment_mgr.acquire_seal_read();
+            if !self.segment_mgr.has_segments() {
+                return self.hot.collect_rows_grouped_by_partition(column_name);
             }
-        }
 
-        // Build hot_skip: hot row_ids + tombstones + pending tombstones
-        let volumes = self.segment_mgr.get_volumes_newest_first()?;
-        let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-        let mut hot_skip: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-        self.hot.collect_hot_row_ids_into(&mut hot_skip);
-        self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+            if self.segment_mgr.seal_overlap() > 0 {
+                return Ok(None);
+            }
 
-        let default_val = self.column_default(col_idx);
-        let has_non_null_default = !default_val.is_null();
-        for (_seg_id, cs) in volumes.iter() {
-            let vol = &cs.volume;
-            let mapping = &cs.mapping;
-            let row_ids = vol.row_ids()?;
-            let Some(start) = (0..vol.meta.row_count).find(|&i| {
-                cs.is_visible(i)
-                    && !self.is_row_tombstoned(&tombstones_arc, row_ids[i])
-                    && !hot_skip.contains(&row_ids[i])
-            }) else {
-                continue;
-            };
-            // Resolve partition column through mapping (handles DROP COLUMN ordinal shifts)
-            let phys_col = if col_idx < mapping.sources.len() {
-                match &mapping.sources[col_idx] {
-                    super::writer::ColSource::Volume(idx) => Some(*idx),
-                    super::writer::ColSource::Default(_) => None,
-                }
-            } else {
-                None
+            let schema = self.hot.schema();
+            let Some(&col_idx) = schema.column_index_map().get(&column_name.to_lowercase()) else {
+                return Ok(None);
             };
 
-            let column = phys_col.map(|pc| vol.columns.get(pc)).transpose()?;
-            let mut reader = super::writer::RowReader::new(Arc::clone(vol));
-            for (i, &rid) in row_ids.iter().enumerate().skip(start) {
-                if !cs.is_visible(i) {
-                    continue;
+            // Start from hot grouped data
+            let mut groups: ValueMap<RowVec> = ValueMap::default();
+            if let Some(hot_groups) = self.hot.collect_rows_grouped_by_partition(column_name)? {
+                for (val, rows) in hot_groups {
+                    groups.insert(val, rows);
                 }
-                if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
-                    continue;
-                }
-                let val = if let Some(col) = column {
-                    if col.is_null(i) {
-                        continue;
-                    }
-                    col.get_value(i)
-                } else if has_non_null_default {
-                    default_val.clone()
-                } else {
+            }
+
+            // Build hot_skip: hot row_ids + tombstones + pending tombstones
+            let volumes = self.segment_mgr.get_volumes_newest_first()?;
+            let tombstones_arc = self.segment_mgr.tombstone_set_arc();
+            let mut hot_skip: FxHashSet<i64> =
+                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+            self.hot.collect_hot_row_ids_into(&mut hot_skip);
+            self.segment_mgr
+                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+
+            let default_val = self.column_default(col_idx);
+            let has_non_null_default = !default_val.is_null();
+            for (_seg_id, cs) in volumes.iter() {
+                let vol = &cs.volume;
+                let mapping = &cs.mapping;
+                let row_ids = vol.row_ids()?;
+                let Some(start) = (0..vol.meta.row_count).find(|&i| {
+                    cs.is_visible(i)
+                        && !self.is_row_tombstoned(&tombstones_arc, row_ids[i])
+                        && !hot_skip.contains(&row_ids[i])
+                }) else {
                     continue;
                 };
-                let row = reader.row(i, mapping)?;
-                groups.entry(val).or_default().push((rid, row));
-            }
-        }
+                // Resolve partition column through mapping (handles DROP COLUMN ordinal shifts)
+                let phys_col = if col_idx < mapping.sources.len() {
+                    match &mapping.sources[col_idx] {
+                        super::writer::ColSource::Volume(idx) => Some(*idx),
+                        super::writer::ColSource::Default(_) => None,
+                    }
+                } else {
+                    None
+                };
 
-        self.check_cold()?;
-        Ok(Some(groups.into_iter().collect()))
+                let column = phys_col.map(|pc| vol.columns.get(pc)).transpose()?;
+                let mut reader = super::writer::RowReader::new(Arc::clone(vol));
+                for (i, &rid) in row_ids.iter().enumerate().skip(start) {
+                    if !cs.is_visible(i) {
+                        continue;
+                    }
+                    if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
+                        continue;
+                    }
+                    let val = if let Some(col) = column {
+                        if col.is_null(i) {
+                            continue;
+                        }
+                        col.get_value(i)
+                    } else if has_non_null_default {
+                        default_val.clone()
+                    } else {
+                        continue;
+                    };
+                    let row = reader.row(i, mapping)?;
+                    groups.entry(val).or_default().push((rid, row));
+                }
+            }
+
+            self.check_cold()?;
+            Ok(Some(groups.into_iter().collect()))
+        })
     }
 
     fn get_rows_for_partition_value(
@@ -5038,114 +5127,117 @@ impl Table for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return Ok(None);
         }
-        let _seal_guard = self.segment_mgr.acquire_seal_read();
-        if !self.segment_mgr.has_segments() {
-            return self
-                .hot
-                .get_rows_for_partition_value(column_name, partition_value);
-        }
-
-        if self.segment_mgr.seal_overlap() > 0 {
-            return Ok(None);
-        }
-
-        let schema = self.hot.schema();
-        let col_idx = match schema.column_index_map().get(&column_name.to_lowercase()) {
-            Some(&idx) => idx,
-            None => return Ok(None),
-        };
-
-        // Get hot rows for this partition value
-        let mut result = self
-            .hot
-            .get_rows_for_partition_value(column_name, partition_value)?
-            .unwrap_or_default();
-
-        // Build hot_skip: hot row_ids + tombstones + pending tombstones
-        // Lazy: prune by zone maps on the partition column before loading cold volumes.
-        let volumes = self.segment_mgr.get_volumes_newest_first_lazy();
-        let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-        let mut hot_skip: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-        self.hot.collect_hot_row_ids_into(&mut hot_skip);
-        self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
-
-        let default_val = self.column_default(col_idx);
-        let has_non_null_default = !default_val.is_null();
-        for (seg_id, cs) in volumes.iter() {
-            let vol = &cs.volume;
-            let mapping = &cs.mapping;
-            // Resolve partition column through mapping (handles DROP COLUMN ordinal shifts)
-            let phys_col = if col_idx < mapping.sources.len() {
-                match &mapping.sources[col_idx] {
-                    super::writer::ColSource::Volume(idx) => Some(*idx),
-                    super::writer::ColSource::Default(_) => None,
-                }
-            } else {
-                None
-            };
-            // Skip volume if missing column and default doesn't match target
-            if phys_col.is_none() && (!has_non_null_default || &default_val != partition_value) {
-                continue;
+        self.clear_of_destruction(|| {
+            let _seal_guard = self.segment_mgr.acquire_seal_read();
+            if !self.segment_mgr.has_segments() {
+                return self
+                    .hot
+                    .get_rows_for_partition_value(column_name, partition_value);
             }
-            // Zone-map prune on partition column (metadata, works for cold)
-            if let Some(pc) = phys_col {
-                if pc < vol.meta.zone_maps.len()
-                    && !vol.meta.zone_maps[pc].may_contain_eq(partition_value)
+
+            if self.segment_mgr.seal_overlap() > 0 {
+                return Ok(None);
+            }
+
+            let schema = self.hot.schema();
+            let col_idx = match schema.column_index_map().get(&column_name.to_lowercase()) {
+                Some(&idx) => idx,
+                None => return Ok(None),
+            };
+
+            // Get hot rows for this partition value
+            let mut result = self
+                .hot
+                .get_rows_for_partition_value(column_name, partition_value)?
+                .unwrap_or_default();
+
+            // Build hot_skip: hot row_ids + tombstones + pending tombstones
+            // Lazy: prune by zone maps on the partition column before loading cold volumes.
+            let volumes = self.segment_mgr.get_volumes_newest_first_lazy();
+            let tombstones_arc = self.segment_mgr.tombstone_set_arc();
+            let mut hot_skip: FxHashSet<i64> =
+                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+            self.hot.collect_hot_row_ids_into(&mut hot_skip);
+            self.segment_mgr
+                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+
+            let default_val = self.column_default(col_idx);
+            let has_non_null_default = !default_val.is_null();
+            for (seg_id, cs) in volumes.iter() {
+                let vol = &cs.volume;
+                let mapping = &cs.mapping;
+                // Resolve partition column through mapping (handles DROP COLUMN ordinal shifts)
+                let phys_col = if col_idx < mapping.sources.len() {
+                    match &mapping.sources[col_idx] {
+                        super::writer::ColSource::Volume(idx) => Some(*idx),
+                        super::writer::ColSource::Default(_) => None,
+                    }
+                } else {
+                    None
+                };
+                // Skip volume if missing column and default doesn't match target
+                if phys_col.is_none() && (!has_non_null_default || &default_val != partition_value)
                 {
                     continue;
                 }
-            }
-            let row_ids = vol.row_ids()?;
-            let Some(start) = (0..vol.meta.row_count).find(|&i| {
-                cs.is_visible(i)
-                    && !self.is_row_tombstoned(&tombstones_arc, row_ids[i])
-                    && !hot_skip.contains(&row_ids[i])
-            }) else {
-                continue;
-            };
-            // Load cold volume on demand after pruning.
-            let loaded;
-            let vol: &Arc<FrozenVolume> = if vol.is_cold() {
-                loaded = match self.segment_mgr.ensure_volume(*seg_id)? {
-                    Some(v) => v,
-                    None => continue,
-                };
-                &loaded
-            } else {
-                vol.mark_accessed();
-                vol
-            };
-
-            let column = phys_col.map(|pc| vol.columns.get(pc)).transpose()?;
-            let mut reader = super::writer::RowReader::new(Arc::clone(vol));
-            for (i, &rid) in row_ids.iter().enumerate().skip(start) {
-                if !cs.is_visible(i) {
-                    continue;
-                }
-                if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
-                    continue;
-                }
-                let matches = if let Some(col) = column {
-                    if col.is_null(i) {
-                        false
-                    } else {
-                        &col.get_value(i) == partition_value
+                // Zone-map prune on partition column (metadata, works for cold)
+                if let Some(pc) = phys_col {
+                    if pc < vol.meta.zone_maps.len()
+                        && !vol.meta.zone_maps[pc].may_contain_eq(partition_value)
+                    {
+                        continue;
                     }
-                } else {
-                    // Missing column → all rows have default, already checked match above
-                    true
+                }
+                let row_ids = vol.row_ids()?;
+                let Some(start) = (0..vol.meta.row_count).find(|&i| {
+                    cs.is_visible(i)
+                        && !self.is_row_tombstoned(&tombstones_arc, row_ids[i])
+                        && !hot_skip.contains(&row_ids[i])
+                }) else {
+                    continue;
                 };
-                if matches {
-                    let row = reader.row(i, mapping)?;
-                    result.push((rid, row));
+                // Load cold volume on demand after pruning.
+                let loaded;
+                let vol: &Arc<FrozenVolume> = if vol.is_cold() {
+                    loaded = match self.segment_mgr.ensure_volume(*seg_id)? {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    &loaded
+                } else {
+                    vol.mark_accessed();
+                    vol
+                };
+
+                let column = phys_col.map(|pc| vol.columns.get(pc)).transpose()?;
+                let mut reader = super::writer::RowReader::new(Arc::clone(vol));
+                for (i, &rid) in row_ids.iter().enumerate().skip(start) {
+                    if !cs.is_visible(i) {
+                        continue;
+                    }
+                    if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
+                        continue;
+                    }
+                    let matches = if let Some(col) = column {
+                        if col.is_null(i) {
+                            false
+                        } else {
+                            &col.get_value(i) == partition_value
+                        }
+                    } else {
+                        // Missing column → all rows have default, already checked match above
+                        true
+                    };
+                    if matches {
+                        let row = reader.row(i, mapping)?;
+                        result.push((rid, row));
+                    }
                 }
             }
-        }
 
-        self.check_cold()?;
-        Ok(Some(result))
+            self.check_cold()?;
+            Ok(Some(result))
+        })
     }
 
     fn collect_rows_ordered_by_index(
@@ -5477,13 +5569,18 @@ impl Table for SegmentedTable {
         // while the generation held saw every row hot; if a seal registered
         // meanwhile, the path below reads hot and volumes together.
         if !self.segment_mgr.has_segments() {
+            let begun = self.segment_mgr.destructions_begun();
             let generation = self.segment_mgr.seal_generation();
-            let answer = self
-                .hot
-                .scan_top_k(where_expr, column_name, ascending, limit, offset)?;
-            if self.segment_mgr.seal_generation() == generation && !self.segment_mgr.has_segments()
-            {
-                return Ok(answer);
+            if !self.segment_mgr.is_destruction_in_progress() {
+                let answer =
+                    self.hot
+                        .scan_top_k(where_expr, column_name, ascending, limit, offset)?;
+                if self.segment_mgr.seal_generation() == generation
+                    && !self.destruction_since(begun)
+                    && !self.segment_mgr.has_segments()
+                {
+                    return Ok(answer);
+                }
             }
         }
         let needed = limit.saturating_add(offset);
@@ -6013,31 +6110,33 @@ impl Table for SegmentedTable {
         column_name: &str,
         row_values: &[Value],
     ) -> Result<Option<i64>> {
-        if !self.segment_mgr.has_segments() {
-            return Ok(None);
-        }
-
-        let schema = self.hot.schema();
-        let mut col_indices = Vec::new();
-        let mut values = Vec::new();
-        for col_name in column_name.split(", ") {
-            let Some(&col_idx) = schema
-                .column_index_map()
-                .get(col_name.to_lowercase().as_str())
-            else {
-                return Ok(None);
-            };
-            let Some(value) = row_values.get(col_idx) else {
-                return Ok(None);
-            };
-            if value.is_null() {
+        self.clear_of_destruction(|| {
+            if !self.segment_mgr.has_segments() {
                 return Ok(None);
             }
-            col_indices.push(col_idx);
-            values.push(value);
-        }
 
-        self.find_segment_row_id_by_values(&col_indices, &values)
+            let schema = self.hot.schema();
+            let mut col_indices = Vec::new();
+            let mut values = Vec::new();
+            for col_name in column_name.split(", ") {
+                let Some(&col_idx) = schema
+                    .column_index_map()
+                    .get(col_name.to_lowercase().as_str())
+                else {
+                    return Ok(None);
+                };
+                let Some(value) = row_values.get(col_idx) else {
+                    return Ok(None);
+                };
+                if value.is_null() {
+                    return Ok(None);
+                }
+                col_indices.push(col_idx);
+                values.push(value);
+            }
+
+            self.find_segment_row_id_by_values(&col_indices, &values)
+        })
     }
 
     fn has_unique_non_pk_indexes(&self) -> bool {
@@ -6056,95 +6155,101 @@ impl Table for SegmentedTable {
     }
 
     fn get_index_min_value(&self, column_name: &str) -> Option<Value> {
-        if let Some(result) = self.unsealed(|hot| hot.get_index_min_value(column_name)) {
-            return result;
-        }
-        let hot_min = self.hot.get_index_min_value(column_name);
-        #[cfg(feature = "test-failpoints")]
-        crate::test_failpoints::index_bound_hot_read();
-        let segments = self.segment_mgr.segments_raw();
-        let mut vol_min: Option<Value> = None;
-        for cs in segments.values() {
-            let vol = &cs.volume;
-            // Through the mapping; a column a volume does not hold carries a
-            // default for every row of it, which this shortcut cannot see
-            let pi = cs.mapping.volume_column(vol, column_name)?;
-            if pi >= vol.meta.zone_maps.len() {
-                continue;
+        let read = || -> Option<Value> {
+            if let Some(result) = self.unsealed(|hot| hot.get_index_min_value(column_name)) {
+                return result;
             }
-            let zm_min = &vol.meta.zone_maps[pi].min;
-            if !zm_min.is_null() {
-                match &vol_min {
-                    None => vol_min = Some(zm_min.clone()),
-                    Some(current) => {
-                        if let Ok(std::cmp::Ordering::Less) = zm_min.compare(current) {
-                            vol_min = Some(zm_min.clone());
+            let hot_min = self.hot.get_index_min_value(column_name);
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::index_bound_hot_read();
+            let segments = self.segment_mgr.segments_raw();
+            let mut vol_min: Option<Value> = None;
+            for cs in segments.values() {
+                let vol = &cs.volume;
+                // Through the mapping; a column a volume does not hold carries a
+                // default for every row of it, which this shortcut cannot see
+                let pi = cs.mapping.volume_column(vol, column_name)?;
+                if pi >= vol.meta.zone_maps.len() {
+                    continue;
+                }
+                let zm_min = &vol.meta.zone_maps[pi].min;
+                if !zm_min.is_null() {
+                    match &vol_min {
+                        None => vol_min = Some(zm_min.clone()),
+                        Some(current) => {
+                            if let Ok(std::cmp::Ordering::Less) = zm_min.compare(current) {
+                                vol_min = Some(zm_min.clone());
+                            }
                         }
                     }
                 }
             }
-        }
-        // Both bounds name the column as this handle's schema does, or the
-        // regular path answers
-        self.check_cold().ok()?;
-        match (hot_min, vol_min) {
-            (Some(h), Some(v)) => {
-                if let Ok(std::cmp::Ordering::Less) = v.compare(&h) {
-                    Some(v)
-                } else {
-                    Some(h)
+            // Both bounds name the column as this handle's schema does, or the
+            // regular path answers
+            self.check_cold().ok()?;
+            match (hot_min, vol_min) {
+                (Some(h), Some(v)) => {
+                    if let Ok(std::cmp::Ordering::Less) = v.compare(&h) {
+                        Some(v)
+                    } else {
+                        Some(h)
+                    }
                 }
+                (Some(h), None) => Some(h),
+                (None, Some(v)) => Some(v),
+                (None, None) => None,
             }
-            (Some(h), None) => Some(h),
-            (None, Some(v)) => Some(v),
-            (None, None) => None,
-        }
+        };
+        self.clear_of_destruction(|| Ok(read())).ok().flatten()
     }
 
     fn get_index_max_value(&self, column_name: &str) -> Option<Value> {
-        if let Some(result) = self.unsealed(|hot| hot.get_index_max_value(column_name)) {
-            return result;
-        }
-        let hot_max = self.hot.get_index_max_value(column_name);
-        #[cfg(feature = "test-failpoints")]
-        crate::test_failpoints::index_bound_hot_read();
-        let segments = self.segment_mgr.segments_raw();
-        let mut vol_max: Option<Value> = None;
-        for cs in segments.values() {
-            let vol = &cs.volume;
-            // Through the mapping; a column a volume does not hold carries a
-            // default for every row of it, which this shortcut cannot see
-            let pi = cs.mapping.volume_column(vol, column_name)?;
-            if pi >= vol.meta.zone_maps.len() {
-                continue;
+        let read = || -> Option<Value> {
+            if let Some(result) = self.unsealed(|hot| hot.get_index_max_value(column_name)) {
+                return result;
             }
-            let zm_max = &vol.meta.zone_maps[pi].max;
-            if !zm_max.is_null() {
-                match &vol_max {
-                    None => vol_max = Some(zm_max.clone()),
-                    Some(current) => {
-                        if let Ok(std::cmp::Ordering::Greater) = zm_max.compare(current) {
-                            vol_max = Some(zm_max.clone());
+            let hot_max = self.hot.get_index_max_value(column_name);
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::index_bound_hot_read();
+            let segments = self.segment_mgr.segments_raw();
+            let mut vol_max: Option<Value> = None;
+            for cs in segments.values() {
+                let vol = &cs.volume;
+                // Through the mapping; a column a volume does not hold carries a
+                // default for every row of it, which this shortcut cannot see
+                let pi = cs.mapping.volume_column(vol, column_name)?;
+                if pi >= vol.meta.zone_maps.len() {
+                    continue;
+                }
+                let zm_max = &vol.meta.zone_maps[pi].max;
+                if !zm_max.is_null() {
+                    match &vol_max {
+                        None => vol_max = Some(zm_max.clone()),
+                        Some(current) => {
+                            if let Ok(std::cmp::Ordering::Greater) = zm_max.compare(current) {
+                                vol_max = Some(zm_max.clone());
+                            }
                         }
                     }
                 }
             }
-        }
-        // Both bounds name the column as this handle's schema does, or the
-        // regular path answers
-        self.check_cold().ok()?;
-        match (hot_max, vol_max) {
-            (Some(h), Some(v)) => {
-                if let Ok(std::cmp::Ordering::Greater) = v.compare(&h) {
-                    Some(v)
-                } else {
-                    Some(h)
+            // Both bounds name the column as this handle's schema does, or the
+            // regular path answers
+            self.check_cold().ok()?;
+            match (hot_max, vol_max) {
+                (Some(h), Some(v)) => {
+                    if let Ok(std::cmp::Ordering::Greater) = v.compare(&h) {
+                        Some(v)
+                    } else {
+                        Some(h)
+                    }
                 }
+                (Some(h), None) => Some(h),
+                (None, Some(v)) => Some(v),
+                (None, None) => None,
             }
-            (Some(h), None) => Some(h),
-            (None, Some(v)) => Some(v),
-            (None, None) => None,
-        }
+        };
+        self.clear_of_destruction(|| Ok(read())).ok().flatten()
     }
 
     // =========================================================================
@@ -6197,10 +6302,15 @@ impl Table for SegmentedTable {
         temporal_type: &str,
         temporal_value: i64,
     ) -> Result<Box<dyn QueryResult>> {
-        if let Some(result) =
-            self.unsealed(|hot| hot.select_as_of(columns, expr, temporal_type, temporal_value))
-        {
-            return result;
+        // A table without volumes answers from the hot store; a truncate
+        // that refused this attempt is waited out, not taken for a volume
+        while !self.segment_mgr.has_segments() {
+            if let Some(result) =
+                self.unsealed(|hot| hot.select_as_of(columns, expr, temporal_type, temporal_value))
+            {
+                return result;
+            }
+            self.wait_out_destruction();
         }
 
         // Historical point-in-time queries on segment-backed tables are not
@@ -6349,48 +6459,49 @@ impl Table for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return Ok(None);
         }
-        let _seal_guard = self.segment_mgr.acquire_seal_read();
-        // Bail out: during seal, hot+cold overlap makes aggregation unreliable
-        if self.segment_mgr.seal_overlap() > 0 {
-            return Ok(None);
-        }
-        // Bail out: no cold volumes — let the regular path handle hot-only data
-        if !self.segment_mgr.has_segments() {
-            return Ok(None);
-        }
-        // Bail out: only conjunctive-simple filters can be evaluated on raw arrays
-        if !where_expr.is_conjunctive_simple() {
-            return Ok(None);
-        }
-        let comparisons = where_expr.collect_comparisons();
-        if comparisons.is_empty() {
-            return Ok(None);
-        }
-
-        let schema = self.hot.schema().clone();
-
-        // --- Type-resolve predicates -----------------------------------------
-        // For each comparison, resolve to (schema_col_idx, operator, typed_target).
-        // If any comparison cannot be resolved to a typed target, bail out.
-        enum TypedTarget {
-            Int64(i64),
-            Float64(f64),
-            DictEq(crate::common::SmartString), // text equality via dictionary lookup
-        }
-        struct ResolvedPred {
-            schema_col_idx: usize,
-            op: crate::core::Operator,
-            target: TypedTarget,
-            is_timestamp: bool,
-        }
-
-        let mut preds: Vec<ResolvedPred> = Vec::with_capacity(comparisons.len());
-        for (col_name, op, value) in &comparisons {
-            let Some(&col_idx) = schema.column_index_map().get(&col_name.to_lowercase()) else {
+        self.clear_of_destruction(|| {
+            let _seal_guard = self.segment_mgr.acquire_seal_read();
+            // Bail out: during seal, hot+cold overlap makes aggregation unreliable
+            if self.segment_mgr.seal_overlap() > 0 {
                 return Ok(None);
-            };
-            let col_type = schema.columns[col_idx].data_type;
-            let target = match (col_type, value) {
+            }
+            // Bail out: no cold volumes — let the regular path handle hot-only data
+            if !self.segment_mgr.has_segments() {
+                return Ok(None);
+            }
+            // Bail out: only conjunctive-simple filters can be evaluated on raw arrays
+            if !where_expr.is_conjunctive_simple() {
+                return Ok(None);
+            }
+            let comparisons = where_expr.collect_comparisons();
+            if comparisons.is_empty() {
+                return Ok(None);
+            }
+
+            let schema = self.hot.schema().clone();
+
+            // --- Type-resolve predicates -----------------------------------------
+            // For each comparison, resolve to (schema_col_idx, operator, typed_target).
+            // If any comparison cannot be resolved to a typed target, bail out.
+            enum TypedTarget {
+                Int64(i64),
+                Float64(f64),
+                DictEq(crate::common::SmartString), // text equality via dictionary lookup
+            }
+            struct ResolvedPred {
+                schema_col_idx: usize,
+                op: crate::core::Operator,
+                target: TypedTarget,
+                is_timestamp: bool,
+            }
+
+            let mut preds: Vec<ResolvedPred> = Vec::with_capacity(comparisons.len());
+            for (col_name, op, value) in &comparisons {
+                let Some(&col_idx) = schema.column_index_map().get(&col_name.to_lowercase()) else {
+                    return Ok(None);
+                };
+                let col_type = schema.columns[col_idx].data_type;
+                let target = match (col_type, value) {
                 (DataType::Integer, Value::Integer(i)) => TypedTarget::Int64(*i),
                 (DataType::Integer, Value::Float(f))
                     // Float literal on integer column: convert to i64 if exact, bail otherwise
@@ -6411,927 +6522,746 @@ impl Table for SegmentedTable {
                 }
                 _ => return Ok(None), // unsupported type combination
             };
-            preds.push(ResolvedPred {
-                schema_col_idx: col_idx,
-                op: *op,
-                target,
-                is_timestamp: col_type == DataType::Timestamp,
-            });
-        }
-
-        // --- Accumulators ----------------------------------------------------
-        #[derive(Clone)]
-        struct Accum {
-            count: i64,
-            int_sum: i128,
-            float_sum: f64,
-            min_i64: Option<i64>,
-            max_i64: Option<i64>,
-            min_f64: Option<f64>,
-            max_f64: Option<f64>,
-            is_int_agg: bool, // track whether accumulator saw only int values
-        }
-        impl Default for Accum {
-            fn default() -> Self {
-                Self {
-                    count: 0,
-                    int_sum: 0,
-                    float_sum: 0.0,
-                    min_i64: None,
-                    max_i64: None,
-                    min_f64: None,
-                    max_f64: None,
-                    is_int_agg: true,
-                }
-            }
-        }
-
-        /// Merge `src` accumulator into `dst`.
-        #[inline(always)]
-        fn merge_accum(dst: &mut Accum, src: &Accum) {
-            dst.count += src.count;
-            dst.int_sum += src.int_sum;
-            dst.float_sum += src.float_sum;
-            if !src.is_int_agg {
-                dst.is_int_agg = false;
-            }
-            if let Some(s) = src.min_i64 {
-                dst.min_i64 = Some(match dst.min_i64 {
-                    Some(d) if d <= s => d,
-                    _ => s,
+                preds.push(ResolvedPred {
+                    schema_col_idx: col_idx,
+                    op: *op,
+                    target,
+                    is_timestamp: col_type == DataType::Timestamp,
                 });
             }
-            if let Some(s) = src.max_i64 {
-                dst.max_i64 = Some(match dst.max_i64 {
-                    Some(d) if d >= s => d,
-                    _ => s,
-                });
-            }
-            if let Some(s) = src.min_f64 {
-                dst.min_f64 = Some(match dst.min_f64 {
-                    Some(d) if d <= s => d,
-                    _ => s,
-                });
-            }
-            if let Some(s) = src.max_f64 {
-                dst.max_f64 = Some(match dst.max_f64 {
-                    Some(d) if d >= s => d,
-                    _ => s,
-                });
-            }
-        }
 
-        let mut accums = vec![Accum::default(); aggregates.len()];
-
-        // --- Hot buffer rows -------------------------------------------------
-        let hot_rows = self.hot.collect_all_rows(Some(where_expr))?;
-        let mut hot_skip: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(hot_rows.len().max(1024), Default::default());
-        for (row_id, row) in &hot_rows {
-            hot_skip.insert(*row_id);
-            for (agg_idx, (op, col_idx)) in aggregates.iter().enumerate() {
-                let acc = &mut accums[agg_idx];
-                match op {
-                    AggregateOp::CountStar => acc.count += 1,
-                    AggregateOp::Count => {
-                        if let Some(v) = row.get(*col_idx) {
-                            if !v.is_null() {
-                                acc.count += 1;
-                            }
-                        }
-                    }
-                    AggregateOp::Sum | AggregateOp::Avg => {
-                        if let Some(v) = row.get(*col_idx) {
-                            match v {
-                                Value::Integer(i) => {
-                                    acc.int_sum += *i as i128;
-                                    acc.count += 1;
-                                }
-                                Value::Float(f) if !f.is_nan() => {
-                                    acc.float_sum += *f;
-                                    acc.count += 1;
-                                    acc.is_int_agg = false;
-                                }
-                                Value::Boolean(b) => {
-                                    acc.int_sum += *b as i128;
-                                    acc.count += 1;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    AggregateOp::Min => {
-                        if let Some(v) = row.get(*col_idx) {
-                            match v {
-                                Value::Integer(i) => match acc.min_i64 {
-                                    None => acc.min_i64 = Some(*i),
-                                    Some(cur) if *i < cur => acc.min_i64 = Some(*i),
-                                    _ => {}
-                                },
-                                Value::Timestamp(t) => {
-                                    let nanos = t.timestamp_nanos_opt().unwrap_or_else(|| {
-                                        t.timestamp().saturating_mul(1_000_000_000)
-                                    });
-                                    match acc.min_i64 {
-                                        None => acc.min_i64 = Some(nanos),
-                                        Some(cur) if nanos < cur => acc.min_i64 = Some(nanos),
-                                        _ => {}
-                                    }
-                                }
-                                Value::Float(f) if !f.is_nan() => {
-                                    acc.is_int_agg = false;
-                                    match acc.min_f64 {
-                                        None => acc.min_f64 = Some(*f),
-                                        Some(cur) if *f < cur => acc.min_f64 = Some(*f),
-                                        _ => {}
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    AggregateOp::Max => {
-                        if let Some(v) = row.get(*col_idx) {
-                            match v {
-                                Value::Integer(i) => match acc.max_i64 {
-                                    None => acc.max_i64 = Some(*i),
-                                    Some(cur) if *i > cur => acc.max_i64 = Some(*i),
-                                    _ => {}
-                                },
-                                Value::Timestamp(t) => {
-                                    let nanos = t.timestamp_nanos_opt().unwrap_or_else(|| {
-                                        t.timestamp().saturating_mul(1_000_000_000)
-                                    });
-                                    match acc.max_i64 {
-                                        None => acc.max_i64 = Some(nanos),
-                                        Some(cur) if nanos > cur => acc.max_i64 = Some(nanos),
-                                        _ => {}
-                                    }
-                                }
-                                Value::Float(f) if !f.is_nan() => {
-                                    acc.is_int_agg = false;
-                                    match acc.max_f64 {
-                                        None => acc.max_f64 = Some(*f),
-                                        Some(cur) if *f > cur => acc.max_f64 = Some(*f),
-                                        _ => {}
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
+            // --- Accumulators ----------------------------------------------------
+            #[derive(Clone)]
+            struct Accum {
+                count: i64,
+                int_sum: i128,
+                float_sum: f64,
+                min_i64: Option<i64>,
+                max_i64: Option<i64>,
+                min_f64: Option<f64>,
+                max_f64: Option<f64>,
+                is_int_agg: bool, // track whether accumulator saw only int values
+            }
+            impl Default for Accum {
+                fn default() -> Self {
+                    Self {
+                        count: 0,
+                        int_sum: 0,
+                        float_sum: 0.0,
+                        min_i64: None,
+                        max_i64: None,
+                        min_f64: None,
+                        max_f64: None,
+                        is_int_agg: true,
                     }
                 }
             }
-        }
 
-        // Add remaining hot row IDs (not in filtered set) to skip set
-        self.hot.collect_hot_row_ids_into(&mut hot_skip);
-
-        // --- Cold volumes (THE FAST PATH) ------------------------------------
-        let volumes = self.segment_mgr.get_volumes_newest_first()?;
-        let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-        self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
-
-        // Physical-predicate and physical-aggregate structs used per volume.
-        struct PhysPred {
-            phys_col: usize,
-            op: crate::core::Operator,
-            target: TypedTarget,
-            dict_id: Option<u32>, // resolved dict_id for DictEq (per-volume)
-            is_timestamp: bool,
-        }
-        struct PhysAgg {
-            phys_col: Option<usize>, // None for CountStar or ColSource::Default
-            op: AggregateOp,
-            default_val: Option<Value>, // For ColSource::Default
-        }
-
-        // Build a zone-map probe Value from a TypedTarget.
-        // Timestamps stored as i64 nanos must become Value::Timestamp for correct comparison.
-        #[inline]
-        fn zm_probe_value(target: &TypedTarget, is_timestamp: bool) -> Value {
-            match target {
-                TypedTarget::Int64(v) => {
-                    if is_timestamp {
-                        chrono::DateTime::from_timestamp(
-                            v.div_euclid(1_000_000_000),
-                            v.rem_euclid(1_000_000_000) as u32,
-                        )
-                        .map(Value::Timestamp)
-                        .unwrap_or(Value::Integer(*v))
-                    } else {
-                        Value::Integer(*v)
-                    }
+            /// Merge `src` accumulator into `dst`.
+            #[inline(always)]
+            fn merge_accum(dst: &mut Accum, src: &Accum) {
+                dst.count += src.count;
+                dst.int_sum += src.int_sum;
+                dst.float_sum += src.float_sum;
+                if !src.is_int_agg {
+                    dst.is_int_agg = false;
                 }
-                TypedTarget::Float64(v) => Value::Float(*v),
-                TypedTarget::DictEq(s) => Value::Text(s.clone()),
+                if let Some(s) = src.min_i64 {
+                    dst.min_i64 = Some(match dst.min_i64 {
+                        Some(d) if d <= s => d,
+                        _ => s,
+                    });
+                }
+                if let Some(s) = src.max_i64 {
+                    dst.max_i64 = Some(match dst.max_i64 {
+                        Some(d) if d >= s => d,
+                        _ => s,
+                    });
+                }
+                if let Some(s) = src.min_f64 {
+                    dst.min_f64 = Some(match dst.min_f64 {
+                        Some(d) if d <= s => d,
+                        _ => s,
+                    });
+                }
+                if let Some(s) = src.max_f64 {
+                    dst.max_f64 = Some(match dst.max_f64 {
+                        Some(d) if d >= s => d,
+                        _ => s,
+                    });
+                }
             }
-        }
 
-        // Accumulate one row into per-volume accumulators from raw columnar data.
-        #[inline(always)]
-        fn accumulate_row(
-            accums: &mut [Accum],
-            phys_aggs: &[PhysAgg],
-            columns: &[Option<&super::column::ColumnData>],
-            i: usize,
-        ) {
-            for (agg_idx, pa) in phys_aggs.iter().enumerate() {
-                let acc = &mut accums[agg_idx];
-                match pa.op {
-                    AggregateOp::CountStar => acc.count += 1,
-                    AggregateOp::Count => {
-                        if let Some(col) = columns[agg_idx] {
-                            if !col.is_null(i) {
-                                acc.count += 1;
-                            }
-                        } else if let Some(ref def) = pa.default_val {
-                            if !def.is_null() {
-                                acc.count += 1;
+            let mut accums = vec![Accum::default(); aggregates.len()];
+
+            // --- Hot buffer rows -------------------------------------------------
+            let hot_rows = self.hot.collect_all_rows(Some(where_expr))?;
+            let mut hot_skip: FxHashSet<i64> =
+                FxHashSet::with_capacity_and_hasher(hot_rows.len().max(1024), Default::default());
+            for (row_id, row) in &hot_rows {
+                hot_skip.insert(*row_id);
+                for (agg_idx, (op, col_idx)) in aggregates.iter().enumerate() {
+                    let acc = &mut accums[agg_idx];
+                    match op {
+                        AggregateOp::CountStar => acc.count += 1,
+                        AggregateOp::Count => {
+                            if let Some(v) = row.get(*col_idx) {
+                                if !v.is_null() {
+                                    acc.count += 1;
+                                }
                             }
                         }
-                    }
-                    AggregateOp::Sum | AggregateOp::Avg => {
-                        if let Some(col) = columns[agg_idx] {
-                            if !col.is_null(i) {
-                                match col.data_type() {
-                                    DataType::Integer | DataType::Timestamp => {
-                                        acc.int_sum += col.get_i64(i) as i128;
+                        AggregateOp::Sum | AggregateOp::Avg => {
+                            if let Some(v) = row.get(*col_idx) {
+                                match v {
+                                    Value::Integer(i) => {
+                                        acc.int_sum += *i as i128;
                                         acc.count += 1;
                                     }
-                                    DataType::Float => {
-                                        let f = col.get_f64(i);
-                                        if !f.is_nan() {
-                                            acc.float_sum += f;
+                                    Value::Float(f) if !f.is_nan() => {
+                                        acc.float_sum += *f;
+                                        acc.count += 1;
+                                        acc.is_int_agg = false;
+                                    }
+                                    Value::Boolean(b) => {
+                                        acc.int_sum += *b as i128;
+                                        acc.count += 1;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        AggregateOp::Min => {
+                            if let Some(v) = row.get(*col_idx) {
+                                match v {
+                                    Value::Integer(i) => match acc.min_i64 {
+                                        None => acc.min_i64 = Some(*i),
+                                        Some(cur) if *i < cur => acc.min_i64 = Some(*i),
+                                        _ => {}
+                                    },
+                                    Value::Timestamp(t) => {
+                                        let nanos = t.timestamp_nanos_opt().unwrap_or_else(|| {
+                                            t.timestamp().saturating_mul(1_000_000_000)
+                                        });
+                                        match acc.min_i64 {
+                                            None => acc.min_i64 = Some(nanos),
+                                            Some(cur) if nanos < cur => acc.min_i64 = Some(nanos),
+                                            _ => {}
+                                        }
+                                    }
+                                    Value::Float(f) if !f.is_nan() => {
+                                        acc.is_int_agg = false;
+                                        match acc.min_f64 {
+                                            None => acc.min_f64 = Some(*f),
+                                            Some(cur) if *f < cur => acc.min_f64 = Some(*f),
+                                            _ => {}
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        AggregateOp::Max => {
+                            if let Some(v) = row.get(*col_idx) {
+                                match v {
+                                    Value::Integer(i) => match acc.max_i64 {
+                                        None => acc.max_i64 = Some(*i),
+                                        Some(cur) if *i > cur => acc.max_i64 = Some(*i),
+                                        _ => {}
+                                    },
+                                    Value::Timestamp(t) => {
+                                        let nanos = t.timestamp_nanos_opt().unwrap_or_else(|| {
+                                            t.timestamp().saturating_mul(1_000_000_000)
+                                        });
+                                        match acc.max_i64 {
+                                            None => acc.max_i64 = Some(nanos),
+                                            Some(cur) if nanos > cur => acc.max_i64 = Some(nanos),
+                                            _ => {}
+                                        }
+                                    }
+                                    Value::Float(f) if !f.is_nan() => {
+                                        acc.is_int_agg = false;
+                                        match acc.max_f64 {
+                                            None => acc.max_f64 = Some(*f),
+                                            Some(cur) if *f > cur => acc.max_f64 = Some(*f),
+                                            _ => {}
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Add remaining hot row IDs (not in filtered set) to skip set
+            self.hot.collect_hot_row_ids_into(&mut hot_skip);
+
+            // --- Cold volumes (THE FAST PATH) ------------------------------------
+            let volumes = self.segment_mgr.get_volumes_newest_first()?;
+            let tombstones_arc = self.segment_mgr.tombstone_set_arc();
+            self.segment_mgr
+                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+
+            // Physical-predicate and physical-aggregate structs used per volume.
+            struct PhysPred {
+                phys_col: usize,
+                op: crate::core::Operator,
+                target: TypedTarget,
+                dict_id: Option<u32>, // resolved dict_id for DictEq (per-volume)
+                is_timestamp: bool,
+            }
+            struct PhysAgg {
+                phys_col: Option<usize>, // None for CountStar or ColSource::Default
+                op: AggregateOp,
+                default_val: Option<Value>, // For ColSource::Default
+            }
+
+            // Build a zone-map probe Value from a TypedTarget.
+            // Timestamps stored as i64 nanos must become Value::Timestamp for correct comparison.
+            #[inline]
+            fn zm_probe_value(target: &TypedTarget, is_timestamp: bool) -> Value {
+                match target {
+                    TypedTarget::Int64(v) => {
+                        if is_timestamp {
+                            chrono::DateTime::from_timestamp(
+                                v.div_euclid(1_000_000_000),
+                                v.rem_euclid(1_000_000_000) as u32,
+                            )
+                            .map(Value::Timestamp)
+                            .unwrap_or(Value::Integer(*v))
+                        } else {
+                            Value::Integer(*v)
+                        }
+                    }
+                    TypedTarget::Float64(v) => Value::Float(*v),
+                    TypedTarget::DictEq(s) => Value::Text(s.clone()),
+                }
+            }
+
+            // Accumulate one row into per-volume accumulators from raw columnar data.
+            #[inline(always)]
+            fn accumulate_row(
+                accums: &mut [Accum],
+                phys_aggs: &[PhysAgg],
+                columns: &[Option<&super::column::ColumnData>],
+                i: usize,
+            ) {
+                for (agg_idx, pa) in phys_aggs.iter().enumerate() {
+                    let acc = &mut accums[agg_idx];
+                    match pa.op {
+                        AggregateOp::CountStar => acc.count += 1,
+                        AggregateOp::Count => {
+                            if let Some(col) = columns[agg_idx] {
+                                if !col.is_null(i) {
+                                    acc.count += 1;
+                                }
+                            } else if let Some(ref def) = pa.default_val {
+                                if !def.is_null() {
+                                    acc.count += 1;
+                                }
+                            }
+                        }
+                        AggregateOp::Sum | AggregateOp::Avg => {
+                            if let Some(col) = columns[agg_idx] {
+                                if !col.is_null(i) {
+                                    match col.data_type() {
+                                        DataType::Integer | DataType::Timestamp => {
+                                            acc.int_sum += col.get_i64(i) as i128;
                                             acc.count += 1;
-                                            acc.is_int_agg = false;
                                         }
+                                        DataType::Float => {
+                                            let f = col.get_f64(i);
+                                            if !f.is_nan() {
+                                                acc.float_sum += f;
+                                                acc.count += 1;
+                                                acc.is_int_agg = false;
+                                            }
+                                        }
+                                        DataType::Boolean => {
+                                            acc.int_sum += col.get_bool(i) as i128;
+                                            acc.count += 1;
+                                        }
+                                        _ => {}
                                     }
-                                    DataType::Boolean => {
-                                        acc.int_sum += col.get_bool(i) as i128;
+                                }
+                            } else if let Some(ref def) = pa.default_val {
+                                match def {
+                                    Value::Integer(v) => {
+                                        acc.int_sum += *v as i128;
+                                        acc.count += 1;
+                                    }
+                                    Value::Float(f) if !f.is_nan() => {
+                                        acc.float_sum += *f;
+                                        acc.count += 1;
+                                        acc.is_int_agg = false;
+                                    }
+                                    Value::Boolean(b) => {
+                                        acc.int_sum += *b as i128;
                                         acc.count += 1;
                                     }
                                     _ => {}
                                 }
                             }
-                        } else if let Some(ref def) = pa.default_val {
-                            match def {
-                                Value::Integer(v) => {
-                                    acc.int_sum += *v as i128;
-                                    acc.count += 1;
-                                }
-                                Value::Float(f) if !f.is_nan() => {
-                                    acc.float_sum += *f;
-                                    acc.count += 1;
-                                    acc.is_int_agg = false;
-                                }
-                                Value::Boolean(b) => {
-                                    acc.int_sum += *b as i128;
-                                    acc.count += 1;
-                                }
-                                _ => {}
-                            }
                         }
-                    }
-                    AggregateOp::Min => {
-                        if let Some(col) = columns[agg_idx] {
-                            if !col.is_null(i) {
-                                match col.data_type() {
-                                    DataType::Integer | DataType::Timestamp => {
-                                        let v = col.get_i64(i);
-                                        if acc.min_i64.is_none_or(|cur| v < cur) {
-                                            acc.min_i64 = Some(v);
+                        AggregateOp::Min => {
+                            if let Some(col) = columns[agg_idx] {
+                                if !col.is_null(i) {
+                                    match col.data_type() {
+                                        DataType::Integer | DataType::Timestamp => {
+                                            let v = col.get_i64(i);
+                                            if acc.min_i64.is_none_or(|cur| v < cur) {
+                                                acc.min_i64 = Some(v);
+                                            }
+                                        }
+                                        DataType::Float => {
+                                            let f = col.get_f64(i);
+                                            if !f.is_nan() {
+                                                acc.is_int_agg = false;
+                                                if acc.min_f64.is_none_or(|cur| f < cur) {
+                                                    acc.min_f64 = Some(f);
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            } else if let Some(ref def) = pa.default_val {
+                                match def {
+                                    Value::Integer(v) if acc.min_i64.is_none_or(|cur| *v < cur) => {
+                                        acc.min_i64 = Some(*v);
+                                    }
+                                    Value::Timestamp(t) => {
+                                        let nanos = t.timestamp_nanos_opt().unwrap_or_else(|| {
+                                            t.timestamp().saturating_mul(1_000_000_000)
+                                        });
+                                        if acc.min_i64.is_none_or(|cur| nanos < cur) {
+                                            acc.min_i64 = Some(nanos);
                                         }
                                     }
-                                    DataType::Float => {
-                                        let f = col.get_f64(i);
-                                        if !f.is_nan() {
-                                            acc.is_int_agg = false;
-                                            if acc.min_f64.is_none_or(|cur| f < cur) {
-                                                acc.min_f64 = Some(f);
-                                            }
+                                    Value::Float(f) if !f.is_nan() => {
+                                        acc.is_int_agg = false;
+                                        if acc.min_f64.is_none_or(|cur| *f < cur) {
+                                            acc.min_f64 = Some(*f);
                                         }
                                     }
                                     _ => {}
                                 }
                             }
-                        } else if let Some(ref def) = pa.default_val {
-                            match def {
-                                Value::Integer(v) if acc.min_i64.is_none_or(|cur| *v < cur) => {
-                                    acc.min_i64 = Some(*v);
-                                }
-                                Value::Timestamp(t) => {
-                                    let nanos = t.timestamp_nanos_opt().unwrap_or_else(|| {
-                                        t.timestamp().saturating_mul(1_000_000_000)
-                                    });
-                                    if acc.min_i64.is_none_or(|cur| nanos < cur) {
-                                        acc.min_i64 = Some(nanos);
-                                    }
-                                }
-                                Value::Float(f) if !f.is_nan() => {
-                                    acc.is_int_agg = false;
-                                    if acc.min_f64.is_none_or(|cur| *f < cur) {
-                                        acc.min_f64 = Some(*f);
-                                    }
-                                }
-                                _ => {}
-                            }
                         }
-                    }
-                    AggregateOp::Max => {
-                        if let Some(col) = columns[agg_idx] {
-                            if !col.is_null(i) {
-                                match col.data_type() {
-                                    DataType::Integer | DataType::Timestamp => {
-                                        let v = col.get_i64(i);
-                                        if acc.max_i64.is_none_or(|cur| v > cur) {
-                                            acc.max_i64 = Some(v);
+                        AggregateOp::Max => {
+                            if let Some(col) = columns[agg_idx] {
+                                if !col.is_null(i) {
+                                    match col.data_type() {
+                                        DataType::Integer | DataType::Timestamp => {
+                                            let v = col.get_i64(i);
+                                            if acc.max_i64.is_none_or(|cur| v > cur) {
+                                                acc.max_i64 = Some(v);
+                                            }
+                                        }
+                                        DataType::Float => {
+                                            let f = col.get_f64(i);
+                                            if !f.is_nan() {
+                                                acc.is_int_agg = false;
+                                                if acc.max_f64.is_none_or(|cur| f > cur) {
+                                                    acc.max_f64 = Some(f);
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            } else if let Some(ref def) = pa.default_val {
+                                match def {
+                                    Value::Integer(v) if acc.max_i64.is_none_or(|cur| *v > cur) => {
+                                        acc.max_i64 = Some(*v);
+                                    }
+                                    Value::Timestamp(t) => {
+                                        let nanos = t.timestamp_nanos_opt().unwrap_or_else(|| {
+                                            t.timestamp().saturating_mul(1_000_000_000)
+                                        });
+                                        if acc.max_i64.is_none_or(|cur| nanos > cur) {
+                                            acc.max_i64 = Some(nanos);
                                         }
                                     }
-                                    DataType::Float => {
-                                        let f = col.get_f64(i);
-                                        if !f.is_nan() {
-                                            acc.is_int_agg = false;
-                                            if acc.max_f64.is_none_or(|cur| f > cur) {
-                                                acc.max_f64 = Some(f);
-                                            }
+                                    Value::Float(f) if !f.is_nan() => {
+                                        acc.is_int_agg = false;
+                                        if acc.max_f64.is_none_or(|cur| *f > cur) {
+                                            acc.max_f64 = Some(*f);
                                         }
                                     }
                                     _ => {}
                                 }
                             }
-                        } else if let Some(ref def) = pa.default_val {
-                            match def {
-                                Value::Integer(v) if acc.max_i64.is_none_or(|cur| *v > cur) => {
-                                    acc.max_i64 = Some(*v);
-                                }
-                                Value::Timestamp(t) => {
-                                    let nanos = t.timestamp_nanos_opt().unwrap_or_else(|| {
-                                        t.timestamp().saturating_mul(1_000_000_000)
-                                    });
-                                    if acc.max_i64.is_none_or(|cur| nanos > cur) {
-                                        acc.max_i64 = Some(nanos);
-                                    }
-                                }
-                                Value::Float(f) if !f.is_nan() => {
-                                    acc.is_int_agg = false;
-                                    if acc.max_f64.is_none_or(|cur| *f > cur) {
-                                        acc.max_f64 = Some(*f);
-                                    }
-                                }
-                                _ => {}
-                            }
                         }
                     }
                 }
             }
-        }
 
-        // Pre-filter volumes using zone-map metadata to reduce parallel dispatch.
-        // Only safe when: (1) the volume has identity column mapping (no schema
-        // evolution), and (2) no timestamp predicates (i64 nanos vs Value::Timestamp
-        // mismatch in zone maps). Schema-evolved volumes and timestamp predicates
-        // are pruned correctly inside the per-volume closure after normalization.
-        let comparisons_for_prune: Vec<_> = where_expr
-            .collect_comparisons()
-            .into_iter()
-            .filter(|(col_name, _, _)| {
-                schema
-                    .column_index_map()
-                    .get(&col_name.to_lowercase())
-                    .and_then(|&idx| schema.columns.get(idx))
-                    .is_none_or(|col| col.data_type != DataType::Timestamp)
-            })
-            .collect();
-        let bloom_hashes = Self::precompute_bloom_hashes(&comparisons_for_prune);
-        let mut pruned_volumes = Vec::with_capacity(volumes.len());
-        for volume in volumes.iter() {
-            if comparisons_for_prune.is_empty()
-                || !volume.1.mapping.is_identity
-                || !Self::prune_volume(
-                    &volume.1.volume,
-                    &volume.1.mapping,
-                    &comparisons_for_prune,
-                    &bloom_hashes,
-                )?
-                .0
-            {
-                pruned_volumes.push(volume);
-            }
-        }
-        let volumes = pruned_volumes;
-
-        // --- Per-volume accumulation closure -----------------------------------
-        // Extracted so both sequential and parallel paths share one implementation.
-        // Returns Some(vol_accums) on success, None to skip (pruned / dict miss).
-        // Sets `bail` to true on schema mismatch (caller must check after collect).
-        let bail = std::sync::atomic::AtomicBool::new(false);
-        let agg_count = aggregates.len();
-        let hot_skip_ref = &hot_skip;
-        let tombstones_ref = &tombstones_arc;
-
-        let process_volume =
-            |(seg_id, cs): &(u64, super::manifest::ColdSegment)| -> Result<Option<Vec<Accum>>> {
-                if bail.load(std::sync::atomic::Ordering::Relaxed) {
-                    return Ok(None);
+            // Pre-filter volumes using zone-map metadata to reduce parallel dispatch.
+            // Only safe when: (1) the volume has identity column mapping (no schema
+            // evolution), and (2) no timestamp predicates (i64 nanos vs Value::Timestamp
+            // mismatch in zone maps). Schema-evolved volumes and timestamp predicates
+            // are pruned correctly inside the per-volume closure after normalization.
+            let comparisons_for_prune: Vec<_> = where_expr
+                .collect_comparisons()
+                .into_iter()
+                .filter(|(col_name, _, _)| {
+                    schema
+                        .column_index_map()
+                        .get(&col_name.to_lowercase())
+                        .and_then(|&idx| schema.columns.get(idx))
+                        .is_none_or(|col| col.data_type != DataType::Timestamp)
+                })
+                .collect();
+            let bloom_hashes = Self::precompute_bloom_hashes(&comparisons_for_prune);
+            let mut pruned_volumes = Vec::with_capacity(volumes.len());
+            for volume in volumes.iter() {
+                if comparisons_for_prune.is_empty()
+                    || !volume.1.mapping.is_identity
+                    || !Self::prune_volume(
+                        &volume.1.volume,
+                        &volume.1.mapping,
+                        &comparisons_for_prune,
+                        &bloom_hashes,
+                    )?
+                    .0
+                {
+                    pruned_volumes.push(volume);
                 }
-                let vol = &cs.volume;
-                let mapping = self.segment_mgr.get_volume_mapping(*seg_id, &schema);
+            }
+            let volumes = pruned_volumes;
 
-                // Resolve predicates to physical column indices via mapping.
-                let mut phys_preds: Vec<PhysPred> = Vec::with_capacity(preds.len());
-                let mut skip_volume = false;
+            // --- Per-volume accumulation closure -----------------------------------
+            // Extracted so both sequential and parallel paths share one implementation.
+            // Returns Some(vol_accums) on success, None to skip (pruned / dict miss).
+            // Sets `bail` to true on schema mismatch (caller must check after collect).
+            let bail = std::sync::atomic::AtomicBool::new(false);
+            let agg_count = aggregates.len();
+            let hot_skip_ref = &hot_skip;
+            let tombstones_ref = &tombstones_arc;
 
-                for pred in &preds {
-                    if pred.schema_col_idx >= mapping.sources.len() {
-                        bail.store(true, std::sync::atomic::Ordering::Relaxed);
+            let process_volume =
+                |(seg_id, cs): &(u64, super::manifest::ColdSegment)| -> Result<Option<Vec<Accum>>> {
+                    if bail.load(std::sync::atomic::Ordering::Relaxed) {
                         return Ok(None);
                     }
-                    match &mapping.sources[pred.schema_col_idx] {
-                        super::writer::ColSource::Volume(phys_idx) => {
-                            let dict_id = if let TypedTarget::DictEq(ref s) = pred.target {
-                                match vol.get_column_dictionary(*phys_idx)? {
-                                    Some(dict) => {
-                                        match dict
-                                            .iter()
-                                            .position(|entry| entry.as_str() == s.as_str())
-                                        {
-                                            Some(pos) => Some(pos as u32),
-                                            None => {
-                                                skip_volume = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    None => {
-                                        bail.store(true, std::sync::atomic::Ordering::Relaxed);
-                                        return Ok(None);
-                                    }
-                                }
-                            } else {
-                                None
-                            };
-                            phys_preds.push(PhysPred {
-                                phys_col: *phys_idx,
-                                op: pred.op,
-                                target: match &pred.target {
-                                    TypedTarget::Int64(v) => TypedTarget::Int64(*v),
-                                    TypedTarget::Float64(v) => TypedTarget::Float64(*v),
-                                    TypedTarget::DictEq(s) => TypedTarget::DictEq(s.clone()),
-                                },
-                                dict_id,
-                                is_timestamp: pred.is_timestamp,
-                            });
-                        }
-                        super::writer::ColSource::Default(val) => {
-                            let passes = match (&pred.target, val) {
-                                (TypedTarget::Int64(target), Value::Integer(def)) => {
-                                    compare_i64(*def, *target, pred.op)
-                                }
-                                (TypedTarget::Int64(target), Value::Timestamp(t)) => {
-                                    let def_nanos = t.timestamp_nanos_opt().unwrap_or(0);
-                                    compare_i64(def_nanos, *target, pred.op)
-                                }
-                                (TypedTarget::Float64(target), Value::Float(def)) => {
-                                    compare_f64(*def, *target, pred.op)
-                                }
-                                (TypedTarget::Float64(target), Value::Integer(def)) => {
-                                    compare_f64(*def as f64, *target, pred.op)
-                                }
-                                (TypedTarget::DictEq(s), Value::Text(def)) => {
-                                    s.as_str() == def.as_str()
-                                }
-                                _ => false,
-                            };
-                            if !passes {
-                                skip_volume = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if skip_volume {
-                    return Ok(None);
-                }
+                    let vol = &cs.volume;
+                    let mapping = self.segment_mgr.get_volume_mapping(*seg_id, &schema);
 
-                // Zone-map pruning
-                for pp in &phys_preds {
-                    if pp.phys_col < vol.meta.zone_maps.len() {
-                        let zm = &vol.meta.zone_maps[pp.phys_col];
-                        let val_for_zm = zm_probe_value(&pp.target, pp.is_timestamp);
-                        let can_match = match pp.op {
-                            crate::core::Operator::Eq => zm.may_contain_eq(&val_for_zm),
-                            crate::core::Operator::Gt | crate::core::Operator::Gte => {
-                                zm.may_contain_gte(&val_for_zm)
-                            }
-                            crate::core::Operator::Lt | crate::core::Operator::Lte => {
-                                zm.may_contain_lte(&val_for_zm)
-                            }
-                            _ => true,
-                        };
-                        if !can_match {
+                    // Resolve predicates to physical column indices via mapping.
+                    let mut phys_preds: Vec<PhysPred> = Vec::with_capacity(preds.len());
+                    let mut skip_volume = false;
+
+                    for pred in &preds {
+                        if pred.schema_col_idx >= mapping.sources.len() {
+                            bail.store(true, std::sync::atomic::Ordering::Relaxed);
                             return Ok(None);
                         }
-                    }
-                }
-
-                // Row-group skip decisions
-                let row_group_skips: Vec<bool> = if !vol.meta.row_groups.is_empty() {
-                    vol.meta
-                        .row_groups
-                        .iter()
-                        .map(|rg| {
-                            for pp in &phys_preds {
-                                if pp.phys_col >= rg.zone_maps.len() {
-                                    continue;
-                                }
-                                let zm = &rg.zone_maps[pp.phys_col];
-                                let val_for_zm = zm_probe_value(&pp.target, pp.is_timestamp);
-                                let dominated = match pp.op {
-                                    crate::core::Operator::Eq => !zm.may_contain_eq(&val_for_zm),
-                                    crate::core::Operator::Gt | crate::core::Operator::Gte => {
-                                        !zm.may_contain_gte(&val_for_zm)
+                        match &mapping.sources[pred.schema_col_idx] {
+                            super::writer::ColSource::Volume(phys_idx) => {
+                                let dict_id = if let TypedTarget::DictEq(ref s) = pred.target {
+                                    match vol.get_column_dictionary(*phys_idx)? {
+                                        Some(dict) => {
+                                            match dict
+                                                .iter()
+                                                .position(|entry| entry.as_str() == s.as_str())
+                                            {
+                                                Some(pos) => Some(pos as u32),
+                                                None => {
+                                                    skip_volume = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        None => {
+                                            bail.store(true, std::sync::atomic::Ordering::Relaxed);
+                                            return Ok(None);
+                                        }
                                     }
-                                    crate::core::Operator::Lt | crate::core::Operator::Lte => {
-                                        !zm.may_contain_lte(&val_for_zm)
+                                } else {
+                                    None
+                                };
+                                phys_preds.push(PhysPred {
+                                    phys_col: *phys_idx,
+                                    op: pred.op,
+                                    target: match &pred.target {
+                                        TypedTarget::Int64(v) => TypedTarget::Int64(*v),
+                                        TypedTarget::Float64(v) => TypedTarget::Float64(*v),
+                                        TypedTarget::DictEq(s) => TypedTarget::DictEq(s.clone()),
+                                    },
+                                    dict_id,
+                                    is_timestamp: pred.is_timestamp,
+                                });
+                            }
+                            super::writer::ColSource::Default(val) => {
+                                let passes = match (&pred.target, val) {
+                                    (TypedTarget::Int64(target), Value::Integer(def)) => {
+                                        compare_i64(*def, *target, pred.op)
+                                    }
+                                    (TypedTarget::Int64(target), Value::Timestamp(t)) => {
+                                        let def_nanos = t.timestamp_nanos_opt().unwrap_or(0);
+                                        compare_i64(def_nanos, *target, pred.op)
+                                    }
+                                    (TypedTarget::Float64(target), Value::Float(def)) => {
+                                        compare_f64(*def, *target, pred.op)
+                                    }
+                                    (TypedTarget::Float64(target), Value::Integer(def)) => {
+                                        compare_f64(*def as f64, *target, pred.op)
+                                    }
+                                    (TypedTarget::DictEq(s), Value::Text(def)) => {
+                                        s.as_str() == def.as_str()
                                     }
                                     _ => false,
                                 };
-                                if dominated {
-                                    return true;
+                                if !passes {
+                                    skip_volume = true;
+                                    break;
                                 }
                             }
-                            false
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-
-                // Resolve aggregate physical columns
-                let mut phys_aggs: Vec<PhysAgg> = Vec::with_capacity(agg_count);
-                for (op, col_idx) in aggregates {
-                    if matches!(op, AggregateOp::CountStar) {
-                        phys_aggs.push(PhysAgg {
-                            phys_col: None,
-                            op: *op,
-                            default_val: None,
-                        });
-                        continue;
+                        }
                     }
-                    if *col_idx >= mapping.sources.len() {
-                        bail.store(true, std::sync::atomic::Ordering::Relaxed);
+                    if skip_volume {
                         return Ok(None);
                     }
-                    match &mapping.sources[*col_idx] {
-                        super::writer::ColSource::Volume(phys_idx) => {
-                            phys_aggs.push(PhysAgg {
-                                phys_col: Some(*phys_idx),
-                                op: *op,
-                                default_val: None,
-                            });
+
+                    // Zone-map pruning
+                    for pp in &phys_preds {
+                        if pp.phys_col < vol.meta.zone_maps.len() {
+                            let zm = &vol.meta.zone_maps[pp.phys_col];
+                            let val_for_zm = zm_probe_value(&pp.target, pp.is_timestamp);
+                            let can_match = match pp.op {
+                                crate::core::Operator::Eq => zm.may_contain_eq(&val_for_zm),
+                                crate::core::Operator::Gt | crate::core::Operator::Gte => {
+                                    zm.may_contain_gte(&val_for_zm)
+                                }
+                                crate::core::Operator::Lt | crate::core::Operator::Lte => {
+                                    zm.may_contain_lte(&val_for_zm)
+                                }
+                                _ => true,
+                            };
+                            if !can_match {
+                                return Ok(None);
+                            }
                         }
-                        super::writer::ColSource::Default(val) => {
+                    }
+
+                    // Row-group skip decisions
+                    let row_group_skips: Vec<bool> = if !vol.meta.row_groups.is_empty() {
+                        vol.meta
+                            .row_groups
+                            .iter()
+                            .map(|rg| {
+                                for pp in &phys_preds {
+                                    if pp.phys_col >= rg.zone_maps.len() {
+                                        continue;
+                                    }
+                                    let zm = &rg.zone_maps[pp.phys_col];
+                                    let val_for_zm = zm_probe_value(&pp.target, pp.is_timestamp);
+                                    let dominated = match pp.op {
+                                        crate::core::Operator::Eq => {
+                                            !zm.may_contain_eq(&val_for_zm)
+                                        }
+                                        crate::core::Operator::Gt | crate::core::Operator::Gte => {
+                                            !zm.may_contain_gte(&val_for_zm)
+                                        }
+                                        crate::core::Operator::Lt | crate::core::Operator::Lte => {
+                                            !zm.may_contain_lte(&val_for_zm)
+                                        }
+                                        _ => false,
+                                    };
+                                    if dominated {
+                                        return true;
+                                    }
+                                }
+                                false
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+
+                    // Resolve aggregate physical columns
+                    let mut phys_aggs: Vec<PhysAgg> = Vec::with_capacity(agg_count);
+                    for (op, col_idx) in aggregates {
+                        if matches!(op, AggregateOp::CountStar) {
                             phys_aggs.push(PhysAgg {
                                 phys_col: None,
                                 op: *op,
-                                default_val: Some(val.clone()),
+                                default_val: None,
                             });
-                        }
-                    }
-                }
-
-                // Inner loop: per-volume accumulators
-                let mut vol_accums = vec![Accum::default(); agg_count];
-                let mut agg_columns =
-                    smallvec::SmallVec::<[Option<&super::column::ColumnData>; 4]>::new();
-                let mut group_candidates: Vec<usize> = Vec::new();
-                let row_ids = vol.row_ids()?;
-                let row_count = vol.meta.row_count;
-                let rg_size = super::column::ROW_GROUP_SIZE;
-                let num_groups = row_count.div_ceil(rg_size);
-
-                for gi in 0..num_groups {
-                    if gi < row_group_skips.len() && row_group_skips[gi] {
-                        continue;
-                    }
-                    let g_start = gi * rg_size;
-                    let g_end = ((gi + 1) * rg_size).min(row_count);
-
-                    // Dictionary equalities are answered for the whole group in
-                    // one pass over the raw ids; the other predicates run per
-                    // surviving row
-                    let dict_preds: smallvec::SmallVec<[super::column::DictFilter<'_>; 4]> =
-                        phys_preds
-                            .iter()
-                            .filter(|pp| matches!(pp.target, TypedTarget::DictEq(_)))
-                            .map(|pp| {
-                                Ok((
-                                    vol.columns.get(pp.phys_col)?,
-                                    g_start,
-                                    pp.dict_id.unwrap_or(u32::MAX),
-                                ))
-                            })
-                            .collect::<std::io::Result<_>>()?;
-                    group_candidates.clear();
-                    let prefiltered = !dict_preds.is_empty()
-                        && super::column::ColumnData::dict_matching_offsets(
-                            &dict_preds,
-                            g_end - g_start,
-                            &mut group_candidates,
-                        )
-                        .is_some();
-                    let mut pos = 0usize;
-                    let mut plain = g_start;
-                    let mut next_row = || -> Option<usize> {
-                        if prefiltered {
-                            let i = g_start + *group_candidates.get(pos)?;
-                            pos += 1;
-                            Some(i)
-                        } else if plain < g_end {
-                            plain += 1;
-                            Some(plain - 1)
-                        } else {
-                            None
-                        }
-                    };
-
-                    while let Some(i) = next_row() {
-                        if !cs.is_visible(i) {
                             continue;
                         }
-                        let row_id = row_ids[i];
-                        if self.is_row_tombstoned(tombstones_ref, row_id)
-                            || hot_skip_ref.contains(&row_id)
-                        {
+                        if *col_idx >= mapping.sources.len() {
+                            bail.store(true, std::sync::atomic::Ordering::Relaxed);
+                            return Ok(None);
+                        }
+                        match &mapping.sources[*col_idx] {
+                            super::writer::ColSource::Volume(phys_idx) => {
+                                phys_aggs.push(PhysAgg {
+                                    phys_col: Some(*phys_idx),
+                                    op: *op,
+                                    default_val: None,
+                                });
+                            }
+                            super::writer::ColSource::Default(val) => {
+                                phys_aggs.push(PhysAgg {
+                                    phys_col: None,
+                                    op: *op,
+                                    default_val: Some(val.clone()),
+                                });
+                            }
+                        }
+                    }
+
+                    // Inner loop: per-volume accumulators
+                    let mut vol_accums = vec![Accum::default(); agg_count];
+                    let mut agg_columns =
+                        smallvec::SmallVec::<[Option<&super::column::ColumnData>; 4]>::new();
+                    let mut group_candidates: Vec<usize> = Vec::new();
+                    let row_ids = vol.row_ids()?;
+                    let row_count = vol.meta.row_count;
+                    let rg_size = super::column::ROW_GROUP_SIZE;
+                    let num_groups = row_count.div_ceil(rg_size);
+
+                    for gi in 0..num_groups {
+                        if gi < row_group_skips.len() && row_group_skips[gi] {
                             continue;
                         }
+                        let g_start = gi * rg_size;
+                        let g_end = ((gi + 1) * rg_size).min(row_count);
 
-                        let mut all_pass = true;
-                        for pp in &phys_preds {
-                            if prefiltered && matches!(pp.target, TypedTarget::DictEq(_)) {
+                        // Dictionary equalities are answered for the whole group in
+                        // one pass over the raw ids; the other predicates run per
+                        // surviving row
+                        let dict_preds: smallvec::SmallVec<[super::column::DictFilter<'_>; 4]> =
+                            phys_preds
+                                .iter()
+                                .filter(|pp| matches!(pp.target, TypedTarget::DictEq(_)))
+                                .map(|pp| {
+                                    Ok((
+                                        vol.columns.get(pp.phys_col)?,
+                                        g_start,
+                                        pp.dict_id.unwrap_or(u32::MAX),
+                                    ))
+                                })
+                                .collect::<std::io::Result<_>>()?;
+                        group_candidates.clear();
+                        let prefiltered = !dict_preds.is_empty()
+                            && super::column::ColumnData::dict_matching_offsets(
+                                &dict_preds,
+                                g_end - g_start,
+                                &mut group_candidates,
+                            )
+                            .is_some();
+                        let mut pos = 0usize;
+                        let mut plain = g_start;
+                        let mut next_row = || -> Option<usize> {
+                            if prefiltered {
+                                let i = g_start + *group_candidates.get(pos)?;
+                                pos += 1;
+                                Some(i)
+                            } else if plain < g_end {
+                                plain += 1;
+                                Some(plain - 1)
+                            } else {
+                                None
+                            }
+                        };
+
+                        while let Some(i) = next_row() {
+                            if !cs.is_visible(i) {
                                 continue;
                             }
-                            let col = vol.columns.get(pp.phys_col)?;
-                            if col.is_null(i) {
-                                all_pass = false;
-                                break;
+                            let row_id = row_ids[i];
+                            if self.is_row_tombstoned(tombstones_ref, row_id)
+                                || hot_skip_ref.contains(&row_id)
+                            {
+                                continue;
                             }
-                            let passes = match &pp.target {
-                                TypedTarget::Int64(target) => {
-                                    compare_i64(col.get_i64(i), *target, pp.op)
+
+                            let mut all_pass = true;
+                            for pp in &phys_preds {
+                                if prefiltered && matches!(pp.target, TypedTarget::DictEq(_)) {
+                                    continue;
                                 }
-                                TypedTarget::Float64(target) => {
-                                    compare_f64(col.get_f64(i), *target, pp.op)
+                                let col = vol.columns.get(pp.phys_col)?;
+                                if col.is_null(i) {
+                                    all_pass = false;
+                                    break;
                                 }
-                                TypedTarget::DictEq(_) => {
-                                    col.get_dict_id(i) == pp.dict_id.unwrap_or(u32::MAX)
+                                let passes = match &pp.target {
+                                    TypedTarget::Int64(target) => {
+                                        compare_i64(col.get_i64(i), *target, pp.op)
+                                    }
+                                    TypedTarget::Float64(target) => {
+                                        compare_f64(col.get_f64(i), *target, pp.op)
+                                    }
+                                    TypedTarget::DictEq(_) => {
+                                        col.get_dict_id(i) == pp.dict_id.unwrap_or(u32::MAX)
+                                    }
+                                };
+                                if !passes {
+                                    all_pass = false;
+                                    break;
                                 }
-                            };
-                            if !passes {
-                                all_pass = false;
-                                break;
                             }
-                        }
-                        if !all_pass {
-                            continue;
-                        }
-
-                        if agg_columns.is_empty() {
-                            for pa in &phys_aggs {
-                                agg_columns
-                                    .push(pa.phys_col.map(|pc| vol.columns.get(pc)).transpose()?);
+                            if !all_pass {
+                                continue;
                             }
-                        }
-                        accumulate_row(&mut vol_accums, &phys_aggs, &agg_columns, i);
-                    }
-                }
 
-                Ok(Some(vol_accums))
-            };
-
-        // Parallel or sequential volume processing.
-        // Only use rayon when total cold rows justify the scheduling overhead.
-        let _total_cold_rows: usize = volumes.iter().map(|(_, cs)| cs.volume.meta.row_count).sum();
-        #[cfg(feature = "parallel")]
-        let volume_accums: Vec<Option<Vec<Accum>>> =
-            if volumes.len() >= 4 && _total_cold_rows >= 100_000 {
-                use rayon::prelude::*;
-                volumes
-                    .par_iter()
-                    .map(|v| process_volume(v))
-                    .collect::<Result<_>>()?
-            } else {
-                volumes
-                    .iter()
-                    .map(|v| process_volume(v))
-                    .collect::<Result<_>>()?
-            };
-        #[cfg(not(feature = "parallel"))]
-        let volume_accums: Vec<Option<Vec<Accum>>> = volumes
-            .iter()
-            .map(|v| process_volume(v))
-            .collect::<Result<_>>()?;
-
-        if bail.load(std::sync::atomic::Ordering::Relaxed) {
-            return Ok(None);
-        }
-
-        // Merge per-volume accumulators
-        for vol_acc in volume_accums.iter().flatten() {
-            for (i, acc) in vol_acc.iter().enumerate() {
-                merge_accum(&mut accums[i], acc);
-            }
-        }
-
-        // --- Finalize accumulators -------------------------------------------
-        let results: Vec<Value> = aggregates
-            .iter()
-            .zip(accums.iter())
-            .map(|((op, col_idx), acc)| match op {
-                AggregateOp::Count | AggregateOp::CountStar => Value::Integer(acc.count),
-                AggregateOp::Sum => {
-                    if acc.count > 0 {
-                        if acc.is_int_agg && acc.float_sum == 0.0 {
-                            // Pure integer sum: check if it fits in i64
-                            if acc.int_sum >= i64::MIN as i128 && acc.int_sum <= i64::MAX as i128 {
-                                Value::Integer(acc.int_sum as i64)
-                            } else {
-                                Value::Float(acc.int_sum as f64)
+                            if agg_columns.is_empty() {
+                                for pa in &phys_aggs {
+                                    agg_columns.push(
+                                        pa.phys_col.map(|pc| vol.columns.get(pc)).transpose()?,
+                                    );
+                                }
                             }
-                        } else {
-                            Value::Float(acc.int_sum as f64 + acc.float_sum)
+                            accumulate_row(&mut vol_accums, &phys_aggs, &agg_columns, i);
                         }
-                    } else {
-                        Value::Null(DataType::Float)
                     }
-                }
-                AggregateOp::Avg => {
-                    if acc.count > 0 {
-                        Value::Float((acc.int_sum as f64 + acc.float_sum) / acc.count as f64)
-                    } else {
-                        Value::Null(DataType::Float)
-                    }
-                }
-                AggregateOp::Min => {
-                    let col_type = if *col_idx < schema.columns.len() {
-                        schema.columns[*col_idx].data_type
-                    } else {
-                        DataType::Null
-                    };
-                    match (acc.min_i64, acc.min_f64) {
-                        (Some(i), None) => match col_type {
-                            DataType::Timestamp => chrono::DateTime::from_timestamp(
-                                i.div_euclid(1_000_000_000),
-                                i.rem_euclid(1_000_000_000) as u32,
-                            )
-                            .map(Value::Timestamp)
-                            .unwrap_or(Value::Null(DataType::Timestamp)),
-                            _ => Value::Integer(i),
-                        },
-                        (None, Some(f)) => Value::Float(f),
-                        (Some(i), Some(f)) => {
-                            if (i as f64) <= f {
-                                Value::Integer(i)
-                            } else {
-                                Value::Float(f)
-                            }
-                        }
-                        (None, None) => Value::Null(col_type),
-                    }
-                }
-                AggregateOp::Max => {
-                    let col_type = if *col_idx < schema.columns.len() {
-                        schema.columns[*col_idx].data_type
-                    } else {
-                        DataType::Null
-                    };
-                    match (acc.max_i64, acc.max_f64) {
-                        (Some(i), None) => match col_type {
-                            DataType::Timestamp => chrono::DateTime::from_timestamp(
-                                i.div_euclid(1_000_000_000),
-                                i.rem_euclid(1_000_000_000) as u32,
-                            )
-                            .map(Value::Timestamp)
-                            .unwrap_or(Value::Null(DataType::Timestamp)),
-                            _ => Value::Integer(i),
-                        },
-                        (None, Some(f)) => Value::Float(f),
-                        (Some(i), Some(f)) => {
-                            if (i as f64) >= f {
-                                Value::Integer(i)
-                            } else {
-                                Value::Float(f)
-                            }
-                        }
-                        (None, None) => Value::Null(col_type),
-                    }
-                }
-            })
-            .collect();
 
-        self.check_cold()?;
-        Ok(Some(results))
-    }
+                    Ok(Some(vol_accums))
+                };
 
-    fn compute_grouped_aggregates(
-        &self,
-        group_by_indices: &[usize],
-        aggregates: &[(AggregateOp, usize)],
-    ) -> Result<Option<Vec<GroupedAggregateResult>>> {
-        #[cfg(feature = "test-failpoints")]
-        crate::test_failpoints::note_read("seg.compute_grouped_aggregates");
-        if self.snapshot_seq.is_some() {
-            return Ok(None);
-        }
-        // Multi-column GROUP BY: fall back to the full executor path.
-        if group_by_indices.len() != 1 {
-            return Ok(None);
-        }
-        let _seal_guard = self.segment_mgr.acquire_seal_read();
-        if !self.segment_mgr.has_segments() {
-            return self
-                .hot
-                .compute_grouped_aggregates(group_by_indices, aggregates);
-        }
+            // Parallel or sequential volume processing.
+            // Only use rayon when total cold rows justify the scheduling overhead.
+            let _total_cold_rows: usize =
+                volumes.iter().map(|(_, cs)| cs.volume.meta.row_count).sum();
+            #[cfg(feature = "parallel")]
+            let volume_accums: Vec<Option<Vec<Accum>>> =
+                if volumes.len() >= 4 && _total_cold_rows >= 100_000 {
+                    use rayon::prelude::*;
+                    volumes
+                        .par_iter()
+                        .map(|v| process_volume(v))
+                        .collect::<Result<_>>()?
+                } else {
+                    volumes
+                        .iter()
+                        .map(|v| process_volume(v))
+                        .collect::<Result<_>>()?
+                };
+            #[cfg(not(feature = "parallel"))]
+            let volume_accums: Vec<Option<Vec<Accum>>> = volumes
+                .iter()
+                .map(|v| process_volume(v))
+                .collect::<Result<_>>()?;
 
-        // During seal, hot+cold overlap — can't reliably aggregate
-        if self.segment_mgr.seal_overlap() > 0 {
-            return Ok(None);
-        }
+            if bail.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(None);
+            }
 
-        let gb_idx = group_by_indices[0];
-
-        // ---- Typed accumulator (no Value in inner loop) ----
-        #[derive(Clone)]
-        struct Accum {
-            count: i64,
-            int_sum: i128,
-            float_sum: f64,
-            min_i64: Option<i64>,
-            max_i64: Option<i64>,
-            min_f64: Option<f64>,
-            max_f64: Option<f64>,
-            is_int_agg: bool,
-        }
-
-        impl Default for Accum {
-            fn default() -> Self {
-                Self {
-                    count: 0,
-                    int_sum: 0,
-                    float_sum: 0.0,
-                    min_i64: None,
-                    max_i64: None,
-                    min_f64: None,
-                    max_f64: None,
-                    is_int_agg: true,
+            // Merge per-volume accumulators
+            for vol_acc in volume_accums.iter().flatten() {
+                for (i, acc) in vol_acc.iter().enumerate() {
+                    merge_accum(&mut accums[i], acc);
                 }
             }
-        }
 
-        /// Merge `src` accumulator into `dst`.
-        #[inline(always)]
-        fn merge_accum(dst: &mut Accum, src: &Accum) {
-            dst.count += src.count;
-            dst.int_sum += src.int_sum;
-            dst.float_sum += src.float_sum;
-            if !src.is_int_agg {
-                dst.is_int_agg = false;
-            }
-            if let Some(s) = src.min_i64 {
-                dst.min_i64 = Some(match dst.min_i64 {
-                    Some(d) if d <= s => d,
-                    _ => s,
-                });
-            }
-            if let Some(s) = src.max_i64 {
-                dst.max_i64 = Some(match dst.max_i64 {
-                    Some(d) if d >= s => d,
-                    _ => s,
-                });
-            }
-            if let Some(s) = src.min_f64 {
-                dst.min_f64 = Some(match dst.min_f64 {
-                    Some(d) if d <= s => d,
-                    _ => s,
-                });
-            }
-            if let Some(s) = src.max_f64 {
-                dst.max_f64 = Some(match dst.max_f64 {
-                    Some(d) if d >= s => d,
-                    _ => s,
-                });
-            }
-        }
-
-        fn finalize_accums(
-            aggregates: &[(AggregateOp, usize)],
-            accums: &[Accum],
-            schema: &crate::core::Schema,
-        ) -> Vec<Value> {
-            aggregates
+            // --- Finalize accumulators -------------------------------------------
+            let results: Vec<Value> = aggregates
                 .iter()
                 .zip(accums.iter())
                 .map(|((op, col_idx), acc)| match op {
@@ -7339,6 +7269,7 @@ impl Table for SegmentedTable {
                     AggregateOp::Sum => {
                         if acc.count > 0 {
                             if acc.is_int_agg && acc.float_sum == 0.0 {
+                                // Pure integer sum: check if it fits in i64
                                 if acc.int_sum >= i64::MIN as i128
                                     && acc.int_sum <= i64::MAX as i128
                                 {
@@ -7415,340 +7346,537 @@ impl Table for SegmentedTable {
                         }
                     }
                 })
-                .collect()
-        }
+                .collect();
 
-        // Update accums from a hot-buffer Row (used for hot rows only).
-        #[inline(always)]
-        fn update_accums_row(accums: &mut [Accum], aggregates: &[(AggregateOp, usize)], row: &Row) {
-            for (agg_idx, (op, col_idx)) in aggregates.iter().enumerate() {
-                let accum = &mut accums[agg_idx];
-                match op {
-                    AggregateOp::CountStar => accum.count += 1,
-                    AggregateOp::Count => {
-                        if let Some(v) = row.get(*col_idx) {
-                            if !v.is_null() {
-                                accum.count += 1;
+            self.check_cold()?;
+            Ok(Some(results))
+        })
+    }
+
+    fn compute_grouped_aggregates(
+        &self,
+        group_by_indices: &[usize],
+        aggregates: &[(AggregateOp, usize)],
+    ) -> Result<Option<Vec<GroupedAggregateResult>>> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("seg.compute_grouped_aggregates");
+        if self.snapshot_seq.is_some() {
+            return Ok(None);
+        }
+        // Multi-column GROUP BY: fall back to the full executor path.
+        if group_by_indices.len() != 1 {
+            return Ok(None);
+        }
+        self.clear_of_destruction(|| {
+            let _seal_guard = self.segment_mgr.acquire_seal_read();
+            if !self.segment_mgr.has_segments() {
+                return self
+                    .hot
+                    .compute_grouped_aggregates(group_by_indices, aggregates);
+            }
+
+            // During seal, hot+cold overlap — can't reliably aggregate
+            if self.segment_mgr.seal_overlap() > 0 {
+                return Ok(None);
+            }
+
+            let gb_idx = group_by_indices[0];
+
+            // ---- Typed accumulator (no Value in inner loop) ----
+            #[derive(Clone)]
+            struct Accum {
+                count: i64,
+                int_sum: i128,
+                float_sum: f64,
+                min_i64: Option<i64>,
+                max_i64: Option<i64>,
+                min_f64: Option<f64>,
+                max_f64: Option<f64>,
+                is_int_agg: bool,
+            }
+
+            impl Default for Accum {
+                fn default() -> Self {
+                    Self {
+                        count: 0,
+                        int_sum: 0,
+                        float_sum: 0.0,
+                        min_i64: None,
+                        max_i64: None,
+                        min_f64: None,
+                        max_f64: None,
+                        is_int_agg: true,
+                    }
+                }
+            }
+
+            /// Merge `src` accumulator into `dst`.
+            #[inline(always)]
+            fn merge_accum(dst: &mut Accum, src: &Accum) {
+                dst.count += src.count;
+                dst.int_sum += src.int_sum;
+                dst.float_sum += src.float_sum;
+                if !src.is_int_agg {
+                    dst.is_int_agg = false;
+                }
+                if let Some(s) = src.min_i64 {
+                    dst.min_i64 = Some(match dst.min_i64 {
+                        Some(d) if d <= s => d,
+                        _ => s,
+                    });
+                }
+                if let Some(s) = src.max_i64 {
+                    dst.max_i64 = Some(match dst.max_i64 {
+                        Some(d) if d >= s => d,
+                        _ => s,
+                    });
+                }
+                if let Some(s) = src.min_f64 {
+                    dst.min_f64 = Some(match dst.min_f64 {
+                        Some(d) if d <= s => d,
+                        _ => s,
+                    });
+                }
+                if let Some(s) = src.max_f64 {
+                    dst.max_f64 = Some(match dst.max_f64 {
+                        Some(d) if d >= s => d,
+                        _ => s,
+                    });
+                }
+            }
+
+            fn finalize_accums(
+                aggregates: &[(AggregateOp, usize)],
+                accums: &[Accum],
+                schema: &crate::core::Schema,
+            ) -> Vec<Value> {
+                aggregates
+                    .iter()
+                    .zip(accums.iter())
+                    .map(|((op, col_idx), acc)| match op {
+                        AggregateOp::Count | AggregateOp::CountStar => Value::Integer(acc.count),
+                        AggregateOp::Sum => {
+                            if acc.count > 0 {
+                                if acc.is_int_agg && acc.float_sum == 0.0 {
+                                    if acc.int_sum >= i64::MIN as i128
+                                        && acc.int_sum <= i64::MAX as i128
+                                    {
+                                        Value::Integer(acc.int_sum as i64)
+                                    } else {
+                                        Value::Float(acc.int_sum as f64)
+                                    }
+                                } else {
+                                    Value::Float(acc.int_sum as f64 + acc.float_sum)
+                                }
+                            } else {
+                                Value::Null(DataType::Float)
                             }
                         }
-                    }
-                    AggregateOp::Sum | AggregateOp::Avg => {
-                        if let Some(v) = row.get(*col_idx) {
-                            match v {
-                                Value::Integer(i) => {
-                                    accum.int_sum += *i as i128;
-                                    accum.count += 1;
-                                }
-                                Value::Float(f) if !f.is_nan() => {
-                                    accum.float_sum += *f;
-                                    accum.count += 1;
-                                    accum.is_int_agg = false;
-                                }
-                                Value::Boolean(b) => {
-                                    accum.int_sum += *b as i128;
-                                    accum.count += 1;
-                                }
-                                _ => {}
+                        AggregateOp::Avg => {
+                            if acc.count > 0 {
+                                Value::Float(
+                                    (acc.int_sum as f64 + acc.float_sum) / acc.count as f64,
+                                )
+                            } else {
+                                Value::Null(DataType::Float)
                             }
                         }
-                    }
-                    AggregateOp::Min => {
-                        if let Some(v) = row.get(*col_idx) {
-                            match v {
-                                Value::Integer(i) => match accum.min_i64 {
-                                    None => accum.min_i64 = Some(*i),
-                                    Some(cur) if *i < cur => accum.min_i64 = Some(*i),
-                                    _ => {}
+                        AggregateOp::Min => {
+                            let col_type = if *col_idx < schema.columns.len() {
+                                schema.columns[*col_idx].data_type
+                            } else {
+                                DataType::Null
+                            };
+                            match (acc.min_i64, acc.min_f64) {
+                                (Some(i), None) => match col_type {
+                                    DataType::Timestamp => chrono::DateTime::from_timestamp(
+                                        i.div_euclid(1_000_000_000),
+                                        i.rem_euclid(1_000_000_000) as u32,
+                                    )
+                                    .map(Value::Timestamp)
+                                    .unwrap_or(Value::Null(DataType::Timestamp)),
+                                    _ => Value::Integer(i),
                                 },
-                                Value::Timestamp(t) => {
-                                    let nanos = t.timestamp_nanos_opt().unwrap_or_else(|| {
-                                        t.timestamp().saturating_mul(1_000_000_000)
-                                    });
-                                    match accum.min_i64 {
-                                        None => accum.min_i64 = Some(nanos),
-                                        Some(cur) if nanos < cur => accum.min_i64 = Some(nanos),
-                                        _ => {}
+                                (None, Some(f)) => Value::Float(f),
+                                (Some(i), Some(f)) => {
+                                    if (i as f64) <= f {
+                                        Value::Integer(i)
+                                    } else {
+                                        Value::Float(f)
                                     }
                                 }
-                                Value::Float(f) if !f.is_nan() => {
-                                    accum.is_int_agg = false;
-                                    match accum.min_f64 {
-                                        None => accum.min_f64 = Some(*f),
-                                        Some(cur) if *f < cur => accum.min_f64 = Some(*f),
-                                        _ => {}
-                                    }
-                                }
-                                _ => {}
+                                (None, None) => Value::Null(col_type),
                             }
                         }
-                    }
-                    AggregateOp::Max => {
-                        if let Some(v) = row.get(*col_idx) {
-                            match v {
-                                Value::Integer(i) => match accum.max_i64 {
-                                    None => accum.max_i64 = Some(*i),
-                                    Some(cur) if *i > cur => accum.max_i64 = Some(*i),
-                                    _ => {}
+                        AggregateOp::Max => {
+                            let col_type = if *col_idx < schema.columns.len() {
+                                schema.columns[*col_idx].data_type
+                            } else {
+                                DataType::Null
+                            };
+                            match (acc.max_i64, acc.max_f64) {
+                                (Some(i), None) => match col_type {
+                                    DataType::Timestamp => chrono::DateTime::from_timestamp(
+                                        i.div_euclid(1_000_000_000),
+                                        i.rem_euclid(1_000_000_000) as u32,
+                                    )
+                                    .map(Value::Timestamp)
+                                    .unwrap_or(Value::Null(DataType::Timestamp)),
+                                    _ => Value::Integer(i),
                                 },
-                                Value::Timestamp(t) => {
-                                    let nanos = t.timestamp_nanos_opt().unwrap_or_else(|| {
-                                        t.timestamp().saturating_mul(1_000_000_000)
-                                    });
-                                    match accum.max_i64 {
-                                        None => accum.max_i64 = Some(nanos),
-                                        Some(cur) if nanos > cur => accum.max_i64 = Some(nanos),
-                                        _ => {}
+                                (None, Some(f)) => Value::Float(f),
+                                (Some(i), Some(f)) => {
+                                    if (i as f64) >= f {
+                                        Value::Integer(i)
+                                    } else {
+                                        Value::Float(f)
                                     }
                                 }
-                                Value::Float(f) if !f.is_nan() => {
-                                    accum.is_int_agg = false;
-                                    match accum.max_f64 {
-                                        None => accum.max_f64 = Some(*f),
-                                        Some(cur) if *f > cur => accum.max_f64 = Some(*f),
-                                        _ => {}
-                                    }
+                                (None, None) => Value::Null(col_type),
+                            }
+                        }
+                    })
+                    .collect()
+            }
+
+            // Update accums from a hot-buffer Row (used for hot rows only).
+            #[inline(always)]
+            fn update_accums_row(
+                accums: &mut [Accum],
+                aggregates: &[(AggregateOp, usize)],
+                row: &Row,
+            ) {
+                for (agg_idx, (op, col_idx)) in aggregates.iter().enumerate() {
+                    let accum = &mut accums[agg_idx];
+                    match op {
+                        AggregateOp::CountStar => accum.count += 1,
+                        AggregateOp::Count => {
+                            if let Some(v) = row.get(*col_idx) {
+                                if !v.is_null() {
+                                    accum.count += 1;
                                 }
-                                _ => {}
+                            }
+                        }
+                        AggregateOp::Sum | AggregateOp::Avg => {
+                            if let Some(v) = row.get(*col_idx) {
+                                match v {
+                                    Value::Integer(i) => {
+                                        accum.int_sum += *i as i128;
+                                        accum.count += 1;
+                                    }
+                                    Value::Float(f) if !f.is_nan() => {
+                                        accum.float_sum += *f;
+                                        accum.count += 1;
+                                        accum.is_int_agg = false;
+                                    }
+                                    Value::Boolean(b) => {
+                                        accum.int_sum += *b as i128;
+                                        accum.count += 1;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        AggregateOp::Min => {
+                            if let Some(v) = row.get(*col_idx) {
+                                match v {
+                                    Value::Integer(i) => match accum.min_i64 {
+                                        None => accum.min_i64 = Some(*i),
+                                        Some(cur) if *i < cur => accum.min_i64 = Some(*i),
+                                        _ => {}
+                                    },
+                                    Value::Timestamp(t) => {
+                                        let nanos = t.timestamp_nanos_opt().unwrap_or_else(|| {
+                                            t.timestamp().saturating_mul(1_000_000_000)
+                                        });
+                                        match accum.min_i64 {
+                                            None => accum.min_i64 = Some(nanos),
+                                            Some(cur) if nanos < cur => accum.min_i64 = Some(nanos),
+                                            _ => {}
+                                        }
+                                    }
+                                    Value::Float(f) if !f.is_nan() => {
+                                        accum.is_int_agg = false;
+                                        match accum.min_f64 {
+                                            None => accum.min_f64 = Some(*f),
+                                            Some(cur) if *f < cur => accum.min_f64 = Some(*f),
+                                            _ => {}
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        AggregateOp::Max => {
+                            if let Some(v) = row.get(*col_idx) {
+                                match v {
+                                    Value::Integer(i) => match accum.max_i64 {
+                                        None => accum.max_i64 = Some(*i),
+                                        Some(cur) if *i > cur => accum.max_i64 = Some(*i),
+                                        _ => {}
+                                    },
+                                    Value::Timestamp(t) => {
+                                        let nanos = t.timestamp_nanos_opt().unwrap_or_else(|| {
+                                            t.timestamp().saturating_mul(1_000_000_000)
+                                        });
+                                        match accum.max_i64 {
+                                            None => accum.max_i64 = Some(nanos),
+                                            Some(cur) if nanos > cur => accum.max_i64 = Some(nanos),
+                                            _ => {}
+                                        }
+                                    }
+                                    Value::Float(f) if !f.is_nan() => {
+                                        accum.is_int_agg = false;
+                                        match accum.max_f64 {
+                                            None => accum.max_f64 = Some(*f),
+                                            Some(cur) if *f > cur => accum.max_f64 = Some(*f),
+                                            _ => {}
+                                        }
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                     }
                 }
             }
-        }
 
-        let current_schema = self.hot.schema();
+            let current_schema = self.hot.schema();
 
-        // Build group map: group_key -> (group_key_values, accumulators)
-        let mut groups: ValueMap<(Vec<Value>, Vec<Accum>)> = ValueMap::default();
+            // Build group map: group_key -> (group_key_values, accumulators)
+            let mut groups: ValueMap<(Vec<Value>, Vec<Accum>)> = ValueMap::default();
 
-        // ---- Process hot rows (small, use Value-based path) ----
-        let hot_rows = self.hot.collect_all_rows(None)?;
-        for (_, row) in &hot_rows {
-            let key = row
-                .get(gb_idx)
-                .cloned()
-                .unwrap_or(Value::Null(DataType::Null));
-            let group_key_values: Vec<Value> = vec![key.clone()];
-            let entry = groups
-                .entry(key)
-                .or_insert_with(|| (group_key_values, vec![Accum::default(); aggregates.len()]));
-            update_accums_row(&mut entry.1, aggregates, row);
-        }
+            // ---- Process hot rows (small, use Value-based path) ----
+            let hot_rows = self.hot.collect_all_rows(None)?;
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::hot_and_cold_reads_split();
+            for (_, row) in &hot_rows {
+                let key = row
+                    .get(gb_idx)
+                    .cloned()
+                    .unwrap_or(Value::Null(DataType::Null));
+                let group_key_values: Vec<Value> = vec![key.clone()];
+                let entry = groups.entry(key).or_insert_with(|| {
+                    (group_key_values, vec![Accum::default(); aggregates.len()])
+                });
+                update_accums_row(&mut entry.1, aggregates, row);
+            }
 
-        // ---- Process cold volumes (columnar fast path) ----
-        let volumes = self.segment_mgr.get_volumes_newest_first()?;
-        let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-        let mut hot_skip: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-        self.hot.collect_hot_row_ids_into(&mut hot_skip);
-        self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+            // ---- Process cold volumes (columnar fast path) ----
+            let volumes = self.segment_mgr.get_volumes_newest_first()?;
+            let tombstones_arc = self.segment_mgr.tombstone_set_arc();
+            let mut hot_skip: FxHashSet<i64> =
+                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+            self.hot.collect_hot_row_ids_into(&mut hot_skip);
+            self.segment_mgr
+                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
 
-        // Determine GROUP BY column type from schema.
-        let gb_data_type = if gb_idx < current_schema.columns.len() {
-            current_schema.columns[gb_idx].data_type
-        } else {
-            return Ok(None);
-        };
+            // Determine GROUP BY column type from schema.
+            let gb_data_type = if gb_idx < current_schema.columns.len() {
+                current_schema.columns[gb_idx].data_type
+            } else {
+                return Ok(None);
+            };
 
-        // Only support Dictionary (Text), Int64 (Integer), and TimestampNanos (Timestamp).
-        // Float, Boolean, Bytes: bail to regular executor path.
-        let gb_is_dict = gb_data_type == DataType::Text;
-        let gb_is_i64 = gb_data_type == DataType::Integer || gb_data_type == DataType::Timestamp;
-        if !gb_is_dict && !gb_is_i64 {
-            return Ok(None);
-        }
+            // Only support Dictionary (Text), Int64 (Integer), and TimestampNanos (Timestamp).
+            // Float, Boolean, Bytes: bail to regular executor path.
+            let gb_is_dict = gb_data_type == DataType::Text;
+            let gb_is_i64 =
+                gb_data_type == DataType::Integer || gb_data_type == DataType::Timestamp;
+            if !gb_is_dict && !gb_is_i64 {
+                return Ok(None);
+            }
 
-        // Resolved physical aggregate column for a volume.
-        struct PhysAgg<'a> {
-            phys_col: Option<&'a super::column::ColumnData>, // None for CountStar or ColSource::Default
-            op: AggregateOp,
-            default_val: Option<Value>, // For ColSource::Default
-        }
+            // Resolved physical aggregate column for a volume.
+            struct PhysAgg<'a> {
+                phys_col: Option<&'a super::column::ColumnData>, // None for CountStar or ColSource::Default
+                op: AggregateOp,
+                default_val: Option<Value>, // For ColSource::Default
+            }
 
-        // Inline accumulation from raw columnar data for a single row.
-        #[inline(always)]
-        fn accumulate_columnar(accums: &mut [Accum], phys_aggs: &[PhysAgg<'_>], i: usize) {
-            for (agg_idx, pa) in phys_aggs.iter().enumerate() {
-                let acc = &mut accums[agg_idx];
-                match pa.op {
-                    AggregateOp::CountStar => acc.count += 1,
-                    AggregateOp::Count => {
-                        if let Some(col) = pa.phys_col {
-                            if !col.is_null(i) {
-                                acc.count += 1;
-                            }
-                        } else if let Some(ref def) = pa.default_val {
-                            if !def.is_null() {
-                                acc.count += 1;
+            // Inline accumulation from raw columnar data for a single row.
+            #[inline(always)]
+            fn accumulate_columnar(accums: &mut [Accum], phys_aggs: &[PhysAgg<'_>], i: usize) {
+                for (agg_idx, pa) in phys_aggs.iter().enumerate() {
+                    let acc = &mut accums[agg_idx];
+                    match pa.op {
+                        AggregateOp::CountStar => acc.count += 1,
+                        AggregateOp::Count => {
+                            if let Some(col) = pa.phys_col {
+                                if !col.is_null(i) {
+                                    acc.count += 1;
+                                }
+                            } else if let Some(ref def) = pa.default_val {
+                                if !def.is_null() {
+                                    acc.count += 1;
+                                }
                             }
                         }
-                    }
-                    AggregateOp::Sum | AggregateOp::Avg => {
-                        if let Some(col) = pa.phys_col {
-                            if !col.is_null(i) {
-                                match col.data_type() {
-                                    DataType::Integer | DataType::Timestamp => {
-                                        acc.int_sum += col.get_i64(i) as i128;
-                                        acc.count += 1;
-                                    }
-                                    DataType::Float => {
-                                        let f = col.get_f64(i);
-                                        if !f.is_nan() {
-                                            acc.float_sum += f;
+                        AggregateOp::Sum | AggregateOp::Avg => {
+                            if let Some(col) = pa.phys_col {
+                                if !col.is_null(i) {
+                                    match col.data_type() {
+                                        DataType::Integer | DataType::Timestamp => {
+                                            acc.int_sum += col.get_i64(i) as i128;
                                             acc.count += 1;
-                                            acc.is_int_agg = false;
                                         }
+                                        DataType::Float => {
+                                            let f = col.get_f64(i);
+                                            if !f.is_nan() {
+                                                acc.float_sum += f;
+                                                acc.count += 1;
+                                                acc.is_int_agg = false;
+                                            }
+                                        }
+                                        DataType::Boolean => {
+                                            acc.int_sum += col.get_bool(i) as i128;
+                                            acc.count += 1;
+                                        }
+                                        _ => {}
                                     }
-                                    DataType::Boolean => {
-                                        acc.int_sum += col.get_bool(i) as i128;
+                                }
+                            } else if let Some(ref def) = pa.default_val {
+                                match def {
+                                    Value::Integer(v) => {
+                                        acc.int_sum += *v as i128;
+                                        acc.count += 1;
+                                    }
+                                    Value::Float(f) if !f.is_nan() => {
+                                        acc.float_sum += *f;
+                                        acc.count += 1;
+                                        acc.is_int_agg = false;
+                                    }
+                                    Value::Boolean(b) => {
+                                        acc.int_sum += *b as i128;
                                         acc.count += 1;
                                     }
                                     _ => {}
                                 }
                             }
-                        } else if let Some(ref def) = pa.default_val {
-                            match def {
-                                Value::Integer(v) => {
-                                    acc.int_sum += *v as i128;
-                                    acc.count += 1;
-                                }
-                                Value::Float(f) if !f.is_nan() => {
-                                    acc.float_sum += *f;
-                                    acc.count += 1;
-                                    acc.is_int_agg = false;
-                                }
-                                Value::Boolean(b) => {
-                                    acc.int_sum += *b as i128;
-                                    acc.count += 1;
-                                }
-                                _ => {}
-                            }
                         }
-                    }
-                    AggregateOp::Min => {
-                        if let Some(col) = pa.phys_col {
-                            if !col.is_null(i) {
-                                match col.data_type() {
-                                    DataType::Integer | DataType::Timestamp => {
-                                        let v = col.get_i64(i);
+                        AggregateOp::Min => {
+                            if let Some(col) = pa.phys_col {
+                                if !col.is_null(i) {
+                                    match col.data_type() {
+                                        DataType::Integer | DataType::Timestamp => {
+                                            let v = col.get_i64(i);
+                                            match acc.min_i64 {
+                                                None => acc.min_i64 = Some(v),
+                                                Some(cur) if v < cur => acc.min_i64 = Some(v),
+                                                _ => {}
+                                            }
+                                        }
+                                        DataType::Float => {
+                                            let f = col.get_f64(i);
+                                            if !f.is_nan() {
+                                                acc.is_int_agg = false;
+                                                match acc.min_f64 {
+                                                    None => acc.min_f64 = Some(f),
+                                                    Some(cur) if f < cur => acc.min_f64 = Some(f),
+                                                    _ => {}
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            } else if let Some(ref def) = pa.default_val {
+                                match def {
+                                    Value::Integer(v) => match acc.min_i64 {
+                                        None => acc.min_i64 = Some(*v),
+                                        Some(cur) if *v < cur => acc.min_i64 = Some(*v),
+                                        _ => {}
+                                    },
+                                    Value::Timestamp(t) => {
+                                        let nanos = t.timestamp_nanos_opt().unwrap_or_else(|| {
+                                            t.timestamp().saturating_mul(1_000_000_000)
+                                        });
                                         match acc.min_i64 {
-                                            None => acc.min_i64 = Some(v),
-                                            Some(cur) if v < cur => acc.min_i64 = Some(v),
+                                            None => acc.min_i64 = Some(nanos),
+                                            Some(cur) if nanos < cur => acc.min_i64 = Some(nanos),
                                             _ => {}
                                         }
                                     }
-                                    DataType::Float => {
-                                        let f = col.get_f64(i);
-                                        if !f.is_nan() {
-                                            acc.is_int_agg = false;
-                                            match acc.min_f64 {
-                                                None => acc.min_f64 = Some(f),
-                                                Some(cur) if f < cur => acc.min_f64 = Some(f),
-                                                _ => {}
-                                            }
+                                    Value::Float(f) if !f.is_nan() => {
+                                        acc.is_int_agg = false;
+                                        match acc.min_f64 {
+                                            None => acc.min_f64 = Some(*f),
+                                            Some(cur) if *f < cur => acc.min_f64 = Some(*f),
+                                            _ => {}
                                         }
                                     }
                                     _ => {}
                                 }
-                            }
-                        } else if let Some(ref def) = pa.default_val {
-                            match def {
-                                Value::Integer(v) => match acc.min_i64 {
-                                    None => acc.min_i64 = Some(*v),
-                                    Some(cur) if *v < cur => acc.min_i64 = Some(*v),
-                                    _ => {}
-                                },
-                                Value::Timestamp(t) => {
-                                    let nanos = t.timestamp_nanos_opt().unwrap_or_else(|| {
-                                        t.timestamp().saturating_mul(1_000_000_000)
-                                    });
-                                    match acc.min_i64 {
-                                        None => acc.min_i64 = Some(nanos),
-                                        Some(cur) if nanos < cur => acc.min_i64 = Some(nanos),
-                                        _ => {}
-                                    }
-                                }
-                                Value::Float(f) if !f.is_nan() => {
-                                    acc.is_int_agg = false;
-                                    match acc.min_f64 {
-                                        None => acc.min_f64 = Some(*f),
-                                        Some(cur) if *f < cur => acc.min_f64 = Some(*f),
-                                        _ => {}
-                                    }
-                                }
-                                _ => {}
                             }
                         }
-                    }
-                    AggregateOp::Max => {
-                        if let Some(col) = pa.phys_col {
-                            if !col.is_null(i) {
-                                match col.data_type() {
-                                    DataType::Integer | DataType::Timestamp => {
-                                        let v = col.get_i64(i);
-                                        match acc.max_i64 {
-                                            None => acc.max_i64 = Some(v),
-                                            Some(cur) if v > cur => acc.max_i64 = Some(v),
-                                            _ => {}
-                                        }
-                                    }
-                                    DataType::Float => {
-                                        let f = col.get_f64(i);
-                                        if !f.is_nan() {
-                                            acc.is_int_agg = false;
-                                            match acc.max_f64 {
-                                                None => acc.max_f64 = Some(f),
-                                                Some(cur) if f > cur => acc.max_f64 = Some(f),
+                        AggregateOp::Max => {
+                            if let Some(col) = pa.phys_col {
+                                if !col.is_null(i) {
+                                    match col.data_type() {
+                                        DataType::Integer | DataType::Timestamp => {
+                                            let v = col.get_i64(i);
+                                            match acc.max_i64 {
+                                                None => acc.max_i64 = Some(v),
+                                                Some(cur) if v > cur => acc.max_i64 = Some(v),
                                                 _ => {}
                                             }
                                         }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        } else if let Some(ref def) = pa.default_val {
-                            match def {
-                                Value::Integer(v) => match acc.max_i64 {
-                                    None => acc.max_i64 = Some(*v),
-                                    Some(cur) if *v > cur => acc.max_i64 = Some(*v),
-                                    _ => {}
-                                },
-                                Value::Timestamp(t) => {
-                                    let nanos = t.timestamp_nanos_opt().unwrap_or_else(|| {
-                                        t.timestamp().saturating_mul(1_000_000_000)
-                                    });
-                                    match acc.max_i64 {
-                                        None => acc.max_i64 = Some(nanos),
-                                        Some(cur) if nanos > cur => acc.max_i64 = Some(nanos),
+                                        DataType::Float => {
+                                            let f = col.get_f64(i);
+                                            if !f.is_nan() {
+                                                acc.is_int_agg = false;
+                                                match acc.max_f64 {
+                                                    None => acc.max_f64 = Some(f),
+                                                    Some(cur) if f > cur => acc.max_f64 = Some(f),
+                                                    _ => {}
+                                                }
+                                            }
+                                        }
                                         _ => {}
                                     }
                                 }
-                                Value::Float(f) if !f.is_nan() => {
-                                    acc.is_int_agg = false;
-                                    match acc.max_f64 {
-                                        None => acc.max_f64 = Some(*f),
-                                        Some(cur) if *f > cur => acc.max_f64 = Some(*f),
+                            } else if let Some(ref def) = pa.default_val {
+                                match def {
+                                    Value::Integer(v) => match acc.max_i64 {
+                                        None => acc.max_i64 = Some(*v),
+                                        Some(cur) if *v > cur => acc.max_i64 = Some(*v),
                                         _ => {}
+                                    },
+                                    Value::Timestamp(t) => {
+                                        let nanos = t.timestamp_nanos_opt().unwrap_or_else(|| {
+                                            t.timestamp().saturating_mul(1_000_000_000)
+                                        });
+                                        match acc.max_i64 {
+                                            None => acc.max_i64 = Some(nanos),
+                                            Some(cur) if nanos > cur => acc.max_i64 = Some(nanos),
+                                            _ => {}
+                                        }
                                     }
+                                    Value::Float(f) if !f.is_nan() => {
+                                        acc.is_int_agg = false;
+                                        match acc.max_f64 {
+                                            None => acc.max_f64 = Some(*f),
+                                            Some(cur) if *f > cur => acc.max_f64 = Some(*f),
+                                            _ => {}
+                                        }
+                                    }
+                                    _ => {}
                                 }
-                                _ => {}
                             }
                         }
                     }
                 }
             }
-        }
 
-        // Per-volume grouped aggregation closure.
-        // Returns Some(local_groups) or None to skip/bail.
-        let bail = std::sync::atomic::AtomicBool::new(false);
-        let agg_count = aggregates.len();
-        let hot_skip_ref = &hot_skip;
-        let tombstones_ref = &tombstones_arc;
+            // Per-volume grouped aggregation closure.
+            // Returns Some(local_groups) or None to skip/bail.
+            let bail = std::sync::atomic::AtomicBool::new(false);
+            let agg_count = aggregates.len();
+            let hot_skip_ref = &hot_skip;
+            let tombstones_ref = &tombstones_arc;
 
-        type VolumeGroups = ValueMap<(Vec<Value>, Vec<Accum>)>;
-        let process_volume =
+            type VolumeGroups = ValueMap<(Vec<Value>, Vec<Accum>)>;
+            let process_volume =
             |(seg_id, cs): &(u64, super::manifest::ColdSegment)| -> Result<Option<VolumeGroups>> {
                 if bail.load(std::sync::atomic::Ordering::Relaxed) {
                     return Ok(None);
@@ -7953,70 +8081,72 @@ impl Table for SegmentedTable {
                 Ok(Some(local_groups))
             };
 
-        // Sequential: merge each volume's groups immediately (O(1) extra maps).
-        // Parallel: collect per-volume maps then merge (O(volumes) extra maps).
-        let _total_cold_rows: usize = volumes.iter().map(|(_, cs)| cs.volume.meta.row_count).sum();
-        #[cfg(feature = "parallel")]
-        let use_parallel = volumes.len() >= 4 && _total_cold_rows >= 100_000;
-        #[cfg(not(feature = "parallel"))]
-        let use_parallel = false;
-
-        if use_parallel {
+            // Sequential: merge each volume's groups immediately (O(1) extra maps).
+            // Parallel: collect per-volume maps then merge (O(volumes) extra maps).
+            let _total_cold_rows: usize =
+                volumes.iter().map(|(_, cs)| cs.volume.meta.row_count).sum();
             #[cfg(feature = "parallel")]
-            {
-                use rayon::prelude::*;
-                let vol_group_maps: Vec<Option<VolumeGroups>> = volumes
-                    .par_iter()
-                    .map(&process_volume)
-                    .collect::<Result<_>>()?;
-                if bail.load(std::sync::atomic::Ordering::Relaxed) {
-                    return Ok(None);
+            let use_parallel = volumes.len() >= 4 && _total_cold_rows >= 100_000;
+            #[cfg(not(feature = "parallel"))]
+            let use_parallel = false;
+
+            if use_parallel {
+                #[cfg(feature = "parallel")]
+                {
+                    use rayon::prelude::*;
+                    let vol_group_maps: Vec<Option<VolumeGroups>> = volumes
+                        .par_iter()
+                        .map(&process_volume)
+                        .collect::<Result<_>>()?;
+                    if bail.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Ok(None);
+                    }
+                    for vol_map in vol_group_maps.into_iter().flatten() {
+                        for (key, (group_values, vol_accums)) in vol_map {
+                            let entry = groups.entry(key).or_insert_with(|| {
+                                (group_values, vec![Accum::default(); agg_count])
+                            });
+                            for (ai, a) in vol_accums.iter().enumerate() {
+                                merge_accum(&mut entry.1[ai], a);
+                            }
+                        }
+                    }
                 }
-                for vol_map in vol_group_maps.into_iter().flatten() {
-                    for (key, (group_values, vol_accums)) in vol_map {
-                        let entry = groups
-                            .entry(key)
-                            .or_insert_with(|| (group_values, vec![Accum::default(); agg_count]));
-                        for (ai, a) in vol_accums.iter().enumerate() {
-                            merge_accum(&mut entry.1[ai], a);
+            } else {
+                for v in volumes.iter() {
+                    if bail.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Ok(None);
+                    }
+                    if let Some(vol_map) = process_volume(v)? {
+                        for (key, (group_values, vol_accums)) in vol_map {
+                            let entry = groups.entry(key).or_insert_with(|| {
+                                (group_values, vec![Accum::default(); agg_count])
+                            });
+                            for (ai, a) in vol_accums.iter().enumerate() {
+                                merge_accum(&mut entry.1[ai], a);
+                            }
                         }
                     }
                 }
             }
-        } else {
-            for v in volumes.iter() {
-                if bail.load(std::sync::atomic::Ordering::Relaxed) {
-                    return Ok(None);
-                }
-                if let Some(vol_map) = process_volume(v)? {
-                    for (key, (group_values, vol_accums)) in vol_map {
-                        let entry = groups
-                            .entry(key)
-                            .or_insert_with(|| (group_values, vec![Accum::default(); agg_count]));
-                        for (ai, a) in vol_accums.iter().enumerate() {
-                            merge_accum(&mut entry.1[ai], a);
-                        }
-                    }
-                }
+
+            if bail.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(None);
             }
-        }
 
-        if bail.load(std::sync::atomic::Ordering::Relaxed) {
-            return Ok(None);
-        }
+            // Convert to results
+            let schema_ref = current_schema;
+            let results: Vec<GroupedAggregateResult> = groups
+                .into_values()
+                .map(|(group_values, accums)| GroupedAggregateResult {
+                    group_values,
+                    aggregate_values: finalize_accums(aggregates, &accums, schema_ref),
+                })
+                .collect();
 
-        // Convert to results
-        let schema_ref = current_schema;
-        let results: Vec<GroupedAggregateResult> = groups
-            .into_values()
-            .map(|(group_values, accums)| GroupedAggregateResult {
-                group_values,
-                aggregate_values: finalize_accums(aggregates, &accums, schema_ref),
-            })
-            .collect();
-
-        self.check_cold()?;
-        Ok(Some(results))
+            self.check_cold()?;
+            Ok(Some(results))
+        })
     }
 }
 
