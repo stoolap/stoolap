@@ -13,7 +13,8 @@
 // limitations under the License.
 
 //! COUNT(*) stays exact while a compaction publishes and cleans up its
-//! tombstones and while a truncate clears the segment set
+//! tombstones, while a truncate clears the segment set, and after a delete
+//! that landed during a recount
 
 #![cfg(feature = "test-failpoints")]
 
@@ -243,4 +244,18 @@ fn count_halfway_through_a_truncate_does_not_bring_deleted_rows_back() {
     let n = seen.get().expect("the truncate cleared the segment set");
     assert!(n == 0 || n == 19, "{n} rows halfway through the truncate");
     assert_eq!(count(&db), 0);
+}
+
+#[test]
+fn a_delete_during_a_recount_is_not_hidden_by_the_recount_cached_after_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = volumes_of_ten(dir.path(), 2);
+    db.execute("DELETE FROM t WHERE id = 5", ()).unwrap();
+
+    let other = db.clone();
+    fp::after_count_captured(move || {
+        other.execute("DELETE FROM t WHERE id = 15", ()).unwrap();
+    });
+    assert_eq!(count(&db), 19, "the recount began before the delete");
+    assert_eq!(count(&db), 18, "the next count sees the delete");
 }
