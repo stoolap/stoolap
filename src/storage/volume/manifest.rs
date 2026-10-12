@@ -929,9 +929,10 @@ fn search_cost(n: usize) -> usize {
 }
 
 /// Visible copies in `segments` of the ids `tombstones` holds. A segment no
-/// tombstone falls in by its `bounds` is skipped, one whose order is decided
-/// is searched when that is cheaper, any other is walked; no order is
-/// decided. Tombstones too many to search or sort out cheaper walk them all
+/// tombstone falls in by its `bounds` (sorted by segment id) is skipped, one
+/// whose order is decided is searched when that is cheaper, any other is
+/// walked; no order is decided. Tombstones too many, or a map too sparse, to
+/// search or sort out cheaper walk them all
 fn tombstoned_visible(
     segments: &FxHashMap<u64, ColdSegment>,
     tombstones: &FxHashMap<i64, u64>,
@@ -939,12 +940,25 @@ fn tombstoned_visible(
 ) -> usize {
     let rows: usize = segments.values().map(|cs| cs.volume.meta.row_count).sum();
     let widest = segments.values().map(|cs| cs.volume.meta.row_count).max();
-    let per_tombstone = segments.len().max(search_cost(widest.unwrap_or(0)));
-    let narrow = tombstones.len().saturating_mul(per_tombstone) <= rows;
+    // A pass over the keys visits every slot, so it costs the capacity
+    let pass = tombstones.capacity();
+    let search = tombstones
+        .len()
+        .saturating_mul(search_cost(widest.unwrap_or(0)));
+    let narrow = pass.saturating_mul(segments.len()).saturating_add(search) <= rows;
+    let range_of = |id: &u64| {
+        let k = bounds
+            .binary_search_by(|b| {
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::count_bounds_probe();
+                b.0.cmp(id)
+            })
+            .ok()?;
+        bounds.get(k).map(|b| (b.1, b.2))
+    };
     let mut hits = 0;
     for (id, cs) in segments.iter() {
-        let range = bounds.iter().find(|b| b.0 == *id).map(|b| (b.1, b.2));
-        if let (true, Some((lo, hi))) = (narrow, range) {
+        if let Some((lo, hi)) = narrow.then(|| range_of(id)).flatten() {
             let in_range = || tombstones.keys().filter(move |t| (lo..=hi).contains(*t));
             let found = in_range().count();
             if found == 0 {
@@ -952,7 +966,8 @@ fn tombstoned_visible(
             }
             let vol = &cs.volume;
             let n = vol.meta.row_count;
-            if vol.meta.row_order.get().is_some() && found.saturating_mul(search_cost(n)) < n {
+            let searched = found.saturating_mul(search_cost(n)).saturating_add(pass);
+            if vol.meta.row_order.get().is_some() && searched < n {
                 hits += in_range()
                     .filter_map(|&t| vol.locate(t))
                     .filter(|&i| cs.is_visible(i))
@@ -3639,13 +3654,14 @@ impl SegmentManager {
         let count = if tombstones.is_empty() {
             visible
         } else {
-            let bounds: Vec<(u64, i64, i64)> = self
+            let mut bounds: Vec<(u64, i64, i64)> = self
                 .manifest
                 .read()
                 .segments
                 .iter()
                 .map(|m| (m.segment_id, m.min_row_id, m.max_row_id))
                 .collect();
+            bounds.sort_unstable_by_key(|b| b.0);
             visible.saturating_sub(tombstoned_visible(&segments, &tombstones, &bounds))
         };
         debug_assert!(same_as_walk(count, &segments, &tombstones));
@@ -4660,6 +4676,78 @@ mod tests {
             assert_eq!(dense_walked, 1013, "too many tombstones walk every volume");
         }
         assert!(segments[&4].volume.meta.row_order.get().is_none());
+    }
+
+    #[test]
+    fn a_tombstone_map_mostly_emptied_is_walked_against_not_scanned_per_segment() {
+        let segments: FxHashMap<u64, ColdSegment> = [
+            (1, segment_holding(&(0..1000).collect::<Vec<_>>(), None)),
+            (2, segment_holding(&(1000..2000).collect::<Vec<_>>(), None)),
+        ]
+        .into_iter()
+        .collect();
+        let bounds = [(1, 0, 999), (2, 1000, 1999)];
+        let mut tombstones: FxHashMap<i64, u64> = (0..100_000).map(|id| (id, 1)).collect();
+        tombstones.retain(|&id, _| id == 5);
+        assert!(tombstones.capacity() >= 100_000);
+        let before = crate::test_failpoints::count_ids_walked();
+        assert_eq!(tombstoned_visible(&segments, &tombstones, &bounds), 1);
+        if cfg!(feature = "test-failpoints") {
+            assert_eq!(
+                crate::test_failpoints::count_ids_walked() - before,
+                2000,
+                "two walks cost less than scanning the emptied map once per segment"
+            );
+        }
+
+        let mut sparse: FxHashMap<i64, u64> = (0..10_000).map(|id| (id, 1)).collect();
+        sparse.clear();
+        sparse.insert(30_005, 1);
+        let segments: FxHashMap<u64, ColdSegment> = [
+            (1, segment_holding(&(0..30_000).collect::<Vec<_>>(), None)),
+            (
+                2,
+                segment_holding(&(30_000..31_000).collect::<Vec<_>>(), None),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let bounds = [(1, 0, 29_999), (2, 30_000, 30_999)];
+        let before = crate::test_failpoints::count_ids_walked();
+        assert_eq!(tombstoned_visible(&segments, &sparse, &bounds), 1);
+        if cfg!(feature = "test-failpoints") {
+            assert_eq!(
+                crate::test_failpoints::count_ids_walked() - before,
+                1000,
+                "a second pass over the sparse map costs more than walking volume 2"
+            );
+        }
+    }
+
+    #[test]
+    fn many_small_segments_find_their_ranges_by_search() {
+        let segments: FxHashMap<u64, ColdSegment> = (0..1024u64)
+            .map(|s| {
+                let lo = s as i64 * 100;
+                (
+                    s,
+                    segment_holding(&(lo..lo + 100).collect::<Vec<_>>(), None),
+                )
+            })
+            .collect();
+        let bounds: Vec<(u64, i64, i64)> = (0..1024u64)
+            .map(|s| (s, s as i64 * 100, s as i64 * 100 + 99))
+            .collect();
+        let tombstones: FxHashMap<i64, u64> = [(5, 1)].into_iter().collect();
+        let before = crate::test_failpoints::count_bounds_probes();
+        assert_eq!(tombstoned_visible(&segments, &tombstones, &bounds), 1);
+        if cfg!(feature = "test-failpoints") {
+            let probes = crate::test_failpoints::count_bounds_probes() - before;
+            assert!(
+                probes <= 1024 * 12,
+                "{probes} comparisons for 1024 segments"
+            );
+        }
     }
 
     #[test]

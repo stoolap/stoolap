@@ -375,6 +375,16 @@ thread_local! {
     static KEY_ORDER_MERGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ROW_ORDERS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static COUNT_IDS_WALKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static COUNT_BOUNDS_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Segment bounds compared on this thread to find a segment's id range
+pub fn count_bounds_probes() -> usize {
+    COUNT_BOUNDS_PROBES.with(std::cell::Cell::get)
+}
+
+pub(crate) fn count_bounds_probe() {
+    COUNT_BOUNDS_PROBES.with(|c| c.set(c.get() + 1));
 }
 
 /// Cold row ids walked on this thread to recount a table's live rows
@@ -1558,6 +1568,7 @@ pub fn reset_all() {
     KEY_ORDER_MERGES.with(|n| n.set(0));
     ROW_ORDERS_BUILT.with(|n| n.set(0));
     COUNT_IDS_WALKED.with(|n| n.set(0));
+    COUNT_BOUNDS_PROBES.with(|n| n.set(0));
     VOLUME_FILE_READS.with(|n| n.set(0));
     SEGMENT_MAP_CLONES.with(|n| n.set(0));
     COLD_MAP_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = None);
