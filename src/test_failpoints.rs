@@ -266,6 +266,12 @@ thread_local! {
     static MANIFESTS_PERSISTED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static BETWEEN_COUNT_CAPTURES_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static SEGMENTS_CLEARING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static TRUNCATE_COLD_CLEARED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static DESTRUCTION_WAIT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static HOT_COLD_READS_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static UNSEALED_READ_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static CLEAR_GENERATION_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static TRUNCATE_MARKED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static COUNT_CAPTURED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static GC_ROWS_REMOVED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static COLUMN_CHANGE_WAITING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
@@ -348,6 +354,84 @@ pub fn after_count_captured(hook: impl FnOnce() + 'static) {
 
 pub(crate) fn count_captured() {
     let hook = COUNT_CAPTURED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next segment set clearing emptied
+/// everything and has not moved the generation yet
+pub fn before_clear_generation_moves(hook: impl FnOnce() + 'static) {
+    CLEAR_GENERATION_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn clear_before_generation() {
+    let hook = CLEAR_GENERATION_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next hot-only read ran, before it
+/// checks that no truncate moved under it
+pub fn after_unsealed_read(hook: impl FnOnce() + 'static) {
+    UNSEALED_READ_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn unsealed_read() {
+    let hook = UNSEALED_READ_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next truncate marked rows as leaving,
+/// before anything decides whether it may go ahead
+pub fn after_truncate_marked(hook: impl FnOnce() + 'static) {
+    TRUNCATE_MARKED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn truncate_marked() {
+    let hook = TRUNCATE_MARKED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next read that takes the hot and the
+/// sealed rows in two steps has taken the first of them
+pub fn between_hot_and_cold_reads(hook: impl FnOnce() + 'static) {
+    HOT_COLD_READS_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn hot_and_cold_reads_split() {
+    let hook = HOT_COLD_READS_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next read waits for a truncate that
+/// is taking rows away
+pub fn on_destruction_wait(hook: impl FnOnce() + 'static) {
+    DESTRUCTION_WAIT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn destruction_waited() {
+    let hook = DESTRUCTION_WAIT_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next truncate cleared the volumes and
+/// not yet the hot rows, with the hot store's claims still shut out
+pub fn after_truncate_cold_cleared(hook: impl FnOnce() + 'static) {
+    TRUNCATE_COLD_CLEARED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn truncate_cold_cleared() {
+    let hook = TRUNCATE_COLD_CLEARED_HOOK.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
         hook();
     }
@@ -1652,6 +1736,12 @@ pub fn reset_all() {
     MANIFESTS_PERSISTED_HOOK.with(|slot| *slot.borrow_mut() = None);
     BETWEEN_COUNT_CAPTURES_HOOK.with(|slot| *slot.borrow_mut() = None);
     SEGMENTS_CLEARING_HOOK.with(|slot| *slot.borrow_mut() = None);
+    TRUNCATE_COLD_CLEARED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    DESTRUCTION_WAIT_HOOK.with(|slot| *slot.borrow_mut() = None);
+    HOT_COLD_READS_HOOK.with(|slot| *slot.borrow_mut() = None);
+    UNSEALED_READ_HOOK.with(|slot| *slot.borrow_mut() = None);
+    CLEAR_GENERATION_HOOK.with(|slot| *slot.borrow_mut() = None);
+    TRUNCATE_MARKED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COUNT_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = None);
     GC_ROWS_REMOVED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLUMN_CHANGE_WAITING_HOOK.with(|slot| *slot.borrow_mut() = None);

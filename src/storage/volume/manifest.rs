@@ -1595,6 +1595,9 @@ pub struct SegmentManager {
     /// says nothing about how many rows moved: it marks the interval in which
     /// rows are leaving, so a reader that captured inside it is not answered.
     destruction_count: std::sync::atomic::AtomicUsize,
+    /// Destructive publications ever begun, so a reader can tell one that
+    /// started and ended inside its read from a seal or a compaction
+    destructions_begun: std::sync::atomic::AtomicU64,
     /// Compactions inside their cleanup window, and those that finished it:
     /// a count across either change cannot take the single-segment shortcut
     cleanups_open: std::sync::atomic::AtomicUsize,
@@ -1637,6 +1640,7 @@ impl SegmentManager {
             txn_seal_gens: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
             seal_overlap_count: std::sync::atomic::AtomicUsize::new(0),
             destruction_count: std::sync::atomic::AtomicUsize::new(0),
+            destructions_begun: std::sync::atomic::AtomicU64::new(0),
             cleanups_open: std::sync::atomic::AtomicUsize::new(0),
             cleanups_done: std::sync::atomic::AtomicU64::new(0),
             shortcut_trusted: std::sync::atomic::AtomicBool::new(true),
@@ -1677,6 +1681,7 @@ impl SegmentManager {
             txn_seal_gens: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
             seal_overlap_count: std::sync::atomic::AtomicUsize::new(0),
             destruction_count: std::sync::atomic::AtomicUsize::new(0),
+            destructions_begun: std::sync::atomic::AtomicU64::new(0),
             cleanups_open: std::sync::atomic::AtomicUsize::new(0),
             cleanups_done: std::sync::atomic::AtomicU64::new(0),
             shortcut_trusted: std::sync::atomic::AtomicBool::new(trusted),
@@ -3860,7 +3865,16 @@ impl SegmentManager {
     pub fn begin_destruction(&self) -> Destruction<'_> {
         self.destruction_count
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.destructions_begun
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Destruction { mgr: self }
+    }
+
+    /// Destructive publications begun so far; a reader compares it before and
+    /// after its read, with `is_destruction_in_progress` at both ends
+    pub fn destructions_begun(&self) -> u64 {
+        self.destructions_begun
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Mark a compaction from before it publishes its outputs until the
@@ -3992,6 +4006,8 @@ impl SegmentManager {
         self.invalidate_count();
         self.has_segments_flag
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::clear_before_generation();
         // Clearing takes rows away as much as a seal does, so a reader that
         // took the generation before it must see the change after
         self.seal_generation

@@ -381,8 +381,11 @@ fn dropping_a_pinned_table_persists_an_empty_manifest() {
             "recovery must not discover pinned, dropped rows"
         );
     });
-    let value: i64 = db.query_one("SELECT k FROM t ORDER BY k", ()).unwrap();
-    assert_eq!(value, 10);
+    let answer = db.query_one::<i64, _>("SELECT k FROM t ORDER BY k", ());
+    assert!(
+        matches!(answer, Err(stoolap::Error::NoRowsReturned)),
+        "a read the drop overtook is taken again on the new table: {answer:?}"
+    );
     let count: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
     assert_eq!(count, 0);
 }
@@ -457,8 +460,17 @@ fn destructive_ddl_keeps_captured_files_without_restoring_them_on_reopen() {
                 "captured files must survive destructive DDL"
             );
         });
-        let value: i64 = db.query_one("SELECT k FROM t ORDER BY k", ()).unwrap();
-        assert_eq!(value, 10);
+        // A read the destructive DDL overtook is taken again: after a drop,
+        // on the dropped table, and after a truncate, on what was added since
+        let answer = db.query_one::<i64, _>("SELECT k FROM t ORDER BY k", ());
+        if drop_table {
+            assert!(
+                matches!(answer, Err(stoolap::Error::NoRowsReturned)),
+                "{answer:?}"
+            );
+        } else {
+            assert_eq!(answer.unwrap(), 20);
+        }
         let after = vol_files(dir.path());
         assert!(old_names.is_disjoint(&after));
         let value: i64 = db.query_one("SELECT k FROM t ORDER BY k", ()).unwrap();
