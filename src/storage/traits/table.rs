@@ -602,10 +602,9 @@ pub trait Table: Send + Sync {
     }
 
     /// `truncate`, running `after_check` once nothing refuses it and before
-    /// any row goes; a table that refuses nothing runs it first
-    fn truncate_after_check(&mut self, after_check: &mut dyn FnMut()) -> Result<i32> {
-        after_check();
-        self.truncate()
+    /// any row goes; a table that cannot promise that order refuses
+    fn truncate_after_check(&mut self, _after_check: &mut dyn FnMut()) -> Result<i32> {
+        Err(Error::NotSupported("truncate_after_check".to_string()))
     }
 
     /// Scans the table and returns a scanner over matching rows
