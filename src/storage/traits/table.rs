@@ -601,6 +601,13 @@ pub trait Table: Send + Sync {
         self.delete(None)
     }
 
+    /// `truncate`, running `after_check` once nothing refuses it and before
+    /// any row goes; a table that refuses nothing runs it first
+    fn truncate_after_check(&mut self, after_check: &mut dyn FnMut()) -> Result<i32> {
+        after_check();
+        self.truncate()
+    }
+
     /// Scans the table and returns a scanner over matching rows
     ///
     /// # Arguments

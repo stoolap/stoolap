@@ -3165,10 +3165,14 @@ impl Table for SegmentedTable {
         // that starts in between must not be answered: mark the whole interval
         let _destruction = self.segment_mgr.begin_destruction();
         let seg_rows = self.segment_mgr.total_row_count() as i32;
-        // Clear pending tombstones for this txn (segments are being dropped)
-        self.segment_mgr.rollback_pending_tombstones(self.txn_id());
-        self.segment_mgr.clear();
-        Ok(self.hot.truncate()? + seg_rows)
+        let (segment_mgr, txn_id) = (&self.segment_mgr, self.txn_id());
+        // The volumes go only once no other transaction's claim refuses the
+        // truncate, and before a claim can be taken again
+        let hot_rows = self.hot.truncate_after_check(&mut || {
+            segment_mgr.rollback_pending_tombstones(txn_id);
+            segment_mgr.clear();
+        })?;
+        Ok(hot_rows + seg_rows)
     }
 
     // =========================================================================
