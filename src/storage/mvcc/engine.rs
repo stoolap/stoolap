@@ -6623,11 +6623,23 @@ impl MVCCEngine {
                     );
                     (ts, mgr.segments_raw())
                 };
-                let outside: Vec<Arc<crate::storage::volume::writer::FrozenVolume>> = segs_then
-                    .iter()
-                    .filter(|(id, _)| !old_ids.contains(id))
-                    .map(|(_, cs)| Arc::clone(&cs.volume))
-                    .collect();
+                // Each with the id range the manifest records for it, when it
+                // still does, so a volume no candidate falls in is not read
+                let outside: Vec<OutsideVolume> = {
+                    let manifest = mgr.manifest();
+                    segs_then
+                        .iter()
+                        .filter(|(id, _)| !old_ids.contains(id))
+                        .map(|(id, cs)| {
+                            let bounds = manifest
+                                .segments
+                                .iter()
+                                .find(|m| m.segment_id == *id)
+                                .map(|m| (m.min_row_id, m.max_row_id));
+                            (Arc::clone(&cs.volume), bounds)
+                        })
+                        .collect()
+                };
                 (old_ids, Arc::new(vols), dead, ts, outside)
             };
 
@@ -6702,12 +6714,27 @@ impl MVCCEngine {
             // stays, newest copy and tombstone, for a batch that holds all
             let candidates: FxHashSet<i64> = tombstoned.iter().map(|t| t.0).collect();
             let held = held_outside(&outside, &candidates);
+            let mut kept: Vec<(i64, usize, usize)> = Vec::new();
             for (row_id, commit_seq, vol_idx, i) in tombstoned {
                 if held.contains(&row_id) {
-                    live_refs.push((row_id, vol_idx, i));
+                    kept.push((row_id, vol_idx, i));
                 } else {
                     applied_tombstones.push((row_id, commit_seq));
                 }
+            }
+            if !kept.is_empty() {
+                // Both lists run by volume and position: merged, each volume
+                // stays one run in its physical order, as the key merge reads it
+                let mut kept = kept.into_iter().peekable();
+                let mut merged = Vec::with_capacity(live_refs.len() + kept.len());
+                for entry in live_refs.drain(..) {
+                    while let Some(k) = kept.next_if(|k| (k.1, k.2) < (entry.1, entry.2)) {
+                        merged.push(k);
+                    }
+                    merged.push(entry);
+                }
+                merged.extend(kept);
+                live_refs = merged;
             }
             drop(outside);
             // Let go of the full map: from here to the cleanup only the
@@ -6816,6 +6843,8 @@ impl MVCCEngine {
                 )?
             };
             if let Some(merged) = merged {
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::key_order_merged();
                 key_held_peak = merged.peak_held_bytes;
                 live_refs = merged.refs;
             } else if schema.cluster_key.is_empty() {
@@ -9629,27 +9658,40 @@ fn applied_commit_seq(
         .filter(|&commit_seq| snapshot_limit.is_none_or(|limit| commit_seq < limit))
 }
 
+/// A volume outside a compaction's batch, with the id range its manifest
+/// entry records when it still has one
+type OutsideVolume = (
+    Arc<crate::storage::volume::writer::FrozenVolume>,
+    Option<(i64, i64)>,
+);
+
 /// The ids of `candidates` of which a volume in `outside` holds a copy,
-/// dead copies included. A volume whose ids ascend is searched; one whose
-/// order is not decided and whose ids do not ascend is walked against the
-/// candidates, so no permutation is built for it
-fn held_outside(
-    outside: &[Arc<crate::storage::volume::writer::FrozenVolume>],
-    candidates: &FxHashSet<i64>,
-) -> FxHashSet<i64> {
+/// dead copies included. Only candidates in a volume's range are looked
+/// for; a volume whose ids ascend is searched, one whose order is not
+/// decided and whose ids do not ascend is walked, so no permutation is
+/// built for it
+fn held_outside(outside: &[OutsideVolume], candidates: &FxHashSet<i64>) -> FxHashSet<i64> {
     let mut held = FxHashSet::default();
-    for volume in outside {
+    for (volume, bounds) in outside {
         if held.len() == candidates.len() {
             break;
         }
+        let in_range: FxHashSet<i64> = candidates
+            .iter()
+            .copied()
+            .filter(|id| !held.contains(id))
+            .filter(|id| bounds.is_none_or(|(lo, hi)| (lo..=hi).contains(id)))
+            .collect();
+        if in_range.is_empty() {
+            continue;
+        }
         let ids = &volume.meta.row_ids;
         if volume.meta.row_order.get().is_none() && !ids.is_sorted() {
-            held.extend(ids.iter().copied().filter(|id| candidates.contains(id)));
+            held.extend(ids.iter().copied().filter(|id| in_range.contains(id)));
         } else {
             held.extend(
-                candidates
-                    .iter()
-                    .copied()
+                in_range
+                    .into_iter()
                     .filter(|&id| volume.locate(id).is_some()),
             );
         }
@@ -9889,10 +9931,18 @@ mod tests {
         let waiting = volume_holding(&[1, 3, 7, 9]);
         let other = volume_holding(&[20, 30]);
         let candidates: FxHashSet<i64> = [7, 8, 25].into_iter().collect();
-        let held = held_outside(&[Arc::clone(&other), waiting], &candidates);
+        let held = held_outside(
+            &[
+                (Arc::clone(&other), Some((20, 30))),
+                (Arc::clone(&waiting), None),
+            ],
+            &candidates,
+        );
         assert_eq!(held, [7].into_iter().collect(), "8 and 25 fall in no copy");
-        assert!(held_outside(&[other], &candidates).is_empty());
+        assert!(held_outside(&[(other, Some((20, 30)))], &candidates).is_empty());
         assert!(held_outside(&[], &candidates).is_empty());
+        // The recorded range decides before any id is read
+        assert!(held_outside(&[(waiting, Some((100, 200)))], &candidates).is_empty());
     }
 
     #[test]

@@ -267,3 +267,33 @@ fn a_volume_read_back_from_disk_holds_its_copy_by_its_metadata() {
     let (_image, reopened) = crash_image(dir.path());
     assert_eq!(values_of(&reopened, 1), Vec::<i64>::new());
 }
+
+#[test]
+fn a_row_kept_beside_merged_rows_leaves_the_key_merge_in_order() {
+    let _guard = FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dsn(dir.path())).unwrap();
+    table(&db, true);
+    insert(&db, 1..=65_536, |id| id);
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    // One small volume holding a row that will be kept and one that merges
+    db.execute("UPDATE t SET v = 1 WHERE id IN (1, 2)", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("UPDATE t SET v = 1 WHERE id = 3", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    insert(&db, std::iter::once(1_000_001), |id| id);
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    assert_eq!(row_counts(&db), vec![65_536, 2, 1, 1]);
+    let merges = fp::key_order_merges();
+    compact_deleting(&db, 1);
+    assert_eq!(row_counts(&db), vec![65_536, 4], "the small volumes merged");
+    assert_eq!(
+        fp::key_order_merges() - merges,
+        1,
+        "merged in key order, not sorted"
+    );
+    assert_eq!(values_of(&db, 1), Vec::<i64>::new());
+    assert_eq!(values_of(&db, 2), vec![1]);
+    assert_eq!(tombstones(&db), 1);
+}

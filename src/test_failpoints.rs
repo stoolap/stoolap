@@ -372,6 +372,20 @@ pub(crate) fn stale_publication_discarded() {
 }
 
 thread_local! {
+    static KEY_ORDER_MERGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Compactions on this thread whose inputs merged in the clustering key's
+/// order, without the sort
+pub fn key_order_merges() -> usize {
+    KEY_ORDER_MERGES.with(std::cell::Cell::get)
+}
+
+pub(crate) fn key_order_merged() {
+    KEY_ORDER_MERGES.with(|n| n.set(n.get() + 1));
+}
+
+thread_local! {
     static MANIFEST_CAPTURED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
@@ -1521,6 +1535,7 @@ pub fn reset_all() {
     WAL_DIRECTORY_SYNC_HOOK.with(|slot| *slot.borrow_mut() = None);
     INDEXES_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = None);
     VOLUME_LOAD_REQUESTS.with(|n| n.set(0));
+    KEY_ORDER_MERGES.with(|n| n.set(0));
     VOLUME_FILE_READS.with(|n| n.set(0));
     SEGMENT_MAP_CLONES.with(|n| n.set(0));
     COLD_MAP_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = None);
