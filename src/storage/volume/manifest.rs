@@ -904,6 +904,106 @@ fn same_as_full_pass(_: &[u64], _: &rustc_hash::FxHashMap<u64, ColdSegment>) -> 
     true
 }
 
+/// Positions of `cs` whose copy is visible
+fn visible_positions(cs: &ColdSegment) -> usize {
+    let n = cs.volume.meta.row_ids.len();
+    let Some(bits) = &cs.visible else {
+        return n;
+    };
+    let full: usize = bits
+        .iter()
+        .take(n / 64)
+        .map(|w| w.count_ones() as usize)
+        .sum();
+    let tail = bits
+        .get(n / 64)
+        .filter(|_| !n.is_multiple_of(64))
+        .map_or(0, |w| (w & ((1u64 << (n % 64)) - 1)).count_ones() as usize);
+    full + tail
+}
+
+/// One search in a volume of `n` rows, in walked ids: a step that misses
+/// the cache costs about what four ids walked in order do
+fn search_cost(n: usize) -> usize {
+    4 * (usize::BITS - n.leading_zeros()) as usize
+}
+
+/// Visible copies in `segments` of the ids `tombstones` holds. A segment no
+/// tombstone falls in by its `bounds` is skipped, one whose order is decided
+/// is searched when that is cheaper, any other is walked; no order is
+/// decided. Tombstones too many to search or sort out cheaper walk them all
+fn tombstoned_visible(
+    segments: &FxHashMap<u64, ColdSegment>,
+    tombstones: &FxHashMap<i64, u64>,
+    bounds: &[(u64, i64, i64)],
+) -> usize {
+    let rows: usize = segments.values().map(|cs| cs.volume.meta.row_count).sum();
+    let widest = segments.values().map(|cs| cs.volume.meta.row_count).max();
+    let per_tombstone = segments.len().max(search_cost(widest.unwrap_or(0)));
+    let narrow = tombstones.len().saturating_mul(per_tombstone) <= rows;
+    let mut hits = 0;
+    for (id, cs) in segments.iter() {
+        let range = bounds.iter().find(|b| b.0 == *id).map(|b| (b.1, b.2));
+        if let (true, Some((lo, hi))) = (narrow, range) {
+            let in_range = || tombstones.keys().filter(move |t| (lo..=hi).contains(*t));
+            let found = in_range().count();
+            if found == 0 {
+                continue;
+            }
+            let vol = &cs.volume;
+            let n = vol.meta.row_count;
+            if vol.meta.row_order.get().is_some() && found.saturating_mul(search_cost(n)) < n {
+                hits += in_range()
+                    .filter_map(|&t| vol.locate(t))
+                    .filter(|&i| cs.is_visible(i))
+                    .count();
+                continue;
+            }
+        }
+        let ids = &cs.volume.meta.row_ids;
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::count_ids_walk(ids.len());
+        let mut live = 0usize;
+        for (i, row_id) in ids.iter().enumerate() {
+            if !cs.is_visible(i) {
+                continue;
+            }
+            if tombstones.contains_key(row_id) {
+                continue;
+            }
+            live += 1;
+        }
+        hits += visible_positions(cs).saturating_sub(live);
+    }
+    hits
+}
+
+/// Whether `count` is what a walk over every visible, untombstoned
+/// position of the same captured segments gives
+#[cfg(debug_assertions)]
+fn same_as_walk(
+    count: usize,
+    segments: &FxHashMap<u64, ColdSegment>,
+    tombstones: &FxHashMap<i64, u64>,
+) -> bool {
+    let walked: usize = segments
+        .values()
+        .map(|cs| {
+            let ids = &cs.volume.meta.row_ids;
+            ids.iter()
+                .enumerate()
+                .filter(|&(i, id)| cs.is_visible(i) && !tombstones.contains_key(id))
+                .count()
+        })
+        .sum();
+    walked == count
+}
+
+#[cfg(not(debug_assertions))]
+fn same_as_walk(_: usize, _: &FxHashMap<u64, ColdSegment>, _: &FxHashMap<i64, u64>) -> bool {
+    true
+}
+
 /// Clears, in `bits` (made from `base` on the first clear), the rows of
 /// `old` whose ids `new` holds again, within the range both span, and
 /// records in `hidden` each (id, position) that was visible in `base`.
@@ -3535,25 +3635,21 @@ impl SegmentManager {
             return Ok(total.saturating_sub(tombstones.len()));
         }
 
-        // Fast path: use visibility bitmaps (O(1) per row, zero allocation).
-        // visible=None means all rows visible (no overlap), is_visible() handles both.
-        {
-            let mut count = 0usize;
-            for cs in segments.values() {
-                let vol = &cs.volume;
-                let ids = vol.row_ids()?;
-                for (i, &row_id) in ids.iter().enumerate() {
-                    if !cs.is_visible(i) {
-                        continue;
-                    }
-                    if !tombstones.is_empty() && tombstones.contains_key(&row_id) {
-                        continue;
-                    }
-                    count += 1;
-                }
-            }
-            Ok(count)
-        }
+        let visible: usize = segments.values().map(visible_positions).sum();
+        let count = if tombstones.is_empty() {
+            visible
+        } else {
+            let bounds: Vec<(u64, i64, i64)> = self
+                .manifest
+                .read()
+                .segments
+                .iter()
+                .map(|m| (m.segment_id, m.min_row_id, m.max_row_id))
+                .collect();
+            visible.saturating_sub(tombstoned_visible(&segments, &tombstones, &bounds))
+        };
+        debug_assert!(same_as_walk(count, &segments, &tombstones));
+        Ok(count)
     }
 
     /// Get the cached column mapping for a volume. Computes on first call,
@@ -4505,6 +4601,65 @@ mod tests {
             assert!(bit(0) && bit(1), "1 and 2 stay: a dead copy hides nothing");
             assert!(!bit(2), "3 goes behind the newer live copy");
         }
+    }
+
+    fn undecided(mut cs: ColdSegment) -> ColdSegment {
+        let volume = Arc::get_mut(&mut cs.volume).unwrap();
+        Arc::get_mut(&mut volume.meta).unwrap().row_order = std::sync::OnceLock::new();
+        cs
+    }
+
+    #[test]
+    fn tombstones_take_away_only_visible_copies() {
+        let mut shadowed = segment_holding(&(0..1000).collect::<Vec<_>>(), None);
+        let mut bits = bits_without(1000, &[5]);
+        bits[15] |= !((1u64 << 40) - 1);
+        shadowed.visible = Some(Arc::new(bits));
+        let segments: FxHashMap<u64, ColdSegment> = [
+            (1, shadowed),
+            (2, segment_holding(&[5, 2000, 2001, 2002], None)),
+            (3, segment_holding(&[7, 3000, 3001], Some(&[0]))),
+            (
+                4,
+                undecided(segment_holding(&[4000, 4001, 4002, 4003], None)),
+            ),
+            (5, segment_holding(&[5000, 5001], None)),
+        ]
+        .into_iter()
+        .collect();
+        let bounds = [(1, 0, 999), (2, 5, 2002), (3, 7, 3001), (4, 4000, 4003)];
+        let visible: usize = segments.values().map(super::visible_positions).sum();
+        assert_eq!(
+            visible, 1011,
+            "bits past a volume's last row count for nothing"
+        );
+        let walking = |tombstones: &FxHashMap<i64, u64>| {
+            let before = crate::test_failpoints::count_ids_walked();
+            let hits = tombstoned_visible(&segments, tombstones, &bounds);
+            (hits, crate::test_failpoints::count_ids_walked() - before)
+        };
+
+        let few: FxHashMap<i64, u64> = [5, 7, 9_999, 4001, 5001, 50]
+            .into_iter()
+            .map(|id| (id, 1))
+            .collect();
+        let (hits, walked) = walking(&few);
+        assert_eq!(
+            hits, 5,
+            "5 and 7 only where visible, 9999 nowhere, 4001 and 5001 walked, 50"
+        );
+        assert!(same_as_walk(1011 - 5, &segments, &few));
+        assert!(segments[&4].volume.meta.row_order.get().is_none());
+
+        let dense: FxHashMap<i64, u64> = (0..100).map(|id| (id, 1)).collect();
+        let (dense_hits, dense_walked) = walking(&dense);
+        assert_eq!(dense_hits, 100);
+        assert!(same_as_walk(1011 - 100, &segments, &dense));
+        if cfg!(feature = "test-failpoints") {
+            assert_eq!(walked, 4 + 3 + 4 + 2, "volume 1 is searched");
+            assert_eq!(dense_walked, 1013, "too many tombstones walk every volume");
+        }
+        assert!(segments[&4].volume.meta.row_order.get().is_none());
     }
 
     #[test]

@@ -374,6 +374,16 @@ pub(crate) fn stale_publication_discarded() {
 thread_local! {
     static KEY_ORDER_MERGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ROW_ORDERS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static COUNT_IDS_WALKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Cold row ids walked on this thread to recount a table's live rows
+pub fn count_ids_walked() -> usize {
+    COUNT_IDS_WALKED.with(std::cell::Cell::get)
+}
+
+pub(crate) fn count_ids_walk(n: usize) {
+    COUNT_IDS_WALKED.with(|c| c.set(c.get() + n));
 }
 
 /// Permutations built on this thread for volumes whose ids do not ascend
@@ -1547,6 +1557,7 @@ pub fn reset_all() {
     VOLUME_LOAD_REQUESTS.with(|n| n.set(0));
     KEY_ORDER_MERGES.with(|n| n.set(0));
     ROW_ORDERS_BUILT.with(|n| n.set(0));
+    COUNT_IDS_WALKED.with(|n| n.set(0));
     VOLUME_FILE_READS.with(|n| n.set(0));
     SEGMENT_MAP_CLONES.with(|n| n.set(0));
     COLD_MAP_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = None);
