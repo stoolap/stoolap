@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! An upsert whose conflict is resolved does not format the key values of
-//! the unique violation it never shows
+//! A unique violation does not format its key until it is shown: neither an
+//! upsert that resolves the conflict nor a refused duplicate vector pays it
 
 // The jemalloc feature, on by default, sets the library's own global allocator
 #![cfg(not(feature = "jemalloc"))]
@@ -108,6 +108,41 @@ fn conflicts_resolved_by_an_upsert_allocate_no_message() {
             "{name}: {allocated} per row, at most {most}"
         );
     }
+}
+
+/// Allocations per refused INSERT of a vector a unique HNSW index holds
+fn per_refused_vector() -> usize {
+    let db = Database::open("memory://unique_conflict_alloc_hnsw").unwrap();
+    db.execute(
+        "CREATE TABLE vecs (id INTEGER PRIMARY KEY, v VECTOR(3))",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE UNIQUE INDEX idx_v ON vecs(v) USING HNSW WITH (metric = 'cosine')",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO vecs VALUES (1, '[1.0, 0.0, 0.0]')", ())
+        .unwrap();
+    let duplicate = db
+        .prepare("INSERT INTO vecs VALUES ($1, '[1.0, 0.0, 0.0]')")
+        .unwrap();
+    assert!(duplicate.execute((2,)).is_err());
+    let before = allocations();
+    for id in 0..KEYS {
+        assert!(duplicate.execute((id + 10,)).is_err());
+    }
+    (allocations() - before) / KEYS as usize
+}
+
+#[test]
+fn a_refused_duplicate_vector_allocates_no_message() {
+    let allocated = per_refused_vector();
+    assert!(
+        allocated <= 20,
+        "{allocated} per refused vector, at most 20"
+    );
 }
 
 #[test]

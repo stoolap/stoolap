@@ -8007,10 +8007,10 @@ impl TransactionVersionStore {
                             return Err(Error::unique_constraint(
                                 index.name(),
                                 index.column_names().join(", "),
-                                vec![Value::text(format!(
-                                    "<vector({} dims)> conflicts with row_id {}",
-                                    dims, existing_row_id
-                                ))],
+                                crate::core::ConflictValues::Vector {
+                                    dims,
+                                    holder: Some(existing_row_id),
+                                },
                             ));
                         }
                     }

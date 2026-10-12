@@ -2911,7 +2911,10 @@ impl Index for HnswIndex {
             return Err(crate::core::Error::unique_constraint(
                 &self.name,
                 self.column_names.join(", "),
-                vec![Value::text(format!("<vector({} dims)>", self.dims))],
+                crate::core::ConflictValues::Vector {
+                    dims: self.dims,
+                    holder: None,
+                },
             ));
         }
         inner.insert(
@@ -2961,7 +2964,10 @@ impl Index for HnswIndex {
                         return Err(crate::core::Error::unique_constraint(
                             &self.name,
                             self.column_names.join(", "),
-                            vec![Value::text(format!("<vector({} dims)>", self.dims))],
+                            crate::core::ConflictValues::Vector {
+                                dims: self.dims,
+                                holder: None,
+                            },
                         ));
                     }
                 } else {
@@ -2979,7 +2985,10 @@ impl Index for HnswIndex {
                     return Err(crate::core::Error::unique_constraint(
                         &self.name,
                         self.column_names.join(", "),
-                        vec![Value::text(format!("<vector({} dims)>", self.dims))],
+                        crate::core::ConflictValues::Vector {
+                            dims: self.dims,
+                            holder: None,
+                        },
                     ));
                 }
             }
@@ -3049,7 +3058,10 @@ impl Index for HnswIndex {
                         return Err(crate::core::Error::unique_constraint(
                             &self.name,
                             self.column_names.join(", "),
-                            vec![Value::text(format!("<vector({} dims)>", self.dims))],
+                            crate::core::ConflictValues::Vector {
+                                dims: self.dims,
+                                holder: None,
+                            },
                         ));
                     }
                 } else {
@@ -3067,7 +3079,10 @@ impl Index for HnswIndex {
                     return Err(crate::core::Error::unique_constraint(
                         &self.name,
                         self.column_names.join(", "),
-                        vec![Value::text(format!("<vector({} dims)>", self.dims))],
+                        crate::core::ConflictValues::Vector {
+                            dims: self.dims,
+                            holder: None,
+                        },
                     ));
                 }
             }

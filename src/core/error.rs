@@ -23,26 +23,40 @@ use super::Value;
 /// Result type alias for Stoolap operations
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// The key values a unique constraint refused, written out only when the
-/// error is shown: an upsert that resolves the conflict never formats them
+/// The key a unique constraint refused, written out only when the error is
+/// shown: an upsert that resolves the conflict never formats it
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConflictValues(pub Vec<Value>);
+pub enum ConflictValues {
+    /// The key's values, in the index's column order
+    Keys(Vec<Value>),
+    /// A vector key, named by its dimensions and the row holding it if known
+    Vector { dims: usize, holder: Option<i64> },
+}
 
 impl std::fmt::Display for ConflictValues {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for (i, value) in self.0.iter().enumerate() {
-            if i > 0 {
-                f.write_str(", ")?;
+        match self {
+            ConflictValues::Keys(values) => {
+                for (i, value) in values.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{value}")?;
+                }
+                Ok(())
             }
-            write!(f, "{value}")?;
+            ConflictValues::Vector { dims, holder: None } => write!(f, "<vector({dims} dims)>"),
+            ConflictValues::Vector {
+                dims,
+                holder: Some(row_id),
+            } => write!(f, "<vector({dims} dims)> conflicts with row_id {row_id}"),
         }
-        Ok(())
     }
 }
 
 impl From<Vec<Value>> for ConflictValues {
     fn from(values: Vec<Value>) -> Self {
-        ConflictValues(values)
+        ConflictValues::Keys(values)
     }
 }
 
@@ -556,6 +570,25 @@ mod tests {
             err.to_string(),
             "unique constraint failed for index idx_email on column email with value test@example.com"
         );
+    }
+
+    #[test]
+    fn a_vector_key_is_named_by_its_dimensions() {
+        let unknown = ConflictValues::Vector {
+            dims: 3,
+            holder: None,
+        };
+        assert_eq!(unknown.to_string(), "<vector(3 dims)>");
+        let held = ConflictValues::Vector {
+            dims: 3,
+            holder: Some(7),
+        };
+        assert_eq!(held.to_string(), "<vector(3 dims)> conflicts with row_id 7");
+    }
+
+    #[test]
+    fn the_conflict_key_does_not_grow_the_error() {
+        assert!(std::mem::size_of::<Error>() <= 120);
     }
 
     #[test]
