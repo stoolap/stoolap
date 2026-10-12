@@ -5807,6 +5807,8 @@ impl MVCCEngine {
                 }
             }
         }
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::checkpoint_manifests_persisted();
 
         // Step 5: Truncate WAL BEFORE compaction.
         // WAL truncation only depends on seal + manifest persist, not compaction.
@@ -6746,12 +6748,14 @@ impl MVCCEngine {
             if live_refs.is_empty() {
                 // Under the DDL guard, so no seal's transfer is halfway
                 let _ddl = self.ddl_guard();
+                let cleanup = mgr.open_cleanup();
                 // All rows in merged volumes are tombstoned. Remove those
                 // volumes and their tombstones, but keep unmerged volumes intact.
                 mgr.replace_segments_atomic_remove_only(&old_ids);
                 // Only clear tombstones that were actually applied during compaction.
                 // Post-snapshot tombstones are preserved for snapshot visibility.
                 mgr.remove_applied_tombstones(&applied_tombstones);
+                drop(cleanup);
 
                 // Persist manifest BEFORE deleting files (same safety as non-empty path).
                 // Written out under the DDL guard, so the manifest never shows a
@@ -7095,6 +7099,7 @@ impl MVCCEngine {
             // between the preparation and the guard) comes back from the
             // commit and is prepared again outside the guard, the
             // identities compared again before the next commit
+            let cleanup = mgr.open_cleanup();
             loop {
                 let ddl = self.ddl_guard();
                 // Written before a change of a column's definition since:
@@ -7152,6 +7157,8 @@ impl MVCCEngine {
             for side in stale_sides {
                 crate::storage::volume::secondary::discard_side(side);
             }
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::compaction_published();
             // The volumes just written are in the key's order. They were
             // built in the rewrite schema's column order, so the key's
             // positions in that schema are their physical columns, whatever
@@ -7167,6 +7174,7 @@ impl MVCCEngine {
             // Clear only tombstones that existed at snapshot time for
             // row_ids in the merged volumes.
             mgr.remove_applied_tombstones(&applied_tombstones);
+            drop(cleanup);
 
             // CRITICAL: Persist manifest BEFORE deleting old files.
             // Written out under the DDL guard, so the manifest never shows a

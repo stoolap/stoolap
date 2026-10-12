@@ -1466,6 +1466,23 @@ impl Drop for Destruction<'_> {
     }
 }
 
+/// Marks a compaction from before it publishes its outputs until it has
+/// removed the tombstones it applied, including on the error path.
+pub struct CleanupWindow<'a> {
+    mgr: &'a SegmentManager,
+}
+
+impl Drop for CleanupWindow<'_> {
+    fn drop(&mut self) {
+        self.mgr
+            .cleanups_done
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.mgr
+            .cleanups_open
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 pub(crate) struct ColumnSchemaChange {
     mgr: Option<Arc<SegmentManager>>,
     changed: bool,
@@ -1576,6 +1593,13 @@ pub struct SegmentManager {
     /// says nothing about how many rows moved: it marks the interval in which
     /// rows are leaving, so a reader that captured inside it is not answered.
     destruction_count: std::sync::atomic::AtomicUsize,
+    /// Compactions inside their cleanup window, and those that finished it:
+    /// a count across either change cannot take the single-segment shortcut
+    cleanups_open: std::sync::atomic::AtomicUsize,
+    cleanups_done: std::sync::atomic::AtomicU64,
+    /// Whether every tombstone was seen with a visible copy since they were
+    /// loaded: a manifest written inside a cleanup window can hold one without
+    shortcut_trusted: std::sync::atomic::AtomicBool,
     /// Even when column schema and mappings agree, odd during or after failed DDL.
     schema_generation: std::sync::atomic::AtomicU64,
     /// Advanced, under the DDL guard, by every change of a column's
@@ -1610,6 +1634,9 @@ impl SegmentManager {
             txn_seal_gens: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
             seal_overlap_count: std::sync::atomic::AtomicUsize::new(0),
             destruction_count: std::sync::atomic::AtomicUsize::new(0),
+            cleanups_open: std::sync::atomic::AtomicUsize::new(0),
+            cleanups_done: std::sync::atomic::AtomicU64::new(0),
+            shortcut_trusted: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -1622,6 +1649,7 @@ impl SegmentManager {
         } = stored;
         let table_name = manifest.table_name.clone();
         let tombstone_map: FxHashMap<i64, u64> = tombstones.into_iter().collect();
+        let trusted = tombstone_map.is_empty();
         Self {
             table_name: RwLock::new(table_name),
             manifest: RwLock::new(manifest),
@@ -1645,6 +1673,9 @@ impl SegmentManager {
             txn_seal_gens: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
             seal_overlap_count: std::sync::atomic::AtomicUsize::new(0),
             destruction_count: std::sync::atomic::AtomicUsize::new(0),
+            cleanups_open: std::sync::atomic::AtomicUsize::new(0),
+            cleanups_done: std::sync::atomic::AtomicU64::new(0),
+            shortcut_trusted: std::sync::atomic::AtomicBool::new(trusted),
         }
     }
 
@@ -3636,20 +3667,34 @@ impl SegmentManager {
     /// Count visible rows using pre-computed visibility bitmaps.
     /// Falls back to hash-based dedup only when bitmaps are not available.
     fn compute_deduped_row_count(&self) -> Result<usize> {
+        use std::sync::atomic::Ordering::Acquire;
+        let done_before = self.cleanups_done.load(Acquire);
+        // Tombstones first: they are removed only after the segment change
+        // that takes their rows away is published
+        let tombstones = Arc::clone(&*self.tombstones.read());
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::between_count_captures_reached();
         let segments = Arc::clone(&*self.segments.read());
         if segments.is_empty() {
             return Ok(0);
         }
-        let tombstones = Arc::clone(&*self.tombstones.read());
-        // A segment with dead copies is counted through its bitmap below
-        if segments.len() == 1 && segments.values().all(|cs| cs.dead.is_none()) {
-            let mut total = 0;
-            for cs in segments.values() {
-                total += cs.volume.row_ids()?.len();
+        // Every tombstone has a visible copy in a lone segment, except while
+        // a compaction holds tombstones its outputs no longer have rows for
+        let lone = segments.len() == 1 && segments.values().all(|cs| cs.dead.is_none());
+        let rows: usize = segments
+            .values()
+            .map(|cs| cs.volume.meta.row_ids.len())
+            .sum();
+        if lone && self.shortcut_trusted.load(Acquire) {
+            // Open before done: a window closes counting done first
+            let quiet = self.cleanups_open.load(Acquire) == 0
+                && self.cleanups_done.load(Acquire) == done_before;
+            if quiet {
+                let count = rows.saturating_sub(tombstones.len());
+                debug_assert!(same_as_walk(count, &segments, &tombstones));
+                return Ok(count);
             }
-            return Ok(total.saturating_sub(tombstones.len()));
         }
-
         let visible: usize = segments.values().map(visible_positions).sum();
         let count = if tombstones.is_empty() {
             visible
@@ -3665,6 +3710,10 @@ impl SegmentManager {
             visible.saturating_sub(tombstoned_visible(&segments, &tombstones, &bounds))
         };
         debug_assert!(same_as_walk(count, &segments, &tombstones));
+        if lone && visible == rows && count + tombstones.len() == rows {
+            self.shortcut_trusted
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         Ok(count)
     }
 
@@ -3807,6 +3856,14 @@ impl SegmentManager {
         Destruction { mgr: self }
     }
 
+    /// Mark a compaction from before it publishes its outputs until the
+    /// returned guard drops, after it removed the tombstones it applied
+    pub(crate) fn open_cleanup(&self) -> CleanupWindow<'_> {
+        self.cleanups_open
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        CleanupWindow { mgr: self }
+    }
+
     /// Whether a destructive publication is in flight.
     pub fn is_destruction_in_progress(&self) -> bool {
         self.destruction_count
@@ -3908,18 +3965,21 @@ impl SegmentManager {
         let _destruction = self.begin_destruction();
         {
             // The tombstones go while the manifest is held, so a persist
-            // never takes the emptied segments with the old tombstones
+            // never takes the emptied segments with the old tombstones, and
+            // after the segments, as a recount reads them the other way round
             let mut manifest = self.manifest.write();
             manifest.segments.clear();
             manifest.dead_copies.clear();
+            {
+                // The cold flag is written with the map it describes
+                let mut segments = self.segments.write();
+                *segments = Arc::new(FxHashMap::default());
+                self.has_cold
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::segments_clearing();
             *self.tombstones.write() = Arc::new(FxHashMap::default());
-        }
-        {
-            // The cold flag is written with the map it describes
-            let mut segments = self.segments.write();
-            *segments = Arc::new(FxHashMap::default());
-            self.has_cold
-                .store(false, std::sync::atomic::Ordering::Relaxed);
         }
         self.key_order_verdicts.lock().clear();
         self.cached_deduped_count
