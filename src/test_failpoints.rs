@@ -263,6 +263,7 @@ thread_local! {
     static COMPACTION_OUTPUTS_BUILT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static COMPACTION_PLANNED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static COMPACTION_PUBLISHED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static MANIFESTS_PERSISTED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static BETWEEN_COUNT_CAPTURES_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static SEGMENTS_CLEARING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static GC_ROWS_REMOVED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
@@ -307,6 +308,19 @@ pub fn after_compaction_planned(hook: impl FnOnce() + 'static) {
 
 pub(crate) fn compaction_planned() {
     let hook = COMPACTION_PLANNED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next checkpoint wrote the manifests,
+/// before it truncates the log and compacts
+pub fn after_checkpoint_manifests_persisted(hook: impl FnOnce() + 'static) {
+    MANIFESTS_PERSISTED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn checkpoint_manifests_persisted() {
+    let hook = MANIFESTS_PERSISTED_HOOK.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
         hook();
     }
@@ -1621,6 +1635,7 @@ pub fn reset_all() {
     COMPACTION_OUTPUTS_BUILT_HOOK.with(|slot| *slot.borrow_mut() = None);
     COMPACTION_PLANNED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COMPACTION_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    MANIFESTS_PERSISTED_HOOK.with(|slot| *slot.borrow_mut() = None);
     BETWEEN_COUNT_CAPTURES_HOOK.with(|slot| *slot.borrow_mut() = None);
     SEGMENTS_CLEARING_HOOK.with(|slot| *slot.borrow_mut() = None);
     GC_ROWS_REMOVED_HOOK.with(|slot| *slot.borrow_mut() = None);
