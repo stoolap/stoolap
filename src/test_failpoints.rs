@@ -266,6 +266,7 @@ thread_local! {
     static MANIFESTS_PERSISTED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static BETWEEN_COUNT_CAPTURES_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static SEGMENTS_CLEARING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static COUNT_CAPTURED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static GC_ROWS_REMOVED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static COLUMN_CHANGE_WAITING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static SEAL_PASSED_CHANGING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
@@ -334,6 +335,19 @@ pub fn after_compaction_published(hook: impl FnOnce() + 'static) {
 
 pub(crate) fn compaction_published() {
     let hook = COMPACTION_PUBLISHED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next live row recount captured both
+/// maps it counts, before it counts them
+pub fn after_count_captured(hook: impl FnOnce() + 'static) {
+    COUNT_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn count_captured() {
+    let hook = COUNT_CAPTURED_HOOK.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
         hook();
     }
@@ -1638,6 +1652,7 @@ pub fn reset_all() {
     MANIFESTS_PERSISTED_HOOK.with(|slot| *slot.borrow_mut() = None);
     BETWEEN_COUNT_CAPTURES_HOOK.with(|slot| *slot.borrow_mut() = None);
     SEGMENTS_CLEARING_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COUNT_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = None);
     GC_ROWS_REMOVED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLUMN_CHANGE_WAITING_HOOK.with(|slot| *slot.borrow_mut() = None);
     COMMIT_COUNTED_HOOK.with(|slot| *slot.borrow_mut() = None);

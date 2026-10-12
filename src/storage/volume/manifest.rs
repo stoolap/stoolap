@@ -1571,9 +1571,11 @@ pub struct SegmentManager {
     // No global cache needed. Each volume builds its index lazily on first
     // unique check and never invalidates (volumes are immutable).
     // Zone maps + bloom filters prune volumes before hash lookup.
-    /// Cached deduplicated row count. Invalidated (set to u64::MAX) on
-    /// segment or tombstone changes. Recomputed lazily on next read.
-    cached_deduped_count: std::sync::atomic::AtomicU64,
+    /// Bumped after each published segment or tombstone change, so a count
+    /// cached at an older epoch is stale
+    count_epoch: std::sync::atomic::AtomicU64,
+    /// The last live row count, with the epoch read before computing it
+    cached_count: parking_lot::Mutex<Option<(u64, usize)>>,
     /// Per-table fence that serializes seal with cold-check + hot insert.
     /// INSERTs take a shared guard while checking cold constraints and
     /// publishing into hot; seal takes the exclusive guard while moving rows.
@@ -1628,7 +1630,8 @@ impl SegmentManager {
             schema_generation: std::sync::atomic::AtomicU64::new(0),
             definition_epoch: std::sync::atomic::AtomicU64::new(0),
             pending_txn_tombstones: RwLock::new(FxHashMap::default()),
-            cached_deduped_count: std::sync::atomic::AtomicU64::new(u64::MAX),
+            count_epoch: std::sync::atomic::AtomicU64::new(0),
+            cached_count: parking_lot::Mutex::new(None),
             seal_fence: RwLock::new(()),
             seal_generation: std::sync::atomic::AtomicU64::new(0),
             txn_seal_gens: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
@@ -1667,7 +1670,8 @@ impl SegmentManager {
             schema_generation: std::sync::atomic::AtomicU64::new(0),
             definition_epoch: std::sync::atomic::AtomicU64::new(0),
             pending_txn_tombstones: RwLock::new(FxHashMap::default()),
-            cached_deduped_count: std::sync::atomic::AtomicU64::new(u64::MAX),
+            count_epoch: std::sync::atomic::AtomicU64::new(0),
+            cached_count: parking_lot::Mutex::new(None),
             seal_fence: RwLock::new(()),
             seal_generation: std::sync::atomic::AtomicU64::new(0),
             txn_seal_gens: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
@@ -2935,8 +2939,7 @@ impl SegmentManager {
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
             *segments = Arc::new(new_map);
         }
-        self.cached_deduped_count
-            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        self.invalidate_count();
         self.has_segments_flag
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
@@ -3043,8 +3046,7 @@ impl SegmentManager {
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
             *segments = Arc::new(new_map);
         }
-        self.cached_deduped_count
-            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        self.invalidate_count();
         self.has_segments_flag
             .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(prepared)
@@ -3155,8 +3157,7 @@ impl SegmentManager {
             }
         }
         if changed {
-            self.cached_deduped_count
-                .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+            self.invalidate_count();
         }
     }
 
@@ -3165,8 +3166,7 @@ impl SegmentManager {
     pub fn clear_tombstones(&self) {
         let _manifest = self.manifest.write();
         *self.tombstones.write() = Arc::new(FxHashMap::default());
-        self.cached_deduped_count
-            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        self.invalidate_count();
     }
 
     /// Remove tombstones only for row_ids that were in the compacted volumes.
@@ -3185,8 +3185,7 @@ impl SegmentManager {
             |rid, _| row_ids.contains(&rid),
         );
         if removed {
-            self.cached_deduped_count
-                .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+            self.invalidate_count();
         }
     }
 
@@ -3214,8 +3213,7 @@ impl SegmentManager {
             }
         }
         if map.len() != before {
-            self.cached_deduped_count
-                .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+            self.invalidate_count();
         }
     }
 
@@ -3587,16 +3585,23 @@ impl SegmentManager {
     /// Get the exact deduplicated row count across all segments.
     /// Uses a cached value that is invalidated on segment/tombstone changes.
     pub fn deduped_row_count(&self) -> Result<usize> {
-        let cached = self
-            .cached_deduped_count
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if cached != u64::MAX {
-            return Ok(cached as usize);
+        // Read before the maps are captured, so a change published after
+        // the capture leaves the stored count stale
+        let epoch = self.count_epoch.load(std::sync::atomic::Ordering::Acquire);
+        if let Some((at, count)) = *self.cached_count.lock() {
+            if at == epoch {
+                return Ok(count);
+            }
         }
         let count = self.compute_deduped_row_count()?;
-        self.cached_deduped_count
-            .store(count as u64, std::sync::atomic::Ordering::Relaxed);
+        *self.cached_count.lock() = Some((epoch, count));
         Ok(count)
+    }
+
+    /// Make every cached count stale; called after the change is published
+    fn invalidate_count(&self) {
+        self.count_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// Acquire a shared guard while performing a cold check + hot insert.
@@ -3675,6 +3680,8 @@ impl SegmentManager {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::between_count_captures_reached();
         let segments = Arc::clone(&*self.segments.read());
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::count_captured();
         if segments.is_empty() {
             return Ok(0);
         }
@@ -3982,8 +3989,7 @@ impl SegmentManager {
             *self.tombstones.write() = Arc::new(FxHashMap::default());
         }
         self.key_order_verdicts.lock().clear();
-        self.cached_deduped_count
-            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        self.invalidate_count();
         self.has_segments_flag
             .store(false, std::sync::atomic::Ordering::Relaxed);
         // Clearing takes rows away as much as a seal does, so a reader that
@@ -4024,8 +4030,7 @@ impl SegmentManager {
             *segments = Arc::new(new_map);
         }
         self.forget_key_order(segment_ids);
-        self.cached_deduped_count
-            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        self.invalidate_count();
     }
 
     /// Atomically replace old segments with a new compacted segment.
@@ -4112,8 +4117,7 @@ impl SegmentManager {
         ) {
             Ok(_) => {
                 self.forget_key_order(&old_segment_ids);
-                self.cached_deduped_count
-                    .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+                self.invalidate_count();
                 Ok(())
             }
             Err(prepared) => Err(Box::new(PreparedReplacement {
@@ -4149,8 +4153,7 @@ impl SegmentManager {
             )
             .unwrap_or(false);
         self.forget_key_order(old_segment_ids);
-        self.cached_deduped_count
-            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        self.invalidate_count();
         fresh
     }
 
@@ -5130,11 +5133,11 @@ mod tests {
         );
         assert_eq!(mgr.tombstone_count(), 99_999);
 
-        mgr.cached_deduped_count.store(7, Relaxed);
+        let epoch = mgr.count_epoch.load(Relaxed);
         mgr.remove_tombstones_for_rows(&targets);
         assert_eq!(
-            mgr.cached_deduped_count.load(Relaxed),
-            7,
+            mgr.count_epoch.load(Relaxed),
+            epoch,
             "a cleanup that removed nothing reset the count"
         );
     }
