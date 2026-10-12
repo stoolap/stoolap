@@ -69,6 +69,33 @@ fn refused_truncate(dir: &Path, claimed: i64) {
 }
 
 #[test]
+fn a_table_that_cannot_check_first_runs_no_step_before_refusing() {
+    use stoolap::storage::traits::Engine;
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dsn(dir.path())).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1), (2, 2)", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let mut claiming = db.begin().unwrap();
+    claiming
+        .execute("UPDATE t SET v = 9 WHERE id = 1", ())
+        .unwrap();
+
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let mut table = txn.get_table("t").unwrap();
+    let mut steps = 0;
+    let refused = table.truncate_after_check(&mut || steps += 1);
+    drop(table);
+    txn.rollback().unwrap();
+    claiming.rollback().unwrap();
+    assert!(refused.is_err());
+    assert_eq!(steps, 0, "the step ran before the refusal");
+    assert_eq!(counts(&db), (2, 2));
+}
+
+#[test]
 fn a_claim_on_a_hot_row_refuses_the_truncate_and_keeps_every_row() {
     let dir = tempfile::tempdir().unwrap();
     refused_truncate(dir.path(), 21);
