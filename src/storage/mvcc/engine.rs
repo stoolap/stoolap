@@ -7152,6 +7152,8 @@ impl MVCCEngine {
             for side in stale_sides {
                 crate::storage::volume::secondary::discard_side(side);
             }
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::compaction_published();
             // The volumes just written are in the key's order. They were
             // built in the rewrite schema's column order, so the key's
             // positions in that schema are their physical columns, whatever

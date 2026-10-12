@@ -3636,20 +3636,15 @@ impl SegmentManager {
     /// Count visible rows using pre-computed visibility bitmaps.
     /// Falls back to hash-based dedup only when bitmaps are not available.
     fn compute_deduped_row_count(&self) -> Result<usize> {
+        // Tombstones first: they are removed only after the segment change
+        // that takes their rows away is published
+        let tombstones = Arc::clone(&*self.tombstones.read());
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::between_count_captures_reached();
         let segments = Arc::clone(&*self.segments.read());
         if segments.is_empty() {
             return Ok(0);
         }
-        let tombstones = Arc::clone(&*self.tombstones.read());
-        // A segment with dead copies is counted through its bitmap below
-        if segments.len() == 1 && segments.values().all(|cs| cs.dead.is_none()) {
-            let mut total = 0;
-            for cs in segments.values() {
-                total += cs.volume.row_ids()?.len();
-            }
-            return Ok(total.saturating_sub(tombstones.len()));
-        }
-
         let visible: usize = segments.values().map(visible_positions).sum();
         let count = if tombstones.is_empty() {
             visible
@@ -3908,18 +3903,21 @@ impl SegmentManager {
         let _destruction = self.begin_destruction();
         {
             // The tombstones go while the manifest is held, so a persist
-            // never takes the emptied segments with the old tombstones
+            // never takes the emptied segments with the old tombstones, and
+            // after the segments, as a recount reads them the other way round
             let mut manifest = self.manifest.write();
             manifest.segments.clear();
             manifest.dead_copies.clear();
+            {
+                // The cold flag is written with the map it describes
+                let mut segments = self.segments.write();
+                *segments = Arc::new(FxHashMap::default());
+                self.has_cold
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::segments_clearing();
             *self.tombstones.write() = Arc::new(FxHashMap::default());
-        }
-        {
-            // The cold flag is written with the map it describes
-            let mut segments = self.segments.write();
-            *segments = Arc::new(FxHashMap::default());
-            self.has_cold
-                .store(false, std::sync::atomic::Ordering::Relaxed);
         }
         self.key_order_verdicts.lock().clear();
         self.cached_deduped_count

@@ -262,6 +262,9 @@ thread_local! {
     static SEAL_VOLUMES_BUILT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static COMPACTION_OUTPUTS_BUILT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static COMPACTION_PLANNED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static COMPACTION_PUBLISHED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static BETWEEN_COUNT_CAPTURES_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static SEGMENTS_CLEARING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static GC_ROWS_REMOVED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static COLUMN_CHANGE_WAITING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static SEAL_PASSED_CHANGING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
@@ -304,6 +307,45 @@ pub fn after_compaction_planned(hook: impl FnOnce() + 'static) {
 
 pub(crate) fn compaction_planned() {
     let hook = COMPACTION_PLANNED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next compaction published its
+/// outputs, before it removes the tombstones it applied
+pub fn after_compaction_published(hook: impl FnOnce() + 'static) {
+    COMPACTION_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn compaction_published() {
+    let hook = COMPACTION_PUBLISHED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next segment set clearing is halfway:
+/// one of its segments and its tombstones is emptied, the other not yet
+pub fn during_segments_clearing(hook: impl FnOnce() + 'static) {
+    SEGMENTS_CLEARING_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn segments_clearing() {
+    let hook = SEGMENTS_CLEARING_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next live row recount took the first of
+/// the two maps it counts and not yet the second
+pub fn between_count_captures(hook: impl FnOnce() + 'static) {
+    BETWEEN_COUNT_CAPTURES_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn between_count_captures_reached() {
+    let hook = BETWEEN_COUNT_CAPTURES_HOOK.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
         hook();
     }
@@ -1578,6 +1620,9 @@ pub fn reset_all() {
     SEAL_VOLUMES_BUILT_HOOK.with(|slot| *slot.borrow_mut() = None);
     COMPACTION_OUTPUTS_BUILT_HOOK.with(|slot| *slot.borrow_mut() = None);
     COMPACTION_PLANNED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COMPACTION_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    BETWEEN_COUNT_CAPTURES_HOOK.with(|slot| *slot.borrow_mut() = None);
+    SEGMENTS_CLEARING_HOOK.with(|slot| *slot.borrow_mut() = None);
     GC_ROWS_REMOVED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLUMN_CHANGE_WAITING_HOOK.with(|slot| *slot.borrow_mut() = None);
     COMMIT_COUNTED_HOOK.with(|slot| *slot.borrow_mut() = None);
