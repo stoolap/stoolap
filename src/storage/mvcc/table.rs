@@ -3138,6 +3138,10 @@ impl Table for MVCCTable {
         self.version_store.truncate_all()
     }
 
+    fn truncate_after_check(&mut self, after_check: &mut dyn FnMut()) -> Result<i32> {
+        self.version_store.truncate_all_then(after_check)
+    }
+
     fn scan(
         &self,
         column_indices: &[usize],

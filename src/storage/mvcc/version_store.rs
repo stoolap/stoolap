@@ -2806,6 +2806,12 @@ impl VersionStore {
     /// Fails with `TableHasActiveTransactions` if another transaction holds
     /// uncommitted UPDATE/DELETE claims on this table.
     pub fn truncate_all(&self) -> crate::core::Result<i32> {
+        self.truncate_all_then(|| {})
+    }
+
+    /// `truncate_all`, running `after_check` once no claim refuses it and
+    /// before any row goes, with the claims still shut out
+    pub fn truncate_all_then(&self, after_check: impl FnOnce()) -> crate::core::Result<i32> {
         // Hold uncommitted_writes(W) for the ENTIRE check-and-clear sequence
         // to prevent TOCTOU race: without this, a concurrent try_claim_row()
         // could add a claim between the check and the clear, and truncate would
@@ -2821,6 +2827,7 @@ impl VersionStore {
         if !uncommitted.is_empty() {
             return Err(crate::core::Error::TableHasActiveTransactions);
         }
+        after_check();
         // A reader that trusts the indexes' order stands down while the
         // rows leave, and one that captured them before sees the epoch move
         // afterwards, as it does across a commit's publication
