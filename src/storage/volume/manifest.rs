@@ -790,6 +790,89 @@ fn compute_visibility_bitmaps(
     }
 }
 
+/// The visibility of a compaction's `outputs` in `segments`, ordered as
+/// `seg_order` (ascending): each output masked by the live copies of the
+/// segments after it. The other segments keep theirs: the batch is closed
+/// over overlap and no copy outside it outlives a tombstone it applies, so
+/// nothing that masked them is gone
+fn mask_outputs(
+    seg_order: &[u64],
+    outputs: &[u64],
+    segments: &mut rustc_hash::FxHashMap<u64, ColdSegment>,
+) {
+    for (position, seg_id) in seg_order.iter().enumerate() {
+        if !outputs.contains(seg_id) {
+            continue;
+        }
+        let Some(output) = segments.get(seg_id).map(|cs| Arc::clone(&cs.volume)) else {
+            continue;
+        };
+        let Some(bounds) = output.id_bounds() else {
+            continue;
+        };
+        let mut bits: Option<Vec<u64>> = None;
+        for newer_id in &seg_order[position + 1..] {
+            let Some(newer) = segments.get(newer_id) else {
+                continue;
+            };
+            let mut scratch = None;
+            let mut hidden = Vec::new();
+            mask_shared_ids(
+                &output,
+                bounds,
+                &newer.volume,
+                &None,
+                &mut scratch,
+                &mut hidden,
+            );
+            let dead: rustc_hash::FxHashSet<i64> = match (&newer.dead, hidden.is_empty()) {
+                (Some(dead), false) => dead
+                    .iter()
+                    .map(|&pos| newer.volume.meta.row_ids[pos as usize])
+                    .collect(),
+                _ => Default::default(),
+            };
+            for (id, pos) in hidden {
+                if dead.contains(&id) {
+                    continue;
+                }
+                let bits = bits.get_or_insert_with(|| bits_without(output.meta.row_count, &[]));
+                bits[pos as usize >> 6] &= !(1u64 << (pos & 63));
+            }
+        }
+        if let Some(cs) = segments.get_mut(seg_id) {
+            cs.visible = bits.map(Arc::new);
+        }
+    }
+    debug_assert!(
+        same_as_full_pass(seg_order, segments),
+        "a compaction's publication changed a bitmap the full pass would set otherwise"
+    );
+}
+
+/// Whether every segment's visibility equals what `compute_visibility_bitmaps`
+/// gives the same map, an absent bitmap and a full one counting as one
+#[cfg(debug_assertions)]
+fn same_as_full_pass(
+    seg_order: &[u64],
+    segments: &rustc_hash::FxHashMap<u64, ColdSegment>,
+) -> bool {
+    let bits_of = |cs: &ColdSegment| match &cs.visible {
+        Some(bits) => (**bits).clone(),
+        None => bits_without(cs.volume.meta.row_count, &[]),
+    };
+    let mut full = segments.clone();
+    compute_visibility_bitmaps(seg_order, &mut full);
+    segments
+        .iter()
+        .all(|(id, cs)| full.get(id).is_some_and(|f| bits_of(f) == bits_of(cs)))
+}
+
+#[cfg(not(debug_assertions))]
+fn same_as_full_pass(_: &[u64], _: &rustc_hash::FxHashMap<u64, ColdSegment>) -> bool {
+    true
+}
+
 /// Clears, in `bits` (made from `base` on the first clear), the rows of
 /// `old` whose ids `new` holds again, within the range both span, and
 /// records in `hidden` each (id, position) that was visible in `base`.
@@ -3924,7 +4007,8 @@ impl SegmentManager {
             (Arc::clone(&*segments), order, map)
         };
         let new_order = published_order(&order, new_volumes, old_segment_ids);
-        compute_visibility_bitmaps(&new_order, &mut map);
+        let outputs: Vec<u64> = new_volumes.iter().map(|(id, _, _)| *id).collect();
+        mask_outputs(&new_order, &outputs, &mut map);
         PreparedPublication {
             snapshot,
             order,
@@ -4000,7 +4084,8 @@ impl SegmentManager {
         }
         if !fresh {
             let seg_ids: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
-            compute_visibility_bitmaps(&seg_ids, &mut map);
+            let outputs: Vec<u64> = new_volumes.iter().map(|(id, _, _)| *id).collect();
+            mask_outputs(&seg_ids, &outputs, &mut map);
         }
         if self.has_cold.load(std::sync::atomic::Ordering::Relaxed)
             && !map.values().any(|cs| cs.volume.is_cold())
