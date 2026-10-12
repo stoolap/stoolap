@@ -7977,12 +7977,10 @@ impl TransactionVersionStore {
                 // Check intra-batch duplicates (applies to all index types, including HNSW)
                 if let Some(&existing_row_id) = seen.get(values.as_slice()) {
                     if existing_row_id != *row_id {
-                        let values_str: Vec<String> =
-                            values.iter().map(|v| format!("{:?}", v)).collect();
                         return Err(Error::unique_constraint(
                             index.name(),
                             index.column_names().join(", "),
-                            format!("[{}]", values_str.join(", ")),
+                            values.to_vec(),
                         ));
                     }
                 }
@@ -8009,10 +8007,10 @@ impl TransactionVersionStore {
                             return Err(Error::unique_constraint(
                                 index.name(),
                                 index.column_names().join(", "),
-                                format!(
-                                    "<vector({} dims)> conflicts with row_id {}",
-                                    dims, existing_row_id
-                                ),
+                                crate::core::ConflictValues::Vector {
+                                    dims,
+                                    holder: Some(existing_row_id),
+                                },
                             ));
                         }
                     }
@@ -8028,12 +8026,10 @@ impl TransactionVersionStore {
                     });
 
                     if has_real_conflict {
-                        let values_str: Vec<String> =
-                            values.iter().map(|v| format!("{:?}", v)).collect();
                         return Err(Error::unique_constraint(
                             index.name(),
                             index.column_names().join(", "),
-                            format!("[{}]", values_str.join(", ")),
+                            values.to_vec(),
                         ));
                     }
                 }

@@ -215,12 +215,10 @@ impl HashIndex {
                 if Self::values_match(stored_values, values) && !row_ids.is_empty() {
                     // Check if any row_id is different (would be a duplicate)
                     if row_ids.iter().any(|id| id != row_id) {
-                        let values_str: Vec<String> =
-                            values.iter().map(|v| format!("{:?}", v)).collect();
                         return Err(Error::unique_constraint(
                             &self.name,
                             self.column_names.join(", "),
-                            format!("[{}]", values_str.join(", ")),
+                            values.to_vec(),
                         ));
                     }
                 }
@@ -452,12 +450,10 @@ impl Index for HashIndex {
                 // Check against other entries in this batch using actual values as key
                 if let Some(&existing_row_id) = batch_values.get(values) {
                     if existing_row_id != row_id {
-                        let values_str: Vec<String> =
-                            values.iter().map(|v| format!("{:?}", v)).collect();
                         return Err(Error::unique_constraint(
                             &self.name,
                             self.column_names.join(", "),
-                            format!("[{}]", values_str.join(", ")),
+                            values.to_vec(),
                         ));
                     }
                 }

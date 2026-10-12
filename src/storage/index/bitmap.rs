@@ -322,12 +322,10 @@ impl BitmapIndex {
                         bitmap.len()
                     };
                     if existing_count > 0 {
-                        let values_str: Vec<String> =
-                            values.iter().map(|v| format!("{:?}", v)).collect();
                         return Err(Error::unique_constraint(
                             &self.name,
                             self.column_names.join(", "),
-                            format!("[{}]", values_str.join(", ")),
+                            values.to_vec(),
                         ));
                     }
                 }
@@ -418,7 +416,7 @@ impl Index for BitmapIndex {
                     return Err(Error::unique_constraint(
                         &self.name,
                         self.column_names.join(", "),
-                        format!("{:?}", lookup_value),
+                        vec![lookup_value.clone()],
                     ));
                 }
             }
@@ -552,7 +550,7 @@ impl Index for BitmapIndex {
                         return Err(Error::unique_constraint(
                             &self.name,
                             self.column_names.join(", "),
-                            format!("{:?}", values),
+                            values.to_vec(),
                         ));
                     }
                 }
@@ -568,7 +566,7 @@ impl Index for BitmapIndex {
                         return Err(Error::unique_constraint(
                             &self.name,
                             self.column_names.join(", "),
-                            format!("{:?}", values),
+                            values.to_vec(),
                         ));
                     }
                 }
