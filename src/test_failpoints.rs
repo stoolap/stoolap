@@ -261,6 +261,7 @@ pub(crate) fn side_files_built() {
 thread_local! {
     static SEAL_VOLUMES_BUILT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static COMPACTION_OUTPUTS_BUILT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static COMPACTION_PLANNED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static GC_ROWS_REMOVED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static COLUMN_CHANGE_WAITING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static SEAL_PASSED_CHANGING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
@@ -290,6 +291,19 @@ pub fn after_compaction_outputs_built(hook: impl FnOnce() + 'static) {
 
 pub(crate) fn compaction_outputs_built() {
     let hook = COMPACTION_OUTPUTS_BUILT_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next compaction settled its batch,
+/// before it loads the members and reads the tombstones it applies
+pub fn after_compaction_planned(hook: impl FnOnce() + 'static) {
+    COMPACTION_PLANNED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn compaction_planned() {
+    let hook = COMPACTION_PLANNED_HOOK.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
         hook();
     }
@@ -1515,6 +1529,7 @@ pub fn reset_all() {
     COLD_ROUND_PREPARED_HOOK.with(|slot| *slot.borrow_mut() = None);
     SEAL_VOLUMES_BUILT_HOOK.with(|slot| *slot.borrow_mut() = None);
     COMPACTION_OUTPUTS_BUILT_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COMPACTION_PLANNED_HOOK.with(|slot| *slot.borrow_mut() = None);
     GC_ROWS_REMOVED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLUMN_CHANGE_WAITING_HOOK.with(|slot| *slot.borrow_mut() = None);
     COMMIT_COUNTED_HOOK.with(|slot| *slot.borrow_mut() = None);
