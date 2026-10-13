@@ -1741,6 +1741,7 @@ mod tests {
                 column: 1,
             },
             quoted: false,
+            keyword: None,
         }
     }
 

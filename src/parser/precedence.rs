@@ -14,6 +14,8 @@
 
 //! Operator precedence levels for the Pratt parser
 
+use super::token::Keyword;
+
 /// Precedence levels (higher number = higher precedence)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -55,28 +57,37 @@ pub enum Precedence {
 }
 
 impl Precedence {
-    /// Get precedence for an operator string
-    pub fn for_operator(op: &str) -> Precedence {
-        // Every operator and keyword below fits in 8 bytes
-        let mut buf = [0u8; 8];
-        let Some(upper) = buf.get_mut(..op.len()) else {
-            return Precedence::Lowest;
-        };
-        upper.copy_from_slice(op.as_bytes());
-        upper.make_ascii_uppercase();
-        match std::str::from_utf8(upper).unwrap_or_default() {
+    /// Get precedence for a keyword
+    pub fn for_keyword(keyword: Keyword) -> Precedence {
+        match keyword {
             // Logical
-            "OR" => Precedence::Or,
-            "XOR" => Precedence::Or, // XOR has same precedence as OR
-            "AND" => Precedence::And,
-            "NOT" => Precedence::Not,
+            Keyword::Or => Precedence::Or,
+            Keyword::Xor => Precedence::Or, // XOR has same precedence as OR
+            Keyword::And => Precedence::And,
+            Keyword::Not => Precedence::Not,
 
             // Comparison
-            "=" | "<>" | "!=" | "IS" | "LIKE" | "ILIKE" | "GLOB" | "REGEXP" | "RLIKE" | "IN"
-            | "BETWEEN" => Precedence::Equals,
+            Keyword::Is
+            | Keyword::Like
+            | Keyword::Ilike
+            | Keyword::Glob
+            | Keyword::Regexp
+            | Keyword::Rlike
+            | Keyword::In
+            | Keyword::Between => Precedence::Equals,
             // AS has lowest precedence to prevent it from being consumed by NOT/AND/OR etc.
             // e.g., "NOT TRUE AS alias" should parse as "(NOT TRUE) AS alias"
-            "AS" => Precedence::Lowest,
+            Keyword::As => Precedence::Lowest,
+
+            _ => Precedence::Lowest,
+        }
+    }
+
+    /// Get precedence for an operator string
+    pub fn for_operator(op: &str) -> Precedence {
+        match op {
+            // Comparison
+            "=" | "<>" | "!=" => Precedence::Equals,
             "<" | ">" | "<=" | ">=" | "<=>" => Precedence::LessGreater,
 
             // Bitwise operators (lower to higher precedence)
@@ -119,8 +130,9 @@ mod tests {
     fn test_operator_precedence() {
         assert_eq!(Precedence::for_operator("+"), Precedence::Sum);
         assert_eq!(Precedence::for_operator("*"), Precedence::Product);
-        assert_eq!(Precedence::for_operator("AND"), Precedence::And);
-        assert_eq!(Precedence::for_operator("OR"), Precedence::Or);
+        assert_eq!(Precedence::for_keyword(Keyword::And), Precedence::And);
+        assert_eq!(Precedence::for_keyword(Keyword::Or), Precedence::Or);
+        assert_eq!(Precedence::for_keyword(Keyword::As), Precedence::Lowest);
         assert_eq!(Precedence::for_operator("="), Precedence::Equals);
         assert_eq!(Precedence::for_operator("."), Precedence::Dot);
     }
