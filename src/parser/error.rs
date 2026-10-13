@@ -60,12 +60,13 @@ impl ParseError {
         }
 
         let lines: Vec<&str> = self.context.lines().collect();
-        if self.position.line == 0 || self.position.line > lines.len() {
+        let line_no = self.position.line as usize;
+        if line_no == 0 || line_no > lines.len() {
             return self.to_string();
         }
 
-        let line = lines[self.position.line - 1];
-        let pointer = " ".repeat(self.position.column.saturating_sub(1)) + "^";
+        let line = lines[line_no - 1];
+        let pointer = " ".repeat(self.position.column.saturating_sub(1) as usize) + "^";
 
         format!("{}\n{}\n{}", self, line, pointer)
     }
@@ -136,10 +137,11 @@ impl ParseErrors {
 
             // Add context from SQL
             let lines: Vec<&str> = self.sql.lines().collect();
-            if err.position.line > 0 && err.position.line <= lines.len() {
-                let line = lines[err.position.line - 1];
+            let line_no = err.position.line as usize;
+            if line_no > 0 && line_no <= lines.len() {
+                let line = lines[line_no - 1];
                 result.push_str(&format!("Line {}: {}\n", err.position.line, line));
-                let pointer = " ".repeat(err.position.column + 7); // +7 for "Line X: "
+                let pointer = " ".repeat(err.position.column as usize + 7); // +7 for "Line X: "
                 result.push_str(&format!("{}^\n", pointer));
             }
 

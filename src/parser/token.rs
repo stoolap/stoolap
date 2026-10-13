@@ -25,16 +25,16 @@ use std::sync::LazyLock;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Position {
     /// Byte offset, starting at 0
-    pub offset: usize,
+    pub offset: u32,
     /// Line number, starting at 1
-    pub line: usize,
+    pub line: u32,
     /// Column number, starting at 1
-    pub column: usize,
+    pub column: u32,
 }
 
 impl Position {
     /// Create a new position
-    pub fn new(offset: usize, line: usize, column: usize) -> Self {
+    pub fn new(offset: u32, line: u32, column: u32) -> Self {
         Self {
             offset,
             line,

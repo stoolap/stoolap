@@ -108,7 +108,7 @@ impl<'a> Lexer<'a> {
             self.read_position += len;
         }
 
-        self.pos.offset = self.position;
+        self.pos.offset = self.position as u32;
     }
 
     /// Peek at the next character without advancing
@@ -367,7 +367,7 @@ impl<'a> Lexer<'a> {
                 // Advance lexer past closing quote
                 self.position = scan_pos;
                 self.read_position = end_pos;
-                self.pos.offset = self.position;
+                self.pos.offset = self.position as u32;
 
                 // Read next char after closing quote
                 if self.read_position >= input_len {
@@ -379,7 +379,7 @@ impl<'a> Lexer<'a> {
                     self.position = self.read_position;
                     self.read_position += len;
                 }
-                self.pos.offset = self.position;
+                self.pos.offset = self.position as u32;
 
                 // SAFETY: input was constructed from valid UTF-8 (String/&str).
                 // We only scanned for ASCII bytes, so all byte boundaries are valid.

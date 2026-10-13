@@ -778,12 +778,8 @@ impl Parser<'_> {
         self.next_token();
 
         Some(Expression::QualifiedIdentifier(QualifiedIdentifier {
-            token: identifier_token(&left_ident),
-            qualifier: Box::new(left_ident),
-            name: Box::new(Identifier::new(
-                self.cur_token.clone(),
-                self.cur_token.literal.clone(),
-            )),
+            qualifier: left_ident,
+            name: Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone()),
         }))
     }
 
