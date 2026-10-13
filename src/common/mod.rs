@@ -17,16 +17,13 @@
 //! This module contains shared utilities used throughout the database:
 //!
 //! - [`version`] - Version information and constants
-//! - [`buffer_pool`] - Self-tuning buffer pool for efficient memory reuse
 //! - [`maps`] - Fast hash maps for integer keys
 //! - [`compact_vec`] - 16-byte vector optimized for Row storage
 //! - [`compact_arc`] - Memory-efficient Arc without weak reference support
 
-pub mod buffer_pool;
 pub mod compact_arc;
 pub mod compact_vec;
 pub mod cow_btree;
-pub mod cow_hashmap;
 pub mod i64_map;
 pub mod maps;
 pub mod smart_string;
@@ -34,11 +31,9 @@ pub mod time_compat;
 pub mod version;
 
 // Re-export main types for convenience
-pub use buffer_pool::{BufferPool, PoolStats};
 pub use compact_arc::{CompactArc, CompactArcDrop};
 pub use compact_vec::CompactVec;
 pub use cow_btree::CowBTree;
-pub use cow_hashmap::CowHashMap;
 pub use i64_map::{I64Map, I64Set};
 pub use maps::{
     new_cow_btree_map, new_i64_map, new_i64_map_with_capacity, CowBTreeMap, StringMap, StringSet,
@@ -49,23 +44,6 @@ pub use version::{version, version_info, SemVer, BUILD_TIME, GIT_COMMIT, MAJOR, 
 #[cfg(test)]
 mod integration_tests {
     use super::*;
-
-    #[test]
-    fn test_buffer_pool_with_i64_map() {
-        // Test buffer pool and i64 map working together
-        let pool = BufferPool::new(1024, 4096, "test");
-        let map: I64Map<Vec<u8>> = new_i64_map();
-
-        // Get buffer, use it, store in map
-        let mut buf = pool.get();
-        buf.extend_from_slice(b"test data");
-
-        let mut map = map;
-        map.insert(1, buf);
-
-        assert!(map.contains_key(1));
-        assert_eq!(map.get(1).unwrap(), b"test data");
-    }
 
     #[test]
     fn test_version_constants() {

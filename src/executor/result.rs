@@ -1866,12 +1866,6 @@ impl QueryResult for ScannerResult {
     }
 }
 
-/// Streaming filter result that applies WHERE clause evaluation row-by-row
-///
-/// This wraps a ScannerResult and applies filtering using the existing FilteredResult
-/// mechanics, but the scanner itself streams rows from storage.
-pub type StreamingFilterResult = FilteredResult;
-
 /// Streaming projection result that projects columns row-by-row
 ///
 /// This allows streaming projection without materializing all rows into a Vec.
