@@ -589,23 +589,35 @@ impl Drop for PublishGuard {
 /// this goes, whether the change completed or not
 pub struct ColumnClosure {
     store: Arc<VersionStore>,
+    reopen: bool,
 }
 
 impl ColumnClosure {
     /// Closes `store`; the caller then waits for what was counted before
     pub fn close(store: Arc<VersionStore>) -> Self {
         store.close_for_column_change();
-        Self { store }
+        Self {
+            store,
+            reopen: true,
+        }
     }
 
     pub fn store(&self) -> &VersionStore {
         &self.store
     }
+
+    /// Leaves the table closed until the database reopens: a change whose
+    /// outcome is durable, or may be, and could not complete
+    pub fn keep_closed(mut self) {
+        self.reopen = false;
+    }
 }
 
 impl Drop for ColumnClosure {
     fn drop(&mut self) {
-        self.store.open_after_column_change();
+        if self.reopen {
+            self.store.open_after_column_change();
+        }
     }
 }
 
@@ -786,6 +798,39 @@ fn is_closed(layout: u64) -> bool {
 /// A row in the layout of `schema`, `width` columns wide: a narrower row
 /// takes the missing columns' defaults, or NULL; a wider one loses the
 /// cell at `cut`. None when the row is in that layout already
+/// Whether a volume's secondary side file can hold a column of `data_type`
+pub(crate) fn side_file_holds(data_type: DataType) -> bool {
+    matches!(data_type, DataType::Integer | DataType::Timestamp)
+}
+
+/// The dimension and graph parameters of the HNSW index `meta` describes,
+/// the dimension from its column in `schema`; None when it has none
+fn hnsw_parameters(
+    meta: &crate::storage::mvcc::persistence::IndexMetadata,
+    schema: &Schema,
+) -> Option<(usize, usize, usize, usize)> {
+    let dims = schema
+        .find_column(meta.column_names.first()?)
+        .map(|(_, col)| col.vector_dimensions as usize)
+        .unwrap_or(0);
+    if dims == 0 {
+        return None;
+    }
+    let m = meta
+        .hnsw_m
+        .map(|v| v as usize)
+        .unwrap_or_else(|| crate::storage::index::default_m_for_dims(dims));
+    let ef_construction = meta
+        .hnsw_ef_construction
+        .map(|v| v as usize)
+        .unwrap_or_else(|| crate::storage::index::default_ef_construction(m));
+    let ef_search = meta
+        .hnsw_ef_search
+        .map(|v| v as usize)
+        .unwrap_or_else(|| crate::storage::index::default_ef_search(m));
+    Some((dims, m, ef_construction, ef_search))
+}
+
 fn lay_out_values(
     values: &[Value],
     width: usize,
@@ -811,6 +856,49 @@ fn lay_out_values(
             Some(CompactArc::from(moved))
         }
         _ => None,
+    }
+}
+
+/// A column type change's cast of the hot rows and of the indexes over the
+/// column, built aside from the store while the table is closed and
+/// published at once by `publish_cast`
+pub struct HotCast {
+    schema: CompactArc<Schema>,
+    heads: Vec<CastHead>,
+    arena: Vec<(usize, CompactArc<[Value]>)>,
+    indexes: Vec<(String, Arc<dyn Index>)>,
+}
+
+/// A row's newest committed version in the new type, with its history
+/// behind it when any of that changed
+struct CastHead {
+    row_id: i64,
+    data: Row,
+    deleted: bool,
+    changed: bool,
+    history: Option<Arc<VersionChainEntry>>,
+}
+
+impl HotCast {
+    /// The rows the hot store holds live, in the new type
+    pub fn live_rows(&self) -> impl Iterator<Item = (i64, &Row)> {
+        self.heads
+            .iter()
+            .filter(|head| !head.deleted)
+            .map(|head| (head.row_id, &head.data))
+    }
+
+    /// Whether the hot store holds a version of `row_id`, live or deleted,
+    /// which hides the row's sealed copies
+    pub fn holds(&self, row_id: i64) -> bool {
+        self.heads
+            .binary_search_by_key(&row_id, |head| head.row_id)
+            .is_ok()
+    }
+
+    /// The new index objects, each taking the place of the one of its name
+    pub fn indexes(&self) -> &[(String, Arc<dyn Index>)] {
+        &self.indexes
     }
 }
 
@@ -1222,6 +1310,189 @@ impl VersionStore {
                 }
             }
         }
+    }
+
+    /// The newest committed version of every row as it stands, nothing
+    /// cast, for a check that reads them with the volumes
+    pub fn current_heads(&self) -> HotCast {
+        let versions = self.versions.read().clone();
+        let heads = versions
+            .iter()
+            .map(|(&row_id, entry)| CastHead {
+                row_id,
+                data: entry.version.data.clone(),
+                deleted: entry.version.is_deleted(),
+                changed: false,
+                history: None,
+            })
+            .collect();
+        HotCast {
+            schema: self.schema(),
+            heads,
+            arena: Vec::new(),
+            indexes: Vec::new(),
+        }
+    }
+
+    /// Casts column `column` of every retained version to its type in
+    /// `schema`, with the new objects of the indexes over it, aside from the
+    /// store, the indexes only when `retyped`. The table is closed, so
+    /// nothing changes until `publish_cast`. A unique index the cast rows
+    /// do not fit refuses the change
+    pub fn prepare_cast(
+        &self,
+        column: usize,
+        schema: CompactArc<Schema>,
+        retyped: bool,
+    ) -> Result<HotCast, Error> {
+        debug_assert!(is_closed(self.layout()), "cast prepared on an open table");
+        let target = schema.columns[column].data_type;
+        let cast = |values: &[Value]| -> Option<CompactArc<[Value]>> {
+            let value = values.get(column)?;
+            if value.data_type() == target {
+                return None;
+            }
+            let mut moved = values.to_vec();
+            moved[column] = value.coerce_to_type(target);
+            Some(CompactArc::from(moved))
+        };
+        let versions = self.versions.read().clone();
+        let mut heads = Vec::with_capacity(versions.len());
+        let mut slots = Vec::new();
+        {
+            let arena = self.arena.read_guard();
+            for (&row_id, entry) in versions.iter() {
+                let in_arena = unpack_arena_idx(entry.arena_idx)
+                    .filter(|&idx| arena.meta().get(idx).is_some_and(|meta| meta.txn_id != 0));
+                let moved = match in_arena {
+                    Some(idx) => {
+                        let moved = cast(&arena.data()[idx]);
+                        if let Some(moved) = &moved {
+                            slots.push((idx, CompactArc::clone(moved)));
+                        }
+                        moved
+                    }
+                    None => cast(entry.version.data.as_slice()),
+                };
+                let history = entry
+                    .prev
+                    .as_ref()
+                    .and_then(|prev| relayout_history(prev, &cast));
+                heads.push(CastHead {
+                    row_id,
+                    changed: moved.is_some() || history.is_some(),
+                    data: moved
+                        .map(Row::from_arc)
+                        .unwrap_or_else(|| entry.version.data.clone()),
+                    deleted: entry.version.is_deleted(),
+                    history,
+                });
+            }
+        }
+        let mut indexes = Vec::new();
+        for index in self.get_all_indexes() {
+            if !retyped || !index.column_ids().contains(&(column as i32)) {
+                continue;
+            }
+            let meta = crate::storage::mvcc::persistence::IndexMetadata {
+                name: index.name().to_string(),
+                table_name: self.table_name.to_string(),
+                column_names: index.column_names().to_vec(),
+                column_ids: index.column_ids().to_vec(),
+                data_types: index
+                    .column_ids()
+                    .iter()
+                    .zip(index.data_types())
+                    .map(|(&id, &data_type)| {
+                        if id == column as i32 {
+                            target
+                        } else {
+                            data_type
+                        }
+                    })
+                    .collect(),
+                is_unique: index.is_unique(),
+                index_type: index.index_type(),
+                hnsw_m: index.hnsw_m(),
+                hnsw_ef_construction: index.hnsw_ef_construction(),
+                hnsw_ef_search: index.default_ef_search().map(|v| v as u16),
+                hnsw_distance_metric: index.hnsw_distance_metric(),
+                identity: self.index_identity(index.name()),
+            };
+            let rebuilt = self
+                .index_object(&meta, &schema, heads.len())
+                .ok_or_else(|| {
+                    Error::InvalidArgument(format!(
+                        "index '{}' cannot hold column '{}' as {:?}",
+                        meta.name, schema.columns[column].name, target
+                    ))
+                })?;
+            let ids: Vec<usize> = meta.column_ids.iter().map(|&id| id as usize).collect();
+            let entries: Vec<(i64, Vec<Value>)> = heads
+                .iter()
+                .filter(|head| !head.deleted)
+                .map(|head| {
+                    let values = ids
+                        .iter()
+                        .map(|&id| head.data.get(id).cloned().unwrap_or(Value::Null(target)))
+                        .collect();
+                    (head.row_id, values)
+                })
+                .collect();
+            let refs: Vec<(i64, &[Value])> = entries
+                .iter()
+                .map(|(row_id, values)| (*row_id, values.as_slice()))
+                .collect();
+            rebuilt.add_batch_slice(&refs)?;
+            indexes.push((meta.name, rebuilt));
+        }
+        Ok(HotCast {
+            schema,
+            heads,
+            arena: slots,
+            indexes,
+        })
+    }
+
+    /// Publishes a cast `prepare_cast` built: the rows, their history and
+    /// the schema under the one versions lock, then the index objects, a
+    /// reader that trusts an index's order standing down across the swap.
+    /// The layout moves on, so no layout stands for two schemas
+    pub fn publish_cast(&self, cast: HotCast) {
+        debug_assert!(is_closed(self.layout()), "cast published on an open table");
+        let HotCast {
+            schema,
+            heads,
+            arena,
+            indexes,
+        } = cast;
+        self.publishing.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut versions = self.versions.write();
+            self.arena.replace_rows(arena);
+            for head in heads.into_iter().filter(|head| head.changed) {
+                if let Some(entry) = versions.get_mut(head.row_id) {
+                    entry.version.data = head.data;
+                    if let Some(history) = head.history {
+                        entry.prev = Some(history);
+                    }
+                }
+            }
+            *self.schema.write() = schema;
+            self.layout.fetch_add(2, Ordering::AcqRel);
+        }
+        // The bounds ANALYZE took hold the old values
+        *self.zone_maps.write() = None;
+        let replaced: Vec<Arc<dyn Index>> = {
+            let mut current = self.indexes.write();
+            indexes
+                .into_iter()
+                .filter_map(|(name, index)| current.insert(name, index))
+                .collect()
+        };
+        self.publish_epoch.fetch_add(1, Ordering::SeqCst);
+        self.publishing.fetch_sub(1, Ordering::SeqCst);
+        drop(replaced);
     }
 
     /// Returns the current auto-increment counter value
@@ -2024,6 +2295,10 @@ impl VersionStore {
                         if meta.deleted_at_txn_id == 0
                             || !checker.is_visible(meta.deleted_at_txn_id, txn_id)
                         {
+                            #[cfg(feature = "test-failpoints")]
+                            crate::test_failpoints::note_read(
+                                "vs.get_visible_versions_batch.arena_probe",
+                            );
                             let row = Row::from_arc(CompactArc::clone(&arena_data[probe_idx]));
                             results.push((row_id, row));
                         }
@@ -4937,7 +5212,7 @@ impl VersionStore {
 
     /// The same identities, into a buffer the caller keeps
     pub fn secondary_index_identities_into(&self, result: &mut Vec<(usize, u64)>) {
-        use crate::core::types::{DataType, IndexType};
+        use crate::core::types::IndexType;
         result.clear();
         let schema = self.schema();
         let pk = schema.pk_column_index();
@@ -4958,12 +5233,7 @@ impl VersionStore {
             else {
                 continue;
             };
-            if pk == Some(column)
-                || !matches!(
-                    schema.columns[column].data_type,
-                    DataType::Integer | DataType::Timestamp
-                )
-            {
+            if pk == Some(column) || !side_file_holds(schema.columns[column].data_type) {
                 continue;
             }
             if !result.iter().any(|(c, _)| *c == column) {
@@ -4981,9 +5251,17 @@ impl VersionStore {
     ///
     /// Zone maps contain min/max statistics per segment, enabling the query
     /// executor to skip entire segments when predicates fall outside the range.
-    pub fn set_zone_maps(&self, zone_maps: crate::storage::mvcc::zonemap::TableZoneMap) {
+    /// Maps built from rows read under `layout` are dropped once a column
+    /// change moved it, which clears the maps after it moves the layout
+    pub fn set_zone_maps(
+        &self,
+        zone_maps: crate::storage::mvcc::zonemap::TableZoneMap,
+        layout: u64,
+    ) {
         let mut guard = self.zone_maps.write();
-        *guard = Some(Arc::new(zone_maps));
+        if layout == self.layout() && !is_closed(layout) {
+            *guard = Some(Arc::new(zone_maps));
+        }
     }
 
     /// Gets the zone maps for this table
@@ -5200,7 +5478,6 @@ impl VersionStore {
         hnsw_graph_path: Option<&std::path::Path>,
     ) -> crate::core::Result<()> {
         use crate::core::IndexType;
-        use crate::storage::index::{BitmapIndex, HashIndex};
 
         // Check if we have the required column information
         if meta.column_names.is_empty() {
@@ -5228,146 +5505,14 @@ impl VersionStore {
         let expected_rows = self.versions.read().len();
 
         if meta.column_names.len() == 1 {
-            // Single-column index
-            let column_name = &meta.column_names[0];
             let column_id = meta.column_ids.first().copied().unwrap_or(0);
-            let data_type = meta
-                .data_types
-                .first()
-                .copied()
-                .unwrap_or(crate::core::DataType::Null);
-
-            // Create index based on stored index_type
-            let index: Arc<dyn crate::storage::Index> = match meta.index_type {
-                IndexType::Hash => {
-                    let idx = HashIndex::new(
-                        meta.name.clone(),
-                        meta.table_name.clone(),
-                        vec![column_name.clone()],
-                        vec![column_id],
-                        vec![data_type],
-                        meta.is_unique,
-                        expected_rows,
-                    );
-                    Arc::new(idx)
-                }
-                IndexType::Bitmap => {
-                    let idx = BitmapIndex::new(
-                        meta.name.clone(),
-                        meta.table_name.clone(),
-                        vec![column_name.clone()],
-                        vec![column_id],
-                        vec![data_type],
-                        meta.is_unique,
-                        expected_rows,
-                    );
-                    Arc::new(idx)
-                }
-                IndexType::BTree => {
-                    // BTree uses BTreeIndex implementation
-                    let idx = crate::storage::index::BTreeIndex::new(
-                        meta.name.clone(),
-                        meta.table_name.clone(),
-                        column_id,
-                        column_name.clone(),
-                        data_type,
-                        meta.is_unique,
-                        expected_rows,
-                    );
-                    Arc::new(idx)
-                }
-                IndexType::MultiColumn => {
-                    // MultiColumn uses MultiColumnIndex implementation
-                    let idx = crate::storage::index::MultiColumnIndex::new(
-                        meta.name.clone(),
-                        meta.table_name.clone(),
-                        meta.column_names.clone(),
-                        meta.column_ids.clone(),
-                        meta.data_types.clone(),
-                        meta.is_unique,
-                        expected_rows,
-                    );
-                    Arc::new(idx)
-                }
-                IndexType::PrimaryKey => {
-                    // PrimaryKey indexes are auto-created, never persisted via CREATE INDEX
-                    return Ok(());
-                }
-                IndexType::Hnsw => {
-                    // Get vector dimensions from schema
-                    let schema = self.schema();
-                    let dims = schema
-                        .find_column(column_name)
-                        .map(|(_, col)| col.vector_dimensions as usize)
-                        .unwrap_or(0);
-                    if dims == 0 {
-                        return Ok(()); // Cannot rebuild without dimension info
-                    }
-                    let m = meta
-                        .hnsw_m
-                        .map(|v| v as usize)
-                        .unwrap_or_else(|| crate::storage::index::default_m_for_dims(dims));
-                    let ef_construction = meta
-                        .hnsw_ef_construction
-                        .map(|v| v as usize)
-                        .unwrap_or_else(|| crate::storage::index::default_ef_construction(m));
-                    let ef_search = meta
-                        .hnsw_ef_search
-                        .map(|v| v as usize)
-                        .unwrap_or_else(|| crate::storage::index::default_ef_search(m));
-
-                    // Try loading saved HNSW graph from snapshot file
-                    if let Some(graph_path) = hnsw_graph_path {
-                        if let Ok(Some(mut loaded)) = crate::storage::index::HnswIndex::load_graph(
-                            graph_path,
-                            meta.name.clone(),
-                            meta.table_name.clone(),
-                            column_name.clone(),
-                            column_id,
-                            dims,
-                            m,
-                            ef_construction,
-                            ef_search,
-                        ) {
-                            loaded.set_unique(meta.is_unique);
-                            Arc::new(loaded)
-                        } else {
-                            let mut idx = crate::storage::index::HnswIndex::new(
-                                meta.name.clone(),
-                                meta.table_name.clone(),
-                                column_name.clone(),
-                                column_id,
-                                dims,
-                                m,
-                                ef_construction,
-                                ef_search,
-                                crate::storage::index::HnswDistanceMetric::from_u8(
-                                    meta.hnsw_distance_metric.unwrap_or(0),
-                                )
-                                .unwrap_or(crate::storage::index::HnswDistanceMetric::L2),
-                            );
-                            idx.set_unique(meta.is_unique);
-                            Arc::new(idx)
-                        }
-                    } else {
-                        let mut idx = crate::storage::index::HnswIndex::new(
-                            meta.name.clone(),
-                            meta.table_name.clone(),
-                            column_name.clone(),
-                            column_id,
-                            dims,
-                            m,
-                            ef_construction,
-                            ef_search,
-                            crate::storage::index::HnswDistanceMetric::from_u8(
-                                meta.hnsw_distance_metric.unwrap_or(0),
-                            )
-                            .unwrap_or(crate::storage::index::HnswDistanceMetric::L2),
-                        );
-                        idx.set_unique(meta.is_unique);
-                        Arc::new(idx)
-                    }
-                }
+            let loaded = hnsw_graph_path.and_then(|path| self.load_hnsw_graph(meta, path));
+            let index = match loaded {
+                Some(index) => index,
+                None => match self.index_object(meta, &self.schema(), expected_rows) {
+                    Some(index) => index,
+                    None => return Ok(()),
+                },
             };
 
             // Populate the index with existing data unless deferred
@@ -5395,18 +5540,9 @@ impl VersionStore {
 
             self.add_index(meta.name.clone(), index);
         } else {
-            // Multi-column index: use MultiColumnIndex
-            let index = crate::storage::index::MultiColumnIndex::new(
-                meta.name.clone(),
-                meta.table_name.clone(),
-                meta.column_names.clone(),
-                meta.column_ids.clone(),
-                meta.data_types.clone(),
-                meta.is_unique,
-                expected_rows,
-            );
-
-            let index = Arc::new(index);
+            let Some(index) = self.index_object(meta, &self.schema(), expected_rows) else {
+                return Ok(());
+            };
 
             // Populate the index with existing data unless deferred
             // Uses batch_slice for better performance
@@ -5443,6 +5579,140 @@ impl VersionStore {
         }
 
         Ok(())
+    }
+
+    /// The HNSW index `meta` describes, read from its saved graph at `path`;
+    /// None when it is not HNSW or the graph cannot be loaded
+    fn load_hnsw_graph(
+        &self,
+        meta: &crate::storage::mvcc::persistence::IndexMetadata,
+        path: &std::path::Path,
+    ) -> Option<Arc<dyn crate::storage::Index>> {
+        if meta.index_type != crate::core::IndexType::Hnsw {
+            return None;
+        }
+        let column_name = meta.column_names.first()?;
+        let column_id = meta.column_ids.first().copied().unwrap_or(0);
+        let (dims, m, ef_construction, ef_search) = hnsw_parameters(meta, &self.schema())?;
+        let mut loaded = crate::storage::index::HnswIndex::load_graph(
+            path,
+            meta.name.clone(),
+            meta.table_name.clone(),
+            column_name.clone(),
+            column_id,
+            dims,
+            m,
+            ef_construction,
+            ef_search,
+        )
+        .ok()
+        .flatten()?;
+        loaded.set_unique(meta.is_unique);
+        Some(Arc::new(loaded))
+    }
+
+    /// A new, empty index object for `meta` under `schema`, not added to the
+    /// store; None for a primary key, which the schema creates, and for an
+    /// HNSW index whose column has no dimension
+    pub(crate) fn index_object(
+        &self,
+        meta: &crate::storage::mvcc::persistence::IndexMetadata,
+        schema: &Schema,
+        expected_rows: usize,
+    ) -> Option<Arc<dyn crate::storage::Index>> {
+        use crate::core::IndexType;
+        use crate::storage::index::{BitmapIndex, HashIndex};
+        if meta.column_names.len() != 1 {
+            return Some(Arc::new(crate::storage::index::MultiColumnIndex::new(
+                meta.name.clone(),
+                meta.table_name.clone(),
+                meta.column_names.clone(),
+                meta.column_ids.clone(),
+                meta.data_types.clone(),
+                meta.is_unique,
+                expected_rows,
+            )));
+        }
+        let column_name = &meta.column_names[0];
+        let column_id = meta.column_ids.first().copied().unwrap_or(0);
+        let data_type = meta
+            .data_types
+            .first()
+            .copied()
+            .unwrap_or(crate::core::DataType::Null);
+        let index: Arc<dyn crate::storage::Index> = match meta.index_type {
+            IndexType::Hash => {
+                let idx = HashIndex::new(
+                    meta.name.clone(),
+                    meta.table_name.clone(),
+                    vec![column_name.clone()],
+                    vec![column_id],
+                    vec![data_type],
+                    meta.is_unique,
+                    expected_rows,
+                );
+                Arc::new(idx)
+            }
+            IndexType::Bitmap => {
+                let idx = BitmapIndex::new(
+                    meta.name.clone(),
+                    meta.table_name.clone(),
+                    vec![column_name.clone()],
+                    vec![column_id],
+                    vec![data_type],
+                    meta.is_unique,
+                    expected_rows,
+                );
+                Arc::new(idx)
+            }
+            IndexType::BTree => {
+                // BTree uses BTreeIndex implementation
+                let idx = crate::storage::index::BTreeIndex::new(
+                    meta.name.clone(),
+                    meta.table_name.clone(),
+                    column_id,
+                    column_name.clone(),
+                    data_type,
+                    meta.is_unique,
+                    expected_rows,
+                );
+                Arc::new(idx)
+            }
+            IndexType::MultiColumn => {
+                // MultiColumn uses MultiColumnIndex implementation
+                let idx = crate::storage::index::MultiColumnIndex::new(
+                    meta.name.clone(),
+                    meta.table_name.clone(),
+                    meta.column_names.clone(),
+                    meta.column_ids.clone(),
+                    meta.data_types.clone(),
+                    meta.is_unique,
+                    expected_rows,
+                );
+                Arc::new(idx)
+            }
+            IndexType::PrimaryKey => return None,
+            IndexType::Hnsw => {
+                let (dims, m, ef_construction, ef_search) = hnsw_parameters(meta, schema)?;
+                let mut idx = crate::storage::index::HnswIndex::new(
+                    meta.name.clone(),
+                    meta.table_name.clone(),
+                    column_name.clone(),
+                    column_id,
+                    dims,
+                    m,
+                    ef_construction,
+                    ef_search,
+                    crate::storage::index::HnswDistanceMetric::from_u8(
+                        meta.hnsw_distance_metric.unwrap_or(0),
+                    )
+                    .unwrap_or(crate::storage::index::HnswDistanceMetric::L2),
+                );
+                idx.set_unique(meta.is_unique);
+                Arc::new(idx)
+            }
+        };
+        Some(index)
     }
 
     /// Populate all indexes in a single pass over the version store

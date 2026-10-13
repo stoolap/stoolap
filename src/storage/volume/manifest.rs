@@ -1151,6 +1151,15 @@ pub(crate) type SealedEntry = (
     Option<Arc<[u32]>>,
 );
 
+/// A publication: whether the preparation was fresh, or the preparation
+/// handed back to be prepared again
+type Publication = std::result::Result<bool, PreparedPublication>;
+
+/// A seal's registration: the published preparation, or the volumes and a
+/// preparation the segments moved under
+pub(crate) type SealRegistration =
+    std::result::Result<PreparedRegistration, (Vec<SealedEntry>, PreparedRegistration)>;
+
 /// What a seal's registration changes in the older segments, decided
 /// outside the locks: each segment whose rows the new volumes hold again,
 /// with the bitmap it had and the one it gets
@@ -1270,7 +1279,7 @@ fn mapping_for(
     volume: &FrozenVolume,
     schema_version: u64,
     schema: Option<&crate::core::Schema>,
-) -> super::writer::ColumnMapping {
+) -> crate::core::Result<super::writer::ColumnMapping> {
     match schema {
         Some(schema) => super::writer::compute_column_mapping_with_drops(
             schema,
@@ -1279,13 +1288,68 @@ fn mapping_for(
             schema_version,
             &manifest.column_renames,
         ),
-        None => super::writer::ColumnMapping {
-            sources: (0..volume.columns.len())
-                .map(super::writer::ColSource::Volume)
-                .collect(),
-            names: Vec::new(),
-            is_identity: true,
-        },
+        None => Ok(identity_mapping(volume)),
+    }
+}
+
+/// A copy of a manifest's drops and renames, for a column change to try
+/// against the volumes before it records itself
+pub struct ColumnHistory {
+    dropped: Vec<(SmartString, u64)>,
+    renames: Vec<(SmartString, SmartString)>,
+}
+
+impl ColumnHistory {
+    pub fn drop_column(&mut self, name: &str, schema_version: u64) {
+        drop_into(&mut self.dropped, name, schema_version);
+    }
+
+    pub fn rename_column(&mut self, old_name: &str, new_name: &str, schema_version: u64) {
+        rename_into(
+            &mut self.dropped,
+            &mut self.renames,
+            old_name,
+            new_name,
+            schema_version,
+        );
+    }
+}
+
+/// Records the drop of `name` at `schema_version`, replacing an earlier
+/// drop of the name (a DROP, ADD, DROP sequence)
+fn drop_into(dropped: &mut Vec<(SmartString, u64)>, name: &str, schema_version: u64) {
+    let lower = SmartString::from(name.to_lowercase());
+    dropped.retain(|(name, _)| name.as_str() != lower.as_str());
+    dropped.push((lower, schema_version));
+}
+
+/// Records a rename at `schema_version`. The version goes into the drop
+/// list under a name no column can carry, so the order of renames against
+/// drops survives without a change of format; a reader that does not know
+/// the marker never matches it against a column
+fn rename_into(
+    dropped: &mut Vec<(SmartString, u64)>,
+    renames: &mut Vec<(SmartString, SmartString)>,
+    old_name: &str,
+    new_name: &str,
+    schema_version: u64,
+) {
+    let ordinal = renames.len();
+    renames.push((SmartString::from(old_name), SmartString::from(new_name)));
+    dropped.push((
+        SmartString::from(super::writer::rename_marker(ordinal).as_str()),
+        schema_version,
+    ));
+}
+
+/// Every volume column read as the schema column at its position
+fn identity_mapping(volume: &FrozenVolume) -> super::writer::ColumnMapping {
+    super::writer::ColumnMapping {
+        sources: (0..volume.columns.len())
+            .map(super::writer::ColSource::Volume)
+            .collect(),
+        names: Vec::new(),
+        is_identity: true,
     }
 }
 
@@ -1598,6 +1662,9 @@ pub struct SegmentManager {
     /// Destructive publications ever begun, so a reader can tell one that
     /// started and ended inside its read from a seal or a compaction
     destructions_begun: std::sync::atomic::AtomicU64,
+    /// A column type change is durable in the log and its manifest is not
+    /// written: no checkpoint may move recovery past the change's record
+    incomplete_change: std::sync::atomic::AtomicBool,
     /// Compactions inside their cleanup window, and those that finished it:
     /// a count across either change cannot take the single-segment shortcut
     cleanups_open: std::sync::atomic::AtomicUsize,
@@ -1641,6 +1708,7 @@ impl SegmentManager {
             seal_overlap_count: std::sync::atomic::AtomicUsize::new(0),
             destruction_count: std::sync::atomic::AtomicUsize::new(0),
             destructions_begun: std::sync::atomic::AtomicU64::new(0),
+            incomplete_change: std::sync::atomic::AtomicBool::new(false),
             cleanups_open: std::sync::atomic::AtomicUsize::new(0),
             cleanups_done: std::sync::atomic::AtomicU64::new(0),
             shortcut_trusted: std::sync::atomic::AtomicBool::new(true),
@@ -1682,6 +1750,7 @@ impl SegmentManager {
             seal_overlap_count: std::sync::atomic::AtomicUsize::new(0),
             destruction_count: std::sync::atomic::AtomicUsize::new(0),
             destructions_begun: std::sync::atomic::AtomicU64::new(0),
+            incomplete_change: std::sync::atomic::AtomicBool::new(false),
             cleanups_open: std::sync::atomic::AtomicUsize::new(0),
             cleanups_done: std::sync::atomic::AtomicU64::new(0),
             shortcut_trusted: std::sync::atomic::AtomicBool::new(trusted),
@@ -2847,12 +2916,12 @@ impl SegmentManager {
         volume: Arc<FrozenVolume>,
         meta: SegmentMeta,
         schema: Option<&crate::core::Schema>,
-    ) {
+    ) -> crate::core::Result<()> {
         let file = volume.file_owner().or_else(|| self.file_of(segment_id));
         if let Some(file) = &file {
             file.remember(&volume);
         }
-        self.register_segment_with_owner(segment_id, volume, meta, schema, file, None);
+        self.register_segment_with_owner(segment_id, volume, meta, schema, file, None)
     }
 
     /// Attaches a side file to the segment registered under `segment_id`,
@@ -2911,7 +2980,7 @@ impl SegmentManager {
         schema: Option<&crate::core::Schema>,
         file: Option<Arc<super::writer::VolumeFile>>,
         side: Option<Arc<super::secondary::IndexFile>>,
-    ) {
+    ) -> crate::core::Result<()> {
         // Both manifest and segments must be updated atomically under write locks.
         // The bitmap computation runs inside the critical section — this is safe
         // because the segments write lock only blocks other writers (readers clone
@@ -2919,11 +2988,11 @@ impl SegmentManager {
         {
             let seg_schema_version = meta.schema_version;
             let mut manifest = self.manifest.write();
+            let mapping = mapping_for(&manifest, &volume, seg_schema_version, schema)?;
             if segment_id >= manifest.next_segment_id {
                 manifest.next_segment_id = segment_id + 1;
             }
             manifest.add_segment(meta);
-            let mapping = mapping_for(&manifest, &volume, seg_schema_version, schema);
             let cold = ColdSegment {
                 volume,
                 mapping,
@@ -2947,6 +3016,7 @@ impl SegmentManager {
         self.invalidate_count();
         self.has_segments_flag
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     /// The visibility a seal's registration of `volumes` changes in the
@@ -2981,7 +3051,7 @@ impl SegmentManager {
         volumes: Vec<SealedEntry>,
         mut prepared: PreparedRegistration,
         schema: Option<&crate::core::Schema>,
-    ) -> std::result::Result<PreparedRegistration, (Vec<SealedEntry>, PreparedRegistration)> {
+    ) -> crate::core::Result<SealRegistration> {
         {
             let mut manifest = self.manifest.write();
             let mut segments = self.segments.write();
@@ -2999,8 +3069,14 @@ impl SegmentManager {
             #[cfg(feature = "test-failpoints")]
             let fresh = fresh && !crate::test_failpoints::seal_registration_forced_stale();
             if !fresh {
-                return Err((volumes, prepared));
+                return Ok(Err((volumes, prepared)));
             }
+            let mappings = volumes
+                .iter()
+                .map(|(_, volume, meta, _, _, _)| {
+                    mapping_for(&manifest, volume, meta.schema_version, schema)
+                })
+                .collect::<crate::core::Result<Vec<_>>>()?;
             let mut dead_ids: Vec<i64> = volumes
                 .iter()
                 .flat_map(|(_, volume, _, _, _, dead)| {
@@ -3011,7 +3087,9 @@ impl SegmentManager {
                 .collect();
             dead_ids.sort_unstable();
             let mut new_map = (**segments).clone();
-            for (segment_id, volume, meta, file, side, dead) in volumes {
+            for ((segment_id, volume, meta, file, side, dead), mapping) in
+                volumes.into_iter().zip(mappings)
+            {
                 if segment_id >= manifest.next_segment_id {
                     manifest.next_segment_id = segment_id + 1;
                 }
@@ -3020,7 +3098,6 @@ impl SegmentManager {
                 if let Some(dead) = &dead {
                     manifest.dead_copies.insert(segment_id, Arc::clone(dead));
                 }
-                let mapping = mapping_for(&manifest, &volume, seg_schema_version, schema);
                 let visible = dead
                     .as_ref()
                     .map(|dead| Arc::new(bits_without(volume.meta.row_count, dead)));
@@ -3054,7 +3131,7 @@ impl SegmentManager {
         self.invalidate_count();
         self.has_segments_flag
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        Ok(prepared)
+        Ok(Ok(prepared))
     }
 
     /// Load a volume into the segments map for an existing manifest entry.
@@ -3751,7 +3828,9 @@ impl SegmentManager {
 
     /// Recompute all column mappings for loaded volumes.
     /// Called on ALTER TABLE (rename/drop/add column).
-    pub fn invalidate_mappings(&self, schema: &crate::core::Schema) {
+    /// Every mapping or none: a volume whose mapping cannot be computed
+    /// leaves them all as they were
+    pub fn invalidate_mappings(&self, schema: &crate::core::Schema) -> crate::core::Result<()> {
         let manifest = self.manifest.read();
         let drops = manifest.dropped_columns.clone();
         let renames = manifest.column_renames.clone();
@@ -3765,23 +3844,46 @@ impl SegmentManager {
                 &drops,
                 cold.schema_version,
                 &renames,
-            );
+            )?;
         }
         *segs = Arc::new(new_map);
+        Ok(())
+    }
+
+    /// Whether every volume's mapping can be computed under `schema` once
+    /// `change` is applied to a copy of the history; nothing is changed. A
+    /// column change asks before it records itself
+    pub fn mappings_hold_after(
+        &self,
+        schema: &crate::core::Schema,
+        change: impl FnOnce(&mut ColumnHistory),
+    ) -> crate::core::Result<()> {
+        let mut history = {
+            let manifest = self.manifest.read();
+            ColumnHistory {
+                dropped: manifest.dropped_columns.clone(),
+                renames: manifest.column_renames.clone(),
+            }
+        };
+        change(&mut history);
+        for cold in self.segments.read().values() {
+            super::writer::compute_column_mapping_with_drops(
+                schema,
+                &cold.volume,
+                &history.dropped,
+                cold.schema_version,
+                &history.renames,
+            )?;
+        }
+        Ok(())
     }
 
     /// Record a column drop so old volumes don't leak stale data.
     /// `schema_version` is the current schema epoch at drop time. Only volumes
     /// with schema_version <= this value will have the column masked.
     pub fn record_column_drop(&self, col_name: &str, schema_version: u64, ddl_lsn: Option<u64>) {
-        let lower = SmartString::from(col_name.to_lowercase());
         let mut manifest = self.manifest.write();
-        // Remove any existing entry for this column name before adding the new one.
-        // This handles DROP + ADD + DROP sequences correctly.
-        manifest
-            .dropped_columns
-            .retain(|(name, _)| name.as_str() != lower.as_str());
-        manifest.dropped_columns.push((lower, schema_version));
+        drop_into(&mut manifest.dropped_columns, col_name, schema_version);
         if let Some(lsn) = ddl_lsn {
             Self::note_ddl_lsn_in(&mut manifest, lsn);
         }
@@ -3877,6 +3979,19 @@ impl SegmentManager {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Set, under the DDL guard, once a column type change's record is
+    /// durable and while its manifest is not written
+    pub(crate) fn set_incomplete_change(&self, incomplete: bool) {
+        self.incomplete_change
+            .store(incomplete, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether a column type change is durable and its manifest not written
+    pub(crate) fn has_incomplete_change(&self) -> bool {
+        self.incomplete_change
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Mark a compaction from before it publishes its outputs until the
     /// returned guard drops, after it removed the tombstones it applied
     pub(crate) fn open_cleanup(&self) -> CleanupWindow<'_> {
@@ -3913,6 +4028,12 @@ impl SegmentManager {
         };
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::manifest_captured();
+        #[cfg(feature = "test-failpoints")]
+        if crate::test_failpoints::MANIFEST_WRITE_FAIL.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(crate::core::Error::internal(
+                "failpoint: manifest write failed",
+            ));
+        }
         let table_dir = vol_dir.join(manifest.table_name.as_str());
         std::fs::create_dir_all(&table_dir).map_err(|e| {
             crate::core::Error::internal(format!("failed to create table dir: {}", e))
@@ -3933,22 +4054,35 @@ impl SegmentManager {
         schema_version: u64,
         ddl_lsn: Option<u64>,
     ) {
-        // Persist in manifest for restart. The version goes into the drop
-        // list under a name no column can carry, so the order of renames
-        // against drops survives without a change of format; a reader that
-        // does not know the marker never matches it against a column
         let mut manifest = self.manifest.write();
-        let ordinal = manifest.column_renames.len();
-        manifest
-            .column_renames
-            .push((SmartString::from(old_name), SmartString::from(new_name)));
-        manifest.dropped_columns.push((
-            SmartString::from(super::writer::rename_marker(ordinal).as_str()),
+        let TableManifest {
+            dropped_columns,
+            column_renames,
+            ..
+        } = &mut *manifest;
+        rename_into(
+            dropped_columns,
+            column_renames,
+            old_name,
+            new_name,
             schema_version,
-        ));
+        );
         if let Some(lsn) = ddl_lsn {
             Self::note_ddl_lsn_in(&mut manifest, lsn);
         }
+    }
+
+    /// Whether a rename carries no version: a build before the markers
+    /// recorded it, and which volume column a name stands for is not known
+    pub fn has_unversioned_renames(&self) -> bool {
+        let manifest = self.manifest.read();
+        (0..manifest.column_renames.len()).any(|ordinal| {
+            let marker = super::writer::rename_marker(ordinal);
+            !manifest
+                .dropped_columns
+                .iter()
+                .any(|(name, _)| name.as_str() == marker)
+        })
     }
 
     /// The largest schema version this table's manifest carries: of its
@@ -4060,13 +4194,13 @@ impl SegmentManager {
         new_meta: SegmentMeta,
         old_segment_ids: &[u64],
         schema: Option<&crate::core::Schema>,
-    ) {
+    ) -> crate::core::Result<()> {
         self.replace_segments_atomic_multi(
             vec![(new_segment_id, new_volume, new_meta)],
             old_segment_ids,
             schema,
             Vec::new(),
-        );
+        )
     }
 
     /// Atomically replace old segments with multiple new ones, `sides`
@@ -4078,12 +4212,12 @@ impl SegmentManager {
         old_segment_ids: &[u64],
         schema: Option<&crate::core::Schema>,
         sides: Vec<Option<Arc<super::secondary::IndexFile>>>,
-    ) {
+    ) -> crate::core::Result<()> {
         if new_volumes.is_empty() {
-            self.replace_segments_atomic_remove_only(old_segment_ids);
-            return;
+            return self.replace_segments_atomic_remove_only(old_segment_ids);
         }
-        self.publish_with(new_volumes, old_segment_ids, schema, sides, |_| {});
+        self.publish_with(new_volumes, old_segment_ids, schema, sides, |_| {})
+            .map(|_| ())
     }
 
     /// A replacement prepared outside the caller's DDL coordination: the
@@ -4116,7 +4250,7 @@ impl SegmentManager {
         &self,
         replacement: PreparedReplacement,
         schema: Option<&crate::core::Schema>,
-    ) -> std::result::Result<(), Box<PreparedReplacement>> {
+    ) -> crate::core::Result<std::result::Result<(), Box<PreparedReplacement>>> {
         let PreparedReplacement {
             new_volumes,
             old_segment_ids,
@@ -4130,18 +4264,18 @@ impl SegmentManager {
             schema,
             &owners,
             false,
-        ) {
+        )? {
             Ok(_) => {
                 self.forget_key_order(&old_segment_ids);
                 self.invalidate_count();
-                Ok(())
+                Ok(Ok(()))
             }
-            Err(prepared) => Err(Box::new(PreparedReplacement {
+            Err(prepared) => Ok(Err(Box::new(PreparedReplacement {
                 new_volumes,
                 old_segment_ids,
                 owners,
                 prepared,
-            })),
+            }))),
         }
     }
 
@@ -4154,7 +4288,7 @@ impl SegmentManager {
         schema: Option<&crate::core::Schema>,
         sides: Vec<Option<Arc<super::secondary::IndexFile>>>,
         between: impl FnOnce(&Self),
-    ) -> bool {
+    ) -> crate::core::Result<bool> {
         let owners = self.output_owners(&new_volumes, sides);
         let prepared = self.prepare_publication(&new_volumes, old_segment_ids, &owners);
         between(self);
@@ -4166,11 +4300,11 @@ impl SegmentManager {
                 schema,
                 &owners,
                 true,
-            )
+            )?
             .unwrap_or(false);
         self.forget_key_order(old_segment_ids);
         self.invalidate_count();
-        fresh
+        Ok(fresh)
     }
 
     /// The handle of each output's file, taken once before the publication
@@ -4217,7 +4351,7 @@ impl SegmentManager {
                 map.insert(
                     *seg_id,
                     ColdSegment {
-                        mapping: mapping_for(&manifest, vol, meta.schema_version, None),
+                        mapping: identity_mapping(vol),
                         volume: Arc::clone(vol),
                         schema_version: meta.schema_version,
                         visible: None,
@@ -4251,7 +4385,7 @@ impl SegmentManager {
         schema: Option<&crate::core::Schema>,
         owners: &[Owners],
         rebuild: bool,
-    ) -> std::result::Result<bool, PreparedPublication> {
+    ) -> crate::core::Result<Publication> {
         let mut manifest = self.manifest.write();
         let mut segments = self.segments.write();
         let current_order: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
@@ -4261,8 +4395,14 @@ impl SegmentManager {
         // that prepares again outside its own locks, unless it asked for
         // the rebuild here
         if !fresh && !rebuild {
-            return Err(prepared);
+            return Ok(Err(prepared));
         }
+        // The mappings read the manifest's history, which the publication
+        // leaves as it is
+        let mappings = new_volumes
+            .iter()
+            .map(|(_, vol, meta)| mapping_for(&manifest, vol, meta.schema_version, schema))
+            .collect::<crate::core::Result<Vec<_>>>()?;
         let mut map = if fresh {
             prepared.map
         } else {
@@ -4279,15 +4419,13 @@ impl SegmentManager {
             .unwrap_or(manifest.segments.len());
         manifest.remove_segments(old_segment_ids);
         let insert_pos = insert_pos.min(manifest.segments.len());
-        for (i, (seg_id, vol, meta)) in new_volumes.iter().enumerate() {
+        for (i, ((seg_id, vol, meta), mapping)) in new_volumes.iter().zip(mappings).enumerate() {
             let seg_id = *seg_id;
             if seg_id >= manifest.next_segment_id {
                 manifest.next_segment_id = seg_id + 1;
             }
             let seg_schema_version = meta.schema_version;
             manifest.segments.insert(insert_pos + i, meta.clone());
-            // The mapping reads the manifest's history as it is now
-            let mapping = mapping_for(&manifest, vol, seg_schema_version, schema);
             match map.get_mut(&seg_id) {
                 Some(cs) if fresh => cs.mapping = mapping,
                 _ => {
@@ -4323,13 +4461,17 @@ impl SegmentManager {
         self.has_segments_flag
             .store(!map.is_empty(), std::sync::atomic::Ordering::Relaxed);
         *segments = Arc::new(map);
-        Ok(fresh)
+        Ok(Ok(fresh))
     }
 
     /// Atomically remove old segments without adding a replacement.
     /// Used when partial compaction finds all rows in merged volumes are tombstoned.
-    pub fn replace_segments_atomic_remove_only(&self, old_segment_ids: &[u64]) {
-        self.publish_with(Vec::new(), old_segment_ids, None, Vec::new(), |_| {});
+    pub fn replace_segments_atomic_remove_only(
+        &self,
+        old_segment_ids: &[u64],
+    ) -> crate::core::Result<()> {
+        self.publish_with(Vec::new(), old_segment_ids, None, Vec::new(), |_| {})
+            .map(|_| ())
     }
 
     /// Get the manifest for reading (e.g., to iterate segment metadata).
@@ -5062,7 +5204,7 @@ mod tests {
             seal_seq: 0,
             schema_version: 0,
         };
-        mgr.register_segment(1, volume, meta, None);
+        mgr.register_segment(1, volume, meta, None).unwrap();
 
         assert_eq!(mgr.segment_count(), 1);
         assert_eq!(mgr.total_row_count(), 10);
@@ -5211,7 +5353,8 @@ mod tests {
                 schema_version: 0,
             },
             None,
-        );
+        )
+        .unwrap();
 
         // Tombstone row_id=5 (commit_seq=1)
         mgr.add_tombstones(&[5], 1);
@@ -5259,7 +5402,8 @@ mod tests {
                     schema_version: 0,
                 },
                 None,
-            );
+            )
+            .unwrap();
         }
 
         let newest_first = mgr.get_volumes_newest_first().unwrap();
@@ -5342,7 +5486,8 @@ mod tests {
             descending_k_volume(&sealed_with, 8),
             meta_of(1, 8),
             Some(&current),
-        );
+        )
+        .unwrap();
         assert_eq!(mgr.known_key_order(1, &[1]), None);
         assert!(
             !mgr.decide_key_order(1, &[1]).unwrap(),
@@ -5355,7 +5500,7 @@ mod tests {
             .column("k", DataType::Integer, false, false)
             .column("z", DataType::Integer, true, false)
             .build();
-        mgr.invalidate_mappings(&widened);
+        mgr.invalidate_mappings(&widened).unwrap();
         assert!(mgr.decide_key_order(1, &[2]).unwrap());
         assert!(!mgr.decide_key_order(1, &[2, 1]).unwrap());
     }
@@ -5385,7 +5530,8 @@ mod tests {
         }
         let volume = Arc::new(builder.finish().unwrap());
         let mgr = SegmentManager::new("t", None);
-        mgr.register_segment(1, volume, meta_of(1, 4), Some(&sealed_with));
+        mgr.register_segment(1, volume, meta_of(1, 4), Some(&sealed_with))
+            .unwrap();
         // The drop completes before the writer records the order it wrote:
         // the schema's positions have moved, the volume's have not
         let current = SchemaBuilder::new("t")
@@ -5394,7 +5540,7 @@ mod tests {
             .column("v", DataType::Integer, false, false)
             .build();
         mgr.record_column_drop("d", 1, None);
-        mgr.invalidate_mappings(&current);
+        mgr.invalidate_mappings(&current).unwrap();
         mgr.record_key_order(1, &[2]);
         assert_eq!(
             mgr.known_key_order(1, &[1]),
@@ -5424,7 +5570,8 @@ mod tests {
                 descending_k_volume(&schema, 4),
                 meta_of(seg_id, 4),
                 Some(&schema),
-            );
+            )
+            .unwrap();
             assert!(!mgr.decide_key_order(seg_id, &[2]).unwrap());
         }
         mgr.replace_segments_atomic(
@@ -5433,9 +5580,10 @@ mod tests {
             meta_of(5, 4),
             &[1],
             None,
-        );
+        )
+        .unwrap();
         mgr.remove_segments(&[2]);
-        mgr.replace_segments_atomic_remove_only(&[3]);
+        mgr.replace_segments_atomic_remove_only(&[3]).unwrap();
         mgr.record_key_order(5, &[2]);
         {
             let verdicts = mgr.key_order_verdicts.lock();
@@ -5560,7 +5708,7 @@ mod tests {
         let volume = volume_of(&[2, 3, 4]);
         let prepared = mgr.prepare_registration(std::slice::from_ref(&volume));
         let entry = (2, volume, meta_for_ids(2, &[2, 3, 4]), None, None, None);
-        let Ok(published) = mgr.register_sealed(vec![entry], prepared, None) else {
+        let Ok(published) = mgr.register_sealed(vec![entry], prepared, None).unwrap() else {
             panic!("the registration was stale");
         };
         let hidden: Vec<&Vec<(i64, u32)>> = published.changes.iter().map(|c| &c.3).collect();
@@ -5662,8 +5810,10 @@ mod tests {
         let mgr = SegmentManager::new("publish", None);
         let a: Vec<i64> = (1..=70).collect();
         let b: Vec<i64> = (50..=120).collect();
-        mgr.register_segment(1, volume_of(&a), meta_for_ids(1, &a), None);
-        mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None);
+        mgr.register_segment(1, volume_of(&a), meta_for_ids(1, &a), None)
+            .unwrap();
+        mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None)
+            .unwrap();
         // A is rewritten as C; C keeps A's place, and B still masks the ids
         // it shares with C
         let c: Vec<i64> = (1..=70).collect();
@@ -5672,6 +5822,7 @@ mod tests {
         let prepared = mgr.prepare_publication(&outputs, &[1], &owners);
         assert!(mgr
             .commit_publication(prepared, &outputs, &[1], None, &owners, true)
+            .unwrap()
             .is_ok_and(|fresh| fresh));
         let order: Vec<u64> = mgr
             .manifest
@@ -5718,9 +5869,12 @@ mod tests {
         let a: Vec<i64> = (1..=200).collect();
         let b: Vec<i64> = (150..=300).collect();
         let c: Vec<i64> = (1000..=1100).collect();
-        mgr.register_segment(1, volume_of(&a), meta_for_ids(1, &a), None);
-        mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None);
-        mgr.register_segment(3, volume_of(&c), meta_for_ids(3, &c), None);
+        mgr.register_segment(1, volume_of(&a), meta_for_ids(1, &a), None)
+            .unwrap();
+        mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None)
+            .unwrap();
+        mgr.register_segment(3, volume_of(&c), meta_for_ids(3, &c), None)
+            .unwrap();
         // Masks rows of A that B masked already, rows of B, and one of C
         let d: Vec<i64> = (100..=160).chain([1050, 5000]).collect();
         assert!(register_prepared(&mgr, 4, &d), "nothing moved in between");
@@ -5739,7 +5893,8 @@ mod tests {
         // An older volume smaller than the new one, spanning its range with
         // none of its ids, is walked itself
         let g: Vec<i64> = vec![20_000, 1_000_000];
-        mgr.register_segment(7, volume_of(&g), meta_for_ids(7, &g), None);
+        mgr.register_segment(7, volume_of(&g), meta_for_ids(7, &g), None)
+            .unwrap();
         let h: Vec<i64> = (20_001..=120_000).collect();
         assert!(register_prepared(&mgr, 8, &h));
         assert_eq!(published_visibility(&mgr), reference_visibility(&mgr));
@@ -5779,7 +5934,8 @@ mod tests {
                 // Loaded as a reopen loads it, so it is older with its order
                 // undecided when the next seals register
                 let volume = reopened_volume_of(dir.path(), id, &ids);
-                mgr.register_segment(id, volume, meta_for_ids(id, &ids), None);
+                mgr.register_segment(id, volume, meta_for_ids(id, &ids), None)
+                    .unwrap();
             } else {
                 assert!(register_prepared(&mgr, id, &ids));
             }
@@ -5799,7 +5955,8 @@ mod tests {
         let a: Vec<i64> = (1..=300).rev().collect();
         let dir = tempfile::tempdir().unwrap();
         let reopened = reopened_volume_of(dir.path(), 1, &a);
-        mgr.register_segment(1, reopened, meta_for_ids(1, &a), None);
+        mgr.register_segment(1, reopened, meta_for_ids(1, &a), None)
+            .unwrap();
         let d: Vec<i64> = (100..=110).collect();
         assert!(register_prepared(&mgr, 2, &d));
         assert_eq!(published_visibility(&mgr), reference_visibility(&mgr));
@@ -5814,12 +5971,14 @@ mod tests {
     fn stale_registration(name: &str) -> (SegmentManager, Vec<SealedEntry>, PreparedRegistration) {
         let mgr = SegmentManager::new(name, None);
         let a: Vec<i64> = (1..=100).collect();
-        mgr.register_segment(1, volume_of(&a), meta_for_ids(1, &a), None);
+        mgr.register_segment(1, volume_of(&a), meta_for_ids(1, &a), None)
+            .unwrap();
         let d: Vec<i64> = (50..=60).collect();
         let volume = volume_of(&d);
         let prepared = mgr.prepare_registration(std::slice::from_ref(&volume));
         let b: Vec<i64> = vec![55, 70, 200];
-        mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None);
+        mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None)
+            .unwrap();
         let entries = vec![(3, volume, meta_for_ids(3, &d), None, None, None)];
         (mgr, entries, prepared)
     }
@@ -5828,7 +5987,7 @@ mod tests {
     fn a_stale_seal_registration_publishes_nothing_and_is_prepared_again() {
         let (mgr, entries, prepared) = stale_registration("register_prepared_stale");
         let before = published_visibility(&mgr);
-        let Err((entries, stale)) = mgr.register_sealed(entries, prepared, None) else {
+        let Err((entries, stale)) = mgr.register_sealed(entries, prepared, None).unwrap() else {
             panic!("a stale preparation is not published");
         };
         assert_eq!(published_visibility(&mgr), before, "nothing published");
@@ -5851,17 +6010,21 @@ mod tests {
         let mgr = SegmentManager::new("publish_stale", None);
         let a: Vec<i64> = (1..=70).collect();
         let b: Vec<i64> = (50..=120).collect();
-        mgr.register_segment(1, volume_of(&a), meta_for_ids(1, &a), None);
-        mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None);
+        mgr.register_segment(1, volume_of(&a), meta_for_ids(1, &a), None)
+            .unwrap();
+        mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None)
+            .unwrap();
         let c: Vec<i64> = (1..=70).collect();
         let outputs = vec![(3, volume_of(&c), meta_for_ids(3, &c))];
         let owners = mgr.output_owners(&outputs, Vec::new());
         let prepared = mgr.prepare_publication(&outputs, &[1], &owners);
         // A seal lands in between: D takes ids 2 and 130 from everyone below
         let d: Vec<i64> = vec![2, 130];
-        mgr.register_segment(4, volume_of(&d), meta_for_ids(4, &d), None);
+        mgr.register_segment(4, volume_of(&d), meta_for_ids(4, &d), None)
+            .unwrap();
         assert!(mgr
             .commit_publication(prepared, &outputs, &[1], None, &owners, true)
+            .unwrap()
             .is_ok_and(|fresh| !fresh));
         let order: Vec<u64> = mgr
             .manifest
@@ -5884,13 +6047,17 @@ mod tests {
     fn a_publication_of_nothing_keeps_the_volume_a_seal_added_meanwhile_visible() {
         let mgr = SegmentManager::new("publish_empty", None);
         let a: Vec<i64> = (1..=10).collect();
-        mgr.register_segment(1, volume_of(&a), meta_for_ids(1, &a), None);
+        mgr.register_segment(1, volume_of(&a), meta_for_ids(1, &a), None)
+            .unwrap();
         // Every row of A is gone: the compaction publishes nothing, and a
         // seal lands between its two steps
         let b: Vec<i64> = vec![20, 21];
-        let fresh = mgr.publish_with(Vec::new(), &[1], None, Vec::new(), |mgr| {
-            mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None);
-        });
+        let fresh = mgr
+            .publish_with(Vec::new(), &[1], None, Vec::new(), |mgr| {
+                mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None)
+                    .unwrap();
+            })
+            .unwrap();
         assert!(!fresh);
         assert!(mgr.has_segments(), "the sealed volume is there to read");
         let order: Vec<u64> = mgr
@@ -5943,7 +6110,8 @@ mod tests {
                 schema_version: 0,
             },
             None,
-        );
+        )
+        .unwrap();
 
         // Verify: volume starts hot (eager + compressed store).
         {
@@ -6104,7 +6272,8 @@ mod tests {
                 schema_version: 0,
             },
             None,
-        );
+        )
+        .unwrap();
         assert!(mgr.segments_raw().get(&1).unwrap().volume.is_warm());
         // A reader holds the volume across the move; while the files move
         // the name is still the old one
@@ -6177,7 +6346,8 @@ mod tests {
             Arc::new(volume.to_cold()),
             meta_for_ids(1, &[1, 2]),
             None,
-        );
+        )
+        .unwrap();
         if !moved.load(Ordering::Relaxed) {
             move_table();
         }
@@ -6224,7 +6394,8 @@ mod tests {
                 schema_version: 0,
             },
             None,
-        );
+        )
+        .unwrap();
 
         let _epoch_guard = EVICTION_EPOCH_LOCK
             .lock()
@@ -6314,7 +6485,8 @@ mod tests {
                 schema_version: 0,
             },
             None,
-        );
+        )
+        .unwrap();
 
         let snap = mgr.statement_snapshot();
 
@@ -6335,7 +6507,8 @@ mod tests {
             },
             &[1],
             None,
-        );
+        )
+        .unwrap();
 
         // The snapshot must keep serving ITS view: segment 1, one volume.
         // (The live-manifest ordering bug returned zero volumes here.)
@@ -6375,7 +6548,8 @@ mod tests {
                 schema_version: 0,
             },
             None,
-        );
+        )
+        .unwrap();
 
         let snap = mgr.statement_snapshot();
 

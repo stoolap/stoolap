@@ -27,7 +27,6 @@ use crate::core::{
     DataType, Error, ForeignKeyAction, ForeignKeyConstraint, Result, Row, SchemaBuilder, Value,
 };
 use crate::parser::ast::*;
-use crate::storage::expression::Expression;
 use crate::storage::traits::{Engine, QueryResult};
 
 /// Validate a foreign key reference and build a `ForeignKeyConstraint`.
@@ -1029,6 +1028,14 @@ impl Executor {
                         default_value,
                         None,
                     );
+                    // Refused before anything changes when a volume would not map
+                    let mut added = crate::core::Schema::clone(&previous_schema);
+                    added.add_column(column.clone())?;
+                    self.engine.check_column_change(
+                        table_name,
+                        &added,
+                        crate::storage::mvcc::engine::ColumnEvent::Added,
+                    )?;
                     self.engine.add_column_schema(table_name, column)?;
                     change.mark_changed();
 
@@ -1091,6 +1098,17 @@ impl Executor {
                 (Some(old_name), Some(new_name)) => {
                     let mut change = self.engine.begin_column_change(table_name)?;
                     let previous_schema = self.engine.get_table_schema(table_name)?;
+                    // Refused before anything changes when a volume would not map
+                    let mut renamed = crate::core::Schema::clone(&previous_schema);
+                    renamed.rename_column(&old_name.value, new_name.value.as_str())?;
+                    self.engine.check_column_change(
+                        table_name,
+                        &renamed,
+                        crate::storage::mvcc::engine::ColumnEvent::Renamed(
+                            &old_name.value,
+                            &new_name.value,
+                        ),
+                    )?;
                     table.rename_column(&old_name.value, &new_name.value)?;
                     change.mark_changed();
 
@@ -1123,7 +1141,7 @@ impl Executor {
                         table_name,
                         &new_name.value,
                         &old_name.value,
-                    );
+                    )?;
                     change.finish();
                 }
                 _ => {
@@ -1139,83 +1157,20 @@ impl Executor {
                         .constraints
                         .iter()
                         .any(|c| matches!(c, ColumnConstraint::NotNull));
-
-                    // Validate existing data satisfies NOT NULL before applying.
-                    // Use IS NULL filter + limit 1 for streaming early-exit scan
-                    // instead of materializing the full table.
-                    if !nullable {
-                        let schema = table.schema();
-                        if schema.get_column_index(&col_def.name.value).is_some() {
-                            let col_name = col_def.name.value.to_string();
-                            let mut filter = crate::storage::expression::ComparisonExpr::new(
-                                col_name.clone(),
-                                crate::core::Operator::IsNull,
-                                Value::Null(data_type),
-                            );
-                            filter.prepare_for_schema(schema);
-                            let nulls =
-                                table.collect_rows_with_limit_unordered(Some(&filter), 1, 0)?;
-                            if !nulls.is_empty() {
-                                return Err(Error::not_null_constraint(col_name));
-                            }
-                            // A value the new type cannot hold would be stored
-                            // as NULL by the next seal or compaction; a column
-                            // turning NOT NULL may hold values an earlier
-                            // change of type left as they were written
-                            if let Some(idx) = schema.get_column_index(&col_name) {
-                                let column = &schema.columns[idx];
-                                if column.data_type != data_type || column.nullable {
-                                    let mut present =
-                                        crate::storage::expression::NullCheckExpr::is_not_null(
-                                            col_name.clone(),
-                                        );
-                                    present.prepare_for_schema(schema);
-                                    let mut rows = table.scan(&[], Some(&present))?;
-                                    while rows.next() {
-                                        let lost = rows.row().get(idx).is_some_and(|value| {
-                                            value.coerce_to_type(data_type).is_null()
-                                        });
-                                        if lost {
-                                            return Err(Error::not_null_constraint(col_name));
-                                        }
-                                    }
-                                    if let Some(error) = rows.err() {
-                                        return Err(error.clone());
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    let mut change = self.engine.begin_column_change(table_name)?;
-                    // Closed until the change is recorded, or taken back
-                    let _closed = self.engine.close_for_column_change(table_name)?;
-                    let previous_schema = self.engine.get_table_schema(table_name)?;
-                    table.modify_column(&col_def.name.value, data_type, nullable)?;
-                    change.mark_changed();
-
-                    // Refresh engine's schema cache from version store
-                    self.engine.refresh_schema_cache(table_name)?;
-
-                    // Record ALTER TABLE MODIFY COLUMN to WAL for persistence
                     let vector_dimensions = if data_type == DataType::Vector {
                         crate::executor::utils::parse_vector_dimension(&col_def.data_type)
                     } else {
                         0
                     };
-                    if let Err(error) = self.engine.record_alter_table_modify_column(
-                        table_name,
-                        &col_def.name.value,
-                        data_type,
-                        nullable,
-                        vector_dimensions,
-                    ) {
-                        self.engine
-                            .restore_column_schema(table_name, previous_schema)?;
-                        change.finish();
-                        return Err(error);
-                    }
-                    change.finish();
+                    self.engine.change_column_type(
+                        &crate::storage::mvcc::engine::ColumnTypeChange {
+                            table: table_name,
+                            column: &col_def.name.value,
+                            data_type,
+                            nullable,
+                            vector_dimensions,
+                        },
+                    )?;
                 } else {
                     return Err(Error::InvalidArgument(
                         "MODIFY COLUMN requires column definition".to_string(),

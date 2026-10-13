@@ -3327,13 +3327,120 @@ fn source_without_order(
 /// `volume_schema_version` is the schema epoch when the volume was created.
 /// For dropped columns, only volumes created before or at the drop are masked.
 /// Callers should use SegmentManager::get_volume_mapping() which caches the result.
+/// A column the volume holds in another type than the schema's is an error,
+/// never a default
 pub fn compute_column_mapping_with_drops(
     schema: &Schema,
     volume: &FrozenVolume,
     dropped_columns: &[(crate::common::SmartString, u64)],
     volume_schema_version: u64,
     column_renames: &[(crate::common::SmartString, crate::common::SmartString)],
-) -> ColumnMapping {
+) -> crate::core::Result<ColumnMapping> {
+    column_mapping(
+        schema,
+        volume,
+        dropped_columns,
+        volume_schema_version,
+        column_renames,
+        false,
+    )
+}
+
+/// The mapping a type change's rewrite reads a volume through: a column
+/// whose physical type differs from its schema type reads its own cells,
+/// which the transfer casts
+pub fn compute_rewrite_mapping(
+    schema: &Schema,
+    volume: &FrozenVolume,
+    dropped_columns: &[(crate::common::SmartString, u64)],
+    volume_schema_version: u64,
+    column_renames: &[(crate::common::SmartString, crate::common::SmartString)],
+) -> crate::core::Result<ColumnMapping> {
+    column_mapping(
+        schema,
+        volume,
+        dropped_columns,
+        volume_schema_version,
+        column_renames,
+        true,
+    )
+}
+
+/// The columns of `schema` that stand, through the history, for a column of
+/// `volume` held in another type, by schema position
+pub fn retyped_columns(
+    schema: &Schema,
+    volume: &FrozenVolume,
+    dropped_columns: &[(crate::common::SmartString, u64)],
+    volume_schema_version: u64,
+    column_renames: &[(crate::common::SmartString, crate::common::SmartString)],
+) -> crate::core::Result<Vec<usize>> {
+    let mapping = compute_rewrite_mapping(
+        schema,
+        volume,
+        dropped_columns,
+        volume_schema_version,
+        column_renames,
+    )?;
+    Ok(mapping
+        .sources
+        .iter()
+        .zip(&schema.columns)
+        .enumerate()
+        .filter(|(_, (source, column))| match source {
+            ColSource::Volume(idx) => volume
+                .meta
+                .column_types
+                .get(*idx)
+                .is_some_and(|&physical| physical != column.data_type),
+            ColSource::Default(_) => false,
+        })
+        .map(|(position, _)| position)
+        .collect())
+}
+
+/// The first column of `schema` whose reading in `volume` turns on a drop's
+/// version: a name it held since the seal was also dropped, and the volume
+/// holds one of those names. Builds before 0.4.2 restarted the version on
+/// reopen, so such a drop is in no known order against the seal
+pub fn reading_turns_on_a_drop<'a>(
+    schema: &'a Schema,
+    volume: &FrozenVolume,
+    dropped_columns: &[(crate::common::SmartString, u64)],
+    volume_schema_version: u64,
+    column_renames: &[(crate::common::SmartString, crate::common::SmartString)],
+) -> Option<&'a str> {
+    let dropped = |name: &str| {
+        dropped_columns
+            .iter()
+            .any(|(d, _)| d.as_str().eq_ignore_ascii_case(name))
+    };
+    let events = schema_events_since(volume_schema_version, dropped_columns, column_renames)?;
+    schema.columns.iter().find_map(|col| {
+        let mut name = col.name_lower.as_str();
+        let mut turns = dropped(name);
+        let mut held = volume.column_index(name).is_some();
+        for (_, _, event) in &events {
+            if let SchemaEvent::Renamed { old, new } = event {
+                if new.eq_ignore_ascii_case(name) {
+                    name = old;
+                    turns |= dropped(name);
+                    held |= volume.column_index(name).is_some();
+                }
+            }
+        }
+        (turns && held).then_some(col.name.as_str())
+    })
+}
+
+fn column_mapping(
+    schema: &Schema,
+    volume: &FrozenVolume,
+    dropped_columns: &[(crate::common::SmartString, u64)],
+    volume_schema_version: u64,
+    column_renames: &[(crate::common::SmartString, crate::common::SmartString)],
+    rewrite: bool,
+) -> crate::core::Result<ColumnMapping> {
     let mut sources = Vec::with_capacity(schema.columns.len());
     let mut is_identity = schema.columns.len() == volume.columns.len();
     // Track which volume column indices are already claimed. Prevents two
@@ -3354,25 +3461,19 @@ pub fn compute_column_mapping_with_drops(
                 volume,
             ),
         };
-
-        if let Some(vol_idx) = vol_idx {
-            let type_matches = vol_idx < volume.meta.column_types.len()
-                && volume.meta.column_types[vol_idx] == col.data_type;
-            let already_used = used_vol_indices.contains(&vol_idx);
-            if type_matches && !already_used {
-                if is_identity && vol_idx != pos {
-                    is_identity = false;
-                }
-                used_vol_indices.push(vol_idx);
-                sources.push(ColSource::Volume(vol_idx));
-            } else {
-                is_identity = false;
-                if let Some(ref default_val) = col.default_value {
-                    sources.push(ColSource::Default(default_val.clone()));
-                } else {
-                    sources.push(ColSource::Default(Value::Null(col.data_type)));
-                }
+        if let Some(vol_idx) = vol_idx.filter(|idx| !used_vol_indices.contains(idx)) {
+            let physical = volume.meta.column_types.get(vol_idx).copied();
+            if physical != Some(col.data_type) && !rewrite {
+                return Err(crate::core::Error::internal(format!(
+                    "column '{}' of table '{}' is held as {:?} in a volume and is {:?} in the schema",
+                    col.name, schema.table_name, physical, col.data_type
+                )));
             }
+            if is_identity && vol_idx != pos {
+                is_identity = false;
+            }
+            used_vol_indices.push(vol_idx);
+            sources.push(ColSource::Volume(vol_idx));
         } else {
             // Column not in volume (added after seal, or dropped+re-added)
             is_identity = false;
@@ -3403,11 +3504,11 @@ pub fn compute_column_mapping_with_drops(
             .map(|col| crate::common::SmartString::from(col.name.as_str()))
             .collect()
     };
-    ColumnMapping {
+    Ok(ColumnMapping {
         sources,
         names,
         is_identity,
-    }
+    })
 }
 
 impl FrozenVolume {
@@ -4329,13 +4430,15 @@ mod tests {
             (sm("b"), 3),
             (sm(&rename_marker(1)), 4),
         ];
-        let mapping = compute_column_mapping_with_drops(&schema, &volume, &drops, 1, &renames);
+        let mapping =
+            compute_column_mapping_with_drops(&schema, &volume, &drops, 1, &renames).unwrap();
         assert!(matches!(mapping.sources[1], ColSource::Volume(2)));
         // The same records without the rename markers have no order: the
         // one-step reading of before applies, and b, dropped at or after
         // the seal, resolves to its default
         let drops = vec![(sm("b"), 3)];
-        let mapping = compute_column_mapping_with_drops(&schema, &volume, &drops, 1, &renames);
+        let mapping =
+            compute_column_mapping_with_drops(&schema, &volume, &drops, 1, &renames).unwrap();
         assert!(matches!(mapping.sources[1], ColSource::Default(_)));
         // A rename recorded in the version the seal carries happened
         // before the seal and is not walked
@@ -4346,8 +4449,72 @@ mod tests {
             .build();
         let renames = vec![(sm("x"), sm("a"))];
         let drops = vec![(sm(&rename_marker(0)), 1)];
-        let mapping = compute_column_mapping_with_drops(&schema, &volume, &drops, 1, &renames);
+        let mapping =
+            compute_column_mapping_with_drops(&schema, &volume, &drops, 1, &renames).unwrap();
         assert!(mapping.is_identity && matches!(mapping.sources[1], ColSource::Volume(1)));
+    }
+
+    #[test]
+    fn a_reading_turns_on_a_drop_only_where_the_volume_holds_the_dropped_name() {
+        let volume = sealed_ac();
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("a", DataType::Integer, false, false)
+            .column("c", DataType::Integer, false, false)
+            .build();
+        let drops = vec![(sm("c"), 3)];
+        assert_eq!(
+            reading_turns_on_a_drop(&schema, &volume, &drops, 1, &[]),
+            Some("c")
+        );
+        let mut builder = VolumeBuilder::new(
+            &SchemaBuilder::new("t")
+                .column("id", DataType::Integer, false, true)
+                .column("a", DataType::Integer, false, false)
+                .build(),
+        );
+        builder.add_row(
+            1,
+            &Row::from_values(vec![Value::Integer(1), Value::Integer(1)]),
+        );
+        assert_eq!(
+            reading_turns_on_a_drop(&schema, &builder.finish().unwrap(), &drops, 1, &[]),
+            None,
+            "c was added after a volume that never held it"
+        );
+        // a came from b since the seal, and b was dropped
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("a", DataType::Integer, false, false)
+            .build();
+        let renames = vec![(sm("b"), sm("a"))];
+        let drops = vec![(sm(&rename_marker(0)), 2), (sm("b"), 3)];
+        assert_eq!(
+            reading_turns_on_a_drop(&schema, &volume, &drops, 1, &renames),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn a_column_the_volume_holds_in_another_type_is_an_error_unless_rewritten() {
+        let mut builder = VolumeBuilder::new(
+            &SchemaBuilder::new("t")
+                .column("id", DataType::Integer, false, true)
+                .column("k", DataType::Integer, false, false)
+                .build(),
+        );
+        builder.add_row(
+            1,
+            &Row::from_values(vec![Value::Integer(1), Value::Integer(7)]),
+        );
+        let volume = builder.finish().unwrap();
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("k", DataType::Text, false, false)
+            .build();
+        assert!(compute_column_mapping_with_drops(&schema, &volume, &[], 1, &[]).is_err());
+        let rewrite = compute_rewrite_mapping(&schema, &volume, &[], 1, &[]).unwrap();
+        assert!(matches!(rewrite.sources[1], ColSource::Volume(1)));
     }
 
     #[test]

@@ -589,7 +589,7 @@ fn a_checkpoint_during_a_rename_statement_persists_the_whole_statement_or_none()
             .record_alter_table_rename_column("t", "a", "b")
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(300));
-        db.engine().propagate_column_alias("t", "b", "a");
+        db.engine().propagate_column_alias("t", "b", "a").unwrap();
         drop(ddl);
         checkpoint.join().unwrap();
         db.execute("INSERT INTO t VALUES (3, 3)", ()).unwrap();

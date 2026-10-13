@@ -56,6 +56,16 @@ ALTER TABLE products MODIFY COLUMN price TEXT;
 ALTER TABLE config MODIFY COLUMN value INTEGER;
 ```
 
+Every existing value is converted to the new type, in memory and in the frozen volumes, before the statement returns. A value the new type cannot hold becomes NULL. The change is refused, with the table left as it was, when:
+
+- the column is the primary key, a foreign key column, or a column a foreign key references;
+- an index on the column cannot hold the new type (an HNSW index holds only vectors of a known dimension);
+- a converted value is NULL and the column is NOT NULL;
+- two rows would hold the same key of a UNIQUE index once converted (for example `'7'` and `'07'` changed to INTEGER);
+- the column becomes a VECTOR of another dimension and a row holds a vector of the old one (values are never padded or cut).
+
+The table is closed while the change runs: other statements on it return `SchemaChanged` until it finishes. Once the statement returns, the change survives a crash whatever the `sync_mode`.
+
 ## RENAME TABLE
 
 Rename an entire table:
@@ -79,6 +89,8 @@ This means ALTER TABLE changes persist correctly even if the database crashes im
 
 If recording an ADD, DROP, RENAME, or MODIFY COLUMN operation in the WAL fails, the engine restores the previous schema and frozen-volume mappings. Reads can continue against that schema. A WAL write or sync failure still requires closing and reopening the database before further writes.
 
+A MODIFY COLUMN whose WAL record may or may not have been written (the failed write could not be cut back), or whose table manifest could not be written after the record, returns an error and leaves the table closed until the database is reopened. The reopen finishes the change from the WAL, or finds it was never written.
+
 ## Concurrent statements
 
 In a file database, a statement can return `SchemaChanged` if column DDL overlaps its capture of the schema and frozen-volume mappings. The engine rejects the mixed view instead of waiting for the ALTER to finish. A new statement can proceed after the ALTER completes.
@@ -90,6 +102,5 @@ A transaction that wrote rows to a table before another connection added or drop
 ## Limitations
 
 - ALTER TABLE operations may temporarily block concurrent writes
-- MODIFY COLUMN can change nullability (add or remove NOT NULL), but does not validate that existing data satisfies the new constraint
 - Composite primary key modifications are not supported
 - **Frozen volume tables**: ALTER TABLE works on tables with frozen volumes. Volume data is normalized on read (new columns return NULL/DEFAULT, dropped columns are skipped). The volume is rebuilt automatically on the next checkpoint cycle

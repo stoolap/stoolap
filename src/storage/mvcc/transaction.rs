@@ -169,16 +169,13 @@ pub trait TransactionEngineOperations: Send + Sync {
     /// Discard later DML across all touched tables, including cold claims.
     fn rollback_dml_after(&self, txn_id: i64, timestamp: i64);
 
-    /// Runs `apply`, a change of a column's definition, as a DDL statement
-    /// runs one: under the DDL guard, the table closed, the schema cache
-    /// refreshed after it
-    fn change_column_definition(
-        &self,
-        table_name: &str,
-        apply: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<()> {
-        let _ = table_name;
-        apply()
+    /// Changes a column's definition as a DDL statement does: under the DDL
+    /// guard, in every layer, with the table closed
+    fn change_column_type(&self, change: &super::engine::ColumnTypeChange<'_>) -> Result<()> {
+        let _ = change;
+        Err(Error::NotSupported(
+            "changing a column's definition needs the engine".to_string(),
+        ))
     }
 
     /// Defer table cleanup to background thread (avoids synchronous deallocation)
@@ -819,12 +816,16 @@ impl Transaction for MvccTransaction {
     fn modify_table_column(&mut self, table_name: &str, column: SchemaColumn) -> Result<()> {
         self.check_active()?;
 
-        let mut table = self.get_table(table_name)?;
-        let mut apply = || table.modify_column(&column.name, column.data_type, column.nullable);
-        match &self.engine_operations {
-            Some(ops) => ops.change_column_definition(table_name, &mut apply),
-            None => apply(),
-        }
+        let ops = self.engine_operations.as_ref().ok_or_else(|| {
+            Error::NotSupported("changing a column's definition needs the engine".to_string())
+        })?;
+        ops.change_column_type(&super::engine::ColumnTypeChange {
+            table: table_name,
+            column: &column.name,
+            data_type: column.data_type,
+            nullable: column.nullable,
+            vector_dimensions: column.vector_dimensions,
+        })
     }
 
     fn select(

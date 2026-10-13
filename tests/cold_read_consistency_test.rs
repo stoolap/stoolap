@@ -214,10 +214,11 @@ fn readers_share_a_retired_volume_without_keeping_its_payload_alive() {
             schema_version: 0,
         },
         Some(&schema),
-    );
+    )
+    .unwrap();
     let view = mgr.cold_snapshot();
     let owner = view.segs[&id].file.as_ref().unwrap();
-    mgr.replace_segments_atomic_remove_only(&[id]);
+    mgr.replace_segments_atomic_remove_only(&[id]).unwrap();
     owner.retire();
     let barrier = std::sync::Barrier::new(8);
     let loaded = std::thread::scope(|scope| {
@@ -320,7 +321,8 @@ fn a_cold_reload_can_reuse_a_readers_unique_index() {
                 schema_version: 0,
             },
             Some(&schema),
-        );
+        )
+        .unwrap();
         mgr.evict_idle_volumes(0, false);
         mgr.evict_idle_volumes(3, false);
         let held = Arc::clone(&mgr.segments_raw()[&id].volume);

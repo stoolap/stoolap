@@ -4583,19 +4583,6 @@ impl Table for MVCCTable {
         Ok(())
     }
 
-    fn modify_column(&mut self, name: &str, column_type: DataType, nullable: bool) -> Result<()> {
-        {
-            let mut schema_guard = self.version_store.schema_mut();
-            CompactArc::make_mut(&mut *schema_guard).modify_column(
-                name,
-                Some(column_type),
-                Some(nullable),
-            )?;
-        }
-        self.take_schema();
-        Ok(())
-    }
-
     fn select(
         &self,
         columns: &[&str],
@@ -5017,7 +5004,7 @@ impl Table for MVCCTable {
     }
 
     fn set_zone_maps(&self, zone_maps: crate::storage::mvcc::zonemap::TableZoneMap) {
-        self.version_store.set_zone_maps(zone_maps);
+        self.version_store.set_zone_maps(zone_maps, self.layout);
     }
 
     fn get_zone_maps(&self) -> Option<std::sync::Arc<crate::storage::mvcc::zonemap::TableZoneMap>> {

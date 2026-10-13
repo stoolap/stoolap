@@ -1,0 +1,120 @@
+// Copyright 2026 Stoolap Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Writes the type change fixtures with a build from before the change
+//! rewrote its layers. usage: retype_fixtures <out dir>
+
+use std::path::Path;
+
+use stoolap::test_failpoints as fp;
+use stoolap::Database;
+
+fn dsn(dir: &Path) -> String {
+    format!(
+        "file://{}?checkpoint_interval=3600&compact_threshold=1000",
+        dir.display()
+    )
+}
+
+/// The files as they stand, as a crash would leave them
+fn crash_image(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            crash_image(&entry.path(), &target);
+        } else if entry.file_name() != "db.lock" {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+fn main() {
+    let out = std::path::PathBuf::from(std::env::args().nth(1).unwrap());
+    std::fs::create_dir_all(&out).unwrap();
+
+    // 1. Volumes holding INTEGER under a TEXT schema
+    let dir = out.join("old_typed_volumes");
+    let db = Database::open(&dsn(&dir)).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER UNIQUE)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 7), (2, 8)", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("ALTER TABLE t MODIFY COLUMN k TEXT", ()).unwrap();
+    db.close().unwrap();
+
+    // 2. Volumes holding '7' and '07' as TEXT under an INTEGER schema
+    let dir = out.join("colliding_volumes");
+    let db = Database::open(&dsn(&dir)).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT UNIQUE)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, '7')", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (2, '07')", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("ALTER TABLE t MODIFY COLUMN k INTEGER", ())
+        .unwrap();
+    db.close().unwrap();
+
+    // 3. A WAL holding row 2, then the change, then row 2's marker
+    let dir = out.join("work_row_alter_marker");
+    let db = Database::open(&dsn(&dir)).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER UNIQUE)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 7)", ()).unwrap();
+    let other = db.clone();
+    fp::before_commit_marker(move || {
+        other
+            .execute("ALTER TABLE t MODIFY COLUMN k TEXT", ())
+            .unwrap();
+    });
+    db.execute("INSERT INTO t VALUES (2, 8)", ()).unwrap();
+    crash_image(&dir, &out.join("row_alter_marker"));
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    // 4. A WAL holding '007', a change to INTEGER and one back to TEXT
+    let dir = out.join("work_text_integer_text");
+    let db = Database::open(&dsn(&dir)).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, '007')", ()).unwrap();
+    db.execute("ALTER TABLE t MODIFY COLUMN k INTEGER", ())
+        .unwrap();
+    db.execute("ALTER TABLE t MODIFY COLUMN k TEXT", ()).unwrap();
+    crash_image(&dir, &out.join("text_integer_text"));
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    // 5. A WAL holding '7' and '07' in a TEXT UNIQUE column, then a change to
+    // INTEGER that makes them equal
+    let dir = out.join("work_hot_colliding");
+    let db = Database::open(&dsn(&dir)).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT UNIQUE)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, '7'), (2, '07')", ())
+        .unwrap();
+    db.execute("ALTER TABLE t MODIFY COLUMN k INTEGER", ())
+        .unwrap();
+    crash_image(&dir, &out.join("hot_colliding"));
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

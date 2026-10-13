@@ -422,6 +422,22 @@ impl RowArena {
         }
     }
 
+    /// Puts each prepared row in its slot, the bytes held following it; a
+    /// slot cleared since the row was prepared keeps no row
+    pub fn replace_rows(&self, rows: Vec<(usize, CompactArc<[Value]>)>) {
+        let mut inner = self.inner.write();
+        let ArenaInner { data, meta } = &mut *inner;
+        for (idx, row) in rows {
+            if meta.get(idx).is_none_or(|meta| meta.txn_id == 0) {
+                continue;
+            }
+            self.bytes
+                .fetch_sub(row_bytes(&data[idx]), Ordering::Relaxed);
+            self.bytes.fetch_add(row_bytes(&row), Ordering::Relaxed);
+            data[idx] = row;
+        }
+    }
+
     /// Drop all data and release the memory.
     /// This releases all memory immediately (O(1) memory release)
     /// unlike clear_batch which only clears slots but retains Vec capacity.

@@ -51,21 +51,23 @@ fn cold_table_with_index(dir: &Path, snapshot: bool, indexed: bool) -> (Segmente
     assert!(volume.is_warm());
     volume.mark_accessed();
     let manager = Arc::new(SegmentManager::new("t", Some(dir.to_path_buf())));
-    manager.register_segment(
-        1,
-        volume,
-        SegmentMeta {
-            segment_id: 1,
-            file_path: PathBuf::from("vol_0000000000000001.vol"),
-            row_count: 2,
-            min_row_id: 1,
-            max_row_id: 2,
-            creation_lsn: 0,
-            seal_seq: 0,
-            schema_version: 0,
-        },
-        Some(&schema),
-    );
+    manager
+        .register_segment(
+            1,
+            volume,
+            SegmentMeta {
+                segment_id: 1,
+                file_path: PathBuf::from("vol_0000000000000001.vol"),
+                row_count: 2,
+                min_row_id: 1,
+                max_row_id: 2,
+                creation_lsn: 0,
+                seal_seq: 0,
+                schema_version: 0,
+            },
+            Some(&schema),
+        )
+        .unwrap();
     manager.evict_idle_volumes(0, true);
     manager.evict_idle_volumes(3, true);
     assert!(manager.segments_raw()[&1].volume.is_cold());

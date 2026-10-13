@@ -32,21 +32,23 @@ fn evicted(
     schema: &stoolap::Schema,
 ) -> Arc<FrozenVolume> {
     let manager = SegmentManager::new("t", Some(dir.to_path_buf()));
-    manager.register_segment(
-        1,
-        Arc::new(volume),
-        SegmentMeta {
-            segment_id: 1,
-            file_path: PathBuf::from("vol_0000000000000001.vol"),
-            row_count: 2,
-            min_row_id: 1,
-            max_row_id: 2,
-            creation_lsn: 0,
-            seal_seq: 0,
-            schema_version: 0,
-        },
-        Some(schema),
-    );
+    manager
+        .register_segment(
+            1,
+            Arc::new(volume),
+            SegmentMeta {
+                segment_id: 1,
+                file_path: PathBuf::from("vol_0000000000000001.vol"),
+                row_count: 2,
+                min_row_id: 1,
+                max_row_id: 2,
+                creation_lsn: 0,
+                seal_seq: 0,
+                schema_version: 0,
+            },
+            Some(schema),
+        )
+        .unwrap();
     for epoch in [0, 3, 6, 9, 12] {
         manager.evict_idle_volumes(epoch, false);
     }
@@ -148,21 +150,23 @@ fn a_volume_a_lookup_reaches_keeps_its_unique_index() {
     let (volume, _, schema) = built(dir.path());
     volume.prebuild_unique_index(&[1]).unwrap();
     let manager = SegmentManager::new("t", Some(dir.path().to_path_buf()));
-    manager.register_segment(
-        1,
-        Arc::new(volume),
-        SegmentMeta {
-            segment_id: 1,
-            file_path: PathBuf::from("vol_0000000000000001.vol"),
-            row_count: 2,
-            min_row_id: 1,
-            max_row_id: 2,
-            creation_lsn: 0,
-            seal_seq: 0,
-            schema_version: 0,
-        },
-        Some(&schema),
-    );
+    manager
+        .register_segment(
+            1,
+            Arc::new(volume),
+            SegmentMeta {
+                segment_id: 1,
+                file_path: PathBuf::from("vol_0000000000000001.vol"),
+                row_count: 2,
+                min_row_id: 1,
+                max_row_id: 2,
+                creation_lsn: 0,
+                seal_seq: 0,
+                schema_version: 0,
+            },
+            Some(&schema),
+        )
+        .unwrap();
     for epoch in [0, 3, 6, 9, 12] {
         manager.segments_raw()[&1]
             .volume
@@ -185,21 +189,23 @@ fn a_lookup_through_a_captured_view_keeps_the_shared_index() {
     let volume = Arc::new(read_volume_from_disk(&path).unwrap());
     volume.prebuild_unique_index(&[1]).unwrap();
     let manager = SegmentManager::new("t", Some(dir.path().to_path_buf()));
-    manager.register_segment(
-        1,
-        Arc::clone(&volume),
-        SegmentMeta {
-            segment_id: 1,
-            file_path: PathBuf::from("vol_0000000000000001.vol"),
-            row_count: 2,
-            min_row_id: 1,
-            max_row_id: 2,
-            creation_lsn: 0,
-            seal_seq: 0,
-            schema_version: 0,
-        },
-        Some(&schema),
-    );
+    manager
+        .register_segment(
+            1,
+            Arc::clone(&volume),
+            SegmentMeta {
+                segment_id: 1,
+                file_path: PathBuf::from("vol_0000000000000001.vol"),
+                row_count: 2,
+                min_row_id: 1,
+                max_row_id: 2,
+                creation_lsn: 0,
+                seal_seq: 0,
+                schema_version: 0,
+            },
+            Some(&schema),
+        )
+        .unwrap();
     let snapshot = manager.statement_snapshot();
     let epoch = volume.last_access_epoch.load(Ordering::Relaxed) + 3;
     manager.evict_idle_volumes(epoch, false);

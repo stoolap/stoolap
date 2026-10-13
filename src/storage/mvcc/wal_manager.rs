@@ -2489,10 +2489,12 @@ fn poisoned_error() -> Error {
 /// A failure whose cleanup could not cut the log back: what was cut away
 /// in memory may still replay
 fn unknown_outcome(error: &Error) -> Error {
-    Error::internal(format!(
-        "{}; the WAL could not be cut back, so the outcome is unknown until the database reopens",
-        error
-    ))
+    Error::WalOutcomeUnknown {
+        message: format!(
+            "{}; the WAL could not be cut back, so the outcome is unknown until the database reopens",
+            error
+        ),
+    }
 }
 
 /// Cuts the open WAL file at `path` to `len` and syncs it, through that

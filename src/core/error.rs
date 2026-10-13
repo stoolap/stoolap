@@ -333,6 +333,11 @@ pub enum Error {
     #[error("{message}")]
     Internal { message: String },
 
+    /// A log write that failed and could not be cut back: it may replay or
+    /// not, which the next open decides
+    #[error("{message}")]
+    WalOutcomeUnknown { message: String },
+
     // =========================================================================
     // Executor errors
     // =========================================================================

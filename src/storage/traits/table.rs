@@ -1371,14 +1371,6 @@ pub trait Table: Send + Sync {
     /// * `new_name` - New column name
     fn rename_column(&mut self, old_name: &str, new_name: &str) -> Result<()>;
 
-    /// Modifies a column's definition
-    ///
-    /// # Arguments
-    /// * `name` - The column name
-    /// * `column_type` - The new data type
-    /// * `nullable` - Whether the column can contain NULL values
-    fn modify_column(&mut self, name: &str, column_type: DataType, nullable: bool) -> Result<()>;
-
     // ---- Query Operations ----
 
     /// Executes a SELECT query on the table

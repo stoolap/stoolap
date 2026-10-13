@@ -210,9 +210,10 @@ fn a_clustered_key_whose_type_changed_is_ordered_by_its_new_values() {
     db.execute("ALTER TABLE t MODIFY COLUMN k TEXT NOT NULL", ())
         .unwrap();
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    // The change rewrote the first volume in the new type
     assert_eq!(
         keys_on_disk(dir.path(), 1),
-        vec![vec![Value::Integer(1)], vec![text("10"), text("2")]]
+        vec![vec![text("1")], vec![text("10"), text("2")]]
     );
     drop(db);
     // Sealed before the change, then compacted with a volume sealed after

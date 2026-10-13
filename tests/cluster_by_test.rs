@@ -513,21 +513,22 @@ fn compaction_of_volumes_whose_keys_are_all_null_does_not_panic() {
 }
 
 #[test]
-fn a_key_column_cannot_lose_its_order_through_the_table_api() {
+fn a_key_column_cannot_lose_its_order_through_the_engine_api() {
     let db = Database::open("memory://cluster_by_table_api").unwrap();
     db.execute(
         "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER) CLUSTER BY (k)",
         (),
     )
     .unwrap();
-    let mut tx = db.engine().begin_transaction().unwrap();
-    let mut table = tx.get_table("t").unwrap();
     assert!(
-        table.modify_column("k", DataType::Json, true).is_err(),
-        "the table API turned a key column into JSON"
+        db.engine()
+            .modify_column("t", "k", DataType::Json, true)
+            .is_err(),
+        "the engine API turned a key column into JSON"
     );
-    table.modify_column("k", DataType::Text, true).unwrap();
-    tx.rollback().unwrap();
+    db.engine()
+        .modify_column("t", "k", DataType::Text, true)
+        .unwrap();
 }
 
 #[test]
@@ -686,14 +687,12 @@ fn a_retained_table_handle_follows_a_key_change_made_elsewhere() {
     let mut table = tx.get_table("t").unwrap();
     // The key moves to b while the handle still remembers a
     db.engine().set_cluster_key("t", vec![2]).unwrap();
-    // a is free now: the change must go through and both copies agree
-    // (the engine's cache is the executor's to refresh, so it is asked to)
-    table.modify_column("a", DataType::Json, true).unwrap();
-    db.engine().refresh_schema_cache("t").unwrap();
+    // a is free now: the change must go through
+    db.engine()
+        .modify_column("t", "a", DataType::Json, true)
+        .unwrap();
     let live = db.engine().get_table_schema("t").unwrap();
     assert_eq!(live.columns[1].data_type, DataType::Json);
-    assert_eq!(table.schema().columns[1].data_type, DataType::Json);
-    assert_eq!(table.schema().cluster_key, vec![2]);
     table.drop_column("a").unwrap();
     db.engine().refresh_schema_cache("t").unwrap();
     let live = db.engine().get_table_schema("t").unwrap();
@@ -704,8 +703,11 @@ fn a_retained_table_handle_follows_a_key_change_made_elsewhere() {
         "the key did not follow the dropped column"
     );
     assert_eq!(table.schema().cluster_key, vec![1]);
-    // b is the key now: the handle refuses to make it JSON
-    assert!(table.modify_column("b", DataType::Json, true).is_err());
+    // b is the key now: making it JSON is refused
+    assert!(db
+        .engine()
+        .modify_column("t", "b", DataType::Json, true)
+        .is_err());
     tx.rollback().unwrap();
 }
 
