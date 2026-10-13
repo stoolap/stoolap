@@ -41,7 +41,6 @@ thiserror = "2.0"
 
 # Concurrency
 parking_lot = { version = "0.12", features = ["arc_lock"] }
-dashmap = "6"
 rayon = { version = "1.8", optional = true }
 
 # Serialization

@@ -57,7 +57,7 @@
 //! ### Parallel Hash Join Path (for large analytical queries)
 //! - **When**: Build side ≥ 10,000 rows AND (no LIMIT or LIMIT > 1,000)
 //! - **Benefits**:
-//!   - Parallel hash build using DashMap (concurrent, lock-free)
+//!   - Parallel hash build into partitioned maps, one thread per partition
 //!   - Parallel probe with Rayon work-stealing
 //!   - 2-4x speedup on multi-core systems for large joins
 //!   - Atomic tracking for OUTER join unmatched rows
@@ -628,7 +628,7 @@ impl JoinExecutor {
         }
     }
 
-    /// Execute hash join using parallel execution (DashMap + Rayon).
+    /// Execute hash join using parallel execution (partitioned build + Rayon).
     ///
     /// Uses parallel hash build and probe phases for bulk analytics workloads.
     /// Better for large datasets without small LIMIT constraints.
