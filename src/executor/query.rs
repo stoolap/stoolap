@@ -2325,6 +2325,18 @@ impl Executor {
         let active_tx = self.active_transaction.lock().unwrap();
         let in_explicit_transaction = active_tx.is_some();
 
+        // Taken before the transaction or snapshot the scan reads under, so a
+        // cached result is never older than its stamp says
+        let cache_stamp = if !in_explicit_transaction
+            && ctx.statement_snapshot().is_none()
+            && classification.is_select_star
+            && stmt.where_clause.is_some()
+        {
+            self.semantic_cache_stamp(table_name)
+        } else {
+            None
+        };
+
         // Get table from active transaction or create a new one
         let (table, _standalone_tx) = if let Some(ref tx_state) = *active_tx {
             // Use the active transaction - this allows seeing uncommitted changes
@@ -2591,13 +2603,13 @@ impl Executor {
             && !in_explicit_transaction; // MVCC safety: no caching in transactions
 
         // Try cache lookup for eligible queries
-        if cache_eligible {
+        if let Some(stamp) = cache_stamp.filter(|_| cache_eligible) {
             if let Some(where_expr) = where_to_use {
                 use super::semantic_cache::CacheLookupResult;
 
                 match self
                     .semantic_cache
-                    .lookup(table_name, &all_columns, Some(where_expr))
+                    .lookup(table_name, &all_columns, Some(where_expr), stamp)
                 {
                     CacheLookupResult::ExactHit(rows_arc) => {
                         // Exact cache hit - return cached rows with zero-copy sharing
@@ -4155,7 +4167,7 @@ impl Executor {
         // Note: The cache stores Vec<Row>, so we extract rows from RowVec for caching.
         // The result keeps the original RowVec.
         // Skip caching when deferred projection is used (rows are not projected yet)
-        if cache_eligible && deferred_proj.is_none() {
+        if let Some(stamp) = cache_stamp.filter(|_| cache_eligible && deferred_proj.is_none()) {
             if let Some(where_expr) = where_to_use {
                 // Clone rows for cache (cache needs Vec<Row>)
                 let rows_for_cache: Vec<Row> = projected_rows.rows().cloned().collect();
@@ -4164,6 +4176,7 @@ impl Executor {
                     all_columns.to_vec(),
                     rows_for_cache,
                     Some(where_expr.clone()),
+                    stamp,
                 );
             }
         }

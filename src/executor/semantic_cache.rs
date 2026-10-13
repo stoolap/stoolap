@@ -168,11 +168,22 @@ impl QueryFingerprint {
     }
 }
 
+/// What a result was read under: its table's publish epoch and the engine's
+/// schema epoch, both taken before the read. A result serves only lookups
+/// under the same stamp, whichever handle changed the table since.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheStamp {
+    pub publish: u64,
+    pub schema: u64,
+}
+
 /// Cached query result with metadata
 #[derive(Debug, Clone)]
 pub struct CachedResult {
     /// The fingerprint identifying this query pattern
     pub fingerprint: QueryFingerprint,
+    /// What the rows were read under
+    pub stamp: CacheStamp,
     /// Column names in order
     pub column_names: Vec<String>,
     /// Cached rows (Arc for zero-copy sharing on cache hits)
@@ -191,6 +202,7 @@ impl CachedResult {
     /// Create a new cached result
     pub fn new(
         fingerprint: QueryFingerprint,
+        stamp: CacheStamp,
         column_names: Vec<String>,
         rows: Vec<Row>,
         predicate: Option<Expression>,
@@ -198,6 +210,7 @@ impl CachedResult {
         let now = Instant::now();
         Self {
             fingerprint,
+            stamp,
             column_names,
             rows: CompactArc::new(rows), // Wrap in CompactArc for zero-copy sharing
             predicate,
@@ -213,6 +226,7 @@ impl CachedResult {
     /// an extra allocation and copy.
     pub fn new_with_arc(
         fingerprint: QueryFingerprint,
+        stamp: CacheStamp,
         column_names: Vec<String>,
         rows: CompactArc<Vec<Row>>,
         predicate: Option<Expression>,
@@ -220,6 +234,7 @@ impl CachedResult {
         let now = Instant::now();
         Self {
             fingerprint,
+            stamp,
             column_names,
             rows, // Use Arc directly - no additional wrapping
             predicate,
@@ -381,6 +396,7 @@ impl SemanticCache {
         table_name: &str,
         columns: &[String],
         predicate: Option<&Expression>,
+        stamp: CacheStamp,
     ) -> CacheLookupResult {
         let (table_key, column_key) = Self::cache_keys(table_name, columns);
 
@@ -420,6 +436,11 @@ impl SemanticCache {
             for (idx, entry) in entries.iter().enumerate() {
                 // Skip expired entries
                 if entry.is_expired_at(self.ttl, now) {
+                    continue;
+                }
+
+                // Rows read before the table or schema last changed are stale
+                if entry.stamp != stamp {
                     continue;
                 }
 
@@ -499,6 +520,7 @@ impl SemanticCache {
         columns: Vec<String>,
         rows: Vec<Row>,
         predicate: Option<Expression>,
+        stamp: CacheStamp,
     ) {
         let new_row_count = rows.len();
 
@@ -513,7 +535,7 @@ impl SemanticCache {
             None => QueryFingerprint::new(table_name, columns.clone()),
         };
 
-        let entry = CachedResult::new(fingerprint, columns, rows, predicate);
+        let entry = CachedResult::new(fingerprint, stamp, columns, rows, predicate);
         self.insert_entry(entry, new_row_count, table_key, column_key);
     }
 
@@ -527,6 +549,7 @@ impl SemanticCache {
         columns: Vec<String>,
         rows: CompactArc<Vec<Row>>,
         predicate: Option<Expression>,
+        stamp: CacheStamp,
     ) {
         let new_row_count = rows.len();
 
@@ -541,7 +564,7 @@ impl SemanticCache {
             None => QueryFingerprint::new(table_name, columns.clone()),
         };
 
-        let entry = CachedResult::new_with_arc(fingerprint, columns, rows, predicate);
+        let entry = CachedResult::new_with_arc(fingerprint, stamp, columns, rows, predicate);
         self.insert_entry(entry, new_row_count, table_key, column_key);
     }
 
@@ -1243,6 +1266,11 @@ mod tests {
     use crate::parser::ast::{Identifier, InExpression, InfixExpression, ListExpression};
     use crate::parser::token::{Position, Token, TokenType};
 
+    const STAMP: CacheStamp = CacheStamp {
+        publish: 7,
+        schema: 3,
+    };
+
     fn make_token() -> Token {
         Token {
             token_type: TokenType::Integer,
@@ -1498,6 +1526,7 @@ mod tests {
             vec!["id".to_string(), "amount".to_string()],
             rows.clone(),
             Some(make_gt("amount", 100)),
+            STAMP,
         );
 
         assert_eq!(cache.size(), 1);
@@ -1507,6 +1536,7 @@ mod tests {
             "orders",
             &["id".to_string(), "amount".to_string()],
             Some(&make_gt("amount", 100)),
+            STAMP,
         ) {
             CacheLookupResult::ExactHit(cached_rows) => {
                 assert_eq!(cached_rows.len(), 3);
@@ -1534,6 +1564,7 @@ mod tests {
             vec!["id".to_string(), "amount".to_string()],
             rows,
             Some(make_gt("amount", 100)),
+            STAMP,
         );
 
         // Lookup with stricter predicate: amount > 180
@@ -1541,6 +1572,7 @@ mod tests {
             "orders",
             &["id".to_string(), "amount".to_string()],
             Some(&make_gt("amount", 180)),
+            STAMP,
         ) {
             CacheLookupResult::SubsumptionHit { rows, .. } => {
                 assert_eq!(rows.len(), 3); // All cached rows returned
@@ -1561,11 +1593,47 @@ mod tests {
             vec!["id".to_string()],
             vec![Row::from_values(vec![Value::Integer(1)])],
             None,
+            STAMP,
         );
 
         assert_eq!(cache.size(), 1);
 
         cache.invalidate_table("orders");
         assert_eq!(cache.size(), 0);
+    }
+
+    #[test]
+    fn test_cache_misses_under_another_stamp() {
+        let cache = SemanticCache::new();
+        let columns = vec!["id".to_string(), "amount".to_string()];
+        let rows = vec![Row::from_values(vec![
+            Value::Integer(1),
+            Value::Integer(150),
+        ])];
+        cache.insert(
+            "orders",
+            columns.clone(),
+            rows,
+            Some(make_gt("amount", 100)),
+            STAMP,
+        );
+        for stamp in [
+            CacheStamp {
+                publish: STAMP.publish + 1,
+                ..STAMP
+            },
+            CacheStamp {
+                schema: STAMP.schema + 1,
+                ..STAMP
+            },
+        ] {
+            assert!(
+                matches!(
+                    cache.lookup("orders", &columns, Some(&make_gt("amount", 100)), stamp),
+                    CacheLookupResult::Miss
+                ),
+                "{stamp:?}"
+            );
+        }
     }
 }
