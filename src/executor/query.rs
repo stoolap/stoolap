@@ -4730,27 +4730,22 @@ impl Executor {
                                 });
                             // The alias and the column stay apart: either may hold a dot
                             let column = Expression::QualifiedIdentifier(QualifiedIdentifier {
-                                token: Token::new(
-                                    TokenType::Identifier,
-                                    inner_alias,
-                                    Position::default(),
-                                ),
-                                qualifier: Box::new(Identifier::new(
+                                qualifier: Identifier::new(
                                     Token::new(
                                         TokenType::Identifier,
                                         inner_alias,
                                         Position::default(),
                                     ),
                                     inner_alias.to_string(),
-                                )),
-                                name: Box::new(Identifier::new(
+                                ),
+                                name: Identifier::new(
                                     Token::new(
                                         TokenType::Identifier,
                                         &inner_col,
                                         Position::default(),
                                     ),
                                     inner_col.clone(),
-                                )),
+                                ),
                             });
                             let members =
                                 keys.and_then(|keys| Self::in_list_expression(column, &keys));
@@ -11768,15 +11763,14 @@ impl Executor {
             let qualifier = &column_name[..dot_pos];
             let name = &column_name[dot_pos + 1..];
             Expression::QualifiedIdentifier(QualifiedIdentifier {
-                token: Token::new(TokenType::Identifier, qualifier, Position::default()),
-                qualifier: Box::new(Identifier::new(
+                qualifier: Identifier::new(
                     Token::new(TokenType::Identifier, qualifier, Position::default()),
                     qualifier.to_string(),
-                )),
-                name: Box::new(Identifier::new(
+                ),
+                name: Identifier::new(
                     Token::new(TokenType::Identifier, name, Position::default()),
                     name.to_string(),
-                )),
+                ),
             })
         } else {
             Expression::Identifier(Identifier::new(

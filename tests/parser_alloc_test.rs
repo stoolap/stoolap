@@ -13,7 +13,8 @@
 // limitations under the License.
 
 //! Parsing allocates for the tree it builds, not for operator precedence,
-//! reserved keyword checks, clause names or a copy of the input
+//! reserved keyword checks, clause names, a copy of the input, a box per
+//! part of a qualified column name or an operator's spelling
 
 // The jemalloc feature, on by default, sets the library's own global allocator
 #![cfg(not(feature = "jemalloc"))]
@@ -59,20 +60,20 @@ fn parse_allocations(sql: &str) -> usize {
 #[test]
 fn test_parse_allocates_only_for_the_tree() {
     for (sql, most) in [
-        ("SELECT * FROM users WHERE id = 42", 9),
+        ("SELECT * FROM users WHERE id = 42", 7),
         (
             "SELECT symbol, date_trunc('hour', ts) AS h, AVG(close), MAX(high), MIN(low), \
              SUM(volume) FROM candles WHERE ts >= 1700000000 AND ts < 1700086400 \
              AND symbol IN ('A','B','C') GROUP BY symbol, h HAVING COUNT(*) > 10 \
              ORDER BY h DESC LIMIT 100",
-            45,
+            37,
         ),
         (
             "SELECT o.id, c.name, SUM(i.qty * i.price) AS total FROM orders o \
              JOIN customers c ON o.customer_id = c.id LEFT JOIN items i ON i.order_id = o.id \
              WHERE o.status = 'open' AND c.region = $1 GROUP BY o.id, c.name \
              ORDER BY total DESC LIMIT 20",
-            67,
+            33,
         ),
     ] {
         parse_allocations(sql);

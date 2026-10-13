@@ -14,96 +14,92 @@
 
 //! SQL Parser - Main Parser struct and core parsing logic
 
-use std::sync::LazyLock;
-
-use rustc_hash::FxHashSet;
-
 use super::ast::*;
 use super::error::{ParseError, ParseErrors};
 use super::lexer::Lexer;
 use super::precedence::Precedence;
-use super::token::{Token, TokenType};
+use super::token::{Keyword, Token, TokenType};
 
-/// Reserved SQL keywords that cannot be used as identifiers (O(1) lookup)
-static RESERVED_KEYWORDS: LazyLock<FxHashSet<&'static str>> = LazyLock::new(|| {
-    [
+/// Reserved SQL keywords that cannot be used as identifiers
+fn is_reserved(keyword: Keyword) -> bool {
+    use Keyword::*;
+    matches!(
+        keyword,
         // Core SQL keywords that should never be identifiers
-        "SELECT",
-        "FROM",
-        "WHERE",
-        "AND",
-        "OR",
-        "NOT",
-        "INSERT",
-        "INTO",
-        "VALUES",
-        "UPDATE",
-        "SET",
-        "DELETE",
-        "CREATE",
-        "DROP",
-        "TABLE",
-        "INDEX",
-        "VIEW",
-        "ALTER",
-        "ADD",
-        "PRIMARY",
-        "KEY",
-        "FOREIGN",
-        "REFERENCES",
-        "NULL",
-        "TRUE",
-        "FALSE",
-        "AS",
-        "ON",
-        "JOIN",
-        // LEFT and RIGHT are handled specially - they can be function names
-        // or column names when not followed by JOIN
-        "INNER",
-        "OUTER",
-        "FULL",
-        "CROSS",
-        "GROUP",
-        "BY",
-        "ORDER",
-        "HAVING",
-        "LIMIT",
-        "OFFSET",
-        "UNION",
-        "INTERSECT",
-        "EXCEPT",
-        "CASE",
-        "WHEN",
-        "THEN",
-        "ELSE",
-        "END",
-        "DISTINCT",
-        "ALL",
-        "EXISTS",
-        "IN",
-        "BETWEEN",
-        "LIKE",
-        "GLOB",
-        "REGEXP",
-        "RLIKE",
-        "IS",
-        "ASC",
-        "DESC",
-        "NULLS",
-        // FIRST and LAST are handled specially - they can be function names
-        // or column names, or ORDER BY modifiers (NULLS FIRST/LAST)
-        "BEGIN",
-        "COMMIT",
-        "ROLLBACK",
-        "SAVEPOINT",
-        "IF",
-        "WITH",
-        "RECURSIVE",
-        "DEFAULT",
-    ]
-    .into_iter()
-    .collect()
-});
+        Select
+            | From
+            | Where
+            | And
+            | Or
+            | Not
+            | Insert
+            | Into
+            | Values
+            | Update
+            | Set
+            | Delete
+            | Create
+            | Drop
+            | Table
+            | Index
+            | View
+            | Alter
+            | Add
+            | Primary
+            | Key
+            | Foreign
+            | References
+            | Null
+            | True
+            | False
+            | As
+            | On
+            | Join
+            // LEFT and RIGHT are handled specially - they can be function names
+            // or column names when not followed by JOIN
+            | Inner
+            | Outer
+            | Full
+            | Cross
+            | Group
+            | By
+            | Order
+            | Having
+            | Limit
+            | Offset
+            | Union
+            | Intersect
+            | Except
+            | Case
+            | When
+            | Then
+            | Else
+            | End
+            | Distinct
+            | All
+            | Exists
+            | In
+            | Between
+            | Like
+            | Glob
+            | Regexp
+            | Rlike
+            | Is
+            | Asc
+            | Desc
+            | Nulls
+            // FIRST and LAST are handled specially - they can be function names
+            // or column names, or ORDER BY modifiers (NULLS FIRST/LAST)
+            | Begin
+            | Commit
+            | Rollback
+            | Savepoint
+            | If
+            | With
+            | Recursive
+            | Default
+    )
+}
 
 /// The lexer's next token that is not a comment. An unterminated block
 /// comment is recorded as an error, so the program is not run.
@@ -211,7 +207,7 @@ impl<'a> Parser<'a> {
             TokenType::Keyword => {
                 // Allow non-reserved keywords as identifiers
                 // Reserved keywords that cannot be used as identifiers
-                !Self::is_reserved_keyword(&self.cur_token.literal)
+                !Self::is_reserved_keyword(&self.cur_token)
             }
             _ => false,
         }
@@ -226,28 +222,18 @@ impl<'a> Parser<'a> {
     /// Check if a keyword is truly reserved and cannot be used as an identifier
     /// Note: Some keywords like LEFT, RIGHT, FIRST, LAST are handled specially in
     /// parse_keyword_prefix() where they can be functions or identifiers.
-    /// Uses O(1) HashSet lookup instead of O(n) match chain.
-    pub(crate) fn is_reserved_keyword(keyword: &str) -> bool {
-        // Every reserved keyword fits in 16 bytes
-        let mut buf = [0u8; 16];
-        let Some(upper) = buf.get_mut(..keyword.len()) else {
-            return false;
-        };
-        upper.copy_from_slice(keyword.as_bytes());
-        upper.make_ascii_uppercase();
-        RESERVED_KEYWORDS.contains(std::str::from_utf8(upper).unwrap_or_default())
+    pub(crate) fn is_reserved_keyword(token: &Token) -> bool {
+        token.keyword.is_some_and(is_reserved)
     }
 
     /// Check if the current token is a specific keyword
-    pub(crate) fn cur_token_is_keyword(&self, keyword: &str) -> bool {
-        self.cur_token.token_type == TokenType::Keyword
-            && self.cur_token.literal.eq_ignore_ascii_case(keyword)
+    pub(crate) fn cur_token_is_keyword(&self, keyword: Keyword) -> bool {
+        self.cur_token.keyword == Some(keyword)
     }
 
     /// Check if the peek token is a specific keyword
-    pub(crate) fn peek_token_is_keyword(&self, keyword: &str) -> bool {
-        self.peek_token.token_type == TokenType::Keyword
-            && self.peek_token.literal.eq_ignore_ascii_case(keyword)
+    pub(crate) fn peek_token_is_keyword(&self, keyword: Keyword) -> bool {
+        self.peek_token.keyword == Some(keyword)
     }
 
     /// Check if the current token is a specific punctuator
@@ -269,7 +255,7 @@ impl<'a> Parser<'a> {
     pub(crate) fn peek_token_is_identifier_like(&self) -> bool {
         match self.peek_token.token_type {
             TokenType::Identifier => true,
-            TokenType::Keyword => !Self::is_reserved_keyword(&self.peek_token.literal),
+            TokenType::Keyword => !Self::is_reserved_keyword(&self.peek_token),
             _ => false,
         }
     }
@@ -297,14 +283,14 @@ impl<'a> Parser<'a> {
     }
 
     /// Expect the peek token to be a specific keyword and advance
-    pub(crate) fn expect_keyword(&mut self, keyword: &str) -> bool {
+    pub(crate) fn expect_keyword(&mut self, keyword: Keyword) -> bool {
         if self.peek_token_is_keyword(keyword) {
             self.next_token();
             true
         } else {
             self.add_error(format!(
                 "expected {} after {}, got {}",
-                keyword,
+                keyword.as_str(),
                 self.cur_token.literal,
                 Self::format_token_for_error(&self.peek_token)
             ));
@@ -316,7 +302,10 @@ impl<'a> Parser<'a> {
     pub(crate) fn peek_precedence(&self) -> Precedence {
         match self.peek_token.token_type {
             TokenType::Operator => Precedence::for_operator(&self.peek_token.literal),
-            TokenType::Keyword => Precedence::for_operator(&self.peek_token.literal),
+            TokenType::Keyword => self
+                .peek_token
+                .keyword
+                .map_or(Precedence::Lowest, Precedence::for_keyword),
             TokenType::Punctuator => {
                 if self.peek_token.literal == "." {
                     Precedence::Dot
@@ -336,7 +325,10 @@ impl<'a> Parser<'a> {
     pub(crate) fn cur_precedence(&self) -> Precedence {
         match self.cur_token.token_type {
             TokenType::Operator => Precedence::for_operator(&self.cur_token.literal),
-            TokenType::Keyword => Precedence::for_operator(&self.cur_token.literal),
+            TokenType::Keyword => self
+                .cur_token
+                .keyword
+                .map_or(Precedence::Lowest, Precedence::for_keyword),
             TokenType::Punctuator => {
                 if self.cur_token.literal == "." {
                     Precedence::Dot
@@ -378,7 +370,7 @@ impl<'a> Parser<'a> {
             }
         } else if expected == TokenType::Identifier
             && self.peek_token.token_type == TokenType::Keyword
-            && Self::is_reserved_keyword(&self.peek_token.literal)
+            && Self::is_reserved_keyword(&self.peek_token)
         {
             self.add_error(format!(
                 "'{}' is a reserved keyword and cannot be used as an identifier. \
@@ -436,13 +428,13 @@ mod tests {
     #[test]
     fn test_parser_creation() {
         let parser = Parser::new("SELECT * FROM users");
-        assert!(parser.cur_token_is_keyword("SELECT"));
+        assert!(parser.cur_token_is_keyword(Keyword::Select));
     }
 
     #[test]
     fn test_next_token() {
         let mut parser = Parser::new("SELECT * FROM users");
-        assert!(parser.cur_token_is_keyword("SELECT"));
+        assert!(parser.cur_token_is_keyword(Keyword::Select));
         parser.next_token();
         assert!(parser.cur_token_is(TokenType::Operator));
         assert_eq!(parser.cur_token.literal, "*");
@@ -451,7 +443,7 @@ mod tests {
     #[test]
     fn test_peek_token() {
         let parser = Parser::new("SELECT * FROM users");
-        assert!(parser.cur_token_is_keyword("SELECT"));
+        assert!(parser.cur_token_is_keyword(Keyword::Select));
         assert!(parser.peek_token_is_operator("*"));
     }
 }

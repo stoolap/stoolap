@@ -17,7 +17,7 @@
 //! TABLE accepts as a column must be accepted everywhere else too.
 
 use std::collections::BTreeSet;
-use stoolap::parser::token::KEYWORDS;
+use stoolap::parser::token::Keyword;
 use stoolap::Database;
 
 fn err(db: &Database, sql: &str) -> Option<String> {
@@ -47,7 +47,7 @@ fn column_positions(t: &str, col: &str) -> Vec<String> {
 #[test]
 fn test_every_keyword_works_as_a_name_bare_or_quoted() {
     let db = Database::open("memory://keyword_identifiers_all").unwrap();
-    let keywords: BTreeSet<&str> = KEYWORDS.iter().copied().collect();
+    let keywords: BTreeSet<&str> = Keyword::ALL.iter().map(|kw| kw.as_str()).collect();
     let mut failures = Vec::new();
     let mut reserved = Vec::new();
     for (i, kw) in keywords.iter().enumerate() {

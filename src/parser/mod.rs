@@ -126,7 +126,7 @@ pub use lexer::Lexer;
 pub use parser::Parser;
 pub use precedence::Precedence;
 pub use token::{
-    is_keyword, is_operator, is_punctuator, Position, Token, TokenType, KEYWORDS, OPERATORS,
+    is_operator, is_punctuator, lookup_keyword, Keyword, Position, Token, TokenType, OPERATORS,
     PUNCTUATORS,
 };
 

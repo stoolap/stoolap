@@ -1477,7 +1477,7 @@ pub fn strip_table_qualifier(expr: &Expression, table_alias: &str) -> Expression
     match expr {
         Expression::QualifiedIdentifier(qi) if qi.qualifier.value_lower.as_str() == alias_lower => {
             // Convert to simple identifier
-            Expression::Identifier((*qi.name).clone())
+            Expression::Identifier(qi.name.clone())
         }
         Expression::Infix(infix) => Expression::Infix(InfixExpression::new(
             infix.token.clone(),
@@ -1561,12 +1561,11 @@ pub fn add_table_qualifier(expr: &Expression, table_alias: &str) -> Expression {
         Expression::Identifier(id) => {
             // Convert to qualified identifier
             Expression::QualifiedIdentifier(QualifiedIdentifier {
-                token: Token::new(TokenType::Identifier, table_alias, Position::default()),
-                qualifier: Box::new(Identifier::new(
+                qualifier: Identifier::new(
                     Token::new(TokenType::Identifier, table_alias, Position::default()),
                     table_alias.to_string(),
-                )),
-                name: Box::new(id.clone()),
+                ),
+                name: id.clone(),
             })
         }
         Expression::Infix(infix) => Expression::Infix(InfixExpression::new(
@@ -2344,15 +2343,11 @@ fn create_column_identifier(col_name: &str) -> Expression {
         let qualifier = &col_name[..dot_idx];
         let name = &col_name[dot_idx + 1..];
         Expression::QualifiedIdentifier(QualifiedIdentifier {
-            token: dummy_token(col_name, TokenType::Identifier),
-            qualifier: Box::new(Identifier::new(
+            qualifier: Identifier::new(
                 dummy_token(qualifier, TokenType::Identifier),
                 qualifier.to_string(),
-            )),
-            name: Box::new(Identifier::new(
-                dummy_token(name, TokenType::Identifier),
-                name.to_string(),
-            )),
+            ),
+            name: Identifier::new(dummy_token(name, TokenType::Identifier), name.to_string()),
         })
     } else {
         Expression::Identifier(Identifier::new(
@@ -2522,9 +2517,8 @@ mod tests {
             unreachable!()
         };
         Expression::QualifiedIdentifier(QualifiedIdentifier {
-            token: dummy_token_clone(),
-            qualifier: Box::new(q),
-            name: Box::new(n),
+            qualifier: q,
+            name: n,
         })
     }
 
@@ -2973,15 +2967,8 @@ mod tests {
     #[test]
     fn test_extract_column_name_qualified() {
         let expr = Expression::QualifiedIdentifier(QualifiedIdentifier {
-            token: dummy_token("t.col", TokenType::Identifier),
-            qualifier: Box::new(Identifier::new(
-                dummy_token("t", TokenType::Identifier),
-                "t".to_string(),
-            )),
-            name: Box::new(Identifier::new(
-                dummy_token("col", TokenType::Identifier),
-                "col".to_string(),
-            )),
+            qualifier: Identifier::new(dummy_token("t", TokenType::Identifier), "t".to_string()),
+            name: Identifier::new(dummy_token("col", TokenType::Identifier), "col".to_string()),
         });
         assert_eq!(extract_column_name(&expr), Some("col".to_string()));
     }
@@ -3319,15 +3306,8 @@ mod tests {
     #[test]
     fn test_extract_column_name_with_qualifier_qualified() {
         let expr = Expression::QualifiedIdentifier(QualifiedIdentifier {
-            token: dummy_token("t.col", TokenType::Identifier),
-            qualifier: Box::new(Identifier::new(
-                dummy_token("t", TokenType::Identifier),
-                "t".to_string(),
-            )),
-            name: Box::new(Identifier::new(
-                dummy_token("col", TokenType::Identifier),
-                "col".to_string(),
-            )),
+            qualifier: Identifier::new(dummy_token("t", TokenType::Identifier), "t".to_string()),
+            name: Identifier::new(dummy_token("col", TokenType::Identifier), "col".to_string()),
         });
         let result = extract_column_name_with_qualifier(&expr);
         assert!(result.is_some());
@@ -3572,15 +3552,8 @@ mod tests {
     #[test]
     fn test_collect_table_qualifiers_qualified() {
         let expr = Expression::QualifiedIdentifier(QualifiedIdentifier {
-            token: dummy_token("t.col", TokenType::Identifier),
-            qualifier: Box::new(Identifier::new(
-                dummy_token("t", TokenType::Identifier),
-                "t".to_string(),
-            )),
-            name: Box::new(Identifier::new(
-                dummy_token("col", TokenType::Identifier),
-                "col".to_string(),
-            )),
+            qualifier: Identifier::new(dummy_token("t", TokenType::Identifier), "t".to_string()),
+            name: Identifier::new(dummy_token("col", TokenType::Identifier), "col".to_string()),
         });
         let result = collect_table_qualifiers(&expr);
         assert_eq!(result.len(), 1);
@@ -3594,15 +3567,8 @@ mod tests {
     #[test]
     fn test_strip_table_qualifier_qualified() {
         let expr = Expression::QualifiedIdentifier(QualifiedIdentifier {
-            token: dummy_token("t.col", TokenType::Identifier),
-            qualifier: Box::new(Identifier::new(
-                dummy_token("t", TokenType::Identifier),
-                "t".to_string(),
-            )),
-            name: Box::new(Identifier::new(
-                dummy_token("col", TokenType::Identifier),
-                "col".to_string(),
-            )),
+            qualifier: Identifier::new(dummy_token("t", TokenType::Identifier), "t".to_string()),
+            name: Identifier::new(dummy_token("col", TokenType::Identifier), "col".to_string()),
         });
         let result = strip_table_qualifier(&expr, "t");
         match result {
@@ -3661,15 +3627,8 @@ mod tests {
     #[test]
     fn test_expression_to_string_qualified() {
         let expr = Expression::QualifiedIdentifier(QualifiedIdentifier {
-            token: dummy_token("t.col", TokenType::Identifier),
-            qualifier: Box::new(Identifier::new(
-                dummy_token("t", TokenType::Identifier),
-                "t".to_string(),
-            )),
-            name: Box::new(Identifier::new(
-                dummy_token("col", TokenType::Identifier),
-                "col".to_string(),
-            )),
+            qualifier: Identifier::new(dummy_token("t", TokenType::Identifier), "t".to_string()),
+            name: Identifier::new(dummy_token("col", TokenType::Identifier), "col".to_string()),
         });
         let result = expression_to_string(&expr);
         assert_eq!(result, "t.col");

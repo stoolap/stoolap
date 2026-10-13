@@ -17,7 +17,7 @@
 //! This module provides the lexer for tokenizing SQL input strings.
 
 use super::token::{
-    is_keyword, is_operator, is_operator_char, is_punctuator, punctuator_str, Position, Token,
+    is_operator, is_operator_char, is_punctuator, lookup_keyword, punctuator_str, Position, Token,
     TokenType,
 };
 use crate::common::SmartString;
@@ -92,10 +92,10 @@ impl<'a> Lexer<'a> {
     fn read_char(&mut self) {
         // Update position before changing character
         if self.ch == '\n' {
-            self.pos.line += 1;
+            self.pos.line = self.pos.line.saturating_add(1);
             self.pos.column = 1;
         } else if self.ch != '\0' {
-            self.pos.column += 1;
+            self.pos.column = self.pos.column.saturating_add(1);
         }
 
         if self.read_position >= self.input.len() {
@@ -108,7 +108,7 @@ impl<'a> Lexer<'a> {
             self.read_position += len;
         }
 
-        self.pos.offset = self.position;
+        self.pos.offset = u32::try_from(self.position).unwrap_or(u32::MAX);
     }
 
     /// Peek at the next character without advancing
@@ -126,12 +126,14 @@ impl<'a> Lexer<'a> {
     /// character past its inline buffer, which made a 400-character comment
     /// cost more than ten short queries.
     fn token_since(&self, start: usize) -> SmartString {
-        // SAFETY: `input` is the byte form of a `&str`, `start` is the first
-        // byte of a decoded char and `position` is the first byte of the
-        // current one, so both bounds are char boundaries.
-        SmartString::new(unsafe {
-            std::str::from_utf8_unchecked(&self.input[start..self.position])
-        })
+        SmartString::new(self.text(start, self.position))
+    }
+
+    /// The input from byte `start` to byte `end`, both the first byte of a char
+    fn text(&self, start: usize, end: usize) -> &'a str {
+        // SAFETY: `input` is the byte form of a `&str` and both bounds are
+        // the first byte of a decoded char, so both are char boundaries.
+        unsafe { std::str::from_utf8_unchecked(&self.input[start..end]) }
     }
 
     /// Get the next token
@@ -240,11 +242,10 @@ impl<'a> Lexer<'a> {
 
             // Identifier or keyword
             c if c.is_alphabetic() || c == '_' => {
-                let literal = self.read_identifier();
-                if is_keyword(&literal) {
-                    Token::new(TokenType::Keyword, literal.to_uppercase(), pos)
-                } else {
-                    Token::new(TokenType::Identifier, literal, pos)
+                let word = self.read_identifier();
+                match lookup_keyword(word) {
+                    Some(keyword) => Token::from_keyword(keyword, pos),
+                    None => Token::new(TokenType::Identifier, word, pos),
                 }
             }
 
@@ -274,15 +275,33 @@ impl<'a> Lexer<'a> {
     }
 
     /// Read an identifier
-    fn read_identifier(&mut self) -> SmartString {
+    fn read_identifier(&mut self) -> &'a str {
         let start = self.position;
-        self.read_char();
+        let ascii = self.input[start..]
+            .iter()
+            .take_while(|&&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$')
+            .count();
+        if ascii > 0 {
+            self.skip_ascii(start + ascii);
+        } else {
+            self.read_char();
+        }
 
         while self.ch.is_alphanumeric() || self.ch == '_' || self.ch == '$' {
             self.read_char();
         }
 
-        self.token_since(start)
+        self.text(start, self.position)
+    }
+
+    /// Move to byte `end` past ASCII chars that are not newlines, from the current one
+    fn skip_ascii(&mut self, end: usize) {
+        debug_assert!(end > self.position && self.input[self.position..end].is_ascii());
+        let before_last = u32::try_from(end - self.position - 1).unwrap_or(u32::MAX);
+        self.pos.column = self.pos.column.saturating_add(before_last);
+        self.ch = char::from(self.input[end - 1]);
+        self.read_position = end;
+        self.read_char();
     }
 
     /// Read a number (integer or float)
@@ -357,17 +376,17 @@ impl<'a> Lexer<'a> {
                 // Step past each char from the opening quote through the closing one, as read_char does
                 for &byte in &self.input[start_pos..end_pos] {
                     if byte == b'\n' {
-                        self.pos.line += 1;
+                        self.pos.line = self.pos.line.saturating_add(1);
                         self.pos.column = 1;
                     } else if byte & 0xC0 != 0x80 {
-                        self.pos.column += 1;
+                        self.pos.column = self.pos.column.saturating_add(1);
                     }
                 }
 
                 // Advance lexer past closing quote
                 self.position = scan_pos;
                 self.read_position = end_pos;
-                self.pos.offset = self.position;
+                self.pos.offset = u32::try_from(self.position).unwrap_or(u32::MAX);
 
                 // Read next char after closing quote
                 if self.read_position >= input_len {
@@ -379,7 +398,7 @@ impl<'a> Lexer<'a> {
                     self.position = self.read_position;
                     self.read_position += len;
                 }
-                self.pos.offset = self.position;
+                self.pos.offset = u32::try_from(self.position).unwrap_or(u32::MAX);
 
                 // SAFETY: input was constructed from valid UTF-8 (String/&str).
                 // We only scanned for ASCII bytes, so all byte boundaries are valid.
@@ -541,33 +560,24 @@ impl<'a> Lexer<'a> {
     }
 
     /// Read an operator
-    fn read_operator(&mut self) -> SmartString {
-        let mut result = SmartString::new("");
-        let first_char = self.ch;
-        result.push(first_char);
+    fn read_operator(&mut self) -> &'a str {
+        let start = self.position;
         self.read_char();
 
-        // Check for multi-character operators
-        if self.ch != '\0' {
-            let two_chars: SmartString =
-                SmartString::from_iter([first_char, self.ch].iter().copied());
-            if is_operator(&two_chars) {
-                result.push(self.ch);
+        // Check for two- and then three-character operators
+        if self.extends_operator(start) {
+            self.read_char();
+            if self.extends_operator(start) {
                 self.read_char();
-
-                // Check for three-character operators
-                if self.ch != '\0' {
-                    let mut three_chars = two_chars.clone();
-                    three_chars.push(self.ch);
-                    if is_operator(&three_chars) {
-                        result.push(self.ch);
-                        self.read_char();
-                    }
-                }
             }
         }
 
-        result
+        self.text(start, self.position)
+    }
+
+    /// Whether the operator read from `start` plus the current char is an operator
+    fn extends_operator(&self, start: usize) -> bool {
+        self.ch != '\0' && is_operator(self.text(start, self.read_position))
     }
 
     /// Read a parameter ($1, $2, etc.)
@@ -662,6 +672,7 @@ impl<'a> Lexer<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::token::Keyword;
 
     #[test]
     fn test_simple_select() {
@@ -921,6 +932,42 @@ mod tests {
     }
 
     #[test]
+    fn test_position_after_identifier() {
+        for (sql, line, column) in [
+            ("ab x", 1, 4),
+            ("SeLeCt x", 1, 8),
+            ("tablo_adı x", 1, 11),
+            ("çağ_ü x", 1, 7),
+            ("a_1$b\ncd x", 2, 4),
+        ] {
+            let mut lexer = Lexer::new(sql);
+            let mut token = lexer.next_token();
+            while token.literal != "x" {
+                token = lexer.next_token();
+            }
+            assert_eq!(
+                (token.position.line, token.position.column),
+                (line, column),
+                "position of x in {sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_position_saturates_at_the_counter_limit() {
+        for sql in ["ab", "a\nb", "'ab'", "'a\nb'"] {
+            let mut lexer = Lexer::new(sql);
+            lexer.pos.line = u32::MAX;
+            lexer.pos.column = u32::MAX;
+            let mut token = lexer.next_token();
+            while !token.is_eof() {
+                token = lexer.next_token();
+            }
+            assert_eq!(token.position.line, u32::MAX, "line at the end of {sql:?}");
+        }
+    }
+
+    #[test]
     fn test_peek_token() {
         let mut lexer = Lexer::new("SELECT FROM");
 
@@ -978,14 +1025,18 @@ mod tests {
 
         // Verify we got reasonable tokens
         assert!(tokens.len() > 30);
-        assert!(tokens.iter().any(|t| t.is_keyword("SELECT")));
-        assert!(tokens.iter().any(|t| t.is_keyword("FROM")));
-        assert!(tokens.iter().any(|t| t.is_keyword("JOIN")));
-        assert!(tokens.iter().any(|t| t.is_keyword("WHERE")));
-        assert!(tokens.iter().any(|t| t.is_keyword("GROUP")));
-        assert!(tokens.iter().any(|t| t.is_keyword("HAVING")));
-        assert!(tokens.iter().any(|t| t.is_keyword("ORDER")));
-        assert!(tokens.iter().any(|t| t.is_keyword("LIMIT")));
+        for keyword in [
+            Keyword::Select,
+            Keyword::From,
+            Keyword::Join,
+            Keyword::Where,
+            Keyword::Group,
+            Keyword::Having,
+            Keyword::Order,
+            Keyword::Limit,
+        ] {
+            assert!(tokens.iter().any(|t| t.is_keyword(keyword)), "{keyword:?}");
+        }
     }
 
     /// The readers slice the input instead of pushing char by char, so the

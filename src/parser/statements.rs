@@ -21,7 +21,7 @@ use rustc_hash::FxHashMap;
 use super::ast::*;
 use super::parser::Parser;
 use super::precedence::Precedence;
-use super::token::{Token, TokenType};
+use super::token::{Keyword, Token, TokenType};
 
 /// Parsed conflict clause (ON DUPLICATE KEY UPDATE or ON CONFLICT)
 #[derive(Default)]
@@ -77,33 +77,36 @@ impl Parser<'_> {
         }
 
         if self.cur_token_is(TokenType::Keyword) {
-            let keyword = self.cur_token.literal.to_uppercase();
-            match keyword.as_str() {
-                "SELECT" => self.parse_select_statement().map(Statement::Select),
-                "WITH" => self.parse_with_statement(),
-                "INSERT" => self.parse_insert_statement().map(Statement::Insert),
-                "UPDATE" => self.parse_update_statement().map(Statement::Update),
-                "DELETE" => self.parse_delete_statement().map(Statement::Delete),
-                "TRUNCATE" => self.parse_truncate_statement().map(Statement::Truncate),
-                "CREATE" => self.parse_create_statement(),
-                "DROP" => self.parse_drop_statement(),
-                "ALTER" => self
+            match self.cur_token.keyword {
+                Some(Keyword::Select) => self.parse_select_statement().map(Statement::Select),
+                Some(Keyword::With) => self.parse_with_statement(),
+                Some(Keyword::Insert) => self.parse_insert_statement().map(Statement::Insert),
+                Some(Keyword::Update) => self.parse_update_statement().map(Statement::Update),
+                Some(Keyword::Delete) => self.parse_delete_statement().map(Statement::Delete),
+                Some(Keyword::Truncate) => self.parse_truncate_statement().map(Statement::Truncate),
+                Some(Keyword::Create) => self.parse_create_statement(),
+                Some(Keyword::Drop) => self.parse_drop_statement(),
+                Some(Keyword::Alter) => self
                     .parse_alter_statement()
                     .map(|s| Statement::AlterTable(Box::new(s))),
-                "BEGIN" => self.parse_begin_statement().map(Statement::Begin),
-                "COMMIT" => self.parse_commit_statement().map(Statement::Commit),
-                "ROLLBACK" => self.parse_rollback_statement().map(Statement::Rollback),
-                "SAVEPOINT" => self.parse_savepoint_statement().map(Statement::Savepoint),
-                "SET" => self
+                Some(Keyword::Begin) => self.parse_begin_statement().map(Statement::Begin),
+                Some(Keyword::Commit) => self.parse_commit_statement().map(Statement::Commit),
+                Some(Keyword::Rollback) => self.parse_rollback_statement().map(Statement::Rollback),
+                Some(Keyword::Savepoint) => {
+                    self.parse_savepoint_statement().map(Statement::Savepoint)
+                }
+                Some(Keyword::Set) => self
                     .parse_set_statement()
                     .map(|s| Statement::Set(Box::new(s))),
-                "PRAGMA" => self.parse_pragma_statement().map(Statement::Pragma),
-                "VACUUM" => self.parse_vacuum_statement().map(Statement::Vacuum),
-                "SHOW" => self.parse_show_statement(),
-                "DESCRIBE" | "DESC" => self.parse_describe_statement().map(Statement::Describe),
-                "EXPLAIN" => self.parse_explain_statement().map(Statement::Explain),
-                "ANALYZE" => self.parse_analyze_statement().map(Statement::Analyze),
-                "COPY" => self.parse_copy_statement().map(Statement::Copy),
+                Some(Keyword::Pragma) => self.parse_pragma_statement().map(Statement::Pragma),
+                Some(Keyword::Vacuum) => self.parse_vacuum_statement().map(Statement::Vacuum),
+                Some(Keyword::Show) => self.parse_show_statement(),
+                Some(Keyword::Describe | Keyword::Desc) => {
+                    self.parse_describe_statement().map(Statement::Describe)
+                }
+                Some(Keyword::Explain) => self.parse_explain_statement().map(Statement::Explain),
+                Some(Keyword::Analyze) => self.parse_analyze_statement().map(Statement::Analyze),
+                Some(Keyword::Copy) => self.parse_copy_statement().map(Statement::Copy),
                 _ => {
                     // Try to parse as expression statement
                     self.parse_expression_statement().map(Statement::Expression)
@@ -111,7 +114,8 @@ impl Parser<'_> {
             }
         } else if self.cur_token_is(TokenType::Identifier)
             && self.cur_token.literal.eq_ignore_ascii_case("RELEASE")
-            && (self.peek_token_is_keyword("SAVEPOINT") || self.peek_token_is_identifier_like())
+            && (self.peek_token_is_keyword(Keyword::Savepoint)
+                || self.peek_token_is_identifier_like())
         {
             // RELEASE stays a plain identifier elsewhere, so `release` remains a column name
             self.parse_release_savepoint_statement()
@@ -144,7 +148,7 @@ impl Parser<'_> {
         };
 
         // Check for DISTINCT / DISTINCT ON (expr, ...)
-        if self.peek_token_is_keyword("DISTINCT") {
+        if self.peek_token_is_keyword(Keyword::Distinct) {
             self.next_token();
             stmt.distinct = true;
             self.parse_distinct_on(&mut stmt);
@@ -155,14 +159,14 @@ impl Parser<'_> {
         stmt.columns = self.parse_select_columns();
 
         // Parse FROM clause
-        if self.peek_token_is_keyword("FROM") {
+        if self.peek_token_is_keyword(Keyword::From) {
             self.next_token(); // consume FROM
             self.next_token(); // move to table expression
             stmt.table_expr = Some(Box::new(self.parse_table_expression()?));
         }
 
         // Parse WHERE clause
-        if self.peek_token_is_keyword("WHERE") {
+        if self.peek_token_is_keyword(Keyword::Where) {
             self.next_token(); // consume WHERE
             self.current_clause = "WHERE";
             self.next_token();
@@ -170,9 +174,9 @@ impl Parser<'_> {
         }
 
         // Parse GROUP BY clause
-        if self.peek_token_is_keyword("GROUP") {
+        if self.peek_token_is_keyword(Keyword::Group) {
             self.next_token(); // consume GROUP
-            if !self.expect_keyword("BY") {
+            if !self.expect_keyword(Keyword::By) {
                 return None;
             }
             self.current_clause = "GROUP BY";
@@ -180,7 +184,7 @@ impl Parser<'_> {
         }
 
         // Parse HAVING clause
-        if self.peek_token_is_keyword("HAVING") {
+        if self.peek_token_is_keyword(Keyword::Having) {
             self.next_token(); // consume HAVING
             self.current_clause = "HAVING";
             self.next_token();
@@ -188,16 +192,16 @@ impl Parser<'_> {
         }
 
         // Parse WINDOW clause (named window definitions)
-        if self.peek_token_is_keyword("WINDOW") {
+        if self.peek_token_is_keyword(Keyword::Window) {
             self.next_token(); // consume WINDOW
             self.current_clause = "WINDOW";
             stmt.window_defs = self.parse_window_definitions();
         }
 
         // Parse UNION, INTERSECT, EXCEPT set operations
-        while self.peek_token_is_keyword("UNION")
-            || self.peek_token_is_keyword("INTERSECT")
-            || self.peek_token_is_keyword("EXCEPT")
+        while self.peek_token_is_keyword(Keyword::Union)
+            || self.peek_token_is_keyword(Keyword::Intersect)
+            || self.peek_token_is_keyword(Keyword::Except)
         {
             if let Some(set_op) = self.parse_set_operation() {
                 stmt.set_operations.push(set_op);
@@ -207,9 +211,9 @@ impl Parser<'_> {
         }
 
         // Parse ORDER BY clause (applies to entire compound query)
-        if self.peek_token_is_keyword("ORDER") {
+        if self.peek_token_is_keyword(Keyword::Order) {
             self.next_token(); // consume ORDER
-            if !self.expect_keyword("BY") {
+            if !self.expect_keyword(Keyword::By) {
                 return None;
             }
             self.current_clause = "ORDER BY";
@@ -217,7 +221,7 @@ impl Parser<'_> {
         }
 
         // Parse LIMIT clause
-        if self.peek_token_is_keyword("LIMIT") {
+        if self.peek_token_is_keyword(Keyword::Limit) {
             self.next_token(); // consume LIMIT
             self.current_clause = "LIMIT";
             self.next_token();
@@ -225,24 +229,27 @@ impl Parser<'_> {
         }
 
         // Parse OFFSET clause
-        if self.peek_token_is_keyword("OFFSET") {
+        if self.peek_token_is_keyword(Keyword::Offset) {
             self.next_token(); // consume OFFSET
             self.current_clause = "OFFSET";
             self.next_token();
             stmt.offset = Some(Box::new(self.parse_expression(Precedence::Lowest)?));
 
             // Optional ROWS/ROW keyword after OFFSET value
-            if self.peek_token_is_keyword("ROWS") || self.peek_token_is_keyword("ROW") {
+            if self.peek_token_is_keyword(Keyword::Rows) || self.peek_token_is_keyword(Keyword::Row)
+            {
                 self.next_token();
             }
         }
 
         // Parse FETCH FIRST/NEXT n ROWS ONLY clause (alternative to LIMIT)
-        if self.peek_token_is_keyword("FETCH") {
+        if self.peek_token_is_keyword(Keyword::Fetch) {
             self.next_token(); // consume FETCH
 
             // FIRST or NEXT (both are equivalent)
-            if !self.peek_token_is_keyword("FIRST") && !self.peek_token_is_keyword("NEXT") {
+            if !self.peek_token_is_keyword(Keyword::First)
+                && !self.peek_token_is_keyword(Keyword::Next)
+            {
                 self.add_error(format!(
                     "expected FIRST or NEXT after FETCH at {}",
                     self.peek_token.position
@@ -256,12 +263,13 @@ impl Parser<'_> {
             stmt.limit = Some(Box::new(self.parse_expression(Precedence::Lowest)?));
 
             // Optional ROWS/ROW keyword
-            if self.peek_token_is_keyword("ROWS") || self.peek_token_is_keyword("ROW") {
+            if self.peek_token_is_keyword(Keyword::Rows) || self.peek_token_is_keyword(Keyword::Row)
+            {
                 self.next_token();
             }
 
             // Optional ONLY keyword
-            if self.peek_token_is_keyword("ONLY") {
+            if self.peek_token_is_keyword(Keyword::Only) {
                 self.next_token();
             }
         }
@@ -275,24 +283,24 @@ impl Parser<'_> {
     fn parse_set_operation(&mut self) -> Option<SetOperation> {
         self.next_token(); // consume UNION/INTERSECT/EXCEPT
 
-        let keyword = self.cur_token.literal.to_uppercase();
-        let is_union = keyword == "UNION";
-        let operation = if keyword == "UNION" {
-            if self.peek_token_is_keyword("ALL") {
+        let keyword = self.cur_token.keyword;
+        let is_union = keyword == Some(Keyword::Union);
+        let operation = if is_union {
+            if self.peek_token_is_keyword(Keyword::All) {
                 self.next_token();
                 SetOperationType::UnionAll
             } else {
                 SetOperationType::Union
             }
-        } else if keyword == "INTERSECT" {
-            if self.peek_token_is_keyword("ALL") {
+        } else if keyword == Some(Keyword::Intersect) {
+            if self.peek_token_is_keyword(Keyword::All) {
                 self.next_token();
                 SetOperationType::IntersectAll
             } else {
                 SetOperationType::Intersect
             }
-        } else if keyword == "EXCEPT" {
-            if self.peek_token_is_keyword("ALL") {
+        } else if keyword == Some(Keyword::Except) {
+            if self.peek_token_is_keyword(Keyword::All) {
                 self.next_token();
                 SetOperationType::ExceptAll
             } else {
@@ -303,7 +311,7 @@ impl Parser<'_> {
         };
 
         // Expect SELECT
-        if !self.expect_keyword("SELECT") {
+        if !self.expect_keyword(Keyword::Select) {
             return None;
         }
 
@@ -313,7 +321,9 @@ impl Parser<'_> {
         // If this is UNION, the right side should consume any INTERSECT/EXCEPT operations
         // because INTERSECT/EXCEPT have higher precedence than UNION
         if is_union {
-            while self.peek_token_is_keyword("INTERSECT") || self.peek_token_is_keyword("EXCEPT") {
+            while self.peek_token_is_keyword(Keyword::Intersect)
+                || self.peek_token_is_keyword(Keyword::Except)
+            {
                 if let Some(set_op) = self.parse_set_operation() {
                     right.set_operations.push(set_op);
                 } else {
@@ -350,7 +360,7 @@ impl Parser<'_> {
         };
 
         // Check for DISTINCT / DISTINCT ON (expr, ...)
-        if self.peek_token_is_keyword("DISTINCT") {
+        if self.peek_token_is_keyword(Keyword::Distinct) {
             self.next_token();
             stmt.distinct = true;
             self.parse_distinct_on(&mut stmt);
@@ -361,14 +371,14 @@ impl Parser<'_> {
         stmt.columns = self.parse_select_columns();
 
         // Parse FROM clause
-        if self.peek_token_is_keyword("FROM") {
+        if self.peek_token_is_keyword(Keyword::From) {
             self.next_token(); // consume FROM
             self.next_token(); // move to table expression
             stmt.table_expr = Some(Box::new(self.parse_table_expression()?));
         }
 
         // Parse WHERE clause
-        if self.peek_token_is_keyword("WHERE") {
+        if self.peek_token_is_keyword(Keyword::Where) {
             self.next_token(); // consume WHERE
             self.current_clause = "WHERE";
             self.next_token();
@@ -376,9 +386,9 @@ impl Parser<'_> {
         }
 
         // Parse GROUP BY clause
-        if self.peek_token_is_keyword("GROUP") {
+        if self.peek_token_is_keyword(Keyword::Group) {
             self.next_token(); // consume GROUP
-            if !self.expect_keyword("BY") {
+            if !self.expect_keyword(Keyword::By) {
                 return None;
             }
             self.current_clause = "GROUP BY";
@@ -386,7 +396,7 @@ impl Parser<'_> {
         }
 
         // Parse HAVING clause
-        if self.peek_token_is_keyword("HAVING") {
+        if self.peek_token_is_keyword(Keyword::Having) {
             self.next_token(); // consume HAVING
             self.current_clause = "HAVING";
             self.next_token();
@@ -431,7 +441,7 @@ impl Parser<'_> {
         let expr = self.parse_expression(Precedence::Lowest)?;
 
         // Check for alias with AS keyword
-        if self.peek_token_is_keyword("AS") {
+        if self.peek_token_is_keyword(Keyword::As) {
             self.next_token(); // consume AS
                                // Allow both identifiers and keywords as aliases (e.g., AS level, AS type)
             if !self.peek_token_is(TokenType::Identifier) && !self.peek_token_is(TokenType::Keyword)
@@ -502,7 +512,7 @@ impl Parser<'_> {
         // Check for subquery or VALUES
         if self.cur_token_is_punctuator("(") {
             self.next_token();
-            if self.cur_token_is_keyword("SELECT") {
+            if self.cur_token_is_keyword(Keyword::Select) {
                 let subquery = self.parse_select_statement()?;
 
                 if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {
@@ -514,7 +524,7 @@ impl Parser<'_> {
                 }
 
                 let mut alias = None;
-                if self.peek_token_is_keyword("AS") {
+                if self.peek_token_is_keyword(Keyword::As) {
                     self.next_token();
                     self.next_token();
                     alias = Some(Identifier::new(
@@ -534,7 +544,7 @@ impl Parser<'_> {
                     subquery: Box::new(subquery),
                     alias,
                 })));
-            } else if self.cur_token_is_keyword("VALUES") {
+            } else if self.cur_token_is_keyword(Keyword::Values) {
                 // Parse VALUES clause as table source
                 return self.parse_values_table_source();
             }
@@ -558,9 +568,9 @@ impl Parser<'_> {
         }
 
         // Check for AS OF clause (temporal queries)
-        let as_of = if self.peek_token_is_keyword("AS") {
+        let as_of = if self.peek_token_is_keyword(Keyword::As) {
             self.next_token(); // consume AS
-            if self.peek_token_is_keyword("OF") {
+            if self.peek_token_is_keyword(Keyword::Of) {
                 self.next_token(); // consume OF
                 self.next_token(); // move to TRANSACTION or TIMESTAMP
 
@@ -591,7 +601,7 @@ impl Parser<'_> {
 
         // Check for alias (can occur after AS OF or after table name)
         let mut alias = None;
-        if self.peek_token_is_keyword("AS") {
+        if self.peek_token_is_keyword(Keyword::As) {
             self.next_token(); // consume AS
             if !self.expect_peek_identifier_like() {
                 return None;
@@ -600,7 +610,7 @@ impl Parser<'_> {
                 self.cur_token.clone(),
                 self.cur_token.literal.clone(),
             ));
-        } else if self.cur_token_is_keyword("AS") && self.peek_token_is_identifier_like() {
+        } else if self.cur_token_is_keyword(Keyword::As) && self.peek_token_is_identifier_like() {
             // The AS OF check above consumed a lone AS; after an explicit AS
             // any non-reserved keyword is the alias
             self.next_token();
@@ -632,66 +642,66 @@ impl Parser<'_> {
     fn parse_join_table_expression(&mut self, mut left: Expression) -> Option<Expression> {
         loop {
             // Check for JOIN keywords
-            let join_type = if self.peek_token_is_keyword("JOIN") {
+            let join_type = if self.peek_token_is_keyword(Keyword::Join) {
                 self.next_token();
                 SmartString::const_new("INNER")
-            } else if self.peek_token_is_keyword("INNER") {
+            } else if self.peek_token_is_keyword(Keyword::Inner) {
                 self.next_token();
-                if !self.expect_keyword("JOIN") {
+                if !self.expect_keyword(Keyword::Join) {
                     return None;
                 }
                 SmartString::const_new("INNER")
-            } else if self.peek_token_is_keyword("LEFT") {
+            } else if self.peek_token_is_keyword(Keyword::Left) {
                 self.next_token();
-                if self.peek_token_is_keyword("OUTER") {
+                if self.peek_token_is_keyword(Keyword::Outer) {
                     self.next_token();
                 }
-                if !self.expect_keyword("JOIN") {
+                if !self.expect_keyword(Keyword::Join) {
                     return None;
                 }
                 SmartString::const_new("LEFT")
-            } else if self.peek_token_is_keyword("RIGHT") {
+            } else if self.peek_token_is_keyword(Keyword::Right) {
                 self.next_token();
-                if self.peek_token_is_keyword("OUTER") {
+                if self.peek_token_is_keyword(Keyword::Outer) {
                     self.next_token();
                 }
-                if !self.expect_keyword("JOIN") {
+                if !self.expect_keyword(Keyword::Join) {
                     return None;
                 }
                 SmartString::const_new("RIGHT")
-            } else if self.peek_token_is_keyword("FULL") {
+            } else if self.peek_token_is_keyword(Keyword::Full) {
                 self.next_token();
-                if self.peek_token_is_keyword("OUTER") {
+                if self.peek_token_is_keyword(Keyword::Outer) {
                     self.next_token();
                 }
-                if !self.expect_keyword("JOIN") {
+                if !self.expect_keyword(Keyword::Join) {
                     return None;
                 }
                 SmartString::const_new("FULL")
-            } else if self.peek_token_is_keyword("CROSS") {
+            } else if self.peek_token_is_keyword(Keyword::Cross) {
                 self.next_token();
-                if !self.expect_keyword("JOIN") {
+                if !self.expect_keyword(Keyword::Join) {
                     return None;
                 }
                 SmartString::const_new("CROSS")
-            } else if self.peek_token_is_keyword("NATURAL") {
+            } else if self.peek_token_is_keyword(Keyword::Natural) {
                 self.next_token();
-                let natural_type = if self.peek_token_is_keyword("LEFT") {
+                let natural_type = if self.peek_token_is_keyword(Keyword::Left) {
                     self.next_token();
-                    if self.peek_token_is_keyword("OUTER") {
+                    if self.peek_token_is_keyword(Keyword::Outer) {
                         self.next_token();
                     }
                     "NATURAL LEFT"
-                } else if self.peek_token_is_keyword("RIGHT") {
+                } else if self.peek_token_is_keyword(Keyword::Right) {
                     self.next_token();
-                    if self.peek_token_is_keyword("OUTER") {
+                    if self.peek_token_is_keyword(Keyword::Outer) {
                         self.next_token();
                     }
                     "NATURAL RIGHT"
                 } else {
                     "NATURAL"
                 };
-                if !self.expect_keyword("JOIN") {
+                if !self.expect_keyword(Keyword::Join) {
                     return None;
                 }
                 SmartString::const_new(natural_type)
@@ -713,11 +723,11 @@ impl Parser<'_> {
             let mut using_columns = Vec::new();
 
             if !join_type.starts_with("CROSS") && !join_type.starts_with("NATURAL") {
-                if self.peek_token_is_keyword("ON") {
+                if self.peek_token_is_keyword(Keyword::On) {
                     self.next_token(); // consume ON
                     self.next_token();
                     condition = Some(Box::new(self.parse_expression(Precedence::Lowest)?));
-                } else if self.peek_token_is_keyword("USING") {
+                } else if self.peek_token_is_keyword(Keyword::Using) {
                     self.next_token(); // consume USING
                     if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != "(" {
                         self.add_error(format!(
@@ -756,11 +766,11 @@ impl Parser<'_> {
 
         // After WITH, expect SELECT or INSERT
         self.next_token();
-        if self.cur_token_is_keyword("SELECT") {
+        if self.cur_token_is_keyword(Keyword::Select) {
             let mut select = self.parse_select_statement()?;
             select.with = Some(with_clause);
             Some(Statement::Select(select))
-        } else if self.cur_token_is_keyword("INSERT") {
+        } else if self.cur_token_is_keyword(Keyword::Insert) {
             // WITH ... INSERT INTO ... SELECT
             let mut insert = self.parse_insert_statement()?;
             // The INSERT must use SELECT (not VALUES) for CTE to make sense
@@ -773,11 +783,11 @@ impl Parser<'_> {
                 return None;
             }
             Some(Statement::Insert(insert))
-        } else if self.cur_token_is_keyword("UPDATE") {
+        } else if self.cur_token_is_keyword(Keyword::Update) {
             let mut update = self.parse_update_statement()?;
             update.with = Some(with_clause);
             Some(Statement::Update(update))
-        } else if self.cur_token_is_keyword("DELETE") {
+        } else if self.cur_token_is_keyword(Keyword::Delete) {
             let mut delete = self.parse_delete_statement()?;
             delete.with = Some(with_clause);
             Some(Statement::Delete(delete))
@@ -796,7 +806,7 @@ impl Parser<'_> {
         let mut is_recursive = false;
 
         // Check for RECURSIVE
-        if self.peek_token_is_keyword("RECURSIVE") {
+        if self.peek_token_is_keyword(Keyword::Recursive) {
             self.next_token();
             is_recursive = true;
         }
@@ -855,7 +865,7 @@ impl Parser<'_> {
         }
 
         // Expect AS
-        if !self.expect_keyword("AS") {
+        if !self.expect_keyword(Keyword::As) {
             return None;
         }
 
@@ -870,7 +880,7 @@ impl Parser<'_> {
 
         // Parse the CTE query
         self.next_token();
-        if !self.cur_token_is_keyword("SELECT") {
+        if !self.cur_token_is_keyword(Keyword::Select) {
             self.add_error(format!(
                 "expected SELECT in CTE at {}",
                 self.cur_token.position
@@ -903,7 +913,7 @@ impl Parser<'_> {
         let token = self.cur_token.clone();
 
         // Expect INTO
-        if !self.expect_keyword("INTO") {
+        if !self.expect_keyword(Keyword::Into) {
             return None;
         }
 
@@ -925,7 +935,7 @@ impl Parser<'_> {
         }
 
         // Check if next is VALUES, SELECT, or WITH (CTE)
-        if self.peek_token_is_keyword("SELECT") {
+        if self.peek_token_is_keyword(Keyword::Select) {
             // INSERT INTO ... SELECT
             self.next_token(); // consume SELECT (we're now on SELECT)
             let select_stmt = self.parse_select_statement()?;
@@ -952,13 +962,13 @@ impl Parser<'_> {
             });
         }
 
-        if self.peek_token_is_keyword("WITH") {
+        if self.peek_token_is_keyword(Keyword::With) {
             // INSERT INTO ... WITH ... SELECT
             self.next_token(); // consume WITH
             let with_clause = self.parse_with_clause()?;
 
             // Expect SELECT after WITH clause
-            if !self.expect_keyword("SELECT") {
+            if !self.expect_keyword(Keyword::Select) {
                 return None;
             }
 
@@ -991,7 +1001,7 @@ impl Parser<'_> {
         }
 
         // Expect VALUES
-        if !self.expect_keyword("VALUES") {
+        if !self.expect_keyword(Keyword::Values) {
             return None;
         }
 
@@ -1023,19 +1033,19 @@ impl Parser<'_> {
     /// Parse conflict clause: ON DUPLICATE KEY UPDATE (MySQL) or ON CONFLICT (PostgreSQL)
     /// Returns ConflictClause with all parsed fields.
     fn parse_conflict_clause(&mut self) -> ConflictClause {
-        if !self.peek_token_is_keyword("ON") {
+        if !self.peek_token_is_keyword(Keyword::On) {
             return ConflictClause::default();
         }
         self.next_token(); // consume ON
 
         // Determine MySQL vs PostgreSQL style
-        if self.peek_token_is_keyword("DUPLICATE") {
+        if self.peek_token_is_keyword(Keyword::Duplicate) {
             // MySQL: ON DUPLICATE KEY UPDATE ...
             self.next_token(); // consume DUPLICATE
-            if !self.expect_keyword("KEY") {
+            if !self.expect_keyword(Keyword::Key) {
                 return ConflictClause::default();
             }
-            if !self.expect_keyword("UPDATE") {
+            if !self.expect_keyword(Keyword::Update) {
                 return ConflictClause::default();
             }
             let (update_columns, update_expressions) = self.parse_update_assignments();
@@ -1045,7 +1055,7 @@ impl Parser<'_> {
                 update_expressions,
                 ..Default::default()
             }
-        } else if self.peek_token_is_keyword("CONFLICT") {
+        } else if self.peek_token_is_keyword(Keyword::Conflict) {
             // PostgreSQL: ON CONFLICT [(columns)] DO UPDATE SET ... | DO NOTHING
             self.next_token(); // consume CONFLICT
 
@@ -1066,26 +1076,26 @@ impl Parser<'_> {
             };
 
             // Expect DO
-            if !self.expect_keyword("DO") {
+            if !self.expect_keyword(Keyword::Do) {
                 return ConflictClause::default();
             }
 
             // DO NOTHING or DO UPDATE SET
-            if self.peek_token_is_keyword("NOTHING") {
+            if self.peek_token_is_keyword(Keyword::Nothing) {
                 self.next_token(); // consume NOTHING
                 ConflictClause {
                     do_nothing: true,
                     conflict_target,
                     ..Default::default()
                 }
-            } else if self.peek_token_is_keyword("UPDATE") {
+            } else if self.peek_token_is_keyword(Keyword::Update) {
                 self.next_token(); // consume UPDATE
-                if !self.expect_keyword("SET") {
+                if !self.expect_keyword(Keyword::Set) {
                     return ConflictClause::default();
                 }
                 let (update_columns, update_expressions) = self.parse_update_assignments();
                 // DO UPDATE ... WHERE: the row is updated only where this holds
-                let update_where = if self.peek_token_is_keyword("WHERE") {
+                let update_where = if self.peek_token_is_keyword(Keyword::Where) {
                     self.next_token(); // consume WHERE
                     self.current_clause = "WHERE";
                     self.next_token();
@@ -1161,7 +1171,7 @@ impl Parser<'_> {
 
     /// Parse DISTINCT ON (expr1, expr2, ...) if present after DISTINCT keyword.
     fn parse_distinct_on(&mut self, stmt: &mut SelectStatement) {
-        if self.peek_token_is_keyword("ON") {
+        if self.peek_token_is_keyword(Keyword::On) {
             self.next_token(); // consume ON
             if self.peek_token_is_punctuator("(") {
                 self.next_token(); // consume (
@@ -1202,7 +1212,7 @@ impl Parser<'_> {
 
     /// Parse RETURNING clause for INSERT/UPDATE/DELETE statements
     fn parse_returning_clause(&mut self) -> Vec<Expression> {
-        if !self.peek_token_is_keyword("RETURNING") {
+        if !self.peek_token_is_keyword(Keyword::Returning) {
             return Vec::new();
         }
 
@@ -1274,7 +1284,7 @@ impl Parser<'_> {
         let mut alias = None;
         let mut column_aliases = Vec::new();
 
-        if self.peek_token_is_keyword("AS") {
+        if self.peek_token_is_keyword(Keyword::As) {
             self.next_token(); // consume AS
             if !self.expect_peek_identifier_like() {
                 self.add_error(format!(
@@ -1378,7 +1388,7 @@ impl Parser<'_> {
         let mut alias = None;
         let mut column_aliases = Vec::new();
 
-        if self.peek_token_is_keyword("AS") {
+        if self.peek_token_is_keyword(Keyword::As) {
             self.next_token(); // consume AS
             if !self.expect_peek_identifier_like() {
                 self.add_error(format!(
@@ -1451,7 +1461,7 @@ impl Parser<'_> {
         let table_name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
 
         // Expect SET
-        if !self.expect_keyword("SET") {
+        if !self.expect_keyword(Keyword::Set) {
             return None;
         }
 
@@ -1487,7 +1497,7 @@ impl Parser<'_> {
         }
 
         // Parse WHERE clause
-        let where_clause = if self.peek_token_is_keyword("WHERE") {
+        let where_clause = if self.peek_token_is_keyword(Keyword::Where) {
             self.next_token(); // consume WHERE
             self.current_clause = "WHERE";
             self.next_token();
@@ -1517,7 +1527,7 @@ impl Parser<'_> {
         let token = self.cur_token.clone();
 
         // Expect FROM
-        if !self.expect_keyword("FROM") {
+        if !self.expect_keyword(Keyword::From) {
             return None;
         }
 
@@ -1533,7 +1543,7 @@ impl Parser<'_> {
         let table_name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
 
         // Parse optional alias (AS alias or just alias)
-        let alias = if self.peek_token_is_keyword("AS") {
+        let alias = if self.peek_token_is_keyword(Keyword::As) {
             self.next_token(); // consume AS
             if !self.expect_peek_identifier_like() {
                 return None;
@@ -1543,8 +1553,8 @@ impl Parser<'_> {
                 self.cur_token.literal.clone(),
             ))
         } else if self.peek_token_is(TokenType::Identifier)
-            && !self.peek_token_is_keyword("WHERE")
-            && !self.peek_token_is_keyword("RETURNING")
+            && !self.peek_token_is_keyword(Keyword::Where)
+            && !self.peek_token_is_keyword(Keyword::Returning)
         {
             // Alias without AS keyword (e.g., DELETE FROM users u WHERE ...)
             self.next_token();
@@ -1557,7 +1567,7 @@ impl Parser<'_> {
         };
 
         // Parse WHERE clause
-        let where_clause = if self.peek_token_is_keyword("WHERE") {
+        let where_clause = if self.peek_token_is_keyword(Keyword::Where) {
             self.next_token(); // consume WHERE
             self.current_clause = "WHERE";
             self.next_token();
@@ -1587,7 +1597,7 @@ impl Parser<'_> {
         let token = self.cur_token.clone();
 
         // Optional TABLE keyword
-        if self.peek_token_is_keyword("TABLE") {
+        if self.peek_token_is_keyword(Keyword::Table) {
             self.next_token(); // consume TABLE
         }
 
@@ -1621,22 +1631,22 @@ impl Parser<'_> {
 
     /// Parse a CREATE statement
     fn parse_create_statement(&mut self) -> Option<Statement> {
-        if self.peek_token_is_keyword("TABLE") {
+        if self.peek_token_is_keyword(Keyword::Table) {
             self.next_token();
             self.parse_create_table_statement()
                 .map(Statement::CreateTable)
-        } else if self.peek_token_is_keyword("UNIQUE") {
+        } else if self.peek_token_is_keyword(Keyword::Unique) {
             self.next_token();
-            if !self.expect_keyword("INDEX") {
+            if !self.expect_keyword(Keyword::Index) {
                 return None;
             }
             self.parse_create_index_statement(true)
                 .map(Statement::CreateIndex)
-        } else if self.peek_token_is_keyword("INDEX") {
+        } else if self.peek_token_is_keyword(Keyword::Index) {
             self.next_token();
             self.parse_create_index_statement(false)
                 .map(Statement::CreateIndex)
-        } else if self.peek_token_is_keyword("VIEW") {
+        } else if self.peek_token_is_keyword(Keyword::View) {
             self.next_token();
             self.parse_create_view_statement()
                 .map(Statement::CreateView)
@@ -1654,12 +1664,12 @@ impl Parser<'_> {
         let token = self.cur_token.clone();
 
         // Check for IF NOT EXISTS
-        let if_not_exists = if self.peek_token_is_keyword("IF") {
+        let if_not_exists = if self.peek_token_is_keyword(Keyword::If) {
             self.next_token();
-            if !self.expect_keyword("NOT") {
+            if !self.expect_keyword(Keyword::Not) {
                 return None;
             }
-            if !self.expect_keyword("EXISTS") {
+            if !self.expect_keyword(Keyword::Exists) {
                 return None;
             }
             true
@@ -1674,9 +1684,9 @@ impl Parser<'_> {
         let table_name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
 
         // Check for AS SELECT (CREATE TABLE ... AS SELECT ...)
-        if self.peek_token_is_keyword("AS") {
+        if self.peek_token_is_keyword(Keyword::As) {
             self.next_token(); // consume AS
-            if !self.expect_keyword("SELECT") {
+            if !self.expect_keyword(Keyword::Select) {
                 return None;
             }
             let select_stmt = self.parse_select_statement()?;
@@ -1709,7 +1719,7 @@ impl Parser<'_> {
         // Optional CLUSTER BY (col, ...); CLUSTER is not a reserved word
         let cluster_by = if self.peek_token.literal.eq_ignore_ascii_case("CLUSTER") {
             self.next_token();
-            if !self.peek_token_is_keyword("BY") {
+            if !self.peek_token_is_keyword(Keyword::By) {
                 self.add_error(format!("expected BY at {}", self.peek_token.position));
                 return None;
             }
@@ -1780,7 +1790,7 @@ impl Parser<'_> {
     /// Parse either a column definition or a table-level constraint
     fn parse_column_or_constraint(&mut self) -> Option<ColumnOrConstraint> {
         // Check if this is a table-level constraint (UNIQUE, CHECK, PRIMARY KEY)
-        if self.cur_token_is_keyword("UNIQUE") {
+        if self.cur_token_is_keyword(Keyword::Unique) {
             // UNIQUE(col1, col2, ...)
             if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != "(" {
                 return None;
@@ -1794,7 +1804,7 @@ impl Parser<'_> {
             )));
         }
 
-        if self.cur_token_is_keyword("CHECK") {
+        if self.cur_token_is_keyword(Keyword::Check) {
             // CHECK(expression)
             if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != "(" {
                 return None;
@@ -1809,9 +1819,9 @@ impl Parser<'_> {
             )));
         }
 
-        if self.cur_token_is_keyword("PRIMARY") {
+        if self.cur_token_is_keyword(Keyword::Primary) {
             // PRIMARY KEY(col1, col2, ...)
-            if !self.expect_keyword("KEY") {
+            if !self.expect_keyword(Keyword::Key) {
                 return None;
             }
             if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != "(" {
@@ -1826,9 +1836,9 @@ impl Parser<'_> {
             )));
         }
 
-        if self.cur_token_is_keyword("FOREIGN") {
+        if self.cur_token_is_keyword(Keyword::Foreign) {
             // FOREIGN KEY(col) REFERENCES parent(col) [ON DELETE ...] [ON UPDATE ...]
-            if !self.expect_keyword("KEY") {
+            if !self.expect_keyword(Keyword::Key) {
                 return None;
             }
             if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != "(" {
@@ -1843,7 +1853,7 @@ impl Parser<'_> {
                 return None;
             }
             // Expect REFERENCES
-            if !self.expect_keyword("REFERENCES") {
+            if !self.expect_keyword(Keyword::References) {
                 return None;
             }
             if !self.expect_peek_identifier_like() {
@@ -1918,7 +1928,7 @@ impl Parser<'_> {
 
         // Parse up to two clauses (ON DELETE and/or ON UPDATE in any order)
         for _ in 0..2 {
-            if !self.peek_token_is_keyword("ON") {
+            if !self.peek_token_is_keyword(Keyword::On) {
                 break;
             }
             self.next_token(); // consume ON
@@ -1978,7 +1988,7 @@ impl Parser<'_> {
         if !self.cur_token_is_identifier_like() {
             // Check if it's a reserved keyword and give a better error message
             if self.cur_token.token_type == TokenType::Keyword
-                && Self::is_reserved_keyword(&self.cur_token.literal)
+                && Self::is_reserved_keyword(&self.cur_token)
             {
                 self.add_error(format!(
                     "'{}' is a reserved keyword and cannot be used as a column name. Use double quotes to escape it: \"{}\"",
@@ -2063,14 +2073,14 @@ impl Parser<'_> {
             match constraint_keyword.as_str() {
                 "PRIMARY" => {
                     self.next_token(); // consume PRIMARY
-                    if !self.expect_keyword("KEY") {
+                    if !self.expect_keyword(Keyword::Key) {
                         return None;
                     }
                     constraints.push(ColumnConstraint::PrimaryKey);
                 }
                 "NOT" => {
                     self.next_token(); // consume NOT
-                    if !self.expect_keyword("NULL") {
+                    if !self.expect_keyword(Keyword::Null) {
                         return None;
                     }
                     constraints.push(ColumnConstraint::NotNull);
@@ -2147,12 +2157,12 @@ impl Parser<'_> {
         let token = self.cur_token.clone();
 
         // Check for IF NOT EXISTS
-        let if_not_exists = if self.peek_token_is_keyword("IF") {
+        let if_not_exists = if self.peek_token_is_keyword(Keyword::If) {
             self.next_token();
-            if !self.expect_keyword("NOT") {
+            if !self.expect_keyword(Keyword::Not) {
                 return None;
             }
-            if !self.expect_keyword("EXISTS") {
+            if !self.expect_keyword(Keyword::Exists) {
                 return None;
             }
             true
@@ -2172,7 +2182,7 @@ impl Parser<'_> {
         let index_name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
 
         // Expect ON
-        if !self.expect_keyword("ON") {
+        if !self.expect_keyword(Keyword::On) {
             return None;
         }
 
@@ -2198,7 +2208,7 @@ impl Parser<'_> {
         }
 
         // Parse optional USING clause
-        let index_method = if self.peek_token_is_keyword("USING") {
+        let index_method = if self.peek_token_is_keyword(Keyword::Using) {
             self.next_token(); // consume USING
             self.next_token(); // move to method name
 
@@ -2221,7 +2231,7 @@ impl Parser<'_> {
         };
 
         // Parse optional WITH clause: WITH (key = value, ...)
-        let options = if self.peek_token_is_keyword("WITH") {
+        let options = if self.peek_token_is_keyword(Keyword::With) {
             self.next_token(); // consume WITH
             if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != "(" {
                 self.add_error(format!(
@@ -2309,12 +2319,12 @@ impl Parser<'_> {
         let token = self.cur_token.clone();
 
         // Check for IF NOT EXISTS
-        let if_not_exists = if self.peek_token_is_keyword("IF") {
+        let if_not_exists = if self.peek_token_is_keyword(Keyword::If) {
             self.next_token();
-            if !self.expect_keyword("NOT") {
+            if !self.expect_keyword(Keyword::Not) {
                 return None;
             }
-            if !self.expect_keyword("EXISTS") {
+            if !self.expect_keyword(Keyword::Exists) {
                 return None;
             }
             true
@@ -2329,19 +2339,19 @@ impl Parser<'_> {
         let view_name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
 
         // Expect AS
-        if !self.expect_keyword("AS") {
+        if !self.expect_keyword(Keyword::As) {
             return None;
         }
 
         // Expect SELECT or WITH (for CTEs)
         self.next_token();
-        let query = if self.cur_token_is_keyword("SELECT") {
+        let query = if self.cur_token_is_keyword(Keyword::Select) {
             self.parse_select_statement()?
-        } else if self.cur_token_is_keyword("WITH") {
+        } else if self.cur_token_is_keyword(Keyword::With) {
             // Parse CTE and attach to SELECT
             let with_clause = self.parse_with_clause()?;
             self.next_token();
-            if !self.cur_token_is_keyword("SELECT") {
+            if !self.cur_token_is_keyword(Keyword::Select) {
                 self.add_error(format!(
                     "expected SELECT after WITH clause in CREATE VIEW at {}",
                     self.cur_token.position
@@ -2369,13 +2379,13 @@ impl Parser<'_> {
 
     /// Parse a DROP statement
     fn parse_drop_statement(&mut self) -> Option<Statement> {
-        if self.peek_token_is_keyword("TABLE") {
+        if self.peek_token_is_keyword(Keyword::Table) {
             self.next_token();
             self.parse_drop_table_statement().map(Statement::DropTable)
-        } else if self.peek_token_is_keyword("INDEX") {
+        } else if self.peek_token_is_keyword(Keyword::Index) {
             self.next_token();
             self.parse_drop_index_statement().map(Statement::DropIndex)
-        } else if self.peek_token_is_keyword("VIEW") {
+        } else if self.peek_token_is_keyword(Keyword::View) {
             self.next_token();
             self.parse_drop_view_statement().map(Statement::DropView)
         } else {
@@ -2392,9 +2402,9 @@ impl Parser<'_> {
         let token = self.cur_token.clone();
 
         // Check for IF EXISTS
-        let if_exists = if self.peek_token_is_keyword("IF") {
+        let if_exists = if self.peek_token_is_keyword(Keyword::If) {
             self.next_token();
-            if !self.expect_keyword("EXISTS") {
+            if !self.expect_keyword(Keyword::Exists) {
                 return None;
             }
             true
@@ -2420,9 +2430,9 @@ impl Parser<'_> {
         let token = self.cur_token.clone();
 
         // Check for IF EXISTS
-        let if_exists = if self.peek_token_is_keyword("IF") {
+        let if_exists = if self.peek_token_is_keyword(Keyword::If) {
             self.next_token();
-            if !self.expect_keyword("EXISTS") {
+            if !self.expect_keyword(Keyword::Exists) {
                 return None;
             }
             true
@@ -2437,7 +2447,7 @@ impl Parser<'_> {
         let index_name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
 
         // Check for optional ON clause
-        let table_name = if self.peek_token_is_keyword("ON") {
+        let table_name = if self.peek_token_is_keyword(Keyword::On) {
             self.next_token();
             if !self.expect_peek_identifier_like() {
                 return None;
@@ -2463,9 +2473,9 @@ impl Parser<'_> {
         let token = self.cur_token.clone();
 
         // Check for IF EXISTS
-        let if_exists = if self.peek_token_is_keyword("IF") {
+        let if_exists = if self.peek_token_is_keyword(Keyword::If) {
             self.next_token();
-            if !self.expect_keyword("EXISTS") {
+            if !self.expect_keyword(Keyword::Exists) {
                 return None;
             }
             true
@@ -2491,7 +2501,7 @@ impl Parser<'_> {
         let token = self.cur_token.clone();
 
         // Expect TABLE
-        if !self.expect_keyword("TABLE") {
+        if !self.expect_keyword(Keyword::Table) {
             return None;
         }
 
@@ -2520,7 +2530,7 @@ impl Parser<'_> {
             match operation_keyword.as_str() {
                 "CLUSTER" => {
                     // CLUSTER BY (col, ...)
-                    if !self.peek_token_is_keyword("BY") {
+                    if !self.peek_token_is_keyword(Keyword::By) {
                         self.add_error(format!("expected BY at {}", self.peek_token.position));
                         return None;
                     }
@@ -2545,7 +2555,7 @@ impl Parser<'_> {
                 }
                 "ADD" => {
                     // Check for optional COLUMN keyword
-                    if self.peek_token_is_keyword("COLUMN") {
+                    if self.peek_token_is_keyword(Keyword::Column) {
                         self.next_token();
                     }
                     self.next_token();
@@ -2560,7 +2570,7 @@ impl Parser<'_> {
                 }
                 "DROP" => {
                     // Check for optional COLUMN keyword
-                    let column_keyword = self.peek_token_is_keyword("COLUMN");
+                    let column_keyword = self.peek_token_is_keyword(Keyword::Column);
                     if column_keyword {
                         self.next_token();
                     }
@@ -2570,7 +2580,7 @@ impl Parser<'_> {
                     // DROP CLUSTER BY; without BY, CLUSTER names a column
                     if !column_keyword
                         && self.cur_token.literal.eq_ignore_ascii_case("CLUSTER")
-                        && self.peek_token_is_keyword("BY")
+                        && self.peek_token_is_keyword(Keyword::By)
                     {
                         self.next_token();
                         (AlterTableOperation::DropClusterBy, None, None, None, None)
@@ -2597,7 +2607,7 @@ impl Parser<'_> {
                         }
                         let col_name =
                             Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
-                        if !self.expect_keyword("TO") {
+                        if !self.expect_keyword(Keyword::To) {
                             return None;
                         }
                         if !self.expect_peek_identifier_like() {
@@ -2635,7 +2645,7 @@ impl Parser<'_> {
                 }
                 "MODIFY" => {
                     // Check for optional COLUMN keyword
-                    if self.peek_token_is_keyword("COLUMN") {
+                    if self.peek_token_is_keyword(Keyword::Column) {
                         self.next_token();
                     }
                     self.next_token();
@@ -2674,14 +2684,14 @@ impl Parser<'_> {
         let token = self.cur_token.clone();
 
         // Check for optional TRANSACTION keyword
-        if self.peek_token_is_keyword("TRANSACTION") {
+        if self.peek_token_is_keyword(Keyword::Transaction) {
             self.next_token();
         }
 
         // Check for ISOLATION LEVEL
-        let isolation_level = if self.peek_token_is_keyword("ISOLATION") {
+        let isolation_level = if self.peek_token_is_keyword(Keyword::Isolation) {
             self.next_token();
-            if !self.expect_keyword("LEVEL") {
+            if !self.expect_keyword(Keyword::Level) {
                 return None;
             }
             self.next_token();
@@ -2690,16 +2700,16 @@ impl Parser<'_> {
             let isolation = match level.as_str() {
                 "SNAPSHOT" | "SERIALIZABLE" => level,
                 "REPEATABLE" => {
-                    if self.peek_token_is_keyword("READ") {
+                    if self.peek_token_is_keyword(Keyword::Read) {
                         self.next_token();
                     }
                     SmartString::const_new("REPEATABLE READ")
                 }
                 "READ" => {
-                    if self.peek_token_is_keyword("UNCOMMITTED") {
+                    if self.peek_token_is_keyword(Keyword::Uncommitted) {
                         self.next_token();
                         SmartString::const_new("READ UNCOMMITTED")
-                    } else if self.peek_token_is_keyword("COMMITTED") {
+                    } else if self.peek_token_is_keyword(Keyword::Committed) {
                         self.next_token();
                         SmartString::const_new("READ COMMITTED")
                     } else {
@@ -2734,7 +2744,7 @@ impl Parser<'_> {
         let token = self.cur_token.clone();
 
         // Check for optional TRANSACTION keyword
-        if self.peek_token_is_keyword("TRANSACTION") {
+        if self.peek_token_is_keyword(Keyword::Transaction) {
             self.next_token();
         }
 
@@ -2746,14 +2756,14 @@ impl Parser<'_> {
         let token = self.cur_token.clone();
 
         // Check for optional TRANSACTION keyword
-        if self.peek_token_is_keyword("TRANSACTION") {
+        if self.peek_token_is_keyword(Keyword::Transaction) {
             self.next_token();
         }
 
         // Check for TO SAVEPOINT clause
-        let savepoint_name = if self.peek_token_is_keyword("TO") {
+        let savepoint_name = if self.peek_token_is_keyword(Keyword::To) {
             self.next_token();
-            if self.peek_token_is_keyword("SAVEPOINT") {
+            if self.peek_token_is_keyword(Keyword::Savepoint) {
                 self.next_token();
             }
             if !self.expect_peek_identifier_like() {
@@ -2795,7 +2805,7 @@ impl Parser<'_> {
         let token = self.cur_token.clone();
 
         // Optional SAVEPOINT keyword
-        if self.peek_token_is_keyword("SAVEPOINT") {
+        if self.peek_token_is_keyword(Keyword::Savepoint) {
             self.next_token();
         }
 
@@ -2830,7 +2840,7 @@ impl Parser<'_> {
         self.next_token();
         // Expect '=' or 'TO'
         let is_equals = self.cur_token_is(TokenType::Operator) && self.cur_token.literal == "=";
-        if !is_equals && !self.cur_token_is_keyword("TO") {
+        if !is_equals && !self.cur_token_is_keyword(Keyword::To) {
             self.add_error(format!(
                 "expected '=' or 'TO' after variable name at {}",
                 self.cur_token.position
@@ -2877,16 +2887,16 @@ impl Parser<'_> {
     fn parse_show_statement(&mut self) -> Option<Statement> {
         let token = self.cur_token.clone();
 
-        if self.peek_token_is_keyword("TABLES") {
+        if self.peek_token_is_keyword(Keyword::Tables) {
             self.next_token();
             Some(Statement::ShowTables(ShowTablesStatement { token }))
-        } else if self.peek_token_is_keyword("VIEWS") {
+        } else if self.peek_token_is_keyword(Keyword::Views) {
             self.next_token();
             Some(Statement::ShowViews(ShowViewsStatement { token }))
-        } else if self.peek_token_is_keyword("CREATE") {
+        } else if self.peek_token_is_keyword(Keyword::Create) {
             self.next_token();
             // Check for TABLE or VIEW
-            if self.peek_token_is_keyword("TABLE") {
+            if self.peek_token_is_keyword(Keyword::Table) {
                 self.next_token();
                 if !self.expect_peek_identifier_like() {
                     return None;
@@ -2897,7 +2907,7 @@ impl Parser<'_> {
                     token,
                     table_name,
                 }))
-            } else if self.peek_token_is_keyword("VIEW") {
+            } else if self.peek_token_is_keyword(Keyword::View) {
                 self.next_token();
                 if !self.expect_peek_identifier_like() {
                     return None;
@@ -2915,9 +2925,11 @@ impl Parser<'_> {
                 ));
                 None
             }
-        } else if self.peek_token_is_keyword("INDEXES") || self.peek_token_is_keyword("INDEX") {
+        } else if self.peek_token_is_keyword(Keyword::Indexes)
+            || self.peek_token_is_keyword(Keyword::Index)
+        {
             self.next_token();
-            if !self.expect_keyword("FROM") {
+            if !self.expect_keyword(Keyword::From) {
                 return None;
             }
             if !self.expect_peek_identifier_like() {
@@ -2970,7 +2982,7 @@ impl Parser<'_> {
         let token = self.cur_token.clone();
 
         // Check for ANALYZE option
-        let analyze = if self.peek_token_is_keyword("ANALYZE") {
+        let analyze = if self.peek_token_is_keyword(Keyword::Analyze) {
             self.next_token();
             true
         } else {
@@ -3087,7 +3099,7 @@ impl Parser<'_> {
         }
 
         // Expect FROM keyword
-        if !self.expect_keyword("FROM") {
+        if !self.expect_keyword(Keyword::From) {
             return None;
         }
 
@@ -3119,7 +3131,7 @@ impl Parser<'_> {
         let mut null_string = None;
 
         // Parse optional WITH (options)
-        if self.peek_token_is_keyword("WITH") {
+        if self.peek_token_is_keyword(Keyword::With) {
             self.next_token(); // consume WITH
 
             if !self.peek_token_is_punctuator("(") {

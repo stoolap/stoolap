@@ -25,16 +25,16 @@ use std::sync::LazyLock;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Position {
     /// Byte offset, starting at 0
-    pub offset: usize,
+    pub offset: u32,
     /// Line number, starting at 1
-    pub line: usize,
+    pub line: u32,
     /// Column number, starting at 1
-    pub column: usize,
+    pub column: u32,
 }
 
 impl Position {
     /// Create a new position
-    pub fn new(offset: usize, line: usize, column: usize) -> Self {
+    pub fn new(offset: u32, line: u32, column: u32) -> Self {
         Self {
             offset,
             line,
@@ -119,6 +119,8 @@ pub struct Token {
     pub position: Position,
     /// Whether this token was double-quoted (identifier with string fallback)
     pub quoted: bool,
+    /// The keyword a Keyword token spells
+    pub keyword: Option<Keyword>,
 }
 
 impl Token {
@@ -129,11 +131,30 @@ impl Token {
     /// comment or identifier meant a second heap string and Arc.
     #[inline]
     pub fn new(token_type: TokenType, literal: impl Into<SmartString>, position: Position) -> Self {
+        let literal = literal.into();
+        let keyword = if token_type == TokenType::Keyword {
+            lookup_keyword(&literal)
+        } else {
+            None
+        };
         Self {
             token_type,
-            literal: literal.into(),
+            literal,
             position,
             quoted: false,
+            keyword,
+        }
+    }
+
+    /// Create a keyword token, spelled in upper case
+    #[inline]
+    pub fn from_keyword(keyword: Keyword, position: Position) -> Self {
+        Self {
+            token_type: TokenType::Keyword,
+            literal: SmartString::new(keyword.as_str()),
+            position,
+            quoted: false,
+            keyword: Some(keyword),
         }
     }
 
@@ -149,6 +170,7 @@ impl Token {
             literal: literal.into(),
             position,
             quoted: true,
+            keyword: None,
         }
     }
 
@@ -159,6 +181,7 @@ impl Token {
             literal: SmartString::from(message.as_ref()),
             position,
             quoted: false,
+            keyword: None,
         }
     }
 
@@ -170,6 +193,7 @@ impl Token {
             literal: SmartString::const_new(""),
             position,
             quoted: false,
+            keyword: None,
         }
     }
 
@@ -183,9 +207,9 @@ impl Token {
         self.token_type == TokenType::Error
     }
 
-    /// Check if this is a keyword with the given value (case-insensitive)
-    pub fn is_keyword(&self, keyword: &str) -> bool {
-        self.token_type == TokenType::Keyword && self.literal.eq_ignore_ascii_case(keyword)
+    /// Check if this is the given keyword
+    pub fn is_keyword(&self, keyword: Keyword) -> bool {
+        self.keyword == Some(keyword)
     }
 
     /// Check if this is an operator with the given value
@@ -224,208 +248,229 @@ impl fmt::Display for Token {
     }
 }
 
-/// SQL keywords (case-insensitive)
-pub static KEYWORDS: &[&str] = &[
-    "SELECT",
-    "FROM",
-    "WHERE",
-    "INSERT",
-    "INTO",
-    "VALUES",
-    "UPDATE",
-    "SET",
-    "DELETE",
-    "CREATE",
-    "TABLE",
-    "DROP",
-    "ALTER",
-    "ADD",
-    "COLUMN",
-    "AND",
-    "OR",
-    "XOR",
-    "NOT",
-    "NULL",
-    "PRIMARY",
-    "PRAGMA",
-    "KEY",
-    "AUTO_INCREMENT",
-    "AUTOINCREMENT",
-    "DEFAULT",
-    "AS",
-    "OF",
-    "DISTINCT",
-    "ORDER",
-    "BY",
-    "ASC",
-    "DESC",
-    "LIMIT",
-    "OFFSET",
-    "GROUP",
-    "HAVING",
-    "JOIN",
-    "INNER",
-    "OUTER",
-    "LEFT",
-    "RIGHT",
-    "FULL",
-    "ON",
-    "DUPLICATE",
-    "CONFLICT",
-    "DO",
-    "NOTHING",
-    "USING",
-    "CROSS",
-    "NATURAL",
-    "TRUE",
-    "FALSE",
-    "INTEGER",
-    "FLOAT",
-    "TEXT",
-    "BOOLEAN",
-    "BOOL",
-    "TIMESTAMP",
-    "TIMESTAMPTZ",
-    "DATETIME",
-    "DATE",
-    "TIME",
-    "JSON",
-    "VECTOR",
-    "CASE",
-    "CAST",
-    "EXTRACT",
-    "WHEN",
-    "THEN",
-    "ELSE",
-    "END",
-    "BETWEEN",
-    "IN",
-    "IS",
-    "LIKE",
-    "ILIKE",
-    "ESCAPE",
-    "GLOB",
-    "REGEXP",
-    "RLIKE",
-    "EXISTS",
-    "ALL",
-    "ANY",
-    "SOME",
-    "IF",
-    "UNION",
-    "INTERSECT",
-    "EXCEPT",
-    "WITH",
-    "UNIQUE",
-    "CHECK",
-    "FOREIGN",
-    "REFERENCES",
-    "SHOW",
-    "DESCRIBE",
-    "DESC",
-    "TABLES",
-    "VIEWS",
-    "INDEXES",
-    "CASCADE",
-    "RESTRICT",
-    "INDEX",
-    "VIEW",
-    "TRIGGER",
-    "PROCEDURE",
-    "FUNCTION",
-    "RETURNING",
-    "OVER",
-    "PARTITION",
-    "RANGE",
-    "ROWS",
-    "WINDOW",
-    "UNBOUNDED",
-    "BEGIN",
-    "TRANSACTION",
-    "COMMIT",
-    "ROLLBACK",
-    "SAVEPOINT",
-    "PRECEDING",
-    "FOLLOWING",
-    "CURRENT",
-    "ROW",
-    "MODIFY",
-    "RENAME",
-    "TO",
-    "VARCHAR",
-    "CHAR",
-    "STRING",
-    "BIGINT",
-    "TINYINT",
-    "SMALLINT",
-    "REAL",
-    "DOUBLE",
-    "DECIMAL",
-    "NUMERIC",
-    "INT",
-    "ISOLATION",
-    "LEVEL",
-    "READ",
-    "COMMITTED",
-    "UNCOMMITTED",
-    "INTERVAL",
-    "RECURSIVE",
-    "UNION",
-    "INTERSECT",
-    "EXCEPT",
-    "NULLS",
-    "FIRST",
-    "LAST",
-    "TRUNCATE",
-    "SOME",
-    "FILTER",
-    "RETURNING",
-    "EXPLAIN",
-    "ANALYZE",
-    "FETCH",
-    "NEXT",
-    "ONLY",
-    "VACUUM",
-    "COPY",
-    "FORMAT",
-    "HEADER",
-    "DELIMITER",
-];
-
-/// Compiled keyword set for O(1) lookups
-/// Uses FxHashSet for fast hashing of short strings
-static KEYWORD_SET: LazyLock<FxHashSet<&'static str>> = LazyLock::new(|| {
-    let mut set = FxHashSet::with_capacity_and_hasher(KEYWORDS.len(), Default::default());
-    for kw in KEYWORDS {
-        set.insert(*kw);
-    }
-    set
-});
-
-/// Check if a string is an SQL keyword (case-insensitive)
-/// Uses a compiled HashSet for O(1) lookups instead of O(n) linear search
-#[inline]
-pub fn is_keyword(s: &str) -> bool {
-    // Fast path: check if already uppercase and in set
-    if KEYWORD_SET.contains(s) {
-        return true;
-    }
-    // Slow path: uppercase and check (only for non-uppercase input)
-    // Use a stack buffer for small strings to avoid allocation
-    if s.len() <= 32 {
-        let mut buf = [0u8; 32];
-        let bytes = s.as_bytes();
-        for (i, &b) in bytes.iter().enumerate() {
-            buf[i] = b.to_ascii_uppercase();
+macro_rules! keywords {
+    ($($variant:ident = $text:literal,)*) => {
+        /// An SQL keyword, matched in any letter case
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum Keyword {
+            $($variant,)*
         }
-        // SAFETY: We only uppercased ASCII bytes, result is valid UTF-8
-        let upper = unsafe { std::str::from_utf8_unchecked(&buf[..s.len()]) };
-        KEYWORD_SET.contains(upper)
-    } else {
-        // Very long identifiers (rare) - fall back to allocation
-        let upper = s.to_uppercase();
-        KEYWORD_SET.contains(upper.as_str())
+
+        impl Keyword {
+            /// Every keyword
+            pub const ALL: &'static [Keyword] = &[$(Keyword::$variant,)*];
+
+            /// The keyword in upper case, as the lexer reports it
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Keyword::$variant => $text,)*
+                }
+            }
+        }
+    };
+}
+
+keywords! {
+    Select = "SELECT",
+    From = "FROM",
+    Where = "WHERE",
+    Insert = "INSERT",
+    Into = "INTO",
+    Values = "VALUES",
+    Update = "UPDATE",
+    Set = "SET",
+    Delete = "DELETE",
+    Create = "CREATE",
+    Table = "TABLE",
+    Drop = "DROP",
+    Alter = "ALTER",
+    Add = "ADD",
+    Column = "COLUMN",
+    And = "AND",
+    Or = "OR",
+    Xor = "XOR",
+    Not = "NOT",
+    Null = "NULL",
+    Primary = "PRIMARY",
+    Pragma = "PRAGMA",
+    Key = "KEY",
+    AutoIncrement = "AUTO_INCREMENT",
+    Autoincrement = "AUTOINCREMENT",
+    Default = "DEFAULT",
+    As = "AS",
+    Of = "OF",
+    Distinct = "DISTINCT",
+    Order = "ORDER",
+    By = "BY",
+    Asc = "ASC",
+    Desc = "DESC",
+    Limit = "LIMIT",
+    Offset = "OFFSET",
+    Group = "GROUP",
+    Having = "HAVING",
+    Join = "JOIN",
+    Inner = "INNER",
+    Outer = "OUTER",
+    Left = "LEFT",
+    Right = "RIGHT",
+    Full = "FULL",
+    On = "ON",
+    Duplicate = "DUPLICATE",
+    Conflict = "CONFLICT",
+    Do = "DO",
+    Nothing = "NOTHING",
+    Using = "USING",
+    Cross = "CROSS",
+    Natural = "NATURAL",
+    True = "TRUE",
+    False = "FALSE",
+    Integer = "INTEGER",
+    Float = "FLOAT",
+    Text = "TEXT",
+    Boolean = "BOOLEAN",
+    Bool = "BOOL",
+    Timestamp = "TIMESTAMP",
+    Timestamptz = "TIMESTAMPTZ",
+    Datetime = "DATETIME",
+    Date = "DATE",
+    Time = "TIME",
+    Json = "JSON",
+    Vector = "VECTOR",
+    Case = "CASE",
+    Cast = "CAST",
+    Extract = "EXTRACT",
+    When = "WHEN",
+    Then = "THEN",
+    Else = "ELSE",
+    End = "END",
+    Between = "BETWEEN",
+    In = "IN",
+    Is = "IS",
+    Like = "LIKE",
+    Ilike = "ILIKE",
+    Escape = "ESCAPE",
+    Glob = "GLOB",
+    Regexp = "REGEXP",
+    Rlike = "RLIKE",
+    Exists = "EXISTS",
+    All = "ALL",
+    Any = "ANY",
+    Some = "SOME",
+    If = "IF",
+    Union = "UNION",
+    Intersect = "INTERSECT",
+    Except = "EXCEPT",
+    With = "WITH",
+    Unique = "UNIQUE",
+    Check = "CHECK",
+    Foreign = "FOREIGN",
+    References = "REFERENCES",
+    Show = "SHOW",
+    Describe = "DESCRIBE",
+    Tables = "TABLES",
+    Views = "VIEWS",
+    Indexes = "INDEXES",
+    Cascade = "CASCADE",
+    Restrict = "RESTRICT",
+    Index = "INDEX",
+    View = "VIEW",
+    Trigger = "TRIGGER",
+    Procedure = "PROCEDURE",
+    Function = "FUNCTION",
+    Returning = "RETURNING",
+    Over = "OVER",
+    Partition = "PARTITION",
+    Range = "RANGE",
+    Rows = "ROWS",
+    Window = "WINDOW",
+    Unbounded = "UNBOUNDED",
+    Begin = "BEGIN",
+    Transaction = "TRANSACTION",
+    Commit = "COMMIT",
+    Rollback = "ROLLBACK",
+    Savepoint = "SAVEPOINT",
+    Preceding = "PRECEDING",
+    Following = "FOLLOWING",
+    Current = "CURRENT",
+    Row = "ROW",
+    Modify = "MODIFY",
+    Rename = "RENAME",
+    To = "TO",
+    Varchar = "VARCHAR",
+    Char = "CHAR",
+    String = "STRING",
+    Bigint = "BIGINT",
+    Tinyint = "TINYINT",
+    Smallint = "SMALLINT",
+    Real = "REAL",
+    Double = "DOUBLE",
+    Decimal = "DECIMAL",
+    Numeric = "NUMERIC",
+    Int = "INT",
+    Isolation = "ISOLATION",
+    Level = "LEVEL",
+    Read = "READ",
+    Committed = "COMMITTED",
+    Uncommitted = "UNCOMMITTED",
+    Interval = "INTERVAL",
+    Recursive = "RECURSIVE",
+    Nulls = "NULLS",
+    First = "FIRST",
+    Last = "LAST",
+    Truncate = "TRUNCATE",
+    Filter = "FILTER",
+    Explain = "EXPLAIN",
+    Analyze = "ANALYZE",
+    Fetch = "FETCH",
+    Next = "NEXT",
+    Only = "ONLY",
+    Vacuum = "VACUUM",
+    Copy = "COPY",
+    Format = "FORMAT",
+    Header = "HEADER",
+    Delimiter = "DELIMITER",
+}
+
+/// Longer than every keyword
+const KEYWORD_MAX_LEN: usize = 16;
+
+/// More than the keywords that share any one bucket
+const KEYWORD_BUCKET_WIDTH: usize = 8;
+
+/// A word's bucket: its length and first letter, the same in either case
+const fn keyword_bucket(word: &[u8]) -> usize {
+    word.len() * 32 + (word[0] & 31) as usize
+}
+
+/// Keywords by bucket, built at compile time, so a lookup compares a few
+/// candidates in place
+static KEYWORD_BUCKETS: [[Option<Keyword>; KEYWORD_BUCKET_WIDTH]; (KEYWORD_MAX_LEN + 1) * 32] = {
+    let mut buckets = [[None; KEYWORD_BUCKET_WIDTH]; (KEYWORD_MAX_LEN + 1) * 32];
+    let mut i = 0;
+    while i < Keyword::ALL.len() {
+        let keyword = Keyword::ALL[i];
+        let bucket = keyword_bucket(keyword.as_str().as_bytes());
+        let mut slot = 0;
+        while buckets[bucket][slot].is_some() {
+            slot += 1;
+        }
+        buckets[bucket][slot] = Some(keyword);
+        i += 1;
     }
+    buckets
+};
+
+/// The keyword `word` spells, in any letter case
+#[inline]
+pub fn lookup_keyword(word: &str) -> Option<Keyword> {
+    let bytes = word.as_bytes();
+    if bytes.is_empty() || bytes.len() > KEYWORD_MAX_LEN {
+        return None;
+    }
+    KEYWORD_BUCKETS[keyword_bucket(bytes)]
+        .iter()
+        .map_while(|keyword| *keyword)
+        .find(|keyword| keyword.as_str().as_bytes().eq_ignore_ascii_case(bytes))
 }
 
 /// SQL operators
@@ -526,9 +571,8 @@ mod tests {
         let token = Token::new(TokenType::Keyword, "SELECT", Position::new(0, 1, 1));
         assert_eq!(token.token_type, TokenType::Keyword);
         assert_eq!(token.literal, "SELECT");
-        assert!(token.is_keyword("SELECT"));
-        assert!(token.is_keyword("select"));
-        assert!(!token.is_keyword("FROM"));
+        assert!(token.is_keyword(Keyword::Select));
+        assert!(!token.is_keyword(Keyword::From));
     }
 
     #[test]
@@ -547,12 +591,24 @@ mod tests {
     }
 
     #[test]
-    fn test_is_keyword() {
-        assert!(is_keyword("SELECT"));
-        assert!(is_keyword("select"));
-        assert!(is_keyword("Select"));
-        assert!(!is_keyword("SELEC"));
-        assert!(!is_keyword("mycolumn"));
+    fn test_lookup_keyword() {
+        assert_eq!(lookup_keyword("SELECT"), Some(Keyword::Select));
+        assert_eq!(lookup_keyword("select"), Some(Keyword::Select));
+        assert_eq!(lookup_keyword("Select"), Some(Keyword::Select));
+        assert_eq!(
+            lookup_keyword("auto_increment"),
+            Some(Keyword::AutoIncrement)
+        );
+        assert_eq!(lookup_keyword("SELEC"), None);
+        assert_eq!(lookup_keyword("mycolumn"), None);
+        assert_eq!(lookup_keyword("ın"), None);
+        assert_eq!(lookup_keyword(""), None);
+        for &keyword in Keyword::ALL {
+            assert!(keyword.as_str().len() <= KEYWORD_MAX_LEN, "{keyword:?}");
+            assert_eq!(lookup_keyword(keyword.as_str()), Some(keyword));
+            let lower = keyword.as_str().to_lowercase();
+            assert_eq!(lookup_keyword(&lower), Some(keyword));
+        }
     }
 
     #[test]

@@ -19,7 +19,7 @@ use crate::common::SmartString;
 use super::ast::*;
 use super::parser::Parser;
 use super::precedence::Precedence;
-use super::token::{Token, TokenType};
+use super::token::{Keyword, Token, TokenType};
 
 /// The token of an identifier the parser has already consumed
 fn identifier_token(ident: &Identifier) -> Token {
@@ -52,25 +52,24 @@ impl Parser<'_> {
     fn is_infix_token(&self) -> bool {
         match self.peek_token.token_type {
             TokenType::Operator => true,
-            TokenType::Keyword => {
-                let kw = self.peek_token.literal.to_uppercase();
-                matches!(
-                    kw.as_str(),
-                    "AND"
-                        | "OR"
-                        | "XOR"
-                        | "LIKE"
-                        | "ILIKE"
-                        | "GLOB"
-                        | "REGEXP"
-                        | "RLIKE"
-                        | "IS"
-                        | "IN"
-                        | "BETWEEN"
-                        | "AS"
-                        | "NOT"
+            TokenType::Keyword => matches!(
+                self.peek_token.keyword,
+                Some(
+                    Keyword::And
+                        | Keyword::Or
+                        | Keyword::Xor
+                        | Keyword::Like
+                        | Keyword::Ilike
+                        | Keyword::Glob
+                        | Keyword::Regexp
+                        | Keyword::Rlike
+                        | Keyword::Is
+                        | Keyword::In
+                        | Keyword::Between
+                        | Keyword::As
+                        | Keyword::Not
                 )
-            }
+            ),
             TokenType::Punctuator => {
                 matches!(self.peek_token.literal.as_str(), "." | "(" | "[")
             }
@@ -282,36 +281,39 @@ impl Parser<'_> {
 
     /// Parse a keyword expression (TRUE, FALSE, NULL, CASE, CAST, etc.)
     fn parse_keyword_expression(&mut self) -> Option<Expression> {
-        let keyword = self.cur_token.literal.to_uppercase();
-        match keyword.as_str() {
-            "TRUE" => Some(Expression::BooleanLiteral(BooleanLiteral {
+        match self.cur_token.keyword {
+            Some(Keyword::True) => Some(Expression::BooleanLiteral(BooleanLiteral {
                 token: self.cur_token.clone(),
                 value: true,
             })),
-            "FALSE" => Some(Expression::BooleanLiteral(BooleanLiteral {
+            Some(Keyword::False) => Some(Expression::BooleanLiteral(BooleanLiteral {
                 token: self.cur_token.clone(),
                 value: false,
             })),
-            "NULL" => Some(Expression::NullLiteral(NullLiteral {
+            Some(Keyword::Null) => Some(Expression::NullLiteral(NullLiteral {
                 token: self.cur_token.clone(),
             })),
-            "CASE" => self.parse_case_expression(),
+            Some(Keyword::Case) => self.parse_case_expression(),
             // Without the shape that follows them, CAST, EXTRACT and INTERVAL
             // are columns of that name
-            "CAST" if self.peek_token_is_punctuator("(") => self.parse_cast_expression(),
-            "EXTRACT" if self.peek_token_is_punctuator("(") => self.parse_extract_expression(),
-            "EXISTS" => self.parse_exists_expression(),
-            "NOT" => self.parse_not_expression(),
-            "INTERVAL"
+            Some(Keyword::Cast) if self.peek_token_is_punctuator("(") => {
+                self.parse_cast_expression()
+            }
+            Some(Keyword::Extract) if self.peek_token_is_punctuator("(") => {
+                self.parse_extract_expression()
+            }
+            Some(Keyword::Exists) => self.parse_exists_expression(),
+            Some(Keyword::Not) => self.parse_not_expression(),
+            Some(Keyword::Interval)
                 if self.peek_token_is(TokenType::String)
                     || self.peek_token_is(TokenType::Integer) =>
             {
                 self.parse_interval_literal()
             }
-            "DEFAULT" => Some(Expression::Default(DefaultExpression {
+            Some(Keyword::Default) => Some(Expression::Default(DefaultExpression {
                 token: self.cur_token.clone(),
             })),
-            "TIMESTAMP" | "DATE" | "TIME" => {
+            Some(Keyword::Timestamp | Keyword::Date | Keyword::Time) => {
                 // These can be either typed literals (TIMESTAMP 'value') or column names
                 if self.peek_token_is(TokenType::String) {
                     self.parse_typed_literal()
@@ -324,7 +326,14 @@ impl Parser<'_> {
                 }
             }
             // Keywords that can also be function names when followed by (
-            "LEFT" | "RIGHT" | "CHAR" | "FIRST" | "LAST" | "TRUNCATE" => {
+            Some(
+                Keyword::Left
+                | Keyword::Right
+                | Keyword::Char
+                | Keyword::First
+                | Keyword::Last
+                | Keyword::Truncate,
+            ) => {
                 if self.peek_token_is_punctuator("(") {
                     // Treat as function call
                     let ident = Expression::Identifier(Identifier::new(
@@ -342,19 +351,19 @@ impl Parser<'_> {
                 }
             }
             // Non-reserved keywords can be used as column names
-            _ if !Self::is_reserved_keyword(&keyword) => Some(Expression::Identifier(
+            _ if !Self::is_reserved_keyword(&self.cur_token) => Some(Expression::Identifier(
                 Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone()),
             )),
             _ => {
                 if self.current_clause.is_empty() {
                     self.add_error(format!(
                         "'{}' cannot be used here, expected expression",
-                        keyword
+                        self.cur_token.literal
                     ));
                 } else {
                     self.add_error(format!(
                         "'{}' cannot be used in {} clause, expected expression",
-                        keyword, self.current_clause
+                        self.cur_token.literal, self.current_clause
                     ));
                 }
                 None
@@ -377,15 +386,15 @@ impl Parser<'_> {
                 || self.peek_token.is_punctuator(",")
                 || self.peek_token.is_punctuator(";")
                 || self.peek_token.is_punctuator(")")
-                || self.peek_token_is_keyword("FROM")
-                || self.peek_token_is_keyword("WHERE")
-                || self.peek_token_is_keyword("ORDER")
-                || self.peek_token_is_keyword("GROUP")
-                || self.peek_token_is_keyword("HAVING")
-                || self.peek_token_is_keyword("LIMIT")
-                || self.peek_token_is_keyword("UNION")
-                || self.peek_token_is_keyword("INTERSECT")
-                || self.peek_token_is_keyword("EXCEPT")
+                || self.peek_token_is_keyword(Keyword::From)
+                || self.peek_token_is_keyword(Keyword::Where)
+                || self.peek_token_is_keyword(Keyword::Order)
+                || self.peek_token_is_keyword(Keyword::Group)
+                || self.peek_token_is_keyword(Keyword::Having)
+                || self.peek_token_is_keyword(Keyword::Limit)
+                || self.peek_token_is_keyword(Keyword::Union)
+                || self.peek_token_is_keyword(Keyword::Intersect)
+                || self.peek_token_is_keyword(Keyword::Except)
             {
                 return Some(Expression::Star(StarExpression { token }));
             }
@@ -452,7 +461,7 @@ impl Parser<'_> {
         let token = self.cur_token.clone();
 
         // Check for subquery
-        if self.peek_token_is_keyword("SELECT") {
+        if self.peek_token_is_keyword(Keyword::Select) {
             self.next_token(); // Move to SELECT
             let subquery = self.parse_select_statement()?;
 
@@ -549,9 +558,9 @@ impl Parser<'_> {
         self.next_token();
 
         // Check for ALL/ANY/SOME subquery comparison
-        if self.cur_token_is_keyword("ALL")
-            || self.cur_token_is_keyword("ANY")
-            || self.cur_token_is_keyword("SOME")
+        if self.cur_token_is_keyword(Keyword::All)
+            || self.cur_token_is_keyword(Keyword::Any)
+            || self.cur_token_is_keyword(Keyword::Some)
         {
             return self.parse_all_any_expression(left, token, operator);
         }
@@ -575,7 +584,7 @@ impl Parser<'_> {
     ) -> Option<Expression> {
         use super::ast::{AllAnyExpression, AllAnyType};
 
-        let all_any_type = if self.cur_token_is_keyword("ALL") {
+        let all_any_type = if self.cur_token_is_keyword(Keyword::All) {
             AllAnyType::All
         } else {
             AllAnyType::Any // SOME is an alias for ANY
@@ -597,7 +606,7 @@ impl Parser<'_> {
         self.next_token();
 
         // Parse subquery
-        if !self.cur_token_is_keyword("SELECT") {
+        if !self.cur_token_is_keyword(Keyword::Select) {
             self.add_error(format!(
                 "expected SELECT in {} subquery at {}",
                 all_any_type, self.cur_token.position
@@ -627,11 +636,10 @@ impl Parser<'_> {
 
     /// Parse a keyword infix expression (AND, OR, LIKE, IS, IN, BETWEEN, AS)
     fn parse_keyword_infix(&mut self, left: Expression) -> Option<Expression> {
-        let keyword = self.cur_token.literal.to_uppercase();
-        match keyword.as_str() {
-            "AND" | "OR" | "XOR" => {
+        match self.cur_token.keyword {
+            Some(Keyword::And | Keyword::Or | Keyword::Xor) => {
                 let token = self.cur_token.clone();
-                let operator = keyword.clone();
+                let operator = self.cur_token.literal.clone();
                 let precedence = self.cur_precedence();
 
                 self.next_token();
@@ -644,50 +652,53 @@ impl Parser<'_> {
                     Box::new(right),
                 )))
             }
-            "LIKE" | "ILIKE" | "GLOB" | "REGEXP" | "RLIKE" => {
-                self.parse_like_expression(left, keyword.clone(), false)
+            Some(
+                Keyword::Like | Keyword::Ilike | Keyword::Glob | Keyword::Regexp | Keyword::Rlike,
+            ) => {
+                let operator = self.cur_token.literal.clone();
+                self.parse_like_expression(left, operator, false)
             }
-            "IS" => self.parse_is_expression(left),
-            "IN" => self.parse_in_expression(left, false),
-            "BETWEEN" => self.parse_between_expression(left, false),
-            "AS" => self.parse_alias_expression(left),
-            "NOT" => {
+            Some(Keyword::Is) => self.parse_is_expression(left),
+            Some(Keyword::In) => self.parse_in_expression(left, false),
+            Some(Keyword::Between) => self.parse_between_expression(left, false),
+            Some(Keyword::As) => self.parse_alias_expression(left),
+            Some(Keyword::Not) => {
                 // Handle NOT IN, NOT BETWEEN, NOT LIKE, NOT ILIKE, NOT GLOB, NOT REGEXP, NOT RLIKE
-                if self.peek_token_is_keyword("IN") {
+                if self.peek_token_is_keyword(Keyword::In) {
                     self.next_token(); // consume IN
                     self.parse_in_expression(left, true)
-                } else if self.peek_token_is_keyword("BETWEEN") {
+                } else if self.peek_token_is_keyword(Keyword::Between) {
                     self.next_token(); // consume BETWEEN
                     self.parse_between_expression(left, true)
-                } else if self.peek_token_is_keyword("LIKE") {
+                } else if self.peek_token_is_keyword(Keyword::Like) {
                     self.next_token(); // consume LIKE
                     self.parse_like_expression(
                         left,
                         crate::common::SmartString::const_new("LIKE"),
                         true,
                     )
-                } else if self.peek_token_is_keyword("ILIKE") {
+                } else if self.peek_token_is_keyword(Keyword::Ilike) {
                     self.next_token(); // consume ILIKE
                     self.parse_like_expression(
                         left,
                         crate::common::SmartString::const_new("ILIKE"),
                         true,
                     )
-                } else if self.peek_token_is_keyword("GLOB") {
+                } else if self.peek_token_is_keyword(Keyword::Glob) {
                     self.next_token(); // consume GLOB
                     self.parse_like_expression(
                         left,
                         crate::common::SmartString::const_new("GLOB"),
                         true,
                     )
-                } else if self.peek_token_is_keyword("REGEXP") {
+                } else if self.peek_token_is_keyword(Keyword::Regexp) {
                     self.next_token(); // consume REGEXP
                     self.parse_like_expression(
                         left,
                         crate::common::SmartString::const_new("REGEXP"),
                         true,
                     )
-                } else if self.peek_token_is_keyword("RLIKE") {
+                } else if self.peek_token_is_keyword(Keyword::Rlike) {
                     self.next_token(); // consume RLIKE
                     self.parse_like_expression(
                         left,
@@ -709,7 +720,7 @@ impl Parser<'_> {
             _ => {
                 self.add_error(format!(
                     "unexpected infix keyword: {} at {}",
-                    keyword, self.cur_token.position
+                    self.cur_token.literal, self.cur_token.position
                 ));
                 None
             }
@@ -778,12 +789,8 @@ impl Parser<'_> {
         self.next_token();
 
         Some(Expression::QualifiedIdentifier(QualifiedIdentifier {
-            token: identifier_token(&left_ident),
-            qualifier: Box::new(left_ident),
-            name: Box::new(Identifier::new(
-                self.cur_token.clone(),
-                self.cur_token.literal.clone(),
-            )),
+            qualifier: left_ident,
+            name: Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone()),
         }))
     }
 
@@ -813,11 +820,11 @@ impl Parser<'_> {
         if self.peek_token_is_punctuator(")") {
             self.next_token();
             // Check for FILTER clause
-            if self.peek_token_is_keyword("FILTER") {
+            if self.peek_token_is_keyword(Keyword::Filter) {
                 call.filter = self.parse_filter_clause();
             }
             // Check for OVER clause (window function with no arguments)
-            if self.peek_token_is_keyword("OVER") {
+            if self.peek_token_is_keyword(Keyword::Over) {
                 return self.parse_window_expression(call);
             }
             return Some(Expression::FunctionCall(Box::new(call)));
@@ -831,7 +838,7 @@ impl Parser<'_> {
             }));
 
             // Check for ORDER BY inside function
-            if self.peek_token_is_keyword("ORDER") {
+            if self.peek_token_is_keyword(Keyword::Order) {
                 self.parse_function_order_by(&mut call);
             }
 
@@ -841,12 +848,12 @@ impl Parser<'_> {
             }
 
             // Check for FILTER clause
-            if self.peek_token_is_keyword("FILTER") {
+            if self.peek_token_is_keyword(Keyword::Filter) {
                 call.filter = self.parse_filter_clause();
             }
 
             // Check for OVER clause (window function with * argument)
-            if self.peek_token_is_keyword("OVER") {
+            if self.peek_token_is_keyword(Keyword::Over) {
                 return self.parse_window_expression(call);
             }
 
@@ -854,7 +861,7 @@ impl Parser<'_> {
         }
 
         // Check for DISTINCT
-        if self.peek_token_is_keyword("DISTINCT") {
+        if self.peek_token_is_keyword(Keyword::Distinct) {
             self.next_token();
             call.is_distinct = true;
         }
@@ -876,7 +883,7 @@ impl Parser<'_> {
 
         // Special handling for POSITION(substring IN string) syntax
         // SQL standard: POSITION(substring IN string) returns position of substring in string
-        if call.function == "POSITION" && self.peek_token_is_keyword("IN") {
+        if call.function == "POSITION" && self.peek_token_is_keyword(Keyword::In) {
             self.next_token(); // consume IN
             self.next_token(); // move to string expression
 
@@ -909,7 +916,7 @@ impl Parser<'_> {
         }
 
         // Check for ORDER BY inside function
-        if self.peek_token_is_keyword("ORDER") {
+        if self.peek_token_is_keyword(Keyword::Order) {
             self.parse_function_order_by(&mut call);
         }
 
@@ -919,12 +926,12 @@ impl Parser<'_> {
         }
 
         // Check for FILTER clause
-        if self.peek_token_is_keyword("FILTER") {
+        if self.peek_token_is_keyword(Keyword::Filter) {
             call.filter = self.parse_filter_clause();
         }
 
         // Check for OVER clause (window function)
-        if self.peek_token_is_keyword("OVER") {
+        if self.peek_token_is_keyword(Keyword::Over) {
             return self.parse_window_expression(call);
         }
 
@@ -945,7 +952,7 @@ impl Parser<'_> {
         }
 
         // Expect WHERE keyword
-        if !self.expect_keyword("WHERE") {
+        if !self.expect_keyword(Keyword::Where) {
             self.add_error(format!(
                 "expected WHERE after FILTER( at {}",
                 self.cur_token.position
@@ -973,7 +980,7 @@ impl Parser<'_> {
     fn parse_function_order_by(&mut self, call: &mut FunctionCall) {
         self.next_token(); // consume ORDER
 
-        if !self.expect_keyword("BY") {
+        if !self.expect_keyword(Keyword::By) {
             return;
         }
 
@@ -1034,9 +1041,9 @@ impl Parser<'_> {
         let mut frame = None;
 
         // Parse PARTITION BY
-        if self.peek_token_is_keyword("PARTITION") {
+        if self.peek_token_is_keyword(Keyword::Partition) {
             self.next_token(); // consume PARTITION
-            if !self.expect_keyword("BY") {
+            if !self.expect_keyword(Keyword::By) {
                 return None;
             }
 
@@ -1055,9 +1062,9 @@ impl Parser<'_> {
         }
 
         // Parse ORDER BY
-        if self.peek_token_is_keyword("ORDER") {
+        if self.peek_token_is_keyword(Keyword::Order) {
             self.next_token(); // consume ORDER
-            if !self.expect_keyword("BY") {
+            if !self.expect_keyword(Keyword::By) {
                 return None;
             }
 
@@ -1076,7 +1083,7 @@ impl Parser<'_> {
         }
 
         // Parse window frame (ROWS/RANGE)
-        if self.peek_token_is_keyword("ROWS") || self.peek_token_is_keyword("RANGE") {
+        if self.peek_token_is_keyword(Keyword::Rows) || self.peek_token_is_keyword(Keyword::Range) {
             frame = self.parse_window_frame();
         }
 
@@ -1101,7 +1108,7 @@ impl Parser<'_> {
     /// Parse a window frame (ROWS/RANGE BETWEEN ... AND ...)
     fn parse_window_frame(&mut self) -> Option<WindowFrame> {
         self.next_token();
-        let unit = if self.cur_token_is_keyword("ROWS") {
+        let unit = if self.cur_token_is_keyword(Keyword::Rows) {
             WindowFrameUnit::Rows
         } else {
             WindowFrameUnit::Range
@@ -1110,11 +1117,11 @@ impl Parser<'_> {
         self.next_token();
 
         // Check for BETWEEN
-        let (start, end) = if self.cur_token_is_keyword("BETWEEN") {
+        let (start, end) = if self.cur_token_is_keyword(Keyword::Between) {
             self.next_token();
             let start = self.parse_window_frame_bound()?;
 
-            if !self.expect_keyword("AND") {
+            if !self.expect_keyword(Keyword::And) {
                 return None;
             }
             self.next_token();
@@ -1131,16 +1138,16 @@ impl Parser<'_> {
 
     /// Parse a window frame bound
     fn parse_window_frame_bound(&mut self) -> Option<WindowFrameBound> {
-        if self.cur_token_is_keyword("CURRENT") {
-            if !self.expect_keyword("ROW") {
+        if self.cur_token_is_keyword(Keyword::Current) {
+            if !self.expect_keyword(Keyword::Row) {
                 return None;
             }
             Some(WindowFrameBound::CurrentRow)
-        } else if self.cur_token_is_keyword("UNBOUNDED") {
+        } else if self.cur_token_is_keyword(Keyword::Unbounded) {
             self.next_token();
-            if self.cur_token_is_keyword("PRECEDING") {
+            if self.cur_token_is_keyword(Keyword::Preceding) {
                 Some(WindowFrameBound::UnboundedPreceding)
-            } else if self.cur_token_is_keyword("FOLLOWING") {
+            } else if self.cur_token_is_keyword(Keyword::Following) {
                 Some(WindowFrameBound::UnboundedFollowing)
             } else {
                 self.add_error(format!(
@@ -1153,9 +1160,9 @@ impl Parser<'_> {
             // N PRECEDING or N FOLLOWING
             let expr = self.parse_expression(Precedence::Lowest)?;
             self.next_token();
-            if self.cur_token_is_keyword("PRECEDING") {
+            if self.cur_token_is_keyword(Keyword::Preceding) {
                 Some(WindowFrameBound::Preceding(Box::new(expr)))
-            } else if self.cur_token_is_keyword("FOLLOWING") {
+            } else if self.cur_token_is_keyword(Keyword::Following) {
                 Some(WindowFrameBound::Following(Box::new(expr)))
             } else {
                 self.add_error(format!(
@@ -1193,7 +1200,7 @@ impl Parser<'_> {
         let mut operator = "IS".to_string();
 
         // Check for IS NOT
-        if self.peek_token_is_keyword("NOT") {
+        if self.peek_token_is_keyword(Keyword::Not) {
             self.next_token();
             operator = "IS NOT".to_string();
         }
@@ -1201,7 +1208,7 @@ impl Parser<'_> {
         self.next_token();
 
         // Handle IS NULL / IS NOT NULL
-        if self.cur_token_is_keyword("NULL") {
+        if self.cur_token_is_keyword(Keyword::Null) {
             return Some(Expression::Infix(InfixExpression::new(
                 token,
                 Box::new(left),
@@ -1213,7 +1220,7 @@ impl Parser<'_> {
         }
 
         // Handle IS TRUE / IS NOT TRUE
-        if self.cur_token_is_keyword("TRUE") {
+        if self.cur_token_is_keyword(Keyword::True) {
             return Some(Expression::Infix(InfixExpression::new(
                 token,
                 Box::new(left),
@@ -1226,7 +1233,7 @@ impl Parser<'_> {
         }
 
         // Handle IS FALSE / IS NOT FALSE
-        if self.cur_token_is_keyword("FALSE") {
+        if self.cur_token_is_keyword(Keyword::False) {
             return Some(Expression::Infix(InfixExpression::new(
                 token,
                 Box::new(left),
@@ -1239,8 +1246,8 @@ impl Parser<'_> {
         }
 
         // Handle IS DISTINCT FROM / IS NOT DISTINCT FROM
-        if self.cur_token_is_keyword("DISTINCT") {
-            if !self.expect_keyword("FROM") {
+        if self.cur_token_is_keyword(Keyword::Distinct) {
+            if !self.expect_keyword(Keyword::From) {
                 return None;
             }
             self.next_token();
@@ -1279,7 +1286,7 @@ impl Parser<'_> {
         self.next_token();
 
         // Check for subquery
-        if self.peek_token_is_keyword("SELECT") {
+        if self.peek_token_is_keyword(Keyword::Select) {
             self.next_token();
             let subquery = self.parse_select_statement()?;
 
@@ -1362,7 +1369,7 @@ impl Parser<'_> {
         self.next_token();
         let lower = self.parse_expression(Precedence::Equals)?;
 
-        if !self.expect_keyword("AND") {
+        if !self.expect_keyword(Keyword::And) {
             return None;
         }
 
@@ -1397,7 +1404,7 @@ impl Parser<'_> {
         let pattern = self.parse_expression(precedence)?;
 
         // Check for optional ESCAPE clause
-        let escape = if self.peek_token_is_keyword("ESCAPE") {
+        let escape = if self.peek_token_is_keyword(Keyword::Escape) {
             self.next_token(); // consume ESCAPE
             self.next_token(); // move to escape character
             Some(Box::new(self.parse_expression(Precedence::Lowest)?))
@@ -1440,20 +1447,20 @@ impl Parser<'_> {
         let mut else_value = None;
 
         // Check if this is a simple CASE (with value) or searched CASE
-        if !self.peek_token_is_keyword("WHEN") {
+        if !self.peek_token_is_keyword(Keyword::When) {
             self.next_token();
             value = Some(Box::new(self.parse_expression(Precedence::Lowest)?));
         }
 
         // Parse WHEN clauses
-        while self.peek_token_is_keyword("WHEN") {
+        while self.peek_token_is_keyword(Keyword::When) {
             self.next_token(); // consume WHEN
             let when_token = self.cur_token.clone();
 
             self.next_token();
             let condition = self.parse_expression(Precedence::Lowest)?;
 
-            if !self.expect_keyword("THEN") {
+            if !self.expect_keyword(Keyword::Then) {
                 return None;
             }
 
@@ -1476,13 +1483,13 @@ impl Parser<'_> {
         }
 
         // Parse ELSE clause
-        if self.peek_token_is_keyword("ELSE") {
+        if self.peek_token_is_keyword(Keyword::Else) {
             self.next_token(); // consume ELSE
             self.next_token();
             else_value = Some(Box::new(self.parse_expression(Precedence::Lowest)?));
         }
 
-        if !self.expect_keyword("END") {
+        if !self.expect_keyword(Keyword::End) {
             return None;
         }
 
@@ -1510,7 +1517,7 @@ impl Parser<'_> {
         // Use Equals precedence to prevent AS from being consumed as an alias
         let expr = self.parse_expression(Precedence::Equals)?;
 
-        if !self.expect_keyword("AS") {
+        if !self.expect_keyword(Keyword::As) {
             return None;
         }
 
@@ -1595,7 +1602,7 @@ impl Parser<'_> {
         }
 
         // Expect FROM keyword
-        if !self.expect_keyword("FROM") {
+        if !self.expect_keyword(Keyword::From) {
             return None;
         }
 
@@ -1631,6 +1638,7 @@ impl Parser<'_> {
                     literal: field.to_lowercase(),
                     position: token.position,
                     quoted: false,
+                    keyword: None,
                 },
                 value: field.to_lowercase(),
                 type_hint: None,
@@ -1659,7 +1667,7 @@ impl Parser<'_> {
         }
 
         self.next_token();
-        if !self.cur_token_is_keyword("SELECT") {
+        if !self.cur_token_is_keyword(Keyword::Select) {
             self.add_error(format!(
                 "expected SELECT in EXISTS subquery at {}",
                 self.cur_token.position
@@ -1688,7 +1696,7 @@ impl Parser<'_> {
         let token = self.cur_token.clone();
 
         // Check for NOT EXISTS
-        if self.peek_token_is_keyword("EXISTS") {
+        if self.peek_token_is_keyword(Keyword::Exists) {
             self.next_token();
             let exists_expr = self.parse_exists_expression()?;
             return Some(Expression::Prefix(PrefixExpression::new(
@@ -2060,7 +2068,7 @@ impl Parser<'_> {
         };
 
         // Expect AS keyword
-        if !self.expect_keyword("AS") {
+        if !self.expect_keyword(Keyword::As) {
             return None;
         }
 
@@ -2078,9 +2086,9 @@ impl Parser<'_> {
         let mut frame = None;
 
         // Parse PARTITION BY
-        if self.peek_token_is_keyword("PARTITION") {
+        if self.peek_token_is_keyword(Keyword::Partition) {
             self.next_token(); // consume PARTITION
-            if !self.expect_keyword("BY") {
+            if !self.expect_keyword(Keyword::By) {
                 return None;
             }
 
@@ -2099,9 +2107,9 @@ impl Parser<'_> {
         }
 
         // Parse ORDER BY
-        if self.peek_token_is_keyword("ORDER") {
+        if self.peek_token_is_keyword(Keyword::Order) {
             self.next_token(); // consume ORDER
-            if !self.expect_keyword("BY") {
+            if !self.expect_keyword(Keyword::By) {
                 return None;
             }
 
@@ -2120,7 +2128,7 @@ impl Parser<'_> {
         }
 
         // Parse window frame (ROWS/RANGE)
-        if self.peek_token_is_keyword("ROWS") || self.peek_token_is_keyword("RANGE") {
+        if self.peek_token_is_keyword(Keyword::Rows) || self.peek_token_is_keyword(Keyword::Range) {
             frame = self.parse_window_frame();
         }
 
@@ -2146,21 +2154,21 @@ impl Parser<'_> {
         let expression = self.parse_expression(Precedence::Lowest)?;
 
         let mut ascending = true;
-        if self.peek_token_is_keyword("ASC") {
+        if self.peek_token_is_keyword(Keyword::Asc) {
             self.next_token();
             ascending = true;
-        } else if self.peek_token_is_keyword("DESC") {
+        } else if self.peek_token_is_keyword(Keyword::Desc) {
             self.next_token();
             ascending = false;
         }
 
         // Parse optional NULLS FIRST / NULLS LAST
-        let nulls_first = if self.peek_token_is_keyword("NULLS") {
+        let nulls_first = if self.peek_token_is_keyword(Keyword::Nulls) {
             self.next_token(); // consume NULLS
-            if self.peek_token_is_keyword("FIRST") {
+            if self.peek_token_is_keyword(Keyword::First) {
                 self.next_token(); // consume FIRST
                 Some(true)
-            } else if self.peek_token_is_keyword("LAST") {
+            } else if self.peek_token_is_keyword(Keyword::Last) {
                 self.next_token(); // consume LAST
                 Some(false)
             } else {

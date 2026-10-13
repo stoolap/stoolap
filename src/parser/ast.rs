@@ -164,7 +164,7 @@ impl Expression {
     pub fn position(&self) -> Position {
         match self {
             Expression::Identifier(e) => e.position,
-            Expression::QualifiedIdentifier(e) => e.token.position,
+            Expression::QualifiedIdentifier(e) => e.qualifier.position,
             Expression::IntegerLiteral(e) => e.token.position,
             Expression::FloatLiteral(e) => e.token.position,
             Expression::StringLiteral(e) => e.token.position,
@@ -255,9 +255,8 @@ impl fmt::Display for Identifier {
 /// Qualified identifier (table.column)
 #[derive(Debug, Clone, PartialEq)]
 pub struct QualifiedIdentifier {
-    pub token: Token,
-    pub qualifier: Box<Identifier>,
-    pub name: Box<Identifier>,
+    pub qualifier: Identifier,
+    pub name: Identifier,
 }
 
 impl fmt::Display for QualifiedIdentifier {
@@ -435,7 +434,14 @@ impl InfixOperator {
     #[inline]
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
-        match s.to_uppercase().as_str() {
+        // Every operator below fits in 24 bytes
+        let mut buf = [0u8; 24];
+        let Some(upper) = buf.get_mut(..s.len()) else {
+            return InfixOperator::Other;
+        };
+        upper.copy_from_slice(s.as_bytes());
+        upper.make_ascii_uppercase();
+        match std::str::from_utf8(upper).unwrap_or_default() {
             "=" => InfixOperator::Equal,
             "<>" | "!=" => InfixOperator::NotEqual,
             "<" => InfixOperator::LessThan,
@@ -492,7 +498,14 @@ impl PrefixOperator {
     #[inline]
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
-        match s.to_uppercase().as_str() {
+        // Every operator below fits in 8 bytes
+        let mut buf = [0u8; 8];
+        let Some(upper) = buf.get_mut(..s.len()) else {
+            return PrefixOperator::Other;
+        };
+        upper.copy_from_slice(s.as_bytes());
+        upper.make_ascii_uppercase();
+        match std::str::from_utf8(upper).unwrap_or_default() {
             "-" => PrefixOperator::Negate,
             "NOT" => PrefixOperator::Not,
             "+" => PrefixOperator::Plus,
@@ -2446,8 +2459,32 @@ mod tests {
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn test_identifier_and_expression_size() {
-        assert_eq!(std::mem::size_of::<Identifier>(), 64);
-        assert_eq!(std::mem::size_of::<Expression>(), 120);
+        assert_eq!(std::mem::size_of::<Identifier>(), 48);
+        assert_eq!(std::mem::size_of::<Expression>(), 96);
+    }
+
+    #[test]
+    fn test_operator_from_str_in_any_case() {
+        assert_eq!(InfixOperator::from_str("and"), InfixOperator::And);
+        assert_eq!(InfixOperator::from_str("Not Like"), InfixOperator::NotLike);
+        assert_eq!(
+            InfixOperator::from_str("is not distinct from"),
+            InfixOperator::IsNotDistinctFrom
+        );
+        assert_eq!(
+            InfixOperator::from_str("->>"),
+            InfixOperator::JsonAccessText
+        );
+        assert_eq!(
+            InfixOperator::from_str("an operator longer than the buffer"),
+            InfixOperator::Other
+        );
+        assert_eq!(PrefixOperator::from_str("not"), PrefixOperator::Not);
+        assert_eq!(PrefixOperator::from_str("~"), PrefixOperator::BitwiseNot);
+        assert_eq!(
+            PrefixOperator::from_str("not a prefix"),
+            PrefixOperator::Other
+        );
     }
 
     #[test]
@@ -2462,15 +2499,11 @@ mod tests {
     #[test]
     fn test_qualified_identifier_display() {
         let qi = QualifiedIdentifier {
-            token: make_token(TokenType::Identifier, "users"),
-            qualifier: Box::new(Identifier::new(
+            qualifier: Identifier::new(
                 make_token(TokenType::Identifier, "users"),
                 "users".to_string(),
-            )),
-            name: Box::new(Identifier::new(
-                make_token(TokenType::Identifier, "id"),
-                "id".to_string(),
-            )),
+            ),
+            name: Identifier::new(make_token(TokenType::Identifier, "id"), "id".to_string()),
         };
         assert_eq!(qi.to_string(), "users.id");
     }
