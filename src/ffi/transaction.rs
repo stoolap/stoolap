@@ -19,7 +19,6 @@ use std::os::raw::c_char;
 use std::panic;
 use std::sync::Arc;
 
-use crate::api::Database;
 use crate::core::types::IsolationLevel;
 
 use super::types::{
@@ -59,7 +58,6 @@ pub unsafe extern "C" fn stoolap_begin(db: *mut StoolapDB, out_tx: *mut *mut Sto
                 tx: Some(tx),
                 last_error: None,
                 _db_keepalive: handle.db.keepalive(),
-                _engine_keepalive: handle._engine_keepalive.clone(),
             });
             *out_tx = Box::into_raw(tx_handle);
             STOOLAP_OK
@@ -120,7 +118,6 @@ pub unsafe extern "C" fn stoolap_begin_with_isolation(
                     tx: Some(tx),
                     last_error: None,
                     _db_keepalive: handle.db.keepalive(),
-                    _engine_keepalive: handle._engine_keepalive.clone(),
                 });
                 *out_tx = Box::into_raw(tx_handle);
                 STOOLAP_OK
@@ -351,14 +348,7 @@ pub unsafe extern "C" fn stoolap_tx_commit(tx: *mut StoolapTx) -> i32 {
             }
         };
 
-        // Retry registry cleanup: the tx keepalive Arcs may have been the
-        // last non-registry references to the engine-owning DatabaseInner.
-        let engine_owning = match &handle._engine_keepalive {
-            Some(arc) => Arc::clone(arc),
-            None => Arc::clone(&handle._db_keepalive),
-        };
         drop(handle);
-        Database::try_unregister_arc(&engine_owning);
 
         rc
     }));
@@ -395,12 +385,7 @@ pub unsafe extern "C" fn stoolap_tx_rollback(tx: *mut StoolapTx) -> i32 {
             }
         };
 
-        let engine_owning = match &handle._engine_keepalive {
-            Some(arc) => Arc::clone(arc),
-            None => Arc::clone(&handle._db_keepalive),
-        };
         drop(handle);
-        Database::try_unregister_arc(&engine_owning);
 
         rc
     }));

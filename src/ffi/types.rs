@@ -74,10 +74,6 @@ pub struct StoolapNamedParam {
 pub struct StoolapDB {
     pub(crate) db: Database,
     pub(crate) last_error: Option<CString>,
-    /// Holds a reference to the original (engine-owning) DatabaseInner.
-    /// Prevents premature engine shutdown when the original handle is closed
-    /// before its clones. `None` for the original handle, `Some` for clones.
-    pub(crate) _engine_keepalive: Option<Arc<DatabaseInner>>,
 }
 
 /// Opaque handle wrapping a [`Statement`].
@@ -89,13 +85,8 @@ pub struct StoolapStmt {
     /// Cached column name CStrings (computed on first query, reused thereafter).
     pub(crate) cached_columns: Option<Arc<Vec<CString>>>,
     /// Keeps the originating `DatabaseInner` alive so the `Statement`'s `Weak`
-    /// reference can be upgraded. For original handles this is the engine-owning
-    /// inner; for clone handles it is the clone's own (non-owning) inner.
+    /// reference can be upgraded, and with it the engine.
     pub(crate) _db_keepalive: Arc<DatabaseInner>,
-    /// For statements prepared from a clone handle, holds the engine-owning
-    /// `DatabaseInner` to prevent `close_engine()` after the original handle
-    /// is closed. `None` when prepared from an original (non-clone) handle.
-    pub(crate) _engine_keepalive: Option<Arc<DatabaseInner>>,
 }
 
 /// Opaque handle wrapping a [`Transaction`].
@@ -105,9 +96,6 @@ pub struct StoolapTx {
     /// Keeps the originating `DatabaseInner` alive so the transaction's
     /// storage references remain valid.
     pub(crate) _db_keepalive: Arc<DatabaseInner>,
-    /// For transactions begun from a clone handle, holds the engine-owning
-    /// `DatabaseInner` to prevent `close_engine()`. `None` for original handles.
-    pub(crate) _engine_keepalive: Option<Arc<DatabaseInner>>,
 }
 
 /// Opaque handle wrapping a [`Rows`] result set.
