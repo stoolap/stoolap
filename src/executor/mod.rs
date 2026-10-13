@@ -645,7 +645,7 @@ impl Executor {
             Statement::DropView(stmt) => self.execute_drop_view(stmt, ctx),
 
             // DML statements
-            Statement::Insert(stmt) => self.execute_insert(stmt, ctx),
+            Statement::Insert(stmt) => self.execute_insert(stmt, ctx, compiled),
             Statement::Update(stmt) => self.execute_update(stmt, ctx),
             Statement::Delete(stmt) => self.execute_delete(stmt, ctx),
             Statement::Truncate(stmt) => self.execute_truncate(stmt, ctx),

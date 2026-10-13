@@ -405,6 +405,7 @@ impl Executor {
                 CompiledExecution::PkUpdate(_)
                 | CompiledExecution::PkDelete(_)
                 | CompiledExecution::Insert(_)
+                | CompiledExecution::ConflictInsert(_)
                 | CompiledExecution::CountDistinct(_)
                 | CompiledExecution::CountStar(_)
                 | CompiledExecution::JoinResidual(_) => return None,
@@ -550,6 +551,7 @@ impl Executor {
             CompiledExecution::PkUpdate(_)
             | CompiledExecution::PkDelete(_)
             | CompiledExecution::Insert(_)
+            | CompiledExecution::ConflictInsert(_)
             | CompiledExecution::CountDistinct(_)
             | CompiledExecution::CountStar(_)
             | CompiledExecution::JoinResidual(_) => return None,
