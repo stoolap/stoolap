@@ -17,7 +17,7 @@
 //! a delete committed after it, must not hide the sealed copy
 
 use stoolap::storage::expression::ConstBoolExpr;
-use stoolap::{Database, Engine, IsolationLevel, Value};
+use stoolap::{Database, Engine, IsolationLevel, Row, Value};
 
 fn sealed_row(dir: &tempfile::TempDir) -> Database {
     let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
@@ -96,4 +96,42 @@ fn test_snapshot_join_reads_sealed_inner_row_under_later_update() {
         .query_one("SELECT t.val FROM o JOIN t ON o.tid = t.id", ())
         .unwrap();
     assert_eq!(val, "orig");
+}
+
+#[test]
+fn test_has_visible_row_counts_own_uncommitted_insert() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = sealed_row(&dir);
+    let tx = db
+        .engine()
+        .begin_transaction_with_level(IsolationLevel::SnapshotIsolation)
+        .unwrap();
+    let mut table = tx.get_table("t").unwrap();
+    table
+        .insert(Row::from_values(vec![
+            Value::Integer(5),
+            Value::text("mine"),
+        ]))
+        .unwrap();
+    assert!(table.has_visible_row(5).unwrap(), "own insert");
+    assert!(table.has_visible_row(1).unwrap(), "sealed row");
+}
+
+#[test]
+fn test_has_visible_row_skips_rows_committed_after_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = sealed_row(&dir);
+    let tx = db
+        .engine()
+        .begin_transaction_with_level(IsolationLevel::SnapshotIsolation)
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (7, 'later')", ()).unwrap();
+    db.execute("UPDATE t SET val = 'new' WHERE id = 1", ())
+        .unwrap();
+    let table = tx.get_table("t").unwrap();
+    assert!(!table.has_visible_row(7).unwrap(), "insert after begin");
+    assert!(
+        table.has_visible_row(1).unwrap(),
+        "sealed copy under a later update"
+    );
 }

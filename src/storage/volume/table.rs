@@ -3845,6 +3845,13 @@ impl Table for SegmentedTable {
         self.segment_mgr.row_exists(row_id)
     }
 
+    fn has_visible_row(&self, row_id: i64) -> Result<bool> {
+        if self.hot.has_visible_row(row_id)? {
+            return Ok(true);
+        }
+        Ok(self.segment_mgr.has_segments() && self.find_segment_row(row_id)?.is_some())
+    }
+
     fn collect_hot_row_ids_into(&self, dest: &mut FxHashSet<i64>) {
         self.hot.collect_hot_row_ids_into(dest);
     }
@@ -8303,6 +8310,9 @@ mod tests {
             for (id, _) in &self.rows {
                 dest.insert(*id);
             }
+        }
+        fn has_visible_row(&self, row_id: i64) -> Result<bool> {
+            Ok(self.rows.iter().any(|(id, _)| *id == row_id))
         }
         fn delete(&mut self, _: Option<&dyn Expression>) -> Result<i32> {
             Ok(0)
