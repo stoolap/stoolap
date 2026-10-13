@@ -2873,6 +2873,24 @@ impl Table for MVCCTable {
         Ok(self.version_store.has_committed_row(row_id))
     }
 
+    fn has_visible_row(&self, row_id: i64) -> Result<bool> {
+        let txn_versions = self
+            .txn_versions
+            .read()
+            .map_err(|_| Error::internal("transaction versions lock poisoned"))?;
+        if txn_versions.get_local_version(row_id).is_some() {
+            return Ok(true);
+        }
+        drop(txn_versions);
+        // A row with no committed version here, the case of every sealed row
+        // no one changed, has nothing visible: one lookup instead of the walk
+        Ok(self.version_store.has_committed_row(row_id)
+            && self
+                .version_store
+                .has_any_visible_version(&[row_id], self.txn_id)
+                .is_some())
+    }
+
     fn try_claim_row(&self, row_id: i64) -> Result<()> {
         // The claim and its write set entry change together, so a failed
         // statement's release cannot fall between them

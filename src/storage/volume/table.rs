@@ -2580,10 +2580,13 @@ impl SegmentedTable {
     }
 
     fn find_segment_row(&self, row_id: i64) -> Result<Option<(u64, Arc<FrozenVolume>, usize)>> {
-        // Hot buffer shadows cold: if the row exists in hot, the cold copy is stale
-        if self.hot.has_row_id(row_id)? {
+        // A hot version this transaction sees decides the row; a newer one it
+        // does not see leaves the sealed copy to the tombstones below
+        if self.hot.has_visible_row(row_id)? {
             return Ok(None);
         }
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::segment_row_hot_checked();
         // Check committed tombstones (snapshot-aware: newer tombstones are invisible)
         {
             let ts = self.segment_mgr.tombstone_set_arc();
@@ -3842,6 +3845,20 @@ impl Table for SegmentedTable {
             return self.segment_mgr.is_row_id_in_volume(row_id);
         }
         self.segment_mgr.row_exists(row_id)
+    }
+
+    fn has_visible_row(&self, row_id: i64) -> Result<bool> {
+        if let Some(result) = self.unsealed(|hot| hot.has_visible_row(row_id)) {
+            return result;
+        }
+        // A row no volume answers for is the hot store's, as in a fetch: an
+        // update committed after the volume lookup's hot check lands there
+        self.settled_across_seals(|| {
+            if self.find_segment_row(row_id)?.is_some() {
+                return Ok(true);
+            }
+            self.hot.has_visible_row(row_id)
+        })
     }
 
     fn collect_hot_row_ids_into(&self, dest: &mut FxHashSet<i64>) {
@@ -8302,6 +8319,9 @@ mod tests {
             for (id, _) in &self.rows {
                 dest.insert(*id);
             }
+        }
+        fn has_visible_row(&self, row_id: i64) -> Result<bool> {
+            Ok(self.rows.iter().any(|(id, _)| *id == row_id))
         }
         fn delete(&mut self, _: Option<&dyn Expression>) -> Result<i32> {
             Ok(0)

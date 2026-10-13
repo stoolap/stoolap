@@ -572,6 +572,11 @@ pub trait Table: Send + Sync {
         Ok(false)
     }
 
+    /// Whether a version this transaction sees here decides the row: its own
+    /// change, a delete included, or a committed live version visible to it.
+    /// A committed delete is not counted; tombstones decide sealed copies.
+    fn has_visible_row(&self, row_id: i64) -> Result<bool>;
+
     /// Claim a row for update to prevent concurrent cold-row modifications.
     /// When two transactions update the same cold row, both write it into hot
     /// under its id. Without claiming, neither detects the other because
