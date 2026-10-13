@@ -167,6 +167,12 @@ impl StatusSegment {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Map lookups and records visited by base advances on this thread
+    static BASE_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Transaction status read without a lock. Segments are created on demand,
 /// never freed, and reused once their run is below the base; a reader checks
 /// the run before and after its read. Writers hold the transactions lock.
@@ -221,20 +227,18 @@ impl TxnStatusTable {
         }
     }
 
-    /// Marks an open `txn_id` as having published; any other slot stays.
-    /// Its run cannot be reused meanwhile: an open id is never below the base
-    fn mark_published(&self, txn_id: i64) {
+    /// Moves an open slot of `txn_id` to `to` in one step; false when the
+    /// slot is not open or no segment holds it. Its run cannot be reused
+    /// meanwhile: an open id is never below the base
+    fn leave_open(&self, txn_id: i64, to: i64) -> bool {
         let run = Self::run_of(txn_id);
-        if let Some(segment) = self.segment_at(run, Ordering::Acquire) {
-            if segment.run.load(Ordering::Acquire) == run {
-                let _ = segment.slots[txn_id as usize & (STATUS_SEGMENT_LEN - 1)].compare_exchange(
-                    SLOT_OPEN,
-                    SLOT_PUBLISHED,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                );
-            }
-        }
+        self.segment_at(run, Ordering::Acquire)
+            .filter(|segment| segment.run.load(Ordering::Acquire) == run)
+            .is_some_and(|segment| {
+                segment.slots[txn_id as usize & (STATUS_SEGMENT_LEN - 1)]
+                    .compare_exchange(SLOT_OPEN, to, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            })
     }
 
     /// Gives `run` a segment, reusing one whose run is below `base_run`.
@@ -357,18 +361,45 @@ impl TransactionRegistry {
     }
 
     /// Moves the base past every finished id from the current one, noting
-    /// aborted ones the map keeps. Called under the transactions lock.
+    /// aborted ones the map keeps. Called under the transactions lock; the
+    /// work is the smaller of the ids passed and the records the map holds.
     fn advance_base(&self, txns: &I64Map<TxnState>) {
         let next = self.next_txn_id.load(Ordering::Acquire);
         let mut base = self.base.load(Ordering::Relaxed);
         let mut floor = self.aborted_floor.load(Ordering::Relaxed);
-        while base <= next {
-            match txns.get(base) {
-                Some(state) if state.is_active_or_committing() => break,
-                Some(_) => floor = base,
-                None => {}
+        if txns
+            .get(base)
+            .is_some_and(|state| state.is_active_or_committing())
+        {
+            return;
+        }
+        if next.saturating_sub(base) > txns.len() as i64 {
+            let open = txns
+                .iter()
+                .filter(|(id, s)| *id >= base && s.is_active_or_committing())
+                .map(|(id, _)| id)
+                .min()
+                .unwrap_or(next + 1);
+            let aborted = txns
+                .iter()
+                .filter(|(id, s)| *id >= base && *id < open && s.is_aborted())
+                .map(|(id, _)| id)
+                .max();
+            #[cfg(test)]
+            BASE_WORK.with(|work| work.set(work.get() + 2 * txns.len()));
+            floor = floor.max(aborted.unwrap_or(0));
+            base = open;
+        } else {
+            while base <= next {
+                #[cfg(test)]
+                BASE_WORK.with(|work| work.set(work.get() + 1));
+                match txns.get(base) {
+                    Some(state) if state.is_active_or_committing() => break,
+                    Some(_) => floor = base,
+                    None => {}
+                }
+                base += 1;
             }
-            base += 1;
         }
         self.aborted_floor.store(floor, Ordering::Release);
         self.base.store(base, Ordering::Release);
@@ -666,10 +697,11 @@ impl TransactionRegistry {
     }
 
     /// Ends a transaction that wrote nothing: no version carries its id, so
-    /// it leaves no aborted record behind. One that published versions, or
-    /// one the table does not cover, is aborted instead
+    /// it leaves no aborted record behind. The slot closes in the same step
+    /// a publication would take; one that published, or one the table does
+    /// not cover, is aborted instead
     pub fn forget_transaction(&self, txn_id: i64) {
-        if self.status.get(txn_id) != Some(SLOT_OPEN) {
+        if !self.status.leave_open(txn_id, SLOT_ABORTED) {
             self.abort_transaction(txn_id);
             return;
         }
@@ -678,7 +710,6 @@ impl TransactionRegistry {
             let was_active = txns
                 .remove(txn_id)
                 .is_some_and(|state| state.is_active_or_committing());
-            self.status.set(txn_id, SLOT_ABORTED);
             self.advance_base(&txns);
             was_active
         };
@@ -1233,8 +1264,20 @@ impl VisibilityChecker for TransactionRegistry {
         TransactionRegistry::needs_snapshot_isolation(self, txn_id)
     }
 
-    fn note_published(&self, txn_id: i64) {
-        self.status.mark_published(txn_id);
+    fn admit_publication(&self, txn_id: i64) -> bool {
+        if self.status.leave_open(txn_id, SLOT_PUBLISHED) {
+            return true;
+        }
+        match self.status.get(txn_id) {
+            // Published before, or committing: start_commit precedes publication
+            Some(slot) if slot == SLOT_PUBLISHED || (slot < 0 && slot > SLOT_PUBLISHED) => true,
+            Some(slot) if slot == SLOT_ABORTED || slot > 0 => false,
+            _ => self
+                .transactions
+                .lock()
+                .get(txn_id)
+                .is_some_and(|state| state.is_active_or_committing()),
+        }
     }
 
     fn oldest_snapshot_begin_seq(&self) -> Option<i64> {
@@ -1831,7 +1874,7 @@ mod tests {
     fn a_published_transaction_is_aborted_not_forgotten() {
         let registry = TransactionRegistry::new();
         let (id, _) = registry.begin_transaction();
-        registry.note_published(id);
+        assert!(registry.admit_publication(id));
         registry.forget_transaction(id);
         assert!(!registry.is_directly_visible(id));
         assert!(registry
@@ -1839,5 +1882,44 @@ mod tests {
             .lock()
             .get(id)
             .is_some_and(|s| s.is_aborted()));
+    }
+
+    #[test]
+    fn a_forgotten_transaction_cannot_publish() {
+        let registry = TransactionRegistry::new();
+        let (id, _) = registry.begin_transaction();
+        registry.forget_transaction(id);
+        assert!(!registry.admit_publication(id));
+    }
+
+    #[test]
+    fn a_committing_transaction_may_publish() {
+        let registry = TransactionRegistry::new();
+        let (id, _) = registry.begin_transaction();
+        registry.start_commit(id);
+        assert!(registry.admit_publication(id));
+        registry.complete_commit(id);
+        assert!(
+            !registry.admit_publication(id),
+            "a committed transaction published again"
+        );
+    }
+
+    #[test]
+    fn closing_a_long_transaction_does_not_walk_every_later_id() {
+        let registry = TransactionRegistry::new();
+        let (long, _) = registry.begin_transaction();
+        let mut last = long;
+        for _ in 0..100_000 {
+            let (id, _) = registry.begin_transaction();
+            registry.commit_transaction(id);
+            last = id;
+        }
+        let before = BASE_WORK.with(|work| work.get());
+        registry.commit_transaction(long);
+        let work = BASE_WORK.with(|work| work.get()) - before;
+        assert!(work < 100, "closing it took {work} steps");
+        assert!(registry.base.load(Ordering::Relaxed) > last);
+        assert!(registry.is_directly_visible(last));
     }
 }

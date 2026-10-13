@@ -56,6 +56,36 @@ fn rows_published_before_a_rollback_stay_hidden() {
 }
 
 #[test]
+fn a_store_held_past_its_rollback_cannot_publish() {
+    let db = table("memory://txn_status_publish_after_rollback");
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let store = db.engine().get_version_store("t").unwrap();
+    let local = TransactionVersionStore::new(Arc::clone(&store), txn.id());
+    let mut handle = MVCCTable::new(txn.id(), store, local);
+    handle
+        .insert(Row::from(vec![Value::Integer(1), Value::Integer(7)]))
+        .unwrap();
+    txn.rollback().unwrap();
+    assert!(handle.txn_versions().write_store().commit().is_err());
+    assert_eq!(rows(&db), 0, "an ended transaction published a row");
+}
+
+#[test]
+fn a_store_held_past_its_drop_cannot_publish() {
+    let db = table("memory://txn_status_publish_after_drop");
+    let txn = db.engine().begin_transaction().unwrap();
+    let store = db.engine().get_version_store("t").unwrap();
+    let local = TransactionVersionStore::new(Arc::clone(&store), txn.id());
+    let mut handle = MVCCTable::new(txn.id(), store, local);
+    handle
+        .insert(Row::from(vec![Value::Integer(1), Value::Integer(7)]))
+        .unwrap();
+    drop(txn);
+    assert!(handle.txn_versions().write_store().commit().is_err());
+    assert_eq!(rows(&db), 0, "an ended transaction published a row");
+}
+
+#[test]
 fn rows_of_a_transaction_dropped_after_publishing_stay_hidden() {
     let db = table("memory://txn_status_published_drop");
     let txn = db.engine().begin_transaction().unwrap();
