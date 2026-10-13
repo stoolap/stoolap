@@ -196,7 +196,7 @@ impl Cli {
             DefaultEditor::with_config(config).map_err(|e| io::Error::other(e.to_string()))?;
 
         // Load history from file
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = std::env::home_dir() {
             let history_file = home.join(".stoolap_history");
             let _ = editor.load_history(&history_file);
         }
@@ -338,7 +338,7 @@ impl Cli {
         }
 
         // Save history
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = std::env::home_dir() {
             let history_file = home.join(".stoolap_history");
             let _ = self.editor.save_history(&history_file);
         }
