@@ -143,7 +143,7 @@ impl Executor {
 
         for stmt in &program.statements {
             let ctx = ExecutionContext::default();
-            self.execute_statement(stmt, &ctx)?;
+            self.run_statement(stmt, &ctx)?;
         }
 
         Ok(())

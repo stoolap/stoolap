@@ -44,7 +44,7 @@
 //! ```
 
 use rustc_hash::FxHashMap;
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, RwLock, Weak};
 
 use crate::core::{DataType, Error, IsolationLevel, Result, Value};
 use crate::executor::context::ExecutionContextBuilder;
@@ -92,7 +92,7 @@ impl Drop for SharedEngine {
 
 /// One session on an engine: its own executor and transaction state
 pub(crate) struct DatabaseInner {
-    executor: Mutex<Executor>,
+    executor: Executor,
     shared: Arc<SharedEngine>,
 }
 
@@ -102,7 +102,7 @@ pub(crate) type DatabaseInnerHandle = DatabaseInner;
 impl DatabaseInner {
     fn session(shared: Arc<SharedEngine>) -> Arc<Self> {
         Arc::new(DatabaseInner {
-            executor: Mutex::new(Executor::new(Arc::clone(&shared.engine))),
+            executor: Executor::new(Arc::clone(&shared.engine)),
             shared,
         })
     }
@@ -608,11 +608,7 @@ impl Database {
     /// )?;
     /// ```
     pub fn execute<P: Params>(&self, sql: &str, params: P) -> Result<i64> {
-        let executor = self
-            .inner
-            .executor
-            .lock()
-            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
+        let executor = &self.inner.executor;
 
         let param_values = params.into_params();
         let result = if param_values.is_empty() {
@@ -655,11 +651,7 @@ impl Database {
     ///     .collect::<Result<Vec<_>, _>>()?;
     /// ```
     pub fn query<P: Params>(&self, sql: &str, params: P) -> Result<Rows> {
-        let executor = self
-            .inner
-            .executor
-            .lock()
-            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
+        let executor = &self.inner.executor;
 
         let param_values = params.into_params();
         let result = if param_values.is_empty() {
@@ -725,11 +717,7 @@ impl Database {
         params: P,
         timeout_ms: u64,
     ) -> Result<i64> {
-        let executor = self
-            .inner
-            .executor
-            .lock()
-            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
+        let executor = &self.inner.executor;
 
         let param_values = params.into_params();
         let ctx = ExecutionContextBuilder::new()
@@ -760,11 +748,7 @@ impl Database {
         params: P,
         timeout_ms: u64,
     ) -> Result<Rows> {
-        let executor = self
-            .inner
-            .executor
-            .lock()
-            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
+        let executor = &self.inner.executor;
 
         let param_values = params.into_params();
         let ctx = ExecutionContextBuilder::new()
@@ -828,11 +812,7 @@ impl Database {
     /// )?;
     /// ```
     pub fn execute_named(&self, sql: &str, params: NamedParams) -> Result<i64> {
-        let executor = self
-            .inner
-            .executor
-            .lock()
-            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
+        let executor = &self.inner.executor;
 
         let result = executor.execute_with_named_params(sql, params.into_inner())?;
         Ok(result.rows_affected())
@@ -861,11 +841,7 @@ impl Database {
     /// }
     /// ```
     pub fn query_named(&self, sql: &str, params: NamedParams) -> Result<Rows> {
-        let executor = self
-            .inner
-            .executor
-            .lock()
-            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
+        let executor = &self.inner.executor;
 
         let result = executor.execute_with_named_params(sql, params.into_inner())?;
         Ok(Rows::new(result))
@@ -989,11 +965,7 @@ impl Database {
     /// tx.commit()?;
     /// ```
     pub fn begin_with_isolation(&self, isolation: IsolationLevel) -> Result<Transaction> {
-        let executor = self
-            .inner
-            .executor
-            .lock()
-            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
+        let executor = &self.inner.executor;
 
         let tx = executor.begin_transaction_with_isolation(isolation)?;
         let engine = executor.engine().clone();
@@ -1034,21 +1006,12 @@ impl Database {
     /// Returns a `CachedPlanRef` that can be stored and passed to
     /// `execute_plan()` / `query_plan()` for zero-lookup execution.
     pub fn cached_plan(&self, sql: &str) -> Result<CachedPlanRef> {
-        let executor = self
-            .inner
-            .executor
-            .lock()
-            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
-        executor.get_or_create_plan(sql)
+        self.inner.executor.get_or_create_plan(sql)
     }
 
     /// Execute a pre-cached plan with positional parameters (no parsing, no cache lookup).
     pub fn execute_plan<P: Params>(&self, plan: &CachedPlanRef, params: P) -> Result<i64> {
-        let executor = self
-            .inner
-            .executor
-            .lock()
-            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
+        let executor = &self.inner.executor;
         let param_values = params.into_params();
         let ctx = if param_values.is_empty() {
             ExecutionContext::new()
@@ -1061,11 +1024,7 @@ impl Database {
 
     /// Query using a pre-cached plan with positional parameters (no parsing, no cache lookup).
     pub fn query_plan<P: Params>(&self, plan: &CachedPlanRef, params: P) -> Result<Rows> {
-        let executor = self
-            .inner
-            .executor
-            .lock()
-            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
+        let executor = &self.inner.executor;
         let param_values = params.into_params();
         let ctx = if param_values.is_empty() {
             ExecutionContext::new()
@@ -1078,11 +1037,7 @@ impl Database {
 
     /// Execute a pre-cached plan with named parameters (no parsing, no cache lookup).
     pub fn execute_named_plan(&self, plan: &CachedPlanRef, params: NamedParams) -> Result<i64> {
-        let executor = self
-            .inner
-            .executor
-            .lock()
-            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
+        let executor = &self.inner.executor;
         let ctx = ExecutionContext::with_named_params(params.into_inner());
         let result = executor.execute_with_cached_plan(plan, &ctx)?;
         Ok(result.rows_affected())
@@ -1090,11 +1045,7 @@ impl Database {
 
     /// Query using a pre-cached plan with named parameters (no parsing, no cache lookup).
     pub fn query_named_plan(&self, plan: &CachedPlanRef, params: NamedParams) -> Result<Rows> {
-        let executor = self
-            .inner
-            .executor
-            .lock()
-            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
+        let executor = &self.inner.executor;
         let ctx = ExecutionContext::with_named_params(params.into_inner());
         let result = executor.execute_with_cached_plan(plan, &ctx)?;
         Ok(Rows::new(result))
@@ -1114,12 +1065,7 @@ impl Database {
 
     /// Set the default isolation level for new transactions
     pub fn set_default_isolation_level(&self, level: IsolationLevel) -> Result<()> {
-        let mut executor = self
-            .inner
-            .executor
-            .lock()
-            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
-        executor.set_default_isolation_level(level);
+        self.inner.executor.set_default_isolation_level(level);
         Ok(())
     }
 
@@ -1148,12 +1094,7 @@ impl Database {
         use crate::storage::Engine;
         let result = self.inner.shared.engine.restore_snapshot(timestamp)?;
         // Clear all query caches since all data has changed.
-        let executor = self
-            .inner
-            .executor
-            .lock()
-            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
-        executor.clear_semantic_cache();
+        self.inner.executor.clear_semantic_cache();
         crate::executor::context::clear_scalar_subquery_cache();
         crate::executor::context::clear_in_subquery_cache();
         crate::executor::context::clear_semi_join_cache();
@@ -1161,7 +1102,7 @@ impl Database {
     }
 
     /// Get the internal executor (for Statement use)
-    pub(crate) fn executor(&self) -> &Mutex<Executor> {
+    pub(crate) fn executor(&self) -> &Executor {
         &self.inner.executor
     }
 
@@ -1180,12 +1121,7 @@ impl Database {
     /// println!("Subsumption hits: {}", stats.subsumption_hits);
     /// ```
     pub fn semantic_cache_stats(&self) -> Result<crate::executor::SemanticCacheStatsSnapshot> {
-        let executor = self
-            .inner
-            .executor
-            .lock()
-            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
-        Ok(executor.semantic_cache_stats())
+        Ok(self.inner.executor.semantic_cache_stats())
     }
 
     /// Clear the semantic cache
@@ -1193,12 +1129,7 @@ impl Database {
     /// This clears all cached query results. Useful for testing or when
     /// you want to force queries to re-execute.
     pub fn clear_semantic_cache(&self) -> Result<()> {
-        let executor = self
-            .inner
-            .executor
-            .lock()
-            .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
-        executor.clear_semantic_cache();
+        self.inner.executor.clear_semantic_cache();
         Ok(())
     }
 

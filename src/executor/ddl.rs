@@ -458,6 +458,7 @@ impl Executor {
                 )?;
             }
         } else {
+            drop(active_tx);
             // No active transaction - use direct engine call (auto-committed)
             self.engine.create_table(schema)?;
 
@@ -641,27 +642,33 @@ impl Executor {
             return Err(Error::TableNotFound(table_name.to_string()));
         }
 
-        // Check if there's an active transaction (peek at txn_id for FK visibility)
+        // Check if there's an active transaction
         let mut active_tx = self.active_transaction.lock().unwrap();
-        let txn_id = active_tx.as_ref().map(|s| s.transaction.id());
-
-        // Check FK constraints: block DROP if child tables reference this table
-        // Uses the caller's transaction (if any) so uncommitted child deletes are visible
-        super::foreign_key::check_no_referencing_rows(&self.engine, table_name, txn_id)?;
-
-        if let Some(ref mut tx_state) = *active_tx {
-            // WARNING: DROP TABLE within a transaction has limited rollback support.
-            // On rollback, the table schema will be recreated but DATA WILL BE LOST.
-            // This is because table data is immediately deleted and cannot be recovered.
-            // For recoverable data deletion, use DELETE FROM or TRUNCATE instead.
-            eprintln!(
-                "Warning: DROP TABLE '{}' within transaction - data cannot be recovered on rollback",
-                table_name
-            );
-            tx_state.transaction.drop_table(table_name)?;
-        } else {
-            // No active transaction - use engine method directly (auto-committed with WAL)
-            self.engine.drop_table_internal(table_name)?;
+        match active_tx.as_mut() {
+            Some(tx_state) => {
+                // Check FK constraints: block DROP if child tables reference this table
+                // Uses the caller's transaction so uncommitted child deletes are visible
+                super::foreign_key::check_no_referencing_rows(
+                    &self.engine,
+                    table_name,
+                    Some(tx_state.transaction.id()),
+                )?;
+                // WARNING: DROP TABLE within a transaction has limited rollback support.
+                // On rollback, the table schema will be recreated but DATA WILL BE LOST.
+                // This is because table data is immediately deleted and cannot be recovered.
+                // For recoverable data deletion, use DELETE FROM or TRUNCATE instead.
+                eprintln!(
+                    "Warning: DROP TABLE '{}' within transaction - data cannot be recovered on rollback",
+                    table_name
+                );
+                tx_state.transaction.drop_table(table_name)?;
+            }
+            None => {
+                drop(active_tx);
+                super::foreign_key::check_no_referencing_rows(&self.engine, table_name, None)?;
+                // No active transaction - use engine method directly (auto-committed with WAL)
+                self.engine.drop_table_internal(table_name)?;
+            }
         }
 
         // Invalidate query cache for this table (schema no longer exists)

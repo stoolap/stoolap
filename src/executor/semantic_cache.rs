@@ -733,13 +733,17 @@ impl SemanticCache {
     /// Clear the entire cache and reset statistics
     pub fn clear(&self) {
         match self.cache.write() {
-            Ok(mut cache) => cache.clear(),
+            Ok(mut cache) => {
+                cache.clear();
+                // Under the lock, so an insert after it counts its rows
+                self.global_row_count.store(0, Ordering::Relaxed);
+            }
             Err(_) => {
                 self.stats.lock_failures.fetch_add(1, Ordering::Relaxed);
             }
         }
-        // Reset global row count
-        self.global_row_count.store(0, Ordering::Relaxed);
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::semantic_cache_cleared();
         // Reset all atomic stats counters
         self.stats.hits.store(0, Ordering::Relaxed);
         self.stats.exact_hits.store(0, Ordering::Relaxed);
