@@ -2585,6 +2585,8 @@ impl SegmentedTable {
         if self.hot.has_visible_row(row_id)? {
             return Ok(None);
         }
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::segment_row_hot_checked();
         // Check committed tombstones (snapshot-aware: newer tombstones are invisible)
         {
             let ts = self.segment_mgr.tombstone_set_arc();
@@ -3846,10 +3848,17 @@ impl Table for SegmentedTable {
     }
 
     fn has_visible_row(&self, row_id: i64) -> Result<bool> {
-        if self.hot.has_visible_row(row_id)? {
-            return Ok(true);
+        if let Some(result) = self.unsealed(|hot| hot.has_visible_row(row_id)) {
+            return result;
         }
-        Ok(self.segment_mgr.has_segments() && self.find_segment_row(row_id)?.is_some())
+        // A row no volume answers for is the hot store's, as in a fetch: an
+        // update committed after the volume lookup's hot check lands there
+        self.settled_across_seals(|| {
+            if self.find_segment_row(row_id)?.is_some() {
+                return Ok(true);
+            }
+            self.hot.has_visible_row(row_id)
+        })
     }
 
     fn collect_hot_row_ids_into(&self, dest: &mut FxHashSet<i64>) {

@@ -868,6 +868,20 @@ pub(crate) fn row_ids_classified() {
 }
 
 thread_local! {
+    static SEGMENT_ROW_HOT_CHECKED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next lookup of a sealed row by id has
+/// found no hot version deciding the row and has not yet read the volumes
+pub fn after_segment_row_hot_checked(hook: impl FnOnce() + 'static) {
+    SEGMENT_ROW_HOT_CHECKED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn segment_row_hot_checked() {
+    run_hook(&SEGMENT_ROW_HOT_CHECKED_HOOK);
+}
+
+thread_local! {
     static DELETE_ROWS_SCANNED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
