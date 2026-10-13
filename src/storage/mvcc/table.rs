@@ -3207,7 +3207,7 @@ impl Table for MVCCTable {
                     return Ok(Box::new(scanner));
                 } else {
                     // Row not found - return empty scanner
-                    let scanner = MVCCScanner::empty(schema, column_indices.to_vec());
+                    let scanner = MVCCScanner::empty(column_indices.to_vec());
                     return Ok(Box::new(scanner));
                 }
             }

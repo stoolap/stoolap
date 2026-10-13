@@ -53,16 +53,6 @@ use ahash::AHasher;
 
 use crate::core::Value;
 
-/// Default bits per element for ~1% false positive rate
-/// This is used as a reference value; actual bits are calculated from expected elements and FP rate
-#[allow(dead_code)]
-const DEFAULT_BITS_PER_ELEMENT: usize = 10;
-
-/// Default number of hash functions (optimal for 10 bits/element)
-/// Actual hash count is calculated using: k = (m/n) * ln(2)
-#[allow(dead_code)]
-const DEFAULT_NUM_HASHES: usize = 7;
-
 /// Minimum bloom filter size in bits
 const MIN_FILTER_BITS: usize = 64;
 

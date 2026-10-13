@@ -177,12 +177,8 @@ fn serialize_v4_opts(
     drop(meta_raw);
 
     // 2. Build CompressedBlockStore (compresses all column blocks when enabled)
-    let store = CompressedBlockStore::compress_columns_opts(
-        &vol.columns,
-        &vol.meta.column_types,
-        vol.meta.row_count,
-        compress,
-    )?;
+    let store =
+        CompressedBlockStore::compress_columns_opts(&vol.columns, vol.meta.row_count, compress)?;
 
     // 3. Compute total size for pre-allocation
     let all_blocks = store.raw_blocks();
@@ -431,7 +427,6 @@ fn read_volume_v4(
         all_comp_lens,
         all_decomp_lens,
         meta.col_type_tags.clone(),
-        meta.column_types.clone(),
         meta.col_ext_types.clone(),
         meta.shared_dict,
         dict_ranges,

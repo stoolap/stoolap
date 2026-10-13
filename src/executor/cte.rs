@@ -184,12 +184,6 @@ impl CteRegistry {
         self.data.get(&name_lower)
     }
 
-    /// Check if a CTE exists
-    #[allow(dead_code)]
-    pub fn exists(&self, name: &str) -> bool {
-        self.data.contains_key(&name.to_lowercase())
-    }
-
     /// Get a shared Arc reference to the internal data map for context transfer
     ///
     /// This is always O(1) - just an Arc reference count increment.
@@ -2857,8 +2851,8 @@ mod tests {
 
         registry.store("my_cte", columns.clone(), rows);
 
-        assert!(registry.exists("my_cte"));
-        assert!(registry.exists("MY_CTE")); // case-insensitive
+        assert!(registry.get("my_cte").is_some());
+        assert!(registry.get("MY_CTE").is_some()); // case-insensitive
 
         let (cols, retrieved_rows) = registry.get("my_cte").unwrap();
         assert_eq!(cols.len(), 2);

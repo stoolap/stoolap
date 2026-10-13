@@ -88,19 +88,16 @@ impl BloomFilterOperator {
     }
 
     /// Get the number of rows checked by the filter.
-    #[allow(dead_code)]
     pub fn rows_checked(&self) -> u64 {
         self.rows_checked
     }
 
     /// Get the number of rows that passed the filter.
-    #[allow(dead_code)]
     pub fn rows_passed(&self) -> u64 {
         self.rows_passed
     }
 
     /// Get the filter selectivity (fraction of rows that passed).
-    #[allow(dead_code)]
     pub fn selectivity(&self) -> f64 {
         if self.rows_checked == 0 {
             1.0

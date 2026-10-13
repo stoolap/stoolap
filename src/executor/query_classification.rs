@@ -52,7 +52,6 @@ pub fn clear_classification_cache() {
 /// Pre-computed characteristics of a SELECT statement
 /// Some fields are computed for future optimizations but not yet used.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct QueryClassification {
     // === Basic query structure ===
     /// Whether the query has aggregate functions (COUNT, SUM, etc.)

@@ -296,9 +296,6 @@ pub struct CompressedBlockStore {
     decompressed_lens: Vec<Vec<usize>>,
     /// Column type tags (COL_INT64, COL_FLOAT64, etc.) for deserialization
     col_type_tags: Vec<u8>,
-    /// Column data types
-    #[allow(dead_code)]
-    col_data_types: Vec<DataType>,
     /// Ext type per column (only meaningful for COL_BYTES columns)
     col_ext_types: Vec<u8>,
     /// Per dictionary column: pre-built Arc, shared across all group decompressions.
@@ -365,12 +362,8 @@ impl CompressedBlockStore {
 
     /// Compress existing columns into per-group LZ4 blocks.
     /// Used when sealing (VolumeBuilder::finish() → eager columns → V4 write).
-    pub fn compress_columns(
-        columns: &LazyColumns,
-        col_data_types: &[DataType],
-        row_count: usize,
-    ) -> std::io::Result<Self> {
-        Self::compress_columns_opts(columns, col_data_types, row_count, true)
+    pub fn compress_columns(columns: &LazyColumns, row_count: usize) -> std::io::Result<Self> {
+        Self::compress_columns_opts(columns, row_count, true)
     }
 
     /// Build per-group blocks from columns. When `compress` is true, blocks are
@@ -378,7 +371,6 @@ impl CompressedBlockStore {
     /// all blocks are stored raw (same V4 layout, no LZ4 overhead).
     pub fn compress_columns_opts(
         columns: &LazyColumns,
-        col_data_types: &[DataType],
         row_count: usize,
         compress: bool,
     ) -> std::io::Result<Self> {
@@ -479,7 +471,6 @@ impl CompressedBlockStore {
             source: BlockSource::Memory(all_blocks),
             decompressed_lens: all_decomp_lens,
             col_type_tags,
-            col_data_types: col_data_types.to_vec(),
             col_ext_types,
             col_dicts,
             group_size,
@@ -497,7 +488,6 @@ impl CompressedBlockStore {
         blocks: Vec<Vec<Vec<u8>>>,
         decompressed_lens: Vec<Vec<usize>>,
         col_type_tags: Vec<u8>,
-        col_data_types: Vec<DataType>,
         col_ext_types: Vec<u8>,
         shared_dict: Vec<SmartString>,
         dict_ranges: Vec<(usize, usize, usize)>,
@@ -513,7 +503,6 @@ impl CompressedBlockStore {
             source: BlockSource::Memory(blocks),
             decompressed_lens,
             col_type_tags,
-            col_data_types,
             col_ext_types,
             col_dicts,
             group_size,
@@ -533,7 +522,6 @@ impl CompressedBlockStore {
         compressed_lens: Vec<Vec<usize>>,
         decompressed_lens: Vec<Vec<usize>>,
         col_type_tags: Vec<u8>,
-        col_data_types: Vec<DataType>,
         col_ext_types: Vec<u8>,
         shared_dict: Vec<SmartString>,
         dict_ranges: Vec<(usize, usize, usize)>,
@@ -547,7 +535,6 @@ impl CompressedBlockStore {
             compressed_lens,
             decompressed_lens,
             col_type_tags,
-            col_data_types,
             col_ext_types,
             shared_dict,
             dict_ranges,
@@ -564,7 +551,6 @@ impl CompressedBlockStore {
         compressed_lens: Vec<Vec<usize>>,
         decompressed_lens: Vec<Vec<usize>>,
         col_type_tags: Vec<u8>,
-        col_data_types: Vec<DataType>,
         col_ext_types: Vec<u8>,
         shared_dict: Vec<SmartString>,
         dict_ranges: Vec<(usize, usize, usize)>,
@@ -583,7 +569,6 @@ impl CompressedBlockStore {
             },
             decompressed_lens,
             col_type_tags,
-            col_data_types,
             col_ext_types,
             col_dicts,
             group_size,

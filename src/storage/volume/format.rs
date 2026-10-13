@@ -1118,8 +1118,6 @@ pub(crate) fn deserialize_column_block(
 /// Metadata parsed from a V4 volume file (everything except column data).
 pub(crate) struct VolumeMetadata {
     pub row_count: usize,
-    #[allow(dead_code)]
-    pub col_count: usize,
     pub col_type_tags: Vec<u8>,
     pub col_ext_types: Vec<u8>,
     pub col_sorted: Vec<bool>,
@@ -1542,7 +1540,6 @@ pub(crate) fn deserialize_volume_metadata(data: &[u8]) -> io::Result<VolumeMetad
 
     Ok(VolumeMetadata {
         row_count,
-        col_count,
         col_type_tags,
         col_ext_types,
         col_sorted,

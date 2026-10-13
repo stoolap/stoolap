@@ -41,9 +41,7 @@ fn a_scan_survives_its_volume_becoming_resident_between_two_rows() {
         );
     }
     let mut volume = builder.finish().unwrap();
-    let store =
-        CompressedBlockStore::compress_columns(&volume.columns, &[DataType::Integer; 2], rows)
-            .unwrap();
+    let store = CompressedBlockStore::compress_columns(&volume.columns, rows).unwrap();
     volume.columns = LazyColumns::deferred(store, vec![DataType::Integer; 2]);
     let volume = Arc::new(volume);
     assert!(!volume.columns.is_eager());

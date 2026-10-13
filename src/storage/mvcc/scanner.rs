@@ -30,17 +30,8 @@ pub struct MVCCScanner {
     current_index: isize,
     /// Column indices to include in projection
     column_indices: Vec<usize>,
-    /// Table schema (kept for future projection improvements)
-    #[allow(dead_code)]
-    schema: CompactArc<Schema>,
-    /// Filter expression (optional, kept for streaming filter support)
-    #[allow(dead_code)]
-    filter: Option<Box<dyn Expression>>,
     /// Any error that occurred
     error: Option<crate::core::Error>,
-    /// Pre-allocated buffer for projected row (kept for future optimization)
-    #[allow(dead_code)]
-    projected_row: Row,
     /// Whether the scanner has been closed
     closed: bool,
 }
@@ -102,44 +93,32 @@ impl MVCCScanner {
             } else {
                 column_indices
             }, // Clear if already projected
-            schema,
-            filter: None,
             error: None,
-            projected_row: Row::default(),
             closed: false,
         }
     }
 
     /// Creates an empty scanner
     #[inline]
-    pub fn empty(schema: CompactArc<Schema>, column_indices: Vec<usize>) -> Self {
+    pub fn empty(column_indices: Vec<usize>) -> Self {
         Self {
             rows: RowVec::new(),
             current_index: -1,
             column_indices,
-            schema,
-            filter: None,
             error: None,
-            projected_row: Row::default(),
             closed: false,
         }
     }
 
     /// Creates a scanner with a single row
-    pub fn single(row: Row, schema: CompactArc<Schema>, column_indices: Vec<usize>) -> Self {
+    pub fn single(row: Row, column_indices: Vec<usize>) -> Self {
         let mut rows = RowVec::new();
         rows.push((0, row));
         Self {
             rows,
             current_index: -1,
-            column_indices: column_indices.clone(),
-            schema,
-            filter: None,
+            column_indices,
             error: None,
-            projected_row: Row::from_values(vec![
-                crate::core::Value::null_unknown();
-                column_indices.len()
-            ]),
             closed: false,
         }
     }
@@ -230,121 +209,6 @@ impl Scanner for MVCCScanner {
     }
 }
 
-/// Range scanner optimized for consecutive ID range queries
-pub struct RangeScanner {
-    /// Transaction ID for visibility checks
-    txn_id: i64,
-    /// Current ID in range (kept for range iteration improvements)
-    #[allow(dead_code)]
-    current_id: i64,
-    /// End ID in range (kept for range iteration improvements)
-    #[allow(dead_code)]
-    end_id: i64,
-    /// Whether end_id is inclusive (kept for range iteration improvements)
-    #[allow(dead_code)]
-    inclusive: bool,
-    /// Column indices to include (kept for future projection improvements)
-    #[allow(dead_code)]
-    column_indices: Vec<usize>,
-    /// Table schema (kept for future projection improvements)
-    #[allow(dead_code)]
-    schema: CompactArc<Schema>,
-    /// Any scanning error
-    error: Option<crate::core::Error>,
-    /// Pre-allocated projected row buffer (kept for future optimization)
-    #[allow(dead_code)]
-    projected_row: Row,
-    /// Row iterator (stores pre-fetched rows)
-    rows: RowVec,
-    /// Current position in rows
-    row_index: isize,
-}
-
-impl RangeScanner {
-    /// Creates a new range scanner
-    pub fn new(
-        start_id: i64,
-        end_id: i64,
-        inclusive: bool,
-        txn_id: i64,
-        schema: CompactArc<Schema>,
-        column_indices: Vec<usize>,
-        rows: RowVec,
-    ) -> Self {
-        // Filter rows to only include those in range
-        let actual_end = if inclusive { end_id } else { end_id - 1 };
-        let filtered_rows: RowVec = rows
-            .into_iter()
-            .filter(|(id, _)| *id >= start_id && *id <= actual_end)
-            .collect();
-
-        Self {
-            txn_id,
-            current_id: start_id,
-            end_id,
-            inclusive,
-            column_indices: column_indices.clone(),
-            schema,
-            error: None,
-            projected_row: Row::from_values(vec![
-                crate::core::Value::null_unknown();
-                column_indices.len()
-            ]),
-            rows: filtered_rows,
-            row_index: -1,
-        }
-    }
-
-    /// Returns the transaction ID
-    pub fn txn_id(&self) -> i64 {
-        self.txn_id
-    }
-}
-
-impl Scanner for RangeScanner {
-    fn next(&mut self) -> bool {
-        if self.error.is_some() {
-            return false;
-        }
-
-        self.row_index += 1;
-
-        // OPTIMIZATION: Don't clone the row here - just track the index
-        // We can return a reference directly in row() since rows are stored in self.rows
-        (self.row_index as usize) < self.rows.len()
-    }
-
-    fn row(&self) -> &Row {
-        static EMPTY_ROW: std::sync::OnceLock<Row> = std::sync::OnceLock::new();
-
-        // OPTIMIZATION: Return reference directly from self.rows instead of cloning
-        if self.row_index >= 0 && (self.row_index as usize) < self.rows.len() {
-            let (_, ref row) = self.rows[self.row_index as usize];
-            row
-        } else {
-            EMPTY_ROW.get_or_init(|| Row::from_values(vec![]))
-        }
-    }
-
-    fn err(&self) -> Option<&crate::core::Error> {
-        self.error.as_ref()
-    }
-
-    fn close(&mut self) -> Result<()> {
-        self.rows.clear();
-        Ok(())
-    }
-
-    fn take_row(&mut self) -> Row {
-        if self.row_index >= 0 && (self.row_index as usize) < self.rows.len() {
-            let idx = self.row_index as usize;
-            std::mem::take(&mut self.rows[idx].1)
-        } else {
-            Row::new()
-        }
-    }
-}
-
 /// Empty scanner that returns no rows
 pub struct EmptyScanner;
 
@@ -380,56 +244,6 @@ impl Scanner for EmptyScanner {
     }
 }
 
-/// Single row scanner that returns exactly one row
-pub struct SingleRowScanner {
-    /// The single row to return
-    row: Row,
-    /// Column indices for projection (kept for future projection support)
-    #[allow(dead_code)]
-    column_indices: Vec<usize>,
-    /// Whether next() has been called
-    done: bool,
-}
-
-impl SingleRowScanner {
-    /// Creates a new single row scanner
-    pub fn new(row: Row, column_indices: Vec<usize>) -> Self {
-        Self {
-            row,
-            column_indices,
-            done: false,
-        }
-    }
-}
-
-impl Scanner for SingleRowScanner {
-    fn next(&mut self) -> bool {
-        if self.done {
-            false
-        } else {
-            self.done = true;
-            true
-        }
-    }
-
-    fn row(&self) -> &Row {
-        if self.done {
-            &self.row
-        } else {
-            static EMPTY_ROW: std::sync::OnceLock<Row> = std::sync::OnceLock::new();
-            EMPTY_ROW.get_or_init(|| Row::from_values(vec![]))
-        }
-    }
-
-    fn err(&self) -> Option<&crate::core::Error> {
-        None
-    }
-
-    fn close(&mut self) -> Result<()> {
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,9 +259,7 @@ mod tests {
 
     #[test]
     fn test_mvcc_scanner_empty() {
-        let schema = test_schema();
-
-        let mut scanner = MVCCScanner::empty(schema, vec![0]);
+        let mut scanner = MVCCScanner::empty(vec![0]);
 
         assert!(!scanner.next());
         assert!(scanner.is_empty());
@@ -455,10 +267,8 @@ mod tests {
 
     #[test]
     fn test_mvcc_scanner_single() {
-        let schema = test_schema();
-
         let row = Row::from_values(vec![Value::Integer(42)]);
-        let mut scanner = MVCCScanner::single(row, schema, vec![0]);
+        let mut scanner = MVCCScanner::single(row, vec![0]);
 
         assert_eq!(scanner.len(), 1);
         assert!(!scanner.is_empty());
@@ -518,45 +328,5 @@ mod tests {
         assert!(!scanner.next());
         assert!(scanner.err().is_none());
         assert!(scanner.close().is_ok());
-    }
-
-    #[test]
-    fn test_single_row_scanner() {
-        let row = Row::from_values(vec![Value::Integer(42), Value::text("test")]);
-
-        let mut scanner = SingleRowScanner::new(row, vec![0, 1]);
-
-        // First call to next should succeed
-        assert!(scanner.next());
-        assert_eq!(scanner.row().get(0), Some(&Value::Integer(42)));
-        assert_eq!(scanner.row().get(1), Some(&Value::text("test")));
-
-        // Second call should fail
-        assert!(!scanner.next());
-    }
-
-    #[test]
-    fn test_range_scanner() {
-        let schema = test_schema();
-
-        let mut rows = RowVec::new();
-        rows.push((1, Row::from_values(vec![Value::Integer(1)])));
-        rows.push((2, Row::from_values(vec![Value::Integer(2)])));
-        rows.push((3, Row::from_values(vec![Value::Integer(3)])));
-        rows.push((5, Row::from_values(vec![Value::Integer(5)])));
-
-        // Inclusive range 1-3
-        let mut scanner = RangeScanner::new(1, 3, true, 1, schema, vec![0], rows);
-
-        assert!(scanner.next());
-        assert_eq!(scanner.row().get(0), Some(&Value::Integer(1)));
-
-        assert!(scanner.next());
-        assert_eq!(scanner.row().get(0), Some(&Value::Integer(2)));
-
-        assert!(scanner.next());
-        assert_eq!(scanner.row().get(0), Some(&Value::Integer(3)));
-
-        assert!(!scanner.next()); // Row 5 is outside range
     }
 }

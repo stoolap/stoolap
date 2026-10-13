@@ -5058,9 +5058,8 @@ impl MVCCEngine {
             .keep_snapshots
             .max(1) as usize;
         for (_, _, table_name) in &pending_snapshots {
-            if let Some(schema) = schemas.get(table_name) {
-                let disk_store =
-                    super::snapshot::DiskVersionStore::new(&snapshot_dir, table_name, schema);
+            if schemas.contains_key(table_name) {
+                let disk_store = super::snapshot::DiskVersionStore::new(&snapshot_dir, table_name);
                 if let Ok(disk_store) = disk_store {
                     if let Err(e) = disk_store.cleanup_old_snapshots(keep_snapshots) {
                         eprintln!(
@@ -6178,6 +6177,7 @@ impl MVCCEngine {
 
     /// One volume of backfill on its own thread, when no pass is running
     /// and the engine is not closing
+    #[cfg(not(target_arch = "wasm32"))]
     fn spawn_backfill(self: &Arc<Self>) {
         if self.backfill_running.load(Ordering::Acquire) || self.closing.load(Ordering::Acquire) {
             return;

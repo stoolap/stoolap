@@ -23,7 +23,6 @@ fn store(block: Vec<u8>, decoded_len: usize, data_type: DataType) -> CompressedB
         vec![vec![block]],
         vec![vec![decoded_len]],
         vec![if data_type == DataType::Json { 6 } else { 1 }],
-        vec![data_type],
         vec![data_type as u8],
         Vec::new(),
         Vec::new(),
@@ -156,7 +155,6 @@ fn two_group_store(
             DataType::Json => 6,
             _ => 1,
         }],
-        vec![data_type],
         vec![data_type as u8],
         if dictionary {
             vec!["value".into()]
@@ -305,7 +303,7 @@ fn boundary_reads_leave_unsupported_types_unnarrowed() {
         }],
         vec![DataType::Float],
     );
-    let store = CompressedBlockStore::compress_columns(&columns, &[DataType::Float], 2).unwrap();
+    let store = CompressedBlockStore::compress_columns(&columns, 2).unwrap();
     assert_eq!(
         store
             .binary_search_ge(0, 1, &[])
@@ -405,9 +403,7 @@ fn range_scan_without_group_metadata_preserves_matching_rows() {
         builder.add_row(id, &Row::from_values(vec![Value::Integer(id); 2]));
     }
     let mut volume = builder.finish().unwrap();
-    let store =
-        CompressedBlockStore::compress_columns(&volume.columns, &[DataType::Integer; 2], rows)
-            .unwrap();
+    let store = CompressedBlockStore::compress_columns(&volume.columns, rows).unwrap();
     volume.columns = LazyColumns::deferred(store, vec![DataType::Integer; 2]);
     Arc::get_mut(&mut volume.meta).unwrap().row_groups.clear();
     let table = warm_table(volume);
@@ -508,7 +504,6 @@ fn whole_column_rejects_inconsistent_row_geometry() {
         vec![vec![vec![0; 18]]],
         vec![vec![18]],
         vec![1],
-        vec![DataType::Integer],
         vec![0],
         Vec::new(),
         Vec::new(),
@@ -542,7 +537,7 @@ fn empty_whole_column_preserves_its_type() {
         }],
         types.clone(),
     );
-    let store = CompressedBlockStore::compress_columns(&columns, &types, 0).unwrap();
+    let store = CompressedBlockStore::compress_columns(&columns, 0).unwrap();
     let decoded = LazyColumns::deferred(store, types);
     assert!(
         matches!(decoded.get(0).unwrap(), ColumnData::Int64 { values, nulls } if values.is_empty() && nulls.is_empty())
@@ -640,7 +635,6 @@ fn group_rejects_missing_metadata() {
                 vec![vec![18]]
             },
             if missing == 1 { Vec::new() } else { vec![1] },
-            vec![DataType::Integer],
             if missing == 2 { Vec::new() } else { vec![0] },
             Vec::new(),
             Vec::new(),
@@ -663,7 +657,6 @@ fn group_rejects_inconsistent_row_geometry() {
             vec![vec![vec![0; 18]]],
             vec![vec![18]],
             vec![1],
-            vec![DataType::Integer],
             vec![0],
             Vec::new(),
             Vec::new(),
@@ -764,8 +757,7 @@ fn valid_group_round_trip_preserves_all_column_types_and_nulls() {
         types.clone(),
     );
     for compress in [false, true] {
-        let store =
-            CompressedBlockStore::compress_columns_opts(&columns, &types, 2, compress).unwrap();
+        let store = CompressedBlockStore::compress_columns_opts(&columns, 2, compress).unwrap();
         for ci in 0..types.len() {
             let group = store.group_column(ci, 0).unwrap();
             assert_eq!(group.len(), 2);
@@ -788,7 +780,6 @@ fn valid_group_round_trip_preserves_all_column_types_and_nulls() {
                 .map(|lengths| vec![lengths[0]; 2])
                 .collect(),
             store.col_type_tags().to_vec(),
-            types.clone(),
             store.col_ext_types().to_vec(),
             vec!["value".into()],
             vec![(4, 0, 1)],
@@ -821,13 +812,7 @@ fn valid_final_partial_group_preserves_rows() {
         vec![DataType::Integer],
     );
     for compress in [false, true] {
-        let store = CompressedBlockStore::compress_columns_opts(
-            &columns,
-            &[DataType::Integer],
-            rows,
-            compress,
-        )
-        .unwrap();
+        let store = CompressedBlockStore::compress_columns_opts(&columns, rows, compress).unwrap();
         assert_eq!(store.group_column(0, 0).unwrap().len(), ROW_GROUP_SIZE);
         let last = store.group_column(0, 1).unwrap();
         assert_eq!(last.len(), 3);
@@ -851,7 +836,6 @@ fn all_null_dictionary_group_does_not_require_a_dictionary_range() {
         vec![vec![raw]],
         vec![vec![10]],
         vec![5],
-        vec![DataType::Text],
         vec![0],
         Vec::new(),
         Vec::new(),
@@ -893,7 +877,6 @@ fn malformed_columns() -> LazyColumns {
             vec![vec![valid], vec![vec![0; 19]]],
             vec![vec![18], vec![19]],
             vec![1; 2],
-            vec![DataType::Integer; 2],
             vec![0; 2],
             Vec::new(),
             Vec::new(),
@@ -910,9 +893,8 @@ fn lazy_columns_cache_failure_and_never_promote_it_to_eager() {
     assert_eq!(columns.get(0).unwrap().get_i64(1), 2);
     assert_io_failure(|| columns.get(1), ErrorKind::InvalidData);
     let good = two_column_volume();
-    columns.attach_compressed_store(
-        CompressedBlockStore::compress_columns(&good.columns, &[DataType::Integer; 2], 2).unwrap(),
-    );
+    columns
+        .attach_compressed_store(CompressedBlockStore::compress_columns(&good.columns, 2).unwrap());
     assert_io_failure(|| columns.get(1), ErrorKind::InvalidData);
     assert_io_failure(|| columns.get_column_dictionary(1), ErrorKind::InvalidData);
     assert!(!columns.is_eager());
@@ -949,8 +931,7 @@ fn metadata_only_columns_return_errors() {
 #[test]
 fn take_columns_decodes_every_uninitialized_column() {
     let volume = two_column_volume();
-    let store = CompressedBlockStore::compress_columns(&volume.columns, &[DataType::Integer; 2], 2)
-        .unwrap();
+    let store = CompressedBlockStore::compress_columns(&volume.columns, 2).unwrap();
     let columns = LazyColumns::deferred(store, vec![DataType::Integer; 2]);
     let decoded = columns.take_columns().unwrap();
     assert_eq!(decoded.len(), 2);
@@ -1513,7 +1494,6 @@ fn scanner_reports_a_missing_group_for_full_and_partial_projections() {
             vec![vec![vec![0; 18]], vec![]],
             vec![vec![18], vec![]],
             vec![1, 1],
-            vec![DataType::Integer; 2],
             vec![0; 2],
             Vec::new(),
             Vec::new(),
