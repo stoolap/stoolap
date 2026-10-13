@@ -496,6 +496,12 @@ pub trait VisibilityChecker: Send + Sync {
     fn oldest_snapshot_begin_seq(&self) -> Option<i64> {
         None
     }
+
+    /// Asked before versions of `txn_id` reach the shared store: true lets
+    /// them in, false refuses a transaction that already ended
+    fn admit_publication(&self, _txn_id: i64) -> bool {
+        true
+    }
 }
 
 /// What a new head keeps of the chain it replaces
@@ -1543,6 +1549,13 @@ impl VersionStore {
     /// Returns the current auto-increment value without incrementing
     pub fn get_current_auto_increment_value(&self) -> i64 {
         self.auto_increment_counter.load(Ordering::Acquire)
+    }
+
+    /// Whether the registry lets versions of `txn_id` into this store
+    pub fn admit_publication(&self, txn_id: i64) -> bool {
+        self.visibility_checker
+            .as_ref()
+            .is_none_or(|checker| checker.admit_publication(txn_id))
     }
 
     /// Adds a new version for a row
@@ -7987,6 +8000,11 @@ impl TransactionVersionStore {
     /// RowVersion values, avoiding expensive clones. The transaction is
     /// consumed after commit anyway, so this is safe.
     pub fn commit(&mut self) -> Result<(), Error> {
+        // Before any index or version is touched: a transaction that ended
+        // publishes nothing
+        if self.has_local_changes() && !self.parent_store.admit_publication(self.txn_id) {
+            return Err(Error::TransactionEnded);
+        }
         // Rows written under a layout a column change has since replaced
         // would be read at the wrong positions: refused here before the
         // indexes take them, and again under the versions lock as they

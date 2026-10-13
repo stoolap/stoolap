@@ -586,7 +586,11 @@ impl Transaction for MvccTransaction {
         let is_read_only = self.is_read_only();
 
         // Mark transaction as aborted in registry
-        self.registry.abort_transaction(self.id);
+        if is_read_only {
+            self.registry.forget_transaction(self.id);
+        } else {
+            self.registry.abort_transaction(self.id);
+        }
 
         // Rollback DDL operations (CREATE TABLE / DROP TABLE) in reverse order
         if let Some(ops) = &self.engine_operations {
@@ -889,7 +893,11 @@ impl Drop for MvccTransaction {
     fn drop(&mut self) {
         if self.state == TransactionState::Active {
             // Silent rollback on drop
-            self.registry.abort_transaction(self.id);
+            if self.is_read_only() {
+                self.registry.forget_transaction(self.id);
+            } else {
+                self.registry.abort_transaction(self.id);
+            }
 
             if let Some(ops) = &self.engine_operations {
                 // Roll back DDL operations (CREATE TABLE / DROP TABLE)
