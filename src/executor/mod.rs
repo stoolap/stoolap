@@ -342,6 +342,10 @@ impl Executor {
                 return StatementGate::Shared { _read: read };
             }
         }
+        #[cfg(feature = "test-failpoints")]
+        if let Err(std::sync::TryLockError::WouldBlock) = self.statement_gate.try_write() {
+            crate::test_failpoints::statement_gate_blocked();
+        }
         StatementGate::Exclusive {
             _write: self
                 .statement_gate
@@ -352,6 +356,10 @@ impl Executor {
 
     /// The shared gate, or None while an explicit transaction is open
     fn enter_shared(&self) -> Option<RwLockReadGuard<'_, ()>> {
+        #[cfg(feature = "test-failpoints")]
+        if let Err(std::sync::TryLockError::WouldBlock) = self.statement_gate.try_read() {
+            crate::test_failpoints::statement_gate_blocked();
+        }
         let read = self
             .statement_gate
             .read()

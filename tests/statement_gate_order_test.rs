@@ -17,13 +17,21 @@
 
 #![cfg(feature = "test-failpoints")]
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{mpsc, Arc};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::Duration;
 
 use stoolap::Database;
+
+const WATCHDOG: Duration = Duration::from_secs(10);
+
+#[derive(Debug, PartialEq)]
+enum Seen {
+    Blocked,
+    Done(Result<i64, String>),
+}
 
 fn table(dsn: &str) -> Arc<Database> {
     let db = Database::open(dsn).unwrap();
@@ -34,94 +42,78 @@ fn table(dsn: &str) -> Arc<Database> {
     Arc::new(db)
 }
 
-/// Starts `sql` on `db` from another thread, then reports whether it
-/// finished within `wait` while the caller is still inside its own statement
-fn finishes_meanwhile(
-    db: &Arc<Database>,
-    sql: &'static str,
-    wait: Duration,
-    joined: &Rc<RefCell<Option<JoinHandle<()>>>>,
-) -> bool {
+/// Runs `sql` on `db` from another thread, which reports whether it found
+/// the statement gate held and then how its statement ended
+fn start(db: &Arc<Database>, sql: &'static str) -> mpsc::Receiver<Seen> {
     let db = Arc::clone(db);
-    let (done, finished) = mpsc::channel();
-    *joined.borrow_mut() = Some(thread::spawn(move || {
-        let _ = db.execute(sql, ());
-        let _ = done.send(());
-    }));
-    finished.recv_timeout(wait).is_ok()
+    let (seen, events) = mpsc::channel();
+    thread::spawn(move || {
+        let blocked = seen.clone();
+        stoolap::test_failpoints::on_statement_gate_blocked(move || {
+            let _ = blocked.send(Seen::Blocked);
+        });
+        let _ = seen.send(Seen::Done(db.execute(sql, ()).map_err(|e| e.to_string())));
+    });
+    events
 }
 
-fn join(joined: &Rc<RefCell<Option<JoinHandle<()>>>>) {
-    if let Some(handle) = joined.borrow_mut().take() {
-        handle.join().unwrap();
-    }
+/// The first thing `events` reports, from inside the caller's statement
+fn first(events: &mpsc::Receiver<Seen>) -> Seen {
+    events
+        .recv_timeout(WATCHDOG)
+        .expect("the other statement neither ran nor reached the gate")
 }
+
+type Shared = Rc<RefCell<Option<(Seen, mpsc::Receiver<Seen>)>>>;
 
 #[test]
 fn test_two_statements_on_one_handle_run_at_once() {
     let db = table("memory://gate_order_parallel");
-    let joined = Rc::new(RefCell::new(None));
-    let overlapped = Rc::new(Cell::new(false));
-    let (hook_db, hook_joined, hook_overlapped) =
-        (Arc::clone(&db), Rc::clone(&joined), Rc::clone(&overlapped));
+    let observed: Shared = Rc::new(RefCell::new(None));
+    let (hook_db, hook_observed) = (Arc::clone(&db), Rc::clone(&observed));
     stoolap::test_failpoints::after_select_table_opened(move || {
-        hook_overlapped.set(finishes_meanwhile(
-            &hook_db,
-            "UPDATE t SET v = 21 WHERE id = 2",
-            Duration::from_secs(2),
-            &hook_joined,
-        ));
+        let events = start(&hook_db, "UPDATE t SET v = 21 WHERE id = 2");
+        *hook_observed.borrow_mut() = Some((first(&events), events));
     });
     assert_eq!(db.query("SELECT * FROM t", ()).unwrap().count(), 2);
-    join(&joined);
-    assert!(
-        overlapped.get(),
-        "the second statement waited for the first"
-    );
+    let (seen, _) = observed.borrow_mut().take().unwrap();
+    assert_eq!(seen, Seen::Done(Ok(1)), "the update waited for the scan");
+    let v: i64 = db.query_one("SELECT v FROM t WHERE id = 2", ()).unwrap();
+    assert_eq!(v, 21);
 }
 
 #[test]
 fn test_begin_waits_for_a_running_statement() {
     let db = table("memory://gate_order_begin");
-    let joined = Rc::new(RefCell::new(None));
-    let overlapped = Rc::new(Cell::new(true));
-    let (hook_db, hook_joined, hook_overlapped) =
-        (Arc::clone(&db), Rc::clone(&joined), Rc::clone(&overlapped));
+    let observed: Shared = Rc::new(RefCell::new(None));
+    let (hook_db, hook_observed) = (Arc::clone(&db), Rc::clone(&observed));
     stoolap::test_failpoints::after_select_table_opened(move || {
-        hook_overlapped.set(finishes_meanwhile(
-            &hook_db,
-            "BEGIN",
-            Duration::from_millis(300),
-            &hook_joined,
-        ));
+        let events = start(&hook_db, "BEGIN");
+        *hook_observed.borrow_mut() = Some((first(&events), events));
     });
     assert_eq!(db.query("SELECT * FROM t", ()).unwrap().count(), 2);
-    join(&joined);
-    assert!(!overlapped.get(), "BEGIN ran inside a running statement");
+    let (seen, events) = observed.borrow_mut().take().unwrap();
+    assert_eq!(seen, Seen::Blocked, "BEGIN ran inside a running statement");
+    assert_eq!(first(&events), Seen::Done(Ok(0)));
     db.execute("ROLLBACK", ()).unwrap();
 }
 
 #[test]
 fn test_no_statement_runs_between_the_statements_of_a_program() {
     let db = table("memory://gate_order_program");
-    let joined = Rc::new(RefCell::new(None));
-    let overlapped = Rc::new(Cell::new(true));
-    let (hook_db, hook_joined, hook_overlapped) =
-        (Arc::clone(&db), Rc::clone(&joined), Rc::clone(&overlapped));
+    let observed: Shared = Rc::new(RefCell::new(None));
+    let (hook_db, hook_observed) = (Arc::clone(&db), Rc::clone(&observed));
     stoolap::test_failpoints::after_program_statement(move || {
-        hook_overlapped.set(finishes_meanwhile(
-            &hook_db,
-            "ROLLBACK",
-            Duration::from_millis(300),
-            &hook_joined,
-        ));
+        let events = start(&hook_db, "ROLLBACK");
+        *hook_observed.borrow_mut() = Some((first(&events), events));
     });
     db.execute(
         "BEGIN; INSERT INTO t VALUES (3, 30); INSERT INTO t VALUES (4, 40); COMMIT",
         (),
     )
     .unwrap();
-    join(&joined);
-    assert!(!overlapped.get(), "a ROLLBACK ran inside the program");
+    let (seen, events) = observed.borrow_mut().take().unwrap();
+    assert_eq!(seen, Seen::Blocked, "a ROLLBACK ran inside the program");
+    assert!(matches!(first(&events), Seen::Done(_)));
     assert_eq!(db.query("SELECT * FROM t", ()).unwrap().count(), 4);
 }
