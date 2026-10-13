@@ -1765,6 +1765,11 @@ impl<'a> CompiledEvaluator<'a> {
         match expr {
             Expression::Identifier(id) => {
                 id.value_lower.hash(hasher);
+                // A quoted name compiles differently, as in the global key
+                id.quoted.hash(hasher);
+                if id.quoted {
+                    id.value.hash(hasher);
+                }
             }
             Expression::QualifiedIdentifier(qid) => {
                 qid.qualifier.value_lower.hash(hasher);
@@ -2668,6 +2673,34 @@ mod tests {
         let result = eval.evaluate(&expr);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), Value::Integer(15));
+    }
+
+    #[test]
+    fn test_quoted_identifier_does_not_reuse_the_unquoted_program() {
+        let cols = vec!["true".to_string()];
+        let mut eval = CompiledEvaluator::default();
+        eval.init_columns(&cols);
+        let row = Row::from(vec![Value::Integer(8)]);
+        eval.set_row_array(&row);
+
+        let quoted = |value: &str| {
+            Expression::Identifier(Identifier {
+                value: value.into(),
+                value_lower: value.to_lowercase().into(),
+                position: Position::default(),
+                quoted: true,
+            })
+        };
+
+        // Unquoted true is the boolean literal; a quoted name is the column
+        assert_eq!(
+            eval.evaluate(&make_identifier("true")).unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(eval.evaluate(&quoted("true")).unwrap(), Value::Integer(8));
+        // With no such column a quoted name is its own text
+        assert_eq!(eval.evaluate(&quoted("ABC")).unwrap(), Value::text("ABC"));
+        assert_eq!(eval.evaluate(&quoted("abc")).unwrap(), Value::text("abc"));
     }
 
     #[test]
