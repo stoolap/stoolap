@@ -29,13 +29,16 @@
 use std::sync::RwLock;
 
 use crate::common::{CompactArc, SmartString};
-use crate::core::{Result, Row, RowVec, Schema, Value};
+use crate::core::{Error, Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::{Expression, SelectStatement};
+use crate::storage::expression::ConstBoolExpr;
 use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::traits::{Engine, QueryResult};
 
 use super::context::ExecutionContext;
-use super::query_cache::{or_normal_path, CompiledExecution, CompiledPkLookup, PkValueSource};
+use super::query_cache::{
+    check_compiled_token, or_normal_path, CompiledExecution, CompiledPkLookup, PkValueSource,
+};
 use super::result::ExecutorResult;
 use super::Executor;
 
@@ -68,21 +71,11 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Option<Result<Box<dyn QueryResult>>> {
-        // Quick reject: if we're in an explicit transaction, skip fast path
-        // The fast path uses fetch_rows_by_ids which only sees committed data,
-        // so it wouldn't see uncommitted changes from the current transaction.
-        // This could return stale data if Transaction A updates a row and then
-        // queries for it - the fast path would return the old committed value.
-        // Use try_lock for faster rejection under contention.
-        {
-            let active_tx = match self.active_transaction.try_lock() {
-                Ok(guard) => guard,
-                Err(_) => return None, // Lock contention - fall back to normal path
-            };
-            if active_tx.is_some() {
-                return None; // Let normal execution path handle transaction context
-            }
-        }
+        // Inside an explicit transaction the row is read through it
+        let in_txn = match self.active_transaction.try_lock() {
+            Ok(active_tx) => active_tx.is_some(),
+            Err(_) => return None, // Lock contention - fall back to normal path
+        };
 
         // Quick reject: must have WHERE clause and table_expr
         let where_clause = stmt.where_clause.as_ref()?;
@@ -124,7 +117,7 @@ impl Executor {
             self.extract_pk_lookup_info(table_name, where_clause, &stmt.columns, ctx)?;
 
         // Execute the fast-path lookup
-        or_normal_path(self.execute_pk_lookup(lookup_info))
+        or_normal_path(self.execute_pk_lookup(lookup_info, in_txn))
     }
 
     /// True for `SELECT *` or a list of plain column names; anything else
@@ -182,6 +175,8 @@ impl Executor {
             self.extract_pk_lookup_structure(table_name, where_clause)?;
         let (projection, column_names) = Self::pk_projection(columns, &schema)?;
         let pk_value = self.extract_pk_value_fast(&pk_value_source, ctx)?;
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::pk_lookup_resolved();
         Some(PkLookupInfo {
             table_name: table_name.to_string(),
             pk_value,
@@ -330,14 +325,43 @@ impl Executor {
         row
     }
 
-    /// Execute the fast-path PK lookup using Engine::fetch_rows_by_ids
-    fn execute_pk_lookup(&self, info: PkLookupInfo) -> Result<Box<dyn QueryResult>> {
-        // Use engine's fetch_rows_by_ids for direct MVCC lookup
-        // This bypasses the full query planner and goes straight to version store
-        // Note: table_name is already lowercased, so storage layer won't call to_lowercase again
-        let rows = self
-            .engine
-            .fetch_rows_by_ids(&info.table_name, &[info.pk_value], info.token)?;
+    /// The row with id `pk_value`: committed state outside a transaction,
+    /// else what the active transaction sees through a handle taken for this
+    /// statement, refused as SchemaChanged unless it holds layout `token`
+    fn fetch_pk_row(
+        &self,
+        table_name: &str,
+        pk_value: i64,
+        token: LayoutToken,
+        in_txn: bool,
+    ) -> Result<RowVec> {
+        if !in_txn {
+            return self
+                .engine
+                .fetch_rows_by_ids(table_name, &[pk_value], token);
+        }
+        let table = {
+            let active = self
+                .active_transaction
+                .lock()
+                .map_err(|_| Error::internal("active transaction lock poisoned"))?;
+            // A missing transaction or table is the normal path's to report
+            let table = active
+                .as_ref()
+                .and_then(|tx| tx.transaction.get_table(table_name).ok());
+            table.ok_or_else(|| Error::SchemaChanged {
+                table: table_name.to_string(),
+            })?
+        };
+        check_compiled_token(&*table, token)?;
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("exec.pk_lookup_in_transaction");
+        table.fetch_rows_by_ids(&[pk_value], &ConstBoolExpr::true_expr())
+    }
+
+    /// Execute the fast-path PK lookup
+    fn execute_pk_lookup(&self, info: PkLookupInfo, in_txn: bool) -> Result<Box<dyn QueryResult>> {
+        let rows = self.fetch_pk_row(&info.table_name, info.pk_value, info.token, in_txn)?;
 
         // Extract Row values and normalize to current schema (handles ADD/DROP COLUMN)
         let result_rows: RowVec = rows
@@ -371,10 +395,8 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         compiled: &RwLock<CompiledExecution>,
+        in_txn: bool,
     ) -> Option<Result<Box<dyn QueryResult>>> {
-        // Caller (try_compiled_fast_paths) guarantees no explicit transaction
-        // is active; this path reads committed state only.
-
         // Try read lock first - check if already compiled
         {
             let compiled_guard = match compiled.read() {
@@ -395,7 +417,9 @@ impl Executor {
                         let pk_value = self.extract_pk_value_fast(&lookup.pk_value_source, ctx)?;
                         #[cfg(feature = "test-failpoints")]
                         crate::test_failpoints::compiled_epoch_checked();
-                        return or_normal_path(self.execute_compiled_pk_lookup(lookup, pk_value));
+                        return or_normal_path(
+                            self.execute_compiled_pk_lookup(lookup, pk_value, in_txn),
+                        );
                     }
                     // Epoch changed - some DDL occurred, need to recompile
                     // Fall through to recompile path
@@ -413,7 +437,7 @@ impl Executor {
         }
 
         // First execution or schema changed - compile and cache (write lock)
-        self.compile_and_execute_pk_lookup(stmt, ctx, compiled)
+        self.compile_and_execute_pk_lookup(stmt, ctx, compiled, in_txn)
     }
 
     /// Extract PK value using pre-compiled source (very fast - just array access)
@@ -482,7 +506,7 @@ impl Executor {
                     // Fast path: extract value from slice directly
                     let pk_value =
                         Self::extract_pk_value_from_slice(&lookup.pk_value_source, params)?;
-                    or_normal_path(self.execute_compiled_pk_lookup(lookup, pk_value))
+                    or_normal_path(self.execute_compiled_pk_lookup(lookup, pk_value, false))
                 } else {
                     // Epoch changed - need recompile, use normal path
                     None
@@ -498,10 +522,9 @@ impl Executor {
         &self,
         lookup: &CompiledPkLookup,
         pk_value: i64,
+        in_txn: bool,
     ) -> Result<Box<dyn QueryResult>> {
-        let rows = self
-            .engine
-            .fetch_rows_by_ids(&lookup.table_name, &[pk_value], lookup.token)?;
+        let rows = self.fetch_pk_row(&lookup.table_name, pk_value, lookup.token, in_txn)?;
         // Normalize rows to current schema (handles ADD/DROP COLUMN)
         // Pre-allocate with capacity 1 for single PK lookup (avoids realloc)
         let mut result_rows = RowVec::with_capacity(1);
@@ -525,6 +548,7 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         compiled: &RwLock<CompiledExecution>,
+        in_txn: bool,
     ) -> Option<Result<Box<dyn QueryResult>>> {
         // Acquire write lock
         let mut compiled_guard = match compiled.write() {
@@ -542,7 +566,9 @@ impl Executor {
                 // Re-validate epoch: another thread may have compiled before DDL
                 if self.engine.schema_epoch() == lookup.cached_epoch {
                     let pk_value = self.extract_pk_value_fast(&lookup.pk_value_source, ctx)?;
-                    return or_normal_path(self.execute_compiled_pk_lookup(lookup, pk_value));
+                    return or_normal_path(
+                        self.execute_compiled_pk_lookup(lookup, pk_value, in_txn),
+                    );
                 }
                 // Epoch changed since last compilation - fall through to recompile
             }
@@ -627,14 +653,17 @@ impl Executor {
                 // Resolve this execution's value; on failure fall back to
                 // the standard path (the stored PkLookup stays valid).
                 let pk_value = self.extract_pk_value_fast(&pk_value_source, ctx)?;
-                or_normal_path(self.execute_pk_lookup(PkLookupInfo {
-                    table_name: table_name.to_string(),
-                    pk_value,
-                    schema,
-                    column_names,
-                    projection,
-                    token,
-                }))
+                or_normal_path(self.execute_pk_lookup(
+                    PkLookupInfo {
+                        table_name: table_name.to_string(),
+                        pk_value,
+                        schema,
+                        column_names,
+                        projection,
+                        token,
+                    },
+                    in_txn,
+                ))
             }
             None => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
