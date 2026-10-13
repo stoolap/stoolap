@@ -52,20 +52,27 @@ fn probe_allocations(build_config: &ParallelConfig) -> u64 {
     allocated
 }
 
+// One test: dhat counts for the whole process, so both builds are measured
+// one after the other, never beside another test
 #[test]
-fn probing_a_sequentially_built_table_allocates_nothing_per_row() {
-    let allocated = probe_allocations(&ParallelConfig::disabled());
-    assert!(allocated < 64, "probe made {allocated} allocations");
-}
+fn probing_a_built_table_allocates_nothing_per_row() {
+    let sequential = probe_allocations(&ParallelConfig::disabled());
+    assert!(
+        sequential < 64,
+        "probe of a sequential table made {sequential} allocations"
+    );
 
-#[cfg(feature = "parallel")]
-#[test]
-fn probing_a_table_built_in_parallel_allocates_nothing_per_row() {
-    let config = ParallelConfig {
-        min_rows_for_parallel_join: 1000,
-        ..ParallelConfig::default()
-    };
-    assert!(config.should_parallel_join(ROWS as usize));
-    let allocated = probe_allocations(&config);
-    assert!(allocated < 64, "probe made {allocated} allocations");
+    #[cfg(feature = "parallel")]
+    {
+        let config = ParallelConfig {
+            min_rows_for_parallel_join: 1000,
+            ..ParallelConfig::default()
+        };
+        assert!(config.should_parallel_join(ROWS as usize));
+        let parallel = probe_allocations(&config);
+        assert!(
+            parallel < 64,
+            "probe of a parallel table made {parallel} allocations"
+        );
+    }
 }

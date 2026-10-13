@@ -571,7 +571,8 @@ pub fn parallel_hash_build(
     if config.should_parallel_join(row_count) {
         let n_threads = num_threads();
         let partitions = n_threads.next_power_of_two().max(2);
-        let shift = u64::BITS - partitions.trailing_zeros();
+        // FxHasher keeps a usize, so a 32-bit target's hashes have no top half
+        let shift = usize::BITS - partitions.trailing_zeros();
         let chunk_size = config.chunk_size.max(row_count / n_threads).max(1000);
 
         let chunk_parts: Vec<Vec<Vec<(u64, usize)>>> = build_rows
