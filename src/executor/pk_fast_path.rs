@@ -72,10 +72,11 @@ impl Executor {
         ctx: &ExecutionContext,
     ) -> Option<Result<Box<dyn QueryResult>>> {
         // Inside an explicit transaction the row is read through it
-        let in_txn = match self.active_transaction.try_lock() {
-            Ok(active_tx) => active_tx.is_some(),
-            Err(_) => return None, // Lock contention - fall back to normal path
-        };
+        let in_txn = self
+            .active_transaction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
         if in_txn {
             // The normal path arms a timeout and refuses a cancelled statement
             if ctx.has_timeout() {

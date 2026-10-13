@@ -78,7 +78,8 @@ pub mod utils;
 mod window;
 
 use rustc_hash::FxHashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::api::params::ParamVec;
 use crate::core::{Error, Result, Value};
@@ -158,6 +159,28 @@ struct ActiveTransaction {
     tables: FxHashMap<String, Box<dyn Table>>,
 }
 
+/// The statement gate held for one entry into the executor
+enum StatementGate<'a> {
+    Shared { _read: RwLockReadGuard<'a, ()> },
+    Exclusive { _write: RwLockWriteGuard<'a, ()> },
+}
+
+/// Whether `statement` changes this session's state, so it runs alone.
+/// EXPLAIN ANALYZE runs the statement it explains.
+fn changes_session(statement: &Statement) -> bool {
+    matches!(
+        statement,
+        Statement::Begin(_)
+            | Statement::Commit(_)
+            | Statement::Rollback(_)
+            | Statement::Savepoint(_)
+            | Statement::ReleaseSavepoint(_)
+            | Statement::Set(_)
+            | Statement::Pragma(_)
+            | Statement::Explain(_)
+    )
+}
+
 /// SQL Query Executor
 ///
 /// The executor is the main entry point for executing SQL statements.
@@ -167,12 +190,15 @@ pub struct Executor {
     engine: Arc<MVCCEngine>,
     /// Function registry for scalar, aggregate, and window functions
     function_registry: Arc<FunctionRegistry>,
-    /// Default isolation level for transactions
-    default_isolation_level: crate::core::IsolationLevel,
+    /// Default isolation level for transactions, as its `u8` value
+    default_isolation_level: AtomicU8,
     /// Query cache for parsed statements
     query_cache: QueryCache,
     /// Semantic cache for query results with subsumption detection
     semantic_cache: SemanticCache,
+    /// Taken before `active_transaction`: shared by statements that run
+    /// outside an explicit transaction, exclusive for the rest
+    statement_gate: RwLock<()>,
     /// Active transaction for explicit transaction control (BEGIN/COMMIT/ROLLBACK)
     active_transaction: Mutex<Option<ActiveTransaction>>,
     /// Query planner for cost-based optimization (lazily initialized)
@@ -185,9 +211,12 @@ impl Executor {
         Self {
             engine,
             function_registry: default_function_registry(),
-            default_isolation_level: crate::core::IsolationLevel::ReadCommitted,
+            default_isolation_level: AtomicU8::new(
+                crate::core::IsolationLevel::ReadCommitted as u8,
+            ),
             query_cache: QueryCache::default(),
             semantic_cache: SemanticCache::default(),
+            statement_gate: RwLock::new(()),
             active_transaction: Mutex::new(None),
             query_planner: std::sync::OnceLock::new(),
         }
@@ -201,9 +230,12 @@ impl Executor {
         Self {
             engine,
             function_registry,
-            default_isolation_level: crate::core::IsolationLevel::ReadCommitted,
+            default_isolation_level: AtomicU8::new(
+                crate::core::IsolationLevel::ReadCommitted as u8,
+            ),
             query_cache: QueryCache::default(),
             semantic_cache: SemanticCache::default(),
+            statement_gate: RwLock::new(()),
             active_transaction: Mutex::new(None),
             query_planner: std::sync::OnceLock::new(),
         }
@@ -214,9 +246,12 @@ impl Executor {
         Self {
             engine,
             function_registry: default_function_registry(),
-            default_isolation_level: crate::core::IsolationLevel::ReadCommitted,
+            default_isolation_level: AtomicU8::new(
+                crate::core::IsolationLevel::ReadCommitted as u8,
+            ),
             query_cache: QueryCache::new(cache_size),
             semantic_cache: SemanticCache::default(),
+            statement_gate: RwLock::new(()),
             active_transaction: Mutex::new(None),
             query_planner: std::sync::OnceLock::new(),
         }
@@ -294,8 +329,39 @@ impl Executor {
     }
 
     /// Set the default isolation level for new transactions
-    pub fn set_default_isolation_level(&mut self, level: crate::core::IsolationLevel) {
-        self.default_isolation_level = level;
+    pub fn set_default_isolation_level(&self, level: crate::core::IsolationLevel) {
+        self.default_isolation_level
+            .store(level as u8, Ordering::Relaxed);
+    }
+
+    /// The gate for one entry: shared while this session has no explicit
+    /// transaction and `exclusive` is false, exclusive otherwise
+    fn enter(&self, exclusive: bool) -> StatementGate<'_> {
+        if !exclusive {
+            if let Some(read) = self.enter_shared() {
+                return StatementGate::Shared { _read: read };
+            }
+        }
+        StatementGate::Exclusive {
+            _write: self
+                .statement_gate
+                .write()
+                .unwrap_or_else(PoisonError::into_inner),
+        }
+    }
+
+    /// The shared gate, or None while an explicit transaction is open
+    fn enter_shared(&self) -> Option<RwLockReadGuard<'_, ()>> {
+        let read = self
+            .statement_gate
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        let no_transaction = self
+            .active_transaction
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none();
+        no_transaction.then_some(read)
     }
 
     /// Get the storage engine
@@ -336,15 +402,7 @@ impl Executor {
         params: &[Value],
     ) -> Option<Result<Box<dyn QueryResult>>> {
         // Quick reject: if in explicit transaction, skip fast path
-        {
-            let active_tx = match self.active_transaction.try_lock() {
-                Ok(guard) => guard,
-                Err(_) => return None,
-            };
-            if active_tx.is_some() {
-                return None;
-            }
-        }
+        let _gate = self.enter_shared()?;
 
         // Try to get from cache
         let cached = self.query_cache.get(sql)?;
@@ -411,6 +469,8 @@ impl Executor {
                 }
             }
 
+            let gate = self.enter(changes_session(&cached.statement));
+
             // INSERT handles the active transaction itself; dispatch before
             // the txn-state capture so the hot prepared-INSERT path takes
             // the transaction mutex only once.
@@ -422,7 +482,7 @@ impl Executor {
             // the probe battery and the ctx txn-id injection both need it,
             // and repeated mutex acquisitions dominate the fixed cost of
             // cached statements.
-            let active_txn_id = self.active_txn_id();
+            let active_txn_id = self.gated_txn_id(&gate);
 
             if let Some(result) = self.try_compiled_fast_paths(
                 cached.statement.as_ref(),
@@ -459,11 +519,13 @@ impl Executor {
                 .query_cache
                 .put(sql, stmt_arc.clone(), has_params, param_count);
 
+            let gate = self.enter(changes_session(&stmt_arc));
+
             if let Statement::Insert(stmt) = stmt_arc.as_ref() {
                 return self.execute_insert_with_compiled_cache(stmt, ctx, &cached_plan.compiled);
             }
 
-            let active_txn_id = self.active_txn_id();
+            let active_txn_id = self.gated_txn_id(&gate);
 
             if let Some(result) = self.try_compiled_fast_paths(
                 stmt_arc.as_ref(),
@@ -484,7 +546,10 @@ impl Executor {
             );
         }
 
-        self.execute_program_with_context(&program, ctx)
+        // One gate for the whole program, so no other statement on this
+        // session runs between its statements
+        let _gate = self.enter(true);
+        self.run_program(&program, ctx)
     }
 
     /// Current explicit-transaction id, if one is active.
@@ -495,6 +560,16 @@ impl Executor {
             .unwrap()
             .as_ref()
             .map(|t| t.transaction.id())
+    }
+
+    /// The explicit-transaction id under `gate`: none can be open while the
+    /// gate is shared, since opening one takes it exclusively
+    #[inline]
+    fn gated_txn_id(&self, gate: &StatementGate<'_>) -> Option<i64> {
+        match gate {
+            StatementGate::Shared { .. } => None,
+            StatementGate::Exclusive { .. } => self.active_txn_id(),
+        }
     }
 
     /// Run the compiled fast-path battery for a single cached statement.
@@ -599,6 +674,16 @@ impl Executor {
         program: &Program,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        let _gate = self.enter(true);
+        self.run_program(program, ctx)
+    }
+
+    /// Runs every statement of `program` under a gate the caller holds
+    fn run_program(
+        &self,
+        program: &Program,
+        ctx: &ExecutionContext,
+    ) -> Result<Box<dyn QueryResult>> {
         if program.statements.is_empty() {
             return Ok(Box::new(ExecResult::empty()));
         }
@@ -606,7 +691,9 @@ impl Executor {
         let mut last_result: Option<Box<dyn QueryResult>> = None;
 
         for statement in &program.statements {
-            last_result = Some(self.execute_statement(statement, ctx)?);
+            last_result = Some(self.run_statement(statement, ctx)?);
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::program_statement_done();
         }
 
         Ok(last_result.unwrap())
@@ -614,6 +701,16 @@ impl Executor {
 
     /// Execute a single statement
     pub fn execute_statement(
+        &self,
+        statement: &Statement,
+        ctx: &ExecutionContext,
+    ) -> Result<Box<dyn QueryResult>> {
+        let _gate = self.enter(changes_session(statement));
+        self.run_statement(statement, ctx)
+    }
+
+    /// Runs one statement under a gate the caller holds
+    pub(crate) fn run_statement(
         &self,
         statement: &Statement,
         ctx: &ExecutionContext,
@@ -712,6 +809,7 @@ impl Executor {
     /// to the full executor pipeline (aggregates, JOINs, window functions, etc.)
     /// while keeping the transaction's uncommitted changes visible.
     pub fn install_transaction(&self, tx: Box<dyn Transaction>) {
+        let _gate = self.enter(true);
         let mut active_tx = self.active_transaction.lock().unwrap();
         *active_tx = Some(ActiveTransaction {
             transaction: tx,
@@ -724,6 +822,7 @@ impl Executor {
     /// Returns the transaction so the caller can continue using it for
     /// further DML operations after the SELECT delegation completes.
     pub fn take_transaction(&self) -> Option<Box<dyn Transaction>> {
+        let _gate = self.enter(true);
         let mut active_tx = self.active_transaction.lock().unwrap();
         active_tx.take().map(|at| at.transaction)
     }
@@ -788,13 +887,15 @@ impl Executor {
             }
         }
 
+        let gate = self.enter(changes_session(&plan.statement));
+
         // INSERT handles the active transaction itself; dispatch before the
         // txn-state capture so prepared INSERT takes the mutex only once.
         if let Statement::Insert(stmt) = plan.statement.as_ref() {
             return self.execute_insert_with_compiled_cache(stmt, ctx, &plan.compiled);
         }
 
-        let active_txn_id = self.active_txn_id();
+        let active_txn_id = self.gated_txn_id(&gate);
         if let Some(result) = self.try_compiled_fast_paths(
             plan.statement.as_ref(),
             ctx,

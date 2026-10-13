@@ -1176,6 +1176,7 @@ thread_local! {
     static INDEX_BOUND_HOT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static CACHE_STAMP_PUBLISH_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static STATUS_RUN_CHECKED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static PROGRAM_STATEMENT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
 /// Run once on this thread when its next swap of an open status slot has
@@ -1186,6 +1187,16 @@ pub fn after_status_run_checked(hook: impl FnOnce() + 'static) {
 
 pub(crate) fn status_run_checked() {
     run_hook(&STATUS_RUN_CHECKED_HOOK);
+}
+
+/// Run once on this thread when a statement of its next multi-statement
+/// program has finished and the next has not started
+pub fn after_program_statement(hook: impl FnOnce() + 'static) {
+    PROGRAM_STATEMENT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn program_statement_done() {
+    run_hook(&PROGRAM_STATEMENT_HOOK);
 }
 
 /// Run once on this thread when its next semantic cache stamp has read the

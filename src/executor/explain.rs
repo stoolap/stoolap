@@ -62,7 +62,7 @@ impl Executor {
         if stmt.analyze {
             // EXPLAIN ANALYZE: Execute the query and collect statistics
             let start = crate::common::time_compat::Instant::now();
-            let mut result = self.execute_statement(&stmt.statement, ctx)?;
+            let mut result = self.run_statement(&stmt.statement, ctx)?;
 
             // Count rows by iterating through the result
             let mut row_count = 0usize;

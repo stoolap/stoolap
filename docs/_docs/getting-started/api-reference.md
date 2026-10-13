@@ -560,6 +560,8 @@ match db.execute("INSERT INTO users VALUES (1, 'Alice')", ()) {
 
 `Database` is `Send + Sync`. Clone to share across threads. Each clone has its own executor with independent transaction state but shares the same storage engine.
 
+Threads may also share one handle. Its statements run at the same time while the handle has no open transaction. `BEGIN`, `COMMIT`, `ROLLBACK`, `SET`, `PRAGMA` and `EXPLAIN` wait for the running statements and run alone, as does every statement while a transaction is open, since those statements run inside that transaction. A multi-statement string runs as a whole.
+
 ```rust
 use std::sync::Arc;
 use std::thread;

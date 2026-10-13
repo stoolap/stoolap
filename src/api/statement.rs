@@ -88,10 +88,7 @@ impl Statement {
         db: &Database,
     ) -> Result<Self> {
         let plan = {
-            let executor = db
-                .executor()
-                .lock()
-                .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
+            let executor = db.executor();
 
             // Check if already cached (e.g. same SQL prepared twice)
             if let Some(cached) = executor.query_cache().get(&sql) {
@@ -163,12 +160,8 @@ impl Statement {
     pub fn execute<P: Params>(&self, params: P) -> Result<i64> {
         let db = self.get_db()?;
         if let Some(plan) = &self.plan {
-            let executor = db
-                .executor()
-                .lock()
-                .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
             let ctx = ExecutionContext::with_params(params.into_params());
-            let result = executor.execute_with_cached_plan(plan, &ctx)?;
+            let result = db.executor().execute_with_cached_plan(plan, &ctx)?;
             Ok(result.rows_affected())
         } else {
             db.execute(&self.sql, params)
@@ -192,12 +185,8 @@ impl Statement {
     pub fn query<P: Params>(&self, params: P) -> Result<Rows> {
         let db = self.get_db()?;
         if let Some(plan) = &self.plan {
-            let executor = db
-                .executor()
-                .lock()
-                .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
             let ctx = ExecutionContext::with_params(params.into_params());
-            let result = executor.execute_with_cached_plan(plan, &ctx)?;
+            let result = db.executor().execute_with_cached_plan(plan, &ctx)?;
             Ok(Rows::new(result))
         } else {
             db.query(&self.sql, params)
