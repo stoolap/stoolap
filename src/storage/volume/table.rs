@@ -2580,8 +2580,9 @@ impl SegmentedTable {
     }
 
     fn find_segment_row(&self, row_id: i64) -> Result<Option<(u64, Arc<FrozenVolume>, usize)>> {
-        // Hot buffer shadows cold: if the row exists in hot, the cold copy is stale
-        if self.hot.has_row_id(row_id)? {
+        // A hot version this transaction sees decides the row; a newer one it
+        // does not see leaves the sealed copy to the tombstones below
+        if self.hot.has_visible_row(row_id)? {
             return Ok(None);
         }
         // Check committed tombstones (snapshot-aware: newer tombstones are invisible)
