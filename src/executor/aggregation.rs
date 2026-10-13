@@ -1132,7 +1132,7 @@ impl Executor {
             if !group_aliases.is_empty() {
                 for source in column_sources.iter_mut() {
                     if let ColumnSource::Expression(expr) = source {
-                        **expr = substitute_group_aliases(expr, &group_aliases);
+                        substitute_group_aliases(expr, &group_aliases);
                     }
                 }
             }
@@ -7507,35 +7507,27 @@ fn same_expression(a: &Expression, b: &Expression) -> bool {
     }
 }
 
-/// `expr` with every subexpression that is the same as an aliased GROUP BY
-/// expression replaced by that alias
-fn substitute_group_aliases(
-    expr: &Expression,
-    aliases: &[(&Expression, &Identifier)],
-) -> Expression {
+/// Replace, in place, every subexpression of `expr` that is the same as an
+/// aliased GROUP BY expression by that alias
+fn substitute_group_aliases(expr: &mut Expression, aliases: &[(&Expression, &Identifier)]) {
     if let Some((_, alias)) = aliases.iter().find(|(e, _)| same_expression(e, expr)) {
-        return Expression::Identifier((*alias).clone());
+        *expr = Expression::Identifier((*alias).clone());
+        return;
     }
-    let mut out = expr.clone();
-    match &mut out {
+    match expr {
         Expression::Infix(infix) => {
-            *infix.left = substitute_group_aliases(&infix.left, aliases);
-            *infix.right = substitute_group_aliases(&infix.right, aliases);
+            substitute_group_aliases(&mut infix.left, aliases);
+            substitute_group_aliases(&mut infix.right, aliases);
         }
-        Expression::Prefix(prefix) => {
-            *prefix.right = substitute_group_aliases(&prefix.right, aliases);
-        }
-        Expression::Cast(cast) => {
-            *cast.expr = substitute_group_aliases(&cast.expr, aliases);
-        }
+        Expression::Prefix(prefix) => substitute_group_aliases(&mut prefix.right, aliases),
+        Expression::Cast(cast) => substitute_group_aliases(&mut cast.expr, aliases),
         Expression::FunctionCall(func) if !is_aggregate_function(&func.function) => {
             for arg in func.arguments.iter_mut() {
-                *arg = substitute_group_aliases(arg, aliases);
+                substitute_group_aliases(arg, aliases);
             }
         }
         _ => {}
     }
-    out
 }
 
 #[cfg(test)]
