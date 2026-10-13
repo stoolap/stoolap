@@ -119,6 +119,12 @@ fn hash_expression<H: std::hash::Hasher>(expr: &Expression, hasher: &mut H) {
     match expr {
         Expression::Identifier(id) => {
             id.value_lower.hash(hasher);
+            // A quoted name compiles differently (no TRUE/FALSE literal, and
+            // its exact text when no column has that name)
+            id.quoted.hash(hasher);
+            if id.quoted {
+                id.value.hash(hasher);
+            }
         }
         Expression::QualifiedIdentifier(qid) => {
             qid.qualifier.value_lower.hash(hasher);

@@ -46,3 +46,14 @@ fn test_quoted_true_and_false_are_columns() {
         assert_eq!(strings(&db, sql), strings(&db, expected), "{}", sql);
     }
 }
+
+#[test]
+fn test_quoted_name_text_is_not_shared_through_the_program_cache() {
+    // A quoted name that is no column reads as its own text, so programs for
+    // "ABC" and "abc" must not be reused for each other
+    let db = Database::open("memory://quoted_name_cache").unwrap();
+    assert_eq!(strings(&db, "SELECT \"ABC\""), ["Text(\"ABC\")"]);
+    assert_eq!(strings(&db, "SELECT \"abc\""), ["Text(\"abc\")"]);
+    assert_eq!(strings(&db, "SELECT \"TRUE\""), ["Text(\"TRUE\")"]);
+    assert_eq!(strings(&db, "SELECT \"true\""), ["Text(\"true\")"]);
+}
