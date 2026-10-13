@@ -573,6 +573,20 @@ impl Executor {
         self.semantic_cache.invalidate_table(table_name);
     }
 
+    /// The stamp a semantic cache read of `table_name` happens under now, or
+    /// None while a commit is publishing to it or its table is being replaced
+    fn semantic_cache_stamp(&self, table_name: &str) -> Option<semantic_cache::CacheStamp> {
+        let schema = self.engine.schema_epoch();
+        let store = self.engine.get_version_store(table_name).ok()?;
+        let publish = store.publish_epoch_if_quiet()?;
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::cache_stamp_publish_read();
+        // DDL bumps the schema epoch after swapping the store, so an unchanged
+        // epoch means the publish epoch belongs to this table's store
+        (self.engine.schema_epoch() == schema)
+            .then_some(semantic_cache::CacheStamp { publish, schema })
+    }
+
     /// Execute a parsed program
     pub fn execute_program(&self, program: &Program) -> Result<Box<dyn QueryResult>> {
         let ctx = ExecutionContext::new();

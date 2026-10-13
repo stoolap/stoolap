@@ -2325,6 +2325,30 @@ impl Executor {
         let active_tx = self.active_transaction.lock().unwrap();
         let in_explicit_transaction = active_tx.is_some();
 
+        // Only a cacheable SELECT * takes a stamp: no transaction, parameters
+        // or row-shaping clauses. Taken before the transaction or snapshot the
+        // scan reads under, so a cached result is never older than its stamp
+        let cache_stamp = if !in_explicit_transaction
+            && ctx.statement_snapshot().is_none()
+            && ctx.outer_row().is_none()
+            && table_source.as_of.is_none()
+            && classification.is_select_star
+            && stmt.where_clause.is_some()
+            && !classification.has_aggregation
+            && !classification.has_window_functions
+            && !classification.has_group_by
+            && !classification.where_has_subqueries
+            && !classification.where_has_parameters
+            && !classification.has_nondeterministic_functions
+            && !classification.has_order_by
+            && !classification.has_distinct
+            && !classification.has_limit
+        {
+            self.semantic_cache_stamp(table_name)
+        } else {
+            None
+        };
+
         // Get table from active transaction or create a new one
         let (table, _standalone_tx) = if let Some(ref tx_state) = *active_tx {
             // Use the active transaction - this allows seeing uncommitted changes
@@ -2547,57 +2571,17 @@ impl Executor {
         let where_still_correlated = classification.where_has_correlated_subqueries
             && where_to_use.is_some_and(Self::has_correlated_subqueries);
 
-        // SEMANTIC CACHE: Check if we can serve this query from cache
-        // Eligible queries: simple column projections with WHERE, no aggregation/window/grouping, no outer context
-        // Use cached classification for is_select_star check
-        let is_select_star = classification.is_select_star;
-
-        let has_aggregation_window_grouping = classification.has_aggregation
-            || classification.has_window_functions
-            || classification.has_group_by;
-        // Use cached classification for subquery detection (avoids AST traversal)
-        let has_subqueries_in_where = classification.where_has_subqueries;
-
-        // CRITICAL: Check if WHERE clause contains parameters ($1, $2, etc.)
-        // Parameterized queries CANNOT be cached because:
-        // 1. The cache stores results tied to specific parameter values
-        // 2. But the AST only has parameter indices ($1), not actual values
-        // 3. A cache "hit" would return wrong results for different parameter values
-        // This was causing 100x slowdown for SELECT by ID queries due to:
-        // - Cache misses on every lookup (unique predicates)
-        // - Streaming disabled for cache-eligible queries
-        // - Cache insertions (write locks) on every query execution
-        // Use cached classification for parameter detection (avoids AST traversal)
-        let has_parameters_in_where = classification.where_has_parameters;
-
-        // Cache eligibility: We cache SELECT * queries because:
-        // 1. The cache stores full table rows with their original column layout
-        // 2. Subsumption detection works on full rows for filtering
-        // 3. For non-SELECT * queries, we would need to project cached rows on hit
-        //
-        // CRITICAL: Disable caching during explicit transactions (BEGIN/COMMIT)
-        // to preserve MVCC isolation guarantees. A transaction must see its own
-        // consistent snapshot, not cached results from other transactions.
-        let cache_eligible = is_select_star
-            && where_to_use.is_some()
-            && !has_aggregation_window_grouping
-            && !has_outer_context
-            && !has_subqueries_in_where
-            && !has_parameters_in_where // Parameters can't be cached (values not in AST)
-            && !classification.has_nondeterministic_functions // NOW(), RANDOM(), etc. return different values per execution
-            && !classification.has_order_by
-            && !classification.has_distinct
-            && !classification.has_limit
-            && !in_explicit_transaction; // MVCC safety: no caching in transactions
+        // SEMANTIC CACHE: a stamp exists only for an eligible query
+        let cache_eligible = cache_stamp.is_some() && where_to_use.is_some();
 
         // Try cache lookup for eligible queries
-        if cache_eligible {
+        if let Some(stamp) = cache_stamp.filter(|_| cache_eligible) {
             if let Some(where_expr) = where_to_use {
                 use super::semantic_cache::CacheLookupResult;
 
                 match self
                     .semantic_cache
-                    .lookup(table_name, &all_columns, Some(where_expr))
+                    .lookup(table_name, &all_columns, Some(where_expr), stamp)
                 {
                     CacheLookupResult::ExactHit(rows_arc) => {
                         // Exact cache hit - return cached rows with zero-copy sharing
@@ -4155,7 +4139,7 @@ impl Executor {
         // Note: The cache stores Vec<Row>, so we extract rows from RowVec for caching.
         // The result keeps the original RowVec.
         // Skip caching when deferred projection is used (rows are not projected yet)
-        if cache_eligible && deferred_proj.is_none() {
+        if let Some(stamp) = cache_stamp.filter(|_| cache_eligible && deferred_proj.is_none()) {
             if let Some(where_expr) = where_to_use {
                 // Clone rows for cache (cache needs Vec<Row>)
                 let rows_for_cache: Vec<Row> = projected_rows.rows().cloned().collect();
@@ -4164,6 +4148,7 @@ impl Executor {
                     all_columns.to_vec(),
                     rows_for_cache,
                     Some(where_expr.clone()),
+                    stamp,
                 );
             }
         }

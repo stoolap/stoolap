@@ -1090,6 +1090,17 @@ thread_local! {
     static JOIN_NEXT_CHUNK_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static ALTER_DDL_GUARD_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static INDEX_BOUND_HOT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static CACHE_STAMP_PUBLISH_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next semantic cache stamp has read the
+/// table's publish epoch and has not yet checked the schema epoch again
+pub fn after_cache_stamp_publish_read(hook: impl FnOnce() + 'static) {
+    CACHE_STAMP_PUBLISH_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn cache_stamp_publish_read() {
+    run_hook(&CACHE_STAMP_PUBLISH_HOOK);
 }
 
 /// Run once on this thread when its next index MIN or MAX over hot and
