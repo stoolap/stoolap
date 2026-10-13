@@ -1107,6 +1107,37 @@ impl Executor {
             }
         }
 
+        // A GROUP BY expression selected under an alias names its column by the
+        // alias, so another column built on the same expression cannot find it by
+        // its text. Point such subexpressions at the alias column, matching them
+        // by structure, not by printed text.
+        if matches!(stmt.group_by.modifier, GroupByModifier::None) {
+            let group_aliases: Vec<(&Expression, &Identifier)> = stmt
+                .columns
+                .iter()
+                .filter_map(|col| match col {
+                    Expression::Aliased(aliased)
+                        if agg_col_index_map.contains_key(aliased.alias.value_lower.as_str())
+                            && stmt
+                                .group_by
+                                .columns
+                                .iter()
+                                .any(|g| same_expression(g, &aliased.expression)) =>
+                    {
+                        Some((aliased.expression.as_ref(), &aliased.alias))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !group_aliases.is_empty() {
+                for source in column_sources.iter_mut() {
+                    if let ColumnSource::Expression(expr) = source {
+                        substitute_group_aliases(expr, &group_aliases);
+                    }
+                }
+            }
+        }
+
         // Check if we have any correlated expressions that need special handling
         let has_correlated_sources = column_sources
             .iter()
@@ -7417,6 +7448,85 @@ impl Executor {
             vec![result_column_name],
             rows,
         ))))
+    }
+}
+
+/// Whether two expressions are the same, comparing node kinds, operators,
+/// names and literal values but not tokens or source positions
+fn same_expression(a: &Expression, b: &Expression) -> bool {
+    fn same_identifier(a: &Identifier, b: &Identifier) -> bool {
+        a.quoted == b.quoted
+            && if a.quoted {
+                a.value == b.value
+            } else {
+                a.value_lower == b.value_lower
+            }
+    }
+    match (a, b) {
+        (Expression::Identifier(a), Expression::Identifier(b)) => same_identifier(a, b),
+        (Expression::QualifiedIdentifier(a), Expression::QualifiedIdentifier(b)) => {
+            same_identifier(&a.qualifier, &b.qualifier) && same_identifier(&a.name, &b.name)
+        }
+        (Expression::IntegerLiteral(a), Expression::IntegerLiteral(b)) => a.value == b.value,
+        (Expression::FloatLiteral(a), Expression::FloatLiteral(b)) => {
+            a.value.to_bits() == b.value.to_bits()
+        }
+        (Expression::StringLiteral(a), Expression::StringLiteral(b)) => {
+            a.value == b.value && a.type_hint == b.type_hint
+        }
+        (Expression::BooleanLiteral(a), Expression::BooleanLiteral(b)) => a.value == b.value,
+        (Expression::NullLiteral(_), Expression::NullLiteral(_)) => true,
+        (Expression::Prefix(a), Expression::Prefix(b)) => {
+            a.op_type == b.op_type
+                && a.operator.eq_ignore_ascii_case(&b.operator)
+                && same_expression(&a.right, &b.right)
+        }
+        (Expression::Infix(a), Expression::Infix(b)) => {
+            a.op_type == b.op_type
+                && a.operator.eq_ignore_ascii_case(&b.operator)
+                && same_expression(&a.left, &b.left)
+                && same_expression(&a.right, &b.right)
+        }
+        (Expression::Cast(a), Expression::Cast(b)) => {
+            a.type_name.eq_ignore_ascii_case(&b.type_name) && same_expression(&a.expr, &b.expr)
+        }
+        (Expression::FunctionCall(a), Expression::FunctionCall(b)) => {
+            a.function.eq_ignore_ascii_case(&b.function)
+                && a.is_distinct == b.is_distinct
+                && a.order_by.is_empty()
+                && b.order_by.is_empty()
+                && a.filter.is_none()
+                && b.filter.is_none()
+                && a.arguments.len() == b.arguments.len()
+                && a.arguments
+                    .iter()
+                    .zip(&b.arguments)
+                    .all(|(a, b)| same_expression(a, b))
+        }
+        _ => false,
+    }
+}
+
+/// Replace, in place, every subexpression of `expr` that is the same as an
+/// aliased GROUP BY expression by that alias
+fn substitute_group_aliases(expr: &mut Expression, aliases: &[(&Expression, &Identifier)]) {
+    if let Some((_, alias)) = aliases.iter().find(|(e, _)| same_expression(e, expr)) {
+        *expr = Expression::Identifier((*alias).clone());
+        return;
+    }
+    match expr {
+        Expression::Infix(infix) => {
+            substitute_group_aliases(&mut infix.left, aliases);
+            substitute_group_aliases(&mut infix.right, aliases);
+        }
+        Expression::Prefix(prefix) => substitute_group_aliases(&mut prefix.right, aliases),
+        Expression::Cast(cast) => substitute_group_aliases(&mut cast.expr, aliases),
+        Expression::FunctionCall(func) if !is_aggregate_function(&func.function) => {
+            for arg in func.arguments.iter_mut() {
+                substitute_group_aliases(arg, aliases);
+            }
+        }
+        _ => {}
     }
 }
 
