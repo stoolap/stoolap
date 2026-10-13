@@ -152,6 +152,17 @@ fn test_split_part_function() {
         .query_one("SELECT SPLIT_PART('a,b', ',', 5)", ())
         .expect("Failed to query");
     assert_eq!(result, "");
+
+    // An empty delimiter does not split
+    let result: String = db
+        .query_one("SELECT SPLIT_PART('abc', '', 1)", ())
+        .expect("Failed to query");
+    assert_eq!(result, "abc");
+
+    let result: String = db
+        .query_one("SELECT SPLIT_PART('abc', '', 2)", ())
+        .expect("Failed to query");
+    assert_eq!(result, "");
 }
 
 // NOTE: POSITION function supports normal syntax POSITION(substring, string)
