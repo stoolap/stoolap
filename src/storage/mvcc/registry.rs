@@ -143,10 +143,27 @@ const STATUS_SEGMENTS: usize = 256;
 const SLOT_UNKNOWN: i64 = 0;
 /// A slot whose transaction aborted
 const SLOT_ABORTED: i64 = i64::MIN;
-/// A slot whose transaction is active
-const SLOT_OPEN: i64 = i64::MIN + 1;
-/// A slot whose active transaction put versions in a shared store
-const SLOT_PUBLISHED: i64 = i64::MIN + 2;
+/// Ids and commit sequences stay below this, so the states below are disjoint
+const SLOT_ID_LIMIT: i64 = 1 << 60;
+
+/// The slot of active `txn_id`: carries the id, so a compare-and-swap never
+/// matches another transaction that reuses the slot
+#[inline(always)]
+const fn slot_open(txn_id: i64) -> i64 {
+    -(2 * SLOT_ID_LIMIT + txn_id)
+}
+
+/// The slot of active `txn_id` once it put versions in a shared store
+#[inline(always)]
+const fn slot_published(txn_id: i64) -> i64 {
+    -(3 * SLOT_ID_LIMIT + txn_id)
+}
+
+/// Whether `slot` is a committing one, the negated commit sequence
+#[inline(always)]
+const fn slot_committing(slot: i64) -> bool {
+    slot < 0 && slot > -SLOT_ID_LIMIT
+}
 
 /// The status of one run of transaction ids: a positive slot is the commit
 /// sequence, a committing one its negation
@@ -227,16 +244,19 @@ impl TxnStatusTable {
         }
     }
 
-    /// Moves an open slot of `txn_id` to `to` in one step; false when the
-    /// slot is not open or no segment holds it. Its run cannot be reused
-    /// meanwhile: an open id is never below the base
+    /// Moves the open slot of `txn_id` to `to` in one step; false when it is
+    /// not open or no segment holds it. The segment may be reused between the
+    /// run check and the swap; the expected value names `txn_id`, so the swap
+    /// then fails instead of changing the transaction that took the slot
     fn leave_open(&self, txn_id: i64, to: i64) -> bool {
         let run = Self::run_of(txn_id);
         self.segment_at(run, Ordering::Acquire)
             .filter(|segment| segment.run.load(Ordering::Acquire) == run)
             .is_some_and(|segment| {
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::status_run_checked();
                 segment.slots[txn_id as usize & (STATUS_SEGMENT_LEN - 1)]
-                    .compare_exchange(SLOT_OPEN, to, Ordering::AcqRel, Ordering::Acquire)
+                    .compare_exchange(slot_open(txn_id), to, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
             })
     }
@@ -598,9 +618,10 @@ impl TransactionRegistry {
             }
             let begin_seq = self.next_sequence.fetch_add(1, Ordering::AcqRel) + 1;
             txns.insert(txn_id, TxnState::new_active(begin_seq));
+            debug_assert!(txn_id < SLOT_ID_LIMIT && begin_seq < SLOT_ID_LIMIT);
             let base_run = TxnStatusTable::run_of(self.base.load(Ordering::Relaxed));
             if self.status.hold(TxnStatusTable::run_of(txn_id), base_run) {
-                self.status.set(txn_id, SLOT_OPEN);
+                self.status.set(txn_id, slot_open(txn_id));
             }
             (txn_id, begin_seq)
         };
@@ -616,6 +637,7 @@ impl TransactionRegistry {
 
         if let Some(entry) = self.transactions.lock().get_mut(txn_id) {
             entry.set_committing(commit_seq);
+            debug_assert!(commit_seq < SLOT_ID_LIMIT);
             self.status.set(txn_id, -commit_seq);
         }
 
@@ -1265,12 +1287,13 @@ impl VisibilityChecker for TransactionRegistry {
     }
 
     fn admit_publication(&self, txn_id: i64) -> bool {
-        if self.status.leave_open(txn_id, SLOT_PUBLISHED) {
+        if self.status.leave_open(txn_id, slot_published(txn_id)) {
             return true;
         }
+        // A read the run check confirms; a slot reused since reads as None
         match self.status.get(txn_id) {
             // Published before, or committing: start_commit precedes publication
-            Some(slot) if slot == SLOT_PUBLISHED || (slot < 0 && slot > SLOT_PUBLISHED) => true,
+            Some(slot) if slot == slot_published(txn_id) || slot_committing(slot) => true,
             Some(slot) if slot == SLOT_ABORTED || slot > 0 => false,
             _ => self
                 .transactions

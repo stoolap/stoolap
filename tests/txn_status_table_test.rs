@@ -151,3 +151,44 @@ fn old_rows_are_checked_without_the_lock_after_many_read_only_transactions() {
         .count();
     assert_eq!(locked, 0, "old rows were checked under the registry lock");
 }
+
+/// Transaction ids one status segment holds
+#[cfg(feature = "test-failpoints")]
+const SEGMENT_IDS: i64 = 16_384;
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_late_publication_cannot_take_the_slot_of_the_transaction_that_reused_it() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use stoolap::storage::traits::Transaction;
+
+    let db = table("memory://txn_status_slot_reuse");
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let ended = txn.id();
+    let store = db.engine().get_version_store("t").unwrap();
+    let local = TransactionVersionStore::new(Arc::clone(&store), ended);
+    let mut handle = MVCCTable::new(ended, store, local);
+    handle
+        .insert(Row::from(vec![Value::Integer(1), Value::Integer(7)]))
+        .unwrap();
+    txn.rollback().unwrap();
+
+    let engine = Arc::clone(db.engine());
+    let reuser: Rc<RefCell<Option<Box<dyn Transaction>>>> = Rc::new(RefCell::new(None));
+    let hook_reuser = Rc::clone(&reuser);
+    stoolap::test_failpoints::after_status_run_checked(move || loop {
+        let next = engine.begin_transaction().unwrap();
+        if next.id() == ended + SEGMENT_IDS {
+            *hook_reuser.borrow_mut() = Some(next);
+            break;
+        }
+    });
+    let published = handle.txn_versions().write_store().commit();
+    let reused = reuser.borrow_mut().take();
+    assert!(reused.is_some(), "the segment was handed to a later run");
+    assert!(published.is_err(), "the ended transaction was let in");
+    assert_eq!(rows(&db), 0, "an ended transaction published a row");
+    let mut reused = reused.unwrap();
+    assert!(reused.rollback().is_ok());
+}

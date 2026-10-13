@@ -1175,6 +1175,17 @@ thread_local! {
     static ALTER_DDL_GUARD_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static INDEX_BOUND_HOT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static CACHE_STAMP_PUBLISH_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static STATUS_RUN_CHECKED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next swap of an open status slot has
+/// checked the segment's run and not yet swapped
+pub fn after_status_run_checked(hook: impl FnOnce() + 'static) {
+    STATUS_RUN_CHECKED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn status_run_checked() {
+    run_hook(&STATUS_RUN_CHECKED_HOOK);
 }
 
 /// Run once on this thread when its next semantic cache stamp has read the
