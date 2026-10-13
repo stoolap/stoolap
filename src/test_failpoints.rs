@@ -1293,6 +1293,20 @@ pub fn after_compile_schema_read(hook: impl FnOnce() + 'static) {
     COMPILE_SCHEMA_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
+thread_local! {
+    static PK_LOOKUP_RESOLVED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next uncached PK lookup has resolved
+/// positions from the schema and has not yet read the row
+pub fn after_pk_lookup_resolved(hook: impl FnOnce() + 'static) {
+    PK_LOOKUP_RESOLVED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn pk_lookup_resolved() {
+    run_hook(&PK_LOOKUP_RESOLVED_HOOK);
+}
+
 pub(crate) fn compile_schema_read() {
     let hook = COMPILE_SCHEMA_HOOK.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {

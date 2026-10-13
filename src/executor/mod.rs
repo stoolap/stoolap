@@ -501,8 +501,9 @@ impl Executor {
     /// Callers dispatch INSERT before calling this (its compiled path
     /// handles the active transaction itself).
     ///
-    /// `in_txn` gates the SELECT/UPDATE/DELETE probes: they read committed
-    /// state only, so inside an explicit transaction they must not fire.
+    /// Inside an explicit transaction (`in_txn`) only the PK lookup runs, read
+    /// through the transaction; the COUNT and UPDATE/DELETE probes read
+    /// committed state only and must not fire.
     #[inline]
     fn try_compiled_fast_paths(
         &self,
@@ -512,9 +513,13 @@ impl Executor {
         in_txn: bool,
     ) -> Option<Result<Box<dyn QueryResult>>> {
         match statement {
-            Statement::Select(stmt) if !in_txn => {
-                if let Some(result) = self.try_fast_pk_lookup_compiled(stmt, ctx, compiled) {
+            Statement::Select(stmt) => {
+                if let Some(result) = self.try_fast_pk_lookup_compiled(stmt, ctx, compiled, in_txn)
+                {
                     return Some(result);
+                }
+                if in_txn {
+                    return None;
                 }
                 if let Some(result) = self.try_fast_count_distinct_compiled(stmt, compiled) {
                     return Some(result);
