@@ -44,7 +44,7 @@
 //! ```
 
 use rustc_hash::FxHashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use crate::core::{DataType, Error, IsolationLevel, Result, Value};
 use crate::executor::context::ExecutionContextBuilder;
@@ -62,37 +62,57 @@ use super::transaction::Transaction;
 pub const MEMORY_SCHEME: &str = "memory";
 pub const FILE_SCHEME: &str = "file";
 
-/// Global database registry to ensure single instance per DSN
-static DATABASE_REGISTRY: std::sync::LazyLock<RwLock<FxHashMap<String, Arc<DatabaseInner>>>> =
+/// Global database registry to ensure single engine per DSN
+static DATABASE_REGISTRY: std::sync::LazyLock<RwLock<FxHashMap<String, Weak<SharedEngine>>>> =
     std::sync::LazyLock::new(|| RwLock::new(FxHashMap::default()));
 
-/// Inner database state (shared between Database instances with same DSN)
-pub(crate) struct DatabaseInner {
+/// An open engine and every handle's claim on it: the engine closes when the
+/// last handle on it drops, whichever handle opened it
+struct SharedEngine {
     engine: Arc<MVCCEngine>,
-    executor: Mutex<Executor>,
     dsn: String,
-    /// Whether this DatabaseInner owns the engine (created it via open()).
-    /// Cloned DatabaseInners share the engine but don't own it.
-    owns_engine: bool,
     /// Temp directory for test-filedb feature. Deleted on drop.
     #[cfg(feature = "test-filedb")]
     _temp_dir: Option<tempfile::TempDir>,
 }
 
+impl Drop for SharedEngine {
+    fn drop(&mut self) {
+        if let Ok(mut registry) = DATABASE_REGISTRY.write() {
+            if registry
+                .get(&self.dsn)
+                .is_some_and(|entry| std::ptr::eq(entry.as_ptr(), self))
+            {
+                registry.remove(&self.dsn);
+            }
+        }
+        let _ = self.engine.close_engine();
+    }
+}
+
+/// One session on an engine: its own executor and transaction state
+pub(crate) struct DatabaseInner {
+    executor: Mutex<Executor>,
+    shared: Arc<SharedEngine>,
+}
+
 /// Type alias for Statement to use (avoids exposing DatabaseInner directly)
 pub(crate) type DatabaseInnerHandle = DatabaseInner;
+
+impl DatabaseInner {
+    fn session(shared: Arc<SharedEngine>) -> Arc<Self> {
+        Arc::new(DatabaseInner {
+            executor: Mutex::new(Executor::new(Arc::clone(&shared.engine))),
+            shared,
+        })
+    }
+}
 
 impl Drop for DatabaseInner {
     fn drop(&mut self) {
         // Clear all thread-local caches to release references to engine internals
         // This prevents memory leaks from cached Arc<dyn Index> and closures
         crate::executor::clear_all_thread_local_caches();
-
-        // Only close the engine if we own it (created via open(), not clone()).
-        // Cloned databases share the engine but don't close it on drop.
-        if self.owns_engine {
-            let _ = self.engine.close_engine();
-        }
     }
 }
 
@@ -132,38 +152,10 @@ pub struct Database {
 
 #[cfg(feature = "ffi")]
 impl Database {
-    /// Returns an Arc reference to the inner state, preventing the engine
-    /// from being closed while any keepalive handle exists.
-    ///
-    /// Used by the FFI layer to ensure cloned handles keep the original
-    /// engine-owning DatabaseInner alive.
+    /// Returns an Arc reference to this handle's session, which keeps it and
+    /// its engine alive.
     pub(crate) fn keepalive(&self) -> Arc<DatabaseInner> {
         Arc::clone(&self.inner)
-    }
-
-    /// Returns a borrow of the inner Arc (no clone, no count change).
-    pub(crate) fn inner_arc(&self) -> &Arc<DatabaseInner> {
-        &self.inner
-    }
-
-    /// Try to remove `inner` from the global registry.
-    ///
-    /// Only removes the entry when:
-    /// 1. The registry entry points to the same `DatabaseInner` (`ptr_eq`), and
-    /// 2. `strong_count == 2`: the caller's reference + registry are the only
-    ///    remaining references. After the caller drops, only the registry holds
-    ///    a reference, so it is safe to clean up.
-    ///
-    /// This correctly handles both shared-DSN scenarios (two `stoolap_open()`
-    /// calls with the same DSN) and clone scenarios (keepalive Arcs).
-    pub(crate) fn try_unregister_arc(inner: &Arc<DatabaseInner>) {
-        if let Ok(mut registry) = DATABASE_REGISTRY.write() {
-            if let Some(entry) = registry.get(&inner.dsn) {
-                if Arc::ptr_eq(entry, inner) && Arc::strong_count(inner) == 2 {
-                    registry.remove(&inner.dsn);
-                }
-            }
-        }
     }
 }
 
@@ -173,40 +165,11 @@ impl Clone for Database {
     /// Each cloned handle has its own executor with independent transaction state,
     /// but shares the same underlying storage engine. This ensures proper transaction
     /// isolation - a BEGIN on one handle won't affect reads on another handle.
+    /// The engine stays open until every handle on it has dropped.
     fn clone(&self) -> Self {
-        // Create a new executor with the same engine (shares data) but independent
-        // transaction state (no dirty reads across handles)
-        let engine = Arc::clone(&self.inner.engine);
-        let executor = crate::executor::Executor::new(Arc::clone(&engine));
-
-        let inner = Arc::new(DatabaseInner {
-            engine,
-            executor: Mutex::new(executor),
-            dsn: self.inner.dsn.clone(),
-            owns_engine: false,
-            #[cfg(feature = "test-filedb")]
-            _temp_dir: None, // Clones don't own the temp dir
-        });
-
-        Database { inner }
-    }
-}
-
-impl Drop for Database {
-    fn drop(&mut self) {
-        // Only remove from registry if:
-        // 1. The registry entry is OUR Arc (ptr_eq check) - prevents open_in_memory()
-        //    from accidentally removing a different DatabaseInner with same DSN
-        // 2. We're the last non-registry holder (strong_count == 2)
-        if let Ok(mut registry) = DATABASE_REGISTRY.write() {
-            if let Some(entry) = registry.get(&self.inner.dsn) {
-                if Arc::ptr_eq(entry, &self.inner) && Arc::strong_count(&self.inner) == 2 {
-                    registry.remove(&self.inner.dsn);
-                }
-            }
+        Database {
+            inner: DatabaseInner::session(Arc::clone(&self.inner.shared)),
         }
-        // Note: Thread-local cache clearing and engine closure happen in DatabaseInner::drop()
-        // when the last Arc<DatabaseInner> is dropped.
     }
 }
 
@@ -230,17 +193,25 @@ impl Database {
     /// # Engine Reuse
     ///
     /// Opening the same DSN multiple times returns the same engine instance.
-    /// This ensures consistency and prevents data corruption.
+    /// This ensures consistency and prevents data corruption. Each call
+    /// returns a new session on it, with its own transaction state, like
+    /// [`Database::clone`].
     pub fn open(dsn: &str) -> Result<Self> {
         // Check if we already have an engine for this DSN
+        let open_engine = |registry: &FxHashMap<String, Weak<SharedEngine>>| {
+            registry
+                .get(dsn)
+                .and_then(Weak::upgrade)
+                .map(|shared| Database {
+                    inner: DatabaseInner::session(shared),
+                })
+        };
         {
             let registry = DATABASE_REGISTRY
                 .read()
                 .map_err(|_| Error::LockAcquisitionFailed("registry read".to_string()))?;
-            if let Some(inner) = registry.get(dsn) {
-                return Ok(Database {
-                    inner: Arc::clone(inner),
-                });
+            if let Some(db) = open_engine(&registry) {
+                return Ok(db);
             }
         }
 
@@ -250,10 +221,8 @@ impl Database {
             .map_err(|_| Error::LockAcquisitionFailed("registry write".to_string()))?;
 
         // Double-check after acquiring write lock
-        if let Some(inner) = registry.get(dsn) {
-            return Ok(Database {
-                inner: Arc::clone(inner),
-            });
+        if let Some(db) = open_engine(&registry) {
+            return Ok(db);
         }
 
         // Parse the DSN
@@ -308,22 +277,19 @@ impl Database {
             }
         };
 
-        // Create executor (uses shared default function registry)
-        let executor = Executor::new(Arc::clone(&engine));
-
-        let inner = Arc::new(DatabaseInner {
+        let shared = Arc::new(SharedEngine {
             engine,
-            executor: Mutex::new(executor),
             dsn: dsn.to_string(),
-            owns_engine: true,
             #[cfg(feature = "test-filedb")]
             _temp_dir: _temp_dir_holder,
         });
 
         // Store in registry
-        registry.insert(dsn.to_string(), Arc::clone(&inner));
+        registry.insert(dsn.to_string(), Arc::downgrade(&shared));
 
-        Ok(Database { inner })
+        Ok(Database {
+            inner: DatabaseInner::session(shared),
+        })
     }
 
     /// Open an in-memory database
@@ -345,15 +311,14 @@ impl Database {
         engine.open_engine()?;
         let engine = Arc::new(engine);
         engine.start_cleanup();
-        let executor = Executor::new(Arc::clone(&engine));
-        let inner = Arc::new(DatabaseInner {
+        let shared = Arc::new(SharedEngine {
             engine,
-            executor: Mutex::new(executor),
             dsn: "memory://".to_string(),
-            owns_engine: true,
             _temp_dir: Some(tmp),
         });
-        Ok(Database { inner })
+        Ok(Database {
+            inner: DatabaseInner::session(shared),
+        })
     }
 
     #[cfg(not(feature = "test-filedb"))]
@@ -362,14 +327,13 @@ impl Database {
         engine.open_engine()?;
         let engine = Arc::new(engine);
         engine.start_cleanup();
-        let executor = Executor::new(Arc::clone(&engine));
-        let inner = Arc::new(DatabaseInner {
+        let shared = Arc::new(SharedEngine {
             engine,
-            executor: Mutex::new(executor),
             dsn: "memory://".to_string(),
-            owns_engine: true,
         });
-        Ok(Database { inner })
+        Ok(Database {
+            inner: DatabaseInner::session(shared),
+        })
     }
 
     /// Parse a DSN into scheme and path
@@ -1040,7 +1004,7 @@ impl Database {
     ///
     /// This is primarily for advanced use cases and testing.
     pub fn engine(&self) -> &Arc<MVCCEngine> {
-        &self.inner.engine
+        &self.inner.shared.engine
     }
 
     /// Close the database connection
@@ -1056,11 +1020,11 @@ impl Database {
             .write()
             .map_err(|_| Error::LockAcquisitionFailed("registry write".to_string()))?;
 
-        registry.remove(&self.inner.dsn);
+        registry.remove(&self.inner.shared.dsn);
 
         // Close the engine immediately to release the file lock
         // This is idempotent - calling close_engine() multiple times is safe
-        self.inner.engine.close_engine()?;
+        self.inner.shared.engine.close_engine()?;
 
         Ok(())
     }
@@ -1138,14 +1102,14 @@ impl Database {
 
     /// Check if a table exists
     pub fn table_exists(&self, name: &str) -> Result<bool> {
-        let engine = &self.inner.engine;
+        let engine = &self.inner.shared.engine;
         let tx = engine.begin_transaction()?;
         Ok(tx.get_table(name).is_ok())
     }
 
     /// Get the DSN this database was opened with
     pub fn dsn(&self) -> &str {
-        &self.inner.dsn
+        &self.inner.shared.dsn
     }
 
     /// Set the default isolation level for new transactions
@@ -1168,7 +1132,7 @@ impl Database {
     /// Note: This is a no-op for in-memory databases.
     pub fn create_snapshot(&self) -> Result<()> {
         use crate::storage::Engine;
-        self.inner.engine.create_snapshot()
+        self.inner.shared.engine.create_snapshot()
     }
 
     /// Restore the database from a backup snapshot.
@@ -1182,7 +1146,7 @@ impl Database {
     /// ddl-{timestamp}.bin or preserved from current in-memory state.
     pub fn restore_snapshot(&self, timestamp: Option<&str>) -> Result<String> {
         use crate::storage::Engine;
-        let result = self.inner.engine.restore_snapshot(timestamp)?;
+        let result = self.inner.shared.engine.restore_snapshot(timestamp)?;
         // Clear all query caches since all data has changed.
         let executor = self
             .inner
@@ -1241,7 +1205,7 @@ impl Database {
     /// Get the oldest snapshot timestamp loaded during startup.
     /// Returns None if no snapshots were loaded.
     pub fn oldest_loaded_snapshot_timestamp(&self) -> Option<String> {
-        self.inner.engine.oldest_loaded_snapshot_timestamp()
+        self.inner.shared.engine.oldest_loaded_snapshot_timestamp()
     }
 }
 

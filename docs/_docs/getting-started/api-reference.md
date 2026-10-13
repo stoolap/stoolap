@@ -36,7 +36,7 @@ let db = Database::open("file:///path/to/database")?;
 let db = Database::open("file:///path/to/db?sync=full&checkpoint_interval=60")?;
 ```
 
-`open_in_memory()` creates a unique, isolated instance each time. `open("memory://")` returns the same shared engine for the same DSN.
+`open_in_memory()` creates a unique, isolated instance each time. `open("memory://")` returns the same shared engine for the same DSN. Each `open` returns a new session on that engine, with its own transaction state, like `clone()`. The engine closes when the last handle on it drops, or on `close()`.
 
 ### Connection String Options
 

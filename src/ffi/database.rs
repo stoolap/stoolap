@@ -72,7 +72,6 @@ pub unsafe extern "C" fn stoolap_open(dsn: *const c_char, out_db: *mut *mut Stoo
                 let handle = Box::new(StoolapDB {
                     db,
                     last_error: None,
-                    _engine_keepalive: None,
                 });
                 *out_db = Box::into_raw(handle);
                 STOOLAP_OK
@@ -108,7 +107,6 @@ pub unsafe extern "C" fn stoolap_open_in_memory(out_db: *mut *mut StoolapDB) -> 
                 let handle = Box::new(StoolapDB {
                     db,
                     last_error: None,
-                    _engine_keepalive: None,
                 });
                 *out_db = Box::into_raw(handle);
                 STOOLAP_OK
@@ -142,21 +140,6 @@ pub unsafe extern "C" fn stoolap_close(db: *mut StoolapDB) -> i32 {
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         let handle = Box::from_raw(db);
-
-        // Try to clean up the registry entry for the engine-owning
-        // DatabaseInner. The method only removes the entry if the caller
-        // holds the last non-registry reference (strong_count == 2).
-        //
-        // For original handles opened via stoolap_open(): self.inner IS
-        //   the registry entry. If another handle from the same DSN is still
-        //   alive, the count is > 2 and we skip removal.
-        // For clone handles: the keepalive Arc points to the original,
-        //   engine-owning DatabaseInner. If we're the last clone (and the
-        //   original is already closed), count == 2 and we clean up.
-        match &handle._engine_keepalive {
-            None => Database::try_unregister_arc(handle.db.inner_arc()),
-            Some(keepalive) => Database::try_unregister_arc(keepalive),
-        }
 
         // Drop the handle. The underlying engine is reference-counted (Arc)
         // and will be closed automatically when the last handle drops.
@@ -198,19 +181,10 @@ pub unsafe extern "C" fn stoolap_clone(db: *const StoolapDB, out_db: *mut *mut S
     };
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        // Keep the original engine-owning DatabaseInner alive.
-        // If the source is the original, grab its keepalive.
-        // If the source is itself a clone, propagate the existing keepalive.
-        let keepalive = match &handle._engine_keepalive {
-            Some(arc) => std::sync::Arc::clone(arc),
-            None => handle.db.keepalive(),
-        };
-
         let cloned = handle.db.clone();
         let new_handle = Box::new(StoolapDB {
             db: cloned,
             last_error: None,
-            _engine_keepalive: Some(keepalive),
         });
         *out_db = Box::into_raw(new_handle);
         STOOLAP_OK

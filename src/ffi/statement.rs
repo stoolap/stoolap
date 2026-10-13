@@ -19,8 +19,6 @@ use std::os::raw::c_char;
 use std::panic;
 use std::sync::Arc;
 
-use crate::api::Database;
-
 use super::types::{StoolapDB, StoolapRows, StoolapStmt, StoolapValue};
 use super::value;
 use super::{STOOLAP_ERROR, STOOLAP_OK};
@@ -67,14 +65,12 @@ pub unsafe extern "C" fn stoolap_prepare(
             Ok(stmt) => {
                 let sql_cstr = CString::new(sql_str).unwrap_or_default();
                 let db_keepalive = handle.db.keepalive();
-                let engine_keepalive = handle._engine_keepalive.clone();
                 let stmt_handle = Box::new(StoolapStmt {
                     stmt,
                     last_error: None,
                     sql_cstr,
                     cached_columns: None,
                     _db_keepalive: db_keepalive,
-                    _engine_keepalive: engine_keepalive,
                 });
                 *out_stmt = Box::into_raw(stmt_handle);
                 STOOLAP_OK
@@ -345,17 +341,7 @@ pub unsafe extern "C" fn stoolap_stmt_finalize(stmt: *mut StoolapStmt) {
     if stmt.is_null() {
         return;
     }
-    let handle = Box::from_raw(stmt);
-
-    // Clone the engine-owning Arc before dropping the statement.
-    // After the statement drops, this may be the last non-registry reference,
-    // so we retry registry cleanup (try_unregister_arc checks strong_count == 2).
-    let engine_owning = match &handle._engine_keepalive {
-        Some(arc) => Arc::clone(arc),
-        None => Arc::clone(&handle._db_keepalive),
-    };
-    drop(handle);
-    Database::try_unregister_arc(&engine_owning);
+    drop(Box::from_raw(stmt));
 }
 
 /// Get the last error message for a statement handle.
