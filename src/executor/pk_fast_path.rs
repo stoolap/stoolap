@@ -76,6 +76,15 @@ impl Executor {
             Ok(active_tx) => active_tx.is_some(),
             Err(_) => return None, // Lock contention - fall back to normal path
         };
+        if in_txn {
+            // The normal path arms a timeout and refuses a cancelled statement
+            if ctx.has_timeout() {
+                return None;
+            }
+            if let Err(e) = ctx.check_cancelled() {
+                return Some(Err(e));
+            }
+        }
 
         // Quick reject: must have WHERE clause and table_expr
         let where_clause = stmt.where_clause.as_ref()?;
@@ -397,6 +406,16 @@ impl Executor {
         compiled: &RwLock<CompiledExecution>,
         in_txn: bool,
     ) -> Option<Result<Box<dyn QueryResult>>> {
+        if in_txn {
+            // The normal path arms a timeout and refuses a cancelled statement
+            if ctx.has_timeout() {
+                return None;
+            }
+            if let Err(e) = ctx.check_cancelled() {
+                return Some(Err(e));
+            }
+        }
+
         // Try read lock first - check if already compiled
         {
             let compiled_guard = match compiled.read() {

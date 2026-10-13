@@ -178,3 +178,66 @@ fn test_sealed_row_under_a_later_update_in_a_snapshot() {
     assert_fast("sealed row");
     db.execute("COMMIT", ()).unwrap();
 }
+
+/// The database is returned too: dropping it closes the engine
+fn executor_in_transaction(name: &str) -> (Database, stoolap::Executor) {
+    let db = table(name);
+    let executor = stoolap::Executor::new(std::sync::Arc::clone(db.engine()));
+    executor.execute("BEGIN").unwrap();
+    (db, executor)
+}
+
+fn cancelled() -> stoolap::ExecutionContext {
+    let ctx = stoolap::ExecutionContext::new();
+    ctx.cancel();
+    ctx
+}
+
+#[test]
+fn test_cancelled_lookup_in_begin_fails() {
+    let (_db, executor) = executor_in_transaction("tx_pk_cancelled_cached");
+    let sql = "SELECT v FROM t WHERE id = 1";
+    executor.execute(sql).unwrap();
+    let result = executor.execute_with_context(sql, &cancelled());
+    assert!(
+        matches!(result, Err(stoolap::Error::QueryCancelled)),
+        "cached plan"
+    );
+}
+
+#[test]
+fn test_cancelled_lookup_of_a_parsed_statement_fails() {
+    let (_db, executor) = executor_in_transaction("tx_pk_cancelled_uncached");
+    let statement = stoolap::parser::parse_sql("SELECT v FROM t WHERE id = 1")
+        .unwrap()
+        .remove(0);
+    let result = executor.execute_statement(&statement, &cancelled());
+    assert!(
+        matches!(result, Err(stoolap::Error::QueryCancelled)),
+        "uncached statement"
+    );
+}
+
+#[test]
+fn test_lookup_with_a_timeout_in_begin_takes_the_normal_path() {
+    let db = table("tx_pk_timeout");
+    db.execute("BEGIN", ()).unwrap();
+    assert_eq!(begin_v(&db, 1), Some(10));
+    #[cfg(feature = "test-failpoints")]
+    stoolap::test_failpoints::take_read_paths();
+    let v: i64 = db
+        .query_with_timeout(SELECT, (1,), 60_000)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(v, 10);
+    #[cfg(feature = "test-failpoints")]
+    assert!(
+        !stoolap::test_failpoints::take_read_paths().contains(&"exec.pk_lookup_in_transaction"),
+        "a timeout is armed by the normal path"
+    );
+    db.execute("COMMIT", ()).unwrap();
+}
