@@ -155,3 +155,17 @@ fn test_literal_case_in_other_aggregate_lookups() {
         strings(&db, "SELECT 1 UNION ALL SELECT 1")
     );
 }
+
+#[test]
+fn test_float_literal_is_not_matched_to_an_integer_group_key() {
+    let db = Database::open("memory://group_by_float_literal").unwrap();
+    db.execute("CREATE TABLE t (v INTEGER)", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (5)", ()).unwrap();
+
+    for sql in [
+        "SELECT v / 2 AS g, v / 2.0 AS h FROM t GROUP BY v, v / 2",
+        "SELECT v / 2, v / 2.0 FROM t GROUP BY v, v / 2",
+    ] {
+        assert_eq!(strings(&db, sql), strings(&db, "SELECT 2, 2.5"), "{}", sql);
+    }
+}
