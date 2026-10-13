@@ -50,6 +50,34 @@ pub static CHECKPOINT_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
 /// The sync of a WAL file retired by a file start fails.
 pub static RETIRED_WAL_SYNC_FAIL: AtomicBool = AtomicBool::new(false);
 
+/// A table manifest's write fails.
+pub static MANIFEST_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
+
+/// The n-th volume a column type change reads fails to read; zero leaves
+/// the reads alone
+pub static RETYPE_READS_BEFORE_FAIL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+// fetch_update is deprecated in 1.99; try_update is stable only from 1.95, above the 1.88 MSRV
+#[allow(deprecated)]
+pub(crate) fn retype_read_fails() -> bool {
+    use std::sync::atomic::Ordering::AcqRel;
+    let mut fails = false;
+    let _ = RETYPE_READS_BEFORE_FAIL.fetch_update(
+        AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+        |left| match left {
+            0 => None,
+            1 => {
+                fails = true;
+                Some(0)
+            }
+            n => Some(n - 1),
+        },
+    );
+    fails
+}
+
 /// The next this many seal registrations find their preparation stale
 pub static SEAL_REGISTRATION_STALE_ROUNDS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -275,6 +303,10 @@ thread_local! {
     static COUNT_CAPTURED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static GC_ROWS_REMOVED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static COLUMN_CHANGE_WAITING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static CHECKPOINT_CUT_TAKEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static RETYPE_OUTPUTS_WRITTEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static RETYPE_MANIFEST_WRITTEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static ANALYZE_ROWS_COLLECTED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static SEAL_PASSED_CHANGING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static COMMIT_COUNTED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
@@ -471,6 +503,58 @@ pub fn after_gc_rows_removed(hook: impl FnOnce() + 'static) {
 
 pub(crate) fn gc_rows_removed() {
     let hook = GC_ROWS_REMOVED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next checkpoint took the cut it will
+/// publish, with the seal fence let go
+pub fn after_checkpoint_cut_taken(hook: impl FnOnce() + 'static) {
+    CHECKPOINT_CUT_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn checkpoint_cut_taken() {
+    let hook = CHECKPOINT_CUT_TAKEN_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next column type change wrote the
+/// volumes it rewrote, before anything registers them
+pub fn after_retype_outputs_written(hook: impl FnOnce() + 'static) {
+    RETYPE_OUTPUTS_WRITTEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn retype_outputs_written() {
+    let hook = RETYPE_OUTPUTS_WRITTEN_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next column type change wrote its
+/// manifest, before the replaced volumes are retired
+pub fn after_retype_manifest_written(hook: impl FnOnce() + 'static) {
+    RETYPE_MANIFEST_WRITTEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn retype_manifest_written() {
+    let hook = RETYPE_MANIFEST_WRITTEN_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next ANALYZE collected a table's rows,
+/// before it builds the zone maps
+pub fn after_analyze_rows_collected(hook: impl FnOnce() + 'static) {
+    ANALYZE_ROWS_COLLECTED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn analyze_rows_collected() {
+    let hook = ANALYZE_ROWS_COLLECTED_HOOK.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
         hook();
     }
@@ -1746,6 +1830,8 @@ pub fn reset_all() {
     SNAPSHOT_RENAME_FAIL.store(false, Release);
     CHECKPOINT_WRITE_FAIL.store(false, Release);
     RETIRED_WAL_SYNC_FAIL.store(false, Release);
+    MANIFEST_WRITE_FAIL.store(false, Release);
+    RETYPE_READS_BEFORE_FAIL.store(0, Release);
     SEAL_REGISTRATION_STALE_ROUNDS.store(0, Release);
     VERSION_ROOT_HOOK.with(|slot| *slot.borrow_mut() = None);
     WAL_SYNC_HOOK.with(|slot| *slot.borrow_mut() = None);
@@ -1784,6 +1870,10 @@ pub fn reset_all() {
     COUNT_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = None);
     GC_ROWS_REMOVED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLUMN_CHANGE_WAITING_HOOK.with(|slot| *slot.borrow_mut() = None);
+    CHECKPOINT_CUT_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
+    RETYPE_OUTPUTS_WRITTEN_HOOK.with(|slot| *slot.borrow_mut() = None);
+    RETYPE_MANIFEST_WRITTEN_HOOK.with(|slot| *slot.borrow_mut() = None);
+    ANALYZE_ROWS_COLLECTED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COMMIT_COUNTED_HOOK.with(|slot| *slot.borrow_mut() = None);
     SEAL_PASSED_CHANGING_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_ROUND_SETTLED_HOOK.with(|slot| *slot.borrow_mut() = None);

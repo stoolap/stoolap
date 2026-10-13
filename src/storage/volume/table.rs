@@ -6294,10 +6294,6 @@ impl Table for SegmentedTable {
         self.hot.rename_column(old_name, new_name)
     }
 
-    fn modify_column(&mut self, name: &str, column_type: DataType, nullable: bool) -> Result<()> {
-        self.hot.modify_column(name, column_type, nullable)
-    }
-
     // =========================================================================
     // Query operations
     // =========================================================================
@@ -8246,7 +8242,8 @@ mod tests {
                 seal_seq: 0,
             },
             None,
-        );
+        )
+        .unwrap();
         mgr
     }
 
@@ -8362,9 +8359,6 @@ mod tests {
             Ok(())
         }
         fn rename_column(&mut self, _: &str, _: &str) -> Result<()> {
-            Ok(())
-        }
-        fn modify_column(&mut self, _: &str, _: DataType, _: bool) -> Result<()> {
             Ok(())
         }
         fn select(&self, _: &[&str], _: Option<&dyn Expression>) -> Result<Box<dyn QueryResult>> {
@@ -8719,7 +8713,8 @@ mod tests {
                 seal_seq: 0,
             },
             None,
-        );
+        )
+        .unwrap();
         let hot = MockHotTable::new(schema.clone(), vec![]);
         let mut table = SegmentedTable::new(Box::new(hot), Arc::clone(&mgr));
 

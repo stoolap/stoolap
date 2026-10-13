@@ -73,21 +73,23 @@ impl Fixture {
                 std::fs::write(&path, bytes).unwrap();
                 damaged_path = path.clone();
             }
-            manager.register_segment(
-                id as u64,
-                Arc::new(read_volume_from_disk(&path).unwrap()),
-                SegmentMeta {
-                    segment_id: id as u64,
-                    file_path: path.file_name().unwrap().into(),
-                    row_count: 1,
-                    min_row_id: id,
-                    max_row_id: id,
-                    creation_lsn: 0,
-                    seal_seq: 0,
-                    schema_version: 0,
-                },
-                Some(&schema),
-            );
+            manager
+                .register_segment(
+                    id as u64,
+                    Arc::new(read_volume_from_disk(&path).unwrap()),
+                    SegmentMeta {
+                        segment_id: id as u64,
+                        file_path: path.file_name().unwrap().into(),
+                        row_count: 1,
+                        min_row_id: id,
+                        max_row_id: id,
+                        creation_lsn: 0,
+                        seal_seq: 0,
+                        schema_version: 0,
+                    },
+                    Some(&schema),
+                )
+                .unwrap();
         }
         manager.persist().unwrap();
         Self {

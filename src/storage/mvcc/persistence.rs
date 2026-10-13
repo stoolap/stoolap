@@ -329,6 +329,8 @@ pub struct PersistenceManager {
     running: AtomicBool,
     /// Table schemas cache
     schemas: RwLock<FxHashMap<String, CompactArc<Schema>>>,
+    /// Whether volumes are written compressed, as configured at open
+    volume_compression: bool,
 }
 
 impl PersistenceManager {
@@ -345,6 +347,7 @@ impl PersistenceManager {
                 keep_count: DEFAULT_KEEP_SNAPSHOTS,
                 running: AtomicBool::new(false),
                 schemas: RwLock::new(FxHashMap::default()),
+                volume_compression: config.volume_compression,
             });
         }
 
@@ -384,11 +387,17 @@ impl PersistenceManager {
             keep_count,
             running: AtomicBool::new(false),
             schemas: RwLock::new(FxHashMap::default()),
+            volume_compression: config.volume_compression,
         };
 
         pm.meta.last_wal_lsn.store(initial_lsn, Ordering::Release);
 
         Ok(pm)
+    }
+
+    /// Whether volumes are written compressed
+    pub fn volume_compression(&self) -> bool {
+        self.volume_compression
     }
 
     /// Check if persistence is enabled
@@ -434,6 +443,27 @@ impl PersistenceManager {
         op: WALOperationType,
         schema_data: &[u8],
     ) -> Result<Option<u64>> {
+        self.record_ddl_unit(table_name, op, schema_data, false)
+    }
+
+    /// The same record, synced whatever the sync mode: a change that is
+    /// decided by its record being durable
+    pub fn record_ddl_operation_synced(
+        &self,
+        table_name: &str,
+        op: WALOperationType,
+        schema_data: &[u8],
+    ) -> Result<Option<u64>> {
+        self.record_ddl_unit(table_name, op, schema_data, true)
+    }
+
+    fn record_ddl_unit(
+        &self,
+        table_name: &str,
+        op: WALOperationType,
+        schema_data: &[u8],
+        synced: bool,
+    ) -> Result<Option<u64>> {
         if !self.is_enabled() {
             return Ok(None);
         }
@@ -450,7 +480,7 @@ impl PersistenceManager {
 
         // The record and its marker are one unit: every DDL commits under
         // the same id, so a record left without its own marker would replay
-        let lsns = wal.append_unit(vec![entry, WALEntry::commit_marker(DDL_TXN_ID)], false)?;
+        let lsns = wal.append_unit(vec![entry, WALEntry::commit_marker(DDL_TXN_ID)], synced)?;
 
         // Attempt WAL rotation if file exceeds max size.
         // Failure is non-critical: the commit is already persisted.

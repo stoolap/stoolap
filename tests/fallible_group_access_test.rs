@@ -1135,21 +1135,23 @@ fn warm_table(
         .build();
     let rows = volume.meta.row_count;
     let manager = Arc::new(SegmentManager::new("group_access", None));
-    manager.register_segment(
-        1,
-        Arc::new(volume),
-        SegmentMeta {
-            segment_id: 1,
-            file_path: Default::default(),
-            row_count: rows,
-            min_row_id: 1,
-            max_row_id: rows as i64,
-            creation_lsn: 0,
-            seal_seq: 0,
-            schema_version: 0,
-        },
-        Some(&schema),
-    );
+    manager
+        .register_segment(
+            1,
+            Arc::new(volume),
+            SegmentMeta {
+                segment_id: 1,
+                file_path: Default::default(),
+                row_count: rows,
+                min_row_id: 1,
+                max_row_id: rows as i64,
+                creation_lsn: 0,
+                seal_seq: 0,
+                schema_version: 0,
+            },
+            Some(&schema),
+        )
+        .unwrap();
     let store = Arc::new(VersionStore::new(schema.table_name.clone(), schema));
     let local = TransactionVersionStore::new(Arc::clone(&store), 1);
     let hot = Box::new(MVCCTable::new(1, store, local));
@@ -1323,21 +1325,23 @@ fn late_compaction_failure_removes_output_and_preserves_original_volumes() {
             std::fs::write(&path, bytes).unwrap();
             last_path = path.clone();
         }
-        manager.register_segment(
-            volume_id,
-            Arc::new(read_volume_from_disk(&path).unwrap()),
-            SegmentMeta {
-                segment_id: volume_id,
-                file_path: path.file_name().unwrap().into(),
-                row_count: volume.meta.row_count,
-                min_row_id: start,
-                max_row_id: end,
-                creation_lsn: 0,
-                seal_seq: 0,
-                schema_version: 0,
-            },
-            Some(&schema),
-        );
+        manager
+            .register_segment(
+                volume_id,
+                Arc::new(read_volume_from_disk(&path).unwrap()),
+                SegmentMeta {
+                    segment_id: volume_id,
+                    file_path: path.file_name().unwrap().into(),
+                    row_count: volume.meta.row_count,
+                    min_row_id: start,
+                    max_row_id: end,
+                    creation_lsn: 0,
+                    seal_seq: 0,
+                    schema_version: 0,
+                },
+                Some(&schema),
+            )
+            .unwrap();
     }
     // Two rows of the volume that splits are deleted: the failed cycles
     // must keep their tombstones, the successful one applies them

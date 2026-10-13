@@ -378,7 +378,9 @@ fn a_column_change_between_the_build_and_the_publication_discards_the_file() {
         (1, 0, 1),
         "{pass:?}"
     );
-    assert_eq!(served(&db, 100, 103), (0, 1), "nothing was attached");
+    // The backfill attached nothing; the change rewrote the volume with a
+    // side file of its own
+    assert_eq!(served(&db, 100, 103), (1, 0), "the rewrite's file serves");
     assert!(leftovers(dir.path(), "t").is_empty());
     assert_eq!(stoolap::test_failpoints::stale_publications() - before, 1);
 }

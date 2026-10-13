@@ -1,0 +1,161 @@
+// Copyright 2026 Stoolap Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Writes a database whose renames carry no version, with a build from
+//! before renames carried one. usage: rename_fixtures <out dir>
+
+use std::path::Path;
+
+use stoolap::Database;
+
+fn dsn(dir: &Path) -> String {
+    format!(
+        "file://{}?checkpoint_interval=3600&compact_threshold=1000",
+        dir.display()
+    )
+}
+
+fn main() {
+    let out = std::path::PathBuf::from(std::env::args().nth(1).unwrap());
+    std::fs::create_dir_all(&out).unwrap();
+
+    // a = 5, b = 6, k = 7 sealed; b becomes c, a takes the name b, which
+    // becomes d: d stands for a, c for b
+    let dir = out.join("unversioned_renames");
+    let db = Database::open(&dsn(&dir)).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, k INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 5, 6, 7)", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("ALTER TABLE t RENAME COLUMN b TO c", ()).unwrap();
+    db.execute("ALTER TABLE t RENAME COLUMN a TO b", ()).unwrap();
+    db.execute("ALTER TABLE t RENAME COLUMN b TO d", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.close().unwrap();
+
+    // a = 5, k = 7; a becomes b, sealed, then b becomes c: the volume
+    // holds b, which c stands for
+    let dir = out.join("sealed_between_renames");
+    let db = Database::open(&dsn(&dir)).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, k INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 5, 7)", ()).unwrap();
+    db.execute("ALTER TABLE t RENAME COLUMN a TO b", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("ALTER TABLE t RENAME COLUMN b TO c", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.close().unwrap();
+
+    // a becomes c and is dropped, b takes the name a, sealed with 6, then
+    // an added c: a stands for the volume's a, c is the added 9
+    let dir = out.join("dropped_before_seal");
+    let db = Database::open(&dsn(&dir)).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, k INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("ALTER TABLE t RENAME COLUMN a TO c", ()).unwrap();
+    db.execute("ALTER TABLE t DROP COLUMN c", ()).unwrap();
+    db.execute("ALTER TABLE t RENAME COLUMN b TO a", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (1, 6, 7)", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 9", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.close().unwrap();
+
+    // a = 5 sealed, renamed through b and c to d and dropped, then an
+    // added c: c is the added 9, not the volume's a
+    let dir = out.join("passed_name_added_again");
+    let db = Database::open(&dsn(&dir)).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, a INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 7, 5)", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("ALTER TABLE t RENAME COLUMN a TO b", ()).unwrap();
+    db.execute("ALTER TABLE t RENAME COLUMN b TO c", ()).unwrap();
+    db.execute("ALTER TABLE t RENAME COLUMN c TO d", ()).unwrap();
+    db.execute("ALTER TABLE t DROP COLUMN d", ()).unwrap();
+    db.execute("ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 9", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.close().unwrap();
+
+    // b becomes c, a = 5, c = 6 sealed; reopened, which restarts the
+    // schema epoch, so the drop of a records a version below the seal's
+    let dir = out.join("dropped_after_reopen");
+    let db = Database::open(&dsn(&dir)).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("ALTER TABLE t RENAME COLUMN b TO c", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (1, 5, 6)", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.close().unwrap();
+    let db = Database::open(&dsn(&dir)).unwrap();
+    db.execute("ALTER TABLE t DROP COLUMN a", ()).unwrap();
+    db.execute("ALTER TABLE t RENAME COLUMN c TO a", ()).unwrap();
+    db.execute("ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 9", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.close().unwrap();
+
+    // a renamed to b, sealed, then k changed to TEXT by this build, which
+    // left the volume holding INTEGER
+    let dir = out.join("unversioned_old_typed");
+    let db = Database::open(&dsn(&dir)).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, k INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 5, 7)", ()).unwrap();
+    db.execute("ALTER TABLE t RENAME COLUMN a TO b", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("ALTER TABLE t MODIFY COLUMN k TEXT", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.close().unwrap();
+
+    // x = 5 sealed at version 2, reopened (which restarts the schema
+    // epoch), then x dropped at version 1 and added again with 9
+    let dir = out.join("name_dropped_after_reopen");
+    let db = Database::open(&dsn(&dir)).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, k INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("ALTER TABLE t ADD COLUMN y INTEGER", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (1, 5, 7, 8)", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.close().unwrap();
+    let db = Database::open(&dsn(&dir)).unwrap();
+    db.execute("ALTER TABLE t DROP COLUMN x", ()).unwrap();
+    db.execute("ALTER TABLE t ADD COLUMN x INTEGER DEFAULT 9", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.close().unwrap();
+}

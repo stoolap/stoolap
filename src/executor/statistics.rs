@@ -162,6 +162,8 @@ impl Executor {
 
         // Extract rows without IDs for statistics computation (these APIs expect Row, not (i64, Row))
         let rows_vec: Vec<Row> = all_rows.drain_rows().collect();
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::analyze_rows_collected();
 
         // Build zone maps from all rows
         let zone_maps = self.build_zone_maps(&rows_vec, &schema);

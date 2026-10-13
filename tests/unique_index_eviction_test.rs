@@ -51,21 +51,23 @@ fn manager_with_indexes(count: u64) -> Arc<SegmentManager> {
         }
         let volume = builder.finish().unwrap();
         volume.prebuild_unique_index(&[1]).unwrap();
-        manager.register_segment(
-            segment,
-            Arc::new(volume),
-            SegmentMeta {
-                segment_id: segment,
-                file_path: PathBuf::from("unused.vol"),
-                row_count: 2,
-                min_row_id: 1,
-                max_row_id: 2,
-                creation_lsn: 0,
-                seal_seq: 0,
-                schema_version: 0,
-            },
-            Some(&schema),
-        );
+        manager
+            .register_segment(
+                segment,
+                Arc::new(volume),
+                SegmentMeta {
+                    segment_id: segment,
+                    file_path: PathBuf::from("unused.vol"),
+                    row_count: 2,
+                    min_row_id: 1,
+                    max_row_id: 2,
+                    creation_lsn: 0,
+                    seal_seq: 0,
+                    schema_version: 0,
+                },
+                Some(&schema),
+            )
+            .unwrap();
     }
     manager
 }

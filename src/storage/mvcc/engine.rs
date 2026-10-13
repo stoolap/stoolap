@@ -55,6 +55,20 @@ use crate::storage::mvcc::{
 };
 use crate::storage::traits::{Engine, Index, Table, Transaction};
 
+mod retype;
+pub use retype::ColumnTypeChange;
+
+/// The operation byte of an ALTER TABLE ... MODIFY COLUMN record
+const ALTER_MODIFY_COLUMN: u8 = 4;
+
+/// The change a column DDL makes to a table's history, checked against its
+/// volumes before it is recorded
+pub(crate) enum ColumnEvent<'a> {
+    Added,
+    Dropped(&'a str),
+    Renamed(&'a str, &'a str),
+}
+
 /// Type alias for a single table entry in the transaction version store
 type TxnTableEntry = (SmartString, Arc<TxnTableStore>);
 
@@ -824,6 +838,10 @@ impl MVCCEngine {
                 // read via normalize_row_to_schema would get NULL instead of the column default.
                 self.populate_schema_defaults();
 
+                // A volume an older build left holding a column in another
+                // type than the schema's is rewritten before any mapping
+                self.repair_retyped_volumes()?;
+
                 // Recompute cold volume column mappings now that schemas have
                 // default_value populated. Volumes loaded from disk had identity
                 // mappings; after ALTER TABLE ADD COLUMN, the schema differs.
@@ -832,7 +850,7 @@ impl MVCCEngine {
                     let mgrs = self.segment_managers.read().unwrap();
                     for (table_name, schema) in schemas.iter() {
                         if let Some(mgr) = mgrs.get(table_name.as_str()) {
-                            mgr.invalidate_mappings(schema);
+                            mgr.invalidate_mappings(schema)?;
                         }
                     }
                 }
@@ -1324,9 +1342,9 @@ impl MVCCEngine {
                 let stable_id =
                     self.promote_snapshot_vol_to_standalone(&table_name_lower, &vol_path);
                 if let Some(id) = stable_id {
-                    self.register_volume_with_id(&table_name_lower, volume, id);
+                    self.register_volume_with_id(&table_name_lower, volume, id)?;
                 } else {
-                    self.register_volume(&table_name_lower, volume);
+                    self.register_volume(&table_name_lower, volume)?;
                 }
             }
 
@@ -1413,9 +1431,9 @@ impl MVCCEngine {
         if vol_row_count > 0 {
             let stable_id = self.promote_snapshot_vol_to_standalone(&table_name_lower, &vol_path);
             if let Some(id) = stable_id {
-                self.register_volume_with_id(&table_name_lower, volume, id);
+                self.register_volume_with_id(&table_name_lower, volume, id)?;
             } else {
-                self.register_volume(&table_name_lower, volume);
+                self.register_volume(&table_name_lower, volume)?;
             }
         }
 
@@ -1590,149 +1608,154 @@ impl MVCCEngine {
 
         for (store, mgr) in tables {
             if mgr.has_segments() {
-                // Collect HNSW index info before iterating volumes
-                let indexes = store.get_all_indexes();
-                let hnsw_infos: Vec<(Vec<String>, std::sync::Arc<dyn Index>)> = indexes
-                    .iter()
-                    .filter(|idx| idx.index_type() == crate::core::IndexType::Hnsw)
-                    .filter_map(|idx| {
-                        let names = idx.column_names();
-                        if names.is_empty() {
-                            return None;
-                        }
-                        Some((names.to_vec(), std::sync::Arc::clone(idx)))
-                    })
-                    .collect();
-
-                if hnsw_infos.is_empty() {
-                    continue;
-                }
-
-                let tombstones = mgr.tombstone_set_arc();
-                // Use newest-first ordering so overlapping row_ids resolve to newest version
-                let volumes = mgr.get_volumes_newest_first()?;
-
-                // Seed seen set with hot row_ids (already indexed by populate_all_indexes)
-                let mut seen: rustc_hash::FxHashSet<i64> = store
-                    .get_all_visible_row_ids(INVALID_TRANSACTION_ID + 1)
-                    .into_iter()
-                    .collect();
-
-                // Stream directly from volumes into per-index batches.
-                // Pre-allocate a reusable buffer to avoid per-row Vec allocations.
-                let max_cols = hnsw_infos
-                    .iter()
-                    .map(|(names, _)| names.len())
-                    .max()
-                    .unwrap_or(0);
-                let mut batches: Vec<Vec<(i64, Vec<crate::core::Value>)>> =
-                    (0..hnsw_infos.len()).map(|_| Vec::new()).collect();
-                let mut values_buf: Vec<crate::core::Value> = Vec::with_capacity(max_cols);
-
-                const HNSW_FLUSH_THRESHOLD: usize = 8192;
-
-                for (_, cs) in volumes.iter() {
-                    let vol = &cs.volume;
-                    let row_ids = vol.row_ids()?;
-                    let Some(start) = (0..vol.meta.row_count).find(|&i| {
-                        let row_id = row_ids[i];
-                        !cs.is_dead(i)
-                            && !tombstones.contains_key(&row_id)
-                            && !seen.contains(&row_id)
-                    }) else {
-                        continue;
-                    };
-                    // Each column through the volume's mapping: a column
-                    // dropped since the seal shifts the ordinals, not the
-                    // volume
-                    let mut columns: smallvec::SmallVec<
-                        [Option<&crate::storage::volume::column::ColumnData>; 16],
-                    > = smallvec::smallvec![None; vol.columns.len()];
-                    let physical: Vec<Vec<Option<usize>>> = hnsw_infos
-                        .iter()
-                        .map(|(names, _)| {
-                            names
-                                .iter()
-                                .map(|name| cs.mapping.volume_column(vol, name))
-                                .collect()
-                        })
-                        .collect();
-                    for ci in physical.iter().flatten().flatten() {
-                        if *ci < columns.len() {
-                            columns[*ci] = Some(vol.columns.get(*ci)?);
-                        }
-                    }
-                    for (i, &row_id) in row_ids.iter().enumerate().skip(start) {
-                        if cs.is_dead(i) || tombstones.contains_key(&row_id) || !seen.insert(row_id)
-                        {
-                            continue;
-                        }
-                        for (batch_idx, _) in hnsw_infos.iter().enumerate() {
-                            values_buf.clear();
-                            let mut has_null = false;
-                            for ci in &physical[batch_idx] {
-                                let v = if let Some(Some(col)) = ci.and_then(|ci| columns.get(ci)) {
-                                    col.get_value(i)
-                                } else {
-                                    crate::core::Value::Null(crate::core::DataType::Null)
-                                };
-                                if v.is_null() {
-                                    has_null = true;
-                                    break;
-                                }
-                                values_buf.push(v);
-                            }
-                            if !has_null {
-                                // Move ownership instead of cloning to avoid per-row allocation
-                                let owned = std::mem::replace(
-                                    &mut values_buf,
-                                    Vec::with_capacity(max_cols),
-                                );
-                                batches[batch_idx].push((row_id, owned));
-                            }
-                        }
-                    }
-
-                    // Flush large batches to limit peak memory
-                    for (idx, (_, index)) in hnsw_infos.iter().enumerate() {
-                        if batches[idx].len() >= HNSW_FLUSH_THRESHOLD {
-                            let entry_refs: Vec<(i64, &[crate::core::Value])> = batches[idx]
-                                .iter()
-                                .map(|(row_id, values)| (*row_id, values.as_slice()))
-                                .collect();
-                            if let Err(e) = index.add_batch_slice(&entry_refs) {
-                                eprintln!(
-                                    "Warning: HNSW index population failed for {}: {}",
-                                    store.table_name(),
-                                    e
-                                );
-                            }
-                            batches[idx].clear();
-                        }
-                    }
-                }
-
-                // Flush remaining entries
-                for (idx, (_, index)) in hnsw_infos.iter().enumerate() {
-                    if !batches[idx].is_empty() {
-                        let entry_refs: Vec<(i64, &[crate::core::Value])> = batches[idx]
-                            .iter()
-                            .map(|(row_id, values)| (*row_id, values.as_slice()))
-                            .collect();
-                        if let Err(e) = index.add_batch_slice(&entry_refs) {
-                            eprintln!(
-                                "Warning: HNSW index population failed for {}: {}",
-                                store.table_name(),
-                                e
-                            );
-                        }
-                    }
-                }
+                populate_hnsw_from_volumes(&store, &mgr, &store.get_all_indexes())?;
             }
         }
         Ok(())
     }
+}
 
+/// Adds the live rows of `mgr`'s volumes that the hot store does not hide
+/// to each HNSW index among `indexes`
+fn populate_hnsw_from_volumes(
+    store: &VersionStore,
+    mgr: &crate::storage::volume::manifest::SegmentManager,
+    indexes: &[Arc<dyn Index>],
+) -> Result<()> {
+    let hnsw_infos: Vec<(Vec<String>, std::sync::Arc<dyn Index>)> = indexes
+        .iter()
+        .filter(|idx| idx.index_type() == crate::core::IndexType::Hnsw)
+        .filter_map(|idx| {
+            let names = idx.column_names();
+            if names.is_empty() {
+                return None;
+            }
+            Some((names.to_vec(), std::sync::Arc::clone(idx)))
+        })
+        .collect();
+
+    if hnsw_infos.is_empty() {
+        return Ok(());
+    }
+
+    let tombstones = mgr.tombstone_set_arc();
+    // Use newest-first ordering so overlapping row_ids resolve to newest version
+    let volumes = mgr.get_volumes_newest_first()?;
+
+    // Seed seen set with hot row_ids (already indexed by populate_all_indexes)
+    let mut seen: rustc_hash::FxHashSet<i64> = store
+        .get_all_visible_row_ids(INVALID_TRANSACTION_ID + 1)
+        .into_iter()
+        .collect();
+
+    // Stream directly from volumes into per-index batches.
+    // Pre-allocate a reusable buffer to avoid per-row Vec allocations.
+    let max_cols = hnsw_infos
+        .iter()
+        .map(|(names, _)| names.len())
+        .max()
+        .unwrap_or(0);
+    let mut batches: Vec<Vec<(i64, Vec<crate::core::Value>)>> =
+        (0..hnsw_infos.len()).map(|_| Vec::new()).collect();
+    let mut values_buf: Vec<crate::core::Value> = Vec::with_capacity(max_cols);
+
+    const HNSW_FLUSH_THRESHOLD: usize = 8192;
+
+    for (_, cs) in volumes.iter() {
+        let vol = &cs.volume;
+        let row_ids = vol.row_ids()?;
+        let Some(start) = (0..vol.meta.row_count).find(|&i| {
+            let row_id = row_ids[i];
+            !cs.is_dead(i) && !tombstones.contains_key(&row_id) && !seen.contains(&row_id)
+        }) else {
+            continue;
+        };
+        // Each column through the volume's mapping: a column
+        // dropped since the seal shifts the ordinals, not the
+        // volume
+        let mut columns: smallvec::SmallVec<
+            [Option<&crate::storage::volume::column::ColumnData>; 16],
+        > = smallvec::smallvec![None; vol.columns.len()];
+        let physical: Vec<Vec<Option<usize>>> = hnsw_infos
+            .iter()
+            .map(|(names, _)| {
+                names
+                    .iter()
+                    .map(|name| cs.mapping.volume_column(vol, name))
+                    .collect()
+            })
+            .collect();
+        for ci in physical.iter().flatten().flatten() {
+            if *ci < columns.len() {
+                columns[*ci] = Some(vol.columns.get(*ci)?);
+            }
+        }
+        for (i, &row_id) in row_ids.iter().enumerate().skip(start) {
+            if cs.is_dead(i) || tombstones.contains_key(&row_id) || !seen.insert(row_id) {
+                continue;
+            }
+            for (batch_idx, _) in hnsw_infos.iter().enumerate() {
+                values_buf.clear();
+                let mut has_null = false;
+                for ci in &physical[batch_idx] {
+                    let v = if let Some(Some(col)) = ci.and_then(|ci| columns.get(ci)) {
+                        col.get_value(i)
+                    } else {
+                        crate::core::Value::Null(crate::core::DataType::Null)
+                    };
+                    if v.is_null() {
+                        has_null = true;
+                        break;
+                    }
+                    values_buf.push(v);
+                }
+                if !has_null {
+                    // Move ownership instead of cloning to avoid per-row allocation
+                    let owned = std::mem::replace(&mut values_buf, Vec::with_capacity(max_cols));
+                    batches[batch_idx].push((row_id, owned));
+                }
+            }
+        }
+
+        // Flush large batches to limit peak memory
+        for (idx, (_, index)) in hnsw_infos.iter().enumerate() {
+            if batches[idx].len() >= HNSW_FLUSH_THRESHOLD {
+                let entry_refs: Vec<(i64, &[crate::core::Value])> = batches[idx]
+                    .iter()
+                    .map(|(row_id, values)| (*row_id, values.as_slice()))
+                    .collect();
+                if let Err(e) = index.add_batch_slice(&entry_refs) {
+                    eprintln!(
+                        "Warning: HNSW index population failed for {}: {}",
+                        store.table_name(),
+                        e
+                    );
+                }
+                batches[idx].clear();
+            }
+        }
+    }
+
+    // Flush remaining entries
+    for (idx, (_, index)) in hnsw_infos.iter().enumerate() {
+        if !batches[idx].is_empty() {
+            let entry_refs: Vec<(i64, &[crate::core::Value])> = batches[idx]
+                .iter()
+                .map(|(row_id, values)| (*row_id, values.as_slice()))
+                .collect();
+            if let Err(e) = index.add_batch_slice(&entry_refs) {
+                eprintln!(
+                    "Warning: HNSW index population failed for {}: {}",
+                    store.table_name(),
+                    e
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+impl MVCCEngine {
     /// Populate pre-computed `default_value` from `default_expr` on all schema columns.
     ///
     /// Neither snapshot nor WAL serialization persists `default_value` (only the expression
@@ -1984,6 +2007,13 @@ impl MVCCEngine {
             WALOperationType::AlterTable => {
                 // Schema modification - replay the ALTER TABLE operation
                 if let Err(e) = self.replay_alter_table(&entry.data, entry.lsn) {
+                    // A type change left half applied holds rows of two types
+                    if entry.data.first() == Some(&ALTER_MODIFY_COLUMN) {
+                        return Err(Error::internal(format!(
+                            "cannot replay a column type change at LSN {}: {}",
+                            entry.lsn, e
+                        )));
+                    }
                     eprintln!("Warning: Failed to replay ALTER TABLE: {}", e);
                 }
             }
@@ -2674,8 +2704,7 @@ impl MVCCEngine {
                 // Apply the RENAME COLUMN using engine method
                 self.rename_column_from_log(&table_name, &old_name, &new_name, lsn)?;
             }
-            4 => {
-                // ModifyColumn
+            ALTER_MODIFY_COLUMN => {
                 // Read column name
                 if pos + 2 > data.len() {
                     return Err(Error::internal(
@@ -3138,6 +3167,13 @@ impl MVCCEngine {
             if schema_arc.has_column(column_name) {
                 return Err(Error::DuplicateColumn);
             }
+            self.check_added_column(
+                &table_name_lower,
+                schema_arc,
+                column_name,
+                data_type,
+                nullable,
+            )?;
         }
 
         // Update version store schema first (source of truth) — if this fails,
@@ -3173,9 +3209,33 @@ impl MVCCEngine {
             }
         }
 
-        self.refresh_column_mappings(table_name);
+        self.refresh_column_mappings(table_name)?;
         change.finish();
         Ok(())
+    }
+
+    /// Whether the volumes of `table_name` still map once `column_name` is
+    /// added to `schema`; WAL replay leaves the check to the open
+    fn check_added_column(
+        &self,
+        table_name: &str,
+        schema: &Schema,
+        column_name: &str,
+        data_type: DataType,
+        nullable: bool,
+    ) -> Result<()> {
+        if self.loading_from_disk.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut added = Schema::clone(schema);
+        added.add_column(crate::core::SchemaColumn::new(
+            schema.columns.len(),
+            column_name,
+            data_type,
+            nullable,
+            false,
+        ))?;
+        self.check_column_change(table_name, &added, ColumnEvent::Added)
     }
 
     /// Creates a column in a table with an optional default expression
@@ -3204,6 +3264,13 @@ impl MVCCEngine {
             if schema_arc.has_column(column_name) {
                 return Err(Error::DuplicateColumn);
             }
+            self.check_added_column(
+                &table_name_lower,
+                schema_arc,
+                column_name,
+                data_type,
+                nullable,
+            )?;
         }
 
         // Update version store schema first (source of truth) — if this fails,
@@ -3245,7 +3312,7 @@ impl MVCCEngine {
             }
         }
 
-        self.refresh_column_mappings(table_name);
+        self.refresh_column_mappings(table_name)?;
         change.finish();
         Ok(())
     }
@@ -3303,10 +3370,10 @@ impl MVCCEngine {
         &self,
         table_name: &str,
         volume: Arc<crate::storage::volume::writer::FrozenVolume>,
-    ) {
+    ) -> Result<()> {
         let mgr = self.get_or_create_segment_manager(table_name);
         let seg_id = mgr.manifest_mut().allocate_segment_id();
-        self.register_volume_with_id(table_name, volume, seg_id);
+        self.register_volume_with_id(table_name, volume, seg_id)
     }
 
     /// Register a frozen volume with a specific segment ID.
@@ -3317,7 +3384,7 @@ impl MVCCEngine {
         table_name: &str,
         volume: Arc<crate::storage::volume::writer::FrozenVolume>,
         seg_id: u64,
-    ) {
+    ) -> Result<()> {
         // A file-backed volume carries the handle it was opened with; only
         // a memory-backed one has to resolve a path here
         let file = volume.file_owner().or_else(|| {
@@ -3335,7 +3402,7 @@ impl MVCCEngine {
             self.ddl.schema_epoch.load(Ordering::Acquire),
             file,
             None,
-        );
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3348,7 +3415,7 @@ impl MVCCEngine {
         schema_version: u64,
         file: Option<Arc<crate::storage::volume::writer::VolumeFile>>,
         side: Option<Arc<crate::storage::volume::secondary::IndexFile>>,
-    ) {
+    ) -> Result<()> {
         use crate::storage::volume::manifest::SegmentMeta;
         let mgr = self.get_or_create_segment_manager(table_name);
         let (min_id, max_id) = volume.id_bounds().unwrap_or((0, 0));
@@ -3377,8 +3444,7 @@ impl MVCCEngine {
             schema,
             file,
             side,
-        );
-        drop(schemas);
+        )
     }
 
     /// Discover volume table directories and load their manifests before WAL replay.
@@ -3734,6 +3800,13 @@ impl MVCCEngine {
     ) -> Result<()> {
         let store = self.get_version_store(table_name)?;
         let without = store.close_for_drop(column_name)?;
+        if !self.should_skip_wal() {
+            let dropped = ColumnEvent::Dropped(column_name);
+            if let Err(error) = self.check_column_change(table_name, &without, dropped) {
+                store.reopen_after_refused_drop();
+                return Err(error);
+            }
+        }
         let ddl_lsn = match record(self) {
             Ok(lsn) => lsn,
             Err(error) => {
@@ -3750,9 +3823,10 @@ impl MVCCEngine {
         // The cold mappings follow while the table is closed, outside the
         // row, arena and schema locks
         let refreshed = self.refresh_schema_cache(table_name);
-        self.propagate_column_drop_inner(table_name, column_name, ddl_lsn);
+        let propagated = self.propagate_column_drop_inner(table_name, column_name, ddl_lsn);
         store.open_after_drop();
         refreshed?;
+        propagated?;
         // On replay the catalog is not final yet; the open discards then
         if !self.should_skip_wal() {
             self.discard_uncovered_side_files(table_name);
@@ -3803,6 +3877,13 @@ impl MVCCEngine {
             if schema_arc.has_column(new_name) {
                 return Err(Error::DuplicateColumn);
             }
+            // Replay leaves the check to the open
+            if replayed_lsn.is_none() && !self.should_skip_wal() {
+                let mut renamed = Schema::clone(schema_arc);
+                renamed.rename_column(old_name, new_name)?;
+                let event = ColumnEvent::Renamed(old_name, new_name);
+                self.check_column_change(&table_name_lower, &renamed, event)?;
+            }
         }
 
         // Update version store schema first (source of truth)
@@ -3849,8 +3930,10 @@ impl MVCCEngine {
                         replayed_lsn,
                     );
                 }
-                if let Some(ref s) = schema {
-                    mgr.invalidate_mappings(s);
+                if let Some(ref s) =
+                    schema.filter(|_| !self.loading_from_disk.load(Ordering::Acquire))
+                {
+                    mgr.invalidate_mappings(s)?;
                 }
             }
         }
@@ -3911,26 +3994,6 @@ impl MVCCEngine {
         }
     }
 
-    /// Closes `table_name` for a change of a column's definition and settles
-    /// what it holds: publications counted before the close finish, and a
-    /// version a still open transaction applied (a table handle's own
-    /// commit) is waited for a bounded time, else the change is refused.
-    /// The table opens again when the closure goes. The caller holds the
-    /// DDL guard
-    pub(crate) fn close_for_column_change(
-        &self,
-        table_name: &str,
-    ) -> Result<super::version_store::ColumnClosure> {
-        debug_assert!(self.ddl.serial.is_locked());
-        close_and_settle(
-            &self.version_stores,
-            &self.segment_managers,
-            &self.persistence,
-            &self.registry,
-            table_name,
-        )
-    }
-
     pub(crate) fn begin_column_change(
         &self,
         table_name: &str,
@@ -3938,14 +4001,48 @@ impl MVCCEngine {
         begin_column_change(&self.segment_managers, &self.persistence, table_name)
     }
 
-    pub(crate) fn refresh_column_mappings(&self, table_name: &str) {
+    /// Whether every volume of `table_name` still maps under `schema` once
+    /// `event` is in its history; a column change asks before it records
+    /// or changes anything, and is refused when a volume would not
+    pub(crate) fn check_column_change(
+        &self,
+        table_name: &str,
+        schema: &Schema,
+        event: ColumnEvent<'_>,
+    ) -> Result<()> {
+        let name = to_lowercase_cow(table_name);
+        let Some(mgr) = self
+            .segment_managers
+            .read()
+            .map_err(|_| Error::internal("segment managers lock poisoned"))?
+            .get(name.as_ref())
+            .cloned()
+        else {
+            return Ok(());
+        };
+        // Above every version a volume or the history holds
+        let version = self.ddl.schema_epoch.load(Ordering::Acquire) + 1;
+        mgr.mappings_hold_after(schema, |history| match event {
+            ColumnEvent::Added => {}
+            ColumnEvent::Dropped(column) => history.drop_column(column, version),
+            ColumnEvent::Renamed(old, new) => history.rename_column(old, new, version),
+        })
+    }
+
+    /// Replay leaves the mappings to the open, which remaps under the final
+    /// schema once the volumes are repaired
+    pub(crate) fn refresh_column_mappings(&self, table_name: &str) -> Result<()> {
+        if self.loading_from_disk.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let name = to_lowercase_cow(table_name);
         let schema = self.schemas.read().unwrap().get(name.as_ref()).cloned();
         if let Some(schema) = schema {
             if let Some(mgr) = self.segment_managers.read().unwrap().get(name.as_ref()) {
-                mgr.invalidate_mappings(&schema);
+                mgr.invalidate_mappings(&schema)?;
             }
         }
+        Ok(())
     }
 
     /// Binds a table's indexes on column `old` to its new name, once the
@@ -3964,8 +4061,7 @@ impl MVCCEngine {
         let store = self.get_version_store(table_name)?;
         *store.schema_mut() = schema;
         self.refresh_schema_cache(table_name)?;
-        self.refresh_column_mappings(table_name);
-        Ok(())
+        self.refresh_column_mappings(table_name)
     }
 
     /// Puts `schema` back and opens the table after an added column whose
@@ -3978,8 +4074,7 @@ impl MVCCEngine {
         self.get_version_store(table_name)?
             .reopen_after_refused_add(schema);
         self.refresh_schema_cache(table_name)?;
-        self.refresh_column_mappings(table_name);
-        Ok(())
+        self.refresh_column_mappings(table_name)
     }
 
     /// Moves a table's hot rows to its schema's layout, once a column
@@ -4044,7 +4139,12 @@ impl MVCCEngine {
     /// `ddl_lsn` is the log position of the change's record: a statement's
     /// own, just written, or a replayed one, which the manifest may hold
     /// already and then records nothing for
-    fn propagate_column_drop_inner(&self, table_name: &str, col_name: &str, ddl_lsn: Option<u64>) {
+    fn propagate_column_drop_inner(
+        &self,
+        table_name: &str,
+        col_name: &str,
+        ddl_lsn: Option<u64>,
+    ) -> Result<()> {
         let table_name_lower = table_name.to_lowercase();
         let schema = self.schemas.read().unwrap().get(&table_name_lower).cloned();
         let current_epoch = self.ddl.schema_epoch.load(Ordering::Acquire);
@@ -4054,9 +4154,10 @@ impl MVCCEngine {
                 mgr.record_column_drop(col_name, current_epoch, ddl_lsn);
             }
             if let Some(ref s) = schema {
-                mgr.invalidate_mappings(s);
+                mgr.invalidate_mappings(s)?;
             }
         }
+        Ok(())
     }
 
     /// The log position the last record took, when the log is on: a
@@ -4071,7 +4172,12 @@ impl MVCCEngine {
 
     /// Record a column rename and propagate alias to all cold volumes.
     /// Persists in the manifest so aliases survive restart.
-    pub fn propagate_column_alias(&self, table_name: &str, new_name: &str, old_name: &str) {
+    pub fn propagate_column_alias(
+        &self,
+        table_name: &str,
+        new_name: &str,
+        old_name: &str,
+    ) -> Result<()> {
         let ddl_lsn = self.recorded_ddl_lsn();
         let table_name_lower = table_name.to_lowercase();
         let schema = self.schemas.read().unwrap().get(&table_name_lower).cloned();
@@ -4086,12 +4192,14 @@ impl MVCCEngine {
                 );
             }
             if let Some(ref s) = schema {
-                mgr.invalidate_mappings(s);
+                mgr.invalidate_mappings(s)?;
             }
         }
+        Ok(())
     }
 
-    /// Modifies a column's type and nullable property in a table
+    /// Changes a column's type and nullability, a vector column keeping its
+    /// dimension, with no log record
     pub fn modify_column(
         &self,
         table_name: &str,
@@ -4099,61 +4207,24 @@ impl MVCCEngine {
         data_type: DataType,
         nullable: bool,
     ) -> Result<()> {
-        if !self.is_open() {
-            return Err(Error::EngineNotOpen);
-        }
-
-        let table_name_lower = table_name.to_lowercase();
-        let _ddl = self.ddl_guard();
-        let mut change = self.begin_column_change(table_name)?;
-        let _closed = self.close_for_column_change(table_name)?;
-
-        // Validate under read lock first
-        {
-            let schemas = self.schemas.read().unwrap();
-            let schema_arc = schemas
-                .get(&table_name_lower)
-                .ok_or_else(|| Error::TableNotFound(table_name_lower.to_string()))?;
-            if !schema_arc.has_column(column_name) {
-                return Err(Error::ColumnNotFound(column_name.to_string()));
-            }
-        }
-
-        // Update version store schema first (source of truth)
-        {
-            let stores = self.version_stores.read().unwrap();
-            if let Some(store) = stores.get(&table_name_lower) {
-                let mut vs_schema_guard = store.schema_mut();
-                CompactArc::make_mut(&mut *vs_schema_guard).modify_column(
-                    column_name,
-                    Some(data_type),
-                    Some(nullable),
-                )?;
-            }
-        }
-
-        change.mark_changed();
-        // Sync engine schema cache from version store
-        {
-            let vs_schema = {
-                let stores = self.version_stores.read().unwrap();
-                stores
-                    .get(&table_name_lower)
-                    .map(|store| store.schema().clone())
-            };
-            if let Some(schema) = vs_schema {
-                let mut schemas = self.schemas.write().unwrap();
-                schemas.insert(table_name_lower, schema);
-                self.ddl.schema_epoch.fetch_add(1, Ordering::Release);
-            }
-        }
-
-        change.finish();
-        Ok(())
+        let schema = self.get_table_schema(table_name)?;
+        let vector_dimensions = schema
+            .find_column(column_name)
+            .filter(|(_, column)| {
+                column.data_type == DataType::Vector && data_type == DataType::Vector
+            })
+            .map_or(0, |(_, column)| column.vector_dimensions);
+        self.modify_column_with_dimensions(
+            table_name,
+            column_name,
+            data_type,
+            nullable,
+            vector_dimensions,
+        )
     }
 
-    /// Modifies a column's type, nullable, and vector dimensions
-    /// Used by WAL replay to restore ALTER TABLE MODIFY COLUMN with full dimension info
+    /// Changes a column's type, nullability and vector dimension, recorded
+    /// as the SQL statement records it; WAL replay applies it unrecorded
     pub fn modify_column_with_dimensions(
         &self,
         table_name: &str,
@@ -4165,55 +4236,31 @@ impl MVCCEngine {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
-
-        let table_name_lower = table_name.to_lowercase();
         let _ddl = self.ddl_guard();
-        let mut change = self.begin_column_change(table_name)?;
-        let _closed = self.close_for_column_change(table_name)?;
+        self.change_column_type(&ColumnTypeChange {
+            table: table_name,
+            column: column_name,
+            data_type,
+            nullable,
+            vector_dimensions,
+        })
+    }
 
-        // Validate under read lock first
-        {
-            let schemas = self.schemas.read().unwrap();
-            let schema_arc = schemas
-                .get(&table_name_lower)
-                .ok_or_else(|| Error::TableNotFound(table_name_lower.to_string()))?;
-            if !schema_arc.has_column(column_name) {
-                return Err(Error::ColumnNotFound(column_name.to_string()));
-            }
-        }
-
-        // Update version store schema first (source of truth)
-        {
-            let stores = self.version_stores.read().unwrap();
-            if let Some(store) = stores.get(&table_name_lower) {
-                let mut vs_schema_guard = store.schema_mut();
-                let vs_schema = CompactArc::make_mut(&mut *vs_schema_guard);
-                vs_schema.modify_column(column_name, Some(data_type), Some(nullable))?;
-                // Set vector_dimensions on the modified column
-                if let Some(idx) = vs_schema.get_column_index(column_name) {
-                    vs_schema.columns[idx].vector_dimensions = vector_dimensions;
-                }
-            }
-        }
-
-        change.mark_changed();
-        // Sync engine schema cache from version store
-        {
-            let vs_schema = {
-                let stores = self.version_stores.read().unwrap();
-                stores
-                    .get(&table_name_lower)
-                    .map(|store| store.schema().clone())
-            };
-            if let Some(schema) = vs_schema {
-                let mut schemas = self.schemas.write().unwrap();
-                schemas.insert(table_name_lower, schema);
-                self.ddl.schema_epoch.fetch_add(1, Ordering::Release);
-            }
-        }
-
-        change.finish();
-        Ok(())
+    /// Changes a column's definition in every layer and records it, except
+    /// in replay; the caller holds the DDL guard
+    pub(crate) fn change_column_type(&self, change: &ColumnTypeChange<'_>) -> Result<()> {
+        retype::change_column_type(
+            &retype::Shared {
+                version_stores: &self.version_stores,
+                segment_managers: &self.segment_managers,
+                persistence: &self.persistence,
+                registry: &self.registry,
+                schemas: &self.schemas,
+                ddl: &self.ddl,
+                replaying: self.loading_from_disk.load(Ordering::Acquire),
+            },
+            change,
+        )
     }
 
     /// Renames a table
@@ -5745,7 +5792,7 @@ impl MVCCEngine {
                         .all(|store| store.committed_row_count() == 0)
                 };
 
-                if all_hot_empty {
+                if all_hot_empty && !self.has_incomplete_change() {
                     // All data is in volumes: the cut is the boundary to
                     // publish once the catalog copies are durable
                     if let Some(ref pm) = *self.persistence {
@@ -5770,9 +5817,22 @@ impl MVCCEngine {
         // makes them, and every record up to the cut, durable. Only then is
         // the cut published as the boundary recovery starts from, so a
         // failure here leaves the boundary where it was.
+        let mut checkpoint_lsn = checkpoint_lsn;
+        #[cfg(feature = "test-failpoints")]
+        if checkpoint_lsn > 0 {
+            crate::test_failpoints::checkpoint_cut_taken();
+        }
         if checkpoint_lsn > 0 {
             // The boundary stays where it was, and the caller learns why
             self.rerecord_ddl_to_wal()?;
+            // A type change taken past its record while the cut was held
+            // and left without its manifest keeps the boundary before it;
+            // the re-recording waited out any change in progress
+            if self.has_incomplete_change() {
+                checkpoint_lsn = 0;
+            }
+        }
+        if checkpoint_lsn > 0 {
             if let Some(ref pm) = *self.persistence {
                 pm.publish_checkpoint(checkpoint_lsn)?;
             }
@@ -5826,6 +5886,42 @@ impl MVCCEngine {
         }
 
         Ok(())
+    }
+
+    /// Rewrites every table's volumes that hold a column in another type
+    /// than its schema's, the table validated first; called at open once the
+    /// log is replayed
+    fn repair_retyped_volumes(&self) -> Result<()> {
+        let tables: Vec<String> = self
+            .segment_managers
+            .read()
+            .map_err(|_| Error::internal("segment managers lock poisoned"))?
+            .keys()
+            .cloned()
+            .collect();
+        let _ddl = self.ddl_guard();
+        let shared = retype::Shared {
+            version_stores: &self.version_stores,
+            segment_managers: &self.segment_managers,
+            persistence: &self.persistence,
+            registry: &self.registry,
+            schemas: &self.schemas,
+            ddl: &self.ddl,
+            replaying: false,
+        };
+        for table in tables {
+            retype::repair_retyped_volumes(&shared, &table)?;
+        }
+        Ok(())
+    }
+
+    /// Whether a table holds a column type change durable in the log whose
+    /// manifest is not written
+    fn has_incomplete_change(&self) -> bool {
+        self.segment_managers
+            .read()
+            .map(|mgrs| mgrs.values().any(|mgr| mgr.has_incomplete_change()))
+            .unwrap_or(true)
     }
 
     /// Run compaction synchronously under the compaction_running flag.
@@ -6751,7 +6847,7 @@ impl MVCCEngine {
                 let cleanup = mgr.open_cleanup();
                 // All rows in merged volumes are tombstoned. Remove those
                 // volumes and their tombstones, but keep unmerged volumes intact.
-                mgr.replace_segments_atomic_remove_only(&old_ids);
+                mgr.replace_segments_atomic_remove_only(&old_ids)?;
                 // Only clear tombstones that were actually applied during compaction.
                 // Post-snapshot tombstones are preserved for snapshot visibility.
                 mgr.remove_applied_tombstones(&applied_tombstones);
@@ -7146,7 +7242,7 @@ impl MVCCEngine {
                     mgr.commit_replacement(prepared, schemas.get(table_name).map(|s| &**s));
                 drop(schemas);
                 drop(ddl);
-                match outcome {
+                match outcome? {
                     Ok(()) => break,
                     Err(stale) => {
                         let (volumes, ids, sides) = (*stale).into_parts();
@@ -7597,6 +7693,7 @@ impl MVCCEngine {
                 // made again outside the fence; after three rounds the table
                 // waits for the next cycle with its rows still hot
                 let mut rounds = 0;
+                let mut refused = None;
                 let Some((_seal_guard, outcome, published)) = (loop {
                     let guard = mgr.acquire_seal_write();
                     // A snapshot that began after the cutoff was read keeps its versions hot
@@ -7631,8 +7728,13 @@ impl MVCCEngine {
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let schema = schemas.get(&table_name).map(|s| &**s);
                     match mgr.register_sealed(std::mem::take(&mut entries), prepared, schema) {
-                        Ok(published) => break Some((guard, outcome, published)),
-                        Err((back, stale)) => {
+                        Ok(Ok(published)) => break Some((guard, outcome, published)),
+                        Err(error) => {
+                            mgr.clear_seal_overlap();
+                            refused = Some(error);
+                            break None;
+                        }
+                        Ok(Err((back, stale))) => {
                             entries = back;
                             mgr.clear_seal_overlap();
                             drop(schemas);
@@ -7654,6 +7756,9 @@ impl MVCCEngine {
                     drop(ddl);
                     for side in stale_sides {
                         crate::storage::volume::secondary::discard_side(side);
+                    }
+                    if let Some(error) = refused {
+                        return Err(error);
                     }
                     continue;
                 };
@@ -8039,7 +8144,7 @@ impl Engine for MVCCEngine {
         // Recompute cold mappings with the post-add schema.
         // dropped_columns stays permanent — old volumes have stale data under
         // the dropped name, new volumes get the re-added column at a new position.
-        self.refresh_column_mappings(table_name);
+        self.refresh_column_mappings(table_name)?;
 
         self.record_ddl(table_name, WALOperationType::AlterTable, &data)
     }
@@ -8090,43 +8195,6 @@ impl Engine for MVCCEngine {
         // New column name
         data.extend_from_slice(&(new_column_name.len() as u16).to_le_bytes());
         data.extend_from_slice(new_column_name.as_bytes());
-
-        self.record_ddl(table_name, WALOperationType::AlterTable, &data)
-    }
-
-    fn record_alter_table_modify_column(
-        &self,
-        table_name: &str,
-        column_name: &str,
-        data_type: crate::core::DataType,
-        nullable: bool,
-        vector_dimensions: u16,
-    ) -> Result<()> {
-        if self.should_skip_wal() {
-            return Ok(());
-        }
-
-        // Serialize: operation_type(1) + table_name_len(2) + table_name
-        //          + column_name_len(2) + column_name + data_type(1) + [IF Vector: vec_dims(2)] + nullable(1)
-        let mut data = Vec::new();
-        data.push(4u8); // Operation type: ModifyColumn = 4
-
-        // Table name
-        data.extend_from_slice(&(table_name.len() as u16).to_le_bytes());
-        data.extend_from_slice(table_name.as_bytes());
-
-        // Column name
-        data.extend_from_slice(&(column_name.len() as u16).to_le_bytes());
-        data.extend_from_slice(column_name.as_bytes());
-
-        // Data type (1 byte, + 2 bytes dimension for Vector)
-        data.push(data_type.as_u8());
-        if data_type == DataType::Vector {
-            data.extend_from_slice(&vector_dimensions.to_le_bytes());
-        }
-
-        // Nullable
-        data.push(if nullable { 1 } else { 0 });
 
         self.record_ddl(table_name, WALOperationType::AlterTable, &data)
     }
@@ -9488,26 +9556,20 @@ impl TransactionEngineOperations for EngineOperations {
         }
     }
 
-    fn change_column_definition(
-        &self,
-        table_name: &str,
-        apply: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<()> {
+    fn change_column_type(&self, change: &ColumnTypeChange<'_>) -> Result<()> {
         let _ddl = self.ddl.serial.lock();
-        let mut change =
-            begin_column_change(&self.segment_managers, &self.persistence, table_name)?;
-        let _closed = close_and_settle(
-            &self.version_stores,
-            &self.segment_managers,
-            &self.persistence,
-            &self.registry,
-            table_name,
-        )?;
-        apply()?;
-        change.mark_changed();
-        refresh_schema(&self.version_stores, &self.schemas, &self.ddl, table_name)?;
-        change.finish();
-        Ok(())
+        retype::change_column_type(
+            &retype::Shared {
+                version_stores: &self.version_stores,
+                segment_managers: &self.segment_managers,
+                persistence: &self.persistence,
+                registry: &self.registry,
+                schemas: &self.schemas,
+                ddl: &self.ddl,
+                replaying: self.loading_from_disk.load(Ordering::Acquire),
+            },
+            change,
+        )
     }
 
     fn rollback_dml_after(&self, txn_id: i64, timestamp: i64) {
@@ -10647,7 +10709,9 @@ mod tests {
             2,
             &Row::from_values(vec![Value::Integer(2), Value::Integer(45)]),
         );
-        engine.register_volume("items", Arc::new(builder.finish().unwrap()));
+        engine
+            .register_volume("items", Arc::new(builder.finish().unwrap()))
+            .unwrap();
 
         let tx = engine.begin_transaction().unwrap();
         let table = tx.get_table("items").unwrap();
@@ -10692,7 +10756,9 @@ mod tests {
             2,
             &Row::from_values(vec![Value::Integer(2), Value::text("dup")]),
         );
-        engine.register_volume("items", Arc::new(builder.finish().unwrap()));
+        engine
+            .register_volume("items", Arc::new(builder.finish().unwrap()))
+            .unwrap();
 
         let tx = engine.begin_transaction().unwrap();
         let table = tx.get_table("items").unwrap();
@@ -10730,7 +10796,9 @@ mod tests {
             2,
             &Row::from_values(vec![Value::Integer(2), Value::text("bob")]),
         );
-        engine.register_volume("items", Arc::new(builder.finish().unwrap()));
+        engine
+            .register_volume("items", Arc::new(builder.finish().unwrap()))
+            .unwrap();
 
         let tx = engine.begin_transaction().unwrap();
         let table = tx.get_table("items").unwrap();
@@ -10762,7 +10830,9 @@ mod tests {
             1,
             &Row::from_values(vec![Value::Integer(1), Value::vector(vec![1.0, 0.0])]),
         );
-        engine.register_volume("items", Arc::new(builder.finish().unwrap()));
+        engine
+            .register_volume("items", Arc::new(builder.finish().unwrap()))
+            .unwrap();
 
         let tx = engine.begin_transaction().unwrap();
         let table = tx.get_table("items").unwrap();

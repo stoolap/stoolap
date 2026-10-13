@@ -234,9 +234,9 @@ ALTER TABLE operations work on tables with frozen volumes. When the schema chang
 - **ADD COLUMN**: New column returns NULL or the column's DEFAULT value for volume rows. When rows are sealed or compacted, the default is materialized
 - **DROP COLUMN**: Dropped column is skipped during projection
 - **RENAME COLUMN**: Column matching is by name, so the renamed column maps correctly
-- **MODIFY COLUMN**: Type coercion is applied on read
+- **MODIFY COLUMN**: A change of type rewrites, with the table closed, every volume holding the column in the old type, the hot rows and the indexes over the column, and validates NOT NULL and UNIQUE first. A database left with volumes in an older type is repaired the same way when it opens
 
-No volume rebuild is needed. The next seal or compact cycle produces new segments with the updated schema.
+For the other changes no volume rebuild is needed. The next seal or compact cycle produces new segments with the updated schema.
 
 ### Memory Model
 
