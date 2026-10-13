@@ -25,6 +25,7 @@ use crate::common::SmartString;
 use crate::core::{DataType, Error, Result, Row, RowVec, Schema, Value, ValueMap};
 use crate::parser::ast::*;
 use crate::storage::expression::{ComparisonExpr, Expression as StorageExpr};
+use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::traits::{Engine, QueryResult, Table, Transaction};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
@@ -35,7 +36,7 @@ use super::context::{
 };
 use super::expression::CompiledEvaluator;
 use super::pushdown;
-use super::query_cache::{CompiledExecution, CompiledInsert};
+use super::query_cache::{CompiledConflictInsert, CompiledExecution, CompiledInsert};
 use super::result::{ExecResult, ExecutorResult};
 use super::utils::dummy_token_clone;
 use super::Executor;
@@ -258,17 +259,98 @@ fn build_default_slots(
     (values, programs)
 }
 
-/// Pre-compiled upsert expressions built once per INSERT statement and reused for every
-/// conflicting row. Without this, `apply_on_duplicate_update` recompiles expressions and
-/// re-parses CHECK constraint SQL on every conflict, causing O(n) allocation churn.
-struct CompiledUpsert {
+/// Compiled ON DUPLICATE KEY UPDATE clause, reused for every conflicting row
+/// and kept in the statement's plan cache
+pub(crate) struct CompiledUpsert {
     /// (column_index, column_type, vector_dimensions, compiled_program)
     compiled_updates: Vec<(usize, DataType, u16, super::expression::SharedProgram)>,
     /// DO UPDATE ... WHERE, read against the row met and the EXCLUDED row
     compiled_where: Option<super::expression::SharedProgram>,
-    /// (column_index, column_name, check_expression_text, compiled_check_program)
-    /// The program is executed with a single-column row containing the new value.
-    compiled_checks: Vec<(usize, String, String, super::expression::SharedProgram)>,
+    /// CHECK constraints of the updated columns
+    compiled_checks: Vec<CompiledCheck>,
+}
+
+/// The CHECK programs of a table without CHECK constraints, shared
+static NO_CHECKS: std::sync::LazyLock<Arc<Vec<CompiledCheck>>> =
+    std::sync::LazyLock::new(|| Arc::new(Vec::new()));
+
+/// One INSERT's CHECK programs and ON DUPLICATE KEY UPDATE clause: taken from
+/// the plan cache when compiled against this table layout, else compiled here
+/// (the clause at the first conflict) and cached
+struct InsertPlan<'a> {
+    checks: Arc<Vec<CompiledCheck>>,
+    upsert: Option<Arc<CompiledUpsert>>,
+    cache: Option<&'a RwLock<CompiledExecution>>,
+    table_name: &'a str,
+    epoch: u64,
+    token: LayoutToken,
+}
+
+impl<'a> InsertPlan<'a> {
+    fn new(
+        cache: Option<&'a RwLock<CompiledExecution>>,
+        table_name: &'a str,
+        epoch: u64,
+        token: LayoutToken,
+        schema: &Schema,
+    ) -> Result<Self> {
+        let cached = cache.and_then(|cache| match &*cache.read().ok()? {
+            CompiledExecution::ConflictInsert(plan)
+                if plan.cached_epoch == epoch
+                    && plan.token == token
+                    && *plan.table_name == *table_name =>
+            {
+                Some((Arc::clone(&plan.checks), plan.upsert.clone()))
+            }
+            _ => None,
+        });
+        let hit = cached.is_some();
+        let (checks, upsert) = match cached {
+            Some(parts) => parts,
+            None => {
+                let checks = compile_check_programs(schema)?;
+                if checks.is_empty() {
+                    (Arc::clone(&NO_CHECKS), None)
+                } else {
+                    (Arc::new(checks), None)
+                }
+            }
+        };
+        let plan = Self {
+            checks,
+            upsert,
+            cache,
+            table_name,
+            epoch,
+            token,
+        };
+        if !hit {
+            plan.store();
+        }
+        Ok(plan)
+    }
+
+    fn upsert(&mut self, schema: &Schema, stmt: &InsertStatement) -> Result<Arc<CompiledUpsert>> {
+        if let Some(upsert) = &self.upsert {
+            return Ok(Arc::clone(upsert));
+        }
+        let upsert = Arc::new(Executor::compile_upsert(schema, stmt)?);
+        self.upsert = Some(Arc::clone(&upsert));
+        self.store();
+        Ok(upsert)
+    }
+
+    fn store(&self) {
+        if let Some(Ok(mut slot)) = self.cache.map(|cache| cache.write()) {
+            *slot = CompiledExecution::ConflictInsert(CompiledConflictInsert {
+                checks: Arc::clone(&self.checks),
+                upsert: self.upsert.clone(),
+                table_name: SmartString::new(self.table_name),
+                cached_epoch: self.epoch,
+                token: self.token,
+            });
+        }
+    }
 }
 
 /// A column's CHECK constraint, compiled once: (column index, column name,
@@ -289,35 +371,43 @@ pub(crate) type CompiledCheck = (
 /// than a silently skipped check.
 pub(crate) fn compile_check_programs(schema: &Schema) -> Result<Vec<CompiledCheck>> {
     let mut compiled = Vec::new();
-    for (idx, c) in schema.columns.iter().enumerate() {
-        let Some(check_expr) = c.check_expr.as_ref() else {
-            continue;
-        };
-        let sql = format!("SELECT {}", check_expr);
-        let Ok(stmts) = crate::parser::parse_sql(&sql) else {
-            continue;
-        };
-        let Some(crate::parser::ast::Statement::Select(select)) = stmts.first() else {
-            continue;
-        };
-        let Some(expr) = select.columns.first() else {
-            continue;
-        };
-        let columns = vec![c.name.to_string()];
-        let program = super::expression::compile_expression(expr, &columns).map_err(|e| {
-            Error::internal(format!(
-                "CHECK constraint on column '{}' failed to compile: {}",
-                c.name, e
-            ))
-        })?;
-        compiled.push((
-            idx,
-            SmartString::new(&c.name),
-            SmartString::new(check_expr),
-            program,
-        ));
+    for idx in 0..schema.columns.len() {
+        if let Some(check) = compile_column_check(schema, idx)? {
+            compiled.push(check);
+        }
     }
     Ok(compiled)
+}
+
+/// Compile the CHECK constraint of column `idx`, if it has one that parses
+fn compile_column_check(schema: &Schema, idx: usize) -> Result<Option<CompiledCheck>> {
+    let c = &schema.columns[idx];
+    let Some(check_expr) = c.check_expr.as_ref() else {
+        return Ok(None);
+    };
+    let sql = format!("SELECT {}", check_expr);
+    let Ok(stmts) = crate::parser::parse_sql(&sql) else {
+        return Ok(None);
+    };
+    let Some(crate::parser::ast::Statement::Select(select)) = stmts.first() else {
+        return Ok(None);
+    };
+    let Some(expr) = select.columns.first() else {
+        return Ok(None);
+    };
+    let columns = vec![c.name.to_string()];
+    let program = super::expression::compile_expression(expr, &columns).map_err(|e| {
+        Error::internal(format!(
+            "CHECK constraint on column '{}' failed to compile: {}",
+            c.name, e
+        ))
+    })?;
+    Ok(Some((
+        idx,
+        SmartString::new(&c.name),
+        SmartString::new(check_expr),
+        program,
+    )))
 }
 
 /// Run one compiled CHECK against `value`. NULL passes, per the standard.
@@ -476,6 +566,7 @@ impl Executor {
         &self,
         stmt: &InsertStatement,
         ctx: &ExecutionContext,
+        plan_cache: Option<&RwLock<CompiledExecution>>,
     ) -> Result<Box<dyn QueryResult>> {
         // OPTIMIZATION: Use pre-computed lowercase name to avoid allocation per query
         let table_name = &stmt.table_name.value_lower;
@@ -550,8 +641,9 @@ impl Executor {
         // Per-statement default slots: constant values plus per-row programs
         let default_values: Vec<Value>;
         let default_programs: Vec<Option<(super::expression::SharedProgram, DataType)>>;
-        // OPTIMIZATION: Only collect columns that have CHECK constraints (saves 3ms clone overhead)
-        let check_exprs: Vec<(usize, String, String)>; // (col_idx, column_name, check_expr)
+        let mut insert_plan: InsertPlan<'_>;
+        let check_programs: Arc<Vec<CompiledCheck>>;
+        let mut check_vm = super::expression::ExprVM::new();
         {
             let schema = table.schema();
             schema_column_count = schema.columns.len();
@@ -560,17 +652,15 @@ impl Executor {
             let (dv, dp) = build_default_slots(schema);
             default_values = dv;
             default_programs = dp;
-            // Only collect columns that actually have CHECK constraints
-            check_exprs = schema
-                .columns
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, c)| {
-                    c.check_expr
-                        .as_ref()
-                        .map(|expr| (idx, c.name.clone(), expr.clone()))
-                })
-                .collect();
+            // Only a conflict-handling INSERT keeps its plan here
+            insert_plan = InsertPlan::new(
+                plan_cache.filter(|_| stmt.on_duplicate || stmt.do_nothing),
+                table_name,
+                self.engine.schema_epoch(),
+                table.layout_token(),
+                schema,
+            )?;
+            check_programs = Arc::clone(&insert_plan.checks);
             all_column_types = schema.columns.iter().map(|c| c.data_type).collect();
 
             // OPTIMIZATION: When no columns specified, insert into all columns in order
@@ -657,18 +747,6 @@ impl Executor {
                 None
             };
 
-            // Pre-compile upsert expressions once for all conflicting rows in this batch.
-            // Without this, compile_upsert work repeats for every conflict (O(n) cost).
-            let compiled_upsert = if stmt.on_duplicate {
-                if let Some(ref s) = select_schema {
-                    Some(Self::compile_upsert(s, stmt)?)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
             // For explicit transactions, materialize the SELECT BEFORE any inserts
             // to ensure statement atomicity: a late runtime error (e.g., invalid REGEXP)
             // won't leave partial inserts pending for commit. Auto-commit transactions
@@ -725,13 +803,13 @@ impl Executor {
                 }
 
                 // Validate CHECK constraints (must happen before insert)
-                for (col_idx, col_name, check_expr) in &check_exprs {
-                    let col_type = all_column_types[*col_idx];
-                    self.validate_check_constraint(
-                        check_expr,
+                for (col_idx, col_name, check_expr, program) in check_programs.iter() {
+                    run_check_program(
+                        &mut check_vm,
+                        program,
                         col_name,
+                        check_expr,
                         &row_values[*col_idx],
-                        col_type,
                     )?;
                 }
 
@@ -804,7 +882,7 @@ impl Executor {
                                 None,
                                 row_values,
                                 stmt,
-                                compiled_upsert.as_ref(),
+                                &mut insert_plan,
                                 ctx,
                                 has_returning,
                             ) {
@@ -852,7 +930,7 @@ impl Executor {
                                         Some(column),
                                         row_values,
                                         stmt,
-                                        compiled_upsert.as_ref(),
+                                        &mut insert_plan,
                                         ctx,
                                         has_returning,
                                     ) {
@@ -930,7 +1008,7 @@ impl Executor {
                                 drop(returning_result);
                                 drop(_upsert_guard);
                                 let retry_ctx = ctx.with_incremented_query_depth();
-                                return self.execute_insert(stmt, &retry_ctx);
+                                return self.execute_insert(stmt, &retry_ctx, plan_cache);
                             }
                             if stmt.do_nothing {
                                 // DO NOTHING: returning 0 rows is the correct semantic
@@ -961,14 +1039,6 @@ impl Executor {
         if stmt.do_nothing || stmt.on_duplicate {
             // ON DUPLICATE KEY UPDATE requires schema (CompactArc ref-count bump, not deep clone)
             let schema = table.schema_arc();
-
-            // Pre-compile upsert expressions once for all conflicting rows in this batch.
-            // Without this, compile_upsert work repeats for every conflict (O(n) cost).
-            let compiled_upsert = if stmt.on_duplicate {
-                Some(Self::compile_upsert(&schema, stmt)?)
-            } else {
-                None
-            };
 
             for value_row in &stmt.values {
                 if value_row.len() != column_indices.len() {
@@ -1021,13 +1091,13 @@ impl Executor {
                 }
 
                 // Validate CHECK constraints (must happen before insert)
-                for (col_idx, col_name, check_expr) in &check_exprs {
-                    let col_type = all_column_types[*col_idx];
-                    self.validate_check_constraint(
-                        check_expr,
+                for (col_idx, col_name, check_expr, program) in check_programs.iter() {
+                    run_check_program(
+                        &mut check_vm,
+                        program,
                         col_name,
+                        check_expr,
                         &row_values[*col_idx],
-                        col_type,
                     )?;
                 }
 
@@ -1092,7 +1162,7 @@ impl Executor {
                                 None,
                                 &row_values,
                                 stmt,
-                                compiled_upsert.as_ref(),
+                                &mut insert_plan,
                                 ctx,
                                 has_returning,
                             ) {
@@ -1141,7 +1211,7 @@ impl Executor {
                                         Some(column),
                                         &row_values,
                                         stmt,
-                                        compiled_upsert.as_ref(),
+                                        &mut insert_plan,
                                         ctx,
                                         has_returning,
                                     ) {
@@ -1223,13 +1293,13 @@ impl Executor {
                 }
 
                 // Validate CHECK constraints (only iterates columns that have CHECK constraints)
-                for (col_idx, col_name, check_expr) in &check_exprs {
-                    let col_type = all_column_types[*col_idx];
-                    self.validate_check_constraint(
-                        check_expr,
+                for (col_idx, col_name, check_expr, program) in check_programs.iter() {
+                    run_check_program(
+                        &mut check_vm,
+                        program,
                         col_name,
+                        check_expr,
                         &row_values[*col_idx],
-                        col_type,
                     )?;
                 }
 
@@ -1286,7 +1356,7 @@ impl Executor {
                             drop(returning_result);
                             drop(_upsert_guard);
                             let retry_ctx = ctx.with_incremented_query_depth();
-                            return self.execute_insert(stmt, &retry_ctx);
+                            return self.execute_insert(stmt, &retry_ctx, plan_cache);
                         }
                         if stmt.do_nothing {
                             // DO NOTHING: returning 0 rows is the correct semantic
@@ -1323,7 +1393,7 @@ impl Executor {
     ) -> Result<Box<dyn QueryResult>> {
         // Conflict handling requires special handling - fall back to non-cached path
         if stmt.on_duplicate || stmt.do_nothing {
-            return self.execute_insert(stmt, ctx);
+            return self.execute_insert(stmt, ctx, Some(compiled_cache));
         }
 
         // OPTIMIZATION: Use pre-computed lowercase name to avoid allocation per query
@@ -1403,12 +1473,10 @@ impl Executor {
             let schema = table.schema();
             let schema_column_count = schema.columns.len();
 
-            // Pre-compile CHECK constraints once per plan. Parse failures
-            // skip validation (matching validate_check_constraint), but a
-            // COMPILE failure must fail the INSERT: the per-row path
-            // propagated it, and swallowing it here would silently disable
-            // the constraint (e.g. after RENAME COLUMN leaves a stale
-            // check_expr).
+            // Pre-compile CHECK constraints once per plan. A constraint that
+            // does not parse is skipped; one that fails to compile fails the
+            // INSERT instead of silently disabling the constraint (e.g. a
+            // stale check_expr after RENAME COLUMN).
             let compiled_checks = compile_check_programs(schema)?;
 
             let all_column_types: Vec<DataType> =
@@ -3353,9 +3421,8 @@ impl Executor {
         schema: &crate::core::Schema,
         stmt: &InsertStatement,
     ) -> Result<CompiledUpsert> {
-        use super::expression::{compile_expression, CompileContext, ExprCompiler, SharedProgram};
+        use super::expression::{CompileContext, ExprCompiler, SharedProgram};
         use crate::functions::registry::global_registry;
-        use crate::parser::parse_sql;
 
         let col_map = schema.column_index_map();
 
@@ -3424,36 +3491,12 @@ impl Executor {
         // Compile CHECK constraints for columns being updated.
         // Store as SharedProgram (not ExpressionEval) so the struct can be shared
         // immutably — the VM used to execute the program lives in the setter closure.
-        let compiled_checks: Vec<(usize, String, String, SharedProgram)> = update_specs
-            .iter()
-            .filter_map(|(idx, _, _, _)| {
-                let col = &schema.columns[*idx];
-                let check_expr = col.check_expr.as_ref()?;
-                let sql = format!("SELECT {}", check_expr);
-                // Parse failures skip validation (matching
-                // validate_check_constraint); compile failures propagate
-                let Ok(stmts) = parse_sql(&sql) else {
-                    return None;
-                };
-                let crate::parser::ast::Statement::Select(select) = stmts.first()? else {
-                    return None;
-                };
-                let expr = select.columns.first()?;
-                let columns = vec![col.name.to_string()];
-                Some(
-                    compile_expression(expr, &columns)
-                        .map(|program| {
-                            (*idx, col.name.to_string(), check_expr.to_string(), program)
-                        })
-                        .map_err(|e| {
-                            Error::internal(format!(
-                                "CHECK constraint on column '{}' failed to compile: {}",
-                                col.name, e
-                            ))
-                        }),
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut compiled_checks = Vec::new();
+        for (idx, _, _, _) in &update_specs {
+            if let Some(check) = compile_column_check(schema, *idx)? {
+                compiled_checks.push(check);
+            }
+        }
 
         Ok(CompiledUpsert {
             compiled_updates,
@@ -3477,7 +3520,7 @@ impl Executor {
         conflict_column: Option<&str>,
         insert_values: &[Value],
         stmt: &InsertStatement,
-        compiled: Option<&CompiledUpsert>,
+        insert_plan: &mut InsertPlan<'_>,
         ctx: &ExecutionContext,
         capture_row: bool,
     ) -> Result<(bool, Option<Row>)> {
@@ -3527,17 +3570,7 @@ impl Executor {
 
         use super::expression::{ExecuteContext, ExprVM};
 
-        // Use pre-compiled programs when provided (normal fast path).
-        // Fall back to inline compilation only when called without a CompiledUpsert
-        // (backward-compatibility / single-row callers).
-        let inline_compiled: Option<CompiledUpsert>;
-        let effective = match compiled {
-            Some(c) => c,
-            None => {
-                inline_compiled = Some(Self::compile_upsert(schema, stmt)?);
-                inline_compiled.as_ref().unwrap()
-            }
-        };
+        let effective = insert_plan.upsert(schema, stmt)?;
 
         // Build the EXCLUDED row from insert_values
         let excluded_row = Row::from_values(insert_values.to_vec());
@@ -3626,8 +3659,8 @@ impl Executor {
                             };
                             if !is_truthy {
                                 return Err(Error::CheckConstraintViolation {
-                                    column: col_name.clone(),
-                                    expression: check_expr.clone(),
+                                    column: col_name.to_string(),
+                                    expression: check_expr.to_string(),
                                 });
                             }
                         }
@@ -3790,82 +3823,6 @@ impl Executor {
         }
 
         Ok(Value::null_unknown())
-    }
-
-    /// Validate a CHECK constraint against row values
-    /// Returns Ok(()) if the constraint passes, Err if it fails
-    pub(crate) fn validate_check_constraint(
-        &self,
-        check_expr: &str,
-        col_name: &str,
-        col_value: &Value,
-        _col_type: crate::core::DataType,
-    ) -> Result<()> {
-        use crate::parser::parse_sql;
-
-        // NULL values pass CHECK constraints (SQL standard)
-        if col_value.is_null() {
-            return Ok(());
-        }
-
-        // Parse the check expression
-        let sql = format!("SELECT {}", check_expr);
-        let stmts = match parse_sql(&sql) {
-            Ok(s) => s,
-            Err(_) => return Ok(()), // If we can't parse, skip validation
-        };
-        if stmts.is_empty() {
-            return Ok(());
-        }
-
-        // Create an evaluator with the column value in context
-        if let crate::parser::ast::Statement::Select(select) = &stmts[0] {
-            if let Some(expr) = select.columns.first() {
-                use super::expression::ExpressionEval;
-
-                // Create evaluator and evaluate with row context
-                let columns = vec![col_name.to_string()];
-                let row = crate::core::Row::from_values(vec![col_value.clone()]);
-
-                // Compile and evaluate expression with single-column row context
-                let result = ExpressionEval::compile(expr, &columns)?.eval(&row)?;
-
-                // Check if the result is truthy
-                match result {
-                    Value::Boolean(true) => Ok(()),
-                    Value::Boolean(false) => Err(Error::CheckConstraintViolation {
-                        column: col_name.to_string(),
-                        expression: check_expr.to_string(),
-                    }),
-                    Value::Null(_) => {
-                        // NULL passes CHECK constraint (SQL standard)
-                        Ok(())
-                    }
-                    _ => {
-                        // Non-boolean truthiness: zero/empty = false, all else = true.
-                        // Timestamp, Extension, etc. are truthy (non-null existence).
-                        let is_truthy = match &result {
-                            Value::Integer(i) => *i != 0,
-                            Value::Float(f) => *f != 0.0,
-                            Value::Text(s) => !s.is_empty(),
-                            _ => true,
-                        };
-                        if is_truthy {
-                            Ok(())
-                        } else {
-                            Err(Error::CheckConstraintViolation {
-                                column: col_name.to_string(),
-                                expression: check_expr.to_string(),
-                            })
-                        }
-                    }
-                }
-            } else {
-                Ok(())
-            }
-        } else {
-            Ok(())
-        }
     }
 
     #[inline(never)]

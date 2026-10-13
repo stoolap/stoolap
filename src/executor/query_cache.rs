@@ -239,6 +239,31 @@ pub struct CompiledInsert {
     pub token: LayoutToken,
 }
 
+/// Compiled parts of an INSERT that handles conflicts (ON DUPLICATE KEY
+/// UPDATE, DO NOTHING)
+#[derive(Clone)]
+pub struct CompiledConflictInsert {
+    /// CHECK constraints of the inserted rows
+    pub(crate) checks: Arc<Vec<super::dml::CompiledCheck>>,
+    /// ON DUPLICATE KEY UPDATE clause, compiled at the first conflict
+    pub(crate) upsert: Option<Arc<super::dml::CompiledUpsert>>,
+    /// Table name (already lowercased)
+    pub table_name: SmartString,
+    /// Schema epoch at compilation time (for fast cache invalidation)
+    pub cached_epoch: u64,
+    /// Layout of the table handle these were compiled against
+    pub token: LayoutToken,
+}
+
+impl std::fmt::Debug for CompiledConflictInsert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompiledConflictInsert")
+            .field("table_name", &self.table_name)
+            .field("cached_epoch", &self.cached_epoch)
+            .finish_non_exhaustive()
+    }
+}
+
 impl std::fmt::Debug for CompiledInsert {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CompiledInsert")
@@ -312,6 +337,8 @@ pub enum CompiledExecution {
     PkDelete(CompiledPkDelete),
     /// Cached INSERT compilation (schema-derived info)
     Insert(CompiledInsert),
+    /// Compiled INSERT with conflict handling
+    ConflictInsert(CompiledConflictInsert),
     /// COUNT(DISTINCT col) fast path
     CountDistinct(CompiledCountDistinct),
     /// COUNT(*) fast path
