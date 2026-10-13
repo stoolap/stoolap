@@ -526,10 +526,18 @@ impl HashTableStorage {
             HashTableStorage::Sequential(map) => map.get(key).map(Vec::as_slice),
             #[cfg(feature = "parallel")]
             HashTableStorage::Partitioned { maps, shift } => {
-                maps[(*key >> shift) as usize].get(key).map(Vec::as_slice)
+                maps[partition_of(*key, *shift)].get(key).map(Vec::as_slice)
             }
         }
     }
+}
+
+/// The partition of `hash`: its top bits within a usize, so any u64 a caller
+/// passes stays below the partition count on a 32-bit target too
+#[cfg(feature = "parallel")]
+#[inline]
+fn partition_of(hash: u64, shift: u32) -> usize {
+    (hash as usize) >> shift
 }
 
 /// Result of parallel hash table build phase
@@ -585,7 +593,7 @@ pub fn parallel_hash_build(
                     .collect();
                 for (local_idx, row) in chunk.iter().enumerate() {
                     let hash = hash_composite_key(row, key_indices);
-                    parts[(hash >> shift) as usize].push((hash, base_idx + local_idx));
+                    parts[partition_of(hash, shift)].push((hash, base_idx + local_idx));
                 }
                 parts
             })
