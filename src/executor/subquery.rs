@@ -1608,7 +1608,7 @@ impl Executor {
         match expr {
             Expression::QualifiedIdentifier(qid) => {
                 // Convert qualified identifier to unqualified
-                Expression::Identifier((*qid.name).clone())
+                Expression::Identifier(qid.name.clone())
             }
             Expression::Infix(infix) => {
                 // Recursively strip aliases from both sides
@@ -4475,12 +4475,8 @@ impl Executor {
         // Build the outer column expression using dummy_token_clone() to avoid allocations
         let outer_col_expr = if let Some(ref tbl) = info.outer_table {
             Expression::QualifiedIdentifier(QualifiedIdentifier {
-                token: dummy_token_clone(),
-                qualifier: Box::new(Identifier::new(dummy_token_clone(), tbl.clone())),
-                name: Box::new(Identifier::new(
-                    dummy_token_clone(),
-                    info.outer_column.clone(),
-                )),
+                qualifier: Identifier::new(dummy_token_clone(), tbl.clone()),
+                name: Identifier::new(dummy_token_clone(), info.outer_column.clone()),
             })
         } else {
             Expression::Identifier(Identifier::new(
@@ -4920,9 +4916,8 @@ mod tests {
 
     fn qual(table: &str, col: &str) -> Expression {
         Expression::QualifiedIdentifier(QualifiedIdentifier {
-            token: tok(),
-            qualifier: Box::new(Identifier::new(tok(), table)),
-            name: Box::new(Identifier::new(tok(), col)),
+            qualifier: Identifier::new(tok(), table),
+            name: Identifier::new(tok(), col),
         })
     }
 

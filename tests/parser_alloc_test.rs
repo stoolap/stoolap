@@ -13,7 +13,8 @@
 // limitations under the License.
 
 //! Parsing allocates for the tree it builds, not for operator precedence,
-//! reserved keyword checks, clause names or a copy of the input
+//! reserved keyword checks, clause names, a copy of the input or a box per
+//! part of a qualified column name
 
 // The jemalloc feature, on by default, sets the library's own global allocator
 #![cfg(not(feature = "jemalloc"))]
@@ -72,7 +73,7 @@ fn test_parse_allocates_only_for_the_tree() {
              JOIN customers c ON o.customer_id = c.id LEFT JOIN items i ON i.order_id = o.id \
              WHERE o.status = 'open' AND c.region = $1 GROUP BY o.id, c.name \
              ORDER BY total DESC LIMIT 20",
-            67,
+            43,
         ),
     ] {
         parse_allocations(sql);

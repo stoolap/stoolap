@@ -92,10 +92,10 @@ impl<'a> Lexer<'a> {
     fn read_char(&mut self) {
         // Update position before changing character
         if self.ch == '\n' {
-            self.pos.line += 1;
+            self.pos.line = self.pos.line.saturating_add(1);
             self.pos.column = 1;
         } else if self.ch != '\0' {
-            self.pos.column += 1;
+            self.pos.column = self.pos.column.saturating_add(1);
         }
 
         if self.read_position >= self.input.len() {
@@ -108,7 +108,7 @@ impl<'a> Lexer<'a> {
             self.read_position += len;
         }
 
-        self.pos.offset = self.position;
+        self.pos.offset = u32::try_from(self.position).unwrap_or(u32::MAX);
     }
 
     /// Peek at the next character without advancing
@@ -357,17 +357,17 @@ impl<'a> Lexer<'a> {
                 // Step past each char from the opening quote through the closing one, as read_char does
                 for &byte in &self.input[start_pos..end_pos] {
                     if byte == b'\n' {
-                        self.pos.line += 1;
+                        self.pos.line = self.pos.line.saturating_add(1);
                         self.pos.column = 1;
                     } else if byte & 0xC0 != 0x80 {
-                        self.pos.column += 1;
+                        self.pos.column = self.pos.column.saturating_add(1);
                     }
                 }
 
                 // Advance lexer past closing quote
                 self.position = scan_pos;
                 self.read_position = end_pos;
-                self.pos.offset = self.position;
+                self.pos.offset = u32::try_from(self.position).unwrap_or(u32::MAX);
 
                 // Read next char after closing quote
                 if self.read_position >= input_len {
@@ -379,7 +379,7 @@ impl<'a> Lexer<'a> {
                     self.position = self.read_position;
                     self.read_position += len;
                 }
-                self.pos.offset = self.position;
+                self.pos.offset = u32::try_from(self.position).unwrap_or(u32::MAX);
 
                 // SAFETY: input was constructed from valid UTF-8 (String/&str).
                 // We only scanned for ASCII bytes, so all byte boundaries are valid.
@@ -917,6 +917,20 @@ mod tests {
                 (line, column),
                 "position of x in {sql:?}"
             );
+        }
+    }
+
+    #[test]
+    fn test_position_saturates_at_the_counter_limit() {
+        for sql in ["ab", "a\nb", "'ab'", "'a\nb'"] {
+            let mut lexer = Lexer::new(sql);
+            lexer.pos.line = u32::MAX;
+            lexer.pos.column = u32::MAX;
+            let mut token = lexer.next_token();
+            while !token.is_eof() {
+                token = lexer.next_token();
+            }
+            assert_eq!(token.position.line, u32::MAX, "line at the end of {sql:?}");
         }
     }
 
