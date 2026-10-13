@@ -24,7 +24,6 @@
 pub mod compact_arc;
 pub mod compact_vec;
 pub mod cow_btree;
-pub mod cow_hashmap;
 pub mod i64_map;
 pub mod maps;
 pub mod smart_string;
@@ -35,7 +34,6 @@ pub mod version;
 pub use compact_arc::{CompactArc, CompactArcDrop};
 pub use compact_vec::CompactVec;
 pub use cow_btree::CowBTree;
-pub use cow_hashmap::CowHashMap;
 pub use i64_map::{I64Map, I64Set};
 pub use maps::{
     new_cow_btree_map, new_i64_map, new_i64_map_with_capacity, CowBTreeMap, StringMap, StringSet,

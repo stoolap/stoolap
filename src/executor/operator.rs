@@ -536,25 +536,6 @@ impl fmt::Display for DirectBuildCompositeRow {
     }
 }
 
-/// A null row with a specified number of columns.
-///
-/// Used for OUTER JOINs when there's no match on one side.
-pub struct NullRow {
-    len: usize,
-}
-
-impl NullRow {
-    /// Create a null row with the specified number of columns.
-    pub fn new(len: usize) -> Self {
-        Self { len }
-    }
-
-    /// Materialize into a Row filled with NULLs.
-    pub fn materialize(&self) -> Row {
-        Row::from_values(vec![Value::null_unknown(); self.len])
-    }
-}
-
 // ============================================================================
 // Helper Operators
 // ============================================================================
@@ -852,16 +833,5 @@ mod tests {
         assert!(op.next().unwrap().is_none());
 
         op.close().unwrap();
-    }
-
-    #[test]
-    fn test_null_row() {
-        let null_row = NullRow::new(3);
-        let materialized = null_row.materialize();
-
-        assert_eq!(materialized.len(), 3);
-        assert!(materialized.get(0).unwrap().is_null());
-        assert!(materialized.get(1).unwrap().is_null());
-        assert!(materialized.get(2).unwrap().is_null());
     }
 }
