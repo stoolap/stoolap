@@ -73,6 +73,9 @@ fn test_uncacheable_selects_take_no_stamp() {
     db.query("SELECT id FROM t WHERE v > 5", ())
         .unwrap()
         .count();
+    db.query("SELECT * FROM t AS OF TRANSACTION 1 WHERE v > 5", ())
+        .unwrap()
+        .count();
     assert!(!stamped.get(), "an uncacheable SELECT took a stamp");
     db.query(CACHED, ()).unwrap().count();
     assert!(stamped.get(), "a cacheable SELECT takes a stamp");

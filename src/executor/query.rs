@@ -2331,6 +2331,7 @@ impl Executor {
         let cache_stamp = if !in_explicit_transaction
             && ctx.statement_snapshot().is_none()
             && ctx.outer_row().is_none()
+            && table_source.as_of.is_none()
             && classification.is_select_star
             && stmt.where_clause.is_some()
             && !classification.has_aggregation
