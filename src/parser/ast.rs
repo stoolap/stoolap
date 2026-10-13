@@ -163,7 +163,7 @@ impl Expression {
     /// Get the position of this expression
     pub fn position(&self) -> Position {
         match self {
-            Expression::Identifier(e) => e.token.position,
+            Expression::Identifier(e) => e.position,
             Expression::QualifiedIdentifier(e) => e.token.position,
             Expression::IntegerLiteral(e) => e.token.position,
             Expression::FloatLiteral(e) => e.token.position,
@@ -209,10 +209,12 @@ impl Expression {
 /// Identifier (column name, table name, etc.)
 #[derive(Debug, Clone, PartialEq)]
 pub struct Identifier {
-    pub token: Token,
     pub value: SmartString,
     /// Pre-computed lowercase value for fast case-insensitive lookups
     pub value_lower: SmartString,
+    pub position: Position,
+    /// Whether the name was written double-quoted
+    pub quoted: bool,
 }
 
 impl Identifier {
@@ -227,16 +229,18 @@ impl Identifier {
             // value and value_lower are identical, so avoid double lowercasing.
             let lowered = value.to_lowercase();
             Self {
-                token,
                 value_lower: lowered.clone(),
                 value: lowered,
+                position: token.position,
+                quoted: token.quoted,
             }
         } else {
             let value_lower = value.to_lowercase();
             Self {
-                token,
                 value,
                 value_lower,
+                position: token.position,
+                quoted: token.quoted,
             }
         }
     }
@@ -2437,6 +2441,13 @@ mod tests {
 
     fn make_token(tt: TokenType, literal: &str) -> Token {
         Token::new(tt, literal, Position::default())
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn test_identifier_and_expression_size() {
+        assert_eq!(std::mem::size_of::<Identifier>(), 64);
+        assert_eq!(std::mem::size_of::<Expression>(), 120);
     }
 
     #[test]

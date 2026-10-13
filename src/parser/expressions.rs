@@ -21,7 +21,14 @@ use super::parser::Parser;
 use super::precedence::Precedence;
 use super::token::{Token, TokenType};
 
-impl Parser {
+/// The token of an identifier the parser has already consumed
+fn identifier_token(ident: &Identifier) -> Token {
+    let mut token = Token::new(TokenType::Identifier, ident.value.clone(), ident.position);
+    token.quoted = ident.quoted;
+    token
+}
+
+impl Parser<'_> {
     /// Parse an expression with the given precedence
     pub fn parse_expression(&mut self, precedence: Precedence) -> Option<Expression> {
         // Parse prefix expression
@@ -757,7 +764,7 @@ impl Parser {
         if self.peek_token_is_operator("*") {
             self.next_token(); // consume *
             return Some(Expression::QualifiedStar(QualifiedStarExpression {
-                token: left_ident.token.clone(),
+                token: identifier_token(&left_ident),
                 qualifier: left_ident.value,
             }));
         }
@@ -771,7 +778,7 @@ impl Parser {
         self.next_token();
 
         Some(Expression::QualifiedIdentifier(QualifiedIdentifier {
-            token: left_ident.token.clone(),
+            token: identifier_token(&left_ident),
             qualifier: Box::new(left_ident),
             name: Box::new(Identifier::new(
                 self.cur_token.clone(),
@@ -794,7 +801,7 @@ impl Parser {
         };
 
         let mut call = FunctionCall {
-            token: left_ident.token.clone(),
+            token: identifier_token(&left_ident),
             function: left_ident.value.to_uppercase(),
             arguments: Vec::new(),
             is_distinct: false,

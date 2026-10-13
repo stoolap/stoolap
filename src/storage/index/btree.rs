@@ -514,7 +514,7 @@ impl Index for BTreeIndex {
                         return Err(Error::unique_constraint(
                             &self.name,
                             &self.column_name,
-                            format!("{:?}", value),
+                            vec![value.clone()],
                         ));
                     }
                 }
@@ -632,7 +632,7 @@ impl Index for BTreeIndex {
                             return Err(Error::unique_constraint(
                                 &self.name,
                                 &self.column_name,
-                                format!("{:?}", value),
+                                vec![value.clone()],
                             ));
                         }
                     }
@@ -656,7 +656,7 @@ impl Index for BTreeIndex {
                         return Err(Error::unique_constraint(
                             &self.name,
                             &self.column_name,
-                            format!("{:?}", value),
+                            vec![value.clone()],
                         ));
                     }
                 }

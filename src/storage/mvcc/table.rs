@@ -31,9 +31,14 @@ use crate::storage::index::{BTreeIndex, BitmapIndex, HashIndex, HnswIndex, Multi
 use crate::storage::mvcc::scanner::MVCCScanner;
 use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::mvcc::version_store::TxnStoreWrite;
+use crate::storage::mvcc::RowVersion;
 use crate::storage::mvcc::{TransactionVersionStore, TxnTableStore, VersionStore};
-use crate::storage::traits::{Index, QueryResult, ScanPlan, Scanner, Table};
+use crate::storage::traits::{Index, PlannedUpdate, QueryResult, ScanPlan, Scanner, Table};
 use crate::storage::MemoryResult;
+
+/// Given the index entries found for a key, the index's columns and the
+/// key, the row of an entry that still holds the key
+type UniqueHolder<'a> = dyn FnMut(&[crate::core::IndexEntry], &[i32], &[Value]) -> Option<i64> + 'a;
 
 /// MVCC Table wrapper that provides MVCC isolation for tables
 pub struct MVCCTable {
@@ -156,6 +161,14 @@ impl MVCCTable {
     /// The layout this handle reads with
     pub(crate) fn layout(&self) -> u64 {
         self.layout
+    }
+
+    /// Rows captured through this handle were held in its layout when the
+    /// live layout is still the handle's and open: layouts only increase.
+    /// The transaction's own rows too: a newer handle wrote them only if the
+    /// layout moved on, and admission refuses rows of an older one
+    fn check_read(&self) -> Result<()> {
+        self.version_store.check_layout(Some(self.layout))
     }
 
     /// The schema as the store holds it now, and the layout that goes with
@@ -300,6 +313,7 @@ impl MVCCTable {
                 rows_with_originals.push((row_id, row, version));
             }
         }
+        self.check_read()?;
 
         // Cold-only row_ids: not in local versions and not in the hot version store.
         // Create phantom delete markers so the WAL records the deletion, enabling
@@ -325,6 +339,8 @@ impl MVCCTable {
         for row_id in &cold_only_ids {
             self.try_claim_row(*row_id)?;
         }
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::cold_only_rows_claimed();
 
         // Step 4: Batch delete all rows
         let delete_count =
@@ -1505,15 +1521,62 @@ impl MVCCTable {
 
     /// Check unique index constraints for a row being inserted.
     fn check_unique_constraints(&self, row: &Row, _row_id: i64) -> Result<()> {
-        let schema = &self.cached_schema;
-        // Taken out of the index map before the transaction's rows are read:
-        // a commit of the same transaction holds those rows while it takes the map
+        let unique = self.unique_indexes()?;
+        self.find_unique_conflict(row, &unique, &mut |entries, column_ids, values| {
+            let txn_versions = self.txn_versions.read().unwrap();
+            entries
+                .iter()
+                .find(|entry| Self::local_holds(&txn_versions, entry.row_id, column_ids, values))
+                .map(|entry| entry.row_id)
+        })
+    }
+
+    /// Taken out of the index map before the transaction's rows are read:
+    /// a commit of the same transaction holds those rows while it takes the map
+    fn unique_indexes(&self) -> Result<smallvec::SmallVec<[Arc<dyn Index>; 8]>> {
         let mut unique = smallvec::SmallVec::<[Arc<dyn Index>; 8]>::new();
         self.version_store.for_each_unique_index(|_, index| {
             unique.push(Arc::clone(index));
             Ok(())
         })?;
-        for index in &unique {
+        // The indexes taken bind the positions of this handle's row
+        self.version_store.check_layout(Some(self.layout))?;
+        Ok(unique)
+    }
+
+    /// The index holds the committed rows. A row this transaction has
+    /// deleted no longer holds the value against it, and one it has
+    /// rewritten holds only what its latest version says
+    fn local_holds(
+        txn_versions: &TransactionVersionStore,
+        row_id: i64,
+        column_ids: &[i32],
+        values: &[Value],
+    ) -> bool {
+        match txn_versions.get_latest_local(row_id) {
+            None => true,
+            Some(version) if version.is_deleted() => false,
+            Some(version) => Self::row_holds(&version.data, column_ids, values),
+        }
+    }
+
+    fn row_holds(row: &Row, column_ids: &[i32], values: &[Value]) -> bool {
+        column_ids
+            .iter()
+            .zip(values)
+            .all(|(&col_id, value)| row.get(col_id as usize) == Some(value))
+    }
+
+    /// Refuses `row` when a unique index holds one of its keys for a row
+    /// `taken` says still holds it
+    fn find_unique_conflict(
+        &self,
+        row: &Row,
+        unique: &[Arc<dyn Index>],
+        taken: &mut UniqueHolder<'_>,
+    ) -> Result<()> {
+        let schema = &self.cached_schema;
+        for index in unique {
             let index_name = index.name();
             let column_ids = index.column_ids();
             if column_ids.is_empty() {
@@ -1532,31 +1595,7 @@ impl MVCCTable {
             let entries = index.find(&values)?;
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::unique_index_found();
-            // The index holds the committed rows. A row this transaction
-            // has deleted no longer holds the value against it, and one
-            // it has rewritten holds only what its latest version says
-            let taken = {
-                let txn_versions = self.txn_versions.read().unwrap();
-                entries.iter().find(|entry| {
-                    let local = txn_versions
-                        .local_versions_ref()
-                        .and_then(|versions| versions.get(entry.row_id))
-                        .and_then(|versions| versions.last());
-                    match local {
-                        None => true,
-                        Some(version) if version.is_deleted() => false,
-                        Some(version) => {
-                            column_ids
-                                .iter()
-                                .zip(values.iter())
-                                .all(|(&col_id, value)| {
-                                    version.data.get(col_id as usize) == Some(value)
-                                })
-                        }
-                    }
-                })
-            };
-            if let Some(entry) = taken {
+            if let Some(row_id) = taken(&entries, column_ids, &values) {
                 let col_names: Vec<&str> = column_ids
                     .iter()
                     .map(|&col_id| {
@@ -1570,8 +1609,8 @@ impl MVCCTable {
                 return Err(Error::UniqueConstraint {
                     index: index_name.to_string(),
                     column: col_names.join(", "),
-                    value: format!("{:?}", values),
-                    row_id: entry.row_id,
+                    value: values.into(),
+                    row_id,
                 });
             }
         }
@@ -1671,11 +1710,18 @@ impl MVCCTable {
         Ok(row_id)
     }
 
-    /// Commits the transaction's local changes
+    /// Keeps the handle's changes with its transaction: the transaction's
+    /// commit publishes them with their WAL records, its rollback drops them
+    pub fn commit(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Commits the local changes under a publication the caller counted, as
+    /// a transaction's commit counts its tables in `begin_publish`
     ///
     /// Index updates are handled by TransactionVersionStore::commit() using batch
     /// operations to reduce lock acquisitions from O(rows × indexes) to O(indexes).
-    pub fn commit(&mut self) -> Result<()> {
+    pub(crate) fn commit_published(&mut self) -> Result<()> {
         // Check if there are local changes before committing
         let has_changes = {
             let txn_versions = self.txn_versions.read().unwrap();
@@ -2117,6 +2163,434 @@ impl MVCCTable {
         drop(txn_versions);
         self.collect_visible_rows_with_limit(filter, limit, offset)
     }
+
+    /// The version read for a row read from the transaction's own
+    /// versions: its txn id, its data and its `create_time`
+    fn local_read(&self, local: &RowVersion) -> RowVersion {
+        RowVersion {
+            txn_id: self.txn_id,
+            deleted_at_txn_id: 0,
+            data: local.data.clone(),
+            create_time: local.create_time,
+        }
+    }
+
+    /// Runs the setter on the planned hot rows from `start` on, in order,
+    /// keeping the rows it changed
+    fn set_planned(
+        plan: &mut PlannedUpdate,
+        start: usize,
+        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+    ) -> Result<()> {
+        let mut kept = start;
+        for i in start..plan.hot.len() {
+            let (row, changed) = setter(std::mem::take(&mut plan.hot[i].1))?;
+            if changed {
+                plan.hot[i].1 = row;
+                plan.hot.swap(kept, i);
+                kept += 1;
+            }
+        }
+        plan.hot.truncate(kept);
+        Ok(())
+    }
+
+    /// The rows `update` sets, except the ids in `skip`, planned. The
+    /// setter runs with no lock of the transaction's rows held, so it may
+    /// write through another handle
+    fn plan_rows(
+        &self,
+        where_expr: Option<&dyn Expression>,
+        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        skip: Option<&FxHashMap<i64, u64>>,
+        plan: &mut PlannedUpdate,
+    ) -> Result<()> {
+        let schema = &self.cached_schema;
+        let skipped = |row_id: i64| skip.is_some_and(|skip| skip.contains_key(&row_id));
+        let start = plan.hot.len();
+
+        if let Some(expr) = where_expr {
+            // Fast path: primary key equality (WHERE id = X)
+            if let Some(pk_id) = self.try_pk_lookup(expr, schema) {
+                if skipped(pk_id) {
+                    return Ok(());
+                }
+                // get_local_version keeps a local delete, which txn_versions.get()
+                // would hide behind the committed row
+                let read = {
+                    let txn_versions = self.txn_versions.read().unwrap();
+                    if let Some(local) = txn_versions.get_local_version(pk_id) {
+                        (!local.is_deleted()).then(|| (local.data.clone(), self.local_read(local)))
+                    } else {
+                        self.version_store
+                            .get_visible_version(pk_id, self.txn_id)
+                            .filter(|version| !version.is_deleted())
+                            .map(|version| (version.data.clone(), version))
+                    }
+                };
+                self.check_read()?;
+                if let Some((row, read)) = read {
+                    let row = self.normalize_row_to_schema(row, schema);
+                    plan.hot.push((pk_id, row, read));
+                    Self::set_planned(plan, start, setter)?;
+                }
+                return Ok(());
+            }
+
+            // Fast path: primary key range (WHERE id >= X AND id < Y)
+            if let Some(pk_range_ids) = self.try_pk_range_lookup(expr, schema) {
+                plan.hot.reserve_exact(pk_range_ids.len());
+                let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(pk_range_ids.len());
+                {
+                    let txn_versions = self.txn_versions.read().unwrap();
+                    self.check_read()?;
+                    for row_id in pk_range_ids {
+                        if skipped(row_id) {
+                            continue;
+                        }
+                        if let Some(local) = txn_versions.get_local_version(row_id) {
+                            if !local.is_deleted() {
+                                let row = self.normalize_row_to_schema(local.data.clone(), schema);
+                                plan.hot.push((row_id, row, self.local_read(local)));
+                            }
+                        } else {
+                            remaining_row_ids.push(row_id);
+                        }
+                    }
+                }
+                Self::set_planned(plan, start, setter)?;
+                if !remaining_row_ids.is_empty() {
+                    let batch_rows = self
+                        .version_store
+                        .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
+                    self.check_read()?;
+                    let stored = plan.hot.len();
+                    for (row_id, row, version) in batch_rows {
+                        let row = self.normalize_row_to_schema(row, schema);
+                        plan.hot.push((row_id, row, version));
+                    }
+                    Self::set_planned(plan, stored, setter)?;
+                }
+                return Ok(());
+            }
+
+            // Index lookup for non-PK columns
+            if let Some(mut filtered_row_ids) = self.try_index_lookup(expr) {
+                filtered_row_ids.extend(self.local_ids_missing_from(&filtered_row_ids));
+                plan.hot.reserve_exact(filtered_row_ids.len());
+                let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(filtered_row_ids.len());
+                {
+                    let txn_versions = self.txn_versions.read().unwrap();
+                    for &row_id in &filtered_row_ids {
+                        if skipped(row_id) {
+                            continue;
+                        }
+                        if let Some(local) = txn_versions.get_local_version(row_id) {
+                            if !local.is_deleted() {
+                                let row = self.normalize_row_to_schema(local.data.clone(), schema);
+                                // The index may match in part
+                                if expr.evaluate(&row).unwrap_or(false) {
+                                    plan.hot.push((row_id, row, self.local_read(local)));
+                                }
+                            }
+                        } else {
+                            remaining_row_ids.push(row_id);
+                        }
+                    }
+                }
+                if !remaining_row_ids.is_empty() {
+                    let batch_rows = self
+                        .version_store
+                        .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
+                    for (row_id, row, original) in batch_rows {
+                        let row = self.normalize_row_to_schema(row, schema);
+                        if expr.evaluate(&row).unwrap_or(false) {
+                            plan.hot.push((row_id, row, original));
+                        }
+                    }
+                }
+                self.check_read()?;
+                return Self::set_planned(plan, start, setter);
+            }
+        }
+
+        // Full scan: the filter is applied before rows are cloned
+        let committed = match where_expr {
+            Some(expr) => self
+                .version_store
+                .get_all_visible_rows_for_update_filtered(self.txn_id, expr),
+            None => self
+                .version_store
+                .get_all_visible_rows_for_update(self.txn_id),
+        };
+        // Collected in place, in the buffer the store returned
+        let committed: Vec<_> = committed
+            .into_iter()
+            .filter(|(row_id, ..)| !skipped(*row_id))
+            .map(|(row_id, row, original)| {
+                (row_id, self.normalize_row_to_schema(row, schema), original)
+            })
+            .collect();
+        if plan.hot.is_empty() {
+            plan.hot = smallvec::SmallVec::from_vec(committed);
+        } else {
+            plan.hot.extend(committed);
+        }
+        self.check_read()?;
+
+        // The transaction's own versions overlay the committed rows: a row
+        // it deleted leaves, a row it rewrote is read as it wrote it, and a
+        // row only it inserted joins
+        {
+            let txn_versions = self.txn_versions.read().unwrap();
+            if txn_versions.has_local_changes() {
+                let mut kept = start;
+                for i in start..plan.hot.len() {
+                    let row_id = plan.hot[i].0;
+                    if let Some(local) = txn_versions.get_latest_local(row_id) {
+                        if local.is_deleted() {
+                            continue;
+                        }
+                        let row = self.normalize_row_to_schema(local.data.clone(), schema);
+                        if where_expr.is_some_and(|expr| !expr.evaluate(&row).unwrap_or(false)) {
+                            continue;
+                        }
+                        plan.hot[i].1 = row;
+                        plan.hot[i].2 = self.local_read(local);
+                    }
+                    plan.hot.swap(kept, i);
+                    kept += 1;
+                }
+                plan.hot.truncate(kept);
+            }
+            for (row_id, version) in txn_versions.iter_local() {
+                if skipped(row_id)
+                    || version.is_deleted()
+                    || self.version_store.quick_check_row_existence(row_id)
+                {
+                    continue;
+                }
+                let row = self.normalize_row_to_schema(version.data.clone(), schema);
+                if where_expr.is_some_and(|expr| !expr.evaluate(&row).unwrap_or(false)) {
+                    continue;
+                }
+                plan.hot.push((row_id, row, self.local_read(version)));
+            }
+        }
+        Self::set_planned(plan, start, setter)
+    }
+
+    /// The rows `update_by_row_ids` sets, planned, with the setter run as in
+    /// `plan_rows`
+    fn plan_rows_by_id(
+        &self,
+        row_ids: &[i64],
+        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        plan: &mut PlannedUpdate,
+    ) -> Result<()> {
+        let schema = &self.cached_schema;
+        let start = plan.hot.len();
+        plan.hot.reserve_exact(row_ids.len());
+        let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(row_ids.len());
+        {
+            let txn_versions = self.txn_versions.read().unwrap();
+            self.check_read()?;
+            for &row_id in row_ids {
+                if let Some(local) = txn_versions.get_local_version(row_id) {
+                    if !local.is_deleted() {
+                        let row = self.normalize_row_to_schema(local.data.clone(), schema);
+                        plan.hot.push((row_id, row, self.local_read(local)));
+                    }
+                } else {
+                    remaining_row_ids.push(row_id);
+                }
+            }
+        }
+        Self::set_planned(plan, start, setter)?;
+        if !remaining_row_ids.is_empty() {
+            let batch_rows = self
+                .version_store
+                .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
+            self.check_read()?;
+            let stored = plan.hot.len();
+            for (row_id, row, version) in batch_rows {
+                let row = self.normalize_row_to_schema(row, schema);
+                plan.hot.push((row_id, row, version));
+            }
+            Self::set_planned(plan, stored, setter)?;
+        }
+        Ok(())
+    }
+
+    /// Writes `plan` under one hold of the transaction's rows: every row is
+    /// checked, the unique keys of every new sealed row (validated when it
+    /// was set) checked, and the committed rows claimed, before the first write
+    fn publish(&self, plan: &mut PlannedUpdate) -> Result<i32> {
+        let count = plan.len() as i32;
+        if count == 0 {
+            return Ok(0);
+        }
+        if plan.compare_hot_keys && !plan.hot.is_empty() {
+            plan.hot_keys_changed = self.hot_unique_keys_changed(plan);
+        }
+        let unique = if plan.cold.is_empty() {
+            smallvec::SmallVec::new()
+        } else {
+            self.unique_indexes()?
+        };
+        let mut txn_versions = self.writes();
+        let layout = txn_versions.check_planned(plan)?;
+        if !unique.is_empty() {
+            self.check_planned_unique(&unique, &txn_versions, plan)?;
+        }
+        let committed = plan
+            .hot
+            .iter()
+            .filter_map(|(row_id, _, read)| (read.txn_id != self.txn_id).then_some(*row_id));
+        self.version_store
+            .claim_rows_all_or_none(committed, self.txn_id)
+            .map_err(|e| Error::internal(e.to_string()))?;
+        txn_versions.publish_planned(plan, layout);
+        Ok(count)
+    }
+
+    /// Whether a planned hot row's new row differs from the version read in
+    /// a column of a unique index other than the primary key
+    fn hot_unique_keys_changed(&self, plan: &PlannedUpdate) -> bool {
+        let pk = self.cached_schema.pk_column_index();
+        let indexes = self.version_store.indexes_read();
+        indexes
+            .values()
+            .filter(|index| index.is_unique())
+            .any(|index| {
+                let column_ids = index.column_ids();
+                if let [only] = column_ids {
+                    if pk == Some(*only as usize) {
+                        return false;
+                    }
+                }
+                plan.hot.iter().any(|(_, row, read)| {
+                    column_ids
+                        .iter()
+                        .any(|&col_id| row.get(col_id as usize) != read.data.get(col_id as usize))
+                })
+            })
+    }
+
+    /// The unique keys of the plan's new sealed rows: free unless a row
+    /// still holds one, where a row the plan sets holds what the plan
+    /// gives it, and no two rows of the plan, one of them sealed, share one
+    fn check_planned_unique(
+        &self,
+        unique: &[Arc<dyn Index>],
+        txn_versions: &TransactionVersionStore,
+        plan: &PlannedUpdate,
+    ) -> Result<()> {
+        let planned: FxHashMap<i64, &Row> = plan
+            .hot
+            .iter()
+            .map(|(row_id, row, _)| (*row_id, row))
+            .chain(
+                plan.cold
+                    .iter()
+                    .map(|change| (change.row_id, &change.new_row)),
+            )
+            .collect();
+        for change in &plan.cold {
+            self.find_unique_conflict(
+                &change.new_row,
+                unique,
+                &mut |entries, column_ids, values| {
+                    entries
+                        .iter()
+                        .filter(|entry| entry.row_id != change.row_id)
+                        .find(|entry| match planned.get(&entry.row_id) {
+                            Some(row) => Self::row_holds(row, column_ids, values),
+                            None => {
+                                Self::local_holds(txn_versions, entry.row_id, column_ids, values)
+                            }
+                        })
+                        .map(|entry| entry.row_id)
+                },
+            )?;
+        }
+        let schema = &self.cached_schema;
+        for index in unique {
+            let column_ids = index.column_ids();
+            let key = |row: &Row| -> Option<u64> {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = rustc_hash::FxHasher::default();
+                for &col_id in column_ids {
+                    let value = row.get(col_id as usize)?;
+                    if value.is_null() {
+                        return None;
+                    }
+                    value.hash(&mut hasher);
+                }
+                Some(hasher.finish())
+            };
+            // (key hash, sealed, position): sealed rows first, then hot rows
+            let mut keys: Vec<(u64, bool, usize)> = plan
+                .cold
+                .iter()
+                .enumerate()
+                .filter_map(|(i, change)| key(&change.new_row).map(|h| (h, true, i)))
+                .chain(
+                    plan.hot
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, (_, row, _))| key(row).map(|h| (h, false, i))),
+                )
+                .collect();
+            keys.sort_unstable();
+            let row_at = |sealed: bool, i: usize| -> (i64, &Row) {
+                if sealed {
+                    (plan.cold[i].row_id, &plan.cold[i].new_row)
+                } else {
+                    (plan.hot[i].0, &plan.hot[i].1)
+                }
+            };
+            for run in keys.chunk_by(|a, b| a.0 == b.0) {
+                // Hot rows sort first; a run of hot rows only is not compared
+                let first_sealed = run.partition_point(|&(_, sealed, _)| !sealed);
+                for (n, &(_, _, a)) in run[first_sealed..].iter().enumerate() {
+                    let (_, row_a) = row_at(true, a);
+                    let values: smallvec::SmallVec<[Value; 4]> = column_ids
+                        .iter()
+                        .filter_map(|&col_id| row_a.get(col_id as usize).cloned())
+                        .collect();
+                    let others = run[..first_sealed]
+                        .iter()
+                        .chain(&run[first_sealed + n + 1..]);
+                    for &(_, sealed_b, b) in others {
+                        #[cfg(any(test, feature = "test-failpoints"))]
+                        crate::test_failpoints::unique_pair_compared();
+                        let (row_id, row_b) = row_at(sealed_b, b);
+                        if Self::row_holds(row_b, column_ids, &values) {
+                            let column = column_ids
+                                .iter()
+                                .map(|&col_id| {
+                                    schema
+                                        .columns
+                                        .get(col_id as usize)
+                                        .map(|c| c.name.as_str())
+                                        .unwrap_or("unknown")
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            return Err(Error::UniqueConstraint {
+                                index: index.name().to_string(),
+                                column,
+                                value: values.into_vec().into(),
+                                row_id,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2197,6 +2671,7 @@ impl Table for MVCCTable {
             let global_rows = self
                 .version_store
                 .get_visible_versions_batch(global_ids, self.txn_id);
+            self.check_read()?;
 
             // Apply filter to fetched rows
             for (row_id, row) in global_rows {
@@ -2206,8 +2681,9 @@ impl Table for MVCCTable {
                     rows.push((row_id, row));
                 }
             }
+            return Ok(());
         }
-        Ok(())
+        self.check_read()
     }
 
     fn create_column(&mut self, name: &str, column_type: DataType, nullable: bool) -> Result<()> {
@@ -2255,8 +2731,7 @@ impl Table for MVCCTable {
     }
 
     fn drop_column(&mut self, name: &str) -> Result<()> {
-        self.version_store.remove_column(name)?;
-        self.version_store.lay_out_rows();
+        self.version_store.drop_column_at_once(name)?;
         self.take_schema();
         Ok(())
     }
@@ -2287,344 +2762,9 @@ impl Table for MVCCTable {
         where_expr: Option<&dyn Expression>,
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
-        // OPTIMIZATION: Borrow schema instead of cloning - saves allocation per update
-        let schema = &self.cached_schema;
-
-        // Fast path: Check if this is a primary key equality lookup (WHERE id = X)
-        if let Some(expr) = where_expr {
-            if let Some(pk_id) = self.try_pk_lookup(expr, schema) {
-                // Direct O(1) lookup by primary key
-                // Use get_local_version to preserve delete signal. txn_versions.get()
-                // swallows deletes as None, causing fallback to committed store and
-                // missing uncommitted deletes in the current transaction.
-                let row_with_original = {
-                    let txn_versions = self.txn_versions.read().unwrap();
-                    if let Some(local) = txn_versions.get_local_version(pk_id) {
-                        if local.is_deleted() {
-                            None // Locally deleted — can't update
-                        } else {
-                            // Local version - no need to track original (already in write-set)
-                            Some((local.data.clone(), None))
-                        }
-                    } else if let Some(version) =
-                        self.version_store.get_visible_version(pk_id, self.txn_id)
-                    {
-                        if !version.is_deleted() {
-                            let data = version.data.clone();
-                            Some((data, Some(version)))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                };
-
-                if let Some((row, original_version)) = row_with_original {
-                    // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
-                    let row = self.normalize_row_to_schema(row, schema);
-                    let (updated_row, changed) = setter(row)?;
-                    if !changed {
-                        return Ok(0);
-                    }
-                    if let Some(orig) = original_version {
-                        // Use optimized put that skips redundant get_visible_version
-                        self.writes()
-                            .put_with_original(pk_id, updated_row, orig, false)?;
-                    } else {
-                        // Local version - use regular put
-                        self.writes().put(pk_id, updated_row, false)?;
-                    }
-                    return Ok(1);
-                }
-                return Ok(0);
-            }
-
-            // Fast path: PK range lookup (WHERE id >= X AND id < Y)
-            if let Some(pk_range_ids) = self.try_pk_range_lookup(expr, schema) {
-                // OPTIMIZATION: Track original versions to avoid redundant lookups
-                let mut local_rows = RowVec::with_capacity(pk_range_ids.len() / 4);
-                let mut rows_with_originals: Vec<(i64, Row, crate::storage::mvcc::RowVersion)> =
-                    Vec::with_capacity(pk_range_ids.len());
-
-                // Step 1: Check local versions first (single lock acquisition)
-                // Use get_local_version to distinguish "no local version" from "locally deleted"
-                let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(pk_range_ids.len());
-                {
-                    let txn_versions = self.txn_versions.read().unwrap();
-                    for row_id in pk_range_ids {
-                        if let Some(local) = txn_versions.get_local_version(row_id) {
-                            if !local.is_deleted() {
-                                let row = self.normalize_row_to_schema(local.data.clone(), schema);
-                                let (updated_row, changed) = setter(row)?;
-                                if changed {
-                                    local_rows.push((row_id, updated_row));
-                                }
-                            }
-                            // Locally deleted — skip, don't fall through
-                        } else {
-                            remaining_row_ids.push(row_id);
-                        }
-                    }
-                }
-
-                // Step 2: Batch fetch remaining from version store (1 lock for N rows)
-                if !remaining_row_ids.is_empty() {
-                    let batch_rows = self
-                        .version_store
-                        .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
-                    for (row_id, row, version) in batch_rows {
-                        let row = self.normalize_row_to_schema(row, schema);
-                        let (updated_row, changed) = setter(row)?;
-                        if changed {
-                            rows_with_originals.push((row_id, updated_row, version));
-                        }
-                    }
-                }
-
-                let update_count = (local_rows.len() + rows_with_originals.len()) as i32;
-                if !local_rows.is_empty() || !rows_with_originals.is_empty() {
-                    let mut txn_versions = self.writes();
-                    if !local_rows.is_empty() {
-                        txn_versions.put_batch_for_update(local_rows)?;
-                    }
-                    if !rows_with_originals.is_empty() {
-                        txn_versions.put_batch_with_originals(rows_with_originals)?;
-                    }
-                }
-                return Ok(update_count);
-            }
-
-            // Try index lookup for non-PK columns
-            if let Some(mut filtered_row_ids) = self.try_index_lookup(expr) {
-                filtered_row_ids.extend(self.local_ids_missing_from(&filtered_row_ids));
-                // Step 1: Check local versions first (these don't need write-set tracking)
-                // Use get_local_version to distinguish "no local version" from "locally deleted"
-                let mut local_rows_to_update = RowVec::with_capacity(filtered_row_ids.len() / 4);
-                let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(filtered_row_ids.len());
-
-                {
-                    let txn_versions = self.txn_versions.read().unwrap();
-                    for &row_id in &filtered_row_ids {
-                        if let Some(local) = txn_versions.get_local_version(row_id) {
-                            if !local.is_deleted() {
-                                let row = self.normalize_row_to_schema(local.data.clone(), schema);
-                                // Re-apply filter
-                                if expr.evaluate(&row).unwrap_or(false) {
-                                    local_rows_to_update.push((row_id, row));
-                                }
-                            }
-                            // Locally deleted — skip, don't fall through
-                        } else {
-                            remaining_row_ids.push(row_id);
-                        }
-                    }
-                }
-
-                // Step 2: Batch fetch remaining rows from version store WITH original versions
-                // This avoids redundant get_visible_version() calls during put
-                // OPTIMIZATION: Pre-allocate with known capacity
-                let mut rows_with_originals: Vec<(i64, Row, crate::storage::mvcc::RowVersion)> =
-                    Vec::with_capacity(remaining_row_ids.len());
-                if !remaining_row_ids.is_empty() {
-                    let batch_rows = self
-                        .version_store
-                        .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
-                    for (row_id, row, original) in batch_rows {
-                        // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
-                        let row = self.normalize_row_to_schema(row, schema);
-                        // Re-apply filter (index may be partial match)
-                        if expr.evaluate(&row).unwrap_or(false) {
-                            rows_with_originals.push((row_id, row, original));
-                        }
-                    }
-                }
-
-                // Step 3: Apply setter to all rows, filtering out unchanged rows
-                // Setter returns Result — on error, abort BEFORE batch put
-                // to guarantee statement-level atomicity.
-                let mut setter_error: Option<crate::core::Error> = None;
-                local_rows_to_update.retain_mut(|(_, row)| {
-                    if setter_error.is_some() {
-                        return false;
-                    }
-                    match setter(std::mem::take(row)) {
-                        Ok((updated_row, changed)) => {
-                            *row = updated_row;
-                            changed
-                        }
-                        Err(e) => {
-                            setter_error = Some(e);
-                            false
-                        }
-                    }
-                });
-
-                // Update rows from version store with pre-fetched originals
-                if setter_error.is_none() {
-                    rows_with_originals.retain_mut(|(_, row, _)| {
-                        if setter_error.is_some() {
-                            return false;
-                        }
-                        match setter(std::mem::take(row)) {
-                            Ok((updated_row, changed)) => {
-                                *row = updated_row;
-                                changed
-                            }
-                            Err(e) => {
-                                setter_error = Some(e);
-                                false
-                            }
-                        }
-                    });
-                }
-
-                // Abort before batch put if setter reported an error
-                if let Some(err) = setter_error {
-                    return Err(err);
-                }
-
-                let update_count = local_rows_to_update.len() + rows_with_originals.len();
-
-                // Batch put - first the local rows (use regular put)
-                {
-                    let mut txn_versions = self.writes();
-                    txn_versions.put_batch_for_update(local_rows_to_update)?;
-                    // Then the rows with originals (use optimized put)
-                    txn_versions.put_batch_with_originals(rows_with_originals)?;
-                }
-                return Ok(update_count as i32);
-            }
-        }
-
-        // Fall back to full scan - use batch fetch WITH original versions for O(1) lock
-        // OPTIMIZATION: When WHERE clause exists, push filter to storage layer
-        // This avoids allocating Row objects for non-matching rows
-        let mut rows_with_originals: Vec<(i64, Row, crate::storage::mvcc::RowVersion)> =
-            if let Some(expr) = where_expr {
-                // Use filtered scan - filter is applied BEFORE cloning rows
-                self.version_store
-                    .get_all_visible_rows_for_update_filtered(self.txn_id, expr)
-                    .into_iter()
-                    .map(|(row_id, row, orig)| {
-                        // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
-                        (row_id, self.normalize_row_to_schema(row, schema), orig)
-                    })
-                    .collect()
-            } else {
-                // No filter - get all rows
-                self.version_store
-                    .get_all_visible_rows_for_update(self.txn_id)
-                    .into_iter()
-                    .map(|(row_id, row, orig)| {
-                        // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
-                        (row_id, self.normalize_row_to_schema(row, schema), orig)
-                    })
-                    .collect()
-            };
-
-        // Overlay local transaction changes onto the global rows:
-        // - Rows locally updated: use local data instead of stale global data
-        // - Rows locally deleted: remove from update set
-        // - Rows locally inserted (not in global store): add to update set
-        let local_rows_to_update: RowVec = {
-            let txn_versions = self.txn_versions.read().unwrap();
-            if txn_versions.has_local_changes() {
-                // Fix up global rows that have local modifications
-                rows_with_originals.retain_mut(|(row_id, row, _orig)| {
-                    if let Some(local_version) = txn_versions.get_latest_local(*row_id) {
-                        if local_version.is_deleted() {
-                            // Locally deleted — exclude from update
-                            return false;
-                        }
-                        // Locally modified — use local data instead of stale global data
-                        *row = self.normalize_row_to_schema(local_version.data.clone(), schema);
-                        // Re-check filter against local data
-                        if let Some(expr) = where_expr {
-                            if !expr.evaluate(row).unwrap_or(false) {
-                                return false;
-                            }
-                        }
-                    }
-                    true
-                });
-            }
-
-            // Collect local-only inserts (not in global store)
-            txn_versions
-                .iter_local()
-                .filter_map(|(row_id, version)| {
-                    // Skip if already in global store (processed above)
-                    if self.version_store.quick_check_row_existence(row_id) {
-                        return None;
-                    }
-                    if version.is_deleted() {
-                        return None;
-                    }
-                    let row = self.normalize_row_to_schema(version.data.clone(), schema);
-                    if let Some(expr) = where_expr {
-                        if !expr.evaluate(&row).unwrap_or(false) {
-                            return None;
-                        }
-                    }
-                    Some((row_id, row))
-                })
-                .collect()
-        };
-
-        // Apply setter to rows with originals (from version store), filtering out unchanged
-        // Setter returns Result — on error, abort BEFORE batch put for statement atomicity.
-        let mut setter_error: Option<crate::core::Error> = None;
-        rows_with_originals.retain_mut(|(_, row, _)| {
-            if setter_error.is_some() {
-                return false;
-            }
-            match setter(std::mem::take(row)) {
-                Ok((updated_row, changed)) => {
-                    *row = updated_row;
-                    changed
-                }
-                Err(e) => {
-                    setter_error = Some(e);
-                    false
-                }
-            }
-        });
-
-        // Apply setter to local rows, filtering out unchanged
-        let mut local_updated: RowVec = RowVec::new();
-        if setter_error.is_none() {
-            for (row_id, row) in local_rows_to_update {
-                match setter(row) {
-                    Ok((updated_row, changed)) => {
-                        if changed {
-                            local_updated.push((row_id, updated_row));
-                        }
-                    }
-                    Err(e) => {
-                        setter_error = Some(e);
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Abort before batch put if setter reported an error
-        if let Some(err) = setter_error {
-            return Err(err);
-        }
-
-        // Batch update all rows at once
-        let update_count = rows_with_originals.len() + local_updated.len();
-        {
-            let mut txn_versions = self.writes();
-            // Use optimized put for rows from version store (avoids O(N) get_visible_version calls)
-            txn_versions.put_batch_with_originals(rows_with_originals)?;
-            // Use regular put for local rows (already tracked in local store)
-            txn_versions.put_batch_for_update(local_updated)?;
-        }
-
-        Ok(update_count as i32)
+        let mut plan = PlannedUpdate::default();
+        self.plan_rows(where_expr, setter, None, &mut plan)?;
+        self.publish(&mut plan)
     }
 
     fn update_by_row_ids(
@@ -2632,60 +2772,36 @@ impl Table for MVCCTable {
         row_ids: &[i64],
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
-        let schema = &self.cached_schema;
+        let mut plan = PlannedUpdate::default();
+        self.plan_rows_by_id(row_ids, setter, &mut plan)?;
+        self.publish(&mut plan)
+    }
 
-        // Step 1: Check local versions first (single lock acquisition)
-        // Use get_local_version to distinguish "no local version" from "locally deleted"
-        let mut local_rows = RowVec::with_capacity(row_ids.len() / 4);
-        let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(row_ids.len());
+    fn plan_update(
+        &mut self,
+        where_expr: Option<&dyn Expression>,
+        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        skip: Option<&FxHashMap<i64, u64>>,
+        plan: &mut PlannedUpdate,
+    ) -> Result<()> {
+        self.plan_rows(where_expr, setter, skip, plan)
+    }
 
-        {
-            let txn_versions = self.txn_versions.read().unwrap();
-            for &row_id in row_ids {
-                if let Some(local) = txn_versions.get_local_version(row_id) {
-                    if !local.is_deleted() {
-                        let row = self.normalize_row_to_schema(local.data.clone(), schema);
-                        let (updated_row, changed) = setter(row)?;
-                        if changed {
-                            local_rows.push((row_id, updated_row));
-                        }
-                    }
-                    // Locally deleted — skip, don't fall through
-                } else {
-                    remaining_row_ids.push(row_id);
-                }
-            }
-        }
+    fn plan_update_by_row_ids(
+        &mut self,
+        row_ids: &[i64],
+        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        plan: &mut PlannedUpdate,
+    ) -> Result<()> {
+        self.plan_rows_by_id(row_ids, setter, plan)
+    }
 
-        // Step 2: Batch fetch remaining from version store with original versions
-        let mut rows_with_originals: Vec<(i64, Row, crate::storage::mvcc::RowVersion)> =
-            Vec::with_capacity(remaining_row_ids.len());
-        if !remaining_row_ids.is_empty() {
-            let batch_rows = self
-                .version_store
-                .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
-            for (row_id, row, version) in batch_rows {
-                let row = self.normalize_row_to_schema(row, schema);
-                let (updated_row, changed) = setter(row)?;
-                if changed {
-                    rows_with_originals.push((row_id, updated_row, version));
-                }
-            }
-        }
+    fn validate_row(&self, row: &mut Row) -> Result<()> {
+        self.validate_and_coerce_row(row)
+    }
 
-        // Step 3: Batch put all updates
-        let update_count = (local_rows.len() + rows_with_originals.len()) as i32;
-        if !local_rows.is_empty() || !rows_with_originals.is_empty() {
-            let mut txn_versions = self.writes();
-            if !local_rows.is_empty() {
-                txn_versions.put_batch_for_update(local_rows)?;
-            }
-            if !rows_with_originals.is_empty() {
-                txn_versions.put_batch_with_originals(rows_with_originals)?;
-            }
-        }
-
-        Ok(update_count)
+    fn publish_update(&mut self, plan: &mut PlannedUpdate) -> Result<i32> {
+        self.publish(plan)
     }
 
     fn delete_by_row_ids(&mut self, row_ids: &[i64]) -> Result<i32> {
@@ -2758,6 +2874,9 @@ impl Table for MVCCTable {
     }
 
     fn try_claim_row(&self, row_id: i64) -> Result<()> {
+        // The claim and its write set entry change together, so a failed
+        // statement's release cannot fall between them
+        let mut writes = self.writes();
         self.version_store
             .try_claim_row(row_id, self.txn_id)
             .map_err(|e| Error::internal(e.to_string()))?;
@@ -2765,8 +2884,12 @@ impl Table for MVCCTable {
         // commit/rollback releases it. Without this, claims made directly
         // on VersionStore (for cold row UPDATE/DELETE) are never released
         // because TransactionVersionStore::commit() only drains write_set.
-        self.writes().track_external_claim(row_id);
+        writes.track_external_claim(row_id);
         Ok(())
+    }
+
+    fn release_claim(&self, row_id: i64) {
+        self.writes().release_external_claim(row_id);
     }
 
     fn delete(&mut self, where_expr: Option<&dyn Expression>) -> Result<i32> {
@@ -2802,6 +2925,7 @@ impl Table for MVCCTable {
                         None
                     }
                 };
+                self.check_read()?;
 
                 if let Some((row, original_version)) = row_with_original {
                     if let Some(orig) = original_version {
@@ -2850,6 +2974,7 @@ impl Table for MVCCTable {
                         rows_with_originals.push((row_id, row, version));
                     }
                 }
+                self.check_read()?;
 
                 let delete_count = (local_rows.len() + rows_with_originals.len()) as i32;
                 if !local_rows.is_empty() || !rows_with_originals.is_empty() {
@@ -2904,6 +3029,7 @@ impl Table for MVCCTable {
                         }
                     }
                 }
+                self.check_read()?;
 
                 // Single batch write for all deletes
                 let delete_count = rows_to_delete.len() as i32;
@@ -2969,6 +3095,7 @@ impl Table for MVCCTable {
                 delete_count += 1;
             }
         }
+        self.check_read()?;
 
         // Also check local inserts that might not be in global store
         let local_ids: Vec<i64> = {
@@ -3011,6 +3138,10 @@ impl Table for MVCCTable {
         self.version_store.truncate_all()
     }
 
+    fn truncate_after_check(&mut self, after_check: &mut dyn FnMut()) -> Result<i32> {
+        self.version_store.truncate_all_then(after_check)
+    }
+
     fn scan(
         &self,
         column_indices: &[usize],
@@ -3047,6 +3178,7 @@ impl Table for MVCCTable {
                         None
                     }
                 };
+                self.check_read()?;
 
                 if let Some(row) = row {
                     // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
@@ -3077,6 +3209,7 @@ impl Table for MVCCTable {
         self.full_scans
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let rows = self.collect_visible_rows(where_expr);
+        self.check_read()?;
         let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
         Ok(Box::new(scanner))
     }
@@ -3169,16 +3302,21 @@ impl Table for MVCCTable {
         if !walked || stale || self.version_store.publish_epoch_if_quiet() != Some(epoch) {
             return Ok(None);
         }
+        self.check_read()?;
         Ok(Some(rows.into_iter().skip(offset).take(limit).collect()))
     }
 
     fn collect_all_rows(&self, where_expr: Option<&dyn Expression>) -> Result<RowVec> {
         // Return cached row vector directly - caller iterates (i64, Row) tuples
-        Ok(self.collect_visible_rows(where_expr))
+        let rows = self.collect_visible_rows(where_expr);
+        self.check_read()?;
+        Ok(rows)
     }
 
     fn collect_all_rows_unsorted(&self) -> Result<RowVec> {
-        Ok(self.collect_visible_rows_unsorted())
+        let rows = self.collect_visible_rows_unsorted();
+        self.check_read()?;
+        Ok(rows)
     }
 
     fn collect_rows_by_ids(&self, row_ids: &[i64]) -> Result<RowVec> {
@@ -3190,6 +3328,7 @@ impl Table for MVCCTable {
                 }
             }
         }
+        self.check_read()?;
         Ok(rows)
     }
 
@@ -3200,7 +3339,9 @@ impl Table for MVCCTable {
         offset: usize,
     ) -> Result<RowVec> {
         // Use the optimized version with limit/offset
-        Ok(self.collect_visible_rows_with_limit(where_expr, limit, offset))
+        let rows = self.collect_visible_rows_with_limit(where_expr, limit, offset);
+        self.check_read()?;
+        Ok(rows)
     }
 
     fn collect_rows_with_limit_unordered(
@@ -3210,7 +3351,9 @@ impl Table for MVCCTable {
         offset: usize,
     ) -> Result<RowVec> {
         // Use the optimized unordered version with true early termination
-        Ok(self.collect_visible_rows_with_limit_unordered(where_expr, limit, offset))
+        let rows = self.collect_visible_rows_with_limit_unordered(where_expr, limit, offset);
+        self.check_read()?;
+        Ok(rows)
     }
 
     fn close(&mut self) -> Result<()> {
@@ -3220,7 +3363,6 @@ impl Table for MVCCTable {
     }
 
     fn commit(&mut self) -> Result<()> {
-        // Call inherent method which handles index updates
         MVCCTable::commit(self)
     }
 
@@ -4141,12 +4283,14 @@ impl Table for MVCCTable {
         if let Some(pk_idx) = self.cached_schema.pk_column_index() {
             let pk_col = &self.cached_schema.columns[pk_idx];
             if pk_col.name_lower == column_name.to_lowercase() {
-                return Ok(self.version_store.collect_rows_pk_ordered(
+                let rows = self.version_store.collect_rows_pk_ordered(
                     self.txn_id,
                     ascending,
                     limit,
                     offset,
-                ));
+                );
+                self.check_read()?;
+                return Ok(rows);
             }
         }
 
@@ -4187,7 +4331,7 @@ impl Table for MVCCTable {
 
                     // Check if we've reached the limit
                     if rows.len() >= limit {
-                        return Ok(Some(rows));
+                        break;
                     }
                 }
             }
@@ -4195,6 +4339,7 @@ impl Table for MVCCTable {
             // If we got all needed rows, return them
             // If not, we may need to fetch more (rare case with many invisible rows)
             if !rows.is_empty() {
+                self.check_read()?;
                 return Ok(Some(rows));
             }
         }
@@ -4246,12 +4391,14 @@ impl Table for MVCCTable {
 
                     // Check if we've reached the limit
                     if rows.len() >= limit {
+                        self.check_read()?;
                         return Ok(Some(rows));
                     }
                 }
             }
         }
 
+        self.check_read()?;
         Ok(Some(rows))
     }
 
@@ -4275,13 +4422,16 @@ impl Table for MVCCTable {
 
         // Use the efficient keyset iteration from version store
         // Returns RowVec with (row_id, Row) tuples
-        Some(self.version_store.collect_rows_keyset(
+        let rows = self.version_store.collect_rows_keyset(
             self.txn_id,
             start_after,
             start_from,
             ascending,
             limit,
-        ))
+        );
+        // Rows of another layout: the regular path reports the change
+        self.check_read().ok()?;
+        Some(rows)
     }
 
     fn collect_rows_grouped_by_partition(
@@ -4331,6 +4481,7 @@ impl Table for MVCCTable {
             }
         }
 
+        self.check_read()?;
         Ok(Some(result))
     }
 
@@ -4399,6 +4550,7 @@ impl Table for MVCCTable {
             }
         }
 
+        self.check_read()?;
         Ok(Some(rows))
     }
 
@@ -4521,6 +4673,7 @@ impl Table for MVCCTable {
                 }
             }
         }
+        self.check_read()?;
 
         // Create result
         let result_columns: Vec<String> = columns.iter().map(|s| s.to_string()).collect();
@@ -4872,7 +5025,9 @@ impl Table for MVCCTable {
         }
         drop(txn_versions);
 
-        Ok(Some(self.version_store.sum_column(self.txn_id, col_idx)))
+        let sum = self.version_store.sum_column(self.txn_id, col_idx);
+        self.check_read()?;
+        Ok(Some(sum))
     }
 
     fn min_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
@@ -4883,7 +5038,9 @@ impl Table for MVCCTable {
         }
         drop(txn_versions);
 
-        Ok(Some(self.version_store.min_column(self.txn_id, col_idx)))
+        let min = self.version_store.min_column(self.txn_id, col_idx);
+        self.check_read()?;
+        Ok(Some(min))
     }
 
     fn max_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
@@ -4894,7 +5051,9 @@ impl Table for MVCCTable {
         }
         drop(txn_versions);
 
-        Ok(Some(self.version_store.max_column(self.txn_id, col_idx)))
+        let max = self.version_store.max_column(self.txn_id, col_idx);
+        self.check_read()?;
+        Ok(Some(max))
     }
 
     fn compute_grouped_aggregates(
@@ -4909,9 +5068,13 @@ impl Table for MVCCTable {
         }
         drop(txn_versions);
 
-        Ok(self
-            .version_store
-            .compute_grouped_aggregates(self.txn_id, group_by_indices, aggregates))
+        let groups = self.version_store.compute_grouped_aggregates(
+            self.txn_id,
+            group_by_indices,
+            aggregates,
+        );
+        self.check_read()?;
+        Ok(groups)
     }
 }
 
@@ -5022,7 +5185,7 @@ mod tests {
                 ]))
                 .unwrap();
         }
-        writer.commit().unwrap();
+        writer.commit_published().unwrap();
         registry.commit_transaction(writer_txn);
         let (reader_txn, _) = registry.begin_transaction();
         let reader = MVCCTable::new(

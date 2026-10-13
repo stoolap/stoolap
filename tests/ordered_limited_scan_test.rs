@@ -252,6 +252,168 @@ fn test_top_k_over_a_volume_written_out_of_time_order() {
     check_all(&db);
 }
 
+/// Each key's whole history before the next key's, as a backfill writes it;
+/// every key shares the timestamps, so rows tie across keys
+fn insert_key_major(db: &Database, from: i64, steps: i64, keys: i64) {
+    for k in 0..keys {
+        let mut stmt = String::from("INSERT INTO c (t, k, v) VALUES ");
+        for s in 0..steps {
+            if s > 0 {
+                stmt.push(',');
+            }
+            stmt.push_str(&format!(
+                "('{}', 'k{k}', {})",
+                ts(from + s * 60),
+                (s * 7 + k) % 100
+            ));
+        }
+        db.execute(&stmt, ()).unwrap();
+    }
+}
+
+fn key_major_table(name: &str) -> (tempfile::TempDir, Database) {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _) = setup(&format!("file://{}/{name}", dir.path().display()));
+    insert_key_major(&db, 1_709_251_200, 4_000, 20);
+    db.execute("DELETE FROM c WHERE v = 13", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    (dir, db)
+}
+
+#[test]
+fn test_top_k_over_a_volume_written_key_by_key() {
+    let (_dir, db) = key_major_table("key_major");
+    check_all(&db);
+    db.execute("DELETE FROM c WHERE v = 77", ()).unwrap();
+    insert_sorted(&db, 1_709_251_200 + 3_990 * 60, 20, 20, 60);
+    check_all(&db);
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_top_k_builds_only_the_rows_that_can_enter_the_heap() {
+    use stoolap::test_failpoints::top_k_cold_rows;
+    let (_dir, db) = key_major_table("key_major_built");
+    for where_clause in ["WHERE k = 'k3'", ""] {
+        for dir in ["DESC", "ASC"] {
+            let before = top_k_cold_rows();
+            let got = ids(
+                &db,
+                &format!("SELECT id FROM c {where_clause} ORDER BY t {dir} LIMIT 50"),
+            );
+            let built = top_k_cold_rows() - before;
+            assert_eq!(got.len(), 50);
+            // At most the LIMIT from each key's run, of 80,000 sealed rows
+            assert!(
+                built <= 20 * 50,
+                "{where_clause} {dir}: built {built} sealed rows for a LIMIT of 50"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_top_k_loads_no_row_group_without_the_key() {
+    use stoolap::test_failpoints::group_cache_loads;
+    let (dir, db) = key_major_table("key_major_groups");
+    drop(db);
+    // Reopened, the volume is read group by group through the group cache
+    let db = Database::open(&format!("file://{}/key_major_groups", dir.path().display())).unwrap();
+    let resident = |db: &Database| -> i64 {
+        db.query("PRAGMA VOLUME_STATS", ())
+            .unwrap()
+            .map(|r| r.unwrap().get::<i64>(4).unwrap())
+            .sum()
+    };
+    let before_bytes = resident(&db);
+    for dir in ["DESC", "ASC"] {
+        let before = group_cache_loads();
+        let got = ids(
+            &db,
+            &format!("SELECT id FROM c WHERE k = 'k17' ORDER BY t {dir} LIMIT 50"),
+        );
+        assert_eq!(got.len(), 50);
+        assert_eq!(
+            group_cache_loads() - before,
+            1,
+            "{dir}: k17 lies in the second of two row groups"
+        );
+    }
+    assert_eq!(
+        resident(&db),
+        before_bytes,
+        "the scan made a whole column of the volume resident"
+    );
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_top_k_decodes_each_block_of_a_reverse_walk_once() {
+    use stoolap::test_failpoints::take_group_column_decodes;
+    let (dir, db) = key_major_table("key_major_decodes");
+    drop(db);
+    let db = Database::open(&format!(
+        "file://{}/key_major_decodes",
+        dir.path().display()
+    ))
+    .unwrap();
+    // With no budget every block request decodes again
+    let _budget = NoGroupCache::set(&db);
+    for where_clause in ["k = 'k17'", "k = 'k17' AND v >= 0 AND k = 'k17'"] {
+        take_group_column_decodes();
+        let got = ids(
+            &db,
+            &format!("SELECT id FROM c WHERE {where_clause} ORDER BY t DESC LIMIT 50"),
+        );
+        let decodes = take_group_column_decodes();
+        assert_eq!(got.len(), 50);
+        let mut seen = std::collections::HashSet::new();
+        let twice: Vec<_> = decodes.iter().filter(|&&b| !seen.insert(b)).collect();
+        assert!(
+            twice.is_empty(),
+            "{where_clause}: blocks decoded twice: {twice:?} of {decodes:?}"
+        );
+    }
+}
+
+/// The process-wide group cache budget at zero while held, restored on
+/// drop; held one at a time, since tests share the process under cargo test
+#[cfg(feature = "test-failpoints")]
+struct NoGroupCache<'a> {
+    db: &'a Database,
+    budget: i64,
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(feature = "test-failpoints")]
+static GROUP_CACHE_BUDGET: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(feature = "test-failpoints")]
+impl<'a> NoGroupCache<'a> {
+    fn set(db: &'a Database) -> Self {
+        let serial = GROUP_CACHE_BUDGET
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let budget: i64 = db.query_one("PRAGMA GROUP_CACHE_MB", ()).unwrap();
+        db.execute("PRAGMA GROUP_CACHE_MB = 0", ()).unwrap();
+        Self {
+            db,
+            budget,
+            _serial: serial,
+        }
+    }
+}
+
+#[cfg(feature = "test-failpoints")]
+impl Drop for NoGroupCache<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .db
+            .execute(&format!("PRAGMA GROUP_CACHE_MB = {}", self.budget), ());
+    }
+}
+
 #[test]
 fn test_top_k_over_a_float_column_keeps_nan_in_order() {
     // Zone maps leave NaN out, so a float column is never answered from the bounds

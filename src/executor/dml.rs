@@ -768,10 +768,10 @@ impl Executor {
                             }
                             rows_affected += 1;
                         }
-                        Err(ref e @ Error::PrimaryKeyConstraint { .. })
-                        | Err(ref e @ Error::UniqueConstraint { .. }) => {
-                            if !conflict_matches_target(&stmt.conflict_target, schema_ref, e) {
-                                return Err(e.clone());
+                        Err(e @ Error::PrimaryKeyConstraint { .. })
+                        | Err(e @ Error::UniqueConstraint { .. }) => {
+                            if !conflict_matches_target(&stmt.conflict_target, schema_ref, &e) {
+                                return Err(e);
                             }
                             // DO NOTHING: conflict skipped, no RETURNING row
                         }
@@ -819,22 +819,20 @@ impl Executor {
                                 Err(e) => return Err(e),
                             }
                         }
-                        Err(
-                            ref e @ Error::UniqueConstraint {
-                                ref index,
-                                ref column,
-                                ref value,
-                                row_id: conflict_rid,
-                            },
-                        ) => {
-                            if !conflict_matches_target(&stmt.conflict_target, schema_ref, e) {
-                                return Err(Error::UniqueConstraint {
-                                    index: index.clone(),
-                                    column: column.clone(),
-                                    value: value.clone(),
-                                    row_id: conflict_rid,
-                                });
+                        Err(mut e @ Error::UniqueConstraint { .. }) => {
+                            if !conflict_matches_target(&stmt.conflict_target, schema_ref, &e) {
+                                return Err(e);
                             }
+                            let Error::UniqueConstraint {
+                                index,
+                                column,
+                                row_id: conflict_rid,
+                                ..
+                            } = &e
+                            else {
+                                return Err(e);
+                            };
+                            let conflict_rid = *conflict_rid;
                             // Use row_id from the error if available (cold segment check
                             // already found it). Only fall back to re-search if row_id < 0
                             // (hot index path sets row_id = -1 when unknown).
@@ -870,12 +868,10 @@ impl Executor {
                                     }
                                 }
                                 Ok(None) => {
-                                    return Err(Error::UniqueConstraint {
-                                        index: index.clone(),
-                                        column: column.clone(),
-                                        value: value.clone(),
-                                        row_id: -1,
-                                    });
+                                    if let Error::UniqueConstraint { row_id, .. } = &mut e {
+                                        *row_id = -1;
+                                    }
+                                    return Err(e);
                                 }
                                 Err(e) => return Err(e),
                             }
@@ -1062,10 +1058,10 @@ impl Executor {
                             }
                             rows_affected += 1;
                         }
-                        Err(ref e @ Error::PrimaryKeyConstraint { .. })
-                        | Err(ref e @ Error::UniqueConstraint { .. }) => {
-                            if !conflict_matches_target(&stmt.conflict_target, &schema, e) {
-                                return Err(e.clone());
+                        Err(e @ Error::PrimaryKeyConstraint { .. })
+                        | Err(e @ Error::UniqueConstraint { .. }) => {
+                            if !conflict_matches_target(&stmt.conflict_target, &schema, &e) {
+                                return Err(e);
                             }
                             // DO NOTHING: conflict skipped, no RETURNING row
                         }
@@ -1111,22 +1107,20 @@ impl Executor {
                                 Err(e) => return Err(e),
                             }
                         }
-                        Err(
-                            ref e @ Error::UniqueConstraint {
-                                ref index,
-                                ref column,
-                                ref value,
-                                row_id: conflict_rid,
-                            },
-                        ) => {
-                            if !conflict_matches_target(&stmt.conflict_target, &schema, e) {
-                                return Err(Error::UniqueConstraint {
-                                    index: index.clone(),
-                                    column: column.clone(),
-                                    value: value.clone(),
-                                    row_id: conflict_rid,
-                                });
+                        Err(mut e @ Error::UniqueConstraint { .. }) => {
+                            if !conflict_matches_target(&stmt.conflict_target, &schema, &e) {
+                                return Err(e);
                             }
+                            let Error::UniqueConstraint {
+                                index,
+                                column,
+                                row_id: conflict_rid,
+                                ..
+                            } = &e
+                            else {
+                                return Err(e);
+                            };
+                            let conflict_rid = *conflict_rid;
                             let found_row_id = if conflict_rid >= 0 {
                                 Ok(Some(conflict_rid))
                             } else {
@@ -1163,12 +1157,10 @@ impl Executor {
                                     }
                                 }
                                 Ok(None) => {
-                                    return Err(Error::UniqueConstraint {
-                                        index: index.clone(),
-                                        column: column.clone(),
-                                        value: value.clone(),
-                                        row_id: -1,
-                                    });
+                                    if let Error::UniqueConstraint { row_id, .. } = &mut e {
+                                        *row_id = -1;
+                                    }
+                                    return Err(e);
                                 }
                                 Err(e) => return Err(e),
                             }

@@ -350,6 +350,8 @@ impl CompressedBlockStore {
             #[cfg(test)]
             self.decoded_groups
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::group_column_decoded(col_idx, group_idx);
             self.decompress_single_group(col_idx, group_idx)
         })
     }
@@ -666,6 +668,8 @@ impl CompressedBlockStore {
                     .try_reserve_exact(len)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::OutOfMemory, e))?;
                 scratch.resize(len, 0);
+                #[cfg(any(test, feature = "test-failpoints"))]
+                crate::test_failpoints::block_file_read();
                 read_exact_at(&file.open()?, scratch, offset)?;
                 Ok(scratch.as_slice())
             }
@@ -2113,6 +2117,22 @@ enum StorageKind {
     Bytes(usize, DataType), // index into bytes_cols + ext type
 }
 
+/// Whether `value` is stored in `kind` as it is: NULL, or a value of the
+/// column's type
+#[inline]
+fn stored_as(kind: StorageKind, value: &Value) -> bool {
+    match (kind, value) {
+        (_, Value::Null(_))
+        | (StorageKind::Int64(_), Value::Integer(_))
+        | (StorageKind::Float64(_), Value::Float(_))
+        | (StorageKind::Timestamp(_), Value::Timestamp(_))
+        | (StorageKind::Boolean(_), Value::Boolean(_))
+        | (StorageKind::Dictionary(_), Value::Text(_)) => true,
+        (StorageKind::Bytes(_, ext), value) => value.data_type() == ext,
+        _ => false,
+    }
+}
+
 impl VolumeBuilder {
     /// Create a new builder from a table schema.
     pub fn new(schema: &Schema) -> Self {
@@ -2750,6 +2770,17 @@ impl VolumeBuilder {
 
     /// Add a row to the volume.
     pub fn add_row(&mut self, row_id: i64, row: &Row) {
+        // A value written before its column changed type is stored as its
+        // cast to the column's type
+        if !row
+            .as_slice()
+            .iter()
+            .zip(&self.col_storage)
+            .all(|(value, &kind)| stored_as(kind, value))
+        {
+            let cast = self.cast_row(row);
+            return self.add_row(row_id, &cast);
+        }
         self.row_ids.push(row_id);
         self.stats.total_rows += 1;
         self.stats.live_rows += 1;
@@ -2902,6 +2933,29 @@ impl VolumeBuilder {
             }
         }
         self.row_count += 1;
+    }
+
+    /// `row` with each value of another type than its column's cast to the
+    /// column's type, NULL where the cast gives none
+    #[cold]
+    fn cast_row(&self, row: &Row) -> Row {
+        Row::from_values(
+            row.iter()
+                .zip(&self.col_storage)
+                .zip(&self.schema.columns)
+                .map(|((value, &kind), column)| {
+                    if stored_as(kind, value) {
+                        return value.clone();
+                    }
+                    let cast = value.coerce_to_type(column.data_type);
+                    if stored_as(kind, &cast) {
+                        cast
+                    } else {
+                        Value::Null(column.data_type)
+                    }
+                })
+                .collect(),
+        )
     }
 
     /// Freeze the builder into a FrozenVolume. Rows must have been added
@@ -3376,7 +3430,14 @@ impl FrozenVolume {
         let ids = &self.meta.row_ids;
         self.meta
             .row_order
-            .get_or_init(|| (!ids.windows(2).all(|w| w[0] < w[1])).then(|| row_order_of(ids)))
+            .get_or_init(|| {
+                let order = (!ids.windows(2).all(|w| w[0] < w[1])).then(|| row_order_of(ids));
+                #[cfg(feature = "test-failpoints")]
+                if order.is_some() {
+                    crate::test_failpoints::row_order_built();
+                }
+                order
+            })
             .as_deref()
     }
 

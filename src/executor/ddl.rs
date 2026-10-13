@@ -974,6 +974,8 @@ impl Executor {
 
         // One ALTER at a time, from its schema change to its WAL record, so
         // the log replays the changes in the order they were made
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::alter_ddl_guard_next();
         let _ddl = self.engine.ddl_guard();
 
         // Get the table for modifications
@@ -1033,6 +1035,8 @@ impl Executor {
                     // Refresh engine's schema cache from version store
                     // The table modified the version_store schema, but engine has a separate cache
                     self.engine.refresh_schema_cache(table_name)?;
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::add_column_published();
 
                     // Record ALTER TABLE ADD COLUMN to WAL for persistence
                     let vector_dimensions = if data_type == DataType::Vector {
@@ -1049,7 +1053,7 @@ impl Executor {
                         vector_dimensions,
                     ) {
                         self.engine
-                            .restore_column_schema(table_name, previous_schema)?;
+                            .reopen_after_refused_add(table_name, previous_schema)?;
                         change.finish();
                         return Err(error);
                     }
@@ -1065,32 +1069,18 @@ impl Executor {
             AlterTableOperation::DropColumn => {
                 if let Some(ref col_name) = stmt.column_name {
                     let mut change = self.engine.begin_column_change(table_name)?;
-                    let previous_schema = self.engine.get_table_schema(table_name)?;
-                    self.engine
-                        .drop_column_schema(table_name, &col_name.value)?;
                     change.mark_changed();
-
-                    // Refresh schema cache FIRST so invalidate_mappings sees the post-drop schema
-                    self.engine.refresh_schema_cache(table_name)?;
-
-                    // Record ALTER TABLE DROP COLUMN to WAL for persistence,
-                    // before the manifest takes the drop with its log position
-                    if let Err(error) = self
-                        .engine
-                        .record_alter_table_drop_column(table_name, &col_name.value)
-                    {
+                    let dropped =
                         self.engine
-                            .restore_column_schema(table_name, previous_schema)?;
-                        change.finish();
-                        return Err(error);
-                    }
-
-                    // The rows lose the column's cells once the drop is recorded
-                    self.engine.lay_out_rows(table_name)?;
-                    // Record column drop in manifest and recompute cold volume mappings
-                    self.engine
-                        .propagate_column_drop(table_name, &col_name.value);
+                            .drop_column_transition(table_name, &col_name.value, |engine| {
+                                // Recorded before the manifest takes the drop
+                                // with its log position
+                                engine
+                                    .record_alter_table_drop_column(table_name, &col_name.value)?;
+                                Ok(engine.recorded_ddl_lsn())
+                            });
                     change.finish();
+                    dropped?;
                 } else {
                     return Err(Error::InvalidArgument(
                         "DROP COLUMN requires column name".to_string(),
@@ -1168,10 +1158,38 @@ impl Executor {
                             if !nulls.is_empty() {
                                 return Err(Error::not_null_constraint(col_name));
                             }
+                            // A value the new type cannot hold would be stored
+                            // as NULL by the next seal or compaction; a column
+                            // turning NOT NULL may hold values an earlier
+                            // change of type left as they were written
+                            if let Some(idx) = schema.get_column_index(&col_name) {
+                                let column = &schema.columns[idx];
+                                if column.data_type != data_type || column.nullable {
+                                    let mut present =
+                                        crate::storage::expression::NullCheckExpr::is_not_null(
+                                            col_name.clone(),
+                                        );
+                                    present.prepare_for_schema(schema);
+                                    let mut rows = table.scan(&[], Some(&present))?;
+                                    while rows.next() {
+                                        let lost = rows.row().get(idx).is_some_and(|value| {
+                                            value.coerce_to_type(data_type).is_null()
+                                        });
+                                        if lost {
+                                            return Err(Error::not_null_constraint(col_name));
+                                        }
+                                    }
+                                    if let Some(error) = rows.err() {
+                                        return Err(error.clone());
+                                    }
+                                }
+                            }
                         }
                     }
 
                     let mut change = self.engine.begin_column_change(table_name)?;
+                    // Closed until the change is recorded, or taken back
+                    let _closed = self.engine.close_for_column_change(table_name)?;
                     let previous_schema = self.engine.get_table_schema(table_name)?;
                     table.modify_column(&col_def.name.value, data_type, nullable)?;
                     change.mark_changed();

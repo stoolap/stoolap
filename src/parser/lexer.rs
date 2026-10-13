@@ -26,9 +26,9 @@ use crate::common::SmartString;
 ///
 /// Uses byte-based indexing for efficiency. SQL is predominantly ASCII,
 /// so we can work with bytes directly and only decode UTF-8 when needed.
-pub struct Lexer {
-    /// Input string as bytes (avoids Vec<char> allocation)
-    input: Box<[u8]>,
+pub struct Lexer<'a> {
+    /// Input string as bytes, borrowed from the caller
+    input: &'a [u8],
     /// Current byte position in input
     position: usize,
     /// Next byte position in input (after current char)
@@ -41,13 +41,11 @@ pub struct Lexer {
     last_error: Option<String>,
 }
 
-impl Lexer {
+impl<'a> Lexer<'a> {
     /// Create a new lexer for the given input
-    pub fn new(input: &str) -> Self {
-        // Store as bytes - much more memory efficient than Vec<char>
-        let bytes: Box<[u8]> = input.as_bytes().into();
+    pub fn new(input: &'a str) -> Self {
         let mut lexer = Self {
-            input: bytes,
+            input: input.as_bytes(),
             position: 0,
             read_position: 0,
             ch: '\0',
@@ -356,17 +354,15 @@ impl Lexer {
                 // Found unescaped closing quote — fast path succeeds
                 let end_pos = scan_pos + 1; // one past closing quote
 
-                // Update line/column tracking for chars between opening and closing quotes
-                for &byte in &self.input[self.read_position..scan_pos] {
+                // Step past each char from the opening quote through the closing one, as read_char does
+                for &byte in &self.input[start_pos..end_pos] {
                     if byte == b'\n' {
                         self.pos.line += 1;
                         self.pos.column = 1;
-                    } else {
+                    } else if byte & 0xC0 != 0x80 {
                         self.pos.column += 1;
                     }
                 }
-                // Account for closing quote
-                self.pos.column += 1;
 
                 // Advance lexer past closing quote
                 self.position = scan_pos;
@@ -901,6 +897,27 @@ mod tests {
         let token = lexer.next_token();
         assert_eq!(token.position.line, 2);
         assert_eq!(token.position.column, 1);
+    }
+
+    #[test]
+    fn test_position_after_string_literal() {
+        for (sql, line, column) in [
+            ("'ab', x", 1, 7),
+            ("'ğü' x", 1, 6),
+            ("'a\nb' x", 2, 4),
+            ("'a''b' x", 1, 8),
+        ] {
+            let mut lexer = Lexer::new(sql);
+            let mut token = lexer.next_token();
+            while token.literal != "x" {
+                token = lexer.next_token();
+            }
+            assert_eq!(
+                (token.position.line, token.position.column),
+                (line, column),
+                "position of x in {sql:?}"
+            );
+        }
     }
 
     #[test]

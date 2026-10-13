@@ -1788,7 +1788,7 @@ impl Executor {
                 Expression::NullLiteral(_) => {
                     extra_args.push(Value::null_unknown());
                 }
-                Expression::Identifier(id) if id.token.quoted => {
+                Expression::Identifier(id) if id.quoted => {
                     extra_args.push(Value::text(id.value.as_str()));
                 }
                 _ => {}

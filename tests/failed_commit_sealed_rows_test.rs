@@ -90,7 +90,7 @@ fn a_failed_commit_leaves_the_sealed_row_visible() {
                 vec![(2, 30)],
                 "sealed={sealed} {statement}: the count and the sum"
             );
-            db.close().unwrap();
+            assert!(db.close().is_err(), "the failed log is reported at close");
             drop(db);
 
             let db = Database::open(&dsn(&dir)).unwrap();
@@ -136,7 +136,7 @@ fn a_failed_commit_restores_a_row_past_its_history_limit() {
             "{statement}: the last committed update stays"
         );
         assert_eq!(pairs(&db, "SELECT COUNT(*), SUM(v) FROM t"), vec![(2, 32)]);
-        db.close().unwrap();
+        assert!(db.close().is_err(), "the failed log is reported at close");
     }
 }
 
@@ -164,7 +164,7 @@ fn a_failed_commit_leaves_the_unique_index_as_it_was() {
             "sealed={sealed}: the old key still finds the row"
         );
         assert_eq!(pairs(&db, "SELECT id, v FROM t WHERE v = 99"), vec![]);
-        db.close().unwrap();
+        assert!(db.close().is_err(), "the failed log is reported at close");
         drop(db);
         let db = Database::open(&dsn(&dir)).unwrap();
         assert!(
@@ -225,7 +225,7 @@ fn a_failed_commit_leaves_the_sealed_vector_in_the_graph() {
                 vec![1, 2],
                 "sealed={sealed} {statement}: the query"
             );
-            db.close().unwrap();
+            assert!(db.close().is_err(), "the failed log is reported at close");
             drop(db);
             // The row is still there to be replaced for real
             let db = Database::open(&dsn(&dir)).unwrap();
@@ -303,7 +303,7 @@ fn a_vector_index_created_before_the_commit_keeps_the_old_vector_when_it_fails()
                 vec![1, 2],
                 "{create} {statement}: the graph"
             );
-            db.close().unwrap();
+            assert!(db.close().is_err(), "the failed log is reported at close");
         }
     }
 }

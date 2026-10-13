@@ -291,7 +291,7 @@ fn pre_check_delete_recursive(
                 // column, whether or not it is the child's primary key
                 let child_handle = engine.get_table_for_txn(txn_id, child_table_name)?;
                 let child_schema = child_handle.schema_arc();
-                let col_name = &child_schema.columns[fk.column_index].name;
+                let col_name = &child_schema.columns[key_position(&child_schema, fk)?].name;
                 let mut filter = crate::storage::expression::ComparisonExpr::new(
                     col_name.as_str(),
                     crate::core::Operator::Eq,
@@ -541,11 +541,13 @@ fn child_rows_exist(
     fk: &ForeignKeyConstraint,
     parent_pk_value: &Value,
 ) -> Result<bool> {
+    #[cfg(feature = "test-failpoints")]
+    crate::test_failpoints::fk_child_probe_next();
     let child = engine.get_table_for_txn(txn_id, child_table)?;
     let child_schema = child.schema();
 
     // Build a ComparisonExpr for `fk_column = parent_pk_value`
-    let col_name = &child_schema.columns[fk.column_index].name;
+    let col_name = &child_schema.columns[key_position(child_schema, fk)?].name;
     let mut expr = crate::storage::expression::ComparisonExpr::new(
         col_name.as_str(),
         crate::core::Operator::Eq,
@@ -555,6 +557,25 @@ fn child_rows_exist(
 
     let rows = child.collect_rows_with_limit_unordered(Some(&expr), 1, 0)?;
     Ok(!rows.is_empty())
+}
+
+/// The position of `fk`'s column in the schema of the child handle that
+/// reads the rows: the key is found there by its own column name and
+/// parent, since the cached copy's position may be another layout's
+fn key_position(child_schema: &Schema, fk: &ForeignKeyConstraint) -> Result<usize> {
+    child_schema
+        .foreign_keys
+        .iter()
+        .find(|key| {
+            key.column_name == fk.column_name
+                && key.referenced_table == fk.referenced_table
+                && key.referenced_column == fk.referenced_column
+        })
+        .map(|key| key.column_index)
+        .filter(|&at| at < child_schema.columns.len())
+        .ok_or_else(|| Error::SchemaChanged {
+            table: child_schema.table_name.clone(),
+        })
 }
 
 /// Maximum CASCADE recursion depth to prevent infinite loops from circular FK references.
@@ -599,7 +620,7 @@ fn cascade_delete_recursive(
         let child_handle = engine.get_table_for_txn(txn_id, child_table)?;
         let child_schema = child_handle.schema_arc();
         // Use filtered scan instead of full table scan
-        let col_name = &child_schema.columns[fk.column_index].name;
+        let col_name = &child_schema.columns[key_position(&child_schema, fk)?].name;
         let mut filter = crate::storage::expression::ComparisonExpr::new(
             col_name.as_str(),
             crate::core::Operator::Eq,
@@ -656,7 +677,7 @@ fn cascade_delete_recursive(
     // Now delete the matching child rows (safe — RESTRICT checks passed above)
     let mut child = engine.get_table_for_txn(txn_id, child_table)?;
     let child_schema = child.schema();
-    let col_name = &child_schema.columns[fk.column_index].name;
+    let col_name = &child_schema.columns[key_position(child_schema, fk)?].name;
     let mut expr = crate::storage::expression::ComparisonExpr::new(
         col_name.as_str(),
         crate::core::Operator::Eq,
@@ -776,10 +797,10 @@ fn cascade_update_recursive(
 
     // Now update the matching child rows (safe — RESTRICT checks passed above)
     let mut child = engine.get_table_for_txn(txn_id, child_table)?;
-    let col_idx = fk.column_index;
     let new_val = new_value.clone();
 
     let child_schema = child.schema();
+    let col_idx = key_position(child_schema, fk)?;
     let col_name = &child_schema.columns[col_idx].name;
     let mut expr = crate::storage::expression::ComparisonExpr::new(
         col_name.as_str(),
@@ -817,9 +838,9 @@ fn cascade_update_recursive(
                     // SET NULL changes the grandchild's FK column from old_value to NULL.
                     // Deeper descendants that reference the grandchild's column must see
                     // this as an update from old_value → NULL and be cascaded accordingly.
+                    let grandchild_schema = engine.get_table_schema(grandchild_table)?;
                     let null_val = Value::null(
-                        engine.get_table_schema(grandchild_table)?.columns
-                            [grandchild_fk.column_index]
+                        grandchild_schema.columns[key_position(&grandchild_schema, grandchild_fk)?]
                             .data_type,
                     );
                     let affected = cascade_update_recursive(
@@ -851,10 +872,9 @@ fn set_null_on_delete(
 ) -> Result<i32> {
     let mut child = engine.get_table_for_txn(txn_id, child_table)?;
 
-    let col_idx = fk.column_index;
-
     // Check that the FK column is nullable
     let child_schema = child.schema();
+    let col_idx = key_position(child_schema, fk)?;
     if !child_schema.columns[col_idx].nullable {
         return Err(Error::foreign_key_violation(
             child_table,
@@ -913,7 +933,7 @@ pub(crate) fn check_no_referencing_rows(
         // The filter's positions come from the handle that reads the rows
         let references = |child: &dyn crate::storage::traits::Table| -> Result<bool> {
             let child_schema = child.schema();
-            let col_name = &child_schema.columns[fk.column_index].name;
+            let col_name = &child_schema.columns[key_position(child_schema, fk)?].name;
             let mut not_null_expr =
                 crate::storage::expression::NullCheckExpr::is_not_null(col_name.as_str());
             not_null_expr.prepare_for_schema(child_schema);

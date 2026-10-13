@@ -18,8 +18,47 @@
 
 use thiserror::Error;
 
+use super::Value;
+
 /// Result type alias for Stoolap operations
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// The key a unique constraint refused, written out only when the error is
+/// shown: an upsert that resolves the conflict never formats it
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictValues {
+    /// The key's values, in the index's column order
+    Keys(Vec<Value>),
+    /// A vector key, named by its dimensions and the row holding it if known
+    Vector { dims: usize, holder: Option<i64> },
+}
+
+impl std::fmt::Display for ConflictValues {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConflictValues::Keys(values) => {
+                for (i, value) in values.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{value}")?;
+                }
+                Ok(())
+            }
+            ConflictValues::Vector { dims, holder: None } => write!(f, "<vector({dims} dims)>"),
+            ConflictValues::Vector {
+                dims,
+                holder: Some(row_id),
+            } => write!(f, "<vector({dims} dims)> conflicts with row_id {row_id}"),
+        }
+    }
+}
+
+impl From<Vec<Value>> for ConflictValues {
+    fn from(values: Vec<Value>) -> Self {
+        ConflictValues::Keys(values)
+    }
+}
 
 /// Main error type for Stoolap storage operations
 ///
@@ -53,6 +92,11 @@ pub enum Error {
     /// Cannot truncate table because other transactions hold uncommitted writes
     #[error("cannot truncate table: active transactions have uncommitted changes")]
     TableHasActiveTransactions,
+
+    /// A column change waited for a transaction that applied rows to the
+    /// table and is still open, and gave up
+    #[error("cannot change a column of table '{table}': a transaction that applied rows to it is still open")]
+    TableHasOpenTransactionRows { table: String },
 
     // =========================================================================
     // Column errors
@@ -108,7 +152,7 @@ pub enum Error {
     UniqueConstraint {
         index: String,
         column: String,
-        value: String,
+        value: ConflictValues,
         /// Row ID of the conflicting row (-1 if unknown)
         row_id: i64,
     },
@@ -340,7 +384,7 @@ impl Error {
     pub fn unique_constraint(
         index: impl Into<String>,
         column: impl Into<String>,
-        value: impl Into<String>,
+        value: impl Into<ConflictValues>,
     ) -> Self {
         Error::UniqueConstraint {
             index: index.into(),
@@ -520,11 +564,31 @@ mod tests {
             "primary key constraint failed with 42 already exists in this table"
         );
 
-        let err = Error::unique_constraint("idx_email", "email", "test@example.com");
+        let err =
+            Error::unique_constraint("idx_email", "email", vec![Value::text("test@example.com")]);
         assert_eq!(
             err.to_string(),
             "unique constraint failed for index idx_email on column email with value test@example.com"
         );
+    }
+
+    #[test]
+    fn a_vector_key_is_named_by_its_dimensions() {
+        let unknown = ConflictValues::Vector {
+            dims: 3,
+            holder: None,
+        };
+        assert_eq!(unknown.to_string(), "<vector(3 dims)>");
+        let held = ConflictValues::Vector {
+            dims: 3,
+            holder: Some(7),
+        };
+        assert_eq!(held.to_string(), "<vector(3 dims)> conflicts with row_id 7");
+    }
+
+    #[test]
+    fn the_conflict_key_does_not_grow_the_error() {
+        assert!(std::mem::size_of::<Error>() <= 120);
     }
 
     #[test]
@@ -536,7 +600,10 @@ mod tests {
 
         assert!(Error::not_null_constraint("col").is_constraint_violation());
         assert!(Error::primary_key_constraint(1).is_constraint_violation());
-        assert!(Error::unique_constraint("idx", "col", "val").is_constraint_violation());
+        assert!(
+            Error::unique_constraint("idx", "col", vec![Value::text("val")])
+                .is_constraint_violation()
+        );
         assert!(!Error::TableNotFound("t".to_string()).is_constraint_violation());
 
         assert!(Error::TransactionNotStarted.is_transaction_error());

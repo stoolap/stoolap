@@ -406,6 +406,16 @@ impl ViewDefinition {
 /// Arc-wrapped so lookups are a ref-count bump (no Vec clone on every FK check).
 type FkReverseCache = (u64, StringMap<Arc<Vec<(String, ForeignKeyConstraint)>>>);
 
+/// What a DDL change shares with the transactions that can make one
+struct DdlShared {
+    /// Held across a DDL statement's schema change and its WAL record, so
+    /// the log replays in the order the changes were applied
+    serial: parking_lot::Mutex<()>,
+    /// Schema epoch counter - increments on any CREATE/ALTER/DROP TABLE
+    /// Used for fast cache invalidation without HashMap lookup
+    schema_epoch: AtomicU64,
+}
+
 /// `hot_max_rows` / `hot_max_bytes` mirrored from the config so the commit
 /// path reads them without the config lock, the seal request a commit
 /// raises when a table passes them, and the wait of commits over the byte
@@ -483,9 +493,8 @@ pub struct MVCCEngine {
     loading_from_disk: Arc<AtomicBool>,
     /// File lock to prevent multiple processes from accessing the same database
     file_lock: Mutex<Option<FileLock>>,
-    /// Schema epoch counter - increments on any CREATE/ALTER/DROP TABLE
-    /// Used for fast cache invalidation without HashMap lookup
-    schema_epoch: AtomicU64,
+    /// The DDL guard and the schema epoch
+    ddl: Arc<DdlShared>,
     /// Statistics epoch counter - increments on ANALYZE. Shared across all
     /// executors on this engine so per-executor stats caches can spot
     /// stats written through another handle.
@@ -528,9 +537,6 @@ pub struct MVCCEngine {
     /// The table and segment a pass last examined, so a volume that cannot
     /// be built, in any table, does not keep the rest from their turn
     backfill_cursor: Mutex<Option<(String, u64)>>,
-    /// Held across a DDL statement's schema change and its WAL record, so
-    /// the log replays in the order the changes were applied
-    ddl_serial: parking_lot::Mutex<()>,
     /// Global epoch counter for volume eviction. Incremented each checkpoint
     /// cycle. Volumes whose last_access_epoch < eviction_epoch are idle.
     #[cfg(not(target_arch = "wasm32"))]
@@ -595,6 +601,75 @@ fn get_or_create_segment_manager(
         .clone()
 }
 
+/// The manager a column change of `table_name` moves: created when the
+/// engine persists, so a seal starting later carries the change
+fn column_change_manager(
+    segment_managers: &RwLock<
+        FxHashMap<String, Arc<crate::storage::volume::manifest::SegmentManager>>,
+    >,
+    persistence: &Option<PersistenceManager>,
+    table_name: &str,
+) -> Result<Option<Arc<crate::storage::volume::manifest::SegmentManager>>> {
+    if persistence.is_some() {
+        return Ok(Some(get_or_create_segment_manager(
+            segment_managers,
+            persistence,
+            table_name,
+        )));
+    }
+    Ok(segment_managers
+        .read()
+        .map_err(|_| Error::internal("segment managers lock poisoned"))?
+        .get(table_name)
+        .cloned())
+}
+
+fn begin_column_change(
+    segment_managers: &RwLock<
+        FxHashMap<String, Arc<crate::storage::volume::manifest::SegmentManager>>,
+    >,
+    persistence: &Option<PersistenceManager>,
+    table_name: &str,
+) -> Result<crate::storage::volume::manifest::ColumnSchemaChange> {
+    let name = to_lowercase_cow(table_name);
+    match column_change_manager(segment_managers, persistence, name.as_ref())? {
+        Some(mgr) => mgr.begin_column_change(),
+        None => Ok(crate::storage::volume::manifest::ColumnSchemaChange::hot_only()),
+    }
+}
+
+/// The engine's schema cache takes the version store's schema of
+/// `table_name`, the schema epoch moving under the same lock
+fn refresh_schema(
+    version_stores: &RwLock<FxHashMap<String, Arc<VersionStore>>>,
+    schemas: &RwLock<FxHashMap<String, CompactArc<Schema>>>,
+    ddl: &DdlShared,
+    table_name: &str,
+) -> Result<()> {
+    let table_name_lower = table_name.to_lowercase();
+
+    // Get the schema from the version store, then release the lock
+    // LOCK ORDERING: Release version_stores(R) before acquiring schemas(W)
+    // to maintain consistent ordering with column DDL (schemas(W) -> version_stores(R))
+    let vs_schema = {
+        let stores = version_stores.read().unwrap();
+        let store = stores
+            .get(&table_name_lower)
+            .ok_or_else(|| Error::TableNotFound(table_name_lower.to_string()))?;
+        store.schema().clone()
+    };
+
+    // Update the engine's schema cache
+    let mut schemas = schemas.write().unwrap();
+    schemas.insert(table_name_lower, vs_schema);
+    ddl.schema_epoch.fetch_add(1, Ordering::Release);
+    // The epoch moves under the same lock the schema does, so a reader
+    // holding it sees the two together
+    drop(schemas);
+
+    Ok(())
+}
+
 impl MVCCEngine {
     /// Creates a new MVCC engine with the given configuration
     pub fn new(config: Config) -> Self {
@@ -632,7 +707,10 @@ impl MVCCEngine {
             persistence_error,
             loading_from_disk: Arc::new(AtomicBool::new(false)),
             file_lock: Mutex::new(None),
-            schema_epoch: AtomicU64::new(0),
+            ddl: Arc::new(DdlShared {
+                serial: parking_lot::Mutex::new(()),
+                schema_epoch: AtomicU64::new(0),
+            }),
             stats_epoch: AtomicU64::new(0),
             cleanup_handle: Mutex::new(None),
             fk_reverse_cache: RwLock::new((u64::MAX, StringMap::default())),
@@ -646,7 +724,6 @@ impl MVCCEngine {
             backfill_running: AtomicBool::new(false),
             closing: AtomicBool::new(false),
             backfill_cursor: Mutex::new(None),
-            ddl_serial: parking_lot::Mutex::new(()),
             #[cfg(not(target_arch = "wasm32"))]
             eviction_epoch: AtomicU64::new(0),
         }
@@ -703,7 +780,9 @@ impl MVCCEngine {
                     mgrs.values().map(|mgr| mgr.max_schema_version()).max()
                 };
                 if let Some(persisted) = persisted {
-                    self.schema_epoch.fetch_max(persisted + 1, Ordering::AcqRel);
+                    self.ddl
+                        .schema_epoch
+                        .fetch_max(persisted + 1, Ordering::AcqRel);
                 }
 
                 // Legacy snapshots: only used when volumes/ does NOT exist.
@@ -2244,6 +2323,9 @@ impl MVCCEngine {
 
         // Stop accepting new transactions
         self.registry.stop_accepting_transactions();
+        // The first failure is returned once every step below has run: the
+        // engine is closed already, so a second close would not finish them
+        let mut first_error: Option<Error> = None;
 
         // Run a final checkpoint to seal ALL remaining hot rows into volumes.
         // Use force_seal=true to bypass thresholds — on close, we want all data
@@ -2259,7 +2341,7 @@ impl MVCCEngine {
                     // Retry ensures WAL truncation happens and startup is fast.
                     for attempt in 0..5 {
                         if let Err(e) = self.checkpoint_cycle_inner(true) {
-                            eprintln!("Warning: final checkpoint during close failed: {}", e);
+                            first_error.get_or_insert(e);
                             break;
                         }
                         let all_empty = self
@@ -2276,7 +2358,7 @@ impl MVCCEngine {
                         }
                     }
                     if let Err(e) = self.compact_after_checkpoint_forced() {
-                        eprintln!("Warning: final compaction during close failed: {}", e);
+                        first_error.get_or_insert(e);
                     }
                 }
             }
@@ -2306,7 +2388,7 @@ impl MVCCEngine {
         if let Some(ref pm) = *self.persistence {
             if pm.is_enabled() {
                 if let Err(e) = pm.stop() {
-                    eprintln!("Warning: Error stopping persistence: {}", e);
+                    first_error.get_or_insert(e);
                 }
             }
         }
@@ -2317,7 +2399,7 @@ impl MVCCEngine {
             *file_lock = None;
         }
 
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Returns whether the engine is open
@@ -2732,26 +2814,6 @@ impl MVCCEngine {
         Ok(None)
     }
 
-    /// A checkpoint's copy of a catalog record: no sync of its own, the
-    /// batch is synced once by `rerecord_ddl_to_wal`. The copy's LSN, or
-    /// None when nothing was written.
-    fn record_catalog_copy(
-        &self,
-        table_name: &str,
-        op: WALOperationType,
-        schema_data: &[u8],
-    ) -> Result<Option<u64>> {
-        if self.should_skip_wal() {
-            return Ok(None);
-        }
-        if let Some(ref pm) = *self.persistence {
-            if pm.is_enabled() {
-                return pm.record_catalog_copy(table_name, op, schema_data);
-            }
-        }
-        Ok(None)
-    }
-
     /// Serialize a schema to binary format for WAL
     pub fn serialize_schema(schema: &Schema) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -2876,7 +2938,7 @@ impl MVCCEngine {
         static EMPTY: std::sync::LazyLock<Arc<Vec<(String, ForeignKeyConstraint)>>> =
             std::sync::LazyLock::new(|| Arc::new(Vec::new()));
 
-        let current_epoch = self.schema_epoch.load(Ordering::Acquire);
+        let current_epoch = self.ddl.schema_epoch.load(Ordering::Acquire);
 
         // Fast path: check if cache is valid (read lock only)
         {
@@ -2969,7 +3031,7 @@ impl MVCCEngine {
         )?;
 
         // Increment schema epoch for cache invalidation
-        self.schema_epoch.fetch_add(1, Ordering::Release);
+        self.ddl.schema_epoch.fetch_add(1, Ordering::Release);
 
         Ok(return_schema)
     }
@@ -3032,7 +3094,7 @@ impl MVCCEngine {
         }
 
         // Increment schema epoch for cache invalidation
-        self.schema_epoch.fetch_add(1, Ordering::Release);
+        self.ddl.schema_epoch.fetch_add(1, Ordering::Release);
 
         Ok(())
     }
@@ -3107,7 +3169,7 @@ impl MVCCEngine {
             if let Some(schema) = vs_schema {
                 let mut schemas = self.schemas.write().unwrap();
                 schemas.insert(table_name_lower, schema);
-                self.schema_epoch.fetch_add(1, Ordering::Release);
+                self.ddl.schema_epoch.fetch_add(1, Ordering::Release);
             }
         }
 
@@ -3179,7 +3241,7 @@ impl MVCCEngine {
             if let Some(schema) = vs_schema {
                 let mut schemas = self.schemas.write().unwrap();
                 schemas.insert(table_name_lower, schema);
-                self.schema_epoch.fetch_add(1, Ordering::Release);
+                self.ddl.schema_epoch.fetch_add(1, Ordering::Release);
             }
         }
 
@@ -3194,29 +3256,7 @@ impl MVCCEngine {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
-
-        let table_name_lower = table_name.to_lowercase();
-
-        // Get the schema from the version store, then release the lock
-        // LOCK ORDERING: Release version_stores(R) before acquiring schemas(W)
-        // to maintain consistent ordering with column DDL (schemas(W) -> version_stores(R))
-        let vs_schema = {
-            let stores = self.version_stores.read().unwrap();
-            let store = stores
-                .get(&table_name_lower)
-                .ok_or_else(|| Error::TableNotFound(table_name_lower.to_string()))?;
-            store.schema().clone()
-        };
-
-        // Update the engine's schema cache
-        let mut schemas = self.schemas.write().unwrap();
-        schemas.insert(table_name_lower, vs_schema);
-        self.schema_epoch.fetch_add(1, Ordering::Release);
-        // The epoch moves under the same lock the schema does, so a reader
-        // holding it sees the two together
-        drop(schemas);
-
-        Ok(())
+        refresh_schema(&self.version_stores, &self.schemas, &self.ddl, table_name)
     }
 
     /// Get or create a segment manager for a table.
@@ -3292,7 +3332,7 @@ impl MVCCEngine {
             volume,
             seg_id,
             0,
-            self.schema_epoch.load(Ordering::Acquire),
+            self.ddl.schema_epoch.load(Ordering::Acquire),
             file,
             None,
         );
@@ -3675,36 +3715,48 @@ impl MVCCEngine {
             }
         }
 
-        // Update version store schema first (source of truth)
-        {
-            let stores = self.version_stores.read().unwrap();
-            if let Some(store) = stores.get(&table_name_lower) {
-                store.remove_column(column_name)?;
-                store.lay_out_rows();
-            }
-        }
         change.mark_changed();
-
-        // Sync engine schema cache from version store
-        {
-            let vs_schema = {
-                let stores = self.version_stores.read().unwrap();
-                stores
-                    .get(&table_name_lower)
-                    .map(|store| store.schema().clone())
-            };
-            if let Some(schema) = vs_schema {
-                let mut schemas = self.schemas.write().unwrap();
-                schemas.insert(table_name_lower, schema);
-                self.schema_epoch.fetch_add(1, Ordering::Release);
-            }
-        }
-
-        // Record the drop in the segment manifest so cold volume mappings
-        // mask stale data. Same as the live DDL path in ddl.rs. Without this,
-        // crash recovery (WAL replay) loses dropped_columns metadata.
-        self.propagate_column_drop_inner(table_name, column_name, replayed_lsn);
+        let dropped = self.drop_column_transition(table_name, column_name, |_| Ok(replayed_lsn));
         change.finish();
+        dropped
+    }
+
+    /// Drops a column from the hot store, the indexes and the cold mappings
+    /// together. The table closes; `record` logs the change and returns the
+    /// log position the manifest takes it at, and a refused record opens
+    /// the table as it was. Then the indexes are rebound, the hot rows and
+    /// schema published, the cold mappings moved, and the table opens
+    pub(crate) fn drop_column_transition(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        record: impl FnOnce(&Self) -> Result<Option<u64>>,
+    ) -> Result<()> {
+        let store = self.get_version_store(table_name)?;
+        let without = store.close_for_drop(column_name)?;
+        let ddl_lsn = match record(self) {
+            Ok(lsn) => lsn,
+            Err(error) => {
+                store.reopen_after_refused_drop();
+                return Err(error);
+            }
+        };
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::drop_column_recorded();
+        store.rebind_indexes_for_drop();
+        store.publish_drop(without);
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::drop_hot_published();
+        // The cold mappings follow while the table is closed, outside the
+        // row, arena and schema locks
+        let refreshed = self.refresh_schema_cache(table_name);
+        self.propagate_column_drop_inner(table_name, column_name, ddl_lsn);
+        store.open_after_drop();
+        refreshed?;
+        // On replay the catalog is not final yet; the open discards then
+        if !self.should_skip_wal() {
+            self.discard_uncovered_side_files(table_name);
+        }
         Ok(())
     }
 
@@ -3778,7 +3830,7 @@ impl MVCCEngine {
             if let Some(schema) = vs_schema {
                 let mut schemas = self.schemas.write().unwrap();
                 schemas.insert(table_name_lower.clone(), schema);
-                self.schema_epoch.fetch_add(1, Ordering::Release);
+                self.ddl.schema_epoch.fetch_add(1, Ordering::Release);
             }
         }
 
@@ -3793,7 +3845,7 @@ impl MVCCEngine {
                     mgr.record_column_rename(
                         old_name,
                         new_name,
-                        self.schema_epoch.load(Ordering::Acquire),
+                        self.ddl.schema_epoch.load(Ordering::Acquire),
                         replayed_lsn,
                     );
                 }
@@ -3811,7 +3863,7 @@ impl MVCCEngine {
     /// against other DDL and against a checkpoint's re-recording of the
     /// catalog, so replay applies the changes in the order they were made
     pub fn ddl_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
-        self.ddl_serial.lock()
+        self.ddl.serial.lock()
     }
 
     /// After an index of `table_name` is dropped: the side file of every
@@ -3859,24 +3911,31 @@ impl MVCCEngine {
         }
     }
 
+    /// Closes `table_name` for a change of a column's definition and settles
+    /// what it holds: publications counted before the close finish, and a
+    /// version a still open transaction applied (a table handle's own
+    /// commit) is waited for a bounded time, else the change is refused.
+    /// The table opens again when the closure goes. The caller holds the
+    /// DDL guard
+    pub(crate) fn close_for_column_change(
+        &self,
+        table_name: &str,
+    ) -> Result<super::version_store::ColumnClosure> {
+        debug_assert!(self.ddl.serial.is_locked());
+        close_and_settle(
+            &self.version_stores,
+            &self.segment_managers,
+            &self.persistence,
+            &self.registry,
+            table_name,
+        )
+    }
+
     pub(crate) fn begin_column_change(
         &self,
         table_name: &str,
     ) -> Result<crate::storage::volume::manifest::ColumnSchemaChange> {
-        let name = to_lowercase_cow(table_name);
-        let mgr = if self.persistence.is_some() {
-            Some(self.get_or_create_segment_manager(name.as_ref()))
-        } else {
-            self.segment_managers
-                .read()
-                .map_err(|_| Error::internal("segment managers lock poisoned"))?
-                .get(name.as_ref())
-                .cloned()
-        };
-        match mgr {
-            Some(mgr) => mgr.begin_column_change(),
-            None => Ok(crate::storage::volume::manifest::ColumnSchemaChange::hot_only()),
-        }
+        begin_column_change(&self.segment_managers, &self.persistence, table_name)
     }
 
     pub(crate) fn refresh_column_mappings(&self, table_name: &str) {
@@ -3904,7 +3963,20 @@ impl MVCCEngine {
     ) -> Result<()> {
         let store = self.get_version_store(table_name)?;
         *store.schema_mut() = schema;
-        store.discard_pending_cut();
+        self.refresh_schema_cache(table_name)?;
+        self.refresh_column_mappings(table_name);
+        Ok(())
+    }
+
+    /// Puts `schema` back and opens the table after an added column whose
+    /// record the log refused
+    pub(crate) fn reopen_after_refused_add(
+        &self,
+        table_name: &str,
+        schema: CompactArc<Schema>,
+    ) -> Result<()> {
+        self.get_version_store(table_name)?
+            .reopen_after_refused_add(schema);
         self.refresh_schema_cache(table_name)?;
         self.refresh_column_mappings(table_name);
         Ok(())
@@ -3925,14 +3997,6 @@ impl MVCCEngine {
         column: crate::core::SchemaColumn,
     ) -> Result<()> {
         self.get_version_store(table_name)?.add_column(column)
-    }
-
-    /// Removes a column from a table's schema, the rows to follow at
-    /// `lay_out_rows` once the change is recorded
-    pub(crate) fn drop_column_schema(&self, table_name: &str, column_name: &str) -> Result<()> {
-        self.get_version_store(table_name)?
-            .remove_column(column_name)?;
-        Ok(())
     }
 
     /// Order a table's sealed rows by `key` from the next seal on; the
@@ -3964,7 +4028,7 @@ impl MVCCEngine {
             if let Some(schema) = vs_schema {
                 let mut schemas = self.schemas.write().unwrap();
                 schemas.insert(table_name_lower.clone(), schema);
-                self.schema_epoch.fetch_add(1, Ordering::Release);
+                self.ddl.schema_epoch.fetch_add(1, Ordering::Release);
             }
         }
 
@@ -3977,18 +4041,13 @@ impl MVCCEngine {
         Ok(())
     }
 
-    /// Record a column drop so old cold volumes don't leak stale data.
-    pub fn propagate_column_drop(&self, table_name: &str, col_name: &str) {
-        self.propagate_column_drop_inner(table_name, col_name, self.recorded_ddl_lsn());
-    }
-
     /// `ddl_lsn` is the log position of the change's record: a statement's
     /// own, just written, or a replayed one, which the manifest may hold
     /// already and then records nothing for
     fn propagate_column_drop_inner(&self, table_name: &str, col_name: &str, ddl_lsn: Option<u64>) {
         let table_name_lower = table_name.to_lowercase();
         let schema = self.schemas.read().unwrap().get(&table_name_lower).cloned();
-        let current_epoch = self.schema_epoch.load(Ordering::Acquire);
+        let current_epoch = self.ddl.schema_epoch.load(Ordering::Acquire);
         if let Some(mgr) = self.segment_managers.read().unwrap().get(&table_name_lower) {
             let held_already = ddl_lsn.is_some_and(|lsn| lsn <= mgr.ddl_recorded_lsn());
             if !held_already {
@@ -4003,7 +4062,7 @@ impl MVCCEngine {
     /// The log position the last record took, when the log is on: a
     /// statement records itself before it propagates, so the manifest
     /// takes the change and the position it reaches in one write
-    fn recorded_ddl_lsn(&self) -> Option<u64> {
+    pub(crate) fn recorded_ddl_lsn(&self) -> Option<u64> {
         match self.persistence.as_ref() {
             Some(pm) if pm.is_enabled() => Some(pm.current_lsn()),
             _ => None,
@@ -4022,7 +4081,7 @@ impl MVCCEngine {
                 mgr.record_column_rename(
                     old_name,
                     new_name,
-                    self.schema_epoch.load(Ordering::Acquire),
+                    self.ddl.schema_epoch.load(Ordering::Acquire),
                     ddl_lsn,
                 );
             }
@@ -4045,7 +4104,9 @@ impl MVCCEngine {
         }
 
         let table_name_lower = table_name.to_lowercase();
+        let _ddl = self.ddl_guard();
         let mut change = self.begin_column_change(table_name)?;
+        let _closed = self.close_for_column_change(table_name)?;
 
         // Validate under read lock first
         {
@@ -4083,7 +4144,7 @@ impl MVCCEngine {
             if let Some(schema) = vs_schema {
                 let mut schemas = self.schemas.write().unwrap();
                 schemas.insert(table_name_lower, schema);
-                self.schema_epoch.fetch_add(1, Ordering::Release);
+                self.ddl.schema_epoch.fetch_add(1, Ordering::Release);
             }
         }
 
@@ -4106,7 +4167,9 @@ impl MVCCEngine {
         }
 
         let table_name_lower = table_name.to_lowercase();
+        let _ddl = self.ddl_guard();
         let mut change = self.begin_column_change(table_name)?;
+        let _closed = self.close_for_column_change(table_name)?;
 
         // Validate under read lock first
         {
@@ -4145,7 +4208,7 @@ impl MVCCEngine {
             if let Some(schema) = vs_schema {
                 let mut schemas = self.schemas.write().unwrap();
                 schemas.insert(table_name_lower, schema);
-                self.schema_epoch.fetch_add(1, Ordering::Release);
+                self.ddl.schema_epoch.fetch_add(1, Ordering::Release);
             }
         }
 
@@ -4280,7 +4343,7 @@ impl MVCCEngine {
         }
 
         // Increment schema epoch for cache invalidation
-        self.schema_epoch.fetch_add(1, Ordering::Release);
+        self.ddl.schema_epoch.fetch_add(1, Ordering::Release);
 
         Ok(())
     }
@@ -4491,6 +4554,8 @@ impl MVCCEngine {
         // (volumes, tombstones) while we read it, ensuring the backup is
         // a true point-in-time snapshot consistent with snapshot_commit_seq.
         let _checkpoint_guard = self.checkpoint_mutex.lock().unwrap();
+        // No column, index or view change starts until ddl.bin is written
+        let _ddl = self.ddl_guard();
 
         // Wait for all in-flight commits to complete before capturing state.
         // The commit path is: start_commit (alloc seq) → commit_all_tables
@@ -4572,12 +4637,24 @@ impl MVCCEngine {
                 }
             };
 
+            // The rows written below must be in the layout of this schema
+            let token = stores
+                .get(table_name)
+                .map(|store| store.token_for(store.layout()));
+            let generation = self
+                .segment_managers
+                .read()
+                .unwrap()
+                .get(table_name)
+                .map(|mgr| mgr.schema_generation());
             if let Err(e) = writer.write_schema(schema) {
                 eprintln!("Warning: Failed to write schema for {}: {}", table_name, e);
                 writer.fail();
                 all_succeeded = false;
                 break;
             }
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::snapshot_schema_written();
 
             let mut write_error = false;
 
@@ -4721,6 +4798,25 @@ impl MVCCEngine {
                         break;
                     }
                 }
+            }
+
+            let moved = token.is_some_and(|token| {
+                stores
+                    .get(table_name)
+                    .is_some_and(|store| store.check_token(token).is_err())
+            }) || generation.is_some_and(|generation| {
+                self.segment_managers
+                    .read()
+                    .unwrap()
+                    .get(table_name)
+                    .is_some_and(|mgr| mgr.check_schema_generation(generation).is_err())
+            });
+            if moved {
+                eprintln!(
+                    "Warning: table {} changed its columns during the snapshot",
+                    table_name
+                );
+                write_error = true;
             }
 
             if write_error {
@@ -5512,7 +5608,8 @@ impl MVCCEngine {
         }
 
         // Increment schema epoch to invalidate all caches
-        self.schema_epoch
+        self.ddl
+            .schema_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Release);
 
         // Re-record DDL to WAL so table schemas survive WAL truncation
@@ -5674,10 +5771,8 @@ impl MVCCEngine {
         // the cut published as the boundary recovery starts from, so a
         // failure here leaves the boundary where it was.
         if checkpoint_lsn > 0 {
-            if let Err(e) = self.rerecord_ddl_to_wal() {
-                eprintln!("Warning: Failed to re-record DDL to WAL: {}", e);
-                return Ok(());
-            }
+            // The boundary stays where it was, and the caller learns why
+            self.rerecord_ddl_to_wal()?;
             if let Some(ref pm) = *self.persistence {
                 pm.publish_checkpoint(checkpoint_lsn)?;
             }
@@ -5712,6 +5807,8 @@ impl MVCCEngine {
                 }
             }
         }
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::checkpoint_manifests_persisted();
 
         // Step 5: Truncate WAL BEFORE compaction.
         // WAL truncation only depends on seal + manifest persist, not compaction.
@@ -5802,11 +5899,12 @@ impl MVCCEngine {
         // a volume that cannot be built in one table does not hold the
         // rest, in any table, forever
         let mut work: Vec<(usize, u64)> = Vec::new();
-        let mut identities_of: Vec<Vec<(usize, u64)>> = Vec::with_capacity(tables.len());
+        let mut identities_of: Vec<(Vec<(usize, u64)>, u64)> = Vec::with_capacity(tables.len());
         for (index, (_, store, mgr)) in tables.iter().enumerate() {
-            let identities = {
+            // The identities and the definition they belong to, together
+            let (identities, definition) = {
                 let _ddl = self.ddl_guard();
-                store.secondary_index_identities()
+                (store.secondary_index_identities(), mgr.definition_epoch())
             };
             let snapshot = mgr.cold_snapshot();
             let mut candidates: Vec<u64> = if identities.is_empty() {
@@ -5830,7 +5928,7 @@ impl MVCCEngine {
             };
             candidates.sort_unstable();
             work.extend(candidates.into_iter().map(|id| (index, id)));
-            identities_of.push(identities);
+            identities_of.push((identities, definition));
         }
         if let Some((table, segment)) = self.backfill_cursor.lock().unwrap().clone() {
             let at = work.partition_point(|&(index, id)| {
@@ -5844,7 +5942,7 @@ impl MVCCEngine {
                 break;
             }
             let (name, store, mgr) = &tables[index];
-            let identities = &identities_of[index];
+            let (identities, definition) = &identities_of[index];
             // Only into an idle ledger, and only into half of it: the seal
             // keeps the other half. A busy ledger ends the pass; the
             // volumes wait for the next one
@@ -5917,6 +6015,13 @@ impl MVCCEngine {
             // or not the segment is still registered, so a discard finds
             // the build directory too
             staged.relocate(&file.path());
+            // Built for a definition a column change has since replaced
+            if mgr.definition_epoch() != *definition {
+                report.discarded += 1;
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::stale_publication_discarded();
+                continue;
+            }
             let now = mgr.cold_snapshot();
             let current_path = now
                 .segs
@@ -6151,38 +6256,51 @@ impl MVCCEngine {
                 .collect()
         };
 
-        // Write CreateTable entries first (schemas must exist before indexes)
-        for (table_name, data) in &table_entries {
-            self.record_catalog_copy(table_name, WALOperationType::CreateTable, data)?;
-        }
-
-        for (table_name, index_name, data) in &index_entries {
-            let lsn = self.record_catalog_copy(table_name, WALOperationType::CreateIndex, data)?;
-            // An index that reached here without an identity (a record or
-            // a restore from before identities) takes its copy's LSN, the
-            // copy being the first record that stands for it
-            if let Some(lsn) = lsn {
-                if let Ok(store) = self.get_version_store(table_name) {
-                    if store.index_identity(index_name).is_none() {
-                        store.set_index_identity(index_name, lsn);
-                    }
-                }
-            }
-        }
-
-        for (view_name, data) in &view_entries {
-            self.record_catalog_copy(view_name, WALOperationType::CreateView, data)?;
-        }
-        drop(ddl);
-
         if self.should_skip_wal() {
             return Ok(());
         }
-        if let Some(ref pm) = *self.persistence {
-            if pm.is_enabled() {
-                pm.sync_wal_for_checkpoint()?;
+        let Some(pm) = self
+            .persistence
+            .as_ref()
+            .as_ref()
+            .filter(|pm| pm.is_enabled())
+        else {
+            return Ok(());
+        };
+
+        // Tables first (schemas must exist before indexes), then indexes,
+        // then views: one unit, one sync
+        let tables = table_entries.len();
+        let mut copies: Vec<(String, WALOperationType, Vec<u8>)> =
+            Vec::with_capacity(tables + index_entries.len() + view_entries.len());
+        copies.extend(
+            table_entries
+                .into_iter()
+                .map(|(name, data)| (name, WALOperationType::CreateTable, data)),
+        );
+        let mut indexes = Vec::with_capacity(index_entries.len());
+        for (table, index, data) in index_entries {
+            copies.push((table.clone(), WALOperationType::CreateIndex, data));
+            indexes.push((table, index));
+        }
+        copies.extend(
+            view_entries
+                .into_iter()
+                .map(|(name, data)| (name, WALOperationType::CreateView, data)),
+        );
+        let lsns = pm.record_catalog_copies(copies)?;
+
+        // An index that reached here without an identity (a record or a
+        // restore from before identities) takes its copy's LSN, the copy
+        // being the first record that stands for it
+        for ((table_name, index_name), &lsn) in indexes.iter().zip(lsns.iter().skip(tables)) {
+            if let Ok(store) = self.get_version_store(table_name) {
+                if store.index_identity(index_name).is_none() {
+                    store.set_index_identity(index_name, lsn);
+                }
             }
         }
+        drop(ddl);
         Ok(())
     }
 
@@ -6248,19 +6366,21 @@ impl MVCCEngine {
             return Ok(());
         }
 
-        for table_name in &tables_to_compact {
+        'tables: for table_name in &tables_to_compact {
             let mgr = self.get_or_create_segment_manager(table_name);
             let generation = mgr.schema_generation();
             if generation & 1 != 0 {
                 continue;
             }
+            // Taken once: a preparation done again keeps it
+            let definition = mgr.definition_epoch();
             // The request is read before the schema: a key set between the
             // two opens a newer request, which this cycle cannot close
             let recluster_request = mgr.recluster_request();
             let (schema, schema_version) = {
                 let schemas = self.schemas.read().unwrap();
                 match schemas.get(table_name) {
-                    Some(s) => (s.clone(), self.schema_epoch.load(Ordering::Acquire)),
+                    Some(s) => (s.clone(), self.ddl.schema_epoch.load(Ordering::Acquire)),
                     None => continue,
                 }
             };
@@ -6281,7 +6401,7 @@ impl MVCCEngine {
             // - Sub-target (< target_volume_rows): small volumes to merge together
             // - Oversized (> target * 3/2): large volumes to split
             // - At-target: properly sized, never rewrite
-            let (old_ids, volumes, dead, tombstones) = {
+            let (old_ids, volumes, dead, tombstones, outside) = {
                 // Planning reads the manifest for metadata only and lets it
                 // go before any volume is read: a seal holds the table's
                 // fence while it waits for the manifest, and DML waits on
@@ -6452,6 +6572,8 @@ impl MVCCEngine {
                     .filter(|entry| entry.2)
                     .map(|entry| (entry.0, entry.1))
                     .collect();
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::compaction_planned();
 
                 // Load only the merge-candidate volumes (not the entire table).
                 // Cold volumes are loaded on demand via ensure_volume.
@@ -6492,17 +6614,35 @@ impl MVCCEngine {
                 // position, and old_ids holds the batch in manifest order
                 vols.reverse();
                 dead.reverse();
-                // Under the DDL guard, so no seal's transfer is halfway
-                let ts = {
+                // Under the DDL guard, so no seal's transfer is halfway; the
+                // segments with them, to find the copies outside the batch
+                let (ts, segs_then) = {
                     let _ddl = self.ddl_guard();
                     let ts = mgr.tombstone_set_arc();
                     #[cfg(feature = "test-failpoints")]
                     crate::test_failpoints::compaction_tombstones_taken(
-                        self.ddl_serial.is_locked(),
+                        self.ddl.serial.is_locked(),
                     );
-                    ts
+                    (ts, mgr.segments_raw())
                 };
-                (old_ids, Arc::new(vols), dead, ts)
+                // Each with the id range the manifest records for it, when it
+                // still does, so a volume no candidate falls in is not read
+                let outside: Vec<OutsideVolume> = {
+                    let manifest = mgr.manifest();
+                    segs_then
+                        .iter()
+                        .filter(|(id, _)| !old_ids.contains(id))
+                        .map(|(id, cs)| {
+                            let bounds = manifest
+                                .segments
+                                .iter()
+                                .find(|m| m.segment_id == *id)
+                                .map(|m| (m.min_row_id, m.max_row_id));
+                            (Arc::clone(&cs.volume), bounds)
+                        })
+                        .collect()
+                };
+                (old_ids, Arc::new(vols), dead, ts, outside)
             };
 
             let vol_mappings: Vec<_> = volumes
@@ -6542,6 +6682,9 @@ impl MVCCEngine {
             // The tombstones this compaction applies, as (row_id, commit_seq):
             // the cleanup removes those whose sequence is still current
             let mut applied_tombstones: Vec<(i64, u64)> = Vec::new();
+            // The newest copy in the batch of each tombstoned row, until the
+            // copies outside the batch are known
+            let mut tombstoned: Vec<(i64, u64, usize, usize)> = Vec::new();
 
             for (vol_idx, (_seg_id, vol)) in volumes.iter().enumerate() {
                 let dead = dead[vol_idx].as_deref().unwrap_or(&[]);
@@ -6560,7 +6703,7 @@ impl MVCCEngine {
                         applied_commit_seq(&tombstones, row_id, compact_seal_seq_limit)
                     {
                         if seen.insert(row_id) {
-                            applied_tombstones.push((row_id, commit_seq));
+                            tombstoned.push((row_id, commit_seq, vol_idx, i));
                         }
                         continue;
                     }
@@ -6569,6 +6712,33 @@ impl MVCCEngine {
                     }
                 }
             }
+            // A copy outside the batch would outlive the tombstone: the row
+            // stays, newest copy and tombstone, for a batch that holds all
+            let candidates: FxHashSet<i64> = tombstoned.iter().map(|t| t.0).collect();
+            let held = held_outside(&outside, &candidates);
+            let mut kept: Vec<(i64, usize, usize)> = Vec::new();
+            for (row_id, commit_seq, vol_idx, i) in tombstoned {
+                if held.contains(&row_id) {
+                    kept.push((row_id, vol_idx, i));
+                } else {
+                    applied_tombstones.push((row_id, commit_seq));
+                }
+            }
+            if !kept.is_empty() {
+                // Both lists run by volume and position: merged, each volume
+                // stays one run in its physical order, as the key merge reads it
+                let mut kept = kept.into_iter().peekable();
+                let mut merged = Vec::with_capacity(live_refs.len() + kept.len());
+                for entry in live_refs.drain(..) {
+                    while let Some(k) = kept.next_if(|k| (k.1, k.2) < (entry.1, entry.2)) {
+                        merged.push(k);
+                    }
+                    merged.push(entry);
+                }
+                merged.extend(kept);
+                live_refs = merged;
+            }
+            drop(outside);
             // Let go of the full map: from here to the cleanup only the
             // applied pairs are needed
             drop(tombstones);
@@ -6578,12 +6748,14 @@ impl MVCCEngine {
             if live_refs.is_empty() {
                 // Under the DDL guard, so no seal's transfer is halfway
                 let _ddl = self.ddl_guard();
+                let cleanup = mgr.open_cleanup();
                 // All rows in merged volumes are tombstoned. Remove those
                 // volumes and their tombstones, but keep unmerged volumes intact.
                 mgr.replace_segments_atomic_remove_only(&old_ids);
                 // Only clear tombstones that were actually applied during compaction.
                 // Post-snapshot tombstones are preserved for snapshot visibility.
                 mgr.remove_applied_tombstones(&applied_tombstones);
+                drop(cleanup);
 
                 // Persist manifest BEFORE deleting files (same safety as non-empty path).
                 // Written out under the DDL guard, so the manifest never shows a
@@ -6641,7 +6813,26 @@ impl MVCCEngine {
             // an input known to be out of order sends the batch to the sort,
             // with the key columns loaded whole
             let mut key_held_peak = 0usize;
+            // A key column an input stores in another type than the key's
+            // now is ordered by its values' casts, which only the sort does
+            let retyped_key = schema.cluster_key.iter().any(|&column| {
+                let data_type = schema.columns[column].data_type;
+                volumes
+                    .iter()
+                    .zip(&vol_mappings)
+                    .any(|((_, vol), mapping)| match mapping.sources.get(column) {
+                        _ if mapping.is_identity => vol.columns.data_type(column) != data_type,
+                        Some(crate::storage::volume::writer::ColSource::Volume(v)) => {
+                            vol.columns.data_type(*v) != data_type
+                        }
+                        Some(crate::storage::volume::writer::ColSource::Default(value)) => {
+                            !value.is_null() && value.data_type() != data_type
+                        }
+                        None => false,
+                    })
+            });
             let merged = if schema.cluster_key.is_empty()
+                || retyped_key
                 || volumes
                     .iter()
                     .any(|(id, _)| mgr.known_key_order(*id, &schema.cluster_key) == Some(false))
@@ -6656,6 +6847,8 @@ impl MVCCEngine {
                 )?
             };
             if let Some(merged) = merged {
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::key_order_merged();
                 key_held_peak = merged.peak_held_bytes;
                 live_refs = merged.refs;
             } else if schema.cluster_key.is_empty() {
@@ -6668,9 +6861,14 @@ impl MVCCEngine {
                 use crate::storage::volume::column::ColumnData;
                 let mut key_cells: Vec<Vec<Option<&ColumnData>>> = Vec::new();
                 let mut key_defaults: Vec<Vec<Option<Value>>> = Vec::new();
+                // By key column, by volume: a column stored in another type
+                // than the key's now, compared by its values' casts
+                let mut key_retyped: Vec<Vec<bool>> = Vec::new();
                 for &column in &schema.cluster_key {
+                    let data_type = schema.columns[column].data_type;
                     let mut cells = Vec::with_capacity(volumes.len());
                     let mut defaults = Vec::with_capacity(volumes.len());
+                    let mut retyped = Vec::with_capacity(volumes.len());
                     for (vol_idx, (_, vol)) in volumes.iter().enumerate() {
                         let mapping = &vol_mappings[vol_idx];
                         let (source, default) = if mapping.is_identity {
@@ -6678,32 +6876,84 @@ impl MVCCEngine {
                         } else {
                             match mapping.sources.get(column) {
                                 Some(ColSource::Volume(v)) => (Some(*v), None),
-                                Some(ColSource::Default(value)) => (None, Some(value.clone())),
+                                Some(ColSource::Default(value)) => {
+                                    (None, Some(value.coerce_to_type(data_type)))
+                                }
                                 None => (None, Some(Value::null_unknown())),
                             }
                         };
-                        cells.push(source.and_then(|v| vol.columns.get(v).ok()));
+                        let cell = source.and_then(|v| vol.columns.get(v).ok());
+                        retyped.push(cell.is_some_and(|c| c.data_type() != data_type));
+                        cells.push(cell);
                         defaults.push(default);
                     }
                     key_cells.push(cells);
                     key_defaults.push(defaults);
+                    key_retyped.push(retyped);
                 }
+                // A retyped key column's cells, cast once before the sort
+                let key_cast: Vec<Vec<Option<Vec<Value>>>> = key_cells
+                    .iter()
+                    .zip(&key_retyped)
+                    .zip(&schema.cluster_key)
+                    .map(|((cells, retyped), &column)| {
+                        let data_type = schema.columns[column].data_type;
+                        cells
+                            .iter()
+                            .zip(retyped)
+                            .map(|(cell, &retyped)| match cell {
+                                Some(cell) if retyped => Some(
+                                    (0..cell.len())
+                                        .map(|i| cell.get_value(i).coerce_to_type(data_type))
+                                        .collect(),
+                                ),
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .collect();
                 let null = Value::null_unknown();
                 let default_of =
                     |k: usize, vol_idx: usize| key_defaults[k][vol_idx].as_ref().unwrap_or(&null);
-                let compare_key = |k: usize, a: (usize, usize), b: (usize, usize)| match (
-                    key_cells[k][a.0],
-                    key_cells[k][b.0],
-                ) {
-                    (Some(ca), Some(cb)) => ca.compare_cells(a.1, cb, b.1),
-                    (Some(ca), None) => ca.compare_cell_with_value(a.1, default_of(k, b.0)),
-                    (None, Some(cb)) => cb
-                        .compare_cell_with_value(b.1, default_of(k, a.0))
-                        .reverse(),
-                    (None, None) => crate::storage::volume::seal::compare_key_values(
-                        default_of(k, a.0),
-                        default_of(k, b.0),
-                    ),
+                let cast_of = |k: usize, at: (usize, usize)| {
+                    key_cast[k][at.0].as_ref().map(|values| &values[at.1])
+                };
+                let compare_key = |k: usize, a: (usize, usize), b: (usize, usize)| {
+                    match (cast_of(k, a), cast_of(k, b)) {
+                        (Some(va), Some(vb)) => {
+                            return crate::storage::volume::seal::compare_key_values(va, vb)
+                        }
+                        (Some(va), None) => {
+                            return match key_cells[k][b.0] {
+                                Some(cb) => cb.compare_cell_with_value(b.1, va).reverse(),
+                                None => crate::storage::volume::seal::compare_key_values(
+                                    va,
+                                    default_of(k, b.0),
+                                ),
+                            }
+                        }
+                        (None, Some(vb)) => {
+                            return match key_cells[k][a.0] {
+                                Some(ca) => ca.compare_cell_with_value(a.1, vb),
+                                None => crate::storage::volume::seal::compare_key_values(
+                                    default_of(k, a.0),
+                                    vb,
+                                ),
+                            }
+                        }
+                        (None, None) => {}
+                    }
+                    match (key_cells[k][a.0], key_cells[k][b.0]) {
+                        (Some(ca), Some(cb)) => ca.compare_cells(a.1, cb, b.1),
+                        (Some(ca), None) => ca.compare_cell_with_value(a.1, default_of(k, b.0)),
+                        (None, Some(cb)) => cb
+                            .compare_cell_with_value(b.1, default_of(k, a.0))
+                            .reverse(),
+                        (None, None) => crate::storage::volume::seal::compare_key_values(
+                            default_of(k, a.0),
+                            default_of(k, b.0),
+                        ),
+                    }
                 };
                 let mut order: Vec<u32> = (0..live_refs.len() as u32).collect();
                 order.sort_unstable_by(|&a, &b| {
@@ -6843,12 +7093,34 @@ impl MVCCEngine {
                 Vec::new();
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::side_files_built();
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::compaction_outputs_built();
             // A preparation the segments moved under (a seal registered
             // between the preparation and the guard) comes back from the
             // commit and is prepared again outside the guard, the
             // identities compared again before the next commit
+            let cleanup = mgr.open_cleanup();
             loop {
                 let ddl = self.ddl_guard();
+                // Written before a change of a column's definition since:
+                // the outputs go and the old volumes stay
+                if mgr.definition_epoch() != definition {
+                    drop(ddl);
+                    let (volumes, _, sides) = prepared.into_parts();
+                    drop(sides);
+                    let vol_table_dir = vol_dir.join(table_name);
+                    for (vid, _, _) in &volumes {
+                        let path = vol_table_dir.join(format!("vol_{:016x}.vol", vid));
+                        let _ = std::fs::remove_file(&path);
+                        crate::storage::volume::secondary::retire_side_of(&path);
+                    }
+                    for side in stale_sides {
+                        crate::storage::volume::secondary::discard_side(side);
+                    }
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::stale_publication_discarded();
+                    continue 'tables;
+                }
                 if let Some(store) = store.as_ref() {
                     let current = store.secondary_index_identities();
                     let stale: Vec<u64> = prepared
@@ -6885,6 +7157,8 @@ impl MVCCEngine {
             for side in stale_sides {
                 crate::storage::volume::secondary::discard_side(side);
             }
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::compaction_published();
             // The volumes just written are in the key's order. They were
             // built in the rewrite schema's column order, so the key's
             // positions in that schema are their physical columns, whatever
@@ -6900,6 +7174,7 @@ impl MVCCEngine {
             // Clear only tombstones that existed at snapshot time for
             // row_ids in the merged volumes.
             mgr.remove_applied_tombstones(&applied_tombstones);
+            drop(cleanup);
 
             // CRITICAL: Persist manifest BEFORE deleting old files.
             // Written out under the DDL guard, so the manifest never shows a
@@ -7063,12 +7338,18 @@ impl MVCCEngine {
             let mgr = self.get_or_create_segment_manager(&table_name);
             let generation = mgr.schema_generation();
             if generation & 1 != 0 {
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::seal_passed_changing_table();
                 continue;
             }
+            let definition = mgr.definition_epoch();
             let (schema, sealed_schema_version) = {
                 let schemas = self.schemas.read().unwrap();
                 match schemas.get(&table_name) {
-                    Some(schema) => (schema.clone(), self.schema_epoch.load(Ordering::Acquire)),
+                    Some(schema) => (
+                        schema.clone(),
+                        self.ddl.schema_epoch.load(Ordering::Acquire),
+                    ),
                     None => continue,
                 }
             };
@@ -7136,8 +7417,22 @@ impl MVCCEngine {
                 }
             }
 
-            // A clustered table's volumes hold their rows in key order
+            // A clustered table's volumes hold their rows in key order, the
+            // order of the values they store: a key value written before its
+            // column changed type is ordered as its cast
             if !schema.cluster_key.is_empty() {
+                for (_row_id, row) in &mut all_rows {
+                    for &column in &schema.cluster_key {
+                        let data_type = schema.columns[column].data_type;
+                        let cast = match row.get(column) {
+                            Some(value) if !value.is_null() && value.data_type() != data_type => {
+                                value.coerce_to_type(data_type)
+                            }
+                            _ => continue,
+                        };
+                        let _ = row.set(column, cast);
+                    }
+                }
                 all_rows.sort_by(|a, b| crate::storage::volume::seal::cluster_order(&schema, a, b));
             }
 
@@ -7218,7 +7513,25 @@ impl MVCCEngine {
             // column DDL wait for the whole fence section meanwhile.
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::side_files_built();
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::seal_volumes_built();
             let ddl = self.ddl_guard();
+            // Built before a change of a column's definition since: the
+            // volumes go and the rows stay hot for the next cycle
+            if mgr.definition_epoch() != definition {
+                drop(ddl);
+                for side in sealed_sides.iter_mut().filter_map(Option::take) {
+                    crate::storage::volume::secondary::discard_side(side);
+                }
+                drop(sealed_files);
+                for (_, path, _) in &sealed_volumes {
+                    let _ = std::fs::remove_file(path);
+                    crate::storage::volume::secondary::retire_side_of(path);
+                }
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::stale_publication_discarded();
+                continue;
+            }
             let mut stale_sides: Vec<Arc<crate::storage::volume::secondary::IndexFile>> =
                 Vec::with_capacity(sealed_sides.len());
             {
@@ -7533,7 +7846,7 @@ impl Engine for MVCCEngine {
 
     #[inline]
     fn schema_epoch(&self) -> u64 {
-        self.schema_epoch.load(Ordering::Acquire)
+        self.ddl.schema_epoch.load(Ordering::Acquire)
     }
 
     fn list_table_indexes(&self, table_name: &str) -> Result<FxHashMap<String, String>> {
@@ -7904,15 +8217,37 @@ impl Engine for MVCCEngine {
             crate::test_failpoints::pk_hot_rows_fetched();
             let schema = store.schema();
             let mgr = self.get_or_create_segment_manager(table_name);
-            if mgr.has_segments() {
-                let found_ids: rustc_hash::FxHashSet<i64> =
-                    result.iter().map(|(id, _)| *id).collect();
-                for &rid in row_ids {
-                    if !found_ids.contains(&rid) {
-                        if let Some(row) = mgr.get_cold_row_normalized(rid, &schema)? {
-                            result.push((rid, row));
+            // Hot rows found before the truncate count are read again after
+            // it, and a truncate around the cold read is waited out and retried
+            let mut stale = !result.is_empty();
+            loop {
+                let begun = mgr.destructions_begun();
+                if mgr.is_destruction_in_progress() {
+                    while mgr.is_destruction_in_progress() {
+                        #[cfg(feature = "test-failpoints")]
+                        crate::test_failpoints::destruction_waited();
+                        std::thread::yield_now();
+                    }
+                    stale = true;
+                    continue;
+                }
+                if stale {
+                    result = store.get_visible_versions_batch(row_ids, read_txn_id);
+                }
+                stale = true;
+                if mgr.has_segments() {
+                    let found_ids: rustc_hash::FxHashSet<i64> =
+                        result.iter().map(|(id, _)| *id).collect();
+                    for &rid in row_ids {
+                        if !found_ids.contains(&rid) {
+                            if let Some(row) = mgr.get_cold_row_normalized(rid, &schema)? {
+                                result.push((rid, row));
+                            }
                         }
                     }
+                }
+                if !mgr.is_destruction_in_progress() && mgr.destructions_begun() == begun {
+                    break;
                 }
             }
             // The manager was found by name: the table under it must still
@@ -8095,6 +8430,48 @@ impl Drop for CleanupHandle {
     }
 }
 
+/// See MVCCEngine::close_for_column_change; the caller holds the DDL guard
+fn close_and_settle(
+    version_stores: &RwLock<FxHashMap<String, Arc<VersionStore>>>,
+    segment_managers: &RwLock<
+        FxHashMap<String, Arc<crate::storage::volume::manifest::SegmentManager>>,
+    >,
+    persistence: &Option<PersistenceManager>,
+    registry: &TransactionRegistry,
+    table_name: &str,
+) -> Result<super::version_store::ColumnClosure> {
+    const SETTLE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+    let name = to_lowercase_cow(table_name);
+    let store = version_stores
+        .read()
+        .map_err(|_| Error::internal("version stores lock poisoned"))?
+        .get(name.as_ref())
+        .cloned()
+        .ok_or_else(|| Error::TableNotFound(name.to_string()))?;
+    // Before the close: what maintenance prepares from now on carries it
+    if let Some(mgr) = column_change_manager(segment_managers, persistence, name.as_ref())? {
+        mgr.advance_definition_epoch();
+    }
+    let closure = super::version_store::ColumnClosure::close(store);
+    #[cfg(feature = "test-failpoints")]
+    crate::test_failpoints::column_change_waiting();
+    let deadline = std::time::Instant::now() + SETTLE_WAIT;
+    let refused = || Error::TableHasOpenTransactionRows {
+        table: name.to_string(),
+    };
+    if !closure.store().wait_until_quiet(deadline) {
+        return Err(refused());
+    }
+    let open = |txn_id: i64| txn_id > 0 && registry.is_open(txn_id);
+    while closure.store().holds_versions_of(&open) {
+        if std::time::Instant::now() >= deadline {
+            return Err(refused());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Ok(closure)
+}
+
 /// Engine operations for transaction callbacks
 ///
 /// Holds Arc references to shared engine state, allowing safe access
@@ -8119,6 +8496,8 @@ struct EngineOperations {
     seal_fence: Arc<parking_lot::RwLock<()>>,
     /// Hot size limits shared with the engine
     hot_limits: Arc<HotLimits>,
+    /// The engine's DDL guard and schema epoch
+    ddl: Arc<DdlShared>,
 }
 
 // EngineOperations is Send + Sync because all fields are Arc-wrapped thread-safe types
@@ -8135,6 +8514,7 @@ impl EngineOperations {
             segment_managers: Arc::clone(&engine.segment_managers),
             seal_fence: Arc::clone(&engine.seal_fence),
             hot_limits: Arc::clone(&engine.hot_limits),
+            ddl: Arc::clone(&engine.ddl),
         }
     }
 
@@ -8169,6 +8549,8 @@ impl EngineOperations {
         version_store: &Arc<VersionStore>,
         mgr: &Arc<crate::storage::volume::manifest::SegmentManager>,
     ) -> Result<()> {
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::cold_rechecked();
         let store = txn_store.read().unwrap();
         let Some(local) = store.local_versions_ref() else {
             return Ok(());
@@ -8258,11 +8640,7 @@ impl EngineOperations {
                             return Err(crate::core::Error::UniqueConstraint {
                                 index: col_names.join("_"),
                                 column: col_names.join(", "),
-                                value: values
-                                    .iter()
-                                    .map(|v| v.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(", "),
+                                value: coerced.into(),
                                 row_id: cold_rid,
                             });
                         }
@@ -8332,11 +8710,7 @@ impl EngineOperations {
                             return Err(crate::core::Error::UniqueConstraint {
                                 index: col_names.join("_"),
                                 column: col_names.join(", "),
-                                value: values
-                                    .iter()
-                                    .map(|v| v.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(", "),
+                                value: coerced.into(),
                                 row_id: cold_rid,
                             });
                         }
@@ -8940,31 +9314,38 @@ impl TransactionEngineOperations for EngineOperations {
                     .get(table_name.as_str())
                     .cloned()
             });
+            // A column change in progress refuses the commit before the
+            // volumes are read through its half-moved layout
+            let schema_generation = mgr_for_commit.as_ref().map(|mgr| mgr.schema_generation());
+            if let Some((mgr, generation)) = mgr_for_commit.as_ref().zip(schema_generation) {
+                if let Err(e) = mgr.check_schema_generation(generation) {
+                    commit_error = Some(e);
+                    break;
+                }
+            }
+
             // Always take fence if manager exists — even before first seal
             // completes, the manager may exist without has_segments() being
             // true yet (created before register_volume publishes the flag).
             let _seal_guard = mgr_for_commit.as_ref().map(|mgr| mgr.acquire_seal_read());
 
-            // Cold revalidation: only when a seal happened since our INSERT.
-            if let Some(mgr) = mgr_for_commit.as_ref() {
-                let recorded = mgr.get_txn_seal_generation(txn_id);
-                let needs_recheck = match recorded {
-                    Some(gen) => gen != mgr.seal_generation(),
-                    // No recorded generation but segments exist: txn started
-                    // before first seal or used hot-only path. Must recheck.
-                    None => mgr.has_segments(),
-                };
-                if needs_recheck {
-                    if let Err(e) =
+            // Cold revalidation: unless every write was checked at the
+            // generation the commit sees, and no column change came since
+            if let Some((mgr, generation)) = mgr_for_commit.as_ref().zip(schema_generation) {
+                let checked = mgr.check_schema_generation(generation).and_then(|()| {
+                    if mgr.txn_needs_cold_recheck(txn_id) {
                         self.validate_pending_against_cold(txn_id, txn_store, version_store, mgr)
-                    {
-                        commit_error = Some(e);
-                        break;
+                    } else {
+                        Ok(())
                     }
+                });
+                if let Err(e) = checked {
+                    commit_error = Some(e);
+                    break;
                 }
             }
 
-            if let Err(e) = table.commit() {
+            if let Err(e) = table.commit_published() {
                 commit_error = Some(e);
                 break;
             }
@@ -9105,6 +9486,28 @@ impl TransactionEngineOperations for EngineOperations {
                 }
             }
         }
+    }
+
+    fn change_column_definition(
+        &self,
+        table_name: &str,
+        apply: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let _ddl = self.ddl.serial.lock();
+        let mut change =
+            begin_column_change(&self.segment_managers, &self.persistence, table_name)?;
+        let _closed = close_and_settle(
+            &self.version_stores,
+            &self.segment_managers,
+            &self.persistence,
+            &self.registry,
+            table_name,
+        )?;
+        apply()?;
+        change.mark_changed();
+        refresh_schema(&self.version_stores, &self.schemas, &self.ddl, table_name)?;
+        change.finish();
+        Ok(())
     }
 
     fn rollback_dml_after(&self, txn_id: i64, timestamp: i64) {
@@ -9275,6 +9678,47 @@ fn applied_commit_seq(
         .get(&row_id)
         .copied()
         .filter(|&commit_seq| snapshot_limit.is_none_or(|limit| commit_seq < limit))
+}
+
+/// A volume outside a compaction's batch, with the id range its manifest
+/// entry records when it still has one
+type OutsideVolume = (
+    Arc<crate::storage::volume::writer::FrozenVolume>,
+    Option<(i64, i64)>,
+);
+
+/// The ids of `candidates` of which a volume in `outside` holds a copy,
+/// dead copies included. Only candidates in a volume's range are looked
+/// for; a volume whose ids ascend is searched, one whose order is not
+/// decided and whose ids do not ascend is walked, so no permutation is
+/// built for it
+fn held_outside(outside: &[OutsideVolume], candidates: &FxHashSet<i64>) -> FxHashSet<i64> {
+    let mut held = FxHashSet::default();
+    for (volume, bounds) in outside {
+        if held.len() == candidates.len() {
+            break;
+        }
+        let in_range: FxHashSet<i64> = candidates
+            .iter()
+            .copied()
+            .filter(|id| !held.contains(id))
+            .filter(|id| bounds.is_none_or(|(lo, hi)| (lo..=hi).contains(id)))
+            .collect();
+        if in_range.is_empty() {
+            continue;
+        }
+        let ids = &volume.meta.row_ids;
+        if volume.meta.row_order.get().is_none() && !ids.is_sorted() {
+            held.extend(ids.iter().copied().filter(|id| in_range.contains(id)));
+        } else {
+            held.extend(
+                in_range
+                    .into_iter()
+                    .filter(|&id| volume.locate(id).is_some()),
+            );
+        }
+    }
+    held
 }
 
 /// Settles a compaction batch's membership: the members that size alone
@@ -9490,6 +9934,38 @@ fn close_batch_over_overlap<'a>(
 mod tests {
     use super::*;
     use crate::core::{DataType, IndexType, Row, SchemaBuilder, Value};
+
+    fn volume_holding(ids: &[i64]) -> Arc<crate::storage::volume::writer::FrozenVolume> {
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .build();
+        let mut builder = crate::storage::volume::writer::VolumeBuilder::new(&schema);
+        for &id in ids {
+            builder.add_row(id, &Row::from_values(vec![Value::Integer(id)]));
+        }
+        Arc::new(builder.finish().unwrap())
+    }
+
+    #[test]
+    fn a_tombstone_held_by_a_volume_left_out_of_the_batch_is_not_applied() {
+        // The batch is the selection alone; the older volume that holds a
+        // copy of 7 waits outside it, as the base does behind a recluster
+        let waiting = volume_holding(&[1, 3, 7, 9]);
+        let other = volume_holding(&[20, 30]);
+        let candidates: FxHashSet<i64> = [7, 8, 25].into_iter().collect();
+        let held = held_outside(
+            &[
+                (Arc::clone(&other), Some((20, 30))),
+                (Arc::clone(&waiting), None),
+            ],
+            &candidates,
+        );
+        assert_eq!(held, [7].into_iter().collect(), "8 and 25 fall in no copy");
+        assert!(held_outside(&[(other, Some((20, 30)))], &candidates).is_empty());
+        assert!(held_outside(&[], &candidates).is_empty());
+        // The recorded range decides before any id is read
+        assert!(held_outside(&[(waiting, Some((100, 200)))], &candidates).is_empty());
+    }
 
     #[test]
     fn a_clustered_seal_classifies_its_rows_in_id_order() {

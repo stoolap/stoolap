@@ -23,6 +23,12 @@ use std::sync::{Mutex, MutexGuard};
 /// Fail WAL `write_to_file()` with an I/O error
 pub static WAL_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
 
+/// Write the WAL buffer but its last 5 bytes, then fail the write
+pub static WAL_WRITE_PARTIAL: AtomicBool = AtomicBool::new(false);
+
+/// Fail the cut of a WAL file back to a length after a failure
+pub static WAL_CUT_FAIL: AtomicBool = AtomicBool::new(false);
+
 /// Fail WAL `sync_locked()` (fsync) with an I/O error
 pub static WAL_SYNC_FAIL: AtomicBool = AtomicBool::new(false);
 
@@ -250,6 +256,317 @@ pub(crate) fn side_files_built() {
     if let Some(hook) = hook {
         hook();
     }
+}
+
+thread_local! {
+    static SEAL_VOLUMES_BUILT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static COMPACTION_OUTPUTS_BUILT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static COMPACTION_PLANNED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static COMPACTION_PUBLISHED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static MANIFESTS_PERSISTED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static BETWEEN_COUNT_CAPTURES_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static SEGMENTS_CLEARING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static TRUNCATE_COLD_CLEARED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static DESTRUCTION_WAIT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static HOT_COLD_READS_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static UNSEALED_READ_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static CLEAR_GENERATION_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static TRUNCATE_MARKED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static COUNT_CAPTURED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static GC_ROWS_REMOVED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static COLUMN_CHANGE_WAITING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static SEAL_PASSED_CHANGING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static COMMIT_COUNTED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+static STALE_PUBLICATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Run once on this thread when its next seal built its volumes, before it
+/// takes the DDL guard to publish them
+pub fn after_seal_volumes_built(hook: impl FnOnce() + 'static) {
+    SEAL_VOLUMES_BUILT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn seal_volumes_built() {
+    let hook = SEAL_VOLUMES_BUILT_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next compaction built its outputs,
+/// before it takes the DDL guard to publish them
+pub fn after_compaction_outputs_built(hook: impl FnOnce() + 'static) {
+    COMPACTION_OUTPUTS_BUILT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn compaction_outputs_built() {
+    let hook = COMPACTION_OUTPUTS_BUILT_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next compaction settled its batch,
+/// before it loads the members and reads the tombstones it applies
+pub fn after_compaction_planned(hook: impl FnOnce() + 'static) {
+    COMPACTION_PLANNED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn compaction_planned() {
+    let hook = COMPACTION_PLANNED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next checkpoint wrote the manifests,
+/// before it truncates the log and compacts
+pub fn after_checkpoint_manifests_persisted(hook: impl FnOnce() + 'static) {
+    MANIFESTS_PERSISTED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn checkpoint_manifests_persisted() {
+    let hook = MANIFESTS_PERSISTED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next compaction published its
+/// outputs, before it removes the tombstones it applied
+pub fn after_compaction_published(hook: impl FnOnce() + 'static) {
+    COMPACTION_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn compaction_published() {
+    let hook = COMPACTION_PUBLISHED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next live row recount captured both
+/// maps it counts, before it counts them
+pub fn after_count_captured(hook: impl FnOnce() + 'static) {
+    COUNT_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn count_captured() {
+    let hook = COUNT_CAPTURED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next segment set clearing emptied
+/// everything and has not moved the generation yet
+pub fn before_clear_generation_moves(hook: impl FnOnce() + 'static) {
+    CLEAR_GENERATION_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn clear_before_generation() {
+    let hook = CLEAR_GENERATION_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next hot-only read ran, before it
+/// checks that no truncate moved under it
+pub fn after_unsealed_read(hook: impl FnOnce() + 'static) {
+    UNSEALED_READ_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn unsealed_read() {
+    let hook = UNSEALED_READ_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next truncate marked rows as leaving,
+/// before anything decides whether it may go ahead
+pub fn after_truncate_marked(hook: impl FnOnce() + 'static) {
+    TRUNCATE_MARKED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn truncate_marked() {
+    let hook = TRUNCATE_MARKED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next read that takes the hot and the
+/// sealed rows in two steps has taken the first of them
+pub fn between_hot_and_cold_reads(hook: impl FnOnce() + 'static) {
+    HOT_COLD_READS_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn hot_and_cold_reads_split() {
+    let hook = HOT_COLD_READS_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next read waits for a truncate that
+/// is taking rows away
+pub fn on_destruction_wait(hook: impl FnOnce() + 'static) {
+    DESTRUCTION_WAIT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn destruction_waited() {
+    let hook = DESTRUCTION_WAIT_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next truncate cleared the volumes and
+/// not yet the hot rows, with the hot store's claims still shut out
+pub fn after_truncate_cold_cleared(hook: impl FnOnce() + 'static) {
+    TRUNCATE_COLD_CLEARED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn truncate_cold_cleared() {
+    let hook = TRUNCATE_COLD_CLEARED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next segment set clearing is halfway:
+/// one of its segments and its tombstones is emptied, the other not yet
+pub fn during_segments_clearing(hook: impl FnOnce() + 'static) {
+    SEGMENTS_CLEARING_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn segments_clearing() {
+    let hook = SEGMENTS_CLEARING_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next live row recount took the first of
+/// the two maps it counts and not yet the second
+pub fn between_count_captures(hook: impl FnOnce() + 'static) {
+    BETWEEN_COUNT_CAPTURES_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn between_count_captures_reached() {
+    let hook = BETWEEN_COUNT_CAPTURES_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next deleted-row cleanup let go of the
+/// versions lock, before it cleans the indexes and the arena
+pub fn after_gc_rows_removed(hook: impl FnOnce() + 'static) {
+    GC_ROWS_REMOVED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn gc_rows_removed() {
+    let hook = GC_ROWS_REMOVED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next column change closed the table and
+/// starts waiting for the publications counted before
+pub fn on_column_change_waiting(hook: impl FnOnce() + 'static) {
+    COLUMN_CHANGE_WAITING_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn column_change_waiting() {
+    let hook = COLUMN_CHANGE_WAITING_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next seal passes a table by because a
+/// column change is in progress on it
+pub fn on_seal_passed_changing_table(hook: impl FnOnce() + 'static) {
+    SEAL_PASSED_CHANGING_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn seal_passed_changing_table() {
+    let hook = SEAL_PASSED_CHANGING_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next commit counted itself in the
+/// tables it publishes into, before it applies any table's versions
+pub fn after_commit_counted(hook: impl FnOnce() + 'static) {
+    COMMIT_COUNTED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn commit_counted() {
+    let hook = COMMIT_COUNTED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Seal, compaction and side file outputs discarded at their publication
+/// because a column change moved the schema since they were prepared
+pub fn stale_publications() -> usize {
+    STALE_PUBLICATIONS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+pub(crate) fn stale_publication_discarded() {
+    STALE_PUBLICATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+thread_local! {
+    static KEY_ORDER_MERGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ROW_ORDERS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static COUNT_IDS_WALKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static COUNT_BOUNDS_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Segment bounds compared on this thread to find a segment's id range
+pub fn count_bounds_probes() -> usize {
+    COUNT_BOUNDS_PROBES.with(std::cell::Cell::get)
+}
+
+pub(crate) fn count_bounds_probe() {
+    COUNT_BOUNDS_PROBES.with(|c| c.set(c.get() + 1));
+}
+
+/// Cold row ids walked on this thread to recount a table's live rows
+pub fn count_ids_walked() -> usize {
+    COUNT_IDS_WALKED.with(std::cell::Cell::get)
+}
+
+pub(crate) fn count_ids_walk(n: usize) {
+    COUNT_IDS_WALKED.with(|c| c.set(c.get() + n));
+}
+
+/// Permutations built on this thread for volumes whose ids do not ascend
+pub fn row_orders_built() -> usize {
+    ROW_ORDERS_BUILT.with(std::cell::Cell::get)
+}
+
+pub(crate) fn row_order_built() {
+    ROW_ORDERS_BUILT.with(|n| n.set(n.get() + 1));
+}
+
+/// Compactions on this thread whose inputs merged in the clustering key's
+/// order, without the sort
+pub fn key_order_merges() -> usize {
+    KEY_ORDER_MERGES.with(std::cell::Cell::get)
+}
+
+pub(crate) fn key_order_merged() {
+    KEY_ORDER_MERGES.with(|n| n.set(n.get() + 1));
 }
 
 thread_local! {
@@ -606,6 +923,40 @@ thread_local! {
     static WAL_SWAPPED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
+thread_local! {
+    static FAILURE_CLEANUP_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next WAL failure cleanup has the file
+/// lock and is about to take the retired file
+pub fn before_wal_failure_cleanup(hook: impl FnOnce() + 'static) {
+    FAILURE_CLEANUP_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn wal_failure_cleanup_starting() {
+    let hook = FAILURE_CLEANUP_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static RECORD_BUFFERED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next WAL record that flushes is in the
+/// buffer and the buffer lock is released, before its own flush
+pub fn after_record_buffered(hook: impl FnOnce() + 'static) {
+    RECORD_BUFFERED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn record_buffered() {
+    let hook = RECORD_BUFFERED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// Run once on this thread right after its next WAL file swap releases the
 /// locks, before the retired file is settled.
 pub fn after_wal_swap(hook: impl FnOnce() + 'static) {
@@ -692,6 +1043,193 @@ pub fn before_commit_index_capture(hook: impl FnOnce() + 'static) {
 
 pub(crate) fn commit_index_capture_next() {
     let hook = COMMIT_CAPTURE_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static READ_PATHS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Notes on this thread that the read entry `path` ran
+pub(crate) fn note_read(path: &'static str) {
+    READ_PATHS.with(|paths| {
+        let mut paths = paths.borrow_mut();
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    });
+}
+
+/// The read entries this thread ran since the last call, in first-run order
+pub fn take_read_paths() -> Vec<&'static str> {
+    READ_PATHS.with(|paths| std::mem::take(&mut *paths.borrow_mut()))
+}
+
+thread_local! {
+    static FK_CHILD_PROBE_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static CORRELATED_FETCH_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static ADD_COLUMN_PUBLISHED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static SNAPSHOT_SCHEMA_WRITTEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static JOIN_INDEX_CHOSEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static JOIN_NEXT_CHUNK_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static ALTER_DDL_GUARD_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static INDEX_BOUND_HOT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next index MIN or MAX over hot and
+/// sealed rows has read the hot bound and is about to read the volumes
+pub fn after_index_bound_hot(hook: impl FnOnce() + 'static) {
+    INDEX_BOUND_HOT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn index_bound_hot_read() {
+    run_hook(&INDEX_BOUND_HOT_HOOK);
+}
+
+/// Run once on this thread when its next ALTER TABLE is about to take the
+/// DDL guard
+pub fn before_alter_ddl_guard(hook: impl FnOnce() + 'static) {
+    ALTER_DDL_GUARD_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn alter_ddl_guard_next() {
+    run_hook(&ALTER_DDL_GUARD_HOOK);
+}
+
+type HookSlot = RefCell<Option<Box<dyn FnOnce()>>>;
+
+fn run_hook(slot: &'static std::thread::LocalKey<HookSlot>) {
+    let hook = slot.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next backup snapshot has written a
+/// table's schema and has not yet taken its rows
+pub fn after_snapshot_schema_written(hook: impl FnOnce() + 'static) {
+    SNAPSHOT_SCHEMA_WRITTEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn snapshot_schema_written() {
+    run_hook(&SNAPSHOT_SCHEMA_WRITTEN_HOOK);
+}
+
+/// Run once on this thread when its next join plan has taken an inner
+/// index from its planning handle, before the join opens a table to run on
+pub fn after_join_index_chosen(hook: impl FnOnce() + 'static) {
+    JOIN_INDEX_CHOSEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn join_index_chosen() {
+    run_hook(&JOIN_INDEX_CHOSEN_HOOK);
+}
+
+/// Run once on this thread when its next streaming index join has joined
+/// one outer chunk and is about to fetch the next one
+pub fn before_join_next_chunk(hook: impl FnOnce() + 'static) {
+    JOIN_NEXT_CHUNK_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn join_next_chunk() {
+    run_hook(&JOIN_NEXT_CHUNK_HOOK);
+}
+
+/// Run once on this thread when its next foreign key check is about to
+/// open a child table, its key positions already taken
+pub fn before_fk_child_probe(hook: impl FnOnce() + 'static) {
+    FK_CHILD_PROBE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn fk_child_probe_next() {
+    run_hook(&FK_CHILD_PROBE_HOOK);
+}
+
+/// Run once on this thread when its next correlated EXISTS probe has
+/// checked its token and has not yet fetched a row
+pub fn before_correlated_fetch(hook: impl FnOnce() + 'static) {
+    CORRELATED_FETCH_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn correlated_fetch_next() {
+    run_hook(&CORRELATED_FETCH_HOOK);
+}
+
+/// Run once on this thread when its next ADD COLUMN has published the
+/// schema and has not yet recorded the change or laid out the rows
+pub fn after_add_column_published(hook: impl FnOnce() + 'static) {
+    ADD_COLUMN_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn add_column_published() {
+    run_hook(&ADD_COLUMN_PUBLISHED_HOOK);
+}
+
+thread_local! {
+    static SELECT_TABLE_OPENED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next table scan SELECT has opened its
+/// table and has not yet read a row
+pub fn after_select_table_opened(hook: impl FnOnce() + 'static) {
+    SELECT_TABLE_OPENED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn select_table_opened() {
+    let hook = SELECT_TABLE_OPENED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static COMMIT_MARKER_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next commit has published its tables
+/// and has not yet written its commit marker
+pub fn before_commit_marker(hook: impl FnOnce() + 'static) {
+    COMMIT_MARKER_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn commit_marker_next() {
+    let hook = COMMIT_MARKER_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static DROP_HOT_PUBLISHED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next DROP COLUMN has published the hot
+/// rows without the column and has not yet moved the cold mappings
+pub fn after_drop_hot_published(hook: impl FnOnce() + 'static) {
+    DROP_HOT_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn drop_hot_published() {
+    let hook = DROP_HOT_PUBLISHED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static DROP_RECORDED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next DROP COLUMN has recorded the drop
+/// in the log and has not yet published the table without the column
+pub fn after_drop_column_recorded(hook: impl FnOnce() + 'static) {
+    DROP_RECORDED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn drop_column_recorded() {
+    let hook = DROP_RECORDED_HOOK.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
         hook();
     }
@@ -821,6 +1359,9 @@ thread_local! {
     static VOLUME_FILE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SEGMENT_MAP_CLONES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ROW_ID_ORDER_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TOP_K_COLD_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GROUP_CACHE_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GROUP_COLUMN_DECODES: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
     static COLD_MAP_CAPTURED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
@@ -853,10 +1394,158 @@ pub fn after_cold_round_prepared(hook: impl FnOnce() + 'static) {
 }
 
 pub(crate) fn cold_round_prepared() {
+    COLD_ROUNDS.with(|n| n.set(n.get() + 1));
     let hook = COLD_ROUND_PREPARED_HOOK.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
         hook();
     }
+}
+
+thread_local! {
+    static COLD_ROUND_SETTLED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static COLD_ROUND_SNAPSHOT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when an UPDATE's cold round has read its
+/// settled generation and not yet taken its snapshot
+pub fn before_cold_round_snapshot(hook: impl FnOnce() + 'static) {
+    COLD_ROUND_SNAPSHOT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn cold_round_snapshot_starting() {
+    let hook = COLD_ROUND_SNAPSHOT_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when an UPDATE's cold round stood its checks
+/// under the seal fence, before the rows are claimed
+pub fn after_cold_round_settled(hook: impl FnOnce() + 'static) {
+    COLD_ROUND_SETTLED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn cold_round_settled() {
+    let hook = COLD_ROUND_SETTLED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static COLD_ROUNDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SEAL_FENCE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BLOCK_FILE_READS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    static VOLUME_FILE_READS_BY_DEPTH: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+    static SIDE_FILE_READS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Cold rounds this thread's UPDATEs prepared outside the seal fence
+pub fn cold_rounds() -> usize {
+    COLD_ROUNDS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn seal_fence_entered() {
+    SEAL_FENCE_DEPTH.with(|d| d.set(d.get() + 1));
+}
+
+pub(crate) fn seal_fence_left() {
+    SEAL_FENCE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+}
+
+/// One more read in `counter`, as (outside, under) the seal fence
+fn count_by_fence_depth(counter: &'static std::thread::LocalKey<std::cell::Cell<(usize, usize)>>) {
+    let under = SEAL_FENCE_DEPTH.with(std::cell::Cell::get) > 0;
+    counter.with(|c| {
+        let (outside, inside) = c.get();
+        c.set(if under {
+            (outside, inside + 1)
+        } else {
+            (outside + 1, inside)
+        });
+    });
+}
+
+/// Row group blocks this thread read from volume files, (outside, under)
+/// the seal fence
+pub fn block_file_reads() -> (usize, usize) {
+    BLOCK_FILE_READS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn block_file_read() {
+    count_by_fence_depth(&BLOCK_FILE_READS);
+}
+
+/// Volume files this thread read whole, (outside, under) the seal fence
+pub fn volume_file_reads_by_fence() -> (usize, usize) {
+    VOLUME_FILE_READS_BY_DEPTH.with(std::cell::Cell::get)
+}
+
+/// Side file reads this thread made, (outside, under) the seal fence
+pub fn side_file_reads() -> (usize, usize) {
+    SIDE_FILE_READS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn side_file_read() {
+    count_by_fence_depth(&SIDE_FILE_READS);
+}
+
+thread_local! {
+    static COLD_CLAIM_TAKEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static COLD_ONLY_CLAIMED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next cold UPDATE has claimed a
+/// prepared row and not yet claimed the next one
+pub fn after_cold_claim_taken(hook: impl FnOnce() + 'static) {
+    COLD_CLAIM_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn cold_claim_taken() {
+    let hook = COLD_CLAIM_TAKEN_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next delete by id has claimed the
+/// rows only a volume holds and not yet written their delete markers
+pub fn after_cold_only_rows_claimed(hook: impl FnOnce() + 'static) {
+    COLD_ONLY_CLAIMED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn cold_only_rows_claimed() {
+    let hook = COLD_ONLY_CLAIMED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static UNIQUE_PAIRS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Pairs of an UPDATE's planned rows this thread compared for one unique key
+pub fn unique_pairs_compared() -> usize {
+    UNIQUE_PAIRS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn unique_pair_compared() {
+    UNIQUE_PAIRS.with(|n| n.set(n.get() + 1));
+}
+
+thread_local! {
+    static COLD_RECHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Commits on this thread that rechecked a table's keys against its volumes
+pub fn cold_rechecks() -> usize {
+    COLD_RECHECKS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn cold_rechecked() {
+    COLD_RECHECKS.with(|n| n.set(n.get() + 1));
 }
 
 /// Segment maps this thread copied to publish reloaded volumes
@@ -923,6 +1612,34 @@ pub(crate) fn row_id_order_scanned() {
     ROW_ID_ORDER_SCANS.with(|n| n.set(n.get() + 1));
 }
 
+/// Sealed rows this thread's ordered top-k scans built, so far
+pub fn top_k_cold_rows() -> usize {
+    TOP_K_COLD_ROWS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn top_k_cold_row_built() {
+    TOP_K_COLD_ROWS.with(|n| n.set(n.get() + 1));
+}
+
+/// Row groups whose needed columns this thread's volume scanners loaded
+pub fn group_cache_loads() -> usize {
+    GROUP_CACHE_LOADS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn group_cache_loaded() {
+    GROUP_CACHE_LOADS.with(|n| n.set(n.get() + 1));
+}
+
+/// The (column, row group) blocks this thread decoded since the last call,
+/// in order; taking them clears the record
+pub fn take_group_column_decodes() -> Vec<(usize, usize)> {
+    GROUP_COLUMN_DECODES.with(|d| std::mem::take(&mut *d.borrow_mut()))
+}
+
+pub(crate) fn group_column_decoded(col: usize, group: usize) {
+    GROUP_COLUMN_DECODES.with(|d| d.borrow_mut().push((col, group)));
+}
+
 thread_local! {
     static SMALL_OUTER_JOINS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static JOIN_SIDE_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -974,12 +1691,15 @@ pub(crate) fn volume_load_requested() {
 
 pub(crate) fn volume_file_read() {
     VOLUME_FILE_READS.with(|n| n.set(n.get() + 1));
+    count_by_fence_depth(&VOLUME_FILE_READS_BY_DEPTH);
 }
 
 /// Reset all failpoints to disabled state
 pub fn reset_all() {
     use std::sync::atomic::Ordering::Release;
     WAL_WRITE_FAIL.store(false, Release);
+    WAL_WRITE_PARTIAL.store(false, Release);
+    WAL_CUT_FAIL.store(false, Release);
     WAL_SYNC_FAIL.store(false, Release);
     WAL_SCAN_READ_FAIL.store(false, Release);
     SNAPSHOT_WRITE_FAIL.store(false, Release);
@@ -992,18 +1712,61 @@ pub fn reset_all() {
     WAL_SYNC_HOOK.with(|slot| *slot.borrow_mut() = None);
     WAL_SWAP_HOOK.with(|slot| *slot.borrow_mut() = None);
     WAL_SWAPPED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    RECORD_BUFFERED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    FAILURE_CLEANUP_HOOK.with(|slot| *slot.borrow_mut() = None);
     RETIRED_SETTLING_HOOK.with(|slot| *slot.borrow_mut() = None);
     RETIRED_AWAITED_HOOK.with(|slot| *slot.borrow_mut() = None);
     WAL_DIRECTORY_SYNC_HOOK.with(|slot| *slot.borrow_mut() = None);
     INDEXES_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = None);
     VOLUME_LOAD_REQUESTS.with(|n| n.set(0));
+    KEY_ORDER_MERGES.with(|n| n.set(0));
+    ROW_ORDERS_BUILT.with(|n| n.set(0));
+    COUNT_IDS_WALKED.with(|n| n.set(0));
+    COUNT_BOUNDS_PROBES.with(|n| n.set(0));
     VOLUME_FILE_READS.with(|n| n.set(0));
     SEGMENT_MAP_CLONES.with(|n| n.set(0));
     COLD_MAP_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = None);
     UNIQUE_INDEX_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     STATEMENT_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_ROUND_PREPARED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    SEAL_VOLUMES_BUILT_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COMPACTION_OUTPUTS_BUILT_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COMPACTION_PLANNED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COMPACTION_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    MANIFESTS_PERSISTED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    BETWEEN_COUNT_CAPTURES_HOOK.with(|slot| *slot.borrow_mut() = None);
+    SEGMENTS_CLEARING_HOOK.with(|slot| *slot.borrow_mut() = None);
+    TRUNCATE_COLD_CLEARED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    DESTRUCTION_WAIT_HOOK.with(|slot| *slot.borrow_mut() = None);
+    HOT_COLD_READS_HOOK.with(|slot| *slot.borrow_mut() = None);
+    UNSEALED_READ_HOOK.with(|slot| *slot.borrow_mut() = None);
+    CLEAR_GENERATION_HOOK.with(|slot| *slot.borrow_mut() = None);
+    TRUNCATE_MARKED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COUNT_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    GC_ROWS_REMOVED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COLUMN_CHANGE_WAITING_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COMMIT_COUNTED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    SEAL_PASSED_CHANGING_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COLD_ROUND_SETTLED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COLD_ROUND_SNAPSHOT_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_READS_FORGET.store(false, Release);
+    SELECT_TABLE_OPENED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    READ_PATHS.with(|paths| paths.borrow_mut().clear());
+    FK_CHILD_PROBE_HOOK.with(|slot| *slot.borrow_mut() = None);
+    CORRELATED_FETCH_HOOK.with(|slot| *slot.borrow_mut() = None);
+    ADD_COLUMN_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    SNAPSHOT_SCHEMA_WRITTEN_HOOK.with(|slot| *slot.borrow_mut() = None);
+    JOIN_INDEX_CHOSEN_HOOK.with(|slot| *slot.borrow_mut() = None);
+    JOIN_NEXT_CHUNK_HOOK.with(|slot| *slot.borrow_mut() = None);
+    ALTER_DDL_GUARD_HOOK.with(|slot| *slot.borrow_mut() = None);
+    INDEX_BOUND_HOT_HOOK.with(|slot| *slot.borrow_mut() = None);
+    JOIN_INNER_OPENED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    DROP_RECORDED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    DROP_HOT_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COLD_CLAIM_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COLD_ONLY_CLAIMED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    UNIQUE_PAIRS.with(|n| n.set(0));
+    COLD_RECHECKS.with(|n| n.set(0));
 }
 
 /// RAII guard that serializes failpoint tests and resets all failpoints on drop.

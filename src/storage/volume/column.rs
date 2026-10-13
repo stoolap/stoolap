@@ -642,40 +642,76 @@ impl ColumnData {
         }
     }
 
-    /// Appends to `out` the offsets in `0..count` whose rows, read at
-    /// `local + offset` in every column of `filters`, carry the expected
-    /// dictionary id and are not null. One tight pass over the first
-    /// column's raw ids; the other columns are only read for its matches.
-    /// None when a filter column is not a dictionary column.
+    /// Appends to `out`, in increasing order, the offsets in `0..count` whose
+    /// rows, read at `local + offset` in every column of `filters`, carry the
+    /// expected dictionary id and are not null. One branch-free pass over the
+    /// lead column's raw ids, 16 at a time; the other columns are only read
+    /// for its matches. None, with `out` untouched, when a filter column is
+    /// not a dictionary column or its window runs past its rows.
     pub fn dict_matching_offsets(
         filters: &[DictFilter<'_>],
         count: usize,
         out: &mut Vec<usize>,
     ) -> Option<()> {
+        const SAMPLE: usize = 64;
         let mut slices: smallvec::SmallVec<[DictSlice<'_>; 4]> =
             smallvec::SmallVec::with_capacity(filters.len());
         for &(col, local, expected) in filters {
             let (ids, nulls) = col.dict_ids()?;
-            if local + count > ids.len() {
+            if local + count > ids.len().min(nulls.len()) {
                 return None;
             }
             slices.push((ids, nulls, local, expected));
         }
-        let Some(&(first_ids, first_nulls, first_local, first_expected)) = slices.first() else {
+        if slices.is_empty() {
             out.extend(0..count);
             return Some(());
-        };
-        let window = &first_ids[first_local..first_local + count];
-        for (offset, &id) in window.iter().enumerate() {
-            if id != first_expected || first_nulls[first_local + offset] {
-                continue;
-            }
-            let others = slices[1..].iter().all(|&(ids, nulls, local, expected)| {
+        }
+        // The filter with the fewest hits on sampled rows leads. The rows
+        // follow the golden ratio, so no power-of-two period lines up with them
+        if slices.len() > 1 && count >= 2 * SAMPLE {
+            let hits = |&(ids, _, local, expected): &DictSlice<'_>| {
+                (0..SAMPLE as u32)
+                    .filter(|&s| {
+                        let fraction = u128::from(s.wrapping_mul(0x9E37_79B9));
+                        let at = ((fraction * count as u128) >> 32) as usize;
+                        ids[local + at] == expected
+                    })
+                    .count()
+            };
+            let lead = (0..slices.len())
+                .min_by_key(|&i| hits(&slices[i]))
+                .unwrap_or(0);
+            slices.swap(0, lead);
+        }
+        let (lead_ids, lead_nulls, lead_local, lead_expected) = slices[0];
+        let others = &slices[1..];
+        let passes = |offset: usize| {
+            others.iter().all(|&(ids, nulls, local, expected)| {
                 let at = local + offset;
                 ids[at] == expected && !nulls[at]
-            });
-            if others {
-                out.push(offset);
+            })
+        };
+        let (id_chunks, id_tail) = lead_ids[lead_local..lead_local + count].as_chunks::<16>();
+        let (null_chunks, null_tail) = lead_nulls[lead_local..lead_local + count].as_chunks::<16>();
+        let mut base = 0;
+        for (ids, nulls) in id_chunks.iter().zip(null_chunks) {
+            let mut mask = 0u32;
+            for (lane, &id) in ids.iter().enumerate() {
+                mask |= u32::from(id == lead_expected) << lane;
+            }
+            while mask != 0 {
+                let lane = mask.trailing_zeros() as usize & 15;
+                mask &= mask - 1;
+                if !nulls[lane] && passes(base + lane) {
+                    out.push(base + lane);
+                }
+            }
+            base += 16;
+        }
+        for (lane, (&id, &null)) in id_tail.iter().zip(null_tail).enumerate() {
+            if id == lead_expected && !null && passes(base + lane) {
+                out.push(base + lane);
             }
         }
         Some(())
@@ -1049,6 +1085,144 @@ mod tests {
         assert!(ColumnData::dict_matching_offsets(&[(&ints, 0, 1)], 1, &mut out).is_none());
         ColumnData::dict_matching_offsets(&[], 3, &mut out).expect("no filters");
         assert_eq!(out, vec![0, 1, 2]);
+    }
+
+    fn dictionary_column(width: u32, len: usize, seed: u64, dense: u32) -> ColumnData {
+        let dictionary: Arc<[SmartString]> = (0..width)
+            .map(|i| SmartString::from(format!("v{i}").as_str()))
+            .collect::<Vec<_>>()
+            .into();
+        let mut state = seed;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as u32
+        };
+        let mut ids = Vec::with_capacity(len);
+        let mut nulls = Vec::with_capacity(len);
+        for _ in 0..len {
+            // `dense` in ten rows of eleven, the rest spread over the dictionary
+            let roll = next();
+            ids.push(if roll % 11 < 10 { dense } else { roll % width });
+            nulls.push(next() % 23 == 0);
+        }
+        ColumnData::Dictionary {
+            ids,
+            dictionary,
+            nulls,
+        }
+    }
+
+    fn scalar_matches(filters: &[DictFilter<'_>], count: usize) -> Vec<usize> {
+        (0..count)
+            .filter(|&offset| {
+                filters.iter().all(|&(col, local, expected)| {
+                    let (ids, nulls) = col.dict_ids().expect("dictionary columns");
+                    ids[local + offset] == expected && !nulls[local + offset]
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dict_matching_offsets_agrees_with_one_row_at_a_time() {
+        let len = 70_100;
+        // A small dictionary whose key is dense and a large one whose key is
+        // rare, then the reverse
+        let shapes = [
+            (
+                dictionary_column(2, len, 1, 0),
+                dictionary_column(232, len, 2, 7),
+            ),
+            (
+                dictionary_column(2, len, 3, 7 % 2),
+                dictionary_column(232, len, 4, 7),
+            ),
+            (
+                dictionary_column(232, len, 5, 7),
+                dictionary_column(2, len, 6, 1),
+            ),
+        ];
+        for (small, large) in &shapes {
+            for count in [
+                0, 1, 15, 16, 17, 31, 33, 63, 64, 65, 127, 128, 129, 65_536, 70_000,
+            ] {
+                for (lead_local, other_local) in [(0, 0), (3, 17), (100, 1)] {
+                    for expected in [0, 1, 7] {
+                        let pairs = [
+                            vec![
+                                (small, lead_local, expected % 2),
+                                (large, other_local, expected),
+                            ],
+                            vec![
+                                (large, other_local, expected),
+                                (small, lead_local, expected % 2),
+                            ],
+                            vec![(large, lead_local, expected)],
+                            vec![(small, other_local, expected % 2)],
+                        ];
+                        for filters in &pairs {
+                            let filters: Vec<DictFilter<'_>> =
+                                filters.iter().map(|&(c, l, e)| (c, l, e)).collect();
+                            let mut out = vec![usize::MAX, 42];
+                            ColumnData::dict_matching_offsets(&filters, count, &mut out)
+                                .expect("dictionary columns");
+                            assert_eq!(&out[..2], &[usize::MAX, 42], "kept what out held");
+                            assert_eq!(
+                                out[2..],
+                                scalar_matches(&filters, count)[..],
+                                "count {count}, locals {lead_local}/{other_local}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dict_matching_offsets_agrees_on_a_periodic_layout() {
+        let periodic = |hit: fn(u32) -> bool| ColumnData::Dictionary {
+            ids: (0..70_000u32).map(|i| u32::from(!hit(i))).collect(),
+            dictionary: vec![SmartString::from("a"), SmartString::from("b")].into(),
+            nulls: (0..70_000u32).map(|i| i % 4096 == 2048).collect(),
+        };
+        let rare = periodic(|i| i % 1024 == 0);
+        let dense = periodic(|i| i % 1024 != 1);
+        for count in [65, 1_024, 65_536, 70_000] {
+            for filters in [
+                [(&rare, 0, 0), (&dense, 0, 0)],
+                [(&dense, 0, 0), (&rare, 0, 0)],
+            ] {
+                let mut out = Vec::new();
+                ColumnData::dict_matching_offsets(&filters, count, &mut out)
+                    .expect("dictionary columns");
+                assert_eq!(out, scalar_matches(&filters, count), "count {count}");
+            }
+        }
+    }
+
+    #[test]
+    fn dict_matching_offsets_leaves_out_untouched_when_it_declines() {
+        let col = dictionary_column(232, 40, 9, 3);
+        let ints = ColumnData::Int64 {
+            values: vec![1; 40],
+            nulls: vec![false; 40],
+        };
+        let mut out = vec![5, 6];
+        assert!(
+            ColumnData::dict_matching_offsets(&[(&col, 0, 3), (&ints, 0, 1)], 40, &mut out)
+                .is_none()
+        );
+        assert!(ColumnData::dict_matching_offsets(&[(&col, 1, 3)], 40, &mut out).is_none());
+        assert!(
+            ColumnData::dict_matching_offsets(&[(&col, 0, 3), (&col, 25, 3)], 16, &mut out)
+                .is_none()
+        );
+        assert_eq!(out, vec![5, 6], "nothing appended on a decline");
+        ColumnData::dict_matching_offsets(&[], 17, &mut out).expect("no filters");
+        assert_eq!(out, [5, 6].into_iter().chain(0..17).collect::<Vec<_>>());
     }
 
     #[test]

@@ -790,6 +790,235 @@ fn compute_visibility_bitmaps(
     }
 }
 
+/// The visibility of a compaction's `outputs` in `segments`, ordered as
+/// `seg_order` (ascending), `bounds` the id range of each from the manifest:
+/// each output masked by the live copies of the segments after it. The
+/// others keep theirs: the batch is closed over overlap and no copy outside
+/// it outlives a tombstone it applies, so nothing that masked them is gone
+fn mask_outputs(
+    seg_order: &[u64],
+    outputs: &[u64],
+    bounds: &rustc_hash::FxHashMap<u64, (i64, i64)>,
+    segments: &mut rustc_hash::FxHashMap<u64, ColdSegment>,
+) {
+    for (position, seg_id) in seg_order.iter().enumerate() {
+        if !outputs.contains(seg_id) {
+            continue;
+        }
+        let Some(output) = segments.get(seg_id).map(|cs| Arc::clone(&cs.volume)) else {
+            continue;
+        };
+        let Some(range) = bounds.get(seg_id).copied().or_else(|| output.id_bounds()) else {
+            continue;
+        };
+        let mut bits: Option<Vec<u64>> = None;
+        for newer_id in &seg_order[position + 1..] {
+            let Some(newer) = segments.get(newer_id) else {
+                continue;
+            };
+            let shared = match bounds.get(newer_id) {
+                Some(&(lo, hi)) if hi < range.0 || range.1 < lo => continue,
+                Some(&(lo, hi)) => (lo.max(range.0), hi.min(range.1)),
+                None => range,
+            };
+            shadow_output(
+                &output,
+                &newer.volume,
+                newer.dead.as_deref(),
+                shared,
+                |pos| {
+                    let bits = bits.get_or_insert_with(|| bits_without(output.meta.row_count, &[]));
+                    bits[pos >> 6] &= !(1u64 << (pos & 63));
+                },
+            );
+        }
+        if let Some(cs) = segments.get_mut(seg_id) {
+            cs.visible = bits.map(Arc::new);
+        }
+    }
+    debug_assert!(
+        same_as_full_pass(seg_order, segments),
+        "a compaction's publication changed a bitmap the full pass would set otherwise"
+    );
+}
+
+/// The id range each manifest entry records, by segment
+fn segment_bounds<'a>(
+    metas: impl IntoIterator<Item = &'a SegmentMeta>,
+) -> rustc_hash::FxHashMap<u64, (i64, i64)> {
+    metas
+        .into_iter()
+        .map(|m| (m.segment_id, (m.min_row_id, m.max_row_id)))
+        .collect()
+}
+
+/// Calls `hide` with each position of `output` whose id, within `(lo, hi)`,
+/// `newer` holds a live copy of. No permutation is built for `newer`: it is
+/// searched only when its order is decided already, else its ids are walked
+/// and located in the output, whose order its build decided
+fn shadow_output(
+    output: &FrozenVolume,
+    newer: &FrozenVolume,
+    dead: Option<&[u32]>,
+    (lo, hi): (i64, i64),
+    mut hide: impl FnMut(usize),
+) {
+    let live = |pos: usize| dead.is_none_or(|dead| dead.binary_search(&(pos as u32)).is_err());
+    if newer.meta.row_order.get().is_some() && output.meta.row_count < newer.meta.row_count {
+        for (pos, &id) in output.meta.row_ids.iter().enumerate() {
+            if (lo..=hi).contains(&id) && newer.locate(id).is_some_and(live) {
+                hide(pos);
+            }
+        }
+    } else {
+        for (newer_pos, &id) in newer.meta.row_ids.iter().enumerate() {
+            if (lo..=hi).contains(&id) && live(newer_pos) {
+                if let Some(pos) = output.locate(id) {
+                    hide(pos);
+                }
+            }
+        }
+    }
+}
+
+/// Whether every segment's visibility equals what `compute_visibility_bitmaps`
+/// gives the same map, an absent bitmap and a full one counting as one
+#[cfg(debug_assertions)]
+fn same_as_full_pass(
+    seg_order: &[u64],
+    segments: &rustc_hash::FxHashMap<u64, ColdSegment>,
+) -> bool {
+    let bits_of = |cs: &ColdSegment| match &cs.visible {
+        Some(bits) => (**bits).clone(),
+        None => bits_without(cs.volume.meta.row_count, &[]),
+    };
+    let mut full = segments.clone();
+    compute_visibility_bitmaps(seg_order, &mut full);
+    segments
+        .iter()
+        .all(|(id, cs)| full.get(id).is_some_and(|f| bits_of(f) == bits_of(cs)))
+}
+
+#[cfg(not(debug_assertions))]
+fn same_as_full_pass(_: &[u64], _: &rustc_hash::FxHashMap<u64, ColdSegment>) -> bool {
+    true
+}
+
+/// Positions of `cs` whose copy is visible
+fn visible_positions(cs: &ColdSegment) -> usize {
+    let n = cs.volume.meta.row_ids.len();
+    let Some(bits) = &cs.visible else {
+        return n;
+    };
+    let full: usize = bits
+        .iter()
+        .take(n / 64)
+        .map(|w| w.count_ones() as usize)
+        .sum();
+    let tail = bits
+        .get(n / 64)
+        .filter(|_| !n.is_multiple_of(64))
+        .map_or(0, |w| (w & ((1u64 << (n % 64)) - 1)).count_ones() as usize);
+    full + tail
+}
+
+/// One search in a volume of `n` rows, in walked ids: a step that misses
+/// the cache costs about what four ids walked in order do
+fn search_cost(n: usize) -> usize {
+    4 * (usize::BITS - n.leading_zeros()) as usize
+}
+
+/// Visible copies in `segments` of the ids `tombstones` holds. A segment no
+/// tombstone falls in by its `bounds` (sorted by segment id) is skipped, one
+/// whose order is decided is searched when that is cheaper, any other is
+/// walked; no order is decided. Tombstones too many, or a map too sparse, to
+/// search or sort out cheaper walk them all
+fn tombstoned_visible(
+    segments: &FxHashMap<u64, ColdSegment>,
+    tombstones: &FxHashMap<i64, u64>,
+    bounds: &[(u64, i64, i64)],
+) -> usize {
+    let rows: usize = segments.values().map(|cs| cs.volume.meta.row_count).sum();
+    let widest = segments.values().map(|cs| cs.volume.meta.row_count).max();
+    // A pass over the keys visits every slot, so it costs the capacity
+    let pass = tombstones.capacity();
+    let search = tombstones
+        .len()
+        .saturating_mul(search_cost(widest.unwrap_or(0)));
+    let narrow = pass.saturating_mul(segments.len()).saturating_add(search) <= rows;
+    let range_of = |id: &u64| {
+        let k = bounds
+            .binary_search_by(|b| {
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::count_bounds_probe();
+                b.0.cmp(id)
+            })
+            .ok()?;
+        bounds.get(k).map(|b| (b.1, b.2))
+    };
+    let mut hits = 0;
+    for (id, cs) in segments.iter() {
+        if let Some((lo, hi)) = narrow.then(|| range_of(id)).flatten() {
+            let in_range = || tombstones.keys().filter(move |t| (lo..=hi).contains(*t));
+            let found = in_range().count();
+            if found == 0 {
+                continue;
+            }
+            let vol = &cs.volume;
+            let n = vol.meta.row_count;
+            let searched = found.saturating_mul(search_cost(n)).saturating_add(pass);
+            if vol.meta.row_order.get().is_some() && searched < n {
+                hits += in_range()
+                    .filter_map(|&t| vol.locate(t))
+                    .filter(|&i| cs.is_visible(i))
+                    .count();
+                continue;
+            }
+        }
+        let ids = &cs.volume.meta.row_ids;
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::count_ids_walk(ids.len());
+        let mut live = 0usize;
+        for (i, row_id) in ids.iter().enumerate() {
+            if !cs.is_visible(i) {
+                continue;
+            }
+            if tombstones.contains_key(row_id) {
+                continue;
+            }
+            live += 1;
+        }
+        hits += visible_positions(cs).saturating_sub(live);
+    }
+    hits
+}
+
+/// Whether `count` is what a walk over every visible, untombstoned
+/// position of the same captured segments gives
+#[cfg(debug_assertions)]
+fn same_as_walk(
+    count: usize,
+    segments: &FxHashMap<u64, ColdSegment>,
+    tombstones: &FxHashMap<i64, u64>,
+) -> bool {
+    let walked: usize = segments
+        .values()
+        .map(|cs| {
+            let ids = &cs.volume.meta.row_ids;
+            ids.iter()
+                .enumerate()
+                .filter(|&(i, id)| cs.is_visible(i) && !tombstones.contains_key(id))
+                .count()
+        })
+        .sum();
+    walked == count
+}
+
+#[cfg(not(debug_assertions))]
+fn same_as_walk(_: usize, _: &FxHashMap<u64, ColdSegment>, _: &FxHashMap<i64, u64>) -> bool {
+    true
+}
+
 /// Clears, in `bits` (made from `base` on the first clear), the rows of
 /// `old` whose ids `new` holds again, within the range both span, and
 /// records in `hidden` each (id, position) that was visible in `base`.
@@ -1101,6 +1330,10 @@ pub(crate) struct LoadedVolume {
 /// releases the fence, loads what it recorded, and prepares again
 const COLD_READ_DEFERRED: &str = "cold volume read deferred under the seal fence";
 
+/// The recorded seal generation of a transaction with a write whose keys
+/// were not checked against the volumes; never a generation a seal reaches
+const UNCHECKED_WRITES: u64 = u64::MAX;
+
 impl StatementSnapshot {
     /// Newest-first (id, segment) list from the snapshot alone, cold
     /// volumes as captured; `volume` gives a cold one's columns.
@@ -1205,6 +1438,20 @@ impl StatementSnapshot {
     }
 }
 
+/// The read side of the seal fence; a test build counts how deep the
+/// current thread holds it
+pub struct SealRead<'a> {
+    _guard: parking_lot::RwLockReadGuard<'a, ()>,
+}
+
+impl Drop for SealRead<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::seal_fence_left();
+    }
+}
+
 /// Keeps a destructive publication marked for as long as it runs, including
 /// on the error path.
 pub struct Destruction<'a> {
@@ -1215,6 +1462,23 @@ impl Drop for Destruction<'_> {
     fn drop(&mut self) {
         self.mgr
             .destruction_count
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Marks a compaction from before it publishes its outputs until it has
+/// removed the tombstones it applied, including on the error path.
+pub struct CleanupWindow<'a> {
+    mgr: &'a SegmentManager,
+}
+
+impl Drop for CleanupWindow<'_> {
+    fn drop(&mut self) {
+        self.mgr
+            .cleanups_done
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.mgr
+            .cleanups_open
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
@@ -1307,9 +1571,11 @@ pub struct SegmentManager {
     // No global cache needed. Each volume builds its index lazily on first
     // unique check and never invalidates (volumes are immutable).
     // Zone maps + bloom filters prune volumes before hash lookup.
-    /// Cached deduplicated row count. Invalidated (set to u64::MAX) on
-    /// segment or tombstone changes. Recomputed lazily on next read.
-    cached_deduped_count: std::sync::atomic::AtomicU64,
+    /// Bumped after each published segment or tombstone change, so a count
+    /// cached at an older epoch is stale
+    count_epoch: std::sync::atomic::AtomicU64,
+    /// The last live row count, with the epoch read before computing it
+    cached_count: parking_lot::Mutex<Option<(u64, usize)>>,
     /// Per-table fence that serializes seal with cold-check + hot insert.
     /// INSERTs take a shared guard while checking cold constraints and
     /// publishing into hot; seal takes the exclusive guard while moving rows.
@@ -1329,8 +1595,22 @@ pub struct SegmentManager {
     /// says nothing about how many rows moved: it marks the interval in which
     /// rows are leaving, so a reader that captured inside it is not answered.
     destruction_count: std::sync::atomic::AtomicUsize,
+    /// Destructive publications ever begun, so a reader can tell one that
+    /// started and ended inside its read from a seal or a compaction
+    destructions_begun: std::sync::atomic::AtomicU64,
+    /// Compactions inside their cleanup window, and those that finished it:
+    /// a count across either change cannot take the single-segment shortcut
+    cleanups_open: std::sync::atomic::AtomicUsize,
+    cleanups_done: std::sync::atomic::AtomicU64,
+    /// Whether every tombstone was seen with a visible copy since they were
+    /// loaded: a manifest written inside a cleanup window can hold one without
+    shortcut_trusted: std::sync::atomic::AtomicBool,
     /// Even when column schema and mappings agree, odd during or after failed DDL.
     schema_generation: std::sync::atomic::AtomicU64,
+    /// Advanced, under the DDL guard, by every change of a column's
+    /// definition; never taken back, so work prepared before one never
+    /// publishes after it
+    definition_epoch: std::sync::atomic::AtomicU64,
 }
 
 impl SegmentManager {
@@ -1351,13 +1631,19 @@ impl SegmentManager {
             persisting: parking_lot::Mutex::new(()),
             tombstones: RwLock::new(Arc::new(FxHashMap::default())),
             schema_generation: std::sync::atomic::AtomicU64::new(0),
+            definition_epoch: std::sync::atomic::AtomicU64::new(0),
             pending_txn_tombstones: RwLock::new(FxHashMap::default()),
-            cached_deduped_count: std::sync::atomic::AtomicU64::new(u64::MAX),
+            count_epoch: std::sync::atomic::AtomicU64::new(0),
+            cached_count: parking_lot::Mutex::new(None),
             seal_fence: RwLock::new(()),
             seal_generation: std::sync::atomic::AtomicU64::new(0),
             txn_seal_gens: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
             seal_overlap_count: std::sync::atomic::AtomicUsize::new(0),
             destruction_count: std::sync::atomic::AtomicUsize::new(0),
+            destructions_begun: std::sync::atomic::AtomicU64::new(0),
+            cleanups_open: std::sync::atomic::AtomicUsize::new(0),
+            cleanups_done: std::sync::atomic::AtomicU64::new(0),
+            shortcut_trusted: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -1370,6 +1656,7 @@ impl SegmentManager {
         } = stored;
         let table_name = manifest.table_name.clone();
         let tombstone_map: FxHashMap<i64, u64> = tombstones.into_iter().collect();
+        let trusted = tombstone_map.is_empty();
         Self {
             table_name: RwLock::new(table_name),
             manifest: RwLock::new(manifest),
@@ -1385,13 +1672,19 @@ impl SegmentManager {
             persisting: parking_lot::Mutex::new(()),
             tombstones: RwLock::new(Arc::new(tombstone_map)),
             schema_generation: std::sync::atomic::AtomicU64::new(0),
+            definition_epoch: std::sync::atomic::AtomicU64::new(0),
             pending_txn_tombstones: RwLock::new(FxHashMap::default()),
-            cached_deduped_count: std::sync::atomic::AtomicU64::new(u64::MAX),
+            count_epoch: std::sync::atomic::AtomicU64::new(0),
+            cached_count: parking_lot::Mutex::new(None),
             seal_fence: RwLock::new(()),
             seal_generation: std::sync::atomic::AtomicU64::new(0),
             txn_seal_gens: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
             seal_overlap_count: std::sync::atomic::AtomicUsize::new(0),
             destruction_count: std::sync::atomic::AtomicUsize::new(0),
+            destructions_begun: std::sync::atomic::AtomicU64::new(0),
+            cleanups_open: std::sync::atomic::AtomicUsize::new(0),
+            cleanups_done: std::sync::atomic::AtomicU64::new(0),
+            shortcut_trusted: std::sync::atomic::AtomicBool::new(trusted),
         }
     }
 
@@ -1403,6 +1696,17 @@ impl SegmentManager {
     pub(crate) fn schema_generation(&self) -> u64 {
         self.schema_generation
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn definition_epoch(&self) -> u64 {
+        self.definition_epoch
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Called under the DDL guard, before the change closes the table
+    pub(crate) fn advance_definition_epoch(&self) {
+        self.definition_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     pub(crate) fn begin_column_change(self: &Arc<Self>) -> Result<ColumnSchemaChange> {
@@ -2640,8 +2944,7 @@ impl SegmentManager {
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
             *segments = Arc::new(new_map);
         }
-        self.cached_deduped_count
-            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        self.invalidate_count();
         self.has_segments_flag
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
@@ -2748,8 +3051,7 @@ impl SegmentManager {
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
             *segments = Arc::new(new_map);
         }
-        self.cached_deduped_count
-            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        self.invalidate_count();
         self.has_segments_flag
             .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(prepared)
@@ -2860,8 +3162,7 @@ impl SegmentManager {
             }
         }
         if changed {
-            self.cached_deduped_count
-                .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+            self.invalidate_count();
         }
     }
 
@@ -2870,8 +3171,7 @@ impl SegmentManager {
     pub fn clear_tombstones(&self) {
         let _manifest = self.manifest.write();
         *self.tombstones.write() = Arc::new(FxHashMap::default());
-        self.cached_deduped_count
-            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        self.invalidate_count();
     }
 
     /// Remove tombstones only for row_ids that were in the compacted volumes.
@@ -2890,8 +3190,7 @@ impl SegmentManager {
             |rid, _| row_ids.contains(&rid),
         );
         if removed {
-            self.cached_deduped_count
-                .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+            self.invalidate_count();
         }
     }
 
@@ -2919,8 +3218,7 @@ impl SegmentManager {
             }
         }
         if map.len() != before {
-            self.cached_deduped_count
-                .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+            self.invalidate_count();
         }
     }
 
@@ -3292,24 +3590,34 @@ impl SegmentManager {
     /// Get the exact deduplicated row count across all segments.
     /// Uses a cached value that is invalidated on segment/tombstone changes.
     pub fn deduped_row_count(&self) -> Result<usize> {
-        let cached = self
-            .cached_deduped_count
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if cached != u64::MAX {
-            return Ok(cached as usize);
+        // Read before the maps are captured, so a change published after
+        // the capture leaves the stored count stale
+        let epoch = self.count_epoch.load(std::sync::atomic::Ordering::Acquire);
+        if let Some((at, count)) = *self.cached_count.lock() {
+            if at == epoch {
+                return Ok(count);
+            }
         }
         let count = self.compute_deduped_row_count()?;
-        self.cached_deduped_count
-            .store(count as u64, std::sync::atomic::Ordering::Relaxed);
+        *self.cached_count.lock() = Some((epoch, count));
         Ok(count)
+    }
+
+    /// Make every cached count stale; called after the change is published
+    fn invalidate_count(&self) {
+        self.count_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// Acquire a shared guard while performing a cold check + hot insert.
     /// Seal takes the exclusive guard so it cannot move rows between the
     /// cold visibility check and hot publication.
     #[inline]
-    pub fn acquire_seal_read(&self) -> parking_lot::RwLockReadGuard<'_, ()> {
-        self.seal_fence.read()
+    pub fn acquire_seal_read(&self) -> SealRead<'_> {
+        let guard = self.seal_fence.read();
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::seal_fence_entered();
+        SealRead { _guard: guard }
     }
 
     /// Acquire the exclusive guard for the seal critical section.
@@ -3337,17 +3645,27 @@ impl SegmentManager {
         let mut map = self.txn_seal_gens.lock();
         map.entry(txn_id)
             .and_modify(|existing| {
-                if gen < *existing {
+                if gen < *existing && *existing != UNCHECKED_WRITES {
                     *existing = gen;
                 }
             })
             .or_insert(gen);
     }
 
-    /// Get the seal generation recorded for a transaction.
+    /// A write whose keys were not checked against the volumes: the commit
+    /// rechecks them, whatever any later statement records
     #[inline]
-    pub fn get_txn_seal_generation(&self, txn_id: i64) -> Option<u64> {
-        self.txn_seal_gens.lock().get(&txn_id).copied()
+    pub fn mark_txn_unchecked(&self, txn_id: i64) {
+        self.txn_seal_gens.lock().insert(txn_id, UNCHECKED_WRITES);
+    }
+
+    /// Whether the commit rechecks the transaction's keys against the
+    /// volumes: not every write was checked at the generation it sees
+    pub fn txn_needs_cold_recheck(&self, txn_id: i64) -> bool {
+        match self.txn_seal_gens.lock().get(&txn_id).copied() {
+            Some(gen) => gen != self.seal_generation(),
+            None => self.has_segments(),
+        }
     }
 
     /// Remove the seal generation record for a transaction (on commit/rollback).
@@ -3359,39 +3677,56 @@ impl SegmentManager {
     /// Count visible rows using pre-computed visibility bitmaps.
     /// Falls back to hash-based dedup only when bitmaps are not available.
     fn compute_deduped_row_count(&self) -> Result<usize> {
+        use std::sync::atomic::Ordering::Acquire;
+        let done_before = self.cleanups_done.load(Acquire);
+        // Tombstones first: they are removed only after the segment change
+        // that takes their rows away is published
+        let tombstones = Arc::clone(&*self.tombstones.read());
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::between_count_captures_reached();
         let segments = Arc::clone(&*self.segments.read());
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::count_captured();
         if segments.is_empty() {
             return Ok(0);
         }
-        let tombstones = Arc::clone(&*self.tombstones.read());
-        // A segment with dead copies is counted through its bitmap below
-        if segments.len() == 1 && segments.values().all(|cs| cs.dead.is_none()) {
-            let mut total = 0;
-            for cs in segments.values() {
-                total += cs.volume.row_ids()?.len();
+        // Every tombstone has a visible copy in a lone segment, except while
+        // a compaction holds tombstones its outputs no longer have rows for
+        let lone = segments.len() == 1 && segments.values().all(|cs| cs.dead.is_none());
+        let rows: usize = segments
+            .values()
+            .map(|cs| cs.volume.meta.row_ids.len())
+            .sum();
+        if lone && self.shortcut_trusted.load(Acquire) {
+            // Open before done: a window closes counting done first
+            let quiet = self.cleanups_open.load(Acquire) == 0
+                && self.cleanups_done.load(Acquire) == done_before;
+            if quiet {
+                let count = rows.saturating_sub(tombstones.len());
+                debug_assert!(same_as_walk(count, &segments, &tombstones));
+                return Ok(count);
             }
-            return Ok(total.saturating_sub(tombstones.len()));
         }
-
-        // Fast path: use visibility bitmaps (O(1) per row, zero allocation).
-        // visible=None means all rows visible (no overlap), is_visible() handles both.
-        {
-            let mut count = 0usize;
-            for cs in segments.values() {
-                let vol = &cs.volume;
-                let ids = vol.row_ids()?;
-                for (i, &row_id) in ids.iter().enumerate() {
-                    if !cs.is_visible(i) {
-                        continue;
-                    }
-                    if !tombstones.is_empty() && tombstones.contains_key(&row_id) {
-                        continue;
-                    }
-                    count += 1;
-                }
-            }
-            Ok(count)
+        let visible: usize = segments.values().map(visible_positions).sum();
+        let count = if tombstones.is_empty() {
+            visible
+        } else {
+            let mut bounds: Vec<(u64, i64, i64)> = self
+                .manifest
+                .read()
+                .segments
+                .iter()
+                .map(|m| (m.segment_id, m.min_row_id, m.max_row_id))
+                .collect();
+            bounds.sort_unstable_by_key(|b| b.0);
+            visible.saturating_sub(tombstoned_visible(&segments, &tombstones, &bounds))
+        };
+        debug_assert!(same_as_walk(count, &segments, &tombstones));
+        if lone && visible == rows && count + tombstones.len() == rows {
+            self.shortcut_trusted
+                .store(true, std::sync::atomic::Ordering::Release);
         }
+        Ok(count)
     }
 
     /// Get the cached column mapping for a volume. Computes on first call,
@@ -3530,7 +3865,24 @@ impl SegmentManager {
     pub fn begin_destruction(&self) -> Destruction<'_> {
         self.destruction_count
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.destructions_begun
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Destruction { mgr: self }
+    }
+
+    /// Destructive publications begun so far; a reader compares it before and
+    /// after its read, with `is_destruction_in_progress` at both ends
+    pub fn destructions_begun(&self) -> u64 {
+        self.destructions_begun
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Mark a compaction from before it publishes its outputs until the
+    /// returned guard drops, after it removed the tombstones it applied
+    pub(crate) fn open_cleanup(&self) -> CleanupWindow<'_> {
+        self.cleanups_open
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        CleanupWindow { mgr: self }
     }
 
     /// Whether a destructive publication is in flight.
@@ -3634,24 +3986,28 @@ impl SegmentManager {
         let _destruction = self.begin_destruction();
         {
             // The tombstones go while the manifest is held, so a persist
-            // never takes the emptied segments with the old tombstones
+            // never takes the emptied segments with the old tombstones, and
+            // after the segments, as a recount reads them the other way round
             let mut manifest = self.manifest.write();
             manifest.segments.clear();
             manifest.dead_copies.clear();
+            {
+                // The cold flag is written with the map it describes
+                let mut segments = self.segments.write();
+                *segments = Arc::new(FxHashMap::default());
+                self.has_cold
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::segments_clearing();
             *self.tombstones.write() = Arc::new(FxHashMap::default());
         }
-        {
-            // The cold flag is written with the map it describes
-            let mut segments = self.segments.write();
-            *segments = Arc::new(FxHashMap::default());
-            self.has_cold
-                .store(false, std::sync::atomic::Ordering::Relaxed);
-        }
         self.key_order_verdicts.lock().clear();
-        self.cached_deduped_count
-            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        self.invalidate_count();
         self.has_segments_flag
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::clear_before_generation();
         // Clearing takes rows away as much as a seal does, so a reader that
         // took the generation before it must see the change after
         self.seal_generation
@@ -3690,8 +4046,7 @@ impl SegmentManager {
             *segments = Arc::new(new_map);
         }
         self.forget_key_order(segment_ids);
-        self.cached_deduped_count
-            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        self.invalidate_count();
     }
 
     /// Atomically replace old segments with a new compacted segment.
@@ -3778,8 +4133,7 @@ impl SegmentManager {
         ) {
             Ok(_) => {
                 self.forget_key_order(&old_segment_ids);
-                self.cached_deduped_count
-                    .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+                self.invalidate_count();
                 Ok(())
             }
             Err(prepared) => Err(Box::new(PreparedReplacement {
@@ -3815,8 +4169,7 @@ impl SegmentManager {
             )
             .unwrap_or(false);
         self.forget_key_order(old_segment_ids);
-        self.cached_deduped_count
-            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        self.invalidate_count();
         fresh
     }
 
@@ -3851,10 +4204,11 @@ impl SegmentManager {
         old_segment_ids: &[u64],
         owners: &[Owners],
     ) -> PreparedPublication {
-        let (snapshot, order, mut map) = {
+        let (snapshot, order, mut bounds, mut map) = {
             let manifest = self.manifest.read();
             let segments = self.segments.read();
             let order: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
+            let bounds = segment_bounds(&manifest.segments);
             let mut map = (**segments).clone();
             for &id in old_segment_ids {
                 map.remove(&id);
@@ -3873,10 +4227,12 @@ impl SegmentManager {
                     },
                 );
             }
-            (Arc::clone(&*segments), order, map)
+            (Arc::clone(&*segments), order, bounds, map)
         };
         let new_order = published_order(&order, new_volumes, old_segment_ids);
-        compute_visibility_bitmaps(&new_order, &mut map);
+        let outputs: Vec<u64> = new_volumes.iter().map(|(id, _, _)| *id).collect();
+        bounds.extend(segment_bounds(new_volumes.iter().map(|(_, _, meta)| meta)));
+        mask_outputs(&new_order, &outputs, &bounds, &mut map);
         PreparedPublication {
             snapshot,
             order,
@@ -3952,7 +4308,9 @@ impl SegmentManager {
         }
         if !fresh {
             let seg_ids: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
-            compute_visibility_bitmaps(&seg_ids, &mut map);
+            let outputs: Vec<u64> = new_volumes.iter().map(|(id, _, _)| *id).collect();
+            let bounds = segment_bounds(&manifest.segments);
+            mask_outputs(&seg_ids, &outputs, &bounds, &mut map);
         }
         if self.has_cold.load(std::sync::atomic::Ordering::Relaxed)
             && !map.values().any(|cs| cs.volume.is_cold())
@@ -4015,6 +4373,12 @@ impl SegmentManager {
     /// metadata (row_ids, zone maps) use this to avoid reloading cold volumes.
     pub fn segments_raw(&self) -> Arc<FxHashMap<u64, ColdSegment>> {
         Arc::clone(&*self.segments.read())
+    }
+
+    /// Whether the live segment map is still `segs`, as a snapshot took it:
+    /// no publication replaced it since, at the moment of the call
+    pub(crate) fn segments_are(&self, segs: &Arc<FxHashMap<u64, ColdSegment>>) -> bool {
+        Arc::ptr_eq(&*self.segments.read(), segs)
     }
 
     /// Reload a single cold volume by segment ID. Returns the loaded volume
@@ -4280,6 +4644,190 @@ fn read_i64(data: &[u8], pos: &mut usize) -> std::io::Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn segment_holding(ids: &[i64], dead: Option<&[u32]>) -> ColdSegment {
+        use crate::core::{DataType, Row, SchemaBuilder, Value};
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .build();
+        let mut builder = super::super::writer::VolumeBuilder::new(&schema);
+        for &id in ids {
+            builder.add_row(id, &Row::from_values(vec![Value::Integer(id)]));
+        }
+        let volume = Arc::new(builder.finish().unwrap());
+        let visible = dead.map(|dead| Arc::new(bits_without(ids.len(), dead)));
+        ColdSegment {
+            volume,
+            mapping: super::super::writer::ColumnMapping {
+                sources: Vec::new(),
+                names: Vec::new(),
+                is_identity: true,
+            },
+            schema_version: 0,
+            visible,
+            dead: dead.map(Arc::from),
+            file: None,
+            side: None,
+        }
+    }
+
+    #[test]
+    fn an_output_row_is_hidden_by_a_newer_live_copy_and_not_by_a_dead_one() {
+        // Output 1 holds 1, 2, 3; segment 2 a dead copy of 2; segment 3 a
+        // live copy of 3. An output larger than the newer volumes walks
+        // them; a smaller one searches them, their order decided by the build
+        let walked: (&[i64], &[i64], &[i64]) = (&[1, 2, 3, 4, 5, 6], &[2, 9], &[3, 20]);
+        let searched: (&[i64], &[i64], &[i64]) = (&[1, 2, 3], &[2, 9, 10, 11], &[3, 20, 21, 22]);
+        for (output, dead_copy, live_copy) in [walked, searched] {
+            let mut segments: rustc_hash::FxHashMap<u64, ColdSegment> = [
+                (1, segment_holding(output, None)),
+                (2, segment_holding(dead_copy, Some(&[0]))),
+                (3, segment_holding(live_copy, None)),
+            ]
+            .into_iter()
+            .collect();
+            assert!(segments[&2].volume.meta.row_order.get().is_some());
+            let bounds = [(1, (1, 6)), (2, (2, 11)), (3, (3, 22))]
+                .into_iter()
+                .collect();
+            mask_outputs(&[1, 2, 3], &[1], &bounds, &mut segments);
+            let visible = segments[&1].visible.as_ref().expect("row 3 is hidden");
+            let bit = |pos: usize| visible[pos >> 6] & (1u64 << (pos & 63)) != 0;
+            assert!(bit(0) && bit(1), "1 and 2 stay: a dead copy hides nothing");
+            assert!(!bit(2), "3 goes behind the newer live copy");
+        }
+    }
+
+    fn undecided(mut cs: ColdSegment) -> ColdSegment {
+        let volume = Arc::get_mut(&mut cs.volume).unwrap();
+        Arc::get_mut(&mut volume.meta).unwrap().row_order = std::sync::OnceLock::new();
+        cs
+    }
+
+    #[test]
+    fn tombstones_take_away_only_visible_copies() {
+        let mut shadowed = segment_holding(&(0..1000).collect::<Vec<_>>(), None);
+        let mut bits = bits_without(1000, &[5]);
+        bits[15] |= !((1u64 << 40) - 1);
+        shadowed.visible = Some(Arc::new(bits));
+        let segments: FxHashMap<u64, ColdSegment> = [
+            (1, shadowed),
+            (2, segment_holding(&[5, 2000, 2001, 2002], None)),
+            (3, segment_holding(&[7, 3000, 3001], Some(&[0]))),
+            (
+                4,
+                undecided(segment_holding(&[4000, 4001, 4002, 4003], None)),
+            ),
+            (5, segment_holding(&[5000, 5001], None)),
+        ]
+        .into_iter()
+        .collect();
+        let bounds = [(1, 0, 999), (2, 5, 2002), (3, 7, 3001), (4, 4000, 4003)];
+        let visible: usize = segments.values().map(super::visible_positions).sum();
+        assert_eq!(
+            visible, 1011,
+            "bits past a volume's last row count for nothing"
+        );
+        let walking = |tombstones: &FxHashMap<i64, u64>| {
+            let before = crate::test_failpoints::count_ids_walked();
+            let hits = tombstoned_visible(&segments, tombstones, &bounds);
+            (hits, crate::test_failpoints::count_ids_walked() - before)
+        };
+
+        let few: FxHashMap<i64, u64> = [5, 7, 9_999, 4001, 5001, 50]
+            .into_iter()
+            .map(|id| (id, 1))
+            .collect();
+        let (hits, walked) = walking(&few);
+        assert_eq!(
+            hits, 5,
+            "5 and 7 only where visible, 9999 nowhere, 4001 and 5001 walked, 50"
+        );
+        assert!(same_as_walk(1011 - 5, &segments, &few));
+        assert!(segments[&4].volume.meta.row_order.get().is_none());
+
+        let dense: FxHashMap<i64, u64> = (0..100).map(|id| (id, 1)).collect();
+        let (dense_hits, dense_walked) = walking(&dense);
+        assert_eq!(dense_hits, 100);
+        assert!(same_as_walk(1011 - 100, &segments, &dense));
+        if cfg!(feature = "test-failpoints") {
+            assert_eq!(walked, 4 + 3 + 4 + 2, "volume 1 is searched");
+            assert_eq!(dense_walked, 1013, "too many tombstones walk every volume");
+        }
+        assert!(segments[&4].volume.meta.row_order.get().is_none());
+    }
+
+    #[test]
+    fn a_tombstone_map_mostly_emptied_is_walked_against_not_scanned_per_segment() {
+        let segments: FxHashMap<u64, ColdSegment> = [
+            (1, segment_holding(&(0..1000).collect::<Vec<_>>(), None)),
+            (2, segment_holding(&(1000..2000).collect::<Vec<_>>(), None)),
+        ]
+        .into_iter()
+        .collect();
+        let bounds = [(1, 0, 999), (2, 1000, 1999)];
+        let mut tombstones: FxHashMap<i64, u64> = (0..100_000).map(|id| (id, 1)).collect();
+        tombstones.retain(|&id, _| id == 5);
+        assert!(tombstones.capacity() >= 100_000);
+        let before = crate::test_failpoints::count_ids_walked();
+        assert_eq!(tombstoned_visible(&segments, &tombstones, &bounds), 1);
+        if cfg!(feature = "test-failpoints") {
+            assert_eq!(
+                crate::test_failpoints::count_ids_walked() - before,
+                2000,
+                "two walks cost less than scanning the emptied map once per segment"
+            );
+        }
+
+        let mut sparse: FxHashMap<i64, u64> = (0..10_000).map(|id| (id, 1)).collect();
+        sparse.clear();
+        sparse.insert(30_005, 1);
+        let segments: FxHashMap<u64, ColdSegment> = [
+            (1, segment_holding(&(0..30_000).collect::<Vec<_>>(), None)),
+            (
+                2,
+                segment_holding(&(30_000..31_000).collect::<Vec<_>>(), None),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let bounds = [(1, 0, 29_999), (2, 30_000, 30_999)];
+        let before = crate::test_failpoints::count_ids_walked();
+        assert_eq!(tombstoned_visible(&segments, &sparse, &bounds), 1);
+        if cfg!(feature = "test-failpoints") {
+            assert_eq!(
+                crate::test_failpoints::count_ids_walked() - before,
+                1000,
+                "a second pass over the sparse map costs more than walking volume 2"
+            );
+        }
+    }
+
+    #[test]
+    fn many_small_segments_find_their_ranges_by_search() {
+        let segments: FxHashMap<u64, ColdSegment> = (0..1024u64)
+            .map(|s| {
+                let lo = s as i64 * 100;
+                (
+                    s,
+                    segment_holding(&(lo..lo + 100).collect::<Vec<_>>(), None),
+                )
+            })
+            .collect();
+        let bounds: Vec<(u64, i64, i64)> = (0..1024u64)
+            .map(|s| (s, s as i64 * 100, s as i64 * 100 + 99))
+            .collect();
+        let tombstones: FxHashMap<i64, u64> = [(5, 1)].into_iter().collect();
+        let before = crate::test_failpoints::count_bounds_probes();
+        assert_eq!(tombstoned_visible(&segments, &tombstones, &bounds), 1);
+        if cfg!(feature = "test-failpoints") {
+            let probes = crate::test_failpoints::count_bounds_probes() - before;
+            assert!(
+                probes <= 1024 * 12,
+                "{probes} comparisons for 1024 segments"
+            );
+        }
+    }
 
     #[test]
     fn test_manifest_new() {
@@ -4601,11 +5149,11 @@ mod tests {
         );
         assert_eq!(mgr.tombstone_count(), 99_999);
 
-        mgr.cached_deduped_count.store(7, Relaxed);
+        let epoch = mgr.count_epoch.load(Relaxed);
         mgr.remove_tombstones_for_rows(&targets);
         assert_eq!(
-            mgr.cached_deduped_count.load(Relaxed),
-            7,
+            mgr.count_epoch.load(Relaxed),
+            epoch,
             "a cleanup that removed nothing reset the count"
         );
     }

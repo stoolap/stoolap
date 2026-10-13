@@ -52,6 +52,9 @@ struct ColumnPredicate {
     target: TypedTarget,
 }
 
+/// Decoded blocks of one row group, by volume column
+type GroupBlocks = smallvec::SmallVec<[(usize, Arc<super::column::ColumnData>); 4]>;
+
 /// Cache holding decompressed columns for a single row group.
 /// Avoids decompressing the entire column when only a few groups are needed.
 struct GroupColumnCache {
@@ -188,6 +191,9 @@ pub struct VolumeScanner {
     /// Stop when the raw key of the row under the cursor is past this bound:
     /// (physical column, key, ascending). Only meaningful on a sorted column.
     stop_key: Option<(usize, i64, bool)>,
+    /// Pass over, without building it, a row whose raw key is past this
+    /// bound; the same form as `stop_key`, for a column in any order
+    skip_key: Option<(usize, i64, bool)>,
     /// Rows of the current group that pass the dictionary filters, ascending,
     /// found in one pass over the raw ids; consumed from the back on a
     /// reverse walk
@@ -208,22 +214,46 @@ impl VolumeScanner {
     /// (below it walking backwards, above it walking forwards). The column
     /// must be sorted in the volume; only integer and timestamp keys count.
     pub fn set_stop_key(&mut self, col_idx: usize, bound: &Value, ascending: bool) {
+        if let Some(key) = self.raw_key(col_idx, bound, ascending) {
+            self.stop_key = Some(key);
+        }
+    }
+
+    /// Pass over each row whose key is past `bound`, as `set_stop_key`
+    /// decides it, without building the row; the column may be in any order
+    pub fn set_skip_key(&mut self, col_idx: usize, bound: &Value, ascending: bool) {
+        if let Some(key) = self.raw_key(col_idx, bound, ascending) {
+            self.skip_key = Some(key);
+        }
+    }
+
+    /// `bound` as the raw key of an integer or timestamp column
+    fn raw_key(
+        &self,
+        col_idx: usize,
+        bound: &Value,
+        ascending: bool,
+    ) -> Option<(usize, i64, bool)> {
         let target = match (bound, self.volume.columns.data_type(col_idx)) {
             (Value::Integer(v), crate::core::DataType::Integer) => *v,
-            (Value::Timestamp(dt), crate::core::DataType::Timestamp) => {
-                match dt.timestamp_nanos_opt() {
-                    Some(nanos) => nanos,
-                    None => return,
-                }
-            }
-            _ => return,
+            (Value::Timestamp(dt), crate::core::DataType::Timestamp) => dt.timestamp_nanos_opt()?,
+            _ => return None,
         };
-        self.stop_key = Some((col_idx, target, ascending));
+        Some((col_idx, target, ascending))
     }
 
     /// True when the row at `idx` lies past the stop key
     fn past_stop_key(&self, idx: usize) -> Result<bool> {
-        let Some((col_idx, target, ascending)) = self.stop_key else {
+        self.past_key(self.stop_key, idx)
+    }
+
+    /// True when the row at `idx` lies past the skip key
+    fn past_skip_key(&self, idx: usize) -> Result<bool> {
+        self.past_key(self.skip_key, idx)
+    }
+
+    fn past_key(&self, key: Option<(usize, i64, bool)>, idx: usize) -> Result<bool> {
+        let Some((col_idx, target, ascending)) = key else {
             return Ok(false);
         };
         let (col, local) = self.col_and_idx(col_idx, idx)?;
@@ -240,26 +270,58 @@ impl VolumeScanner {
 
     /// The rows in `[lo, hi)` that pass every dictionary filter, in one pass
     /// over the raw ids of the group; None when a filter column is not a
-    /// dictionary column here and the rows must be tested one by one
-    fn dictionary_candidates(&self, lo: usize, hi: usize) -> Result<Option<Vec<usize>>> {
-        let filters: smallvec::SmallVec<[super::column::DictFilter<'_>; 4]> = self
-            .dict_filters
-            .iter()
-            .map(|&(col_idx, expected)| {
-                let (col, local_lo) = self.col_and_idx(col_idx, lo)?;
-                Ok((col, local_lo, expected))
-            })
-            .collect::<Result<_>>()?;
+    /// dictionary column here and the rows must be tested one by one. Read
+    /// group by group, only the filter columns of the group are decoded, and
+    /// they come back with the answer for the group's load to take over
+    fn dictionary_candidates(
+        &self,
+        group_idx: usize,
+        lo: usize,
+        hi: usize,
+    ) -> Result<(Option<Vec<usize>>, GroupBlocks)> {
+        let store = if self.volume.columns.should_use_group_cache() {
+            self.volume.columns.compressed_store()
+        } else {
+            None
+        };
+        // One block per column, however many filters name it
+        let mut blocks = GroupBlocks::new();
+        if let Some(st) = store {
+            for &(col_idx, _) in &self.dict_filters {
+                if blocks.iter().all(|&(c, _)| c != col_idx) {
+                    let col = st
+                        .group_column(col_idx, group_idx)
+                        .map_err(|e| Error::internal(format!("corrupt V4 block: {}", e)))?;
+                    blocks.push((col_idx, col));
+                }
+            }
+        }
+        let group_start = group_idx * super::column::ROW_GROUP_SIZE;
         let mut candidates = Vec::new();
-        if super::column::ColumnData::dict_matching_offsets(&filters, hi - lo, &mut candidates)
-            .is_none()
-        {
-            return Ok(None);
+        let decided = {
+            let filters: smallvec::SmallVec<[super::column::DictFilter<'_>; 4]> = self
+                .dict_filters
+                .iter()
+                .map(
+                    |&(col_idx, expected)| match blocks.iter().find(|&&(c, _)| c == col_idx) {
+                        Some((_, col)) => Ok((&**col, lo - group_start, expected)),
+                        None => {
+                            let (col, local_lo) = self.col_and_idx(col_idx, lo)?;
+                            Ok((col, local_lo, expected))
+                        }
+                    },
+                )
+                .collect::<Result<_>>()?;
+            super::column::ColumnData::dict_matching_offsets(&filters, hi - lo, &mut candidates)
+                .is_some()
+        };
+        if !decided {
+            return Ok((None, blocks));
         }
         for idx in &mut candidates {
             *idx += lo;
         }
-        Ok(Some(candidates))
+        Ok((Some(candidates), blocks))
     }
 
     /// The reverse walk: the newest row of the range first. Row groups are
@@ -282,17 +344,14 @@ impl VolumeScanner {
                         continue;
                     }
                 }
-                if use_group_cache {
-                    self.load_group_cache(group_idx);
-                    if self.error.is_some() {
-                        self.has_current = false;
-                        return Ok(false);
-                    }
-                }
             }
+            let mut blocks = GroupBlocks::new();
             if !self.dict_filters.is_empty() && self.candidates_group != Some(group_idx) {
                 let lo = group_start.max(self.current_idx);
-                match self.dictionary_candidates(lo, self.end_idx)? {
+                let (found, filter_blocks) =
+                    self.dictionary_candidates(group_idx, lo, self.end_idx)?;
+                blocks = filter_blocks;
+                match found {
                     Some(candidates) => {
                         self.group_candidates = candidates;
                         self.candidates_group = Some(group_idx);
@@ -301,6 +360,16 @@ impl VolumeScanner {
                         self.group_candidates.clear();
                         self.candidates_group = None;
                     }
+                }
+            }
+            if cached != Some(group_idx)
+                && use_group_cache
+                && !(self.candidates_group == Some(group_idx) && self.group_candidates.is_empty())
+            {
+                self.load_group_cache_with(group_idx, blocks);
+                if self.error.is_some() {
+                    self.has_current = false;
+                    return Ok(false);
                 }
             }
             let idx = if self.candidates_group == Some(group_idx) {
@@ -321,7 +390,7 @@ impl VolumeScanner {
                 return Ok(false);
             }
             self.end_idx = idx;
-            if self.should_skip_row(idx) {
+            if self.should_skip_row(idx) || self.past_skip_key(idx)? {
                 continue;
             }
             if self.candidates_group != Some(group_idx)
@@ -394,6 +463,7 @@ impl VolumeScanner {
             reverse: false,
             ordered_walk: false,
             stop_key: None,
+            skip_key: None,
             group_candidates: Vec::new(),
             candidates_group: None,
         };
@@ -454,6 +524,7 @@ impl VolumeScanner {
             reverse: false,
             ordered_walk: false,
             stop_key: None,
+            skip_key: None,
             group_candidates: Vec::new(),
             candidates_group: None,
         };
@@ -546,6 +617,7 @@ impl VolumeScanner {
             reverse: false,
             ordered_walk: false,
             stop_key: None,
+            skip_key: None,
             group_candidates: Vec::new(),
             candidates_group: None,
         }
@@ -1036,6 +1108,11 @@ impl VolumeScanner {
     /// Load group cache for a new row group. Decompresses only the columns
     /// needed for filtering + projection from the compressed store.
     fn load_group_cache(&mut self, group_idx: usize) {
+        self.load_group_cache_with(group_idx, GroupBlocks::new());
+    }
+
+    /// As `load_group_cache`, taking over blocks of the group already decoded
+    fn load_group_cache_with(&mut self, group_idx: usize, mut decoded: GroupBlocks) {
         let store = match self.volume.columns.compressed_store() {
             Some(s) => s,
             None => {
@@ -1085,6 +1162,10 @@ impl VolumeScanner {
             if !need {
                 continue;
             }
+            if let Some(pos) = decoded.iter().position(|&(c, _)| c == ci) {
+                columns[ci] = Some(decoded.swap_remove(pos).1);
+                continue;
+            }
             match store.group_column(ci, group_idx) {
                 Ok(col) => columns[ci] = Some(col),
                 Err(e) => {
@@ -1094,6 +1175,8 @@ impl VolumeScanner {
             }
         }
 
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::group_cache_loaded();
         self.group_cache = Some(GroupColumnCache {
             group_idx,
             columns,
@@ -1372,6 +1455,9 @@ impl VolumeScanner {
                     }
                 }
 
+                if self.past_skip_key(idx)? {
+                    continue;
+                }
                 if !self.typed_predicates.is_empty() && !self.evaluate_typed_predicates(idx)? {
                     continue;
                 }
@@ -1421,7 +1507,7 @@ impl VolumeScanner {
                 return Ok(false);
             }
 
-            if self.should_skip_row(self.current_idx) {
+            if self.should_skip_row(self.current_idx) || self.past_skip_key(self.current_idx)? {
                 self.current_idx += 1;
                 continue;
             }

@@ -320,6 +320,39 @@ impl CapturedGroups {
     }
 }
 
+/// A sealed row an UPDATE set, with the volume's copy it replaces
+pub struct ColdChange {
+    pub row_id: i64,
+    pub old_row: Row,
+    pub new_row: Row,
+}
+
+/// What one UPDATE statement set and has not written yet
+#[derive(Default)]
+pub struct PlannedUpdate {
+    pub cold: Vec<ColdChange>,
+    /// Hot rows in the order the setter ran on them, with the new row and
+    /// the version read: the committed one, or for a row read from the
+    /// transaction's own versions its txn id, data and `create_time`
+    pub hot: smallvec::SmallVec<[(i64, Row, crate::storage::mvcc::RowVersion); 1]>,
+    /// Set by the caller: the publish compares the hot rows' unique keys
+    /// with the versions read
+    pub compare_hot_keys: bool,
+    /// Set by the publish: a hot row's new unique key, never checked
+    /// against the volumes
+    pub hot_keys_changed: bool,
+}
+
+impl PlannedUpdate {
+    pub fn len(&self) -> usize {
+        self.cold.len() + self.hot.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 pub trait Table: Send + Sync {
     /// Returns the name of the table
     fn name(&self) -> &str;
@@ -453,6 +486,43 @@ pub trait Table: Send + Sync {
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32>;
 
+    /// Runs the setter on the rows `update` sets, except the ids in `skip`,
+    /// and adds what it set to `plan` without writing it
+    fn plan_update(
+        &mut self,
+        _where_expr: Option<&dyn Expression>,
+        _setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        _skip: Option<&FxHashMap<i64, u64>>,
+        _plan: &mut PlannedUpdate,
+    ) -> Result<()> {
+        Err(Error::NotSupported("plan_update".to_string()))
+    }
+
+    /// Runs the setter on the rows `update_by_row_ids` sets and adds what
+    /// it set to `plan` without writing it
+    fn plan_update_by_row_ids(
+        &mut self,
+        _row_ids: &[i64],
+        _setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        _plan: &mut PlannedUpdate,
+    ) -> Result<()> {
+        Err(Error::NotSupported("plan_update_by_row_ids".to_string()))
+    }
+
+    /// Validates and coerces a row an UPDATE set, as an insert stores it
+    fn validate_row(&self, _row: &mut Row) -> Result<()> {
+        Err(Error::NotSupported("validate_row".to_string()))
+    }
+
+    /// Writes `plan`, every check done before the first write, so an error
+    /// leaves none of it. The rows are taken out; the row ids stay
+    fn publish_update(&mut self, plan: &mut PlannedUpdate) -> Result<i32> {
+        if plan.is_empty() {
+            return Ok(0);
+        }
+        Err(Error::NotSupported("publish_update".to_string()))
+    }
+
     /// Deletes rows by their row IDs directly (O(k) lookup instead of O(n) scan).
     ///
     /// This is an optimization for DELETE with IN subquery on INTEGER PRIMARY KEY.
@@ -503,13 +573,17 @@ pub trait Table: Send + Sync {
     }
 
     /// Claim a row for update to prevent concurrent cold-row modifications.
-    /// When two transactions update the same cold row, both mirror it into hot
-    /// via insert_discard. Without claiming, neither detects the other because
+    /// When two transactions update the same cold row, both write it into hot
+    /// under its id. Without claiming, neither detects the other because
     /// the row starts absent from hot. This method uses the VersionStore's
     /// uncommitted_writes map to serialize access.
     fn try_claim_row(&self, _row_id: i64) -> Result<()> {
         Ok(())
     }
+
+    /// Lets go of a claim `try_claim_row` took, unless another claim of the
+    /// transaction met it or the row was written since
+    fn release_claim(&self, _row_id: i64) {}
 
     /// Deletes rows matching the given expression
     ///
@@ -525,6 +599,12 @@ pub trait Table: Send + Sync {
     /// Default implementation falls back to delete(None).
     fn truncate(&mut self) -> Result<i32> {
         self.delete(None)
+    }
+
+    /// `truncate`, running `after_check` once nothing refuses it and before
+    /// any row goes; a table that cannot promise that order refuses
+    fn truncate_after_check(&mut self, _after_check: &mut dyn FnMut()) -> Result<i32> {
+        Err(Error::NotSupported("truncate_after_check".to_string()))
     }
 
     /// Scans the table and returns a scanner over matching rows
@@ -644,10 +724,11 @@ pub trait Table: Send + Sync {
     /// Closes the table and releases any resources
     fn close(&mut self) -> Result<()>;
 
-    /// Commits any pending changes in this table's transaction
+    /// Leaves the table's pending changes with its transaction
     ///
-    /// This applies the table's local transaction changes to the global store,
-    /// making them visible to other transactions.
+    /// The transaction's commit publishes them, with their WAL records, and
+    /// makes them visible to other transactions; its rollback, or a rollback
+    /// to an earlier savepoint, drops them.
     fn commit(&mut self) -> Result<()>;
 
     /// Rolls back any pending changes in this table's transaction

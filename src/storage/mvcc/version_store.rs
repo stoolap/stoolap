@@ -46,6 +46,7 @@ use crate::storage::mvcc::arena::{Relayout, RowArena};
 use crate::storage::mvcc::get_fast_timestamp;
 #[cfg(not(test))]
 use crate::storage::mvcc::registry::TransactionRegistry;
+use crate::storage::traits::PlannedUpdate;
 use crate::storage::Index;
 use ahash::AHashMap;
 #[cfg(feature = "parallel")]
@@ -337,6 +338,9 @@ pub struct WriteSetEntry {
     /// The version read is a volume's copy of the row: the indexes that
     /// keep sealed rows held its keys, the hot indexes never did
     pub sealed: bool,
+    /// Another claim of the transaction met this entry, so a statement that
+    /// fails does not let its claim go
+    pub shared: bool,
 }
 
 // ============================================================================
@@ -581,6 +585,43 @@ impl Drop for PublishGuard {
     }
 }
 
+/// A table closed for a change of a column's definition, opened again when
+/// this goes, whether the change completed or not
+pub struct ColumnClosure {
+    store: Arc<VersionStore>,
+}
+
+impl ColumnClosure {
+    /// Closes `store`; the caller then waits for what was counted before
+    pub fn close(store: Arc<VersionStore>) -> Self {
+        store.close_for_column_change();
+        Self { store }
+    }
+
+    pub fn store(&self) -> &VersionStore {
+        &self.store
+    }
+}
+
+impl Drop for ColumnClosure {
+    fn drop(&mut self) {
+        self.store.open_after_column_change();
+    }
+}
+
+/// A GC pass, counted as `PublishGuard` counts a commit; see
+/// VersionStore::admit_gc
+pub struct GcAdmission<'a> {
+    store: &'a VersionStore,
+}
+
+impl Drop for GcAdmission<'_> {
+    fn drop(&mut self) {
+        self.store.publish_epoch.fetch_add(1, Ordering::SeqCst);
+        self.store.publishing.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// What a committing transaction holds while it publishes: a guard per
 /// table it writes, and the tables' stores so their index updates can be
 /// undone if the commit fails after they were applied. Four tables fit
@@ -735,6 +776,43 @@ pub struct LayoutToken {
 
 /// Issues each version store a number no other store in the process takes
 static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// An odd layout is a table closed for a column change: its rows may be
+/// read under the schema of that layout, and nothing is written under it
+fn is_closed(layout: u64) -> bool {
+    layout % 2 == 1
+}
+
+/// A row in the layout of `schema`, `width` columns wide: a narrower row
+/// takes the missing columns' defaults, or NULL; a wider one loses the
+/// cell at `cut`. None when the row is in that layout already
+fn lay_out_values(
+    values: &[Value],
+    width: usize,
+    cut: Option<usize>,
+    schema: &Schema,
+) -> Option<CompactArc<[Value]>> {
+    if values.len() < width {
+        let mut moved = Vec::with_capacity(width);
+        moved.extend_from_slice(values);
+        moved.extend(schema.columns[values.len()..].iter().map(|column| {
+            column
+                .default_value
+                .clone()
+                .unwrap_or_else(|| Value::null(column.data_type))
+        }));
+        return Some(CompactArc::from(moved));
+    }
+    match cut {
+        Some(at) if values.len() > width && at < values.len() => {
+            let mut moved = Vec::with_capacity(width);
+            moved.extend_from_slice(&values[..at]);
+            moved.extend_from_slice(&values[at + 1..]);
+            Some(CompactArc::from(moved))
+        }
+        _ => None,
+    }
+}
 
 impl VersionStore {
     /// Creates a new version store
@@ -959,7 +1037,10 @@ impl VersionStore {
     /// Positions resolved under `token` read this store's rows only while
     /// the store is open and its rows are still in that layout
     pub fn check_token(&self, token: LayoutToken) -> Result<(), Error> {
-        if self.closed.load(Ordering::Acquire) || token != self.token_for(self.layout()) {
+        if self.closed.load(Ordering::Acquire)
+            || is_closed(token.layout)
+            || token != self.token_for(self.layout())
+        {
             return Err(Error::SchemaChanged {
                 table: self.table_name.to_string(),
             });
@@ -967,9 +1048,9 @@ impl VersionStore {
         Ok(())
     }
 
-    /// Adds `column` to the schema. The rows follow at `lay_out_rows`, once
-    /// the change is durable: a change that fails to record leaves the
-    /// rows as they were under the schema put back
+    /// Adds `column` to the schema and closes the table: the rows follow at
+    /// `lay_out_rows`, which opens it, once the change is durable; a change
+    /// that fails to record reopens at `reopen_after_refused_add`
     pub fn add_column(&self, column: crate::core::SchemaColumn) -> Result<(), Error> {
         let mut schema = self.schema.write();
         CompactArc::make_mut(&mut *schema).add_column(column)?;
@@ -977,23 +1058,124 @@ impl VersionStore {
         Ok(())
     }
 
-    /// Removes `name` from the schema. The rows keep its cells until
-    /// `lay_out_rows` cuts them, once the change is durable
-    pub fn remove_column(&self, name: &str) -> Result<crate::core::SchemaColumn, Error> {
-        let mut schema = self.schema.write();
+    /// Opens the table again under `schema` after an added column whose
+    /// record the log refused; the rows were never laid out for it
+    pub fn reopen_after_refused_add(&self, schema: CompactArc<Schema>) {
+        let mut current = self.schema.write();
+        *current = schema;
+        self.layout.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Closes the table to drop `name`: the drop is checked on a copy of the
+    /// schema, which comes back without the column for `publish_drop`, and
+    /// the column's position is noted. The schema and the rows stay as they
+    /// are, and nothing is written, until the drop is published
+    pub fn close_for_drop(&self, name: &str) -> Result<CompactArc<Schema>, Error> {
+        let schema = self.schema.write();
         let at = schema
             .get_column_index(name)
             .ok_or_else(|| Error::ColumnNotFound(name.to_string()))?;
-        let column = CompactArc::make_mut(&mut *schema).remove_column(name)?;
+        let mut without = Schema::clone(&schema);
+        without.remove_column(name)?;
         *self.pending_cut.lock() = Some(at);
         self.layout.fetch_add(1, Ordering::AcqRel);
-        Ok(column)
+        Ok(CompactArc::new(without))
     }
 
-    /// Forgets a column removal the rows were never cut for: the schema
-    /// went back to holding the column
-    pub fn discard_pending_cut(&self) {
+    /// Opens the table again after a drop whose record the log refused
+    pub fn reopen_after_refused_drop(&self) {
+        let _schema = self.schema.write();
         *self.pending_cut.lock() = None;
+        self.layout.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Takes out the indexes over the column a drop removes and binds the
+    /// indexes after it one position down, each keeping its data and
+    /// identity. A reader that trusts an index's order stands down across
+    /// the swap, as across a commit's publication
+    pub fn rebind_indexes_for_drop(&self) {
+        let Some(at) = *self.pending_cut.lock() else {
+            return;
+        };
+        let at = at as i32;
+        let current: Vec<(String, Arc<dyn Index>)> = self
+            .indexes
+            .read()
+            .iter()
+            .map(|(name, index)| (name.clone(), Arc::clone(index)))
+            .collect();
+        let mut removed = Vec::new();
+        let mut rebound = Vec::new();
+        for (name, index) in current {
+            let ids = index.column_ids();
+            if ids.contains(&at) {
+                removed.push(name);
+            } else if ids.iter().any(|&id| id > at) {
+                let moved: Vec<i32> = ids
+                    .iter()
+                    .map(|&id| if id > at { id - 1 } else { id })
+                    .collect();
+                rebound.push((name, index.rebound(index.column_names(), &moved)));
+            }
+        }
+        if removed.is_empty() && rebound.is_empty() {
+            return;
+        }
+        self.publishing.fetch_add(1, Ordering::SeqCst);
+        let taken: Vec<Arc<dyn Index>> = {
+            let mut indexes = self.indexes.write();
+            let taken = removed
+                .iter()
+                .filter_map(|name| indexes.remove(name))
+                .collect();
+            for (name, index) in rebound {
+                indexes.insert(name, index);
+            }
+            taken
+        };
+        {
+            let mut identities = self.index_identities.write();
+            for name in &removed {
+                identities.remove(name);
+            }
+        }
+        self.publish_epoch.fetch_add(1, Ordering::SeqCst);
+        self.publishing.fetch_sub(1, Ordering::SeqCst);
+        drop(taken);
+    }
+
+    /// Publishes a drop `close_for_drop` prepared to the hot rows: the rows
+    /// lose the column's cells and the schema the column under the one
+    /// versions lock, and the table stays closed for the cold mappings to
+    /// follow. The layout moves on, so no layout stands for two schemas
+    pub fn publish_drop(&self, without: CompactArc<Schema>) {
+        let width = without.columns.len();
+        let cut = self.pending_cut.lock().take();
+        let padded = CompactArc::clone(&without);
+        self.relayout_rows(
+            &|values| lay_out_values(values, width, cut, &padded),
+            || {
+                *self.schema.write() = without;
+                self.layout.fetch_add(2, Ordering::AcqRel);
+            },
+        );
+    }
+
+    /// Opens the table once its schema, hot rows, index bindings and cold
+    /// mappings agree again
+    pub fn open_after_drop(&self) {
+        let _schema = self.schema.write();
+        self.layout.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Drops `name` with no record and no cold rows to follow, as a
+    /// table handle does: close, rebind, publish and open back to back
+    pub fn drop_column_at_once(&self, name: &str) -> Result<(), Error> {
+        let without = self.close_for_drop(name)?;
+        self.rebind_indexes_for_drop();
+        self.publish_drop(without);
+        self.open_after_drop();
+        Ok(())
     }
 
     /// Moves every row to the schema's layout: a row narrower than the
@@ -1005,35 +1187,23 @@ impl VersionStore {
         let schema = self.schema();
         let width = schema.columns.len();
         let cut = self.pending_cut.lock().take();
-        self.relayout_rows(&|values| {
-            if values.len() < width {
-                let mut moved = Vec::with_capacity(width);
-                moved.extend_from_slice(values);
-                moved.extend(schema.columns[values.len()..].iter().map(|column| {
-                    column
-                        .default_value
-                        .clone()
-                        .unwrap_or_else(|| Value::null(column.data_type))
-                }));
-                return Some(CompactArc::from(moved));
-            }
-            match cut {
-                Some(at) if values.len() > width && at < values.len() => {
-                    let mut moved = Vec::with_capacity(width);
-                    moved.extend_from_slice(&values[..at]);
-                    moved.extend_from_slice(&values[at + 1..]);
-                    Some(CompactArc::from(moved))
-                }
-                _ => None,
-            }
-        });
+        debug_assert!(is_closed(self.layout()), "rows laid out on an open table");
+        // The layout opens with the rows, under the versions lock
+        self.relayout_rows(
+            &|values| lay_out_values(values, width, cut, &schema),
+            || {
+                self.layout.fetch_add(1, Ordering::AcqRel);
+            },
+        );
     }
 
     /// Rewrites every row `relayout` returns a new layout for: the heads
-    /// in the arena and the history behind them, under the one versions lock
-    fn relayout_rows(&self, relayout: Relayout<'_>) {
+    /// in the arena and the history behind them, under the one versions
+    /// lock. `published` runs under that lock once the heads are moved
+    fn relayout_rows(&self, relayout: Relayout<'_>, published: impl FnOnce()) {
         let mut versions = self.versions.write();
         self.arena.relayout(relayout);
+        published();
         let row_ids: Vec<i64> = versions.keys().collect();
         for row_id in row_ids {
             let Some(entry) = versions.get_mut(row_id) else {
@@ -1428,8 +1598,9 @@ impl VersionStore {
     /// wrong positions. Checked under the versions lock the change holds
     /// while it moves the rows, so no change slips between the check and
     /// the publication
-    fn check_layout(&self, layout: Option<u64>) -> Result<(), Error> {
-        if layout.is_some_and(|seen| seen != self.layout()) {
+    pub(crate) fn check_layout(&self, layout: Option<u64>) -> Result<(), Error> {
+        // An odd layout is a table closed for a column change
+        if layout.is_some_and(|seen| seen != self.layout() || is_closed(seen)) {
             return Err(Error::SchemaChanged {
                 table: self.table_name.to_string(),
             });
@@ -1678,6 +1849,8 @@ impl VersionStore {
                         return None;
                     }
                     let data = Row::from_arc(CompactArc::clone(&arena_guard.data()[probe_idx]));
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::note_read("vs.get_visible_version.arena_probe");
                     return Some(RowVersion {
                         txn_id: meta.txn_id,
                         deleted_at_txn_id: meta.deleted_at_txn_id,
@@ -1694,6 +1867,8 @@ impl VersionStore {
         }
 
         // Phase 2: CowBTree fallback (correct lock ordering: versions first, then arena)
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.get_visible_version.chain");
         let versions = self.versions.read();
         let chain = versions.get(row_id)?;
 
@@ -1813,6 +1988,8 @@ impl VersionStore {
     /// Pre-acquires all locks once, then performs per-key CowBTree lookups
     /// with visibility checking and version chain traversal as needed.
     pub fn get_visible_versions_batch(&self, row_ids: &[i64], txn_id: i64) -> RowVec {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.get_visible_versions_batch");
         if self.closed.load(Ordering::Acquire) || row_ids.is_empty() {
             return RowVec::new();
         }
@@ -1917,6 +2094,8 @@ impl VersionStore {
     where
         F: FnMut(i64, Row) -> bool,
     {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.for_each_visible");
         if self.closed.load(Ordering::Acquire) || row_ids.is_empty() {
             return;
         }
@@ -2155,6 +2334,8 @@ impl VersionStore {
         row_ids: &[i64],
         txn_id: i64,
     ) -> Vec<(i64, Row, RowVersion)> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.get_visible_versions_for_update");
         if self.closed.load(Ordering::Acquire) {
             return Vec::new();
         }
@@ -2536,6 +2717,67 @@ impl VersionStore {
         }
     }
 
+    /// Admits a GC pass until the guard goes; None once a column change
+    /// closed the table. The count is taken before the layout is read and
+    /// the change closes before it reads the count, so one sees the other
+    pub fn admit_gc(&self) -> Option<GcAdmission<'_>> {
+        self.publishing.fetch_add(1, Ordering::SeqCst);
+        if is_closed(self.layout.load(Ordering::SeqCst)) {
+            self.publishing.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(GcAdmission { store: self })
+    }
+
+    /// Closes the table for a change of a column's definition: GC passes are
+    /// refused from here, commits by the layout checks, and those counted
+    /// before are waited for with `wait_until_quiet`
+    pub fn close_for_column_change(&self) {
+        let _schema = self.schema.write();
+        self.layout.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Opens the table a column change closed
+    pub fn open_after_column_change(&self) {
+        let _schema = self.schema.write();
+        debug_assert!(is_closed(self.layout()), "opened a table not closed");
+        self.layout.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Waits until no publication counted before the close is running;
+    /// false when one still is at `deadline`
+    pub fn wait_until_quiet(&self, deadline: std::time::Instant) -> bool {
+        while self.publishing.load(Ordering::SeqCst) != 0 {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        true
+    }
+
+    /// Whether a version in the store, a head or behind one, was written or
+    /// deleted by a transaction `open` names
+    pub fn holds_versions_of(&self, open: &dyn Fn(i64) -> bool) -> bool {
+        let of_open = |v: &RowVersion| {
+            open(v.txn_id) || (v.deleted_at_txn_id != 0 && open(v.deleted_at_txn_id))
+        };
+        let root = self.snapshot_versions();
+        for (_, chain) in root.iter() {
+            if of_open(&chain.version) {
+                return true;
+            }
+            let mut behind = chain.prev.as_ref();
+            while let Some(node) = behind {
+                if of_open(&node.version) {
+                    return true;
+                }
+                behind = node.prev.as_ref();
+            }
+        }
+        false
+    }
+
     /// The publish epoch while no commit is publishing; None while one is.
     /// Equal values before and after a read mean no publish overlapped it.
     pub fn publish_epoch_if_quiet(&self) -> Option<u64> {
@@ -2564,6 +2806,12 @@ impl VersionStore {
     /// Fails with `TableHasActiveTransactions` if another transaction holds
     /// uncommitted UPDATE/DELETE claims on this table.
     pub fn truncate_all(&self) -> crate::core::Result<i32> {
+        self.truncate_all_then(|| {})
+    }
+
+    /// `truncate_all`, running `after_check` once no claim refuses it and
+    /// before any row goes, with the claims still shut out
+    pub fn truncate_all_then(&self, after_check: impl FnOnce()) -> crate::core::Result<i32> {
         // Hold uncommitted_writes(W) for the ENTIRE check-and-clear sequence
         // to prevent TOCTOU race: without this, a concurrent try_claim_row()
         // could add a claim between the check and the clear, and truncate would
@@ -2579,6 +2827,7 @@ impl VersionStore {
         if !uncommitted.is_empty() {
             return Err(crate::core::Error::TableHasActiveTransactions);
         }
+        after_check();
         // A reader that trusts the indexes' order stands down while the
         // rows leave, and one that captured them before sees the epoch move
         // afterwards, as it does across a commit's publication
@@ -2798,6 +3047,8 @@ impl VersionStore {
     /// The returned `RowVec` auto-returns to cache on drop.
     #[inline]
     pub fn get_all_visible_rows_cached(&self, txn_id: i64) -> RowVec {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.get_all_visible_rows_cached");
         let mut result = RowVec::new();
 
         if self.closed.load(Ordering::Acquire) {
@@ -2862,6 +3113,8 @@ impl VersionStore {
     /// Note: read_version_seq is obtained from visibility_checker, not from create_time.
     #[inline]
     pub fn get_all_visible_rows_for_update(&self, txn_id: i64) -> Vec<(i64, Row, RowVersion)> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.get_all_visible_rows_for_update");
         if self.closed.load(Ordering::Acquire) {
             return Vec::new();
         }
@@ -2927,6 +3180,8 @@ impl VersionStore {
         txn_id: i64,
         filter: &dyn crate::storage::expression::Expression,
     ) -> Vec<(i64, Row, RowVersion)> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.get_all_visible_rows_for_update_filtered");
         if self.closed.load(Ordering::Acquire) {
             return Vec::new();
         }
@@ -3060,6 +3315,8 @@ impl VersionStore {
     /// * `limit` - Maximum number of rows to return
     /// * `offset` - Number of rows to skip before collecting
     pub fn get_visible_rows_with_limit(&self, txn_id: i64, limit: usize, offset: usize) -> RowVec {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.get_visible_rows_with_limit");
         if self.closed.load(Ordering::Acquire) || limit == 0 {
             return RowVec::new();
         }
@@ -3385,6 +3642,8 @@ impl VersionStore {
         limit: usize,
         offset: usize,
     ) -> Option<RowVec> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.collect_rows_pk_ordered");
         if self.closed.load(Ordering::Acquire) || limit == 0 {
             return Some(RowVec::new());
         }
@@ -3478,6 +3737,8 @@ impl VersionStore {
         ascending: bool,
         limit: usize,
     ) -> RowVec {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.collect_rows_keyset");
         if self.closed.load(Ordering::Acquire) || limit == 0 {
             return RowVec::new();
         }
@@ -3563,6 +3824,8 @@ impl VersionStore {
         txn_id: i64,
         filter: &dyn crate::storage::expression::Expression,
     ) -> RowVec {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.get_all_visible_rows_filtered");
         if self.closed.load(Ordering::Acquire) {
             return RowVec::new();
         }
@@ -3629,6 +3892,8 @@ impl VersionStore {
     ) where
         F: FnMut(i64, Row) -> bool,
     {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.for_each_visible_filtered");
         if self.closed.load(Ordering::Acquire) {
             return;
         }
@@ -3692,6 +3957,8 @@ impl VersionStore {
         limit: usize,
         offset: usize,
     ) -> RowVec {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.get_visible_rows_filtered_with_limit");
         if self.closed.load(Ordering::Acquire) || limit == 0 {
             return RowVec::new();
         }
@@ -3786,6 +4053,8 @@ impl VersionStore {
     /// Avoids Vec allocation and second iteration over indices.
     /// Returns (sum, count_non_null) for proper NULL handling.
     pub fn sum_column(&self, txn_id: i64, col_idx: usize) -> (f64, usize) {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.sum_column");
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => c,
             None => return (0.0, 0),
@@ -3911,6 +4180,8 @@ impl VersionStore {
     ///
     /// OPTIMIZATION: Single-pass approach that combines visibility checking with min computation.
     pub fn min_column(&self, txn_id: i64, col_idx: usize) -> Option<Value> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.min_column");
         let checker = self.visibility_checker.as_ref()?;
 
         let mut min_val: Option<Value> = None;
@@ -4018,6 +4289,8 @@ impl VersionStore {
     ///
     /// OPTIMIZATION: Single-pass approach that combines visibility checking with max computation.
     pub fn max_column(&self, txn_id: i64, col_idx: usize) -> Option<Value> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.max_column");
         let checker = self.visibility_checker.as_ref()?;
 
         let mut max_val: Option<Value> = None;
@@ -4316,10 +4589,7 @@ impl VersionStore {
             Entry::Occupied(e) => {
                 let existing_txn = *e.get();
                 if existing_txn != txn_id {
-                    return Err(Error::internal(format!(
-                        "row {} has uncommitted changes from transaction {}",
-                        row_id, existing_txn
-                    )));
+                    return Err(Self::claim_refused(row_id, existing_txn));
                 }
                 Ok(())
             }
@@ -4352,6 +4622,38 @@ impl VersionStore {
                 }
             }
         }
+    }
+
+    /// Claims every row of `row_ids` for `txn_id` or none: a row another
+    /// transaction holds refuses the set before any claim is taken
+    pub fn claim_rows_all_or_none(
+        &self,
+        row_ids: impl Iterator<Item = i64> + Clone,
+        txn_id: i64,
+    ) -> Result<(), Error> {
+        use crate::common::i64_map::Entry;
+
+        let mut map = self.uncommitted_writes.write();
+        for row_id in row_ids.clone() {
+            if let Some(&holder) = map.get(row_id) {
+                if holder != txn_id {
+                    return Err(Self::claim_refused(row_id, holder));
+                }
+            }
+        }
+        for row_id in row_ids {
+            if let Entry::Vacant(e) = map.entry(row_id) {
+                e.insert(txn_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn claim_refused(row_id: i64, holder: i64) -> Error {
+        Error::internal(format!(
+            "row {} has uncommitted changes from transaction {}",
+            row_id, holder
+        ))
     }
 
     /// Check if an index exists
@@ -5528,6 +5830,10 @@ impl VersionStore {
         if self.closed.load(Ordering::Acquire) {
             return 0;
         }
+        // Held through the index and arena cleanup after the versions lock
+        let Some(_admitted) = self.admit_gc() else {
+            return 0;
+        };
 
         let now = get_fast_timestamp();
         let cutoff_time = now - retention_period.as_nanos() as i64;
@@ -5581,6 +5887,8 @@ impl VersionStore {
         if actually_deleted.is_empty() {
             return 0;
         }
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::gc_rows_removed();
 
         // Third pass: remove from indexes using batch operations (single lock per index)
         // This runs AFTER the version store removal so we use the snapshot data
@@ -6035,6 +6343,8 @@ impl VersionStore {
         group_by_indices: &[usize],
         aggregates: &[(AggregateOp, usize)],
     ) -> Option<Vec<GroupedAggregateResult>> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("vs.compute_grouped_aggregates");
         if self.closed.load(Ordering::Acquire) {
             return Some(Vec::new());
         }
@@ -6548,6 +6858,7 @@ impl TxnTableStore {
     pub fn write_for(&self, layout: u64) -> TxnStoreWrite<'_> {
         let mut store = self.write_store();
         let refused = match store.layout_bound() {
+            _ if is_closed(layout) => true,
             Some(held) if held != layout => true,
             _ => {
                 // Stored before `newest` is read; `admit` raises it before it reads
@@ -6712,21 +7023,28 @@ impl TransactionVersionStore {
     /// handle's layout, and to the oldest of them when handles under two
     /// layouts wrote, which the commit refuses if a change came between
     fn note_layout(&mut self, at: i64) -> Result<(), Error> {
-        let seen = match self.writing {
-            // A handle under a newer layout reads these rows as its own
-            Some((_, true)) => {
-                return Err(Error::SchemaChanged {
-                    table: self.parent_store.table_name.to_string(),
-                })
-            }
-            Some((layout, false)) => layout,
-            None => self.parent_store.layout(),
-        };
+        let seen = self.layout_to_bind()?;
+        self.bind_layout(seen, at);
+        Ok(())
+    }
+
+    /// The layout a write now binds the transaction's rows to, refused while
+    /// a handle under a newer layout reads these rows as its own
+    fn layout_to_bind(&self) -> Result<u64, Error> {
+        match self.writing {
+            Some((_, true)) => Err(Error::SchemaChanged {
+                table: self.parent_store.table_name.to_string(),
+            }),
+            Some((layout, false)) => Ok(layout),
+            None => Ok(self.parent_store.layout()),
+        }
+    }
+
+    fn bind_layout(&mut self, seen: u64, at: i64) {
         match self.bound.iter_mut().find(|(layout, _)| *layout == seen) {
             Some((_, first)) => *first = (*first).min(at),
             None => self.bound.push((seen, at)),
         }
-        Ok(())
     }
 
     /// The oldest layout the transaction's surviving rows were written under
@@ -6786,6 +7104,7 @@ impl TransactionVersionStore {
                         read_version,
                         read_version_seq,
                         sealed: false,
+                        shared: false,
                     },
                 );
 
@@ -6888,6 +7207,7 @@ impl TransactionVersionStore {
                         read_version: Some(original_version),
                         read_version_seq,
                         sealed: false,
+                        shared: false,
                     },
                 );
 
@@ -6955,6 +7275,7 @@ impl TransactionVersionStore {
                         read_version: Some(original_version),
                         read_version_seq,
                         sealed: false,
+                        shared: false,
                     },
                 );
 
@@ -6966,6 +7287,106 @@ impl TransactionVersionStore {
             self.ensure_local_versions().insert(row_id, smallvec![rv]);
         }
         Ok(())
+    }
+
+    /// Checks a planned UPDATE against the transaction's rows as they are
+    /// now, writing nothing: a sealed row and a row read from the committed
+    /// store have no local version since, and a row read from the
+    /// transaction's own versions still has the version read
+    pub fn check_planned(&self, plan: &PlannedUpdate) -> Result<u64, Error> {
+        let layout = self.layout_to_bind()?;
+        let latest = |row_id: i64| {
+            self.local_versions
+                .as_ref()
+                .and_then(|versions| versions.get(row_id))
+                .and_then(|versions| versions.last())
+                .map(|version| version.create_time)
+        };
+        for change in &plan.cold {
+            if latest(change.row_id).is_some() {
+                return Err(Self::written_since(change.row_id));
+            }
+        }
+        for (row_id, _, read) in &plan.hot {
+            let read = (read.txn_id == self.txn_id).then_some(read.create_time);
+            if latest(*row_id) != read {
+                return Err(Self::written_since(*row_id));
+            }
+        }
+        Ok(layout)
+    }
+
+    fn written_since(row_id: i64) -> Error {
+        Error::internal(format!(
+            "write conflict: row {row_id} was written since the statement read it"
+        ))
+    }
+
+    /// Writes a planned UPDATE `check_planned` passed, under the same hold
+    /// of the store, with its claims already taken. A sealed row's entry
+    /// gets the volume's copy as the version it replaces; an entry already
+    /// there keeps its sequence and sharing
+    pub fn publish_planned(&mut self, plan: &mut PlannedUpdate, layout: u64) {
+        use crate::common::i64_map::Entry;
+
+        if plan.is_empty() {
+            return;
+        }
+        let now = get_fast_timestamp();
+        self.bind_layout(layout, now);
+        let read_version_seq = self
+            .parent_store
+            .visibility_checker
+            .as_ref()
+            .map(|c| c.get_current_sequence())
+            .unwrap_or(0);
+        let txn_id = self.txn_id;
+        for change in &mut plan.cold {
+            let original = RowVersion {
+                txn_id: 0,
+                deleted_at_txn_id: 0,
+                data: std::mem::take(&mut change.old_row),
+                create_time: 0,
+            };
+            match self.ensure_write_set().entry(change.row_id) {
+                Entry::Occupied(mut e) => {
+                    let entry = e.get_mut();
+                    entry.read_version = Some(original);
+                    entry.sealed = true;
+                }
+                Entry::Vacant(e) => {
+                    e.insert(WriteSetEntry {
+                        read_version: Some(original),
+                        read_version_seq,
+                        sealed: true,
+                        shared: false,
+                    });
+                }
+            }
+            let data = Row::from_arc(std::mem::take(&mut change.new_row).into_arc());
+            let rv = RowVersion::new_with_timestamp(txn_id, data, now);
+            self.ensure_local_versions()
+                .insert(change.row_id, smallvec![rv]);
+        }
+        for (row_id, data, read) in plan.hot.drain(..) {
+            let rv = RowVersion::new_with_timestamp(txn_id, Row::from_arc(data.into_arc()), now);
+            // A version of this transaction is never a committed one
+            if read.txn_id == txn_id {
+                if let Some(versions) = self.ensure_local_versions().get_mut(row_id) {
+                    versions.push(rv);
+                }
+                continue;
+            }
+            if let Entry::Vacant(e) = self.ensure_write_set().entry(row_id) {
+                e.insert(WriteSetEntry {
+                    read_version: Some(read),
+                    read_version_seq,
+                    sealed: false,
+                    shared: false,
+                });
+            }
+            self.ensure_local_versions().insert(row_id, smallvec![rv]);
+        }
     }
 
     /// Optimized batch delete for DELETE operations
@@ -7014,6 +7435,7 @@ impl TransactionVersionStore {
                             read_version,
                             read_version_seq,
                             sealed: false,
+                            shared: false,
                         },
                     );
 
@@ -7086,6 +7508,7 @@ impl TransactionVersionStore {
                         read_version: Some(original_version),
                         read_version_seq,
                         sealed: false,
+                        shared: false,
                     },
                 );
 
@@ -7398,6 +7821,8 @@ impl TransactionVersionStore {
         // Get all indexes - early exit if none
         let indexes: SmallVec<[Arc<dyn Index>; 4]> =
             self.parent_store.get_all_indexes().into_iter().collect();
+        // The set taken binds the positions of the layout the rows are in
+        self.parent_store.check_layout(self.layout_bound())?;
         if indexes.is_empty() {
             return Ok(());
         }
@@ -7559,12 +7984,10 @@ impl TransactionVersionStore {
                 // Check intra-batch duplicates (applies to all index types, including HNSW)
                 if let Some(&existing_row_id) = seen.get(values.as_slice()) {
                     if existing_row_id != *row_id {
-                        let values_str: Vec<String> =
-                            values.iter().map(|v| format!("{:?}", v)).collect();
                         return Err(Error::unique_constraint(
                             index.name(),
                             index.column_names().join(", "),
-                            format!("[{}]", values_str.join(", ")),
+                            values.to_vec(),
                         ));
                     }
                 }
@@ -7591,10 +8014,10 @@ impl TransactionVersionStore {
                             return Err(Error::unique_constraint(
                                 index.name(),
                                 index.column_names().join(", "),
-                                format!(
-                                    "<vector({} dims)> conflicts with row_id {}",
-                                    dims, existing_row_id
-                                ),
+                                crate::core::ConflictValues::Vector {
+                                    dims,
+                                    holder: Some(existing_row_id),
+                                },
                             ));
                         }
                     }
@@ -7610,12 +8033,10 @@ impl TransactionVersionStore {
                     });
 
                     if has_real_conflict {
-                        let values_str: Vec<String> =
-                            values.iter().map(|v| format!("{:?}", v)).collect();
                         return Err(Error::unique_constraint(
                             index.name(),
                             index.column_names().join(", "),
-                            format!("[{}]", values_str.join(", ")),
+                            values.to_vec(),
                         ));
                     }
                 }
@@ -7913,12 +8334,33 @@ impl TransactionVersionStore {
         // Use empty read_version since this is a cold-only claim — the actual
         // row data lives in cold storage, not in the hot version store.
         use crate::common::i64_map::Entry;
-        if let Entry::Vacant(e) = write_set.entry(row_id) {
-            e.insert(WriteSetEntry {
-                read_version: None,
-                read_version_seq: 0,
-                sealed: false,
-            });
+        match write_set.entry(row_id) {
+            Entry::Vacant(e) => {
+                e.insert(WriteSetEntry {
+                    read_version: None,
+                    read_version_seq: 0,
+                    sealed: false,
+                    shared: false,
+                });
+            }
+            Entry::Occupied(mut e) => e.get_mut().shared = true,
+        }
+    }
+
+    /// Lets go of a claim `track_external_claim` recorded, with its write set
+    /// entry, while no other claim of the transaction met it and no local
+    /// version of the row was written
+    pub fn release_external_claim(&mut self, row_id: i64) {
+        let written = self
+            .local_versions
+            .as_ref()
+            .is_some_and(|versions| versions.contains_key(row_id));
+        let Some(write_set) = self.write_set.as_mut() else {
+            return;
+        };
+        if !written && write_set.get(row_id).is_some_and(|e| !e.shared) {
+            write_set.remove(row_id);
+            self.parent_store.release_row_claim(row_id, self.txn_id);
         }
     }
 
@@ -8189,6 +8631,67 @@ mod tests {
         assert_eq!(
             recheck(&[3, 259, 4, 260, 3, 259]),
             (vec![1, 5], vec![2, 3, 4, 6], 6)
+        );
+    }
+
+    #[test]
+    fn a_publish_keeps_what_an_earlier_claim_left_in_an_entry() {
+        use crate::core::DataType;
+        use crate::storage::traits::ColdChange;
+
+        let schema = crate::core::SchemaBuilder::new("keep")
+            .column("id", DataType::Integer, false, true)
+            .column("v", DataType::Integer, true, false)
+            .build();
+        let store = Arc::new(VersionStore::with_visibility_checker(
+            "keep".to_string(),
+            schema,
+            Arc::new(ReadCommittedChecker),
+        ));
+        let row = |id: i64, v: i64| Row::from(vec![Value::from(id), Value::from(v)]);
+        let mut txn = TransactionVersionStore::new(Arc::clone(&store), 5);
+        // Each row claimed twice, so its entry is shared, with a sequence of its own
+        for id in [1, 2] {
+            txn.track_external_claim(id);
+            txn.track_external_claim(id);
+            txn.write_set
+                .as_mut()
+                .unwrap()
+                .get_mut(id)
+                .unwrap()
+                .read_version_seq = 40 + id;
+        }
+        let mut plan = PlannedUpdate::default();
+        plan.cold.push(ColdChange {
+            row_id: 1,
+            old_row: row(1, 0),
+            new_row: row(1, 7),
+        });
+        plan.hot.push((2, row(2, 8), RowVersion::new(3, row(2, 0))));
+        let layout = txn.check_planned(&plan).unwrap();
+        txn.publish_planned(&mut plan, layout);
+
+        let ws = txn.write_set.as_ref().unwrap();
+        let sealed = ws.get(1).unwrap();
+        assert_eq!(
+            (sealed.read_version_seq, sealed.shared, sealed.sealed),
+            (41, true, true),
+            "the sealed row's entry lost its sequence or sharing"
+        );
+        assert_eq!(
+            sealed.read_version.as_ref().map(|version| &version.data),
+            Some(&row(1, 0)),
+            "the sealed row's entry does not hold the volume's copy"
+        );
+        let hot = ws.get(2).unwrap();
+        assert_eq!(
+            (hot.read_version_seq, hot.shared, hot.sealed),
+            (42, true, false),
+            "the hot row's entry was replaced"
+        );
+        assert!(
+            hot.read_version.is_none(),
+            "the hot row's entry was replaced"
         );
     }
 
@@ -8789,6 +9292,7 @@ mod tests {
             read_version: Some(version),
             read_version_seq: 42,
             sealed: false,
+            shared: false,
         };
 
         let cloned = entry.clone();
@@ -8800,6 +9304,7 @@ mod tests {
             read_version: None,
             read_version_seq: 0,
             sealed: false,
+            shared: false,
         };
         let cloned_empty = empty_entry.clone();
         assert!(cloned_empty.read_version.is_none());
