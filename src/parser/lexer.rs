@@ -26,9 +26,9 @@ use crate::common::SmartString;
 ///
 /// Uses byte-based indexing for efficiency. SQL is predominantly ASCII,
 /// so we can work with bytes directly and only decode UTF-8 when needed.
-pub struct Lexer {
-    /// Input string as bytes (avoids Vec<char> allocation)
-    input: Box<[u8]>,
+pub struct Lexer<'a> {
+    /// Input string as bytes, borrowed from the caller
+    input: &'a [u8],
     /// Current byte position in input
     position: usize,
     /// Next byte position in input (after current char)
@@ -41,13 +41,11 @@ pub struct Lexer {
     last_error: Option<String>,
 }
 
-impl Lexer {
+impl<'a> Lexer<'a> {
     /// Create a new lexer for the given input
-    pub fn new(input: &str) -> Self {
-        // Store as bytes - much more memory efficient than Vec<char>
-        let bytes: Box<[u8]> = input.as_bytes().into();
+    pub fn new(input: &'a str) -> Self {
         let mut lexer = Self {
-            input: bytes,
+            input: input.as_bytes(),
             position: 0,
             read_position: 0,
             ch: '\0',

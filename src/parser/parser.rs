@@ -124,9 +124,9 @@ fn next_significant_token(lexer: &mut Lexer, errors: &mut Vec<ParseError>) -> To
 }
 
 /// SQL Parser using Pratt parsing algorithm
-pub struct Parser {
+pub struct Parser<'a> {
     /// The lexer providing tokens
-    lexer: Lexer,
+    lexer: Lexer<'a>,
     /// Current token being examined
     pub(crate) cur_token: Token,
     /// Next token (peek)
@@ -134,16 +134,16 @@ pub struct Parser {
     /// Collected errors
     errors: Vec<ParseError>,
     /// Current clause context (for error messages and parameter tracking)
-    pub(crate) current_clause: String,
+    pub(crate) current_clause: &'static str,
     /// Current statement ID (for multi-statement queries)
     current_statement_id: usize,
     /// Parameter counter within current statement
     parameter_counter: usize,
 }
 
-impl Parser {
+impl<'a> Parser<'a> {
     /// Create a new parser for the given input
-    pub fn new(input: &str) -> Self {
+    pub fn new(input: &'a str) -> Self {
         let mut lexer = Lexer::new(input);
         let mut errors = Vec::new();
         let cur_token = next_significant_token(&mut lexer, &mut errors);
@@ -154,7 +154,7 @@ impl Parser {
             cur_token,
             peek_token,
             errors,
-            current_clause: String::new(),
+            current_clause: "",
             current_statement_id: 0,
             parameter_counter: 1,
         }
@@ -228,9 +228,14 @@ impl Parser {
     /// parse_keyword_prefix() where they can be functions or identifiers.
     /// Uses O(1) HashSet lookup instead of O(n) match chain.
     pub(crate) fn is_reserved_keyword(keyword: &str) -> bool {
-        // Use uppercase for case-insensitive comparison
-        // Note: Keywords are typically already uppercase from the lexer
-        RESERVED_KEYWORDS.contains(keyword.to_uppercase().as_str())
+        // Every reserved keyword fits in 16 bytes
+        let mut buf = [0u8; 16];
+        let Some(upper) = buf.get_mut(..keyword.len()) else {
+            return false;
+        };
+        upper.copy_from_slice(keyword.as_bytes());
+        upper.make_ascii_uppercase();
+        RESERVED_KEYWORDS.contains(std::str::from_utf8(upper).unwrap_or_default())
     }
 
     /// Check if the current token is a specific keyword

@@ -69,7 +69,7 @@ fn is_reserved_alias_keyword(upper: &str) -> bool {
         .any(|&kw| kw.eq_ignore_ascii_case(upper))
 }
 
-impl Parser {
+impl Parser<'_> {
     /// Parse a statement
     pub fn parse_statement(&mut self) -> Option<Statement> {
         if self.cur_token_is(TokenType::Eof) {
@@ -164,7 +164,7 @@ impl Parser {
         // Parse WHERE clause
         if self.peek_token_is_keyword("WHERE") {
             self.next_token(); // consume WHERE
-            self.current_clause = "WHERE".to_string();
+            self.current_clause = "WHERE";
             self.next_token();
             stmt.where_clause = Some(Box::new(self.parse_expression(Precedence::Lowest)?));
         }
@@ -175,14 +175,14 @@ impl Parser {
             if !self.expect_keyword("BY") {
                 return None;
             }
-            self.current_clause = "GROUP BY".to_string();
+            self.current_clause = "GROUP BY";
             stmt.group_by = self.parse_group_by_clause();
         }
 
         // Parse HAVING clause
         if self.peek_token_is_keyword("HAVING") {
             self.next_token(); // consume HAVING
-            self.current_clause = "HAVING".to_string();
+            self.current_clause = "HAVING";
             self.next_token();
             stmt.having = Some(Box::new(self.parse_expression(Precedence::Lowest)?));
         }
@@ -190,7 +190,7 @@ impl Parser {
         // Parse WINDOW clause (named window definitions)
         if self.peek_token_is_keyword("WINDOW") {
             self.next_token(); // consume WINDOW
-            self.current_clause = "WINDOW".to_string();
+            self.current_clause = "WINDOW";
             stmt.window_defs = self.parse_window_definitions();
         }
 
@@ -212,14 +212,14 @@ impl Parser {
             if !self.expect_keyword("BY") {
                 return None;
             }
-            self.current_clause = "ORDER BY".to_string();
+            self.current_clause = "ORDER BY";
             stmt.order_by = self.parse_order_by_expressions();
         }
 
         // Parse LIMIT clause
         if self.peek_token_is_keyword("LIMIT") {
             self.next_token(); // consume LIMIT
-            self.current_clause = "LIMIT".to_string();
+            self.current_clause = "LIMIT";
             self.next_token();
             stmt.limit = Some(Box::new(self.parse_expression(Precedence::Lowest)?));
         }
@@ -227,7 +227,7 @@ impl Parser {
         // Parse OFFSET clause
         if self.peek_token_is_keyword("OFFSET") {
             self.next_token(); // consume OFFSET
-            self.current_clause = "OFFSET".to_string();
+            self.current_clause = "OFFSET";
             self.next_token();
             stmt.offset = Some(Box::new(self.parse_expression(Precedence::Lowest)?));
 
@@ -251,7 +251,7 @@ impl Parser {
             }
             self.next_token(); // consume FIRST/NEXT
 
-            self.current_clause = "FETCH".to_string();
+            self.current_clause = "FETCH";
             self.next_token();
             stmt.limit = Some(Box::new(self.parse_expression(Precedence::Lowest)?));
 
@@ -266,7 +266,7 @@ impl Parser {
             }
         }
 
-        self.current_clause.clear();
+        self.current_clause = "";
         Some(stmt)
     }
 
@@ -370,7 +370,7 @@ impl Parser {
         // Parse WHERE clause
         if self.peek_token_is_keyword("WHERE") {
             self.next_token(); // consume WHERE
-            self.current_clause = "WHERE".to_string();
+            self.current_clause = "WHERE";
             self.next_token();
             stmt.where_clause = Some(Box::new(self.parse_expression(Precedence::Lowest)?));
         }
@@ -381,19 +381,19 @@ impl Parser {
             if !self.expect_keyword("BY") {
                 return None;
             }
-            self.current_clause = "GROUP BY".to_string();
+            self.current_clause = "GROUP BY";
             stmt.group_by = self.parse_group_by_clause();
         }
 
         // Parse HAVING clause
         if self.peek_token_is_keyword("HAVING") {
             self.next_token(); // consume HAVING
-            self.current_clause = "HAVING".to_string();
+            self.current_clause = "HAVING";
             self.next_token();
             stmt.having = Some(Box::new(self.parse_expression(Precedence::Lowest)?));
         }
 
-        self.current_clause.clear();
+        self.current_clause = "";
         Some(stmt)
     }
 
@@ -1087,7 +1087,7 @@ impl Parser {
                 // DO UPDATE ... WHERE: the row is updated only where this holds
                 let update_where = if self.peek_token_is_keyword("WHERE") {
                     self.next_token(); // consume WHERE
-                    self.current_clause = "WHERE".to_string();
+                    self.current_clause = "WHERE";
                     self.next_token();
                     match self.parse_expression(Precedence::Lowest) {
                         Some(expr) => Some(Box::new(expr)),
@@ -1489,14 +1489,14 @@ impl Parser {
         // Parse WHERE clause
         let where_clause = if self.peek_token_is_keyword("WHERE") {
             self.next_token(); // consume WHERE
-            self.current_clause = "WHERE".to_string();
+            self.current_clause = "WHERE";
             self.next_token();
             Some(Box::new(self.parse_expression(Precedence::Lowest)?))
         } else {
             None
         };
 
-        self.current_clause.clear();
+        self.current_clause = "";
 
         // Parse optional RETURNING clause
         let returning = self.parse_returning_clause();
@@ -1559,14 +1559,14 @@ impl Parser {
         // Parse WHERE clause
         let where_clause = if self.peek_token_is_keyword("WHERE") {
             self.next_token(); // consume WHERE
-            self.current_clause = "WHERE".to_string();
+            self.current_clause = "WHERE";
             self.next_token();
             Some(Box::new(self.parse_expression(Precedence::Lowest)?))
         } else {
             None
         };
 
-        self.current_clause.clear();
+        self.current_clause = "";
 
         // Parse optional RETURNING clause
         let returning = self.parse_returning_clause();
