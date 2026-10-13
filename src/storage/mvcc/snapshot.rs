@@ -66,29 +66,6 @@ const ROW_COMPRESSION_THRESHOLD: usize = 64;
 const COMPRESSED_LENGTH_FLAG: u32 = 0x8000_0000;
 
 // ============================================================================
-// Feature Flags (4 bytes)
-// ============================================================================
-
-/// Feature flag: Data is compressed
-#[allow(dead_code)]
-const FEATURE_HAS_COMPRESSION: u32 = 1 << 0;
-/// Feature flag: Has schema definition block
-#[allow(dead_code)]
-const FEATURE_HAS_SCHEMA_BLOCK: u32 = 1 << 1;
-/// Feature flag: Has statistics extension
-#[allow(dead_code)]
-const FEATURE_HAS_STATISTICS: u32 = 1 << 2;
-/// Feature flag: Has bloom filter extension
-#[allow(dead_code)]
-const FEATURE_HAS_BLOOM_FILTER: u32 = 1 << 3;
-/// Feature flag: Has min/max index extension
-#[allow(dead_code)]
-const FEATURE_HAS_MIN_MAX_INDEX: u32 = 1 << 4;
-/// Feature flag: This is an incremental snapshot
-#[allow(dead_code)]
-const FEATURE_INCREMENTAL_SNAPSHOT: u32 = 1 << 5;
-
-// ============================================================================
 // File Header and Footer structures
 // ============================================================================
 
@@ -149,12 +126,6 @@ impl FileHeader {
 
     fn with_source_lsn(mut self, lsn: u64) -> Self {
         self.source_lsn = lsn;
-        self
-    }
-
-    #[allow(dead_code)]
-    fn with_prev_snap_lsn(mut self, lsn: u64) -> Self {
-        self.prev_snap_lsn = lsn;
         self
     }
 
@@ -1093,7 +1064,6 @@ pub struct SnapshotReader {
     /// File path
     file_path: PathBuf,
     /// File header (kept for version info and future compatibility)
-    #[allow(dead_code)]
     header: FileHeader,
     /// File footer
     footer: Footer,
@@ -1566,14 +1536,11 @@ pub struct DiskVersionStore {
     table_name: String,
     /// Active snapshot readers
     readers: RwLock<Vec<SnapshotReader>>,
-    /// Schema hash for validation (kept for future schema migration support)
-    #[allow(dead_code)]
-    schema_hash: u64,
 }
 
 impl DiskVersionStore {
     /// Create a new disk version store
-    pub fn new(base_dir: impl AsRef<Path>, table_name: &str, schema: &Schema) -> Result<Self> {
+    pub fn new(base_dir: impl AsRef<Path>, table_name: &str) -> Result<Self> {
         let base_dir = base_dir.as_ref().to_path_buf();
         let store_dir = base_dir.join(table_name);
 
@@ -1589,7 +1556,6 @@ impl DiskVersionStore {
             base_dir,
             table_name: table_name.to_string(),
             readers: RwLock::new(Vec::new()),
-            schema_hash: schema_hash(schema),
         })
     }
 
@@ -1841,49 +1807,6 @@ impl DiskVersionStore {
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-/// Compute a hash of the schema for validation
-fn schema_hash(schema: &Schema) -> u64 {
-    // FNV-1a hash
-    let mut hash: u64 = 14695981039346656037;
-
-    // Hash table name
-    for c in schema.table_name.chars() {
-        hash ^= c as u64;
-        hash = hash.wrapping_mul(1099511628211);
-    }
-
-    // Hash columns
-    for col in &schema.columns {
-        // Hash column name
-        for c in col.name.chars() {
-            hash ^= c as u64;
-            hash = hash.wrapping_mul(1099511628211);
-        }
-
-        // Hash column type
-        hash ^= col.data_type.as_u8() as u64;
-        hash = hash.wrapping_mul(1099511628211);
-
-        // Hash nullable flag
-        if col.nullable {
-            hash ^= 1;
-        }
-        hash = hash.wrapping_mul(1099511628211);
-
-        // Hash primary key flag
-        if col.primary_key {
-            hash ^= 1;
-        }
-        hash = hash.wrapping_mul(1099511628211);
-    }
-
-    hash
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2045,25 +1968,11 @@ mod tests {
     #[test]
     fn test_disk_version_store() {
         let dir = tempdir().unwrap();
-        let schema = create_test_schema();
 
-        let dvs = DiskVersionStore::new(dir.path(), "test_table", &schema).unwrap();
+        let dvs = DiskVersionStore::new(dir.path(), "test_table").unwrap();
 
         // Initially no snapshots
         assert!(dvs.load_snapshots().is_ok());
         assert!(dvs.get_row(1).is_none());
-    }
-
-    #[test]
-    fn test_schema_hash() {
-        let schema1 = create_test_schema();
-        let schema2 = create_test_schema();
-
-        assert_eq!(schema_hash(&schema1), schema_hash(&schema2));
-
-        // Different schema should have different hash
-        let mut schema3 = create_test_schema();
-        schema3.table_name = "different_table".to_string();
-        assert_ne!(schema_hash(&schema1), schema_hash(&schema3));
     }
 }

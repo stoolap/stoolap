@@ -268,66 +268,6 @@ impl Executor {
             .get_or_init(|| QueryPlanner::new(Arc::clone(&self.engine)))
     }
 
-    /// Get or create a table within the active transaction
-    /// Returns (table, should_auto_commit) where should_auto_commit is false if there's an active transaction
-    #[allow(dead_code)]
-    fn get_table_for_dml(&self, table_name: &str) -> Result<(Box<dyn Table>, bool)> {
-        let mut active_tx = self.active_transaction.lock().unwrap();
-
-        if let Some(ref mut tx_state) = *active_tx {
-            // There's an active transaction - use it
-            let table_name_lower = table_name.to_lowercase();
-
-            // Check if we already have this table cached
-            if tx_state.tables.contains_key(&table_name_lower) {
-                // We need to get the table from the transaction again since we can't clone Box<dyn Table>
-                let table = tx_state.transaction.get_table(table_name)?;
-                return Ok((table, false));
-            }
-
-            // Get the table from the transaction and cache it
-            let table = tx_state.transaction.get_table(table_name)?;
-
-            // Store a reference indicator that this table is active in the transaction
-            // Note: We can't cache the actual table as Box<dyn Table> isn't Clone
-            // But we can get a fresh handle each time - the key is using the same transaction
-            tx_state.tables.insert(
-                table_name_lower.clone(),
-                tx_state.transaction.get_table(table_name)?,
-            );
-
-            Ok((table, false))
-        } else {
-            // No active transaction - create a new one with auto-commit
-            let tx = self.engine.begin_transaction()?;
-            let table = tx.get_table(table_name)?;
-            Ok((table, true))
-        }
-    }
-
-    /// Start a transaction and get a table, returning transaction and table
-    #[allow(dead_code)]
-    #[allow(clippy::type_complexity)]
-    fn start_transaction_for_dml(
-        &self,
-        table_name: &str,
-    ) -> Result<(Option<Box<dyn Transaction>>, Box<dyn Table>, bool)> {
-        let active_tx = self.active_transaction.lock().unwrap();
-
-        if active_tx.is_some() {
-            // There's an active transaction - we'll use the cached version
-            drop(active_tx);
-            let (table, auto_commit) = self.get_table_for_dml(table_name)?;
-            Ok((None, table, auto_commit))
-        } else {
-            // No active transaction - create a new one with auto-commit
-            drop(active_tx);
-            let tx = self.engine.begin_transaction()?;
-            let table = tx.get_table(table_name)?;
-            Ok((Some(tx), table, true))
-        }
-    }
-
     /// Set the default isolation level for new transactions
     pub fn set_default_isolation_level(&self, level: crate::core::IsolationLevel) {
         self.default_isolation_level

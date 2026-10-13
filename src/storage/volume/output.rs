@@ -527,7 +527,6 @@ impl VolumeFileWriter {
             comp_lens,
             decomp_lens,
             kinds.iter().map(|k| k.0).collect(),
-            column_types.clone(),
             kinds.iter().map(|k| k.1).collect(),
             shared_dict,
             dict_ranges,

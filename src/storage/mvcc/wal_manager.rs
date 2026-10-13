@@ -22,7 +22,7 @@ use crate::common::time_compat::{SystemTime, UNIX_EPOCH};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::common::I64Set;
@@ -1016,19 +1016,9 @@ pub struct WALManager {
     failure_cleaned: Mutex<Option<bool>>,
     /// A failed settlement could not cut the retired file back
     retired_cut_failed: AtomicBool,
-    /// Pending commits (legacy, kept for API compatibility)
-    #[allow(dead_code)]
-    pending_commits: AtomicI32,
     /// Last sync time in nanoseconds (legacy, kept for API compatibility)
-    #[allow(dead_code)]
     last_sync_time: AtomicI64,
-    /// Commit batch size (legacy, kept for API compatibility)
-    /// Note: Batching is disabled in Normal mode to ensure durability.
-    /// Commits are now always immediately synced to disk.
-    #[allow(dead_code)]
-    commit_batch_size: i32,
     /// Sync interval in nanoseconds (legacy, kept for API compatibility)
-    #[allow(dead_code)]
     sync_interval: i64,
     /// Current file position (for rotation check)
     current_file_position: AtomicU64,
@@ -1136,7 +1126,6 @@ impl WALManager {
     /// Create a new WAL manager with custom config
     ///
     /// This allows configuring:
-    /// - `commit_batch_size`: Number of commits to batch before syncing (SyncNormal mode)
     /// - `sync_interval_ms`: Minimum time between syncs in milliseconds (SyncNormal mode)
     /// - `wal_flush_trigger`: Buffer size that triggers a flush
     /// - `wal_buffer_size`: Initial buffer size
@@ -1235,24 +1224,21 @@ impl WALManager {
             .unwrap_or(0);
 
         // Extract config values with defaults
-        let (commit_batch_size, sync_interval, flush_trigger, buffer_size, max_wal_size) =
-            if let Some(cfg) = config {
-                (
-                    cfg.commit_batch_size as i32,
-                    (cfg.sync_interval_ms as i64) * 1_000_000, // ms to ns
-                    cfg.wal_flush_trigger as u64,
-                    cfg.wal_buffer_size,
-                    cfg.wal_max_size as u64,
-                )
-            } else {
-                (
-                    100,        // Default batch size
-                    10_000_000, // 10ms in nanoseconds
-                    DEFAULT_WAL_FLUSH_TRIGGER,
-                    DEFAULT_WAL_BUFFER_SIZE,
-                    DEFAULT_WAL_MAX_SIZE,
-                )
-            };
+        let (sync_interval, flush_trigger, buffer_size, max_wal_size) = if let Some(cfg) = config {
+            (
+                (cfg.sync_interval_ms as i64) * 1_000_000, // ms to ns
+                cfg.wal_flush_trigger as u64,
+                cfg.wal_buffer_size,
+                cfg.wal_max_size as u64,
+            )
+        } else {
+            (
+                10_000_000, // 10ms in nanoseconds
+                DEFAULT_WAL_FLUSH_TRIGGER,
+                DEFAULT_WAL_BUFFER_SIZE,
+                DEFAULT_WAL_MAX_SIZE,
+            )
+        };
 
         // Get initial file position if we have an existing WAL file
         let initial_file_position = if let Some(ref file) = wal_file {
@@ -1284,9 +1270,7 @@ impl WALManager {
             buffered_lsn: AtomicU64::new(initial_lsn),
             failure_cleaned: Mutex::new(None),
             retired_cut_failed: AtomicBool::new(false),
-            pending_commits: AtomicI32::new(0),
             last_sync_time: AtomicI64::new(now),
-            commit_batch_size,
             sync_interval,
             current_file_position: AtomicU64::new(initial_file_position),
             synced_position: AtomicU64::new(initial_file_position),

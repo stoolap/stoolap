@@ -131,8 +131,6 @@ pub struct Parser<'a> {
     errors: Vec<ParseError>,
     /// Current clause context (for error messages and parameter tracking)
     pub(crate) current_clause: &'static str,
-    /// Current statement ID (for multi-statement queries)
-    current_statement_id: usize,
     /// Parameter counter within current statement
     parameter_counter: usize,
 }
@@ -151,7 +149,6 @@ impl<'a> Parser<'a> {
             peek_token,
             errors,
             current_clause: "",
-            current_statement_id: 0,
             parameter_counter: 1,
         }
     }
@@ -172,7 +169,6 @@ impl<'a> Parser<'a> {
             }
 
             self.next_token();
-            self.current_statement_id += 1;
             self.parameter_counter = 1;
         }
 
@@ -412,12 +408,6 @@ impl<'a> Parser<'a> {
         let idx = self.parameter_counter;
         self.parameter_counter += 1;
         idx
-    }
-
-    /// Get current statement ID
-    #[allow(dead_code)]
-    pub(crate) fn current_statement_id(&self) -> usize {
-        self.current_statement_id
     }
 }
 

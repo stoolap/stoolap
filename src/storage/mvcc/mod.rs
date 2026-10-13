@@ -64,7 +64,7 @@ pub use persistence::{
     DEFAULT_CHECKPOINT_INTERVAL, DEFAULT_KEEP_SNAPSHOTS,
 };
 pub use registry::{TransactionRegistry, INVALID_TRANSACTION_ID, RECOVERY_TRANSACTION_ID};
-pub use scanner::{EmptyScanner, MVCCScanner, RangeScanner, SingleRowScanner};
+pub use scanner::{EmptyScanner, MVCCScanner};
 pub use snapshot::{DiskVersionStore, SnapshotReader, SnapshotWriter};
 pub use table::MVCCTable;
 pub use timestamp::get_fast_timestamp;

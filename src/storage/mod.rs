@@ -54,9 +54,9 @@ pub use traits::{
 // Re-export MVCC types
 pub use mvcc::{
     get_fast_timestamp, EmptyScanner as MvccEmptyScanner, MVCCEngine, MVCCScanner, MVCCTable,
-    MvccTransaction, RangeScanner, RowVersion, SingleRowScanner, TransactionEngineOperations,
-    TransactionRegistry, TransactionState, TransactionVersionStore, VersionStore,
-    VisibilityChecker, WriteSetEntry, INVALID_TRANSACTION_ID, RECOVERY_TRANSACTION_ID,
+    MvccTransaction, RowVersion, TransactionEngineOperations, TransactionRegistry,
+    TransactionState, TransactionVersionStore, VersionStore, VisibilityChecker, WriteSetEntry,
+    INVALID_TRANSACTION_ID, RECOVERY_TRANSACTION_ID,
 };
 
 // Re-export WAL types

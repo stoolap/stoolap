@@ -4936,31 +4936,6 @@ impl Executor {
         None
     }
 
-    /// Get column value from row
-    #[allow(dead_code)]
-    fn get_column_value(
-        &self,
-        row: &Row,
-        column: &str,
-        columns: &[String],
-        col_index_map: &StringMap<usize>,
-    ) -> Value {
-        if column == "*" {
-            // For COUNT(*), return a non-null value
-            Value::Integer(1)
-        } else if let Some(idx) = Self::lookup_column_index(&column.to_lowercase(), col_index_map) {
-            row.get(idx).cloned().unwrap_or_else(Value::null_unknown)
-        } else {
-            // Try to find by case-insensitive match
-            for (i, col) in columns.iter().enumerate() {
-                if col.eq_ignore_ascii_case(column) {
-                    return row.get(i).cloned().unwrap_or_else(Value::null_unknown);
-                }
-            }
-            Value::null_unknown()
-        }
-    }
-
     /// Apply HAVING clause to aggregated results
     #[allow(clippy::too_many_arguments)]
     fn apply_having(

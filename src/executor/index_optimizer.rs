@@ -28,18 +28,6 @@ use crate::core::{Result, Row, RowVec, Value, ValueSet};
 use crate::parser::ast::*;
 use crate::storage::traits::{QueryResult, Table};
 
-/// Classification of a window expression's PARTITION BY for index optimization.
-#[allow(dead_code)]
-enum WindowPartitionKind {
-    /// Not a window expression at all (plain column, function, etc.)
-    NotAWindow,
-    /// Window expression whose partition clause is incompatible with per-partition
-    /// index fetch (global window, multi-column, complex expression, window ref).
-    Incompatible,
-    /// Window with a single simple column PARTITION BY.
-    SimpleColumn(String),
-}
-
 use super::context::{
     cache_in_subquery, extract_table_names_for_cache, get_cached_in_subquery, ExecutionContext,
 };

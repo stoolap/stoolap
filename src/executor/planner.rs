@@ -62,8 +62,6 @@ const MAX_STATS_CACHE_SIZE: usize = 1000;
 struct CachedStats {
     table_stats: TableStats,
     column_stats: StringMap<ColumnStatsCache>,
-    #[allow(dead_code)]
-    zone_maps: Option<TableZoneMap>,
     /// Timestamp when this cache entry was created
     cached_at: crate::common::time_compat::Instant,
     /// Engine stats epoch at creation: ANALYZE through any handle bumps
@@ -102,7 +100,6 @@ pub struct ColumnStatsCache {
     /// Maximum value in the column
     pub max_value: Option<Value>,
     /// Average width of values in bytes
-    #[allow(dead_code)]
     pub avg_width: usize,
     /// Histogram for range selectivity estimation
     pub histogram: Option<Histogram>,
@@ -295,7 +292,6 @@ impl QueryPlanner {
                 CachedStats {
                     table_stats: table_stats.clone(),
                     column_stats,
-                    zone_maps: None, // Zone maps are stored in the table, not here
                     cached_at: crate::common::time_compat::Instant::now(),
                     stats_epoch: stats_epoch_before_read,
                     last_accessed: std::sync::atomic::AtomicU64::new(self.now_secs()),
@@ -1488,7 +1484,6 @@ mod tests {
         let entry = CachedStats {
             table_stats: TableStats::default(),
             column_stats: StringMap::new(),
-            zone_maps: None,
             cached_at: crate::common::time_compat::Instant::now(),
             stats_epoch: 1,
             last_accessed: std::sync::atomic::AtomicU64::new(0),

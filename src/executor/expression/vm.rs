@@ -40,13 +40,10 @@ const STACK_INLINE_CAPACITY: usize = 16;
 
 /// Arithmetic operation type (used for safe wrapping operations)
 #[derive(Clone, Copy)]
-#[allow(dead_code)]
 enum ArithmeticOp {
     Add,
     Sub,
     Mul,
-    Div,
-    Mod,
 }
 
 /// Execution context for the VM
@@ -3534,18 +3531,6 @@ impl ExprVM {
                     ArithmeticOp::Add => x.checked_add(*y),
                     ArithmeticOp::Sub => x.checked_sub(*y),
                     ArithmeticOp::Mul => x.checked_mul(*y),
-                    ArithmeticOp::Div => {
-                        if *y == 0 {
-                            return Ok(Value::Null(DataType::Integer));
-                        }
-                        x.checked_div(*y)
-                    }
-                    ArithmeticOp::Mod => {
-                        if *y == 0 {
-                            return Ok(Value::Null(DataType::Integer));
-                        }
-                        x.checked_rem(*y)
-                    }
                 };
                 match result {
                     Some(r) => Ok(Value::Integer(r)),

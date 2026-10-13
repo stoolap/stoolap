@@ -120,7 +120,6 @@ struct IndexNestedLoopInfo {
     outer_table: Option<String>,
     inner_column: String,
     inner_table: String,
-    #[allow(dead_code)]
     additional_predicate: Option<Expression>,
 }
 

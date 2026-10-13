@@ -122,10 +122,10 @@ pub use storage::{
 
 // Re-export MVCC types
 pub use storage::{
-    BTreeIndex, MVCCEngine, MVCCScanner, MVCCTable, MvccTransaction, RangeScanner, RowVersion,
-    SingleRowScanner, TransactionEngineOperations, TransactionRegistry, TransactionState,
-    TransactionVersionStore, VersionStore, VisibilityChecker, WriteSetEntry,
-    INVALID_TRANSACTION_ID, RECOVERY_TRANSACTION_ID,
+    BTreeIndex, MVCCEngine, MVCCScanner, MVCCTable, MvccTransaction, RowVersion,
+    TransactionEngineOperations, TransactionRegistry, TransactionState, TransactionVersionStore,
+    VersionStore, VisibilityChecker, WriteSetEntry, INVALID_TRANSACTION_ID,
+    RECOVERY_TRANSACTION_ID,
 };
 
 // Re-export WAL types

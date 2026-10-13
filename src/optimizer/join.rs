@@ -394,23 +394,6 @@ impl JoinOptimizer {
         self.sorted_inputs.get(table_name)
     }
 
-    /// Check if input is sorted by a specific column
-    #[allow(dead_code)]
-    fn is_sorted_by_column(&self, tables: &FxHashSet<String>, column: &str) -> bool {
-        for table in tables {
-            if let Some(sorted_cols) = self.sorted_inputs.get(table) {
-                if sorted_cols
-                    .first()
-                    .map(|s| s.column == column || s.column.ends_with(&format!(".{}", column)))
-                    .unwrap_or(false)
-                {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
     /// Get table row count (with fallback)
     fn get_row_count(&self, table_name: &str) -> u64 {
         self.table_stats

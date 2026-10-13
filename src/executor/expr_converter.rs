@@ -42,10 +42,9 @@
 
 use crate::core::Value;
 use crate::executor::utils::{
-    dummy_token, extract_column_name, extract_literal_value, flip_operator, infix_to_operator,
+    extract_column_name, extract_literal_value, flip_operator, infix_to_operator,
 };
 use crate::parser::ast::{self as ast, InfixOperator, PrefixOperator};
-use crate::parser::token::TokenType;
 use crate::storage::expression::{
     AndExpr, BetweenExpr, ComparisonExpr, Expression, InListExpr, LikeExpr, NotExpr, NullCheckExpr,
     OrExpr,
@@ -276,59 +275,12 @@ fn convert_like(like: &ast::LikeExpression) -> Option<Box<dyn Expression>> {
     Some(Box::new(expr))
 }
 
-/// Split an expression into pushable and non-pushable parts
-///
-/// For AND expressions, extracts the parts that can be pushed down.
-/// Returns (pushable, remaining) where remaining is None if everything was pushed.
-#[allow(dead_code)]
-pub fn split_pushable_predicates(
-    expr: &ast::Expression,
-) -> (Option<Box<dyn Expression>>, Option<ast::Expression>) {
-    match expr {
-        ast::Expression::Infix(infix) if infix.op_type == InfixOperator::And => {
-            // For AND, we can push down individual parts even if others can't be pushed
-            let (left_push, left_remain) = split_pushable_predicates(&infix.left);
-            let (right_push, right_remain) = split_pushable_predicates(&infix.right);
-
-            // Combine pushable parts
-            let pushable = match (left_push, right_push) {
-                (Some(l), Some(r)) => Some(Box::new(AndExpr::and(l, r)) as Box<dyn Expression>),
-                (Some(l), None) => Some(l),
-                (None, Some(r)) => Some(r),
-                (None, None) => None,
-            };
-
-            // Combine remaining parts
-            let remaining = match (left_remain, right_remain) {
-                (Some(l), Some(r)) => Some(ast::Expression::Infix(ast::InfixExpression::new(
-                    dummy_token("AND", TokenType::Keyword),
-                    Box::new(l),
-                    "AND".to_string(),
-                    Box::new(r),
-                ))),
-                (Some(l), None) => Some(l),
-                (None, Some(r)) => Some(r),
-                (None, None) => None,
-            };
-
-            (pushable, remaining)
-        }
-
-        _ => {
-            // For non-AND expressions, it's all-or-nothing
-            if let Some(storage_expr) = convert_ast_to_storage_expr(expr) {
-                (Some(storage_expr), None)
-            } else {
-                (None, Some(expr.clone()))
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::{DataType, Row, Schema, SchemaBuilder};
+    use crate::executor::utils::dummy_token;
+    use crate::parser::token::TokenType;
 
     fn test_schema() -> Schema {
         SchemaBuilder::new("test")

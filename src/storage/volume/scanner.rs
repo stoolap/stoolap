@@ -58,7 +58,6 @@ type GroupBlocks = smallvec::SmallVec<[(usize, Arc<super::column::ColumnData>); 
 /// Cache holding decompressed columns for a single row group.
 /// Avoids decompressing the entire column when only a few groups are needed.
 struct GroupColumnCache {
-    #[allow(dead_code)]
     group_idx: usize,
     /// Decoded columns for this group (only needed columns populated),
     /// shared with the decoded group cache
