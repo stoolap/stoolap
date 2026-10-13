@@ -169,3 +169,28 @@ fn test_float_literal_is_not_matched_to_an_integer_group_key() {
         assert_eq!(strings(&db, sql), strings(&db, "SELECT 2, 2.5"), "{}", sql);
     }
 }
+
+#[test]
+fn test_quoted_column_is_not_matched_to_an_expression_group_key() {
+    let db = Database::open("memory://group_by_quoted_column").unwrap();
+    db.execute("CREATE TABLE t (v INTEGER, \"v / 2\" INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (5, 99)", ()).unwrap();
+    for (sql, expected) in [
+        (
+            "SELECT \"v / 2\" AS g, v / 2 AS h FROM t GROUP BY v, g",
+            "SELECT 99, 2",
+        ),
+        (
+            "SELECT \"v / 2\" + 1 AS g, (v / 2) + 1 AS h FROM t GROUP BY v, g",
+            "SELECT 100, 3",
+        ),
+        // A quoted name that can be written bare still matches its bare spelling
+        (
+            "SELECT \"v\" / 2 AS g, v / 2 + 1 AS h FROM t GROUP BY v / 2",
+            "SELECT 2, 3",
+        ),
+    ] {
+        assert_eq!(strings(&db, sql), strings(&db, expected), "{}", sql);
+    }
+}

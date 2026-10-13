@@ -823,6 +823,10 @@ impl Executor {
         // Build column index map for aggregate result columns
         let mut agg_col_index_map = build_column_index_map(&agg_columns);
 
+        // The printer drops quotes, so a column named "v / 2" prints like
+        // the expression v / 2; keep such statements off the expression keys
+        let keys_are_unambiguous = !stmt.columns.iter().any(mentions_unprintable_name);
+
         // Build additional mappings for aggregate expressions to handle deduplication
         // When aggregates are deduplicated (e.g., SUM(value) and SUM(value) AS total),
         // we need to map the expression "sum(value)" to the index even if the column
@@ -848,7 +852,9 @@ impl Executor {
                     {
                         agg_col_index_map.entry(alias_lower).or_insert(idx);
                     }
-                } else if let Some(&idx) = agg_col_index_map.get(aliased.alias.value_lower.as_str())
+                } else if let Some(&idx) = agg_col_index_map
+                    .get(aliased.alias.value_lower.as_str())
+                    .filter(|_| keys_are_unambiguous)
                 {
                     // A GROUP BY expression selected under an alias names its
                     // column by the alias; another column built on the same
@@ -7434,6 +7440,41 @@ impl Executor {
             vec![result_column_name],
             rows,
         ))))
+    }
+}
+
+/// Whether an expression may name a column that expression_to_string would
+/// print like some other expression: a quoted name that could not be
+/// written bare, or anything this walk does not look into
+fn mentions_unprintable_name(expr: &Expression) -> bool {
+    let unprintable = |id: &Identifier| {
+        let mut chars = id.value.chars();
+        let bare = chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
+            && chars.all(|c| c.is_alphanumeric() || c == '_');
+        id.quoted && !bare
+    };
+    match expr {
+        Expression::Identifier(id) => unprintable(id),
+        Expression::QualifiedIdentifier(qid) => {
+            unprintable(&qid.qualifier) || unprintable(&qid.name)
+        }
+        Expression::IntegerLiteral(_)
+        | Expression::FloatLiteral(_)
+        | Expression::StringLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::NullLiteral(_) => false,
+        Expression::Aliased(aliased) => mentions_unprintable_name(&aliased.expression),
+        Expression::Prefix(prefix) => mentions_unprintable_name(&prefix.right),
+        Expression::Infix(infix) => {
+            mentions_unprintable_name(&infix.left) || mentions_unprintable_name(&infix.right)
+        }
+        Expression::Cast(cast) => mentions_unprintable_name(&cast.expr),
+        Expression::FunctionCall(func) => {
+            !func.order_by.is_empty()
+                || func.filter.is_some()
+                || func.arguments.iter().any(mentions_unprintable_name)
+        }
+        _ => true,
     }
 }
 
