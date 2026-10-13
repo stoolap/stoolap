@@ -888,7 +888,13 @@ impl ScalarFunction for SplitPartFunction {
             ));
         }
 
-        let parts: Vec<&str> = s.split(&delimiter).collect();
+        // An empty delimiter leaves the string whole, where str::split
+        // would cut it between every character
+        let parts: Vec<&str> = if delimiter.is_empty() {
+            vec![s.as_str()]
+        } else {
+            s.split(&delimiter).collect()
+        };
         let idx = (n - 1) as usize;
 
         if idx >= parts.len() {
