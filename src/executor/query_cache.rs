@@ -245,7 +245,7 @@ pub struct CompiledInsert {
 pub struct CompiledConflictInsert {
     /// CHECK constraints of the inserted rows
     pub(crate) checks: Arc<Vec<super::dml::CompiledCheck>>,
-    /// ON DUPLICATE KEY UPDATE clause, compiled at the first conflict
+    /// ON DUPLICATE KEY UPDATE clause
     pub(crate) upsert: Option<Arc<super::dml::CompiledUpsert>>,
     /// Table name (already lowercased)
     pub table_name: SmartString,

@@ -55,11 +55,24 @@ fn test_upsert_enforces_check_on_insert_and_update() {
     .unwrap();
     let upsert = "INSERT INTO t VALUES ($1, $2) ON DUPLICATE KEY UPDATE v = $2";
     db.execute(upsert, (1, 5)).unwrap();
-    db.execute(upsert, (1, 6)).unwrap();
     assert!(is_check_violation(db.execute(upsert, (2, -1))), "insert");
-    assert!(is_check_violation(db.execute(upsert, (1, -1))), "update");
+    let update = "INSERT INTO t VALUES ($1, 1) ON DUPLICATE KEY UPDATE v = $2";
+    db.execute(update, (1, 6)).unwrap();
+    assert!(is_check_violation(db.execute(update, (1, -1))), "update");
     assert_eq!(value(&db, "SELECT COUNT(*) FROM t"), 1);
     assert_eq!(value(&db, "SELECT v FROM t WHERE id = 1"), 6);
+}
+
+#[test]
+fn test_invalid_upsert_clause_fails_without_a_conflict() {
+    let db = Database::open("memory://insert_plan_cache_invalid_clause").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    let upsert = "INSERT INTO t VALUES ($1, 10) ON CONFLICT (id) DO UPDATE SET v = missing_column";
+    for id in [1, 2] {
+        assert!(db.execute(upsert, (id,)).is_err(), "run with id {id}");
+    }
+    assert_eq!(value(&db, "SELECT COUNT(*) FROM t"), 0);
 }
 
 #[test]

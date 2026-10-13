@@ -275,8 +275,8 @@ static NO_CHECKS: std::sync::LazyLock<Arc<Vec<CompiledCheck>>> =
     std::sync::LazyLock::new(|| Arc::new(Vec::new()));
 
 /// One INSERT's CHECK programs and ON DUPLICATE KEY UPDATE clause: taken from
-/// the plan cache when compiled against this table layout, else compiled here
-/// (the clause at the first conflict) and cached
+/// the plan cache when compiled against this table layout, else compiled
+/// before the first write and cached
 struct InsertPlan<'a> {
     checks: Arc<Vec<CompiledCheck>>,
     upsert: Option<Arc<CompiledUpsert>>,
@@ -293,6 +293,7 @@ impl<'a> InsertPlan<'a> {
         epoch: u64,
         token: LayoutToken,
         schema: &Schema,
+        stmt: &InsertStatement,
     ) -> Result<Self> {
         let cached = cache.and_then(|cache| match &*cache.read().ok()? {
             CompiledExecution::ConflictInsert(plan)
@@ -309,11 +310,19 @@ impl<'a> InsertPlan<'a> {
             Some(parts) => parts,
             None => {
                 let checks = compile_check_programs(schema)?;
-                if checks.is_empty() {
-                    (Arc::clone(&NO_CHECKS), None)
+                let checks = if checks.is_empty() {
+                    Arc::clone(&NO_CHECKS)
                 } else {
-                    (Arc::new(checks), None)
-                }
+                    Arc::new(checks)
+                };
+                // Compiled before the first write, so an invalid clause
+                // fails the statement even when no row conflicts
+                let upsert = if stmt.on_duplicate {
+                    Some(Arc::new(Executor::compile_upsert(schema, stmt)?))
+                } else {
+                    None
+                };
+                (checks, upsert)
             }
         };
         let plan = Self {
@@ -659,6 +668,7 @@ impl Executor {
                 self.engine.schema_epoch(),
                 table.layout_token(),
                 schema,
+                stmt,
             )?;
             check_programs = Arc::clone(&insert_plan.checks);
             all_column_types = schema.columns.iter().map(|c| c.data_type).collect();
