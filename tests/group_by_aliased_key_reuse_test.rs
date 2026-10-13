@@ -162,12 +162,13 @@ fn test_float_literal_is_not_matched_to_an_integer_group_key() {
     db.execute("CREATE TABLE t (v INTEGER)", ()).unwrap();
     db.execute("INSERT INTO t VALUES (5)", ()).unwrap();
 
-    for sql in [
-        "SELECT v / 2 AS g, v / 2.0 AS h FROM t GROUP BY v, v / 2",
-        "SELECT v / 2, v / 2.0 FROM t GROUP BY v, v / 2",
-    ] {
-        assert_eq!(strings(&db, sql), strings(&db, "SELECT 2, 2.5"), "{}", sql);
-    }
+    assert_eq!(
+        strings(
+            &db,
+            "SELECT v / 2 AS g, v / 2.0 AS h FROM t GROUP BY v, v / 2"
+        ),
+        strings(&db, "SELECT 2, 2.5")
+    );
 }
 
 #[test]
@@ -198,5 +199,16 @@ fn test_quoted_column_is_not_matched_to_a_literal() {
     assert_eq!(
         strings(&db, "SELECT \"null\" AS g, NULL AS h FROM t GROUP BY g"),
         strings(&db, "SELECT 7, NULL")
+    );
+}
+
+#[test]
+fn test_float_group_key_does_not_split_on_its_decimal_point() {
+    let db = Database::open("memory://group_by_float_key_name").unwrap();
+    db.execute("CREATE TABLE t (v INTEGER)", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (5)", ()).unwrap();
+    assert_eq!(
+        strings(&db, "SELECT v / 2.0, 0 AS z FROM t GROUP BY v / 2.0"),
+        strings(&db, "SELECT 2.5, 0")
     );
 }

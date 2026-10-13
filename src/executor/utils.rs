@@ -1914,8 +1914,7 @@ pub fn expression_to_string(expr: &Expression) -> String {
             format!("{}.{}", qid.qualifier.value, qid.name.value)
         }
         Expression::IntegerLiteral(lit) => lit.value.to_string(),
-        // Debug keeps the decimal point, so 2.0 is not printed like the integer 2
-        Expression::FloatLiteral(lit) => format!("{:?}", lit.value),
+        Expression::FloatLiteral(lit) => lit.value.to_string(),
         Expression::StringLiteral(lit) => format!("'{}'", lit.value),
         Expression::BooleanLiteral(lit) => lit.value.to_string(),
         Expression::FunctionCall(func) => {

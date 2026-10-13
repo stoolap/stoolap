@@ -823,50 +823,26 @@ impl Executor {
         // Build column index map for aggregate result columns
         let mut agg_col_index_map = build_column_index_map(&agg_columns);
 
-        // The printer drops quotes, so a column named "v / 2" or "null" prints
-        // like an expression or a literal; keep such statements off the
-        // expression keys
-        let keys_are_unambiguous = !stmt.columns.iter().any(mentions_quoted_name);
-
         // Build additional mappings for aggregate expressions to handle deduplication
         // When aggregates are deduplicated (e.g., SUM(value) and SUM(value) AS total),
         // we need to map the expression "sum(value)" to the index even if the column
         // is named by its alias "total"
         for col_expr in &stmt.columns {
             if let Expression::Aliased(aliased) = col_expr {
-                let aggregate = match aliased.expression.as_ref() {
-                    Expression::FunctionCall(func) if is_aggregate_function(&func.function) => {
-                        Some(func)
-                    }
-                    _ => None,
-                };
-                if let Some(func) = aggregate {
-                    let expr_name: String = self.get_aggregate_column_name(func).to_lowercase();
-                    let alias_lower: String = aliased.alias.value_lower.to_string();
-                    // If the alias exists in the map but the expression doesn't, add the expression
-                    if let Some(&idx) = agg_col_index_map.get(&alias_lower) {
-                        agg_col_index_map.entry(expr_name).or_insert(idx);
-                    }
-                    // If the expression exists in the map but the alias doesn't, add the alias
-                    if let Some(&idx) =
-                        agg_col_index_map.get(&self.get_aggregate_column_name(func).to_lowercase())
-                    {
-                        agg_col_index_map.entry(alias_lower).or_insert(idx);
-                    }
-                } else if let Some(&idx) = agg_col_index_map
-                    .get(aliased.alias.value_lower.as_str())
-                    .filter(|_| keys_are_unambiguous)
-                {
-                    // A GROUP BY expression selected under an alias names its
-                    // column by the alias; another column built on the same
-                    // expression still finds it by the expression. Keys are
-                    // lowercased whole, so skip expressions with a quote,
-                    // whose literals would collide with differently cased ones.
-                    let expr_str = self.expression_to_string(aliased.expression.as_ref());
-                    if !expr_str.contains('\'') {
-                        agg_col_index_map
-                            .entry(expr_str.to_lowercase())
-                            .or_insert(idx);
+                if let Expression::FunctionCall(func) = aliased.expression.as_ref() {
+                    if is_aggregate_function(&func.function) {
+                        let expr_name: String = self.get_aggregate_column_name(func).to_lowercase();
+                        let alias_lower: String = aliased.alias.value_lower.to_string();
+                        // If the alias exists in the map but the expression doesn't, add the expression
+                        if let Some(&idx) = agg_col_index_map.get(&alias_lower) {
+                            agg_col_index_map.entry(expr_name).or_insert(idx);
+                        }
+                        // If the expression exists in the map but the alias doesn't, add the alias
+                        if let Some(&idx) = agg_col_index_map
+                            .get(&self.get_aggregate_column_name(func).to_lowercase())
+                        {
+                            agg_col_index_map.entry(alias_lower).or_insert(idx);
+                        }
                     }
                 }
             } else if let Expression::FunctionCall(func) = col_expr {
@@ -1127,6 +1103,37 @@ impl Executor {
                     // Other expressions
                     final_columns.push(self.expression_to_string(col_expr));
                     column_sources.push(make_source(col_expr, is_correlated));
+                }
+            }
+        }
+
+        // A GROUP BY expression selected under an alias names its column by the
+        // alias, so another column built on the same expression cannot find it by
+        // its text. Point such subexpressions at the alias column, matching them
+        // by structure, not by printed text.
+        if matches!(stmt.group_by.modifier, GroupByModifier::None) {
+            let group_aliases: Vec<(&Expression, &Identifier)> = stmt
+                .columns
+                .iter()
+                .filter_map(|col| match col {
+                    Expression::Aliased(aliased)
+                        if agg_col_index_map.contains_key(aliased.alias.value_lower.as_str())
+                            && stmt
+                                .group_by
+                                .columns
+                                .iter()
+                                .any(|g| same_expression(g, &aliased.expression)) =>
+                    {
+                        Some((aliased.expression.as_ref(), &aliased.alias))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !group_aliases.is_empty() {
+                for source in column_sources.iter_mut() {
+                    if let ColumnSource::Expression(expr) = source {
+                        **expr = substitute_group_aliases(expr, &group_aliases);
+                    }
                 }
             }
         }
@@ -7444,31 +7451,91 @@ impl Executor {
     }
 }
 
-/// Whether an expression may name a column that expression_to_string would
-/// print like some other expression: any quoted name, since the printer
-/// drops the quotes ("v / 2", "null"), or anything this walk does not look into
-fn mentions_quoted_name(expr: &Expression) -> bool {
-    match expr {
-        Expression::Identifier(id) => id.quoted,
-        Expression::QualifiedIdentifier(qid) => qid.qualifier.quoted || qid.name.quoted,
-        Expression::IntegerLiteral(_)
-        | Expression::FloatLiteral(_)
-        | Expression::StringLiteral(_)
-        | Expression::BooleanLiteral(_)
-        | Expression::NullLiteral(_) => false,
-        Expression::Aliased(aliased) => mentions_quoted_name(&aliased.expression),
-        Expression::Prefix(prefix) => mentions_quoted_name(&prefix.right),
-        Expression::Infix(infix) => {
-            mentions_quoted_name(&infix.left) || mentions_quoted_name(&infix.right)
-        }
-        Expression::Cast(cast) => mentions_quoted_name(&cast.expr),
-        Expression::FunctionCall(func) => {
-            !func.order_by.is_empty()
-                || func.filter.is_some()
-                || func.arguments.iter().any(mentions_quoted_name)
-        }
-        _ => true,
+/// Whether two expressions are the same, comparing node kinds, operators,
+/// names and literal values but not tokens or source positions
+fn same_expression(a: &Expression, b: &Expression) -> bool {
+    fn same_identifier(a: &Identifier, b: &Identifier) -> bool {
+        a.quoted == b.quoted
+            && if a.quoted {
+                a.value == b.value
+            } else {
+                a.value_lower == b.value_lower
+            }
     }
+    match (a, b) {
+        (Expression::Identifier(a), Expression::Identifier(b)) => same_identifier(a, b),
+        (Expression::QualifiedIdentifier(a), Expression::QualifiedIdentifier(b)) => {
+            same_identifier(&a.qualifier, &b.qualifier) && same_identifier(&a.name, &b.name)
+        }
+        (Expression::IntegerLiteral(a), Expression::IntegerLiteral(b)) => a.value == b.value,
+        (Expression::FloatLiteral(a), Expression::FloatLiteral(b)) => {
+            a.value.to_bits() == b.value.to_bits()
+        }
+        (Expression::StringLiteral(a), Expression::StringLiteral(b)) => {
+            a.value == b.value && a.type_hint == b.type_hint
+        }
+        (Expression::BooleanLiteral(a), Expression::BooleanLiteral(b)) => a.value == b.value,
+        (Expression::NullLiteral(_), Expression::NullLiteral(_)) => true,
+        (Expression::Prefix(a), Expression::Prefix(b)) => {
+            a.op_type == b.op_type
+                && a.operator.eq_ignore_ascii_case(&b.operator)
+                && same_expression(&a.right, &b.right)
+        }
+        (Expression::Infix(a), Expression::Infix(b)) => {
+            a.op_type == b.op_type
+                && a.operator.eq_ignore_ascii_case(&b.operator)
+                && same_expression(&a.left, &b.left)
+                && same_expression(&a.right, &b.right)
+        }
+        (Expression::Cast(a), Expression::Cast(b)) => {
+            a.type_name.eq_ignore_ascii_case(&b.type_name) && same_expression(&a.expr, &b.expr)
+        }
+        (Expression::FunctionCall(a), Expression::FunctionCall(b)) => {
+            a.function.eq_ignore_ascii_case(&b.function)
+                && a.is_distinct == b.is_distinct
+                && a.order_by.is_empty()
+                && b.order_by.is_empty()
+                && a.filter.is_none()
+                && b.filter.is_none()
+                && a.arguments.len() == b.arguments.len()
+                && a.arguments
+                    .iter()
+                    .zip(&b.arguments)
+                    .all(|(a, b)| same_expression(a, b))
+        }
+        _ => false,
+    }
+}
+
+/// `expr` with every subexpression that is the same as an aliased GROUP BY
+/// expression replaced by that alias
+fn substitute_group_aliases(
+    expr: &Expression,
+    aliases: &[(&Expression, &Identifier)],
+) -> Expression {
+    if let Some((_, alias)) = aliases.iter().find(|(e, _)| same_expression(e, expr)) {
+        return Expression::Identifier((*alias).clone());
+    }
+    let mut out = expr.clone();
+    match &mut out {
+        Expression::Infix(infix) => {
+            *infix.left = substitute_group_aliases(&infix.left, aliases);
+            *infix.right = substitute_group_aliases(&infix.right, aliases);
+        }
+        Expression::Prefix(prefix) => {
+            *prefix.right = substitute_group_aliases(&prefix.right, aliases);
+        }
+        Expression::Cast(cast) => {
+            *cast.expr = substitute_group_aliases(&cast.expr, aliases);
+        }
+        Expression::FunctionCall(func) if !is_aggregate_function(&func.function) => {
+            for arg in func.arguments.iter_mut() {
+                *arg = substitute_group_aliases(arg, aliases);
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 #[cfg(test)]
