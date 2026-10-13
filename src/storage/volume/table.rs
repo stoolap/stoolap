@@ -5540,6 +5540,23 @@ impl Table for SegmentedTable {
         self.hot.index_view_epoch()
     }
 
+    fn count_equal_candidates(
+        &self,
+        row_ids: &[i64],
+        column: usize,
+        key: &Value,
+        limit: usize,
+        epoch: Option<u64>,
+    ) -> Result<usize> {
+        // Without volumes every candidate is a hot row, counted as the hot store counts
+        self.unsealed(|hot| hot.count_equal_candidates(row_ids, column, key, limit, epoch))
+            .unwrap_or_else(|| {
+                crate::storage::traits::table::count_equal_by_reading(
+                    self, row_ids, column, key, limit,
+                )
+            })
+    }
+
     fn get_pending_versions(&self) -> Vec<(i64, Row, bool, i64)> {
         self.hot.get_pending_versions()
     }
