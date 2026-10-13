@@ -1249,6 +1249,7 @@ mod tests {
             literal: "".into(),
             position: Position::new(0, 1, 1),
             quoted: false,
+            keyword: None,
         }
     }
 

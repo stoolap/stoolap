@@ -413,6 +413,7 @@ fn test_compiler_simple_expression() {
                 column: 1,
             },
             quoted: false,
+            keyword: None,
         }
     }
 
