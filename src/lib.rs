@@ -61,7 +61,7 @@
 //! - [`functions`] - 101+ SQL functions (scalar, aggregate, window)
 //! - [`executor`] - Query executor with parallel execution
 //! - [`optimizer`] - Cost-based query optimizer with cardinality feedback
-//! - [`common`] - Utilities (BufferPool, I64Map, version)
+//! - [`common`] - Utilities (I64Map, version)
 
 // stoolap-jemalloc as the global allocator, on by default, without its
 // profiler unless heap-profile is on; dhat-heap needs its own allocator
@@ -103,7 +103,7 @@ pub use core::{
 };
 
 // Re-export common utilities
-pub use common::{BufferPool, I64Map, I64Set, PoolStats, SemVer, SmartString};
+pub use common::{I64Map, I64Set, SemVer, SmartString};
 
 // Re-export storage/expression types
 pub use storage::{
