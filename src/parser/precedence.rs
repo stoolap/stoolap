@@ -57,7 +57,14 @@ pub enum Precedence {
 impl Precedence {
     /// Get precedence for an operator string
     pub fn for_operator(op: &str) -> Precedence {
-        match op.to_uppercase().as_str() {
+        // Every operator and keyword below fits in 8 bytes
+        let mut buf = [0u8; 8];
+        let Some(upper) = buf.get_mut(..op.len()) else {
+            return Precedence::Lowest;
+        };
+        upper.copy_from_slice(op.as_bytes());
+        upper.make_ascii_uppercase();
+        match std::str::from_utf8(upper).unwrap_or_default() {
             // Logical
             "OR" => Precedence::Or,
             "XOR" => Precedence::Or, // XOR has same precedence as OR

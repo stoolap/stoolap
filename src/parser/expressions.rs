@@ -21,7 +21,7 @@ use super::parser::Parser;
 use super::precedence::Precedence;
 use super::token::{Token, TokenType};
 
-impl Parser {
+impl Parser<'_> {
     /// Parse an expression with the given precedence
     pub fn parse_expression(&mut self, precedence: Precedence) -> Option<Expression> {
         // Parse prefix expression
