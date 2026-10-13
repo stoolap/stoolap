@@ -473,9 +473,13 @@ pub struct ParallelStats {
 enum HashTableStorage {
     /// Sequential execution using FxHashMap (optimized for trusted keys)
     Sequential(FxHashMap<u64, Vec<usize>>),
-    /// Parallel execution using DashMap (concurrent, lock-free)
+    /// Built in parallel: one map per partition, picked by the hash's top
+    /// bits, each built by one thread without a lock
     #[cfg(feature = "parallel")]
-    Parallel(dashmap::DashMap<u64, Vec<usize>>),
+    Partitioned {
+        maps: Vec<FxHashMap<u64, Vec<usize>>>,
+        shift: u32,
+    },
 }
 
 /// Build side match tracking using atomic operations
@@ -517,13 +521,23 @@ impl BuildMatchedTracker {
 impl HashTableStorage {
     /// Get matching build row indices for a hash key
     #[inline]
-    fn get(&self, key: &u64) -> Option<Vec<usize>> {
+    fn get(&self, key: &u64) -> Option<&[usize]> {
         match self {
-            HashTableStorage::Sequential(map) => map.get(key).cloned(),
+            HashTableStorage::Sequential(map) => map.get(key).map(Vec::as_slice),
             #[cfg(feature = "parallel")]
-            HashTableStorage::Parallel(map) => map.get(key).map(|v| v.clone()),
+            HashTableStorage::Partitioned { maps, shift } => {
+                maps[partition_of(*key, *shift)].get(key).map(Vec::as_slice)
+            }
         }
     }
+}
+
+/// The partition of `hash`: its top bits within a usize, so any u64 a caller
+/// passes stays below the partition count on a 32-bit target too
+#[cfg(feature = "parallel")]
+#[inline]
+fn partition_of(hash: u64, shift: u32) -> usize {
+    (hash as usize) >> shift
 }
 
 /// Result of parallel hash table build phase
@@ -537,7 +551,7 @@ pub struct ParallelHashTable {
 impl ParallelHashTable {
     /// Get matching build row indices for a hash key
     #[inline]
-    pub fn get(&self, key: &u64) -> Option<Vec<usize>> {
+    pub fn get(&self, key: &u64) -> Option<&[usize]> {
         self.storage.get(key)
     }
 }
@@ -546,8 +560,8 @@ impl ParallelHashTable {
 ///
 /// This function builds the hash table from the build side of a join in parallel:
 /// 1. Split build rows into chunks
-/// 2. Each thread computes hashes and builds a partial hash table
-/// 3. Merge partial tables into a concurrent DashMap
+/// 2. Each thread hashes a chunk and splits its rows by partition
+/// 3. Each thread builds one partition's map from every chunk's share
 ///
 /// # Performance
 ///
@@ -563,36 +577,45 @@ pub fn parallel_hash_build(
 
     #[cfg(feature = "parallel")]
     if config.should_parallel_join(row_count) {
-        use dashmap::DashMap;
-
-        // Parallel build using DashMap's concurrent access
-        let table: DashMap<u64, Vec<usize>> = DashMap::with_capacity(row_count);
         let n_threads = num_threads();
+        let partitions = n_threads.next_power_of_two().max(2);
+        // FxHasher keeps a usize, so a 32-bit target's hashes have no top half
+        let shift = usize::BITS - partitions.trailing_zeros();
         let chunk_size = config.chunk_size.max(row_count / n_threads).max(1000);
 
-        // Process chunks in parallel, each inserting directly into the concurrent hash table
-        build_rows
+        let chunk_parts: Vec<Vec<Vec<(u64, usize)>>> = build_rows
             .par_chunks(chunk_size)
             .enumerate()
-            .for_each(|(chunk_idx, chunk)| {
+            .map(|(chunk_idx, chunk)| {
                 let base_idx = chunk_idx * chunk_size;
+                let mut parts: Vec<Vec<(u64, usize)>> = (0..partitions)
+                    .map(|_| Vec::with_capacity(chunk.len() / partitions + 1))
+                    .collect();
                 for (local_idx, row) in chunk.iter().enumerate() {
-                    // SAFETY: Check for index overflow (would require ~18 quintillion rows on 64-bit)
-                    // Use debug_assert for zero runtime cost in release builds
-                    debug_assert!(
-                        base_idx.checked_add(local_idx).is_some(),
-                        "Index overflow in parallel hash build: base_idx={} + local_idx={}",
-                        base_idx,
-                        local_idx
-                    );
-                    let global_idx = base_idx + local_idx;
                     let hash = hash_composite_key(row, key_indices);
-                    table.entry(hash).or_default().push(global_idx);
+                    parts[partition_of(hash, shift)].push((hash, base_idx + local_idx));
                 }
-            });
+                parts
+            })
+            .collect();
+
+        // Chunks are taken in order, so each key's rows stay in row order
+        let maps: Vec<FxHashMap<u64, Vec<usize>>> = (0..partitions)
+            .into_par_iter()
+            .map(|partition| {
+                let len = chunk_parts.iter().map(|parts| parts[partition].len()).sum();
+                let mut map = FxHashMap::with_capacity_and_hasher(len, Default::default());
+                for parts in &chunk_parts {
+                    for &(hash, idx) in &parts[partition] {
+                        map.entry(hash).or_insert_with(Vec::new).push(idx);
+                    }
+                }
+                map
+            })
+            .collect();
 
         return ParallelHashTable {
-            storage: HashTableStorage::Parallel(table),
+            storage: HashTableStorage::Partitioned { maps, shift },
             row_count,
         };
     }
@@ -655,7 +678,7 @@ where
                     let hash = hash_composite_key(probe_row, probe_key_indices);
 
                     if let Some(build_indices) = hash_table.get(&hash) {
-                        for build_idx in build_indices {
+                        for &build_idx in build_indices {
                             if verify_match(probe_row, &build_rows[build_idx]) {
                                 local_matches.push((probe_idx, build_idx));
                             }
@@ -674,7 +697,7 @@ where
     for (probe_idx, probe_row) in probe_rows.iter().enumerate() {
         let hash = hash_composite_key(probe_row, probe_key_indices);
         if let Some(build_indices) = hash_table.get(&hash) {
-            for build_idx in build_indices {
+            for &build_idx in build_indices {
                 if verify_match(probe_row, &build_rows[build_idx]) {
                     matches.push((probe_idx, build_idx));
                 }
@@ -741,7 +764,7 @@ fn sequential_probe(
         let mut matched = false;
 
         if let Some(build_indices) = hash_table.get(&hash) {
-            for build_idx in build_indices {
+            for &build_idx in build_indices {
                 let build_row = &build_rows[build_idx];
                 if verify_key_match(probe_row, build_row, probe_key_indices, build_key_indices) {
                     matched = true;
@@ -834,7 +857,7 @@ pub fn parallel_hash_join(
                         for probe_row in chunk {
                             let hash = hash_row_by_keys(probe_row, probe_key_indices);
                             if let Some(build_indices) = hash_table.get(&hash) {
-                                for build_idx in build_indices {
+                                for &build_idx in build_indices {
                                     let build_row = &build_rows[build_idx];
                                     if verify_key_match(
                                         probe_row,
@@ -875,7 +898,7 @@ pub fn parallel_hash_join(
                             let hash = hash_row_by_keys(probe_row, probe_key_indices);
 
                             if let Some(build_indices) = hash_table.get(&hash) {
-                                for build_idx in build_indices {
+                                for &build_idx in build_indices {
                                     let build_row = &build_rows[build_idx];
                                     if verify_key_match(
                                         probe_row,
