@@ -1477,10 +1477,7 @@ pub fn strip_table_qualifier(expr: &Expression, table_alias: &str) -> Expression
     match expr {
         Expression::QualifiedIdentifier(qi) if qi.qualifier.value_lower.as_str() == alias_lower => {
             // Convert to simple identifier
-            Expression::Identifier(Identifier::new(
-                qi.name.token.clone(),
-                qi.name.value.clone(),
-            ))
+            Expression::Identifier((*qi.name).clone())
         }
         Expression::Infix(infix) => Expression::Infix(InfixExpression::new(
             infix.token.clone(),
@@ -2510,9 +2507,10 @@ mod tests {
 
     fn ident(name: &str) -> Expression {
         Expression::Identifier(Identifier {
-            token: dummy_token_clone(),
             value: name.into(),
             value_lower: name.to_lowercase().into(),
+            position: Position::default(),
+            quoted: false,
         })
     }
 
