@@ -496,6 +496,10 @@ pub trait VisibilityChecker: Send + Sync {
     fn oldest_snapshot_begin_seq(&self) -> Option<i64> {
         None
     }
+
+    /// Versions of `txn_id` reached the shared store: its id must keep an
+    /// aborted record if it never commits
+    fn note_published(&self, _txn_id: i64) {}
 }
 
 /// What a new head keeps of the chain it replaces
@@ -1543,6 +1547,13 @@ impl VersionStore {
     /// Returns the current auto-increment value without incrementing
     pub fn get_current_auto_increment_value(&self) -> i64 {
         self.auto_increment_counter.load(Ordering::Acquire)
+    }
+
+    /// Tells the registry versions of `txn_id` are about to reach this store
+    pub fn note_published(&self, txn_id: i64) {
+        if let Some(checker) = self.visibility_checker.as_ref() {
+            checker.note_published(txn_id);
+        }
     }
 
     /// Adds a new version for a row
@@ -8007,6 +8018,9 @@ impl TransactionVersionStore {
 
         // Commit local versions to parent store
         if let Some(local_versions) = self.local_versions.as_mut() {
+            if !local_versions.is_empty() {
+                self.parent_store.note_published(self.txn_id);
+            }
             if local_versions.len() == 1 {
                 // Single-row fast path: avoid Vec allocation
                 let single = local_versions
