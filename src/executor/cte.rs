@@ -2753,13 +2753,10 @@ impl Executor {
                     // Create ORDER BY item without table qualifier
                     let col_compact: SmartString = col.clone().into();
                     let new_expr = Expression::Identifier(Identifier {
-                        token: Token::new(
-                            TokenType::Identifier,
-                            col_compact.clone(),
-                            Position::new(0, 0, 0),
-                        ),
                         value: col_compact.clone(),
                         value_lower: col_compact,
+                        position: Position::new(0, 0, 0),
+                        quoted: false,
                     });
                     result.push(OrderByExpression {
                         expression: new_expr,

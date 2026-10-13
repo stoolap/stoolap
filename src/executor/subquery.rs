@@ -1116,11 +1116,10 @@ impl Executor {
         // Build the batch aggregate query:
         // SELECT correlation_column, AGG(...) FROM table GROUP BY correlation_column
         let inner_col_val: SmartString = correlation.inner_column.clone().into();
-        let inner_col_expr = Expression::Identifier(Identifier {
-            token: dummy_token(&correlation.inner_column, TokenType::Identifier),
-            value: inner_col_val.clone(),
-            value_lower: inner_col_val.to_lowercase(),
-        });
+        let inner_col_expr = Expression::Identifier(Identifier::new(
+            dummy_token(&correlation.inner_column, TokenType::Identifier),
+            inner_col_val,
+        ));
 
         // Clone the aggregate expression from the original subquery
         let agg_expr = subquery.columns[0].clone();
@@ -1609,10 +1608,7 @@ impl Executor {
         match expr {
             Expression::QualifiedIdentifier(qid) => {
                 // Convert qualified identifier to unqualified
-                Expression::Identifier(Identifier::new(
-                    qid.name.token.clone(),
-                    qid.name.value.clone(),
-                ))
+                Expression::Identifier((*qid.name).clone())
             }
             Expression::Infix(infix) => {
                 // Recursively strip aliases from both sides

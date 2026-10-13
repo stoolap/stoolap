@@ -2239,9 +2239,10 @@ mod tests {
         let filter_expr = Expression::Infix(InfixExpression {
             token: dummy_token(">", TokenType::Operator),
             left: Box::new(Expression::Identifier(Identifier {
-                token: dummy_token("value", TokenType::Identifier),
                 value: "value".into(),
                 value_lower: "value".into(),
+                position: Default::default(),
+                quoted: false,
             })),
             operator: ">".into(),
             op_type: InfixOperator::GreaterThan,

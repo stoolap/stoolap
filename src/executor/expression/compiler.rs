@@ -466,7 +466,7 @@ impl<'a> ExprCompiler<'a> {
                         }
                     } else if let Some(name) = self.ctx.resolve_outer_column(column) {
                         builder.emit(Op::LoadOuterColumn(name));
-                    } else if id.token.quoted {
+                    } else if id.quoted {
                         // Double-quoted identifier falls back to string literal
                         builder.emit(Op::LoadConst(Value::text(id.value.as_str())));
                     } else {
@@ -479,7 +479,7 @@ impl<'a> ExprCompiler<'a> {
                     }
                 } else if let Some(name) = self.ctx.resolve_outer_column(&id.value_lower) {
                     builder.emit(Op::LoadOuterColumn(name));
-                } else if id.token.quoted {
+                } else if id.quoted {
                     // Double-quoted identifier falls back to string literal
                     builder.emit(Op::LoadConst(Value::text(id.value.as_str())));
                 } else {
@@ -1367,7 +1367,7 @@ impl<'a> ExprCompiler<'a> {
     fn extract_pattern_string(expr: &Expression) -> Option<SmartString> {
         match expr {
             Expression::StringLiteral(lit) => Some(lit.value.clone()),
-            Expression::Identifier(id) if id.token.quoted => Some(id.value.clone()),
+            Expression::Identifier(id) if id.quoted => Some(id.value.clone()),
             _ => None,
         }
     }
@@ -1718,7 +1718,7 @@ fn try_eval_constant(expr: &Expression) -> Option<Value> {
         Expression::StringLiteral(lit) => Some(Value::Text(lit.value.clone())),
         Expression::BooleanLiteral(lit) => Some(Value::Boolean(lit.value)),
         Expression::NullLiteral(_) => Some(Value::null_unknown()),
-        Expression::Identifier(id) if id.token.quoted => Some(Value::Text(id.value.clone())),
+        Expression::Identifier(id) if id.quoted => Some(Value::Text(id.value.clone())),
         _ => None,
     }
 }

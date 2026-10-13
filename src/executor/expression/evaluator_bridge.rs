@@ -2184,9 +2184,10 @@ mod tests {
 
     fn make_identifier(name: &str) -> Expression {
         Expression::Identifier(Identifier {
-            token: dummy_token(),
             value: name.into(),
             value_lower: name.to_lowercase().into(),
+            position: Position::default(),
+            quoted: false,
         })
     }
 
