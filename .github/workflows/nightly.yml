@@ -271,14 +271,14 @@ jobs:
         echo "Miri group: ${GROUP}/5"
 
         # Rotate through 5 module groups (full cycle every 5 days):
-        #   0: compact_arc + compact_vec + buffer_pool  (fast, unsafe data structures)
-        #   1: cow_hashmap + i64_map                    (unsafe, recent Stacked Borrows fixes)
+        #   0: compact_arc + compact_vec                (fast, unsafe data structures)
+        #   1: i64_map                                  (unsafe, recent Stacked Borrows fixes)
         #   2: cow_btree (excluding deep-tree tests)    (unsafe, moderate speed)
         #   3: core:: (value, row, schema, error)       (many tests, moderate speed)
         #   4: cow_btree deep-tree tests only           (slowest tests, ~5-10 min each)
         case "$GROUP" in
-          0) FILTER='test(/^common::(compact_arc|compact_vec|buffer_pool)::/)' ;;
-          1) FILTER='test(/^common::(cow_hashmap|i64_map)::/)' ;;
+          0) FILTER='test(/^common::(compact_arc|compact_vec)::/)' ;;
+          1) FILTER='test(/^common::i64_map::/)' ;;
           2) FILTER='test(/^common::cow_btree::/) - test(/deep_tree/)' ;;
           3) FILTER='test(/^core::/)' ;;
           4) FILTER='test(/^common::cow_btree::.*deep_tree/)' ;;
