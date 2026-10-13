@@ -356,17 +356,15 @@ impl Lexer {
                 // Found unescaped closing quote — fast path succeeds
                 let end_pos = scan_pos + 1; // one past closing quote
 
-                // Update line/column tracking for chars between opening and closing quotes
-                for &byte in &self.input[self.read_position..scan_pos] {
+                // Step past each char from the opening quote through the closing one, as read_char does
+                for &byte in &self.input[start_pos..end_pos] {
                     if byte == b'\n' {
                         self.pos.line += 1;
                         self.pos.column = 1;
-                    } else {
+                    } else if byte & 0xC0 != 0x80 {
                         self.pos.column += 1;
                     }
                 }
-                // Account for closing quote
-                self.pos.column += 1;
 
                 // Advance lexer past closing quote
                 self.position = scan_pos;
@@ -901,6 +899,27 @@ mod tests {
         let token = lexer.next_token();
         assert_eq!(token.position.line, 2);
         assert_eq!(token.position.column, 1);
+    }
+
+    #[test]
+    fn test_position_after_string_literal() {
+        for (sql, line, column) in [
+            ("'ab', x", 1, 7),
+            ("'ğü' x", 1, 6),
+            ("'a\nb' x", 2, 4),
+            ("'a''b' x", 1, 8),
+        ] {
+            let mut lexer = Lexer::new(sql);
+            let mut token = lexer.next_token();
+            while token.literal != "x" {
+                token = lexer.next_token();
+            }
+            assert_eq!(
+                (token.position.line, token.position.column),
+                (line, column),
+                "position of x in {sql:?}"
+            );
+        }
     }
 
     #[test]
