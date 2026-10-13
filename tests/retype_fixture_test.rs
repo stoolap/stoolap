@@ -40,14 +40,16 @@ fn copy_tree(from: &Path, to: &Path) {
     }
 }
 
-/// Every file under `root` with its content, by path relative to `root`
+/// Every file under `root` with its content, by path relative to `root`;
+/// the lock file an open database holds (locked against reads on Windows)
+/// is left out
 fn contents(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
             if path.is_dir() {
                 walk(root, &path, out);
-            } else {
+            } else if path.file_name().is_some_and(|name| name != "db.lock") {
                 let content = std::fs::read(&path).unwrap();
                 out.insert(path.strip_prefix(root).unwrap().to_path_buf(), content);
             }
