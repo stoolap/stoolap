@@ -441,12 +441,13 @@ impl<'a> ExprCompiler<'a> {
             Expression::Identifier(id) => {
                 // CURRENT_DATE, CURRENT_TIME, CURRENT_TIMESTAMP are now parsed as
                 // FunctionCall by the parser, so they no longer reach this path.
+                // A double-quoted "true" or "false" names a column, not a literal.
                 match id.value_lower.as_str() {
-                    "true" => {
+                    "true" if !id.quoted => {
                         builder.emit(Op::LoadConst(Value::Boolean(true)));
                         return Ok(());
                     }
-                    "false" => {
+                    "false" if !id.quoted => {
                         builder.emit(Op::LoadConst(Value::Boolean(false)));
                         return Ok(());
                     }
