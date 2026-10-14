@@ -4429,6 +4429,8 @@ impl Executor {
                 ..
             } = plan;
             let left_cap = left_cap_override.unwrap_or(cap);
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::join_side_ran();
             let (left_result, left_cols, left_bounded, _) = self
                 .execute_table_expression_with_filter_limit(
                     &join_source.left,
@@ -4465,6 +4467,8 @@ impl Executor {
             } else {
                 right_filter.clone()
             };
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::join_side_ran();
             let (right_result, right_cols) = self.execute_table_expression_with_filter(
                 &join_source.right,
                 ctx,
@@ -4800,6 +4804,8 @@ impl Executor {
                 };
 
                 // Execute outer side with limit optimization for true early termination
+                #[cfg(any(test, feature = "test-failpoints"))]
+                crate::test_failpoints::join_side_ran();
                 let (outer_result, outer_cols, outer_bounded, outer_token) = self
                     .execute_table_expression_with_filter_limit(
                         outer_expr,
@@ -5156,11 +5162,6 @@ impl Executor {
                             cross_row_filter.as_ref(),
                             &mut result_rows,
                         )?;
-                        // An outer key no probe answers: the join runs on the
-                        // hash path instead
-                        if op.needs_fallback() {
-                            break 'index_nl;
-                        }
                     }
 
                     // No rotation needed - all_columns matches physical order
@@ -5415,12 +5416,16 @@ impl Executor {
                     let build_left = left_card < right_card;
 
                     // Execute both sides
+                    #[cfg(any(test, feature = "test-failpoints"))]
+                    crate::test_failpoints::join_side_ran();
                     let (left_result, left_cols) = self.execute_table_expression_with_filter(
                         &join_source.left,
                         ctx,
                         left_filter.as_ref(),
                     )?;
 
+                    #[cfg(any(test, feature = "test-failpoints"))]
+                    crate::test_failpoints::join_side_ran();
                     let (right_result, right_cols) = self.execute_table_expression_with_filter(
                         &join_source.right,
                         ctx,
@@ -7618,6 +7623,8 @@ impl Executor {
         } else {
             Some(plan.cap)
         };
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::join_side_ran();
         let (outer_result, outer_cols, outer_bounded, outer_token) = self
             .execute_table_expression_with_filter_limit(
                 &join_source.left,

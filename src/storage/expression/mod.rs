@@ -196,6 +196,13 @@ pub trait Expression: Send + Sync + Debug {
         false
     }
 
+    /// Whether a false from `evaluate` may stand for an UNKNOWN that
+    /// `is_unknown_due_to_null` does not report, so the expression cannot
+    /// be negated in storage
+    fn hides_unknown(&self) -> bool {
+        false
+    }
+
     /// Get a reference to the expression as Any for downcasting
     fn as_any(&self) -> &dyn Any {
         // Default implementation that returns self

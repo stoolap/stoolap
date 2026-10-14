@@ -149,6 +149,8 @@ pub struct PredicateSet {
     has_numbers: bool,
     /// A TEXT member that is not a number: UNKNOWN against any number
     has_unreadable_text: bool,
+    /// A FLOAT member that is NaN: UNKNOWN against any TEXT read as a number
+    has_nan: bool,
 }
 
 impl PredicateSet {
@@ -156,9 +158,14 @@ impl PredicateSet {
         let mut numbers_in_text = ValueSet::default();
         let mut has_numbers = false;
         let mut has_unreadable_text = false;
+        let mut has_nan = false;
         for member in members.iter() {
             match member {
-                Value::Integer(_) | Value::Float(_) => has_numbers = true,
+                Value::Integer(_) => has_numbers = true,
+                Value::Float(f) => {
+                    has_numbers = true;
+                    has_nan |= f.is_nan();
+                }
                 Value::Text(text) => match parse_sql_number(text) {
                     Some(number) => {
                         numbers_in_text.insert(number);
@@ -174,6 +181,7 @@ impl PredicateSet {
             has_null,
             has_numbers,
             has_unreadable_text,
+            has_nan,
         }
     }
 
@@ -212,11 +220,12 @@ impl PredicateSet {
                 if self.numbers_in_text.contains(probe) {
                     return Some(true);
                 }
-                unknown |= self.has_unreadable_text;
+                let nan = matches!(probe, Value::Float(f) if f.is_nan());
+                unknown |= self.has_unreadable_text || (nan && !self.numbers_in_text.is_empty());
             }
             Value::Text(text) if self.has_numbers => match parse_sql_number(text) {
                 Some(number) if self.members.contains(&number) => return Some(true),
-                Some(_) => {}
+                Some(_) => unknown |= self.has_nan,
                 None => unknown = true,
             },
             _ => {}

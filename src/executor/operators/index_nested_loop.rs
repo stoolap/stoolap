@@ -25,6 +25,7 @@
 use std::sync::Arc;
 
 use crate::common::{CompactVec, I64Map, I64Set};
+use crate::core::predicate::{parse_sql_number, sql_eq};
 use crate::core::value::NULL_VALUE;
 use crate::core::ValueMap;
 use crate::core::{DataType, Result, Row, RowVec, Value};
@@ -55,14 +56,9 @@ pub enum IndexLookupStrategy {
 /// The most row ids one probe takes from the inner table's index
 pub const EQUALITY_CANDIDATE_CAP: usize = 1024;
 
-/// Specifies which side (outer or inner) a projected column comes from.
-/// A projected value out of a row that is being consumed. A source used
-/// more than once must be cloned every time; moving it would hand the
-/// second use a NULL.
-#[inline]
 /// Whether the inner key column is TEXT (true) or a number (false); None for
 /// any other type
-pub(crate) fn inner_key_is_text(
+fn inner_key_is_text(
     table: &dyn Table,
     strategy: &IndexLookupStrategy,
     idx: Option<usize>,
@@ -78,7 +74,7 @@ pub(crate) fn inner_key_is_text(
 }
 
 /// An outer key the comparison reads against the inner column as a number
-/// against a TEXT, which no probe follows
+/// against a TEXT
 #[inline]
 pub(crate) fn crosses_inner_key(inner_is_text: Option<bool>, key: &Value) -> bool {
     matches!(
@@ -87,6 +83,59 @@ pub(crate) fn crosses_inner_key(inner_is_text: Option<bool>, key: &Value) -> boo
     )
 }
 
+/// A number as `TextNumbers` holds it: an integral FLOAT that fits i64 as
+/// that INTEGER, so equal numbers meet; None for NaN and any non-number
+fn number_key(number: &Value) -> Option<Value> {
+    match number {
+        Value::Integer(_) => Some(number.clone()),
+        Value::Float(f) if f.is_nan() => None,
+        Value::Float(f) => Some(match crate::executor::Executor::lossless_float_key(*f) {
+            Some(i) => Value::Integer(i),
+            None => number.clone(),
+        }),
+        _ => None,
+    }
+}
+
+/// The inner rows of a TEXT key column by the number each TEXT reads as,
+/// taken by one scan when a number first meets that column
+struct TextNumbers(ValueMap<SmallVec<[i64; 2]>>);
+
+impl TextNumbers {
+    fn scan(table: &dyn Table, column: usize) -> Result<Self> {
+        let width = table.schema().columns.len();
+        let columns: Vec<usize> = (0..width).collect();
+        let mut needed = vec![false; width];
+        needed[column] = true;
+        let mut scanner = table.scan_needed(&columns, &needed, None)?;
+        let mut by_number: ValueMap<SmallVec<[i64; 2]>> = ValueMap::default();
+        while scanner.next() {
+            let row_id = scanner.current_row_id();
+            if let Some(Value::Text(text)) = scanner.row().get(column) {
+                if let Some(number) = parse_sql_number(text).as_ref().and_then(number_key) {
+                    by_number.entry(number).or_default().push(row_id);
+                }
+            }
+        }
+        if let Some(error) = scanner.err() {
+            return Err(error.clone());
+        }
+        scanner.close()?;
+        Ok(Self(by_number))
+    }
+
+    fn row_ids(&self, number: &Value) -> &[i64] {
+        number_key(number)
+            .and_then(|key| self.0.get(&key))
+            .map_or(&[], |ids| ids.as_slice())
+    }
+}
+
+/// Specifies which side (outer or inner) a projected column comes from.
+/// A projected value out of a row that is being consumed. A source used
+/// more than once must be cloned every time; moving it would hand the
+/// second use a NULL.
+#[inline]
 fn take_or_clone(row: &mut Row, idx: usize, repeats: bool) -> Value {
     if repeats {
         row.as_slice()[idx].clone()
@@ -177,6 +226,8 @@ pub struct IndexNestedLoopJoinOperator {
     // This transaction's uncommitted inner rows, whose keys the shared
     // index may not hold yet; taken once at open
     local_rows: Option<LocalRows>,
+    // The inner TEXT keys read as numbers, taken when a number first meets them
+    text_numbers: Option<TextNumbers>,
 }
 
 /// The transaction's uncommitted rows of the inner table: every row it
@@ -289,6 +340,7 @@ impl IndexNestedLoopJoinOperator {
             ended_on: None,
             probe_scratch: ProbeScratch::default(),
             local_rows: None,
+            text_numbers: None,
         }
     }
 
@@ -445,8 +497,7 @@ impl IndexNestedLoopJoinOperator {
         self.row_id_buffer.clear();
         self.current_inner_rows.clear();
         if crosses_inner_key(self.inner_is_text, key_value) {
-            self.needs_fallback = true;
-            return Ok(());
+            return self.lookup_across(key_value);
         }
 
         // Get row IDs based on lookup strategy into buffer
@@ -519,12 +570,50 @@ impl IndexNestedLoopJoinOperator {
         Ok(())
     }
 
+    /// The inner rows for a key of the other family: a TEXT key probes as
+    /// the number it reads as, a number takes the TEXT rows that read as it
+    fn lookup_across(&mut self, key_value: &Value) -> Result<()> {
+        if let Value::Text(text) = key_value {
+            return match parse_sql_number(text) {
+                Some(number) => self.lookup_inner_rows(&number),
+                None => Ok(()),
+            };
+        }
+        let Some(idx) = self.inner_key_idx else {
+            return Ok(());
+        };
+        if self.text_numbers.is_none() {
+            self.text_numbers = Some(TextNumbers::scan(&*self.inner_table, idx)?);
+        }
+        if let Some(numbers) = &self.text_numbers {
+            self.row_id_buffer
+                .extend_from_slice(numbers.row_ids(key_value));
+        }
+        if self.row_id_buffer.is_empty() {
+            return Ok(());
+        }
+        let filter: &dyn Expression = match &self.inner_filter {
+            Some(filter) => filter.as_ref(),
+            None => &self.true_expr,
+        };
+        self.inner_table.fetch_rows_by_ids_into(
+            &self.row_id_buffer,
+            filter,
+            &mut self.current_inner_rows,
+        )?;
+        self.current_inner_rows
+            .retain(|(_, row)| row.get(idx).and_then(|key| sql_eq(key, key_value)) == Some(true));
+        Ok(())
+    }
+
     /// Advance to the next outer row and lookup matching inner rows.
     fn advance_outer(&mut self) -> Result<bool> {
         match self.outer.next()? {
             Some(row_ref) => {
                 let outer_row = row_ref.into_owned();
                 self.outer_rows_seen += 1;
+                #[cfg(any(test, feature = "test-failpoints"))]
+                crate::test_failpoints::index_join_outer_row();
 
                 // Get the join key value from the outer row
                 let key_value = match outer_row.get(self.outer_key_idx) {
@@ -732,8 +821,6 @@ pub struct BatchIndexNestedLoopJoinOperator {
 
     // State
     opened: bool,
-    // Set when an outer key cannot be probed; the join then produced nothing
-    needs_fallback: bool,
 }
 
 impl BatchIndexNestedLoopJoinOperator {
@@ -771,7 +858,6 @@ impl BatchIndexNestedLoopJoinOperator {
             // Pre-allocate buffer for typical number of matches
             row_id_buffer: Vec::with_capacity(16),
             opened: false,
-            needs_fallback: false,
         }
     }
 
@@ -782,12 +868,6 @@ impl BatchIndexNestedLoopJoinOperator {
         self.inner_is_text =
             inner_key_is_text(&*self.inner_table, &self.lookup_strategy, inner_key_idx);
         self
-    }
-
-    /// Whether an outer key could not be probed, so the join produced
-    /// nothing and is to be run another way
-    pub fn needs_fallback(&self) -> bool {
-        self.needs_fallback
     }
 
     /// Set projection pushdown configuration.
@@ -880,6 +960,7 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
         // SmallVec keeps the common unique-key case inline (no heap Vec
         // per distinct row id)
         let mut key_to_outer_indices: I64Map<SmallVec<[usize; 2]>> = I64Map::new();
+        let mut text_numbers: Option<TextNumbers> = None;
 
         while let Some(row_ref) = self.outer.next()? {
             let outer_row = row_ref.into_owned();
@@ -894,11 +975,40 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
                     continue;
                 }
             };
-            if crosses_inner_key(self.inner_is_text, &key_value) {
-                self.needs_fallback = true;
-                self.opened = true;
-                return Ok(());
-            }
+            let key_value = if crosses_inner_key(self.inner_is_text, &key_value) {
+                match &key_value {
+                    // A TEXT key probes as the number it reads as
+                    Value::Text(text) => match parse_sql_number(text) {
+                        Some(number) => number,
+                        None => {
+                            outer_rows.push(outer_row);
+                            continue;
+                        }
+                    },
+                    // A number takes the TEXT rows that read as it
+                    _ => {
+                        if let Some(idx) = self.inner_key_idx {
+                            if text_numbers.is_none() {
+                                text_numbers = Some(TextNumbers::scan(&*self.inner_table, idx)?);
+                            }
+                            for &row_id in text_numbers
+                                .as_ref()
+                                .map_or(&[][..], |numbers| numbers.row_ids(&key_value))
+                            {
+                                key_to_outer_indices
+                                    .entry(row_id)
+                                    .or_default()
+                                    .push(outer_idx);
+                                row_id_set.insert(row_id);
+                            }
+                        }
+                        outer_rows.push(outer_row);
+                        continue;
+                    }
+                }
+            } else {
+                key_value
+            };
 
             // Get row IDs based on lookup strategy into reusable buffer
             self.row_id_buffer.clear();
@@ -971,7 +1081,11 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
                     if let (IndexLookupStrategy::SecondaryIndex(_), Some(idx)) =
                         (&self.lookup_strategy, self.inner_key_idx)
                     {
-                        if inner_row.get(idx) != outer_row.get(self.outer_key_idx) {
+                        let equal = inner_row
+                            .get(idx)
+                            .zip(outer_row.get(self.outer_key_idx))
+                            .and_then(|(inner, outer)| sql_eq(inner, outer));
+                        if equal != Some(true) {
                             continue;
                         }
                     }

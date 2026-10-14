@@ -207,6 +207,16 @@ fn test_in_and_between_follow_the_comparison() {
         U,
         "the probe as a parameter"
     );
+    let nan = Value::Float(f64::NAN);
+    for (sql, params) in [
+        ("SELECT $1 NOT IN ('1')", vec![nan.clone()]),
+        ("SELECT $1 IN ('1', '2')", vec![nan.clone()]),
+        ("SELECT $1 NOT IN ($2)", vec![nan.clone(), Value::text("1")]),
+        ("SELECT '1' IN (SELECT $1)", vec![nan.clone()]),
+        ("SELECT '1' NOT IN ($1)", vec![nan.clone()]),
+    ] {
+        assert_eq!(truth(&db, sql, params), U, "{sql} with NaN");
+    }
 }
 
 fn table(name: &str) -> Database {
@@ -286,8 +296,41 @@ fn test_columns_follow_the_comparison() {
             ),
             ("k IS DISTINCT FROM '01'", vec![], vec![2, 3, 4]),
             ("s IS NOT DISTINCT FROM 1", vec![], vec![1, 4]),
+            ("ABS(k) = '01'", vec![], vec![1]),
+            ("ABS(k) < '9.5'", vec![], vec![1, 2]),
+            ("'01' = ABS(k)", vec![], vec![1]),
+            ("LENGTH(s) = '2'", vec![], vec![1]),
+            ("ABS(k) <> 'abc'", vec![], vec![]),
+            ("NOT (ABS(k) <> 'abc')", vec![], vec![]),
+            ("NOT (ABS(k) <> 'abc' AND id > 0)", vec![], vec![]),
+            ("(ABS(k) = 1) XOR (ABS(k) <> 'abc')", vec![], vec![]),
+            ("NOT (ABS(k) = 9)", vec![], vec![1, 3, 4]),
+            ("k NOT BETWEEN NULL AND 0", vec![], vec![1, 2, 3, 4]),
+            ("k BETWEEN NULL AND 0", vec![], vec![]),
+            ("k NOT BETWEEN 0 AND NULL", vec![], vec![]),
+            (
+                "k NOT BETWEEN $1 AND 0",
+                vec![Value::Null(stoolap::DataType::Integer)],
+                vec![1, 2, 3, 4],
+            ),
         ],
     );
+}
+
+#[test]
+fn test_a_negated_function_comparison_keeps_a_null_unknown() {
+    let db = open("contract_negated_function_null");
+    db.execute("CREATE TABLE n (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO n VALUES (1, 1), (2, NULL)", ())
+        .unwrap();
+    for condition in ["NOT (ABS(k) = 5)", "NOT (ABS(k) = 5 OR id > 5)"] {
+        assert_eq!(
+            ids(&db, &format!("SELECT id FROM n WHERE {condition}"), vec![]),
+            vec![1],
+            "{condition}"
+        );
+    }
 }
 
 #[test]
@@ -497,6 +540,15 @@ fn test_index_joins_on_a_number_and_a_text() {
          SELECT c.id, b.id FROM c JOIN b ON c.v = b.id",
         "WITH c AS (SELECT id, v FROM a), d AS (SELECT * FROM c) \
          SELECT c.id, b.id FROM c JOIN b ON c.v = b.n",
+    ] {
+        assert_eq!(sorted_pairs(&db, sql), expected, "{sql}");
+    }
+    db.execute("CREATE INDEX a_v ON a (v)", ()).unwrap();
+    for sql in [
+        "SELECT a.id, b.id FROM b JOIN a ON b.n = a.v",
+        "SELECT a.id, b.id FROM b JOIN a ON b.n = a.v LIMIT 10",
+        "SELECT a.id, d.id FROM (SELECT id, n FROM b) d JOIN a ON d.n = a.v",
+        "SELECT a.id, d.id FROM (SELECT id, n FROM b) d JOIN a ON d.n = a.v LIMIT 10",
     ] {
         assert_eq!(sorted_pairs(&db, sql), expected, "{sql}");
     }
@@ -769,5 +821,80 @@ fn test_in_a_subquery_on_a_number_and_a_text() {
         ),
     ] {
         check_semi(&db, query, &expected);
+    }
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_an_index_join_on_a_number_and_a_text_runs_each_side_once() {
+    use stoolap::test_failpoints::join_side_runs;
+    let db = join_tables("contract_join_index_sides");
+    db.execute("CREATE INDEX b_n ON b (n)", ()).unwrap();
+    let expected = vec![(1, 1), (2, 2), (3, 3)];
+    for sql in [
+        "SELECT a.id, b.id FROM a JOIN b ON a.v = b.id",
+        "SELECT a.id, b.id FROM a JOIN b ON a.v = b.id LIMIT 10",
+        "SELECT a.id, b.id FROM a JOIN b ON a.v = b.n",
+        "SELECT d.id, b.id FROM (SELECT id, v FROM a) d JOIN b ON d.v = b.id",
+        "SELECT d.id, b.id FROM (SELECT id, v FROM a) d JOIN b ON d.v = b.id LIMIT 10",
+        "SELECT d.id, b.id FROM (SELECT id, v FROM a) d JOIN b ON d.v = b.n",
+    ] {
+        let before = join_side_runs();
+        assert_eq!(sorted_pairs(&db, sql), expected, "{sql}");
+        let runs = join_side_runs() - before;
+        assert!(runs <= 2, "a side ran more than once, {runs} runs: {sql}");
+    }
+    let sql =
+        "SELECT x.id, COUNT(y.id) FROM a x LEFT JOIN b y ON x.v = y.id GROUP BY x.id LIMIT 10";
+    let before = join_side_runs();
+    assert_eq!(
+        sorted_pairs(&db, sql),
+        vec![(1, 1), (2, 1), (3, 1), (4, 0)],
+        "{sql}"
+    );
+    let runs = join_side_runs() - before;
+    assert!(runs <= 2, "a side ran more than once, {runs} runs: {sql}");
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_an_index_join_answers_either_family_while_it_streams() {
+    use stoolap::test_failpoints::index_join_outer_rows;
+    let db = open("contract_join_index_streams");
+    db.execute(
+        "CREATE TABLE big (id INTEGER PRIMARY KEY, n INTEGER, t TEXT)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO big SELECT g.value, g.value % 100, CAST(g.value % 100 AS TEXT) \
+         FROM generate_series(1, 5000) g",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE TABLE small (id INTEGER PRIMARY KEY, s TEXT)", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO small SELECT g.value, CAST(g.value AS TEXT) FROM generate_series(0, 99) g",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX small_s ON small (s)", ()).unwrap();
+    for sql in [
+        "SELECT d.id, small.id FROM (SELECT id, n FROM big) d JOIN small ON d.n = small.id LIMIT 10",
+        "SELECT d.id, small.id FROM (SELECT id, t FROM big) d JOIN small ON d.t = small.id LIMIT 10",
+        "SELECT d.id, small.id FROM (SELECT id, n FROM big) d JOIN small ON d.n = small.s LIMIT 10",
+        "SELECT big.id, small.id FROM big JOIN small ON big.t = small.id LIMIT 10",
+        "SELECT big.id, small.id FROM big JOIN small ON big.n = small.s LIMIT 10",
+    ] {
+        let before = index_join_outer_rows();
+        let pairs = sorted_pairs(&db, sql);
+        let read = index_join_outer_rows() - before;
+        assert_eq!(pairs.len(), 10, "{sql}");
+        assert!(pairs.iter().all(|(d, s)| d % 100 == *s), "{sql}: {pairs:?}");
+        assert!(
+            read > 0 && read < 200,
+            "{sql}: the index join read {read} outer rows"
+        );
     }
 }

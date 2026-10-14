@@ -23,11 +23,13 @@
 //! ```
 
 use std::any::Any;
+use std::cmp::Ordering;
 use std::fmt::{self, Debug};
 
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
+use crate::core::predicate::{sql_compare, sql_eq};
 use crate::core::{Operator, Result, Row, Schema, Value};
 use crate::functions::ScalarFunction;
 
@@ -192,13 +194,14 @@ impl FunctionExpr {
 
     /// Compare two values using the configured operator
     fn compare(&self, result: &Value, target: &Value) -> bool {
+        let order = || sql_compare(result, target);
         match self.operator {
-            Operator::Eq => result == target,
-            Operator::Ne => result != target,
-            Operator::Lt => result < target,
-            Operator::Lte => result <= target,
-            Operator::Gt => result > target,
-            Operator::Gte => result >= target,
+            Operator::Eq => sql_eq(result, target) == Some(true),
+            Operator::Ne => sql_eq(result, target) == Some(false),
+            Operator::Lt => order() == Some(Ordering::Less),
+            Operator::Lte => matches!(order(), Some(Ordering::Less | Ordering::Equal)),
+            Operator::Gt => order() == Some(Ordering::Greater),
+            Operator::Gte => matches!(order(), Some(Ordering::Greater | Ordering::Equal)),
             // For other operators, fall back to equality check or false
             _ => false,
         }
@@ -315,6 +318,11 @@ impl Expression for FunctionExpr {
         // Function expressions generally can't use indexes
         // unless we have function-based indexes (future optimization)
         false
+    }
+
+    // A NULL result or a pair the comparison cannot order is false here
+    fn hides_unknown(&self) -> bool {
+        true
     }
 
     fn clone_box(&self) -> Box<dyn Expression> {

@@ -341,6 +341,7 @@ impl PushdownRule for LogicalNotRule {
 
         // NOT requires the inner expression to be fully pushable
         match registry().convert_expr_exact(&prefix.right, ctx) {
+            Some(inner) if inner.hides_unknown() => PushdownResult::CannotPush,
             Some(mut inner) => {
                 inner.prepare_for_schema(ctx.schema);
                 PushdownResult::Converted(Box::new(NotExpr::new(inner)))
@@ -372,6 +373,9 @@ impl PushdownRule for LogicalXorRule {
         let right = registry().convert_expr_exact(&infix.right, ctx);
 
         match (left, right) {
+            (Some(l), Some(r)) if l.hides_unknown() || r.hides_unknown() => {
+                PushdownResult::CannotPush
+            }
             (Some(mut l1), Some(mut r1)) => {
                 l1.prepare_for_schema(ctx.schema);
                 r1.prepare_for_schema(ctx.schema);
@@ -432,6 +436,11 @@ impl PushdownRule for BetweenRule {
             Some(v) => v,
             None => return PushdownResult::CannotPush,
         };
+        // A NULL bound leaves the other bound to decide, which the storage
+        // between does not follow under NOT
+        if lower.is_null() || upper.is_null() {
+            return PushdownResult::CannotPush;
+        }
 
         let mut expr = if between.not {
             BetweenExpr::not_between(column, lower, upper)
