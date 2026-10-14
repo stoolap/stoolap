@@ -551,8 +551,7 @@ impl<'a> ExprCompiler<'a> {
 
             Expression::InHashSet(in_hash) => {
                 self.compile_expr(&in_hash.column, builder)?;
-                let has_null = in_hash.values.iter().any(|v| v.is_null());
-                let set = CompactArc::new(PredicateSet::new(in_hash.values.clone(), has_null));
+                let set = CompactArc::clone(&in_hash.values);
                 if in_hash.not {
                     builder.emit(Op::NotInSet(set));
                 } else {

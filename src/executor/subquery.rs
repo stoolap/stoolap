@@ -262,7 +262,8 @@ impl Executor {
                             Some(arc) => arc,
                             None => {
                                 let values = self.execute_in_subquery(&subquery.subquery, ctx)?;
-                                CompactArc::new(values.into_iter().collect::<ValueSet>())
+                                let members = CompactArc::new(values.into_iter().collect());
+                                CompactArc::new(PredicateSet::of(members))
                             }
                         };
 
@@ -692,9 +693,7 @@ impl Executor {
             non_correlated_where: None,
             is_negated: false,
         };
-        let members = self.execute_semi_join_optimization(&info, ctx)?;
-        let has_null = members.contains(&Value::null_unknown());
-        let set = CompactArc::new(PredicateSet::new(members, has_null));
+        let set = self.execute_semi_join_optimization(&info, ctx)?;
         let found = set.contains(key) == Some(true);
         cache_exists_probe_fallback(subquery_ptr, Some(set));
         Ok(Some(found))
@@ -2707,7 +2706,7 @@ impl Executor {
                     return Ok(Expression::InHashSet(InHashSetExpression {
                         token: in_expr.token.clone(),
                         column: Box::new(processed_left),
-                        values: CompactArc::new(hash_set),
+                        values: CompactArc::new(PredicateSet::of(CompactArc::new(hash_set))),
                         not: in_expr.not,
                     }));
                 }
@@ -3840,7 +3839,7 @@ impl Executor {
                     return Ok(Expression::InHashSet(InHashSetExpression {
                         token: in_expr.token.clone(),
                         column: Box::new(processed_left),
-                        values: CompactArc::new(hash_set),
+                        values: CompactArc::new(PredicateSet::of(CompactArc::new(hash_set))),
                         not: in_expr.not,
                     }));
                 }
@@ -4317,7 +4316,7 @@ impl Executor {
         &self,
         info: &SemiJoinInfo,
         ctx: &ExecutionContext,
-    ) -> Result<CompactArc<ValueSet>> {
+    ) -> Result<CompactArc<PredicateSet>> {
         // The set answers only the inner query it was taken for, the
         // statement's parameter values included
         let origin = SemiJoinOrigin {
@@ -4410,8 +4409,9 @@ impl Executor {
         // Build FxHashSet from Vec - this deduplicates automatically
         let hash_set: ValueSet = values_vec.into_iter().collect();
 
-        // Wrap in CompactArc once - no cloning needed
-        let hash_set_arc = CompactArc::new(hash_set);
+        // Read once for what the comparison needs of the members, and
+        // wrapped in CompactArc once - no cloning needed
+        let hash_set_arc = CompactArc::new(PredicateSet::of(CompactArc::new(hash_set)));
 
         // Cache for subsequent calls within this query (CompactArc clone is cheap)
         if cacheable {
@@ -4606,7 +4606,7 @@ impl Executor {
     /// Replaces: EXISTS (SELECT ...) with: outer_col IN (hash_set_values)
     pub(crate) fn transform_exists_to_in_list(
         info: &SemiJoinInfo,
-        hash_set: CompactArc<ValueSet>,
+        hash_set: CompactArc<PredicateSet>,
         test: SetTest,
     ) -> Expression {
         // For empty hash set, return FALSE (no matches exist)
@@ -4845,7 +4845,7 @@ impl Executor {
                         let hash_set = self.execute_semi_join_optimization(&info, ctx)?;
                         // A NULL member leaves no value known to be outside
                         // the set, so a negated IN keeps nothing
-                        if info.is_negated && hash_set.contains(&Value::null_unknown()) {
+                        if info.is_negated && hash_set.has_null() {
                             return Ok(Some(Expression::BooleanLiteral(BooleanLiteral {
                                 token: dummy_token_clone(),
                                 value: false,
@@ -5452,7 +5452,9 @@ mod tests {
         let expr = Expression::InHashSet(InHashSetExpression {
             token: tok(),
             column: Box::new(outer_ref()),
-            values: CompactArc::new(crate::core::ValueSet::default()),
+            values: CompactArc::new(PredicateSet::of(CompactArc::new(
+                crate::core::ValueSet::default(),
+            ))),
             not: false,
         });
         assert!(!has_outer(&expr));

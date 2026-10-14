@@ -917,3 +917,189 @@ fn test_an_index_join_answers_either_family_while_it_streams() {
         }
     }
 }
+
+const CTE_SIDES: &str = "WITH x AS (SELECT id, v, n FROM a), y AS (SELECT id, n FROM b) ";
+
+#[test]
+fn test_a_limit_join_of_ctes_on_a_number_and_a_text() {
+    let db = join_tables("contract_cte_limit_join");
+    for (join, expected) in [
+        ("FROM x JOIN y ON x.v = y.n", vec![(1, 1), (2, 2), (3, 3)]),
+        ("FROM y JOIN x ON y.n = x.v", vec![(1, 1), (2, 2), (3, 3)]),
+        (
+            "FROM x LEFT JOIN y ON x.v = y.n",
+            vec![(1, 1), (2, 2), (3, 3), (4, -1)],
+        ),
+        (
+            "FROM y LEFT JOIN x ON y.n = x.v",
+            vec![(1, 1), (2, 2), (3, 3), (5, -1)],
+        ),
+        (
+            "FROM x JOIN y ON x.v = y.n AND x.id = y.id",
+            vec![(1, 1), (2, 2), (3, 3)],
+        ),
+    ] {
+        let first = join.split_whitespace().nth(1).unwrap();
+        let second = if first == "x" { "y" } else { "x" };
+        let sql = format!("{CTE_SIDES}SELECT {first}.id, {second}.id {join} LIMIT 10");
+        assert_eq!(sorted_pairs(&db, &sql), expected, "{sql}");
+    }
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_a_limit_join_of_ctes_streams_over_one_key() {
+    use stoolap::test_failpoints::streaming_joins_streamed;
+    let db = join_tables("contract_cte_limit_join_streams");
+    for (join, streams) in [
+        ("FROM x JOIN y ON x.n = y.n", true),
+        ("FROM x JOIN y ON x.v = y.n", true),
+        ("FROM y JOIN x ON y.n = x.v", true),
+        ("FROM x JOIN y ON x.v = y.n AND x.id = y.id", false),
+    ] {
+        let sql = format!("{CTE_SIDES}SELECT x.id, y.id {join} LIMIT 10");
+        let before = streaming_joins_streamed();
+        sorted_pairs(&db, &sql);
+        assert_eq!(
+            streaming_joins_streamed() - before == 1,
+            streams,
+            "{sql}: streamed {}",
+            streaming_joins_streamed() - before
+        );
+    }
+}
+
+#[test]
+fn test_a_limit_join_with_the_build_side_on_the_left_reads_each_side_s_key() {
+    let db = open("contract_limit_join_build_left");
+    db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, s TEXT, n INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO a VALUES (1, 7)", ()).unwrap();
+    // The one row it knows of makes `a` the build side, on the left
+    db.execute("ANALYZE a", ()).unwrap();
+    db.execute(
+        "INSERT INTO b SELECT g.value, CASE WHEN g.value = 1 THEN '07' ELSE 'x' END, \
+         CASE WHEN g.value = 1 THEN 7 ELSE 0 END FROM generate_series(1, 300) g",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE TABLE c (n INTEGER, id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO c VALUES (7, 1), (0, 2)", ())
+        .unwrap();
+    for sql in [
+        "SELECT a.id FROM a JOIN (SELECT s FROM b) x ON a.k = x.s LIMIT 10",
+        "SELECT a.id FROM a JOIN (SELECT n FROM b) x ON a.k = x.n LIMIT 10",
+        "SELECT a.id FROM a JOIN c ON a.k = c.n LIMIT 10",
+    ] {
+        assert_eq!(ids(&db, sql, vec![]), vec![1], "{sql}");
+    }
+}
+
+#[test]
+fn test_a_limit_join_of_ctes_with_a_window_function() {
+    let db = join_tables("contract_cte_limit_join_window");
+    for sql in [
+        format!(
+            "{CTE_SIDES}SELECT x.id, ROW_NUMBER() OVER (ORDER BY x.id) AS rn \
+             FROM x JOIN y ON x.v = y.n LIMIT 10"
+        ),
+        "SELECT a.id, ROW_NUMBER() OVER (ORDER BY a.id) AS rn \
+         FROM a JOIN b ON a.n = b.n LIMIT 10"
+            .to_string(),
+    ] {
+        let rows: Vec<(i64, i64)> = db
+            .query(&sql, ())
+            .unwrap()
+            .map(|row| {
+                let row = row.unwrap();
+                (row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap())
+            })
+            .collect();
+        assert_eq!(rows, vec![(1, 1), (2, 2), (3, 3)], "{sql}");
+    }
+}
+
+#[test]
+fn test_a_join_limit_below_its_matches_counts_every_match_first() {
+    let db = join_tables("contract_join_limit_below_matches");
+    db.execute("CREATE TABLE d (id INTEGER PRIMARY KEY, g INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO d VALUES (1, 1), (2, 1), (3, 2)", ())
+        .unwrap();
+    for (sql, expected) in [
+        (
+            "SELECT COUNT(*) OVER () FROM a JOIN b ON a.n = b.n LIMIT 1",
+            vec![3],
+        ),
+        (
+            "SELECT COUNT(*) OVER () FROM a JOIN b ON a.n = b.id LIMIT 1",
+            vec![3],
+        ),
+        (
+            "SELECT DISTINCT d.g FROM b JOIN d ON b.n = d.id LIMIT 2",
+            vec![1, 2],
+        ),
+        (
+            "SELECT DISTINCT d.g FROM b JOIN d ON b.n = d.id ORDER BY d.g LIMIT 2",
+            vec![1, 2],
+        ),
+        (
+            "SELECT DISTINCT d.g FROM b JOIN d ON b.n = d.id ORDER BY d.g LIMIT 1 OFFSET 1",
+            vec![2],
+        ),
+        (
+            "WITH x AS (SELECT id, g FROM d), y AS (SELECT n FROM b) \
+             SELECT DISTINCT x.g FROM x JOIN y ON x.id = y.n ORDER BY x.g LIMIT 2",
+            vec![1, 2],
+        ),
+        (
+            "WITH x AS (SELECT id, n FROM a), y AS (SELECT id, n FROM b) \
+             SELECT COUNT(*) OVER () FROM x JOIN y ON x.n = y.n LIMIT 1",
+            vec![3],
+        ),
+        (
+            "SELECT DISTINCT d.g FROM d JOIN b ON d.id = b.n ORDER BY 1 LIMIT 2",
+            vec![1, 2],
+        ),
+        (
+            "SELECT DISTINCT d.g FROM d JOIN b ON d.id = b.n LIMIT 2",
+            vec![1, 2],
+        ),
+        (
+            "WITH x AS (SELECT id, g FROM d), y AS (SELECT n FROM b) \
+             SELECT DISTINCT x.g FROM x JOIN y ON x.id = y.n LIMIT 2",
+            vec![1, 2],
+        ),
+    ] {
+        let mut found = ids(&db, sql, vec![]);
+        found.sort_unstable();
+        assert_eq!(found, expected, "{sql}");
+    }
+}
+
+#[test]
+fn test_a_distinct_on_join_orders_by_a_column_it_does_not_select() {
+    let db = join_tables("contract_join_distinct_on_hidden_order");
+    db.execute("CREATE TABLE d (id INTEGER PRIMARY KEY, g INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO d VALUES (1, 1), (2, 1), (3, 2)", ())
+        .unwrap();
+    for (order, expected) in [
+        ("ASC", vec![(1, 1), (2, 3)]),
+        ("DESC", vec![(1, 2), (2, 3)]),
+    ] {
+        for limit in ["", " LIMIT 5"] {
+            let sql = format!(
+                "SELECT DISTINCT ON (d.g) d.g, b.n AS picked FROM b JOIN d ON b.n = d.id \
+                 ORDER BY d.g, d.id {order}{limit}"
+            );
+            assert_eq!(sorted_pairs(&db, &sql), expected, "{sql}");
+        }
+    }
+}

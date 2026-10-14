@@ -36,7 +36,7 @@ const SEMI_JOIN_CACHE_SIZE: usize = 256;
 use crate::api::params::ParamVec;
 use crate::common::{CompactArc, SmartString, StringMap};
 use crate::core::predicate::PredicateSet;
-use crate::core::{Result, Row, Value, ValueMap, ValueSet};
+use crate::core::{Result, Row, Value, ValueMap};
 
 // Static defaults for ExecutionContext to avoid allocations for empty values.
 // These are shared across all contexts and only require Arc refcount bump on clone.
@@ -113,12 +113,21 @@ pub fn cache_scalar_subquery(key: String, tables: SmallVec<[CompactArc<str>; 2]>
 // LRU-bounded to prevent unbounded memory growth.
 
 /// Cached IN subquery entry: (tables_referenced for invalidation, result
-/// values, lazily built shared hash set for single-column IN)
+/// values, lazily built shared hash set for single-column IN, the values'
+/// kinds)
 type InSubqueryCacheEntry = (
     SmallVec<[CompactArc<str>; 2]>,
     Vec<Value>,
-    Option<CompactArc<crate::core::ValueSet>>,
+    Option<CompactArc<PredicateSet>>,
+    MemberKinds,
 );
+
+/// Whether a list of values holds a TEXT and whether it holds a number
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemberKinds {
+    pub texts: bool,
+    pub numbers: bool,
+}
 
 thread_local! {
     static IN_SUBQUERY_CACHE: RefCell<LruCache<String, InSubqueryCacheEntry>> =
@@ -146,7 +155,7 @@ pub fn invalidate_in_subquery_cache_for_table(table_name: &str) {
         // Collect keys to remove (LruCache doesn't have retain)
         let keys_to_remove: Vec<String> = c
             .iter()
-            .filter(|(_, (tables, _, _))| tables.iter().any(|t| t.eq_ignore_ascii_case(table_name)))
+            .filter(|(_, (tables, ..))| tables.iter().any(|t| t.eq_ignore_ascii_case(table_name)))
             .map(|(k, _)| k.clone())
             .collect();
         for key in keys_to_remove {
@@ -157,18 +166,32 @@ pub fn invalidate_in_subquery_cache_for_table(table_name: &str) {
 
 /// Get a cached IN subquery result by SQL string key.
 pub fn get_cached_in_subquery(key: &str) -> Option<Vec<Value>> {
-    IN_SUBQUERY_CACHE.with(|cache| cache.borrow_mut().get(key).map(|(_, v, _)| v.clone()))
+    IN_SUBQUERY_CACHE.with(|cache| cache.borrow_mut().get(key).map(|(_, v, ..)| v.clone()))
+}
+
+/// A cached IN subquery result with the kinds of its values, taken when
+/// it was cached
+pub fn get_cached_in_subquery_with_kinds(key: &str) -> Option<(Vec<Value>, MemberKinds)> {
+    IN_SUBQUERY_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .get(key)
+            .map(|(_, v, _, kinds)| (v.clone(), *kinds))
+    })
 }
 
 /// Get a cached IN subquery result as a shared hash set, building and
 /// memoizing the set inside the entry on first request. Later hits are
 /// an Arc clone: no value clones, no set rebuild.
-pub fn get_cached_in_subquery_set(key: &str) -> Option<CompactArc<crate::core::ValueSet>> {
+pub fn get_cached_in_subquery_set(key: &str) -> Option<CompactArc<PredicateSet>> {
     IN_SUBQUERY_CACHE.with(|cache| {
         let mut c = cache.borrow_mut();
         let entry = c.get_mut(key)?;
         if entry.2.is_none() {
-            entry.2 = Some(CompactArc::new(entry.1.iter().cloned().collect()));
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::in_subquery_set_built();
+            let members = CompactArc::new(entry.1.iter().cloned().collect());
+            entry.2 = Some(CompactArc::new(PredicateSet::of(members)));
         }
         entry.2.clone()
     })
@@ -179,11 +202,17 @@ pub fn get_cached_in_subquery_set(key: &str) -> Option<CompactArc<crate::core::V
 /// this cache and keeps no row for such a set, which its readers decide
 /// on a fresh list alone
 pub fn cache_in_subquery(key: String, tables: SmallVec<[CompactArc<str>; 2]>, values: Vec<Value>) {
-    if values.iter().any(|v| v.is_null()) {
-        return;
+    let mut kinds = MemberKinds::default();
+    for value in &values {
+        match value {
+            Value::Null(_) => return,
+            Value::Text(_) => kinds.texts = true,
+            Value::Integer(_) | Value::Float(_) => kinds.numbers = true,
+            _ => {}
+        }
     }
     IN_SUBQUERY_CACHE.with(|cache| {
-        cache.borrow_mut().put(key, (tables, values, None));
+        cache.borrow_mut().put(key, (tables, values, None, kinds));
     });
 }
 
@@ -333,7 +362,7 @@ impl SemiJoinOrigin<'_> {
 
 /// Cached semi-join entry: its origin, checked on a hit and read for
 /// invalidation by table, and the set
-type SemiJoinCacheEntry = (KeptOrigin, CompactArc<ValueSet>);
+type SemiJoinCacheEntry = (KeptOrigin, CompactArc<PredicateSet>);
 
 thread_local! {
     static SEMI_JOIN_CACHE: RefCell<LruCache<u64, SemiJoinCacheEntry>> =
@@ -372,7 +401,10 @@ pub fn invalidate_semi_join_cache_for_table(table_name: &str) {
 
 /// The cached semi-join set taken for `origin`, under its `key`
 #[inline]
-pub fn get_cached_semi_join(origin: &SemiJoinOrigin<'_>, key: u64) -> Option<CompactArc<ValueSet>> {
+pub fn get_cached_semi_join(
+    origin: &SemiJoinOrigin<'_>,
+    key: u64,
+) -> Option<CompactArc<PredicateSet>> {
     SEMI_JOIN_CACHE.with(|cache| {
         cache
             .borrow_mut()
@@ -384,7 +416,11 @@ pub fn get_cached_semi_join(origin: &SemiJoinOrigin<'_>, key: u64) -> Option<Com
 
 /// Cache a semi-join hash set result (CompactArc version for zero-copy).
 #[inline]
-pub fn cache_semi_join_arc(origin: &SemiJoinOrigin<'_>, key: u64, values: CompactArc<ValueSet>) {
+pub fn cache_semi_join_arc(
+    origin: &SemiJoinOrigin<'_>,
+    key: u64,
+    values: CompactArc<PredicateSet>,
+) {
     SEMI_JOIN_CACHE.with(|cache| {
         cache.borrow_mut().put(key, (origin.keep(), values));
     });
@@ -1623,8 +1659,12 @@ mod tests {
         };
         let taken = origin("semi_join_origin_test", &[Value::Integer(10)]);
         let key = taken.key();
-        let set: CompactArc<ValueSet> = CompactArc::new([Value::Integer(1)].into_iter().collect());
-        cache_semi_join_arc(&taken, key, set);
+        let set = || {
+            CompactArc::new(PredicateSet::of(CompactArc::new(
+                [Value::Integer(1)].into_iter().collect(),
+            )))
+        };
+        cache_semi_join_arc(&taken, key, set());
         assert!(get_cached_semi_join(&taken, key).is_some());
         for other in [
             origin("semi_join_origin_test", &[Value::Integer(20)]),
@@ -1643,8 +1683,7 @@ mod tests {
         let null_key = null.key();
         let other_null = origin("semi_join_origin_test", &[Value::Null(DataType::Float)]);
         assert_ne!(null_key, other_null.key());
-        let set: CompactArc<ValueSet> = CompactArc::new([Value::Integer(1)].into_iter().collect());
-        cache_semi_join_arc(&null, null_key, set);
+        cache_semi_join_arc(&null, null_key, set());
         assert!(get_cached_semi_join(&other_null, null_key).is_none());
         invalidate_semi_join_cache_for_table("semi_join_origin_test");
     }

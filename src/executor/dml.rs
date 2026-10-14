@@ -500,8 +500,12 @@ impl Executor {
                     };
                     if in_expr.not {
                         // NOT IN: get all active row_ids and exclude the ones in the set
-                        let excluded: I64Set =
-                            in_expr.values.iter().filter_map(member_key).collect();
+                        let excluded: I64Set = in_expr
+                            .values
+                            .members()
+                            .iter()
+                            .filter_map(member_key)
+                            .collect();
 
                         let mut row_ids: Vec<i64> = table
                             .get_active_row_ids()?
@@ -512,8 +516,12 @@ impl Executor {
                         return Ok(Some(row_ids));
                     } else {
                         // IN: the keys the members name
-                        let mut row_ids: Vec<i64> =
-                            in_expr.values.iter().filter_map(member_key).collect();
+                        let mut row_ids: Vec<i64> = in_expr
+                            .values
+                            .members()
+                            .iter()
+                            .filter_map(member_key)
+                            .collect();
                         row_ids.sort_unstable();
                         return Ok(Some(row_ids));
                     }
