@@ -77,6 +77,107 @@ type TxnTableEntry = (SmartString, Arc<TxnTableStore>);
 /// Uses SmallVec<[T; 2]> since most transactions access 1-2 tables, avoiding heap allocation
 type TxnVersionStoreMap = I64Map<SmallVec<[TxnTableEntry; 2]>>;
 
+/// A commit's unique indexes for its cold recheck: columns, names, defaults
+type RecheckIndex = (Vec<usize>, Vec<String>, Vec<crate::core::Value>);
+
+/// One key the cold recheck looks up for a row of the transaction
+struct KeyCheck {
+    row_id: i64,
+    /// An update, whose own sealed row is no conflict
+    update: bool,
+    /// The unique index in the recheck's list, or None for the primary key
+    index: Option<usize>,
+    /// Where the key's values start in `RecheckKeys::values`
+    start: usize,
+}
+
+/// The keys a commit rechecks, copied out of the transaction's store so no
+/// lookup holds it; one buffer per commit, reused across its rounds
+#[derive(Default)]
+struct RecheckKeys {
+    checks: Vec<KeyCheck>,
+    values: Vec<crate::core::Value>,
+}
+
+impl RecheckKeys {
+    /// The keys of the rows the recheck covers. Room is taken before the
+    /// store is held, so nothing allocates while it is
+    fn collect(
+        &mut self,
+        txn_id: i64,
+        txn_store: &TxnTableStore,
+        mgr: &crate::storage::volume::manifest::SegmentManager,
+        pk_idx: Option<usize>,
+        unique_indexes: &[RecheckIndex],
+    ) -> Result<()> {
+        self.checks.clear();
+        self.values.clear();
+        let poisoned = |_| Error::internal("transaction store lock poisoned");
+        let rows = txn_store.read().map_err(poisoned)?.local_count();
+        let columns: usize = unique_indexes.iter().map(|(cols, ..)| cols.len()).sum();
+        self.checks.reserve(rows * (1 + unique_indexes.len()));
+        self.values.reserve(rows * (1 + columns));
+        let store = txn_store.read().map_err(poisoned)?;
+        #[cfg(feature = "test-failpoints")]
+        let _held = crate::test_failpoints::RecheckStoreLock::enter();
+        let Some(local) = store.local_versions_ref() else {
+            return Ok(());
+        };
+        for (row_id, versions) in local.iter() {
+            let Some(version) = versions.last() else {
+                continue;
+            };
+            if version.is_deleted() {
+                continue;
+            }
+            let row = &version.data;
+            // A hot update keeps the row it read; a cold one left a tombstone
+            let old_row = store
+                .write_set_ref()
+                .and_then(|ws| ws.get(row_id))
+                .and_then(|entry| entry.read_version.as_ref())
+                .map(|rv| &rv.data);
+            let update = old_row.is_some() || mgr.is_pending_tombstone(txn_id, row_id);
+            if let Some(pk_val) = pk_idx.and_then(|pk| row.get(pk)) {
+                let old_pk = pk_idx.and_then(|pk| old_row.and_then(|old| old.get(pk)));
+                if !pk_val.is_null() && (!update || old_pk != Some(pk_val)) {
+                    self.checks.push(KeyCheck {
+                        row_id,
+                        update,
+                        index: None,
+                        start: self.values.len(),
+                    });
+                    self.values.push(pk_val.clone());
+                }
+            }
+            for (index, (col_indices, ..)) in unique_indexes.iter().enumerate() {
+                if let Some(old) = old_row {
+                    if col_indices.iter().all(|&idx| row.get(idx) == old.get(idx)) {
+                        continue;
+                    }
+                }
+                if col_indices.iter().any(|&idx| row.get(idx).is_none()) {
+                    continue;
+                }
+                self.checks.push(KeyCheck {
+                    row_id,
+                    update,
+                    index: Some(index),
+                    start: self.values.len(),
+                });
+                self.values
+                    .extend(col_indices.iter().filter_map(|&idx| row.get(idx).cloned()));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The snapshot a commit's cold recheck read through, let go after the seal
+/// fence: a last owner of a volume takes locks a seal must not wait on, and
+/// may remove a retired file
+type RecheckRead = Box<crate::storage::volume::manifest::StatementSnapshot>;
+
 /// Helper to get registry as the visibility checker type expected by VersionStore.
 /// In production: returns concrete Arc<TransactionRegistry> (zero-cost, inlined).
 /// In tests: returns Arc<dyn VisibilityChecker> for TestVisibilityChecker flexibility.
@@ -6204,6 +6305,23 @@ impl MVCCEngine {
             .and_then(|store| store.index_identity(index))
     }
 
+    /// Seals every hot row as a checkpoint's first steps do, without the
+    /// checkpoint's cut, which waits for the commits in flight
+    #[cfg(feature = "test-failpoints")]
+    pub fn seal_for_test(&self) -> Result<()> {
+        self.force_seal_all.store(true, Ordering::Release);
+        let sealed = self.seal_hot_buffers();
+        self.force_seal_all.store(false, Ordering::Release);
+        sealed
+    }
+
+    /// Runs the compaction a checkpoint runs after its seal, without the
+    /// checkpoint's cut
+    #[cfg(feature = "test-failpoints")]
+    pub fn compact_for_test(&self) -> Result<()> {
+        self.compact_after_checkpoint_forced()
+    }
+
     /// Marks one table's volumes idle and evicts them to metadata-only, so a
     /// test can read through the reload path. The epochs are local: the
     /// global eviction epoch does not move, and nothing else in the process
@@ -8623,24 +8741,111 @@ impl EngineOperations {
         self.loading_from_disk.load(Ordering::Acquire)
     }
 
-    /// Validate pending INSERT/UPDATE rows against cold segments at commit time.
-    /// Called when seal_generation changed since the transaction's INSERT,
-    /// meaning a seal may have moved conflicting rows from hot to cold.
-    /// The seal read fence is held by the caller.
-    fn validate_pending_against_cold(
+    /// Rechecks the transaction's keys against `mgr`'s volumes outside the
+    /// seal fence, then takes the fence: a round stands only when the schema
+    /// generation, then the seal generation, are unchanged under it. Returns
+    /// what the round read, to be let go after the fence, and the fence.
+    fn cold_recheck_then_fence<'m>(
         &self,
         txn_id: i64,
         txn_store: &Arc<TxnTableStore>,
         version_store: &Arc<VersionStore>,
-        mgr: &Arc<crate::storage::volume::manifest::SegmentManager>,
+        mgr: &'m crate::storage::volume::manifest::SegmentManager,
+        schema_generation: u64,
+        keys: &mut RecheckKeys,
+    ) -> Result<(
+        Option<RecheckRead>,
+        crate::storage::volume::manifest::SealRead<'m>,
+    )> {
+        // A write records its generation under the seal read fence, so a
+        // record equal to the generation now was settled and none came since
+        let generation = mgr.seal_generation();
+        let recorded = mgr.txn_recorded_generation(txn_id);
+        if recorded.is_none_or(|checked| checked == generation) {
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::commit_fence_next();
+            let guard = mgr.acquire_seal_read();
+            #[cfg(feature = "test-failpoints")]
+            let _decided = crate::test_failpoints::RecheckFenceSection::enter();
+            mgr.check_schema_generation(schema_generation)?;
+            // With no record, only a table with no volumes needs no recheck
+            if mgr.seal_generation() == generation && (recorded.is_some() || !mgr.has_segments()) {
+                return Ok((None, guard));
+            }
+        }
+        self.cold_recheck_rounds(
+            txn_id,
+            txn_store,
+            version_store,
+            mgr,
+            schema_generation,
+            keys,
+        )
+    }
+
+    /// The rounds of `cold_recheck_then_fence`, at most `COLD_READ_RETRIES`,
+    /// then a write conflict
+    #[inline(never)]
+    fn cold_recheck_rounds<'m>(
+        &self,
+        txn_id: i64,
+        txn_store: &Arc<TxnTableStore>,
+        version_store: &Arc<VersionStore>,
+        mgr: &'m crate::storage::volume::manifest::SegmentManager,
+        schema_generation: u64,
+        keys: &mut RecheckKeys,
+    ) -> Result<(
+        Option<RecheckRead>,
+        crate::storage::volume::manifest::SealRead<'m>,
+    )> {
+        for _ in 0..crate::storage::volume::table::COLD_READ_RETRIES {
+            let settled = {
+                let _fence = mgr.acquire_seal_read();
+                mgr.seal_generation()
+            };
+            let snapshot = mgr.statement_snapshot();
+            let found = self.recheck_keys(txn_id, txn_store, version_store, mgr, &snapshot, keys);
+            // Residency only, under the segment lock's own owner and cold
+            // checks: before the fence, which then decides from memory alone
+            mgr.publish_loaded(snapshot.take_loaded());
+            let read = Box::new(snapshot);
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::commit_fence_next();
+            // Declared after the snapshot, so every return lets the fence go first
+            let guard = mgr.acquire_seal_read();
+            #[cfg(feature = "test-failpoints")]
+            let decided = crate::test_failpoints::RecheckFenceSection::enter();
+            mgr.check_schema_generation(schema_generation)?;
+            if mgr.seal_generation() == settled {
+                found?;
+                return Ok((Some(read), guard));
+            }
+            #[cfg(feature = "test-failpoints")]
+            drop(decided);
+            drop(guard);
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::commit_round_moved();
+        }
+        Err(Error::internal(format!(
+            "write conflict: the sealed volumes of table '{}' kept changing while the commit read them",
+            mgr.table_name()
+        )))
+    }
+
+    /// One round of the cold recheck against `snapshot`: the keys of the
+    /// transaction's inserts, and of its updates that changed them, found in
+    /// no sealed row but their own. A conflict is the round's error.
+    fn recheck_keys(
+        &self,
+        txn_id: i64,
+        txn_store: &Arc<TxnTableStore>,
+        version_store: &Arc<VersionStore>,
+        mgr: &crate::storage::volume::manifest::SegmentManager,
+        snapshot: &crate::storage::volume::manifest::StatementSnapshot,
+        keys: &mut RecheckKeys,
     ) -> Result<()> {
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::cold_rechecked();
-        let store = txn_store.read().unwrap();
-        let Some(local) = store.local_versions_ref() else {
-            return Ok(());
-        };
-
         let schema_arc = version_store.schema();
         let schema = &*schema_arc;
         let pk_idx = schema.pk_column_index();
@@ -8665,143 +8870,46 @@ impl EngineOperations {
 
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::cold_recheck_started();
-        for (row_id, versions) in local.iter() {
-            let Some(version) = versions.last() else {
+        keys.collect(txn_id, txn_store, mgr, pk_idx, &unique_indexes)?;
+
+        for check in &keys.checks {
+            let Some(index) = check.index else {
+                let Some(pk_col) = pk_idx else {
+                    continue;
+                };
+                let pk_val = &keys.values[check.start];
+                if let Some(cold_rid) = mgr.check_value_exists_in(snapshot, pk_col, pk_val)? {
+                    if (!check.update || cold_rid != check.row_id)
+                        && !mgr.is_pending_tombstone(txn_id, cold_rid)
+                    {
+                        return Err(crate::core::Error::PrimaryKeyConstraint { row_id: cold_rid });
+                    }
+                }
                 continue;
             };
-            if version.is_deleted() {
+            let (col_indices, col_names, defaults) = &unique_indexes[index];
+            let raw = &keys.values[check.start..check.start + col_indices.len()];
+            let coerced: smallvec::SmallVec<[crate::core::Value; 4]> = raw
+                .iter()
+                .zip(col_indices)
+                .map(|(val, &idx)| val.coerce_to_type(schema.columns[idx].data_type))
+                .collect();
+            if coerced.iter().any(|v| v.is_null()) {
                 continue;
             }
-            let row = &version.data;
-
-            // Classify INSERT vs UPDATE:
-            // - Hot UPDATE: write_set has read_version: Some(old_row)
-            // - Cold UPDATE: pending tombstone exists for this row_id
-            //   (added during cold-row claim in update/update_by_row_ids)
-            // - Fresh INSERT: neither of the above
-            // Note: put() creates write_set entries for all rows (including
-            // INSERTs with read_version: None), so write_set presence alone
-            // cannot distinguish INSERT from cold-row claim.
-            let has_read_version = store
-                .write_set_ref()
-                .and_then(|ws| ws.get(row_id))
-                .and_then(|entry| entry.read_version.as_ref())
-                .is_some();
-            let is_cold_claim = mgr.is_pending_tombstone(txn_id, row_id);
-            let is_insert = !has_read_version && !is_cold_claim;
-
-            if is_insert {
-                // PK check against cold
-                if let Some(pk_col) = pk_idx {
-                    if let Some(pk_val) = row.get(pk_col) {
-                        if !pk_val.is_null() {
-                            if let Some(cold_rid) =
-                                mgr.check_value_exists_in_segments(pk_col, pk_val)?
-                            {
-                                if !mgr.is_pending_tombstone(txn_id, cold_rid) {
-                                    return Err(crate::core::Error::PrimaryKeyConstraint {
-                                        row_id: cold_rid,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-                // UNIQUE constraint checks against cold
-                for (col_indices, col_names, defaults) in &unique_indexes {
-                    let coerced: Vec<crate::core::Value> = col_indices
-                        .iter()
-                        .filter_map(|&idx| {
-                            let val = row.get(idx)?;
-                            Some(val.coerce_to_type(schema.columns[idx].data_type))
-                        })
-                        .collect();
-                    if coerced.len() != col_indices.len() || coerced.iter().any(|v| v.is_null()) {
-                        continue;
-                    }
-                    let values: Vec<&crate::core::Value> = coerced.iter().collect();
-                    if let Some(cold_rid) =
-                        mgr.find_row_id_by_values(col_indices, &values, defaults)?
-                    {
-                        if !mgr.is_pending_tombstone(txn_id, cold_rid) {
-                            return Err(crate::core::Error::UniqueConstraint {
-                                index: col_names.join("_"),
-                                column: col_names.join(", "),
-                                value: coerced.into(),
-                                row_id: cold_rid,
-                            });
-                        }
-                    }
-                }
-            } else {
-                // UPDATE: check PK if it changed
-                if let Some(pk_col) = pk_idx {
-                    let new_pk = row.get(pk_col);
-                    let old_pk = store
-                        .write_set_ref()
-                        .and_then(|ws| ws.get(row_id))
-                        .and_then(|entry| entry.read_version.as_ref())
-                        .and_then(|rv| rv.data.get(pk_col));
-                    if new_pk != old_pk {
-                        if let Some(pk_val) = new_pk {
-                            if !pk_val.is_null() {
-                                if let Some(cold_rid) =
-                                    mgr.check_value_exists_in_segments(pk_col, pk_val)?
-                                {
-                                    if cold_rid != row_id
-                                        && !mgr.is_pending_tombstone(txn_id, cold_rid)
-                                    {
-                                        return Err(crate::core::Error::PrimaryKeyConstraint {
-                                            row_id: cold_rid,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                // UPDATE: check unique constraints excluding the row being updated.
-                // Skip when the indexed columns haven't changed.
-                let old_row = store
-                    .write_set_ref()
-                    .and_then(|ws| ws.get(row_id))
-                    .and_then(|entry| entry.read_version.as_ref())
-                    .map(|rv| &rv.data);
-
-                for (col_indices, col_names, defaults) in &unique_indexes {
-                    // Skip if none of the indexed columns changed
-                    if let Some(old_r) = old_row {
-                        let any_changed = col_indices
-                            .iter()
-                            .any(|&idx| row.get(idx) != old_r.get(idx));
-                        if !any_changed {
-                            continue;
-                        }
-                    }
-
-                    let coerced: Vec<crate::core::Value> = col_indices
-                        .iter()
-                        .filter_map(|&idx| {
-                            let val = row.get(idx)?;
-                            Some(val.coerce_to_type(schema.columns[idx].data_type))
-                        })
-                        .collect();
-                    if coerced.len() != col_indices.len() || coerced.iter().any(|v| v.is_null()) {
-                        continue;
-                    }
-                    let values: Vec<&crate::core::Value> = coerced.iter().collect();
-                    if let Some(cold_rid) =
-                        mgr.find_row_id_by_values(col_indices, &values, defaults)?
-                    {
-                        if cold_rid != row_id && !mgr.is_pending_tombstone(txn_id, cold_rid) {
-                            return Err(crate::core::Error::UniqueConstraint {
-                                index: col_names.join("_"),
-                                column: col_names.join(", "),
-                                value: coerced.into(),
-                                row_id: cold_rid,
-                            });
-                        }
-                    }
+            let values: smallvec::SmallVec<[&crate::core::Value; 4]> = coerced.iter().collect();
+            let found = mgr.find_row_id_by_values_in(snapshot, col_indices, &values, defaults)?;
+            drop(values);
+            if let Some(cold_rid) = found {
+                if (!check.update || cold_rid != check.row_id)
+                    && !mgr.is_pending_tombstone(txn_id, cold_rid)
+                {
+                    return Err(crate::core::Error::UniqueConstraint {
+                        index: col_names.join("_"),
+                        column: col_names.join(", "),
+                        value: coerced.into_vec().into(),
+                        row_id: cold_rid,
+                    });
                 }
             }
         }
@@ -8810,6 +8918,8 @@ impl EngineOperations {
 
     /// Record pending versions for a table to WAL (helper for commit_all_tables)
     fn record_table_to_wal(&self, txn_id: i64, table: &MVCCTable) -> Result<()> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::table_wal_record_written();
         if let Some(ref pm) = self.persistence() {
             let table_name = table.name();
             let pending = table.get_pending_versions();
@@ -9325,6 +9435,7 @@ impl TransactionEngineOperations for EngineOperations {
 
         let mut commit_error: Option<crate::core::Error> = None;
         let mut any_committed = false;
+        let mut recheck_keys = RecheckKeys::default();
         let mut tombstones_wal_recorded: rustc_hash::FxHashSet<String> =
             rustc_hash::FxHashSet::default();
 
@@ -9428,25 +9539,30 @@ impl TransactionEngineOperations for EngineOperations {
             // Always take fence if manager exists — even before first seal
             // completes, the manager may exist without has_segments() being
             // true yet (created before register_volume publishes the flag).
-            let _seal_guard = mgr_for_commit.as_ref().map(|mgr| mgr.acquire_seal_read());
-
-            // Cold revalidation: unless every write was checked at the
-            // generation the commit sees, and no column change came since
-            if let Some((mgr, generation)) = mgr_for_commit.as_ref().zip(schema_generation) {
-                let checked = mgr.check_schema_generation(generation).and_then(|()| {
-                    if !mgr.txn_needs_cold_recheck(txn_id) {
-                        return Ok(());
+            // The cold recheck reads outside the fence; declared before the
+            // fence, what it read is let go after it on every path
+            let (_recheck_read, _seal_guard) = match mgr_for_commit.as_ref().zip(schema_generation)
+            {
+                Some((mgr, generation)) => match self.cold_recheck_then_fence(
+                    txn_id,
+                    txn_store,
+                    version_store,
+                    mgr,
+                    generation,
+                    &mut recheck_keys,
+                ) {
+                    Ok((read, guard)) => (read, Some(guard)),
+                    Err(e) => {
+                        commit_error = Some(e);
+                        break;
                     }
-                    let found =
-                        self.validate_pending_against_cold(txn_id, txn_store, version_store, mgr);
-                    // A column change during the recheck moved the layout it read through
-                    mgr.check_schema_generation(generation).and(found)
-                });
-                if let Err(e) = checked {
-                    commit_error = Some(e);
-                    break;
+                },
+                None => {
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::commit_fence_next();
+                    (None, None)
                 }
-            }
+            };
 
             if let Err(e) = table.commit_published() {
                 commit_error = Some(e);

@@ -2099,6 +2099,26 @@ impl SegmentManager {
             &snapshot.ts,
             col_idx,
             value,
+            None,
+        )
+    }
+
+    /// Statement-snapshot variant of `check_value_exists_in_segments`: a cold
+    /// candidate, and the newer copies of its row, read through the
+    /// statement's captured owners
+    pub fn check_value_exists_in(
+        &self,
+        snap: &StatementSnapshot,
+        col_idx: usize,
+        value: &crate::core::Value,
+    ) -> crate::core::Result<Option<i64>> {
+        self.check_value_exists_impl(
+            &snap.seg_ids_newest_first,
+            &snap.segs,
+            &snap.tombstones,
+            col_idx,
+            value,
+            Some(snap),
         )
     }
 
@@ -2116,6 +2136,7 @@ impl SegmentManager {
             &snapshot.ts,
             col_idx,
             value,
+            None,
         )
     }
 
@@ -2173,6 +2194,7 @@ impl SegmentManager {
         ts: &FxHashMap<i64, u64>,
         col_idx: usize,
         value: &crate::core::Value,
+        stmt: Option<&StatementSnapshot>,
     ) -> crate::core::Result<Option<i64>> {
         let mut seen = FxHashSet::default();
 
@@ -2203,9 +2225,12 @@ impl SegmentManager {
             // Zone map passed — need column data. Load cold volumes on demand.
             let loaded: Arc<FrozenVolume>;
             let vol = if vol.is_cold() {
-                loaded = match self.ensure_volume(seg_id)? {
-                    Some(v) => v,
-                    None => continue,
+                loaded = match stmt {
+                    Some(snap) => snap.volume(self, seg_id, cold)?,
+                    None => match self.ensure_volume(seg_id)? {
+                        Some(v) => v,
+                        None => continue,
+                    },
                 };
                 &*loaded
             } else {
@@ -2244,7 +2269,7 @@ impl SegmentManager {
                         if !col.is_null(i) && col.get_i64(i) == target && !ts.contains_key(&rid) {
                             if seg_ids.len() > 1 {
                                 if let Some(current_val) =
-                                    self.get_authoritative_value(seg_ids, segs, rid, col_idx, None)?
+                                    self.get_authoritative_value(seg_ids, segs, rid, col_idx, stmt)?
                                 {
                                     if &current_val != value {
                                         continue;
@@ -3128,6 +3153,8 @@ impl SegmentManager {
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
             *segments = Arc::new(new_map);
         }
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::seal_generation_moved();
         self.invalidate_count();
         self.has_segments_flag
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3736,13 +3763,10 @@ impl SegmentManager {
         self.txn_seal_gens.lock().insert(txn_id, UNCHECKED_WRITES);
     }
 
-    /// Whether the commit rechecks the transaction's keys against the
-    /// volumes: not every write was checked at the generation it sees
-    pub fn txn_needs_cold_recheck(&self, txn_id: i64) -> bool {
-        match self.txn_seal_gens.lock().get(&txn_id).copied() {
-            Some(gen) => gen != self.seal_generation(),
-            None => self.has_segments(),
-        }
+    /// The generation the transaction's writes were checked at, the unchecked
+    /// mark if any write was not, or None when no write recorded one
+    pub fn txn_recorded_generation(&self, txn_id: i64) -> Option<u64> {
+        self.txn_seal_gens.lock().get(&txn_id).copied()
     }
 
     /// Remove the seal generation record for a transaction (on commit/rollback).
@@ -4530,6 +4554,8 @@ impl SegmentManager {
     /// `Err` means the cold volume could not be reloaded and the caller
     /// must fail closed rather than serve partial data.
     pub fn ensure_volume(&self, seg_id: u64) -> crate::core::Result<Option<Arc<FrozenVolume>>> {
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::live_volume_load();
         self.ensure_volume_inner(seg_id, None)
     }
 

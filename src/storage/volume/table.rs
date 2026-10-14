@@ -82,7 +82,7 @@ const SIDE_SCAN_SHARE: u64 = super::secondary::SCAN_SHARE;
 
 /// Times a statement releases the seal fence to read cold volumes a seal,
 /// compaction or eviction left unread before it gives up
-const COLD_READ_RETRIES: usize = 3;
+pub(crate) const COLD_READ_RETRIES: usize = 3;
 
 /// A side file read that failed is the statement's error
 fn side_error(error: std::io::Error) -> crate::core::Error {

@@ -218,6 +218,8 @@ impl VolumeFile {
 
 impl Drop for VolumeFile {
     fn drop(&mut self) {
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::volume_file_dropped();
         // The file goes under the registry lock, which a move holds too
         let mut registry = VOLUME_FILES.lock();
         let path = registry
@@ -322,6 +324,8 @@ fn next_store_id() -> usize {
 
 impl Drop for CompressedBlockStore {
     fn drop(&mut self) {
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::block_store_dropped();
         super::group_cache::DECODED_GROUPS.remove_store(self.id);
     }
 }
