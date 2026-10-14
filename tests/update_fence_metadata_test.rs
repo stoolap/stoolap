@@ -409,3 +409,57 @@ fn a_compaction_after_the_fence_check_keeps_one_updated_version() {
         .unwrap();
     assert_eq!((rows, v_of(&db, 5)), (1, Some(4)));
 }
+
+/// Runs VACUUM until it removes a deleted row; false when it never did
+fn vacuum_until_collected(db: &Database) -> bool {
+    for _ in 0..50 {
+        let removed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let slot = std::rc::Rc::clone(&removed);
+        stoolap::test_failpoints::after_gc_rows_removed(move || slot.set(true));
+        db.execute("VACUUM", ()).unwrap();
+        if removed.get() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    false
+}
+
+#[test]
+fn a_sealed_row_another_transaction_deleted_and_collected_is_not_updated_back() {
+    let _guard = FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?checkpoint_interval=3600",
+        dir.path().display()
+    ))
+    .unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 20)", ())
+        .unwrap();
+    db.engine().seal_for_test().unwrap();
+    let mut txn = db
+        .begin_with_isolation(stoolap::core::IsolationLevel::SnapshotIsolation)
+        .unwrap();
+    let seen: i64 = txn.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
+    assert_eq!(seen, 2);
+    let other = db.clone();
+    std::thread::spawn(move || other.execute("DELETE FROM t WHERE id = 1", ()).unwrap())
+        .join()
+        .unwrap();
+    assert!(
+        vacuum_until_collected(&db),
+        "VACUUM never collected the deleted hot version"
+    );
+    let updated = txn.execute("UPDATE t SET v = 5 WHERE id = 1", ());
+    let _ = txn.commit();
+    let left: i64 = db
+        .query_one("SELECT COUNT(*) FROM t WHERE id = 1", ())
+        .unwrap();
+    assert_eq!(left, 0, "the deleted row came back: {updated:?}");
+    assert!(
+        matches!(&updated, Err(stoolap::core::Error::Internal { message }) if message.contains("write conflict")),
+        "{updated:?}"
+    );
+}

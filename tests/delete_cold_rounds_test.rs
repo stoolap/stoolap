@@ -134,6 +134,21 @@ impl Drop for NoGroupCache<'_> {
     }
 }
 
+/// Runs VACUUM until it removes a deleted row; false when it never did
+fn vacuum_until_collected(db: &Database) -> bool {
+    for _ in 0..50 {
+        let removed = Rc::new(Cell::new(false));
+        let slot = Rc::clone(&removed);
+        stoolap::test_failpoints::after_gc_rows_removed(move || slot.set(true));
+        db.execute("VACUUM", ()).unwrap();
+        if removed.get() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
 /// Seals a row in each of the next three DELETE rounds
 fn seal_in_three_rounds(db: Database, rounds: Rc<Cell<usize>>) {
     after_cold_round_prepared(move || {
@@ -307,7 +322,10 @@ fn a_row_another_transaction_deleted_and_collected_is_a_write_conflict() {
         2
     );
     assert!(execute_apart(&db, "DELETE FROM t WHERE id = 1"));
-    db.execute("VACUUM", ()).unwrap();
+    assert!(
+        vacuum_until_collected(&db),
+        "VACUUM never collected the deleted hot version"
+    );
     let deleted = txn.execute("DELETE FROM t WHERE id = 1", ());
     assert!(is_write_conflict(&deleted), "{deleted:?}");
     txn.rollback().unwrap();
