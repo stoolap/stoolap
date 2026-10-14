@@ -35,6 +35,7 @@ use crate::core::{Result, Row, RowVec, Value};
 use crate::functions::aggregate::CompiledAggregate;
 use crate::functions::AggregateFunction;
 use crate::parser::ast::*;
+use crate::storage::traits::transaction::StatementTable;
 use crate::storage::traits::{Engine, QueryResult};
 
 use super::context::ExecutionContext;
@@ -6909,7 +6910,7 @@ impl Executor {
     ) -> Result<Box<dyn QueryResult>> {
         // Get table and count distinct values directly
         let tx = self.engine.begin_transaction()?;
-        let table = tx.get_table(&cd.table_name)?;
+        let table = tx.get_statement_table(&cd.table_name)?;
 
         let count = table
             .get_partition_count(&cd.column_name)?
@@ -7079,7 +7080,7 @@ impl Executor {
             }
         };
 
-        let table = match tx.get_table(&table_name) {
+        let table = match tx.get_statement_table(&table_name) {
             Ok(t) => t,
             Err(_) => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
@@ -7178,7 +7179,7 @@ impl Executor {
     ) -> Result<Box<dyn QueryResult>> {
         // Get table and count rows directly
         let tx = self.engine.begin_transaction()?;
-        let table = tx.get_table(&cs.table_name)?;
+        let table = tx.get_statement_table(&cs.table_name)?;
 
         let count = table.row_count()?;
 
@@ -7389,7 +7390,7 @@ impl Executor {
             }
         };
 
-        let table = match tx.get_table(&table_name) {
+        let table = match tx.get_statement_table(&table_name) {
             Ok(t) => t,
             Err(_) => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());

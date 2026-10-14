@@ -33,6 +33,7 @@ use std::sync::Arc;
 use crate::core::{Error, ForeignKeyAction, ForeignKeyConstraint, Result, Schema, Value};
 use crate::storage::expression::Expression as StorageExpression;
 use crate::storage::mvcc::engine::MVCCEngine;
+use crate::storage::traits::transaction::StatementTable;
 use crate::storage::traits::Engine;
 
 /// Check that all FK values in a row reference existing parent rows.
@@ -946,7 +947,7 @@ pub(crate) fn check_no_referencing_rows(
             references(&*engine.get_table_for_txn(tid, child_table)?)?
         } else {
             let tx = engine.begin_transaction()?;
-            references(&*tx.get_table(child_table)?)?
+            references(&*tx.get_statement_table(child_table)?)?
         };
 
         if has_ref {

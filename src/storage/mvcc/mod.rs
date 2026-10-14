@@ -45,6 +45,7 @@ pub mod snapshot;
 pub mod table;
 pub mod timestamp;
 pub mod transaction;
+pub mod txn_gate;
 pub mod version_store;
 pub mod wal_manager;
 pub mod zonemap;

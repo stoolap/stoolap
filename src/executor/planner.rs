@@ -28,6 +28,7 @@
 use std::sync::Arc;
 
 use crate::common::StringMap;
+use crate::storage::traits::transaction::StatementTable;
 
 use crate::core::{Operator, Result, Value};
 use crate::optimizer::feedback::{fingerprint_predicate, global_feedback_cache};
@@ -307,7 +308,7 @@ impl QueryPlanner {
     /// Table schema is:
     /// id (0), table_name (1), row_count (2), page_count (3), avg_row_size (4), last_analyzed (5)
     fn read_table_stats(&self, tx: &dyn Transaction, table_name: &str) -> Result<TableStats> {
-        let stats_table = match tx.get_table(SYS_TABLE_STATS) {
+        let stats_table = match tx.get_statement_table(SYS_TABLE_STATS) {
             Ok(t) => t,
             Err(_) => return Ok(TableStats::default()),
         };
@@ -345,7 +346,7 @@ impl QueryPlanner {
     ) -> Result<StringMap<ColumnStatsCache>> {
         let mut stats = StringMap::new();
 
-        let stats_table = match tx.get_table(SYS_COLUMN_STATS) {
+        let stats_table = match tx.get_statement_table(SYS_COLUMN_STATS) {
             Ok(t) => t,
             Err(_) => return Ok(stats),
         };

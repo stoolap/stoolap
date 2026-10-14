@@ -63,7 +63,7 @@ fn a_unique_check_a_commit_and_an_index_change_all_finish() {
         .recv_timeout(limit)
         .expect("the check reaches its point");
     std::thread::spawn(move || {
-        stoolap::test_failpoints::before_commit_index_capture(move || {
+        stoolap::test_failpoints::on_txn_gate_wait(move || {
             ready.send(()).unwrap();
             commit_go.recv().unwrap();
         });

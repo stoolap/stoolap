@@ -20,6 +20,7 @@
 use crate::common::{CompactArc, SmartString};
 use crate::core::{DataType, Error, Result, Row, Schema, Value};
 use crate::parser::ast::{CopyFormat, CopyStatement};
+use crate::storage::traits::transaction::StatementTable;
 use crate::storage::traits::{Engine, QueryResult, Table};
 
 use super::context::{
@@ -128,7 +129,7 @@ impl Executor {
 
         // Create a standalone auto-commit transaction
         let mut tx = self.engine.begin_transaction()?;
-        let mut table = tx.get_table(table_name)?;
+        let mut table = tx.get_statement_table(table_name)?;
 
         // Pre-compute schema information
         let schema = table.schema();

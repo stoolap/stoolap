@@ -28,6 +28,7 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use crate::common::SmartString;
+use crate::storage::traits::transaction::StatementTable;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::common::{CompactArc, CompactVec, StringMap};
@@ -2352,13 +2353,16 @@ impl Executor {
         // Get table from active transaction or create a new one
         let (table, _standalone_tx) = if let Some(ref tx_state) = *active_tx {
             // Use the active transaction - this allows seeing uncommitted changes
-            let table = tx_state.transaction.get_table(table_name).map_err(|e| {
-                if matches!(e, Error::TableNotFound(_)) {
-                    Error::TableOrViewNotFound(table_name.to_string())
-                } else {
-                    e
-                }
-            })?;
+            let table = tx_state
+                .transaction
+                .get_statement_table(table_name)
+                .map_err(|e| {
+                    if matches!(e, Error::TableNotFound(_)) {
+                        Error::TableOrViewNotFound(table_name.to_string())
+                    } else {
+                        e
+                    }
+                })?;
             drop(active_tx); // Release lock before doing work
             (table, None)
         } else {
@@ -2378,7 +2382,7 @@ impl Executor {
                         classification,
                     );
                 }
-                let table = snapshot.get_table(table_name).map_err(|e| {
+                let table = snapshot.statement_table(table_name).map_err(|e| {
                     if matches!(e, Error::TableNotFound(_)) {
                         Error::TableOrViewNotFound(table_name.to_string())
                     } else {
@@ -2401,7 +2405,7 @@ impl Executor {
                     );
                 }
 
-                let table = tx.get_table(table_name).map_err(|e| {
+                let table = tx.get_statement_table(table_name).map_err(|e| {
                     if matches!(e, Error::TableNotFound(_)) {
                         Error::TableOrViewNotFound(table_name.to_string())
                     } else {
@@ -7524,9 +7528,9 @@ impl Executor {
         name: &str,
     ) -> Result<Box<dyn crate::storage::traits::Table>> {
         if let Some(active) = self.active_transaction.lock().unwrap().as_ref() {
-            return active.transaction.get_table(name);
+            return active.transaction.get_statement_table(name);
         }
-        snapshot.get_table(name)
+        snapshot.statement_table(name)
     }
 
     /// The inner table of an index join for one pass: a later pass reads it
@@ -10901,7 +10905,7 @@ impl Executor {
         // classification is passed from caller to avoid redundant cache lookups
 
         // Get table schema
-        let table = tx.get_table(table_name)?;
+        let table = tx.get_statement_table(table_name)?;
         let schema = table.schema().clone();
         let all_columns: Vec<String> = schema.column_names_owned().to_vec();
 
@@ -11808,7 +11812,7 @@ impl Executor {
 
         // Try to get the table and check for index or PK
         let txn = self.engine.begin_transaction().ok()?;
-        let table = txn.get_table(table_name_ref).ok()?;
+        let table = txn.get_statement_table(table_name_ref).ok()?;
         let schema = table.schema();
 
         // First check if inner column is the PRIMARY KEY (direct row_id lookup)

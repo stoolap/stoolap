@@ -1585,6 +1585,114 @@ pub(crate) fn cold_recheck_started() {
     }
 }
 
+/// A hook and the number of batch rows written it runs at
+type BatchRowHook = (usize, Box<dyn FnOnce()>);
+
+thread_local! {
+    static TABLE_WAL_RECORDED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static STATEMENT_ADMITTED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static BATCH_ROW_HOOK: RefCell<Option<BatchRowHook>> = RefCell::new(None);
+    static HOT_PUBLISHED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static TXN_GATE_WAIT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its commit has recorded a table's versions
+/// to the WAL, before the table's cold recheck and publication
+pub fn after_table_wal_recorded(hook: impl FnOnce() + 'static) {
+    TABLE_WAL_RECORDED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn table_wal_recorded() {
+    run_hook(&TABLE_WAL_RECORDED_HOOK);
+}
+
+/// Run once on this thread when its next write statement on a table was
+/// admitted for its transaction, before it reads or writes anything
+pub fn after_statement_admitted(hook: impl FnOnce() + 'static) {
+    STATEMENT_ADMITTED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn statement_admitted() {
+    run_hook(&STATEMENT_ADMITTED_HOOK);
+}
+
+/// Run once on this thread when a batch insert has written `rows` rows to
+/// the hot store
+pub fn after_batch_rows(rows: usize, hook: impl FnOnce() + 'static) {
+    BATCH_ROW_HOOK.with(|slot| *slot.borrow_mut() = Some((rows, Box::new(hook))));
+}
+
+pub(crate) fn batch_rows_written(rows: usize) {
+    let hook = BATCH_ROW_HOOK.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        match slot.as_ref() {
+            Some((at, _)) if *at == rows => slot.take().map(|(_, hook)| hook),
+            _ => None,
+        }
+    });
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when an update statement has published its hot
+/// versions, before its pending tombstones and its seal stamp
+pub fn after_hot_publish(hook: impl FnOnce() + 'static) {
+    HOT_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn hot_published() {
+    run_hook(&HOT_PUBLISHED_HOOK);
+}
+
+/// Run once on this thread when its commit, rollback, drop or savepoint
+/// starts waiting for the transaction's statements in flight
+pub fn on_txn_gate_wait(hook: impl FnOnce() + 'static) {
+    TXN_GATE_WAIT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn txn_gate_waiting() {
+    run_hook(&TXN_GATE_WAIT_HOOK);
+}
+
+thread_local! {
+    static TXN_GATE_HELD_OFF_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when a statement it starts finds the
+/// transaction's new statements held off by a savepoint
+pub fn on_txn_gate_held_off(hook: impl FnOnce() + 'static) {
+    TXN_GATE_HELD_OFF_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn txn_gate_held_off() {
+    run_hook(&TXN_GATE_HELD_OFF_HOOK);
+}
+
+thread_local! {
+    static TXN_GATE_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TXN_GATE_ADMISSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The times this thread asked a transaction's gate to admit a statement
+pub fn txn_gate_lookups() -> usize {
+    TXN_GATE_LOOKUPS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn txn_gate_looked_up() {
+    TXN_GATE_LOOKUPS.with(|n| n.set(n.get() + 1));
+}
+
+/// The statements this thread was admitted for by a gate, nested ones not
+/// counted
+pub fn txn_gate_admissions() -> usize {
+    TXN_GATE_ADMISSIONS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn txn_gate_admitted() {
+    TXN_GATE_ADMISSIONS.with(|n| n.set(n.get() + 1));
+}
+
 thread_local! {
     static COLD_ROUND_SETTLED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static COLD_ROUND_SNAPSHOT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
@@ -1969,6 +2077,12 @@ pub fn reset_all() {
     COMMIT_COUNTED_HOOK.with(|slot| *slot.borrow_mut() = None);
     SEAL_PASSED_CHANGING_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_RECHECK_HOOK.with(|slot| *slot.borrow_mut() = None);
+    TABLE_WAL_RECORDED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    STATEMENT_ADMITTED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    BATCH_ROW_HOOK.with(|slot| *slot.borrow_mut() = None);
+    HOT_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    TXN_GATE_WAIT_HOOK.with(|slot| *slot.borrow_mut() = None);
+    TXN_GATE_HELD_OFF_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_ROUND_SETTLED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_ROUND_SNAPSHOT_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_READS_FORGET.store(false, Release);
@@ -1989,6 +2103,8 @@ pub fn reset_all() {
     COLD_ONLY_CLAIMED_HOOK.with(|slot| *slot.borrow_mut() = None);
     UNIQUE_PAIRS.with(|n| n.set(0));
     COLD_RECHECKS.with(|n| n.set(0));
+    TXN_GATE_LOOKUPS.with(|n| n.set(0));
+    TXN_GATE_ADMISSIONS.with(|n| n.set(0));
 }
 
 /// RAII guard that serializes failpoint tests and resets all failpoints on drop.

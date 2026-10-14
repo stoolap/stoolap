@@ -29,6 +29,7 @@ use crate::storage::expression::Expression;
 use crate::storage::index::id_list::GroupIds;
 use crate::storage::index::{BTreeIndex, BitmapIndex, HashIndex, HnswIndex, MultiColumnIndex};
 use crate::storage::mvcc::scanner::MVCCScanner;
+use crate::storage::mvcc::txn_gate::{GateRef, TxnGate};
 use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::mvcc::version_store::TxnStoreWrite;
 use crate::storage::mvcc::RowVersion;
@@ -53,6 +54,9 @@ pub struct MVCCTable {
     /// The rows' layout when the cached schema was taken: what the rows
     /// this handle writes are laid out under
     layout: u64,
+    /// The transaction's gate, which admits this handle's statements; None
+    /// for a handle another owns and admits for
+    gate: Option<GateRef>,
     /// Scans that fell through to the full visible-row walk
     #[cfg(test)]
     full_scans: std::sync::atomic::AtomicU64,
@@ -124,6 +128,7 @@ impl MVCCTable {
             full_scans: std::sync::atomic::AtomicU64::new(0),
             cached_schema,
             layout,
+            gate: None,
         }
     }
 
@@ -144,7 +149,15 @@ impl MVCCTable {
             full_scans: std::sync::atomic::AtomicU64::new(0),
             cached_schema,
             layout,
+            gate: None,
         }
+    }
+
+    /// The handle admits its statements through `gate`: it is handed to a
+    /// caller as it is, not owned by a wrapper that admits for it
+    pub(crate) fn with_txn_gate(mut self, gate: Option<GateRef>) -> Self {
+        self.gate = gate;
+        self
     }
 
     /// Returns the transaction ID
@@ -1617,6 +1630,13 @@ impl MVCCTable {
         Ok(())
     }
 
+    /// Inserts a row for a statement already admitted
+    fn insert_admitted(&mut self, mut row: Row) -> Result<()> {
+        let row_id = self.prepare_insert(&mut row)?;
+        self.writes().put(row_id, row, false)?;
+        Ok(())
+    }
+
     /// Prepares a row for insertion: handles auto-increment, validates, and checks constraints.
     /// Returns the row_id on success. The row is modified in-place with auto-increment values.
     #[inline]
@@ -2737,22 +2757,30 @@ impl Table for MVCCTable {
     }
 
     fn insert(&mut self, mut row: Row) -> Result<Row> {
+        let _admitted = TxnGate::admit_for(&self.gate)?;
         let row_id = self.prepare_insert(&mut row)?;
         let inserted_row = row.clone();
         self.writes().put(row_id, row, false)?;
         Ok(inserted_row)
     }
 
-    fn insert_discard(&mut self, mut row: Row) -> Result<()> {
-        let row_id = self.prepare_insert(&mut row)?;
-        self.writes().put(row_id, row, false)?;
-        Ok(())
+    fn insert_discard(&mut self, row: Row) -> Result<()> {
+        let _admitted = TxnGate::admit_for(&self.gate)?;
+        self.insert_admitted(row)
     }
 
     fn insert_batch(&mut self, rows: Vec<Row>) -> Result<()> {
-        // Use insert_discard since we don't need returned rows
+        let _admitted = TxnGate::admit_for(&self.gate)?;
+        // Each row goes in as insert_discard puts it, under the one admission
+        #[cfg(feature = "test-failpoints")]
+        let mut written = 0;
         for row in rows {
-            self.insert_discard(row)?;
+            self.insert_admitted(row)?;
+            #[cfg(feature = "test-failpoints")]
+            {
+                written += 1;
+                crate::test_failpoints::batch_rows_written(written);
+            }
         }
         Ok(())
     }
@@ -2762,6 +2790,7 @@ impl Table for MVCCTable {
         where_expr: Option<&dyn Expression>,
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
+        let _admitted = TxnGate::admit_for(&self.gate)?;
         let mut plan = PlannedUpdate::default();
         self.plan_rows(where_expr, setter, None, &mut plan)?;
         self.publish(&mut plan)
@@ -2772,6 +2801,7 @@ impl Table for MVCCTable {
         row_ids: &[i64],
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
+        let _admitted = TxnGate::admit_for(&self.gate)?;
         let mut plan = PlannedUpdate::default();
         self.plan_rows_by_id(row_ids, setter, &mut plan)?;
         self.publish(&mut plan)
@@ -2784,6 +2814,7 @@ impl Table for MVCCTable {
         skip: Option<&FxHashMap<i64, u64>>,
         plan: &mut PlannedUpdate,
     ) -> Result<()> {
+        let _admitted = TxnGate::admit_for(&self.gate)?;
         self.plan_rows(where_expr, setter, skip, plan)
     }
 
@@ -2793,6 +2824,7 @@ impl Table for MVCCTable {
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
         plan: &mut PlannedUpdate,
     ) -> Result<()> {
+        let _admitted = TxnGate::admit_for(&self.gate)?;
         self.plan_rows_by_id(row_ids, setter, plan)
     }
 
@@ -2801,14 +2833,17 @@ impl Table for MVCCTable {
     }
 
     fn publish_update(&mut self, plan: &mut PlannedUpdate) -> Result<i32> {
+        let _admitted = TxnGate::admit_for(&self.gate)?;
         self.publish(plan)
     }
 
     fn delete_by_row_ids(&mut self, row_ids: &[i64]) -> Result<i32> {
+        let _admitted = TxnGate::admit_for(&self.gate)?;
         self.delete_rows_by_id(row_ids, None)
     }
 
     fn delete_scanned_rows(&mut self, row_ids: &mut Vec<i64>) -> Result<i32> {
+        let _admitted = TxnGate::admit_for(&self.gate)?;
         let mut deleted = I64Set::new();
         let count = self.delete_rows_by_id(row_ids, Some(&mut deleted))?;
         if deleted.len() != row_ids.len() {
@@ -2892,6 +2927,7 @@ impl Table for MVCCTable {
     }
 
     fn try_claim_row(&self, row_id: i64) -> Result<()> {
+        let _admitted = TxnGate::admit_for(&self.gate)?;
         // The claim and its write set entry change together, so a failed
         // statement's release cannot fall between them
         let mut writes = self.writes();
@@ -2907,10 +2943,15 @@ impl Table for MVCCTable {
     }
 
     fn release_claim(&self, row_id: i64) {
+        // A closed transaction's finish releases every claim
+        let Ok(_admitted) = TxnGate::admit_for(&self.gate) else {
+            return;
+        };
         self.writes().release_external_claim(row_id);
     }
 
     fn delete(&mut self, where_expr: Option<&dyn Expression>) -> Result<i32> {
+        let _admitted = TxnGate::admit_for(&self.gate)?;
         // OPTIMIZATION: Borrow schema instead of cloning - saves allocation per delete
         let schema = &self.cached_schema;
 
@@ -3153,10 +3194,12 @@ impl Table for MVCCTable {
         // Fast path: drop all storage directly, bypassing per-row MVCC versioning.
         // This is O(1) instead of O(N) for delete-all.
         // Fails if other transactions have uncommitted writes on this table.
+        let _admitted = TxnGate::admit_for(&self.gate)?;
         self.version_store.truncate_all()
     }
 
     fn truncate_after_check(&mut self, after_check: &mut dyn FnMut()) -> Result<i32> {
+        let _admitted = TxnGate::admit_for(&self.gate)?;
         self.version_store.truncate_all_then(after_check)
     }
 
@@ -3375,6 +3418,10 @@ impl Table for MVCCTable {
     }
 
     fn close(&mut self) -> Result<()> {
+        // A closed transaction's finish owns its stores
+        let Ok(_admitted) = TxnGate::admit_for(&self.gate) else {
+            return Ok(());
+        };
         // Rollback any uncommitted changes
         self.txn_versions.write_store().rollback();
         Ok(())
@@ -3385,10 +3432,16 @@ impl Table for MVCCTable {
     }
 
     fn rollback(&mut self) {
+        let Ok(_admitted) = TxnGate::admit_for(&self.gate) else {
+            return;
+        };
         self.txn_versions.write_store().rollback();
     }
 
     fn rollback_to_timestamp_with_pending(&self, timestamp: i64, pending: &[i64]) {
+        let Ok(_admitted) = TxnGate::admit_for(&self.gate) else {
+            return;
+        };
         self.txn_versions
             .write_store()
             .rollback_to_timestamp_with_pending(timestamp, pending);
@@ -3943,6 +3996,7 @@ impl Table for MVCCTable {
     }
 
     fn mark_sealed_original(&mut self, row_id: i64, old_row: Row) -> Result<()> {
+        let _admitted = TxnGate::admit_for(&self.gate)?;
         self.writes().mark_sealed_original(row_id, old_row)
     }
 

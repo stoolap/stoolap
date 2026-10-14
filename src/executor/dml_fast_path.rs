@@ -29,6 +29,7 @@ use crate::core::{Result, Row, Schema, Value};
 use crate::parser::ast::{DeleteStatement, Expression, UpdateStatement};
 use crate::storage::expression::{ComparisonExpr, Expression as StorageExpression};
 use crate::storage::mvcc::version_store::LayoutToken;
+use crate::storage::traits::transaction::StatementTable;
 use crate::storage::traits::{Engine, QueryResult};
 
 use super::context::{
@@ -402,7 +403,7 @@ impl Executor {
     ) -> Result<Box<dyn QueryResult>> {
         // Create auto-commit transaction
         let tx = self.engine.begin_transaction()?;
-        let mut table = tx.get_table(table_name)?;
+        let mut table = tx.get_statement_table(table_name)?;
         check_compiled_token(table.as_ref(), token)?;
 
         // Build WHERE expression for PK lookup
@@ -483,7 +484,7 @@ impl Executor {
     ) -> Result<Box<dyn QueryResult>> {
         // Create auto-commit transaction
         let tx = self.engine.begin_transaction()?;
-        let mut table = tx.get_table(table_name)?;
+        let mut table = tx.get_statement_table(table_name)?;
         check_compiled_token(table.as_ref(), token)?;
 
         // Build WHERE expression for PK lookup

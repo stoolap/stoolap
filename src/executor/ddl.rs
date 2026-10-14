@@ -27,6 +27,7 @@ use crate::core::{
     DataType, Error, ForeignKeyAction, ForeignKeyConstraint, Result, Row, SchemaBuilder, Value,
 };
 use crate::parser::ast::*;
+use crate::storage::traits::transaction::StatementTable;
 use crate::storage::traits::{Engine, QueryResult};
 
 /// Validate a foreign key reference and build a `ForeignKeyConstraint`.
@@ -468,7 +469,7 @@ impl Executor {
                 || !fk_index_columns.is_empty();
             if needs_indexes {
                 let tx = self.engine.begin_transaction()?;
-                let table = tx.get_table(table_name)?;
+                let table = tx.get_statement_table(table_name)?;
 
                 for col_name in &unique_columns {
                     let index_name = format!("unique_{}_{}", table_name, col_name);
@@ -596,7 +597,7 @@ impl Executor {
         let rows_count = rows.len();
         if !rows.is_empty() {
             let mut tx = self.engine.begin_transaction()?;
-            let mut table = tx.get_table(table_name)?;
+            let mut table = tx.get_statement_table(table_name)?;
 
             for row in rows {
                 let _ = table.insert(row)?;
@@ -716,7 +717,7 @@ impl Executor {
 
         // Get table to validate columns exist
         let tx = self.engine.begin_transaction()?;
-        let table = tx.get_table(table_name)?;
+        let table = tx.get_statement_table(table_name)?;
         let schema = table.schema();
 
         // Validate columns
@@ -958,7 +959,7 @@ impl Executor {
 
         // Now apply the in-memory change
         let tx = self.engine.begin_transaction()?;
-        let table = tx.get_table(&table_name)?;
+        let table = tx.get_statement_table(&table_name)?;
         table.drop_index(&index_name)?;
         self.engine.discard_uncovered_side_files(&table_name);
 
@@ -986,7 +987,7 @@ impl Executor {
 
         // Get the table for modifications
         let mut tx = self.engine.begin_transaction()?;
-        let mut table = tx.get_table(table_name)?;
+        let mut table = tx.get_statement_table(table_name)?;
 
         // Process the single ALTER TABLE operation
         match stmt.operation {

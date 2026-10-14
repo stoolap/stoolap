@@ -26,6 +26,7 @@ use crate::core::{DataType, Error, Result, Row, RowVec, Schema, Value, ValueMap}
 use crate::parser::ast::*;
 use crate::storage::expression::{ComparisonExpr, Expression as StorageExpr};
 use crate::storage::mvcc::version_store::LayoutToken;
+use crate::storage::traits::transaction::StatementTable;
 use crate::storage::traits::{Engine, QueryResult, Table, Transaction};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
@@ -608,13 +609,13 @@ impl Executor {
             if let Some(ref mut tx_state) = *active_tx {
                 // Use the active transaction
                 // NOTE: table_name is already lowercase (value_lower from AST)
-                let table = tx_state.transaction.get_table(table_name)?;
+                let table = tx_state.transaction.get_statement_table(table_name)?;
 
                 // Store a reference to this table for commit/rollback
                 if !tx_state.tables.contains_key(table_name.as_str()) {
                     tx_state.tables.insert(
                         table_name.to_string(),
-                        tx_state.transaction.get_table(table_name)?,
+                        tx_state.transaction.get_statement_table(table_name)?,
                     );
                 }
 
@@ -622,7 +623,7 @@ impl Executor {
             } else {
                 // No active transaction - create a standalone transaction with auto-commit
                 let tx = self.engine.begin_transaction()?;
-                let table = tx.get_table(table_name)?;
+                let table = tx.get_statement_table(table_name)?;
                 (table, true, Some(tx))
             };
 
@@ -1424,13 +1425,13 @@ impl Executor {
         let (mut table, should_auto_commit, standalone_tx) =
             if let Some(ref mut tx_state) = *active_tx {
                 // Use the active transaction
-                let table = tx_state.transaction.get_table(table_name)?;
+                let table = tx_state.transaction.get_statement_table(table_name)?;
 
                 // Store a reference to this table for commit/rollback
                 if !tx_state.tables.contains_key(table_name.as_str()) {
                     tx_state.tables.insert(
                         table_name.to_string(),
-                        tx_state.transaction.get_table(table_name)?,
+                        tx_state.transaction.get_statement_table(table_name)?,
                     );
                 }
 
@@ -1438,7 +1439,7 @@ impl Executor {
             } else {
                 // No active transaction - create a standalone transaction with auto-commit
                 let tx = self.engine.begin_transaction()?;
-                let table = tx.get_table(table_name)?;
+                let table = tx.get_statement_table(table_name)?;
                 (table, true, Some(tx))
             };
 
@@ -1883,13 +1884,13 @@ impl Executor {
             if let Some(ref mut tx_state) = *active_tx {
                 // Use the active transaction
                 // NOTE: table_name is already lowercase (value_lower from AST)
-                let table = tx_state.transaction.get_table(table_name)?;
+                let table = tx_state.transaction.get_statement_table(table_name)?;
 
                 // Store a reference to this table for commit/rollback
                 if !tx_state.tables.contains_key(table_name.as_str()) {
                     tx_state.tables.insert(
                         table_name.to_string(),
-                        tx_state.transaction.get_table(table_name)?,
+                        tx_state.transaction.get_statement_table(table_name)?,
                     );
                 }
 
@@ -1897,7 +1898,7 @@ impl Executor {
             } else {
                 // No active transaction - create a standalone transaction with auto-commit
                 let tx = self.engine.begin_transaction()?;
-                let table = tx.get_table(table_name)?;
+                let table = tx.get_statement_table(table_name)?;
                 (table, true, Some(tx))
             };
 
@@ -2872,13 +2873,13 @@ impl Executor {
             if let Some(ref mut tx_state) = *active_tx {
                 // Use the active transaction
                 // NOTE: table_name is already lowercase (value_lower from AST)
-                let table = tx_state.transaction.get_table(table_name)?;
+                let table = tx_state.transaction.get_statement_table(table_name)?;
 
                 // Store a reference to this table for commit/rollback
                 if !tx_state.tables.contains_key(table_name.as_str()) {
                     tx_state.tables.insert(
                         table_name.to_string(),
-                        tx_state.transaction.get_table(table_name)?,
+                        tx_state.transaction.get_statement_table(table_name)?,
                     );
                 }
 
@@ -2886,7 +2887,7 @@ impl Executor {
             } else {
                 // No active transaction - create a standalone transaction with auto-commit
                 let tx = self.engine.begin_transaction()?;
-                let table = tx.get_table(table_name)?;
+                let table = tx.get_statement_table(table_name)?;
                 (table, true, Some(tx))
             };
 
@@ -3375,19 +3376,19 @@ impl Executor {
                 }
 
                 // Use the active transaction
-                let table = tx_state.transaction.get_table(table_name)?;
+                let table = tx_state.transaction.get_statement_table(table_name)?;
 
                 // Register this table for commit/rollback
                 tx_state.tables.insert(
                     table_name.to_string(),
-                    tx_state.transaction.get_table(table_name)?,
+                    tx_state.transaction.get_statement_table(table_name)?,
                 );
 
                 (table, false, None)
             } else {
                 // No active transaction - create a standalone transaction with auto-commit
                 let tx = self.engine.begin_transaction()?;
-                let table = tx.get_table(table_name)?;
+                let table = tx.get_statement_table(table_name)?;
                 (table, true, Some(tx))
             };
 

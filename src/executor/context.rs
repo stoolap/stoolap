@@ -18,6 +18,7 @@
 //! parameter handling, transaction state, and query options.
 
 use crate::common::time_compat::Instant;
+use crate::storage::traits::transaction::StatementTable;
 use lru::LruCache;
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
@@ -790,16 +791,28 @@ impl StatementSnapshot {
             .get_table(name)
     }
 
+    /// The table the executor's own statements use, without the write gate
+    pub(crate) fn statement_table(
+        &self,
+        name: &str,
+    ) -> crate::core::Result<Box<dyn crate::storage::traits::Table>> {
+        self.0
+            .transaction
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_statement_table(name)
+    }
+
     /// Runs `f` on the table every correlated probe of the statement reads,
     /// taken on the first. None when there is no such table, as for a view
-    pub fn with_probe_table<T>(
+    pub(crate) fn with_probe_table<T>(
         &self,
         name: &str,
         f: impl FnOnce(&dyn crate::storage::traits::Table) -> crate::core::Result<T>,
     ) -> crate::core::Result<Option<T>> {
         let first = &self.0.first_probe_table;
         if first.get().is_none() {
-            let table = match self.get_table(name) {
+            let table = match self.statement_table(name) {
                 Err(crate::core::Error::TableNotFound(_)) => return Ok(None),
                 table => table?,
             };
@@ -822,7 +835,7 @@ impl StatementSnapshot {
         {
             Some(at) => at,
             None => {
-                let table = match self.get_table(name) {
+                let table = match self.statement_table(name) {
                     Err(crate::core::Error::TableNotFound(_)) => return Ok(None),
                     table => table?,
                 };

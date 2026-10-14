@@ -33,6 +33,7 @@ use crate::core::{Error, Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::{Expression, SelectStatement};
 use crate::storage::expression::ConstBoolExpr;
 use crate::storage::mvcc::version_store::LayoutToken;
+use crate::storage::traits::transaction::StatementTable;
 use crate::storage::traits::{Engine, QueryResult};
 
 use super::context::ExecutionContext;
@@ -358,7 +359,7 @@ impl Executor {
             // A missing transaction or table is the normal path's to report
             let table = active
                 .as_ref()
-                .and_then(|tx| tx.transaction.get_table(table_name).ok());
+                .and_then(|tx| tx.transaction.get_statement_table(table_name).ok());
             table.ok_or_else(|| Error::SchemaChanged {
                 table: table_name.to_string(),
             })?

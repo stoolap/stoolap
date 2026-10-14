@@ -34,6 +34,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::core::{DataType, IndexType, Result, Row, RowVec, Schema, Value, ValueMap, ValueSet};
 use crate::storage::expression::Expression;
 use crate::storage::index::id_list::GroupIds;
+use crate::storage::mvcc::txn_gate::{GateRef, TxnGate};
 use crate::storage::mvcc::version_store::{AggregateOp, GroupedAggregateResult, LayoutToken};
 use crate::storage::traits::table::ScanPlan;
 use crate::storage::traits::{
@@ -283,6 +284,9 @@ pub struct SegmentedTable {
     /// None for auto-commit transactions (all tombstones visible).
     snapshot_seq: Option<u64>,
     schema_generation: u64,
+    /// The transaction's gate, which admits each statement once for both
+    /// layers; the hot table it owns has none
+    gate: Option<GateRef>,
 }
 
 impl SegmentedTable {
@@ -314,7 +318,14 @@ impl SegmentedTable {
             segment_mgr,
             snapshot_seq,
             schema_generation,
+            gate: None,
         }
+    }
+
+    /// The table admits its statements through `gate`
+    pub(crate) fn with_txn_gate(mut self, gate: Option<GateRef>) -> Self {
+        self.gate = gate;
+        self
     }
 
     /// Create a segmented table with no segments (equivalent to plain MVCCTable).
@@ -324,6 +335,7 @@ impl SegmentedTable {
             hot,
             snapshot_seq: None,
             schema_generation: 0,
+            gate: None,
         }
     }
 
@@ -1156,6 +1168,30 @@ impl SegmentedTable {
         Ok(())
     }
 
+    /// Updates the rows named for a statement already admitted
+    fn update_admitted_by_row_ids(
+        &mut self,
+        row_ids: &[i64],
+        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+    ) -> Result<i32> {
+        let txn_id = self.txn_id();
+        // The cold rows named are read, set and checked outside the fence;
+        // the ids no cold volume holds are the hot store's
+        let prepared = self.prepare_cold_updates(&self.segment_mgr, Some(row_ids), None, setter)?;
+        let mut plan = PlannedUpdate {
+            cold: prepared.changes,
+            ..PlannedUpdate::default()
+        };
+        Self::claim_prepared(self.hot.as_ref(), &plan.cold)?;
+        let planned = if prepared.hot_ids.is_empty() {
+            Ok(())
+        } else {
+            self.hot
+                .plan_update_by_row_ids(&prepared.hot_ids, setter, &mut plan)
+        };
+        Self::publish_prepared(&mut self.hot, &self.segment_mgr, txn_id, plan, planned)
+    }
+
     /// Writes a plan whose sealed rows are claimed through the hot store,
     /// each sealed row under its own id. A plan that failed, or a refused
     /// publish, lets go of the claims the statement took
@@ -1177,6 +1213,8 @@ impl SegmentedTable {
                 return Err(e);
             }
         };
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::hot_published();
         // The hot versions shadow the cold ones from here on
         for change in &plan.cold {
             segment_mgr.add_pending_tombstone(txn_id, change.row_id);
@@ -2810,6 +2848,9 @@ impl Table for SegmentedTable {
     // =========================================================================
 
     fn insert(&mut self, row: Row) -> Result<Row> {
+        let _admitted = TxnGate::admit_for(&self.gate)?;
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::statement_admitted();
         let (_seal_guard, _) = Self::fence_after_cold_check(&self.segment_mgr, |snapshot| {
             self.check_segment_constraints_with_snapshot(snapshot, &row, None)
         })?;
@@ -2820,6 +2861,7 @@ impl Table for SegmentedTable {
     }
 
     fn insert_discard(&mut self, row: Row) -> Result<()> {
+        let _admitted = TxnGate::admit_for(&self.gate)?;
         let (_seal_guard, _) = Self::fence_after_cold_check(&self.segment_mgr, |snapshot| {
             self.check_segment_constraints_with_snapshot(snapshot, &row, None)
         })?;
@@ -2829,6 +2871,9 @@ impl Table for SegmentedTable {
     }
 
     fn insert_batch(&mut self, rows: Vec<Row>) -> Result<()> {
+        let _admitted = TxnGate::admit_for(&self.gate)?;
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::statement_admitted();
         let (_seal_guard, _) = Self::fence_after_cold_check(&self.segment_mgr, |snapshot| {
             // Snapshot once for the entire batch — eliminates 3 lock reads per row.
             let unique_indexes = if rows.len() > 1 && self.hot.has_unique_non_pk_indexes() {
@@ -2855,12 +2900,15 @@ impl Table for SegmentedTable {
         where_expr: Option<&dyn Expression>,
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
+        let _admitted = TxnGate::admit_for(&self.gate)?;
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::statement_admitted();
         // A bare `pk = k` names one row: resolve it by id instead of walking
         // every cold row and collecting every hot id
         if let Some(pk) = where_expr
             .and_then(|e| crate::storage::mvcc::table::pk_equality_id(e, self.hot.schema()))
         {
-            return self.update_by_row_ids(&[pk], setter);
+            return self.update_admitted_by_row_ids(&[pk], setter);
         }
         let txn_id = self.txn_id();
         // The cold rows the statement changes are read, filtered, set and
@@ -2882,25 +2930,14 @@ impl Table for SegmentedTable {
         row_ids: &[i64],
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
-        let txn_id = self.txn_id();
-        // The cold rows named are read, set and checked outside the fence;
-        // the ids no cold volume holds are the hot store's
-        let prepared = self.prepare_cold_updates(&self.segment_mgr, Some(row_ids), None, setter)?;
-        let mut plan = PlannedUpdate {
-            cold: prepared.changes,
-            ..PlannedUpdate::default()
-        };
-        Self::claim_prepared(self.hot.as_ref(), &plan.cold)?;
-        let planned = if prepared.hot_ids.is_empty() {
-            Ok(())
-        } else {
-            self.hot
-                .plan_update_by_row_ids(&prepared.hot_ids, setter, &mut plan)
-        };
-        Self::publish_prepared(&mut self.hot, &self.segment_mgr, txn_id, plan, planned)
+        let _admitted = TxnGate::admit_for(&self.gate)?;
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::statement_admitted();
+        self.update_admitted_by_row_ids(row_ids, setter)
     }
 
     fn delete_by_row_ids(&mut self, row_ids: &[i64]) -> Result<i32> {
+        let _admitted = TxnGate::admit_for(&self.gate)?;
         let mgr = Arc::clone(&self.segment_mgr);
         // The snapshot's cold volumes the ids reach are read before the hot
         // store changes, and none under the fence
@@ -2918,6 +2955,7 @@ impl Table for SegmentedTable {
     }
 
     fn delete_scanned_rows(&mut self, row_ids: &mut Vec<i64>) -> Result<i32> {
+        let _admitted = TxnGate::admit_for(&self.gate)?;
         let mgr = Arc::clone(&self.segment_mgr);
         let (_seal_guard, cold_snapshot) =
             self.fenced_snapshot(&mgr, &mut |snap| self.read_cold_volumes_of(snap, row_ids))?;
@@ -2992,6 +3030,7 @@ impl Table for SegmentedTable {
     }
 
     fn delete(&mut self, where_expr: Option<&dyn Expression>) -> Result<i32> {
+        let _admitted = TxnGate::admit_for(&self.gate)?;
         // A bare `pk = k` names one row: the hot half keeps the predicate and
         // the cold half resolves the id instead of walking every cold row
         if let Some(pk) = where_expr
@@ -3214,6 +3253,7 @@ impl Table for SegmentedTable {
     }
 
     fn truncate(&mut self) -> Result<i32> {
+        let _admitted = TxnGate::admit_for(&self.gate)?;
         let _seal_guard = self.segment_mgr.acquire_seal_read();
         // The hot rows leave after the segment set is cleared, and a reader
         // that starts in between must not be answered: mark the whole interval
@@ -5510,6 +5550,10 @@ impl Table for SegmentedTable {
     // =========================================================================
 
     fn close(&mut self) -> Result<()> {
+        // A closed transaction's finish owns its stores
+        let Ok(_admitted) = TxnGate::admit_for(&self.gate) else {
+            return Ok(());
+        };
         self.hot.close()
     }
 
@@ -5519,6 +5563,9 @@ impl Table for SegmentedTable {
     }
 
     fn rollback(&mut self) {
+        let Ok(_admitted) = TxnGate::admit_for(&self.gate) else {
+            return;
+        };
         self.hot.rollback();
         let txn_id = self.txn_id();
         self.segment_mgr.rollback_pending_tombstones(txn_id);
@@ -5526,6 +5573,9 @@ impl Table for SegmentedTable {
     }
 
     fn rollback_to_timestamp_with_pending(&self, timestamp: i64, retained: &[i64]) {
+        let Ok(_admitted) = TxnGate::admit_for(&self.gate) else {
+            return;
+        };
         let txn_id = self.txn_id();
         self.segment_mgr
             .rollback_pending_tombstones_after(txn_id, timestamp);
