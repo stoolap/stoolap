@@ -39,7 +39,7 @@ use super::context::{
     get_cached_batch_aggregate, get_cached_batch_aggregate_info, get_cached_exists_correlation,
     get_cached_exists_pred_key, get_cached_exists_predicate, get_cached_exists_schema,
     get_cached_in_subquery, get_cached_in_subquery_set, get_cached_scalar_subquery,
-    get_cached_semi_join, get_exists_probe_fallback, subquery_cache_tables,
+    get_cached_semi_join, get_exists_probe_fallback, holds_subquery, subquery_cache_tables,
     BatchAggregateLookupInfo, ExecutionContext, ExistsCorrelationInfo, SemiJoinOrigin,
     StatementSnapshot, SubqueryStamp,
 };
@@ -4353,8 +4353,7 @@ impl Executor {
         let cacheable = Self::reads_cacheable_rows(ctx)
             && !ctx.has_cte(&info.inner_table)
             && !info.non_correlated_where.as_deref().is_some_and(|filter| {
-                Self::expression_varies_by_statement(filter, ctx)
-                    || Self::expr_contains_subquery(filter)
+                Self::expression_varies_by_statement(filter, ctx) || holds_subquery(filter)
             });
         let cache_stamp = if cacheable {
             self.subquery_cache_stamp(&[info.inner_table.as_str()])

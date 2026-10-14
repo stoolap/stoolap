@@ -255,3 +255,22 @@ fn test_subquery_caches_see_writes_to_a_table_only_an_inner_subquery_reads() {
         "after writes to c alone from another thread"
     );
 }
+
+#[test]
+fn test_subquery_caches_with_a_star_or_a_value_list_see_another_thread_write() {
+    let db = open("cache_staleness_plain_shapes");
+    let reads = [
+        "SELECT (SELECT COUNT(*) FROM b WHERE bv > 0)",
+        "SELECT COUNT(*) FROM a WHERE x IN (SELECT bv FROM b WHERE bid IN (1, 2))",
+    ];
+    let before: Vec<String> = reads.iter().map(|sql| one(&db, sql)).collect();
+    assert_eq!(before, ["1", "2"]);
+    let other = db.clone();
+    std::thread::spawn(move || {
+        other.execute("INSERT INTO b VALUES (2, 20)", ()).unwrap();
+    })
+    .join()
+    .unwrap();
+    let after: Vec<String> = reads.iter().map(|sql| one(&db, sql)).collect();
+    assert_eq!(after, ["2", "5"], "after a write from another thread");
+}

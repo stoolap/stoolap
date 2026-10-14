@@ -224,14 +224,8 @@ use crate::parser::ast::{Expression, SelectStatement, WindowFrameBound};
 /// joins, with no subquery, CTE, set operation, AS OF or table function
 /// anywhere in it. A cached result of anything else cannot be checked
 pub fn subquery_cache_tables(stmt: &SelectStatement) -> Option<SmallVec<[CompactArc<str>; 2]>> {
-    let plain = |expr: &Expression| {
-        matches!(expr, Expression::Star(_) | Expression::QualifiedStar(_))
-            || !super::Executor::expr_contains_subquery(expr)
-    };
-    let plain_bound = |bound: &WindowFrameBound| match bound {
-        WindowFrameBound::Preceding(expr) | WindowFrameBound::Following(expr) => plain(expr),
-        _ => true,
-    };
+    let plain = |expr: &Expression| !holds_subquery(expr);
+    let plain_bound = |bound: &WindowFrameBound| !bound_holds_subquery(bound);
     let windows = stmt.window_defs.iter().all(|w| {
         w.partition_by.iter().all(plain)
             && w.order_by.iter().all(|o| plain(&o.expression))
@@ -274,15 +268,93 @@ fn collect_plain_tables(
             Some(())
         }
         Expression::JoinSource(js)
-            if js
-                .condition
-                .as_deref()
-                .is_none_or(|c| !super::Executor::expr_contains_subquery(c)) =>
+            if js.condition.as_deref().is_none_or(|c| !holds_subquery(c)) =>
         {
             collect_plain_tables(&js.left, tables)?;
             collect_plain_tables(&js.right, tables)
         }
         _ => None,
+    }
+}
+
+/// Whether `expr` reads a table of its own: a subquery anywhere in it, or a
+/// table source where an expression stands. Every kind is named, so a new
+/// one is decided here before it compiles
+pub(crate) fn holds_subquery(expr: &Expression) -> bool {
+    let any = |exprs: &[Expression]| exprs.iter().any(holds_subquery);
+    let call = |f: &crate::parser::ast::FunctionCall| {
+        any(&f.arguments)
+            || f.filter.as_deref().is_some_and(holds_subquery)
+            || f.order_by.iter().any(|o| holds_subquery(&o.expression))
+    };
+    match expr {
+        Expression::ScalarSubquery(_)
+        | Expression::Exists(_)
+        | Expression::AllAny(_)
+        | Expression::TableSource(_)
+        | Expression::JoinSource(_)
+        | Expression::SubquerySource(_)
+        | Expression::ValuesSource(_)
+        | Expression::CteReference(_)
+        | Expression::FunctionTableSource(_) => true,
+        Expression::Prefix(p) => holds_subquery(&p.right),
+        Expression::Infix(i) => holds_subquery(&i.left) || holds_subquery(&i.right),
+        Expression::List(l) => any(&l.elements),
+        Expression::ExpressionList(l) => any(&l.expressions),
+        Expression::Distinct(d) => holds_subquery(&d.expr),
+        Expression::In(i) => holds_subquery(&i.left) || holds_subquery(&i.right),
+        Expression::InHashSet(h) => holds_subquery(&h.column),
+        Expression::Between(b) => {
+            holds_subquery(&b.expr) || holds_subquery(&b.lower) || holds_subquery(&b.upper)
+        }
+        Expression::Like(l) => {
+            holds_subquery(&l.left)
+                || holds_subquery(&l.pattern)
+                || l.escape.as_deref().is_some_and(holds_subquery)
+        }
+        Expression::Case(c) => {
+            c.value.as_deref().is_some_and(holds_subquery)
+                || c.when_clauses
+                    .iter()
+                    .any(|w| holds_subquery(&w.condition) || holds_subquery(&w.then_result))
+                || c.else_value.as_deref().is_some_and(holds_subquery)
+        }
+        Expression::Cast(c) => holds_subquery(&c.expr),
+        Expression::FunctionCall(f) => call(f),
+        Expression::Aliased(a) => holds_subquery(&a.expression),
+        Expression::Window(w) => {
+            call(&w.function)
+                || any(&w.partition_by)
+                || w.order_by.iter().any(|o| holds_subquery(&o.expression))
+                || w.frame.as_ref().is_some_and(|f| {
+                    bound_holds_subquery(&f.start)
+                        || f.end.as_ref().is_some_and(bound_holds_subquery)
+                })
+        }
+        Expression::Identifier(_)
+        | Expression::QualifiedIdentifier(_)
+        | Expression::IntegerLiteral(_)
+        | Expression::FloatLiteral(_)
+        | Expression::StringLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::NullLiteral(_)
+        | Expression::IntervalLiteral(_)
+        | Expression::Parameter(_)
+        | Expression::Star(_)
+        | Expression::QualifiedStar(_)
+        | Expression::Default(_) => false,
+    }
+}
+
+/// [`holds_subquery`] for the offset of a window frame bound
+fn bound_holds_subquery(bound: &WindowFrameBound) -> bool {
+    match bound {
+        WindowFrameBound::Preceding(expr) | WindowFrameBound::Following(expr) => {
+            holds_subquery(expr)
+        }
+        WindowFrameBound::CurrentRow
+        | WindowFrameBound::UnboundedPreceding
+        | WindowFrameBound::UnboundedFollowing => false,
     }
 }
 

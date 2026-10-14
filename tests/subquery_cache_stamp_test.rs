@@ -56,15 +56,23 @@ fn one(db: &Database, sql: &str) -> String {
 #[test]
 fn test_an_unchanged_subquery_is_served_from_its_cache() {
     let db = open("subquery_stamp_hits");
-    for sql in QUERIES {
+    let plain = [
+        "SELECT (SELECT COUNT(*) FROM b WHERE bv > 0)",
+        "SELECT COUNT(*) FROM a WHERE x IN (SELECT bv FROM b WHERE bid IN (1, 2))",
+    ];
+    let mut ran_again = Vec::new();
+    for sql in QUERIES.into_iter().chain(plain) {
         let first = one(&db, sql);
         let hits = stoolap::test_failpoints::subquery_cache_hits();
         assert_eq!(one(&db, sql), first, "{sql}");
-        assert!(
-            stoolap::test_failpoints::subquery_cache_hits() > hits,
-            "{sql} ran again over unchanged tables"
-        );
+        if stoolap::test_failpoints::subquery_cache_hits() == hits {
+            ran_again.push(sql);
+        }
     }
+    assert!(
+        ran_again.is_empty(),
+        "ran again over unchanged tables: {ran_again:?}"
+    );
 }
 
 #[test]
