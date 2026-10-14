@@ -645,7 +645,10 @@ fn a_table_from_a_statement_snapshot_admits_through_the_gate() {
     let _guard = FailpointGuard::new();
     let dir = tempfile::tempdir().unwrap();
     let db = kv_table(dir.path());
-    let snapshot = StatementSnapshot::new(db.engine().begin_transaction().unwrap());
+    let snapshot = StatementSnapshot::new(
+        db.engine().begin_transaction().unwrap(),
+        stoolap::core::IsolationLevel::ReadCommitted,
+    );
     let mut handle = snapshot.get_table("t").unwrap();
     let (hook, paused) = pause();
     let writer = thread::spawn(move || {

@@ -31,10 +31,7 @@ use crate::storage::traits::{Engine, QueryResult, Table, Transaction};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
-use super::context::{
-    invalidate_in_subquery_cache_for_table, invalidate_scalar_subquery_cache_for_table,
-    invalidate_semi_join_cache_for_table, ExecutionContext,
-};
+use super::context::ExecutionContext;
 use super::expression::CompiledEvaluator;
 use super::pushdown;
 use super::query_cache::{CompiledConflictInsert, CompiledExecution, CompiledInsert};
@@ -996,9 +993,6 @@ impl Executor {
             // where concurrent queries could see new data in storage but get old cached results
             if rows_affected > 0 {
                 self.semantic_cache.invalidate_table(table_name);
-                invalidate_semi_join_cache_for_table(table_name);
-                invalidate_scalar_subquery_cache_for_table(table_name);
-                invalidate_in_subquery_cache_for_table(table_name);
             }
 
             let mut returning_result = if let Some(column_names) = &schema_column_names_arc {
@@ -1351,9 +1345,6 @@ impl Executor {
         // CRITICAL: Must invalidate before commit to prevent stale data window
         if rows_affected > 0 {
             self.semantic_cache.invalidate_table(table_name);
-            invalidate_semi_join_cache_for_table(table_name);
-            invalidate_scalar_subquery_cache_for_table(table_name);
-            invalidate_in_subquery_cache_for_table(table_name);
         }
 
         let mut returning_result = if let Some(column_names) = &schema_column_names_arc {
@@ -1801,9 +1792,6 @@ impl Executor {
         // CRITICAL: Must invalidate before commit to prevent stale data window
         if rows_affected > 0 {
             self.semantic_cache.invalidate_table(table_name);
-            invalidate_semi_join_cache_for_table(table_name);
-            invalidate_scalar_subquery_cache_for_table(table_name);
-            invalidate_in_subquery_cache_for_table(table_name);
         }
 
         if let Some(column_names) = &schema_column_names_arc {
@@ -2784,9 +2772,6 @@ impl Executor {
         // CRITICAL: Must invalidate before commit to prevent stale data window
         if rows_affected > 0 {
             self.semantic_cache.invalidate_table(table_name);
-            invalidate_semi_join_cache_for_table(table_name);
-            invalidate_scalar_subquery_cache_for_table(table_name);
-            invalidate_in_subquery_cache_for_table(table_name);
         }
 
         if has_returning {
@@ -3316,9 +3301,6 @@ impl Executor {
         // CRITICAL: Must invalidate before commit to prevent stale data window
         if rows_affected > 0 {
             self.semantic_cache.invalidate_table(table_name);
-            invalidate_semi_join_cache_for_table(table_name);
-            invalidate_scalar_subquery_cache_for_table(table_name);
-            invalidate_in_subquery_cache_for_table(table_name);
         }
 
         if has_returning {
@@ -3416,9 +3398,6 @@ impl Executor {
         // CRITICAL: Must invalidate before commit to prevent stale data window
         // (TRUNCATE always invalidates, regardless of rows_affected, for safety)
         self.semantic_cache.invalidate_table(table_name);
-        invalidate_semi_join_cache_for_table(table_name);
-        invalidate_scalar_subquery_cache_for_table(table_name);
-        invalidate_in_subquery_cache_for_table(table_name);
 
         // Commit if this is a standalone (auto-commit) transaction
         if should_auto_commit {

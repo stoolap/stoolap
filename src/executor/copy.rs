@@ -23,10 +23,7 @@ use crate::parser::ast::{CopyFormat, CopyStatement};
 use crate::storage::traits::transaction::StatementTable;
 use crate::storage::traits::{Engine, QueryResult, Table};
 
-use super::context::{
-    invalidate_in_subquery_cache_for_table, invalidate_scalar_subquery_cache_for_table,
-    invalidate_semi_join_cache_for_table, ExecutionContext,
-};
+use super::context::ExecutionContext;
 use super::result::ExecResult;
 use super::Executor;
 
@@ -212,9 +209,6 @@ impl Executor {
         // Invalidate caches and commit
         if rows_affected > 0 {
             self.semantic_cache.invalidate_table(table_name);
-            invalidate_semi_join_cache_for_table(table_name);
-            invalidate_scalar_subquery_cache_for_table(table_name);
-            invalidate_in_subquery_cache_for_table(table_name);
         }
 
         tx.commit()?;

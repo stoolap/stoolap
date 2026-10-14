@@ -29,10 +29,7 @@ use crate::core::{DataType, Result, Row, RowVec, Value, ValueSet};
 use crate::parser::ast::*;
 use crate::storage::traits::{QueryResult, Table};
 
-use super::context::{
-    cache_in_subquery, extract_table_names_for_cache, get_cached_in_subquery_with_kinds,
-    ExecutionContext,
-};
+use super::context::{cache_in_subquery, get_cached_in_subquery_with_kinds, ExecutionContext};
 use super::expression::{ExpressionEval, RowFilter};
 use super::query_classification::QueryClassification;
 use super::result::ExecutorResult;
@@ -1293,18 +1290,12 @@ impl Executor {
         };
 
         // Execute the subquery to get values (with caching for
-        // non-correlated subqueries). Inside an explicit transaction the
-        // cache is bypassed: a cached in-transaction view would survive
-        // ROLLBACK
-        let cache_key = if ctx.transaction_id().is_none() {
-            Self::subquery_cache_key(&subquery.subquery, ctx)
-        } else {
-            None
-        };
+        // non-correlated subqueries, under the stamp taken before the read)
+        let cache_slot = self.subquery_cache_slot(&subquery.subquery, ctx);
         // A cached list comes with its kinds, taken when it was cached
-        let cached = cache_key
-            .as_deref()
-            .and_then(get_cached_in_subquery_with_kinds);
+        let cached = cache_slot
+            .as_ref()
+            .and_then(|(key, stamp)| get_cached_in_subquery_with_kinds(key, stamp));
         let (mut values, has_texts, has_numbers) = if let Some((cached, kinds)) = cached {
             (cached, kinds.texts, kinds.numbers)
         } else {
@@ -1342,12 +1333,8 @@ impl Executor {
                 return Ok(None);
             }
             // Cache for future use
-            if let Some(key) = cache_key {
-                cache_in_subquery(
-                    key,
-                    extract_table_names_for_cache(&subquery.subquery),
-                    values.clone(),
-                );
+            if let Some((key, stamp)) = cache_slot {
+                cache_in_subquery(key, stamp, values.clone());
             }
             (values, texts, numbers)
         };
