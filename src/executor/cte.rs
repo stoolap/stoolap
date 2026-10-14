@@ -222,7 +222,7 @@ impl Executor {
         }
 
         // LAZY CTE OPTIMIZATION:
-        // For single-use CTEs in INNER JOIN with LIMIT, push LIMIT into CTE
+        // For a single-use CTE kept by an outer join with LIMIT, push LIMIT into CTE
         // This enables streaming GROUP BY early termination
         let cte_limit_hints = self.compute_cte_limit_hints(stmt, with_clause);
 
@@ -587,6 +587,10 @@ impl Executor {
     ) -> Result<Option<Box<dyn QueryResult>>> {
         // OPTIMIZATION: Get cached query classification to avoid repeated AST traversals
         let classification = get_classification(stmt);
+
+        if !self.cte_join_path_finishes(stmt, &classification, join_source) {
+            return Ok(None);
+        }
 
         // Try to resolve left side - either from CTE registry or regular table
         let left_data = self.resolve_table_or_cte(&join_source.left, ctx, cte_registry)?;
@@ -1586,6 +1590,34 @@ impl Executor {
             })
     }
 
+    /// Whether the CTE join path can finish a statement by itself: it
+    /// applies LIMIT only through the join or the aggregation, and leaves
+    /// ordering, DISTINCT, OFFSET, windows and set operations to execute_select
+    fn cte_join_path_finishes(
+        &self,
+        stmt: &SelectStatement,
+        classification: &QueryClassification,
+        join_source: &JoinTableSource,
+    ) -> bool {
+        let limit_applied = match &stmt.limit {
+            None => true,
+            Some(_) if classification.has_aggregation => stmt.having.is_none(),
+            Some(limit) => {
+                let join_type = join_source.join_type.to_uppercase();
+                matches!(join_type.as_str(), "" | "INNER" | "CROSS")
+                    && stmt.where_clause.is_none()
+                    && self.evaluate_limit_offset(limit).is_some()
+            }
+        };
+        limit_applied
+            && stmt.order_by.is_empty()
+            && stmt.offset.is_none()
+            && !stmt.distinct
+            && stmt.distinct_on.is_empty()
+            && stmt.set_operations.is_empty()
+            && !classification.has_window_functions
+    }
+
     /// Apply ORDER BY to rows
     fn apply_order_by_to_rows(
         &self,
@@ -1841,11 +1873,10 @@ impl Executor {
         };
 
         let join_type = join_source.join_type.to_uppercase();
-        let is_inner_join = join_type == "INNER" || join_type.is_empty() || join_type == "JOIN";
         let is_left_join = join_type == "LEFT" || join_type == "LEFT OUTER";
         let is_right_join = join_type == "RIGHT" || join_type == "RIGHT OUTER";
 
-        if !is_inner_join && !is_left_join && !is_right_join {
+        if !is_left_join && !is_right_join {
             return false;
         }
 
@@ -1868,14 +1899,27 @@ impl Executor {
             .extract_cte_name_for_lookup(&join_source.right)
             .filter(|n| cte_names.contains(&n.to_lowercase()));
 
-        // For INNER JOIN: either side can be CTE
-        // For LEFT JOIN: CTE must be on the RIGHT (each CTE row produces at most one result)
-        // For RIGHT JOIN: CTE must be on the LEFT (each CTE row produces at most one result)
-        match (&left_cte, &right_cte) {
-            (Some(_), None) if is_inner_join || is_right_join => true,
-            (None, Some(_)) if is_inner_join || is_left_join => true,
-            _ => false,
-        }
+        Self::limit_keeps_cte_rows(stmt)
+            && match (&left_cte, &right_cte) {
+                (Some(_), None) => is_left_join,
+                (None, Some(_)) => is_right_join,
+                _ => false,
+            }
+    }
+
+    /// Whether the first N rows of the outer side of an outer join give the
+    /// first N rows of the statement: each outer row yields at least one
+    /// joined row, and nothing after the join drops or merges rows
+    fn limit_keeps_cte_rows(stmt: &SelectStatement) -> bool {
+        let classification = get_classification(stmt);
+        stmt.where_clause.is_none()
+            && stmt.group_by.columns.is_empty()
+            && stmt.having.is_none()
+            && !stmt.distinct
+            && stmt.distinct_on.is_empty()
+            && stmt.set_operations.is_empty()
+            && !classification.has_aggregation
+            && !classification.has_window_functions
     }
 
     /// Try to inline single-use, non-recursive CTEs as subqueries.
@@ -1897,7 +1941,7 @@ impl Executor {
         // This happens when:
         // 1. Main query has LIMIT (no ORDER BY)
         // 2. CTE has GROUP BY (can use streaming aggregation)
-        // 3. CTE is in INNER JOIN (limit pushdown is safe)
+        // 3. CTE is the kept side of an outer join (limit pushdown is safe)
         if self.should_use_limit_pushdown_instead(stmt, with_clause) {
             return None;
         }
@@ -2565,7 +2609,7 @@ impl Executor {
     ///
     /// Returns a map from CTE name to the hint (LIMIT + optional ORDER BY).
     /// This is safe when:
-    /// 1. CTE is used exactly once in INNER/LEFT/RIGHT JOIN
+    /// 1. CTE is used exactly once, as the kept side of a LEFT/RIGHT JOIN
     /// 2. Main query has LIMIT
     /// 3. ORDER BY (if present) references only CTE columns
     fn compute_cte_limit_hints(
@@ -2603,11 +2647,10 @@ impl Executor {
         };
 
         let join_type = join_source.join_type.to_uppercase();
-        let is_inner_join = join_type == "INNER" || join_type.is_empty() || join_type == "JOIN";
         let is_left_join = join_type == "LEFT" || join_type == "LEFT OUTER";
         let is_right_join = join_type == "RIGHT" || join_type == "RIGHT OUTER";
 
-        if !is_inner_join && !is_left_join && !is_right_join {
+        if (!is_left_join && !is_right_join) || !Self::limit_keeps_cte_rows(stmt) {
             return hints;
         }
 
@@ -2627,12 +2670,10 @@ impl Executor {
             .extract_cte_name_for_lookup(&join_source.right)
             .filter(|n| cte_names.contains(&n.to_lowercase()));
 
-        // For INNER JOIN: either side can be CTE
-        // For LEFT JOIN: CTE must be on the RIGHT
-        // For RIGHT JOIN: CTE must be on the LEFT
+        // The CTE must be the side the outer join keeps
         let cte_name = match (&left_cte, &right_cte) {
-            (Some(name), None) if is_inner_join || is_right_join => name.to_lowercase(),
-            (None, Some(name)) if is_inner_join || is_left_join => name.to_lowercase(),
+            (Some(name), None) if is_left_join => name.to_lowercase(),
+            (None, Some(name)) if is_right_join => name.to_lowercase(),
             _ => return hints,
         };
 
