@@ -102,3 +102,26 @@ fn test_a_deterministic_subquery_keeps_its_answer() {
         HashSet::from([format!("{:?}", Value::Integer(100))])
     );
 }
+
+#[test]
+fn test_a_subquery_reading_a_cte_of_its_statement_runs_in_each_statement() {
+    let db = setup("volatile_subquery_cte");
+    for (n, expected) in [(1, Value::Integer(1)), (2, Value::Integer(2))] {
+        let sql = format!("WITH c(r) AS (SELECT {n}) SELECT (SELECT r FROM c)");
+        assert_eq!(
+            answers(&db, &sql),
+            HashSet::from([format!("{expected:?}")]),
+            "{sql}"
+        );
+    }
+    let sql = "WITH c(r) AS (SELECT RANDOM()) SELECT (SELECT r FROM c)";
+    assert!(answers(&db, sql).len() > 1, "{sql} gave one answer");
+}
+
+#[test]
+fn test_a_non_deterministic_as_of_runs_in_each_statement() {
+    let db = setup("volatile_subquery_as_of");
+    let sql = "SELECT (SELECT MAX(bid) FROM b AS OF TIMESTAMP CASE WHEN RANDOM() < 0.5 \
+               THEN '1970-01-01 00:00:00' ELSE '2099-01-01 00:00:00' END)";
+    assert!(answers(&db, sql).len() > 1, "{sql} gave one answer");
+}
