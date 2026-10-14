@@ -36,12 +36,12 @@ use super::context::{
     cache_batch_aggregate, cache_batch_aggregate_info, cache_exists_correlation,
     cache_exists_pred_key, cache_exists_predicate, cache_exists_probe_fallback,
     cache_exists_schema, cache_in_subquery, cache_scalar_subquery, cache_semi_join_arc,
-    get_cached_batch_aggregate, get_cached_batch_aggregate_info, get_cached_exists_correlation,
-    get_cached_exists_pred_key, get_cached_exists_predicate, get_cached_exists_schema,
-    get_cached_in_subquery, get_cached_in_subquery_set, get_cached_scalar_subquery,
-    get_cached_semi_join, get_exists_probe_fallback, holds_subquery, subquery_cache_tables,
-    BatchAggregateLookupInfo, ExecutionContext, ExistsCorrelationInfo, SemiJoinOrigin,
-    StatementSnapshot, SubqueryStamp,
+    expr_tables, get_cached_batch_aggregate, get_cached_batch_aggregate_info,
+    get_cached_exists_correlation, get_cached_exists_pred_key, get_cached_exists_predicate,
+    get_cached_exists_schema, get_cached_in_subquery, get_cached_in_subquery_set,
+    get_cached_scalar_subquery, get_cached_semi_join, get_exists_probe_fallback,
+    subquery_cache_tables, BatchAggregateLookupInfo, CacheTables, ExecutionContext,
+    ExistsCorrelationInfo, SemiJoinOrigin, StatementSnapshot, SubqueryStamp,
 };
 use super::expression::compute_expression_hash;
 use super::index_optimizer::SetTest;
@@ -4347,18 +4347,37 @@ impl Executor {
         let cache_key = origin.key();
 
         // Check cache first - return Arc directly (no clone needed), under
-        // the stamp taken before the read. Bypassed where the read sees rows
-        // older than the stamp, for an inner table or filter whose answer is
-        // its statement's alone, and for a filter that reads tables of its own
+        // the stamp taken before the read, which covers the tables the
+        // filter's subqueries read too. Bypassed where the read sees rows
+        // older than the stamp, and for an inner table or filter whose
+        // answer is its statement's alone
         let cacheable = Self::reads_cacheable_rows(ctx)
             && !ctx.has_cte(&info.inner_table)
-            && !info.non_correlated_where.as_deref().is_some_and(|filter| {
-                Self::expression_varies_by_statement(filter, ctx) || holds_subquery(filter)
-            });
-        let cache_stamp = if cacheable {
+            && !info
+                .non_correlated_where
+                .as_deref()
+                .is_some_and(|filter| Self::expression_varies_by_statement(filter, ctx));
+        let mut filter_tables = CacheTables::new();
+        let checkable = cacheable
+            && info
+                .non_correlated_where
+                .as_deref()
+                .is_none_or(|filter| expr_tables(filter, &mut filter_tables).is_some());
+        let cache_stamp = if !checkable {
+            None
+        } else if filter_tables.is_empty() {
             self.subquery_cache_stamp(&[info.inner_table.as_str()])
         } else {
-            None
+            let inner = info.inner_table.as_str();
+            let names: smallvec::SmallVec<[&str; 4]> = std::iter::once(inner)
+                .chain(
+                    filter_tables
+                        .iter()
+                        .map(|table| &**table)
+                        .filter(|&table| !table.eq_ignore_ascii_case(inner)),
+                )
+                .collect();
+            self.subquery_cache_stamp(&names)
         };
         if let Some(stamp) = &cache_stamp {
             if let Some(cached) = get_cached_semi_join(&origin, cache_key, stamp) {

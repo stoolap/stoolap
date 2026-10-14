@@ -137,3 +137,26 @@ fn test_a_table_replaced_while_the_stamp_is_read_is_not_answered_from_the_cache(
         );
     }
 }
+
+#[test]
+fn test_a_subquery_holding_another_is_served_from_its_cache() {
+    let db = open("subquery_stamp_nested_hits");
+    let shapes = [
+        "SELECT COUNT(*) FROM a WHERE x IN (SELECT bv FROM b WHERE bv >= (SELECT MIN(bv) FROM b))",
+        "SELECT COUNT(*) FROM a WHERE x IN \
+         (SELECT bv FROM b WHERE EXISTS (SELECT 1 FROM a WHERE a.id = b.bid))",
+    ];
+    let mut ran_again = Vec::new();
+    for sql in shapes {
+        let first = one(&db, sql);
+        let before = stoolap::test_failpoints::in_subquery_runs();
+        assert_eq!(one(&db, sql), first, "{sql}");
+        if stoolap::test_failpoints::in_subquery_runs() != before {
+            ran_again.push(sql);
+        }
+    }
+    assert!(
+        ran_again.is_empty(),
+        "read their tables again: {ran_again:?}"
+    );
+}

@@ -220,116 +220,153 @@ pub fn cache_in_subquery(key: String, stamp: SubqueryStamp, values: Vec<Value>) 
 
 use crate::parser::ast::{Expression, SelectStatement, WindowFrameBound};
 
-/// The tables `stmt` reads, when that is all it reads: plain tables and
-/// joins, with no subquery, CTE, set operation, AS OF or table function
-/// anywhere in it. A cached result of anything else cannot be checked
-pub fn subquery_cache_tables(stmt: &SelectStatement) -> Option<SmallVec<[CompactArc<str>; 2]>> {
-    let plain = |expr: &Expression| !holds_subquery(expr);
-    let plain_bound = |bound: &WindowFrameBound| !bound_holds_subquery(bound);
-    let windows = stmt.window_defs.iter().all(|w| {
-        w.partition_by.iter().all(plain)
-            && w.order_by.iter().all(|o| plain(&o.expression))
-            && w.frame
-                .as_ref()
-                .is_none_or(|f| plain_bound(&f.start) && f.end.as_ref().is_none_or(plain_bound))
-    });
-    let grouping_sets = match &stmt.group_by.modifier {
-        crate::parser::ast::GroupByModifier::GroupingSets(sets) => sets.iter().flatten().all(plain),
-        _ => true,
-    };
-    let clauses = stmt.columns.iter().all(plain)
-        && stmt.distinct_on.iter().all(plain)
-        && stmt.where_clause.as_deref().is_none_or(plain)
-        && stmt.group_by.columns.iter().all(plain)
-        && grouping_sets
-        && stmt.having.as_deref().is_none_or(plain)
-        && stmt.order_by.iter().all(|o| plain(&o.expression))
-        && stmt.limit.as_deref().is_none_or(plain)
-        && stmt.offset.as_deref().is_none_or(plain)
-        && windows;
-    if stmt.with.is_some() || !stmt.set_operations.is_empty() || !clauses {
-        return None;
-    }
+/// The tables a cached subquery result is checked against
+pub type CacheTables = SmallVec<[CompactArc<str>; 2]>;
+
+/// The tables `stmt` reads, its nested subqueries included, when that is
+/// all it reads: plain tables and joins, with no CTE, set operation, AS OF
+/// or table function anywhere in it. A cached result of anything else
+/// cannot be checked
+pub fn subquery_cache_tables(stmt: &SelectStatement) -> Option<CacheTables> {
     let mut tables = SmallVec::new();
-    if let Some(source) = stmt.table_expr.as_deref() {
-        collect_plain_tables(source, &mut tables)?;
-    }
+    statement_tables(stmt, &mut tables)?;
     Some(tables)
 }
 
+/// Adds the tables `stmt` reads to `tables`; None when it reads anything else
+fn statement_tables(stmt: &SelectStatement, tables: &mut CacheTables) -> Option<()> {
+    if stmt.with.is_some() || !stmt.set_operations.is_empty() {
+        return None;
+    }
+    let grouping_sets = match &stmt.group_by.modifier {
+        crate::parser::ast::GroupByModifier::GroupingSets(sets) => sets.as_slice(),
+        _ => &[],
+    };
+    let clauses = stmt
+        .columns
+        .iter()
+        .chain(stmt.distinct_on.iter())
+        .chain(stmt.where_clause.as_deref())
+        .chain(stmt.group_by.columns.iter())
+        .chain(grouping_sets.iter().flatten())
+        .chain(stmt.having.as_deref())
+        .chain(stmt.order_by.iter().map(|o| &o.expression))
+        .chain(stmt.limit.as_deref())
+        .chain(stmt.offset.as_deref());
+    for expr in clauses {
+        expr_tables(expr, tables)?;
+    }
+    for window in &stmt.window_defs {
+        exprs_tables(&window.partition_by, tables)?;
+        for order in &window.order_by {
+            expr_tables(&order.expression, tables)?;
+        }
+        if let Some(frame) = &window.frame {
+            bound_tables(&frame.start, tables)?;
+            if let Some(end) = &frame.end {
+                bound_tables(end, tables)?;
+            }
+        }
+    }
+    match stmt.table_expr.as_deref() {
+        Some(source) => source_tables(source, tables),
+        None => Some(()),
+    }
+}
+
 /// The tables of a FROM made of plain tables and joins; None for any other source
-fn collect_plain_tables(
-    source: &Expression,
-    tables: &mut SmallVec<[CompactArc<str>; 2]>,
-) -> Option<()> {
+fn source_tables(source: &Expression, tables: &mut CacheTables) -> Option<()> {
     match source {
         Expression::TableSource(ts) if ts.as_of.is_none() => {
-            tables.push(CompactArc::from(ts.name.value_lower.as_str()));
+            let name = ts.name.value_lower.as_str();
+            if !tables.iter().any(|kept| &**kept == name) {
+                tables.push(CompactArc::from(name));
+            }
             Some(())
         }
-        Expression::JoinSource(js)
-            if js.condition.as_deref().is_none_or(|c| !holds_subquery(c)) =>
-        {
-            collect_plain_tables(&js.left, tables)?;
-            collect_plain_tables(&js.right, tables)
+        Expression::JoinSource(js) => {
+            if let Some(condition) = js.condition.as_deref() {
+                expr_tables(condition, tables)?;
+            }
+            source_tables(&js.left, tables)?;
+            source_tables(&js.right, tables)
         }
         _ => None,
     }
 }
 
-/// Whether `expr` reads a table of its own: a subquery anywhere in it, or a
-/// table source where an expression stands. Every kind is named, so a new
-/// one is decided here before it compiles
-pub(crate) fn holds_subquery(expr: &Expression) -> bool {
-    let any = |exprs: &[Expression]| exprs.iter().any(holds_subquery);
-    let call = |f: &crate::parser::ast::FunctionCall| {
-        any(&f.arguments)
-            || f.filter.as_deref().is_some_and(holds_subquery)
-            || f.order_by.iter().any(|o| holds_subquery(&o.expression))
-    };
+/// Adds the tables `expr`'s subqueries read to `tables`; None for one the
+/// cache cannot check, or a table source where an expression stands. Every
+/// kind is named, so a new one is decided here before it compiles
+pub(crate) fn expr_tables(expr: &Expression, tables: &mut CacheTables) -> Option<()> {
     match expr {
-        Expression::ScalarSubquery(_)
-        | Expression::Exists(_)
-        | Expression::AllAny(_)
-        | Expression::TableSource(_)
+        Expression::ScalarSubquery(s) => statement_tables(&s.subquery, tables),
+        Expression::Exists(e) => statement_tables(&e.subquery, tables),
+        Expression::AllAny(a) => {
+            expr_tables(&a.left, tables)?;
+            statement_tables(&a.subquery, tables)
+        }
+        Expression::TableSource(_)
         | Expression::JoinSource(_)
         | Expression::SubquerySource(_)
         | Expression::ValuesSource(_)
         | Expression::CteReference(_)
-        | Expression::FunctionTableSource(_) => true,
-        Expression::Prefix(p) => holds_subquery(&p.right),
-        Expression::Infix(i) => holds_subquery(&i.left) || holds_subquery(&i.right),
-        Expression::List(l) => any(&l.elements),
-        Expression::ExpressionList(l) => any(&l.expressions),
-        Expression::Distinct(d) => holds_subquery(&d.expr),
-        Expression::In(i) => holds_subquery(&i.left) || holds_subquery(&i.right),
-        Expression::InHashSet(h) => holds_subquery(&h.column),
+        | Expression::FunctionTableSource(_) => None,
+        Expression::Prefix(p) => expr_tables(&p.right, tables),
+        Expression::Infix(i) => {
+            expr_tables(&i.left, tables)?;
+            expr_tables(&i.right, tables)
+        }
+        Expression::List(l) => exprs_tables(&l.elements, tables),
+        Expression::ExpressionList(l) => exprs_tables(&l.expressions, tables),
+        Expression::Distinct(d) => expr_tables(&d.expr, tables),
+        Expression::In(i) => {
+            expr_tables(&i.left, tables)?;
+            expr_tables(&i.right, tables)
+        }
+        Expression::InHashSet(h) => expr_tables(&h.column, tables),
         Expression::Between(b) => {
-            holds_subquery(&b.expr) || holds_subquery(&b.lower) || holds_subquery(&b.upper)
+            expr_tables(&b.expr, tables)?;
+            expr_tables(&b.lower, tables)?;
+            expr_tables(&b.upper, tables)
         }
         Expression::Like(l) => {
-            holds_subquery(&l.left)
-                || holds_subquery(&l.pattern)
-                || l.escape.as_deref().is_some_and(holds_subquery)
+            expr_tables(&l.left, tables)?;
+            expr_tables(&l.pattern, tables)?;
+            match l.escape.as_deref() {
+                Some(escape) => expr_tables(escape, tables),
+                None => Some(()),
+            }
         }
         Expression::Case(c) => {
-            c.value.as_deref().is_some_and(holds_subquery)
-                || c.when_clauses
-                    .iter()
-                    .any(|w| holds_subquery(&w.condition) || holds_subquery(&w.then_result))
-                || c.else_value.as_deref().is_some_and(holds_subquery)
+            if let Some(value) = c.value.as_deref() {
+                expr_tables(value, tables)?;
+            }
+            for when in &c.when_clauses {
+                expr_tables(&when.condition, tables)?;
+                expr_tables(&when.then_result, tables)?;
+            }
+            match c.else_value.as_deref() {
+                Some(other) => expr_tables(other, tables),
+                None => Some(()),
+            }
         }
-        Expression::Cast(c) => holds_subquery(&c.expr),
-        Expression::FunctionCall(f) => call(f),
-        Expression::Aliased(a) => holds_subquery(&a.expression),
+        Expression::Cast(c) => expr_tables(&c.expr, tables),
+        Expression::FunctionCall(f) => call_tables(f, tables),
+        Expression::Aliased(a) => expr_tables(&a.expression, tables),
         Expression::Window(w) => {
-            call(&w.function)
-                || any(&w.partition_by)
-                || w.order_by.iter().any(|o| holds_subquery(&o.expression))
-                || w.frame.as_ref().is_some_and(|f| {
-                    bound_holds_subquery(&f.start)
-                        || f.end.as_ref().is_some_and(bound_holds_subquery)
-                })
+            call_tables(&w.function, tables)?;
+            exprs_tables(&w.partition_by, tables)?;
+            for order in &w.order_by {
+                expr_tables(&order.expression, tables)?;
+            }
+            if let Some(frame) = &w.frame {
+                bound_tables(&frame.start, tables)?;
+                if let Some(end) = &frame.end {
+                    bound_tables(end, tables)?;
+                }
+            }
+            Some(())
         }
         Expression::Identifier(_)
         | Expression::QualifiedIdentifier(_)
@@ -342,19 +379,35 @@ pub(crate) fn holds_subquery(expr: &Expression) -> bool {
         | Expression::Parameter(_)
         | Expression::Star(_)
         | Expression::QualifiedStar(_)
-        | Expression::Default(_) => false,
+        | Expression::Default(_) => Some(()),
     }
 }
 
-/// [`holds_subquery`] for the offset of a window frame bound
-fn bound_holds_subquery(bound: &WindowFrameBound) -> bool {
+/// [`expr_tables`] for each of `exprs`
+fn exprs_tables(exprs: &[Expression], tables: &mut CacheTables) -> Option<()> {
+    exprs.iter().try_for_each(|expr| expr_tables(expr, tables))
+}
+
+/// [`expr_tables`] for a call's arguments, FILTER and ORDER BY
+fn call_tables(call: &crate::parser::ast::FunctionCall, tables: &mut CacheTables) -> Option<()> {
+    exprs_tables(&call.arguments, tables)?;
+    if let Some(filter) = call.filter.as_deref() {
+        expr_tables(filter, tables)?;
+    }
+    call.order_by
+        .iter()
+        .try_for_each(|order| expr_tables(&order.expression, tables))
+}
+
+/// [`expr_tables`] for the offset of a window frame bound
+fn bound_tables(bound: &WindowFrameBound, tables: &mut CacheTables) -> Option<()> {
     match bound {
         WindowFrameBound::Preceding(expr) | WindowFrameBound::Following(expr) => {
-            holds_subquery(expr)
+            expr_tables(expr, tables)
         }
         WindowFrameBound::CurrentRow
         | WindowFrameBound::UnboundedPreceding
-        | WindowFrameBound::UnboundedFollowing => false,
+        | WindowFrameBound::UnboundedFollowing => Some(()),
     }
 }
 
