@@ -113,12 +113,21 @@ pub fn cache_scalar_subquery(key: String, tables: SmallVec<[CompactArc<str>; 2]>
 // LRU-bounded to prevent unbounded memory growth.
 
 /// Cached IN subquery entry: (tables_referenced for invalidation, result
-/// values, lazily built shared hash set for single-column IN)
+/// values, lazily built shared hash set for single-column IN, the values'
+/// kinds)
 type InSubqueryCacheEntry = (
     SmallVec<[CompactArc<str>; 2]>,
     Vec<Value>,
     Option<CompactArc<PredicateSet>>,
+    MemberKinds,
 );
+
+/// Whether a list of values holds a TEXT and whether it holds a number
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemberKinds {
+    pub texts: bool,
+    pub numbers: bool,
+}
 
 thread_local! {
     static IN_SUBQUERY_CACHE: RefCell<LruCache<String, InSubqueryCacheEntry>> =
@@ -146,7 +155,7 @@ pub fn invalidate_in_subquery_cache_for_table(table_name: &str) {
         // Collect keys to remove (LruCache doesn't have retain)
         let keys_to_remove: Vec<String> = c
             .iter()
-            .filter(|(_, (tables, _, _))| tables.iter().any(|t| t.eq_ignore_ascii_case(table_name)))
+            .filter(|(_, (tables, ..))| tables.iter().any(|t| t.eq_ignore_ascii_case(table_name)))
             .map(|(k, _)| k.clone())
             .collect();
         for key in keys_to_remove {
@@ -157,7 +166,18 @@ pub fn invalidate_in_subquery_cache_for_table(table_name: &str) {
 
 /// Get a cached IN subquery result by SQL string key.
 pub fn get_cached_in_subquery(key: &str) -> Option<Vec<Value>> {
-    IN_SUBQUERY_CACHE.with(|cache| cache.borrow_mut().get(key).map(|(_, v, _)| v.clone()))
+    IN_SUBQUERY_CACHE.with(|cache| cache.borrow_mut().get(key).map(|(_, v, ..)| v.clone()))
+}
+
+/// A cached IN subquery result with the kinds of its values, taken when
+/// it was cached
+pub fn get_cached_in_subquery_with_kinds(key: &str) -> Option<(Vec<Value>, MemberKinds)> {
+    IN_SUBQUERY_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .get(key)
+            .map(|(_, v, _, kinds)| (v.clone(), *kinds))
+    })
 }
 
 /// Get a cached IN subquery result as a shared hash set, building and
@@ -168,6 +188,8 @@ pub fn get_cached_in_subquery_set(key: &str) -> Option<CompactArc<PredicateSet>>
         let mut c = cache.borrow_mut();
         let entry = c.get_mut(key)?;
         if entry.2.is_none() {
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::in_subquery_set_built();
             let members = CompactArc::new(entry.1.iter().cloned().collect());
             entry.2 = Some(CompactArc::new(PredicateSet::of(members)));
         }
@@ -180,11 +202,17 @@ pub fn get_cached_in_subquery_set(key: &str) -> Option<CompactArc<PredicateSet>>
 /// this cache and keeps no row for such a set, which its readers decide
 /// on a fresh list alone
 pub fn cache_in_subquery(key: String, tables: SmallVec<[CompactArc<str>; 2]>, values: Vec<Value>) {
-    if values.iter().any(|v| v.is_null()) {
-        return;
+    let mut kinds = MemberKinds::default();
+    for value in &values {
+        match value {
+            Value::Null(_) => return,
+            Value::Text(_) => kinds.texts = true,
+            Value::Integer(_) | Value::Float(_) => kinds.numbers = true,
+            _ => {}
+        }
     }
     IN_SUBQUERY_CACHE.with(|cache| {
-        cache.borrow_mut().put(key, (tables, values, None));
+        cache.borrow_mut().put(key, (tables, values, None, kinds));
     });
 }
 

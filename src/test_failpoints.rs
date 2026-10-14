@@ -1827,6 +1827,7 @@ pub(crate) fn group_column_decoded(col: usize, group: usize) {
 thread_local! {
     static SMALL_OUTER_JOINS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static JOIN_SIDE_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static IN_SUBQUERY_SETS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static INDEX_JOIN_OUTER_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -1855,6 +1856,15 @@ pub fn join_side_runs() -> usize {
 
 pub(crate) fn join_side_ran() {
     JOIN_SIDE_RUNS.with(|n| n.set(n.get() + 1));
+}
+
+/// Shared sets this thread built from cached IN subquery lists, so far
+pub fn in_subquery_sets_built() -> usize {
+    IN_SUBQUERY_SETS_BUILT.with(std::cell::Cell::get)
+}
+
+pub(crate) fn in_subquery_set_built() {
+    IN_SUBQUERY_SETS_BUILT.with(|n| n.set(n.get() + 1));
 }
 
 /// Run once on this thread when its next statement snapshot has read the

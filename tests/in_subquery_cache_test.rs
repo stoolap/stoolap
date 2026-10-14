@@ -171,3 +171,39 @@ fn in_index_fast_path_not_poisoned_by_rollback() {
         "index fast-path cache poisoned by rolled-back insert"
     );
 }
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn an_in_subquery_answered_by_the_primary_key_builds_no_shared_set() {
+    use stoolap::test_failpoints::in_subquery_sets_built;
+    let db = Database::open("memory://in_subq_pk_no_set").unwrap();
+    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE inner_t (id INTEGER PRIMARY KEY, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO users SELECT g.value, g.value FROM generate_series(0, 199) g",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO inner_t SELECT g.value, g.value FROM generate_series(0, 49) g",
+        (),
+    )
+    .unwrap();
+    let stmt = db
+        .prepare("SELECT id FROM users WHERE id IN (SELECT id FROM inner_t WHERE v >= 0)")
+        .unwrap();
+    let before = in_subquery_sets_built();
+    for _ in 0..3 {
+        assert_eq!(stmt.query(()).unwrap().count(), 50);
+    }
+    assert_eq!(
+        in_subquery_sets_built() - before,
+        0,
+        "the primary key path built a set it does not read"
+    );
+}

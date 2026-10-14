@@ -30,8 +30,8 @@ use crate::parser::ast::*;
 use crate::storage::traits::{QueryResult, Table};
 
 use super::context::{
-    cache_in_subquery, extract_table_names_for_cache, get_cached_in_subquery,
-    get_cached_in_subquery_set, ExecutionContext,
+    cache_in_subquery, extract_table_names_for_cache, get_cached_in_subquery_with_kinds,
+    ExecutionContext,
 };
 use super::expression::{ExpressionEval, RowFilter};
 use super::query_classification::QueryClassification;
@@ -1301,13 +1301,12 @@ impl Executor {
         } else {
             None
         };
-        // A cached list comes with its set, which knows its members' kinds
-        let cached = cache_key.as_deref().and_then(|key| {
-            let set = get_cached_in_subquery_set(key)?;
-            Some((get_cached_in_subquery(key)?, set))
-        });
-        let (mut values, has_texts, has_numbers) = if let Some((cached, set)) = cached {
-            (cached, set.has_text(), set.has_numbers())
+        // A cached list comes with its kinds, taken when it was cached
+        let cached = cache_key
+            .as_deref()
+            .and_then(get_cached_in_subquery_with_kinds);
+        let (mut values, has_texts, has_numbers) = if let Some((cached, kinds)) = cached {
+            (cached, kinds.texts, kinds.numbers)
         } else {
             let subquery_ctx = ctx.with_incremented_query_depth();
             #[cfg(any(test, feature = "test-failpoints"))]
