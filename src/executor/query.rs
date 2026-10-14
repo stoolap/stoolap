@@ -28,6 +28,7 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use crate::common::SmartString;
+use crate::storage::traits::transaction::StatementTable;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::common::{CompactArc, CompactVec, StringMap};
@@ -2381,7 +2382,7 @@ impl Executor {
                         classification,
                     );
                 }
-                let table = snapshot.get_table(table_name).map_err(|e| {
+                let table = snapshot.statement_table(table_name).map_err(|e| {
                     if matches!(e, Error::TableNotFound(_)) {
                         Error::TableOrViewNotFound(table_name.to_string())
                     } else {
@@ -7529,7 +7530,7 @@ impl Executor {
         if let Some(active) = self.active_transaction.lock().unwrap().as_ref() {
             return active.transaction.get_statement_table(name);
         }
-        snapshot.get_table(name)
+        snapshot.statement_table(name)
     }
 
     /// The inner table of an index join for one pass: a later pass reads it

@@ -33,6 +33,7 @@ use crate::core::{Error, Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::{Expression, SelectStatement};
 use crate::storage::expression::ConstBoolExpr;
 use crate::storage::mvcc::version_store::LayoutToken;
+use crate::storage::traits::transaction::StatementTable;
 use crate::storage::traits::{Engine, QueryResult};
 
 use super::context::ExecutionContext;

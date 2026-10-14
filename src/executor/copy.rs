@@ -20,6 +20,7 @@
 use crate::common::{CompactArc, SmartString};
 use crate::core::{DataType, Error, Result, Row, Schema, Value};
 use crate::parser::ast::{CopyFormat, CopyStatement};
+use crate::storage::traits::transaction::StatementTable;
 use crate::storage::traits::{Engine, QueryResult, Table};
 
 use super::context::{

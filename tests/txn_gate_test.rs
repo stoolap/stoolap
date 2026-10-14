@@ -26,6 +26,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use stoolap::core::{Error, Row, Value};
+use stoolap::executor::context::StatementSnapshot;
 use stoolap::storage::traits::Engine;
 use stoolap::test_failpoints::{
     after_batch_rows, after_hot_publish, after_statement_admitted, after_table_wal_recorded,
@@ -632,6 +633,28 @@ fn a_drop_waits_for_a_statement_begun_before_it() {
     });
     paused.reached();
     finish_on_thread(move || drop(txn)).after_letting_go(&paused);
+    let (written, kept) = join(writer);
+    assert_eq!(written.unwrap(), 1);
+    assert!(!kept.has_local_changes(), "the kept handle holds its rows");
+    assert_eq!(one(&db, "SELECT v FROM t WHERE id = 1"), Some(0));
+    row_one_is_free(&db, "dropped");
+}
+
+#[test]
+fn a_table_from_a_statement_snapshot_admits_through_the_gate() {
+    let _guard = FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db = kv_table(dir.path());
+    let snapshot = StatementSnapshot::new(db.engine().begin_transaction().unwrap());
+    let mut handle = snapshot.get_table("t").unwrap();
+    let (hook, paused) = pause();
+    let writer = thread::spawn(move || {
+        after_statement_admitted(hook);
+        let written = handle.update_by_row_ids(&[1], &mut set(1, 5));
+        (written, handle)
+    });
+    paused.reached();
+    finish_on_thread(move || drop(snapshot)).after_letting_go(&paused);
     let (written, kept) = join(writer);
     assert_eq!(written.unwrap(), 1);
     assert!(!kept.has_local_changes(), "the kept handle holds its rows");

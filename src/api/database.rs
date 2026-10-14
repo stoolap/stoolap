@@ -50,6 +50,7 @@ use crate::core::{DataType, Error, IsolationLevel, Result, Value};
 use crate::executor::context::ExecutionContextBuilder;
 use crate::executor::{CachedPlanRef, ExecutionContext, Executor};
 use crate::storage::mvcc::engine::MVCCEngine;
+use crate::storage::traits::transaction::StatementTable;
 use crate::storage::traits::Engine;
 use crate::storage::{Config, SyncMode};
 

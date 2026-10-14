@@ -46,6 +46,7 @@ use crate::parser::ast::{Expression, RollbackStatement, Statement};
 use crate::parser::Parser;
 use crate::storage::expression::Expression as StorageExprTrait;
 use crate::storage::mvcc::engine::MVCCEngine;
+use crate::storage::traits::transaction::StatementTable;
 use crate::storage::traits::{QueryResult, Transaction as StorageTransaction};
 
 use super::database::FromValue;

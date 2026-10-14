@@ -33,6 +33,7 @@ use std::sync::Arc;
 use crate::core::{Error, ForeignKeyAction, ForeignKeyConstraint, Result, Schema, Value};
 use crate::storage::expression::Expression as StorageExpression;
 use crate::storage::mvcc::engine::MVCCEngine;
+use crate::storage::traits::transaction::StatementTable;
 use crate::storage::traits::Engine;
 
 /// Check that all FK values in a row reference existing parent rows.

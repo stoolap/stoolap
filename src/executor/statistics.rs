@@ -18,6 +18,7 @@
 //! about tables and stores them in system tables for query optimization.
 
 use crate::common::time_compat::SystemTime;
+use crate::storage::traits::transaction::StatementTable;
 
 use rand::Rng;
 use rustc_hash::FxHashSet;

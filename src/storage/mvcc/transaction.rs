@@ -24,6 +24,7 @@ use std::sync::{Arc, OnceLock};
 use crate::core::{Error, IsolationLevel, Result, Schema, SchemaColumn};
 use crate::storage::mvcc::txn_gate::{GateRef, TxnGate};
 use crate::storage::mvcc::{get_fast_timestamp, TransactionRegistry};
+use crate::storage::traits::transaction::StatementAccess;
 use crate::storage::traits::{QueryResult, Table, Transaction};
 use crate::storage::Expression;
 
@@ -836,7 +837,7 @@ impl Transaction for MvccTransaction {
         ops.get_table_for_transaction(self.id, name, Some(gate))
     }
 
-    fn get_statement_table(&self, name: &str) -> Result<Box<dyn Table>> {
+    fn get_table_ungated(&self, name: &str, _access: StatementAccess) -> Result<Box<dyn Table>> {
         self.check_active()?;
         let ops = self.get_engine_ops()?;
         ops.get_table_for_transaction(self.id, name, None)

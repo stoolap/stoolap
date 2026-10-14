@@ -27,6 +27,7 @@ use crate::core::{
     DataType, Error, ForeignKeyAction, ForeignKeyConstraint, Result, Row, SchemaBuilder, Value,
 };
 use crate::parser::ast::*;
+use crate::storage::traits::transaction::StatementTable;
 use crate::storage::traits::{Engine, QueryResult};
 
 /// Validate a foreign key reference and build a `ForeignKeyConstraint`.

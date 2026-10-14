@@ -26,6 +26,7 @@ use crate::core::{DataType, Error, Result, Row, RowVec, Schema, Value, ValueMap}
 use crate::parser::ast::*;
 use crate::storage::expression::{ComparisonExpr, Expression as StorageExpr};
 use crate::storage::mvcc::version_store::LayoutToken;
+use crate::storage::traits::transaction::StatementTable;
 use crate::storage::traits::{Engine, QueryResult, Table, Transaction};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;

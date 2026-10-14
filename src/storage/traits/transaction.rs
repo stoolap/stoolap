@@ -90,14 +90,34 @@ pub trait Transaction: Send {
     /// Drops a table
     fn drop_table(&mut self, name: &str) -> Result<()>;
 
-    /// Gets a reference to a table by name
+    /// Gets a reference to a table by name. Its statements are admitted at
+    /// the transaction's write gate, so none of them writes once the
+    /// transaction's commit, rollback or drop has started:
+    ///
+    /// ```
+    /// use stoolap::storage::traits::Engine;
+    /// let db = stoolap::Database::open("memory://get_table_doc").unwrap();
+    /// db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ()).unwrap();
+    /// let txn = db.engine().begin_transaction().unwrap();
+    /// let _table = txn.get_table("t").unwrap();
+    /// ```
+    ///
+    /// No table without that gate can be taken outside this crate:
+    ///
+    /// ```compile_fail
+    /// use stoolap::storage::traits::Engine;
+    /// let db = stoolap::Database::open("memory://get_table_doc").unwrap();
+    /// db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ()).unwrap();
+    /// let txn = db.engine().begin_transaction().unwrap();
+    /// let _table = txn.get_statement_table("t").unwrap();
+    /// ```
     fn get_table(&self, name: &str) -> Result<Box<dyn Table>>;
 
     /// Gets a table for the query executor, which uses it only inside its
     /// own statements on the thread that ends the transaction: its
     /// statements take no admission at the transaction's write gate
     #[doc(hidden)]
-    fn get_statement_table(&self, name: &str) -> Result<Box<dyn Table>> {
+    fn get_table_ungated(&self, name: &str, _access: StatementAccess) -> Result<Box<dyn Table>> {
         self.get_table(name)
     }
 
@@ -216,6 +236,23 @@ pub trait Transaction: Send {
         temporal_value: i64,
         original_columns: Option<&[String]>,
     ) -> Result<Box<dyn QueryResult>>;
+}
+
+/// What only this crate can make: the key to a table without the write
+/// gate, for the query executor's own statements
+pub struct StatementAccess(());
+
+/// The query executor's table for its own statements on the thread that
+/// ends the transaction
+pub(crate) trait StatementTable {
+    fn get_statement_table(&self, name: &str) -> Result<Box<dyn Table>>;
+}
+
+impl<T: Transaction + ?Sized> StatementTable for T {
+    #[inline]
+    fn get_statement_table(&self, name: &str) -> Result<Box<dyn Table>> {
+        self.get_table_ungated(name, StatementAccess(()))
+    }
 }
 
 /// Temporal query type for time-travel queries

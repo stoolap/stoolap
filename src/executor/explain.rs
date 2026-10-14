@@ -22,6 +22,7 @@ use crate::core::{Result, Row, RowVec, Value};
 use crate::functions::registry::global_registry;
 use crate::optimizer::feedback::{fingerprint_predicate, global_feedback_cache};
 use crate::parser::ast::*;
+use crate::storage::traits::transaction::StatementTable;
 use crate::storage::traits::{Engine, QueryResult, ScanPlan};
 
 use super::context::ExecutionContext;

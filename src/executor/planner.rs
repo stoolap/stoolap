@@ -28,6 +28,7 @@
 use std::sync::Arc;
 
 use crate::common::StringMap;
+use crate::storage::traits::transaction::StatementTable;
 
 use crate::core::{Operator, Result, Value};
 use crate::optimizer::feedback::{fingerprint_predicate, global_feedback_cache};

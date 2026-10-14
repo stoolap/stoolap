@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use crate::common::CompactArc;
 use crate::common::SmartString;
+use crate::storage::traits::transaction::StatementTable;
 
 use crate::core::{Error, Result, Row, RowVec, Value, ValueMap, ValueSet};
 use crate::parser::ast::*;
