@@ -1311,12 +1311,11 @@ impl SegmentedTable {
                         .check_value_exists_with_snapshot(snapshot, pk_idx, pk_value)?
                     {
                         // check_value_exists_in_segments filters committed tombstones.
-                        // Check pending tombstones (no Vec clone).
-                        if self.segment_mgr.is_pending_tombstone(self.txn_id(), row_id) {
-                            // This txn deleted this cold row — not a real conflict
-                            return Ok(());
+                        // A row this txn deleted is no key conflict; the
+                        // row's unique keys are still checked below
+                        if !self.segment_mgr.is_pending_tombstone(self.txn_id(), row_id) {
+                            return Err(crate::core::Error::PrimaryKeyConstraint { row_id });
                         }
-                        return Err(crate::core::Error::PrimaryKeyConstraint { row_id });
                     }
                 }
             }
