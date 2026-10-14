@@ -223,23 +223,117 @@ fn collect_real_table_names(source: &Expression, tables: &mut SmallVec<[CompactA
 
 // Cache for semi-join (EXISTS) hash sets to avoid re-execution.
 // Thread-local to avoid synchronization overhead.
-// Uses u64 hash key to avoid string allocation entirely.
+// Keyed by a u64 hash, checked against the entry's origin on every hit.
 // LRU-bounded to prevent unbounded memory growth.
 use ahash::AHashMap;
 use std::hash::{Hash, Hasher};
 
-/// Cached semi-join entry: (table_name for invalidation, hash_set values)
-type SemiJoinCacheEntry = (CompactArc<str>, CompactArc<ValueSet>);
-
-/// Compute a cache key hash from table, column, and predicate hash without allocation.
-#[inline]
-pub fn compute_semi_join_cache_key(table: &str, column: &str, pred_hash: u64) -> u64 {
-    let mut hasher = rustc_hash::FxHasher::default();
-    table.hash(&mut hasher);
-    column.hash(&mut hasher);
-    pred_hash.hash(&mut hasher);
-    hasher.finish()
+/// What a semi-join set is taken for: the inner table, column and alias,
+/// the inner filter, and the statement's parameter values
+pub struct SemiJoinOrigin<'a> {
+    pub table: &'a str,
+    pub column: &'a str,
+    pub alias: Option<&'a str>,
+    pub filter: Option<&'a Arc<crate::parser::ast::Expression>>,
+    pub params: &'a [Value],
+    pub named_params: &'a FxHashMap<String, Value>,
 }
+
+/// A `SemiJoinOrigin` as its cache entry keeps it
+struct KeptOrigin {
+    table: CompactArc<str>,
+    column: String,
+    alias: Option<String>,
+    filter: Option<Arc<crate::parser::ast::Expression>>,
+    params: Vec<Value>,
+    named_params: FxHashMap<String, Value>,
+}
+
+/// Whether two parameter values are one input: of one type, a NULL of one
+/// type and a FLOAT of one bit pattern. `Value`'s equality is wider (INTEGER
+/// 1 is FLOAT 1.0, NULLs of any type meet), which `TYPEOF` tells apart
+fn same_parameter(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Null(x), Value::Null(y)) => x == y,
+        (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
+        _ => std::mem::discriminant(a) == std::mem::discriminant(b) && a == b,
+    }
+}
+
+/// The hash that agrees with `same_parameter`
+fn hash_parameter<H: Hasher>(value: &Value, state: &mut H) {
+    std::mem::discriminant(value).hash(state);
+    match value {
+        Value::Null(data_type) => data_type.hash(state),
+        Value::Float(f) => f.to_bits().hash(state),
+        _ => value.hash(state),
+    }
+}
+
+impl SemiJoinOrigin<'_> {
+    /// The cache key: a hash of every part, taken without allocation
+    pub fn key(&self) -> u64 {
+        let mut hasher = rustc_hash::FxHasher::default();
+        self.table.hash(&mut hasher);
+        self.column.hash(&mut hasher);
+        self.alias.hash(&mut hasher);
+        self.filter
+            .map(|filter| super::expression::compute_expression_hash(filter))
+            .hash(&mut hasher);
+        self.params.len().hash(&mut hasher);
+        for value in self.params {
+            hash_parameter(value, &mut hasher);
+        }
+        // Map order is not stable, so each pair is hashed alone and combined
+        let named = self.named_params.iter().fold(0u64, |acc, (name, value)| {
+            let mut pair_hasher = rustc_hash::FxHasher::default();
+            name.hash(&mut pair_hasher);
+            hash_parameter(value, &mut pair_hasher);
+            acc ^ pair_hasher.finish()
+        });
+        named.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn is(&self, kept: &KeptOrigin) -> bool {
+        let same_filter = match (self.filter, &kept.filter) {
+            (None, None) => true,
+            (Some(filter), Some(kept)) => Arc::ptr_eq(filter, kept) || **filter == **kept,
+            _ => false,
+        };
+        same_filter
+            && *kept.table == *self.table
+            && kept.column == self.column
+            && kept.alias.as_deref() == self.alias
+            && kept.params.len() == self.params.len()
+            && kept
+                .params
+                .iter()
+                .zip(self.params)
+                .all(|(kept, value)| same_parameter(kept, value))
+            && kept.named_params.len() == self.named_params.len()
+            && self.named_params.iter().all(|(name, value)| {
+                kept.named_params
+                    .get(name)
+                    .is_some_and(|kept| same_parameter(kept, value))
+            })
+    }
+
+    fn keep(&self) -> KeptOrigin {
+        KeptOrigin {
+            table: CompactArc::from(self.table),
+            column: self.column.to_string(),
+            alias: self.alias.map(str::to_string),
+            filter: self.filter.cloned(),
+            params: self.params.to_vec(),
+            named_params: self.named_params.clone(),
+        }
+    }
+}
+
+/// Cached semi-join entry: its origin, checked on a hit and read for
+/// invalidation by table, and the set
+type SemiJoinCacheEntry = (KeptOrigin, CompactArc<ValueSet>);
 
 thread_local! {
     static SEMI_JOIN_CACHE: RefCell<LruCache<u64, SemiJoinCacheEntry>> =
@@ -267,7 +361,7 @@ pub fn invalidate_semi_join_cache_for_table(table_name: &str) {
         // Collect keys to remove (LruCache doesn't have retain)
         let keys_to_remove: Vec<u64> = c
             .iter()
-            .filter(|(_, (key_table, _))| key_table.eq_ignore_ascii_case(table_name))
+            .filter(|(_, (origin, _))| origin.table.eq_ignore_ascii_case(table_name))
             .map(|(k, _)| *k)
             .collect();
         for key in keys_to_remove {
@@ -276,24 +370,23 @@ pub fn invalidate_semi_join_cache_for_table(table_name: &str) {
     });
 }
 
-/// Get a cached semi-join hash set by key hash.
+/// The cached semi-join set taken for `origin`, under its `key`
 #[inline]
-pub fn get_cached_semi_join(key_hash: u64) -> Option<CompactArc<ValueSet>> {
+pub fn get_cached_semi_join(origin: &SemiJoinOrigin<'_>, key: u64) -> Option<CompactArc<ValueSet>> {
     SEMI_JOIN_CACHE.with(|cache| {
         cache
             .borrow_mut()
-            .get(&key_hash)
+            .get(&key)
+            .filter(|(kept, _)| origin.is(kept))
             .map(|(_, v)| CompactArc::clone(v))
     })
 }
 
 /// Cache a semi-join hash set result (CompactArc version for zero-copy).
 #[inline]
-pub fn cache_semi_join_arc(key_hash: u64, table: &str, values: CompactArc<ValueSet>) {
+pub fn cache_semi_join_arc(origin: &SemiJoinOrigin<'_>, key: u64, values: CompactArc<ValueSet>) {
     SEMI_JOIN_CACHE.with(|cache| {
-        cache
-            .borrow_mut()
-            .put(key_hash, (CompactArc::from(table), values));
+        cache.borrow_mut().put(key, (origin.keep(), values));
     });
 }
 
@@ -1430,6 +1523,7 @@ impl Default for ExecutionContextBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::DataType;
     use rustc_hash::FxHashMap;
 
     #[test]
@@ -1514,5 +1608,44 @@ mod tests {
         assert!(!ctx.auto_commit());
         assert_eq!(ctx.current_database(), Some("mydb"));
         assert_eq!(ctx.timeout_ms(), 5000);
+    }
+
+    #[test]
+    fn a_semi_join_set_answers_only_its_own_origin_under_a_shared_key() {
+        let named = FxHashMap::default();
+        let origin = |table, params| SemiJoinOrigin {
+            table,
+            column: "bid",
+            alias: None,
+            filter: None,
+            params,
+            named_params: &named,
+        };
+        let taken = origin("semi_join_origin_test", &[Value::Integer(10)]);
+        let key = taken.key();
+        let set: CompactArc<ValueSet> = CompactArc::new([Value::Integer(1)].into_iter().collect());
+        cache_semi_join_arc(&taken, key, set);
+        assert!(get_cached_semi_join(&taken, key).is_some());
+        for other in [
+            origin("semi_join_origin_test", &[Value::Integer(20)]),
+            origin("semi_join_origin_test", &[Value::Float(10.0)]),
+            origin("semi_join_origin_other", &[Value::Integer(10)]),
+        ] {
+            assert!(
+                get_cached_semi_join(&other, key).is_none(),
+                "a set kept under the key answered another origin"
+            );
+        }
+        invalidate_semi_join_cache_for_table("semi_join_origin_test");
+        assert!(get_cached_semi_join(&taken, key).is_none());
+
+        let null = origin("semi_join_origin_test", &[Value::Null(DataType::Integer)]);
+        let null_key = null.key();
+        let other_null = origin("semi_join_origin_test", &[Value::Null(DataType::Float)]);
+        assert_ne!(null_key, other_null.key());
+        let set: CompactArc<ValueSet> = CompactArc::new([Value::Integer(1)].into_iter().collect());
+        cache_semi_join_arc(&null, null_key, set);
+        assert!(get_cached_semi_join(&other_null, null_key).is_none());
+        invalidate_semi_join_cache_for_table("semi_join_origin_test");
     }
 }

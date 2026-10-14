@@ -35,11 +35,11 @@ use super::context::{
     cache_batch_aggregate, cache_batch_aggregate_info, cache_exists_correlation,
     cache_exists_pred_key, cache_exists_predicate, cache_exists_probe_fallback,
     cache_exists_schema, cache_in_subquery, cache_scalar_subquery, cache_semi_join_arc,
-    compute_semi_join_cache_key, extract_table_names_for_cache, get_cached_batch_aggregate,
-    get_cached_batch_aggregate_info, get_cached_exists_correlation, get_cached_exists_pred_key,
-    get_cached_exists_predicate, get_cached_exists_schema, get_cached_in_subquery,
-    get_cached_in_subquery_set, get_cached_scalar_subquery, get_cached_semi_join,
-    get_exists_probe_fallback, BatchAggregateLookupInfo, ExecutionContext, ExistsCorrelationInfo,
+    extract_table_names_for_cache, get_cached_batch_aggregate, get_cached_batch_aggregate_info,
+    get_cached_exists_correlation, get_cached_exists_pred_key, get_cached_exists_predicate,
+    get_cached_exists_schema, get_cached_in_subquery, get_cached_in_subquery_set,
+    get_cached_scalar_subquery, get_cached_semi_join, get_exists_probe_fallback,
+    BatchAggregateLookupInfo, ExecutionContext, ExistsCorrelationInfo, SemiJoinOrigin,
 };
 use super::expression::compute_expression_hash;
 use super::index_optimizer::SetTest;
@@ -4218,22 +4218,24 @@ impl Executor {
         info: &SemiJoinInfo,
         ctx: &ExecutionContext,
     ) -> Result<CompactArc<ValueSet>> {
-        // Build cache key hash from inner table, column, and WHERE predicate hash
-        // Uses u64 hash to avoid any string allocation
-        let pred_hash = info
-            .non_correlated_where
-            .as_ref()
-            .map(|arc| compute_expression_hash(arc.as_ref()))
-            .unwrap_or(0);
-        let cache_key =
-            compute_semi_join_cache_key(&info.inner_table, &info.inner_column, pred_hash);
+        // The set answers only the inner query it was taken for, the
+        // statement's parameter values included
+        let origin = SemiJoinOrigin {
+            table: &info.inner_table,
+            column: &info.inner_column,
+            alias: info.inner_alias.as_deref(),
+            filter: info.non_correlated_where.as_ref(),
+            params: ctx.params(),
+            named_params: ctx.named_params(),
+        };
+        let cache_key = origin.key();
 
         // Check cache first - return Arc directly (no clone needed).
         // Bypassed inside explicit transactions (a cached in-transaction
         // view would survive ROLLBACK)
         let cacheable = ctx.transaction_id().is_none();
         if cacheable {
-            if let Some(cached) = get_cached_semi_join(cache_key) {
+            if let Some(cached) = get_cached_semi_join(&origin, cache_key) {
                 return Ok(cached);
             }
         }
@@ -4307,11 +4309,7 @@ impl Executor {
 
         // Cache for subsequent calls within this query (CompactArc clone is cheap)
         if cacheable {
-            cache_semi_join_arc(
-                cache_key,
-                &info.inner_table,
-                CompactArc::clone(&hash_set_arc),
-            );
+            cache_semi_join_arc(&origin, cache_key, CompactArc::clone(&hash_set_arc));
         }
 
         Ok(hash_set_arc)
