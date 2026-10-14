@@ -6620,11 +6620,13 @@ impl MVCCEngine {
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::maintenance_schema_taken();
 
-            // Per-table snapshot gating: capture the current min snapshot begin_seq
-            // for each table to close the TOCTOU window. A snapshot starting between
-            // tables must not cause earlier compacted tables to lose visible rows.
-            let compact_seal_seq_limit =
-                self.registry.get_min_snapshot_begin_seq().map(|s| s as u64);
+            // Per-table snapshot and view gating: capture the current reader
+            // bound for each table to close the TOCTOU window. A reader starting
+            // between tables must not cause earlier compacted tables to lose
+            // visible rows.
+            let compact_seal_seq_limit = self.registry.min_reader_seq().map(|s| s as u64);
+            // Planning's estimate of the tombstones a rewrite applies
+            let planned_limit = self.registry.maintenance_limit() as u64;
 
             // Targeted compaction: only rewrite volumes that need work.
             // At-target volumes are left untouched to minimize disk I/O.
@@ -6666,18 +6668,14 @@ impl MVCCEngine {
                                 continue;
                             }
                         }
-                        // Tombstoned rows that compaction can actually apply. When
-                        // snapshots are active, only count tombstones with
-                        // commit_seq < limit (post-snapshot tombstones will be
-                        // preserved, so rewriting is pointless).
+                        // Tombstoned rows that compaction can actually apply:
+                        // only tombstones with commit_seq < limit (the others
+                        // will be preserved, so rewriting is pointless).
                         let tombstoned = !ts.is_empty()
                             && segs.get(&seg.segment_id).is_some_and(|cs| {
                                 cs.volume.meta.row_ids.iter().any(|rid| {
-                                    if let Some(limit) = compact_seal_seq_limit {
-                                        ts.get(rid).is_some_and(|&commit_seq| commit_seq < limit)
-                                    } else {
-                                        ts.contains_key(rid)
-                                    }
+                                    ts.get(rid)
+                                        .is_some_and(|&commit_seq| commit_seq < planned_limit)
                                 })
                             });
                         // Copies that never got authority are dropped by a
@@ -6876,6 +6874,9 @@ impl MVCCEngine {
                 };
                 (old_ids, Arc::new(vols), dead, ts, outside)
             };
+            // Read after the tombstones were taken: one below it belongs to a
+            // complete commit every snapshot and view sees
+            let tombstone_limit = self.registry.maintenance_limit() as u64;
 
             let vol_mappings: Vec<_> = volumes
                 .iter()
@@ -6925,14 +6926,14 @@ impl MVCCEngine {
                     if !dead.is_empty() && dead.binary_search(&(i as u32)).is_ok() {
                         continue;
                     }
-                    // Apply tombstone only if it was committed before the earliest
-                    // snapshot (safe to physically remove). Tombstones created after
+                    // Apply tombstone only if it was committed below the maintenance
+                    // limit (safe to physically remove). Tombstones created after
                     // are preserved — the row stays in the merged volume so snapshots
                     // can still see it via versioned tombstone filtering.
                     // A tombstone names the row id, so every copy of it goes and
                     // its pair is taken once
                     if let Some(commit_seq) =
-                        applied_commit_seq(&tombstones, row_id, compact_seal_seq_limit)
+                        applied_commit_seq(&tombstones, row_id, tombstone_limit)
                     {
                         if seen.insert(row_id) {
                             tombstoned.push((row_id, commit_seq, vol_idx, i));
@@ -7592,10 +7593,10 @@ impl MVCCEngine {
             // The snapshot records each row's txn_id at extraction time.
             // classify_sealed_rows compares against it to detect concurrent
             // commits that modified a row after extraction.
-            // Re-check snapshot state per-table to close the TOCTOU window
-            // between the top-of-function check and extraction. A snapshot that
-            // starts between those points would otherwise cause phantom reads.
-            let per_table_cutoff = self.registry.get_min_snapshot_begin_seq();
+            // Re-check snapshot and view state per-table to close the TOCTOU
+            // window between the top-of-function check and extraction. A reader
+            // that starts between those points would otherwise cause phantom reads.
+            let per_table_cutoff = self.registry.min_reader_seq();
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::seal_cutoff_read();
             let (mut all_rows, extraction_snapshot) = if let Some(cutoff) = per_table_cutoff {
@@ -7832,10 +7833,11 @@ impl MVCCEngine {
                 let mut refused = None;
                 let Some((_seal_guard, outcome, published)) = (loop {
                     let guard = mgr.acquire_seal_write();
-                    // A snapshot that began after the cutoff was read keeps its versions hot
+                    // Read after the extraction classified its heads: a snapshot
+                    // or view counted since keeps its versions hot
                     let begun_since = self
                         .registry
-                        .get_min_snapshot_begin_seq()
+                        .min_reader_seq()
                         .filter(|&begin| per_table_cutoff.is_none_or(|cutoff| begin < cutoff));
                     // Decided under the fence, before anything is published:
                     // only moved rows get authority and leave the hot store
@@ -9916,16 +9918,12 @@ fn compaction_chunk_rows(target_volume_rows: usize) -> usize {
 }
 
 /// The commit_seq of a row's tombstone when a compaction may apply it: one
-/// committed before the earliest snapshot began, or any when none is open
-fn applied_commit_seq(
-    tombstones: &FxHashMap<i64, u64>,
-    row_id: i64,
-    snapshot_limit: Option<u64>,
-) -> Option<u64> {
+/// committed below the maintenance limit
+fn applied_commit_seq(tombstones: &FxHashMap<i64, u64>, row_id: i64, limit: u64) -> Option<u64> {
     tombstones
         .get(&row_id)
         .copied()
-        .filter(|&commit_seq| snapshot_limit.is_none_or(|limit| commit_seq < limit))
+        .filter(|&commit_seq| commit_seq < limit)
 }
 
 /// A volume outside a compaction's batch, with the id range its manifest
@@ -10245,17 +10243,12 @@ mod tests {
     }
 
     #[test]
-    fn a_compaction_applies_a_tombstone_only_below_the_snapshot_limit() {
+    fn a_compaction_applies_a_tombstone_only_below_the_maintenance_limit() {
         let tombstones: FxHashMap<i64, u64> = [(1, 9), (2, 10), (3, 11)].into_iter().collect();
-        assert_eq!(applied_commit_seq(&tombstones, 1, Some(10)), Some(9));
-        assert_eq!(
-            applied_commit_seq(&tombstones, 2, Some(10)),
-            None,
-            "at the limit"
-        );
-        assert_eq!(applied_commit_seq(&tombstones, 3, Some(10)), None);
-        assert_eq!(applied_commit_seq(&tombstones, 3, None), Some(11));
-        assert_eq!(applied_commit_seq(&tombstones, 4, None), None);
+        assert_eq!(applied_commit_seq(&tombstones, 1, 10), Some(9));
+        assert_eq!(applied_commit_seq(&tombstones, 2, 10), None, "at the limit");
+        assert_eq!(applied_commit_seq(&tombstones, 3, 10), None);
+        assert_eq!(applied_commit_seq(&tombstones, 4, 12), None);
     }
 
     /// Volumes at positions 0..n with the given row ids; none base, none

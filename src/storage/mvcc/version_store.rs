@@ -467,9 +467,6 @@ pub trait VisibilityChecker: Send + Sync {
     /// Get the current global sequence number
     fn get_current_sequence(&self) -> i64;
 
-    /// Get all active transaction IDs (for cleanup operations)
-    fn get_active_transaction_ids(&self) -> Vec<i64>;
-
     /// Check if a transaction was committed before a given commit sequence cutoff.
     ///
     /// Returns true if the transaction is committed AND its commit sequence
@@ -491,9 +488,15 @@ pub trait VisibilityChecker: Send + Sync {
         false // Default: ReadCommitted (arena fast path is safe)
     }
 
-    /// The begin sequence of the oldest open snapshot transaction, None
-    /// when no snapshot is open
-    fn oldest_snapshot_begin_seq(&self) -> Option<i64> {
+    /// The sequence maintenance may act below: a commit with a lower
+    /// sequence is complete and seen by every snapshot and live view
+    fn maintenance_limit(&self) -> i64 {
+        i64::MAX
+    }
+
+    /// [`Self::maintenance_limit`] for history behind a completed head,
+    /// None without a lock when no snapshot or view can read that history
+    fn history_limit(&self) -> Option<i64> {
         None
     }
 
@@ -1003,10 +1006,10 @@ impl VersionStore {
     }
 
     /// What a new head keeps of `existing`'s chain. Past the history limit
-    /// the chain goes, except what an open snapshot still reads: cut below
-    /// a version the oldest snapshot sees within the first `limit`
-    /// versions, since every snapshot walking from the head stops there;
-    /// kept whole when the oldest snapshot reads further back. Both walks
+    /// the chain goes, except what a snapshot or view still reads: cut below
+    /// a version the maintenance limit sees within the first `limit`
+    /// versions, since every reader walking from the head stops there;
+    /// kept whole when the oldest reader reads further back. Both walks
     /// stop at the limit, so a write does not traverse a long chain
     fn history_kept(&self, existing: &VersionChainEntry) -> KeptHistory {
         let limit = self.max_version_history;
@@ -1016,7 +1019,8 @@ impl VersionStore {
         let Some(checker) = self.visibility_checker.as_ref() else {
             return KeptHistory::Nothing;
         };
-        let Some(begin_seq) = checker.oldest_snapshot_begin_seq() else {
+        // The writer holds the row, so every version of the chain is complete
+        let Some(bound) = checker.history_limit() else {
             return KeptHistory::Nothing;
         };
         let mut walked: SmallVec<[&VersionChainEntry; 16]> = SmallVec::new();
@@ -1029,7 +1033,7 @@ impl VersionStore {
             current = node.prev.as_deref();
         }
         let sees =
-            |node: &VersionChainEntry| checker.is_committed_before(node.version.txn_id, begin_seq);
+            |node: &VersionChainEntry| checker.is_committed_before(node.version.txn_id, bound - 1);
         // Any version it sees will do: the cut keeps every version above it
         let (mut low, mut high) = (0, walked.len() - 1);
         if !sees(walked[high]) {
@@ -3187,9 +3191,9 @@ impl VersionStore {
     }
 
     /// Extract committed rows for seal, filtered by commit_seq cutoff.
-    /// Only includes rows committed before `commit_seq_cutoff`, ensuring
-    /// snapshot isolation transactions that began before the cutoff can still
-    /// see those rows after they move to cold storage.
+    /// Only includes rows committed at or before `commit_seq_cutoff`, ensuring
+    /// the snapshots and views that see the cutoff can still see those rows
+    /// after they move to cold storage. A view's cutoff may be 0.
     pub fn extract_for_seal_with_cutoff(
         &self,
         commit_seq_cutoff: i64,
@@ -3197,15 +3201,13 @@ impl VersionStore {
         let Some(checker) = self.visibility_checker.as_ref() else {
             return self.extract_heads(Some(0), |_| false);
         };
-        let use_cutoff = commit_seq_cutoff > 0;
         // The live rows, not the deleted heads the root also keeps
         self.extract_heads(Some(self.committed_row_count()), |v| {
             checker.is_visible(v.txn_id, i64::MAX)
-                && (!use_cutoff || checker.is_committed_before(v.txn_id, commit_seq_cutoff))
+                && checker.is_committed_before(v.txn_id, commit_seq_cutoff)
                 && !(v.deleted_at_txn_id != 0
                     && checker.is_visible(v.deleted_at_txn_id, i64::MAX)
-                    && (!use_cutoff
-                        || checker.is_committed_before(v.deleted_at_txn_id, commit_seq_cutoff)))
+                    && checker.is_committed_before(v.deleted_at_txn_id, commit_seq_cutoff))
         })
     }
 
@@ -6122,19 +6124,23 @@ impl VersionStore {
         let cutoff_time = now - retention_period.as_nanos() as i64;
 
         let mut rows_to_delete = Vec::new();
+        // A delete committed below the bound is complete and seen by every reader
+        let checker = self.visibility_checker.as_ref();
+        let cutoff = checker.map_or(i64::MAX, |checker| checker.maintenance_limit() - 1);
+        let removable = |version: &RowVersion| {
+            version.is_deleted()
+                && checker.is_none_or(|checker| {
+                    checker.is_committed_before(version.deleted_at_txn_id, cutoff)
+                })
+        };
 
         // Clone CowBTree once, reuse for index cleanup (O(1) Arc clone)
         let versions = self.versions.read().clone();
 
         // First pass: identify deleted rows older than retention period
         for (&row_id, chain) in versions.iter() {
-            let version = &chain.version;
-            // Only process rows that are actually deleted and old enough
-            if version.is_deleted() && version.create_time < cutoff_time {
-                // Check if safe to remove (no active transaction can see it)
-                if self.can_safely_remove(version) {
-                    rows_to_delete.push(row_id);
-                }
+            if chain.version.create_time < cutoff_time && removable(&chain.version) {
+                rows_to_delete.push(row_id);
             }
         }
 
@@ -6154,9 +6160,9 @@ impl VersionStore {
         {
             let mut versions = self.versions.write();
             for &row_id in &rows_to_delete {
-                // Re-check: the row must still exist AND still be deleted
+                // Re-check: the row must still exist AND still be deleted below the bound
                 if let Some(entry) = versions.get(row_id) {
-                    if entry.version.is_deleted() {
+                    if removable(&entry.version) {
                         if let Some(idx) = unpack_arena_idx(entry.arena_idx) {
                             actual_arena_indices.push(idx);
                         }
@@ -6233,31 +6239,6 @@ impl VersionStore {
         actually_deleted.len() as i32
     }
 
-    /// Check if a version can be safely removed (not visible to any active transaction)
-    fn can_safely_remove(&self, version: &RowVersion) -> bool {
-        let checker = match self.visibility_checker.as_ref() {
-            Some(c) => c,
-            None => return true, // No checker, assume safe
-        };
-
-        // Get all active transaction IDs
-        let active_txns = checker.get_active_transaction_ids();
-
-        // If no active transactions, safe to remove
-        if active_txns.is_empty() {
-            return true;
-        }
-
-        // Check if any active transaction can still see this version
-        for txn_id in active_txns {
-            if checker.is_visible(version.txn_id, txn_id) {
-                return false; // Still visible to at least one transaction
-            }
-        }
-
-        true
-    }
-
     /// Cleanup old previous versions that are no longer needed
     ///
     /// This prunes old version chains, keeping only versions that are:
@@ -6273,10 +6254,10 @@ impl VersionStore {
     }
 
     /// Cuts every chain longer than the history limit whose head is
-    /// committed: below the first version the oldest open snapshot sees,
-    /// however deep, keeping at least the limit; to the limit when no
-    /// snapshot is open. A publication looks no further than the limit, so
-    /// this pass reclaims what it leaves. Returns the versions dropped
+    /// committed: below the first version the maintenance limit sees,
+    /// however deep, keeping at least the history limit. A publication
+    /// looks no further than the limit, so this pass reclaims what it
+    /// leaves. Returns the versions dropped
     pub fn trim_history_past_limit(&self) -> usize {
         let limit = self.max_version_history;
         if limit == 0 || self.closed.load(Ordering::Acquire) {
@@ -6301,32 +6282,30 @@ impl VersionStore {
         let mut dropped = 0;
         let mut versions = self.versions.write();
         // Read under the lock, so no commit can replace a head a newer snapshot reads
-        let begin_seq = checker.oldest_snapshot_begin_seq();
+        let cutoff = checker.maintenance_limit() - 1;
         for row_id in candidates {
             let Some(entry) = versions.get(row_id) else {
                 continue;
             };
-            // A head not yet committed may be taken back onto its history
-            if !checker.is_committed_before(entry.version.txn_id, i64::MAX) {
+            // A head below the bound is committed; one not yet committed may
+            // be taken back onto its history
+            let head_seen = checker.is_committed_before(entry.version.txn_id, cutoff);
+            if !head_seen && !checker.is_committed_before(entry.version.txn_id, i64::MAX) {
                 continue;
             }
             let mut depth = 0;
-            let mut seen_at = None;
+            let mut seen_at = head_seen.then_some(0);
             let mut current = Some(entry);
             while let Some(node) = current {
-                if seen_at.is_none()
-                    && begin_seq
-                        .is_some_and(|seq| checker.is_committed_before(node.version.txn_id, seq))
-                {
+                if seen_at.is_none() && checker.is_committed_before(node.version.txn_id, cutoff) {
                     seen_at = Some(depth);
                 }
                 depth += 1;
                 current = node.prev.as_deref();
             }
-            let keep = match (begin_seq, seen_at) {
-                (None, _) => limit,
-                (Some(_), Some(at)) => limit.max(at + 1),
-                (Some(_), None) => depth,
+            let keep = match seen_at {
+                Some(at) => limit.max(at + 1),
+                None => depth,
             };
             if keep >= depth {
                 continue;
@@ -6359,8 +6338,8 @@ impl VersionStore {
         let now = get_fast_timestamp();
         let retention_cutoff = now - retention_period.as_nanos() as i64;
 
-        // Get active transaction IDs
-        let active_txns = checker.get_active_transaction_ids();
+        // A version committed below the bound is seen by every reader
+        let cutoff = checker.maintenance_limit() - 1;
 
         // First pass (read lock): identify row_ids that MAY need pruning
         let mut candidate_row_ids: Vec<i64> = Vec::new();
@@ -6402,37 +6381,23 @@ impl VersionStore {
                 continue;
             }
 
-            // Check each previous version independently — do NOT assume monotonic
-            // visibility. With rapid updates, a newer prev version may be invisible
-            // to an active txn while an older one IS visible (e.g., HEAD seq=120,
-            // prev_0 seq=110, prev_1 seq=80, active txn snapshot at seq=100 needs prev_1).
-            let mut keep_count = 0;
-            for (i, prev_entry) in prev_versions.iter().enumerate() {
-                let mut keep = false;
-
-                // Rule 1: Keep if needed by any active transaction
-                for &txn_id in &active_txns {
-                    if checker.is_visible(prev_entry.version.txn_id, txn_id) {
-                        keep = true;
-                        break;
-                    }
-                }
-
-                // Rule 2: Keep if within retention period
-                if !keep && prev_entry.version.create_time >= retention_cutoff {
-                    keep = true;
-                }
-
-                if keep {
-                    // Keep this version and all newer ones (indices 0..=i)
-                    keep_count = i + 1;
-                }
-            }
-            // A head whose commit is not visible yet keeps the version before it:
-            // its readers read it, and a failed commit's undo restores it
-            if keep_count == 0 && !checker.is_committed_before(chain_entry.version.txn_id, i64::MAX)
+            // Every reader stops at the first version committed below the bound.
+            // A head above it keeps that version: its readers read it, and a
+            // failed commit's undo restores it
+            let mut keep_count = if checker.is_committed_before(chain_entry.version.txn_id, cutoff)
             {
-                keep_count = 1;
+                0
+            } else {
+                prev_versions
+                    .iter()
+                    .position(|prev| checker.is_committed_before(prev.version.txn_id, cutoff))
+                    .map_or(prev_versions.len(), |at| at + 1)
+            };
+            // Versions within the retention period stay, with all newer ones
+            for (i, prev_entry) in prev_versions.iter().enumerate() {
+                if prev_entry.version.create_time >= retention_cutoff {
+                    keep_count = keep_count.max(i + 1);
+                }
             }
 
             // If we need to prune some versions, modify the live entry
@@ -8755,11 +8720,6 @@ mod tests {
         fn get_current_sequence(&self) -> i64 {
             self.current_seq.fetch_add(1, Ordering::AcqRel)
         }
-
-        fn get_active_transaction_ids(&self) -> Vec<i64> {
-            // No active transactions in test
-            Vec::new()
-        }
     }
 
     /// A visibility checker that does not force snapshot isolation, so the
@@ -8773,10 +8733,6 @@ mod tests {
 
         fn get_current_sequence(&self) -> i64 {
             0
-        }
-
-        fn get_active_transaction_ids(&self) -> Vec<i64> {
-            Vec::new()
         }
 
         fn needs_snapshot_isolation(&self, _txn_id: i64) -> bool {
@@ -8797,10 +8753,6 @@ mod tests {
 
         fn get_current_sequence(&self) -> i64 {
             0
-        }
-
-        fn get_active_transaction_ids(&self) -> Vec<i64> {
-            Vec::new()
         }
 
         fn is_committed_before(&self, txn_id: i64, _cutoff_commit_seq: i64) -> bool {
@@ -10804,5 +10756,128 @@ mod tests {
             // Claim was first — truncate correctly rejected
             assert!(claim_result.is_ok());
         }
+    }
+
+    fn registry_store(
+        history: usize,
+    ) -> (
+        Arc<crate::storage::mvcc::registry::TransactionRegistry>,
+        VersionStore,
+    ) {
+        let registry = Arc::new(crate::storage::mvcc::registry::TransactionRegistry::new());
+        let mut store = VersionStore::with_visibility_checker(
+            "t".to_string(),
+            test_schema(),
+            Arc::clone(&registry) as Arc<dyn VisibilityChecker>,
+        );
+        store.set_max_version_history(history);
+        (registry, store)
+    }
+
+    /// Row 1's version by a new transaction, published and left committing
+    fn publish(
+        registry: &crate::storage::mvcc::registry::TransactionRegistry,
+        store: &VersionStore,
+        deleted: bool,
+    ) -> i64 {
+        let (txn_id, _) = registry.begin_transaction();
+        registry.start_commit(txn_id);
+        let version = RowVersion {
+            txn_id,
+            deleted_at_txn_id: if deleted { txn_id } else { 0 },
+            data: Row::from(vec![Value::from(txn_id)]),
+            create_time: 0,
+        };
+        store.add_version_single(1, version, None).unwrap();
+        txn_id
+    }
+
+    #[test]
+    fn a_trim_keeps_the_version_a_view_reads_below_a_commit_it_excludes() {
+        let (registry, mut store) = registry_store(10);
+        let first = publish(&registry, &store, false);
+        registry.complete_commit(first);
+        let excluded = publish(&registry, &store, false);
+        let view = registry.capture_view();
+        registry.complete_commit(excluded);
+        store.set_max_version_history(1);
+        store.trim_history_past_limit();
+        assert_eq!(store.chain_entries(), 1, "the view's version was trimmed");
+        drop(view);
+        store.trim_history_past_limit();
+        assert_eq!(store.chain_entries(), 0, "the trim keeps it after the view");
+    }
+
+    #[test]
+    fn a_retention_cleanup_keeps_the_version_a_view_reads_below_a_commit_it_excludes() {
+        let (registry, store) = registry_store(10);
+        let first = publish(&registry, &store, false);
+        registry.complete_commit(first);
+        let excluded = publish(&registry, &store, false);
+        let view = registry.capture_view();
+        registry.complete_commit(excluded);
+        store.cleanup_old_previous_versions_with_retention(std::time::Duration::ZERO);
+        assert_eq!(store.chain_entries(), 1, "the view's version was removed");
+        drop(view);
+        store.cleanup_old_previous_versions_with_retention(std::time::Duration::ZERO);
+        assert_eq!(
+            store.chain_entries(),
+            0,
+            "the cleanup keeps it after the view"
+        );
+    }
+
+    #[test]
+    fn a_new_head_keeps_the_history_a_view_reads_past_the_head_it_replaces() {
+        let (registry, store) = registry_store(2);
+        let first = publish(&registry, &store, false);
+        registry.complete_commit(first);
+        let excluded = publish(&registry, &store, false);
+        let view = registry.capture_view();
+        registry.complete_commit(excluded);
+        let newer = publish(&registry, &store, false);
+        registry.complete_commit(newer);
+        assert_eq!(store.chain_entries(), 2, "the view's version was cut");
+        drop(view);
+        let last = publish(&registry, &store, false);
+        registry.complete_commit(last);
+        assert_eq!(store.chain_entries(), 1, "past the limit with no reader");
+    }
+
+    #[test]
+    fn a_deleted_row_stays_while_its_delete_commits() {
+        let (registry, store) = registry_store(10);
+        let first = publish(&registry, &store, false);
+        registry.complete_commit(first);
+        let delete = publish(&registry, &store, true);
+        store.cleanup_deleted_rows(std::time::Duration::ZERO);
+        assert!(
+            store.has_committed_row(1),
+            "removed while its delete commits"
+        );
+        registry.complete_commit(delete);
+        store.cleanup_deleted_rows(std::time::Duration::ZERO);
+        assert!(
+            !store.has_committed_row(1),
+            "kept after its delete completed"
+        );
+    }
+
+    #[test]
+    fn a_deleted_row_stays_while_a_view_excludes_its_delete() {
+        let (registry, store) = registry_store(10);
+        let first = publish(&registry, &store, false);
+        registry.complete_commit(first);
+        let delete = publish(&registry, &store, true);
+        let view = registry.capture_view();
+        registry.complete_commit(delete);
+        store.cleanup_deleted_rows(std::time::Duration::ZERO);
+        assert!(
+            store.has_committed_row(1),
+            "removed while the view reads it"
+        );
+        drop(view);
+        store.cleanup_deleted_rows(std::time::Duration::ZERO);
+        assert!(!store.has_committed_row(1), "kept after the view");
     }
 }
