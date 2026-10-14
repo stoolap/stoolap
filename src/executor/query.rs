@@ -5356,6 +5356,7 @@ impl Executor {
             // - Has equality keys (hash join applicable)
             // - No ORDER BY, GROUP BY, aggregation (would negate early termination)
             // - No window function, which only the standard path evaluates
+            // - No DISTINCT, which reads every joined row before the LIMIT
             // - No cross-table predicates (applied after join)
 
             let streaming_limit = if !join_type.contains("FULL")
@@ -5365,6 +5366,8 @@ impl Executor {
                 && !classification.has_group_by
                 && !classification.has_aggregation
                 && !classification.has_window_functions
+                && !stmt.distinct
+                && stmt.distinct_on.is_empty()
                 && cross_filter.is_none()
             {
                 // Compute limit value
@@ -5817,12 +5820,16 @@ impl Executor {
         // - Early termination with LIMIT
 
         // Compute LIMIT for early termination pushdown
-        // Safe to push when: no ORDER BY, no GROUP BY/aggregation, no FULL OUTER
+        // Safe to push when: no ORDER BY, no GROUP BY/aggregation, no window
+        // function or DISTINCT, which read every joined row, no FULL OUTER
         let can_push_limit = !join_type.contains("FULL")
             && !classification.has_order_by
             && cross_filter.is_none()
             && !classification.has_group_by
-            && !classification.has_aggregation;
+            && !classification.has_aggregation
+            && !classification.has_window_functions
+            && !stmt.distinct
+            && stmt.distinct_on.is_empty();
 
         let join_limit = if can_push_limit {
             let limit = stmt.limit.as_ref().and_then(|limit_expr| {
@@ -11469,10 +11476,15 @@ impl Executor {
         classification: &QueryClassification,
         join_type: &str,
     ) -> Option<u64> {
+        // A window function and DISTINCT read every joined row before the
+        // LIMIT counts any
         if join_type.contains("FULL")
             || classification.has_order_by
             || classification.has_group_by
             || classification.has_aggregation
+            || classification.has_window_functions
+            || stmt.distinct
+            || !stmt.distinct_on.is_empty()
         {
             return None;
         }

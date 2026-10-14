@@ -1024,3 +1024,48 @@ fn test_a_limit_join_of_ctes_with_a_window_function() {
         assert_eq!(rows, vec![(1, 1), (2, 2), (3, 3)], "{sql}");
     }
 }
+
+#[test]
+fn test_a_join_limit_below_its_matches_counts_every_match_first() {
+    let db = join_tables("contract_join_limit_below_matches");
+    db.execute("CREATE TABLE d (id INTEGER PRIMARY KEY, g INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO d VALUES (1, 1), (2, 1), (3, 2)", ())
+        .unwrap();
+    for (sql, expected) in [
+        (
+            "SELECT COUNT(*) OVER () FROM a JOIN b ON a.n = b.n LIMIT 1",
+            vec![3],
+        ),
+        (
+            "SELECT COUNT(*) OVER () FROM a JOIN b ON a.n = b.id LIMIT 1",
+            vec![3],
+        ),
+        (
+            "SELECT DISTINCT d.g FROM b JOIN d ON b.n = d.id LIMIT 2",
+            vec![1, 2],
+        ),
+        (
+            "WITH x AS (SELECT id, n FROM a), y AS (SELECT id, n FROM b) \
+             SELECT COUNT(*) OVER () FROM x JOIN y ON x.n = y.n LIMIT 1",
+            vec![3],
+        ),
+        (
+            "SELECT DISTINCT d.g FROM d JOIN b ON d.id = b.n ORDER BY 1 LIMIT 2",
+            vec![1, 2],
+        ),
+        (
+            "SELECT DISTINCT d.g FROM d JOIN b ON d.id = b.n LIMIT 2",
+            vec![1, 2],
+        ),
+        (
+            "WITH x AS (SELECT id, g FROM d), y AS (SELECT n FROM b) \
+             SELECT DISTINCT x.g FROM x JOIN y ON x.id = y.n LIMIT 2",
+            vec![1, 2],
+        ),
+    ] {
+        let mut found = ids(&db, sql, vec![]);
+        found.sort_unstable();
+        assert_eq!(found, expected, "{sql}");
+    }
+}
