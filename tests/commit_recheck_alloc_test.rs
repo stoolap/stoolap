@@ -20,9 +20,12 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::rc::Rc;
 
+use stoolap::core::Error;
 use stoolap::test_failpoints::{
-    cold_rechecks, in_recheck_fence_section, in_recheck_store_lock, volume_loads, FailpointGuard,
+    cold_rechecks, in_recheck_fence_section, in_recheck_store_lock, on_cold_recheck,
+    on_commit_fence, volume_loads, FailpointGuard,
 };
 use stoolap::Database;
 
@@ -106,5 +109,97 @@ fn a_recheck_allocates_nothing_holding_the_store_or_deciding_under_the_fence() {
         after.1 - before.1,
         0,
         "allocations while a recheck round was decided under the seal fence"
+    );
+}
+
+/// Drops column `v` from another thread; true when it finished
+fn drop_v_apart(db: &Database) -> bool {
+    let db = db.clone();
+    std::thread::spawn(move || db.execute("ALTER TABLE t DROP COLUMN v", ()).is_ok())
+        .join()
+        .unwrap()
+}
+
+/// A file database with (1, 10) and (3, 30) sealed
+fn sealed_t(dir: &std::path::Path) -> Database {
+    let db = Database::open(&format!(
+        "file://{}?checkpoint_interval=3600",
+        dir.display()
+    ))
+    .unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER UNIQUE, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10, 0), (3, 30, 0)", ())
+        .unwrap();
+    db.engine().seal_for_test().unwrap();
+    db
+}
+
+#[test]
+fn a_commit_refused_for_a_column_change_without_a_recheck_allocates_nothing_under_the_fence() {
+    let _guard = FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db = sealed_t(dir.path());
+    let mut txn = db.begin().unwrap();
+    txn.execute("INSERT INTO t VALUES (2, 20, 0)", ()).unwrap();
+    let ddl = db.clone();
+    let dropped = Rc::new(Cell::new(None));
+    let slot = Rc::clone(&dropped);
+    on_commit_fence(move || {
+        if slot.get().is_none() {
+            slot.set(Some(drop_v_apart(&ddl)));
+        }
+    });
+    let (rechecks, before) = (cold_rechecks(), counts().1);
+    let committed = txn.commit();
+    assert_eq!(
+        dropped.get(),
+        Some(true),
+        "the column change did not finish"
+    );
+    assert_eq!(cold_rechecks() - rechecks, 0, "the commit rechecked");
+    assert!(
+        matches!(committed, Err(Error::SchemaChanged { .. })),
+        "{committed:?}"
+    );
+    assert_eq!(
+        counts().1 - before,
+        0,
+        "allocations while the commit refused a column change under the seal fence"
+    );
+}
+
+#[test]
+fn a_commit_refused_for_a_column_change_in_its_recheck_allocates_nothing_under_the_fence() {
+    let _guard = FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db = sealed_t(dir.path());
+    let mut txn = db.begin().unwrap();
+    txn.execute("INSERT INTO t VALUES (2, 20, 0)", ()).unwrap();
+    // A seal after the write sends the commit to its recheck rounds
+    db.execute("INSERT INTO t VALUES (5, 50, 0)", ()).unwrap();
+    db.engine().seal_for_test().unwrap();
+    let ddl = db.clone();
+    let dropped = Rc::new(Cell::new(false));
+    let slot = Rc::clone(&dropped);
+    on_cold_recheck(move || slot.set(drop_v_apart(&ddl)));
+    let (rechecks, before) = (cold_rechecks(), counts().1);
+    let committed = txn.commit();
+    assert!(
+        dropped.get(),
+        "the column change did not finish in the recheck"
+    );
+    assert!(cold_rechecks() > rechecks, "the commit did not recheck");
+    assert!(
+        matches!(committed, Err(Error::SchemaChanged { .. })),
+        "{committed:?}"
+    );
+    assert_eq!(
+        counts().1 - before,
+        0,
+        "allocations while the commit refused a column change under the seal fence"
     );
 }
