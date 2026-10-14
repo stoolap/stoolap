@@ -1606,6 +1606,146 @@ pub(crate) fn table_wal_recorded() {
     run_hook(&TABLE_WAL_RECORDED_HOOK);
 }
 
+pub(crate) fn table_wal_record_written() {
+    TABLE_WAL_RECORDS.with(|n| n.set(n.get() + 1));
+}
+
+thread_local! {
+    static TABLE_WAL_RECORDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LIVE_VOLUME_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BLOCK_STORE_DROPS: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+    static COMMIT_FENCE_HOOK: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
+    static SEAL_GENERATION_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static COMMIT_ROUND_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static RECHECK_STORE_LOCKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static RECHECK_FENCE_SECTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static VOLUME_FILE_DROPS: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Tables this thread's commits recorded to the WAL
+pub fn table_wal_records() -> usize {
+    TABLE_WAL_RECORDS.with(std::cell::Cell::get)
+}
+
+/// Run on this thread each time its commit is about to take a table's seal
+/// fence, until the failpoints are reset
+pub fn on_commit_fence(hook: impl FnMut() + 'static) {
+    COMMIT_FENCE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn commit_fence_next() {
+    let hook = COMMIT_FENCE_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(mut hook) = hook {
+        hook();
+        COMMIT_FENCE_HOOK.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(hook);
+            }
+        });
+    }
+}
+
+/// Run once on this thread when its commit dropped a cold recheck round
+/// whose seal generation moved, before the next round begins
+pub fn after_commit_round_moved(hook: impl FnOnce() + 'static) {
+    COMMIT_ROUND_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn commit_round_moved() {
+    run_hook(&COMMIT_ROUND_HOOK);
+}
+
+/// Run once on this thread when its seal has moved the seal generation and
+/// not yet marked the table as having segments
+pub fn after_seal_generation_moved(hook: impl FnOnce() + 'static) {
+    SEAL_GENERATION_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn seal_generation_moved() {
+    run_hook(&SEAL_GENERATION_HOOK);
+}
+
+/// Whether this thread's commit holds a transaction store for its cold
+/// recheck; read by a test's counting allocator
+pub fn in_recheck_store_lock() -> bool {
+    RECHECK_STORE_LOCKED
+        .try_with(std::cell::Cell::get)
+        .unwrap_or(false)
+}
+
+/// Marks this thread as holding a transaction store for its cold recheck
+pub(crate) struct RecheckStoreLock;
+
+impl RecheckStoreLock {
+    pub(crate) fn enter() -> Self {
+        RECHECK_STORE_LOCKED.with(|l| l.set(true));
+        Self
+    }
+}
+
+impl Drop for RecheckStoreLock {
+    fn drop(&mut self) {
+        RECHECK_STORE_LOCKED.with(|l| l.set(false));
+    }
+}
+
+/// Whether this thread's commit is deciding a cold recheck round under the
+/// seal fence; read by a test's counting allocator
+pub fn in_recheck_fence_section() -> bool {
+    RECHECK_FENCE_SECTION
+        .try_with(std::cell::Cell::get)
+        .unwrap_or(false)
+}
+
+/// Marks this thread as deciding a cold recheck round under the seal fence
+pub(crate) struct RecheckFenceSection;
+
+impl RecheckFenceSection {
+    pub(crate) fn enter() -> Self {
+        RECHECK_FENCE_SECTION.with(|s| s.set(true));
+        Self
+    }
+}
+
+impl Drop for RecheckFenceSection {
+    fn drop(&mut self) {
+        RECHECK_FENCE_SECTION.with(|s| s.set(false));
+    }
+}
+
+/// Volume file owners this thread let go last, (outside, under) the seal
+/// fence: each takes the file registry lock and may remove a retired file
+pub fn volume_file_drops_by_fence() -> (usize, usize) {
+    VOLUME_FILE_DROPS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn volume_file_dropped() {
+    count_by_fence_depth(&VOLUME_FILE_DROPS);
+}
+
+/// Volumes this thread loaded through the live segment map, not through a
+/// statement's captured owners
+pub fn live_volume_loads() -> usize {
+    LIVE_VOLUME_LOADS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn live_volume_load() {
+    LIVE_VOLUME_LOADS.with(|n| n.set(n.get() + 1));
+}
+
+/// Loaded volumes' block stores this thread let go last, (outside, under)
+/// the seal fence: each takes the decoded group cache's lock
+pub fn block_store_drops_by_fence() -> (usize, usize) {
+    BLOCK_STORE_DROPS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn block_store_dropped() {
+    count_by_fence_depth(&BLOCK_STORE_DROPS);
+}
+
 /// Run once on this thread when its next write statement on a table was
 /// admitted for its transaction, before it reads or writes anything
 pub fn after_statement_admitted(hook: impl FnOnce() + 'static) {
@@ -2078,6 +2218,9 @@ pub fn reset_all() {
     SEAL_PASSED_CHANGING_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_RECHECK_HOOK.with(|slot| *slot.borrow_mut() = None);
     TABLE_WAL_RECORDED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COMMIT_FENCE_HOOK.with(|slot| *slot.borrow_mut() = None);
+    SEAL_GENERATION_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COMMIT_ROUND_HOOK.with(|slot| *slot.borrow_mut() = None);
     STATEMENT_ADMITTED_HOOK.with(|slot| *slot.borrow_mut() = None);
     BATCH_ROW_HOOK.with(|slot| *slot.borrow_mut() = None);
     HOT_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = None);
