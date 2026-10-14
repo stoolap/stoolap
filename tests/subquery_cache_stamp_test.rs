@@ -160,3 +160,18 @@ fn test_a_subquery_holding_another_is_served_from_its_cache() {
         "read their tables again: {ran_again:?}"
     );
 }
+
+#[test]
+fn test_a_subquery_grouped_by_a_volatile_set_runs_every_time() {
+    let db = open("subquery_stamp_volatile_grouping");
+    let sql = "SELECT COUNT(*) FROM a WHERE x IN \
+               (SELECT COUNT(*) FROM b GROUP BY GROUPING SETS ((CAST(RANDOM() * 2 AS INTEGER))))";
+    one(&db, sql);
+    let before = stoolap::test_failpoints::in_subquery_runs();
+    one(&db, sql);
+    assert_eq!(
+        stoolap::test_failpoints::in_subquery_runs() - before,
+        1,
+        "a set grouped by RANDOM() was served from the cache"
+    );
+}

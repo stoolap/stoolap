@@ -2952,6 +2952,8 @@ impl Executor {
             || boxed(&stmt.table_expr)
             || boxed(&stmt.where_clause)
             || any(&stmt.group_by.columns)
+            || matches!(&stmt.group_by.modifier, GroupByModifier::GroupingSets(sets)
+                if sets.iter().any(|set| any(set)))
             || boxed(&stmt.having)
             || stmt
                 .window_defs

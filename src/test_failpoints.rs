@@ -860,16 +860,17 @@ pub(crate) fn index_filled_from_cold() {
     INDEXES_FILLED_FROM_COLD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Process-wide: IN subqueries run to take their members
-static IN_SUBQUERY_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static IN_SUBQUERY_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
-/// IN subqueries run to take their members, so far
+/// IN subqueries this thread ran to take their members, so far
 pub fn in_subquery_runs() -> usize {
-    IN_SUBQUERY_RUNS.load(std::sync::atomic::Ordering::Relaxed)
+    IN_SUBQUERY_RUNS.with(std::cell::Cell::get)
 }
 
 pub(crate) fn in_subquery_ran() {
-    IN_SUBQUERY_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    IN_SUBQUERY_RUNS.with(|n| n.set(n.get() + 1));
 }
 
 /// Process-wide: EXISTS subqueries run whole for one outer row

@@ -274,3 +274,22 @@ fn test_subquery_caches_with_a_star_or_a_value_list_see_another_thread_write() {
     let after: Vec<String> = reads.iter().map(|sql| one(&db, sql)).collect();
     assert_eq!(after, ["2", "5"], "after a write from another thread");
 }
+
+#[test]
+fn test_subqueries_that_differ_only_in_grouping_sets_do_not_share_a_result() {
+    let db = Database::open("memory://cache_staleness_grouping_sets").unwrap();
+    db.execute("CREATE TABLE g (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE TABLE n (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO g VALUES (1, 1), (2, 1), (3, 2)", ())
+        .unwrap();
+    db.execute("INSERT INTO n VALUES (1, 1), (2, 2), (3, 3)", ())
+        .unwrap();
+    let grouped = "SELECT COUNT(*) FROM n WHERE v IN \
+                   (SELECT COUNT(*) FROM g WHERE EXISTS (SELECT 1 FROM n) GROUP BY GROUPING SETS ((g.k)))";
+    let whole = "SELECT COUNT(*) FROM n WHERE v IN \
+                 (SELECT COUNT(*) FROM g WHERE EXISTS (SELECT 1 FROM n))";
+    assert_eq!(one(&db, grouped), "2", "counts {{2, 1}} hold v 1 and 2");
+    assert_eq!(one(&db, whole), "1", "count {{3}} holds v 3 alone");
+}
