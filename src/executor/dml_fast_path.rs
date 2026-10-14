@@ -32,10 +32,7 @@ use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::traits::transaction::StatementTable;
 use crate::storage::traits::{Engine, QueryResult};
 
-use super::context::{
-    invalidate_in_subquery_cache_for_table, invalidate_scalar_subquery_cache_for_table,
-    invalidate_semi_join_cache_for_table, ExecutionContext,
-};
+use super::context::ExecutionContext;
 use super::query_cache::{
     check_compiled_token, or_normal_path, CompiledExecution, CompiledPkDelete, CompiledPkUpdate,
     CompiledUpdateColumn, PkValueSource, UpdateValueSource,
@@ -458,9 +455,6 @@ impl Executor {
         // Invalidate caches
         if rows_affected > 0 {
             self.semantic_cache.invalidate_table(table_name);
-            invalidate_semi_join_cache_for_table(table_name);
-            invalidate_scalar_subquery_cache_for_table(table_name);
-            invalidate_in_subquery_cache_for_table(table_name);
         }
 
         // Commit
@@ -501,9 +495,6 @@ impl Executor {
         // Invalidate caches
         if rows_affected > 0 {
             self.semantic_cache.invalidate_table(table_name);
-            invalidate_semi_join_cache_for_table(table_name);
-            invalidate_scalar_subquery_cache_for_table(table_name);
-            invalidate_in_subquery_cache_for_table(table_name);
         }
 
         // Commit

@@ -610,6 +610,8 @@ pub struct MVCCEngine {
     file_lock: Mutex<Option<FileLock>>,
     /// The DDL guard and the schema epoch
     ddl: Arc<DdlShared>,
+    /// This engine's number in the process, never given to another engine
+    instance: u64,
     /// Statistics epoch counter - increments on ANALYZE. Shared across all
     /// executors on this engine so per-executor stats caches can spot
     /// stats written through another handle.
@@ -785,7 +787,16 @@ fn refresh_schema(
     Ok(())
 }
 
+/// The number the next engine created in this process takes
+static NEXT_ENGINE_INSTANCE: AtomicU64 = AtomicU64::new(0);
+
 impl MVCCEngine {
+    /// This engine's number in the process: results cached on a thread that
+    /// several databases share are told apart by it
+    pub(crate) fn instance(&self) -> u64 {
+        self.instance
+    }
+
     /// Creates a new MVCC engine with the given configuration
     pub fn new(config: Config) -> Self {
         let path = config.path.clone().unwrap_or_default();
@@ -826,6 +837,7 @@ impl MVCCEngine {
                 serial: parking_lot::Mutex::new(()),
                 schema_epoch: AtomicU64::new(0),
             }),
+            instance: NEXT_ENGINE_INSTANCE.fetch_add(1, Ordering::Relaxed),
             stats_epoch: AtomicU64::new(0),
             cleanup_handle: Mutex::new(None),
             fk_reverse_cache: RwLock::new((u64::MAX, StringMap::default())),

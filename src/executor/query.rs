@@ -433,7 +433,11 @@ impl Executor {
             && ctx.statement_snapshot().is_none()
             && self.active_transaction.lock().unwrap().is_none()
         {
-            let snapshot = StatementSnapshot::new(self.engine.begin_transaction()?);
+            let isolation = self.engine.get_isolation_level();
+            let snapshot = StatementSnapshot::new(
+                self.engine.begin_transaction_with_level(isolation)?,
+                isolation,
+            );
             snapshot_ctx = ctx.with_statement_snapshot(snapshot);
             &snapshot_ctx
         } else {
@@ -7579,7 +7583,7 @@ impl Executor {
         isolation: crate::core::IsolationLevel,
     ) -> Result<StatementSnapshot> {
         let transaction = self.engine.begin_transaction_with_level(isolation)?;
-        Ok(StatementSnapshot::new(transaction))
+        Ok(StatementSnapshot::new(transaction, isolation))
     }
 
     /// True when a filter carries a subquery anywhere inside it. The grouped

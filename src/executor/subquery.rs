@@ -36,11 +36,12 @@ use super::context::{
     cache_batch_aggregate, cache_batch_aggregate_info, cache_exists_correlation,
     cache_exists_pred_key, cache_exists_predicate, cache_exists_probe_fallback,
     cache_exists_schema, cache_in_subquery, cache_scalar_subquery, cache_semi_join_arc,
-    extract_table_names_for_cache, get_cached_batch_aggregate, get_cached_batch_aggregate_info,
-    get_cached_exists_correlation, get_cached_exists_pred_key, get_cached_exists_predicate,
-    get_cached_exists_schema, get_cached_in_subquery, get_cached_in_subquery_set,
-    get_cached_scalar_subquery, get_cached_semi_join, get_exists_probe_fallback,
+    get_cached_batch_aggregate, get_cached_batch_aggregate_info, get_cached_exists_correlation,
+    get_cached_exists_pred_key, get_cached_exists_predicate, get_cached_exists_schema,
+    get_cached_in_subquery, get_cached_in_subquery_set, get_cached_scalar_subquery,
+    get_cached_semi_join, get_exists_probe_fallback, holds_subquery, subquery_cache_tables,
     BatchAggregateLookupInfo, ExecutionContext, ExistsCorrelationInfo, SemiJoinOrigin,
+    StatementSnapshot, SubqueryStamp,
 };
 use super::expression::compute_expression_hash;
 use super::index_optimizer::SetTest;
@@ -251,11 +252,10 @@ impl Executor {
                         // A repeated non-correlated subquery reuses the
                         // memoized shared set from the cache entry
                         let is_non_correlated = ctx.outer_row().is_none()
-                            && !Self::is_subquery_correlated(&subquery.subquery)
-                            && ctx.transaction_id().is_none();
+                            && !Self::is_subquery_correlated(&subquery.subquery);
                         let cached_set = if is_non_correlated {
-                            Self::subquery_cache_key(&subquery.subquery, ctx)
-                                .and_then(|key| get_cached_in_subquery_set(&key))
+                            self.subquery_cache_slot(&subquery.subquery, ctx)
+                                .and_then(|(key, stamp)| get_cached_in_subquery_set(&key, &stamp))
                         } else {
                             None
                         };
@@ -1879,15 +1879,14 @@ impl Executor {
             ctx.outer_row().is_none() && !Self::is_subquery_correlated(subquery);
 
         // For non-correlated subqueries, check cache first using SQL string
-        // as key; bypassed inside explicit transactions (see
-        // execute_in_subquery for the ROLLBACK rationale)
-        let cache_key = if is_non_correlated && ctx.transaction_id().is_none() {
-            Self::subquery_cache_key(subquery, ctx)
+        // as key, under the stamp taken before the read
+        let cache_slot = if is_non_correlated {
+            self.subquery_cache_slot(subquery, ctx)
         } else {
             None
         };
-        if let Some(key) = &cache_key {
-            if let Some(cached_value) = get_cached_scalar_subquery(key) {
+        if let Some((key, stamp)) = &cache_slot {
+            if let Some(cached_value) = get_cached_scalar_subquery(key, stamp) {
                 return Ok(cached_value);
             }
         }
@@ -1942,12 +1941,8 @@ impl Executor {
             }
             let null_value = crate::core::Value::null_unknown();
             // Cache the result for non-correlated subqueries
-            if let Some(key) = cache_key {
-                cache_scalar_subquery(
-                    key,
-                    extract_table_names_for_cache(subquery),
-                    null_value.clone(),
-                );
+            if let Some((key, stamp)) = cache_slot {
+                cache_scalar_subquery(key, stamp, null_value.clone());
             }
             return Ok(null_value);
         }
@@ -1958,12 +1953,8 @@ impl Executor {
             Some(v) => v,
             None => {
                 let null_value = crate::core::Value::null_unknown();
-                if let Some(key) = cache_key {
-                    cache_scalar_subquery(
-                        key,
-                        extract_table_names_for_cache(subquery),
-                        null_value.clone(),
-                    );
+                if let Some((key, stamp)) = cache_slot {
+                    cache_scalar_subquery(key, stamp, null_value.clone());
                 }
                 return Ok(null_value);
             }
@@ -1980,12 +1971,8 @@ impl Executor {
         }
 
         // Cache the result for non-correlated subqueries
-        if let Some(key) = cache_key {
-            cache_scalar_subquery(
-                key,
-                extract_table_names_for_cache(subquery),
-                first_value.clone(),
-            );
+        if let Some((key, stamp)) = cache_slot {
+            cache_scalar_subquery(key, stamp, first_value.clone());
         }
 
         Ok(first_value)
@@ -2005,16 +1992,17 @@ impl Executor {
             ctx.outer_row().is_none() && !Self::is_subquery_correlated(subquery);
 
         // For non-correlated subqueries, check cache first using SQL string
-        // as key. Inside an explicit transaction the caches are bypassed
-        // entirely: an in-transaction execution sees uncommitted rows, and
-        // caching that view would survive a ROLLBACK
-        let cache_key = if is_non_correlated && ctx.transaction_id().is_none() {
-            Self::subquery_cache_key(subquery, ctx)
+        // as key, under the stamp taken before the read. Inside an explicit
+        // transaction the caches are bypassed entirely: an in-transaction
+        // execution sees uncommitted rows, and caching that view would
+        // survive a ROLLBACK
+        let cache_slot = if is_non_correlated {
+            self.subquery_cache_slot(subquery, ctx)
         } else {
             None
         };
-        if let Some(key) = &cache_key {
-            if let Some(cached_values) = get_cached_in_subquery(key) {
+        if let Some((key, stamp)) = &cache_slot {
+            if let Some(cached_values) = get_cached_in_subquery(key, stamp) {
                 return Ok(cached_values);
             }
         }
@@ -2039,8 +2027,8 @@ impl Executor {
         }
 
         // Cache the result for non-correlated subqueries
-        if let Some(key) = cache_key {
-            cache_in_subquery(key, extract_table_names_for_cache(subquery), values.clone());
+        if let Some((key, stamp)) = cache_slot {
+            cache_in_subquery(key, stamp, values.clone());
         }
 
         Ok(values)
@@ -2914,6 +2902,34 @@ impl Executor {
             }
         }
         Some(key)
+    }
+
+    /// The cache key of a non-correlated subquery and the stamp a cached
+    /// result of it must carry, when one may be cached or read: outside a
+    /// transaction and a snapshot that holds older rows, over plain tables
+    /// alone. The stamp is taken now, before the subquery reads anything
+    pub(crate) fn subquery_cache_slot(
+        &self,
+        subquery: &SelectStatement,
+        ctx: &ExecutionContext,
+    ) -> Option<(String, SubqueryStamp)> {
+        if !Self::reads_cacheable_rows(ctx) {
+            return None;
+        }
+        let tables = subquery_cache_tables(subquery)?;
+        let key = Self::subquery_cache_key(subquery, ctx)?;
+        let stamp = self.subquery_cache_stamp(&tables)?;
+        Some((key, stamp))
+    }
+
+    /// Whether a subquery under `ctx` reads committed rows no older than a
+    /// stamp taken before its read: no explicit transaction, and no
+    /// statement snapshot that keeps the rows of its start
+    fn reads_cacheable_rows(ctx: &ExecutionContext) -> bool {
+        ctx.transaction_id().is_none()
+            && ctx
+                .statement_snapshot()
+                .is_none_or(StatementSnapshot::reads_latest)
     }
 
     /// Whether the answer of `stmt` may change from one statement to the
@@ -4330,18 +4346,22 @@ impl Executor {
         };
         let cache_key = origin.key();
 
-        // Check cache first - return Arc directly (no clone needed).
-        // Bypassed inside explicit transactions (a cached in-transaction
-        // view would survive ROLLBACK), and for an inner table or filter
-        // whose answer is its statement's alone
-        let cacheable = ctx.transaction_id().is_none()
+        // Check cache first - return Arc directly (no clone needed), under
+        // the stamp taken before the read. Bypassed where the read sees rows
+        // older than the stamp, for an inner table or filter whose answer is
+        // its statement's alone, and for a filter that reads tables of its own
+        let cacheable = Self::reads_cacheable_rows(ctx)
             && !ctx.has_cte(&info.inner_table)
-            && !info
-                .non_correlated_where
-                .as_deref()
-                .is_some_and(|filter| Self::expression_varies_by_statement(filter, ctx));
-        if cacheable {
-            if let Some(cached) = get_cached_semi_join(&origin, cache_key) {
+            && !info.non_correlated_where.as_deref().is_some_and(|filter| {
+                Self::expression_varies_by_statement(filter, ctx) || holds_subquery(filter)
+            });
+        let cache_stamp = if cacheable {
+            self.subquery_cache_stamp(&[info.inner_table.as_str()])
+        } else {
+            None
+        };
+        if let Some(stamp) = &cache_stamp {
+            if let Some(cached) = get_cached_semi_join(&origin, cache_key, stamp) {
                 return Ok(cached);
             }
         }
@@ -4415,8 +4435,8 @@ impl Executor {
         let hash_set_arc = CompactArc::new(PredicateSet::of(CompactArc::new(hash_set)));
 
         // Cache for subsequent calls within this query (CompactArc clone is cheap)
-        if cacheable {
-            cache_semi_join_arc(&origin, cache_key, CompactArc::clone(&hash_set_arc));
+        if let Some(stamp) = cache_stamp {
+            cache_semi_join_arc(&origin, cache_key, stamp, CompactArc::clone(&hash_set_arc));
         }
 
         Ok(hash_set_arc)

@@ -53,12 +53,22 @@ static EMPTY_SESSION_VARS: LazyLock<Arc<AHashMap<String, Value>>> =
 // Cache for scalar subquery results to avoid re-execution.
 // Thread-local to avoid synchronization overhead.
 // Uses SQL string as key (not hash) to avoid collision risk.
-// Stores (tables_referenced, result) for table-based invalidation.
+// Each result serves only a lookup under the stamp it was read under.
 // LRU-bounded to prevent unbounded memory growth.
 use smallvec::SmallVec;
 
-/// Cached scalar subquery entry: (tables_referenced for invalidation, result value)
-type ScalarSubqueryCacheEntry = (SmallVec<[CompactArc<str>; 2]>, Value);
+/// What a cached subquery result was read under: its engine, the schema
+/// epoch and the publish epoch of each table it reads, all taken before the
+/// read. Any commit, DDL or other database changes one of them
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubqueryStamp {
+    pub engine: u64,
+    pub schema: u64,
+    pub publish: SmallVec<[u64; 2]>,
+}
+
+/// Cached scalar subquery entry: the stamp it was read under, and the value
+type ScalarSubqueryCacheEntry = (SubqueryStamp, Value);
 
 thread_local! {
     static SCALAR_SUBQUERY_CACHE: RefCell<LruCache<String, ScalarSubqueryCacheEntry>> =
@@ -66,58 +76,49 @@ thread_local! {
 }
 
 /// Clear the scalar subquery cache completely.
-/// NOTE: For normal operation, use `invalidate_scalar_subquery_cache_for_table` instead.
-/// This is only used for explicit cache clearing (e.g., after DDL operations).
 pub fn clear_scalar_subquery_cache() {
     SCALAR_SUBQUERY_CACHE.with(|cache| {
         cache.borrow_mut().clear();
     });
 }
 
-/// Invalidate scalar subquery cache entries for a specific table.
-/// Should be called after INSERT, UPDATE, DELETE, or TRUNCATE on a table.
-#[inline]
-pub fn invalidate_scalar_subquery_cache_for_table(table_name: &str) {
+/// The cached scalar subquery result of `key` read under `stamp`; an
+/// entry read under another stamp is dropped
+pub fn get_cached_scalar_subquery(key: &str, stamp: &SubqueryStamp) -> Option<Value> {
     SCALAR_SUBQUERY_CACHE.with(|cache| {
         let mut c = cache.borrow_mut();
-        if c.is_empty() {
-            return;
+        match c.get(key) {
+            Some((kept, value)) if kept == stamp => {
+                #[cfg(any(test, feature = "test-failpoints"))]
+                crate::test_failpoints::subquery_cache_hit();
+                Some(value.clone())
+            }
+            Some(_) => {
+                c.pop(key);
+                None
+            }
+            None => None,
         }
-        // Collect keys to remove (LruCache doesn't have retain)
-        let keys_to_remove: Vec<String> = c
-            .iter()
-            .filter(|(_, (tables, _))| tables.iter().any(|t| t.eq_ignore_ascii_case(table_name)))
-            .map(|(k, _)| k.clone())
-            .collect();
-        for key in keys_to_remove {
-            c.pop(&key);
-        }
-    });
+    })
 }
 
-/// Get a cached scalar subquery result by SQL string key.
-pub fn get_cached_scalar_subquery(key: &str) -> Option<Value> {
-    SCALAR_SUBQUERY_CACHE.with(|cache| cache.borrow_mut().get(key).map(|(_, v)| v.clone()))
-}
-
-/// Cache a scalar subquery result with the tables it references.
-pub fn cache_scalar_subquery(key: String, tables: SmallVec<[CompactArc<str>; 2]>, value: Value) {
+/// Cache a scalar subquery result under the stamp taken before its read
+pub fn cache_scalar_subquery(key: String, stamp: SubqueryStamp, value: Value) {
     SCALAR_SUBQUERY_CACHE.with(|cache| {
-        cache.borrow_mut().put(key, (tables, value));
+        cache.borrow_mut().put(key, (stamp, value));
     });
 }
 
 // Cache for IN subquery results to avoid re-execution.
 // Thread-local to avoid synchronization overhead.
 // Uses SQL string as key (not hash) to avoid collision risk.
-// Stores (tables_referenced, result) for table-based invalidation.
+// Each result serves only a lookup under the stamp it was read under.
 // LRU-bounded to prevent unbounded memory growth.
 
-/// Cached IN subquery entry: (tables_referenced for invalidation, result
-/// values, lazily built shared hash set for single-column IN, the values'
-/// kinds)
+/// Cached IN subquery entry: (the stamp it was read under, result values,
+/// lazily built shared hash set for single-column IN, the values' kinds)
 type InSubqueryCacheEntry = (
-    SmallVec<[CompactArc<str>; 2]>,
+    SubqueryStamp,
     Vec<Value>,
     Option<CompactArc<PredicateSet>>,
     MemberKinds,
@@ -136,58 +137,57 @@ thread_local! {
 }
 
 /// Clear the IN subquery cache completely.
-/// NOTE: For normal operation, use `invalidate_in_subquery_cache_for_table` instead.
-/// This is only used for explicit cache clearing (e.g., after DDL operations).
 pub fn clear_in_subquery_cache() {
     IN_SUBQUERY_CACHE.with(|cache| {
         cache.borrow_mut().clear();
     });
 }
 
-/// Invalidate IN subquery cache entries for a specific table.
-/// Should be called after INSERT, UPDATE, DELETE, or TRUNCATE on a table.
-#[inline]
-pub fn invalidate_in_subquery_cache_for_table(table_name: &str) {
+/// The cache entry of `key` read under `stamp`, dropping one read under another
+fn with_in_subquery_entry<T>(
+    key: &str,
+    stamp: &SubqueryStamp,
+    read: impl FnOnce(&mut InSubqueryCacheEntry) -> T,
+) -> Option<T> {
     IN_SUBQUERY_CACHE.with(|cache| {
         let mut c = cache.borrow_mut();
-        if c.is_empty() {
-            return;
+        match c.get_mut(key) {
+            Some(entry) if entry.0 == *stamp => {
+                #[cfg(any(test, feature = "test-failpoints"))]
+                crate::test_failpoints::subquery_cache_hit();
+                Some(read(entry))
+            }
+            Some(_) => {
+                c.pop(key);
+                None
+            }
+            None => None,
         }
-        // Collect keys to remove (LruCache doesn't have retain)
-        let keys_to_remove: Vec<String> = c
-            .iter()
-            .filter(|(_, (tables, ..))| tables.iter().any(|t| t.eq_ignore_ascii_case(table_name)))
-            .map(|(k, _)| k.clone())
-            .collect();
-        for key in keys_to_remove {
-            c.pop(&key);
-        }
-    });
+    })
 }
 
-/// Get a cached IN subquery result by SQL string key.
-pub fn get_cached_in_subquery(key: &str) -> Option<Vec<Value>> {
-    IN_SUBQUERY_CACHE.with(|cache| cache.borrow_mut().get(key).map(|(_, v, ..)| v.clone()))
+/// The cached IN subquery result of `key` read under `stamp`
+pub fn get_cached_in_subquery(key: &str, stamp: &SubqueryStamp) -> Option<Vec<Value>> {
+    with_in_subquery_entry(key, stamp, |entry| entry.1.clone())
 }
 
 /// A cached IN subquery result with the kinds of its values, taken when
 /// it was cached
-pub fn get_cached_in_subquery_with_kinds(key: &str) -> Option<(Vec<Value>, MemberKinds)> {
-    IN_SUBQUERY_CACHE.with(|cache| {
-        cache
-            .borrow_mut()
-            .get(key)
-            .map(|(_, v, _, kinds)| (v.clone(), *kinds))
-    })
+pub fn get_cached_in_subquery_with_kinds(
+    key: &str,
+    stamp: &SubqueryStamp,
+) -> Option<(Vec<Value>, MemberKinds)> {
+    with_in_subquery_entry(key, stamp, |entry| (entry.1.clone(), entry.3))
 }
 
 /// Get a cached IN subquery result as a shared hash set, building and
 /// memoizing the set inside the entry on first request. Later hits are
 /// an Arc clone: no value clones, no set rebuild.
-pub fn get_cached_in_subquery_set(key: &str) -> Option<CompactArc<PredicateSet>> {
-    IN_SUBQUERY_CACHE.with(|cache| {
-        let mut c = cache.borrow_mut();
-        let entry = c.get_mut(key)?;
+pub fn get_cached_in_subquery_set(
+    key: &str,
+    stamp: &SubqueryStamp,
+) -> Option<CompactArc<PredicateSet>> {
+    with_in_subquery_entry(key, stamp, |entry| {
         if entry.2.is_none() {
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::in_subquery_set_built();
@@ -196,13 +196,14 @@ pub fn get_cached_in_subquery_set(key: &str) -> Option<CompactArc<PredicateSet>>
         }
         entry.2.clone()
     })
+    .flatten()
 }
 
-/// Cache an IN subquery result with the tables it references. A result
-/// holding a NULL is not kept: the negated form of the same subquery reads
-/// this cache and keeps no row for such a set, which its readers decide
-/// on a fresh list alone
-pub fn cache_in_subquery(key: String, tables: SmallVec<[CompactArc<str>; 2]>, values: Vec<Value>) {
+/// Cache an IN subquery result under the stamp taken before its read. A
+/// result holding a NULL is not kept: the negated form of the same subquery
+/// reads this cache and keeps no row for such a set, which its readers
+/// decide on a fresh list alone
+pub fn cache_in_subquery(key: String, stamp: SubqueryStamp, values: Vec<Value>) {
     let mut kinds = MemberKinds::default();
     for value in &values {
         match value {
@@ -213,41 +214,147 @@ pub fn cache_in_subquery(key: String, tables: SmallVec<[CompactArc<str>; 2]>, va
         }
     }
     IN_SUBQUERY_CACHE.with(|cache| {
-        cache.borrow_mut().put(key, (tables, values, None, kinds));
+        cache.borrow_mut().put(key, (stamp, values, None, kinds));
     });
 }
 
-use crate::parser::ast::{Expression, SelectStatement};
+use crate::parser::ast::{Expression, SelectStatement, WindowFrameBound};
 
-/// Extract actual table names from a SelectStatement for cache invalidation.
-/// This returns the real table names (not aliases) because DML operations
-/// reference tables by their actual names, not aliases.
-pub fn extract_table_names_for_cache(stmt: &SelectStatement) -> SmallVec<[CompactArc<str>; 2]> {
-    let mut tables = SmallVec::new();
-    if let Some(ref table_expr) = stmt.table_expr {
-        collect_real_table_names(table_expr, &mut tables);
+/// The tables `stmt` reads, when that is all it reads: plain tables and
+/// joins, with no subquery, CTE, set operation, AS OF or table function
+/// anywhere in it. A cached result of anything else cannot be checked
+pub fn subquery_cache_tables(stmt: &SelectStatement) -> Option<SmallVec<[CompactArc<str>; 2]>> {
+    let plain = |expr: &Expression| !holds_subquery(expr);
+    let plain_bound = |bound: &WindowFrameBound| !bound_holds_subquery(bound);
+    let windows = stmt.window_defs.iter().all(|w| {
+        w.partition_by.iter().all(plain)
+            && w.order_by.iter().all(|o| plain(&o.expression))
+            && w.frame
+                .as_ref()
+                .is_none_or(|f| plain_bound(&f.start) && f.end.as_ref().is_none_or(plain_bound))
+    });
+    let grouping_sets = match &stmt.group_by.modifier {
+        crate::parser::ast::GroupByModifier::GroupingSets(sets) => sets.iter().flatten().all(plain),
+        _ => true,
+    };
+    let clauses = stmt.columns.iter().all(plain)
+        && stmt.distinct_on.iter().all(plain)
+        && stmt.where_clause.as_deref().is_none_or(plain)
+        && stmt.group_by.columns.iter().all(plain)
+        && grouping_sets
+        && stmt.having.as_deref().is_none_or(plain)
+        && stmt.order_by.iter().all(|o| plain(&o.expression))
+        && stmt.limit.as_deref().is_none_or(plain)
+        && stmt.offset.as_deref().is_none_or(plain)
+        && windows;
+    if stmt.with.is_some() || !stmt.set_operations.is_empty() || !clauses {
+        return None;
     }
-    tables
+    let mut tables = SmallVec::new();
+    if let Some(source) = stmt.table_expr.as_deref() {
+        collect_plain_tables(source, &mut tables)?;
+    }
+    Some(tables)
 }
 
-/// Recursively collect actual table names (not aliases) from a table source expression.
-fn collect_real_table_names(source: &Expression, tables: &mut SmallVec<[CompactArc<str>; 2]>) {
+/// The tables of a FROM made of plain tables and joins; None for any other source
+fn collect_plain_tables(
+    source: &Expression,
+    tables: &mut SmallVec<[CompactArc<str>; 2]>,
+) -> Option<()> {
     match source {
-        Expression::TableSource(ts) => {
-            // Always use the actual table name for cache invalidation
+        Expression::TableSource(ts) if ts.as_of.is_none() => {
             tables.push(CompactArc::from(ts.name.value_lower.as_str()));
+            Some(())
         }
-        Expression::JoinSource(js) => {
-            collect_real_table_names(&js.left, tables);
-            collect_real_table_names(&js.right, tables);
+        Expression::JoinSource(js)
+            if js.condition.as_deref().is_none_or(|c| !holds_subquery(c)) =>
+        {
+            collect_plain_tables(&js.left, tables)?;
+            collect_plain_tables(&js.right, tables)
         }
-        Expression::SubquerySource(ss) => {
-            // Recursively extract tables from nested subquery
-            if let Some(ref table_expr) = ss.subquery.table_expr {
-                collect_real_table_names(table_expr, tables);
-            }
+        _ => None,
+    }
+}
+
+/// Whether `expr` reads a table of its own: a subquery anywhere in it, or a
+/// table source where an expression stands. Every kind is named, so a new
+/// one is decided here before it compiles
+pub(crate) fn holds_subquery(expr: &Expression) -> bool {
+    let any = |exprs: &[Expression]| exprs.iter().any(holds_subquery);
+    let call = |f: &crate::parser::ast::FunctionCall| {
+        any(&f.arguments)
+            || f.filter.as_deref().is_some_and(holds_subquery)
+            || f.order_by.iter().any(|o| holds_subquery(&o.expression))
+    };
+    match expr {
+        Expression::ScalarSubquery(_)
+        | Expression::Exists(_)
+        | Expression::AllAny(_)
+        | Expression::TableSource(_)
+        | Expression::JoinSource(_)
+        | Expression::SubquerySource(_)
+        | Expression::ValuesSource(_)
+        | Expression::CteReference(_)
+        | Expression::FunctionTableSource(_) => true,
+        Expression::Prefix(p) => holds_subquery(&p.right),
+        Expression::Infix(i) => holds_subquery(&i.left) || holds_subquery(&i.right),
+        Expression::List(l) => any(&l.elements),
+        Expression::ExpressionList(l) => any(&l.expressions),
+        Expression::Distinct(d) => holds_subquery(&d.expr),
+        Expression::In(i) => holds_subquery(&i.left) || holds_subquery(&i.right),
+        Expression::InHashSet(h) => holds_subquery(&h.column),
+        Expression::Between(b) => {
+            holds_subquery(&b.expr) || holds_subquery(&b.lower) || holds_subquery(&b.upper)
         }
-        _ => {}
+        Expression::Like(l) => {
+            holds_subquery(&l.left)
+                || holds_subquery(&l.pattern)
+                || l.escape.as_deref().is_some_and(holds_subquery)
+        }
+        Expression::Case(c) => {
+            c.value.as_deref().is_some_and(holds_subquery)
+                || c.when_clauses
+                    .iter()
+                    .any(|w| holds_subquery(&w.condition) || holds_subquery(&w.then_result))
+                || c.else_value.as_deref().is_some_and(holds_subquery)
+        }
+        Expression::Cast(c) => holds_subquery(&c.expr),
+        Expression::FunctionCall(f) => call(f),
+        Expression::Aliased(a) => holds_subquery(&a.expression),
+        Expression::Window(w) => {
+            call(&w.function)
+                || any(&w.partition_by)
+                || w.order_by.iter().any(|o| holds_subquery(&o.expression))
+                || w.frame.as_ref().is_some_and(|f| {
+                    bound_holds_subquery(&f.start)
+                        || f.end.as_ref().is_some_and(bound_holds_subquery)
+                })
+        }
+        Expression::Identifier(_)
+        | Expression::QualifiedIdentifier(_)
+        | Expression::IntegerLiteral(_)
+        | Expression::FloatLiteral(_)
+        | Expression::StringLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::NullLiteral(_)
+        | Expression::IntervalLiteral(_)
+        | Expression::Parameter(_)
+        | Expression::Star(_)
+        | Expression::QualifiedStar(_)
+        | Expression::Default(_) => false,
+    }
+}
+
+/// [`holds_subquery`] for the offset of a window frame bound
+fn bound_holds_subquery(bound: &WindowFrameBound) -> bool {
+    match bound {
+        WindowFrameBound::Preceding(expr) | WindowFrameBound::Following(expr) => {
+            holds_subquery(expr)
+        }
+        WindowFrameBound::CurrentRow
+        | WindowFrameBound::UnboundedPreceding
+        | WindowFrameBound::UnboundedFollowing => false,
     }
 }
 
@@ -361,9 +468,9 @@ impl SemiJoinOrigin<'_> {
     }
 }
 
-/// Cached semi-join entry: its origin, checked on a hit and read for
-/// invalidation by table, and the set
-type SemiJoinCacheEntry = (KeptOrigin, CompactArc<PredicateSet>);
+/// Cached semi-join entry: its origin, checked on a hit, the stamp the set
+/// was read under, and the set
+type SemiJoinCacheEntry = (KeptOrigin, SubqueryStamp, CompactArc<PredicateSet>);
 
 thread_local! {
     static SEMI_JOIN_CACHE: RefCell<LruCache<u64, SemiJoinCacheEntry>> =
@@ -371,59 +478,47 @@ thread_local! {
 }
 
 /// Clear the semi-join cache completely.
-/// NOTE: This is now only used for explicit cache clearing (e.g., after DDL operations).
-/// For DML operations, use `invalidate_semi_join_cache_for_table` instead.
 pub fn clear_semi_join_cache() {
     SEMI_JOIN_CACHE.with(|cache| {
         cache.borrow_mut().clear();
     });
 }
 
-/// Invalidate semi-join cache entries for a specific table.
-/// Should be called after INSERT, UPDATE, DELETE, or TRUNCATE on a table.
-#[inline]
-pub fn invalidate_semi_join_cache_for_table(table_name: &str) {
-    SEMI_JOIN_CACHE.with(|cache| {
-        let mut c = cache.borrow_mut();
-        if c.is_empty() {
-            return;
-        }
-        // Collect keys to remove (LruCache doesn't have retain)
-        let keys_to_remove: Vec<u64> = c
-            .iter()
-            .filter(|(_, (origin, _))| origin.table.eq_ignore_ascii_case(table_name))
-            .map(|(k, _)| *k)
-            .collect();
-        for key in keys_to_remove {
-            c.pop(&key);
-        }
-    });
-}
-
-/// The cached semi-join set taken for `origin`, under its `key`
+/// The cached semi-join set taken for `origin` under `stamp`, under its
+/// `key`; an entry read under another stamp is dropped
 #[inline]
 pub fn get_cached_semi_join(
     origin: &SemiJoinOrigin<'_>,
     key: u64,
+    stamp: &SubqueryStamp,
 ) -> Option<CompactArc<PredicateSet>> {
     SEMI_JOIN_CACHE.with(|cache| {
-        cache
-            .borrow_mut()
-            .get(&key)
-            .filter(|(kept, _)| origin.is(kept))
-            .map(|(_, v)| CompactArc::clone(v))
+        let mut c = cache.borrow_mut();
+        match c.get(&key) {
+            Some((kept, kept_stamp, set)) if origin.is(kept) => {
+                if kept_stamp == stamp {
+                    #[cfg(any(test, feature = "test-failpoints"))]
+                    crate::test_failpoints::subquery_cache_hit();
+                    return Some(CompactArc::clone(set));
+                }
+                c.pop(&key);
+                None
+            }
+            _ => None,
+        }
     })
 }
 
-/// Cache a semi-join hash set result (CompactArc version for zero-copy).
+/// Cache a semi-join set under the stamp taken before its read
 #[inline]
 pub fn cache_semi_join_arc(
     origin: &SemiJoinOrigin<'_>,
     key: u64,
+    stamp: SubqueryStamp,
     values: CompactArc<PredicateSet>,
 ) {
     SEMI_JOIN_CACHE.with(|cache| {
-        cache.borrow_mut().put(key, (origin.keep(), values));
+        cache.borrow_mut().put(key, (origin.keep(), stamp, values));
     });
 }
 
@@ -763,6 +858,9 @@ pub struct StatementSnapshot(Arc<SnapshotState>);
 
 struct SnapshotState {
     transaction: Mutex<Box<dyn crate::storage::traits::Transaction>>,
+    /// Whether its reads see each commit as it lands (READ COMMITTED), so
+    /// a result read through it is no older than a stamp taken before the read
+    reads_latest: bool,
     /// The first table the statement's correlated probes read, read without a lock
     first_probe_table: std::sync::OnceLock<ProbeTable>,
     /// Any further tables they read, taken once each
@@ -772,12 +870,22 @@ struct SnapshotState {
 type ProbeTable = (SmartString, Box<dyn crate::storage::traits::Table>);
 
 impl StatementSnapshot {
-    pub fn new(transaction: Box<dyn crate::storage::traits::Transaction>) -> Self {
+    /// The statement's reads through `transaction`, begun at `isolation`
+    pub fn new(
+        transaction: Box<dyn crate::storage::traits::Transaction>,
+        isolation: crate::core::IsolationLevel,
+    ) -> Self {
         Self(Arc::new(SnapshotState {
             transaction: Mutex::new(transaction),
+            reads_latest: isolation == crate::core::IsolationLevel::ReadCommitted,
             first_probe_table: std::sync::OnceLock::new(),
             probe_tables: Mutex::new(SmallVec::new()),
         }))
+    }
+
+    /// Whether its reads see each commit as it lands
+    pub(crate) fn reads_latest(&self) -> bool {
+        self.0.reads_latest
     }
 
     pub fn get_table(
@@ -1677,27 +1785,38 @@ mod tests {
                 [Value::Integer(1)].into_iter().collect(),
             )))
         };
-        cache_semi_join_arc(&taken, key, set());
-        assert!(get_cached_semi_join(&taken, key).is_some());
+        let stamp = |publish| SubqueryStamp {
+            engine: 0,
+            schema: 0,
+            publish: smallvec::smallvec![publish],
+        };
+        cache_semi_join_arc(&taken, key, stamp(1), set());
+        assert!(get_cached_semi_join(&taken, key, &stamp(1)).is_some());
         for other in [
             origin("semi_join_origin_test", &[Value::Integer(20)]),
             origin("semi_join_origin_test", &[Value::Float(10.0)]),
             origin("semi_join_origin_other", &[Value::Integer(10)]),
         ] {
             assert!(
-                get_cached_semi_join(&other, key).is_none(),
+                get_cached_semi_join(&other, key, &stamp(1)).is_none(),
                 "a set kept under the key answered another origin"
             );
         }
-        invalidate_semi_join_cache_for_table("semi_join_origin_test");
-        assert!(get_cached_semi_join(&taken, key).is_none());
+        assert!(
+            get_cached_semi_join(&taken, key, &stamp(2)).is_none(),
+            "a set read under one stamp answered another"
+        );
+        assert!(
+            get_cached_semi_join(&taken, key, &stamp(1)).is_none(),
+            "a set seen under a newer stamp stayed"
+        );
 
         let null = origin("semi_join_origin_test", &[Value::Null(DataType::Integer)]);
         let null_key = null.key();
         let other_null = origin("semi_join_origin_test", &[Value::Null(DataType::Float)]);
         assert_ne!(null_key, other_null.key());
-        cache_semi_join_arc(&null, null_key, set());
-        assert!(get_cached_semi_join(&other_null, null_key).is_none());
-        invalidate_semi_join_cache_for_table("semi_join_origin_test");
+        cache_semi_join_arc(&null, null_key, stamp(1), set());
+        assert!(get_cached_semi_join(&other_null, null_key, &stamp(1)).is_none());
+        clear_semi_join_cache();
     }
 }

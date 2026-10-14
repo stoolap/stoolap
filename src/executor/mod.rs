@@ -609,6 +609,29 @@ impl Executor {
             .then_some(semantic_cache::CacheStamp { publish, schema })
     }
 
+    /// The stamp a cached subquery result over `tables` is read under now,
+    /// or None while a commit is publishing to one of them or one of them is
+    /// not a table of this engine
+    pub(crate) fn subquery_cache_stamp<T: AsRef<str>>(
+        &self,
+        tables: &[T],
+    ) -> Option<context::SubqueryStamp> {
+        let schema = self.engine.schema_epoch();
+        let mut publish = smallvec::SmallVec::with_capacity(tables.len());
+        for table in tables {
+            let store = self.engine.get_version_store(table.as_ref()).ok()?;
+            publish.push(store.publish_epoch_if_quiet()?);
+        }
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::cache_stamp_publish_read();
+        // An unchanged schema epoch means each publish epoch is its table's store's
+        (self.engine.schema_epoch() == schema).then(|| context::SubqueryStamp {
+            engine: self.engine.instance(),
+            schema,
+            publish,
+        })
+    }
+
     /// Execute a parsed program
     pub fn execute_program(&self, program: &Program) -> Result<Box<dyn QueryResult>> {
         let ctx = ExecutionContext::new();

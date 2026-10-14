@@ -1221,8 +1221,20 @@ pub(crate) fn program_statement_done() {
     run_hook(&PROGRAM_STATEMENT_HOOK);
 }
 
-/// Run once on this thread when its next semantic cache stamp has read the
-/// table's publish epoch and has not yet checked the schema epoch again
+/// Process-wide: scalar, IN and semi-join results served from their caches
+static SUBQUERY_CACHE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Subquery results served from the scalar, IN and semi-join caches, so far
+pub fn subquery_cache_hits() -> usize {
+    SUBQUERY_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn subquery_cache_hit() {
+    SUBQUERY_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Run once on this thread when its next semantic or subquery cache stamp
+/// has read the publish epochs and has not yet checked the schema epoch again
 pub fn after_cache_stamp_publish_read(hook: impl FnOnce() + 'static) {
     CACHE_STAMP_PUBLISH_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
