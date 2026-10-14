@@ -8778,8 +8778,13 @@ impl EngineOperations {
             crate::test_failpoints::commit_fence_next();
             let guard = mgr.acquire_seal_read();
             #[cfg(feature = "test-failpoints")]
-            let _decided = crate::test_failpoints::RecheckFenceSection::enter();
-            mgr.check_schema_generation(schema_generation)?;
+            let decided = crate::test_failpoints::RecheckFenceSection::enter();
+            if !mgr.schema_generation_is(schema_generation) {
+                #[cfg(feature = "test-failpoints")]
+                drop(decided);
+                drop(guard);
+                return Err(mgr.schema_changed());
+            }
             // With no record, only a table with no volumes needs no recheck
             if mgr.seal_generation() == generation && (recorded.is_some() || !mgr.has_segments()) {
                 return Ok((None, guard));
@@ -8827,7 +8832,12 @@ impl EngineOperations {
             let guard = mgr.acquire_seal_read();
             #[cfg(feature = "test-failpoints")]
             let decided = crate::test_failpoints::RecheckFenceSection::enter();
-            mgr.check_schema_generation(schema_generation)?;
+            if !mgr.schema_generation_is(schema_generation) {
+                #[cfg(feature = "test-failpoints")]
+                drop(decided);
+                drop(guard);
+                return Err(mgr.schema_changed());
+            }
             if mgr.seal_generation() == settled {
                 found?;
                 return Ok((Some(read), guard));

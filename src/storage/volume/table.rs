@@ -755,7 +755,7 @@ impl SegmentedTable {
         values: &[&Value],
     ) -> Result<Option<i64>> {
         let snapshot = self.segment_mgr.cold_snapshot();
-        self.find_segment_row_id_by_values_with_snapshot(&snapshot, col_indices, values)
+        self.find_segment_row_id_by_values_with_snapshot(&snapshot, None, col_indices, values)
     }
 
     /// Statement-snapshot variant: the unique lookup runs entirely
@@ -791,6 +791,7 @@ impl SegmentedTable {
     fn find_segment_row_id_by_values_with_snapshot(
         &self,
         snapshot: &super::manifest::ColdSnapshot,
+        loads: Option<&super::manifest::ColdLoads>,
         col_indices: &[usize],
         values: &[&Value],
     ) -> Result<Option<i64>> {
@@ -804,6 +805,7 @@ impl SegmentedTable {
             .collect();
         let rid = match self.segment_mgr.find_row_id_by_values_with_snapshot(
             snapshot,
+            loads,
             col_indices,
             values,
             &defaults,
@@ -839,34 +841,53 @@ impl SegmentedTable {
         (mgr.seal_generation(), mgr.cold_snapshot().seg_ids)
     }
 
-    /// Runs `check` against a cold snapshot at a settled generation, then
-    /// takes the fence; the check stands when the generation is the same,
-    /// otherwise it runs again, after three rounds under the fence. None
-    /// when the table has no segments under the fence
+    /// Runs `check` outside the fence on a cold snapshot at a settled
+    /// generation, its volumes loaded through the snapshot's owners. Under
+    /// the fence the schema is checked first, then the generation; the
+    /// check's result stands when it is the same. The snapshot comes back
+    /// to be let go after the fence; three rounds that move are a conflict
     fn fence_after_cold_check<'m, T>(
         mgr: &'m super::manifest::SegmentManager,
-        mut check: impl FnMut(&super::manifest::ColdSnapshot) -> Result<T>,
-    ) -> Result<(super::manifest::SealRead<'m>, Option<T>)> {
+        schema_generation: u64,
+        mut check: impl FnMut(&super::manifest::ColdSnapshot, &super::manifest::ColdLoads) -> Result<T>,
+    ) -> Result<(
+        Option<super::manifest::ColdSnapshot>,
+        super::manifest::SealRead<'m>,
+        Option<T>,
+    )> {
         if !mgr.has_segments() {
             let guard = mgr.acquire_seal_read();
             if !mgr.has_segments() {
-                return Ok((guard, None));
+                return Ok((None, guard, None));
             }
             drop(guard);
         }
-        for _ in 0..3 {
+        for _ in 0..COLD_READ_RETRIES {
             let generation = Self::settled_generation(mgr);
             let snapshot = mgr.cold_snapshot();
-            let checked = check(&snapshot)?;
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::insert_cold_snapshot_taken();
+            let loads = super::manifest::ColdLoads::default();
+            let checked = check(&snapshot, &loads);
+            mgr.publish_loaded(loads.take());
             let guard = mgr.acquire_seal_read();
-            if mgr.seal_generation() == generation {
-                return Ok((guard, Some(checked)));
+            #[cfg(feature = "test-failpoints")]
+            let section = crate::test_failpoints::RecheckFenceSection::enter();
+            if !mgr.schema_generation_is(schema_generation) {
+                #[cfg(feature = "test-failpoints")]
+                drop(section);
+                drop(guard);
+                return Err(mgr.schema_changed());
             }
+            if mgr.seal_generation() == generation {
+                let checked = checked?;
+                return Ok((Some(snapshot), guard, Some(checked)));
+            }
+            #[cfg(feature = "test-failpoints")]
+            drop(section);
+            drop(guard);
         }
-        let guard = mgr.acquire_seal_read();
-        let snapshot = mgr.cold_snapshot();
-        let checked = check(&snapshot)?;
-        Ok((guard, Some(checked)))
+        Err(Self::cold_reads_unsettled(mgr))
     }
 
     fn write_conflict(row_id: i64) -> crate::core::Error {
@@ -1297,6 +1318,7 @@ impl SegmentedTable {
     fn check_segment_constraints_with_snapshot(
         &self,
         snapshot: &super::manifest::ColdSnapshot,
+        loads: &super::manifest::ColdLoads,
         row: &Row,
         unique_indexes: Option<&[(String, Vec<String>)]>,
     ) -> Result<()> {
@@ -1308,7 +1330,7 @@ impl SegmentedTable {
                 if !pk_value.is_null() {
                     if let Some(row_id) = self
                         .segment_mgr
-                        .check_value_exists_with_snapshot(snapshot, pk_idx, pk_value)?
+                        .check_value_exists_with_snapshot(snapshot, loads, pk_idx, pk_value)?
                     {
                         // check_value_exists_in_segments filters committed tombstones.
                         // A row this txn deleted is no key conflict; the
@@ -1350,9 +1372,12 @@ impl SegmentedTable {
             }
             let values: smallvec::SmallVec<[&Value; 4]> = coerced.iter().collect();
 
-            if let Some(conflict_row_id) =
-                self.find_segment_row_id_by_values_with_snapshot(snapshot, &col_indices, &values)?
-            {
+            if let Some(conflict_row_id) = self.find_segment_row_id_by_values_with_snapshot(
+                snapshot,
+                Some(loads),
+                &col_indices,
+                &values,
+            )? {
                 drop(values);
                 return Err(crate::core::Error::UniqueConstraint {
                     index: idx_name.to_string(),
@@ -2850,9 +2875,13 @@ impl Table for SegmentedTable {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::statement_admitted();
-        let (_seal_guard, _) = Self::fence_after_cold_check(&self.segment_mgr, |snapshot| {
-            self.check_segment_constraints_with_snapshot(snapshot, &row, None)
-        })?;
+        let (_read, _seal_guard, _) = Self::fence_after_cold_check(
+            &self.segment_mgr,
+            self.schema_generation,
+            |snapshot, loads| {
+                self.check_segment_constraints_with_snapshot(snapshot, loads, &row, None)
+            },
+        )?;
         let result = self.hot.insert(row)?;
         // Checked at this generation, trivially when no volume exists yet
         self.segment_mgr.record_txn_seal_generation(self.txn_id());
@@ -2861,9 +2890,13 @@ impl Table for SegmentedTable {
 
     fn insert_discard(&mut self, row: Row) -> Result<()> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
-        let (_seal_guard, _) = Self::fence_after_cold_check(&self.segment_mgr, |snapshot| {
-            self.check_segment_constraints_with_snapshot(snapshot, &row, None)
-        })?;
+        let (_read, _seal_guard, _) = Self::fence_after_cold_check(
+            &self.segment_mgr,
+            self.schema_generation,
+            |snapshot, loads| {
+                self.check_segment_constraints_with_snapshot(snapshot, loads, &row, None)
+            },
+        )?;
         self.hot.insert_discard(row)?;
         self.segment_mgr.record_txn_seal_generation(self.txn_id());
         Ok(())
@@ -2873,22 +2906,27 @@ impl Table for SegmentedTable {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::statement_admitted();
-        let (_seal_guard, _) = Self::fence_after_cold_check(&self.segment_mgr, |snapshot| {
-            // Snapshot once for the entire batch — eliminates 3 lock reads per row.
-            let unique_indexes = if rows.len() > 1 && self.hot.has_unique_non_pk_indexes() {
-                Some(self.cold_unique_indexes()?)
-            } else {
-                None
-            };
-            for row in &rows {
-                self.check_segment_constraints_with_snapshot(
-                    snapshot,
-                    row,
-                    unique_indexes.as_deref(),
-                )?;
-            }
-            Ok(())
-        })?;
+        let (_read, _seal_guard, _) = Self::fence_after_cold_check(
+            &self.segment_mgr,
+            self.schema_generation,
+            |snapshot, loads| {
+                // Snapshot once for the entire batch — eliminates 3 lock reads per row.
+                let unique_indexes = if rows.len() > 1 && self.hot.has_unique_non_pk_indexes() {
+                    Some(self.cold_unique_indexes()?)
+                } else {
+                    None
+                };
+                for row in &rows {
+                    self.check_segment_constraints_with_snapshot(
+                        snapshot,
+                        loads,
+                        row,
+                        unique_indexes.as_deref(),
+                    )?;
+                }
+                Ok(())
+            },
+        )?;
         // Before the hot batch, which keeps the rows written before a failing one
         self.segment_mgr.record_txn_seal_generation(self.txn_id());
         self.hot.insert_batch(rows)

@@ -1390,6 +1390,69 @@ pub(crate) struct LoadedVolume {
     volume: Arc<FrozenVolume>,
 }
 
+/// Where a lookup reads a cold volume its view captured: through the
+/// captured file owner, without publishing the volume
+pub(crate) trait CapturedVolumes {
+    fn volume(
+        &self,
+        mgr: &SegmentManager,
+        seg_id: u64,
+        cs: &ColdSegment,
+    ) -> crate::core::Result<Arc<FrozenVolume>>;
+}
+
+impl CapturedVolumes for StatementSnapshot {
+    fn volume(
+        &self,
+        mgr: &SegmentManager,
+        seg_id: u64,
+        cs: &ColdSegment,
+    ) -> crate::core::Result<Arc<FrozenVolume>> {
+        StatementSnapshot::volume(self, mgr, seg_id, cs)
+    }
+}
+
+/// The cold volumes one INSERT round read through its cold snapshot's
+/// captured files, each read once; it allocates only once a volume is cold
+#[derive(Default)]
+pub struct ColdLoads(std::cell::RefCell<Vec<LoadedVolume>>);
+
+impl ColdLoads {
+    /// The volumes read, for publication
+    pub(crate) fn take(&self) -> Vec<LoadedVolume> {
+        std::mem::take(&mut *self.0.borrow_mut())
+    }
+}
+
+impl CapturedVolumes for ColdLoads {
+    fn volume(
+        &self,
+        mgr: &SegmentManager,
+        seg_id: u64,
+        cs: &ColdSegment,
+    ) -> crate::core::Result<Arc<FrozenVolume>> {
+        if !cs.volume.is_cold() {
+            cs.volume.mark_accessed();
+            return Ok(Arc::clone(&cs.volume));
+        }
+        // The captured file owner names the volume across tables, a segment id does not
+        let same = |l: &LoadedVolume| {
+            l.seg_id == seg_id
+                && matches!((&l.file, &cs.file), (Some(a), Some(b)) if Arc::ptr_eq(a, b))
+        };
+        if let Some(loaded) = self.0.borrow().iter().find(|l| same(l)) {
+            return Ok(Arc::clone(&loaded.volume));
+        }
+        let volume = mgr.load_captured(seg_id, cs)?;
+        self.0.borrow_mut().push(LoadedVolume {
+            seg_id,
+            file: cs.file.clone(),
+            volume: Arc::clone(&volume),
+        });
+        Ok(volume)
+    }
+}
+
 /// The message of the error a deferred cold read returns; the statement
 /// releases the fence, loads what it recorded, and prepares again
 const COLD_READ_DEFERRED: &str = "cold volume read deferred under the seal fence";
@@ -1802,12 +1865,22 @@ impl SegmentManager {
     }
 
     pub(crate) fn check_schema_generation(&self, generation: u64) -> Result<()> {
-        if generation & 1 != 0 || self.schema_generation() != generation {
-            return Err(crate::core::Error::SchemaChanged {
-                table: self.table_name().to_string(),
-            });
+        if !self.schema_generation_is(generation) {
+            return Err(self.schema_changed());
         }
         Ok(())
+    }
+
+    /// Whether `generation` is the settled schema generation now; allocates
+    /// nothing, so it decides under the seal fence
+    pub(crate) fn schema_generation_is(&self, generation: u64) -> bool {
+        generation & 1 == 0 && self.schema_generation() == generation
+    }
+
+    pub(crate) fn schema_changed(&self) -> crate::core::Error {
+        crate::core::Error::SchemaChanged {
+            table: self.table_name().to_string(),
+        }
     }
 
     /// Ensure all volumes have column data before column access.
@@ -1952,7 +2025,7 @@ impl SegmentManager {
             col_indices,
             values,
             column_defaults,
-            Some(snap),
+            Some(snap as &dyn CapturedVolumes),
         )
     }
 
@@ -2086,10 +2159,13 @@ impl SegmentManager {
         Some(super::writer::VolumeFile::shared(&path))
     }
 
-    /// Check if a value exists using a pre-captured snapshot (no lock acquisition).
+    /// Check if a value exists using a pre-captured snapshot (no lock
+    /// acquisition); a cold volume is read through the owner the snapshot
+    /// captured and kept in `loads`
     pub fn check_value_exists_with_snapshot(
         &self,
         snapshot: &ColdSnapshot,
+        loads: &ColdLoads,
         col_idx: usize,
         value: &crate::core::Value,
     ) -> crate::core::Result<Option<i64>> {
@@ -2099,7 +2175,7 @@ impl SegmentManager {
             &snapshot.ts,
             col_idx,
             value,
-            None,
+            Some(loads as &dyn CapturedVolumes),
         )
     }
 
@@ -2118,7 +2194,7 @@ impl SegmentManager {
             &snap.tombstones,
             col_idx,
             value,
-            Some(snap),
+            Some(snap as &dyn CapturedVolumes),
         )
     }
 
@@ -2154,7 +2230,7 @@ impl SegmentManager {
         segments: &FxHashMap<u64, ColdSegment>,
         row_id: i64,
         col_idx: usize,
-        stmt: Option<&StatementSnapshot>,
+        stmt: Option<&dyn CapturedVolumes>,
     ) -> crate::core::Result<Option<crate::core::Value>> {
         for seg_id in seg_ids {
             if let Some(cold) = segments.get(seg_id) {
@@ -2194,7 +2270,7 @@ impl SegmentManager {
         ts: &FxHashMap<i64, u64>,
         col_idx: usize,
         value: &crate::core::Value,
-        stmt: Option<&StatementSnapshot>,
+        stmt: Option<&dyn CapturedVolumes>,
     ) -> crate::core::Result<Option<i64>> {
         let mut seen = FxHashSet::default();
 
@@ -2299,9 +2375,12 @@ impl SegmentManager {
     /// No global cache. Each volume's hash index is built once on first use
     /// and lives on the immutable FrozenVolume. Zero invalidation cost.
     /// Find row by values using a pre-captured snapshot (no lock acquisition).
+    /// With `loads`, a cold candidate is read through the owner `snapshot`
+    /// captured and kept in `loads`; without, through the live map
     pub fn find_row_id_by_values_with_snapshot(
         &self,
         snapshot: &ColdSnapshot,
+        loads: Option<&ColdLoads>,
         col_indices: &[usize],
         values: &[&Value],
         column_defaults: &[Value],
@@ -2313,7 +2392,7 @@ impl SegmentManager {
             col_indices,
             values,
             column_defaults,
-            None,
+            loads.map(|loads| loads as &dyn CapturedVolumes),
         )
     }
 
@@ -2346,7 +2425,7 @@ impl SegmentManager {
         col_indices: &[usize],
         values: &[&Value],
         column_defaults: &[Value],
-        stmt: Option<&StatementSnapshot>,
+        stmt: Option<&dyn CapturedVolumes>,
     ) -> crate::core::Result<Option<i64>> {
         if col_indices.is_empty() || col_indices.len() != values.len() {
             return Ok(None);

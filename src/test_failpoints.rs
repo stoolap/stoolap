@@ -1619,6 +1619,20 @@ pub(crate) fn table_wal_recorded() {
     run_hook(&TABLE_WAL_RECORDED_HOOK);
 }
 
+thread_local! {
+    static INSERT_COLD_SNAPSHOT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next INSERT took the cold snapshot it
+/// checks its keys against, before the check reads it
+pub fn after_insert_cold_snapshot(hook: impl FnOnce() + 'static) {
+    INSERT_COLD_SNAPSHOT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn insert_cold_snapshot_taken() {
+    run_hook(&INSERT_COLD_SNAPSHOT_HOOK);
+}
+
 pub(crate) fn table_wal_record_written() {
     TABLE_WAL_RECORDS.with(|n| n.set(n.get() + 1));
 }
@@ -1705,15 +1719,17 @@ impl Drop for RecheckStoreLock {
     }
 }
 
-/// Whether this thread's commit is deciding a cold recheck round under the
-/// seal fence; read by a test's counting allocator
+/// Whether this thread is deciding a commit's cold recheck round or an
+/// INSERT's cold check under the seal fence; read by a test's counting
+/// allocator
 pub fn in_recheck_fence_section() -> bool {
     RECHECK_FENCE_SECTION
         .try_with(std::cell::Cell::get)
         .unwrap_or(false)
 }
 
-/// Marks this thread as deciding a cold recheck round under the seal fence
+/// Marks this thread as deciding a cold recheck or check round under the
+/// seal fence
 pub(crate) struct RecheckFenceSection;
 
 impl RecheckFenceSection {
@@ -2241,6 +2257,7 @@ pub fn reset_all() {
     TXN_GATE_HELD_OFF_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_ROUND_SETTLED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_ROUND_SNAPSHOT_HOOK.with(|slot| *slot.borrow_mut() = None);
+    INSERT_COLD_SNAPSHOT_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_READS_FORGET.store(false, Release);
     SELECT_TABLE_OPENED_HOOK.with(|slot| *slot.borrow_mut() = None);
     READ_PATHS.with(|paths| paths.borrow_mut().clear());
