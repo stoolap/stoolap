@@ -5183,7 +5183,15 @@ impl Executor {
                         .iter()
                         .any(|ob| matches!(ob.expression, Expression::IntegerLiteral(_)));
                     let mut order_limit_applied = false;
-                    if !has_agg && !has_window && !has_positional && !stmt.order_by.is_empty() {
+                    // DISTINCT merges rows before the LIMIT counts them, so
+                    // its ordering and LIMIT are left to the standard path
+                    let distinct = stmt.distinct || !stmt.distinct_on.is_empty();
+                    if !has_agg
+                        && !has_window
+                        && !has_positional
+                        && !distinct
+                        && !stmt.order_by.is_empty()
+                    {
                         // Build sort specs by evaluating ORDER BY expressions
                         let mut evaluator = CompiledEvaluator::new(&self.function_registry);
                         evaluator = evaluator.with_context(ctx);

@@ -1046,6 +1046,19 @@ fn test_a_join_limit_below_its_matches_counts_every_match_first() {
             vec![1, 2],
         ),
         (
+            "SELECT DISTINCT d.g FROM b JOIN d ON b.n = d.id ORDER BY d.g LIMIT 2",
+            vec![1, 2],
+        ),
+        (
+            "SELECT DISTINCT d.g FROM b JOIN d ON b.n = d.id ORDER BY d.g LIMIT 1 OFFSET 1",
+            vec![2],
+        ),
+        (
+            "WITH x AS (SELECT id, g FROM d), y AS (SELECT n FROM b) \
+             SELECT DISTINCT x.g FROM x JOIN y ON x.id = y.n ORDER BY x.g LIMIT 2",
+            vec![1, 2],
+        ),
+        (
             "WITH x AS (SELECT id, n FROM a), y AS (SELECT id, n FROM b) \
              SELECT COUNT(*) OVER () FROM x JOIN y ON x.n = y.n LIMIT 1",
             vec![3],
