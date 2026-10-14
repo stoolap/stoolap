@@ -34,6 +34,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use super::ops::{CompareOp, CompiledPattern, Op};
 use super::program::{Program, ProgramBuilder};
 use super::vm::{ExecuteContext, ExprVM};
+use crate::core::predicate::PredicateSet;
 use crate::core::{DataType, Row, Value, ValueSet};
 use crate::executor::utils::{expression_to_string, string_to_datatype};
 use crate::functions::{global_registry, FunctionRegistry};
@@ -551,10 +552,11 @@ impl<'a> ExprCompiler<'a> {
             Expression::InHashSet(in_hash) => {
                 self.compile_expr(&in_hash.column, builder)?;
                 let has_null = in_hash.values.iter().any(|v| v.is_null());
+                let set = CompactArc::new(PredicateSet::new(in_hash.values.clone(), has_null));
                 if in_hash.not {
-                    builder.emit(Op::NotInSet(in_hash.values.clone(), has_null));
+                    builder.emit(Op::NotInSet(set));
                 } else {
-                    builder.emit(Op::InSet(in_hash.values.clone(), has_null));
+                    builder.emit(Op::InSet(set));
                 }
             }
 
@@ -1148,10 +1150,11 @@ impl<'a> ExprCompiler<'a> {
             } else {
                 // Optimized: use pre-built HashSet
                 self.compile_expr(&in_expr.left, builder)?;
+                let set = CompactArc::new(PredicateSet::new(CompactArc::new(values), has_null));
                 if in_expr.not {
-                    builder.emit(Op::NotInSet(CompactArc::new(values), has_null));
+                    builder.emit(Op::NotInSet(set));
                 } else {
-                    builder.emit(Op::InSet(CompactArc::new(values), has_null));
+                    builder.emit(Op::InSet(set));
                 }
             }
         } else {

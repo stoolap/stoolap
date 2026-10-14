@@ -27,7 +27,7 @@ use std::sync::Arc;
 use crate::common::{CompactVec, I64Map, I64Set};
 use crate::core::value::NULL_VALUE;
 use crate::core::ValueMap;
-use crate::core::{Result, Row, RowVec, Value};
+use crate::core::{DataType, Result, Row, RowVec, Value};
 use crate::executor::expression::JoinFilter;
 use crate::executor::operator::{ColumnInfo, Operator, RowRef};
 use crate::storage::expression::{ConstBoolExpr, Expression};
@@ -60,6 +60,33 @@ pub const EQUALITY_CANDIDATE_CAP: usize = 1024;
 /// more than once must be cloned every time; moving it would hand the
 /// second use a NULL.
 #[inline]
+/// Whether the inner key column is TEXT (true) or a number (false); None for
+/// any other type
+pub(crate) fn inner_key_is_text(
+    table: &dyn Table,
+    strategy: &IndexLookupStrategy,
+    idx: Option<usize>,
+) -> Option<bool> {
+    if matches!(strategy, IndexLookupStrategy::PrimaryKey) {
+        return Some(false);
+    }
+    match table.schema().columns.get(idx?)?.data_type {
+        DataType::Text => Some(true),
+        DataType::Integer | DataType::Float => Some(false),
+        _ => None,
+    }
+}
+
+/// An outer key the comparison reads against the inner column as a number
+/// against a TEXT, which no probe follows
+#[inline]
+pub(crate) fn crosses_inner_key(inner_is_text: Option<bool>, key: &Value) -> bool {
+    matches!(
+        (inner_is_text, key),
+        (Some(true), Value::Integer(_) | Value::Float(_)) | (Some(false), Value::Text(_))
+    )
+}
+
 fn take_or_clone(row: &mut Row, idx: usize, repeats: bool) -> Value {
     if repeats {
         row.as_slice()[idx].clone()
@@ -106,6 +133,8 @@ pub struct IndexNestedLoopJoinOperator {
     // The inner key column, checked on each fetched row: inside a
     // transaction an index entry may be older than the row it points at
     inner_key_idx: Option<usize>,
+    // Whether that column is TEXT or a number, for outer keys no probe answers
+    inner_is_text: Option<bool>,
 
     // Output schema
     schema: Vec<ColumnInfo>,
@@ -230,6 +259,7 @@ impl IndexNestedLoopJoinOperator {
             IndexLookupStrategy::TableEquality { .. } => EQUALITY_CANDIDATE_CAP,
             _ => 16,
         };
+        let inner_is_text = inner_key_is_text(&*inner_table, &lookup_strategy, None);
 
         Self {
             outer,
@@ -239,6 +269,7 @@ impl IndexNestedLoopJoinOperator {
             lookup_strategy,
             residual_filter,
             inner_key_idx: None,
+            inner_is_text,
             schema,
             inner_col_count,
             projection: None,
@@ -298,6 +329,8 @@ impl IndexNestedLoopJoinOperator {
     /// only when its own key equals the outer one
     pub fn with_inner_key(mut self, inner_key_idx: Option<usize>) -> Self {
         self.inner_key_idx = inner_key_idx;
+        self.inner_is_text =
+            inner_key_is_text(&*self.inner_table, &self.lookup_strategy, inner_key_idx);
         self
     }
 
@@ -411,6 +444,10 @@ impl IndexNestedLoopJoinOperator {
         // Clear buffers for reuse
         self.row_id_buffer.clear();
         self.current_inner_rows.clear();
+        if crosses_inner_key(self.inner_is_text, key_value) {
+            self.needs_fallback = true;
+            return Ok(());
+        }
 
         // Get row IDs based on lookup strategy into buffer
         match &self.lookup_strategy {
@@ -676,6 +713,8 @@ pub struct BatchIndexNestedLoopJoinOperator {
     // The inner key column, checked on each fetched row: inside a
     // transaction an index entry may be older than the row it points at
     inner_key_idx: Option<usize>,
+    // Whether that column is TEXT or a number, for outer keys no probe answers
+    inner_is_text: Option<bool>,
 
     // Output schema
     schema: Vec<ColumnInfo>,
@@ -693,6 +732,8 @@ pub struct BatchIndexNestedLoopJoinOperator {
 
     // State
     opened: bool,
+    // Set when an outer key cannot be probed; the join then produced nothing
+    needs_fallback: bool,
 }
 
 impl BatchIndexNestedLoopJoinOperator {
@@ -711,6 +752,7 @@ impl BatchIndexNestedLoopJoinOperator {
         schema.extend(inner_schema.iter().cloned());
 
         let inner_col_count = inner_schema.len();
+        let inner_is_text = inner_key_is_text(&*inner_table, &lookup_strategy, None);
 
         Self {
             outer,
@@ -720,6 +762,7 @@ impl BatchIndexNestedLoopJoinOperator {
             lookup_strategy,
             residual_filter,
             inner_key_idx: None,
+            inner_is_text,
             schema,
             inner_col_count,
             projection: None,
@@ -728,6 +771,7 @@ impl BatchIndexNestedLoopJoinOperator {
             // Pre-allocate buffer for typical number of matches
             row_id_buffer: Vec::with_capacity(16),
             opened: false,
+            needs_fallback: false,
         }
     }
 
@@ -735,7 +779,15 @@ impl BatchIndexNestedLoopJoinOperator {
     /// only when its own key equals the outer one
     pub fn with_inner_key(mut self, inner_key_idx: Option<usize>) -> Self {
         self.inner_key_idx = inner_key_idx;
+        self.inner_is_text =
+            inner_key_is_text(&*self.inner_table, &self.lookup_strategy, inner_key_idx);
         self
+    }
+
+    /// Whether an outer key could not be probed, so the join produced
+    /// nothing and is to be run another way
+    pub fn needs_fallback(&self) -> bool {
+        self.needs_fallback
     }
 
     /// Set projection pushdown configuration.
@@ -842,6 +894,11 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
                     continue;
                 }
             };
+            if crosses_inner_key(self.inner_is_text, &key_value) {
+                self.needs_fallback = true;
+                self.opened = true;
+                return Ok(());
+            }
 
             // Get row IDs based on lookup strategy into reusable buffer
             self.row_id_buffer.clear();

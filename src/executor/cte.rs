@@ -43,7 +43,9 @@ use super::expression::ExpressionEval;
 use super::join_executor::{JoinExecutor, JoinRequest};
 use super::operator::{ColumnInfo, Operator, QueryResultOperator};
 use super::operators::hash_join::JoinType as OperatorJoinType;
-use super::operators::index_nested_loop::{IndexLookupStrategy, IndexNestedLoopJoinOperator};
+use super::operators::index_nested_loop::{
+    crosses_inner_key, inner_key_is_text, IndexLookupStrategy, IndexNestedLoopJoinOperator,
+};
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::ExecutorResult;
 use super::utils::{build_column_index_map, extract_join_keys_and_residual, is_sorted_on_keys};
@@ -815,6 +817,8 @@ impl Executor {
             limit: effective_limit,
             ctx,
             algorithm_hint: Some(&algorithm_decision),
+            left_schema: None,
+            right_schema: None,
         })?;
         let result_rows = join_result.rows;
 
@@ -2444,6 +2448,14 @@ impl Executor {
                 .next()
                 .is_some_and(|name| name.eq_ignore_ascii_case(&table_col_unqualified))
         });
+        // An outer key no probe answers leaves the join to the standard path
+        let inner_is_text = inner_key_is_text(&*table, &lookup_strategy, inner_key_idx);
+        if outer_rows.iter().any(|(_, row)| {
+            row.get(outer_key_idx)
+                .is_some_and(|key| crosses_inner_key(inner_is_text, key))
+        }) {
+            return Ok(None);
+        }
 
         // Parse join type
         let op_join_type = OperatorJoinType::parse(&join_type);

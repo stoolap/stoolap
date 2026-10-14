@@ -97,8 +97,21 @@ impl<'a> PushdownContext<'a> {
     /// rows. A float constant against an INTEGER column converts only when
     /// lossless; otherwise it stays a Float and the storage comparison
     /// compares numerically.
-    pub fn coerce_to_column_type(&self, column: &str, value: Value) -> Value {
-        match (self.column_type(column), &value) {
+    ///
+    /// A TEXT against a numeric column is read as a number by the predicate
+    /// comparison's own rule. None, so nothing is pushed, for unreadable TEXT
+    /// against a numeric column and for a number against a TEXT column.
+    pub fn coerce_to_column_type(&self, column: &str, value: Value) -> Option<Value> {
+        use crate::core::DataType;
+        let column_type = self.column_type(column);
+        let value = match (column_type, value) {
+            (Some(DataType::Integer | DataType::Float), Value::Text(text)) => {
+                crate::core::predicate::parse_sql_number(&text)?
+            }
+            (Some(DataType::Text), Value::Integer(_) | Value::Float(_)) => return None,
+            (_, value) => value,
+        };
+        Some(match (column_type, &value) {
             (Some(crate::core::DataType::Integer), Value::Float(f)) => {
                 match crate::executor::Executor::lossless_float_key(*f) {
                     Some(i) => Value::Integer(i),
@@ -116,7 +129,7 @@ impl<'a> PushdownContext<'a> {
             }
             (Some(col_type), _) => value.into_coerce_to_type(col_type),
             (None, _) => value,
-        }
+        })
     }
 }
 

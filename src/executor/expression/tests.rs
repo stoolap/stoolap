@@ -179,7 +179,10 @@ fn test_in_set() {
 
     let program = Program::new(vec![
         Op::LoadColumn(0),
-        Op::InSet(CompactArc::new(set), false),
+        Op::InSet(CompactArc::new(crate::core::predicate::PredicateSet::new(
+            CompactArc::new(set),
+            false,
+        ))),
         Op::Return,
     ]);
 

@@ -31,7 +31,7 @@ use crate::common::SmartString;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::common::{CompactArc, CompactVec, StringMap};
-use crate::core::{Error, Result, Row, RowVec, Value, ValueSet};
+use crate::core::{DataType, Error, Result, Row, RowVec, Schema, Value, ValueSet};
 use crate::optimizer::ExpressionSimplifier;
 use crate::parser::ast::*;
 use crate::parser::token::{Position, Token, TokenType};
@@ -94,7 +94,7 @@ use super::result::{
 };
 use super::utils::compute_join_projection;
 use super::utils::{
-    add_table_qualifier, build_column_index_map, collect_table_qualifiers,
+    add_table_qualifier, build_column_index_map, collect_table_qualifiers, column_families,
     combine_predicates_with_and, dummy_token, expression_contains_aggregate,
     extract_base_column_name, extract_join_keys_and_residual, filter_references_column,
     flatten_and_predicates, get_table_alias_from_expr, strip_table_qualifier,
@@ -3256,8 +3256,15 @@ impl Executor {
                             && !classification.has_distinct
                             && !classification.has_distinct_on;
                         let use_anti_join = is_pure_not_exists && !has_limit && is_plain_projection;
+                        // Decided before any row is read: an inner WHERE storage
+                        // cannot answer whole leaves NOT EXISTS to the general path
+                        let inner_filter = if use_anti_join {
+                            self.anti_join_inner_filter(&not_exists_info, ctx)
+                        } else {
+                            None
+                        };
 
-                        if use_anti_join {
+                        if let Some(inner_filter) = inner_filter {
                             // Materialize outer table rows
                             let mut outer_rows = table.collect_all_rows(storage_expr.as_deref())?;
 
@@ -3266,6 +3273,7 @@ impl Executor {
                                 &not_exists_info,
                                 CompactArc::new(outer_rows.drain_rows().collect()),
                                 &all_columns,
+                                inner_filter.as_deref(),
                                 ctx,
                             )?;
 
@@ -4627,12 +4635,33 @@ impl Executor {
                 // The join condition u.id = o.user_id means:
                 //   Filter "o.user_id IN (1,2,3)" is equivalent to "u.id IN (1,2,3)" for join results
                 // A small outer keeps the filter the standard join gives it
+                // The equivalence holds only for two keys of one family: a TEXT
+                // key's filter does not carry over to a numeric key or back
+                let same_family = || {
+                    let family = |data_type| match data_type {
+                        Some(DataType::Text) => Some(true),
+                        Some(DataType::Integer | DataType::Float) => Some(false),
+                        _ => None,
+                    };
+                    let column_type = |expr: &Expression, column: &str| {
+                        let name = column.rsplit('.').next().unwrap_or(column);
+                        self.base_table_side_schema(expr, ctx)
+                            .and_then(|schema| schema.get_column_type(name))
+                    };
+                    let inner_expr = if swapped {
+                        &join_source.left
+                    } else {
+                        &join_source.right
+                    };
+                    let inner = family(column_type(inner_expr, &inner_col));
+                    inner.is_none() || inner == family(column_type(outer_expr, &outer_col))
+                };
                 let nl_left_filter = if small_outer {
                     nl_left_filter
                 } else if let Some(ref right_f) = nl_right_filter {
                     // Check if right filter references the inner join key column
                     let references = filter_references_column(right_f, &inner_col);
-                    if references {
+                    if references && same_family() {
                         // Create equivalent filter for outer side by substituting the column
                         if let Some(outer_filter) =
                             substitute_filter_column(right_f, &inner_col, &outer_col)
@@ -5106,7 +5135,7 @@ impl Executor {
                         // Batch INL for NO LIMIT - single batch fetch, O(1) lock overhead
                         let outer_op: Box<dyn Operator> =
                             Box::new(QueryResultOperator::new(outer_result, outer_cols.clone()));
-                        let op = BatchIndexNestedLoopJoinOperator::new(
+                        let mut op = BatchIndexNestedLoopJoinOperator::new(
                             outer_op,
                             inner_table,
                             inner_cols.iter().map(ColumnInfo::new).collect(),
@@ -5116,20 +5145,22 @@ impl Executor {
                             build_residual_filter(),
                         )
                         .with_inner_key(inner_key_idx);
-                        let mut join_op: Box<dyn Operator> =
-                            if let Some(ref proj) = projection_pushdown {
-                                let projected_schema: Vec<ColumnInfo> =
-                                    proj.output_columns.iter().map(ColumnInfo::new).collect();
-                                Box::new(op.with_projection(proj.columns.clone(), projected_schema))
-                            } else {
-                                Box::new(op)
-                            };
+                        if let Some(ref proj) = projection_pushdown {
+                            let projected_schema: Vec<ColumnInfo> =
+                                proj.output_columns.iter().map(ColumnInfo::new).collect();
+                            op = op.with_projection(proj.columns.clone(), projected_schema);
+                        }
                         Self::collect_join_rows(
-                            join_op.as_mut(),
+                            &mut op,
                             None,
                             cross_row_filter.as_ref(),
                             &mut result_rows,
                         )?;
+                        // An outer key no probe answers: the join runs on the
+                        // hash path instead
+                        if op.needs_fallback() {
+                            break 'index_nl;
+                        }
                     }
 
                     // No rotation needed - all_columns matches physical order
@@ -5369,8 +5400,12 @@ impl Executor {
                 .map(|cond| Self::has_equality_condition(cond))
                 .unwrap_or(false);
 
-            // Use streaming path if eligible
-            if let Some(limit) = streaming_limit {
+            // Use streaming path if eligible; sides it ran but could not join
+            // by hash go on to the standard path
+            let streamed = 'streaming: {
+                let Some(limit) = streaming_limit else {
+                    break 'streaming None;
+                };
                 if has_equality_keys_for_streaming {
                     // Estimate cardinalities to choose optimal build side (smaller = build)
                     let left_card = self
@@ -5420,6 +5455,47 @@ impl Executor {
                     } else {
                         (right_key_indices, left_key_indices)
                     };
+
+                    // A key pair where a number may meet a TEXT is no hash key.
+                    // A base table side's schema says what it holds, else the
+                    // build rows do; a probe of no known type is read whole and
+                    // joined by the standard path
+                    let (build_expr, probe_expr) = if build_is_left {
+                        (&join_source.left, &join_source.right)
+                    } else {
+                        (&join_source.right, &join_source.left)
+                    };
+                    let build_schema = self.base_table_side_schema(build_expr, ctx);
+                    let probe_schema = self.base_table_side_schema(probe_expr, ctx);
+                    let unverified = build_key_indices.iter().zip(&probe_key_indices).any(
+                        |(&build_idx, &probe_idx)| {
+                            let (numbers, texts) = column_families(
+                                &build_rows,
+                                &build_cols,
+                                build_schema.as_deref(),
+                                build_idx,
+                            );
+                            if !numbers && !texts {
+                                return false;
+                            }
+                            let probe_column = &probe_cols[probe_idx];
+                            let name = probe_column.rsplit('.').next().unwrap_or(probe_column);
+                            match probe_schema.as_ref().and_then(|s| s.get_column_type(name)) {
+                                Some(DataType::Text) => numbers,
+                                Some(DataType::Integer | DataType::Float) => texts,
+                                Some(_) => false,
+                                None => true,
+                            }
+                        },
+                    );
+                    if unverified {
+                        let probe_rows = Self::materialize_result_arc(probe_result)?;
+                        break 'streaming Some(if build_is_left {
+                            (build_rows, build_cols, probe_rows, probe_cols)
+                        } else {
+                            (probe_rows, probe_cols, build_rows, build_cols)
+                        });
+                    }
 
                     // Convert probe side to streaming operator
                     let probe_source: Box<dyn Operator> =
@@ -5513,46 +5589,52 @@ impl Executor {
                     );
                     return Ok((Box::new(result), output_columns, false, None));
                 }
-            }
+                None
+            };
 
             // =================================================================
             // STANDARD PATH: Materialize both sides
             // =================================================================
 
-            // Execute both sides; a side the index join already ran is taken
-            // as it left it, and the other side is read in the same context
-            let side_ctx = prepared_ctx.as_ref().unwrap_or(ctx);
-            let run_side = |expr: &Expression, filter: Option<&Expression>| {
-                #[cfg(any(test, feature = "test-failpoints"))]
-                crate::test_failpoints::join_side_ran();
-                let (result, columns) =
-                    self.execute_table_expression_with_filter(expr, side_ctx, filter)?;
-                Ok::<_, Error>((Self::materialize_result_arc(result)?, columns))
-            };
-            match prepared_side.take() {
-                Some(PreparedSide {
-                    rows,
-                    columns,
-                    is_right: true,
-                }) => {
-                    let filter = reduced_inner.as_ref().or(left_filter.as_ref());
-                    let (left_rows, left_cols) = run_side(&join_source.left, filter)?;
-                    (left_rows, left_cols, rows.into_rows()?, columns)
-                }
-                Some(PreparedSide {
-                    rows,
-                    columns,
-                    is_right: false,
-                }) => {
-                    let filter = reduced_inner.as_ref().or(right_filter.as_ref());
-                    let (right_rows, right_cols) = run_side(&join_source.right, filter)?;
-                    (rows.into_rows()?, columns, right_rows, right_cols)
-                }
-                None => {
-                    let (left_rows, left_cols) = run_side(&join_source.left, left_filter.as_ref())?;
-                    let (right_rows, right_cols) =
-                        run_side(&join_source.right, right_filter.as_ref())?;
-                    (left_rows, left_cols, right_rows, right_cols)
+            if let Some(sides) = streamed {
+                sides
+            } else {
+                // Execute both sides; a side the index join already ran is taken
+                // as it left it, and the other side is read in the same context
+                let side_ctx = prepared_ctx.as_ref().unwrap_or(ctx);
+                let run_side = |expr: &Expression, filter: Option<&Expression>| {
+                    #[cfg(any(test, feature = "test-failpoints"))]
+                    crate::test_failpoints::join_side_ran();
+                    let (result, columns) =
+                        self.execute_table_expression_with_filter(expr, side_ctx, filter)?;
+                    Ok::<_, Error>((Self::materialize_result_arc(result)?, columns))
+                };
+                match prepared_side.take() {
+                    Some(PreparedSide {
+                        rows,
+                        columns,
+                        is_right: true,
+                    }) => {
+                        let filter = reduced_inner.as_ref().or(left_filter.as_ref());
+                        let (left_rows, left_cols) = run_side(&join_source.left, filter)?;
+                        (left_rows, left_cols, rows.into_rows()?, columns)
+                    }
+                    Some(PreparedSide {
+                        rows,
+                        columns,
+                        is_right: false,
+                    }) => {
+                        let filter = reduced_inner.as_ref().or(right_filter.as_ref());
+                        let (right_rows, right_cols) = run_side(&join_source.right, filter)?;
+                        (rows.into_rows()?, columns, right_rows, right_cols)
+                    }
+                    None => {
+                        let (left_rows, left_cols) =
+                            run_side(&join_source.left, left_filter.as_ref())?;
+                        let (right_rows, right_cols) =
+                            run_side(&join_source.right, right_filter.as_ref())?;
+                        (left_rows, left_cols, right_rows, right_cols)
+                    }
                 }
             }
         };
@@ -5749,6 +5831,8 @@ impl Executor {
             limit: join_limit,
             ctx,
             algorithm_hint: Some(&algorithm_decision),
+            left_schema: self.base_table_side_schema(&join_source.left, ctx),
+            right_schema: self.base_table_side_schema(&join_source.right, ctx),
         };
 
         let join_result = join_executor.execute(join_request)?;
@@ -11468,6 +11552,27 @@ impl Executor {
             Ok(Some(_)) => JoinIndexUse::Grouped,
             _ => JoinIndexUse::None,
         }
+    }
+
+    /// The schema of a join side that reads a base table directly; None for
+    /// a CTE, a view, a subquery or any other source
+    fn base_table_side_schema(
+        &self,
+        expr: &Expression,
+        ctx: &ExecutionContext,
+    ) -> Option<CompactArc<Schema>> {
+        let ts = match expr {
+            Expression::TableSource(ts) => ts,
+            Expression::Aliased(aliased) => match aliased.expression.as_ref() {
+                Expression::TableSource(ts) => ts,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if ctx.get_cte_by_lower(&ts.name.value_lower).is_some() {
+            return None;
+        }
+        self.engine.get_table_schema(&ts.name.value_lower).ok()
     }
 
     #[allow(clippy::too_many_arguments)]

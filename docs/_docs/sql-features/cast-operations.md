@@ -167,10 +167,15 @@ Stoolap performs implicit type conversion in these contexts:
    SELECT 1 + 2.5;  -- INTEGER implicitly converted to FLOAT
    ```
 
-2. **Comparison operations**: When comparing different types
+2. **Comparison operations**: When a number is compared with a TEXT, the TEXT is read as a number
    ```sql
-   SELECT * FROM table WHERE id = '100';  -- String implicitly converted to INTEGER
+   SELECT * FROM table WHERE id = '100';  -- '100' is read as the number 100
+   SELECT 1 = '01';                       -- true
+   SELECT 1 < '1.5';                      -- true
+   SELECT '01' = '1';                     -- false: two TEXT values compare as text
+   SELECT 1 = 'abc';                      -- NULL: 'abc' is not a number
    ```
+   A TEXT reads as a number when it has the form `[+-]digits[.digits][e[+-]digits]`, with no spaces. Integral values that fit a 64-bit integer are compared exactly; others are compared as FLOAT. A TEXT that is not a number makes the comparison unknown (NULL), so `1 IS DISTINCT FROM 'abc'` is true and `1 IN ('abc', 2)` is NULL. The same rule applies to `=`, `<>`, `<`, `<=`, `>`, `>=`, `IS [NOT] DISTINCT FROM`, `BETWEEN`, `IN` lists and subqueries, `EXISTS`, and join conditions, whichever plan or index the query uses.
 
 3. **Function arguments**: When a function expects specific types
    ```sql

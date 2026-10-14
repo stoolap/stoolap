@@ -24,7 +24,7 @@
 use std::sync::Arc;
 
 use crate::common::{CompactArc, I64Set};
-use crate::core::{Result, Row, RowVec, Value, ValueSet};
+use crate::core::{DataType, Result, Row, RowVec, Value, ValueSet};
 use crate::parser::ast::*;
 use crate::storage::traits::{QueryResult, Table};
 
@@ -42,6 +42,47 @@ const FETCH_BATCH_ROWS: usize = 1024;
 /// The most candidate ids an IN list's members may name in all, 512 KiB
 /// of ids, before the members are read by a scan instead
 const IN_CANDIDATE_CAP: usize = 65_536;
+
+/// What a row must be to a set of values to be kept
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SetTest {
+    /// `x IN set` holds
+    In,
+    /// `x NOT IN set` holds: no member equals x and none is UNKNOWN to it
+    NotIn,
+    /// No member equals x, as NOT EXISTS asks: an UNKNOWN member is no match
+    NoMatch,
+}
+
+/// The members of a set as the comparison reads them against a numeric
+/// column: the numbers, a TEXT read as one; and whether a member was UNKNOWN
+/// to every number, a NULL or a TEXT that is no number
+fn numeric_members<'a>(members: impl Iterator<Item = &'a Value>) -> (Vec<Value>, bool) {
+    let mut numbers = Vec::new();
+    let mut unknown = false;
+    for member in members {
+        match member {
+            Value::Integer(_) | Value::Float(_) => numbers.push(member.clone()),
+            Value::Text(text) => match crate::core::predicate::parse_sql_number(text) {
+                Some(number) => numbers.push(number),
+                None => unknown = true,
+            },
+            Value::Null(_) => unknown = true,
+            _ => {}
+        }
+    }
+    (numbers, unknown)
+}
+
+/// Whether a set holds a TEXT, which a numeric column reads as a number
+fn has_text<'a>(mut members: impl Iterator<Item = &'a Value>) -> bool {
+    members.any(|v| matches!(v, Value::Text(_)))
+}
+
+/// Whether a set holds a number, which a TEXT column cannot be probed for
+fn has_number<'a>(mut members: impl Iterator<Item = &'a Value>) -> bool {
+    members.any(|v| matches!(v, Value::Integer(_) | Value::Float(_)))
+}
 
 /// Pre-compiled projection slot for vector search results.
 /// Built once, applied per row — avoids per-row expression compilation.
@@ -990,6 +1031,50 @@ impl Executor {
                 .is_some_and(|index| index.index_type() == crate::core::IndexType::BTree)
     }
 
+    /// The rows whose column is IN the members, by a scan that asks each
+    /// row the predicate comparison, with the remaining predicate
+    fn rows_in_members_by_scan(
+        &self,
+        table: &dyn Table,
+        column: &str,
+        members: Vec<Value>,
+        remaining: Option<&Expression>,
+        all_columns: &[String],
+        ctx: &ExecutionContext,
+    ) -> Result<RowVec> {
+        let token = crate::executor::utils::dummy_token_clone;
+        let membership = Expression::InHashSet(InHashSetExpression {
+            token: token(),
+            column: Box::new(Expression::Identifier(Identifier::new(
+                token(),
+                column.to_string(),
+            ))),
+            values: CompactArc::new(members.into_iter().collect()),
+            not: false,
+        });
+        let membership = RowFilter::new(&membership, all_columns)?.with_context(ctx);
+        let remaining = self.remaining_row_filter(remaining, all_columns, ctx)?;
+        let columns: Vec<usize> = (0..table.schema().columns.len()).collect();
+        let mut scanner = table.scan(&columns, None)?;
+        let mut rows = RowVec::new();
+        while scanner.next() {
+            let row_id = scanner.current_row_id();
+            let row = scanner.take_row();
+            if membership.matches_checked(&row)?
+                && remaining
+                    .as_ref()
+                    .map_or(Ok(true), |filter| filter.matches_checked(&row))?
+            {
+                rows.push((row_id, row));
+            }
+        }
+        if let Some(error) = scanner.err() {
+            return Err(error.clone());
+        }
+        scanner.close()?;
+        Ok(rows)
+    }
+
     /// The filter of the conjuncts beside an IN, its subqueries run
     fn remaining_row_filter(
         &self,
@@ -1260,6 +1345,31 @@ impl Executor {
             values
         };
 
+        // The members as the comparison reads them against the column. A
+        // member UNKNOWN to every number leaves NOT IN true for no row; a
+        // TEXT column is read by a scan for a set holding a number
+        let mut text_scan = false;
+        match schema.get_column_type(&column_name) {
+            Some(DataType::Integer | DataType::Float) if has_text(values.iter()) => {
+                let (numbers, unknown) = numeric_members(values.iter());
+                if is_negated && unknown {
+                    let output_columns = CompactArc::new(self.get_output_column_names(
+                        &stmt.columns,
+                        all_columns,
+                        table_alias,
+                    ));
+                    let result = ExecutorResult::with_arc_columns(
+                        CompactArc::clone(&output_columns),
+                        RowVec::new(),
+                    );
+                    return Ok(Some((Box::new(result), output_columns, true)));
+                }
+                values = numbers;
+            }
+            Some(DataType::Text) if !is_negated && has_number(values.iter()) => text_scan = true,
+            _ => {}
+        }
+
         if values.is_empty() {
             // Empty subquery result
             if is_negated {
@@ -1283,7 +1393,16 @@ impl Executor {
         // A table that keeps rows outside its index: the members' rows by
         // its candidates, else by a scan of the members already taken, so
         // the subquery does not run again
-        let member_rows = if !is_pk_column && index.is_none() {
+        let member_rows = if text_scan {
+            Some(self.rows_in_members_by_scan(
+                table,
+                &column_name,
+                std::mem::take(&mut values),
+                remaining_predicate.as_ref(),
+                all_columns,
+                ctx,
+            )?)
+        } else if !is_pk_column && index.is_none() {
             Self::in_member_rows(
                 table,
                 &column_name,
@@ -1581,6 +1700,18 @@ impl Executor {
         // classification is passed from caller to avoid redundant cache lookups
         if classification.select_has_correlated_subqueries {
             return Ok(None);
+        }
+
+        // The members as the comparison reads them against the column; a
+        // number against a TEXT column is left to the scan
+        if !is_negated {
+            match schema.get_column_type(&column_name) {
+                Some(DataType::Integer | DataType::Float) => {
+                    values = numeric_members(values.iter()).0;
+                }
+                Some(DataType::Text) if has_number(values.iter()) => return Ok(None),
+                _ => {}
+            }
         }
 
         // A secondary index probe collects every matching row id for every
@@ -1969,12 +2100,13 @@ impl Executor {
         table_alias: Option<&str>,
         ctx: &ExecutionContext,
     ) -> Result<Option<(Box<dyn QueryResult>, CompactArc<Vec<String>>, bool)>> {
-        // Extract InHashSet info: (column_name, values, is_negated, remaining_predicate)
-        let (column_name, values, is_negated, remaining_predicate) =
+        // Extract InHashSet info: (column_name, values, test, remaining_predicate)
+        let (column_name, values, test, remaining_predicate) =
             match Self::extract_in_hashset_info(where_expr) {
                 Some(info) => info,
                 None => return Ok(None),
             };
+        let is_negated = test != SetTest::In;
         // LIMIT and OFFSET can be applied here only when nothing runs on the
         // rows afterwards: no ORDER BY to sort them and no DISTINCT to merge them
         let limit_here = stmt.order_by.is_empty() && !stmt.distinct && stmt.distinct_on.is_empty();
@@ -1992,6 +2124,30 @@ impl Executor {
         if is_negated && !is_pk_column {
             return Ok(None);
         }
+
+        // The members as the comparison reads them against the column. A
+        // member UNKNOWN to every number leaves NOT IN true for no row and is
+        // no match to NOT EXISTS; a TEXT column is not probed for a number
+        let values = match schema.get_column_type(&column_name) {
+            Some(DataType::Integer | DataType::Float) if has_text(values.iter()) => {
+                let (numbers, unknown) = numeric_members(values.iter());
+                if test == SetTest::NotIn && unknown {
+                    let output_columns = CompactArc::new(self.get_output_column_names(
+                        &stmt.columns,
+                        all_columns,
+                        table_alias,
+                    ));
+                    let result = ExecutorResult::with_arc_columns(
+                        CompactArc::clone(&output_columns),
+                        RowVec::new(),
+                    );
+                    return Ok(Some((Box::new(result), output_columns, true)));
+                }
+                CompactArc::new(numbers.into_iter().collect::<ValueSet>())
+            }
+            Some(DataType::Text) if has_number(values.iter()) => return Ok(None),
+            _ => values,
+        };
 
         // If not PK, check for index (only for non-negated IN); a table that
         // keeps rows outside its index reads the members by its candidates,
@@ -2275,11 +2431,16 @@ impl Executor {
     }
 
     /// Extract InHashSet information from a WHERE clause.
-    /// Returns (column_name, hash_set_values, is_negated, remaining_predicate)
+    /// Returns (column_name, hash_set_values, test, remaining_predicate)
     #[allow(clippy::type_complexity)]
     pub(crate) fn extract_in_hashset_info(
         expr: &Expression,
-    ) -> Option<(String, CompactArc<ValueSet>, bool, Option<Expression>)> {
+    ) -> Option<(String, CompactArc<ValueSet>, SetTest, Option<Expression>)> {
+        let column_of = |in_hash: &InHashSetExpression| match in_hash.column.as_ref() {
+            Expression::Identifier(id) => Some(id.value_lower.to_string()),
+            Expression::QualifiedIdentifier(qid) => Some(qid.name.value_lower.to_string()),
+            _ => None, // Can't optimize complex column expressions
+        };
         match expr {
             // Direct InHashSet: column IN {hash_set}
             Expression::InHashSet(in_hash) => {
@@ -2288,51 +2449,34 @@ impl Executor {
                 if in_hash.not && in_hash.values.contains(&Value::null_unknown()) {
                     return None;
                 }
-                // Get the column name from the column expression (lowercase for case-insensitive match)
-                let column_name = match in_hash.column.as_ref() {
-                    Expression::Identifier(id) => id.value_lower.to_string(),
-                    Expression::QualifiedIdentifier(qid) => qid.name.value_lower.to_string(),
-                    _ => return None, // Can't optimize complex column expressions
+                let test = if in_hash.not {
+                    SetTest::NotIn
+                } else {
+                    SetTest::In
                 };
-
-                Some((column_name, in_hash.values.clone(), in_hash.not, None))
+                Some((column_of(in_hash)?, in_hash.values.clone(), test, None))
             }
 
-            // A NOT EXISTS rewrite keeps a NULL outer value beside the
-            // negated set: column NOT IN {hash_set} OR column IS NULL. The
-            // negated set is only probed on a primary key, which holds no
-            // NULL, so the second side never fires there
-            Expression::Infix(infix) if infix.op_type == InfixOperator::Or => {
-                // Only the bare negated set qualifies: a set holding a NULL
-                // keeps no row, and a conjunct beside the set would be lost
+            // The NOT EXISTS rewrite: (column IN {hash_set}) IS NOT TRUE
+            Expression::Infix(infix)
+                if infix.op_type == InfixOperator::IsNot
+                    && matches!(
+                        infix.right.as_ref(),
+                        Expression::BooleanLiteral(BooleanLiteral { value: true, .. })
+                    ) =>
+            {
                 let Expression::InHashSet(in_hash) = infix.left.as_ref() else {
                     return None;
                 };
-                if !in_hash.not || in_hash.values.contains(&Value::null_unknown()) {
+                if in_hash.not {
                     return None;
                 }
-                let column_name = match in_hash.column.as_ref() {
-                    Expression::Identifier(id) => id.value_lower.to_string(),
-                    Expression::QualifiedIdentifier(qid) => qid.name.value_lower.to_string(),
-                    _ => return None,
-                };
-                let values = in_hash.values.clone();
-                match infix.right.as_ref() {
-                    Expression::Infix(is_null)
-                        if is_null.operator.eq_ignore_ascii_case("IS")
-                            && matches!(is_null.right.as_ref(), Expression::NullLiteral(_)) =>
-                    {
-                        let same_column = match is_null.left.as_ref() {
-                            Expression::Identifier(id) => id.value_lower == column_name,
-                            Expression::QualifiedIdentifier(qid) => {
-                                qid.name.value_lower == column_name
-                            }
-                            _ => false,
-                        };
-                        same_column.then_some((column_name, values, true, None))
-                    }
-                    _ => None,
-                }
+                Some((
+                    column_of(in_hash)?,
+                    in_hash.values.clone(),
+                    SetTest::NoMatch,
+                    None,
+                ))
             }
 
             // InHashSet with AND: column IN {hash_set} AND other_condition
@@ -2636,7 +2780,8 @@ impl Executor {
             // Collect rows — push WHERE to storage level for index-accelerated filtering
             let scan_rows = if let Some(ref where_expr) = stmt.where_clause {
                 // Try storage-level pushdown (uses indexes when available)
-                let storage_expr = super::expr_converter::convert_ast_to_storage_expr(where_expr);
+                let (storage_expr, _) =
+                    super::pushdown::try_pushdown(where_expr, schema, Some(ctx));
                 let rows = table.collect_all_rows(storage_expr.as_deref())?;
                 // Storage may not handle all predicates — apply residual in-memory filter
                 if let Some(ref filter) = where_filter {

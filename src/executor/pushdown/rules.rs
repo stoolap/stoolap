@@ -158,7 +158,7 @@ fn extract_comparison_parts(
     if let Some(column) = extract_column_name(left) {
         if ctx.has_column(&column) {
             if let Some(value) = extract_literal_with_ctx(right, ctx) {
-                let coerced = ctx.coerce_to_column_type(&column, value);
+                let coerced = ctx.coerce_to_column_type(&column, value)?;
                 return Some((column, coerced, false)); // false = not flipped
             }
         }
@@ -168,7 +168,7 @@ fn extract_comparison_parts(
     if let Some(column) = extract_column_name(right) {
         if ctx.has_column(&column) {
             if let Some(value) = extract_literal_with_ctx(left, ctx) {
-                let coerced = ctx.coerce_to_column_type(&column, value);
+                let coerced = ctx.coerce_to_column_type(&column, value)?;
                 return Some((column, coerced, true)); // true = flipped
             }
         }
@@ -419,13 +419,17 @@ impl PushdownRule for BetweenRule {
             return PushdownResult::CannotPush;
         }
 
-        let lower = match extract_literal_with_ctx(&between.lower, ctx) {
-            Some(v) => ctx.coerce_to_column_type(&column, v),
+        let lower = match extract_literal_with_ctx(&between.lower, ctx)
+            .and_then(|v| ctx.coerce_to_column_type(&column, v))
+        {
+            Some(v) => v,
             None => return PushdownResult::CannotPush,
         };
 
-        let upper = match extract_literal_with_ctx(&between.upper, ctx) {
-            Some(v) => ctx.coerce_to_column_type(&column, v),
+        let upper = match extract_literal_with_ctx(&between.upper, ctx)
+            .and_then(|v| ctx.coerce_to_column_type(&column, v))
+        {
+            Some(v) => v,
             None => return PushdownResult::CannotPush,
         };
 
@@ -472,10 +476,14 @@ impl PushdownRule for InListRule {
         };
 
         // Coerce values to column type
-        let coerced_values: Vec<Value> = values
+        let coerced_values: Vec<Value> = match values
             .into_iter()
             .map(|v| ctx.coerce_to_column_type(&column, v))
-            .collect();
+            .collect()
+        {
+            Some(v) => v,
+            None => return PushdownResult::CannotPush,
+        };
 
         let mut expr = if in_expr.not {
             InListExpr::not_in(column, coerced_values)

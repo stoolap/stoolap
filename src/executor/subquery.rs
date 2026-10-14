@@ -41,14 +41,16 @@ use super::context::{
     get_cached_in_subquery_set, get_cached_scalar_subquery, get_cached_semi_join,
     get_exists_probe_fallback, BatchAggregateLookupInfo, ExecutionContext, ExistsCorrelationInfo,
 };
-use super::expr_converter::convert_ast_to_storage_expr;
 use super::expression::compute_expression_hash;
+use super::index_optimizer::SetTest;
 use super::operator::{ColumnInfo, MaterializedOperator, Operator};
 use super::operators::hash_join::{HashJoinOperator, JoinSide, JoinType};
-use super::operators::index_nested_loop::EQUALITY_CANDIDATE_CAP;
+use super::operators::index_nested_loop::{crosses_inner_key, EQUALITY_CANDIDATE_CAP};
 use super::query_cache::check_compiled_token;
-use super::utils::{dummy_token, dummy_token_clone, value_to_expression};
+use super::utils::{dummy_token, dummy_token_clone, number_text_key_pair, value_to_expression};
 use super::Executor;
+use crate::core::predicate::PredicateSet;
+use crate::core::{DataType, NULL_VALUE};
 
 // ============================================================================
 // Constants
@@ -666,7 +668,7 @@ impl Executor {
     ) -> Result<Option<bool>> {
         let subquery_ptr = subquery as *const SelectStatement as usize;
         if let Some(known) = get_exists_probe_fallback(subquery_ptr) {
-            return Ok(known.map(|set| set.contains(key)));
+            return Ok(known.map(|set| set.contains(key) == Some(true)));
         }
         let sealed = self
             .with_correlated_probe_table(ctx, &correlation.inner_table, |table| {
@@ -690,8 +692,10 @@ impl Executor {
             non_correlated_where: None,
             is_negated: false,
         };
-        let set = self.execute_semi_join_optimization(&info, ctx)?;
-        let found = set.contains(key);
+        let members = self.execute_semi_join_optimization(&info, ctx)?;
+        let has_null = members.contains(&Value::null_unknown());
+        let set = CompactArc::new(PredicateSet::new(members, has_null));
+        let found = set.contains(key) == Some(true);
         cache_exists_probe_fallback(subquery_ptr, Some(set));
         Ok(Some(found))
     }
@@ -1301,6 +1305,16 @@ impl Executor {
             else {
                 return Ok(None);
             };
+            // A key the comparison reads as a number against a TEXT column, or
+            // back, is no key the index holds
+            let inner_is_text = match table.schema().columns[key_idx].data_type {
+                DataType::Text => Some(true),
+                DataType::Integer | DataType::Float => Some(false),
+                _ => None,
+            };
+            if crosses_inner_key(inner_is_text, key) {
+                return Ok(None);
+            }
             PROBE_BUFFERS.with(|cell| {
                 let mut fresh = ProbeBuffers::default();
                 let mut held = cell.try_borrow_mut();
@@ -4303,6 +4317,25 @@ impl Executor {
         Ok(hash_set_arc)
     }
 
+    /// The inner WHERE of a NOT EXISTS as the storage filter the anti-join
+    /// reads the inner rows by: Some(None) for no WHERE, None when storage
+    /// cannot answer all of it, which the anti-join has no memory filter for
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn anti_join_inner_filter(
+        &self,
+        info: &SemiJoinInfo,
+        ctx: &ExecutionContext,
+    ) -> Option<Option<Box<dyn crate::storage::expression::Expression>>> {
+        let Some(where_expr) = info.non_correlated_where.as_ref() else {
+            return Some(None);
+        };
+        let schema = self.engine.get_table_schema(&info.inner_table).ok()?;
+        match super::pushdown::try_pushdown(where_expr, &schema, Some(ctx)) {
+            (Some(filter), false) => Some(Some(filter)),
+            _ => None,
+        }
+    }
+
     /// Execute NOT EXISTS as a true anti-join using HashJoinOperator.
     ///
     /// This is more efficient than the InHashSet approach because:
@@ -4324,21 +4357,15 @@ impl Executor {
         info: &SemiJoinInfo,
         outer_rows: CompactArc<Vec<crate::core::Row>>,
         outer_columns: &[String],
+        inner_filter: Option<&dyn crate::storage::expression::Expression>,
         _ctx: &ExecutionContext,
     ) -> Result<crate::core::RowVec> {
         // Direct table access - much faster than going through execute_select
         let txn = self.engine.begin_transaction()?;
         let inner_table = txn.get_table(&info.inner_table)?;
 
-        // Convert non-correlated WHERE to storage expression for pushdown
-        let storage_expr = info
-            .non_correlated_where
-            .as_ref()
-            .and_then(|arc| convert_ast_to_storage_expr(arc.as_ref()));
-
         // Get inner table rows with filter pushed down to storage layer
-        let inner_all_rows =
-            inner_table.collect_all_rows(storage_expr.as_ref().map(|e| e.as_ref()))?;
+        let inner_all_rows = inner_table.collect_all_rows(inner_filter)?;
 
         // Find the inner column index for join key extraction
         // Use schema's cached lowercase column names to avoid computing to_lowercase()
@@ -4401,6 +4428,21 @@ impl Executor {
                 })?
         };
 
+        // A number against a TEXT is no hash key: each outer row is asked the
+        // predicate comparison against the inner keys, and kept when none is
+        // equal to it
+        if number_text_key_pair(&outer_rows, outer_key_idx, &inner_rows, 0) {
+            let keys = PredicateSet::new(CompactArc::new(seen), false);
+            let mut result_rows = crate::core::RowVec::new();
+            for row in outer_rows.iter() {
+                let key = row.get(outer_key_idx).unwrap_or(&NULL_VALUE);
+                if keys.contains(key) != Some(true) {
+                    result_rows.push((result_rows.len() as i64, row.clone()));
+                }
+            }
+            return Ok(result_rows);
+        }
+
         // Inner column is always index 0 (we extracted only the join key)
         let inner_key_idx = 0;
 
@@ -4458,16 +4500,17 @@ impl Executor {
     /// Transform a WHERE clause with EXISTS into one using a pre-computed hash set.
     ///
     /// Replaces: EXISTS (SELECT ...) with: outer_col IN (hash_set_values)
-    pub fn transform_exists_to_in_list(
+    pub(crate) fn transform_exists_to_in_list(
         info: &SemiJoinInfo,
         hash_set: CompactArc<ValueSet>,
+        test: SetTest,
     ) -> Expression {
         // For empty hash set, return FALSE (no matches exist)
         // For NOT EXISTS with empty set, return TRUE (nothing exists to negate)
         if hash_set.is_empty() {
             return Expression::BooleanLiteral(BooleanLiteral {
                 token: dummy_token_clone(),
-                value: info.is_negated,
+                value: test != SetTest::In,
             });
         }
 
@@ -4484,51 +4527,28 @@ impl Executor {
             ))
         };
 
-        // EXISTS asks whether an inner row equals the outer value, and a
-        // NULL on either side equals nothing. IN reads it differently: a
-        // NULL outer value, or a NULL among the members, leaves the answer
-        // unknown. For EXISTS the unknown is the same as false in a filter;
-        // for NOT EXISTS it is not, since the answer there is true. So the
-        // negated set is asked without its NULLs, and an outer NULL, which
-        // no inner row can match, is kept alongside
-        let (hash_set, not) = if info.is_negated && hash_set.contains(&Value::null_unknown()) {
-            let without_nulls: ValueSet =
-                hash_set.iter().filter(|v| !v.is_null()).cloned().collect();
-            if without_nulls.is_empty() {
-                return Expression::BooleanLiteral(BooleanLiteral {
-                    token: dummy_token_clone(),
-                    value: true,
-                });
-            }
-            (CompactArc::new(without_nulls), true)
-        } else {
-            (hash_set, info.is_negated)
-        };
-
         // Use InHashSet with Arc for O(1) lookup and cheap cloning in parallel execution
         let membership = Expression::InHashSet(InHashSetExpression {
             token: dummy_token_clone(),
-            column: Box::new(outer_col_expr.clone()),
+            column: Box::new(outer_col_expr),
             values: hash_set, // Already Arc, no wrapping needed
-            not,
+            not: test == SetTest::NotIn,
         });
-        if !not {
+        if test != SetTest::NoMatch {
             return membership;
         }
 
-        let outer_is_null = Expression::Infix(InfixExpression::new(
-            dummy_token_clone(),
-            Box::new(outer_col_expr),
-            "IS".to_string(),
-            Box::new(Expression::NullLiteral(NullLiteral {
-                token: dummy_token_clone(),
-            })),
-        ));
+        // NOT EXISTS holds where no inner row equals the outer value: where
+        // the membership is FALSE, and where it is UNKNOWN, by a NULL or by
+        // a value the comparison cannot read against a member
         Expression::Infix(InfixExpression::new(
             dummy_token_clone(),
             Box::new(membership),
-            "OR".to_string(),
-            Box::new(outer_is_null),
+            "IS NOT".to_string(),
+            Box::new(Expression::BooleanLiteral(BooleanLiteral {
+                token: dummy_token_clone(),
+                value: true,
+            })),
         ))
     }
 
@@ -4559,7 +4579,11 @@ impl Executor {
                     // Semi-join optimization: execute inner query once, collect into hash set
                     // This enables InHashSet optimization to probe outer table's PK directly
                     let hash_set = self.execute_semi_join_optimization(&info, ctx)?;
-                    return Ok(Some(Self::transform_exists_to_in_list(&info, hash_set)));
+                    return Ok(Some(Self::transform_exists_to_in_list(
+                        &info,
+                        hash_set,
+                        SetTest::In,
+                    )));
                 }
                 Ok(None)
             }
@@ -4573,7 +4597,11 @@ impl Executor {
                             return Ok(None); // Skip semi-join, use index probing per row
                         }
                         let hash_set = self.execute_semi_join_optimization(&info, ctx)?;
-                        return Ok(Some(Self::transform_exists_to_in_list(&info, hash_set)));
+                        return Ok(Some(Self::transform_exists_to_in_list(
+                            &info,
+                            hash_set,
+                            SetTest::NoMatch,
+                        )));
                     }
                 }
                 Ok(None)
@@ -4719,7 +4747,14 @@ impl Executor {
                                 value: false,
                             })));
                         }
-                        return Ok(Some(Self::transform_exists_to_in_list(&info, hash_set)));
+                        let test = if info.is_negated {
+                            SetTest::NotIn
+                        } else {
+                            SetTest::In
+                        };
+                        return Ok(Some(Self::transform_exists_to_in_list(
+                            &info, hash_set, test,
+                        )));
                     }
                 }
                 Ok(None)
