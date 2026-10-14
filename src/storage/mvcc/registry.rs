@@ -407,6 +407,7 @@ impl Drop for StatementView {
         let mut txns = self.registry.transactions.lock();
         if let Some(position) = txns.views.iter().position(|view| view.id == self.id) {
             txns.views.swap_remove(position);
+            self.registry.live_views.fetch_sub(1, Ordering::Release);
         }
     }
 }
@@ -460,6 +461,9 @@ pub struct TransactionRegistry {
 
     /// The number the next statement view takes
     next_view_id: AtomicU64,
+
+    /// The number of live statement views; written under the transactions lock
+    live_views: AtomicUsize,
 }
 
 impl TransactionRegistry {
@@ -484,6 +488,7 @@ impl TransactionRegistry {
             base: AtomicI64::new(1),
             aborted_floor: AtomicI64::new(0),
             next_view_id: AtomicU64::new(0),
+            live_views: AtomicUsize::new(0),
         }
     }
 
@@ -667,15 +672,8 @@ impl TransactionRegistry {
         Vec::new()
     }
 
-    /// Get the minimum begin_seq among active snapshot isolation transactions.
-    /// Returns None if no snapshot transactions are active (seal/compaction can proceed freely).
-    /// Returns Some(min_begin_seq) otherwise — only rows committed before this seq are safe to seal.
-    pub fn get_min_snapshot_begin_seq(&self) -> Option<i64> {
-        let transactions = self.transactions.lock();
-        self.min_snapshot_begin(&transactions)
-    }
-
-    /// [`Self::get_min_snapshot_begin_seq`] for a caller holding the lock
+    /// The minimum begin_seq among active snapshot isolation transactions,
+    /// None with none, for a caller holding the lock
     fn min_snapshot_begin(&self, transactions: &TxnTable) -> Option<i64> {
         let global = self.global_isolation_level.load(Ordering::Relaxed);
         if global == 1 {
@@ -1164,6 +1162,7 @@ impl TransactionRegistry {
         let in_flight: SmallVec<[i64; 4]> = txns.committing.iter().copied().collect();
         let floor = in_flight.iter().min().map_or(seq, |&s| s - 1);
         txns.views.push(LiveView { id, floor, base });
+        self.live_views.fetch_add(1, Ordering::Release);
         drop(txns);
         Arc::new(StatementView {
             registry: Arc::clone(self),
@@ -1185,6 +1184,19 @@ impl TransactionRegistry {
         drop(txns);
         let limit = views.map_or(completed, |floor| floor.min(completed)) + 1;
         snapshot.map_or(limit, |begin| begin.min(limit))
+    }
+
+    /// Every commit at or below the returned sequence is seen by every open
+    /// snapshot and live view; None with neither. It says nothing about
+    /// commits still in flight: a caller classifies by state first
+    pub fn min_reader_seq(&self) -> Option<i64> {
+        let txns = self.transactions.lock();
+        let snapshot = self.min_snapshot_begin(&txns);
+        let views = txns.views.iter().map(|view| view.floor).min();
+        match (snapshot, views) {
+            (Some(begin), Some(floor)) => Some(begin.min(floor)),
+            (begin, floor) => begin.or(floor),
+        }
     }
 
     /// Whether `version_txn_id`'s version is visible to a statement of
@@ -1507,15 +1519,6 @@ impl VisibilityChecker for TransactionRegistry {
         TransactionRegistry::get_current_sequence(self)
     }
 
-    fn get_active_transaction_ids(&self) -> Vec<i64> {
-        self.transactions
-            .lock()
-            .iter()
-            .filter(|(_, s)| s.status() == TxnStatus::Active)
-            .map(|(id, _)| id)
-            .collect()
-    }
-
     fn is_committed_before(&self, txn_id: i64, cutoff_commit_seq: i64) -> bool {
         TransactionRegistry::is_committed_before(self, txn_id, cutoff_commit_seq)
     }
@@ -1541,13 +1544,18 @@ impl VisibilityChecker for TransactionRegistry {
         }
     }
 
-    fn oldest_snapshot_begin_seq(&self) -> Option<i64> {
+    fn maintenance_limit(&self) -> i64 {
+        TransactionRegistry::maintenance_limit(self)
+    }
+
+    fn history_limit(&self) -> Option<i64> {
         if self.global_isolation_level.load(Ordering::Relaxed) != 1
             && self.override_count.load(Ordering::Relaxed) == 0
+            && self.live_views.load(Ordering::Acquire) == 0
         {
             return None;
         }
-        self.get_min_snapshot_begin_seq()
+        Some(TransactionRegistry::maintenance_limit(self))
     }
 }
 
