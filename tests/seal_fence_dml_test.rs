@@ -965,3 +965,35 @@ fn a_new_sealed_row_is_checked_with_the_key_it_is_published_with() {
         "row 2 took row 1's sealed key: {updated:?}"
     );
 }
+
+#[test]
+fn a_sealed_row_another_transaction_deleted_and_collected_is_not_updated_back() {
+    use stoolap::core::IsolationLevel;
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 20)", ())
+        .unwrap();
+    db.engine().seal_for_test().unwrap();
+    let mut txn = db
+        .begin_with_isolation(IsolationLevel::SnapshotIsolation)
+        .unwrap();
+    let seen: i64 = txn.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
+    assert_eq!(seen, 2);
+    let other = db.clone();
+    std::thread::spawn(move || other.execute("DELETE FROM t WHERE id = 1", ()).unwrap())
+        .join()
+        .unwrap();
+    db.execute("VACUUM", ()).unwrap();
+    let updated = txn.execute("UPDATE t SET v = 5 WHERE id = 1", ());
+    let _ = txn.commit();
+    let left: i64 = db
+        .query_one("SELECT COUNT(*) FROM t WHERE id = 1", ())
+        .unwrap();
+    assert_eq!(left, 0, "the deleted row came back: {updated:?}");
+    assert!(
+        matches!(&updated, Err(stoolap::core::Error::Internal { message }) if message.contains("write conflict")),
+        "{updated:?}"
+    );
+}

@@ -3460,6 +3460,10 @@ impl Table for MVCCTable {
         self.version_store.publish_epoch_if_quiet()
     }
 
+    fn publish_epoch_if_quiet(&self) -> Option<u64> {
+        self.version_store.publish_epoch_if_quiet()
+    }
+
     fn walk_btree_groups(
         &self,
         column: &str,

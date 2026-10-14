@@ -1561,10 +1561,6 @@ thread_local! {
     static COLD_ROUND_PREPARED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
-/// A statement takes over none of the cold volumes it read earlier, so
-/// every read under the fence is deferred
-pub static COLD_READS_FORGET: AtomicBool = AtomicBool::new(false);
-
 /// Run once on this thread when its next statement snapshot is captured
 /// and every guard of the capture is released
 pub fn after_statement_captured(hook: impl FnOnce() + 'static) {
@@ -1658,6 +1654,7 @@ thread_local! {
     static COMMIT_ROUND_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static RECHECK_STORE_LOCKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static RECHECK_FENCE_SECTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PENDING_SET_LOCKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static VOLUME_FILE_DROPS: std::cell::Cell<(usize, usize)> =
         const { std::cell::Cell::new((0, 0)) };
 }
@@ -1730,9 +1727,34 @@ impl Drop for RecheckStoreLock {
     }
 }
 
-/// Whether this thread is deciding a commit's cold recheck round or an
-/// INSERT's cold check under the seal fence; read by a test's counting
+/// Whether this thread holds the pending tombstone sets to find a
+/// statement's rows its transaction changed; read by a test's counting
 /// allocator
+pub fn in_pending_set_lock() -> bool {
+    PENDING_SET_LOCKED
+        .try_with(std::cell::Cell::get)
+        .unwrap_or(false)
+}
+
+/// Marks this thread as holding the pending tombstone sets
+pub(crate) struct PendingSetLock;
+
+impl PendingSetLock {
+    pub(crate) fn enter() -> Self {
+        PENDING_SET_LOCKED.with(|l| l.set(true));
+        Self
+    }
+}
+
+impl Drop for PendingSetLock {
+    fn drop(&mut self) {
+        PENDING_SET_LOCKED.with(|l| l.set(false));
+    }
+}
+
+/// Whether this thread is deciding a commit's cold recheck round, an
+/// INSERT's cold check or an UPDATE or DELETE round under the seal fence;
+/// read by a test's counting allocator
 pub fn in_recheck_fence_section() -> bool {
     RECHECK_FENCE_SECTION
         .try_with(std::cell::Cell::get)
@@ -2269,7 +2291,6 @@ pub fn reset_all() {
     COLD_ROUND_SETTLED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_ROUND_SNAPSHOT_HOOK.with(|slot| *slot.borrow_mut() = None);
     INSERT_COLD_SNAPSHOT_HOOK.with(|slot| *slot.borrow_mut() = None);
-    COLD_READS_FORGET.store(false, Release);
     SELECT_TABLE_OPENED_HOOK.with(|slot| *slot.borrow_mut() = None);
     READ_PATHS.with(|paths| paths.borrow_mut().clear());
     FK_CHILD_PROBE_HOOK.with(|slot| *slot.borrow_mut() = None);
