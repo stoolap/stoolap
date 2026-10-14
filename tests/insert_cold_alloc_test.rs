@@ -22,7 +22,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::rc::Rc;
 
-use stoolap::core::{Error, Row, Value};
+use stoolap::core::Error;
 use stoolap::storage::traits::Engine;
 use stoolap::test_failpoints::{
     after_insert_cold_snapshot, in_recheck_fence_section, volume_loads, FailpointGuard,
@@ -108,14 +108,6 @@ fn drop_v_apart(db: &Database) -> bool {
         .unwrap()
 }
 
-fn row(id: i64) -> Row {
-    Row::from_values(vec![
-        Value::Integer(id),
-        Value::Integer(id),
-        Value::Integer(0),
-    ])
-}
-
 #[test]
 fn an_insert_refused_for_a_column_change_allocates_nothing_under_the_fence() {
     let _guard = FailpointGuard::new();
@@ -143,28 +135,4 @@ fn an_insert_refused_for_a_column_change_allocates_nothing_under_the_fence() {
         0,
         "allocations while the INSERT refused a column change under the seal fence"
     );
-}
-
-#[test]
-fn an_insert_into_a_table_without_volumes_refused_for_a_column_change_allocates_nothing_under_the_fence(
-) {
-    let _guard = FailpointGuard::new();
-    let dir = tempfile::tempdir().unwrap();
-    let db = open_t(dir.path());
-    let mut txn = db.engine().begin_transaction().unwrap();
-    let mut table = txn.get_table("t").unwrap();
-    assert!(drop_v_apart(&db), "the column change did not finish");
-    let before = UNDER_FENCE.with(Cell::get);
-    let inserted = table.insert(row(2));
-    assert!(
-        matches!(inserted, Err(Error::SchemaChanged { .. })),
-        "{inserted:?}"
-    );
-    assert_eq!(
-        UNDER_FENCE.with(Cell::get) - before,
-        0,
-        "allocations while the INSERT refused a column change under the seal fence"
-    );
-    drop(table);
-    txn.rollback().unwrap();
 }

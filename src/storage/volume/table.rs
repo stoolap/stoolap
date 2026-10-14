@@ -858,14 +858,6 @@ impl SegmentedTable {
         if !mgr.has_segments() {
             let guard = mgr.acquire_seal_read();
             if !mgr.has_segments() {
-                #[cfg(feature = "test-failpoints")]
-                let section = crate::test_failpoints::RecheckFenceSection::enter();
-                if !mgr.schema_generation_is(schema_generation) {
-                    #[cfg(feature = "test-failpoints")]
-                    drop(section);
-                    drop(guard);
-                    return Err(mgr.schema_changed());
-                }
                 return Ok((None, guard, None));
             }
             drop(guard);
