@@ -8646,6 +8646,8 @@ impl EngineOperations {
             })
             .collect();
 
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::cold_recheck_started();
         for (row_id, versions) in local.iter() {
             let Some(version) = versions.last() else {
                 continue;
@@ -9401,11 +9403,13 @@ impl TransactionEngineOperations for EngineOperations {
             // generation the commit sees, and no column change came since
             if let Some((mgr, generation)) = mgr_for_commit.as_ref().zip(schema_generation) {
                 let checked = mgr.check_schema_generation(generation).and_then(|()| {
-                    if mgr.txn_needs_cold_recheck(txn_id) {
-                        self.validate_pending_against_cold(txn_id, txn_store, version_store, mgr)
-                    } else {
-                        Ok(())
+                    if !mgr.txn_needs_cold_recheck(txn_id) {
+                        return Ok(());
                     }
+                    let found =
+                        self.validate_pending_against_cold(txn_id, txn_store, version_store, mgr);
+                    // A column change during the recheck moved the layout it read through
+                    mgr.check_schema_generation(generation).and(found)
                 });
                 if let Err(e) = checked {
                     commit_error = Some(e);

@@ -1569,6 +1569,23 @@ pub(crate) fn cold_round_prepared() {
 }
 
 thread_local! {
+    static COLD_RECHECK_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its commit's cold recheck has read the
+/// schema and the unique indexes, before its first lookup
+pub fn on_cold_recheck(hook: impl FnOnce() + 'static) {
+    COLD_RECHECK_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn cold_recheck_started() {
+    let hook = COLD_RECHECK_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static COLD_ROUND_SETTLED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static COLD_ROUND_SNAPSHOT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
@@ -1920,6 +1937,7 @@ pub fn reset_all() {
     ANALYZE_ROWS_COLLECTED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COMMIT_COUNTED_HOOK.with(|slot| *slot.borrow_mut() = None);
     SEAL_PASSED_CHANGING_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COLD_RECHECK_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_ROUND_SETTLED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_ROUND_SNAPSHOT_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_READS_FORGET.store(false, Release);
