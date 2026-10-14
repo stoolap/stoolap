@@ -1055,7 +1055,7 @@ impl Database {
     pub fn table_exists(&self, name: &str) -> Result<bool> {
         let engine = &self.inner.shared.engine;
         let tx = engine.begin_transaction()?;
-        Ok(tx.get_table(name).is_ok())
+        Ok(tx.get_statement_table(name).is_ok())
     }
 
     /// Get the DSN this database was opened with

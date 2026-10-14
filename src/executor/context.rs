@@ -787,7 +787,7 @@ impl StatementSnapshot {
             .transaction
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get_table(name)
+            .get_statement_table(name)
     }
 
     /// Runs `f` on the table every correlated probe of the statement reads,

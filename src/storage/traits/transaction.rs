@@ -93,6 +93,14 @@ pub trait Transaction: Send {
     /// Gets a reference to a table by name
     fn get_table(&self, name: &str) -> Result<Box<dyn Table>>;
 
+    /// Gets a table for the query executor, which uses it only inside its
+    /// own statements on the thread that ends the transaction: its
+    /// statements take no admission at the transaction's write gate
+    #[doc(hidden)]
+    fn get_statement_table(&self, name: &str) -> Result<Box<dyn Table>> {
+        self.get_table(name)
+    }
+
     /// Lists all table names
     fn list_tables(&self) -> Result<Vec<String>>;
 

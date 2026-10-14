@@ -2543,6 +2543,12 @@ impl MVCCEngine {
         Arc::clone(&self.registry)
     }
 
+    /// The transactions holding an entry in the store cache
+    #[cfg(feature = "test-failpoints")]
+    pub fn txn_store_entries(&self) -> usize {
+        self.txn_version_stores.read().unwrap().len()
+    }
+
     /// Replay an ALTER TABLE operation from WAL
     fn replay_alter_table(&self, data: &[u8], lsn: u64) -> Result<()> {
         if data.is_empty() {
@@ -2948,12 +2954,12 @@ impl MVCCEngine {
     /// Get a table handle for an existing transaction by txn_id.
     /// This allows FK enforcement to participate in the caller's transaction,
     /// ensuring CASCADE effects are atomic and uncommitted rows are visible.
-    pub fn get_table_for_txn(
+    pub(crate) fn get_table_for_txn(
         &self,
         txn_id: i64,
         table_name: &str,
     ) -> Result<Box<dyn crate::storage::traits::Table>> {
-        EngineOperations::new(self).get_table_for_transaction(txn_id, table_name)
+        EngineOperations::new(self).get_table_for_transaction(txn_id, table_name, None)
     }
 
     /// Find all FK constraints in other tables that reference the given parent table.
@@ -8571,6 +8577,17 @@ struct EngineOperations {
 // EngineOperations is Send + Sync because all fields are Arc-wrapped thread-safe types
 
 impl EngineOperations {
+    /// Lets the rows and claims of stores a handle handed out may hold past
+    /// the transaction's end go now, once its statements are done
+    fn discard_stores(tables: &[TxnTableEntry]) {
+        for (_, txn_store) in tables {
+            // A published or read-only store is empty: its drop lets it go
+            if txn_store.read().map_or(true, |store| store.holds_writes()) {
+                txn_store.write_store().discard();
+            }
+        }
+    }
+
     fn new(engine: &MVCCEngine) -> Self {
         Self {
             schemas: Arc::clone(&engine.schemas),
@@ -8819,7 +8836,12 @@ impl EngineOperations {
 }
 
 impl TransactionEngineOperations for EngineOperations {
-    fn get_table_for_transaction(&self, txn_id: i64, table_name: &str) -> Result<Box<dyn Table>> {
+    fn get_table_for_transaction(
+        &self,
+        txn_id: i64,
+        table_name: &str,
+        gate: Option<&super::txn_gate::GateRef>,
+    ) -> Result<Box<dyn Table>> {
         // Use Cow to avoid allocation when table_name is already lowercase (common case)
         let table_name_lower = to_lowercase_cow(table_name);
 
@@ -8901,7 +8923,8 @@ impl TransactionEngineOperations for EngineOperations {
                 _ => {
                     drop(mgrs);
                     let table =
-                        MVCCTable::new_with_shared_store(txn_id, version_store, txn_versions);
+                        MVCCTable::new_with_shared_store(txn_id, version_store, txn_versions)
+                            .with_txn_gate(gate.cloned());
                     admit(&table)?;
                     return Ok(Box::new(table));
                 }
@@ -8914,13 +8937,15 @@ impl TransactionEngineOperations for EngineOperations {
         let snapshot_seq = (self.registry.get_isolation_level(txn_id)
             == crate::IsolationLevel::SnapshotIsolation)
             .then(|| self.registry.get_transaction_begin_sequence(txn_id) as u64);
+        // The wrapper admits every statement; the hot table it owns does not
         Ok(Box::new(
             crate::storage::volume::table::SegmentedTable::from_captured_schema(
                 Box::new(table),
                 mgr,
                 snapshot_seq,
                 schema_generation,
-            ),
+            )
+            .with_txn_gate(gate.cloned()),
         ))
     }
 
@@ -9262,7 +9287,11 @@ impl TransactionEngineOperations for EngineOperations {
         false
     }
 
-    fn commit_all_tables(&self, txn_id: i64) -> (bool, Option<crate::core::Error>) {
+    fn commit_all_tables(
+        &self,
+        txn_id: i64,
+        handed_out: bool,
+    ) -> (bool, Option<crate::core::Error>) {
         // Collect table data under the read lock, then drop the lock before WAL I/O.
         // This prevents blocking concurrent get_table_for_transaction (which needs
         // a write lock on txn_version_stores) during potentially slow WAL writes.
@@ -9369,6 +9398,8 @@ impl TransactionEngineOperations for EngineOperations {
                     break;
                 }
             }
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::table_wal_recorded();
 
             // Commit-time seal coordination:
             // 1. Always take fence for tables with segments (prevents concurrent
@@ -9436,10 +9467,13 @@ impl TransactionEngineOperations for EngineOperations {
         }
 
         // Always cleanup txn_version_stores to prevent memory leak,
-        // even if commit failed partway through
-        let mut cache = self.txn_version_stores().write().unwrap();
-        cache.remove(txn_id);
-        drop(cache);
+        // even if commit failed partway through. Handles handed out leave
+        // it to the finish or rollback that lets their rows and claims go
+        if !handed_out {
+            let mut cache = self.txn_version_stores().write().unwrap();
+            cache.remove(txn_id);
+            drop(cache);
+        }
 
         drop(tables_to_commit);
 
@@ -9535,7 +9569,14 @@ impl TransactionEngineOperations for EngineOperations {
         }
     }
 
-    fn rollback_all_tables(&self, txn_id: i64) {
+    fn finish_all_tables(&self, txn_id: i64) {
+        let removed = self.txn_version_stores().write().unwrap().remove(txn_id);
+        if let Some(tables) = removed {
+            Self::discard_stores(&tables);
+        }
+    }
+
+    fn rollback_all_tables(&self, txn_id: i64, handed_out: bool) {
         // Collect touched table names BEFORE removing the cache entry,
         // so we only rollback tombstones on tables this txn actually used
         // instead of iterating every segment manager (O(tables) → O(touched)).
@@ -9544,8 +9585,11 @@ impl TransactionEngineOperations for EngineOperations {
             .get(txn_id)
             .map(|tables| tables.iter().map(|(name, _)| name.clone()).collect())
             .unwrap_or_default();
-        cache.remove(txn_id);
+        let removed = cache.remove(txn_id);
         drop(cache);
+        if let (true, Some(tables)) = (handed_out, removed) {
+            Self::discard_stores(&tables);
+        }
 
         // Rollback pending tombstones and clean up seal generation records
         // only on tables this transaction touched.

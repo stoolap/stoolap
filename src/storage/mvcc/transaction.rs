@@ -18,9 +18,11 @@
 //!
 
 use rustc_hash::FxHashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use crate::core::{Error, IsolationLevel, Result, Schema, SchemaColumn};
+use crate::storage::mvcc::txn_gate::{GateRef, TxnGate};
 use crate::storage::mvcc::{get_fast_timestamp, TransactionRegistry};
 use crate::storage::traits::{QueryResult, Table, Transaction};
 use crate::storage::Expression;
@@ -81,6 +83,21 @@ pub struct MvccTransaction {
     created_tables: Vec<String>,
     /// Tables dropped in this transaction (for rollback - stores name and schema)
     dropped_tables: Vec<(String, Schema)>,
+    /// The write gate the handles handed out admit through, made by the
+    /// first of them
+    gate: OnceLock<GateRef>,
+    /// Set once the gate is made, so an executor-only transaction checks
+    /// one flag rather than the gate
+    handed_out: AtomicBool,
+}
+
+/// The refusal of a finish or savepoint rollback inside one of the
+/// transaction's own statements, whose end its wait would never see
+pub(crate) fn inside_own_statement() -> Error {
+    Error::InvalidArgument(
+        "a transaction cannot finish or roll back to a savepoint inside one of its own statements"
+            .to_string(),
+    )
 }
 
 /// Operations that require engine access
@@ -88,8 +105,14 @@ pub struct MvccTransaction {
 /// This trait allows the transaction to call back into the engine
 /// without creating circular dependencies.
 pub trait TransactionEngineOperations: Send + Sync {
-    /// Get a table by name, initializing transaction-local version store
-    fn get_table_for_transaction(&self, txn_id: i64, table_name: &str) -> Result<Box<dyn Table>>;
+    /// Get a table by name, initializing transaction-local version store;
+    /// a handle given a `gate` admits its statements through it
+    fn get_table_for_transaction(
+        &self,
+        txn_id: i64,
+        table_name: &str,
+        gate: Option<&GateRef>,
+    ) -> Result<Box<dyn Table>>;
 
     /// Create a new table
     fn create_table(&self, name: &str, schema: Schema) -> Result<Box<dyn Table>>;
@@ -128,11 +151,23 @@ pub trait TransactionEngineOperations: Send + Sync {
     ///
     /// Callers MUST complete_commit if any_committed is true, even on error,
     /// to avoid orphaning already-committed rows.
-    fn commit_all_tables(&self, txn_id: i64) -> (bool, Option<crate::core::Error>);
+    ///
+    /// With `handed_out`, handles that may outlive the transaction keep
+    /// its entry for the finish or rollback that follows.
+    fn commit_all_tables(
+        &self,
+        txn_id: i64,
+        handed_out: bool,
+    ) -> (bool, Option<crate::core::Error>);
 
     /// Rollback all tables for a transaction at once
-    /// This cleans up the transaction's entries in txn_version_stores
-    fn rollback_all_tables(&self, txn_id: i64);
+    /// This cleans up the transaction's entries in txn_version_stores;
+    /// with `handed_out`, the rows and claims of its stores go now
+    fn rollback_all_tables(&self, txn_id: i64, handed_out: bool);
+
+    /// Lets the stores of a transaction with handles handed out go once its
+    /// outcome is settled, with the claims of a table it did not write
+    fn finish_all_tables(&self, txn_id: i64);
 
     /// Makes the transaction's pending cold tombstones visible under its
     /// commit sequence, once its commit marker is durable; a commit whose
@@ -248,6 +283,8 @@ impl MvccTransaction {
             savepoints: Vec::new(),
             created_tables: Vec::new(),
             dropped_tables: Vec::new(),
+            gate: OnceLock::new(),
+            handed_out: AtomicBool::new(false),
         }
     }
 
@@ -308,11 +345,66 @@ impl MvccTransaction {
         self.registry.remove_transaction_isolation_level(self.id);
     }
 
+    /// The transaction's gate when this thread is inside one of its
+    /// statements
+    fn own_statement_gate(&self) -> Option<GateRef> {
+        if !self.handed_out() {
+            return None;
+        }
+        self.gate.get().filter(|gate| gate.held_here()).cloned()
+    }
+
+    /// Whether a handle was handed out, which may outlive the transaction
+    fn handed_out(&self) -> bool {
+        self.handed_out.load(Ordering::Relaxed)
+    }
+
+    /// Refused inside one of the transaction's own statements
+    fn refuse_inside_own_statement(&self) -> Result<()> {
+        if self.own_statement_gate().is_some() {
+            return Err(inside_own_statement());
+        }
+        Ok(())
+    }
+
+    /// Admits no statement of the transaction from now on, then waits for
+    /// those in flight to finish; refused inside one of its own statements
+    #[inline(always)]
+    fn close_writes(&self) -> Result<()> {
+        if !self.handed_out() {
+            return Ok(());
+        }
+        match self.gate.get() {
+            Some(gate) => Self::close_gate(gate),
+            None => Ok(()),
+        }
+    }
+
+    #[inline(never)]
+    fn close_gate(gate: &GateRef) -> Result<()> {
+        if gate.held_here() {
+            return Err(inside_own_statement());
+        }
+        gate.close();
+        gate.wait_idle();
+        Ok(())
+    }
+
+    /// Holds the transaction's new statements off while those in flight
+    /// finish; the gate, to hold on to while the hold lasts
+    fn hold_writes(&self) -> Option<GateRef> {
+        self.gate.get().cloned()
+    }
+
     /// Roll back DDL operations (CREATE TABLE / DROP TABLE) in reverse order.
     /// Used by both explicit rollback() and implicit Drop.
-    fn rollback_ddl(&self, ops: &dyn TransactionEngineOperations) {
+    fn rollback_ddl(
+        ops: &dyn TransactionEngineOperations,
+        created_tables: &[String],
+        dropped_tables: &[(String, Schema)],
+    ) {
         // Drop tables that were created in this transaction
-        for table_name in self.created_tables.iter().rev() {
+        for table_name in created_tables.iter().rev() {
             if let Err(e) = ops.drop_table(table_name) {
                 eprintln!(
                     "Warning: Failed to drop table '{}' during DDL rollback: {}",
@@ -322,7 +414,7 @@ impl MvccTransaction {
         }
 
         // Recreate tables that were dropped in this transaction
-        for (table_name, schema) in self.dropped_tables.iter().rev() {
+        for (table_name, schema) in dropped_tables.iter().rev() {
             if let Err(e) = ops.create_table(table_name, schema.clone()) {
                 eprintln!(
                     "Warning: Failed to recreate table '{}' during DDL rollback: {}",
@@ -353,6 +445,11 @@ impl MvccTransaction {
     /// A name already in use starts a new, more recent savepoint of that name.
     pub fn create_savepoint(&mut self, name: &str) -> Result<()> {
         self.check_active()?;
+        self.refuse_inside_own_statement()?;
+        // Never in the middle of a statement, so a rollback to it keeps
+        // or drops whole statements
+        let gate = self.hold_writes();
+        let _hold = gate.as_ref().map(|gate| gate.hold());
         let timestamp = get_fast_timestamp();
         let ddl_state = SavepointDdlState {
             created_tables_len: self.created_tables.len(),
@@ -394,6 +491,9 @@ impl MvccTransaction {
     /// Savepoints created after it are removed; the savepoint itself stays.
     pub fn rollback_to_savepoint(&mut self, name: &str) -> Result<()> {
         self.check_active()?;
+        self.refuse_inside_own_statement()?;
+        let gate = self.hold_writes();
+        let _hold = gate.as_ref().map(|gate| gate.hold());
 
         let position = self.savepoint_position(name)?;
         let sp_state = self.savepoints[position].1;
@@ -458,6 +558,9 @@ impl Transaction for MvccTransaction {
 
     fn commit(&mut self) -> Result<()> {
         self.check_active()?;
+        // Before anything reads the local changes or takes the seal fence,
+        // which a statement in flight holds
+        self.close_writes()?;
 
         // Update state to committing
         self.state = TransactionState::Committing;
@@ -501,7 +604,7 @@ impl Transaction for MvccTransaction {
             // Phase 2: Commit all tables - apply local changes to global store
             // This now includes WAL recording internally (before each table commit)
             if let Some(ops) = &self.engine_operations {
-                let (_, error) = ops.commit_all_tables(self.id);
+                let (_, error) = ops.commit_all_tables(self.id, self.handed_out());
                 if let Some(e) = error {
                     // A table that failed leaves the transaction unfinished, and
                     // nothing of it is visible yet: the tables that applied
@@ -515,7 +618,7 @@ impl Transaction for MvccTransaction {
                     }
                     ops.discard_pending_tombstones(self.id);
                     self.registry.abort_transaction(self.id);
-                    ops.rollback_all_tables(self.id);
+                    ops.rollback_all_tables(self.id, self.handed_out());
                     self.state = TransactionState::RolledBack;
                     self.cleanup();
                     return Err(e);
@@ -543,6 +646,9 @@ impl Transaction for MvccTransaction {
                     // tombstones were held back for this marker
                     ops.discard_pending_tombstones(self.id);
                     self.registry.abort_transaction(self.id);
+                    if self.handed_out() {
+                        ops.finish_all_tables(self.id);
+                    }
                     self.state = TransactionState::RolledBack;
                     self.cleanup();
                     return Err(e);
@@ -562,13 +668,16 @@ impl Transaction for MvccTransaction {
                 hold.release_publication();
                 ops.request_seal_if_over(hold);
             }
+            if let (Some(ops), true) = (&self.engine_operations, self.handed_out()) {
+                ops.finish_all_tables(self.id);
+            }
         } else {
             // Read-only transaction - just mark as committed in registry
             self.registry.complete_commit(self.id);
             // Nothing to publish; drop the stores its reads opened, as a
             // rollback does
             if let Some(ops) = &self.engine_operations {
-                ops.rollback_all_tables(self.id);
+                ops.rollback_all_tables(self.id, self.handed_out());
             }
         }
 
@@ -581,6 +690,7 @@ impl Transaction for MvccTransaction {
 
     fn rollback(&mut self) -> Result<()> {
         self.check_active()?;
+        self.close_writes()?;
 
         // Check if read-only before rolling back
         let is_read_only = self.is_read_only();
@@ -594,7 +704,7 @@ impl Transaction for MvccTransaction {
 
         // Rollback DDL operations (CREATE TABLE / DROP TABLE) in reverse order
         if let Some(ops) = &self.engine_operations {
-            self.rollback_ddl(ops.as_ref());
+            Self::rollback_ddl(ops.as_ref(), &self.created_tables, &self.dropped_tables);
         }
 
         // Rollback all tables - discard local changes
@@ -608,7 +718,7 @@ impl Transaction for MvccTransaction {
                 ops.rollback_table(self.id, table.as_ref());
             }
             // Clean up txn_version_stores entry to prevent memory leak
-            ops.rollback_all_tables(self.id);
+            ops.rollback_all_tables(self.id, self.handed_out());
         }
 
         // Record in WAL if not read-only
@@ -686,7 +796,7 @@ impl Transaction for MvccTransaction {
         // Scope the borrow to allow later mutable operations
         let schema = {
             let ops = self.get_engine_ops()?;
-            let table = ops.get_table_for_transaction(self.id, name)?;
+            let table = ops.get_table_for_transaction(self.id, name, None)?;
             table.schema().clone()
         };
 
@@ -719,7 +829,17 @@ impl Transaction for MvccTransaction {
 
         // Get from engine
         let ops = self.get_engine_ops()?;
-        ops.get_table_for_transaction(self.id, name)
+        let gate = self.gate.get_or_init(|| {
+            self.handed_out.store(true, Ordering::Relaxed);
+            TxnGate::open()
+        });
+        ops.get_table_for_transaction(self.id, name, Some(gate))
+    }
+
+    fn get_statement_table(&self, name: &str) -> Result<Box<dyn Table>> {
+        self.check_active()?;
+        let ops = self.get_engine_ops()?;
+        ops.get_table_for_transaction(self.id, name, None)
     }
 
     fn list_tables(&self) -> Result<Vec<String>> {
@@ -892,6 +1012,14 @@ impl std::fmt::Debug for MvccTransaction {
 impl Drop for MvccTransaction {
     fn drop(&mut self) {
         if self.state == TransactionState::Active {
+            // Dropped from inside one of its own statements, it cannot wait
+            // for that statement: the last statement out cleans up
+            let own_gate = self.own_statement_gate();
+            if own_gate.is_none() {
+                // Not inside its own statement, so the close is not refused
+                let _ = self.close_writes();
+            }
+
             // Silent rollback on drop
             if self.is_read_only() {
                 self.registry.forget_transaction(self.id);
@@ -900,13 +1028,23 @@ impl Drop for MvccTransaction {
             }
 
             if let Some(ops) = &self.engine_operations {
-                // Roll back DDL operations (CREATE TABLE / DROP TABLE)
-                self.rollback_ddl(ops.as_ref());
+                if let Some(gate) = own_gate {
+                    let (ops, id) = (Arc::clone(ops), self.id);
+                    let created = std::mem::take(&mut self.created_tables);
+                    let dropped = std::mem::take(&mut self.dropped_tables);
+                    gate.finish_after_statements(Box::new(move || {
+                        Self::rollback_ddl(ops.as_ref(), &created, &dropped);
+                        ops.rollback_all_tables(id, true);
+                    }));
+                } else {
+                    // Roll back DDL operations (CREATE TABLE / DROP TABLE)
+                    Self::rollback_ddl(ops.as_ref(), &self.created_tables, &self.dropped_tables);
 
-                // Clean up txn_version_stores to prevent memory leak
-                // This is critical for read-only transactions that call get_table()
-                // but are dropped without explicit commit/rollback
-                ops.rollback_all_tables(self.id);
+                    // Clean up txn_version_stores to prevent memory leak
+                    // This is critical for read-only transactions that call get_table()
+                    // but are dropped without explicit commit/rollback
+                    ops.rollback_all_tables(self.id, self.handed_out());
+                }
             }
 
             self.cleanup();

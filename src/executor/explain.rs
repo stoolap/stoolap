@@ -99,7 +99,7 @@ impl Executor {
                             let tx = self.engine.begin_transaction().ok();
                             let estimated_rows = tx
                                 .as_ref()
-                                .and_then(|tx| tx.get_table(&table_name).ok())
+                                .and_then(|tx| tx.get_statement_table(&table_name).ok())
                                 .map(|table| {
                                     let stats = self
                                         .get_query_planner()
@@ -332,7 +332,7 @@ impl Executor {
             Expression::TableSource(simple) => {
                 // Try to get the table and analyze access plan
                 if let Ok(tx) = self.engine.begin_transaction() {
-                    if let Ok(table) = tx.get_table(&simple.name.value) {
+                    if let Ok(table) = tx.get_statement_table(&simple.name.value) {
                         // Build storage expression from WHERE clause for analysis
                         let storage_expr = if let Some(where_expr) = where_clause {
                             let schema = table.schema();
@@ -715,7 +715,7 @@ impl Executor {
             Expression::TableSource(simple) => {
                 // Try to get the table and analyze access plan
                 if let Ok(tx) = self.engine.begin_transaction() {
-                    if let Ok(table) = tx.get_table(&simple.name.value) {
+                    if let Ok(table) = tx.get_statement_table(&simple.name.value) {
                         // Build storage expression from WHERE clause for analysis
                         let storage_expr = if let Some(where_expr) = where_clause {
                             let schema = table.schema();
@@ -1138,7 +1138,7 @@ impl Executor {
         let filter = select.where_clause.as_ref().map(|w| format!("{}", w));
 
         if let Ok(tx) = self.engine.begin_transaction() {
-            if let Ok(table) = tx.get_table(table_name) {
+            if let Ok(table) = tx.get_statement_table(table_name) {
                 let hnsw_index = table.get_index_on_column(&vec_col_name).filter(|idx| {
                     idx.index_type() == crate::core::IndexType::Hnsw
                         && idx.hnsw_distance_metric() == Some(expected_metric)

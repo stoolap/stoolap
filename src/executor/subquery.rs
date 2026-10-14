@@ -1220,7 +1220,7 @@ impl Executor {
         }
         let active = self.active_transaction.lock().unwrap();
         let table = match active.as_ref() {
-            Some(tx) => tx.transaction.get_table(name),
+            Some(tx) => tx.transaction.get_statement_table(name),
             None => {
                 drop(active);
                 return match ctx.statement_snapshot() {
@@ -4466,7 +4466,7 @@ impl Executor {
     ) -> Result<crate::core::RowVec> {
         // Direct table access - much faster than going through execute_select
         let txn = self.engine.begin_transaction()?;
-        let inner_table = txn.get_table(&info.inner_table)?;
+        let inner_table = txn.get_statement_table(&info.inner_table)?;
 
         // Get inner table rows with filter pushed down to storage layer
         let inner_all_rows = inner_table.collect_all_rows(inner_filter)?;

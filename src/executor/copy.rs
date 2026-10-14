@@ -128,7 +128,7 @@ impl Executor {
 
         // Create a standalone auto-commit transaction
         let mut tx = self.engine.begin_transaction()?;
-        let mut table = tx.get_table(table_name)?;
+        let mut table = tx.get_statement_table(table_name)?;
 
         // Pre-compute schema information
         let schema = table.schema();

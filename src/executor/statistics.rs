@@ -151,7 +151,7 @@ impl Executor {
 
     /// Analyze a single table and update statistics
     fn analyze_table(&self, tx: &mut dyn Transaction, table_name: &str) -> Result<()> {
-        let table = tx.get_table(table_name)?;
+        let table = tx.get_statement_table(table_name)?;
         let schema = table.schema().clone();
 
         // Get row count

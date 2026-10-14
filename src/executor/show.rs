@@ -84,7 +84,7 @@ impl Executor {
     ) -> Result<Box<dyn QueryResult>> {
         let table_name = &stmt.table_name.value;
         let tx = self.engine.begin_transaction()?;
-        let table = tx.get_table(table_name)?;
+        let table = tx.get_statement_table(table_name)?;
         let schema = table.schema();
 
         // Get unique column names from indexes
@@ -216,7 +216,7 @@ impl Executor {
 
         // Get a table reference to access indexes
         let tx = self.engine.begin_transaction()?;
-        let table = tx.get_table(table_name)?;
+        let table = tx.get_statement_table(table_name)?;
 
         // Get index info from version store through the table
         let index_names = {
@@ -293,7 +293,7 @@ impl Executor {
     ) -> Result<Box<dyn QueryResult>> {
         let table_name = &stmt.table_name.value;
         let tx = self.engine.begin_transaction()?;
-        let table = tx.get_table(table_name)?;
+        let table = tx.get_statement_table(table_name)?;
         let schema = table.schema();
 
         // Column headers: Field, Type, Null, Key, Default, Extra

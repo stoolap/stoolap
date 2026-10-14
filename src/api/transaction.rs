@@ -381,7 +381,7 @@ impl Transaction {
                 };
 
                 let table_name = &stmt.table_name.value;
-                let mut table = tx.get_table(table_name)?;
+                let mut table = tx.get_statement_table(table_name)?;
                 // Get schema and column names owned to avoid borrow conflict with table.update()
                 let schema = table.schema().clone();
                 let columns: Vec<String> = schema.column_names_owned().to_vec();
@@ -469,7 +469,7 @@ impl Transaction {
             }
             Statement::Delete(stmt) => {
                 let table_name = &stmt.table_name.value;
-                let mut table = tx.get_table(table_name)?;
+                let mut table = tx.get_statement_table(table_name)?;
                 let schema = table.schema().clone();
 
                 // Convert WHERE clause to Expression if present

@@ -7827,6 +7827,11 @@ impl TransactionVersionStore {
             .is_some_and(|lv| !lv.is_empty())
     }
 
+    /// Whether the store holds rows or claims for a discard to let go
+    pub(crate) fn holds_writes(&self) -> bool {
+        self.has_local_changes() || self.write_set.as_ref().is_some_and(|ws| !ws.is_empty())
+    }
+
     /// Returns the number of local changes (distinct row IDs)
     pub fn local_count(&self) -> usize {
         self.local_versions.as_ref().map_or(0, |lv| lv.len())
@@ -8667,8 +8672,16 @@ impl TransactionVersionStore {
     }
 }
 
-impl Drop for TransactionVersionStore {
-    fn drop(&mut self) {
+impl TransactionVersionStore {
+    /// Lets the local rows, the claims and the commit's records go, as the
+    /// store's drop does, while a handle kept past the rollback holds it
+    pub(crate) fn discard(&mut self) {
+        self.let_go();
+        self.bound.clear();
+    }
+
+    #[inline(always)]
+    fn let_go(&mut self) {
         // A store dropped with its commit's records still held lets them
         // go; a commit that became visible let them go already
         self.release_applied();
@@ -8688,6 +8701,12 @@ impl Drop for TransactionVersionStore {
         if let Some(map) = self.write_set.take() {
             return_write_set_map(map);
         }
+    }
+}
+
+impl Drop for TransactionVersionStore {
+    fn drop(&mut self) {
+        self.let_go();
     }
 }
 

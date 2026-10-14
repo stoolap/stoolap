@@ -402,7 +402,7 @@ impl Executor {
     ) -> Result<Box<dyn QueryResult>> {
         // Create auto-commit transaction
         let tx = self.engine.begin_transaction()?;
-        let mut table = tx.get_table(table_name)?;
+        let mut table = tx.get_statement_table(table_name)?;
         check_compiled_token(table.as_ref(), token)?;
 
         // Build WHERE expression for PK lookup
@@ -483,7 +483,7 @@ impl Executor {
     ) -> Result<Box<dyn QueryResult>> {
         // Create auto-commit transaction
         let tx = self.engine.begin_transaction()?;
-        let mut table = tx.get_table(table_name)?;
+        let mut table = tx.get_statement_table(table_name)?;
         check_compiled_token(table.as_ref(), token)?;
 
         // Build WHERE expression for PK lookup

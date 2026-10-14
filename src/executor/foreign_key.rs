@@ -946,7 +946,7 @@ pub(crate) fn check_no_referencing_rows(
             references(&*engine.get_table_for_txn(tid, child_table)?)?
         } else {
             let tx = engine.begin_transaction()?;
-            references(&*tx.get_table(child_table)?)?
+            references(&*tx.get_statement_table(child_table)?)?
         };
 
         if has_ref {

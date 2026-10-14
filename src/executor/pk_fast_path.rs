@@ -358,7 +358,7 @@ impl Executor {
             // A missing transaction or table is the normal path's to report
             let table = active
                 .as_ref()
-                .and_then(|tx| tx.transaction.get_table(table_name).ok());
+                .and_then(|tx| tx.transaction.get_statement_table(table_name).ok());
             table.ok_or_else(|| Error::SchemaChanged {
                 table: table_name.to_string(),
             })?
