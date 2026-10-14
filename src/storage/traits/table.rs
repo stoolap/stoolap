@@ -790,6 +790,13 @@ pub trait Table: Send + Sync {
         None
     }
 
+    /// The committed store's publish epoch while no commit is publishing;
+    /// equal values before and after a read mean no version was published
+    /// in between. None when the table cannot tell
+    fn publish_epoch_if_quiet(&self) -> Option<u64> {
+        None
+    }
+
     /// Runs `f` over the groups of a B-tree or primary-key index on
     /// `column`, in key order, while the table can answer for every visible
     /// row. None when there is no such index or the table cannot answer that

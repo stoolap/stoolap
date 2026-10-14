@@ -160,14 +160,37 @@ fn a_statement_that_cannot_settle_its_cold_reads_leaves_the_transaction_usable()
     let mut tx = db.begin().unwrap();
     tx.execute("INSERT INTO t VALUES (9001, 90010, 0)", ())
         .unwrap();
-    stoolap::test_failpoints::COLD_READS_FORGET.store(true, std::sync::atomic::Ordering::Release);
+    seal_in_each_round(db.clone(), 3);
     let error = tx.execute("DELETE FROM t WHERE id = 5", ()).unwrap_err();
-    stoolap::test_failpoints::COLD_READS_FORGET.store(false, std::sync::atomic::Ordering::Release);
     assert!(error.to_string().contains("write conflict"), "{error}");
     tx.execute("INSERT INTO t VALUES (9002, 90020, 0)", ())
         .unwrap();
     tx.commit().unwrap();
-    assert_eq!(count(&db), 8 * ROWS + 2, "both inserts kept, id 5 kept");
+    assert_eq!(
+        count(&db),
+        8 * ROWS + 2 + 3,
+        "both inserts and the three sealed rows kept, id 5 kept"
+    );
+}
+
+/// Commits and seals a row from another thread in each of the next
+/// `rounds` statement rounds, so none of them settles
+fn seal_in_each_round(db: Database, rounds: i64) {
+    stoolap::test_failpoints::after_cold_round_prepared(move || {
+        let sealer = db.clone();
+        let id = 20_000 + rounds;
+        std::thread::spawn(move || {
+            sealer
+                .execute(&format!("INSERT INTO t VALUES ({id}, {}, 0)", id * 10), ())
+                .unwrap();
+            sealer.engine().seal_for_test().unwrap();
+        })
+        .join()
+        .unwrap();
+        if rounds > 1 {
+            seal_in_each_round(db, rounds - 1);
+        }
+    });
 }
 
 #[test]

@@ -1376,11 +1376,7 @@ pub struct StatementSnapshot {
 /// The cold volumes a statement read through their captured file owners
 #[derive(Default)]
 struct StatementLoads {
-    /// False while the statement holds the seal fence: no file is read then
-    deferred: bool,
     loaded: Vec<LoadedVolume>,
-    /// Segments a deferred read needed, loaded once the fence is released
-    missing: Vec<u64>,
 }
 
 /// A cold volume read through the owner its statement captured
@@ -1453,10 +1449,6 @@ impl CapturedVolumes for ColdLoads {
     }
 }
 
-/// The message of the error a deferred cold read returns; the statement
-/// releases the fence, loads what it recorded, and prepares again
-const COLD_READ_DEFERRED: &str = "cold volume read deferred under the seal fence";
-
 /// The recorded seal generation of a transaction with a write whose keys
 /// were not checked against the volumes; never a generation a seal reaches
 const UNCHECKED_WRITES: u64 = u64::MAX;
@@ -1472,9 +1464,7 @@ impl StatementSnapshot {
     }
 
     /// The captured volume of `seg_id` with its columns: a cold one is read
-    /// through its captured owner, once per statement. While reads are
-    /// deferred, a cold volume not read yet is recorded and the call fails
-    /// with the error `is_deferred` recognises.
+    /// through its captured owner, once per statement.
     pub fn volume(
         &self,
         mgr: &SegmentManager,
@@ -1489,12 +1479,6 @@ impl StatementSnapshot {
         if let Some(loaded) = loads.loaded.iter().find(|l| l.seg_id == seg_id) {
             return Ok(Arc::clone(&loaded.volume));
         }
-        if loads.deferred {
-            if !loads.missing.contains(&seg_id) {
-                loads.missing.push(seg_id);
-            }
-            return Err(crate::core::Error::internal(COLD_READ_DEFERRED));
-        }
         let volume = mgr.load_captured(seg_id, cs)?;
         loads.loaded.push(LoadedVolume {
             seg_id,
@@ -1504,24 +1488,9 @@ impl StatementSnapshot {
         Ok(volume)
     }
 
-    /// Whether `error` is a cold read this snapshot deferred
-    pub(crate) fn is_deferred(&self, error: &crate::core::Error) -> bool {
-        !self.loads.borrow().missing.is_empty()
-            && matches!(error, crate::core::Error::Internal { message } if message == COLD_READ_DEFERRED)
-    }
-
-    /// Defers every cold read not done yet, for a statement holding the fence
-    pub(crate) fn defer_reads(&self) {
-        self.loads.borrow_mut().deferred = true;
-    }
-
     /// Takes the volumes an earlier snapshot of the statement read whose
     /// segment this one captured with the same file owner
     pub(crate) fn adopt(&self, earlier: Vec<LoadedVolume>) {
-        #[cfg(any(test, feature = "test-failpoints"))]
-        if crate::test_failpoints::COLD_READS_FORGET.load(std::sync::atomic::Ordering::Acquire) {
-            return;
-        }
         let mut loads = self.loads.borrow_mut();
         for loaded in earlier {
             let same = self.segs.get(&loaded.seg_id).is_some_and(|cs| {
@@ -1536,27 +1505,6 @@ impl StatementSnapshot {
                 loads.loaded.push(loaded);
             }
         }
-    }
-
-    /// Reads the deferred volumes, outside the fence, and hands over every
-    /// volume the statement read
-    pub(crate) fn into_loaded(
-        self,
-        mgr: &SegmentManager,
-    ) -> crate::core::Result<Vec<LoadedVolume>> {
-        let loads = self.loads.into_inner();
-        let mut loaded = loads.loaded;
-        for seg_id in loads.missing {
-            let Some(cs) = self.segs.get(&seg_id) else {
-                continue;
-            };
-            loaded.push(LoadedVolume {
-                seg_id,
-                file: cs.file.clone(),
-                volume: mgr.load_captured(seg_id, cs)?,
-            });
-        }
-        Ok(loaded)
     }
 
     /// Every volume the statement read, for `SegmentManager::publish_loaded`
@@ -3472,6 +3420,40 @@ impl SegmentManager {
             .read()
             .get(&txn_id)
             .is_some_and(|set| set.contains_key(&row_id))
+    }
+
+    /// The ids among `ids` with a pending tombstone of `txn_id`; none looked
+    /// up when the transaction has no pending set. Room for more than fit
+    /// inline is made with the lock released, then the ids are read again
+    pub(crate) fn pending_among(
+        &self,
+        txn_id: i64,
+        ids: impl Iterator<Item = i64> + Clone,
+    ) -> smallvec::SmallVec<[i64; 4]> {
+        let mut found = smallvec::SmallVec::new();
+        loop {
+            let pending = self.pending_txn_tombstones.read();
+            #[cfg(feature = "test-failpoints")]
+            let locked = crate::test_failpoints::PendingSetLock::enter();
+            found.clear();
+            let Some(set) = pending.get(&txn_id) else {
+                return found;
+            };
+            let mut needed = 0;
+            for id in ids.clone().filter(|id| set.contains_key(id)) {
+                if found.len() < found.capacity() {
+                    found.push(id);
+                }
+                needed += 1;
+            }
+            if needed <= found.capacity() {
+                return found;
+            }
+            #[cfg(feature = "test-failpoints")]
+            drop(locked);
+            drop(pending);
+            found.reserve_exact(needed);
+        }
     }
 
     /// Commit pending tombstones: move from per-txn pending to shared tombstone set.
