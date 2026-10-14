@@ -397,8 +397,9 @@ const SHAPES: [Shape; 7] = [
     },
 ];
 
-const CUTS: [(Option<usize>, usize); 6] = [
+const CUTS: [(Option<usize>, usize); 7] = [
     (None, 0),
+    (Some(0), 0),
     (Some(1), 0),
     (Some(2), 0),
     (Some(3), 0),

@@ -618,3 +618,87 @@ fn test_ctes_give_the_rows_of_the_tables() {
         found.join("\n")
     );
 }
+
+#[test]
+fn test_cte_limits_keep_the_rows_of_the_statement() {
+    let db = Database::open("memory://cte_subquery_matrix_limits").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2), (3)", ())
+        .unwrap();
+    db.execute("CREATE TABLE s AS SELECT id FROM t", ())
+        .unwrap();
+    let rows = |sql: &str, offset: Option<i64>| -> Vec<String> {
+        let result = match offset {
+            Some(offset) => db.query(sql, (offset,)),
+            None => db.query(sql, ()),
+        };
+        result
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .map(|row| cells(&row.unwrap()))
+            .collect()
+    };
+    type Check = fn(&[String]) -> bool;
+    let cases: [(&str, Option<i64>, Check); 8] = [
+        (
+            "WITH c AS (SELECT id FROM t GROUP BY id) \
+             SELECT c.id FROM c LEFT JOIN b ON b.id = c.id LIMIT 1 OFFSET $1",
+            Some(1),
+            |got| got.len() == 1,
+        ),
+        (
+            "WITH c AS (SELECT id FROM t GROUP BY id) \
+             SELECT c.id, (SELECT COUNT(*) FROM c) AS n FROM c LEFT JOIN b ON b.id = c.id LIMIT 1",
+            None,
+            |got| got.len() == 1 && got[0].ends_with("|3"),
+        ),
+        (
+            "WITH c(id) AS (SELECT id FROM t GROUP BY id ORDER BY id DESC) \
+             SELECT c.id FROM c LEFT JOIN b ON b.id = c.id ORDER BY c.id ASC LIMIT 1",
+            None,
+            |got| got == ["1"],
+        ),
+        (
+            "WITH c AS (SELECT id FROM t) \
+             SELECT a.id, COUNT(*) FROM c a JOIN c b ON a.id = b.id GROUP BY ROLLUP(a.id) LIMIT 1",
+            None,
+            |got| got.len() == 1,
+        ),
+        (
+            "WITH c AS (SELECT id FROM t) \
+             SELECT COUNT(*) FROM c a JOIN c b ON a.id = b.id LIMIT 0",
+            None,
+            |got| got.is_empty(),
+        ),
+        (
+            "WITH c AS (SELECT id FROM t GROUP BY id) \
+             SELECT c.id, s.id FROM c LEFT JOIN s ON s.id = c.id AND (SELECT COUNT(*) FROM c) = 3 \
+             LIMIT 1",
+            None,
+            |got| got.len() == 1 && got[0].split('|').all(|v| v != "NULL"),
+        ),
+        (
+            "WITH c AS (SELECT id FROM t GROUP BY id) \
+             SELECT c.id, 3 IN ((SELECT COUNT(*) FROM c), 99) AS ok FROM c LEFT JOIN b ON b.id = c.id \
+             LIMIT 1",
+            None,
+            |got| got.len() == 1 && got[0].contains("true"),
+        ),
+        (
+            "WITH c AS (SELECT id FROM t GROUP BY id) \
+             SELECT c.id FROM c LEFT JOIN b ON b.id = c.id LIMIT 9223372036854775807 OFFSET 1",
+            None,
+            |got| got.len() == 2,
+        ),
+    ];
+    let wrong: Vec<String> = cases
+        .iter()
+        .filter_map(|(sql, offset, ok)| {
+            let got = rows(sql, *offset);
+            (!ok(&got)).then(|| format!("{sql}\n    got {got:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "wrong rows:\n{}", wrong.join("\n"));
+}

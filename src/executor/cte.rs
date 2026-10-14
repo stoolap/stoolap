@@ -1591,7 +1591,7 @@ impl Executor {
     }
 
     /// Whether the CTE join path can finish a statement by itself: it
-    /// applies LIMIT only through the join or the aggregation, and leaves
+    /// applies a positive LIMIT only through a plain join, and leaves
     /// ordering, DISTINCT, OFFSET, windows and set operations to execute_select
     fn cte_join_path_finishes(
         &self,
@@ -1601,15 +1601,22 @@ impl Executor {
     ) -> bool {
         let limit_applied = match &stmt.limit {
             None => true,
-            Some(_) if classification.has_aggregation => stmt.having.is_none(),
             Some(limit) => {
                 let join_type = join_source.join_type.to_uppercase();
                 matches!(join_type.as_str(), "" | "INNER" | "CROSS")
+                    && !classification.has_aggregation
                     && stmt.where_clause.is_none()
-                    && self.evaluate_limit_offset(limit).is_some()
+                    && self.evaluate_limit_offset(limit).is_some_and(|n| n > 0)
             }
         };
+        // The path evaluates ON and WHERE as plain expressions, without the subqueries
+        let plain_filters = join_source
+            .condition
+            .iter()
+            .chain(stmt.where_clause.iter())
+            .all(|expr| !Self::expr_contains_subquery(expr));
         limit_applied
+            && plain_filters
             && stmt.order_by.is_empty()
             && stmt.offset.is_none()
             && !stmt.distinct
@@ -2109,8 +2116,8 @@ impl Executor {
         self.count_cte_references_outside_from(stmt, ref_counts);
     }
 
-    /// Count CTE references in the clauses other than FROM and WHERE: the
-    /// select list, HAVING, ORDER BY, named windows and set-operation branches
+    /// Count CTE references in every clause other than FROM and WHERE,
+    /// the nested WITH bodies and the set-operation branches included
     fn count_cte_references_outside_from(
         &self,
         stmt: &SelectStatement,
@@ -2120,19 +2127,57 @@ impl Executor {
             w.partition_by
                 .iter()
                 .chain(w.order_by.iter().map(|o| &o.expression))
+                .chain(Self::frame_bounds(w.frame.as_ref()))
         });
+        let grouping_sets = match &stmt.group_by.modifier {
+            GroupByModifier::GroupingSets(sets) => sets.as_slice(),
+            _ => &[],
+        };
         for expr in stmt
             .columns
             .iter()
+            .chain(stmt.distinct_on.iter())
+            .chain(stmt.group_by.columns.iter())
+            .chain(grouping_sets.iter().flatten())
             .chain(stmt.having.as_deref())
             .chain(stmt.order_by.iter().map(|o| &o.expression))
+            .chain(stmt.limit.as_deref())
+            .chain(stmt.offset.as_deref())
             .chain(windows)
         {
             self.count_cte_references_in_expr(expr, ref_counts);
         }
 
+        for cte in stmt.with.iter().flat_map(|w| &w.ctes) {
+            self.count_cte_references_in_stmt(&cte.query, ref_counts);
+        }
         for set_op in &stmt.set_operations {
             self.count_cte_references_in_stmt(&set_op.right, ref_counts);
+        }
+    }
+
+    /// The offset expressions of a window frame
+    fn frame_bounds(frame: Option<&WindowFrame>) -> impl Iterator<Item = &Expression> {
+        frame
+            .into_iter()
+            .flat_map(|f| std::iter::once(&f.start).chain(f.end.as_ref()))
+            .filter_map(|bound| match bound {
+                WindowFrameBound::Preceding(expr) | WindowFrameBound::Following(expr) => {
+                    Some(expr.as_ref())
+                }
+                _ => None,
+            })
+    }
+
+    /// Count the CTE references in a function call's arguments, ORDER BY and FILTER
+    fn count_cte_references_in_call(&self, func: &FunctionCall, ref_counts: &mut StringMap<usize>) {
+        for arg in func
+            .arguments
+            .iter()
+            .chain(func.order_by.iter().map(|o| &o.expression))
+            .chain(func.filter.as_deref())
+        {
+            self.count_cte_references_in_expr(arg, ref_counts);
         }
     }
 
@@ -2160,9 +2205,38 @@ impl Executor {
             Expression::JoinSource(js) => {
                 self.count_cte_references_in_expr(&js.left, ref_counts);
                 self.count_cte_references_in_expr(&js.right, ref_counts);
+                if let Some(condition) = js.condition.as_deref() {
+                    self.count_cte_references_in_expr(condition, ref_counts);
+                }
             }
             Expression::SubquerySource(sq) => {
                 self.count_cte_references_in_stmt(&sq.subquery, ref_counts);
+            }
+            Expression::List(list) => {
+                for element in &list.elements {
+                    self.count_cte_references_in_expr(element, ref_counts);
+                }
+            }
+            Expression::ExpressionList(list) => {
+                for element in &list.expressions {
+                    self.count_cte_references_in_expr(element, ref_counts);
+                }
+            }
+            Expression::Distinct(distinct) => {
+                self.count_cte_references_in_expr(&distinct.expr, ref_counts);
+            }
+            Expression::InHashSet(in_set) => {
+                self.count_cte_references_in_expr(&in_set.column, ref_counts);
+            }
+            Expression::ValuesSource(values) => {
+                for value in values.rows.iter().flatten() {
+                    self.count_cte_references_in_expr(value, ref_counts);
+                }
+            }
+            Expression::FunctionTableSource(source) => {
+                for arg in &source.arguments {
+                    self.count_cte_references_in_expr(arg, ref_counts);
+                }
             }
             Expression::ScalarSubquery(sq) => {
                 self.count_cte_references_in_stmt(&sq.subquery, ref_counts);
@@ -2196,12 +2270,11 @@ impl Executor {
             Expression::Like(like) => {
                 self.count_cte_references_in_expr(&like.left, ref_counts);
                 self.count_cte_references_in_expr(&like.pattern, ref_counts);
-            }
-            Expression::FunctionCall(func) => {
-                for arg in func.arguments.iter().chain(func.filter.as_deref()) {
-                    self.count_cte_references_in_expr(arg, ref_counts);
+                if let Some(escape) = like.escape.as_deref() {
+                    self.count_cte_references_in_expr(escape, ref_counts);
                 }
             }
+            Expression::FunctionCall(func) => self.count_cte_references_in_call(func, ref_counts),
             Expression::Case(case) => {
                 for expr in case
                     .value
@@ -2221,18 +2294,27 @@ impl Executor {
                 self.count_cte_references_in_expr(&aliased.expression, ref_counts);
             }
             Expression::Window(window) => {
+                self.count_cte_references_in_call(&window.function, ref_counts);
                 for expr in window
-                    .function
-                    .arguments
+                    .partition_by
                     .iter()
-                    .chain(window.function.filter.as_deref())
-                    .chain(window.partition_by.iter())
                     .chain(window.order_by.iter().map(|o| &o.expression))
+                    .chain(Self::frame_bounds(window.frame.as_ref()))
                 {
                     self.count_cte_references_in_expr(expr, ref_counts);
                 }
             }
-            _ => {}
+            Expression::QualifiedIdentifier(_)
+            | Expression::IntegerLiteral(_)
+            | Expression::FloatLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::IntervalLiteral(_)
+            | Expression::Parameter(_)
+            | Expression::Star(_)
+            | Expression::QualifiedStar(_)
+            | Expression::Default(_) => {}
         }
     }
 
@@ -2605,6 +2687,19 @@ impl Executor {
     // LAZY CTE LIMIT PUSHDOWN
     // =========================================================================
 
+    /// Whether the statement reads the CTE once and no other CTE reads it
+    fn cte_read_once(&self, stmt: &SelectStatement, with_clause: &WithClause, name: &str) -> bool {
+        let mut counts: StringMap<usize> = StringMap::new();
+        counts.insert(name.to_string(), 0);
+        self.count_cte_references_in_stmt(stmt, &mut counts);
+        for cte in &with_clause.ctes {
+            if cte.name.value_lower.as_str() != name {
+                self.count_cte_references_in_stmt(&cte.query, &mut counts);
+            }
+        }
+        counts.get(name).copied() == Some(1)
+    }
+
     /// Compute LIMIT hints for CTEs that can benefit from early termination.
     ///
     /// Returns a map from CTE name to the hint (LIMIT + optional ORDER BY).
@@ -2628,11 +2723,17 @@ impl Executor {
             None => return hints,
         };
 
-        // Add OFFSET to limit if present
+        // Add OFFSET to limit if present; an OFFSET known only at run time, or
+        // a sum past what the pushed LIMIT literal can hold, gives no hint
         let main_limit = match &stmt.offset {
             Some(off) => match off.as_ref() {
-                Expression::IntegerLiteral(lit) => main_limit.saturating_add(lit.value as u64),
-                _ => main_limit,
+                Expression::IntegerLiteral(lit) if lit.value >= 0 => {
+                    match (main_limit as i64).checked_add(lit.value) {
+                        Some(sum) => sum as u64,
+                        None => return hints,
+                    }
+                }
+                _ => return hints,
             },
             None => main_limit,
         };
@@ -2684,8 +2785,15 @@ impl Executor {
             .find(|c| c.name.value_lower.as_str() == cte_name);
 
         if let Some(cte) = cte {
-            // CTE must have GROUP BY for streaming optimization to help
-            if !cte.query.group_by.columns.is_empty() {
+            // CTE must have GROUP BY for streaming optimization to help, no
+            // order or cut of its own, and no reader but this join
+            if !cte.query.group_by.columns.is_empty()
+                && cte.query.order_by.is_empty()
+                && cte.query.limit.is_none()
+                && cte.query.offset.is_none()
+                && cte.query.set_operations.is_empty()
+                && self.cte_read_once(stmt, with_clause, &cte_name)
+            {
                 // Check if ORDER BY can be pushed down (all columns from CTE)
                 let cte_alias = match (&left_cte, &right_cte) {
                     (Some(name), None) => name.clone(),
