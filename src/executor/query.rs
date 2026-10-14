@@ -5326,6 +5326,29 @@ impl Executor {
                             final_rows,
                         );
                         return Ok((Box::new(result), output_columns, order_limit_applied, None));
+                    } else if !order_limit_applied
+                        && self.order_by_needs_extra_columns(stmt, &all_columns)
+                    {
+                        // Ordering left to the standard path keeps the ORDER BY
+                        // and DISTINCT ON columns the SELECT does not hold
+                        let (projected_rows, extra_names) = self.project_rows_with_order_by(
+                            &stmt.columns,
+                            &stmt.order_by,
+                            &stmt.distinct_on,
+                            final_rows,
+                            &all_columns,
+                            None,
+                            ctx,
+                        )?;
+                        let mut output_columns =
+                            self.get_output_column_names(&stmt.columns, &all_columns, None);
+                        output_columns.extend(extra_names);
+                        let output_columns = CompactArc::new(output_columns);
+                        let result = ExecutorResult::with_arc_columns(
+                            CompactArc::clone(&output_columns),
+                            projected_rows,
+                        );
+                        return Ok((Box::new(result), output_columns, false, None));
                     } else {
                         // Project rows according to SELECT expressions
                         let projected_rows = self.project_rows_with_alias(

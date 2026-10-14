@@ -1082,3 +1082,24 @@ fn test_a_join_limit_below_its_matches_counts_every_match_first() {
         assert_eq!(found, expected, "{sql}");
     }
 }
+
+#[test]
+fn test_a_distinct_on_join_orders_by_a_column_it_does_not_select() {
+    let db = join_tables("contract_join_distinct_on_hidden_order");
+    db.execute("CREATE TABLE d (id INTEGER PRIMARY KEY, g INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO d VALUES (1, 1), (2, 1), (3, 2)", ())
+        .unwrap();
+    for (order, expected) in [
+        ("ASC", vec![(1, 1), (2, 3)]),
+        ("DESC", vec![(1, 2), (2, 3)]),
+    ] {
+        for limit in ["", " LIMIT 5"] {
+            let sql = format!(
+                "SELECT DISTINCT ON (d.g) d.g, b.n AS picked FROM b JOIN d ON b.n = d.id \
+                 ORDER BY d.g, d.id {order}{limit}"
+            );
+            assert_eq!(sorted_pairs(&db, &sql), expected, "{sql}");
+        }
+    }
+}
