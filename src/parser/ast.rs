@@ -1559,7 +1559,9 @@ impl fmt::Display for SelectStatement {
         if let Some(ref where_clause) = self.where_clause {
             result.push_str(&format!(" WHERE {}", where_clause));
         }
-        if !self.group_by.columns.is_empty() {
+        if !self.group_by.columns.is_empty()
+            || matches!(self.group_by.modifier, GroupByModifier::GroupingSets(_))
+        {
             result.push_str(&format!(" GROUP BY {}", self.group_by));
         }
         if let Some(ref having) = self.having {
