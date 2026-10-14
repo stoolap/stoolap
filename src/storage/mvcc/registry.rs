@@ -2227,41 +2227,19 @@ mod tests {
     }
 
     #[test]
-    fn a_view_taken_while_a_commit_holds_its_sequence_sees_it_in_flight() {
+    fn a_commit_sequence_is_taken_under_the_lock_views_are_taken_in() {
         let registry = Arc::new(TransactionRegistry::new());
         let (a, _) = registry.begin_transaction();
-        let (viewer, _) = registry.begin_transaction();
-        let (taken, sequence_taken) = std::sync::mpsc::channel();
-        let (captured, view_captured) = std::sync::mpsc::channel::<()>();
-        let committer = {
-            let registry = Arc::clone(&registry);
-            std::thread::spawn(move || {
-                // Waits for the view while holding the sequence: a view that can be
-                // taken meanwhile is taken before the commit is marked; the timeout
-                // only ends the wait when the view cannot be taken
-                crate::test_failpoints::after_commit_seq_taken(move || {
-                    taken.send(()).unwrap();
-                    let _ = view_captured.recv_timeout(std::time::Duration::from_millis(500));
-                });
-                registry.start_commit(a)
-            })
-        };
-        sequence_taken.recv().unwrap();
-        let capturer = {
-            let registry = Arc::clone(&registry);
-            std::thread::spawn(move || {
-                let view = registry.capture_view();
-                let _ = captured.send(());
-                view
-            })
-        };
-        let a_seq = committer.join().unwrap();
-        let view = capturer.join().unwrap();
-        registry.complete_commit(a);
-        assert!(
-            !registry.is_visible_at(a, viewer, &view),
-            "a held sequence {a_seq} when the view (at {}) was taken",
-            view.seq()
+        let held = std::rc::Rc::new(std::cell::Cell::new(None));
+        let (hook_registry, hook_held) = (Arc::clone(&registry), std::rc::Rc::clone(&held));
+        crate::test_failpoints::after_commit_seq_taken(move || {
+            hook_held.set(Some(hook_registry.transactions.try_lock().is_none()));
+        });
+        registry.start_commit(a);
+        assert_eq!(
+            held.get(),
+            Some(true),
+            "the sequence was taken with the lock free, so a view could be taken before the commit is marked"
         );
     }
 
