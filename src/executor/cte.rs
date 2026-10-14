@@ -117,6 +117,9 @@ fn expr_to_normalized_string(expr: &Expression) -> String {
 pub(crate) struct CtePushdownHint {
     limit: u64,
     order_by: Vec<OrderByExpression>,
+    /// Under an INNER join, the rows the statement must still return from
+    /// the cut CTE, or it runs again under a larger cut; None for a kept side
+    must_fill: Option<u64>,
 }
 
 /// Registry for CTE results during query execution
@@ -222,14 +225,42 @@ impl Executor {
         }
 
         // LAZY CTE OPTIMIZATION:
-        // For a single-use CTE kept by an outer join with LIMIT, push LIMIT into CTE
+        // For a single-use CTE joined with LIMIT, push LIMIT into CTE
         // This enables streaming GROUP BY early termination
-        let cte_limit_hints = self.compute_cte_limit_hints(stmt, with_clause);
+        let mut cte_limit_hints = self.compute_cte_limit_hints(stmt, with_clause);
 
-        let mut cte_registry = self.materialize_ctes(with_clause, ctx, Some(&cte_limit_hints))?;
+        loop {
+            let mut cte_registry =
+                self.materialize_ctes(with_clause, ctx, Some(&cte_limit_hints))?;
 
-        // Execute the main query with CTE registry
-        self.execute_main_query_with_ctes(stmt, ctx, &mut cte_registry)
+            // Execute the main query with CTE registry
+            let result = self.execute_main_query_with_ctes(stmt, ctx, &mut cte_registry)?;
+
+            // A CTE cut under an INNER join may match fewer rows than the LIMIT
+            // asks; then its cut grows until the rows fill it or nothing is cut
+            let short = cte_limit_hints.iter_mut().find_map(|(name, hint)| {
+                let wanted = hint.must_fill?;
+                let cut = cte_registry
+                    .get(name)
+                    .is_some_and(|(_, rows)| rows.len() as u64 >= hint.limit);
+                cut.then_some((wanted, hint))
+            });
+            let Some((wanted, hint)) = short else {
+                return Ok(result);
+            };
+            let columns = result.columns().to_vec();
+            let rows = Self::materialize_result(result)?;
+            if rows.len() as u64 >= wanted {
+                return Ok(Box::new(ExecutorResult::new(columns, rows)));
+            }
+            // Grow by the share of cut rows that matched, with an eighth to spare
+            let got = rows.len() as u128;
+            let grown = match got {
+                0 => hint.limit as u128 * 2,
+                _ => hint.limit as u128 * wanted as u128 * 9 / (got * 8) + 1,
+            };
+            hint.limit = grown.clamp(hint.limit as u128 + 1, i64::MAX as u128) as u64;
+        }
     }
 
     /// Run the CTEs of a WITH clause in order and store each result, so
@@ -1880,10 +1911,11 @@ impl Executor {
         };
 
         let join_type = join_source.join_type.to_uppercase();
+        let is_inner_join = join_type == "INNER" || join_type.is_empty() || join_type == "JOIN";
         let is_left_join = join_type == "LEFT" || join_type == "LEFT OUTER";
         let is_right_join = join_type == "RIGHT" || join_type == "RIGHT OUTER";
 
-        if !is_left_join && !is_right_join {
+        if !is_inner_join && !is_left_join && !is_right_join {
             return false;
         }
 
@@ -1908,15 +1940,14 @@ impl Executor {
 
         Self::limit_keeps_cte_rows(stmt)
             && match (&left_cte, &right_cte) {
-                (Some(_), None) => is_left_join,
-                (None, Some(_)) => is_right_join,
+                (Some(_), None) => is_left_join || is_inner_join,
+                (None, Some(_)) => is_right_join || is_inner_join,
                 _ => false,
             }
     }
 
-    /// Whether the first N rows of the outer side of an outer join give the
-    /// first N rows of the statement: each outer row yields at least one
-    /// joined row, and nothing after the join drops or merges rows
+    /// Whether nothing after the join drops or merges rows, so the rows a
+    /// cut CTE joins are rows the statement may return
     fn limit_keeps_cte_rows(stmt: &SelectStatement) -> bool {
         let classification = get_classification(stmt);
         stmt.where_clause.is_none()
@@ -2704,7 +2735,8 @@ impl Executor {
     ///
     /// Returns a map from CTE name to the hint (LIMIT + optional ORDER BY).
     /// This is safe when:
-    /// 1. CTE is used exactly once, as the kept side of a LEFT/RIGHT JOIN
+    /// 1. CTE is used exactly once, as the kept side of a LEFT/RIGHT JOIN or
+    ///    either side of an INNER JOIN, whose result must then fill the LIMIT
     /// 2. Main query has LIMIT
     /// 3. ORDER BY (if present) references only CTE columns
     fn compute_cte_limit_hints(
@@ -2715,7 +2747,7 @@ impl Executor {
         let mut hints = StringMap::new();
 
         // Must have a LIMIT on the main query
-        let main_limit = match &stmt.limit {
+        let wanted = match &stmt.limit {
             Some(lim) => match lim.as_ref() {
                 Expression::IntegerLiteral(lit) if lit.value > 0 => lit.value as u64,
                 _ => return hints,
@@ -2728,14 +2760,14 @@ impl Executor {
         let main_limit = match &stmt.offset {
             Some(off) => match off.as_ref() {
                 Expression::IntegerLiteral(lit) if lit.value >= 0 => {
-                    match (main_limit as i64).checked_add(lit.value) {
+                    match (wanted as i64).checked_add(lit.value) {
                         Some(sum) => sum as u64,
                         None => return hints,
                     }
                 }
                 _ => return hints,
             },
-            None => main_limit,
+            None => wanted,
         };
 
         // Check for JOIN pattern in main query
@@ -2748,10 +2780,12 @@ impl Executor {
         };
 
         let join_type = join_source.join_type.to_uppercase();
+        let is_inner_join = join_type == "INNER" || join_type.is_empty() || join_type == "JOIN";
         let is_left_join = join_type == "LEFT" || join_type == "LEFT OUTER";
         let is_right_join = join_type == "RIGHT" || join_type == "RIGHT OUTER";
 
-        if (!is_left_join && !is_right_join) || !Self::limit_keeps_cte_rows(stmt) {
+        if (!is_inner_join && !is_left_join && !is_right_join) || !Self::limit_keeps_cte_rows(stmt)
+        {
             return hints;
         }
 
@@ -2771,12 +2805,14 @@ impl Executor {
             .extract_cte_name_for_lookup(&join_source.right)
             .filter(|n| cte_names.contains(&n.to_lowercase()));
 
-        // The CTE must be the side the outer join keeps
+        // The CTE must be the side an outer join keeps, or either side of an
+        // INNER join, whose result is checked to fill the LIMIT
         let cte_name = match (&left_cte, &right_cte) {
-            (Some(name), None) if is_left_join => name.to_lowercase(),
-            (None, Some(name)) if is_right_join => name.to_lowercase(),
+            (Some(name), None) if is_left_join || is_inner_join => name.to_lowercase(),
+            (None, Some(name)) if is_right_join || is_inner_join => name.to_lowercase(),
             _ => return hints,
         };
+        let must_fill = is_inner_join.then_some(wanted);
 
         // Check that the CTE has GROUP BY (the pattern we're optimizing)
         let cte = with_clause
@@ -2818,6 +2854,7 @@ impl Executor {
                     CtePushdownHint {
                         limit: main_limit,
                         order_by: order_by_for_cte,
+                        must_fill,
                     },
                 );
             }
