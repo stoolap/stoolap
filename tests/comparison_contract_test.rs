@@ -968,3 +968,59 @@ fn test_a_limit_join_of_ctes_streams_over_one_key() {
         );
     }
 }
+
+#[test]
+fn test_a_limit_join_with_the_build_side_on_the_left_reads_each_side_s_key() {
+    let db = open("contract_limit_join_build_left");
+    db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, s TEXT, n INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO a VALUES (1, 7)", ()).unwrap();
+    // The one row it knows of makes `a` the build side, on the left
+    db.execute("ANALYZE a", ()).unwrap();
+    db.execute(
+        "INSERT INTO b SELECT g.value, CASE WHEN g.value = 1 THEN '07' ELSE 'x' END, \
+         CASE WHEN g.value = 1 THEN 7 ELSE 0 END FROM generate_series(1, 300) g",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE TABLE c (n INTEGER, id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO c VALUES (7, 1), (0, 2)", ())
+        .unwrap();
+    for sql in [
+        "SELECT a.id FROM a JOIN (SELECT s FROM b) x ON a.k = x.s LIMIT 10",
+        "SELECT a.id FROM a JOIN (SELECT n FROM b) x ON a.k = x.n LIMIT 10",
+        "SELECT a.id FROM a JOIN c ON a.k = c.n LIMIT 10",
+    ] {
+        assert_eq!(ids(&db, sql, vec![]), vec![1], "{sql}");
+    }
+}
+
+#[test]
+fn test_a_limit_join_of_ctes_with_a_window_function() {
+    let db = join_tables("contract_cte_limit_join_window");
+    for sql in [
+        format!(
+            "{CTE_SIDES}SELECT x.id, ROW_NUMBER() OVER (ORDER BY x.id) AS rn \
+             FROM x JOIN y ON x.v = y.n LIMIT 10"
+        ),
+        "SELECT a.id, ROW_NUMBER() OVER (ORDER BY a.id) AS rn \
+         FROM a JOIN b ON a.n = b.n LIMIT 10"
+            .to_string(),
+    ] {
+        let rows: Vec<(i64, i64)> = db
+            .query(&sql, ())
+            .unwrap()
+            .map(|row| {
+                let row = row.unwrap();
+                (row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap())
+            })
+            .collect();
+        assert_eq!(rows, vec![(1, 1), (2, 2), (3, 3)], "{sql}");
+    }
+}

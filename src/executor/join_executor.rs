@@ -408,13 +408,18 @@ impl JoinExecutor {
         // Create hash join operator - use pre-built hash table if available
         let mut join_op = if let Some(hash_table) = request.pre_built_hash_table {
             // Fast path: hash table already built (avoids double iteration of build_rows)
+            let (probe_keys, build_keys) = if request.build_is_left {
+                (&analysis.right_key_indices, &analysis.left_key_indices)
+            } else {
+                (&analysis.left_key_indices, &analysis.right_key_indices)
+            };
             HashJoinOperator::with_prebuilt(
                 probe_op,
                 request.build_rows,
                 hash_table,
                 analysis.join_type,
-                analysis.left_key_indices.clone(),
-                analysis.right_key_indices.clone(),
+                probe_keys.clone(),
+                build_keys.clone(),
                 request.build_is_left,
             )
         } else {

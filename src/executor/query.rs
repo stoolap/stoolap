@@ -5355,6 +5355,7 @@ impl Executor {
             // - INNER JOIN (simpler, no NULL padding needed)
             // - Has equality keys (hash join applicable)
             // - No ORDER BY, GROUP BY, aggregation (would negate early termination)
+            // - No window function, which only the standard path evaluates
             // - No cross-table predicates (applied after join)
 
             let streaming_limit = if !join_type.contains("FULL")
@@ -5363,6 +5364,7 @@ impl Executor {
                 && !classification.has_order_by
                 && !classification.has_group_by
                 && !classification.has_aggregation
+                && !classification.has_window_functions
                 && cross_filter.is_none()
             {
                 // Compute limit value
