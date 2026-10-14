@@ -2889,12 +2889,16 @@ impl Executor {
     /// text would otherwise answer for two executions. None when the text
     /// holds an anonymous marker, which two bindings of one statement share.
     /// The bindings go in debug form: it carries the type a value prints
-    /// without, and escapes a separator a text could otherwise hold
+    /// without, and escapes a separator a text could otherwise hold. None
+    /// too for a subquery calling a non-deterministic function
     pub(crate) fn subquery_cache_key(
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Option<String> {
         use std::fmt::Write;
+        if Self::calls_non_deterministic(subquery) {
+            return None;
+        }
         let mut key = subquery.to_string();
         if key.contains('?') {
             return None;
@@ -2910,6 +2914,96 @@ impl Executor {
             }
         }
         Some(key)
+    }
+
+    /// Whether `stmt` calls a function the registry does not call
+    /// deterministic (RANDOM, NOW and the like) anywhere, its subqueries,
+    /// CTEs, derived tables and set operations included
+    pub(crate) fn calls_non_deterministic(stmt: &SelectStatement) -> bool {
+        let any = |exprs: &[Expression]| exprs.iter().any(Self::expression_calls_non_deterministic);
+        let ordered = |order: &[OrderByExpression]| {
+            order
+                .iter()
+                .any(|o| Self::expression_calls_non_deterministic(&o.expression))
+        };
+        let boxed = |expr: &Option<Box<Expression>>| {
+            expr.as_deref()
+                .is_some_and(Self::expression_calls_non_deterministic)
+        };
+        any(&stmt.distinct_on)
+            || any(&stmt.columns)
+            || stmt.with.as_ref().is_some_and(|with| {
+                with.ctes
+                    .iter()
+                    .any(|cte| Self::calls_non_deterministic(&cte.query))
+            })
+            || boxed(&stmt.table_expr)
+            || boxed(&stmt.where_clause)
+            || any(&stmt.group_by.columns)
+            || boxed(&stmt.having)
+            || stmt
+                .window_defs
+                .iter()
+                .any(|window| any(&window.partition_by) || ordered(&window.order_by))
+            || ordered(&stmt.order_by)
+            || boxed(&stmt.limit)
+            || boxed(&stmt.offset)
+            || stmt
+                .set_operations
+                .iter()
+                .any(|op| Self::calls_non_deterministic(&op.right))
+    }
+
+    /// [`Self::calls_non_deterministic`] for one expression
+    pub(crate) fn expression_calls_non_deterministic(expr: &Expression) -> bool {
+        let one = Self::expression_calls_non_deterministic;
+        let call = |f: &FunctionCall| {
+            crate::executor::expression::is_non_foldable_function(&f.function)
+                || f.arguments.iter().any(one)
+                || f.order_by.iter().any(|o| one(&o.expression))
+                || f.filter.as_deref().is_some_and(one)
+        };
+        match expr {
+            Expression::FunctionCall(f) => call(f),
+            Expression::Window(w) => {
+                call(&w.function)
+                    || w.partition_by.iter().any(one)
+                    || w.order_by.iter().any(|o| one(&o.expression))
+            }
+            Expression::Prefix(p) => one(&p.right),
+            Expression::Infix(i) => one(&i.left) || one(&i.right),
+            Expression::List(l) => l.elements.iter().any(one),
+            Expression::ExpressionList(l) => l.expressions.iter().any(one),
+            Expression::Distinct(d) => one(&d.expr),
+            Expression::Exists(e) => Self::calls_non_deterministic(&e.subquery),
+            Expression::ScalarSubquery(s) => Self::calls_non_deterministic(&s.subquery),
+            Expression::AllAny(a) => one(&a.left) || Self::calls_non_deterministic(&a.subquery),
+            Expression::In(i) => one(&i.left) || one(&i.right),
+            Expression::InHashSet(h) => one(&h.column),
+            Expression::Between(b) => one(&b.expr) || one(&b.lower) || one(&b.upper),
+            Expression::Like(l) => {
+                one(&l.left) || one(&l.pattern) || l.escape.as_deref().is_some_and(one)
+            }
+            Expression::Case(c) => {
+                c.value.as_deref().is_some_and(one)
+                    || c.when_clauses
+                        .iter()
+                        .any(|w| one(&w.condition) || one(&w.then_result))
+                    || c.else_value.as_deref().is_some_and(one)
+            }
+            Expression::Cast(c) => one(&c.expr),
+            Expression::Aliased(a) => one(&a.expression),
+            Expression::JoinSource(j) => {
+                one(&j.left) || one(&j.right) || j.condition.as_deref().is_some_and(one)
+            }
+            Expression::SubquerySource(s) => Self::calls_non_deterministic(&s.subquery),
+            Expression::ValuesSource(v) => v.rows.iter().flatten().any(one),
+            Expression::FunctionTableSource(f) => {
+                crate::executor::expression::is_non_foldable_function(&f.function.value)
+                    || f.arguments.iter().any(one)
+            }
+            _ => false,
+        }
     }
 
     /// Whether a window function, its OVER clause or a named window holds a subquery
@@ -4232,8 +4326,13 @@ impl Executor {
 
         // Check cache first - return Arc directly (no clone needed).
         // Bypassed inside explicit transactions (a cached in-transaction
-        // view would survive ROLLBACK)
-        let cacheable = ctx.transaction_id().is_none();
+        // view would survive ROLLBACK), and for a filter whose answer is
+        // its statement's alone
+        let cacheable = ctx.transaction_id().is_none()
+            && !info
+                .non_correlated_where
+                .as_deref()
+                .is_some_and(Self::expression_calls_non_deterministic);
         if cacheable {
             if let Some(cached) = get_cached_semi_join(&origin, cache_key) {
                 return Ok(cached);
