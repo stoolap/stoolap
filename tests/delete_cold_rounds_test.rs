@@ -24,7 +24,7 @@ use std::sync::mpsc;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-use stoolap::core::{Error, IsolationLevel};
+use stoolap::core::Error;
 use stoolap::storage::traits::Engine;
 use stoolap::test_failpoints::{
     after_cold_round_prepared, after_delete_rows_scanned, block_file_reads,
@@ -134,19 +134,18 @@ impl Drop for NoGroupCache<'_> {
     }
 }
 
-/// Runs VACUUM until it removes a deleted row; false when it never did
-fn vacuum_until_collected(db: &Database) -> bool {
-    for _ in 0..50 {
+/// From another thread: deletes row 1 and commits, then runs VACUUM;
+/// true when its GC removed the deleted hot version
+fn delete_and_collect_apart(db: &Database) -> bool {
+    let db = db.clone();
+    on_thread(move || {
+        db.execute("DELETE FROM t WHERE id = 1", ()).unwrap();
         let removed = Rc::new(Cell::new(false));
         let slot = Rc::clone(&removed);
         stoolap::test_failpoints::after_gc_rows_removed(move || slot.set(true));
         db.execute("VACUUM", ()).unwrap();
-        if removed.get() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    false
+        removed.get()
+    }) == Some(true)
 }
 
 /// Seals a row in each of the next three DELETE rounds
@@ -308,27 +307,19 @@ fn a_row_another_transaction_updates_while_prepared_is_a_write_conflict() {
 }
 
 #[test]
-fn a_row_another_transaction_deleted_and_collected_is_a_write_conflict() {
+fn a_row_another_transaction_deleted_and_collected_while_prepared_is_a_write_conflict() {
     let _guard = FailpointGuard::new();
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path());
     seal_rows(&db, &[(1, 10), (2, 20)]);
-    let mut txn = db
-        .begin_with_isolation(IsolationLevel::SnapshotIsolation)
-        .unwrap();
-    assert_eq!(
-        txn.query_one::<i64, _>("SELECT COUNT(*) FROM t", ())
-            .unwrap(),
-        2
-    );
-    assert!(execute_apart(&db, "DELETE FROM t WHERE id = 1"));
-    assert!(
-        vacuum_until_collected(&db),
-        "VACUUM never collected the deleted hot version"
-    );
-    let deleted = txn.execute("DELETE FROM t WHERE id = 1", ());
+    let other = db.clone();
+    let done = Rc::new(Cell::new(false));
+    let slot = Rc::clone(&done);
+    after_cold_round_prepared(move || slot.set(delete_and_collect_apart(&other)));
+    let deleted = db.execute("DELETE FROM t WHERE v <= 20", ());
+    assert!(done.get(), "the delete was not collected inside the round");
     assert!(is_write_conflict(&deleted), "{deleted:?}");
-    txn.rollback().unwrap();
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM t WHERE id = 2"), 1);
 }
 
 /// Seals a row in each of the next two DELETE rounds, then drops column

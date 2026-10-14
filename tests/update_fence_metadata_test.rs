@@ -410,23 +410,8 @@ fn a_compaction_after_the_fence_check_keeps_one_updated_version() {
     assert_eq!((rows, v_of(&db, 5)), (1, Some(4)));
 }
 
-/// Runs VACUUM until it removes a deleted row; false when it never did
-fn vacuum_until_collected(db: &Database) -> bool {
-    for _ in 0..50 {
-        let removed = std::rc::Rc::new(std::cell::Cell::new(false));
-        let slot = std::rc::Rc::clone(&removed);
-        stoolap::test_failpoints::after_gc_rows_removed(move || slot.set(true));
-        db.execute("VACUUM", ()).unwrap();
-        if removed.get() {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    false
-}
-
 #[test]
-fn a_sealed_row_another_transaction_deleted_and_collected_is_not_updated_back() {
+fn a_sealed_row_another_transaction_deleted_and_collected_while_prepared_is_not_updated_back() {
     let _guard = FailpointGuard::new();
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(&format!(
@@ -439,24 +424,32 @@ fn a_sealed_row_another_transaction_deleted_and_collected_is_not_updated_back() 
     db.execute("INSERT INTO t VALUES (1, 10), (2, 20)", ())
         .unwrap();
     db.engine().seal_for_test().unwrap();
-    let mut txn = db
-        .begin_with_isolation(stoolap::core::IsolationLevel::SnapshotIsolation)
-        .unwrap();
-    let seen: i64 = txn.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
-    assert_eq!(seen, 2);
+    // Inside the round, another thread deletes row 1, commits, and VACUUM
+    // collects the deleted hot version
     let other = db.clone();
-    std::thread::spawn(move || other.execute("DELETE FROM t WHERE id = 1", ()).unwrap())
+    let collected = std::rc::Rc::new(std::cell::Cell::new(false));
+    let slot = std::rc::Rc::clone(&collected);
+    after_cold_round_prepared(move || {
+        let done = std::thread::spawn(move || {
+            other.execute("DELETE FROM t WHERE id = 1", ()).unwrap();
+            let removed = std::rc::Rc::new(std::cell::Cell::new(false));
+            let seen = std::rc::Rc::clone(&removed);
+            stoolap::test_failpoints::after_gc_rows_removed(move || seen.set(true));
+            other.execute("VACUUM", ()).unwrap();
+            removed.get()
+        })
         .join()
         .unwrap();
-    assert!(
-        vacuum_until_collected(&db),
-        "VACUUM never collected the deleted hot version"
-    );
-    let updated = txn.execute("UPDATE t SET v = 5 WHERE id = 1", ());
-    let _ = txn.commit();
+        slot.set(done);
+    });
+    let updated = db.execute("UPDATE t SET v = 5 WHERE v <= 20", ());
     let left: i64 = db
         .query_one("SELECT COUNT(*) FROM t WHERE id = 1", ())
         .unwrap();
+    assert!(
+        collected.get(),
+        "the delete was not collected inside the round"
+    );
     assert_eq!(left, 0, "the deleted row came back: {updated:?}");
     assert!(
         matches!(&updated, Err(stoolap::core::Error::Internal { message }) if message.contains("write conflict")),
