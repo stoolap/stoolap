@@ -975,7 +975,7 @@ fn a_sealed_row_another_transaction_deleted_and_collected_is_not_updated_back() 
         .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10), (2, 20)", ())
         .unwrap();
-    db.engine().seal_for_test().unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     let mut txn = db
         .begin_with_isolation(IsolationLevel::SnapshotIsolation)
         .unwrap();
