@@ -1827,6 +1827,16 @@ pub(crate) fn group_column_decoded(col: usize, group: usize) {
 thread_local! {
     static SMALL_OUTER_JOINS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static JOIN_SIDE_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INDEX_JOIN_OUTER_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Outer rows this thread's streaming index joins read, so far
+pub fn index_join_outer_rows() -> usize {
+    INDEX_JOIN_OUTER_ROWS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn index_join_outer_row() {
+    INDEX_JOIN_OUTER_ROWS.with(|n| n.set(n.get() + 1));
 }
 
 /// Joins this thread ran by a table's candidates for a small outer side

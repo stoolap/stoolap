@@ -815,6 +815,8 @@ impl Executor {
             limit: effective_limit,
             ctx,
             algorithm_hint: Some(&algorithm_decision),
+            left_schema: None,
+            right_schema: None,
         })?;
         let result_rows = join_result.rows;
 

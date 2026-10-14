@@ -84,6 +84,10 @@ impl Expression for AndExpr {
         true // All expressions were true
     }
 
+    fn hides_unknown(&self) -> bool {
+        self.expressions.iter().any(|expr| expr.hides_unknown())
+    }
+
     /// UNKNOWN AND FALSE is FALSE; UNKNOWN AND TRUE is UNKNOWN
     fn is_unknown_due_to_null(&self, row: &Row) -> bool {
         let mut any_unknown = false;
@@ -200,6 +204,10 @@ impl Expression for OrExpr {
             }
         }
         false // No expression was true
+    }
+
+    fn hides_unknown(&self) -> bool {
+        self.expressions.iter().any(|expr| expr.hides_unknown())
     }
 
     /// UNKNOWN OR TRUE is TRUE; UNKNOWN OR FALSE is UNKNOWN
@@ -324,6 +332,10 @@ impl Expression for NotExpr {
     fn is_unknown_due_to_null(&self, row: &Row) -> bool {
         // NOT(UNKNOWN) = UNKNOWN, so propagate from inner expression
         self.inner.is_unknown_due_to_null(row)
+    }
+
+    fn hides_unknown(&self) -> bool {
+        self.inner.hides_unknown()
     }
 
     fn as_any(&self) -> &dyn Any {

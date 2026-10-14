@@ -35,6 +35,7 @@ const SEMI_JOIN_CACHE_SIZE: usize = 256;
 
 use crate::api::params::ParamVec;
 use crate::common::{CompactArc, SmartString, StringMap};
+use crate::core::predicate::PredicateSet;
 use crate::core::{Result, Row, Value, ValueMap, ValueSet};
 
 // Static defaults for ExecutionContext to avoid allocations for empty values.
@@ -500,16 +501,16 @@ pub fn clear_exists_correlation_cache() {
 // built on its first refusal in the statement, by subquery address; None for
 // an inner table without sealed rows.
 thread_local! {
-    static EXISTS_PROBE_FALLBACKS: RefCell<FxHashMap<usize, Option<CompactArc<ValueSet>>>> = RefCell::new(FxHashMap::default());
+    static EXISTS_PROBE_FALLBACKS: RefCell<FxHashMap<usize, Option<CompactArc<PredicateSet>>>> = RefCell::new(FxHashMap::default());
 }
 
 /// Get the probe fallback kept for a subquery address.
-pub fn get_exists_probe_fallback(subquery_ptr: usize) -> Option<Option<CompactArc<ValueSet>>> {
+pub fn get_exists_probe_fallback(subquery_ptr: usize) -> Option<Option<CompactArc<PredicateSet>>> {
     EXISTS_PROBE_FALLBACKS.with(|cache| cache.borrow().get(&subquery_ptr).cloned())
 }
 
 /// Keep the probe fallback for a subquery address.
-pub fn cache_exists_probe_fallback(subquery_ptr: usize, set: Option<CompactArc<ValueSet>>) {
+pub fn cache_exists_probe_fallback(subquery_ptr: usize, set: Option<CompactArc<PredicateSet>>) {
     EXISTS_PROBE_FALLBACKS.with(|cache| {
         cache.borrow_mut().insert(subquery_ptr, set);
     });

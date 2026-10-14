@@ -2007,6 +2007,17 @@ pub fn extract_join_keys_and_residual(
     left_columns: &[String],
     right_columns: &[String],
 ) -> (Vec<usize>, Vec<usize>, Vec<Expression>) {
+    extract_join_keys_and_residual_keeping(condition, left_columns, right_columns, &|_, _| true)
+}
+
+/// The same extraction, where a column pair that `keep` refuses stays in the
+/// residual as an ordinary equality.
+pub fn extract_join_keys_and_residual_keeping(
+    condition: &Expression,
+    left_columns: &[String],
+    right_columns: &[String],
+    keep: &dyn Fn(usize, usize) -> bool,
+) -> (Vec<usize>, Vec<usize>, Vec<Expression>) {
     let mut left_indices = Vec::new();
     let mut right_indices = Vec::new();
     let mut residual = Vec::new();
@@ -2015,6 +2026,7 @@ pub fn extract_join_keys_and_residual(
         condition,
         left_columns,
         right_columns,
+        keep,
         &mut left_indices,
         &mut right_indices,
         &mut residual,
@@ -2023,11 +2035,70 @@ pub fn extract_join_keys_and_residual(
     (left_indices, right_indices, residual)
 }
 
+/// Whether a join key pair holds a number on one side and a TEXT on the other
+/// in any rows: the comparison reads such a TEXT as a number, which no key
+/// equality follows, so the pair cannot be a key.
+pub fn number_text_key_pair(
+    left_rows: &[Row],
+    left_idx: usize,
+    right_rows: &[Row],
+    right_idx: usize,
+) -> bool {
+    let (numbers, texts) = key_families(left_rows, left_idx);
+    if !numbers && !texts {
+        return false;
+    }
+    right_rows.iter().any(|row| match row.get(right_idx) {
+        Some(Value::Integer(_) | Value::Float(_)) => texts,
+        Some(Value::Text(_)) => numbers,
+        _ => false,
+    })
+}
+
+/// Whether a key column holds numbers and whether it holds TEXT: by the
+/// schema of a side that reads a base table, else by its rows
+pub fn column_families(
+    rows: &[Row],
+    columns: &[String],
+    schema: Option<&Schema>,
+    idx: usize,
+) -> (bool, bool) {
+    let name = columns
+        .get(idx)
+        .map(|column| column.rsplit('.').next().unwrap_or(column));
+    match schema
+        .zip(name)
+        .and_then(|(schema, name)| schema.get_column_type(name))
+    {
+        Some(DataType::Integer | DataType::Float) => (true, false),
+        Some(DataType::Text) => (false, true),
+        Some(_) => (false, false),
+        None => key_families(rows, idx),
+    }
+}
+
+/// Whether a key column holds numbers and whether it holds TEXT, in any rows
+pub fn key_families(rows: &[Row], idx: usize) -> (bool, bool) {
+    let (mut numbers, mut texts) = (false, false);
+    for row in rows {
+        match row.get(idx) {
+            Some(Value::Integer(_) | Value::Float(_)) => numbers = true,
+            Some(Value::Text(_)) => texts = true,
+            _ => {}
+        }
+        if numbers && texts {
+            break;
+        }
+    }
+    (numbers, texts)
+}
+
 /// Recursively extract equality join keys from AND expressions.
 fn extract_join_keys_recursive(
     condition: &Expression,
     left_columns: &[String],
     right_columns: &[String],
+    keep: &dyn Fn(usize, usize) -> bool,
     left_indices: &mut Vec<usize>,
     right_indices: &mut Vec<usize>,
     residual: &mut Vec<Expression>,
@@ -2039,6 +2110,7 @@ fn extract_join_keys_recursive(
                 &infix.left,
                 left_columns,
                 right_columns,
+                keep,
                 left_indices,
                 right_indices,
                 residual,
@@ -2047,6 +2119,7 @@ fn extract_join_keys_recursive(
                 &infix.right,
                 left_columns,
                 right_columns,
+                keep,
                 left_indices,
                 right_indices,
                 residual,
@@ -2063,9 +2136,11 @@ fn extract_join_keys_recursive(
                     find_join_side_index(&left_col, left_columns, right_columns),
                     find_join_side_index(&right_col, right_columns, left_columns),
                 ) {
-                    left_indices.push(left_idx);
-                    right_indices.push(right_idx);
-                    return;
+                    if keep(left_idx, right_idx) {
+                        left_indices.push(left_idx);
+                        right_indices.push(right_idx);
+                        return;
+                    }
                 }
 
                 // Case 2: right.col = left.col (swapped)
@@ -2073,9 +2148,11 @@ fn extract_join_keys_recursive(
                     find_join_side_index(&right_col, left_columns, right_columns),
                     find_join_side_index(&left_col, right_columns, left_columns),
                 ) {
-                    left_indices.push(left_idx);
-                    right_indices.push(right_idx);
-                    return;
+                    if keep(left_idx, right_idx) {
+                        left_indices.push(left_idx);
+                        right_indices.push(right_idx);
+                        return;
+                    }
                 }
             }
             // Non-join equality (e.g., a.x = 5) - add to residual

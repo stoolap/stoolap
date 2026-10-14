@@ -25,7 +25,8 @@ use std::sync::Arc;
 use crate::common::CompactArc;
 use memchr::memmem;
 
-use crate::core::{DataType, Value, ValueSet};
+use crate::core::predicate::PredicateSet;
+use crate::core::{DataType, Value};
 use crate::functions::{NativeFn1, ScalarFunction};
 
 /// Compiled LIKE/ILIKE pattern for fast matching
@@ -453,7 +454,7 @@ pub enum Op {
 
     /// Fused: column IN (constant set with AHash)
     /// Stack: [] -> [bool]
-    InSetColumn(u16, CompactArc<ValueSet>, bool), // col_idx, set, has_null
+    InSetColumn(u16, CompactArc<PredicateSet>), // col_idx, set
 
     /// Fused: column BETWEEN low AND high (constants)
     /// Stack: [] -> [bool]
@@ -613,11 +614,11 @@ pub enum Op {
     // =========================================================================
     /// IN set membership (pre-built FxHashSet for fast lookups)
     /// Stack: [value] -> [bool]
-    InSet(CompactArc<ValueSet>, bool), // set, has_null
+    InSet(CompactArc<PredicateSet>),
 
     /// NOT IN set membership
     /// Stack: [value] -> [bool]
-    NotInSet(CompactArc<ValueSet>, bool), // set, has_null
+    NotInSet(CompactArc<PredicateSet>),
 
     /// IN over items evaluated at run time; the value is judged once
     /// Stack: [value, item_1, ..., item_n] -> [bool]
@@ -888,13 +889,13 @@ impl std::fmt::Debug for Op {
             Op::IsNullColumn(col) => write!(f, "IsNullColumn({})", col),
             Op::IsNotNullColumn(col) => write!(f, "IsNotNullColumn({})", col),
             Op::LikeColumn(col, _, ci) => write!(f, "LikeColumn({}, case_insensitive={})", col, ci),
-            Op::InSetColumn(col, set, has_null) => {
+            Op::InSetColumn(col, set) => {
                 write!(
                     f,
                     "InSetColumn({}, len={}, has_null={})",
                     col,
                     set.len(),
-                    has_null
+                    set.has_null()
                 )
             }
             Op::BetweenColumnConst(col, low, high) => {
@@ -948,11 +949,16 @@ impl std::fmt::Debug for Op {
             Op::VectorDistanceL2 => write!(f, "VectorDistanceL2"),
             Op::VectorDistanceCosine => write!(f, "VectorDistanceCosine"),
             Op::VectorDistanceIP => write!(f, "VectorDistanceIP"),
-            Op::InSet(set, has_null) => {
-                write!(f, "InSet(len={}, has_null={})", set.len(), has_null)
+            Op::InSet(set) => {
+                write!(f, "InSet(len={}, has_null={})", set.len(), set.has_null())
             }
-            Op::NotInSet(set, has_null) => {
-                write!(f, "NotInSet(len={}, has_null={})", set.len(), has_null)
+            Op::NotInSet(set) => {
+                write!(
+                    f,
+                    "NotInSet(len={}, has_null={})",
+                    set.len(),
+                    set.has_null()
+                )
             }
             Op::InList(count) => write!(f, "InList({})", count),
             Op::Between => write!(f, "Between"),
@@ -1585,11 +1591,15 @@ mod tests {
 
     #[test]
     fn test_op_debug_sets() {
+        use crate::core::predicate::PredicateSet;
         use crate::core::ValueSet;
-        let set = CompactArc::new(ValueSet::default());
-        assert!(format!("{:?}", Op::InSet(set.clone(), false)).contains("InSet"));
-        assert!(format!("{:?}", Op::NotInSet(set.clone(), true)).contains("NotInSet"));
-        assert!(format!("{:?}", Op::InSetColumn(0, set, false)).contains("InSetColumn"));
+        let set = CompactArc::new(PredicateSet::new(
+            CompactArc::new(ValueSet::default()),
+            false,
+        ));
+        assert!(format!("{:?}", Op::InSet(set.clone())).contains("InSet"));
+        assert!(format!("{:?}", Op::NotInSet(set.clone())).contains("NotInSet"));
+        assert!(format!("{:?}", Op::InSetColumn(0, set)).contains("InSetColumn"));
     }
 
     #[test]

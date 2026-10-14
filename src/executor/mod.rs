@@ -64,7 +64,6 @@ mod ddl;
 mod dml;
 mod dml_fast_path;
 mod explain;
-pub(crate) mod expr_converter;
 mod foreign_key;
 mod index_optimizer;
 mod pk_fast_path;

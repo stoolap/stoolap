@@ -238,7 +238,7 @@ impl Program {
                 | Op::IsNullColumn(_)
                 | Op::IsNotNullColumn(_)
                 | Op::LikeColumn(_, _, _)
-                | Op::InSetColumn(_, _, _)
+                | Op::InSetColumn(_, _)
                 | Op::BetweenColumnConst(_, _, _) => 1,
 
                 // Pop 2, push 1 (-1)
@@ -303,8 +303,8 @@ impl Program {
                 | Op::LikeEscape(_, _, _)
                 | Op::Glob(_)
                 | Op::Regexp(_)
-                | Op::InSet(_, _)
-                | Op::NotInSet(_, _)
+                | Op::InSet(_)
+                | Op::NotInSet(_)
                 | Op::Cast(_)
                 | Op::TruncateToDate
                 | Op::ExecScalarSubquery(_)
@@ -555,9 +555,7 @@ impl Program {
                             Op::Like(pattern, case_insensitive) => {
                                 Some(Op::LikeColumn(*col_idx, pattern.clone(), *case_insensitive))
                             }
-                            Op::InSet(set, has_null) => {
-                                Some(Op::InSetColumn(*col_idx, set.clone(), *has_null))
-                            }
+                            Op::InSet(set) => Some(Op::InSetColumn(*col_idx, set.clone())),
                             _ => None,
                         };
 

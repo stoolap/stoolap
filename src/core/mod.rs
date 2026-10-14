@@ -25,6 +25,7 @@
 //! - [`Error`] - Error types for all storage operations
 
 pub mod error;
+pub mod predicate;
 pub mod row;
 pub mod row_vec;
 pub mod schema;

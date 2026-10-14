@@ -93,7 +93,7 @@
 //! checks are not yet integrated into the streaming operators.
 
 use crate::common::CompactArc;
-use crate::core::{Result, Row, RowVec};
+use crate::core::{Result, Row, RowVec, Schema};
 use crate::executor::context::ExecutionContext;
 use crate::executor::expression::{JoinFilter, RowFilter};
 use crate::executor::hash_table::JoinHashTable;
@@ -105,7 +105,9 @@ use crate::executor::parallel::{
     parallel_hash_join, ParallelConfig, DEFAULT_PARALLEL_JOIN_THRESHOLD,
 };
 use crate::executor::planner::{RuntimeJoinAlgorithm, RuntimeJoinDecision};
-use crate::executor::utils::{extract_join_keys_and_residual, is_sorted_on_keys};
+use crate::executor::utils::{
+    column_families, extract_join_keys_and_residual_keeping, is_sorted_on_keys,
+};
 use crate::functions::registry::global_registry;
 use crate::optimizer::bloom::RuntimeBloomFilter;
 use crate::parser::ast::Expression;
@@ -184,6 +186,10 @@ pub struct JoinRequest<'a> {
     /// Optional algorithm decision from QueryPlanner.
     /// When provided, the executor uses this instead of making its own decision.
     pub algorithm_hint: Option<&'a RuntimeJoinDecision>,
+    /// The schema of a side that reads a base table directly, which says
+    /// what its key columns hold without reading the rows
+    pub left_schema: Option<CompactArc<Schema>>,
+    pub right_schema: Option<CompactArc<Schema>>,
 }
 
 /// Request to execute a streaming hash join.
@@ -257,19 +263,55 @@ impl JoinExecutor {
         all_columns.extend(request.right_columns.iter().cloned());
 
         // Analyze the join (key extraction only - sort check is deferred)
-        let analysis = self.analyze(
+        let mut analysis = self.analyze(
             request.left_columns,
             request.right_columns,
             request.condition,
             request.join_type,
+            &|_, _| true,
         );
+
+        // A key pair holding a number on one side and a TEXT on the other is
+        // compared in the residual instead, and the algorithm chosen again
+        let cross_pairs: Vec<(usize, usize)> = analysis
+            .left_key_indices
+            .iter()
+            .zip(&analysis.right_key_indices)
+            .filter(|(l, r)| {
+                let (left_numbers, left_texts) = column_families(
+                    &request.left_rows,
+                    request.left_columns,
+                    request.left_schema.as_deref(),
+                    **l,
+                );
+                if !left_numbers && !left_texts {
+                    return false;
+                }
+                let (right_numbers, right_texts) = column_families(
+                    &request.right_rows,
+                    request.right_columns,
+                    request.right_schema.as_deref(),
+                    **r,
+                );
+                (left_numbers && right_texts) || (left_texts && right_numbers)
+            })
+            .map(|(l, r)| (*l, *r))
+            .collect();
+        if !cross_pairs.is_empty() {
+            analysis = self.analyze(
+                request.left_columns,
+                request.right_columns,
+                request.condition,
+                request.join_type,
+                &|l, r| !cross_pairs.contains(&(l, r)),
+            );
+        }
 
         // Select algorithm: use provided hint from QueryPlanner if available,
         // otherwise fall back to local heuristics
-        let config = if let Some(hint) = request.algorithm_hint {
-            self.convert_runtime_decision(hint, &analysis)
-        } else {
-            self.select_algorithm(&analysis, &request.left_rows, &request.right_rows)
+        let config = match request.algorithm_hint {
+            Some(hint) if cross_pairs.is_empty() => self.convert_runtime_decision(hint, &analysis),
+            _ => self.select_algorithm(&analysis, &request.left_rows, &request.right_rows),
         };
 
         // Execute join based on algorithm (takes ownership of rows)
@@ -348,6 +390,7 @@ impl JoinExecutor {
             &right_columns,
             request.condition,
             request.join_type,
+            &|_, _| true,
         );
 
         // Probe side is already a streaming operator
@@ -439,13 +482,14 @@ impl JoinExecutor {
         right_columns: &[String],
         condition: Option<&Expression>,
         join_type_str: &str,
+        keep: &dyn Fn(usize, usize) -> bool,
     ) -> JoinAnalysis {
         let join_type = JoinType::parse(join_type_str);
 
         // Extract equality keys and residual conditions
         let (left_key_indices, right_key_indices, residual_conditions) =
             if let Some(cond) = condition {
-                extract_join_keys_and_residual(cond, left_columns, right_columns)
+                extract_join_keys_and_residual_keeping(cond, left_columns, right_columns, keep)
             } else {
                 (Vec::new(), Vec::new(), Vec::new())
             };
@@ -1001,6 +1045,8 @@ mod tests {
             limit: None,
             ctx: &ctx,
             algorithm_hint: None,
+            left_schema: None,
+            right_schema: None,
         };
 
         let result = executor.execute(request).unwrap();
@@ -1046,6 +1092,8 @@ mod tests {
             limit: None,
             ctx: &ctx,
             algorithm_hint: None,
+            left_schema: None,
+            right_schema: None,
         };
 
         let result = executor.execute(request).unwrap();
@@ -1091,6 +1139,8 @@ mod tests {
             limit: Some(1), // Only need 1 row
             ctx: &ctx,
             algorithm_hint: None,
+            left_schema: None,
+            right_schema: None,
         };
 
         let result = executor.execute(request).unwrap();
@@ -1120,6 +1170,8 @@ mod tests {
             limit: None,
             ctx: &ctx,
             algorithm_hint: None,
+            left_schema: None,
+            right_schema: None,
         };
 
         let result = executor.execute(request).unwrap();

@@ -29,10 +29,46 @@ use smallvec::SmallVec;
 use super::ops::{CompareOp, CompiledPattern, Op};
 use super::program::Program;
 use crate::common::{CompactArc, SmartString};
+use crate::core::predicate::{number_against_text, sql_compare, sql_distinct, sql_eq};
 use crate::core::{DataType, Result, Row, Value, NULL_VALUE};
 
 /// Stack value that can be borrowed (from row/constants) or owned (from operations)
 type StackValue<'a> = Cow<'a, Value>;
+
+/// A predicate's result as a value: None is UNKNOWN, a boolean NULL
+#[inline]
+fn truth(result: Option<bool>) -> Value {
+    result.map_or(Value::Null(DataType::Boolean), Value::Boolean)
+}
+
+/// A fused `=` against a non-numeric constant: a number against a TEXT by the
+/// predicate comparison, any other pair as `Value::compare` orders it
+#[inline]
+fn eq_const(col_val: &Value, val: &Value) -> Option<bool> {
+    if col_val.is_null() || val.is_null() {
+        return None;
+    }
+    if let Some(ordering) = number_against_text(col_val, val) {
+        return ordering.map(std::cmp::Ordering::is_eq);
+    }
+    Some(match col_val.compare(val) {
+        Ok(ordering) => ordering.is_eq(),
+        Err(_) => col_val == val,
+    })
+}
+
+/// `value BETWEEN low AND high`: `value >= low AND value <= high`, where a
+/// false half decides even when the other is UNKNOWN
+#[cold]
+fn between_cell(value: &Value, low: &Value, high: &Value) -> Option<bool> {
+    let above = sql_compare(value, low).map(|o| o.is_ge());
+    let below = sql_compare(value, high).map(|o| o.is_le());
+    match (above, below) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (Some(true), Some(true)) => Some(true),
+        _ => None,
+    }
+}
 
 /// Stack capacity for inline storage (avoids heap allocation for simple expressions)
 /// Most expressions need 4-8 stack slots, so 8 covers the common case.
@@ -410,24 +446,14 @@ impl ExprVM {
                 Op::Eq => {
                     let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = if a.is_null() || b.is_null() {
-                        Value::Null(DataType::Boolean)
-                    } else {
-                        Value::Boolean(a == b)
-                    };
-                    self.stack.push(result);
+                    self.stack.push(truth(sql_eq(&a, &b)));
                     pc += 1;
                 }
 
                 Op::Ne => {
                     let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = if a.is_null() || b.is_null() {
-                        Value::Null(DataType::Boolean)
-                    } else {
-                        Value::Boolean(a != b)
-                    };
-                    self.stack.push(result);
+                    self.stack.push(truth(sql_eq(&a, &b).map(|eq| !eq)));
                     pc += 1;
                 }
 
@@ -522,28 +548,14 @@ impl ExprVM {
                 Op::IsDistinctFrom => {
                     let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    // NULL IS DISTINCT FROM NULL = FALSE
-                    // NULL IS DISTINCT FROM non-NULL = TRUE
-                    // non-NULL IS DISTINCT FROM NULL = TRUE
-                    // Otherwise use regular comparison
-                    let result = match (a.is_null(), b.is_null()) {
-                        (true, true) => false,
-                        (true, false) | (false, true) => true,
-                        (false, false) => a != b,
-                    };
-                    self.stack.push(Value::Boolean(result));
+                    self.stack.push(Value::Boolean(sql_distinct(&a, &b)));
                     pc += 1;
                 }
 
                 Op::IsNotDistinctFrom => {
                     let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match (a.is_null(), b.is_null()) {
-                        (true, true) => true,
-                        (true, false) | (false, true) => false,
-                        (false, false) => a == b,
-                    };
-                    self.stack.push(Value::Boolean(result));
+                    self.stack.push(Value::Boolean(!sql_distinct(&a, &b)));
                     pc += 1;
                 }
 
@@ -560,17 +572,7 @@ impl ExprVM {
                     let result = match val {
                         Value::Integer(v) => Self::eq_int(col_val, *v),
                         Value::Float(v) => Self::eq_float(col_val, *v),
-                        _ => {
-                            if col_val.is_null() || val.is_null() {
-                                Value::Null(DataType::Boolean)
-                            } else {
-                                match col_val.compare(val) {
-                                    Ok(std::cmp::Ordering::Equal) => Value::Boolean(true),
-                                    Ok(_) => Value::Boolean(false),
-                                    Err(_) => Value::Boolean(col_val == val),
-                                }
-                            }
-                        }
+                        _ => truth(eq_const(col_val, val)),
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -585,17 +587,7 @@ impl ExprVM {
                     let result = match val {
                         Value::Integer(v) => Self::ne_int(col_val, *v),
                         Value::Float(v) => Self::ne_float(col_val, *v),
-                        _ => {
-                            if col_val.is_null() || val.is_null() {
-                                Value::Null(DataType::Boolean)
-                            } else {
-                                match col_val.compare(val) {
-                                    Ok(std::cmp::Ordering::Equal) => Value::Boolean(false),
-                                    Ok(_) => Value::Boolean(true),
-                                    Err(_) => Value::Boolean(col_val != val),
-                                }
-                            }
-                        }
+                        _ => truth(eq_const(col_val, val).map(|eq| !eq)),
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -695,25 +687,12 @@ impl ExprVM {
                     pc += 1;
                 }
 
-                Op::InSetColumn(idx, set, has_null) => {
+                Op::InSetColumn(idx, set) => {
                     let col_val = ctx
                         .row
                         .get(*idx as usize)
                         .unwrap_or(&Value::Null(DataType::Null));
-                    // A set holding nothing matches nothing, whatever it is
-                    // asked about, so NOT IN over it holds for every row
-                    let result = if set.is_empty() && !*has_null {
-                        Value::Boolean(false)
-                    } else if col_val.is_null() {
-                        Value::Null(DataType::Boolean)
-                    } else if set.contains(col_val) {
-                        Value::Boolean(true)
-                    } else if *has_null {
-                        Value::Null(DataType::Boolean)
-                    } else {
-                        Value::Boolean(false)
-                    };
-                    self.stack.push(result);
+                    self.stack.push(truth(set.contains(col_val)));
                     pc += 1;
                 }
 
@@ -736,10 +715,7 @@ impl ExprVM {
                         (Value::Float(lo), Value::Integer(hi)) => {
                             Self::between_mixed_int_hi(col_val, *lo, *hi)
                         }
-                        _ if col_val.is_null() || low.is_null() || high.is_null() => {
-                            Value::Null(DataType::Boolean)
-                        }
-                        _ => Value::Boolean(col_val >= low && col_val <= high),
+                        _ => truth(between_cell(col_val, low, high)),
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -1373,22 +1349,9 @@ impl ExprVM {
                 // =============================================================
                 // SET OPERATIONS
                 // =============================================================
-                Op::InSet(set, has_null) => {
+                Op::InSet(set) => {
                     let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    // A set holding nothing matches nothing, whatever it is
-                    // asked about, so NOT IN over it holds for every row
-                    let result = if set.is_empty() && !*has_null {
-                        Value::Boolean(false)
-                    } else if v.is_null() {
-                        Value::Null(DataType::Boolean)
-                    } else if set.contains(&v) {
-                        Value::Boolean(true)
-                    } else if *has_null {
-                        Value::Null(DataType::Boolean)
-                    } else {
-                        Value::Boolean(false)
-                    };
-                    self.stack.push(result);
+                    self.stack.push(truth(set.contains(&v)));
                     pc += 1;
                 }
 
@@ -1396,33 +1359,25 @@ impl ExprVM {
                     let start = self.stack.len().saturating_sub(*count as usize);
                     let items: Vec<Value> = self.stack.drain(start..).collect();
                     let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = if v.is_null() {
-                        Value::Null(DataType::Boolean)
-                    } else if items.iter().any(|item| !item.is_null() && *item == v) {
-                        Value::Boolean(true)
-                    } else if items.iter().any(Value::is_null) {
-                        Value::Null(DataType::Boolean)
-                    } else {
-                        Value::Boolean(false)
-                    };
-                    self.stack.push(result);
+                    // value = item OR value = item ..., with OR's UNKNOWN
+                    let mut result = Some(false);
+                    for item in &items {
+                        match sql_eq(&v, item) {
+                            Some(true) => {
+                                result = Some(true);
+                                break;
+                            }
+                            Some(false) => {}
+                            None => result = None,
+                        }
+                    }
+                    self.stack.push(truth(result));
                     pc += 1;
                 }
 
-                Op::NotInSet(set, has_null) => {
+                Op::NotInSet(set) => {
                     let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = if set.is_empty() && !*has_null {
-                        Value::Boolean(true)
-                    } else if v.is_null() {
-                        Value::Null(DataType::Boolean)
-                    } else if set.contains(&v) {
-                        Value::Boolean(false)
-                    } else if *has_null {
-                        Value::Null(DataType::Boolean)
-                    } else {
-                        Value::Boolean(true)
-                    };
-                    self.stack.push(result);
+                    self.stack.push(truth(set.contains(&v).map(|found| !found)));
                     pc += 1;
                 }
 
@@ -1461,10 +1416,7 @@ impl ExprVM {
                             crate::core::value::i64_ge_f64(*v, *lo)
                                 && crate::core::value::i64_le_f64(*v, *hi),
                         ),
-                        _ if val.is_null() || low.is_null() || high.is_null() => {
-                            Value::Null(DataType::Boolean)
-                        }
-                        _ => Value::Boolean(val >= low && val <= high),
+                        _ => truth(between_cell(&val, &low, &high)),
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -1505,10 +1457,7 @@ impl ExprVM {
                             crate::core::value::i64_lt_f64(*v, *lo)
                                 || crate::core::value::i64_gt_f64(*v, *hi),
                         ),
-                        _ if val.is_null() || low.is_null() || high.is_null() => {
-                            Value::Null(DataType::Boolean)
-                        }
-                        _ => Value::Boolean(val < low || val > high),
+                        _ => truth(between_cell(&val, &low, &high).map(|inside| !inside)),
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -1526,25 +1475,35 @@ impl ExprVM {
                     self.args_buffer.clear();
                     self.args_buffer.extend(self.stack.drain(start..));
 
-                    // Check if any values are NULL
-                    let has_null_in_tuple = self.args_buffer.iter().any(|v| v.is_null());
-
-                    if has_null_in_tuple {
-                        // NULL in tuple -> result is NULL
-                        self.stack.push(Value::Null(DataType::Boolean));
-                    } else {
-                        // Check membership
-                        let found = values.iter().any(|tuple| {
-                            tuple.len() == self.args_buffer.len()
-                                && tuple
-                                    .iter()
-                                    .zip(self.args_buffer.iter())
-                                    .all(|(a, b)| a == b)
-                        });
-
-                        let result = if *negated { !found } else { found };
-                        self.stack.push(Value::Boolean(result));
+                    // OR over the tuples of an AND over their columns, each
+                    // with UNKNOWN as SQL has it
+                    let mut found = Some(false);
+                    for tuple in values.iter() {
+                        if tuple.len() != self.args_buffer.len() {
+                            continue;
+                        }
+                        let mut equal = Some(true);
+                        for (member, probe) in tuple.iter().zip(self.args_buffer.iter()) {
+                            match sql_eq(probe, member) {
+                                Some(true) => {}
+                                Some(false) => {
+                                    equal = Some(false);
+                                    break;
+                                }
+                                None => equal = None,
+                            }
+                        }
+                        match equal {
+                            Some(true) => {
+                                found = Some(true);
+                                break;
+                            }
+                            Some(false) => {}
+                            None => found = None,
+                        }
                     }
+                    let result = if *negated { found.map(|f| !f) } else { found };
+                    self.stack.push(truth(result));
                     pc += 1;
                 }
 
@@ -2173,24 +2132,14 @@ impl ExprVM {
                 Op::Eq => {
                     let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
                     let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    let result = if a.is_null() || b.is_null() {
-                        Value::Null(DataType::Boolean)
-                    } else {
-                        Value::Boolean(*a == *b)
-                    };
-                    stack.push(Cow::Owned(result));
+                    stack.push(Cow::Owned(truth(sql_eq(&a, &b))));
                     pc += 1;
                 }
 
                 Op::Ne => {
                     let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
                     let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    let result = if a.is_null() || b.is_null() {
-                        Value::Null(DataType::Boolean)
-                    } else {
-                        Value::Boolean(*a != *b)
-                    };
-                    stack.push(Cow::Owned(result));
+                    stack.push(Cow::Owned(truth(sql_eq(&a, &b).map(|eq| !eq))));
                     pc += 1;
                 }
 
@@ -2377,17 +2326,7 @@ impl ExprVM {
                     let result = match val {
                         Value::Integer(v) => Self::eq_int(col_val, *v),
                         Value::Float(v) => Self::eq_float(col_val, *v),
-                        _ => {
-                            if col_val.is_null() || val.is_null() {
-                                Value::Null(DataType::Boolean)
-                            } else {
-                                match col_val.compare(val) {
-                                    Ok(std::cmp::Ordering::Equal) => Value::Boolean(true),
-                                    Ok(_) => Value::Boolean(false),
-                                    Err(_) => Value::Boolean(col_val == val),
-                                }
-                            }
-                        }
+                        _ => truth(eq_const(col_val, val)),
                     };
                     stack.push(Cow::Owned(result));
                     pc += 1;
@@ -2906,64 +2845,62 @@ impl ExprVM {
             Op::GtColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Integer(v)) => *v > *threshold,
                 Some(Value::Float(v)) => crate::core::value::i64_lt_f64(*threshold, *v),
-                _ => false,
+                cell => Self::fused_cell(op, cell) == Some(true),
             },
             Op::GtColumnConst(idx, Value::Float(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Float(v)) => *v > *threshold,
                 Some(Value::Integer(v)) => crate::core::value::i64_gt_f64(*v, *threshold),
-                _ => false,
+                cell => Self::fused_cell(op, cell) == Some(true),
             },
             Op::LtColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Integer(v)) => *v < *threshold,
                 Some(Value::Float(v)) => crate::core::value::i64_gt_f64(*threshold, *v),
-                _ => false,
+                cell => Self::fused_cell(op, cell) == Some(true),
             },
             Op::LtColumnConst(idx, Value::Float(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Float(v)) => *v < *threshold,
                 Some(Value::Integer(v)) => crate::core::value::i64_lt_f64(*v, *threshold),
-                _ => false,
+                cell => Self::fused_cell(op, cell) == Some(true),
             },
             Op::GeColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Integer(v)) => *v >= *threshold,
                 Some(Value::Float(v)) => crate::core::value::i64_le_f64(*threshold, *v),
-                _ => false,
+                cell => Self::fused_cell(op, cell) == Some(true),
             },
             Op::GeColumnConst(idx, Value::Float(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Float(v)) => *v >= *threshold,
                 Some(Value::Integer(v)) => crate::core::value::i64_ge_f64(*v, *threshold),
-                _ => false,
+                cell => Self::fused_cell(op, cell) == Some(true),
             },
             Op::LeColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Integer(v)) => *v <= *threshold,
                 Some(Value::Float(v)) => crate::core::value::i64_ge_f64(*threshold, *v),
-                _ => false,
+                cell => Self::fused_cell(op, cell) == Some(true),
             },
             Op::LeColumnConst(idx, Value::Float(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Float(v)) => *v <= *threshold,
                 Some(Value::Integer(v)) => crate::core::value::i64_le_f64(*v, *threshold),
-                _ => false,
+                cell => Self::fused_cell(op, cell) == Some(true),
             },
             Op::EqColumnConst(idx, Value::Integer(val)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Integer(v)) => *v == *val,
                 Some(Value::Float(v)) => crate::core::value::i64_eq_f64(*val, *v),
-                _ => false,
+                cell => Self::fused_cell(op, cell) == Some(true),
             },
             Op::EqColumnConst(idx, Value::Float(val)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Float(v)) => *v == *val,
                 Some(Value::Integer(v)) => crate::core::value::i64_eq_f64(*v, *val),
-                _ => false,
+                cell => Self::fused_cell(op, cell) == Some(true),
             },
             Op::NeColumnConst(idx, Value::Integer(val)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Integer(v)) => *v != *val,
                 Some(Value::Float(v)) => crate::core::value::i64_ne_f64(*val, *v),
-                Some(Value::Null(_)) => false,
-                _ => true,
+                cell => Self::fused_cell(op, cell) == Some(true),
             },
             Op::NeColumnConst(idx, Value::Float(val)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Float(v)) => *v != *val,
                 Some(Value::Integer(v)) => crate::core::value::i64_ne_f64(*v, *val),
-                Some(Value::Null(_)) => false,
-                _ => true,
+                cell => Self::fused_cell(op, cell) == Some(true),
             },
             Op::IsNullColumn(idx) => ctx.row.get(*idx as usize).is_some_and(|v| v.is_null()),
             Op::IsNotNullColumn(idx) => ctx.row.get(*idx as usize).is_some_and(|v| !v.is_null()),
@@ -2974,7 +2911,7 @@ impl ExprVM {
                         crate::core::value::i64_le_f64(*lo, *v)
                             && crate::core::value::i64_ge_f64(*hi, *v)
                     }
-                    _ => false,
+                    cell => Self::fused_cell(op, cell) == Some(true),
                 }
             }
             Op::BetweenColumnConst(idx, Value::Float(lo), Value::Float(hi)) => {
@@ -2984,47 +2921,30 @@ impl ExprVM {
                         crate::core::value::i64_ge_f64(*v, *lo)
                             && crate::core::value::i64_le_f64(*v, *hi)
                     }
-                    _ => false,
+                    cell => Self::fused_cell(op, cell) == Some(true),
                 }
             }
             Op::BetweenColumnConst(idx, Value::Integer(lo), Value::Float(hi)) => {
                 match ctx.row.get(*idx as usize) {
                     Some(Value::Float(v)) => crate::core::value::i64_le_f64(*lo, *v) && *v <= *hi,
                     Some(Value::Integer(v)) => *v >= *lo && crate::core::value::i64_le_f64(*v, *hi),
-                    _ => false,
+                    cell => Self::fused_cell(op, cell) == Some(true),
                 }
             }
             Op::BetweenColumnConst(idx, Value::Float(lo), Value::Integer(hi)) => {
                 match ctx.row.get(*idx as usize) {
                     Some(Value::Float(v)) => *v >= *lo && crate::core::value::i64_ge_f64(*hi, *v),
                     Some(Value::Integer(v)) => crate::core::value::i64_ge_f64(*v, *lo) && *v <= *hi,
-                    _ => false,
+                    cell => Self::fused_cell(op, cell) == Some(true),
                 }
             }
-            Op::BetweenColumnConst(idx, low, high) => match ctx.row.get(*idx as usize) {
-                Some(col_val) if col_val.is_null() => false,
-                Some(col_val) => {
-                    let ge_low = col_val
-                        .compare(low)
-                        .map(|o| o != std::cmp::Ordering::Less)
-                        .unwrap_or(false);
-                    let le_high = col_val
-                        .compare(high)
-                        .map(|o| o != std::cmp::Ordering::Greater)
-                        .unwrap_or(false);
-                    ge_low && le_high
-                }
-                _ => false,
-            },
-            Op::InSetColumn(idx, set, has_null) => {
-                match ctx.row.get(*idx as usize) {
-                    Some(v) if v.is_null() => false, // NULL IN set -> NULL -> false in bool context
-                    Some(v) if set.contains(v) => true,
-                    Some(_) if *has_null => false, // val not in set, but set has NULL -> NULL -> false
-                    Some(_) => false,
-                    None => false,
-                }
+            Op::BetweenColumnConst(idx, _, _) => {
+                Self::fused_cell(op, ctx.row.get(*idx as usize)) == Some(true)
             }
+            Op::InSetColumn(idx, set) => ctx
+                .row
+                .get(*idx as usize)
+                .is_some_and(|v| set.contains(v) == Some(true)),
             // Handle LIKE pattern matching (e.g., fruit LIKE 'a%')
             Op::LikeColumn(idx, pattern, case_insensitive) => {
                 match ctx.row.get(*idx as usize) {
@@ -3045,74 +2965,62 @@ impl ExprVM {
             Op::GtColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Integer(v)) => Some(*v > *threshold),
                 Some(Value::Float(v)) => Some(crate::core::value::i64_lt_f64(*threshold, *v)),
-                Some(Value::Null(_)) | None => None,
-                _ => Some(false),
+                cell => Self::fused_cell(op, cell),
             },
             Op::GtColumnConst(idx, Value::Float(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Float(v)) => Some(*v > *threshold),
                 Some(Value::Integer(v)) => Some(crate::core::value::i64_gt_f64(*v, *threshold)),
-                Some(Value::Null(_)) | None => None,
-                _ => Some(false),
+                cell => Self::fused_cell(op, cell),
             },
             Op::LtColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Integer(v)) => Some(*v < *threshold),
                 Some(Value::Float(v)) => Some(crate::core::value::i64_gt_f64(*threshold, *v)),
-                Some(Value::Null(_)) | None => None,
-                _ => Some(false),
+                cell => Self::fused_cell(op, cell),
             },
             Op::LtColumnConst(idx, Value::Float(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Float(v)) => Some(*v < *threshold),
                 Some(Value::Integer(v)) => Some(crate::core::value::i64_lt_f64(*v, *threshold)),
-                Some(Value::Null(_)) | None => None,
-                _ => Some(false),
+                cell => Self::fused_cell(op, cell),
             },
             Op::GeColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Integer(v)) => Some(*v >= *threshold),
                 Some(Value::Float(v)) => Some(crate::core::value::i64_le_f64(*threshold, *v)),
-                Some(Value::Null(_)) | None => None,
-                _ => Some(false),
+                cell => Self::fused_cell(op, cell),
             },
             Op::GeColumnConst(idx, Value::Float(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Float(v)) => Some(*v >= *threshold),
                 Some(Value::Integer(v)) => Some(crate::core::value::i64_ge_f64(*v, *threshold)),
-                Some(Value::Null(_)) | None => None,
-                _ => Some(false),
+                cell => Self::fused_cell(op, cell),
             },
             Op::LeColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Integer(v)) => Some(*v <= *threshold),
                 Some(Value::Float(v)) => Some(crate::core::value::i64_ge_f64(*threshold, *v)),
-                Some(Value::Null(_)) | None => None,
-                _ => Some(false),
+                cell => Self::fused_cell(op, cell),
             },
             Op::LeColumnConst(idx, Value::Float(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Float(v)) => Some(*v <= *threshold),
                 Some(Value::Integer(v)) => Some(crate::core::value::i64_le_f64(*v, *threshold)),
-                Some(Value::Null(_)) | None => None,
-                _ => Some(false),
+                cell => Self::fused_cell(op, cell),
             },
             Op::EqColumnConst(idx, Value::Integer(val)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Integer(v)) => Some(*v == *val),
                 Some(Value::Float(v)) => Some(crate::core::value::i64_eq_f64(*val, *v)),
-                Some(Value::Null(_)) | None => None,
-                _ => Some(false),
+                cell => Self::fused_cell(op, cell),
             },
             Op::EqColumnConst(idx, Value::Float(val)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Float(v)) => Some(*v == *val),
                 Some(Value::Integer(v)) => Some(crate::core::value::i64_eq_f64(*v, *val)),
-                Some(Value::Null(_)) | None => None,
-                _ => Some(false),
+                cell => Self::fused_cell(op, cell),
             },
             Op::NeColumnConst(idx, Value::Integer(val)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Integer(v)) => Some(*v != *val),
                 Some(Value::Float(v)) => Some(crate::core::value::i64_ne_f64(*val, *v)),
-                Some(Value::Null(_)) | None => None,
-                _ => Some(true),
+                cell => Self::fused_cell(op, cell),
             },
             Op::NeColumnConst(idx, Value::Float(val)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Float(v)) => Some(*v != *val),
                 Some(Value::Integer(v)) => Some(crate::core::value::i64_ne_f64(*v, *val)),
-                Some(Value::Null(_)) | None => None,
-                _ => Some(true),
+                cell => Self::fused_cell(op, cell),
             },
             Op::IsNullColumn(idx) => Some(ctx.row.get(*idx as usize).is_some_and(|v| v.is_null())),
             Op::IsNotNullColumn(idx) => {
@@ -3125,8 +3033,7 @@ impl ExprVM {
                         crate::core::value::i64_le_f64(*lo, *v)
                             && crate::core::value::i64_ge_f64(*hi, *v),
                     ),
-                    Some(Value::Null(_)) | None => None,
-                    _ => Some(false),
+                    cell => Self::fused_cell(op, cell),
                 }
             }
             Op::BetweenColumnConst(idx, Value::Float(lo), Value::Float(hi)) => {
@@ -3136,8 +3043,7 @@ impl ExprVM {
                         crate::core::value::i64_ge_f64(*v, *lo)
                             && crate::core::value::i64_le_f64(*v, *hi),
                     ),
-                    Some(Value::Null(_)) | None => None,
-                    _ => Some(false),
+                    cell => Self::fused_cell(op, cell),
                 }
             }
             Op::BetweenColumnConst(idx, Value::Integer(lo), Value::Float(hi)) => {
@@ -3148,8 +3054,7 @@ impl ExprVM {
                     Some(Value::Integer(v)) => {
                         Some(*v >= *lo && crate::core::value::i64_le_f64(*v, *hi))
                     }
-                    Some(Value::Null(_)) | None => None,
-                    _ => Some(false),
+                    cell => Self::fused_cell(op, cell),
                 }
             }
             Op::BetweenColumnConst(idx, Value::Float(lo), Value::Integer(hi)) => {
@@ -3160,42 +3065,12 @@ impl ExprVM {
                     Some(Value::Integer(v)) => {
                         Some(crate::core::value::i64_ge_f64(*v, *lo) && *v <= *hi)
                     }
-                    Some(Value::Null(_)) | None => None,
-                    _ => Some(false),
+                    cell => Self::fused_cell(op, cell),
                 }
             }
-            Op::BetweenColumnConst(idx, low, high) => match ctx.row.get(*idx as usize) {
-                Some(col_val) if col_val.is_null() => None,
-                Some(col_val) => {
-                    let ge_low = col_val
-                        .compare(low)
-                        .map(|o| o != std::cmp::Ordering::Less)
-                        .ok();
-                    let le_high = col_val
-                        .compare(high)
-                        .map(|o| o != std::cmp::Ordering::Greater)
-                        .ok();
-                    match (ge_low, le_high) {
-                        (Some(true), Some(true)) => Some(true),
-                        (Some(false), _) | (_, Some(false)) => Some(false),
-                        _ => None,
-                    }
-                }
-                None => None,
-            },
-            Op::InSetColumn(idx, set, has_null) => {
-                // A set holding nothing matches nothing, whatever it is
-                // asked about
-                if set.is_empty() && !*has_null {
-                    return Some(false);
-                }
-                match ctx.row.get(*idx as usize) {
-                    Some(v) if v.is_null() => None, // NULL IN set -> NULL
-                    Some(v) if set.contains(v) => Some(true),
-                    Some(_) if *has_null => None, // val not in set, but set has NULL -> NULL
-                    Some(_) => Some(false),
-                    None => None,
-                }
+            Op::BetweenColumnConst(idx, _, _) => Self::fused_cell(op, ctx.row.get(*idx as usize)),
+            Op::InSetColumn(idx, set) => {
+                set.contains(ctx.row.get(*idx as usize).unwrap_or(&NULL_VALUE))
             }
             // Handle boolean constants (from processed subqueries like NOT EXISTS)
             Op::LoadConst(Value::Boolean(b)) => Some(*b),
@@ -3205,6 +3080,9 @@ impl ExprVM {
             Op::EqColumnConst(idx, Value::Text(val)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Text(v)) => Some(v == val),
                 Some(Value::Null(_)) | None => None,
+                Some(cell @ (Value::Integer(_) | Value::Float(_))) => {
+                    Self::fused_cell(op, Some(cell))
+                }
                 Some(col_val) => match col_val.compare(&Value::Text(val.clone())) {
                     Ok(std::cmp::Ordering::Equal) => Some(true),
                     Ok(_) => Some(false),
@@ -3214,6 +3092,9 @@ impl ExprVM {
             Op::NeColumnConst(idx, Value::Text(val)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Text(v)) => Some(v != val),
                 Some(Value::Null(_)) | None => None,
+                Some(cell @ (Value::Integer(_) | Value::Float(_))) => {
+                    Self::fused_cell(op, Some(cell))
+                }
                 Some(col_val) => match col_val.compare(&Value::Text(val.clone())) {
                     Ok(std::cmp::Ordering::Equal) => Some(false),
                     Ok(_) => Some(true),
@@ -3226,54 +3107,13 @@ impl ExprVM {
                 Some(Value::Null(_)) | None => None,
                 _ => Some(false),
             },
-            // Generic comparison for non-numeric fused ops (e.g., Timestamp < Text)
-            // Uses Value::compare() which handles cross-type comparison via string fallback
-            Op::LtColumnConst(idx, val)
-            | Op::LeColumnConst(idx, val)
-            | Op::GtColumnConst(idx, val)
-            | Op::GeColumnConst(idx, val) => match ctx.row.get(*idx as usize) {
-                Some(col_val) if col_val.is_null() => None,
-                Some(col_val) => {
-                    let expected = match op {
-                        Op::LtColumnConst(..) => std::cmp::Ordering::Less,
-                        Op::LeColumnConst(..) => std::cmp::Ordering::Less, // handled below
-                        Op::GtColumnConst(..) => std::cmp::Ordering::Greater,
-                        Op::GeColumnConst(..) => std::cmp::Ordering::Greater, // handled below
-                        _ => unreachable!(),
-                    };
-                    match col_val.compare(val) {
-                        Ok(ord) => {
-                            let result = match op {
-                                Op::LeColumnConst(..) | Op::GeColumnConst(..) => {
-                                    ord == expected || ord == std::cmp::Ordering::Equal
-                                }
-                                _ => ord == expected,
-                            };
-                            Some(result)
-                        }
-                        Err(_) => None,
-                    }
-                }
-                None => None,
-            },
-            Op::EqColumnConst(idx, val) => match ctx.row.get(*idx as usize) {
-                Some(col_val) if col_val.is_null() => None,
-                Some(col_val) => match col_val.compare(val) {
-                    Ok(std::cmp::Ordering::Equal) => Some(true),
-                    Ok(_) => Some(false),
-                    Err(_) => None,
-                },
-                None => None,
-            },
-            Op::NeColumnConst(idx, val) => match ctx.row.get(*idx as usize) {
-                Some(col_val) if col_val.is_null() => None,
-                Some(col_val) => match col_val.compare(val) {
-                    Ok(std::cmp::Ordering::Equal) => Some(false),
-                    Ok(_) => Some(true),
-                    Err(_) => None,
-                },
-                None => None,
-            },
+            // Any other fused comparison, by the predicate comparison
+            Op::LtColumnConst(idx, _)
+            | Op::LeColumnConst(idx, _)
+            | Op::GtColumnConst(idx, _)
+            | Op::GeColumnConst(idx, _)
+            | Op::EqColumnConst(idx, _)
+            | Op::NeColumnConst(idx, _) => Self::fused_cell(op, ctx.row.get(*idx as usize)),
             // For other comparisons, return None to fall back to full VM
             _ => None,
         }
@@ -3307,29 +3147,13 @@ impl ExprVM {
     fn compare_values(&self, a: &Value, b: &Value, expected: std::cmp::Ordering) -> Value {
         // Two NULLs order equal so an index can hold them; asked whether one
         // is below or above the other, SQL answers that it does not know
-        if a.is_null() || b.is_null() {
-            return Value::Null(DataType::Boolean);
-        }
-        match a.partial_cmp(b) {
-            Some(ord) if ord == expected => Value::Boolean(true),
-            Some(_) => Value::Boolean(false),
-            None => Value::Null(DataType::Boolean),
-        }
+        truth(sql_compare(a, b).map(|ord| ord == expected))
     }
 
     /// Answer `<=` or `>=`: `expected` is the strict half of the operator.
     #[inline]
     fn compare_values_or_equal(&self, a: &Value, b: &Value, expected: std::cmp::Ordering) -> Value {
-        if a.is_null() || b.is_null() {
-            return Value::Null(DataType::Boolean);
-        }
-        match a.partial_cmp(b) {
-            Some(ord) if ord == expected || ord == std::cmp::Ordering::Equal => {
-                Value::Boolean(true)
-            }
-            Some(_) => Value::Boolean(false),
-            None => Value::Null(DataType::Boolean),
-        }
+        truth(sql_compare(a, b).map(|ord| ord == expected || ord == std::cmp::Ordering::Equal))
     }
 
     // =========================================================================
@@ -3338,6 +3162,58 @@ impl ExprVM {
     // for the common case of integer/float column vs constant comparisons.
     // =========================================================================
 
+    /// A fused column comparison for a cell the numeric fast arms do not
+    /// take, by the same rules as the general interpreter
+    #[cold]
+    fn fused_cell(op: &Op, cell: Option<&Value>) -> Option<bool> {
+        let cell = cell.unwrap_or(&NULL_VALUE);
+        let value = match op {
+            Op::GtColumnConst(_, Value::Integer(t)) => Self::gt_int(cell, *t),
+            Op::GtColumnConst(_, Value::Float(t)) => Self::gt_float(cell, *t),
+            Op::LtColumnConst(_, Value::Integer(t)) => Self::lt_int(cell, *t),
+            Op::LtColumnConst(_, Value::Float(t)) => Self::lt_float(cell, *t),
+            Op::GeColumnConst(_, Value::Integer(t)) => Self::ge_int(cell, *t),
+            Op::GeColumnConst(_, Value::Float(t)) => Self::ge_float(cell, *t),
+            Op::LeColumnConst(_, Value::Integer(t)) => Self::le_int(cell, *t),
+            Op::LeColumnConst(_, Value::Float(t)) => Self::le_float(cell, *t),
+            Op::EqColumnConst(_, Value::Integer(v)) => Self::eq_int(cell, *v),
+            Op::EqColumnConst(_, Value::Float(v)) => Self::eq_float(cell, *v),
+            Op::NeColumnConst(_, Value::Integer(v)) => Self::ne_int(cell, *v),
+            Op::NeColumnConst(_, Value::Float(v)) => Self::ne_float(cell, *v),
+            Op::GtColumnConst(_, v) => truth(sql_compare(cell, v).map(|o| o.is_gt())),
+            Op::LtColumnConst(_, v) => truth(sql_compare(cell, v).map(|o| o.is_lt())),
+            Op::GeColumnConst(_, v) => truth(sql_compare(cell, v).map(|o| o.is_ge())),
+            Op::LeColumnConst(_, v) => truth(sql_compare(cell, v).map(|o| o.is_le())),
+            Op::EqColumnConst(_, v) => return Self::eq_by_order(cell, v),
+            Op::NeColumnConst(_, v) => return Self::eq_by_order(cell, v).map(|eq| !eq),
+            Op::BetweenColumnConst(_, low, high) => truth(between_cell(cell, low, high)),
+            _ => return None,
+        };
+        Self::to_tribool(&value)
+    }
+
+    /// A fast path `=`: a number against a TEXT by the predicate comparison,
+    /// any other pair equal when `Value::compare` orders it so
+    fn eq_by_order(cell: &Value, v: &Value) -> Option<bool> {
+        if cell.is_null() || v.is_null() {
+            return None;
+        }
+        match number_against_text(cell, v) {
+            Some(ordering) => ordering.map(std::cmp::Ordering::is_eq),
+            None => cell.compare(v).ok().map(std::cmp::Ordering::is_eq),
+        }
+    }
+
+    /// A TEXT cell against a numeric constant, by the predicate comparison
+    #[inline]
+    fn text_against(
+        col_val: &Value,
+        constant: Value,
+        holds: fn(std::cmp::Ordering) -> bool,
+    ) -> Value {
+        truth(sql_compare(col_val, &constant).map(holds))
+    }
+
     /// Inline greater-than comparison for integer constant
     #[inline(always)]
     fn gt_int(col_val: &Value, threshold: i64) -> Value {
@@ -3345,6 +3221,7 @@ impl ExprVM {
             Value::Integer(v) => Value::Boolean(*v > threshold),
             Value::Float(v) => Value::Boolean(crate::core::value::i64_lt_f64(threshold, *v)),
             Value::Null(_) => Value::Null(DataType::Boolean),
+            Value::Text(_) => Self::text_against(col_val, Value::Integer(threshold), |o| o.is_gt()),
             _ => Value::Boolean(false),
         }
     }
@@ -3356,6 +3233,7 @@ impl ExprVM {
             Value::Float(v) => Value::Boolean(*v > threshold),
             Value::Integer(v) => Value::Boolean(crate::core::value::i64_gt_f64(*v, threshold)),
             Value::Null(_) => Value::Null(DataType::Boolean),
+            Value::Text(_) => Self::text_against(col_val, Value::Float(threshold), |o| o.is_gt()),
             _ => Value::Boolean(false),
         }
     }
@@ -3367,6 +3245,7 @@ impl ExprVM {
             Value::Integer(v) => Value::Boolean(*v < threshold),
             Value::Float(v) => Value::Boolean(crate::core::value::i64_gt_f64(threshold, *v)),
             Value::Null(_) => Value::Null(DataType::Boolean),
+            Value::Text(_) => Self::text_against(col_val, Value::Integer(threshold), |o| o.is_lt()),
             _ => Value::Boolean(false),
         }
     }
@@ -3378,6 +3257,7 @@ impl ExprVM {
             Value::Float(v) => Value::Boolean(*v < threshold),
             Value::Integer(v) => Value::Boolean(crate::core::value::i64_lt_f64(*v, threshold)),
             Value::Null(_) => Value::Null(DataType::Boolean),
+            Value::Text(_) => Self::text_against(col_val, Value::Float(threshold), |o| o.is_lt()),
             _ => Value::Boolean(false),
         }
     }
@@ -3389,6 +3269,7 @@ impl ExprVM {
             Value::Integer(v) => Value::Boolean(*v >= threshold),
             Value::Float(v) => Value::Boolean(crate::core::value::i64_le_f64(threshold, *v)),
             Value::Null(_) => Value::Null(DataType::Boolean),
+            Value::Text(_) => Self::text_against(col_val, Value::Integer(threshold), |o| o.is_ge()),
             _ => Value::Boolean(false),
         }
     }
@@ -3400,6 +3281,7 @@ impl ExprVM {
             Value::Float(v) => Value::Boolean(*v >= threshold),
             Value::Integer(v) => Value::Boolean(crate::core::value::i64_ge_f64(*v, threshold)),
             Value::Null(_) => Value::Null(DataType::Boolean),
+            Value::Text(_) => Self::text_against(col_val, Value::Float(threshold), |o| o.is_ge()),
             _ => Value::Boolean(false),
         }
     }
@@ -3411,6 +3293,7 @@ impl ExprVM {
             Value::Integer(v) => Value::Boolean(*v <= threshold),
             Value::Float(v) => Value::Boolean(crate::core::value::i64_ge_f64(threshold, *v)),
             Value::Null(_) => Value::Null(DataType::Boolean),
+            Value::Text(_) => Self::text_against(col_val, Value::Integer(threshold), |o| o.is_le()),
             _ => Value::Boolean(false),
         }
     }
@@ -3422,6 +3305,7 @@ impl ExprVM {
             Value::Float(v) => Value::Boolean(*v <= threshold),
             Value::Integer(v) => Value::Boolean(crate::core::value::i64_le_f64(*v, threshold)),
             Value::Null(_) => Value::Null(DataType::Boolean),
+            Value::Text(_) => Self::text_against(col_val, Value::Float(threshold), |o| o.is_le()),
             _ => Value::Boolean(false),
         }
     }
@@ -3433,6 +3317,7 @@ impl ExprVM {
             Value::Integer(v) => Value::Boolean(*v == val),
             Value::Float(v) => Value::Boolean(crate::core::value::i64_eq_f64(val, *v)),
             Value::Null(_) => Value::Null(DataType::Boolean),
+            Value::Text(_) => Self::text_against(col_val, Value::Integer(val), |o| o.is_eq()),
             _ => Value::Boolean(false),
         }
     }
@@ -3444,6 +3329,7 @@ impl ExprVM {
             Value::Float(v) => Value::Boolean(*v == val),
             Value::Integer(v) => Value::Boolean(crate::core::value::i64_eq_f64(*v, val)),
             Value::Null(_) => Value::Null(DataType::Boolean),
+            Value::Text(_) => Self::text_against(col_val, Value::Float(val), |o| o.is_eq()),
             _ => Value::Boolean(false),
         }
     }
@@ -3455,6 +3341,7 @@ impl ExprVM {
             Value::Integer(v) => Value::Boolean(*v != val),
             Value::Float(v) => Value::Boolean(crate::core::value::i64_ne_f64(val, *v)),
             Value::Null(_) => Value::Null(DataType::Boolean),
+            Value::Text(_) => Self::text_against(col_val, Value::Integer(val), |o| o.is_ne()),
             _ => Value::Boolean(true),
         }
     }
@@ -3466,6 +3353,7 @@ impl ExprVM {
             Value::Float(v) => Value::Boolean(*v != val),
             Value::Integer(v) => Value::Boolean(crate::core::value::i64_ne_f64(*v, val)),
             Value::Null(_) => Value::Null(DataType::Boolean),
+            Value::Text(_) => Self::text_against(col_val, Value::Float(val), |o| o.is_ne()),
             _ => Value::Boolean(true),
         }
     }
@@ -3478,6 +3366,11 @@ impl ExprVM {
             Value::Integer(v) => Value::Boolean(*v >= lo && crate::core::value::i64_le_f64(*v, hi)),
             Value::Float(v) => Value::Boolean(crate::core::value::i64_le_f64(lo, *v) && *v <= hi),
             Value::Null(_) => Value::Null(DataType::Boolean),
+            Value::Text(_) => truth(between_cell(
+                col_val,
+                &Value::Integer(lo),
+                &Value::Float(hi),
+            )),
             _ => Value::Boolean(false),
         }
     }
@@ -3489,6 +3382,11 @@ impl ExprVM {
             Value::Integer(v) => Value::Boolean(crate::core::value::i64_ge_f64(*v, lo) && *v <= hi),
             Value::Float(v) => Value::Boolean(*v >= lo && crate::core::value::i64_ge_f64(hi, *v)),
             Value::Null(_) => Value::Null(DataType::Boolean),
+            Value::Text(_) => truth(between_cell(
+                col_val,
+                &Value::Float(lo),
+                &Value::Integer(hi),
+            )),
             _ => Value::Boolean(false),
         }
     }
@@ -3502,6 +3400,11 @@ impl ExprVM {
                 crate::core::value::i64_le_f64(low, *v) && crate::core::value::i64_ge_f64(high, *v),
             ),
             Value::Null(_) => Value::Null(DataType::Boolean),
+            Value::Text(_) => truth(between_cell(
+                col_val,
+                &Value::Integer(low),
+                &Value::Integer(high),
+            )),
             _ => Value::Boolean(false),
         }
     }
@@ -3515,6 +3418,11 @@ impl ExprVM {
                 crate::core::value::i64_ge_f64(*v, low) && crate::core::value::i64_le_f64(*v, high),
             ),
             Value::Null(_) => Value::Null(DataType::Boolean),
+            Value::Text(_) => truth(between_cell(
+                col_val,
+                &Value::Float(low),
+                &Value::Float(high),
+            )),
             _ => Value::Boolean(false),
         }
     }
@@ -3909,9 +3817,14 @@ fn extract_vector_bytes<'a>(v: &'a Value, buf: &'a mut Vec<u8>) -> Option<&'a [u
 mod tests {
     use super::*;
     use crate::common::CompactArc;
+    use crate::core::predicate::PredicateSet;
     use crate::core::ValueSet;
     use crate::Row;
     use std::sync::Arc;
+
+    fn pset(set: ValueSet, has_null: bool) -> CompactArc<PredicateSet> {
+        CompactArc::new(PredicateSet::new(CompactArc::new(set), has_null))
+    }
 
     #[test]
     fn test_simple_comparison() {
@@ -3968,7 +3881,7 @@ mod tests {
 
         let program = Program::new(vec![
             Op::LoadColumn(0),
-            Op::InSet(CompactArc::new(set), false),
+            Op::InSet(pset(set, false)),
             Op::Return,
         ]);
 
@@ -4823,7 +4736,7 @@ mod tests {
 
         let program = Program::new(vec![
             Op::LoadColumn(0),
-            Op::NotInSet(CompactArc::new(set), false),
+            Op::NotInSet(pset(set, false)),
             Op::Return,
         ]);
 
@@ -4844,7 +4757,7 @@ mod tests {
         // has_null = true means the set conceptually contains NULL
         let program = Program::new(vec![
             Op::LoadColumn(0),
-            Op::InSet(CompactArc::new(set), true),
+            Op::InSet(pset(set, true)),
             Op::Return,
         ]);
 
@@ -4866,10 +4779,7 @@ mod tests {
             .into_iter()
             .collect();
 
-        let program = Program::new(vec![
-            Op::InSetColumn(0, CompactArc::new(set), false),
-            Op::Return,
-        ]);
+        let program = Program::new(vec![Op::InSetColumn(0, pset(set, false)), Op::Return]);
 
         let row = Row::from_values(vec![Value::Integer(2)]);
         let ctx = ExecuteContext::new(&row);
