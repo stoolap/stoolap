@@ -425,6 +425,13 @@ pub fn compile_expression(expr: &Expression, columns: &[String]) -> Result<Share
 /// Note: this is distinct from compile-time constant folding (which rejects ALL
 /// non-deterministic functions to avoid caching stale values in the program LRU).
 pub fn try_eval_constant_expr(expr: &Expression) -> Option<Value> {
+    try_eval_constant_expr_with_context(expr, None)
+}
+
+pub(crate) fn try_eval_constant_expr_with_context(
+    expr: &Expression,
+    context: Option<&ExecutionContext>,
+) -> Option<Value> {
     use std::cell::RefCell;
 
     // Reject expressions that require execution context (e.g. transaction_id).
@@ -445,7 +452,12 @@ pub fn try_eval_constant_expr(expr: &Expression) -> Option<Value> {
     let program = compiler.compile(expr).ok()?;
 
     EVAL_ROW.with(|empty_row| {
-        let exec_ctx = ExecuteContext::new(empty_row);
+        let mut exec_ctx = ExecuteContext::new(empty_row);
+        if let Some(context) = context {
+            exec_ctx = exec_ctx
+                .with_params(context.params())
+                .with_named_params(context.named_params());
+        }
         EVAL_VM.with(|vm_cell| {
             let mut vm = vm_cell.borrow_mut();
             vm.execute(&program, &exec_ctx).ok()

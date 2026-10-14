@@ -70,10 +70,10 @@ fn extract_literal_with_ctx(expr: &ast::Expression, ctx: &PushdownContext<'_>) -
     }
     match expr {
         ast::Expression::Infix(_) | ast::Expression::Prefix(_) => {
-            crate::executor::expression::try_eval_constant_expr(expr)
+            crate::executor::expression::try_eval_constant_expr_with_context(expr, ctx.exec_ctx)
         }
         ast::Expression::FunctionCall(fc) if fc.arguments.is_empty() => {
-            crate::executor::expression::try_eval_constant_expr(expr)
+            crate::executor::expression::try_eval_constant_expr_with_context(expr, ctx.exec_ctx)
         }
         _ => None,
     }
