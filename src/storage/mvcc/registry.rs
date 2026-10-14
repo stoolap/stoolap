@@ -21,10 +21,13 @@
 //!
 //! Memory: O(active_transactions + aborted_transactions)
 
-use std::sync::atomic::{fence, AtomicBool, AtomicI64, AtomicU32, AtomicU8, AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use std::sync::atomic::{
+    fence, AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
+use smallvec::SmallVec;
 
 use crate::common::I64Map;
 use crate::core::IsolationLevel;
@@ -233,15 +236,17 @@ impl TxnStatusTable {
         (segment.run.load(Ordering::Relaxed) == run).then_some(slot)
     }
 
-    /// Stores `slot` for `txn_id` when a segment holds its run
-    fn set(&self, txn_id: i64, slot: i64) {
+    /// Stores `slot` for `txn_id` when a segment holds its run; false when none does
+    fn set(&self, txn_id: i64, slot: i64) -> bool {
         let run = Self::run_of(txn_id);
         if let Some(segment) = self.segment_at(run, Ordering::Relaxed) {
             if segment.run.load(Ordering::Relaxed) == run {
                 segment.slots[txn_id as usize & (STATUS_SEGMENT_LEN - 1)]
                     .store(slot, Ordering::Release);
+                return true;
             }
         }
+        false
     }
 
     /// Moves the open slot of `txn_id` to `to` in one step; false when it is
@@ -307,6 +312,105 @@ impl TxnStatusTable {
     }
 }
 
+/// The transactions map and what is kept beside it under the same lock
+struct TxnTable {
+    /// All tracked transactions (Active, Committing, Aborted).
+    /// Committed transactions are REMOVED from this map.
+    map: I64Map<TxnState>,
+    /// The commit sequences of transactions committing and not yet complete
+    committing: SmallVec<[i64; 4]>,
+    /// The statement views alive now
+    views: SmallVec<[LiveView; 4]>,
+    /// The commit sequences of committed ids the status table holds no slot
+    /// for, kept until no live view or base can ask about them
+    slotless: I64Map<i64>,
+}
+
+impl TxnTable {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            map: I64Map::with_capacity(capacity),
+            committing: SmallVec::new(),
+            views: SmallVec::new(),
+            slotless: I64Map::new(),
+        }
+    }
+
+    /// Ends `seq`'s place among the commits not yet complete
+    fn uncommitting(&mut self, seq: i64) {
+        if let Some(position) = self.committing.iter().position(|&s| s == seq) {
+            self.committing.swap_remove(position);
+        }
+    }
+
+    /// The smallest base any live view was taken at, or None with no view
+    fn oldest_view_base(&self) -> Option<i64> {
+        self.views.iter().map(|view| view.base).min()
+    }
+}
+
+impl std::ops::Deref for TxnTable {
+    type Target = I64Map<TxnState>;
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl std::ops::DerefMut for TxnTable {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.map
+    }
+}
+
+/// What the registry keeps of a live statement view
+#[derive(Clone, Copy)]
+struct LiveView {
+    id: u64,
+    floor: i64,
+    base: i64,
+}
+
+/// One statement's view of the commits: those complete at its start, read
+/// through `is_visible_at`. Registered while it lives, so maintenance keeps
+/// what it reads and the commit metadata it asks about
+pub struct StatementView {
+    registry: Arc<TransactionRegistry>,
+    id: u64,
+    /// The sequence the view was taken at
+    seq: i64,
+    /// Commit sequences at or below `seq` not complete at the start
+    in_flight: SmallVec<[i64; 4]>,
+    /// Every id below this finished before the view was taken
+    base: i64,
+}
+
+impl StatementView {
+    /// The sequence the view was taken at
+    pub fn seq(&self) -> i64 {
+        self.seq
+    }
+
+    /// Every commit at or below this sequence is visible to the view
+    pub fn floor(&self) -> i64 {
+        self.in_flight.iter().min().map_or(self.seq, |&s| s - 1)
+    }
+
+    /// Whether a commit that completed with `commit_seq` is visible to the view
+    #[inline]
+    fn sees_commit(&self, commit_seq: i64) -> bool {
+        commit_seq <= self.seq && !self.in_flight.contains(&commit_seq)
+    }
+}
+
+impl Drop for StatementView {
+    fn drop(&mut self) {
+        let mut txns = self.registry.transactions.lock();
+        if let Some(position) = txns.views.iter().position(|view| view.id == self.id) {
+            txns.views.swap_remove(position);
+        }
+    }
+}
+
 /// Transaction registry with minimal memory footprint.
 ///
 /// Design:
@@ -316,9 +420,8 @@ impl TxnStatusTable {
 ///
 /// Memory: O(active + aborted) instead of O(total)
 pub struct TransactionRegistry {
-    /// All tracked transactions (Active, Committing, Aborted).
-    /// Committed transactions are REMOVED from this map.
-    transactions: Mutex<I64Map<TxnState>>,
+    /// All tracked transactions, and what is kept beside them under one lock
+    transactions: Mutex<TxnTable>,
 
     /// For SNAPSHOT ISOLATION: txn_id -> commit_seq.
     /// GC removes old entries when commit_seq < min_active_begin_seq.
@@ -354,6 +457,9 @@ pub struct TransactionRegistry {
     /// The highest id below `base` the map still holds as aborted, or 0.
     /// Written before `base`, read after it.
     aborted_floor: AtomicI64,
+
+    /// The number the next statement view takes
+    next_view_id: AtomicU64,
 }
 
 impl TransactionRegistry {
@@ -365,7 +471,7 @@ impl TransactionRegistry {
     /// Creates a new transaction registry with pre-allocated capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            transactions: Mutex::new(I64Map::with_capacity(capacity)),
+            transactions: Mutex::new(TxnTable::with_capacity(capacity)),
             snapshot_seqs: Mutex::new(I64Map::new()),
             next_txn_id: AtomicI64::new(0),
             next_sequence: AtomicI64::new(0),
@@ -377,6 +483,7 @@ impl TransactionRegistry {
             status: TxnStatusTable::new(),
             base: AtomicI64::new(1),
             aborted_floor: AtomicI64::new(0),
+            next_view_id: AtomicU64::new(0),
         }
     }
 
@@ -564,9 +671,13 @@ impl TransactionRegistry {
     /// Returns None if no snapshot transactions are active (seal/compaction can proceed freely).
     /// Returns Some(min_begin_seq) otherwise — only rows committed before this seq are safe to seal.
     pub fn get_min_snapshot_begin_seq(&self) -> Option<i64> {
-        let global = self.global_isolation_level.load(Ordering::Relaxed);
         let transactions = self.transactions.lock();
+        self.min_snapshot_begin(&transactions)
+    }
 
+    /// [`Self::get_min_snapshot_begin_seq`] for a caller holding the lock
+    fn min_snapshot_begin(&self, transactions: &TxnTable) -> Option<i64> {
+        let global = self.global_isolation_level.load(Ordering::Relaxed);
         if global == 1 {
             return transactions
                 .values()
@@ -585,6 +696,14 @@ impl TransactionRegistry {
         }
 
         None
+    }
+
+    /// The lowest id whose status slot must stay: the base, or a live view's
+    /// base below it, since a view may ask about any id at or above its own
+    fn status_kept_from(&self, txns: &TxnTable) -> i64 {
+        let base = self.base.load(Ordering::Relaxed);
+        txns.oldest_view_base()
+            .map_or(base, |view_base| view_base.min(base))
     }
 
     /// Begins a new transaction.
@@ -619,7 +738,7 @@ impl TransactionRegistry {
             let begin_seq = self.next_sequence.fetch_add(1, Ordering::AcqRel) + 1;
             txns.insert(txn_id, TxnState::new_active(begin_seq));
             debug_assert!(txn_id < SLOT_ID_LIMIT && begin_seq < SLOT_ID_LIMIT);
-            let base_run = TxnStatusTable::run_of(self.base.load(Ordering::Relaxed));
+            let base_run = TxnStatusTable::run_of(self.status_kept_from(&txns));
             if self.status.hold(TxnStatusTable::run_of(txn_id), base_run) {
                 self.status.set(txn_id, slot_open(txn_id));
             }
@@ -630,15 +749,21 @@ impl TransactionRegistry {
         (txn_id, begin_seq)
     }
 
-    /// Starts the commit process (two-phase commit).
+    /// Starts the commit process (two-phase commit). The sequence is taken in
+    /// the lock section that marks the transaction committing, so a view
+    /// never sees a sequence it does not also see as in flight
     #[inline]
     pub fn start_commit(&self, txn_id: i64) -> i64 {
+        let mut txns = self.transactions.lock();
         let commit_seq = self.next_sequence.fetch_add(1, Ordering::AcqRel) + 1;
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::commit_seq_taken();
 
-        if let Some(entry) = self.transactions.lock().get_mut(txn_id) {
+        if let Some(entry) = txns.get_mut(txn_id) {
             entry.set_committing(commit_seq);
             debug_assert!(commit_seq < SLOT_ID_LIMIT);
             self.status.set(txn_id, -commit_seq);
+            txns.committing.push(commit_seq);
         }
 
         commit_seq
@@ -650,6 +775,9 @@ impl TransactionRegistry {
         {
             let mut txns = self.transactions.lock();
             let seq = txns.get(txn_id).map(|e| e.commit_seq()).unwrap_or(0);
+            if seq > 0 {
+                txns.uncommitting(seq);
+            }
 
             // Store commit_seq for snapshot isolation while holding transactions lock
             // This prevents a race where the transaction is removed from txns but not yet
@@ -662,18 +790,22 @@ impl TransactionRegistry {
             }
 
             txns.remove(txn_id);
-            self.status.set(txn_id, seq);
+            // With no slot to hold it, a view that asks later learns the sequence here
+            if !self.status.set(txn_id, seq) && seq > 0 {
+                txns.slotless.insert(txn_id, seq);
+            }
             self.advance_base(&txns);
         };
         self.active_txn_count.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Commits a transaction (single-phase).
+    /// Commits a transaction (single-phase). Its sequence is taken in the
+    /// lock section that makes it visible, as `start_commit` does
     pub fn commit_transaction(&self, txn_id: i64) -> i64 {
-        let commit_seq = self.next_sequence.fetch_add(1, Ordering::AcqRel) + 1;
-
+        let commit_seq;
         {
             let mut txns = self.transactions.lock();
+            commit_seq = self.next_sequence.fetch_add(1, Ordering::AcqRel) + 1;
 
             // Store commit_seq for snapshot isolation while holding transactions lock
             if self.global_isolation_level.load(Ordering::Relaxed) == 1
@@ -683,7 +815,10 @@ impl TransactionRegistry {
             }
 
             txns.remove(txn_id);
-            self.status.set(txn_id, commit_seq);
+            // With no slot to hold it, a view that asks later learns the sequence here
+            if !self.status.set(txn_id, commit_seq) {
+                txns.slotless.insert(txn_id, commit_seq);
+            }
             self.advance_base(&txns);
         }
         self.active_txn_count.fetch_sub(1, Ordering::Relaxed);
@@ -704,7 +839,12 @@ impl TransactionRegistry {
             let mut txns = self.transactions.lock();
             if let Some(state) = txns.get_mut(txn_id) {
                 let was_active = state.is_active_or_committing();
+                let committing =
+                    (state.status() == TxnStatus::Committing).then(|| state.commit_seq());
                 *state = TxnState::new_aborted();
+                if let Some(seq) = committing {
+                    txns.uncommitting(seq);
+                }
                 self.status.set(txn_id, SLOT_ABORTED);
                 self.advance_base(&txns);
                 was_active
@@ -1002,23 +1142,102 @@ impl TransactionRegistry {
     /// removed from transactions map).
     pub fn safe_snapshot_cutoff(&self) -> i64 {
         let txns = self.transactions.lock();
-        let mut min_committing = i64::MAX;
-        for (_, entry) in txns.iter() {
-            if entry.status() == TxnStatus::Committing {
-                let seq = entry.commit_seq();
-                if seq > 0 && seq < min_committing {
-                    min_committing = seq;
-                }
-            }
-        }
-        // Read next_sequence WHILE holding the lock to prevent a concurrent
-        // start_commit from bumping the sequence between the scan and this read.
-        let current = self.next_sequence.load(Ordering::Acquire);
+        Self::completed_through(&txns, self.next_sequence.load(Ordering::Acquire))
+    }
+
+    /// Every commit at or below the returned sequence is complete. Read under
+    /// the lock `start_commit` takes its sequence in, with `current` loaded
+    /// under it
+    fn completed_through(txns: &TxnTable, current: i64) -> i64 {
+        txns.committing.iter().min().map_or(current, |&seq| seq - 1)
+    }
+
+    /// Takes a statement view: the commits complete now, plus the reader's
+    /// own writes, and nothing that completes later. Registered under the
+    /// lock commits take their sequence in, so maintenance and the status
+    /// table keep what it reads until it drops
+    pub fn capture_view(self: &Arc<Self>) -> Arc<StatementView> {
+        let id = self.next_view_id.fetch_add(1, Ordering::Relaxed);
+        let mut txns = self.transactions.lock();
+        let base = self.base.load(Ordering::Acquire);
+        let seq = self.next_sequence.load(Ordering::Acquire);
+        let in_flight: SmallVec<[i64; 4]> = txns.committing.iter().copied().collect();
+        let floor = in_flight.iter().min().map_or(seq, |&s| s - 1);
+        txns.views.push(LiveView { id, floor, base });
         drop(txns);
-        if min_committing == i64::MAX {
-            current
-        } else {
-            min_committing - 1
+        Arc::new(StatementView {
+            registry: Arc::clone(self),
+            id,
+            seq,
+            in_flight,
+            base,
+        })
+    }
+
+    /// The sequence maintenance may act below: a commit with a lower sequence
+    /// is complete and visible to every snapshot and every live view.
+    /// Removals act only on what they classified before reading it
+    pub fn maintenance_limit(&self) -> i64 {
+        let txns = self.transactions.lock();
+        let snapshot = self.min_snapshot_begin(&txns);
+        let completed = Self::completed_through(&txns, self.next_sequence.load(Ordering::Acquire));
+        let views = txns.views.iter().map(|view| view.floor).min();
+        drop(txns);
+        let limit = views.map_or(completed, |floor| floor.min(completed)) + 1;
+        snapshot.map_or(limit, |begin| begin.min(limit))
+    }
+
+    /// Whether `version_txn_id`'s version is visible to a statement of
+    /// `viewer_txn_id` under `view`
+    #[inline]
+    pub fn is_visible_at(
+        &self,
+        version_txn_id: i64,
+        viewer_txn_id: i64,
+        view: &StatementView,
+    ) -> bool {
+        if version_txn_id == viewer_txn_id || version_txn_id == RECOVERY_TRANSACTION_ID {
+            return true;
+        }
+        if version_txn_id <= 0 {
+            return false;
+        }
+        // Finished before the view was taken: committed or aborted for good
+        if version_txn_id < view.base {
+            return self.check_committed(version_txn_id);
+        }
+        match self.status.get(version_txn_id) {
+            Some(slot) if slot > 0 => return view.sees_commit(slot),
+            // Open, published, committing or aborted: a commit completing
+            // after this read completed after the view was taken
+            Some(slot) if slot < 0 => return false,
+            _ => {}
+        }
+        self.is_visible_at_locked(version_txn_id, view)
+    }
+
+    /// [`Self::is_visible_at`] for an id the status table holds no slot for
+    #[cold]
+    #[inline(never)]
+    fn is_visible_at_locked(&self, version_txn_id: i64, view: &StatementView) -> bool {
+        let txns = self.transactions.lock();
+        match self.status.get(version_txn_id) {
+            Some(slot) if slot > 0 => return view.sees_commit(slot),
+            Some(slot) if slot < 0 => return false,
+            _ => {}
+        }
+        if txns.contains_key(version_txn_id) {
+            return false;
+        }
+        match txns.slotless.get(version_txn_id) {
+            Some(&seq) => view.sees_commit(seq),
+            None => {
+                debug_assert!(
+                    false,
+                    "transaction {version_txn_id} at or above a live view's base has no commit record"
+                );
+                false
+            }
         }
     }
 
@@ -1041,9 +1260,10 @@ impl TransactionRegistry {
 
         // Step 2: Single lock on transactions to:
         // - Calculate min values
-        // - Remove old aborted entries
+        // - Remove old aborted entries, slotless records and snapshot_seqs,
+        //   so no view registers between a bound and the removal it allows
         // - Check which override keys are no longer active
-        let (min_begin_seq, invalid_overrides) = {
+        let invalid_overrides = {
             let mut txns = self.transactions.lock();
             let mut min_begin = i64::MAX;
             let mut min_id = i64::MAX;
@@ -1059,14 +1279,28 @@ impl TransactionRegistry {
                 min_id = self.next_txn_id.load(Ordering::Acquire);
             }
 
-            // GC aborted entries while holding lock
-            let aborted_cutoff = min_id.saturating_sub(10000);
+            // GC aborted entries while holding lock, keeping any a live view may ask about
+            let view_base = txns.oldest_view_base().unwrap_or(i64::MAX);
+            let aborted_cutoff = min_id.saturating_sub(10000).min(view_base);
             if aborted_cutoff > 0 {
                 let len_before = txns.len();
                 txns.retain(|id, state| !state.is_aborted() || id >= aborted_cutoff);
                 removed += len_before - txns.len();
             }
             self.rebase(&txns);
+
+            // A slotless record goes once its id is below the base and below every view's
+            let slotless_cutoff = self.base.load(Ordering::Relaxed).min(view_base);
+            let len_before = txns.slotless.len();
+            txns.slotless.retain(|id, _| id >= slotless_cutoff);
+            removed += len_before - txns.slotless.len();
+
+            {
+                let mut seqs = self.snapshot_seqs.lock();
+                let len_before = seqs.len();
+                seqs.retain(|_, &mut commit_seq| commit_seq >= min_begin);
+                removed += len_before - seqs.len();
+            }
 
             // Check which override keys are no longer active (O(Overrides) lookups)
             let invalid: Vec<i64> = override_keys
@@ -1082,18 +1316,10 @@ impl TransactionRegistry {
                 .copied()
                 .collect();
 
-            (min_begin, invalid)
+            invalid
         };
 
-        // Step 3: GC snapshot_seqs
-        {
-            let mut seqs = self.snapshot_seqs.lock();
-            let len_before = seqs.len();
-            seqs.retain(|_, &mut commit_seq| commit_seq >= min_begin_seq);
-            removed += len_before - seqs.len();
-        }
-
-        // Step 4: Remove invalid isolation overrides (O(InvalidOverrides))
+        // Step 3: Remove invalid isolation overrides (O(InvalidOverrides))
         if !invalid_overrides.is_empty() {
             let mut overrides = self.isolation_overrides.lock();
             let mut actual_removals = 0usize;
@@ -1235,10 +1461,22 @@ impl TransactionRegistry {
             return true;
         }
 
-        // Check if still in transactions map
-        if self.transactions.lock().contains_key(txn_id) {
+        // A slot answers without a lock: the commit sequence, or not complete
+        match self.status.get(txn_id) {
+            Some(slot) if slot > 0 => return slot <= cutoff_commit_seq,
+            Some(slot) if slot < 0 => return false,
+            _ => {}
+        }
+
+        {
+            let txns = self.transactions.lock();
             // If aborted or still active/committing, not committed
-            return false;
+            if txns.contains_key(txn_id) {
+                return false;
+            }
+            if let Some(&commit_seq) = txns.slotless.get(txn_id) {
+                return commit_seq <= cutoff_commit_seq;
+            }
         }
 
         // Check snapshot_seqs for exact commit_seq
@@ -1944,5 +2182,201 @@ mod tests {
         assert!(work < 100, "closing it took {work} steps");
         assert!(registry.base.load(Ordering::Relaxed) > last);
         assert!(registry.is_directly_visible(last));
+    }
+
+    /// Drops the status segment holding `txn_id`'s run, as a reuse would
+    fn drop_status_segment(registry: &TransactionRegistry, txn_id: i64) {
+        let run = TxnStatusTable::run_of(txn_id);
+        registry.status.directory[run as usize % STATUS_SEGMENTS].store(0, Ordering::Release);
+    }
+
+    #[test]
+    fn a_view_hides_a_commit_in_flight_and_shows_one_completed_above_it() {
+        let registry = Arc::new(TransactionRegistry::new());
+        let (a, _) = registry.begin_transaction();
+        let (b, _) = registry.begin_transaction();
+        let (viewer, _) = registry.begin_transaction();
+        let a_seq = registry.start_commit(a);
+        let b_seq = registry.start_commit(b);
+        registry.complete_commit(b);
+        assert!(b_seq > a_seq);
+        let view = registry.capture_view();
+        assert!(
+            registry.is_visible_at(b, viewer, &view),
+            "b completed before the view"
+        );
+        assert!(
+            !registry.is_visible_at(a, viewer, &view),
+            "a was in flight at the view"
+        );
+        registry.complete_commit(a);
+        assert!(
+            !registry.is_visible_at(a, viewer, &view),
+            "a completed after the view"
+        );
+        let (c, _) = registry.begin_transaction();
+        registry.commit_transaction(c);
+        assert!(
+            !registry.is_visible_at(c, viewer, &view),
+            "c began after the view"
+        );
+        let later = registry.capture_view();
+        assert!(registry.is_visible_at(a, viewer, &later));
+        assert!(registry.is_visible_at(c, viewer, &later));
+        assert_eq!(view.floor(), a_seq - 1);
+    }
+
+    #[test]
+    fn a_view_taken_while_a_commit_holds_its_sequence_sees_it_in_flight() {
+        let registry = Arc::new(TransactionRegistry::new());
+        let (a, _) = registry.begin_transaction();
+        let (viewer, _) = registry.begin_transaction();
+        let (taken, sequence_taken) = std::sync::mpsc::channel();
+        let committer = {
+            let registry = Arc::clone(&registry);
+            std::thread::spawn(move || {
+                crate::test_failpoints::after_commit_seq_taken(move || {
+                    taken.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                });
+                registry.start_commit(a)
+            })
+        };
+        sequence_taken.recv().unwrap();
+        let view = registry.capture_view();
+        let a_seq = committer.join().unwrap();
+        registry.complete_commit(a);
+        assert!(
+            !registry.is_visible_at(a, viewer, &view),
+            "a held sequence {a_seq} when the view (at {}) was taken",
+            view.seq()
+        );
+    }
+
+    #[test]
+    fn a_live_view_keeps_the_status_runs_from_its_base() {
+        let registry = Arc::new(TransactionRegistry::new());
+        let (old, _) = registry.begin_transaction();
+        let view = registry.capture_view();
+        registry.commit_transaction(old);
+        let (later, _) = registry.begin_transaction();
+        registry.commit_transaction(later);
+        let txns = registry.transactions.lock();
+        assert!(registry.base.load(Ordering::Relaxed) > old);
+        assert_eq!(registry.status_kept_from(&txns), view.base);
+        drop(txns);
+        drop(view);
+        let txns = registry.transactions.lock();
+        assert_eq!(
+            registry.status_kept_from(&txns),
+            registry.base.load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn a_commit_without_a_slot_before_any_view_is_seen_by_a_later_one() {
+        let registry = Arc::new(TransactionRegistry::new());
+        let (old, _) = registry.begin_transaction();
+        let (x, _) = registry.begin_transaction();
+        drop_status_segment(&registry, x);
+        let x_seq = registry.start_commit(x);
+        registry.complete_commit(x);
+        let (y, _) = registry.begin_transaction();
+        drop_status_segment(&registry, y);
+        let y_seq = registry.commit_transaction(y);
+        let (viewer, _) = registry.begin_transaction();
+        let view = registry.capture_view();
+        assert!(view.base <= x, "the old transaction holds the base below x");
+        assert!(
+            registry.is_visible_at(x, viewer, &view),
+            "x completed at {x_seq}"
+        );
+        assert!(
+            registry.is_visible_at(y, viewer, &view),
+            "y committed at {y_seq}"
+        );
+        assert!(registry.is_committed_before(x, x_seq));
+        assert!(!registry.is_committed_before(x, x_seq - 1));
+
+        // The old transaction ends and the base passes x while the view lives
+        registry.commit_transaction(old);
+        registry.commit_transaction(viewer);
+        assert!(registry.base.load(Ordering::Relaxed) > x);
+        registry.run_gc();
+        assert!(
+            registry.is_visible_at(x, viewer, &view),
+            "run_gc removed x's record while a view below it lived"
+        );
+        drop(view);
+        registry.run_gc();
+        assert!(registry.transactions.lock().slotless.is_empty());
+    }
+
+    #[test]
+    fn a_view_reads_an_open_transaction_as_invisible_through_its_commit() {
+        let registry = Arc::new(TransactionRegistry::new());
+        let (viewer, _) = registry.begin_transaction();
+        let (a, _) = registry.begin_transaction();
+        let view = registry.capture_view();
+        assert!(!registry.is_visible_at(a, viewer, &view));
+        registry.start_commit(a);
+        assert!(!registry.is_visible_at(a, viewer, &view));
+        registry.complete_commit(a);
+        assert!(!registry.is_visible_at(a, viewer, &view));
+        assert!(registry.is_visible_at(viewer, viewer, &view), "own writes");
+    }
+
+    #[test]
+    fn the_maintenance_limit_stays_below_commits_in_flight_and_view_floors() {
+        let registry = Arc::new(TransactionRegistry::new());
+        let (a, _) = registry.begin_transaction();
+        let a_seq = registry.start_commit(a);
+        let (b, _) = registry.begin_transaction();
+        registry.commit_transaction(b);
+        assert_eq!(registry.maintenance_limit(), a_seq, "a is still committing");
+        let view = registry.capture_view();
+        registry.complete_commit(a);
+        assert_eq!(
+            registry.maintenance_limit(),
+            view.floor() + 1,
+            "the view excludes a"
+        );
+        assert_eq!(view.floor(), a_seq - 1);
+        drop(view);
+        assert_eq!(
+            registry.maintenance_limit(),
+            registry.get_current_sequence() + 1,
+            "nothing in flight and no view"
+        );
+        assert_eq!(
+            registry.safe_snapshot_cutoff(),
+            registry.get_current_sequence()
+        );
+    }
+
+    #[test]
+    fn a_failed_commit_leaves_no_sequence_in_flight() {
+        let registry = Arc::new(TransactionRegistry::new());
+        let (a, _) = registry.begin_transaction();
+        registry.start_commit(a);
+        registry.abort_transaction(a);
+        assert!(registry.transactions.lock().committing.is_empty());
+        assert_eq!(
+            registry.safe_snapshot_cutoff(),
+            registry.get_current_sequence()
+        );
+    }
+
+    #[test]
+    fn committed_before_compares_a_read_committed_commit_with_its_sequence() {
+        let registry = TransactionRegistry::new();
+        let (x, _) = registry.begin_transaction();
+        let x_seq = registry.commit_transaction(x);
+        assert!(registry.is_committed_before(x, x_seq));
+        assert!(
+            !registry.is_committed_before(x, x_seq - 1),
+            "a commit at {x_seq} was taken as before {}",
+            x_seq - 1
+        );
     }
 }
