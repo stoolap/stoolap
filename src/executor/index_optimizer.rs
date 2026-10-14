@@ -1298,7 +1298,7 @@ impl Executor {
         // cache is bypassed: a cached in-transaction view would survive
         // ROLLBACK
         let cache_key = if ctx.transaction_id().is_none() {
-            Some(subquery.subquery.to_string())
+            Self::subquery_cache_key(&subquery.subquery, ctx)
         } else {
             None
         };
