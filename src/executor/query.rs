@@ -5463,8 +5463,10 @@ impl Executor {
 
                     // A key pair where a number may meet a TEXT is no hash key.
                     // A base table side's schema says what it holds, else the
-                    // build rows do; a probe of no known type is read whole and
-                    // joined by the standard path
+                    // build rows do. One key over a build column of one family
+                    // has a probe key of the other answered as it streams; any
+                    // other such pair has the probe read whole and joined by
+                    // the standard path
                     let (build_expr, probe_expr) = if build_is_left {
                         (&join_source.left, &join_source.right)
                     } else {
@@ -5472,27 +5474,77 @@ impl Executor {
                     };
                     let build_schema = self.base_table_side_schema(build_expr, ctx);
                     let probe_schema = self.base_table_side_schema(probe_expr, ctx);
-                    let unverified = build_key_indices.iter().zip(&probe_key_indices).any(
-                        |(&build_idx, &probe_idx)| {
-                            let (numbers, texts) = column_families(
+
+                    // Skip bloom filter for small LIMIT queries - the overhead of building
+                    // a bloom filter for thousands of rows isn't worth it when we only
+                    // need a few results. With streaming + early termination, we don't
+                    // probe many rows anyway.
+                    let skip_bloom_for_small_limit = limit <= 500;
+                    let wants_bloom = build_rows.len() >= 100
+                        && !build_key_indices.is_empty()
+                        && !skip_bloom_for_small_limit;
+                    let new_bloom = || {
+                        BloomFilterBuilder::new(
+                            "join_key".to_string(),
+                            "build".to_string(),
+                            build_rows.len(),
+                        )
+                    };
+                    // One key no schema types: the pass that builds its hash table
+                    // tells what the build column holds
+                    let typed = |idx: usize| {
+                        let name = build_cols[idx]
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or(&build_cols[idx]);
+                        build_schema
+                            .as_ref()
+                            .and_then(|s| s.get_column_type(name))
+                            .is_some()
+                    };
+                    let one_key_built = match build_key_indices.as_slice() {
+                        &[build_idx] if !typed(build_idx) => {
+                            let mut builder = wants_bloom.then(new_bloom);
+                            let (table, numbers, texts) = JoinHashTable::build_one_key(
+                                &build_rows,
+                                build_idx,
+                                builder.as_mut(),
+                            );
+                            Some((table, builder, numbers, texts))
+                        }
+                        _ => None,
+                    };
+                    let mut cross_key = None;
+                    let mut unverified = false;
+                    for (&build_idx, &probe_idx) in build_key_indices.iter().zip(&probe_key_indices)
+                    {
+                        let (numbers, texts) = match &one_key_built {
+                            Some((_, _, numbers, texts)) => (*numbers, *texts),
+                            None => column_families(
                                 &build_rows,
                                 &build_cols,
                                 build_schema.as_deref(),
                                 build_idx,
-                            );
-                            if !numbers && !texts {
-                                return false;
-                            }
-                            let probe_column = &probe_cols[probe_idx];
-                            let name = probe_column.rsplit('.').next().unwrap_or(probe_column);
+                            ),
+                        };
+                        if !numbers && !texts {
+                            continue;
+                        }
+                        let probe_column = &probe_cols[probe_idx];
+                        let name = probe_column.rsplit('.').next().unwrap_or(probe_column);
+                        let crosses =
                             match probe_schema.as_ref().and_then(|s| s.get_column_type(name)) {
                                 Some(DataType::Text) => numbers,
                                 Some(DataType::Integer | DataType::Float) => texts,
                                 Some(_) => false,
                                 None => true,
-                            }
-                        },
-                    );
+                            };
+                        if crosses && build_key_indices.len() == 1 && numbers != texts {
+                            cross_key = Some(texts);
+                        } else if crosses {
+                            unverified = true;
+                        }
+                    }
                     if unverified {
                         let probe_rows = Self::materialize_result_arc(probe_result)?;
                         break 'streaming Some(if build_is_left {
@@ -5508,37 +5560,33 @@ impl Executor {
 
                     // Build hash table and bloom filter together in a single pass
                     // This avoids iterating build_rows twice (once for bloom, once for hash table)
-                    //
-                    // Skip bloom filter for small LIMIT queries - the overhead of building
-                    // a bloom filter for thousands of rows isn't worth it when we only
-                    // need a few results. With streaming + early termination, we don't
-                    // probe many rows anyway.
-                    let skip_bloom_for_small_limit = limit <= 500;
-                    let (bloom_filter, pre_built_hash_table) = if build_rows.len() >= 100
-                        && !build_key_indices.is_empty()
-                        && !skip_bloom_for_small_limit
-                    {
-                        let mut builder = BloomFilterBuilder::new(
-                            "join_key".to_string(),
-                            "build".to_string(),
-                            build_rows.len(),
-                        );
-                        // Single-pass: build hash table and populate bloom filter
-                        let hash_table = JoinHashTable::build_with_bloom(
-                            &build_rows,
-                            &build_key_indices,
-                            &mut builder,
-                        );
-                        let bf = builder.build();
-                        let bloom = if bf.is_effective() { Some(bf) } else { None };
-                        (bloom, Some(hash_table))
-                    } else if !build_key_indices.is_empty() {
-                        // No bloom filter, but still pre-build hash table
-                        let hash_table = JoinHashTable::build(&build_rows, &build_key_indices);
-                        (None, Some(hash_table))
-                    } else {
-                        (None, None)
-                    };
+                    // A probe key the comparison reads as a number would miss a
+                    // bloom filter of the build keys as they are
+                    let (bloom_filter, pre_built_hash_table) =
+                        if let Some((table, builder, _, _)) = one_key_built {
+                            let bloom = builder
+                                .filter(|_| cross_key.is_none())
+                                .map(BloomFilterBuilder::build)
+                                .filter(|bf| bf.is_effective());
+                            (bloom, Some(table))
+                        } else if wants_bloom && cross_key.is_none() {
+                            let mut builder = new_bloom();
+                            // Single-pass: build hash table and populate bloom filter
+                            let hash_table = JoinHashTable::build_with_bloom(
+                                &build_rows,
+                                &build_key_indices,
+                                &mut builder,
+                            );
+                            let bf = builder.build();
+                            let bloom = if bf.is_effective() { Some(bf) } else { None };
+                            (bloom, Some(hash_table))
+                        } else if !build_key_indices.is_empty() {
+                            // No bloom filter, but still pre-build hash table
+                            let hash_table = JoinHashTable::build(&build_rows, &build_key_indices);
+                            (None, Some(hash_table))
+                        } else {
+                            (None, None)
+                        };
 
                     // Wrap probe with bloom filter if available
                     let probe_source: Box<dyn Operator> = if let Some(ref bf) = bloom_filter {
@@ -5569,8 +5617,11 @@ impl Executor {
                         ctx,
                         bloom_filter,
                         pre_built_hash_table,
+                        cross_key,
                     };
 
+                    #[cfg(any(test, feature = "test-failpoints"))]
+                    crate::test_failpoints::streaming_join_streamed();
                     let join_result = join_executor.execute_streaming(streaming_request)?;
 
                     // Project and return results

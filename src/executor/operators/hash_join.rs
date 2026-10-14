@@ -32,12 +32,18 @@
 //! - RIGHT OUTER: All right rows, matched left or NULLs
 //! - FULL OUTER: All rows from both sides
 
+use smallvec::SmallVec;
+
 use crate::common::CompactArc;
+use crate::core::predicate::{parse_sql_number, sql_eq};
 use crate::core::value::NULL_VALUE;
-use crate::core::{Result, Row};
+use crate::core::{Result, Row, Value, ValueMap};
 use crate::executor::expression::RowFilter;
-use crate::executor::hash_table::{hash_row_keys, verify_key_equality, JoinHashTable};
+use crate::executor::hash_table::{
+    hash_key_value, hash_row_keys, verify_key_equality, JoinHashTable,
+};
 use crate::executor::operator::{ColumnInfo, Operator, RowRef};
+use crate::executor::operators::index_nested_loop::{crosses_inner_key, number_key};
 
 /// Pre-computed column names to avoid format! allocations in hot paths.
 /// Covers most common cases (up to 32 columns).
@@ -251,6 +257,20 @@ pub struct HashJoinOperator {
     // State tracking
     opened: bool,
     probe_exhausted: bool,
+
+    // The one key's build family, when a probe key of the other family is
+    // answered by the comparison rather than the hash table's equality
+    cross: Option<CrossKey>,
+    // The current probe key as that comparison reads it, for such a key
+    current_cross_key: Option<Value>,
+}
+
+/// A build key column of one family that probe keys of the other meet:
+/// TEXT (true) or a number (false), and for a TEXT one, the build rows by
+/// the number each TEXT reads as, taken when a number first meets them
+struct CrossKey {
+    build_is_text: bool,
+    text_numbers: Option<ValueMap<SmallVec<[usize; 2]>>>,
 }
 
 impl HashJoinOperator {
@@ -311,6 +331,8 @@ impl HashJoinOperator {
             cached_null_probe: None,
             opened: false,
             probe_exhausted: false,
+            cross: None,
+            current_cross_key: None,
         }
     }
 
@@ -422,6 +444,8 @@ impl HashJoinOperator {
             cached_null_probe: None,
             opened: false,
             probe_exhausted: false,
+            cross: None,
+            current_cross_key: None,
         }
     }
 
@@ -470,6 +494,8 @@ impl HashJoinOperator {
             cached_null_probe: None,
             opened: false,
             probe_exhausted: false,
+            cross: None,
+            current_cross_key: None,
         }
     }
 
@@ -482,6 +508,53 @@ impl HashJoinOperator {
     pub fn with_residual(mut self, residual: Vec<RowFilter>) -> Self {
         self.residual = residual;
         self
+    }
+
+    /// For a join on one key whose build column holds one family, TEXT
+    /// (true) or numbers (false): a probe key of the other family is
+    /// answered by the comparison, while the probe streams
+    pub fn with_cross_key(mut self, build_is_text: bool) -> Self {
+        debug_assert_eq!(self.probe_key_indices().len(), 1);
+        self.cross = Some(CrossKey {
+            build_is_text,
+            text_numbers: None,
+        });
+        self
+    }
+
+    /// The build rows a probe key of the other family meets: a TEXT key as
+    /// the number it reads as, a number by the TEXT build keys that read
+    /// as it. Leaves the key the matches are checked against
+    fn probe_across(&mut self, key: &Value) {
+        self.current_matches.clear();
+        if let Value::Text(text) = key {
+            self.current_cross_key = parse_sql_number(text);
+            if let (Some(number), Some(table)) = (&self.current_cross_key, &self.hash_table) {
+                self.current_matches
+                    .extend(table.probe(hash_key_value(number)));
+            }
+            return;
+        }
+        self.current_cross_key = Some(key.clone());
+        let build_idx = self.build_key_indices()[0];
+        let Some(cross) = self.cross.as_mut() else {
+            return;
+        };
+        let build_rows = &self.build_rows;
+        let numbers = cross.text_numbers.get_or_insert_with(|| {
+            let mut numbers: ValueMap<SmallVec<[usize; 2]>> = ValueMap::default();
+            for (idx, row) in build_rows.iter().enumerate() {
+                if let Some(Value::Text(text)) = row.get(build_idx) {
+                    if let Some(number) = parse_sql_number(text).as_ref().and_then(number_key) {
+                        numbers.entry(number).or_default().push(idx);
+                    }
+                }
+            }
+            numbers
+        });
+        if let Some(rows) = number_key(key).and_then(|number| numbers.get(&number)) {
+            self.current_matches.extend_from_slice(rows);
+        }
     }
 
     /// Test a candidate pair against the residual ON conditions.
@@ -702,12 +775,21 @@ impl Operator for HashJoinOperator {
                 let build_row = &self.build_rows[build_idx];
 
                 // Verify actual key equality (handle hash collisions)
-                if verify_key_equality(
-                    self.current_probe_row.as_ref().unwrap(),
-                    build_row,
-                    self.probe_key_indices(),
-                    self.build_key_indices(),
-                ) {
+                let equal = match &self.current_cross_key {
+                    Some(key) => {
+                        build_row
+                            .get(self.build_key_indices()[0])
+                            .and_then(|build_key| sql_eq(build_key, key))
+                            == Some(true)
+                    }
+                    None => verify_key_equality(
+                        self.current_probe_row.as_ref().unwrap(),
+                        build_row,
+                        self.probe_key_indices(),
+                        self.build_key_indices(),
+                    ),
+                };
+                if equal {
                     if !self.residual.is_empty() && !self.residual_matches(build_idx)? {
                         continue;
                     }
@@ -779,10 +861,21 @@ impl Operator for HashJoinOperator {
                     let probe_key_indices = self.probe_key_indices();
                     let hash = hash_row_keys(&probe_row, probe_key_indices);
 
-                    // Find matching build rows - reuse Vec to avoid allocation
-                    let hash_table = self.hash_table.as_ref().unwrap();
-                    self.current_matches.clear();
-                    self.current_matches.extend(hash_table.probe(hash));
+                    let crosses = self.cross.as_ref().is_some_and(|cross| {
+                        probe_row
+                            .get(probe_key_indices[0])
+                            .is_some_and(|key| crosses_inner_key(Some(cross.build_is_text), key))
+                    });
+                    if crosses {
+                        let key_idx = self.probe_key_indices()[0];
+                        self.probe_across(&probe_row.as_slice()[key_idx]);
+                    } else {
+                        // Find matching build rows - reuse Vec to avoid allocation
+                        let hash_table = self.hash_table.as_ref().unwrap();
+                        self.current_matches.clear();
+                        self.current_matches.extend(hash_table.probe(hash));
+                        self.current_cross_key = None;
+                    }
 
                     // Store probe row directly (no Arc wrapping needed)
                     self.current_probe_row = Some(probe_row);

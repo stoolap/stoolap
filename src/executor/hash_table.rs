@@ -191,6 +191,38 @@ impl JoinHashTable {
         table
     }
 
+    /// `build` over one key column, filling a bloom filter too when one is
+    /// given, and telling whether the column holds a number and whether
+    /// it holds a TEXT
+    pub fn build_one_key(
+        rows: &[Row],
+        key_idx: usize,
+        mut bloom_builder: Option<&mut crate::optimizer::bloom::BloomFilterBuilder>,
+    ) -> (Self, bool, bool) {
+        let mut table = Self::with_capacity(rows.len());
+        let key_indices = [key_idx];
+        let (mut numbers, mut texts) = (false, false);
+        for (idx, row) in rows.iter().enumerate() {
+            // The key read once, for its family and for its hash
+            let hash = match row.get(key_idx) {
+                Some(value) => {
+                    match value {
+                        Value::Integer(_) | Value::Float(_) => numbers = true,
+                        Value::Text(_) => texts = true,
+                        _ => {}
+                    }
+                    hash_key_value(value)
+                }
+                None => hash_row_keys(row, &key_indices),
+            };
+            table.insert(hash, idx as u32);
+            if let Some(builder) = bloom_builder.as_deref_mut() {
+                builder.insert_raw_hash(hash);
+            }
+        }
+        (table, numbers, texts)
+    }
+
     /// Insert a row index with its pre-computed hash.
     ///
     /// # Arguments
@@ -339,6 +371,14 @@ pub fn hash_row_keys(row: &Row, key_indices: &[usize]) -> u64 {
         }
     }
 
+    hasher.finish()
+}
+
+/// The hash `hash_row_keys` gives a row whose one key is `value`
+#[inline]
+pub fn hash_key_value(value: &Value) -> u64 {
+    let mut hasher = FxHasher::default();
+    hash_value(&mut hasher, value);
     hasher.finish()
 }
 

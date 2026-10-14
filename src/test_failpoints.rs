@@ -1828,6 +1828,7 @@ thread_local! {
     static SMALL_OUTER_JOINS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static JOIN_SIDE_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static IN_SUBQUERY_SETS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static STREAMING_JOINS_STREAMED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static INDEX_JOIN_OUTER_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -1865,6 +1866,16 @@ pub fn in_subquery_sets_built() -> usize {
 
 pub(crate) fn in_subquery_set_built() {
     IN_SUBQUERY_SETS_BUILT.with(|n| n.set(n.get() + 1));
+}
+
+/// Streaming LIMIT joins this thread ran as they stream, without leaving
+/// for the standard join, so far
+pub fn streaming_joins_streamed() -> usize {
+    STREAMING_JOINS_STREAMED.with(std::cell::Cell::get)
+}
+
+pub(crate) fn streaming_join_streamed() {
+    STREAMING_JOINS_STREAMED.with(|n| n.set(n.get() + 1));
 }
 
 /// Run once on this thread when its next statement snapshot has read the

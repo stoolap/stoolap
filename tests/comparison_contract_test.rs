@@ -917,3 +917,54 @@ fn test_an_index_join_answers_either_family_while_it_streams() {
         }
     }
 }
+
+const CTE_SIDES: &str = "WITH x AS (SELECT id, v, n FROM a), y AS (SELECT id, n FROM b) ";
+
+#[test]
+fn test_a_limit_join_of_ctes_on_a_number_and_a_text() {
+    let db = join_tables("contract_cte_limit_join");
+    for (join, expected) in [
+        ("FROM x JOIN y ON x.v = y.n", vec![(1, 1), (2, 2), (3, 3)]),
+        ("FROM y JOIN x ON y.n = x.v", vec![(1, 1), (2, 2), (3, 3)]),
+        (
+            "FROM x LEFT JOIN y ON x.v = y.n",
+            vec![(1, 1), (2, 2), (3, 3), (4, -1)],
+        ),
+        (
+            "FROM y LEFT JOIN x ON y.n = x.v",
+            vec![(1, 1), (2, 2), (3, 3), (5, -1)],
+        ),
+        (
+            "FROM x JOIN y ON x.v = y.n AND x.id = y.id",
+            vec![(1, 1), (2, 2), (3, 3)],
+        ),
+    ] {
+        let first = join.split_whitespace().nth(1).unwrap();
+        let second = if first == "x" { "y" } else { "x" };
+        let sql = format!("{CTE_SIDES}SELECT {first}.id, {second}.id {join} LIMIT 10");
+        assert_eq!(sorted_pairs(&db, &sql), expected, "{sql}");
+    }
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_a_limit_join_of_ctes_streams_over_one_key() {
+    use stoolap::test_failpoints::streaming_joins_streamed;
+    let db = join_tables("contract_cte_limit_join_streams");
+    for (join, streams) in [
+        ("FROM x JOIN y ON x.n = y.n", true),
+        ("FROM x JOIN y ON x.v = y.n", true),
+        ("FROM y JOIN x ON y.n = x.v", true),
+        ("FROM x JOIN y ON x.v = y.n AND x.id = y.id", false),
+    ] {
+        let sql = format!("{CTE_SIDES}SELECT x.id, y.id {join} LIMIT 10");
+        let before = streaming_joins_streamed();
+        sorted_pairs(&db, &sql);
+        assert_eq!(
+            streaming_joins_streamed() - before == 1,
+            streams,
+            "{sql}: streamed {}",
+            streaming_joins_streamed() - before
+        );
+    }
+}

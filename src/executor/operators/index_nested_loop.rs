@@ -85,7 +85,7 @@ pub(crate) fn crosses_inner_key(inner_is_text: Option<bool>, key: &Value) -> boo
 
 /// A number as `TextNumbers` holds it: an integral FLOAT that fits i64 as
 /// that INTEGER, so equal numbers meet; None for NaN and any non-number
-fn number_key(number: &Value) -> Option<Value> {
+pub(crate) fn number_key(number: &Value) -> Option<Value> {
     match number {
         Value::Integer(_) => Some(number.clone()),
         Value::Float(f) if f.is_nan() => None,

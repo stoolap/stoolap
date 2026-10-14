@@ -234,6 +234,9 @@ pub struct StreamingJoinRequest<'a> {
     /// Pre-built hash table (if available). When provided, skips the hash table
     /// build phase in HashJoinOperator, avoiding double iteration of build_rows.
     pub pre_built_hash_table: Option<JoinHashTable>,
+    /// The one key's build family, TEXT (true) or numbers (false), when a
+    /// probe key of the other family may come and is answered as it streams
+    pub cross_key: Option<bool>,
 }
 
 /// Modern streaming join executor.
@@ -439,6 +442,9 @@ impl JoinExecutor {
                 build_side,
             )
         };
+        if let Some(build_is_text) = request.cross_key {
+            join_op = join_op.with_cross_key(build_is_text);
+        }
 
         // Compile the non-equality part of the ON clause
         let is_inner = !analysis.join_type_str.contains("LEFT")
