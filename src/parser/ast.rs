@@ -23,7 +23,8 @@ use rustc_hash::FxHashMap;
 use std::fmt;
 
 use crate::common::CompactArc;
-use crate::core::{ForeignKeyAction, ValueSet};
+use crate::core::predicate::PredicateSet;
+use crate::core::ForeignKeyAction;
 
 // ============================================================================
 // Core Traits
@@ -730,8 +731,9 @@ pub struct InHashSetExpression {
     pub token: Token,
     /// The column/expression to check
     pub column: Box<Expression>,
-    /// Pre-computed ValueSet for O(1) lookup - Arc for cheap parallel cloning
-    pub values: CompactArc<ValueSet>,
+    /// The members, read once for what the comparison needs of them; Arc
+    /// for cheap parallel cloning
+    pub values: CompactArc<PredicateSet>,
     /// Whether this is NOT IN
     pub not: bool,
 }

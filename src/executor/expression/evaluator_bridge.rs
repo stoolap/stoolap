@@ -198,7 +198,7 @@ fn hash_expression<H: std::hash::Hasher>(expr: &Expression, hasher: &mut H) {
             // when its input omits the values. Canonical (sorted) order
             // keeps the hash set-order-independent while every algorithm
             // hashing this expression sees the full material directly.
-            let mut sorted: Vec<&crate::core::Value> = in_hash.values.iter().collect();
+            let mut sorted: Vec<&crate::core::Value> = in_hash.values.members().iter().collect();
             sorted.sort_by(|a, b| crate::executor::utils::compare_values(a, b));
             for v in sorted {
                 v.hash(hasher);
@@ -1866,7 +1866,7 @@ impl<'a> CompiledEvaluator<'a> {
                 // trips on the broken order once the set is large enough
                 #[allow(clippy::unnecessary_sort_by)]
                 let members = {
-                    let mut members: Vec<&Value> = in_hash.values.iter().collect();
+                    let mut members: Vec<&Value> = in_hash.values.members().iter().collect();
                     members.sort_unstable_by(|a, b| a.cmp(b));
                     members
                 };
@@ -2243,7 +2243,9 @@ mod tests {
             Expression::InHashSet(InHashSetExpression {
                 token: dummy_token(),
                 column: Box::new(make_identifier("a")),
-                values: CompactArc::new(set),
+                values: CompactArc::new(crate::core::predicate::PredicateSet::of(CompactArc::new(
+                    set,
+                ))),
                 not: false,
             })
         }
@@ -2632,7 +2634,9 @@ mod tests {
             Expression::InHashSet(InHashSetExpression {
                 token: dummy_token("IN", TokenType::Keyword),
                 column: Box::new(make_identifier("id")),
-                values: CompactArc::new(set),
+                values: CompactArc::new(crate::core::predicate::PredicateSet::of(CompactArc::new(
+                    set,
+                ))),
                 not: false,
             })
         };

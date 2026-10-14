@@ -36,7 +36,7 @@ const SEMI_JOIN_CACHE_SIZE: usize = 256;
 use crate::api::params::ParamVec;
 use crate::common::{CompactArc, SmartString, StringMap};
 use crate::core::predicate::PredicateSet;
-use crate::core::{Result, Row, Value, ValueMap, ValueSet};
+use crate::core::{Result, Row, Value, ValueMap};
 
 // Static defaults for ExecutionContext to avoid allocations for empty values.
 // These are shared across all contexts and only require Arc refcount bump on clone.
@@ -117,7 +117,7 @@ pub fn cache_scalar_subquery(key: String, tables: SmallVec<[CompactArc<str>; 2]>
 type InSubqueryCacheEntry = (
     SmallVec<[CompactArc<str>; 2]>,
     Vec<Value>,
-    Option<CompactArc<crate::core::ValueSet>>,
+    Option<CompactArc<PredicateSet>>,
 );
 
 thread_local! {
@@ -163,12 +163,13 @@ pub fn get_cached_in_subquery(key: &str) -> Option<Vec<Value>> {
 /// Get a cached IN subquery result as a shared hash set, building and
 /// memoizing the set inside the entry on first request. Later hits are
 /// an Arc clone: no value clones, no set rebuild.
-pub fn get_cached_in_subquery_set(key: &str) -> Option<CompactArc<crate::core::ValueSet>> {
+pub fn get_cached_in_subquery_set(key: &str) -> Option<CompactArc<PredicateSet>> {
     IN_SUBQUERY_CACHE.with(|cache| {
         let mut c = cache.borrow_mut();
         let entry = c.get_mut(key)?;
         if entry.2.is_none() {
-            entry.2 = Some(CompactArc::new(entry.1.iter().cloned().collect()));
+            let members = CompactArc::new(entry.1.iter().cloned().collect());
+            entry.2 = Some(CompactArc::new(PredicateSet::of(members)));
         }
         entry.2.clone()
     })
@@ -333,7 +334,7 @@ impl SemiJoinOrigin<'_> {
 
 /// Cached semi-join entry: its origin, checked on a hit and read for
 /// invalidation by table, and the set
-type SemiJoinCacheEntry = (KeptOrigin, CompactArc<ValueSet>);
+type SemiJoinCacheEntry = (KeptOrigin, CompactArc<PredicateSet>);
 
 thread_local! {
     static SEMI_JOIN_CACHE: RefCell<LruCache<u64, SemiJoinCacheEntry>> =
@@ -372,7 +373,10 @@ pub fn invalidate_semi_join_cache_for_table(table_name: &str) {
 
 /// The cached semi-join set taken for `origin`, under its `key`
 #[inline]
-pub fn get_cached_semi_join(origin: &SemiJoinOrigin<'_>, key: u64) -> Option<CompactArc<ValueSet>> {
+pub fn get_cached_semi_join(
+    origin: &SemiJoinOrigin<'_>,
+    key: u64,
+) -> Option<CompactArc<PredicateSet>> {
     SEMI_JOIN_CACHE.with(|cache| {
         cache
             .borrow_mut()
@@ -384,7 +388,11 @@ pub fn get_cached_semi_join(origin: &SemiJoinOrigin<'_>, key: u64) -> Option<Com
 
 /// Cache a semi-join hash set result (CompactArc version for zero-copy).
 #[inline]
-pub fn cache_semi_join_arc(origin: &SemiJoinOrigin<'_>, key: u64, values: CompactArc<ValueSet>) {
+pub fn cache_semi_join_arc(
+    origin: &SemiJoinOrigin<'_>,
+    key: u64,
+    values: CompactArc<PredicateSet>,
+) {
     SEMI_JOIN_CACHE.with(|cache| {
         cache.borrow_mut().put(key, (origin.keep(), values));
     });
@@ -1623,8 +1631,12 @@ mod tests {
         };
         let taken = origin("semi_join_origin_test", &[Value::Integer(10)]);
         let key = taken.key();
-        let set: CompactArc<ValueSet> = CompactArc::new([Value::Integer(1)].into_iter().collect());
-        cache_semi_join_arc(&taken, key, set);
+        let set = || {
+            CompactArc::new(PredicateSet::of(CompactArc::new(
+                [Value::Integer(1)].into_iter().collect(),
+            )))
+        };
+        cache_semi_join_arc(&taken, key, set());
         assert!(get_cached_semi_join(&taken, key).is_some());
         for other in [
             origin("semi_join_origin_test", &[Value::Integer(20)]),
@@ -1643,8 +1655,7 @@ mod tests {
         let null_key = null.key();
         let other_null = origin("semi_join_origin_test", &[Value::Null(DataType::Float)]);
         assert_ne!(null_key, other_null.key());
-        let set: CompactArc<ValueSet> = CompactArc::new([Value::Integer(1)].into_iter().collect());
-        cache_semi_join_arc(&null, null_key, set);
+        cache_semi_join_arc(&null, null_key, set());
         assert!(get_cached_semi_join(&other_null, null_key).is_none());
         invalidate_semi_join_cache_for_table("semi_join_origin_test");
     }

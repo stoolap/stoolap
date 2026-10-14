@@ -193,8 +193,24 @@ impl PredicateSet {
         self.members.is_empty()
     }
 
+    /// The set of `members`, with a NULL among them as its NULL member
+    pub fn of(members: CompactArc<ValueSet>) -> Self {
+        let has_null = members.contains(&super::value::NULL_VALUE);
+        Self::new(members, has_null)
+    }
+
     pub fn has_null(&self) -> bool {
         self.has_null
+    }
+
+    /// Whether a member is a TEXT
+    pub fn has_text(&self) -> bool {
+        self.has_unreadable_text || !self.numbers_in_text.is_empty()
+    }
+
+    /// Whether a member is a number
+    pub fn has_numbers(&self) -> bool {
+        self.has_numbers
     }
 
     /// The members as stored, for callers that read them as values

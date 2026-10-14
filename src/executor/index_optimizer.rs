@@ -24,12 +24,14 @@
 use std::sync::Arc;
 
 use crate::common::{CompactArc, I64Set};
+use crate::core::predicate::PredicateSet;
 use crate::core::{DataType, Result, Row, RowVec, Value, ValueSet};
 use crate::parser::ast::*;
 use crate::storage::traits::{QueryResult, Table};
 
 use super::context::{
-    cache_in_subquery, extract_table_names_for_cache, get_cached_in_subquery, ExecutionContext,
+    cache_in_subquery, extract_table_names_for_cache, get_cached_in_subquery,
+    get_cached_in_subquery_set, ExecutionContext,
 };
 use super::expression::{ExpressionEval, RowFilter};
 use super::query_classification::QueryClassification;
@@ -72,11 +74,6 @@ fn numeric_members<'a>(members: impl Iterator<Item = &'a Value>) -> (Vec<Value>,
         }
     }
     (numbers, unknown)
-}
-
-/// Whether a set holds a TEXT, which a numeric column reads as a number
-fn has_text<'a>(mut members: impl Iterator<Item = &'a Value>) -> bool {
-    members.any(|v| matches!(v, Value::Text(_)))
 }
 
 /// Whether a set holds a number, which a TEXT column cannot be probed for
@@ -1049,7 +1046,9 @@ impl Executor {
                 token(),
                 column.to_string(),
             ))),
-            values: CompactArc::new(members.into_iter().collect()),
+            values: CompactArc::new(PredicateSet::of(CompactArc::new(
+                members.into_iter().collect(),
+            ))),
             not: false,
         });
         let membership = RowFilter::new(&membership, all_columns)?.with_context(ctx);
@@ -1302,9 +1301,13 @@ impl Executor {
         } else {
             None
         };
-        let cached = cache_key.as_deref().and_then(get_cached_in_subquery);
-        let mut values = if let Some(cached) = cached {
-            cached
+        // A cached list comes with its set, which knows its members' kinds
+        let cached = cache_key.as_deref().and_then(|key| {
+            let set = get_cached_in_subquery_set(key)?;
+            Some((get_cached_in_subquery(key)?, set))
+        });
+        let (mut values, has_texts, has_numbers) = if let Some((cached, set)) = cached {
+            (cached, set.has_text(), set.has_numbers())
         } else {
             let subquery_ctx = ctx.with_incremented_query_depth();
             #[cfg(any(test, feature = "test-failpoints"))]
@@ -1313,7 +1316,7 @@ impl Executor {
 
             // Collect all values from the first column
             let mut values = Vec::new();
-            let mut has_null = false;
+            let (mut has_null, mut texts, mut numbers) = (false, false, false);
             while result.next() {
                 let row = result.row();
                 if !row.is_empty() {
@@ -1321,7 +1324,12 @@ impl Executor {
                         .get(0)
                         .cloned()
                         .unwrap_or_else(crate::core::Value::null_unknown);
-                    has_null |= value.is_null();
+                    match value {
+                        Value::Null(_) => has_null = true,
+                        Value::Text(_) => texts = true,
+                        Value::Integer(_) | Value::Float(_) => numbers = true,
+                        _ => {}
+                    }
                     values.push(value);
                 }
             }
@@ -1342,7 +1350,7 @@ impl Executor {
                     values.clone(),
                 );
             }
-            values
+            (values, texts, numbers)
         };
 
         // The members as the comparison reads them against the column. A
@@ -1350,7 +1358,7 @@ impl Executor {
         // TEXT column is read by a scan for a set holding a number
         let mut text_scan = false;
         match schema.get_column_type(&column_name) {
-            Some(DataType::Integer | DataType::Float) if has_text(values.iter()) => {
+            Some(DataType::Integer | DataType::Float) if has_texts => {
                 let (numbers, unknown) = numeric_members(values.iter());
                 if is_negated && unknown {
                     let output_columns = CompactArc::new(self.get_output_column_names(
@@ -1366,7 +1374,7 @@ impl Executor {
                 }
                 values = numbers;
             }
-            Some(DataType::Text) if !is_negated && has_number(values.iter()) => text_scan = true,
+            Some(DataType::Text) if !is_negated && has_numbers => text_scan = true,
             _ => {}
         }
 
@@ -2128,9 +2136,9 @@ impl Executor {
         // The members as the comparison reads them against the column. A
         // member UNKNOWN to every number leaves NOT IN true for no row and is
         // no match to NOT EXISTS; a TEXT column is not probed for a number
-        let values = match schema.get_column_type(&column_name) {
-            Some(DataType::Integer | DataType::Float) if has_text(values.iter()) => {
-                let (numbers, unknown) = numeric_members(values.iter());
+        let values: CompactArc<ValueSet> = match schema.get_column_type(&column_name) {
+            Some(DataType::Integer | DataType::Float) if values.has_text() => {
+                let (numbers, unknown) = numeric_members(values.members().iter());
                 if test == SetTest::NotIn && unknown {
                     let output_columns = CompactArc::new(self.get_output_column_names(
                         &stmt.columns,
@@ -2145,8 +2153,8 @@ impl Executor {
                 }
                 CompactArc::new(numbers.into_iter().collect::<ValueSet>())
             }
-            Some(DataType::Text) if has_number(values.iter()) => return Ok(None),
-            _ => values,
+            Some(DataType::Text) if values.has_numbers() => return Ok(None),
+            _ => CompactArc::clone(values.members()),
         };
 
         // If not PK, check for index (only for non-negated IN); a table that
@@ -2435,7 +2443,12 @@ impl Executor {
     #[allow(clippy::type_complexity)]
     pub(crate) fn extract_in_hashset_info(
         expr: &Expression,
-    ) -> Option<(String, CompactArc<ValueSet>, SetTest, Option<Expression>)> {
+    ) -> Option<(
+        String,
+        CompactArc<PredicateSet>,
+        SetTest,
+        Option<Expression>,
+    )> {
         let column_of = |in_hash: &InHashSetExpression| match in_hash.column.as_ref() {
             Expression::Identifier(id) => Some(id.value_lower.to_string()),
             Expression::QualifiedIdentifier(qid) => Some(qid.name.value_lower.to_string()),
@@ -2446,7 +2459,7 @@ impl Executor {
             Expression::InHashSet(in_hash) => {
                 // A negated set holding a NULL keeps no row, which the probe
                 // of the keys outside the set cannot say; the evaluator can
-                if in_hash.not && in_hash.values.contains(&Value::null_unknown()) {
+                if in_hash.not && in_hash.values.has_null() {
                     return None;
                 }
                 let test = if in_hash.not {
