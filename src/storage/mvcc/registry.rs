@@ -2232,19 +2232,31 @@ mod tests {
         let (a, _) = registry.begin_transaction();
         let (viewer, _) = registry.begin_transaction();
         let (taken, sequence_taken) = std::sync::mpsc::channel();
+        let (captured, view_captured) = std::sync::mpsc::channel::<()>();
         let committer = {
             let registry = Arc::clone(&registry);
             std::thread::spawn(move || {
+                // Waits for the view while holding the sequence: a view that can be
+                // taken meanwhile is taken before the commit is marked; the timeout
+                // only ends the wait when the view cannot be taken
                 crate::test_failpoints::after_commit_seq_taken(move || {
                     taken.send(()).unwrap();
-                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    let _ = view_captured.recv_timeout(std::time::Duration::from_millis(500));
                 });
                 registry.start_commit(a)
             })
         };
         sequence_taken.recv().unwrap();
-        let view = registry.capture_view();
+        let capturer = {
+            let registry = Arc::clone(&registry);
+            std::thread::spawn(move || {
+                let view = registry.capture_view();
+                let _ = captured.send(());
+                view
+            })
+        };
         let a_seq = committer.join().unwrap();
+        let view = capturer.join().unwrap();
         registry.complete_commit(a);
         assert!(
             !registry.is_visible_at(a, viewer, &view),
@@ -2254,23 +2266,34 @@ mod tests {
     }
 
     #[test]
-    fn a_live_view_keeps_the_status_runs_from_its_base() {
+    fn a_live_view_keeps_the_status_segment_a_new_run_would_reuse() {
         let registry = Arc::new(TransactionRegistry::new());
         let (old, _) = registry.begin_transaction();
+        let (x, _) = registry.begin_transaction();
+        let x_seq = registry.commit_transaction(x);
+        let (viewer, _) = registry.begin_transaction();
         let view = registry.capture_view();
         registry.commit_transaction(old);
-        let (later, _) = registry.begin_transaction();
-        registry.commit_transaction(later);
-        let txns = registry.transactions.lock();
-        assert!(registry.base.load(Ordering::Relaxed) > old);
-        assert_eq!(registry.status_kept_from(&txns), view.base);
-        drop(txns);
-        drop(view);
-        let txns = registry.transactions.lock();
+        registry.commit_transaction(viewer);
+        // The next ids start a run past x's, whose hold may take x's segment
+        registry.reserve_txn_ids_through(3 * STATUS_SEGMENT_LEN as i64);
+        let x_run = TxnStatusTable::run_of(x);
+        assert!(TxnStatusTable::run_of(registry.base.load(Ordering::Relaxed)) > x_run);
+        let (z, _) = registry.begin_transaction();
+        assert!(TxnStatusTable::run_of(z) > x_run);
         assert_eq!(
-            registry.status_kept_from(&txns),
-            registry.base.load(Ordering::Relaxed)
+            registry.status.get(x),
+            Some(x_seq),
+            "a new run took x's segment while a view below it lived"
         );
+        assert!(registry.is_visible_at(x, viewer, &view));
+
+        // With no view left, the next new run reuses that segment as before
+        drop(view);
+        registry.commit_transaction(z);
+        registry.reserve_txn_ids_through(5 * STATUS_SEGMENT_LEN as i64);
+        registry.begin_transaction();
+        assert_eq!(registry.status.get(x), None);
     }
 
     #[test]
