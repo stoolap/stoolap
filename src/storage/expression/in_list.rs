@@ -253,6 +253,12 @@ impl InListExpr {
             if v.is_null() {
                 continue;
             }
+            // NaN sorts last in compare but fails every `<=`, so it bounds nothing
+            if matches!(v, Value::Float(x) if x.is_nan()) {
+                min_val = None;
+                max_val = None;
+                break;
+            }
             match (&min_val, &max_val) {
                 (None, _) => {
                     min_val = Some(v.clone());
