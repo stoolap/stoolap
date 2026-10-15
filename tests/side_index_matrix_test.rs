@@ -142,7 +142,7 @@ fn strangers(ty: Type) -> Vec<Value> {
 /// Whether the side file holds the index, so a rare key is read through it
 fn held(ty: Type, form: Form) -> bool {
     match form {
-        Form::Composite => true,
+        Form::Composite => false,
         Form::BTree => ty != Type::Boolean,
         Form::Hash => ty == Type::Text,
         Form::Bitmap => false,
