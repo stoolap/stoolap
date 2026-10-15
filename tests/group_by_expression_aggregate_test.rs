@@ -149,19 +149,9 @@ fn test_group_by_column_with_null_group_and_expression_aggregate() {
     assert_eq!(rows, vec![(None, 60), (Some(7), 60)]);
 }
 
-/// The grouping paths do not agree on whether `0.0` and `-0.0` are one group.
-///
-/// The storage fast path keys a float column by its bit pattern, so it keeps
-/// them apart, and so does the executor path that a query with an expression,
-/// FILTER or ORDER BY aggregate takes today. The executor's raw-entry path
-/// compares keys with `Value` equality instead, which merges them.
-///
-/// This pins what each shape answers now. Unifying the paths is worth doing,
-/// but it changes group membership rather than just row order, so it has to be
-/// a deliberate change with these numbers updated in the same commit, not a
-/// side effect of moving a query from one path to another.
+/// Every grouping path takes `0.0` and `-0.0` as one group
 #[test]
-fn test_signed_zero_group_membership_is_stable_per_shape() {
+fn test_signed_zeros_are_one_group_in_every_shape() {
     let db = Database::open("memory://group_by_expr_agg_signed_zero").unwrap();
     db.execute(
         "CREATE TABLE t (id INTEGER PRIMARY KEY, v FLOAT, w INTEGER)",
@@ -177,7 +167,7 @@ fn test_signed_zero_group_membership_is_stable_per_shape() {
 
     let groups = |sql: &str| db.query(sql, ()).unwrap().count();
 
-    assert_eq!(groups("SELECT v, SUM(w) FROM t GROUP BY v"), 3);
-    assert_eq!(groups("SELECT v, COUNT(*) FROM t GROUP BY v"), 3);
-    assert_eq!(groups("SELECT v, SUM(w * 1) FROM t GROUP BY v"), 3);
+    assert_eq!(groups("SELECT v, SUM(w) FROM t GROUP BY v"), 2);
+    assert_eq!(groups("SELECT v, COUNT(*) FROM t GROUP BY v"), 2);
+    assert_eq!(groups("SELECT v, SUM(w * 1) FROM t GROUP BY v"), 2);
 }

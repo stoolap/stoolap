@@ -1496,6 +1496,19 @@ pub fn parse_vector_str(s: &str) -> Option<Vec<f32>> {
     Some(result)
 }
 
+/// A float as a grouping key: 0.0 for either zero and one NaN for every NaN,
+/// as `Value`'s equality has them. Stored values keep their bits.
+#[inline]
+pub(crate) fn grouping_float(f: f64) -> f64 {
+    if f.is_nan() {
+        f64::NAN
+    } else if f == 0.0 {
+        0.0
+    } else {
+        f
+    }
+}
+
 /// Compare two floats with proper NaN handling
 pub(crate) fn compare_floats(a: f64, b: f64) -> Ordering {
     // Handle NaN: treat as greater than all other values for consistency

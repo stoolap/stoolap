@@ -31,7 +31,7 @@ use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 use crate::common::StringMap;
 
-use crate::core::value::NULL_VALUE;
+use crate::core::value::{grouping_float, NULL_VALUE};
 use crate::core::{DataType, Operator, Row, Schema, Value};
 use crate::executor::operators::index_nested_loop::ColumnSource;
 use crate::parser::ast::{
@@ -747,7 +747,7 @@ pub fn hash_value_into<H: Hasher>(value: &Value, hasher: &mut H) {
         }
         Value::Float(f) => {
             2u8.hash(hasher);
-            f.to_bits().hash(hasher);
+            grouping_float(*f).to_bits().hash(hasher);
         }
         Value::Text(s) => {
             3u8.hash(hasher);
