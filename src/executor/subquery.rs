@@ -4289,10 +4289,15 @@ impl Executor {
         else {
             return false;
         };
-        // Only an ordered i64 entry answers a key probe
+        // A key probe asks an ordered i64 entry, or a single-column TEXT one
         table.side_index_defs().iter().any(|def| {
-            def.kind == crate::storage::volume::side_index::KeyKind::OrderedI64
-                && def.leading().is_some_and(|c| c.column as usize == at)
+            use crate::storage::volume::side_index::{Domain, KeyKind};
+            match def.components.as_slice() {
+                [only] if only.column as usize == at => {
+                    def.kind == KeyKind::OrderedI64 || only.domain == Domain::Text
+                }
+                _ => false,
+            }
         })
     }
 

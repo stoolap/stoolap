@@ -221,6 +221,8 @@ impl fmt::Display for ScanPlan {
 pub struct ProbeScratch {
     pub(crate) defs: Vec<crate::storage::volume::side_index::SideIndexDef>,
     pub(crate) reader: crate::storage::volume::secondary::ReaderSpace,
+    /// A probe's ordered-bytes key followed by its successor
+    pub(crate) key: crate::storage::volume::secondary::KeyBuffer,
 }
 
 /// `Table::count_equal_candidates` by reading each row and checking its key

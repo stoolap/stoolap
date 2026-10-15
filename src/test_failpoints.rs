@@ -2109,6 +2109,23 @@ pub(crate) fn dictionary_searched() {
     DICTIONARY_SEARCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Process-wide: the most bytes a TEXT probe's key buffer held
+static TEXT_PROBE_KEY_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The most bytes a TEXT probe's key buffer held since the last reset
+pub fn text_probe_key_bytes() -> usize {
+    TEXT_PROBE_KEY_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn reset_text_probe_key_bytes() {
+    TEXT_PROBE_KEY_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn text_probe_key_held(bytes: usize) {
+    TEXT_PROBE_KEY_BYTES.fetch_max(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Process-wide: side walks still to refuse when they take their reader
 static REFUSE_SIDE_WALKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 

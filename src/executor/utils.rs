@@ -44,6 +44,21 @@ use crate::parser::ast::{
 };
 use crate::parser::token::{Position, Token, TokenType};
 
+/// Whether a table that keeps rows outside its index answers an equality
+/// probe of `column` key by key: a B-tree on it, or a hash on a TEXT column
+pub(crate) fn probes_by_equality(table: &dyn crate::storage::traits::Table, column: &str) -> bool {
+    use crate::core::IndexType;
+    table
+        .get_index_on_column(column)
+        .is_some_and(|index| match index.index_type() {
+            IndexType::BTree => true,
+            IndexType::Hash => table.schema().columns.iter().any(|c| {
+                c.data_type == DataType::Text && c.name_lower.eq_ignore_ascii_case(column)
+            }),
+            _ => false,
+        })
+}
+
 // ============================================================================
 // Token Creation Utilities
 // ============================================================================

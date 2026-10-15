@@ -155,6 +155,75 @@ fn a_refused_probe_reads_one_semi_join_set() {
     );
 }
 
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_text_key_no_page_holds_is_not_encoded_for_a_probe() {
+    use stoolap::storage::volume::secondary::PAGE_BYTES;
+    use stoolap::test_failpoints::{reset_text_probe_key_bytes, text_probe_key_bytes};
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+    for table in ["t", "u"] {
+        db.execute(
+            &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, s TEXT)"),
+            (),
+        )
+        .unwrap();
+        // A dense key gives the volume heavy keys, which an IN list is
+        // checked against before its reads
+        db.execute(
+            &format!(
+                "INSERT INTO {table} SELECT value, \
+                 CASE WHEN value % 4 = 0 THEN 'dense' ELSE 'key-' || value END \
+                 FROM generate_series(1, 2000)"
+            ),
+            (),
+        )
+        .unwrap();
+    }
+    db.execute("CREATE INDEX t_s ON t(s) USING BTREE", ())
+        .unwrap();
+    db.execute("CREATE TABLE o (id INTEGER PRIMARY KEY, s TEXT)", ())
+        .unwrap();
+    let long = "x".repeat(1 << 20);
+    db.execute(
+        "INSERT INTO o VALUES (1, 'key-5'), (2, $1)",
+        (long.as_str(),),
+    )
+    .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    reset_text_probe_key_bytes();
+    let before = READS.probes.load(Ordering::Relaxed);
+    let exists = "SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM {t} WHERE {t}.s = o.s) \
+                  ORDER BY o.id LIMIT 10";
+    assert_eq!(
+        ids(&db, &exists.replace("{t}", "t")),
+        ids(&db, &exists.replace("{t}", "u"))
+    );
+    let in_list = |t: &str| -> Vec<i64> {
+        let mut got: Vec<i64> = db
+            .query(
+                &format!("SELECT id FROM {t} WHERE s IN ('key-7', $1)"),
+                (long.as_str(),),
+            )
+            .unwrap()
+            .map(|r| r.unwrap().get(0).unwrap())
+            .collect();
+        got.sort_unstable();
+        got
+    };
+    assert_eq!(in_list("t"), in_list("u"));
+    assert!(
+        READS.probes.load(Ordering::Relaxed) > before,
+        "the short keys read the side files"
+    );
+    assert!(
+        text_probe_key_bytes() <= 4 * PAGE_BYTES,
+        "a probe's key buffer held {} bytes",
+        text_probe_key_bytes()
+    );
+}
+
 #[test]
 fn a_refused_probe_set_is_not_read_by_the_next_statement() {
     let _serial = serial();

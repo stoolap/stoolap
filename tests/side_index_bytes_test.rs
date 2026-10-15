@@ -457,7 +457,7 @@ fn a_key_longer_than_a_page_leaves_its_index_unsupported_and_not_rebuilt() {
 }
 
 #[test]
-fn text_key_probes_answer_as_the_scan() {
+fn text_key_probes_are_answered_by_the_side_file() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     for form in ["BTREE", "HASH"] {
         let dir = tempfile::tempdir().unwrap();
@@ -500,6 +500,12 @@ fn text_key_probes_answer_as_the_scan() {
                 .unwrap();
         }
         let join = "SELECT t.id FROM o JOIN t ON t.k = o.k LIMIT 100";
+        let plan: String = db
+            .query(&format!("EXPLAIN {join}"), ())
+            .unwrap()
+            .map(|row| row.unwrap().get::<String>(0).unwrap())
+            .collect();
+        assert!(plan.contains("Index Nested Loop"), "{form}: {plan}");
         let cases = [
             (
                 "SELECT id FROM t WHERE k IN ($1, $2, $3)",
@@ -514,7 +520,9 @@ fn text_key_probes_answer_as_the_scan() {
         for (sql, params) in &cases {
             let want = ids(&db, &sql.replace(" t ", " u ").replace("t.", "u."), params);
             assert!(!want.is_empty(), "rows for {sql}");
-            assert_eq!(ids(&db, sql, params), want, "{form}: {sql}");
+            let before = side_reads(&db);
+            assert_eq!(ids(&db, sql, params), want, "{sql}");
+            assert!(side_reads(&db) > before, "side file read: {sql}");
         }
     }
 }

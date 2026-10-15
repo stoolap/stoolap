@@ -11859,9 +11859,7 @@ impl Executor {
                 .iter()
                 .any(|c| c.name_lower.eq_ignore_ascii_case(&outer_col));
         if (bounded || (small_outer && outer_is_sure && table.has_sealed_rows()))
-            && table
-                .get_index_on_column(&inner_col_unqualified)
-                .is_some_and(|index| index.index_type() == crate::core::IndexType::BTree)
+            && crate::executor::utils::probes_by_equality(&*table, &inner_col_unqualified)
         {
             return Some((
                 table_name,
