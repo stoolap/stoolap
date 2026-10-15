@@ -259,6 +259,17 @@ impl InListExpr {
                 max_val = None;
                 break;
             }
+            // Value::compare compares a number with a TEXT as two strings,
+            // not as the column does, so mixed members' extremes bound nothing
+            let numeric = |v: &Value| matches!(v, Value::Integer(_) | Value::Float(_));
+            if min_val.as_ref().is_some_and(|first| {
+                !(numeric(first) && numeric(v))
+                    && std::mem::discriminant(first) != std::mem::discriminant(v)
+            }) {
+                min_val = None;
+                max_val = None;
+                break;
+            }
             match (&min_val, &max_val) {
                 (None, _) => {
                     min_val = Some(v.clone());
