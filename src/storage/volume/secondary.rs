@@ -764,6 +764,11 @@ fn byte_key<'a>(data: &'a [u8], starts: &[u32], i: usize) -> &'a [u8] {
 /// The bytes one ordered-bytes key page entry takes besides its key: the
 /// key's length and the position index it ends at
 const BYTE_KEY_OVERHEAD: usize = 6;
+/// The longest ordered-bytes key a key page holds
+pub(crate) const MAX_BYTE_KEY: usize = PAGE_BYTES - PAGE_OVERHEAD - BYTE_KEY_OVERHEAD;
+/// What a key buffer holds at most: a TEXT is pushed only when its unescaped
+/// bytes fit `MAX_BYTE_KEY`, and escaping at most doubles them
+pub(crate) const KEY_BUFFER_BYTES: usize = 2 * PAGE_BYTES;
 
 /// Parses ordered-bytes key page entries into the buffers given, checking
 /// that they fill the page and ascend
@@ -3401,7 +3406,7 @@ fn build_byte_entry<'b, W: Write>(
     let for_runs = after_sink - after_sink / 4;
     let per_input = MERGE_READ_BYTES + PAGE_BYTES + MERGE_INPUT_BYTES;
     let fan_in = ((for_runs / 2) / per_input).clamp(MIN_FAN_IN, MAX_FAN_IN);
-    let free = for_runs.saturating_sub(fan_in * per_input + PAGE_BYTES);
+    let free = for_runs.saturating_sub(fan_in * per_input + KEY_BUFFER_BYTES);
     let start_bytes = std::mem::size_of::<(u64, u32)>();
     let starts_cap = free / 2 / start_bytes;
     let records_cap = free - free / 2;
@@ -3414,23 +3419,23 @@ fn build_byte_entry<'b, W: Write>(
         ));
     }
     let run_charge = budget.take(
-        records_cap + starts_cap * start_bytes + PAGE_BYTES,
+        records_cap + starts_cap * start_bytes + KEY_BUFFER_BYTES,
         "a sort run",
     )?;
     let mut run = ByteRun {
         records: Vec::with_capacity(records_cap),
         starts: Vec::with_capacity(starts_cap),
     };
-    let mut key = Vec::with_capacity(PAGE_BYTES);
+    let mut key = Vec::with_capacity(KEY_BUFFER_BYTES);
     let mut spilled: Vec<PathBuf> = Vec::new();
     // Run names are handed out once each: a merge leaves runs alive
     let mut runs_named = 0usize;
     let mut unsupported = false;
-    while let Some(pos) = input.keys.next_key(&mut key) {
-        if PAGE_OVERHEAD + BYTE_KEY_OVERHEAD + key.len() > PAGE_BYTES {
+    while let Some(next) = input.keys.next_key(&mut key) {
+        let NextKey::Row(pos) = next else {
             unsupported = true;
             break;
-        }
+        };
         if run.records.len() + BYTE_KEY_OVERHEAD + key.len() > records_cap
             || run.starts.len() == starts_cap
         {
@@ -4205,10 +4210,20 @@ impl Iterator for GroupPairs<'_> {
     }
 }
 
+/// What one `KeySource::next_key` call read
+#[derive(Debug, PartialEq, Eq)]
+pub enum NextKey {
+    /// The key in `out` belongs to the row at this position
+    Row(u32),
+    /// A key longer than `MAX_BYTE_KEY`, stopped before `out` outgrew
+    /// `KEY_BUFFER_BYTES`
+    TooLong,
+}
+
 /// Where an ordered-bytes entry's build takes its keys: each call writes the
-/// next keyed row's key into `out` and gives its position, None at the end
+/// next keyed row's key into `out`, None at the end
 pub trait KeySource {
-    fn next_key(&mut self, out: &mut Vec<u8>) -> Option<u32>;
+    fn next_key(&mut self, out: &mut Vec<u8>) -> Option<NextKey>;
 }
 
 /// An ordered-bytes entry to build: the index's identity, its components'
@@ -4223,6 +4238,8 @@ pub struct BytesInput<'a> {
 enum Cell {
     Pushed,
     Null,
+    /// A TEXT longer than the key can still take, not pushed
+    TooLong,
     /// A column no key holds, or a row past its group
     Failed(&'static str),
 }
@@ -4265,6 +4282,8 @@ fn push_cell(data: &super::column::ColumnData, i: usize, out: &mut Vec<u8>) -> C
         } => match (nulls.get(i), ids.get(i)) {
             (Some(true), _) => Cell::Null,
             (_, Some(&id)) => match dictionary.get(id as usize) {
+                // Its tag and terminator take three bytes beside the text
+                Some(text) if out.len() + 3 + text.len() > MAX_BYTE_KEY => Cell::TooLong,
                 Some(text) => {
                     push_text(out, text.as_bytes());
                     Cell::Pushed
@@ -4291,7 +4310,7 @@ struct VolumeKeys<'a> {
 }
 
 impl VolumeKeys<'_> {
-    fn fail(&mut self, error: std::io::Error) -> Option<u32> {
+    fn fail(&mut self, error: std::io::Error) -> Option<NextKey> {
         self.failure.set(Some(error));
         self.next = self.rows;
         None
@@ -4299,7 +4318,7 @@ impl VolumeKeys<'_> {
 }
 
 impl KeySource for VolumeKeys<'_> {
-    fn next_key(&mut self, out: &mut Vec<u8>) -> Option<u32> {
+    fn next_key(&mut self, out: &mut Vec<u8>) -> Option<NextKey> {
         let single = self.columns.len() == 1;
         'rows: while self.next < self.rows {
             let row = self.next;
@@ -4330,10 +4349,14 @@ impl KeySource for VolumeKeys<'_> {
                     Cell::Pushed => {}
                     Cell::Null if single => continue 'rows,
                     Cell::Null => super::side_index::push_null(out),
+                    Cell::TooLong => return Some(NextKey::TooLong),
                     Cell::Failed(what) => return self.fail(invalid(what)),
                 }
+                if out.len() > MAX_BYTE_KEY {
+                    return Some(NextKey::TooLong);
+                }
             }
-            return Some(row as u32);
+            return Some(NextKey::Row(row as u32));
         }
         for group in &mut self.groups {
             *group = None;
@@ -4854,6 +4877,56 @@ mod tests {
             want.sort();
             assert_eq!(sorted_run(&keys), want, "prefix {prefix:?}");
         }
+    }
+
+    #[test]
+    fn a_key_too_long_for_a_page_stops_within_the_key_buffer() {
+        use crate::core::{DataType, Row, SchemaBuilder, Value};
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("s", DataType::Text, true, false)
+            .build();
+        let texts = [
+            "x".repeat(1 << 20),
+            "\0".repeat(MAX_BYTE_KEY - 3),
+            "short".to_string(),
+            "a".repeat(MAX_BYTE_KEY - 3),
+            "b".repeat(MAX_BYTE_KEY / 2),
+        ];
+        let mut builder = super::super::writer::VolumeBuilder::new(&schema);
+        for (id, text) in texts.iter().enumerate() {
+            let id = id as i64;
+            builder.add_row(
+                id,
+                &Row::from_values(vec![Value::Integer(id), Value::text(text)]),
+            );
+        }
+        let volume = builder.finish().unwrap();
+        let read = |columns: Vec<usize>| {
+            let failure = std::cell::Cell::new(None);
+            let mut keys = VolumeKeys {
+                volume: &volume,
+                groups: vec![None; columns.len()],
+                columns,
+                rows: volume.meta.row_count,
+                next: 0,
+                failure: &failure,
+            };
+            let mut out = Vec::with_capacity(KEY_BUFFER_BYTES);
+            let mut reads = Vec::new();
+            while let Some(next) = keys.next_key(&mut out) {
+                assert_eq!(out.capacity(), KEY_BUFFER_BYTES, "the key buffer grew");
+                reads.push(next);
+            }
+            assert!(failure.take().is_none());
+            reads
+        };
+        use NextKey::{Row as At, TooLong};
+        assert_eq!(read(vec![1]), [TooLong, TooLong, At(2), At(3), At(4)]);
+        assert_eq!(
+            read(vec![1, 1]),
+            [TooLong, TooLong, At(2), TooLong, TooLong]
+        );
     }
 
     /// A counting allocator for the tests of this binary: live and peak
