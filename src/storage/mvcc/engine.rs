@@ -4086,13 +4086,18 @@ impl MVCCEngine {
         let Ok(store) = self.get_version_store(name.as_ref()) else {
             return;
         };
-        let current = store.secondary_index_identities();
+        let current = store.side_index_defs();
         // A segment's file covers a column at the position the volume
         // holds it, through the segment's mapping, not the schema's
         for side in mgr.uncover_where(|segment| {
-            !current
-                .iter()
-                .any(|&(column, identity)| segment.side_for(column, identity).is_some())
+            !current.iter().any(|def| {
+                segment
+                    .side_for(
+                        def,
+                        crate::storage::volume::side_index::Capability::Equality,
+                    )
+                    .is_some()
+            })
         }) {
             crate::storage::volume::secondary::discard_side(side);
         }
@@ -6086,24 +6091,20 @@ impl MVCCEngine {
                 .collect()
         };
         tables.sort_by(|a, b| a.0.cmp(&b.0));
-        // The physical columns of `identities` a segment holds, through its
-        // captured mapping: an added column the volume has none of, and a
-        // dropped one, are no business of its side file
+        // The physical columns of `defs` a segment holds in their domain,
+        // through its captured mapping: an added column the volume has none
+        // of, and a dropped one, are no business of its side file
         let wanted_of = |cs: &crate::storage::volume::manifest::ColdSegment,
-                         identities: &[(usize, u64)]|
+                         defs: &[crate::storage::volume::side_index::SideIndexDef]|
          -> Vec<(usize, u64)> {
-            identities
-                .iter()
-                .filter_map(|&(column, identity)| {
-                    let physical = match cs.mapping.sources.get(column) {
-                        Some(crate::storage::volume::writer::ColSource::Volume(p)) => *p,
-                        Some(crate::storage::volume::writer::ColSource::Default(_)) => return None,
-                        None if cs.mapping.is_identity && column < cs.volume.columns.len() => {
-                            column
-                        }
-                        None => return None,
-                    };
-                    Some((physical, identity))
+            defs.iter()
+                .filter_map(|def| {
+                    let component = def.leading()?;
+                    let physical = cs.physical_column(component.column)?;
+                    let stored = *cs.volume.meta.column_types.get(physical)?;
+                    (crate::storage::volume::side_index::Domain::of(stored)
+                        == Some(component.domain))
+                    .then_some((physical, def.identity))
                 })
                 .collect()
         };
@@ -6113,12 +6114,13 @@ impl MVCCEngine {
         // a volume that cannot be built in one table does not hold the
         // rest, in any table, forever
         let mut work: Vec<(usize, u64)> = Vec::new();
-        let mut identities_of: Vec<(Vec<(usize, u64)>, u64)> = Vec::with_capacity(tables.len());
+        let mut identities_of: Vec<(Vec<crate::storage::volume::side_index::SideIndexDef>, u64)> =
+            Vec::with_capacity(tables.len());
         for (index, (_, store, mgr)) in tables.iter().enumerate() {
             // The identities and the definition they belong to, together
             let (identities, definition) = {
                 let _ddl = self.ddl_guard();
-                (store.secondary_index_identities(), mgr.definition_epoch())
+                (store.side_index_defs(), mgr.definition_epoch())
             };
             let snapshot = mgr.cold_snapshot();
             let mut candidates: Vec<u64> = if identities.is_empty() {
@@ -6254,7 +6256,7 @@ impl MVCCEngine {
                 report.discarded += 1;
                 continue;
             };
-            let current = store.secondary_index_identities();
+            let current = store.side_index_defs();
             let still_wanted = wanted_of(cs, &current);
             let covers = match staged.open() {
                 Ok(built) => !still_wanted.is_empty() && covers_all(&built, &still_wanted),
@@ -6898,7 +6900,7 @@ impl MVCCEngine {
                 .as_ref()
                 .map(|store| {
                     let _ddl = self.ddl_guard();
-                    store.secondary_index_identities()
+                    crate::storage::volume::side_index::schema_entries(&store.side_index_defs())
                 })
                 .unwrap_or_default();
             if mgr.check_schema_generation(generation).is_err() {
@@ -7355,7 +7357,9 @@ impl MVCCEngine {
                     continue 'tables;
                 }
                 if let Some(store) = store.as_ref() {
-                    let current = store.secondary_index_identities();
+                    let current = crate::storage::volume::side_index::schema_entries(
+                        &store.side_index_defs(),
+                    );
                     let stale: Vec<u64> = prepared
                         .sides()
                         .filter(|(_, side)| {
@@ -7610,7 +7614,7 @@ impl MVCCEngine {
             // guard the index DDL runs under
             let identities = {
                 let _ddl = self.ddl_guard();
-                store.secondary_index_identities()
+                crate::storage::volume::side_index::schema_entries(&store.side_index_defs())
             };
             if mgr.check_schema_generation(generation).is_err() {
                 continue;
@@ -7768,7 +7772,8 @@ impl MVCCEngine {
             let mut stale_sides: Vec<Arc<crate::storage::volume::secondary::IndexFile>> =
                 Vec::with_capacity(sealed_sides.len());
             {
-                let current = store.secondary_index_identities();
+                let current =
+                    crate::storage::volume::side_index::schema_entries(&store.side_index_defs());
                 for side in sealed_sides.iter_mut() {
                     if side.as_ref().is_some_and(|s| {
                         !crate::storage::volume::secondary::still_covers(s, &current)

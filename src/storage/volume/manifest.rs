@@ -67,24 +67,38 @@ pub struct ColdSegment {
 }
 
 impl ColdSegment {
-    /// The side file and the physical column that may serve schema column
-    /// `column` for the index definition with `identity`: the column is
-    /// resolved through this segment's captured mapping alone, and the
-    /// attached side file must cover that physical column under that
-    /// identity. None sends the volume through the scan.
+    /// The side file that may serve `def` for `capability`: the key's
+    /// column is resolved through this segment's captured mapping alone,
+    /// the volume must store it in the key's domain, and the attached side
+    /// file must hold the definition's entry over that physical column.
+    /// None sends the volume through the scan.
     pub fn side_for(
         &self,
-        column: usize,
-        identity: u64,
-    ) -> Option<(&Arc<super::secondary::IndexFile>, usize)> {
+        def: &super::side_index::SideIndexDef,
+        capability: super::side_index::Capability,
+    ) -> Option<&Arc<super::secondary::IndexFile>> {
         let side = self.side.as_ref()?;
-        let physical = match self.mapping.sources.get(column) {
-            Some(super::writer::ColSource::Volume(physical)) => *physical,
-            Some(super::writer::ColSource::Default(_)) => return None,
-            None if self.mapping.is_identity && column < self.volume.columns.len() => column,
-            None => return None,
+        let [component] = def.components.as_slice() else {
+            return None;
         };
-        side.covers(physical, identity).then_some((side, physical))
+        let physical = self.physical_column(component.column)?;
+        let stored = self.volume.meta.column_types.get(physical).copied()?;
+        if super::side_index::Domain::of(stored) != Some(component.domain) {
+            return None;
+        }
+        side.covers(def.identity, physical, capability)
+            .then_some(side)
+    }
+
+    /// The physical column holding schema column `column` in this volume,
+    /// through the captured mapping; None for a default or an unmapped one
+    pub fn physical_column(&self, column: usize) -> Option<usize> {
+        match self.mapping.sources.get(column) {
+            Some(super::writer::ColSource::Volume(physical)) => Some(*physical),
+            Some(super::writer::ColSource::Default(_)) => None,
+            None if self.mapping.is_identity && column < self.volume.columns.len() => Some(column),
+            None => None,
+        }
     }
 
     /// Check whether row at position `idx` in this volume is the authoritative

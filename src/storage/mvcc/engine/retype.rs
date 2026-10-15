@@ -455,10 +455,15 @@ fn prepare_cold(
         .collect();
     // Taken under the old schema: an index whose column the change takes to
     // a type no side file holds covers no output
-    let mut identities = store.secondary_index_identities();
-    identities.retain(|&(column, _)| {
-        crate::storage::mvcc::version_store::side_file_holds(schema.columns[column].data_type)
-    });
+    let identities: Vec<(usize, u64)> = store
+        .side_index_defs()
+        .iter()
+        .filter_map(|def| {
+            let column = def.leading()?.column;
+            crate::storage::volume::side_index::Domain::of(schema.columns[column].data_type)?;
+            Some((column, def.identity))
+        })
+        .collect();
     let unversioned = mgr.has_unversioned_renames();
     let snapshot = mgr.cold_snapshot();
     for &seg_id in &snapshot.seg_ids {

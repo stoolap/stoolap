@@ -219,7 +219,7 @@ impl fmt::Display for ScanPlan {
 /// probes, so a table reuses it instead of allocating per probe
 #[derive(Default)]
 pub struct ProbeScratch {
-    pub(crate) identities: Vec<(usize, u64)>,
+    pub(crate) defs: Vec<crate::storage::volume::side_index::SideIndexDef>,
     pub(crate) reader: crate::storage::volume::secondary::ReaderSpace,
 }
 
@@ -969,15 +969,18 @@ pub trait Table: Send + Sync {
         None // Default implementation - override in concrete tables
     }
 
-    /// The columns a volume's side file may serve for this table's
-    /// indexes, each with the identity the catalog issued to the index:
-    /// empty for a table without such indexes
-    fn secondary_index_identities(&self) -> Vec<(usize, u64)> {
+    /// The indexes a volume's side file may serve for this table, by the
+    /// identity the catalog issued to each: empty for a table without such
+    /// indexes
+    fn side_index_defs(&self) -> Vec<crate::storage::volume::side_index::SideIndexDef> {
         Vec::new()
     }
 
-    /// The same identities, into a buffer the caller keeps
-    fn secondary_index_identities_into(&self, out: &mut Vec<(usize, u64)>) {
+    /// The same definitions, into a buffer the caller keeps
+    fn side_index_defs_into(
+        &self,
+        out: &mut Vec<crate::storage::volume::side_index::SideIndexDef>,
+    ) {
         out.clear();
     }
 

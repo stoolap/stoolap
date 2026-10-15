@@ -49,6 +49,7 @@ use crate::storage::mvcc::registry::StatementView;
 #[cfg(not(test))]
 use crate::storage::mvcc::registry::TransactionRegistry;
 use crate::storage::traits::PlannedUpdate;
+use crate::storage::volume::side_index::SideIndexDef;
 use crate::storage::Index;
 use ahash::AHashMap;
 #[cfg(feature = "parallel")]
@@ -948,14 +949,6 @@ static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
 /// read under the schema of that layout, and nothing is written under it
 fn is_closed(layout: u64) -> bool {
     layout % 2 == 1
-}
-
-/// A row in the layout of `schema`, `width` columns wide: a narrower row
-/// takes the missing columns' defaults, or NULL; a wider one loses the
-/// cell at `cut`. None when the row is in that layout already
-/// Whether a volume's secondary side file can hold a column of `data_type`
-pub(crate) fn side_file_holds(data_type: DataType) -> bool {
-    matches!(data_type, DataType::Integer | DataType::Timestamp)
 }
 
 /// The dimension and graph parameters of the HNSW index `meta` describes,
@@ -5408,20 +5401,21 @@ impl VersionStore {
         result
     }
 
-    /// The columns a volume's side file indexes: each single-column
-    /// B-tree index on an INTEGER or TIMESTAMP column other than the
-    /// primary key, as the column's index and the index definition's
-    /// identity, in column order. An index the catalog has not issued an
-    /// identity to is left out: nothing can be built or served for it.
-    pub fn secondary_index_identities(&self) -> Vec<(usize, u64)> {
+    /// The indexes a volume's side file holds entries for: each
+    /// single-column B-tree index on an INTEGER or TIMESTAMP column other
+    /// than the primary key, by identity. An index the catalog has not
+    /// issued an identity to is left out: nothing can be built or served
+    /// for it.
+    pub fn side_index_defs(&self) -> Vec<SideIndexDef> {
         let mut result = Vec::new();
-        self.secondary_index_identities_into(&mut result);
+        self.side_index_defs_into(&mut result);
         result
     }
 
-    /// The same identities, into a buffer the caller keeps
-    pub fn secondary_index_identities_into(&self, result: &mut Vec<(usize, u64)>) {
+    /// The same definitions, into a buffer the caller keeps
+    pub fn side_index_defs_into(&self, result: &mut Vec<SideIndexDef>) {
         use crate::core::types::IndexType;
+        use crate::storage::volume::side_index::{Component, Domain, KeyKind};
         result.clear();
         let schema = self.schema();
         let pk = schema.pk_column_index();
@@ -5442,14 +5436,19 @@ impl VersionStore {
             else {
                 continue;
             };
-            if pk == Some(column) || !side_file_holds(schema.columns[column].data_type) {
+            if pk == Some(column) {
                 continue;
             }
-            if !result.iter().any(|(c, _)| *c == column) {
-                result.push((column, identity));
-            }
+            let Some(domain) = Domain::of(schema.columns[column].data_type) else {
+                continue;
+            };
+            result.push(SideIndexDef {
+                identity,
+                components: smallvec![Component { column, domain }],
+                kind: KeyKind::OrderedI64,
+            });
         }
-        result.sort_unstable();
+        result.sort_unstable_by_key(|def| def.identity);
     }
 
     // =========================================================================
