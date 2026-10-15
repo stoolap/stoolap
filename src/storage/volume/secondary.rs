@@ -2837,6 +2837,8 @@ struct Runs<'t> {
     temps: &'t TempFiles,
     column: usize,
     fan_in: usize,
+    /// The runs hold i64 pairs or ordered-bytes records
+    kind: KeyKind,
     levels: Vec<Level>,
     live: usize,
 }
@@ -2850,11 +2852,12 @@ struct Level {
 }
 
 impl<'t> Runs<'t> {
-    fn new(temps: &'t TempFiles, column: usize, fan_in: usize) -> Self {
+    fn new(temps: &'t TempFiles, column: usize, fan_in: usize, kind: KeyKind) -> Self {
         Self {
             temps,
             column,
             fan_in,
+            kind,
             levels: Vec::new(),
             live: 0,
         }
@@ -2916,9 +2919,23 @@ impl<'t> Runs<'t> {
             "run names",
         )?;
         let sink_buffer = budget.take(OUT_BUFFER_BYTES, "merge output buffer")?;
-        let mut sink = RunSink::create(target)?;
-        merge_runs(inputs, budget, report, |key, pos| sink.push(key, pos))?;
-        sink.finish()?;
+        match self.kind {
+            KeyKind::OrderedI64 => {
+                let mut sink = RunSink::create(target)?;
+                merge_runs(inputs, budget, report, |key, pos| sink.push(key, pos))?;
+                sink.finish()?;
+            }
+            KeyKind::OrderedBytes => {
+                let mut sink =
+                    BufWriter::with_capacity(OUT_BUFFER_BYTES, std::fs::File::create(target)?);
+                merge_byte_runs(inputs, budget, report, |key, pos| {
+                    sink.write_all(&(key.len() as u16).to_le_bytes())?;
+                    sink.write_all(key)?;
+                    sink.write_all(&pos.to_le_bytes())
+                })?;
+                sink.flush()?;
+            }
+        }
         drop(sink_buffer);
         drop(names);
         for input in inputs {
@@ -3153,7 +3170,7 @@ fn build_i64_entry<'b>(
     let run_len = run_capacity.min(hint.unwrap_or(run_capacity).max(MIN_RUN_PAIRS));
     let run_charge = budget.take(run_len * PAIR_BYTES, "a sort run")?;
     let mut pairs: Vec<(i64, u32)> = Vec::with_capacity(run_len);
-    let mut runs = Runs::new(temps, ci, fan_in);
+    let mut runs = Runs::new(temps, ci, fan_in, KeyKind::OrderedI64);
     for (pos, key) in input.pairs {
         if pairs.len() == run_len {
             pairs.sort_unstable();
@@ -3202,6 +3219,8 @@ thread_local! {
     /// A test fails the spill with this number (from one) on its thread
     static FAIL_SPILL: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static SPILLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Ordered-bytes records a merge has emitted on this thread
+    static BYTES_MERGED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn spill(run: &Path, pairs: &[(i64, u32)], budget: &Budget) -> std::io::Result<()> {
@@ -3379,6 +3398,8 @@ fn merge_byte_runs(
         }
     }
     while let Some(std::cmp::Reverse((mut key, pos, i))) = heap.pop() {
+        #[cfg(test)]
+        BYTES_MERGED.with(|m| m.set(m.get() + 1));
         emit(&key, pos)?;
         if let Some(pos) = next_byte_record(&mut readers[i], &mut key)? {
             heap.push(std::cmp::Reverse((key, pos, i)));
@@ -3427,9 +3448,7 @@ fn build_byte_entry<'b, W: Write>(
         starts: Vec::with_capacity(starts_cap),
     };
     let mut key = Vec::with_capacity(KEY_BUFFER_BYTES);
-    let mut spilled: Vec<PathBuf> = Vec::new();
-    // Run names are handed out once each: a merge leaves runs alive
-    let mut runs_named = 0usize;
+    let mut runs = Runs::new(temps, slot, fan_in, KeyKind::OrderedBytes);
     let mut unsupported = false;
     while let Some(next) = input.keys.next_key(&mut key) {
         let NextKey::Row(pos) = next else {
@@ -3440,30 +3459,11 @@ fn build_byte_entry<'b, W: Write>(
             || run.starts.len() == starts_cap
         {
             run.sort();
-            let path = temps.run_path(slot, 0, runs_named);
-            runs_named += 1;
+            let path = runs.next_path(0);
             run.spill(&path, budget)?;
             report.runs_spilled += 1;
-            spilled.push(path);
+            runs.added(0, budget, report)?;
             run.clear();
-            while spilled.len() >= fan_in {
-                // Merging the oldest runs keeps the files alive under the fan-in
-                let merged = temps.run_path(slot, 1, report.merge_passes);
-                let group: Vec<PathBuf> = spilled.drain(..fan_in).collect();
-                let mut sink =
-                    BufWriter::with_capacity(OUT_BUFFER_BYTES, std::fs::File::create(&merged)?);
-                merge_byte_runs(&group, budget, report, |k, p| {
-                    sink.write_all(&(k.len() as u16).to_le_bytes())?;
-                    sink.write_all(k)?;
-                    sink.write_all(&p.to_le_bytes())
-                })?;
-                sink.flush()?;
-                report.merge_passes += 1;
-                for path in &group {
-                    std::fs::remove_file(path)?;
-                }
-                spilled.insert(0, merged);
-            }
         }
         run.starts.push((0, run.records.len() as u32));
         run.records
@@ -3474,8 +3474,8 @@ fn build_byte_entry<'b, W: Write>(
     if unsupported {
         drop(run);
         drop(run_charge);
-        for path in &spilled {
-            std::fs::remove_file(path)?;
+        for (level, number) in runs.all() {
+            std::fs::remove_file(runs.path(level, number))?;
         }
         let (column, domain) = input.components[0];
         let entry = ColumnDirectory {
@@ -3496,7 +3496,7 @@ fn build_byte_entry<'b, W: Write>(
     }
     run.sort();
     let mut writer = PageWriter::for_bytes(out, offset, input.identity, input.components, budget)?;
-    if spilled.is_empty() {
+    if runs.live == 0 {
         for &(_, start) in &run.starts {
             let (key, pos) = run.key_pos(start);
             writer.push_bytes(key, pos)?;
@@ -3504,17 +3504,24 @@ fn build_byte_entry<'b, W: Write>(
         drop(run);
         drop(run_charge);
     } else {
-        let path = temps.run_path(slot, 0, runs_named);
+        let path = runs.next_path(0);
         run.spill(&path, budget)?;
         report.runs_spilled += 1;
-        spilled.push(path);
+        runs.added(0, budget, report)?;
         drop(run);
         drop(run_charge);
-        merge_byte_runs(&spilled, budget, report, |key, pos| {
+        let inputs = runs.settle(budget, report)?;
+        let names = budget.take(
+            inputs.iter().map(|p| p.capacity()).sum::<usize>()
+                + inputs.capacity() * std::mem::size_of::<PathBuf>(),
+            "run names",
+        )?;
+        merge_byte_runs(&inputs, budget, report, |key, pos| {
             writer.push_bytes(key, pos)
         })?;
-        for path in &spilled {
-            std::fs::remove_file(path)?;
+        drop(names);
+        for input in &inputs {
+            std::fs::remove_file(input)?;
         }
     }
     writer.finish()
@@ -4927,6 +4934,72 @@ mod tests {
             read(vec![1, 1]),
             [TooLong, TooLong, At(2), TooLong, TooLong]
         );
+    }
+
+    /// TEXT keys of rows `0..rows`, out of order, one per row
+    struct ScatteredTexts {
+        next: u32,
+        rows: u32,
+    }
+
+    fn scattered_text(pos: u32) -> Vec<u8> {
+        let mut key = Vec::new();
+        let scrambled = (pos as u64 * 2_654_435_761) % 1_000_003;
+        super::super::side_index::push_text(
+            &mut key,
+            format!("customer-{scrambled:08}-{pos}").as_bytes(),
+        );
+        key
+    }
+
+    impl KeySource for ScatteredTexts {
+        fn next_key(&mut self, out: &mut Vec<u8>) -> Option<NextKey> {
+            (self.next < self.rows).then(|| {
+                out.clear();
+                out.extend_from_slice(&scattered_text(self.next));
+                self.next += 1;
+                NextKey::Row(self.next - 1)
+            })
+        }
+    }
+
+    #[test]
+    fn ordered_bytes_runs_merge_level_by_level() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bytes.sidx");
+        let rows = 50_000u32;
+        BYTES_MERGED.with(|m| m.set(0));
+        let report = build_side_file_with(
+            &path,
+            next_generation(),
+            Vec::new(),
+            vec![BytesInput {
+                identity: 4,
+                components: vec![(1, Domain::Text)],
+                keys: Box::new(ScatteredTexts { next: 0, rows }),
+            }],
+            MIN_WORKSPACE_BYTES + 400_000,
+        )
+        .unwrap();
+        let merged = BYTES_MERGED.with(|m| m.get());
+        let (runs, fan_in) = (report.runs_spilled, report.max_fan_in);
+        assert!(runs >= 8 * fan_in, "{runs} runs with fan-in {fan_in}");
+        // Each record passes once through each level and once into the pages
+        let levels = (runs as f64).log(fan_in as f64).ceil() as usize;
+        assert!(
+            merged <= rows as usize * (levels + 1),
+            "{merged} records merged for {rows} rows in {runs} runs, fan-in {fan_in}"
+        );
+        let file = IndexFile::open(&path, 10).unwrap();
+        assert_eq!(file.range_bytes(4, &[], None).unwrap(), (0, rows as u64));
+        for pos in (0..rows).step_by(997) {
+            let key = scattered_text(pos);
+            let mut upper = key.clone();
+            *upper.last_mut().unwrap() = 1;
+            let range = file.range_bytes(4, &key, Some(&upper)).unwrap();
+            assert_eq!(all_positions_of(&file, 4, range), [pos]);
+        }
     }
 
     /// A counting allocator for the tests of this binary: live and peak
