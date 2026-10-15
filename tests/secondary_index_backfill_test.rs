@@ -39,6 +39,11 @@ fn key_of(id: i64) -> i64 {
     ((id * 7919) % ROWS) / 8
 }
 
+/// The ids permuted out of row order, row 100 kept in place, times three
+fn value_of(id: i64) -> i64 {
+    (((id - 100).rem_euclid(ROWS) * 7919 % ROWS + 99) % ROWS + 1) * 3
+}
+
 fn expected_range(low: i64, high: i64) -> Vec<i64> {
     (1..=ROWS)
         .filter(|&id| (low..=high).contains(&key_of(id)))
@@ -65,7 +70,7 @@ fn insert(db: &Database, from: i64, to: i64) {
     for chunk_start in (from..=to).step_by(2000) {
         let chunk_end = (chunk_start + 1999).min(to);
         let values = (chunk_start..=chunk_end)
-            .map(|id| format!("({id},{},{})", key_of(id), id * 3))
+            .map(|id| format!("({id},{},{})", key_of(id), value_of(id)))
             .collect::<Vec<_>>()
             .join(",");
         db.execute(&format!("INSERT INTO t VALUES {values}"), ())
