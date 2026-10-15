@@ -26,6 +26,7 @@
 use std::sync::Arc;
 
 use crate::core::{Error, Result, Row, Value};
+use crate::storage::mvcc::registry::StatementView;
 use crate::storage::traits::Scanner;
 
 use super::writer::FrozenVolume;
@@ -161,6 +162,9 @@ pub struct VolumeScanner {
     /// Snapshot sequence: if Some, only tombstones with commit_seq <= this are visible.
     /// None means auto-commit (all tombstones visible).
     pub snapshot_seq: Option<u64>,
+    /// The statement view of the read: a tombstone counts only when it sees
+    /// the commit
+    pub view: Option<Arc<StatementView>>,
     /// Typed pre-filter predicates extracted from the WHERE clause.
     /// Evaluated directly on column data without Value construction.
     typed_predicates: Vec<ColumnPredicate>,
@@ -453,6 +457,7 @@ impl VolumeScanner {
             pending_cold_deletes: None,
             committed_tombstones: None,
             snapshot_seq: None,
+            view: None,
             typed_predicates: Vec::new(),
             needed_cols: None,
             wanted: false,
@@ -514,6 +519,7 @@ impl VolumeScanner {
             pending_cold_deletes: None,
             committed_tombstones: None,
             snapshot_seq: None,
+            view: None,
             typed_predicates: Vec::new(),
             needed_cols: None,
             wanted: false,
@@ -607,6 +613,7 @@ impl VolumeScanner {
             pending_cold_deletes: None,
             committed_tombstones: None,
             snapshot_seq: None,
+            view: None,
             typed_predicates: Vec::new(),
             needed_cols: None,
             wanted: false,
@@ -1204,7 +1211,12 @@ impl VolumeScanner {
         let rid = self.volume.meta.row_ids[idx];
         if let Some(ref ts) = self.committed_tombstones {
             if let Some(&commit_seq) = ts.get(&rid) {
-                if self.snapshot_seq.is_none_or(|ss| commit_seq <= ss) {
+                if self.snapshot_seq.is_none_or(|ss| commit_seq <= ss)
+                    && self
+                        .view
+                        .as_ref()
+                        .is_none_or(|view| view.sees_commit(commit_seq as i64))
+                {
                     return true;
                 }
             }

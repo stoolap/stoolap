@@ -397,7 +397,7 @@ impl StatementView {
 
     /// Whether a commit that completed with `commit_seq` is visible to the view
     #[inline]
-    fn sees_commit(&self, commit_seq: i64) -> bool {
+    pub fn sees_commit(&self, commit_seq: i64) -> bool {
         commit_seq <= self.seq && !self.in_flight.contains(&commit_seq)
     }
 }
@@ -1511,8 +1511,19 @@ impl Default for TransactionRegistry {
 }
 
 impl VisibilityChecker for TransactionRegistry {
+    #[inline(always)]
     fn is_visible(&self, version_txn_id: i64, viewing_txn_id: i64) -> bool {
         TransactionRegistry::is_visible(self, version_txn_id, viewing_txn_id)
+    }
+
+    #[inline]
+    fn is_visible_at(
+        &self,
+        version_txn_id: i64,
+        viewing_txn_id: i64,
+        view: &StatementView,
+    ) -> bool {
+        TransactionRegistry::is_visible_at(self, version_txn_id, viewing_txn_id, view)
     }
 
     fn get_current_sequence(&self) -> i64 {
@@ -1523,6 +1534,7 @@ impl VisibilityChecker for TransactionRegistry {
         TransactionRegistry::is_committed_before(self, txn_id, cutoff_commit_seq)
     }
 
+    #[inline(always)]
     fn needs_snapshot_isolation(&self, txn_id: i64) -> bool {
         TransactionRegistry::needs_snapshot_isolation(self, txn_id)
     }

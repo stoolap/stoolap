@@ -44,6 +44,7 @@ use crate::core::{Error, Row, RowVec, Schema, Value};
 use crate::storage::expression::CompiledFilter;
 use crate::storage::mvcc::arena::{Relayout, RowArena};
 use crate::storage::mvcc::get_fast_timestamp;
+use crate::storage::mvcc::registry::StatementView;
 #[cfg(not(test))]
 use crate::storage::mvcc::registry::TransactionRegistry;
 use crate::storage::traits::PlannedUpdate;
@@ -464,6 +465,16 @@ pub trait VisibilityChecker: Send + Sync {
     /// Check if a version created by `version_txn_id` is visible to `viewing_txn_id`
     fn is_visible(&self, version_txn_id: i64, viewing_txn_id: i64) -> bool;
 
+    /// [`Self::is_visible`] for a statement of `viewing_txn_id` held to `view`
+    fn is_visible_at(
+        &self,
+        version_txn_id: i64,
+        viewing_txn_id: i64,
+        _view: &StatementView,
+    ) -> bool {
+        self.is_visible(version_txn_id, viewing_txn_id)
+    }
+
     /// Get the current global sequence number
     fn get_current_sequence(&self) -> i64;
 
@@ -504,6 +515,132 @@ pub trait VisibilityChecker: Send + Sync {
     /// them in, false refuses a transaction that already ended
     fn admit_publication(&self, _txn_id: i64) -> bool {
         true
+    }
+}
+
+/// The delete a returned version carries: one `reader` does not see is no
+/// delete to a view, so callers that ask `is_deleted` keep the row
+#[inline(always)]
+fn kept_delete(reader: Reader<'_>, deleted_at_txn_id: i64) -> i64 {
+    if reader.view.is_some() {
+        0
+    } else {
+        deleted_at_txn_id
+    }
+}
+
+/// Adds a numeric value to SUM's accumulators
+#[inline(always)]
+fn accumulate_sum(int_sum: &mut i128, float_sum: &mut f64, count: &mut usize, val: &Value) {
+    match val {
+        Value::Integer(i) => {
+            *int_sum += *i as i128;
+            *count += 1;
+        }
+        Value::Float(f) => {
+            *float_sum += *f;
+            *count += 1;
+        }
+        // A boolean counts as one or nought, as SUM reads it
+        Value::Boolean(b) => {
+            *int_sum += *b as i128;
+            *count += 1;
+        }
+        _ => {} // NULL or non-numeric
+    }
+}
+
+/// SUM's accumulators over the live heads whose transaction `visible`
+/// accepts, asked once per run of heads from one transaction. Kept out of
+/// line, so the caller's state does not crowd the loop's registers
+#[inline(never)]
+fn sum_live_heads(
+    meta: &[crate::storage::mvcc::arena::ArenaRowMeta],
+    data: &[CompactArc<[Value]>],
+    col_idx: usize,
+    mut visible: impl FnMut(i64) -> bool,
+) -> (i128, f64, usize) {
+    let (mut int_sum, mut float_sum, mut count) = (0i128, 0.0f64, 0usize);
+    let mut last_txn_id: i64 = 0;
+    let mut last_visible = false;
+    for (meta, row) in meta.iter().zip(data) {
+        if meta.txn_id == 0 || meta.deleted_at_txn_id != 0 {
+            continue;
+        }
+        if meta.txn_id != last_txn_id {
+            last_txn_id = meta.txn_id;
+            last_visible = visible(meta.txn_id);
+        }
+        if last_visible {
+            if let Some(val) = row.get(col_idx) {
+                accumulate_sum(&mut int_sum, &mut float_sum, &mut count, val);
+            }
+        }
+    }
+    (int_sum, float_sum, count)
+}
+
+/// Whether any version of `chain` is visible to `txn_id` through `checker`
+fn chain_seen<C: VisibilityChecker + ?Sized>(
+    checker: &ReaderChecker<'_, '_, C>,
+    txn_id: i64,
+    chain: &VersionChainEntry,
+) -> bool {
+    let mut current = Some(chain);
+    while let Some(node) = current {
+        if checker.is_visible(node.version.txn_id, txn_id) {
+            return true;
+        }
+        current = node.prev.as_deref();
+    }
+    false
+}
+
+/// Who reads the store: the transaction, and the statement view its reads
+/// are held to when it has one
+#[derive(Clone, Copy)]
+pub struct Reader<'a> {
+    pub txn_id: i64,
+    pub view: Option<&'a StatementView>,
+}
+
+impl From<i64> for Reader<'_> {
+    fn from(txn_id: i64) -> Self {
+        Self { txn_id, view: None }
+    }
+}
+
+impl<'a> Reader<'a> {
+    /// `checker` as this reader sees through it
+    #[inline(always)]
+    fn over<'c, C: VisibilityChecker + ?Sized>(self, checker: &'c C) -> ReaderChecker<'c, 'a, C> {
+        ReaderChecker {
+            checker,
+            view: self.view,
+        }
+    }
+}
+
+/// A checker answering for one reader: through its view when it has one
+struct ReaderChecker<'c, 'a, C: ?Sized> {
+    checker: &'c C,
+    view: Option<&'a StatementView>,
+}
+
+impl<C: VisibilityChecker + ?Sized> ReaderChecker<'_, '_, C> {
+    #[inline(always)]
+    fn is_visible(&self, version_txn_id: i64, viewing_txn_id: i64) -> bool {
+        match self.view {
+            Some(view) => self
+                .checker
+                .is_visible_at(version_txn_id, viewing_txn_id, view),
+            None => self.checker.is_visible(version_txn_id, viewing_txn_id),
+        }
+    }
+
+    #[inline(always)]
+    fn needs_snapshot_isolation(&self, txn_id: i64) -> bool {
+        self.checker.needs_snapshot_isolation(txn_id)
     }
 }
 
@@ -654,8 +791,13 @@ pub struct PublishHold {
 }
 
 impl PublishHold {
-    pub fn add(&mut self, version_store: &Arc<VersionStore>, txn_store: Arc<TxnTableStore>) {
-        self.guards.push(version_store.begin_publish());
+    pub fn add(
+        &mut self,
+        version_store: &Arc<VersionStore>,
+        txn_store: Arc<TxnTableStore>,
+        commit_seq: i64,
+    ) {
+        self.guards.push(version_store.begin_publish(commit_seq));
         self.stores.push(txn_store);
     }
 
@@ -776,6 +918,9 @@ pub struct VersionStore {
     publishing: AtomicUsize,
     /// Publishes completed
     publish_epoch: AtomicU64,
+    /// The largest commit sequence that began publishing here, set before
+    /// its first change; a view at or above it sees every head as it stands
+    newest_commit_seq: AtomicI64,
     /// Moved by every column added or dropped: the rows are laid out as
     /// the schema says from then on, and a transaction that wrote under
     /// the layout before cannot commit its rows
@@ -947,6 +1092,7 @@ impl VersionStore {
             upsert_mutex: Arc::new(parking_lot::Mutex::new(())),
             publishing: AtomicUsize::new(0),
             publish_epoch: AtomicU64::new(0),
+            newest_commit_seq: AtomicI64::new(0),
             layout: AtomicU64::new(0),
             pending_cut: Mutex::new(None),
             store_id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
@@ -980,6 +1126,7 @@ impl VersionStore {
             upsert_mutex: Arc::new(parking_lot::Mutex::new(())),
             publishing: AtomicUsize::new(0),
             publish_epoch: AtomicU64::new(0),
+            newest_commit_seq: AtomicI64::new(0),
             layout: AtomicU64::new(0),
             pending_cut: Mutex::new(None),
             store_id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
@@ -2112,12 +2259,13 @@ impl VersionStore {
     }
 
     /// Gets the latest visible version of a row
-    pub fn get_visible_version(&self, row_id: i64, txn_id: i64) -> Option<RowVersion> {
+    pub fn get_visible_version(&self, row_id: i64, reader: Reader<'_>) -> Option<RowVersion> {
         if self.closed.load(Ordering::Acquire) {
             return None;
         }
 
-        let checker = self.visibility_checker.as_ref()?;
+        let checker = reader.over(&**self.visibility_checker.as_ref()?);
+        let txn_id = reader.txn_id;
 
         // Phase 1: Speculative arena probe (arena lock only, self-contained).
         // For row_id N, probe arena slot N-1. Verify meta.row_id == row_id.
@@ -2141,7 +2289,7 @@ impl VersionStore {
                     crate::test_failpoints::note_read("vs.get_visible_version.arena_probe");
                     return Some(RowVersion {
                         txn_id: meta.txn_id,
-                        deleted_at_txn_id: meta.deleted_at_txn_id,
+                        deleted_at_txn_id: kept_delete(reader, meta.deleted_at_txn_id),
                         data,
                         // Arena metadata doesn't store create_time (saves 8 bytes/row).
                         // All callers of get_visible_version() only use .data, .is_deleted(),
@@ -2181,7 +2329,7 @@ impl VersionStore {
             };
             return Some(RowVersion {
                 txn_id: head_txn_id,
-                deleted_at_txn_id: head_deleted_at,
+                deleted_at_txn_id: kept_delete(reader, head_deleted_at),
                 data: row,
                 create_time: chain.version.create_time,
             });
@@ -2198,7 +2346,9 @@ impl VersionStore {
                 if deleted_at_txn_id != 0 && checker.is_visible(deleted_at_txn_id, txn_id) {
                     return None;
                 }
-                return Some(e.version.clone());
+                let mut version = e.version.clone();
+                version.deleted_at_txn_id = kept_delete(reader, deleted_at_txn_id);
+                return Some(version);
             }
             current = e.prev.as_ref().map(|b| b.as_ref());
         }
@@ -2210,12 +2360,13 @@ impl VersionStore {
     /// Returns the first row_id that has a visible version, or None if none exist
     /// OPTIMIZATION: Used for conflict detection - stops at first hit, no data fetch
     #[inline]
-    pub fn has_any_visible_version(&self, row_ids: &[i64], txn_id: i64) -> Option<i64> {
+    pub fn has_any_visible_version(&self, row_ids: &[i64], reader: Reader<'_>) -> Option<i64> {
         if self.closed.load(Ordering::Acquire) || row_ids.is_empty() {
             return None;
         }
 
-        let checker = self.visibility_checker.as_ref()?;
+        let checker = reader.over(&**self.visibility_checker.as_ref()?);
+        let txn_id = reader.txn_id;
 
         // Lock ordering: versions first, then arena (matches commit path)
         let versions = self.versions.read();
@@ -2275,7 +2426,7 @@ impl VersionStore {
     ///
     /// Pre-acquires all locks once, then performs per-key CowBTree lookups
     /// with visibility checking and version chain traversal as needed.
-    pub fn get_visible_versions_batch(&self, row_ids: &[i64], txn_id: i64) -> RowVec {
+    pub fn get_visible_versions_batch(&self, row_ids: &[i64], reader: Reader<'_>) -> RowVec {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.get_visible_versions_batch");
         if self.closed.load(Ordering::Acquire) || row_ids.is_empty() {
@@ -2283,9 +2434,10 @@ impl VersionStore {
         }
 
         let checker = match self.visibility_checker.as_ref() {
-            Some(c) => c,
+            Some(c) => reader.over(&**c),
             None => return RowVec::new(),
         };
+        let txn_id = reader.txn_id;
 
         // Lock ordering: versions first, then arena (matches commit path)
         let versions = self.versions.read();
@@ -2382,7 +2534,7 @@ impl VersionStore {
     /// This is more efficient than calling get_visible_version() per row_id because:
     /// - Single lock acquisition for CowBTree + arena (not per-row)
     /// - Supports early termination (unlike get_visible_versions_batch which collects all)
-    pub fn for_each_visible<F>(&self, row_ids: &[i64], txn_id: i64, mut callback: F)
+    pub fn for_each_visible<F>(&self, row_ids: &[i64], reader: Reader<'_>, mut callback: F)
     where
         F: FnMut(i64, Row) -> bool,
     {
@@ -2393,9 +2545,10 @@ impl VersionStore {
         }
 
         let checker = match self.visibility_checker.as_ref() {
-            Some(c) => c,
+            Some(c) => reader.over(&**c),
             None => return,
         };
+        let txn_id = reader.txn_id;
 
         // Lock ordering: versions first, then arena (matches commit path)
         let versions = self.versions.read();
@@ -2482,15 +2635,16 @@ impl VersionStore {
     ///
     /// Uses parallel processing for large batches (>1000 row_ids) to leverage
     /// multiple CPU cores for visibility checking.
-    pub fn count_visible_versions_batch(&self, row_ids: &[i64], txn_id: i64) -> usize {
+    pub fn count_visible_versions_batch(&self, row_ids: &[i64], reader: Reader<'_>) -> usize {
         if self.closed.load(Ordering::Acquire) || row_ids.is_empty() {
             return 0;
         }
 
         let checker = match self.visibility_checker.as_ref() {
-            Some(c) => c,
+            Some(c) => reader.over(&**c),
             None => return 0,
         };
+        let txn_id = reader.txn_id;
 
         /// Minimum batch size before enabling parallel processing
         #[cfg(feature = "parallel")]
@@ -2781,39 +2935,60 @@ impl VersionStore {
         }
     }
 
+    /// Adds the row ids whose chain holds a version `reader` sees, a delete
+    /// included: that version, not any sealed copy, decides the row for it
+    pub fn collect_seen_row_ids_into(
+        &self,
+        reader: Reader<'_>,
+        dest: &mut rustc_hash::FxHashSet<i64>,
+    ) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(checker) = self.visibility_checker.as_ref() else {
+            return;
+        };
+        let checker = reader.over(&**checker);
+        let versions = self.versions.read();
+        for (&row_id, chain) in versions.iter() {
+            if chain_seen(&checker, reader.txn_id, chain) {
+                dest.insert(row_id);
+            }
+        }
+    }
+
     /// Returns all row IDs that are visible to the given transaction
     ///
     /// OPTIMIZATION: Single-pass iteration with O(1) lock acquisition instead of O(N).
     /// Uses the same HEAD-first visibility pattern as count_visible_rows.
-    pub fn get_all_visible_row_ids(&self, txn_id: i64) -> Vec<i64> {
+    pub fn get_all_visible_row_ids(&self, reader: Reader<'_>) -> Vec<i64> {
         if self.closed.load(Ordering::Acquire) {
             return Vec::new();
         }
 
         let checker = match self.visibility_checker.as_ref() {
-            Some(c) => c,
+            Some(c) => reader.over(&**c),
             None => return Vec::new(),
         };
+        let txn_id = reader.txn_id;
 
-        // FAST PATH: Scan arena directly when no uncommitted writes.
-        // SAFETY: Arena heads are used only under ReadCommitted isolation.
-        {
-            let uncommitted_empty = self.uncommitted_writes.read().is_empty();
-            if uncommitted_empty && !checker.needs_snapshot_isolation(txn_id) {
-                let arena_guard = self.arena.read_guard();
-                let arena_meta = arena_guard.meta();
-                let arena_len = arena_guard.len();
+        // FAST PATH: Scan the arena's heads; dropped if a publish overlapped
+        if let Some(epoch) = self.arena_window(&checker, reader) {
+            let arena_guard = self.arena.read_guard();
+            let arena_meta = arena_guard.meta();
+            let arena_len = arena_guard.len();
 
-                if arena_len > 0 {
-                    let mut visible_row_ids = Vec::with_capacity(arena_len);
-                    for meta in arena_meta {
-                        if meta.txn_id != 0
-                            && meta.deleted_at_txn_id == 0
-                            && checker.is_visible(meta.txn_id, txn_id)
-                        {
-                            visible_row_ids.push(meta.row_id);
-                        }
+            if arena_len > 0 {
+                let mut visible_row_ids = Vec::with_capacity(arena_len);
+                for meta in arena_meta {
+                    if meta.txn_id != 0
+                        && meta.deleted_at_txn_id == 0
+                        && checker.is_visible(meta.txn_id, txn_id)
+                    {
+                        visible_row_ids.push(meta.row_id);
                     }
+                }
+                if self.publish_epoch_if_quiet() == Some(epoch) {
                     return visible_row_ids;
                 }
             }
@@ -2859,35 +3034,34 @@ impl VersionStore {
     ///
     /// OPTIMIZATION: This method counts rows in O(1) lock acquisition instead of O(N)
     /// by iterating through versions once without cloning any row data.
-    pub fn count_visible_rows(&self, txn_id: i64) -> usize {
+    pub fn count_visible_rows(&self, reader: Reader<'_>) -> usize {
         if self.closed.load(Ordering::Acquire) {
             return 0;
         }
 
         let checker = match self.visibility_checker.as_ref() {
-            Some(c) => c,
+            Some(c) => reader.over(&**c),
             None => return 0,
         };
+        let txn_id = reader.txn_id;
 
-        // FAST PATH: Scan arena directly when no uncommitted writes.
-        // SAFETY: Arena heads are used only under ReadCommitted isolation.
-        {
-            let uncommitted_empty = self.uncommitted_writes.read().is_empty();
-            if uncommitted_empty && !checker.needs_snapshot_isolation(txn_id) {
-                let arena_guard = self.arena.read_guard();
-                let arena_meta = arena_guard.meta();
-                let arena_len = arena_guard.len();
+        // FAST PATH: Count the arena's heads; dropped if a publish overlapped
+        if let Some(epoch) = self.arena_window(&checker, reader) {
+            let arena_guard = self.arena.read_guard();
+            let arena_meta = arena_guard.meta();
+            let arena_len = arena_guard.len();
 
-                if arena_len > 0 {
-                    let mut count = 0usize;
-                    for meta in arena_meta {
-                        if meta.txn_id != 0
-                            && meta.deleted_at_txn_id == 0
-                            && checker.is_visible(meta.txn_id, txn_id)
-                        {
-                            count += 1;
-                        }
+            if arena_len > 0 {
+                let mut count = 0usize;
+                for meta in arena_meta {
+                    if meta.txn_id != 0
+                        && meta.deleted_at_txn_id == 0
+                        && checker.is_visible(meta.txn_id, txn_id)
+                    {
+                        count += 1;
                     }
+                }
+                if self.publish_epoch_if_quiet() == Some(epoch) {
                     return count;
                 }
             }
@@ -3002,7 +3176,9 @@ impl VersionStore {
     /// Marks a commit's publish, from its index updates until its versions
     /// are visible or undone, so a reader that trusts the index order can
     /// stand down
-    pub fn begin_publish(self: &Arc<Self>) -> PublishGuard {
+    pub fn begin_publish(self: &Arc<Self>, commit_seq: i64) -> PublishGuard {
+        self.newest_commit_seq
+            .fetch_max(commit_seq, Ordering::SeqCst);
         self.publishing.fetch_add(1, Ordering::SeqCst);
         PublishGuard {
             store: Arc::clone(self),
@@ -3077,6 +3253,32 @@ impl VersionStore {
             return None;
         }
         Some(self.publish_epoch.load(Ordering::SeqCst))
+    }
+
+    /// The epoch a pass over the arena's heads may answer `reader` under, or
+    /// None when the chains must be walked: rows are claimed, the reader
+    /// reads a snapshot, a commit is publishing, or its view excludes a
+    /// commit that published here. The pass answers only if the epoch holds
+    fn arena_window<C: VisibilityChecker + ?Sized>(
+        &self,
+        checker: &ReaderChecker<'_, '_, C>,
+        reader: Reader<'_>,
+    ) -> Option<u64> {
+        // Read before the checks: a commit that ends between the two moves it
+        let epoch = self.publish_epoch_if_quiet()?;
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::arena_epoch_read();
+        if !self.uncommitted_writes.read().is_empty()
+            || checker.needs_snapshot_isolation(reader.txn_id)
+            || reader
+                .view
+                .is_some_and(|view| self.newest_commit_seq.load(Ordering::SeqCst) > view.floor())
+        {
+            return None;
+        }
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::arena_window_opened();
+        Some(epoch)
     }
 
     pub fn needs_snapshot_isolation(&self, txn_id: i64) -> bool {
@@ -3173,8 +3375,8 @@ impl VersionStore {
     /// because it batches the visibility checks and avoids repeated map lookups.
     /// Results are sorted by row_id.
     #[inline]
-    pub fn get_all_visible_rows(&self, txn_id: i64) -> RowVec {
-        self.get_all_visible_rows_internal(txn_id)
+    pub fn get_all_visible_rows(&self, reader: Reader<'_>) -> RowVec {
+        self.get_all_visible_rows_internal(reader)
     }
 
     /// Extract the rows whose head is visible to `txn_id` and live, AND the
@@ -3235,15 +3437,16 @@ impl VersionStore {
 
     /// Internal implementation for getting all visible rows
     #[inline]
-    fn get_all_visible_rows_internal(&self, txn_id: i64) -> RowVec {
+    fn get_all_visible_rows_internal(&self, reader: Reader<'_>) -> RowVec {
         if self.closed.load(Ordering::Acquire) {
             return RowVec::new();
         }
 
         let checker = match self.visibility_checker.as_ref() {
-            Some(c) => c,
+            Some(c) => reader.over(&**c),
             None => return RowVec::new(),
         };
+        let txn_id = reader.txn_id;
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
@@ -3284,15 +3487,16 @@ impl VersionStore {
 
     /// Returns all visible rows from a captured version root.
     #[inline]
-    pub fn get_all_visible_rows_arena(&self, txn_id: i64) -> RowVec {
+    pub fn get_all_visible_rows_arena(&self, reader: Reader<'_>) -> RowVec {
         if self.closed.load(Ordering::Acquire) {
             return RowVec::new();
         }
 
         let checker = match self.visibility_checker.as_ref() {
-            Some(c) => c,
+            Some(c) => reader.over(&**c),
             None => return RowVec::new(),
         };
+        let txn_id = reader.txn_id;
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
@@ -3336,7 +3540,7 @@ impl VersionStore {
     /// Same as `get_all_visible_rows_arena` but uses cached RowVec.
     /// The returned `RowVec` auto-returns to cache on drop.
     #[inline]
-    pub fn get_all_visible_rows_cached(&self, txn_id: i64) -> RowVec {
+    pub fn get_all_visible_rows_cached(&self, reader: Reader<'_>) -> RowVec {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.get_all_visible_rows_cached");
         let mut result = RowVec::new();
@@ -3346,9 +3550,10 @@ impl VersionStore {
         }
 
         let checker = match self.visibility_checker.as_ref() {
-            Some(c) => c,
+            Some(c) => reader.over(&**c),
             None => return result,
         };
+        let txn_id = reader.txn_id;
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
@@ -3359,13 +3564,19 @@ impl VersionStore {
         if current_capacity < needed {
             result.reserve(needed - current_capacity);
         }
+        // A head's visibility is asked once per run of heads from one transaction
+        let (mut last_txn_id, mut last_visible) = (0i64, false);
 
         for (&row_id, chain) in versions.iter() {
             // FAST PATH: Check HEAD version first - O(1) for common case
             let head_txn_id = chain.version.txn_id;
             let head_deleted_at = chain.version.deleted_at_txn_id;
 
-            if checker.is_visible(head_txn_id, txn_id) {
+            if head_txn_id != last_txn_id {
+                last_txn_id = head_txn_id;
+                last_visible = checker.is_visible(head_txn_id, txn_id);
+            }
+            if last_visible {
                 // HEAD is visible - check if deleted
                 if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
                     result.push((row_id, chain.version.data.clone()));
@@ -3546,15 +3757,16 @@ impl VersionStore {
     ///
     /// Note: Functionally identical to get_all_visible_rows_arena (iteration is ordered).
     #[inline]
-    pub fn get_all_visible_rows_unsorted(&self, txn_id: i64) -> RowVec {
+    pub fn get_all_visible_rows_unsorted(&self, reader: Reader<'_>) -> RowVec {
         if self.closed.load(Ordering::Acquire) {
             return RowVec::new();
         }
 
         let checker = match self.visibility_checker.as_ref() {
-            Some(c) => c,
+            Some(c) => reader.over(&**c),
             None => return RowVec::new(),
         };
+        let txn_id = reader.txn_id;
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
@@ -3604,7 +3816,12 @@ impl VersionStore {
     /// * `txn_id` - Transaction ID for visibility check
     /// * `limit` - Maximum number of rows to return
     /// * `offset` - Number of rows to skip before collecting
-    pub fn get_visible_rows_with_limit(&self, txn_id: i64, limit: usize, offset: usize) -> RowVec {
+    pub fn get_visible_rows_with_limit(
+        &self,
+        reader: Reader<'_>,
+        limit: usize,
+        offset: usize,
+    ) -> RowVec {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.get_visible_rows_with_limit");
         if self.closed.load(Ordering::Acquire) || limit == 0 {
@@ -3612,9 +3829,10 @@ impl VersionStore {
         }
 
         let checker = match self.visibility_checker.as_ref() {
-            Some(c) => c,
+            Some(c) => reader.over(&**c),
             None => return RowVec::new(),
         };
+        let txn_id = reader.txn_id;
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
@@ -3680,7 +3898,7 @@ impl VersionStore {
     /// in `exclude` and stopping after `limit` of them
     pub fn visible_row_ids_excluding(
         &self,
-        txn_id: i64,
+        reader: Reader<'_>,
         exclude: &crate::common::I64Set,
         limit: usize,
     ) -> Vec<i64> {
@@ -3688,9 +3906,10 @@ impl VersionStore {
             return Vec::new();
         }
         let checker = match self.visibility_checker.as_ref() {
-            Some(c) => c,
+            Some(c) => reader.over(&**c),
             None => return Vec::new(),
         };
+        let txn_id = reader.txn_id;
         // Read under the lock rather than cloning the tree: the walk stops
         // at the limit, and a full one only reads keys and heads
         let versions = self.versions.read();
@@ -3727,12 +3946,12 @@ impl VersionStore {
     #[inline]
     pub fn get_visible_rows_with_limit_unordered(
         &self,
-        txn_id: i64,
+        reader: Reader<'_>,
         limit: usize,
         offset: usize,
     ) -> RowVec {
         // Delegate to the sorted version
-        self.get_visible_rows_with_limit(txn_id, limit, offset)
+        self.get_visible_rows_with_limit(reader, limit, offset)
     }
 
     /// Get a batch of visible rows starting after a given row_id (cursor-based pagination).
@@ -3749,7 +3968,7 @@ impl VersionStore {
     /// A tuple of (rows, has_more) where has_more indicates if there are more rows to fetch
     pub fn get_visible_rows_batch(
         &self,
-        txn_id: i64,
+        reader: Reader<'_>,
         after_row_id: i64,
         batch_size: usize,
     ) -> (RowVec, bool) {
@@ -3758,9 +3977,10 @@ impl VersionStore {
         }
 
         let checker = match self.visibility_checker.as_ref() {
-            Some(c) => c,
+            Some(c) => reader.over(&**c),
             None => return (RowVec::new(), false),
         };
+        let txn_id = reader.txn_id;
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
@@ -3836,7 +4056,7 @@ impl VersionStore {
     /// `has_more` - true if there are more rows to fetch after this batch
     pub fn get_visible_rows_batch_into(
         &self,
-        txn_id: i64,
+        reader: Reader<'_>,
         after_row_id: i64,
         batch_size: usize,
         buffer: &mut RowVec,
@@ -3848,9 +4068,10 @@ impl VersionStore {
         }
 
         let checker = match self.visibility_checker.as_ref() {
-            Some(c) => c,
+            Some(c) => reader.over(&**c),
             None => return false,
         };
+        let txn_id = reader.txn_id;
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
@@ -3927,7 +4148,7 @@ impl VersionStore {
     /// Vector of rows in row_id order, or None if iteration fails
     pub fn collect_rows_pk_ordered(
         &self,
-        txn_id: i64,
+        reader: Reader<'_>,
         ascending: bool,
         limit: usize,
         offset: usize,
@@ -3939,9 +4160,10 @@ impl VersionStore {
         }
 
         let checker = match self.visibility_checker.as_ref() {
-            Some(c) => c,
+            Some(c) => reader.over(&**c),
             None => return Some(RowVec::new()),
         };
+        let txn_id = reader.txn_id;
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
@@ -4021,7 +4243,7 @@ impl VersionStore {
     /// RowVec of (row_id, row) pairs in row_id order
     pub fn collect_rows_keyset(
         &self,
-        txn_id: i64,
+        reader: Reader<'_>,
         start_after_row_id: Option<i64>,
         start_from_row_id: Option<i64>,
         ascending: bool,
@@ -4034,9 +4256,10 @@ impl VersionStore {
         }
 
         let checker = match self.visibility_checker.as_ref() {
-            Some(c) => c,
+            Some(c) => reader.over(&**c),
             None => return RowVec::new(),
         };
+        let txn_id = reader.txn_id;
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
@@ -4111,7 +4334,7 @@ impl VersionStore {
     /// ~3-5x speedup for filter-heavy queries.
     pub fn get_all_visible_rows_filtered(
         &self,
-        txn_id: i64,
+        reader: Reader<'_>,
         filter: &dyn crate::storage::expression::Expression,
     ) -> RowVec {
         #[cfg(feature = "test-failpoints")]
@@ -4121,9 +4344,10 @@ impl VersionStore {
         }
 
         let checker = match self.visibility_checker.as_ref() {
-            Some(c) => c,
+            Some(c) => reader.over(&**c),
             None => return RowVec::new(),
         };
+        let txn_id = reader.txn_id;
 
         // Compile the filter once at the start for ~3-5x speedup in hot loop
         // CompiledFilter eliminates virtual dispatch via enum-based specialization
@@ -4176,7 +4400,7 @@ impl VersionStore {
     /// This avoids materializing all matching rows into a Vec.
     pub fn for_each_visible_filtered<F>(
         &self,
-        txn_id: i64,
+        reader: Reader<'_>,
         filter: &dyn crate::storage::expression::Expression,
         mut callback: F,
     ) where
@@ -4189,9 +4413,10 @@ impl VersionStore {
         }
 
         let checker = match self.visibility_checker.as_ref() {
-            Some(c) => c,
+            Some(c) => reader.over(&**c),
             None => return,
         };
+        let txn_id = reader.txn_id;
 
         let schema = self.schema.read();
         let compiled_filter = CompiledFilter::compile(filter, &schema);
@@ -4242,7 +4467,7 @@ impl VersionStore {
     /// * `offset` - Number of matching rows to skip before collecting
     pub fn get_visible_rows_filtered_with_limit(
         &self,
-        txn_id: i64,
+        reader: Reader<'_>,
         filter: &dyn crate::storage::expression::Expression,
         limit: usize,
         offset: usize,
@@ -4254,9 +4479,10 @@ impl VersionStore {
         }
 
         let checker = match self.visibility_checker.as_ref() {
-            Some(c) => c,
+            Some(c) => reader.over(&**c),
             None => return RowVec::new(),
         };
+        let txn_id = reader.txn_id;
 
         // Compile the filter once at the start
         let schema = self.schema.read();
@@ -4317,13 +4543,13 @@ impl VersionStore {
     #[inline]
     pub fn get_visible_rows_filtered_with_limit_unordered(
         &self,
-        txn_id: i64,
+        reader: Reader<'_>,
         filter: &dyn crate::storage::expression::Expression,
         limit: usize,
         offset: usize,
     ) -> RowVec {
         // Delegate to the sorted version
-        self.get_visible_rows_filtered_with_limit(txn_id, filter, limit, offset)
+        self.get_visible_rows_filtered_with_limit(reader, filter, limit, offset)
     }
 
     /// Compute COUNT(*) without materializing any rows
@@ -4334,7 +4560,7 @@ impl VersionStore {
     /// - O(n) time, O(1) memory
     #[inline]
     pub fn count_visible(&self, txn_id: i64) -> usize {
-        self.count_visible_rows(txn_id)
+        self.count_visible_rows(txn_id.into())
     }
 
     /// Compute SUM(column) without materializing full rows
@@ -4342,13 +4568,14 @@ impl VersionStore {
     /// OPTIMIZATION: Single-pass approach that combines visibility checking with summing.
     /// Avoids Vec allocation and second iteration over indices.
     /// Returns (sum, count_non_null) for proper NULL handling.
-    pub fn sum_column(&self, txn_id: i64, col_idx: usize) -> (f64, usize) {
+    pub fn sum_column(&self, reader: Reader<'_>, col_idx: usize) -> (f64, usize) {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.sum_column");
         let checker = match self.visibility_checker.as_ref() {
-            Some(c) => c,
+            Some(c) => reader.over(&**c),
             None => return (0.0, 0),
         };
+        let txn_id = reader.txn_id;
 
         // OPTIMIZATION: Separate accumulators to avoid i64->f64 conversion per row.
         // Uses i128 for integer accumulation to prevent overflow (i128 holds sum of
@@ -4357,70 +4584,20 @@ impl VersionStore {
         let mut float_sum = 0.0f64;
         let mut count = 0usize;
 
-        // Helper to accumulate numeric value
-        #[inline(always)]
-        fn accumulate_sum(int_sum: &mut i128, float_sum: &mut f64, count: &mut usize, val: &Value) {
-            match val {
-                Value::Integer(i) => {
-                    *int_sum += *i as i128;
-                    *count += 1;
-                }
-                Value::Float(f) => {
-                    *float_sum += *f;
-                    *count += 1;
-                }
-                // A boolean counts as one or nought, as SUM reads it
-                Value::Boolean(b) => {
-                    *int_sum += *b as i128;
-                    *count += 1;
-                }
-                _ => {} // NULL or non-numeric
-            }
-        }
-
-        // FAST PATH: If uncommitted_writes is empty, scan arena directly (single pass).
-        // SAFETY: Arena heads are used only under ReadCommitted isolation.
+        // FAST PATH: the arena's heads in a single pass: its sums are dropped
+        // whole if a publish overlapped it.
         //
         // LOCK ORDERING: Check uncommitted_writes BEFORE acquiring arena to maintain
         // consistent ordering with truncate_all (uncommitted_writes → arena).
-        let uncommitted_empty = self.uncommitted_writes.read().is_empty();
-
-        {
+        if let Some(epoch) = self.arena_window(&checker, reader) {
             let arena_guard = self.arena.read_guard();
-            let arena_meta = arena_guard.meta();
-            let arena_data = arena_guard.data();
-            let arena_len = arena_guard.len();
-
-            if uncommitted_empty && arena_len > 0 && !checker.needs_snapshot_isolation(txn_id) {
-                // OPTIMIZATION: Cache visibility result for repeated txn_ids
-                // When rows are inserted in batches, consecutive rows often have the same txn_id.
-                // Caching avoids repeated thread-local access overhead (~27ms per 100K rows).
-                let mut last_txn_id: i64 = 0;
-                let mut last_visible: bool = false;
-
-                let mut idx = 0;
-                while idx < arena_len {
-                    let meta = &arena_meta[idx];
-                    if meta.txn_id != 0 && meta.deleted_at_txn_id == 0 {
-                        // Check visibility with cache
-                        let version_txn_id = meta.txn_id;
-                        let is_vis = if version_txn_id == last_txn_id {
-                            last_visible
-                        } else {
-                            let vis = checker.is_visible(version_txn_id, txn_id);
-                            last_txn_id = version_txn_id;
-                            last_visible = vis;
-                            vis
-                        };
-
-                        if is_vis {
-                            if let Some(val) = arena_data[idx].get(col_idx) {
-                                accumulate_sum(&mut int_sum, &mut float_sum, &mut count, val);
-                            }
-                        }
-                    }
-                    idx += 1;
-                }
+            let (int_sum, float_sum, count) = sum_live_heads(
+                arena_guard.meta(),
+                arena_guard.data(),
+                col_idx,
+                |version_txn_id| checker.is_visible(version_txn_id, txn_id),
+            );
+            if !arena_guard.is_empty() && self.publish_epoch_if_quiet() == Some(epoch) {
                 return (int_sum as f64 + float_sum, count);
             }
             // arena_guard dropped here — no need to hold it for slow path
@@ -4469,10 +4646,11 @@ impl VersionStore {
     /// Compute MIN(column) without materializing full rows
     ///
     /// OPTIMIZATION: Single-pass approach that combines visibility checking with min computation.
-    pub fn min_column(&self, txn_id: i64, col_idx: usize) -> Option<Value> {
+    pub fn min_column(&self, reader: Reader<'_>, col_idx: usize) -> Option<Value> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.min_column");
-        let checker = self.visibility_checker.as_ref()?;
+        let checker = reader.over(&**self.visibility_checker.as_ref()?);
+        let txn_id = reader.txn_id;
 
         let mut min_val: Option<Value> = None;
 
@@ -4491,20 +4669,18 @@ impl VersionStore {
             }
         }
 
-        // FAST PATH: If uncommitted_writes is empty, scan arena directly (single pass).
-        // SAFETY: Arena heads are used only under ReadCommitted isolation.
+        // FAST PATH: the arena's heads in a single pass, with a minimum of its
+        // own: dropped whole if a publish overlapped it.
         //
         // LOCK ORDERING: Check uncommitted_writes BEFORE acquiring arena to maintain
         // consistent ordering with truncate_all (uncommitted_writes → arena).
-        let uncommitted_empty = self.uncommitted_writes.read().is_empty();
-
-        {
+        if let Some(epoch) = self.arena_window(&checker, reader) {
             let arena_guard = self.arena.read_guard();
             let arena_meta = arena_guard.meta();
             let arena_data = arena_guard.data();
             let arena_len = arena_guard.len();
 
-            if uncommitted_empty && arena_len > 0 && !checker.needs_snapshot_isolation(txn_id) {
+            if arena_len > 0 {
                 // OPTIMIZATION: Cache visibility result for repeated txn_ids
                 let mut last_txn_id: i64 = 0;
                 let mut last_visible: bool = false;
@@ -4531,7 +4707,10 @@ impl VersionStore {
                     }
                     idx += 1;
                 }
-                return min_val;
+                if self.publish_epoch_if_quiet() == Some(epoch) {
+                    return min_val;
+                }
+                min_val = None;
             }
             // arena_guard dropped here — no need to hold it for slow path
         }
@@ -4578,10 +4757,11 @@ impl VersionStore {
     /// Compute MAX(column) without materializing full rows
     ///
     /// OPTIMIZATION: Single-pass approach that combines visibility checking with max computation.
-    pub fn max_column(&self, txn_id: i64, col_idx: usize) -> Option<Value> {
+    pub fn max_column(&self, reader: Reader<'_>, col_idx: usize) -> Option<Value> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.max_column");
-        let checker = self.visibility_checker.as_ref()?;
+        let checker = reader.over(&**self.visibility_checker.as_ref()?);
+        let txn_id = reader.txn_id;
 
         let mut max_val: Option<Value> = None;
 
@@ -4600,20 +4780,18 @@ impl VersionStore {
             }
         }
 
-        // FAST PATH: If uncommitted_writes is empty, scan arena directly (single pass).
-        // SAFETY: Arena heads are used only under ReadCommitted isolation.
+        // FAST PATH: the arena's heads in a single pass, with a maximum of its
+        // own: dropped whole if a publish overlapped it.
         //
         // LOCK ORDERING: Check uncommitted_writes BEFORE acquiring arena to maintain
         // consistent ordering with truncate_all (uncommitted_writes → arena).
-        let uncommitted_empty = self.uncommitted_writes.read().is_empty();
-
-        {
+        if let Some(epoch) = self.arena_window(&checker, reader) {
             let arena_guard = self.arena.read_guard();
             let arena_meta = arena_guard.meta();
             let arena_data = arena_guard.data();
             let arena_len = arena_guard.len();
 
-            if uncommitted_empty && arena_len > 0 && !checker.needs_snapshot_isolation(txn_id) {
+            if arena_len > 0 {
                 // OPTIMIZATION: Cache visibility result for repeated txn_ids
                 let mut last_txn_id: i64 = 0;
                 let mut last_visible: bool = false;
@@ -4640,7 +4818,10 @@ impl VersionStore {
                     }
                     idx += 1;
                 }
-                return max_val;
+                if self.publish_epoch_if_quiet() == Some(epoch) {
+                    return max_val;
+                }
+                max_val = None;
             }
             // arena_guard dropped here — no need to hold it for slow path
         }
@@ -4692,7 +4873,7 @@ impl VersionStore {
     /// Returns aggregates in the order requested.
     pub fn compute_aggregates(
         &self,
-        txn_id: i64,
+        reader: Reader<'_>,
         aggregates: &[(AggregateOp, usize)], // (operation, column_index)
     ) -> Vec<AggregateResult> {
         let empty_result = || {
@@ -4709,21 +4890,25 @@ impl VersionStore {
         };
 
         let checker = match self.visibility_checker.as_ref() {
-            Some(c) => c,
+            Some(c) => reader.over(&**c),
             None => return empty_result(),
         };
+        let txn_id = reader.txn_id;
 
         // Initialize accumulators
-        let mut results: Vec<AggregateAccumulator> = aggregates
-            .iter()
-            .map(|(op, _)| match op {
-                AggregateOp::Count | AggregateOp::CountStar => AggregateAccumulator::Count(0),
-                AggregateOp::Sum => AggregateAccumulator::Sum(0, 0.0, 0),
-                AggregateOp::Min => AggregateAccumulator::Min(None),
-                AggregateOp::Max => AggregateAccumulator::Max(None),
-                AggregateOp::Avg => AggregateAccumulator::Avg(0, 0.0, 0),
-            })
-            .collect();
+        let accumulators = || -> Vec<AggregateAccumulator> {
+            aggregates
+                .iter()
+                .map(|(op, _)| match op {
+                    AggregateOp::Count | AggregateOp::CountStar => AggregateAccumulator::Count(0),
+                    AggregateOp::Sum => AggregateAccumulator::Sum(0, 0.0, 0),
+                    AggregateOp::Min => AggregateAccumulator::Min(None),
+                    AggregateOp::Max => AggregateAccumulator::Max(None),
+                    AggregateOp::Avg => AggregateAccumulator::Avg(0, 0.0, 0),
+                })
+                .collect()
+        };
+        let mut results = accumulators();
 
         // Helper to update accumulator with a value
         fn update_accumulator(acc: &mut AggregateAccumulator, op: &AggregateOp, val: &Value) {
@@ -4797,41 +4982,49 @@ impl VersionStore {
             };
         }
 
-        // FAST PATH: Scan arena directly when no uncommitted writes.
-        // SAFETY: Arena heads are used only under ReadCommitted isolation.
-        let uncommitted_empty = self.uncommitted_writes.read().is_empty();
-        if uncommitted_empty && !checker.needs_snapshot_isolation(txn_id) {
+        // FAST PATH: the arena's heads: the accumulators are dropped whole if
+        // a publish overlapped the pass
+        if let Some(epoch) = self.arena_window(&checker, reader) {
             let arena_guard = self.arena.read_guard();
             let arena_meta = arena_guard.meta();
             let arena_data = arena_guard.data();
             let arena_len = arena_guard.len();
 
             if arena_len > 0 {
+                // Asked once per run of heads from one transaction
+                let (mut last_txn_id, mut last_visible) = (0i64, false);
                 for (idx, meta) in arena_meta.iter().enumerate() {
-                    if meta.txn_id != 0
-                        && meta.deleted_at_txn_id == 0
-                        && checker.is_visible(meta.txn_id, txn_id)
-                    {
+                    if meta.txn_id == 0 || meta.deleted_at_txn_id != 0 {
+                        continue;
+                    }
+                    if meta.txn_id != last_txn_id {
+                        last_txn_id = meta.txn_id;
+                        last_visible = checker.is_visible(meta.txn_id, txn_id);
+                    }
+                    if last_visible {
                         if let Some(arc_row) = arena_data.get(idx) {
                             accumulate_from!(arc_row, results, aggregates);
                         }
                     }
                 }
-
-                return results
-                    .into_iter()
-                    .map(|acc| match acc {
-                        AggregateAccumulator::Count(c) => AggregateResult::Count(c),
-                        AggregateAccumulator::Sum(is, fs, c) => {
-                            AggregateResult::Sum(is as f64 + fs, c)
-                        }
-                        AggregateAccumulator::Min(v) => AggregateResult::Min(v),
-                        AggregateAccumulator::Max(v) => AggregateResult::Max(v),
-                        AggregateAccumulator::Avg(is, fs, c) => {
-                            AggregateResult::Avg(is as f64 + fs, c)
-                        }
-                    })
-                    .collect();
+                if self.publish_epoch_if_quiet() != Some(epoch) {
+                    results = accumulators();
+                } else {
+                    return results
+                        .into_iter()
+                        .map(|acc| match acc {
+                            AggregateAccumulator::Count(c) => AggregateResult::Count(c),
+                            AggregateAccumulator::Sum(is, fs, c) => {
+                                AggregateResult::Sum(is as f64 + fs, c)
+                            }
+                            AggregateAccumulator::Min(v) => AggregateResult::Min(v),
+                            AggregateAccumulator::Max(v) => AggregateResult::Max(v),
+                            AggregateAccumulator::Avg(is, fs, c) => {
+                                AggregateResult::Avg(is as f64 + fs, c)
+                            }
+                        })
+                        .collect();
+                }
             }
         }
 
@@ -5418,7 +5611,7 @@ impl VersionStore {
     pub fn mark_deleted(&self, row_id: i64, txn_id: i64) {
         // Get the old row data for index removal BEFORE creating the deleted version
         let old_row = self
-            .get_visible_version(row_id, txn_id)
+            .get_visible_version(row_id, txn_id.into())
             .map(|v| v.data.clone());
 
         // Create a deleted version (empty data with deleted flag)
@@ -6587,7 +6780,7 @@ impl VersionStore {
     /// Vector of grouped aggregate results, or empty if optimization not possible
     pub fn compute_grouped_aggregates(
         &self,
-        txn_id: i64,
+        reader: Reader<'_>,
         group_by_indices: &[usize],
         aggregates: &[(AggregateOp, usize)],
     ) -> Option<Vec<GroupedAggregateResult>> {
@@ -6598,19 +6791,16 @@ impl VersionStore {
         }
 
         let checker = match self.visibility_checker.as_ref() {
-            Some(c) => c,
+            Some(c) => reader.over(&**c),
             None => return Some(Vec::new()),
         };
+        let txn_id = reader.txn_id;
 
-        // Guard: arena-only path requires ReadCommitted and no uncommitted writes.
-        // Under snapshot isolation, HEAD versions in the arena may have been committed
-        // after the viewer's snapshot. The correct behavior requires walking version
-        // chains to find older visible versions, which the arena path doesn't support.
-        // Return None to let the caller fall back to regular GROUP BY aggregation.
-        let uncommitted_empty = self.uncommitted_writes.read().is_empty();
-        if !uncommitted_empty || checker.needs_snapshot_isolation(txn_id) {
-            return None;
-        }
+        // Guard: this path reads only the arena's heads. A head may hide an
+        // older version the reader sees, so it runs only inside the arena
+        // window and answers only if the window held; None lets the caller
+        // fall back to regular GROUP BY aggregation.
+        let epoch = self.arena_window(&checker, reader)?;
 
         // Accumulator for each group: (count, sum, min, max) per aggregate
         #[derive(Clone)]
@@ -6773,10 +6963,19 @@ impl VersionStore {
             let mut null_group: Option<u32> = None;
             // Only used for String/other types that can't be mapped to i64
             let mut other_groups: GroupKeyMap<u32> = GroupKeyMap::default();
+            // Asked once per run of heads from one transaction
+            let (mut last_txn_id, mut last_visible) = (0i64, false);
 
             for (idx, meta) in arena_meta.iter().enumerate() {
                 // Visibility check (standard pattern: check creation, then deletion)
-                if meta.txn_id == 0 || !checker.is_visible(meta.txn_id, txn_id) {
+                if meta.txn_id == 0 {
+                    continue;
+                }
+                if meta.txn_id != last_txn_id {
+                    last_txn_id = meta.txn_id;
+                    last_visible = checker.is_visible(meta.txn_id, txn_id);
+                }
+                if !last_visible {
                     continue;
                 }
                 if meta.deleted_at_txn_id != 0 && checker.is_visible(meta.deleted_at_txn_id, txn_id)
@@ -6930,7 +7129,7 @@ impl VersionStore {
                 });
             }
 
-            return Some(results);
+            return (self.publish_epoch_if_quiet() == Some(epoch)).then_some(results);
         }
 
         // SLOW PATH: Multi-column GROUP BY (currently not used from try_storage_aggregation)
@@ -6983,7 +7182,7 @@ impl VersionStore {
             });
         }
 
-        Some(results)
+        (self.publish_epoch_if_quiet() == Some(epoch)).then_some(results)
     }
 }
 
@@ -7336,7 +7535,9 @@ impl TransactionVersionStore {
                 .is_none_or(|ws| !ws.contains_key(row_id));
 
             if needs_write_set_entry {
-                let read_version = self.parent_store.get_visible_version(row_id, self.txn_id);
+                let read_version = self
+                    .parent_store
+                    .get_visible_version(row_id, self.txn_id.into());
                 let row_exists = read_version.is_some();
 
                 let read_version_seq = self
@@ -7667,7 +7868,9 @@ impl TransactionVersionStore {
                     .is_none_or(|ws| !ws.contains_key(row_id));
 
                 if needs_write_set_entry {
-                    let read_version = self.parent_store.get_visible_version(row_id, self.txn_id);
+                    let read_version = self
+                        .parent_store
+                        .get_visible_version(row_id, self.txn_id.into());
                     let row_exists = read_version.is_some();
 
                     let read_version_seq = self
@@ -7886,7 +8089,7 @@ impl TransactionVersionStore {
 
         // Check parent store
         self.parent_store
-            .get_visible_version(row_id, self.txn_id)
+            .get_visible_version(row_id, self.txn_id.into())
             .map(|v| v.data.clone())
     }
 
@@ -7934,7 +8137,7 @@ impl TransactionVersionStore {
                 // uniqueness), but it is the safety net for user-supplied PKs.
                 if self
                     .parent_store
-                    .has_any_visible_version(&[row_id], self.txn_id)
+                    .has_any_visible_version(&[row_id], self.txn_id.into())
                     .is_some()
                 {
                     return Err(Error::internal(format!(
@@ -8980,7 +9183,7 @@ mod tests {
 
         let row = |id: i64| {
             store
-                .get_visible_version(id, 99)
+                .get_visible_version(id, 99.into())
                 .map(|version| version.data.get(1).cloned())
         };
 
@@ -9007,7 +9210,11 @@ mod tests {
             Some(Some(Value::from(20i64))),
             "the update is undone"
         );
-        assert_eq!(store.get_all_visible_rows(99).len(), 2, "the arena agrees");
+        assert_eq!(
+            store.get_all_visible_rows(99.into()).len(),
+            2,
+            "the arena agrees"
+        );
 
         // A created row leaves with its commit
         let mut txn = TransactionVersionStore::new(Arc::clone(&store), 3);
@@ -9082,7 +9289,7 @@ mod tests {
         txn.commit().unwrap();
 
         let results = store
-            .compute_grouped_aggregates(2, &[1], &[])
+            .compute_grouped_aggregates(2.into(), &[1], &[])
             .expect("arena path should handle an empty aggregate list");
 
         let mut keys: Vec<i64> = results
@@ -9189,7 +9396,7 @@ mod tests {
         store.add_version(100, version);
 
         // Transaction 2 should see version from transaction 1
-        let visible = store.get_visible_version(100, 2);
+        let visible = store.get_visible_version(100, 2.into());
         assert!(visible.is_some());
         assert_eq!(visible.unwrap().txn_id, 1);
     }
@@ -9206,15 +9413,15 @@ mod tests {
         store.add_version(100, version);
 
         // Transaction 3 should NOT see version from transaction 5
-        let visible = store.get_visible_version(100, 3);
+        let visible = store.get_visible_version(100, 3.into());
         assert!(visible.is_none());
 
         // Transaction 5 should see its own version
-        let visible = store.get_visible_version(100, 5);
+        let visible = store.get_visible_version(100, 5.into());
         assert!(visible.is_some());
 
         // Transaction 10 should see version from transaction 5
-        let visible = store.get_visible_version(100, 10);
+        let visible = store.get_visible_version(100, 10.into());
         assert!(visible.is_some());
     }
 
@@ -9234,11 +9441,11 @@ mod tests {
         store.add_version(100, deleted_version);
 
         // Transaction 1 should still see the row (delete not visible)
-        let visible = store.get_visible_version(100, 1);
+        let visible = store.get_visible_version(100, 1.into());
         assert!(visible.is_some());
 
         // Transaction 3 should NOT see the deleted row
-        let visible = store.get_visible_version(100, 3);
+        let visible = store.get_visible_version(100, 3.into());
         assert!(visible.is_none());
     }
 
@@ -9312,7 +9519,7 @@ mod tests {
         tvs.commit().unwrap();
 
         // Should be visible in parent store now
-        let visible = store.get_visible_version(100, 2);
+        let visible = store.get_visible_version(100, 2.into());
         assert!(visible.is_some());
     }
 
@@ -9335,7 +9542,7 @@ mod tests {
         tvs.rollback();
 
         // Should NOT be visible in parent store
-        let visible = store.get_visible_version(100, 2);
+        let visible = store.get_visible_version(100, 2.into());
         assert!(visible.is_none());
     }
 
@@ -9636,7 +9843,7 @@ mod tests {
 
         // Batch query
         let row_ids = vec![1, 3, 5, 99]; // 99 doesn't exist
-        let results = store.get_visible_versions_batch(&row_ids, 2);
+        let results = store.get_visible_versions_batch(&row_ids, 2.into());
 
         assert_eq!(results.len(), 3); // Only 1, 3, 5 exist
     }
@@ -9654,7 +9861,7 @@ mod tests {
             store.add_version(i, version);
         }
 
-        let count = store.count_visible_versions_batch(&[1, 2, 3, 99, 100], 2);
+        let count = store.count_visible_versions_batch(&[1, 2, 3, 99, 100], 2.into());
         assert_eq!(count, 3); // Only 1, 2, 3 exist
     }
 
@@ -9664,7 +9871,7 @@ mod tests {
         let store =
             VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
 
-        assert_eq!(store.count_visible_rows(1), 0);
+        assert_eq!(store.count_visible_rows(1.into()), 0);
 
         // Add rows
         for i in 1..=10 {
@@ -9673,7 +9880,7 @@ mod tests {
             store.add_version(i, version);
         }
 
-        assert_eq!(store.count_visible_rows(2), 10);
+        assert_eq!(store.count_visible_rows(2.into()), 10);
     }
 
     #[test]
@@ -9691,10 +9898,10 @@ mod tests {
         store.mark_deleted(100, 2);
 
         // Transaction 1 should still see it
-        assert!(store.get_visible_version(100, 1).is_some());
+        assert!(store.get_visible_version(100, 1.into()).is_some());
 
         // Transaction 3 should not see deleted row
-        assert!(store.get_visible_version(100, 3).is_none());
+        assert!(store.get_visible_version(100, 3.into()).is_none());
 
         // Mark non-existent row as deleted (no-op)
         store.mark_deleted(999, 2);
@@ -9714,11 +9921,11 @@ mod tests {
         }
 
         // Get with limit (txn_id, limit, offset)
-        let results = store.get_visible_rows_with_limit(2, 5, 0);
+        let results = store.get_visible_rows_with_limit(2.into(), 5, 0);
         assert_eq!(results.len(), 5);
 
         // Test with offset
-        let results_offset = store.get_visible_rows_with_limit(2, 5, 10);
+        let results_offset = store.get_visible_rows_with_limit(2.into(), 5, 10);
         assert_eq!(results_offset.len(), 5);
     }
 
@@ -9803,7 +10010,7 @@ mod tests {
             store.add_version(i, version);
         }
 
-        let (sum, count) = store.sum_column(2, 0);
+        let (sum, count) = store.sum_column(2.into(), 0);
         assert_eq!(sum, 150.0); // 10 + 20 + 30 + 40 + 50
         assert_eq!(count, 5);
     }
@@ -9822,7 +10029,7 @@ mod tests {
             store.add_version((i + 1) as i64, version);
         }
 
-        let (sum, count) = store.sum_column(2, 0);
+        let (sum, count) = store.sum_column(2.into(), 0);
         assert!((sum - 7.5).abs() < 0.001);
         assert_eq!(count, 3);
     }
@@ -9840,10 +10047,10 @@ mod tests {
             store.add_version(i, version);
         }
 
-        let min = store.min_column(2, 0);
+        let min = store.min_column(2.into(), 0);
         assert_eq!(min, Some(Value::from(10)));
 
-        let max = store.max_column(2, 0);
+        let max = store.max_column(2.into(), 0);
         assert_eq!(max, Some(Value::from(50)));
     }
 
@@ -9851,10 +10058,10 @@ mod tests {
     fn test_version_store_min_max_empty() {
         let store = VersionStore::new("test_table".to_string(), test_schema());
 
-        let min = store.min_column(1, 0);
+        let min = store.min_column(1.into(), 0);
         assert!(min.is_none());
 
-        let max = store.max_column(1, 0);
+        let max = store.max_column(1.into(), 0);
         assert!(max.is_none());
     }
 
@@ -9880,7 +10087,7 @@ mod tests {
             (AggregateOp::Avg, 0),
         ];
 
-        let results = store.compute_aggregates(2, &ops);
+        let results = store.compute_aggregates(2.into(), &ops);
         assert_eq!(results.len(), 5);
 
         // Check count
@@ -10028,7 +10235,7 @@ mod tests {
         let version = RowVersion::new(1, row);
         store.add_version(100, version);
 
-        let visible = store.get_visible_version(100, 2);
+        let visible = store.get_visible_version(100, 2.into());
         assert!(visible.is_some());
     }
 
@@ -10063,7 +10270,7 @@ mod tests {
         tvs.commit().unwrap();
 
         // Updated value should be visible
-        let visible = store.get_visible_version(100, 3);
+        let visible = store.get_visible_version(100, 3.into());
         assert!(visible.is_some());
         assert_eq!(visible.unwrap().data.get(0), Some(&Value::from(99)));
     }
@@ -10097,7 +10304,7 @@ mod tests {
         tvs.commit().unwrap();
 
         // Should not be visible after commit
-        let visible = store.get_visible_version(100, 3);
+        let visible = store.get_visible_version(100, 3.into());
         assert!(visible.is_none());
     }
 
@@ -10114,7 +10321,7 @@ mod tests {
             store.add_version(i, version);
         }
 
-        let rows = store.get_all_visible_rows(2);
+        let rows = store.get_all_visible_rows(2.into());
         assert_eq!(rows.len(), 5);
 
         // Verify values
@@ -10143,7 +10350,7 @@ mod tests {
             store.add_version(i, version);
         }
 
-        let row_ids = store.get_all_visible_row_ids(2);
+        let row_ids = store.get_all_visible_row_ids(2.into());
         assert_eq!(row_ids.len(), 5);
         assert!(row_ids.contains(&1));
         assert!(row_ids.contains(&5));
@@ -10163,7 +10370,7 @@ mod tests {
         }
 
         // Get rows in ascending PK order
-        let rows = store.collect_rows_pk_ordered(2, true, 3, 0);
+        let rows = store.collect_rows_pk_ordered(2.into(), true, 3, 0);
         assert!(rows.is_some());
         let rows = rows.unwrap();
         assert_eq!(rows.len(), 3);
@@ -10175,7 +10382,7 @@ mod tests {
         assert_eq!(rows[2].1.get(0), Some(&Value::from(30)));
 
         // Test descending order
-        let rows_desc = store.collect_rows_pk_ordered(2, false, 3, 0);
+        let rows_desc = store.collect_rows_pk_ordered(2.into(), false, 3, 0);
         assert!(rows_desc.is_some());
         let rows_desc = rows_desc.unwrap();
         assert_eq!(rows_desc.len(), 3);
@@ -10187,7 +10394,7 @@ mod tests {
         assert_eq!(rows_desc[2].1.get(0), Some(&Value::from(30)));
 
         // Test with offset
-        let rows_offset = store.collect_rows_pk_ordered(2, true, 2, 2);
+        let rows_offset = store.collect_rows_pk_ordered(2.into(), true, 2, 2);
         assert!(rows_offset.is_some());
         let rows_offset = rows_offset.unwrap();
         assert_eq!(rows_offset.len(), 2);
@@ -10471,7 +10678,9 @@ mod tests {
         // Expected: row_id=1 should have value=100, row_id=2 should have value=200
 
         // Ascending order — materializes during iteration (should be correct)
-        let asc = store.collect_rows_pk_ordered(2, true, 100, 0).unwrap();
+        let asc = store
+            .collect_rows_pk_ordered(2.into(), true, 100, 0)
+            .unwrap();
         assert_eq!(asc.len(), 2, "Should see 2 rows ascending");
         // row_id=1 should have the original value (100), NOT the update (999)
         let (rid1, data1) = &asc[0];
@@ -10483,7 +10692,9 @@ mod tests {
         );
 
         // Descending order
-        let desc = store.collect_rows_pk_ordered(2, false, 100, 0).unwrap();
+        let desc = store
+            .collect_rows_pk_ordered(2.into(), false, 100, 0)
+            .unwrap();
         assert_eq!(desc.len(), 2, "Should see 2 rows descending");
         // row_id=1 is at index 1 in descending order (row_id=2 comes first)
         let (rid1_desc, data1_desc) = &desc[1];
@@ -10586,10 +10797,10 @@ mod tests {
         assert!(result.is_ok(), "Commit failed: {:?}", result.err());
 
         // Verify values
-        let v1_new = store.get_visible_version(1, 3).unwrap();
+        let v1_new = store.get_visible_version(1, 3.into()).unwrap();
         assert_eq!(v1_new.data.get(1).unwrap(), &Value::from(20));
 
-        let v2_new = store.get_visible_version(2, 3).unwrap();
+        let v2_new = store.get_visible_version(2, 3.into()).unwrap();
         assert_eq!(v2_new.data.get(1).unwrap(), &Value::from(10));
     }
 

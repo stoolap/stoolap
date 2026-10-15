@@ -34,6 +34,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::core::{DataType, IndexType, Result, Row, RowVec, Schema, Value, ValueMap, ValueSet};
 use crate::storage::expression::Expression;
 use crate::storage::index::id_list::GroupIds;
+use crate::storage::mvcc::registry::StatementView;
 use crate::storage::mvcc::txn_gate::{GateRef, TxnGate};
 use crate::storage::mvcc::version_store::{AggregateOp, GroupedAggregateResult, LayoutToken};
 use crate::storage::traits::table::ScanPlan;
@@ -349,6 +350,9 @@ pub struct SegmentedTable {
     /// preserving the snapshot's point-in-time view of cold data.
     /// None for auto-commit transactions (all tombstones visible).
     snapshot_seq: Option<u64>,
+    /// The statement view this handle's reads are held to, the same one its
+    /// hot table reads through: a tombstone counts only when it sees the commit
+    view: Option<Arc<StatementView>>,
     schema_generation: u64,
     /// The transaction's gate, which admits each statement once for both
     /// layers; the hot table it owns has none
@@ -383,6 +387,7 @@ impl SegmentedTable {
             hot,
             segment_mgr,
             snapshot_seq,
+            view: None,
             schema_generation,
             gate: None,
         }
@@ -394,12 +399,26 @@ impl SegmentedTable {
         self
     }
 
+    /// The table's cold reads see `view`, which its hot table reads through
+    pub(crate) fn with_view(mut self, view: Option<Arc<StatementView>>) -> Self {
+        self.view = view;
+        self
+    }
+
+    /// Whether this handle may see older rows than the newest committed
+    /// ones: under a snapshot or a statement view
+    #[inline]
+    fn reads_back_in_time(&self) -> bool {
+        self.snapshot_seq.is_some() || self.view.is_some()
+    }
+
     /// Create a segmented table with no segments (equivalent to plain MVCCTable).
     pub fn hot_only(hot: Box<dyn Table>) -> Self {
         Self {
             segment_mgr: Arc::new(SegmentManager::new("", None)),
             hot,
             snapshot_seq: None,
+            view: None,
             schema_generation: 0,
             gate: None,
         }
@@ -595,6 +614,10 @@ impl SegmentedTable {
     #[inline]
     fn is_tombstone_visible(&self, commit_seq: u64) -> bool {
         self.snapshot_seq.is_none_or(|ss| commit_seq <= ss)
+            && self
+                .view
+                .as_ref()
+                .is_none_or(|view| view.sees_commit(commit_seq as i64))
     }
 
     /// Check if a row_id is tombstoned and visible to this snapshot.
@@ -1666,7 +1689,7 @@ impl SegmentedTable {
     ) -> Result<Vec<UniqueKey<'a>>> {
         use crate::core::DataType;
         if comparisons.is_empty()
-            || self.snapshot_seq.is_some()
+            || self.reads_back_in_time()
             || !self.hot.has_unique_non_pk_indexes()
         {
             return Ok(Vec::new());
@@ -2293,6 +2316,7 @@ impl SegmentedTable {
             scanner.set_skip_sets(Arc::clone(tombstones_arc), Arc::clone(&hot_skip_arc));
             scanner.set_visibility_bitmap(cs.visible.clone());
             scanner.snapshot_seq = self.snapshot_seq;
+            scanner.view = self.view.clone();
             let current_schema = self.hot.schema();
             // From the captured segment: a retired volume's mapping is no
             // longer in the live map, which answers with an identity one
@@ -4115,7 +4139,7 @@ impl Table for SegmentedTable {
         }
         // Snapshot-aware: row_exists() checks all tombstones unconditionally,
         // but a snapshot txn should still see rows tombstoned after its begin_seq.
-        if self.snapshot_seq.is_some() {
+        if self.reads_back_in_time() {
             let ts = self.segment_mgr.tombstone_set_arc();
             if self.is_row_tombstoned(&ts, row_id) {
                 return Ok(false);
@@ -4150,7 +4174,7 @@ impl Table for SegmentedTable {
     fn row_count(&self) -> Result<usize> {
         // Snapshot isolation: deduped_row_count and the fast path subtract ALL
         // tombstones, but a snapshot may not see newer ones. Use full scan.
-        if self.snapshot_seq.is_some() {
+        if self.reads_back_in_time() {
             return self.collect_all_rows(None).map(|rows| rows.len());
         }
         // During seal, rows temporarily exist in both hot and cold.
@@ -4180,7 +4204,7 @@ impl Table for SegmentedTable {
         // Snapshot isolation: deduped_row_count subtracts ALL tombstones, but
         // this snapshot may not see newer tombstones. Fall back to scan which
         // correctly filters by snapshot_seq.
-        if self.snapshot_seq.is_some() {
+        if self.reads_back_in_time() {
             return Ok(None);
         }
         self.clear_of_destruction(|| {
@@ -4211,7 +4235,7 @@ impl Table for SegmentedTable {
         crate::test_failpoints::note_read("seg.sum_column");
         // Snapshot isolation: cold aggregation uses tombstones without snapshot
         // filtering. Bail so the executor falls back to full scan.
-        if self.snapshot_seq.is_some() {
+        if self.reads_back_in_time() {
             return Ok(None);
         }
         self.clear_of_destruction(|| {
@@ -4382,7 +4406,7 @@ impl Table for SegmentedTable {
     fn min_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.min_column");
-        if self.snapshot_seq.is_some() {
+        if self.reads_back_in_time() {
             return Ok(None);
         }
         self.clear_of_destruction(|| {
@@ -4699,7 +4723,7 @@ impl Table for SegmentedTable {
     fn max_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.max_column");
-        if self.snapshot_seq.is_some() {
+        if self.reads_back_in_time() {
             return Ok(None);
         }
         self.clear_of_destruction(|| {
@@ -5010,7 +5034,7 @@ impl Table for SegmentedTable {
     // =========================================================================
 
     fn get_partition_count(&self, column_name: &str) -> Result<Option<usize>> {
-        if self.snapshot_seq.is_some() {
+        if self.reads_back_in_time() {
             return Ok(None);
         }
         self.clear_of_destruction(|| {
@@ -5095,7 +5119,7 @@ impl Table for SegmentedTable {
     }
 
     fn get_partition_values(&self, column_name: &str) -> Result<Option<Vec<Value>>> {
-        if self.snapshot_seq.is_some() {
+        if self.reads_back_in_time() {
             return Ok(None);
         }
         if let Some(result) = self.unsealed(|hot| hot.get_partition_values(column_name)) {
@@ -5184,7 +5208,7 @@ impl Table for SegmentedTable {
 
     fn compute_distinct_values(&self, col_idx: usize) -> Result<Option<Vec<Value>>> {
         // Bail for snapshot isolation — tombstone visibility is snapshot-dependent
-        if self.snapshot_seq.is_some() {
+        if self.reads_back_in_time() {
             return Ok(None);
         }
         // Bail during seal overlap — hot and cold may have duplicates
@@ -5327,7 +5351,7 @@ impl Table for SegmentedTable {
         &self,
         column_name: &str,
     ) -> Result<Option<Vec<(Value, RowVec)>>> {
-        if self.snapshot_seq.is_some() {
+        if self.reads_back_in_time() {
             return Ok(None);
         }
         self.clear_of_destruction(|| {
@@ -5419,7 +5443,7 @@ impl Table for SegmentedTable {
         column_name: &str,
         partition_value: &Value,
     ) -> Result<Option<RowVec>> {
-        if self.snapshot_seq.is_some() {
+        if self.reads_back_in_time() {
             return Ok(None);
         }
         self.clear_of_destruction(|| {
@@ -5550,7 +5574,7 @@ impl Table for SegmentedTable {
 
         // Snapshot isolation: the merge path doesn't filter by snapshot_seq.
         // Fall back to the full scan + sort path which handles MVCC correctly.
-        if self.snapshot_seq.is_some() {
+        if self.reads_back_in_time() {
             return Ok(None);
         }
 
@@ -5882,7 +5906,7 @@ impl Table for SegmentedTable {
     ) -> Result<Option<RowVec>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.scan_top_k");
-        if self.snapshot_seq.is_some() {
+        if self.reads_back_in_time() {
             return Ok(None);
         }
         // Without volumes the hot store answers alone, from its index or not
@@ -6077,6 +6101,7 @@ impl Table for SegmentedTable {
                     scanner.set_skip_sets(Arc::clone(&tombstones_arc), Arc::clone(&hot_skip_arc));
                     scanner.set_visibility_bitmap(cs.visible.clone());
                     scanner.snapshot_seq = self.snapshot_seq;
+                    scanner.view = self.view.clone();
                     scanner.set_column_mapping(
                         self.segment_mgr.get_volume_mapping(*seg_id, current_schema),
                     );
@@ -6269,7 +6294,7 @@ impl Table for SegmentedTable {
         scratch: &mut crate::storage::traits::ProbeScratch,
     ) -> Result<Option<crate::storage::traits::CappedEqual>> {
         use crate::storage::traits::CappedEqual;
-        if self.snapshot_seq.is_some() {
+        if self.reads_back_in_time() {
             return Ok(None);
         }
         let generation = self.segment_mgr.seal_generation();
@@ -6346,7 +6371,7 @@ impl Table for SegmentedTable {
         max_bytes: usize,
         f: &mut dyn FnMut(&Value, GroupIds<'_>) -> Result<bool>,
     ) -> Result<Option<()>> {
-        if self.snapshot_seq.is_some() {
+        if self.reads_back_in_time() {
             return Ok(None);
         }
         // Sampled before either check below. A publication that starts and
@@ -6774,7 +6799,7 @@ impl Table for SegmentedTable {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.compute_filtered_aggregates");
         // Bail out: snapshot isolation requires tombstone filtering by snapshot_seq
-        if self.snapshot_seq.is_some() {
+        if self.reads_back_in_time() {
             return Ok(None);
         }
         self.clear_of_destruction(|| {
@@ -7678,7 +7703,7 @@ impl Table for SegmentedTable {
     ) -> Result<Option<Vec<GroupedAggregateResult>>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.compute_grouped_aggregates");
-        if self.snapshot_seq.is_some() {
+        if self.reads_back_in_time() {
             return Ok(None);
         }
         // Multi-column GROUP BY: fall back to the full executor path.
