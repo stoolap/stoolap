@@ -47,6 +47,7 @@ use super::query_classification::QueryClassification;
 use super::result::ExecutorResult;
 use super::utils::{build_column_index_map, hash_value_into};
 use super::Executor;
+use crate::core::value::grouping_float;
 
 // Re-export for backward compatibility
 pub use super::utils::{expression_contains_aggregate, is_aggregate_function};
@@ -5978,7 +5979,7 @@ impl Executor {
                         let mut hasher = ahash::AHasher::default();
                         match value {
                             Value::Integer(i) => i.hash(&mut hasher),
-                            Value::Float(f) => f.to_bits().hash(&mut hasher),
+                            Value::Float(f) => grouping_float(*f).to_bits().hash(&mut hasher),
                             Value::Text(s) => s.hash(&mut hasher),
                             Value::Boolean(b) => b.hash(&mut hasher),
                             _ => continue,

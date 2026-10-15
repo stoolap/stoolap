@@ -40,6 +40,7 @@ use crate::common::{
     new_cow_btree_map, new_i64_map, new_i64_map_with_capacity, CompactArc, CowBTreeMap, I64Map,
 };
 use crate::core::types::DataType;
+use crate::core::value::grouping_float;
 use crate::core::{Error, Row, RowVec, Schema, Value};
 use crate::storage::expression::CompiledFilter;
 use crate::storage::mvcc::arena::{Relayout, RowArena};
@@ -7024,7 +7025,7 @@ impl VersionStore {
                             key_type = 1;
                         }
                         if key_type == 1 {
-                            Some(key_from_f64(*f))
+                            Some(key_from_f64(grouping_float(*f)))
                         } else {
                             None // Type mismatch → other_groups
                         }
