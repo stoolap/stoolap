@@ -124,6 +124,17 @@ pub trait Transaction: Send {
         self.get_table(name)
     }
 
+    /// [`Self::get_table_ungated`] for a table whose reads see `view`
+    #[doc(hidden)]
+    fn get_table_ungated_with_view(
+        &self,
+        name: &str,
+        _access: StatementAccess,
+        view: Arc<StatementView>,
+    ) -> Result<Box<dyn Table>> {
+        self.get_table_with_view(name, view)
+    }
+
     /// Gets a table whose reads see `view`: the commits complete when it was
     /// taken, and this transaction's own writes. It is for reading only; a
     /// write takes its handle from `get_table`, which reads the newest state.
@@ -255,12 +266,33 @@ pub struct StatementAccess(());
 /// ends the transaction
 pub(crate) trait StatementTable {
     fn get_statement_table(&self, name: &str) -> Result<Box<dyn Table>>;
+
+    /// The statement's table, read through `view` when it has one
+    fn get_statement_table_at(
+        &self,
+        name: &str,
+        view: Option<&Arc<StatementView>>,
+    ) -> Result<Box<dyn Table>>;
 }
 
 impl<T: Transaction + ?Sized> StatementTable for T {
     #[inline]
     fn get_statement_table(&self, name: &str) -> Result<Box<dyn Table>> {
-        self.get_table_ungated(name, StatementAccess(()))
+        self.get_statement_table_at(name, None)
+    }
+
+    #[inline]
+    fn get_statement_table_at(
+        &self,
+        name: &str,
+        view: Option<&Arc<StatementView>>,
+    ) -> Result<Box<dyn Table>> {
+        match view {
+            Some(view) => {
+                self.get_table_ungated_with_view(name, StatementAccess(()), Arc::clone(view))
+            }
+            None => self.get_table_ungated(name, StatementAccess(())),
+        }
     }
 }
 

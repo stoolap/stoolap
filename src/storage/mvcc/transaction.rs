@@ -318,6 +318,18 @@ impl MvccTransaction {
             .unwrap_or_else(|| self.registry.get_global_isolation_level())
     }
 
+    /// The transaction is active and reads read committed: a snapshot reads
+    /// at its own point, which a statement view cannot narrow
+    fn check_view_allowed(&self) -> Result<()> {
+        self.check_active()?;
+        if self.get_isolation_level() == IsolationLevel::SnapshotIsolation {
+            return Err(Error::NotSupported(
+                "a statement view is for read committed transactions".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Check if transaction is active
     fn check_active(&self) -> Result<()> {
         if self.state != TransactionState::Active {
@@ -846,14 +858,19 @@ impl Transaction for MvccTransaction {
         ops.get_table_for_transaction(self.id, name, None, None)
     }
 
+    fn get_table_ungated_with_view(
+        &self,
+        name: &str,
+        _access: StatementAccess,
+        view: Arc<StatementView>,
+    ) -> Result<Box<dyn Table>> {
+        self.check_view_allowed()?;
+        let ops = self.get_engine_ops()?;
+        ops.get_table_for_transaction(self.id, name, None, Some(view))
+    }
+
     fn get_table_with_view(&self, name: &str, view: Arc<StatementView>) -> Result<Box<dyn Table>> {
-        self.check_active()?;
-        // A snapshot reads at its own point, which a statement view cannot narrow
-        if self.get_isolation_level() == IsolationLevel::SnapshotIsolation {
-            return Err(Error::NotSupported(
-                "a statement view is for read committed transactions".into(),
-            ));
-        }
+        self.check_view_allowed()?;
         let ops = self.get_engine_ops()?;
         let gate = self.gate.get_or_init(|| {
             self.handed_out.store(true, Ordering::Relaxed);
