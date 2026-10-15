@@ -189,35 +189,35 @@ fn composite_keys_answer_as_the_scan() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path());
     let int = Value::Integer;
-    let (yes, any) = (Some(true), None);
+    let (no, any) = (Some(false), None);
     check(
         &db,
         &[
             (
                 "SELECT id FROM t WHERE a = $1 AND s = $2",
                 vec![int(17), s_of(17)],
-                yes,
+                any,
             ),
             (
                 "SELECT id FROM t WHERE a = $1 AND s = $2",
                 vec![int(1), text("")],
-                yes,
+                any,
             ),
             (
                 "SELECT id FROM t WHERE a = $1 AND s = $2",
                 vec![int(2), text("a\0b")],
-                yes,
+                any,
             ),
             (
                 "SELECT id FROM t WHERE a = $1 AND s = $2",
                 vec![int(3), text("a\0b")],
                 any,
             ),
-            ("SELECT id FROM t WHERE a = $1", vec![int(17)], yes),
+            ("SELECT id FROM t WHERE a = $1", vec![int(17)], no),
             (
                 "SELECT id FROM t WHERE a = $1",
                 vec![Value::Float(17.0)],
-                yes,
+                no,
             ),
             (
                 "SELECT id FROM t WHERE a = $1",
@@ -227,12 +227,12 @@ fn composite_keys_answer_as_the_scan() {
             (
                 "SELECT id FROM t WHERE a = $1 AND s > $2",
                 vec![int(17), text("key-001000")],
-                yes,
+                any,
             ),
             (
                 "SELECT id FROM t WHERE a = $1 AND f >= $2 AND f < $3",
                 vec![int(17), Value::Float(400.0), Value::Float(1300.0)],
-                yes,
+                no,
             ),
             // NULL and NaN components stay in the key and are found by a
             // shorter prefix, never by a comparison on them
@@ -244,24 +244,24 @@ fn composite_keys_answer_as_the_scan() {
             (
                 "SELECT id FROM t WHERE a = $1 AND f IS NULL",
                 vec![int(89)],
-                yes,
+                no,
             ),
             (
                 "SELECT id FROM t WHERE a = $1 AND f > $2",
                 vec![int(194), Value::Float(0.0)],
-                yes,
+                no,
             ),
             (
                 "SELECT id FROM t WHERE a = $1 AND f = $2",
                 vec![int(17), Value::Float(817.0)],
-                yes,
+                no,
             ),
         ],
     );
 }
 
 #[test]
-fn text_and_composite_entries_record_their_kind_and_domains() {
+fn text_entries_record_their_kind_and_composites_hold_none() {
     use stoolap::storage::volume::secondary::IndexFile;
     use stoolap::storage::volume::side_index::{Domain, KeyKind, Outcome};
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -284,15 +284,14 @@ fn text_and_composite_entries_record_their_kind_and_domains() {
     assert_eq!(s.domain, Some(Domain::Text));
     // Every row but the NULL
     assert_eq!(s.n_positions, ROWS as u64 - 1);
-    let af = entry("t_af");
-    assert_eq!(af.kind, KeyKind::OrderedBytes);
-    assert_eq!(
-        af.components.iter().map(|c| c.1).collect::<Vec<_>>(),
-        [Domain::Integer, Domain::Float]
-    );
-    // NULL and NaN components are kept
-    assert_eq!(af.n_positions, ROWS as u64);
     assert_eq!(entry("t_h").kind, KeyKind::OrderedBytes);
+    for composite in ["t_as", "t_af"] {
+        let identity = db.engine().index_identity("t", composite).unwrap();
+        assert!(
+            side.directory().entry(identity).is_none(),
+            "{composite} has no side file entry"
+        );
+    }
 }
 
 #[test]

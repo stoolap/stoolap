@@ -589,11 +589,10 @@ pub struct SideIndexDef {
 }
 
 /// The kind a side file holds an index of `index_type` over `components`
-/// in: a B-tree on one numeric or time column, a TEXT B-tree or hash, or a
-/// key of several keyed columns. None for any other index
+/// in: a B-tree on one numeric or time column, or a TEXT B-tree or hash.
+/// None for any other index, a key of several columns included
 pub fn kind_for(index_type: IndexType, components: &[Component]) -> Option<KeyKind> {
     match components {
-        [] => None,
         [one] => match (one.domain, index_type) {
             (Domain::Text, IndexType::BTree | IndexType::Hash) => Some(KeyKind::OrderedBytes),
             (Domain::Integer | Domain::Timestamp | Domain::Float, IndexType::BTree) => {
@@ -601,11 +600,7 @@ pub fn kind_for(index_type: IndexType, components: &[Component]) -> Option<KeyKi
             }
             _ => None,
         },
-        _ => matches!(
-            index_type,
-            IndexType::BTree | IndexType::Hash | IndexType::MultiColumn
-        )
-        .then_some(KeyKind::OrderedBytes),
+        _ => None,
     }
 }
 
