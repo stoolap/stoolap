@@ -436,3 +436,143 @@ fn probes_find_sealed_keys_stored_another_way() {
         assert_eq!(ids(&db, sql, &[]), want, "sealed: {sql}");
     }
 }
+
+fn reopen(dir: &std::path::Path) -> Database {
+    Database::open(&format!(
+        "file://{}?checkpoint_interval=3600",
+        dir.display()
+    ))
+    .unwrap()
+}
+
+/// The FLOAT reads a side file must serve, and one it must answer empty
+fn served_float_reads() -> Vec<(&'static str, Vec<Value>, Option<bool>)> {
+    let f = Value::Float;
+    vec![
+        ("SELECT id FROM t WHERE f = $1", vec![f(1.5)], Some(true)),
+        ("SELECT id FROM t WHERE f = $1", vec![f(-0.0)], Some(true)),
+        (
+            "SELECT id FROM t WHERE f = $1",
+            vec![Value::Integer(5)],
+            Some(true),
+        ),
+        ("SELECT id FROM t WHERE f = $1", vec![f(7.3)], None),
+        (
+            "SELECT id FROM w WHERE f BETWEEN $1 AND $2",
+            vec![f(10.0), f(12.0)],
+            Some(true),
+        ),
+    ]
+}
+
+/// Whether a side file of table `table` records its index `index` with
+/// the FLOAT domain
+fn float_entry_recorded(db: &Database, dir: &std::path::Path, table: &str, index: &str) -> bool {
+    use stoolap::storage::volume::secondary::IndexFile;
+    use stoolap::storage::volume::side_index::Domain;
+    let identity = db.engine().index_identity(table, index).unwrap();
+    std::fs::read_dir(dir.join("volumes").join(table))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("sidx"))
+        .filter_map(|path| IndexFile::open(&path, 1).ok())
+        .any(|side| {
+            side.directory()
+                .entry(identity)
+                .is_some_and(|entry| entry.domain == Some(Domain::Float))
+        })
+}
+
+#[test]
+fn float_keys_are_served_after_a_reopen() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    drop(open(dir.path(), true));
+    let db = reopen(dir.path());
+    assert!(float_entry_recorded(&db, dir.path(), "t", "t_f"));
+    check(&db, &served_float_reads());
+}
+
+#[test]
+fn a_float_index_created_after_the_seal_is_backfilled_and_survives_a_reopen() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let db = reopen(dir.path());
+    for table in ["t", "u"] {
+        db.execute(
+            &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, f FLOAT)"),
+            (),
+        )
+        .unwrap();
+        db.execute(
+            &format!(
+                "INSERT INTO {table} SELECT value, value * 0.25 - 300.0 FROM generate_series(0, 2999)"
+            ),
+            (),
+        )
+        .unwrap();
+    }
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("CREATE INDEX t_f ON t(f)", ()).unwrap();
+    let eq = "SELECT id FROM t WHERE f = $1";
+    check(&db, &[(eq, vec![Value::Float(1.5)], Some(false))]);
+    db.execute("PRAGMA INDEX_BACKFILL", ()).unwrap();
+    assert!(float_entry_recorded(&db, dir.path(), "t", "t_f"));
+    let served = [
+        (eq, vec![Value::Float(1.5)], Some(true)),
+        (eq, vec![Value::Float(0.0)], Some(true)),
+        (eq, vec![Value::Integer(-299)], Some(true)),
+    ];
+    check(&db, &served);
+    drop(db);
+    let db = reopen(dir.path());
+    check(&db, &served);
+}
+
+#[test]
+fn an_indexed_integer_column_retyped_to_float_is_served_as_float_keys() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let db = reopen(dir.path());
+    for table in ["t", "u"] {
+        db.execute(
+            &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, k INTEGER)"),
+            (),
+        )
+        .unwrap();
+        db.execute(
+            &format!(
+                "INSERT INTO {table} SELECT value, value % 1000 FROM generate_series(0, 2999)"
+            ),
+            (),
+        )
+        .unwrap();
+    }
+    db.execute("CREATE INDEX t_k ON t(k)", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    for table in ["t", "u"] {
+        db.execute(&format!("ALTER TABLE {table} MODIFY COLUMN k FLOAT"), ())
+            .unwrap();
+    }
+    assert!(float_entry_recorded(&db, dir.path(), "t", "t_k"));
+    let f = Value::Float;
+    let reads = [
+        ("SELECT id FROM t WHERE k = $1", vec![f(5.0)], Some(true)),
+        (
+            "SELECT id FROM t WHERE k = $1",
+            vec![Value::Integer(5)],
+            Some(true),
+        ),
+        ("SELECT id FROM t WHERE k = $1", vec![f(5.5)], None),
+        (
+            "SELECT id FROM t WHERE k > $1 AND k < $2",
+            vec![f(10.5), f(20.5)],
+            Some(true),
+        ),
+    ];
+    check(&db, &reads);
+    drop(db);
+    let db = reopen(dir.path());
+    check(&db, &reads);
+}
