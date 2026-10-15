@@ -4006,8 +4006,13 @@ impl Table for MVCCTable {
                     (data_type, key) if key.data_type() == data_type => key.clone(),
                     _ => return Ok(None),
                 };
+                // An index that caps before it copies answers here
+                let stored = std::slice::from_ref(&stored);
+                if let Some(found) = index.get_row_ids_equal_capped_into(stored, max, out) {
+                    return Ok(Some(found));
+                }
                 let start = out.len();
-                index.get_row_ids_equal_into(std::slice::from_ref(&stored), out);
+                index.get_row_ids_equal_into(stored, out);
                 if out.len() - start > max {
                     out.truncate(start);
                     return Ok(Some(crate::storage::traits::CappedEqual::OverCap));
