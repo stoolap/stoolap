@@ -1847,6 +1847,31 @@ pub(crate) fn hot_published() {
     run_hook(&HOT_PUBLISHED_HOOK);
 }
 
+thread_local! {
+    static ARENA_WINDOW_HOOK: HookSlot = RefCell::new(None);
+    static ARENA_EPOCH_HOOK: HookSlot = RefCell::new(None);
+}
+
+/// Run once on this thread when its next read took the epoch an arena
+/// window starts from, before it checks the window may open
+pub fn after_arena_epoch_read(hook: impl FnOnce() + 'static) {
+    ARENA_EPOCH_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn arena_epoch_read() {
+    run_hook(&ARENA_EPOCH_HOOK);
+}
+
+/// Run once on this thread when its next read opened a window over the
+/// arena's heads, before it reads them
+pub fn after_arena_window_opened(hook: impl FnOnce() + 'static) {
+    ARENA_WINDOW_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn arena_window_opened() {
+    run_hook(&ARENA_WINDOW_HOOK);
+}
+
 /// Run once on this thread when its commit, rollback, drop or savepoint
 /// starts waiting for the transaction's statements in flight
 pub fn on_txn_gate_wait(hook: impl FnOnce() + 'static) {

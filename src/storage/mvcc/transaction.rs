@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::core::{Error, IsolationLevel, Result, Schema, SchemaColumn};
+use crate::storage::mvcc::registry::StatementView;
 use crate::storage::mvcc::txn_gate::{GateRef, TxnGate};
 use crate::storage::mvcc::{get_fast_timestamp, TransactionRegistry};
 use crate::storage::traits::transaction::StatementAccess;
@@ -107,12 +108,14 @@ pub(crate) fn inside_own_statement() -> Error {
 /// without creating circular dependencies.
 pub trait TransactionEngineOperations: Send + Sync {
     /// Get a table by name, initializing transaction-local version store;
-    /// a handle given a `gate` admits its statements through it
+    /// a handle given a `gate` admits its statements through it, and one
+    /// given a `view` reads through it
     fn get_table_for_transaction(
         &self,
         txn_id: i64,
         table_name: &str,
         gate: Option<&GateRef>,
+        view: Option<Arc<StatementView>>,
     ) -> Result<Box<dyn Table>>;
 
     /// Create a new table
@@ -185,8 +188,8 @@ pub trait TransactionEngineOperations: Send + Sync {
 
     /// Marks every table the transaction writes as publishing, from before
     /// its index updates until the transaction is visible or undone
-    fn begin_publish(&self, txn_id: i64) -> super::version_store::PublishHold {
-        let _ = txn_id;
+    fn begin_publish(&self, txn_id: i64, commit_seq: i64) -> super::version_store::PublishHold {
+        let _ = (txn_id, commit_seq);
         super::version_store::PublishHold::default()
     }
 
@@ -591,13 +594,13 @@ impl Transaction for MvccTransaction {
                 .and_then(|ops| ops.acquire_seal_fence());
 
             // Phase 1: Start commit - mark transaction as "committing"
-            self.registry.start_commit(self.id);
+            let commit_seq = self.registry.start_commit(self.id);
             // Held until the transaction is visible or undone: readers that
             // trust an index's order stand down while it publishes
             let publish = self
                 .engine_operations
                 .as_ref()
-                .map(|ops| ops.begin_publish(self.id));
+                .map(|ops| ops.begin_publish(self.id, commit_seq));
 
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::commit_counted();
@@ -797,7 +800,7 @@ impl Transaction for MvccTransaction {
         // Scope the borrow to allow later mutable operations
         let schema = {
             let ops = self.get_engine_ops()?;
-            let table = ops.get_table_for_transaction(self.id, name, None)?;
+            let table = ops.get_table_for_transaction(self.id, name, None, None)?;
             table.schema().clone()
         };
 
@@ -834,13 +837,29 @@ impl Transaction for MvccTransaction {
             self.handed_out.store(true, Ordering::Relaxed);
             TxnGate::open()
         });
-        ops.get_table_for_transaction(self.id, name, Some(gate))
+        ops.get_table_for_transaction(self.id, name, Some(gate), None)
     }
 
     fn get_table_ungated(&self, name: &str, _access: StatementAccess) -> Result<Box<dyn Table>> {
         self.check_active()?;
         let ops = self.get_engine_ops()?;
-        ops.get_table_for_transaction(self.id, name, None)
+        ops.get_table_for_transaction(self.id, name, None, None)
+    }
+
+    fn get_table_with_view(&self, name: &str, view: Arc<StatementView>) -> Result<Box<dyn Table>> {
+        self.check_active()?;
+        // A snapshot reads at its own point, which a statement view cannot narrow
+        if self.get_isolation_level() == IsolationLevel::SnapshotIsolation {
+            return Err(Error::NotSupported(
+                "a statement view is for read committed transactions".into(),
+            ));
+        }
+        let ops = self.get_engine_ops()?;
+        let gate = self.gate.get_or_init(|| {
+            self.handed_out.store(true, Ordering::Relaxed);
+            TxnGate::open()
+        });
+        ops.get_table_for_transaction(self.id, name, Some(gate), Some(view))
     }
 
     fn list_tables(&self) -> Result<Vec<String>> {

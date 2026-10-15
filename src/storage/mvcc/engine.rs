@@ -1757,7 +1757,7 @@ fn populate_hnsw_from_volumes(
 
     // Seed seen set with hot row_ids (already indexed by populate_all_indexes)
     let mut seen: rustc_hash::FxHashSet<i64> = store
-        .get_all_visible_row_ids(INVALID_TRANSACTION_ID + 1)
+        .get_all_visible_row_ids((INVALID_TRANSACTION_ID + 1).into())
         .into_iter()
         .collect();
 
@@ -3072,7 +3072,7 @@ impl MVCCEngine {
         txn_id: i64,
         table_name: &str,
     ) -> Result<Box<dyn crate::storage::traits::Table>> {
-        EngineOperations::new(self).get_table_for_transaction(txn_id, table_name, None)
+        EngineOperations::new(self).get_table_for_transaction(txn_id, table_name, None, None)
     }
 
     /// Find all FK constraints in other tables that reference the given parent table.
@@ -8415,7 +8415,7 @@ impl Engine for MVCCEngine {
 
         let store = self.get_version_store(table_name)?;
         let read_txn_id = INVALID_TRANSACTION_ID + 1;
-        let mut result = store.get_visible_versions_batch(row_ids, read_txn_id);
+        let mut result = store.get_visible_versions_batch(row_ids, read_txn_id.into());
 
         // Fall back to cold segments for rows not found in hot
         if result.len() < row_ids.len() {
@@ -8438,7 +8438,7 @@ impl Engine for MVCCEngine {
                     continue;
                 }
                 if stale {
-                    result = store.get_visible_versions_batch(row_ids, read_txn_id);
+                    result = store.get_visible_versions_batch(row_ids, read_txn_id.into());
                 }
                 stale = true;
                 if mgr.has_segments() {
@@ -8975,6 +8975,7 @@ impl TransactionEngineOperations for EngineOperations {
         txn_id: i64,
         table_name: &str,
         gate: Option<&super::txn_gate::GateRef>,
+        view: Option<Arc<super::registry::StatementView>>,
     ) -> Result<Box<dyn Table>> {
         // Use Cow to avoid allocation when table_name is already lowercase (common case)
         let table_name_lower = to_lowercase_cow(table_name);
@@ -9058,14 +9059,16 @@ impl TransactionEngineOperations for EngineOperations {
                     drop(mgrs);
                     let table =
                         MVCCTable::new_with_shared_store(txn_id, version_store, txn_versions)
-                            .with_txn_gate(gate.cloned());
+                            .with_txn_gate(gate.cloned())
+                            .with_view(view);
                     admit(&table)?;
                     return Ok(Box::new(table));
                 }
             }
         };
         let schema_generation = mgr.schema_generation();
-        let table = MVCCTable::new_with_shared_store(txn_id, version_store, txn_versions);
+        let table = MVCCTable::new_with_shared_store(txn_id, version_store, txn_versions)
+            .with_view(view.clone());
         admit(&table)?;
         mgr.check_schema_generation(schema_generation)?;
         let snapshot_seq = (self.registry.get_isolation_level(txn_id)
@@ -9079,7 +9082,8 @@ impl TransactionEngineOperations for EngineOperations {
                 snapshot_seq,
                 schema_generation,
             )
-            .with_txn_gate(gate.cloned()),
+            .with_txn_gate(gate.cloned())
+            .with_view(view),
         ))
     }
 
@@ -9678,7 +9682,7 @@ impl TransactionEngineOperations for EngineOperations {
         (any_committed, commit_error)
     }
 
-    fn begin_publish(&self, txn_id: i64) -> super::version_store::PublishHold {
+    fn begin_publish(&self, txn_id: i64, commit_seq: i64) -> super::version_store::PublishHold {
         let mut hold = super::version_store::PublishHold::default();
         let cache = self.txn_version_stores().read().unwrap();
         if let Some(txn_tables) = cache.get(txn_id) {
@@ -9688,7 +9692,7 @@ impl TransactionEngineOperations for EngineOperations {
                     continue;
                 }
                 if let Some(version_store) = stores.get(table_name.as_str()) {
-                    hold.add(version_store, Arc::clone(txn_store));
+                    hold.add(version_store, Arc::clone(txn_store), commit_seq);
                 }
             }
         }

@@ -28,9 +28,11 @@ use crate::storage::expression::logical::OrExpr;
 use crate::storage::expression::Expression;
 use crate::storage::index::id_list::GroupIds;
 use crate::storage::index::{BTreeIndex, BitmapIndex, HashIndex, HnswIndex, MultiColumnIndex};
+use crate::storage::mvcc::registry::StatementView;
 use crate::storage::mvcc::scanner::MVCCScanner;
 use crate::storage::mvcc::txn_gate::{GateRef, TxnGate};
 use crate::storage::mvcc::version_store::LayoutToken;
+use crate::storage::mvcc::version_store::Reader;
 use crate::storage::mvcc::version_store::TxnStoreWrite;
 use crate::storage::mvcc::RowVersion;
 use crate::storage::mvcc::{TransactionVersionStore, TxnTableStore, VersionStore};
@@ -57,6 +59,9 @@ pub struct MVCCTable {
     /// The transaction's gate, which admits this handle's statements; None
     /// for a handle another owns and admits for
     gate: Option<GateRef>,
+    /// The statement view this handle's reads are held to; None reads the
+    /// newest committed state, as writes do
+    view: Option<Arc<StatementView>>,
     /// Scans that fell through to the full visible-row walk
     #[cfg(test)]
     full_scans: std::sync::atomic::AtomicU64,
@@ -129,6 +134,7 @@ impl MVCCTable {
             cached_schema,
             layout,
             gate: None,
+            view: None,
         }
     }
 
@@ -150,6 +156,7 @@ impl MVCCTable {
             cached_schema,
             layout,
             gate: None,
+            view: None,
         }
     }
 
@@ -158,6 +165,29 @@ impl MVCCTable {
     pub(crate) fn with_txn_gate(mut self, gate: Option<GateRef>) -> Self {
         self.gate = gate;
         self
+    }
+
+    /// The handle's reads see `view`: the commits complete when it was
+    /// taken, and this transaction's own writes
+    pub(crate) fn with_view(mut self, view: Option<Arc<StatementView>>) -> Self {
+        self.view = view;
+        self
+    }
+
+    /// Who reads through this handle
+    #[inline]
+    fn reader(&self) -> Reader<'_> {
+        Reader {
+            txn_id: self.txn_id,
+            view: self.view.as_deref(),
+        }
+    }
+
+    /// Whether this handle may see versions older than the store's newest
+    /// committed ones: under a snapshot or a statement view
+    #[inline]
+    fn reads_back_in_time(&self) -> bool {
+        self.view.is_some() || self.version_store.needs_snapshot_isolation(self.txn_id)
     }
 
     /// Returns the transaction ID
@@ -1185,7 +1215,7 @@ impl MVCCTable {
                 let settled = quiet.is_some()
                     && self.version_store.publish_epoch_if_quiet() == quiet
                     && !self.txn_versions.read().unwrap().has_local_changes()
-                    && !self.version_store.needs_snapshot_isolation(self.txn_id);
+                    && !self.reads_back_in_time();
                 settled.then_some(row_ids)
             }
             Operator::Gt | Operator::Gte | Operator::Lt | Operator::Lte => {
@@ -1233,7 +1263,7 @@ impl MVCCTable {
         let mut skipped = 0usize;
 
         self.version_store
-            .for_each_visible(&row_ids, self.txn_id, |row_id, row_data| {
+            .for_each_visible(&row_ids, self.reader(), |row_id, row_data| {
                 // Re-apply filter (index may return superset for complex expressions)
                 let row = self.normalize_row_to_schema(row_data, schema);
                 if expr.evaluate_fast(&row) {
@@ -1354,7 +1384,7 @@ impl MVCCTable {
         let mut skipped = 0usize;
 
         self.version_store
-            .for_each_visible(&deduped_ids, self.txn_id, |row_id, row_data| {
+            .for_each_visible(&deduped_ids, self.reader(), |row_id, row_data| {
                 let row = self.normalize_row_to_schema(row_data, schema);
                 // Re-apply full OR filter to ensure correctness (index may return superset)
                 if expr.evaluate_fast(&row) {
@@ -1388,7 +1418,7 @@ impl MVCCTable {
 
         // Streaming scan: filter + dedup + limit inline, no bulk materialization
         self.version_store.for_each_visible_filtered(
-            self.txn_id,
+            self.reader(),
             unindexed_filter.as_ref(),
             |row_id, row_data| {
                 // Skip rows already found by index
@@ -1717,7 +1747,10 @@ impl MVCCTable {
 
         // Check if row exists in global store
         if !deleted_locally && self.version_store.quick_check_row_existence(row_id) {
-            if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
+            if let Some(version) = self
+                .version_store
+                .get_visible_version(row_id, self.reader())
+            {
                 if !version.is_deleted() {
                     return Err(Error::primary_key_constraint(row_id));
                 }
@@ -1771,7 +1804,7 @@ impl MVCCTable {
     /// Reduces lock acquisitions from O(N) to O(1) for the global store.
     pub fn row_count(&self) -> usize {
         // Count global visible versions in single pass (O(1) lock instead of O(N))
-        let mut count = self.version_store.count_visible_rows(self.txn_id);
+        let mut count = self.version_store.count_visible_rows(self.reader());
 
         // Adjust for local changes (uncommitted in this transaction)
         let txn_versions = self.txn_versions.read().unwrap();
@@ -1809,13 +1842,15 @@ impl MVCCTable {
         if txn_versions.has_local_changes() {
             return None;
         }
-        // Under snapshot isolation, committed_row_count includes rows committed
-        // after our snapshot point, so the O(1) count would be wrong.
-        if self.version_store.needs_snapshot_isolation(self.txn_id) {
+        // Under snapshot isolation or a view, committed_row_count includes rows
+        // committed after the reader's point, so the O(1) count would be wrong.
+        if self.reads_back_in_time() {
             return None;
         }
-        // No local changes, read-committed - use the O(1) committed row count
-        Some(self.version_store.committed_row_count())
+        // A commit moves the count as it publishes, before it is visible
+        let quiet = self.version_store.publish_epoch_if_quiet()?;
+        let count = self.version_store.committed_row_count();
+        (self.version_store.publish_epoch_if_quiet() == Some(quiet)).then_some(count)
     }
 
     /// Collect all visible rows, optionally filtered
@@ -1838,11 +1873,13 @@ impl MVCCTable {
                 // Use filtered version - returns RowVec directly
                 return self
                     .version_store
-                    .get_all_visible_rows_filtered(self.txn_id, expr);
+                    .get_all_visible_rows_filtered(self.reader(), expr);
             }
 
             // Use cached version for unfiltered scans (main optimization)
-            let raw_rows = self.version_store.get_all_visible_rows_cached(self.txn_id);
+            let raw_rows = self
+                .version_store
+                .get_all_visible_rows_cached(self.reader());
 
             // OPTIMIZATION: Skip normalization if first row matches schema column count
             // This is the common case when no ALTER TABLE ADD/DROP COLUMN has occurred
@@ -1866,7 +1903,9 @@ impl MVCCTable {
         // Has local versions - use batch fetch then merge
         // Step 1: Get all global rows in one batch (single lock acquisition)
         // Uses thread-local cached Vec for zero-allocation reuse
-        let global_rows = self.version_store.get_all_visible_rows_cached(self.txn_id);
+        let global_rows = self
+            .version_store
+            .get_all_visible_rows_cached(self.reader());
 
         // Step 2: Build set of local row IDs for quick lookup (I64Set for fast i64 lookups)
         let mut local_row_ids = I64Set::new();
@@ -1952,7 +1991,7 @@ impl MVCCTable {
                         Some((pk_id, local.data.clone()))
                     }
                 } else if let Some(version) =
-                    self.version_store.get_visible_version(pk_id, self.txn_id)
+                    self.version_store.get_visible_version(pk_id, self.reader())
                 {
                     if !version.is_deleted() {
                         Some((pk_id, version.data.clone()))
@@ -2001,7 +2040,7 @@ impl MVCCTable {
                 // With filter + limit: use filtered limit pushdown
                 // This early-terminates when limit is reached after filtering
                 self.version_store.get_visible_rows_filtered_with_limit(
-                    self.txn_id,
+                    self.reader(),
                     expr,
                     limit,
                     offset,
@@ -2010,7 +2049,7 @@ impl MVCCTable {
                 // No filter: use simple LIMIT pushdown
                 // This avoids scanning all 10K rows for LIMIT 10 queries - ~30x speedup
                 self.version_store
-                    .get_visible_rows_with_limit(self.txn_id, limit, offset)
+                    .get_visible_rows_with_limit(self.reader(), limit, offset)
             };
 
             // Keep row IDs in RowVec
@@ -2022,7 +2061,9 @@ impl MVCCTable {
 
         // Has local versions - use batch fetch then merge with early termination
         // Uses thread-local cached Vec for zero-allocation reuse
-        let global_rows = self.version_store.get_all_visible_rows_cached(self.txn_id);
+        let global_rows = self
+            .version_store
+            .get_all_visible_rows_cached(self.reader());
 
         // Build set of local row IDs for quick lookup
         let mut local_row_ids = I64Set::new();
@@ -2112,7 +2153,7 @@ impl MVCCTable {
                         Some((pk_id, local.data.clone()))
                     }
                 } else if let Some(version) =
-                    self.version_store.get_visible_version(pk_id, self.txn_id)
+                    self.version_store.get_visible_version(pk_id, self.reader())
                 {
                     if !version.is_deleted() {
                         Some((pk_id, version.data.clone()))
@@ -2160,14 +2201,17 @@ impl MVCCTable {
             let raw_rows = if let Some(expr) = filter {
                 self.version_store
                     .get_visible_rows_filtered_with_limit_unordered(
-                        self.txn_id,
+                        self.reader(),
                         expr,
                         limit,
                         offset,
                     )
             } else {
-                self.version_store
-                    .get_visible_rows_with_limit_unordered(self.txn_id, limit, offset)
+                self.version_store.get_visible_rows_with_limit_unordered(
+                    self.reader(),
+                    limit,
+                    offset,
+                )
             };
 
             // Keep row IDs in RowVec
@@ -2243,7 +2287,7 @@ impl MVCCTable {
                         (!local.is_deleted()).then(|| (local.data.clone(), self.local_read(local)))
                     } else {
                         self.version_store
-                            .get_visible_version(pk_id, self.txn_id)
+                            .get_visible_version(pk_id, self.reader())
                             .filter(|version| !version.is_deleted())
                             .map(|version| (version.data.clone(), version))
                     }
@@ -2690,7 +2734,7 @@ impl Table for MVCCTable {
         if !global_ids.is_empty() {
             let global_rows = self
                 .version_store
-                .get_visible_versions_batch(global_ids, self.txn_id);
+                .get_visible_versions_batch(global_ids, self.reader());
             self.check_read()?;
 
             // Apply filter to fetched rows
@@ -2856,7 +2900,7 @@ impl Table for MVCCTable {
         // Only the keys this transaction sees: a committed delete stays in
         // the version tree until it is collected, but it is not a row
         let mut ids = self.version_store.visible_row_ids_excluding(
-            self.txn_id,
+            self.reader(),
             &crate::common::I64Set::new(),
             usize::MAX,
         );
@@ -2897,11 +2941,17 @@ impl Table for MVCCTable {
         }
         Ok(self
             .version_store
-            .visible_row_ids_excluding(self.txn_id, exclude, limit))
+            .visible_row_ids_excluding(self.reader(), exclude, limit))
     }
 
     fn collect_hot_row_ids_into(&self, dest: &mut rustc_hash::FxHashSet<i64>) {
-        self.version_store.collect_row_ids_into(dest);
+        // Under a view, only a hot version the view sees hides a sealed copy
+        if self.view.is_some() {
+            self.version_store
+                .collect_seen_row_ids_into(self.reader(), dest);
+        } else {
+            self.version_store.collect_row_ids_into(dest);
+        }
     }
 
     fn has_row_id(&self, row_id: i64) -> Result<bool> {
@@ -2922,7 +2972,7 @@ impl Table for MVCCTable {
         Ok(self.version_store.has_committed_row(row_id)
             && self
                 .version_store
-                .has_any_visible_version(&[row_id], self.txn_id)
+                .has_any_visible_version(&[row_id], self.reader())
                 .is_some())
     }
 
@@ -2972,7 +3022,7 @@ impl Table for MVCCTable {
                             Some((local.data.clone(), None))
                         }
                     } else if let Some(version) =
-                        self.version_store.get_visible_version(pk_id, self.txn_id)
+                        self.version_store.get_visible_version(pk_id, self.reader())
                     {
                         if !version.is_deleted() {
                             let data = version.data.clone();
@@ -3080,7 +3130,7 @@ impl Table for MVCCTable {
                 if !remaining_row_ids.is_empty() {
                     let batch_rows = self
                         .version_store
-                        .get_visible_versions_batch(&remaining_row_ids, self.txn_id);
+                        .get_visible_versions_batch(&remaining_row_ids, self.reader());
                     for (row_id, row) in batch_rows {
                         // Re-apply filter (index may be partial match)
                         if expr.evaluate(&row).unwrap_or(false) {
@@ -3133,8 +3183,9 @@ impl Table for MVCCTable {
                 // Mark as deleted
                 self.writes().put(row_id, row, true)?;
                 delete_count += 1;
-            } else if let Some(version) =
-                self.version_store.get_visible_version(row_id, self.txn_id)
+            } else if let Some(version) = self
+                .version_store
+                .get_visible_version(row_id, self.reader())
             {
                 if version.is_deleted() {
                     continue;
@@ -3228,7 +3279,7 @@ impl Table for MVCCTable {
                         }
                     } else if let Some(version) = self
                         .version_store
-                        .get_visible_version(pk_lookup, self.txn_id)
+                        .get_visible_version(pk_lookup, self.reader())
                     {
                         if !version.is_deleted() {
                             Some(version.data.clone())
@@ -3291,10 +3342,8 @@ impl Table for MVCCTable {
             return Ok(Some(RowVec::new()));
         }
         // Rows this transaction wrote are not in the shared indexes yet, and
-        // a snapshot may see older versions than the keys the index holds
-        if self.txn_versions.read().unwrap().has_local_changes()
-            || self.version_store.needs_snapshot_isolation(self.txn_id)
-        {
+        // a snapshot or view may see older versions than the keys the index holds
+        if self.txn_versions.read().unwrap().has_local_changes() || self.reads_back_in_time() {
             return Ok(None);
         }
         let Some(expr) = where_expr else {
@@ -3345,7 +3394,10 @@ impl Table for MVCCTable {
                 // A version comes back only when it is visible and its
                 // deletion, if any, is not: the raw deleted flag may belong
                 // to an aborted or unfinished transaction
-                if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
+                if let Some(version) = self
+                    .version_store
+                    .get_visible_version(row_id, self.reader())
+                {
                     let row = self.normalize_row_to_schema(version.data, schema);
                     if row.get(col_idx) != Some(key_value) {
                         stale = true;
@@ -3383,7 +3435,10 @@ impl Table for MVCCTable {
     fn collect_rows_by_ids(&self, row_ids: &[i64]) -> Result<RowVec> {
         let mut rows = RowVec::with_capacity(row_ids.len());
         for &row_id in row_ids {
-            if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
+            if let Some(version) = self
+                .version_store
+                .get_visible_version(row_id, self.reader())
+            {
                 if !version.is_deleted() {
                     rows.push((row_id, version.data.clone()));
                 }
@@ -3452,9 +3507,7 @@ impl Table for MVCCTable {
     }
 
     fn index_view_epoch(&self) -> Option<u64> {
-        if self.txn_versions.read().unwrap().has_local_changes()
-            || self.version_store.needs_snapshot_isolation(self.txn_id)
-        {
+        if self.txn_versions.read().unwrap().has_local_changes() || self.reads_back_in_time() {
             return None;
         }
         self.version_store.publish_epoch_if_quiet()
@@ -3736,8 +3789,11 @@ impl Table for MVCCTable {
         // Collect all entries first, then add in a single batch operation
         let mut entries: Vec<(i64, Vec<Value>)> = Vec::new();
 
-        for row_id in self.version_store.get_all_visible_row_ids(self.txn_id) {
-            if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
+        for row_id in self.version_store.get_all_visible_row_ids(self.reader()) {
+            if let Some(version) = self
+                .version_store
+                .get_visible_version(row_id, self.reader())
+            {
                 if !version.is_deleted() {
                     let values: Vec<Value> = col_indices
                         .iter()
@@ -3847,8 +3903,11 @@ impl Table for MVCCTable {
 
         // Populate with existing data
         let mut entries: Vec<(i64, Vec<Value>)> = Vec::new();
-        for row_id in self.version_store.get_all_visible_row_ids(self.txn_id) {
-            if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
+        for row_id in self.version_store.get_all_visible_row_ids(self.reader()) {
+            if let Some(version) = self
+                .version_store
+                .get_visible_version(row_id, self.reader())
+            {
                 if !version.is_deleted() {
                     let val = version
                         .data
@@ -3983,7 +4042,7 @@ impl Table for MVCCTable {
         for ids in row_ids.chunks(chunk) {
             count += self
                 .version_store
-                .count_visible_versions_batch(ids, self.txn_id);
+                .count_visible_versions_batch(ids, self.reader());
             if count >= limit {
                 break;
             }
@@ -4142,8 +4201,11 @@ impl Table for MVCCTable {
         let mut entries: Vec<(i64, Vec<Value>)> = Vec::new();
 
         // Scan all visible rows
-        for row_id in self.version_store.get_all_visible_row_ids(self.txn_id) {
-            if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
+        for row_id in self.version_store.get_all_visible_row_ids(self.reader()) {
+            if let Some(version) = self
+                .version_store
+                .get_visible_version(row_id, self.reader())
+            {
                 if !version.is_deleted() {
                     if let Some(value) = version.data.get(col_idx) {
                         entries.push((row_id, vec![value.clone()]));
@@ -4227,8 +4289,11 @@ impl Table for MVCCTable {
         // Populate the index with existing data using batch_slice
         let mut entries: Vec<(i64, Vec<Value>)> = Vec::new();
 
-        for row_id in self.version_store.get_all_visible_row_ids(self.txn_id) {
-            if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
+        for row_id in self.version_store.get_all_visible_row_ids(self.reader()) {
+            if let Some(version) = self
+                .version_store
+                .get_visible_version(row_id, self.reader())
+            {
                 if !version.is_deleted() {
                     // Collect values for all columns in the index
                     let values: Vec<Value> = col_indices
@@ -4360,7 +4425,7 @@ impl Table for MVCCTable {
             let pk_col = &self.cached_schema.columns[pk_idx];
             if pk_col.name_lower == column_name.to_lowercase() {
                 let rows = self.version_store.collect_rows_pk_ordered(
-                    self.txn_id,
+                    self.reader(),
                     ascending,
                     limit,
                     offset,
@@ -4392,7 +4457,10 @@ impl Table for MVCCTable {
 
             for row_id in ordered_row_ids {
                 // Check visibility and get row
-                if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
+                if let Some(version) = self
+                    .version_store
+                    .get_visible_version(row_id, self.reader())
+                {
                     if version.is_deleted() {
                         continue;
                     }
@@ -4452,7 +4520,10 @@ impl Table for MVCCTable {
             for row_id in &row_ids {
                 let row_id = *row_id;
                 // Check visibility and get row
-                if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
+                if let Some(version) = self
+                    .version_store
+                    .get_visible_version(row_id, self.reader())
+                {
                     if version.is_deleted() {
                         continue;
                     }
@@ -4499,7 +4570,7 @@ impl Table for MVCCTable {
         // Use the efficient keyset iteration from version store
         // Returns RowVec with (row_id, Row) tuples
         let rows = self.version_store.collect_rows_keyset(
-            self.txn_id,
+            self.reader(),
             start_after,
             start_from,
             ascending,
@@ -4545,7 +4616,10 @@ impl Table for MVCCTable {
             // Collect visible rows for this partition
             let mut partition_rows = RowVec::with_capacity(row_ids.len());
             for &row_id in &row_ids {
-                if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
+                if let Some(version) = self
+                    .version_store
+                    .get_visible_version(row_id, self.reader())
+                {
                     if !version.is_deleted() {
                         partition_rows.push((row_id, version.data.clone()));
                     }
@@ -4619,7 +4693,10 @@ impl Table for MVCCTable {
         // Collect visible rows for this partition
         let mut rows = RowVec::with_capacity(row_ids.len());
         for &row_id in row_ids.iter() {
-            if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
+            if let Some(version) = self
+                .version_store
+                .get_visible_version(row_id, self.reader())
+            {
                 if !version.is_deleted() {
                     rows.push((row_id, version.data.clone()));
                 }
@@ -5088,7 +5165,7 @@ impl Table for MVCCTable {
         }
         drop(txn_versions);
 
-        let sum = self.version_store.sum_column(self.txn_id, col_idx);
+        let sum = self.version_store.sum_column(self.reader(), col_idx);
         self.check_read()?;
         Ok(Some(sum))
     }
@@ -5101,7 +5178,7 @@ impl Table for MVCCTable {
         }
         drop(txn_versions);
 
-        let min = self.version_store.min_column(self.txn_id, col_idx);
+        let min = self.version_store.min_column(self.reader(), col_idx);
         self.check_read()?;
         Ok(Some(min))
     }
@@ -5114,7 +5191,7 @@ impl Table for MVCCTable {
         }
         drop(txn_versions);
 
-        let max = self.version_store.max_column(self.txn_id, col_idx);
+        let max = self.version_store.max_column(self.reader(), col_idx);
         self.check_read()?;
         Ok(Some(max))
     }
@@ -5132,7 +5209,7 @@ impl Table for MVCCTable {
         drop(txn_versions);
 
         let groups = self.version_store.compute_grouped_aggregates(
-            self.txn_id,
+            self.reader(),
             group_by_indices,
             aggregates,
         );

@@ -17,8 +17,11 @@
 
 use rustc_hash::FxHashMap;
 
+use std::sync::Arc;
+
 use crate::core::{IsolationLevel, Result, Schema, SchemaColumn};
 use crate::storage::expression::Expression;
+use crate::storage::mvcc::registry::StatementView;
 use crate::storage::traits::{QueryResult, Table};
 
 /// Transaction represents a database transaction
@@ -120,6 +123,12 @@ pub trait Transaction: Send {
     fn get_table_ungated(&self, name: &str, _access: StatementAccess) -> Result<Box<dyn Table>> {
         self.get_table(name)
     }
+
+    /// Gets a table whose reads see `view`: the commits complete when it was
+    /// taken, and this transaction's own writes. It is for reading only; a
+    /// write takes its handle from `get_table`, which reads the newest state.
+    /// A snapshot transaction is refused: it reads at its own point
+    fn get_table_with_view(&self, name: &str, view: Arc<StatementView>) -> Result<Box<dyn Table>>;
 
     /// Lists all table names
     fn list_tables(&self) -> Result<Vec<String>>;
