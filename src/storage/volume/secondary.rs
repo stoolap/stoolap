@@ -3253,10 +3253,11 @@ fn merge_runs(
 }
 
 /// A sorted run of ordered-bytes keys being filled: the records back to
-/// back as `[len u16][key][pos u32]` and where each starts
+/// back as `[len u16][key][pos u32]`, and where each starts beside the
+/// eight bytes its key holds past the run's common prefix
 struct ByteRun {
     records: Vec<u8>,
-    starts: Vec<u32>,
+    starts: Vec<(u64, u32)>,
 }
 
 impl ByteRun {
@@ -3268,17 +3269,52 @@ impl ByteRun {
         (key, u32::from_le_bytes([pos[0], pos[1], pos[2], pos[3]]))
     }
 
-    /// Orders the records by key, then position
+    /// Orders the records by key, then position. Two keys whose eight
+    /// bytes past the common prefix differ are ordered by those bytes,
+    /// read big-endian with a short key padded by zeros; the rest are
+    /// compared whole
     fn sort(&mut self) {
         let mut starts = std::mem::take(&mut self.starts);
-        starts.sort_unstable_by(|&a, &b| self.key_pos(a).cmp(&self.key_pos(b)));
+        let skip = self.common_prefix(&starts);
+        for (prefix, start) in starts.iter_mut() {
+            let tail = self.key_pos(*start).0.get(skip..).unwrap_or_default();
+            let mut bytes = [0u8; 8];
+            let n = tail.len().min(8);
+            bytes[..n].copy_from_slice(&tail[..n]);
+            *prefix = u64::from_be_bytes(bytes);
+        }
+        starts.sort_unstable_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| self.key_pos(a.1).cmp(&self.key_pos(b.1)))
+        });
         self.starts = starts;
+    }
+
+    /// The length of the prefix every key of the run starts with
+    fn common_prefix(&self, starts: &[(u64, u32)]) -> usize {
+        let Some(&(_, first)) = starts.first() else {
+            return 0;
+        };
+        let first = self.key_pos(first).0;
+        let mut len = first.len();
+        for &(_, start) in &starts[1..] {
+            let key = self.key_pos(start).0;
+            len = first[..len]
+                .iter()
+                .zip(key)
+                .take_while(|(a, b)| a == b)
+                .count();
+            if len == 0 {
+                break;
+            }
+        }
+        len
     }
 
     fn spill(&self, run: &Path, budget: &Budget) -> std::io::Result<()> {
         let _buffer = budget.take(OUT_BUFFER_BYTES, "a spill buffer")?;
         let mut out = BufWriter::with_capacity(OUT_BUFFER_BYTES, std::fs::File::create(run)?);
-        for &start in &self.starts {
+        for &(_, start) in &self.starts {
             let at = start as usize;
             let len = u16::from_le_bytes([self.records[at], self.records[at + 1]]) as usize;
             out.write_all(&self.records[at..at + BYTE_KEY_OVERHEAD + len])?;
@@ -3366,8 +3402,9 @@ fn build_byte_entry<'b, W: Write>(
     let per_input = MERGE_READ_BYTES + PAGE_BYTES + MERGE_INPUT_BYTES;
     let fan_in = ((for_runs / 2) / per_input).clamp(MIN_FAN_IN, MAX_FAN_IN);
     let free = for_runs.saturating_sub(fan_in * per_input + PAGE_BYTES);
-    let starts_cap = free / 4 / std::mem::size_of::<u32>();
-    let records_cap = free - free / 4;
+    let start_bytes = std::mem::size_of::<(u64, u32)>();
+    let starts_cap = free / 2 / start_bytes;
+    let records_cap = free - free / 2;
     if records_cap < PAGE_BYTES || starts_cap < MIN_RUN_PAIRS {
         return Err(workspace_exceeded(
             "an ordered-bytes sort run",
@@ -3376,7 +3413,10 @@ fn build_byte_entry<'b, W: Write>(
             budget.workspace,
         ));
     }
-    let run_charge = budget.take(records_cap + starts_cap * 4 + PAGE_BYTES, "a sort run")?;
+    let run_charge = budget.take(
+        records_cap + starts_cap * start_bytes + PAGE_BYTES,
+        "a sort run",
+    )?;
     let mut run = ByteRun {
         records: Vec::with_capacity(records_cap),
         starts: Vec::with_capacity(starts_cap),
@@ -3420,7 +3460,7 @@ fn build_byte_entry<'b, W: Write>(
                 spilled.insert(0, merged);
             }
         }
-        run.starts.push(run.records.len() as u32);
+        run.starts.push((0, run.records.len() as u32));
         run.records
             .extend_from_slice(&(key.len() as u16).to_le_bytes());
         run.records.extend_from_slice(&key);
@@ -3452,7 +3492,7 @@ fn build_byte_entry<'b, W: Write>(
     run.sort();
     let mut writer = PageWriter::for_bytes(out, offset, input.identity, input.components, budget)?;
     if spilled.is_empty() {
-        for &start in &run.starts {
+        for &(_, start) in &run.starts {
             let (key, pos) = run.key_pos(start);
             writer.push_bytes(key, pos)?;
         }
@@ -4743,6 +4783,78 @@ mod tests {
     use super::*;
 
     static SERIAL: Mutex<()> = Mutex::new(());
+
+    /// A run of `keys`, each at the position of its index, sorted
+    fn sorted_run(keys: &[Vec<u8>]) -> Vec<(Vec<u8>, u32)> {
+        let mut run = ByteRun {
+            records: Vec::new(),
+            starts: Vec::new(),
+        };
+        for (pos, key) in keys.iter().enumerate() {
+            run.starts.push((0, run.records.len() as u32));
+            run.records
+                .extend_from_slice(&(key.len() as u16).to_le_bytes());
+            run.records.extend_from_slice(key);
+            run.records.extend_from_slice(&(pos as u32).to_le_bytes());
+        }
+        run.sort();
+        run.starts
+            .iter()
+            .map(|&(_, start)| {
+                let (key, pos) = run.key_pos(start);
+                (key.to_vec(), pos)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_byte_run_sorts_as_its_keys_compare() {
+        let tails: [&[u8]; 14] = [
+            b"",
+            b"\0",
+            b"\0\0",
+            b"\x01",
+            b"0",
+            b"0000000",
+            b"00000000",
+            b"00000000a",
+            b"00000000b",
+            b"0000000\0z",
+            b"0000000\0",
+            b"9",
+            b"\xff\xff\xff\xff\xff\xff\xff\xff\x01",
+            b"\xff\xff\xff\xff\xff\xff\xff\xff",
+        ];
+        let mut seed = 7u64;
+        let mut generated = Vec::new();
+        for _ in 0..2000 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let len = (seed >> 59) as usize;
+            let tail: Vec<u8> = (0..len)
+                .map(|i| [0u8, 1, b'0', b'9', 0xff][(seed.rotate_right(i as u32 * 3) % 5) as usize])
+                .collect();
+            generated.push(tail);
+        }
+        for prefix in [&b"\x01customer-"[..], b""] {
+            let mut keys: Vec<Vec<u8>> = tails
+                .iter()
+                .map(|t| t.to_vec())
+                .chain(generated.iter().cloned())
+                .map(|tail| [prefix, &tail].concat())
+                .collect();
+            // The same key at several positions
+            keys.extend(keys[..20].to_vec());
+            let mut want: Vec<(Vec<u8>, u32)> = keys
+                .iter()
+                .enumerate()
+                .map(|(pos, key)| (key.clone(), pos as u32))
+                .collect();
+            want.sort();
+            assert_eq!(sorted_run(&keys), want, "prefix {prefix:?}");
+        }
+    }
 
     /// A counting allocator for the tests of this binary: live and peak
     /// bytes per thread, so a build's or a lookup's allocations are
