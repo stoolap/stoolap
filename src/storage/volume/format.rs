@@ -74,16 +74,13 @@ fn write_nulls(buf: &mut Vec<u8>, nulls: &[bool]) -> io::Result<()> {
 
 fn read_nulls(data: &[u8], pos: &mut usize, count: usize) -> io::Result<Vec<bool>> {
     let end = *pos + count;
-    if end > data.len() {
+    let Some(bytes) = data.get(*pos..end) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "truncated volume: null bitmap extends past end of data",
         ));
-    }
-    let mut nulls = Vec::with_capacity(count);
-    for i in 0..count {
-        nulls.push(data[*pos + i] != 0);
-    }
+    };
+    let nulls = bytes.iter().map(|&b| b != 0).collect();
     *pos = end;
     Ok(nulls)
 }
@@ -666,16 +663,13 @@ pub(crate) fn read_nulls_into(
     out: &mut Vec<bool>,
 ) -> io::Result<()> {
     let end = *pos + count;
-    if end > data.len() {
+    let Some(bytes) = data.get(*pos..end) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "truncated volume: null bitmap extends past end of data",
         ));
-    }
-    out.reserve(count);
-    for i in 0..count {
-        out.push(data[*pos + i] != 0);
-    }
+    };
+    out.extend(bytes.iter().map(|&b| b != 0));
     *pos = end;
     Ok(())
 }
