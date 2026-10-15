@@ -185,6 +185,13 @@ pub fn push_text(out: &mut Vec<u8>, text: &[u8]) {
     out.extend_from_slice(&[0, 0]);
 }
 
+/// Whether `push_text` writes `text` within the longest key a key page
+/// holds, found without encoding it
+pub fn text_key_fits(text: &[u8]) -> bool {
+    let limit = super::secondary::MAX_BYTE_KEY;
+    text.len() + 3 <= limit && text.len() + 3 + text.iter().filter(|&&b| b == 0).count() <= limit
+}
+
 /// A TEXT key and after it the bound just above it, so that `[key, bound)`
 /// holds that key alone; returns where the bound starts
 pub fn push_text_range(out: &mut Vec<u8>, text: &[u8]) -> usize {

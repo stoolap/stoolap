@@ -2171,9 +2171,15 @@ impl SegmentedTable {
                 continue;
             }
             for key in keys {
+                // A key no page holds is no heavy key
                 if let Value::Text(text) = key {
+                    if !super::side_index::text_key_fits(text.as_bytes()) {
+                        continue;
+                    }
                     buf.clear();
                     super::side_index::push_text(buf, text.as_bytes());
+                    #[cfg(any(test, feature = "test-failpoints"))]
+                    crate::test_failpoints::text_probe_key_held(buf.capacity());
                     if refused_by(buf) {
                         return Ok(false);
                     }
@@ -2212,7 +2218,12 @@ impl SegmentedTable {
                 let Some(def) = self.text_probe_def(column, &scratch.defs) else {
                     return Ok(None);
                 };
+                if !super::side_index::text_key_fits(text.as_bytes()) {
+                    return Ok(None);
+                }
                 let split = super::side_index::push_text_range(&mut scratch.key, text.as_bytes());
+                #[cfg(any(test, feature = "test-failpoints"))]
+                crate::test_failpoints::text_probe_key_held(scratch.key.capacity());
                 (def, 0, 0, Some(split))
             }
         };
