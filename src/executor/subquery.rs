@@ -4290,9 +4290,9 @@ impl Executor {
             return false;
         };
         table
-            .secondary_index_identities()
+            .side_index_defs()
             .iter()
-            .any(|&(indexed, _)| indexed == at)
+            .any(|def| def.leading().is_some_and(|c| c.column == at))
     }
 
     /// Check if index-nested-loop should be preferred over anti-join for NOT EXISTS.

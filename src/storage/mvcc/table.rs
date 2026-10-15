@@ -4055,12 +4055,15 @@ impl Table for MVCCTable {
         Ok(count.min(limit))
     }
 
-    fn secondary_index_identities(&self) -> Vec<(usize, u64)> {
-        self.version_store.secondary_index_identities()
+    fn side_index_defs(&self) -> Vec<crate::storage::volume::side_index::SideIndexDef> {
+        self.version_store.side_index_defs()
     }
 
-    fn secondary_index_identities_into(&self, out: &mut Vec<(usize, u64)>) {
-        self.version_store.secondary_index_identities_into(out)
+    fn side_index_defs_into(
+        &self,
+        out: &mut Vec<crate::storage::volume::side_index::SideIndexDef>,
+    ) {
+        self.version_store.side_index_defs_into(out)
     }
 
     fn mark_sealed_original(&mut self, row_id: i64, old_row: Row) -> Result<()> {

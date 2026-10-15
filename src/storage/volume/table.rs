@@ -45,6 +45,7 @@ use crate::storage::traits::{
 
 use super::manifest::SegmentManager;
 use super::scanner::{RowVecScanner, VolumeScanner};
+use super::side_index::{Capability, SideIndexDef};
 use super::writer::FrozenVolume;
 
 /// What a volume's side file decided for a read: the volume goes through
@@ -75,7 +76,7 @@ struct UniqueKey<'a> {
 enum SideAdmission {
     Empty,
     Scan,
-    Probe(Arc<super::secondary::IndexFile>, usize),
+    Probe(Arc<super::secondary::IndexFile>),
 }
 
 /// The index serves a volume when the candidates are at most this share
@@ -1630,23 +1631,23 @@ impl SegmentedTable {
         &self,
         cs: &super::manifest::ColdSegment,
         comparisons: &[(&str, crate::core::Operator, &Value)],
-        identities: &[(usize, u64)],
+        identities: &[SideIndexDef],
     ) -> Result<SideDecision> {
         use super::secondary::{is_refused, SidePlan, READS};
-        let Some((column, identity, low, high)) = self.side_bounds(comparisons, identities) else {
+        let Some((def, low, high)) = self.side_bounds(comparisons, identities) else {
             return Ok(SideDecision::Scan);
         };
         let reserve = super::secondary::reader_bytes(super::secondary::SIDE_WINDOW);
-        let (side, physical) = match self.side_admits(cs, column, identity, low, high, reserve)? {
+        let side = match self.side_admits(cs, def, low, high, reserve)? {
             SideAdmission::Empty => return Ok(SideDecision::Empty),
             SideAdmission::Scan => return Ok(SideDecision::Scan),
-            SideAdmission::Probe(side, physical) => (side, physical),
+            SideAdmission::Probe(side) => side,
         };
         let rows = cs.volume.meta.row_count as u64;
         // The probe reads the boundary pages through a reader of its own,
         // let go before the decision is handed on: the walk takes its
         // reservation when it starts
-        let reader = match side.reader(physical, 1) {
+        let reader = match side.reader(def.identity, 1) {
             Ok(reader) => reader,
             Err(error) if is_refused(&error) => {
                 READS.count(&READS.refused, 1);
@@ -1675,7 +1676,7 @@ impl SegmentedTable {
         drop(reader);
         Ok(SideDecision::Walk(Box::new(SidePlan::new(
             Arc::clone(&side),
-            physical,
+            def.identity,
             range,
         ))))
     }
@@ -1757,17 +1758,17 @@ impl SegmentedTable {
         UniqueDecision::Pass
     }
 
-    /// The indexed column the comparisons bound, with its index identity
-    /// and the key range: one equality, or a lower and an upper bound. None
-    /// when they bound no indexed column, or a bound has no exact key (a
-    /// timestamp outside the range nanoseconds hold), and the scan decides.
-    fn side_bounds(
+    /// The index whose column the comparisons bound, with the key range:
+    /// one equality, or a lower and an upper bound. None when they bound no
+    /// indexed column, or a bound has no exact key (a timestamp outside the
+    /// range nanoseconds hold), and the scan decides.
+    fn side_bounds<'d>(
         &self,
         comparisons: &[(&str, crate::core::Operator, &Value)],
-        identities: &[(usize, u64)],
-    ) -> Option<(usize, u64, i64, i64)> {
+        defs: &'d [SideIndexDef],
+    ) -> Option<(&'d SideIndexDef, i64, i64)> {
         use crate::core::Operator;
-        if identities.is_empty() || comparisons.is_empty() {
+        if defs.is_empty() || comparisons.is_empty() {
             return None;
         }
         let key = |value: &Value| match value {
@@ -1776,7 +1777,10 @@ impl SegmentedTable {
             _ => None,
         };
         let schema = self.hot.schema();
-        for &(column, identity) in identities {
+        for def in defs {
+            let Some(column) = def.leading().map(|c| c.column) else {
+                continue;
+            };
             let Some(name) = schema.columns.get(column).map(|c| c.name_lower.as_str()) else {
                 continue;
             };
@@ -1819,36 +1823,41 @@ impl SegmentedTable {
                 (None, None, Some(h)) => (i64::MIN, h),
                 (None, None, None) => continue,
             };
-            return Some((column, identity, low, high));
+            return Some((def, low, high));
         }
         None
     }
 
-    /// Whether a volume's side file is asked for `[low, high]` on `column`,
-    /// decided before any page is read: the file must cover the column under
-    /// the index's identity, the directory must not rule the range out or
-    /// estimate more candidates than the scan share, and a volume one
-    /// position page holds must have its pages admissible beside `reserve`,
-    /// the working space the reader will still take, since it is scanned
-    /// about as fast as its pages are read from the file. Counted by why
-    /// when not.
+    /// Whether a volume's side file is asked for `[low, high]` under `def`,
+    /// decided before any page is read: the file must hold the index's
+    /// entry over the volume's column, the directory must not rule the
+    /// range out or estimate more candidates than the scan share, and a
+    /// volume one position page holds must have its pages admissible beside
+    /// `reserve`, the working space the reader will still take, since it is
+    /// scanned about as fast as its pages are read from the file. Counted
+    /// by why when not.
     fn side_admits(
         &self,
         cs: &super::manifest::ColdSegment,
-        column: usize,
-        identity: u64,
+        def: &SideIndexDef,
         low: i64,
         high: i64,
         reserve: usize,
     ) -> Result<SideAdmission> {
         use super::secondary::READS;
-        let Some((side, physical)) = cs.side_for(column, identity) else {
+        let capability = if low == high {
+            Capability::Equality
+        } else {
+            Capability::Range
+        };
+        let Some(side) = cs.side_for(def, capability) else {
             READS.count(&READS.ineligible, 1);
             return Ok(SideAdmission::Scan);
         };
+        let identity = def.identity;
         let rows = cs.volume.meta.row_count as u64;
         let Some(estimate) = side
-            .candidate_estimate(physical, low, high)
+            .candidate_estimate(identity, low, high)
             .map_err(side_error)?
         else {
             READS.count(&READS.misses, 1);
@@ -1860,19 +1869,19 @@ impl SegmentedTable {
         }
         if rows <= super::secondary::POSITIONS_PER_PAGE as u64
             && !side
-                .pages_admissible(physical, low, high, reserve)
+                .pages_admissible(identity, low, high, reserve)
                 .map_err(side_error)?
         {
             READS.count(&READS.page_scans, 1);
             return Ok(SideAdmission::Scan);
         }
-        Ok(SideAdmission::Probe(Arc::clone(side), physical))
+        Ok(SideAdmission::Probe(Arc::clone(side)))
     }
 
-    /// The identities of the indexes the side files may serve, taken once
-    /// per read with the cold view
-    fn side_identities(&self) -> Vec<(usize, u64)> {
-        self.hot.secondary_index_identities()
+    /// The indexes the side files may serve, taken once per read with the
+    /// cold view
+    fn side_identities(&self) -> Vec<SideIndexDef> {
+        self.hot.side_index_defs()
     }
 
     /// Whether no key of `keys` holds more than the scan share of a volume's
@@ -1885,24 +1894,23 @@ impl SegmentedTable {
         view: &super::manifest::ColdSnapshot,
         column: &str,
         keys: &[Value],
-        identities: &[(usize, u64)],
+        defs: &[SideIndexDef],
     ) -> Result<bool> {
         let Some(first) = keys.iter().find(|key| !key.is_null()) else {
             return Ok(true);
         };
         let comparisons = [(column, crate::core::Operator::Eq, first)];
-        let Some((physical_column, identity, _, _)) = self.side_bounds(&comparisons, identities)
-        else {
+        let Some((def, _, _)) = self.side_bounds(&comparisons, defs) else {
             return Ok(true);
         };
         for (_, cs) in view.volumes() {
-            let Some((side, physical)) = cs.side_for(physical_column, identity) else {
+            let Some(side) = cs.side_for(def, Capability::Equality) else {
                 continue;
             };
             let heavy = side
                 .directory()
-                .column(physical)
-                .and_then(|column| column.heavy_keys.as_deref())
+                .entry(def.identity)
+                .and_then(|entry| entry.heavy_keys.as_deref())
                 .unwrap_or_default();
             if heavy.is_empty() {
                 continue;
@@ -1944,9 +1952,7 @@ impl SegmentedTable {
         use super::secondary::{is_refused, READS};
         use crate::storage::traits::CappedEqual;
         let comparisons = [(column, crate::core::Operator::Eq, key)];
-        let Some((column, identity, low, high)) =
-            self.side_bounds(&comparisons, &scratch.identities)
-        else {
+        let Some((def, low, high)) = self.side_bounds(&comparisons, &scratch.defs) else {
             return Ok(None);
         };
         let bloom = [Some(super::column::ColumnBloomFilter::hash_value_static(
@@ -1965,13 +1971,12 @@ impl SegmentedTable {
             let window = left.min(super::secondary::SIDE_WINDOW);
             let reserve = super::secondary::reader_bytes(window)
                 .saturating_sub(scratch.reader.reserved_bytes());
-            let (side, physical) =
-                match self.side_admits(cs, column, identity, low, high, reserve)? {
-                    SideAdmission::Empty => continue,
-                    SideAdmission::Scan => return Ok(None),
-                    SideAdmission::Probe(side, physical) => (side, physical),
-                };
-            let mut reader = match side.reader_in(physical, window, &mut scratch.reader) {
+            let side = match self.side_admits(cs, def, low, high, reserve)? {
+                SideAdmission::Empty => continue,
+                SideAdmission::Scan => return Ok(None),
+                SideAdmission::Probe(side) => side,
+            };
+            let mut reader = match side.reader_in(def.identity, window, &mut scratch.reader) {
                 Ok(reader) => reader,
                 Err(error) if is_refused(&error) => {
                     READS.count(&READS.refused, 1);
@@ -6283,12 +6288,12 @@ impl Table for SegmentedTable {
         self.segment_mgr.has_segments()
     }
 
-    fn secondary_index_identities(&self) -> Vec<(usize, u64)> {
-        self.hot.secondary_index_identities()
+    fn side_index_defs(&self) -> Vec<SideIndexDef> {
+        self.hot.side_index_defs()
     }
 
-    fn secondary_index_identities_into(&self, out: &mut Vec<(usize, u64)>) {
-        self.hot.secondary_index_identities_into(out)
+    fn side_index_defs_into(&self, out: &mut Vec<SideIndexDef>) {
+        self.hot.side_index_defs_into(out)
     }
 
     fn equality_candidates(
@@ -6328,8 +6333,7 @@ impl Table for SegmentedTable {
         };
         let start = out.len();
         let view = if self.segment_mgr.has_segments() {
-            self.hot
-                .secondary_index_identities_into(&mut scratch.identities);
+            self.hot.side_index_defs_into(&mut scratch.defs);
             self.segment_mgr
                 .check_schema_generation(self.schema_generation)?;
             let view = self.segment_mgr.cold_snapshot();
@@ -6344,7 +6348,7 @@ impl Table for SegmentedTable {
         // A key the directories already refuse is found before any key's
         // pages are read
         if let Some(view) = view.as_ref().filter(|_| keys.len() > 1) {
-            if !self.cold_keys_admitted(view, column, keys, &scratch.identities)? {
+            if !self.cold_keys_admitted(view, column, keys, &scratch.defs)? {
                 return Ok(None);
             }
         }

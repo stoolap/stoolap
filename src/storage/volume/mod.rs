@@ -67,6 +67,7 @@ pub mod output;
 pub mod scanner;
 pub mod seal;
 pub mod secondary;
+pub mod side_index;
 pub mod stats;
 pub mod table;
 pub mod transfer;
