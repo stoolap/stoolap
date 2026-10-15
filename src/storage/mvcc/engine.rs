@@ -6067,7 +6067,7 @@ impl MVCCEngine {
     /// running, or an engine closing, makes this one a no-op.
     pub fn backfill_side_files(&self, limit: usize) -> Result<BackfillReport> {
         use crate::storage::volume::secondary::{
-            covers_all, side_path_for, stage_side_for, SideBuild, INDEX_BUILDS,
+            advances, covers_all, side_path_for, stage_side_for, SideBuild, INDEX_BUILDS,
         };
         let mut report = BackfillReport::default();
         if self.closing.load(Ordering::Acquire)
@@ -6207,25 +6207,29 @@ impl MVCCEngine {
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::backfill_volume_loaded();
             let cap = (ledger.budget_bytes / 2) as usize;
-            let mut staged = match stage_side_for(&volume, &path, seg_id, &wanted, Some(cap)) {
-                Ok(SideBuild::Built(staged)) => staged,
-                Ok(SideBuild::Refused) => {
-                    report.refused += 1;
-                    continue;
-                }
-                Ok(SideBuild::Failed) => {
-                    report.failed += 1;
-                    continue;
-                }
-                Err(error) => {
-                    eprintln!(
-                        "Warning: backfill of volume {seg_id} of {} could not read it: {error}",
-                        store.table_name()
-                    );
-                    report.failed += 1;
-                    continue;
-                }
-            };
+            // The captured side file is held through the build: the entries
+            // it already holds are copied from it
+            let earlier = cs.side.as_deref();
+            let mut staged =
+                match stage_side_for(&volume, &path, seg_id, &wanted, Some(cap), earlier) {
+                    Ok(SideBuild::Built(staged)) => staged,
+                    Ok(SideBuild::Refused) => {
+                        report.refused += 1;
+                        continue;
+                    }
+                    Ok(SideBuild::Failed) => {
+                        report.failed += 1;
+                        continue;
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "Warning: backfill of volume {seg_id} of {} could not read it: {error}",
+                            store.table_name()
+                        );
+                        report.failed += 1;
+                        continue;
+                    }
+                };
             drop(volume);
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::side_backfilled();
@@ -6269,7 +6273,7 @@ impl MVCCEngine {
             let current = store.side_index_defs();
             let still_wanted = wanted_of(cs, &current);
             let covers = match staged.open() {
-                Ok(built) => !still_wanted.is_empty() && covers_all(&built, &still_wanted),
+                Ok(built) => advances(&built, cs.side.as_deref(), &still_wanted),
                 Err(_) => false,
             };
             if !covers {

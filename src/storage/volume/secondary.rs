@@ -1035,6 +1035,33 @@ pub struct ColumnDirectory {
     pub bytes: BytePages,
 }
 
+impl ColumnDirectory {
+    /// Bytes the entry's vectors take resident
+    fn heap_bytes(&self) -> usize {
+        self.key_pages.capacity() * std::mem::size_of::<KeyPageMeta>()
+            + self.bytes.bytes()
+            + self.components.capacity() * std::mem::size_of::<(u32, Domain)>()
+            + self.pos_pages.capacity() * std::mem::size_of::<PosPageMeta>()
+            + self
+                .heavy_keys
+                .as_ref()
+                .map_or(0, |keys| keys.capacity() * HEAVY_ENTRY)
+    }
+}
+
+/// Bytes a copy of `source` for `target` takes resident: its vectors, and
+/// the heavy keys and components a version 4 or 5 entry gains
+fn copied_bytes(source: &ColumnDirectory, target: &SideTarget) -> usize {
+    let mut bytes = source.heap_bytes();
+    if source.heavy_keys.is_none() {
+        bytes += HEAVY_SLOTS * HEAVY_ENTRY;
+    }
+    if source.components.is_empty() {
+        bytes += target.components.len() * std::mem::size_of::<(u32, Domain)>();
+    }
+    bytes
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Directory {
     pub generation: u64,
@@ -1078,15 +1105,7 @@ impl Directory {
     pub fn bytes(&self) -> usize {
         self.columns
             .iter()
-            .map(|c| {
-                c.key_pages.capacity() * std::mem::size_of::<KeyPageMeta>()
-                    + c.bytes.bytes()
-                    + c.components.capacity() * std::mem::size_of::<(u32, Domain)>()
-                    + c.pos_pages.capacity() * std::mem::size_of::<PosPageMeta>()
-                    + c.heavy_keys
-                        .as_ref()
-                        .map_or(0, |keys| keys.capacity() * HEAVY_ENTRY)
-            })
+            .map(ColumnDirectory::heap_bytes)
             .sum::<usize>()
             + self.columns.capacity() * std::mem::size_of::<ColumnDirectory>()
     }
@@ -1656,9 +1675,8 @@ impl IndexFile {
         })
     }
 
-    /// Reads one page's raw bytes into `buf`, whose capacity the caller
-    /// reserved
-    fn read_page_into(&self, offset: u64, len: u32, buf: &mut Vec<u8>) -> std::io::Result<()> {
+    /// The file, checked to still be the generation the directory was read from
+    fn open_checked(&self) -> std::io::Result<std::fs::File> {
         let file = self.file.open()?;
         let mut header = [0u8; HEADER_LEN as usize];
         read_exact_at(&file, &mut header, 0)?;
@@ -1669,9 +1687,116 @@ impl IndexFile {
         if generation != self.directory.generation {
             return Err(invalid("generation changed"));
         }
+        Ok(file)
+    }
+
+    /// Reads one page's raw bytes into `buf`, whose capacity the caller
+    /// reserved
+    fn read_page_into(&self, offset: u64, len: u32, buf: &mut Vec<u8>) -> std::io::Result<()> {
+        let file = self.open_checked()?;
         buf.clear();
         buf.resize(len as usize, 0);
         read_exact_at(&file, buf, offset)
+    }
+
+    /// Copies the pages of the entry for `target` to `out` at `offset`, one
+    /// at a time through `buf` with its checksum checked, and returns the
+    /// entry with its pages where they now lie, and the offset after. A
+    /// version 4 or 5 entry takes the target's components, and a version 4
+    /// entry its heavy keys from the key pages it copies
+    fn copy_entry<W: Write>(
+        &self,
+        target: &SideTarget,
+        out: &mut W,
+        offset: u64,
+        buf: &mut Vec<u8>,
+    ) -> std::io::Result<(ColumnDirectory, u64)> {
+        let source = self
+            .directory
+            .entry(target.identity)
+            .ok_or_else(|| invalid("index has no entry"))?;
+        let mut heavy = (source.heavy_keys.is_none() && source.kind == KeyKind::OrderedI64)
+            .then(|| Vec::with_capacity(HEAVY_SLOTS));
+        // Each kind's pages lie in ascending order: walked as one sequence
+        let span = |n: [usize; 3]| {
+            [
+                source.key_pages.get(n[0]).map(|p| (p.offset, p.len)),
+                source.bytes.pages.get(n[1]).map(|p| (p.offset, p.len)),
+                source.pos_pages.get(n[2]).map(|p| (p.offset, p.len)),
+            ]
+        };
+        let mut at = [0usize; 3];
+        let mut file = None;
+        let (mut first, mut next) = (None, 0);
+        while let Some((kind, (start, len))) = span(at)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(kind, s)| Some((kind, s?)))
+            .min_by_key(|&(_, (start, _))| start)
+        {
+            if first.is_some_and(|_| start != next) || len as usize > PAGE_BYTES {
+                return Err(invalid("an entry's pages do not follow one another"));
+            }
+            let file = match &file {
+                Some(file) => file,
+                None => file.insert(self.open_checked()?),
+            };
+            buf.clear();
+            buf.resize(len as usize, 0);
+            read_exact_at(file, buf, start)?;
+            let (n, entries) = verified_entries(buf)?;
+            if let (0, Some(heavy)) = (kind, heavy.as_mut()) {
+                if entries.len() != n * KEY_ENTRY {
+                    return Err(invalid("key page length does not match its count"));
+                }
+                let mut before = source.key_pages[at[0]].pos_start;
+                for entry in entries.as_chunks::<KEY_ENTRY>().0 {
+                    let (mut key, mut end) = ([0u8; 8], [0u8; 4]);
+                    key.copy_from_slice(&entry[..8]);
+                    end.copy_from_slice(&entry[8..]);
+                    let end = u32::from_le_bytes(end) as u64;
+                    let count = end.saturating_sub(before);
+                    before = end;
+                    if count * SCAN_SHARE > source.n_positions {
+                        if heavy.len() == HEAVY_SLOTS {
+                            return Err(invalid("more heavy keys than a share allows"));
+                        }
+                        heavy.push((i64::from_le_bytes(key), count));
+                    }
+                }
+            }
+            out.write_all(buf)?;
+            first.get_or_insert(start);
+            next = start + len as u64;
+            at[kind] += 1;
+        }
+        let mut entry = source.clone();
+        if heavy.is_some() {
+            entry.heavy_keys = heavy;
+        }
+        if entry.components.is_empty() {
+            let components = target.components.iter();
+            entry.components = components.map(|&(c, d)| (c as u32, d)).collect();
+            entry.domain = target.components.first().map(|&(_, domain)| domain);
+        }
+        let Some(first) = first else {
+            return Ok((entry, offset));
+        };
+        let moved = |at: &mut u64| *at = *at - first + offset;
+        entry
+            .key_pages
+            .iter_mut()
+            .for_each(|p| moved(&mut p.offset));
+        entry
+            .bytes
+            .pages
+            .iter_mut()
+            .for_each(|p| moved(&mut p.offset));
+        entry
+            .pos_pages
+            .iter_mut()
+            .for_each(|p| moved(&mut p.offset));
+        Ok((entry, offset + (next - first)))
     }
 
     fn read_page(&self, offset: u64, len: u32) -> std::io::Result<Vec<u8>> {
@@ -2807,6 +2932,22 @@ impl TempFiles {
             .join(format!("run{column}-L{level}-{number}"))
     }
 
+    /// Removes the runs left of column `column`'s build
+    fn remove_runs(&self, column: usize) -> std::io::Result<()> {
+        let prefix = format!("run{column}-");
+        for entry in std::fs::read_dir(&self.build_dir)? {
+            let entry = entry?;
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(&prefix))
+            {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
+        Ok(())
+    }
+
     /// The output was renamed out; the directory is empty and goes
     fn finished(mut self) {
         self.keep = true;
@@ -3012,17 +3153,19 @@ pub fn build_side_file_with(
     workspace_bytes: usize,
 ) -> std::io::Result<BuildReport> {
     let (report, temps) =
-        build_side_file_staged(path, generation, columns, bytes, workspace_bytes)?;
+        build_side_file_staged(path, generation, &[], columns, bytes, workspace_bytes)?;
     std::fs::rename(temps.tmp_path(), path)?;
     temps.finished();
     Ok(report)
 }
 
 /// `build_side_file` up to the rename: the output stays in its build
-/// directory beside `path`, to be published by the caller or dropped
+/// directory beside `path`, to be published by the caller or dropped. The
+/// entries in `copies` are copied from an earlier file before any is built
 fn build_side_file_staged(
     path: &Path,
     generation: u64,
+    copies: &[(&IndexFile, &SideTarget)],
     columns: Vec<ColumnInput<'_>>,
     bytes: Vec<BytesInput<'_>>,
     workspace_bytes: usize,
@@ -3045,7 +3188,7 @@ fn build_side_file_staged(
     // and so do the directory's columns and their metadata charges, one
     // slot per input column, taken before either vector is allocated
     let fixed = budget.take(OUT_BUFFER_BYTES + WRITER_BYTES, "output and page buffers")?;
-    let entries = columns.len() + bytes.len();
+    let entries = copies.len() + columns.len() + bytes.len();
     let per_column = budget.take(entries * COLUMN_SLOT_BYTES, "the directory's columns")?;
     let temps = TempFiles::new(path, generation)?;
     let tmp = temps.tmp_path();
@@ -3063,20 +3206,76 @@ fn build_side_file_staged(
     // directory is
     let mut meta_charges: Vec<Charge<'_>> = Vec::with_capacity(entries);
     let first_byte_slot = columns.len();
+    // An entry the workspace cannot hold is left out, its bytes written
+    // over, and the next pass builds it; the first such refusal is the
+    // build's when no entry is built
+    let mut refusal = None;
+    let mut rewound = false;
+    if !copies.is_empty() {
+        let buffer = budget.take(PAGE_BYTES, "a page copy buffer")?;
+        let mut buf = Vec::with_capacity(PAGE_BYTES);
+        for (k, &(earlier, target)) in copies.iter().enumerate() {
+            let copied = earlier
+                .directory()
+                .entry(target.identity)
+                .ok_or_else(|| invalid("index has no entry"))
+                .and_then(|source| {
+                    budget.take(copied_bytes(source, target), "copied page metadata")
+                })
+                .and_then(|metas| {
+                    let (entry, next) = earlier.copy_entry(target, &mut out, offset, &mut buf)?;
+                    Ok((entry, next, metas))
+                });
+            match copied {
+                Ok((entry, next_offset, metas)) => {
+                    meta_charges.push(metas);
+                    directory.columns.push(entry);
+                    offset = next_offset;
+                }
+                Err(error) if entry_refused(&error) => {
+                    leave_out(&mut out, offset, &temps, entries + k)?;
+                    rewound = true;
+                    refusal.get_or_insert(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        drop(buf);
+        drop(buffer);
+    }
     for (ci, input) in columns.into_iter().enumerate() {
-        let (column_dir, next_offset, metas) =
-            build_i64_entry(&mut out, offset, input, &temps, ci, &budget, &mut report)?;
-        meta_charges.push(metas);
-        directory.columns.push(column_dir);
-        offset = next_offset;
+        match build_i64_entry(&mut out, offset, input, &temps, ci, &budget, &mut report) {
+            Ok((column_dir, next_offset, metas)) => {
+                meta_charges.push(metas);
+                directory.columns.push(column_dir);
+                offset = next_offset;
+            }
+            Err(error) if entry_refused(&error) => {
+                leave_out(&mut out, offset, &temps, ci)?;
+                rewound = true;
+                refusal.get_or_insert(error);
+            }
+            Err(error) => return Err(error),
+        }
     }
     for (bi, input) in bytes.into_iter().enumerate() {
         let slot = first_byte_slot + bi;
-        let (entry, next_offset, metas) =
-            build_byte_entry(&mut out, offset, input, &temps, slot, &budget, &mut report)?;
-        meta_charges.push(metas);
-        directory.columns.push(entry);
-        offset = next_offset;
+        match build_byte_entry(&mut out, offset, input, &temps, slot, &budget, &mut report) {
+            Ok((entry, next_offset, metas)) => {
+                meta_charges.push(metas);
+                directory.columns.push(entry);
+                offset = next_offset;
+            }
+            Err(error) if entry_refused(&error) => {
+                leave_out(&mut out, offset, &temps, slot)?;
+                rewound = true;
+                refusal.get_or_insert(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if let (true, Some(error)) = (directory.columns.is_empty(), refusal) {
+        return Err(error);
     }
     for entry in &directory.columns {
         report.keys += entry.n_keys;
@@ -3095,6 +3294,9 @@ fn build_side_file_staged(
     out.write_all(&MAGIC)?;
     out.flush()?;
     let file = out.into_inner().map_err(|e| e.into_error())?;
+    if rewound {
+        file.set_len(offset + dir_len as u64 + FOOTER_LEN)?;
+    }
     file.sync_all()?;
     drop(file);
     // Each owner before the charge that backs it
@@ -3108,6 +3310,28 @@ fn build_side_file_staged(
     report.workspace_peak = budget.peak.get();
     report.build_ns = started.elapsed().as_nanos() as u64;
     Ok((report, temps))
+}
+
+/// Whether an entry's build was stopped by what the workspace or a budget
+/// could give it, not by the volume or the disk
+fn entry_refused(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::WouldBlock
+    )
+}
+
+/// Leaves a refused entry out: the output goes back to where it began, so
+/// the next entry writes over its bytes, and its runs go
+fn leave_out(
+    out: &mut BufWriter<std::fs::File>,
+    offset: u64,
+    temps: &TempFiles,
+    slot: usize,
+) -> std::io::Result<()> {
+    use std::io::Seek;
+    out.seek(std::io::SeekFrom::Start(offset))?;
+    temps.remove_runs(slot)
 }
 
 /// Builds one ordered i64 entry into `out` at `offset` within what the
@@ -3221,6 +3445,9 @@ thread_local! {
     static SPILLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Ordered-bytes records a merge has emitted on this thread
     static BYTES_MERGED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// A test has the budget refuse the build after this page is written
+    static REFUSE_PAGE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static PAGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn spill(run: &Path, pairs: &[(i64, u32)], budget: &Budget) -> std::io::Result<()> {
@@ -3887,6 +4114,16 @@ impl<'a, 'b, W: Write> PageWriter<'a, 'b, W> {
         let at = self.offset;
         let len = (self.body.len() + 4) as u32;
         self.offset += len as u64;
+        #[cfg(test)]
+        {
+            let number = PAGES.with(|p| {
+                p.set(p.get() + 1);
+                p.get()
+            });
+            if REFUSE_PAGE.with(|r| r.get()) == Some(number) {
+                return Err(refused("a page, by the test"));
+            }
+        }
         Ok((at, len))
     }
 
@@ -4427,7 +4664,7 @@ pub fn build_side_for(
     file_id: u64,
     identities: &[SideTarget],
 ) -> std::io::Result<Option<Arc<IndexFile>>> {
-    match stage_side_for(volume, volume_path, file_id, identities, None)? {
+    match stage_side_for(volume, volume_path, file_id, identities, None, None)? {
         SideBuild::Built(staged) => match staged.publish(&side_path(volume_path), file_id) {
             Ok(side) => Ok(Some(side)),
             Err(error) => {
@@ -4503,18 +4740,41 @@ impl StagedSide {
 /// Builds the side file of `volume` beside it, staged: admitted through the
 /// builds budget as the seal's build is, and when `cap` is given, sized to
 /// fit under it (a backfill takes at most its share of the budget, and a
-/// build that does not fit even at its least is refused)
+/// build that does not fit even at its least is refused). An entry the
+/// `earlier` file holds, in any version, is copied from it, not built
 pub fn stage_side_for(
     volume: &super::writer::FrozenVolume,
     volume_path: &Path,
     file_id: u64,
     identities: &[SideTarget],
     cap: Option<usize>,
+    earlier: Option<&IndexFile>,
 ) -> std::io::Result<SideBuild> {
     if identities.is_empty() {
         return Ok(SideBuild::Refused);
     }
     let side = side_path(volume_path);
+    let held = |target: &SideTarget| earlier.filter(|earlier| earlier.records(target));
+    let copies: Vec<(&IndexFile, &SideTarget)> = identities
+        .iter()
+        .filter_map(|target| Some((held(target)?, target)))
+        .collect();
+    let copy_bytes = match copies.is_empty() {
+        true => 0,
+        false => {
+            PAGE_BYTES
+                + copies
+                    .iter()
+                    .filter_map(|&(earlier, target)| {
+                        Some(copied_bytes(
+                            earlier.directory().entry(target.identity)?,
+                            target,
+                        ))
+                    })
+                    .sum::<usize>()
+        }
+    };
+    let identities: Vec<&SideTarget> = identities.iter().filter(|t| held(t).is_none()).collect();
     // Entries are built one after another; an ordered-bytes entry decodes
     // a group of each of its columns at once
     let input = identities
@@ -4533,9 +4793,9 @@ pub fn stage_side_for(
         .filter(|t| t.kind == KeyKind::OrderedBytes)
         .count();
     let entries = (identities.len() - byte_entries, byte_entries);
-    let mut workspace = workspace_for(volume.meta.row_count, entries, input);
+    let mut workspace = workspace_for(volume.meta.row_count, entries, input) + copy_bytes;
     if let Some(cap) = cap {
-        let least = least_workspace(volume.meta.row_count, entries);
+        let least = least_workspace(volume.meta.row_count, entries) + copy_bytes;
         if input + least > cap {
             INDEX_BUILDS.count_refused();
             return Ok(SideBuild::Refused);
@@ -4586,7 +4846,7 @@ pub fn stage_side_for(
         })
         .collect();
     let generation = next_generation();
-    let built = build_side_file_staged(&side, generation, columns, bytes, workspace);
+    let built = build_side_file_staged(&side, generation, &copies, columns, bytes, workspace);
     if let Some(error) = failure.take() {
         // The volume could not be read: whatever was written goes
         return Err(error);
@@ -4631,6 +4891,21 @@ pub fn retire_side_of(volume_path: &Path) {
     if let Some(dir) = volume_path.parent() {
         SideFiles::in_dir(dir).retire_for(volume_path);
     }
+}
+
+/// Whether `built` may take the place of `before`: it records every entry
+/// of `wanted` that `before` records, and one at least that it does not
+pub fn advances(built: &IndexFile, before: Option<&IndexFile>, wanted: &[SideTarget]) -> bool {
+    let mut gained = false;
+    for target in wanted {
+        let had = before.is_some_and(|before| before.records(target));
+        let has = built.records(target);
+        if had && !has {
+            return false;
+        }
+        gained |= has && !had;
+    }
+    gained
 }
 
 /// Whether any entry of `side` still stands for an index the catalog has
@@ -5111,6 +5386,176 @@ mod tests {
     }
 
     const WORKSPACE: usize = 64 * 1024 * 1024;
+
+    fn two_columns() -> Vec<ColumnInput<'static>> {
+        [(1u32, 11u64), (2, 22)]
+            .into_iter()
+            .map(|(column, identity)| ColumnInput {
+                column,
+                identity,
+                domain: Domain::Integer,
+                pairs: Box::new(scattered(100_000, 100_003 + column as u64)),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_entry_the_budget_refuses_midway_is_left_out_and_the_others_are_kept() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sidx");
+        // The first entry has written pages when the refusal comes
+        PAGES.with(|p| p.set(0));
+        REFUSE_PAGE.with(|r| r.set(Some(3)));
+        let report = build_side_file(&path, next_generation(), two_columns(), WORKSPACE);
+        REFUSE_PAGE.with(|r| r.set(None));
+        let report = report.unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            report.file_bytes,
+            "the refused entry's bytes are written over or cut off"
+        );
+        let file = IndexFile::open(&path, 1).unwrap();
+        assert!(file.directory().entry(11).is_none(), "the refused entry");
+        let kept = file.directory().entry(22).expect("the other entry");
+        assert_eq!(kept.n_positions, 100_000);
+        let key = (7 * 104_729 % 100_005) as i64;
+        let (start, end) = file.equal(22, key).unwrap().unwrap();
+        assert!(end > start);
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".build-")),
+            "no run of the refused entry is left"
+        );
+        // The last entry refused midway: its bytes are cut off
+        let mut first = two_columns();
+        first.truncate(1);
+        let alone = build_side_file(&path, next_generation(), first, WORKSPACE).unwrap();
+        PAGES.with(|p| p.set(0));
+        REFUSE_PAGE.with(|r| r.set(Some(alone.key_pages + alone.pos_pages + 3)));
+        let report = build_side_file(&path, next_generation(), two_columns(), WORKSPACE);
+        REFUSE_PAGE.with(|r| r.set(None));
+        let report = report.unwrap();
+        assert_eq!(report.file_bytes, alone.file_bytes);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), report.file_bytes);
+        let file = IndexFile::open(&path, 1).unwrap();
+        assert!(file.directory().entry(22).is_none());
+        assert_eq!(file.directory().entry(11).unwrap().n_positions, 100_000);
+    }
+
+    /// Builds `columns` at `path` with the entries `copies` copied first
+    fn build_with_copies(
+        path: &Path,
+        copies: &[(&IndexFile, &SideTarget)],
+        columns: Vec<ColumnInput<'_>>,
+    ) -> std::io::Result<()> {
+        let (_, temps) = build_side_file_staged(
+            path,
+            next_generation(),
+            copies,
+            columns,
+            Vec::new(),
+            WORKSPACE,
+        )?;
+        std::fs::rename(temps.tmp_path(), path)?;
+        temps.finished();
+        Ok(())
+    }
+
+    #[test]
+    fn an_entry_copied_from_an_earlier_file_reads_as_it_did() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let (first, second) = (dir.path().join("a.sidx"), dir.path().join("b.sidx"));
+        build_side_file(&first, next_generation(), two_columns(), WORKSPACE).unwrap();
+        let earlier = IndexFile::open(&first, 1).unwrap();
+        let mut fresh = two_columns();
+        fresh.truncate(1);
+        let [b] = integer_target(2, 22);
+        build_with_copies(&second, &[(&earlier, &b)], fresh).unwrap();
+        let copied = IndexFile::open(&second, 2).unwrap();
+        let (was, now) = (
+            earlier.directory().entry(22).unwrap(),
+            copied.directory().entry(22).unwrap(),
+        );
+        assert_eq!((now.n_keys, now.n_positions), (was.n_keys, was.n_positions));
+        assert_eq!(now.key_pages.len(), was.key_pages.len());
+        assert_ne!(now.key_pages[0].offset, was.key_pages[0].offset, "moved");
+        assert!(copied.directory().entry(11).is_some(), "the built entry");
+        for p in (0..100_000u32).step_by(997) {
+            let key = ((p as u64 * 104_729) % 100_005) as i64;
+            assert_eq!(
+                copied.equal(22, key).unwrap(),
+                earlier.equal(22, key).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn a_copy_that_reads_a_damaged_page_fails_the_build() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let (first, second) = (dir.path().join("a.sidx"), dir.path().join("b.sidx"));
+        build_side_file(&first, next_generation(), two_columns(), WORKSPACE).unwrap();
+        let at = IndexFile::open(&first, 1)
+            .unwrap()
+            .directory()
+            .entry(22)
+            .unwrap()
+            .pos_pages[1]
+            .offset;
+        let mut bytes = std::fs::read(&first).unwrap();
+        bytes[at as usize + 9] ^= 0x40;
+        std::fs::write(&first, &bytes).unwrap();
+        let earlier = IndexFile::open(&first, 1).unwrap();
+        let [b] = integer_target(2, 22);
+        let error = build_with_copies(&second, &[(&earlier, &b)], Vec::new()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{error}");
+        assert!(!second.exists());
+    }
+
+    #[test]
+    fn a_rebuild_advances_only_keeping_every_entry_and_adding_one() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let target = |identity, column| SideTarget {
+            identity,
+            kind: KeyKind::OrderedI64,
+            components: smallvec::smallvec![(column, Domain::Integer)],
+        };
+        let wanted = [target(11, 1), target(22, 2)];
+        let file = |name: &str, keep: &[u64]| {
+            let path = dir.path().join(name);
+            let mut columns = two_columns();
+            columns.retain(|c| keep.contains(&c.identity));
+            build_side_file(&path, next_generation(), columns, WORKSPACE).unwrap();
+            IndexFile::open(&path, 1).unwrap()
+        };
+        let (only_a, only_b, both) = (file("a", &[11]), file("b", &[22]), file("ab", &[11, 22]));
+        assert!(advances(&only_a, None, &wanted));
+        assert!(advances(&both, Some(&only_a), &wanted));
+        assert!(!advances(&only_b, Some(&only_a), &wanted), "loses 11");
+        assert!(!advances(&only_a, Some(&only_a), &wanted), "gains nothing");
+        assert!(!advances(&only_a, Some(&both), &wanted));
+    }
+
+    #[test]
+    fn a_build_whose_every_entry_is_refused_is_refused() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sidx");
+        let mut columns = two_columns();
+        columns.truncate(1);
+        PAGES.with(|p| p.set(0));
+        REFUSE_PAGE.with(|r| r.set(Some(1)));
+        let result = build_side_file(&path, next_generation(), columns, WORKSPACE);
+        REFUSE_PAGE.with(|r| r.set(None));
+        assert!(result.is_err_and(|e| is_refused(&e)));
+        assert!(!path.exists());
+    }
 
     #[test]
     fn keys_map_to_their_positions_through_pages() {
@@ -6295,9 +6740,10 @@ mod tests {
         assert!(err.to_string().contains("version"), "{err}");
     }
 
-    /// Rewrites a built file's directory in the version 5 layout, as the
-    /// release before version 6 wrote it
-    fn rewrite_as_version_5(path: &Path) {
+    /// Rewrites a built file of ordered i64 entries in the version 5
+    /// layout, or the version 4 one without heavy keys, as the releases
+    /// before version 6 wrote them
+    fn rewrite_as_legacy(path: &Path, version: u32) {
         let mut bytes = std::fs::read(path).unwrap();
         let footer = bytes.len() - FOOTER_LEN as usize;
         let dir_offset = u64::from_le_bytes(bytes[footer..footer + 8].try_into().unwrap());
@@ -6332,15 +6778,17 @@ mod tests {
                 dir.extend_from_slice(&p.len.to_le_bytes());
                 dir.extend_from_slice(&p.pos_start.to_le_bytes());
             }
-            let heavy = c.heavy_keys.as_deref().unwrap_or_default();
-            dir.push(heavy.len() as u8);
-            for (key, count) in heavy {
-                dir.extend_from_slice(&key.to_le_bytes());
-                dir.extend_from_slice(&count.to_le_bytes());
+            if version == VERSION_WITH_HEAVY_KEYS {
+                let heavy = c.heavy_keys.as_deref().unwrap_or_default();
+                dir.push(heavy.len() as u8);
+                for (key, count) in heavy {
+                    dir.extend_from_slice(&key.to_le_bytes());
+                    dir.extend_from_slice(&count.to_le_bytes());
+                }
             }
         }
         bytes.truncate(start);
-        bytes[4..8].copy_from_slice(&VERSION_WITH_HEAVY_KEYS.to_le_bytes());
+        bytes[4..8].copy_from_slice(&version.to_le_bytes());
         let crc = crc32fast::hash(&dir);
         let len = dir.len() as u32;
         bytes.extend_from_slice(&dir);
@@ -6362,7 +6810,7 @@ mod tests {
         let want = built.equal(1, key).unwrap().expect("the key is present");
         let want_positions = all_positions_of(&built, 1, want);
         drop(built);
-        rewrite_as_version_5(&path);
+        rewrite_as_legacy(&path, VERSION_WITH_HEAVY_KEYS);
         let old = Arc::new(IndexFile::open(&path, 42).unwrap());
         let entry = old.directory().entry(1).unwrap();
         assert_eq!(entry.domain, None, "a version 5 entry records no domain");
@@ -6473,6 +6921,141 @@ mod tests {
             kind: KeyKind::OrderedI64,
             components: smallvec::smallvec![(column, Domain::Integer)],
         }]
+    }
+
+    #[test]
+    fn a_legacy_entry_is_copied_with_its_components_and_heavy_keys() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        for version in [VERSION_WITHOUT_HEAVY_KEYS, VERSION_WITH_HEAVY_KEYS] {
+            let dir = tempfile::tempdir().unwrap();
+            let (first, second) = (dir.path().join("a.sidx"), dir.path().join("b.sidx"));
+            // Key 7 holds a third of the positions, key 8 a tenth
+            let skewed = (0..60_000u32).map(|p| {
+                let key = match p % 30 {
+                    0..10 => 7,
+                    10..13 => 8,
+                    _ => p as i64 + 100,
+                };
+                (p, key)
+            });
+            build_side_file(
+                &first,
+                next_generation(),
+                vec![ColumnInput {
+                    column: 1,
+                    identity: 11,
+                    domain: Domain::Integer,
+                    pairs: Box::new(skewed),
+                }],
+                WORKSPACE,
+            )
+            .unwrap();
+            let built = IndexFile::open(&first, 1).unwrap();
+            let heavy = built.directory().entry(11).unwrap().heavy_keys.clone();
+            assert_eq!(heavy.as_ref().map(Vec::len), Some(2));
+            let want = all_positions_of(&built, 11, built.equal(11, 8).unwrap().unwrap());
+            drop(built);
+            rewrite_as_legacy(&first, version);
+            let earlier = IndexFile::open(&first, 2).unwrap();
+            let old = earlier.directory().entry(11).unwrap();
+            assert_eq!(old.domain, None);
+            assert_eq!(old.heavy_keys.is_some(), version == VERSION_WITH_HEAVY_KEYS);
+            let [a] = integer_target(1, 11);
+            let mut fresh = two_columns();
+            fresh.retain(|c| c.identity == 22);
+            build_with_copies(&second, &[(&earlier, &a)], fresh).unwrap();
+            drop(earlier);
+            let copied = IndexFile::open(&second, 3).unwrap();
+            let entry = copied.directory().entry(11).unwrap();
+            assert_eq!(entry.heavy_keys, heavy, "version {version}");
+            assert_eq!(entry.domain, Some(Domain::Integer));
+            assert_eq!(entry.components, [(1, Domain::Integer)]);
+            assert!(copied.records(&a));
+            let got = copied.equal(11, 8).unwrap().unwrap();
+            assert_eq!(all_positions_of(&copied, 11, got), want);
+            assert!(copied.directory().entry(22).is_some());
+        }
+    }
+
+    /// `file_backed` with a BOOLEAN column f, true on one row in a thousand,
+    /// whose groups decode to an eighth of the integer column's
+    fn file_backed_with_flag(
+        dir: &Path,
+        rows: usize,
+    ) -> (super::super::writer::FrozenVolume, PathBuf) {
+        use super::super::writer::TypedCells;
+        use crate::core::{DataType, SchemaBuilder};
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("k", DataType::Integer, false, false)
+            .column("f", DataType::Boolean, false, false)
+            .build();
+        let ids: Vec<i64> = (0..rows as i64).collect();
+        let keys: Vec<i64> = ids.iter().map(|i| (i * 104_729) % 65_521).collect();
+        let flags: Vec<bool> = ids.iter().map(|i| i % 1000 == 7).collect();
+        let nulls = vec![false; rows];
+        let mut writer =
+            super::super::output::VolumeFileWriter::new(dir, "t", 1, &schema, rows, true).unwrap();
+        let int = |values| TypedCells::Int64 {
+            values,
+            nulls: &nulls,
+        };
+        let flag = TypedCells::Boolean {
+            values: &flags,
+            nulls: &nulls,
+        };
+        writer
+            .append_typed(&ids, &[int(&ids), int(&keys), flag])
+            .unwrap();
+        writer.finish().unwrap()
+    }
+
+    #[test]
+    fn a_legacy_entry_the_budget_cannot_rebuild_is_kept_while_another_is_added() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        for version in [VERSION_WITHOUT_HEAVY_KEYS, VERSION_WITH_HEAVY_KEYS] {
+            let dir = tempfile::tempdir().unwrap();
+            let rows = 131_072;
+            let (volume, path) = file_backed_with_flag(dir.path(), rows);
+            let [a] = integer_target(1, 41);
+            let b = SideTarget {
+                identity: 42,
+                kind: KeyKind::OrderedI64,
+                components: smallvec::smallvec![(2, Domain::Boolean)],
+            };
+            build_side_for(&volume, &path, 1, std::slice::from_ref(&a))
+                .unwrap()
+                .expect("A built");
+            rewrite_as_legacy(&side_path(&path), version);
+            let earlier = IndexFile::open(&side_path(&path), 1).unwrap();
+            let key = (5 * 104_729) % 65_521;
+            let want = all_positions_of(&earlier, 41, earlier.equal(41, key).unwrap().unwrap());
+            // Room for B and A's copy, not for decoding A's column again
+            let (input_b, input_a) = (decode_allowance(&volume, 2), decode_allowance(&volume, 1));
+            let copy = PAGE_BYTES + copied_bytes(earlier.directory().entry(41).unwrap(), &a);
+            let cap = input_b + least_workspace(rows, (1, 0)) + copy;
+            let rebuild = input_a.max(input_b) + least_workspace(rows, (2, 0));
+            assert!(rebuild > cap, "A cannot be rebuilt: {rebuild} within {cap}");
+            let wanted = [a.clone(), b.clone()];
+            let staged = match stage_side_for(&volume, &path, 1, &wanted, Some(cap), Some(&earlier))
+                .unwrap()
+            {
+                SideBuild::Built(staged) => staged,
+                _ => panic!("version {version}: refused although A can be copied"),
+            };
+            let built = staged.open().unwrap();
+            assert!(built.records(&a) && built.records(&b));
+            assert!(advances(&built, Some(&earlier), &wanted));
+            drop(built);
+            let published = dir.path().join("published.sidx");
+            drop(staged.publish(&published, 2).unwrap());
+            let reopened = IndexFile::open(&published, 3).unwrap();
+            let got = reopened.equal(41, key).unwrap().unwrap();
+            assert_eq!(all_positions_of(&reopened, 41, got), want);
+            let flagged = reopened.equal(42, 1).unwrap().unwrap();
+            let want_flagged: Vec<u32> = (0..rows as u32).filter(|i| i % 1000 == 7).collect();
+            assert_eq!(all_positions_of(&reopened, 42, flagged), want_flagged);
+        }
     }
 
     #[test]
