@@ -2126,6 +2126,18 @@ pub(crate) fn text_probe_key_held(bytes: usize) {
     TEXT_PROBE_KEY_BYTES.fetch_max(bytes, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Process-wide: rows the volumes' pruning left to scan, summed
+static VOLUME_ROWS_LEFT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Rows the volumes' pruning left to scan, summed so far
+pub fn volume_rows_left() -> usize {
+    VOLUME_ROWS_LEFT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn volume_range_pruned(rows: usize) {
+    VOLUME_ROWS_LEFT.fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Process-wide: rows a volume scanner built for its filter
 static ROWS_MATERIALIZED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 

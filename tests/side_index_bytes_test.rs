@@ -354,7 +354,7 @@ fn a_text_index_created_after_the_seal_is_backfilled_beside_the_integer_one() {
         for id in 0..ROWS {
             db.execute(
                 &insert,
-                vec![Value::Integer(id), Value::Integer(id), s_of(id)],
+                vec![Value::Integer(id), Value::Integer(id * 7 % ROWS), s_of(id)],
             )
             .unwrap();
         }
@@ -409,8 +409,11 @@ fn a_key_longer_than_a_page_leaves_its_index_unsupported_and_not_rebuilt() {
                 9 => Value::text("x".repeat(40_000)),
                 _ => s_of(id),
             };
-            db.execute(&insert, vec![Value::Integer(id), Value::Integer(id), s])
-                .unwrap();
+            db.execute(
+                &insert,
+                vec![Value::Integer(id), Value::Integer(id * 7 % ROWS), s],
+            )
+            .unwrap();
         }
     }
     db.execute("COMMIT", ()).unwrap();

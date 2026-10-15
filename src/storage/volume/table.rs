@@ -2335,6 +2335,13 @@ impl SegmentedTable {
         out.truncate(kept);
     }
 
+    /// Whether binary search on a sorted column already narrowed `vol` to
+    /// `start..end`, no more rows than one side file window reads, so the
+    /// range is scanned and the side file is not asked
+    fn range_beats_side(vol: &FrozenVolume, start: usize, end: usize) -> bool {
+        (start > 0 || end < vol.meta.row_count) && end - start <= super::secondary::SIDE_WINDOW
+    }
+
     fn prune_volume(
         vol: &FrozenVolume,
         mapping: &super::writer::ColumnMapping,
@@ -2446,6 +2453,66 @@ impl SegmentedTable {
         }
 
         Ok((start >= end, start, end))
+    }
+
+    /// `start..end` narrowed to the rows equal to each equality on a column
+    /// `vol` holds sorted, found by binary search. Asked only once a unique
+    /// index has passed the volume, since a search may decode a row group
+    fn narrow_to_equalities(
+        vol: &FrozenVolume,
+        mapping: &super::writer::ColumnMapping,
+        comparisons: &[(&str, crate::core::Operator, &Value)],
+        mut start: usize,
+        mut end: usize,
+    ) -> Result<(usize, usize)> {
+        if vol.is_cold() {
+            return Ok((start, end));
+        }
+        let store = if vol.columns.should_use_group_cache() {
+            vol.columns.compressed_store()
+        } else {
+            None
+        };
+        for &(col_name, op, value) in comparisons {
+            if op != crate::core::Operator::Eq {
+                continue;
+            }
+            let Some(col_idx) = mapping.volume_column(vol, col_name) else {
+                continue;
+            };
+            // Only a value of the column's own type has its rows between
+            // the two searches
+            let target = match (value, vol.columns.data_type(col_idx)) {
+                (Value::Integer(i), DataType::Integer) => *i,
+                (Value::Timestamp(ts), DataType::Timestamp) => match ts.timestamp_nanos_opt() {
+                    Some(nanos) => nanos,
+                    None => continue,
+                },
+                _ => continue,
+            };
+            if !vol.is_sorted(col_idx) {
+                continue;
+            }
+            let (first, past) = if let Some(st) = store {
+                (
+                    st.binary_search_ge(col_idx, target, &vol.meta.row_groups)?,
+                    st.binary_search_gt(col_idx, target, &vol.meta.row_groups)?,
+                )
+            } else {
+                let col = vol.columns.get(col_idx)?;
+                (
+                    Some(col.binary_search_ge(target)),
+                    Some(col.binary_search_gt(target)),
+                )
+            };
+            if let Some(idx) = first {
+                start = start.max(idx);
+            }
+            if let Some(idx) = past {
+                end = end.min(idx);
+            }
+        }
+        Ok((start, end))
     }
 
     /// Create lazy segment scanners for a read query, applying zone map pruning
@@ -2564,16 +2631,28 @@ impl SegmentedTable {
             if should_skip {
                 continue;
             }
-            // A built unique index, then the side file, are probed before the
-            // volume's data is touched: an empty answer skips the volume
-            let (plan, positions) = match self.unique_decision(cs, &unique_keys) {
+            // A built unique index, then an equality on a sorted column, then
+            // the side file, are asked before the volume's data is touched:
+            // an empty answer skips the volume
+            let (start, end, plan, positions) = match self.unique_decision(cs, &unique_keys) {
                 UniqueDecision::Empty => continue,
-                UniqueDecision::Positions(positions) => (None, Some(positions)),
-                UniqueDecision::Pass => match self.side_decision(cs, ask.as_ref())? {
-                    SideDecision::Empty => continue,
-                    SideDecision::Walk(plan) => (Some(plan), None),
-                    SideDecision::Scan => (None, None),
-                },
+                UniqueDecision::Positions(positions) => (start, end, None, Some(positions)),
+                UniqueDecision::Pass => {
+                    let (start, end) =
+                        Self::narrow_to_equalities(vol, &cs.mapping, &comparisons, start, end)?;
+                    if start >= end {
+                        continue;
+                    }
+                    if Self::range_beats_side(vol, start, end) {
+                        (start, end, None, None)
+                    } else {
+                        match self.side_decision(cs, ask.as_ref())? {
+                            SideDecision::Empty => continue,
+                            SideDecision::Walk(plan) => (start, end, Some(plan), None),
+                            SideDecision::Scan => (start, end, None, None),
+                        }
+                    }
+                }
             };
             let walk = &plan;
             let positioned = walk.is_some() || positions.is_some();
@@ -2593,11 +2672,17 @@ impl SegmentedTable {
                 } else {
                     let (_, s, e) =
                         Self::prune_volume(&loaded, &cs.mapping, &comparisons, &bloom_hashes)?;
+                    let (s, e) =
+                        Self::narrow_to_equalities(&loaded, &cs.mapping, &comparisons, s, e)?;
                     (&loaded, s, e)
                 }
             } else {
                 (vol, start, end)
             };
+            #[cfg(feature = "test-failpoints")]
+            if !positioned {
+                crate::test_failpoints::volume_range_pruned(end.saturating_sub(start));
+            }
 
             // VolumeScanner constructor calls mark_accessed.
             let mut scanner = if !positioned && (start > 0 || end < vol.meta.row_count) {
@@ -2733,16 +2818,29 @@ impl SegmentedTable {
                 if should_skip {
                     return Ok(None);
                 }
-                // A built unique index, then the side file, are probed before
-                // the volume's data is touched
-                let (mut walk, positions) = match self.unique_decision(cs, &unique_keys) {
+                // A built unique index, then an equality on a sorted column,
+                // then the side file, are asked before the volume's data is
+                // touched
+                let (start, end, mut walk, positions) = match self.unique_decision(cs, &unique_keys)
+                {
                     UniqueDecision::Empty => return Ok(None),
-                    UniqueDecision::Positions(positions) => (None, Some(positions)),
-                    UniqueDecision::Pass => match self.side_decision(cs, ask.as_ref())? {
-                        SideDecision::Empty => return Ok(None),
-                        SideDecision::Walk(plan) => (start_walk(&plan)?, None),
-                        SideDecision::Scan => (None, None),
-                    },
+                    UniqueDecision::Positions(positions) => (start, end, None, Some(positions)),
+                    UniqueDecision::Pass => {
+                        let (start, end) =
+                            Self::narrow_to_equalities(vol, &cs.mapping, &comparisons, start, end)?;
+                        if start >= end {
+                            return Ok(None);
+                        }
+                        if Self::range_beats_side(vol, start, end) {
+                            (start, end, None, None)
+                        } else {
+                            match self.side_decision(cs, ask.as_ref())? {
+                                SideDecision::Empty => return Ok(None),
+                                SideDecision::Walk(plan) => (start, end, start_walk(&plan)?, None),
+                                SideDecision::Scan => (start, end, None, None),
+                            }
+                        }
+                    }
                 };
                 let positioned = walk.is_some() || positions.is_some();
                 // Load cold volume on demand after zone-map/bloom pruning.
@@ -2760,12 +2858,18 @@ impl SegmentedTable {
                     } else {
                         let (_, s, e) =
                             Self::prune_volume(&loaded, &cs.mapping, &comparisons, &bloom_hashes)?;
+                        let (s, e) =
+                            Self::narrow_to_equalities(&loaded, &cs.mapping, &comparisons, s, e)?;
                         (&loaded, s, e)
                     }
                 } else {
                     vol.mark_accessed();
                     (vol, start, end)
                 };
+                #[cfg(feature = "test-failpoints")]
+                if !positioned {
+                    crate::test_failpoints::volume_range_pruned(end.saturating_sub(start));
+                }
 
                 let mut start = start;
 

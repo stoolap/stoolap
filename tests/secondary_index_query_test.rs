@@ -655,10 +655,12 @@ fn a_timestamp_bound_outside_the_nanosecond_range_goes_to_the_scan() {
     )
     .unwrap();
     db.execute("CREATE INDEX idx_t_ts ON t(ts)", ()).unwrap();
+    // Row ids out of ts order, so the volume does not hold ts sorted
     let values = (1..=600)
         .map(|i| {
             format!(
-                "({i}, '2020-01-{:02} {:02}:00:00', {i})",
+                "({}, '2020-01-{:02} {:02}:00:00', {i})",
+                i * 37 % 600 + 1,
                 1 + (i / 24) % 28,
                 i % 24
             )
@@ -1039,15 +1041,16 @@ fn a_small_volumes_admission_counts_the_parsed_pages_and_the_raw_read() {
     let db = open(dir.path(), "");
     create(&db);
     db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
-    // One position page of rows, every key its own: three key pages
+    // One position page of rows, every key its own: three key pages. Keys
+    // out of row order, so the volume does not hold k sorted
     let values = (1..=8190)
-        .map(|id| format!("({id},{id},{})", id * 3))
+        .map(|id| format!("({id},{},{})", id * 37 % 8191, id * 3))
         .collect::<Vec<_>>()
         .join(",");
     db.execute(&format!("INSERT INTO t VALUES {values}"), ())
         .unwrap();
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
-    let lookup = |db: &Database| assert_eq!(ids_db(db, EQ, &[100]), vec![100]);
+    let lookup = |db: &Database| assert_eq!(ids_db(db, EQ, &[3700]), vec![100]);
     // The parsed size of the two pages a lookup touches, from a warm probe
     INDEX_PAGES.clear();
     let idle = INDEX_PAGES.stats();
