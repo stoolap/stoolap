@@ -719,6 +719,35 @@ impl Index for HashIndex {
         }
     }
 
+    fn get_row_ids_equal_capped_into(
+        &self,
+        values: &[Value],
+        max: usize,
+        buffer: &mut Vec<i64>,
+    ) -> Option<crate::storage::traits::CappedEqual> {
+        use crate::storage::traits::CappedEqual;
+        if self.closed.load(AtomicOrdering::Acquire) || values.len() != self.column_ids.len() {
+            return Some(CappedEqual::Copied);
+        }
+        let hash = hash_values(values);
+        let hash_to_values = self.hash_to_values.read();
+        let Some(entries) = hash_to_values.get(&hash) else {
+            return Some(CappedEqual::Copied);
+        };
+        // The length is read before anything is appended, so an over-cap
+        // key costs one lookup and no copy
+        for (stored_values, row_ids) in entries {
+            if Self::values_match(stored_values, values) {
+                if row_ids.len() > max {
+                    return Some(CappedEqual::OverCap);
+                }
+                row_ids.copy_into(buffer);
+                break;
+            }
+        }
+        Some(CappedEqual::Copied)
+    }
+
     /// Optimized IN list lookup - acquires lock once for all values
     fn get_row_ids_in_into(&self, value_list: &[Value], buffer: &mut Vec<i64>) {
         if self.closed.load(AtomicOrdering::Acquire) {
