@@ -14,6 +14,7 @@
 
 //! MAX aggregate function
 
+use crate::core::value::compare_floats;
 use crate::core::Value;
 use crate::functions::{
     AggregateFunction, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType,
@@ -83,9 +84,11 @@ fn is_greater_than(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Null(_), _) | (_, Value::Null(_)) => false,
         (Value::Integer(a), Value::Integer(b)) => a > b,
-        (Value::Float(a), Value::Float(b)) => a > b,
-        (Value::Integer(a), Value::Float(b)) => (*a as f64) > *b,
-        (Value::Float(a), Value::Integer(b)) => *a > (*b as f64),
+        // NaN orders after every number
+        (Value::Float(a), Value::Float(b)) => compare_floats(*a, *b).is_gt(),
+        (Value::Integer(_), Value::Float(_)) | (Value::Float(_), Value::Integer(_)) => {
+            a.compare(b).is_ok_and(|o| o.is_gt())
+        }
         (Value::Text(a), Value::Text(b)) => a > b,
         (Value::Boolean(a), Value::Boolean(b)) => *a && !b, // true > false
         (Value::Timestamp(a), Value::Timestamp(b)) => a > b,

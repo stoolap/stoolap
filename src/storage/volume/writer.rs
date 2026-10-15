@@ -1650,6 +1650,20 @@ pub struct VolumeMeta {
 }
 
 impl VolumeMeta {
+    /// NaN cells of a physical column: the zone map counts them among its
+    /// rows, the stats never count them. Zero for a non-FLOAT column, None
+    /// when the column has no zone map or stats.
+    pub fn nan_count(&self, col: usize) -> Option<u64> {
+        if self.column_types.get(col) != Some(&DataType::Float) {
+            return Some(0);
+        }
+        let zone = self.zone_maps.get(col)?;
+        let stats = self.stats.columns.get(col)?;
+        let non_null = u64::from(zone.row_count.saturating_sub(zone.null_count));
+        debug_assert!(non_null >= stats.non_null_count);
+        Some(non_null.saturating_sub(stats.non_null_count))
+    }
+
     /// Estimate the in-memory size of this metadata in bytes.
     pub fn memory_size(&self) -> usize {
         let mut size = 0usize;

@@ -35,6 +35,7 @@
 //!
 //! Expected speedup: 2-5x for aggregation-heavy queries.
 
+use crate::core::value::compare_floats;
 use crate::core::Value;
 use crate::functions::AggregateFunction;
 
@@ -401,7 +402,9 @@ impl CompiledAggregate {
                 if let Value::Float(v) = value {
                     match min_value {
                         None => *min_value = Some(*v),
-                        Some(current) if *v < *current => *min_value = Some(*v),
+                        Some(current) if compare_floats(*v, *current).is_lt() => {
+                            *min_value = Some(*v)
+                        }
                         _ => {}
                     }
                 }
@@ -412,7 +415,9 @@ impl CompiledAggregate {
                 if let Value::Float(v) = value {
                     match max_value {
                         None => *max_value = Some(*v),
-                        Some(current) if *v > *current => *max_value = Some(*v),
+                        Some(current) if compare_floats(*v, *current).is_gt() => {
+                            *max_value = Some(*v)
+                        }
                         _ => {}
                     }
                 }
@@ -577,9 +582,11 @@ impl CompiledAggregate {
         match (a, b) {
             (Value::Null(_), _) | (_, Value::Null(_)) => false,
             (Value::Integer(a), Value::Integer(b)) => a < b,
-            (Value::Float(a), Value::Float(b)) => a < b,
-            (Value::Integer(a), Value::Float(b)) => (*a as f64) < *b,
-            (Value::Float(a), Value::Integer(b)) => *a < (*b as f64),
+            // NaN orders after every number
+            (Value::Float(a), Value::Float(b)) => compare_floats(*a, *b).is_lt(),
+            (Value::Integer(_), Value::Float(_)) | (Value::Float(_), Value::Integer(_)) => {
+                a.compare(b).is_ok_and(|o| o.is_lt())
+            }
             (Value::Text(a), Value::Text(b)) => a < b,
             (Value::Boolean(a), Value::Boolean(b)) => !a && *b,
             (Value::Timestamp(a), Value::Timestamp(b)) => a < b,
@@ -593,9 +600,11 @@ impl CompiledAggregate {
         match (a, b) {
             (Value::Null(_), _) | (_, Value::Null(_)) => false,
             (Value::Integer(a), Value::Integer(b)) => a > b,
-            (Value::Float(a), Value::Float(b)) => a > b,
-            (Value::Integer(a), Value::Float(b)) => (*a as f64) > *b,
-            (Value::Float(a), Value::Integer(b)) => *a > (*b as f64),
+            // NaN orders after every number
+            (Value::Float(a), Value::Float(b)) => compare_floats(*a, *b).is_gt(),
+            (Value::Integer(_), Value::Float(_)) | (Value::Float(_), Value::Integer(_)) => {
+                a.compare(b).is_ok_and(|o| o.is_gt())
+            }
             (Value::Text(a), Value::Text(b)) => a > b,
             (Value::Boolean(a), Value::Boolean(b)) => *a && !b,
             (Value::Timestamp(a), Value::Timestamp(b)) => a > b,
@@ -607,6 +616,24 @@ impl CompiledAggregate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn float_min_and_max_order_nan_last() {
+        let is_nan = |v: Value| matches!(v, Value::Float(f) if f.is_nan());
+        for order in [[f64::NAN, -2.0, 1.5], [-2.0, 1.5, f64::NAN]] {
+            let mut min = CompiledAggregate::min_float();
+            let mut max = CompiledAggregate::max_float();
+            for v in order {
+                min.accumulate(&Value::Float(v));
+                max.accumulate(&Value::Float(v));
+            }
+            assert_eq!(min.result(), Value::Float(-2.0), "{order:?}");
+            assert!(is_nan(max.result()), "{order:?}");
+        }
+        let mut min = CompiledAggregate::min_float();
+        min.accumulate(&Value::Float(f64::NAN));
+        assert!(is_nan(min.result()));
+    }
 
     #[test]
     fn test_count_star() {

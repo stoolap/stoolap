@@ -31,6 +31,7 @@ use std::sync::Arc;
 use crate::common::{CompactArc, I64Set};
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::core::value::compare_floats;
 use crate::core::{DataType, IndexType, Result, Row, RowVec, Schema, Value, ValueMap, ValueSet};
 use crate::storage::expression::Expression;
 use crate::storage::index::id_list::GroupIds;
@@ -4299,6 +4300,7 @@ impl Table for SegmentedTable {
                 let mut cold_sum_int: i128 = 0;
                 let mut cold_sum_float: f64 = 0.0;
                 let mut total_count = hot_count;
+                let mut stats_cover = true;
                 for (seg_id, cs) in segs.iter() {
                     let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
                     let phys = if col_idx < mapping.sources.len() {
@@ -4311,20 +4313,31 @@ impl Table for SegmentedTable {
                     };
                     if let Some(pi) = phys {
                         if pi < cs.volume.meta.stats.columns.len() {
+                            // The stats leave NaN out; SUM and AVG take it in
+                            let Some(nans) = cs.volume.meta.nan_count(pi) else {
+                                stats_cover = false;
+                                break;
+                            };
                             let (int_part, float_part) =
                                 cs.volume.meta.stats.columns[pi].sum_parts();
                             cold_sum_int += int_part;
                             cold_sum_float += float_part;
                             total_count += cs.volume.meta.stats.columns[pi].numeric_count as usize;
+                            if nans > 0 {
+                                cold_sum_float = f64::NAN;
+                                total_count += nans as usize;
+                            }
                         }
                     } else if let Some(def) = default_f64 {
                         cold_sum_float += def * cs.volume.meta.row_count as f64;
                         total_count += cs.volume.meta.row_count;
                     }
                 }
-                let total_sum = hot_sum + cold_sum_int as f64 + cold_sum_float;
-                self.check_cold()?;
-                return Ok(Some((total_sum, total_count)));
+                if stats_cover {
+                    let total_sum = hot_sum + cold_sum_int as f64 + cold_sum_float;
+                    self.check_cold()?;
+                    return Ok(Some((total_sum, total_count)));
+                }
             }
 
             // Tombstones exist: scan columnar data with dedup (avoids full Row materialization)
@@ -4437,10 +4450,13 @@ impl Table for SegmentedTable {
                 && !self.segment_mgr.has_pending_tombstones(self.txn_id())
                 && self.segment_mgr.total_row_count() == self.segment_mgr.deduped_row_count()?;
 
+            // A stats pass cut short leaves the minimum of the volumes it read
+            let mut overall_min = hot_min;
             if can_use_stats {
                 // Fast path: use pre-computed volume stats (zone map min)
                 let segs = self.segment_mgr.segments_raw();
-                let mut overall_min = hot_min;
+                let nan = Value::Float(f64::NAN);
+                let mut stats_cover = true;
                 for (seg_id, cs) in segs.iter() {
                     let vol = &cs.volume;
                     let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
@@ -4455,10 +4471,17 @@ impl Table for SegmentedTable {
                     let vol_min = if let Some(pi) = phys {
                         if pi < vol.meta.stats.columns.len() {
                             let m = &vol.meta.stats.columns[pi].min;
-                            if m.is_null() {
-                                None
-                            } else {
+                            // The stats leave NaN out; it is the minimum only alone
+                            let Some(nans) = vol.meta.nan_count(pi) else {
+                                stats_cover = false;
+                                break;
+                            };
+                            if !m.is_null() {
                                 Some(m)
+                            } else if nans > 0 {
+                                Some(&nan)
+                            } else {
+                                None
                             }
                         } else {
                             None
@@ -4479,8 +4502,10 @@ impl Table for SegmentedTable {
                         }
                     }
                 }
-                self.check_cold()?;
-                return Ok(Some(overall_min));
+                if stats_cover {
+                    self.check_cold()?;
+                    return Ok(Some(overall_min));
+                }
             }
 
             // Zone-map fast path: when there are no tombstones/pending tombstones
@@ -4510,7 +4535,6 @@ impl Table for SegmentedTable {
             let empty_tombstones: FxHashMap<i64, u64> = FxHashMap::default();
             let tombstones_ref = tombstones_arc.as_deref().unwrap_or(&empty_tombstones);
 
-            let mut overall_min = hot_min;
             for (seg_id, cs) in volumes.iter() {
                 let vol = &cs.volume;
                 let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
@@ -4614,11 +4638,7 @@ impl Table for SegmentedTable {
                                     continue;
                                 }
                                 let v = values[i];
-                                // Skip NaN: engine ordering contract treats NaN as > all finite
-                                if v.is_nan() {
-                                    continue;
-                                }
-                                if best_f64.is_none() || v < best_f64.unwrap_or(f64::INFINITY) {
+                                if best_f64.is_none_or(|b| compare_floats(v, b).is_lt()) {
                                     best_f64 = Some(v);
                                 }
                             }
@@ -4754,11 +4774,14 @@ impl Table for SegmentedTable {
                 && !self.segment_mgr.has_pending_tombstones(self.txn_id())
                 && self.segment_mgr.total_row_count() == self.segment_mgr.deduped_row_count()?;
 
+            // A stats pass cut short leaves the maximum of the volumes it read
+            let mut overall_max = hot_max;
             if can_use_stats {
                 // Fast path: use pre-computed volume stats (zone map max)
                 // Use segments_raw (metadata only, no cold volume reload).
                 let segs = self.segment_mgr.segments_raw();
-                let mut overall_max = hot_max;
+                let nan = Value::Float(f64::NAN);
+                let mut stats_cover = true;
                 for (seg_id, cs) in segs.iter() {
                     let vol = &cs.volume;
                     let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
@@ -4773,7 +4796,14 @@ impl Table for SegmentedTable {
                     let vol_max = if let Some(pi) = phys {
                         if pi < vol.meta.stats.columns.len() {
                             let m = &vol.meta.stats.columns[pi].max;
-                            if m.is_null() {
+                            // The stats leave NaN out; any NaN is the maximum
+                            let Some(nans) = vol.meta.nan_count(pi) else {
+                                stats_cover = false;
+                                break;
+                            };
+                            if nans > 0 {
+                                Some(&nan)
+                            } else if m.is_null() {
                                 None
                             } else {
                                 Some(m)
@@ -4797,8 +4827,10 @@ impl Table for SegmentedTable {
                         }
                     }
                 }
-                self.check_cold()?;
-                return Ok(Some(overall_max));
+                if stats_cover {
+                    self.check_cold()?;
+                    return Ok(Some(overall_max));
+                }
             }
 
             // See min_column: same zone-map + typed scan strategy for MAX.
@@ -4822,7 +4854,6 @@ impl Table for SegmentedTable {
             let empty_tombstones: FxHashMap<i64, u64> = FxHashMap::default();
             let tombstones_ref = tombstones_arc.as_deref().unwrap_or(&empty_tombstones);
 
-            let mut overall_max = hot_max;
             for (seg_id, cs) in volumes.iter() {
                 let vol = &cs.volume;
                 let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
@@ -4840,7 +4871,8 @@ impl Table for SegmentedTable {
                     if let Some(pi) = phys {
                         if pi < vol.meta.zone_maps.len() {
                             let zm = &vol.meta.zone_maps[pi];
-                            if !zm.max.is_null() {
+                            // The zone map leaves NaN out, and a NaN would beat it
+                            if !zm.max.is_null() && vol.meta.nan_count(pi) == Some(0) {
                                 if let Ok(std::cmp::Ordering::Less | std::cmp::Ordering::Equal) =
                                     zm.max.compare(current_best)
                                 {
@@ -4923,11 +4955,7 @@ impl Table for SegmentedTable {
                                     continue;
                                 }
                                 let v = values[i];
-                                // Skip NaN: engine ordering contract treats NaN as > all finite
-                                if v.is_nan() {
-                                    continue;
-                                }
-                                if best_f64.is_none() || v > best_f64.unwrap_or(f64::NEG_INFINITY) {
+                                if best_f64.is_none_or(|b| compare_floats(v, b).is_gt()) {
                                     best_f64 = Some(v);
                                 }
                             }
@@ -6917,13 +6945,13 @@ impl Table for SegmentedTable {
                 }
                 if let Some(s) = src.min_f64 {
                     dst.min_f64 = Some(match dst.min_f64 {
-                        Some(d) if d <= s => d,
+                        Some(d) if compare_floats(d, s).is_le() => d,
                         _ => s,
                     });
                 }
                 if let Some(s) = src.max_f64 {
                     dst.max_f64 = Some(match dst.max_f64 {
-                        Some(d) if d >= s => d,
+                        Some(d) if compare_floats(d, s).is_ge() => d,
                         _ => s,
                     });
                 }
@@ -6955,7 +6983,7 @@ impl Table for SegmentedTable {
                                         acc.int_sum += *i as i128;
                                         acc.count += 1;
                                     }
-                                    Value::Float(f) if !f.is_nan() => {
+                                    Value::Float(f) => {
                                         acc.float_sum += *f;
                                         acc.count += 1;
                                         acc.is_int_agg = false;
@@ -6986,11 +7014,13 @@ impl Table for SegmentedTable {
                                             _ => {}
                                         }
                                     }
-                                    Value::Float(f) if !f.is_nan() => {
+                                    Value::Float(f) => {
                                         acc.is_int_agg = false;
                                         match acc.min_f64 {
                                             None => acc.min_f64 = Some(*f),
-                                            Some(cur) if *f < cur => acc.min_f64 = Some(*f),
+                                            Some(cur) if compare_floats(*f, cur).is_lt() => {
+                                                acc.min_f64 = Some(*f)
+                                            }
                                             _ => {}
                                         }
                                     }
@@ -7016,11 +7046,13 @@ impl Table for SegmentedTable {
                                             _ => {}
                                         }
                                     }
-                                    Value::Float(f) if !f.is_nan() => {
+                                    Value::Float(f) => {
                                         acc.is_int_agg = false;
                                         match acc.max_f64 {
                                             None => acc.max_f64 = Some(*f),
-                                            Some(cur) if *f > cur => acc.max_f64 = Some(*f),
+                                            Some(cur) if compare_floats(*f, cur).is_gt() => {
+                                                acc.max_f64 = Some(*f)
+                                            }
                                             _ => {}
                                         }
                                     }
@@ -7109,12 +7141,9 @@ impl Table for SegmentedTable {
                                             acc.count += 1;
                                         }
                                         DataType::Float => {
-                                            let f = col.get_f64(i);
-                                            if !f.is_nan() {
-                                                acc.float_sum += f;
-                                                acc.count += 1;
-                                                acc.is_int_agg = false;
-                                            }
+                                            acc.float_sum += col.get_f64(i);
+                                            acc.count += 1;
+                                            acc.is_int_agg = false;
                                         }
                                         DataType::Boolean => {
                                             acc.int_sum += col.get_bool(i) as i128;
@@ -7129,7 +7158,7 @@ impl Table for SegmentedTable {
                                         acc.int_sum += *v as i128;
                                         acc.count += 1;
                                     }
-                                    Value::Float(f) if !f.is_nan() => {
+                                    Value::Float(f) => {
                                         acc.float_sum += *f;
                                         acc.count += 1;
                                         acc.is_int_agg = false;
@@ -7154,11 +7183,12 @@ impl Table for SegmentedTable {
                                         }
                                         DataType::Float => {
                                             let f = col.get_f64(i);
-                                            if !f.is_nan() {
-                                                acc.is_int_agg = false;
-                                                if acc.min_f64.is_none_or(|cur| f < cur) {
-                                                    acc.min_f64 = Some(f);
-                                                }
+                                            acc.is_int_agg = false;
+                                            if acc
+                                                .min_f64
+                                                .is_none_or(|cur| compare_floats(f, cur).is_lt())
+                                            {
+                                                acc.min_f64 = Some(f);
                                             }
                                         }
                                         _ => {}
@@ -7177,9 +7207,12 @@ impl Table for SegmentedTable {
                                             acc.min_i64 = Some(nanos);
                                         }
                                     }
-                                    Value::Float(f) if !f.is_nan() => {
+                                    Value::Float(f) => {
                                         acc.is_int_agg = false;
-                                        if acc.min_f64.is_none_or(|cur| *f < cur) {
+                                        if acc
+                                            .min_f64
+                                            .is_none_or(|cur| compare_floats(*f, cur).is_lt())
+                                        {
                                             acc.min_f64 = Some(*f);
                                         }
                                     }
@@ -7199,11 +7232,12 @@ impl Table for SegmentedTable {
                                         }
                                         DataType::Float => {
                                             let f = col.get_f64(i);
-                                            if !f.is_nan() {
-                                                acc.is_int_agg = false;
-                                                if acc.max_f64.is_none_or(|cur| f > cur) {
-                                                    acc.max_f64 = Some(f);
-                                                }
+                                            acc.is_int_agg = false;
+                                            if acc
+                                                .max_f64
+                                                .is_none_or(|cur| compare_floats(f, cur).is_gt())
+                                            {
+                                                acc.max_f64 = Some(f);
                                             }
                                         }
                                         _ => {}
@@ -7222,9 +7256,12 @@ impl Table for SegmentedTable {
                                             acc.max_i64 = Some(nanos);
                                         }
                                     }
-                                    Value::Float(f) if !f.is_nan() => {
+                                    Value::Float(f) => {
                                         acc.is_int_agg = false;
-                                        if acc.max_f64.is_none_or(|cur| *f > cur) {
+                                        if acc
+                                            .max_f64
+                                            .is_none_or(|cur| compare_floats(*f, cur).is_gt())
+                                        {
                                             acc.max_f64 = Some(*f);
                                         }
                                     }
@@ -7646,7 +7683,10 @@ impl Table for SegmentedTable {
                             },
                             (None, Some(f)) => Value::Float(f),
                             (Some(i), Some(f)) => {
-                                if (i as f64) <= f {
+                                if Value::Integer(i)
+                                    .compare(&Value::Float(f))
+                                    .is_ok_and(|o| o.is_le())
+                                {
                                     Value::Integer(i)
                                 } else {
                                     Value::Float(f)
@@ -7673,7 +7713,10 @@ impl Table for SegmentedTable {
                             },
                             (None, Some(f)) => Value::Float(f),
                             (Some(i), Some(f)) => {
-                                if (i as f64) >= f {
+                                if Value::Integer(i)
+                                    .compare(&Value::Float(f))
+                                    .is_ok_and(|o| o.is_ge())
+                                {
                                     Value::Integer(i)
                                 } else {
                                     Value::Float(f)
@@ -7770,13 +7813,13 @@ impl Table for SegmentedTable {
                 }
                 if let Some(s) = src.min_f64 {
                     dst.min_f64 = Some(match dst.min_f64 {
-                        Some(d) if d <= s => d,
+                        Some(d) if compare_floats(d, s).is_le() => d,
                         _ => s,
                     });
                 }
                 if let Some(s) = src.max_f64 {
                     dst.max_f64 = Some(match dst.max_f64 {
-                        Some(d) if d >= s => d,
+                        Some(d) if compare_floats(d, s).is_ge() => d,
                         _ => s,
                     });
                 }
@@ -7836,7 +7879,10 @@ impl Table for SegmentedTable {
                                 },
                                 (None, Some(f)) => Value::Float(f),
                                 (Some(i), Some(f)) => {
-                                    if (i as f64) <= f {
+                                    if Value::Integer(i)
+                                        .compare(&Value::Float(f))
+                                        .is_ok_and(|o| o.is_le())
+                                    {
                                         Value::Integer(i)
                                     } else {
                                         Value::Float(f)
@@ -7863,7 +7909,10 @@ impl Table for SegmentedTable {
                                 },
                                 (None, Some(f)) => Value::Float(f),
                                 (Some(i), Some(f)) => {
-                                    if (i as f64) >= f {
+                                    if Value::Integer(i)
+                                        .compare(&Value::Float(f))
+                                        .is_ok_and(|o| o.is_ge())
+                                    {
                                         Value::Integer(i)
                                     } else {
                                         Value::Float(f)
@@ -7901,7 +7950,7 @@ impl Table for SegmentedTable {
                                         accum.int_sum += *i as i128;
                                         accum.count += 1;
                                     }
-                                    Value::Float(f) if !f.is_nan() => {
+                                    Value::Float(f) => {
                                         accum.float_sum += *f;
                                         accum.count += 1;
                                         accum.is_int_agg = false;
@@ -7932,11 +7981,13 @@ impl Table for SegmentedTable {
                                             _ => {}
                                         }
                                     }
-                                    Value::Float(f) if !f.is_nan() => {
+                                    Value::Float(f) => {
                                         accum.is_int_agg = false;
                                         match accum.min_f64 {
                                             None => accum.min_f64 = Some(*f),
-                                            Some(cur) if *f < cur => accum.min_f64 = Some(*f),
+                                            Some(cur) if compare_floats(*f, cur).is_lt() => {
+                                                accum.min_f64 = Some(*f)
+                                            }
                                             _ => {}
                                         }
                                     }
@@ -7962,11 +8013,13 @@ impl Table for SegmentedTable {
                                             _ => {}
                                         }
                                     }
-                                    Value::Float(f) if !f.is_nan() => {
+                                    Value::Float(f) => {
                                         accum.is_int_agg = false;
                                         match accum.max_f64 {
                                             None => accum.max_f64 = Some(*f),
-                                            Some(cur) if *f > cur => accum.max_f64 = Some(*f),
+                                            Some(cur) if compare_floats(*f, cur).is_gt() => {
+                                                accum.max_f64 = Some(*f)
+                                            }
                                             _ => {}
                                         }
                                     }
@@ -8058,12 +8111,9 @@ impl Table for SegmentedTable {
                                             acc.count += 1;
                                         }
                                         DataType::Float => {
-                                            let f = col.get_f64(i);
-                                            if !f.is_nan() {
-                                                acc.float_sum += f;
-                                                acc.count += 1;
-                                                acc.is_int_agg = false;
-                                            }
+                                            acc.float_sum += col.get_f64(i);
+                                            acc.count += 1;
+                                            acc.is_int_agg = false;
                                         }
                                         DataType::Boolean => {
                                             acc.int_sum += col.get_bool(i) as i128;
@@ -8078,7 +8128,7 @@ impl Table for SegmentedTable {
                                         acc.int_sum += *v as i128;
                                         acc.count += 1;
                                     }
-                                    Value::Float(f) if !f.is_nan() => {
+                                    Value::Float(f) => {
                                         acc.float_sum += *f;
                                         acc.count += 1;
                                         acc.is_int_agg = false;
@@ -8105,13 +8155,13 @@ impl Table for SegmentedTable {
                                         }
                                         DataType::Float => {
                                             let f = col.get_f64(i);
-                                            if !f.is_nan() {
-                                                acc.is_int_agg = false;
-                                                match acc.min_f64 {
-                                                    None => acc.min_f64 = Some(f),
-                                                    Some(cur) if f < cur => acc.min_f64 = Some(f),
-                                                    _ => {}
+                                            acc.is_int_agg = false;
+                                            match acc.min_f64 {
+                                                None => acc.min_f64 = Some(f),
+                                                Some(cur) if compare_floats(f, cur).is_lt() => {
+                                                    acc.min_f64 = Some(f)
                                                 }
+                                                _ => {}
                                             }
                                         }
                                         _ => {}
@@ -8134,11 +8184,13 @@ impl Table for SegmentedTable {
                                             _ => {}
                                         }
                                     }
-                                    Value::Float(f) if !f.is_nan() => {
+                                    Value::Float(f) => {
                                         acc.is_int_agg = false;
                                         match acc.min_f64 {
                                             None => acc.min_f64 = Some(*f),
-                                            Some(cur) if *f < cur => acc.min_f64 = Some(*f),
+                                            Some(cur) if compare_floats(*f, cur).is_lt() => {
+                                                acc.min_f64 = Some(*f)
+                                            }
                                             _ => {}
                                         }
                                     }
@@ -8160,13 +8212,13 @@ impl Table for SegmentedTable {
                                         }
                                         DataType::Float => {
                                             let f = col.get_f64(i);
-                                            if !f.is_nan() {
-                                                acc.is_int_agg = false;
-                                                match acc.max_f64 {
-                                                    None => acc.max_f64 = Some(f),
-                                                    Some(cur) if f > cur => acc.max_f64 = Some(f),
-                                                    _ => {}
+                                            acc.is_int_agg = false;
+                                            match acc.max_f64 {
+                                                None => acc.max_f64 = Some(f),
+                                                Some(cur) if compare_floats(f, cur).is_gt() => {
+                                                    acc.max_f64 = Some(f)
                                                 }
+                                                _ => {}
                                             }
                                         }
                                         _ => {}
@@ -8189,11 +8241,13 @@ impl Table for SegmentedTable {
                                             _ => {}
                                         }
                                     }
-                                    Value::Float(f) if !f.is_nan() => {
+                                    Value::Float(f) => {
                                         acc.is_int_agg = false;
                                         match acc.max_f64 {
                                             None => acc.max_f64 = Some(*f),
-                                            Some(cur) if *f > cur => acc.max_f64 = Some(*f),
+                                            Some(cur) if compare_floats(*f, cur).is_gt() => {
+                                                acc.max_f64 = Some(*f)
+                                            }
                                             _ => {}
                                         }
                                     }

@@ -1497,7 +1497,7 @@ pub fn parse_vector_str(s: &str) -> Option<Vec<f32>> {
 }
 
 /// Compare two floats with proper NaN handling
-fn compare_floats(a: f64, b: f64) -> Ordering {
+pub(crate) fn compare_floats(a: f64, b: f64) -> Ordering {
     // Handle NaN: treat as greater than all other values for consistency
     match (a.is_nan(), b.is_nan()) {
         (true, true) => Ordering::Equal,
