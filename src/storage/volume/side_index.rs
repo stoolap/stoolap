@@ -185,6 +185,20 @@ pub fn push_text(out: &mut Vec<u8>, text: &[u8]) {
     out.extend_from_slice(&[0, 0]);
 }
 
+/// A TEXT key and after it the bound just above it, so that `[key, bound)`
+/// holds that key alone; returns where the bound starts
+pub fn push_text_range(out: &mut Vec<u8>, text: &[u8]) -> usize {
+    out.clear();
+    push_text(out, text);
+    let split = out.len();
+    out.extend_from_within(..split);
+    // The key ends in its 0x00 0x00 terminator
+    if let Some(last) = out.last_mut() {
+        *last = 1;
+    }
+    split
+}
+
 /// A component holding the resolved key `key` of `domain`
 pub fn push_key(out: &mut Vec<u8>, domain: Domain, key: i64) {
     match domain {

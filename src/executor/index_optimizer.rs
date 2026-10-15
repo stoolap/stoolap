@@ -1015,14 +1015,12 @@ impl Executor {
     }
 
     /// Whether an IN on `column` may be read by `in_member_rows`: a table
-    /// that keeps rows outside its index, a B-tree on the column, and no
-    /// change of the transaction's own the index would miss
+    /// that keeps rows outside its index, an index probed key by key on the
+    /// column, and no change of the transaction's own the index would miss
     fn in_members_eligible(table: &dyn Table, column: &str) -> bool {
         table.lookup_index_on_column(column).is_none()
             && !table.has_local_changes()
-            && table
-                .get_index_on_column(column)
-                .is_some_and(|index| index.index_type() == crate::core::IndexType::BTree)
+            && crate::executor::utils::probes_by_equality(table, column)
     }
 
     /// The rows whose column is IN the members, by a scan that asks each

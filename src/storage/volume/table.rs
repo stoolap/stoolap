@@ -2076,24 +2076,43 @@ impl SegmentedTable {
         })
     }
 
+    /// The single-column TEXT entry a key probe of `column` asks
+    fn text_probe_def<'d>(
+        &self,
+        column: &str,
+        defs: &'d [SideIndexDef],
+    ) -> Option<&'d SideIndexDef> {
+        let schema = self.hot.schema();
+        defs.iter().find(|def| {
+            def.kind == KeyKind::OrderedBytes
+                && matches!(def.components.as_slice(), [only] if only.domain == Domain::Text
+                    && schema.columns.get(only.column as usize)
+                        .is_some_and(|c| c.name_lower.eq_ignore_ascii_case(column)))
+        })
+    }
+
     /// Whether no key of `keys` holds more than the scan share of a volume's
     /// rows in `view` by the counts its side file lists, which name every
     /// key the reads refuse by count, so the refusal is found before any
     /// page is read. A volume without a side file or a list (version 4) is
-    /// left to the reads
+    /// left to the reads. A TEXT key is encoded into `buf`
     fn cold_keys_admitted(
         &self,
         view: &super::manifest::ColdSnapshot,
         column: &str,
         keys: &[Value],
         defs: &[SideIndexDef],
+        buf: &mut Vec<u8>,
     ) -> Result<bool> {
         let Some(first) = keys.iter().find(|key| !key.is_null()) else {
             return Ok(true);
         };
         let comparisons = [(column, crate::core::Operator::Eq, first)];
         let Some((def, _, _)) = self.side_bounds(&comparisons, defs) else {
-            return Ok(true);
+            return match self.text_probe_def(column, defs) {
+                Some(def) => self.cold_text_keys_admitted(view, def, keys, buf),
+                None => Ok(true),
+            };
         };
         for (_, cs) in view.volumes() {
             let Some(side) = cs.side_for(def, Capability::Equality) else {
@@ -2126,6 +2145,44 @@ impl SegmentedTable {
         Ok(true)
     }
 
+    /// `cold_keys_admitted` for the TEXT entry `def`
+    fn cold_text_keys_admitted(
+        &self,
+        view: &super::manifest::ColdSnapshot,
+        def: &SideIndexDef,
+        keys: &[Value],
+        buf: &mut Vec<u8>,
+    ) -> Result<bool> {
+        for (_, cs) in view.volumes() {
+            let Some(side) = cs.side_for(def, Capability::Equality) else {
+                continue;
+            };
+            let Some(entry) = side.directory().entry(def.identity) else {
+                continue;
+            };
+            let rows = cs.volume.meta.row_count as u64;
+            let refused_by = |key: &[u8]| {
+                entry
+                    .bytes
+                    .heavy()
+                    .any(|(stored, count)| stored == key && count * SIDE_SCAN_SHARE > rows.max(1))
+            };
+            if entry.bytes.heavy().next().is_none() {
+                continue;
+            }
+            for key in keys {
+                if let Value::Text(text) = key {
+                    buf.clear();
+                    super::side_index::push_text(buf, text.as_bytes());
+                    if refused_by(buf) {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// One key's ids from every volume's side file in `view`, newest volume
     /// first, under the index identities in `scratch`; each volume admitted
     /// as the scan admits it and read through one reader on the caller's
@@ -2145,8 +2202,19 @@ impl SegmentedTable {
         use super::secondary::{is_refused, READS};
         use crate::storage::traits::CappedEqual;
         let comparisons = [(column, crate::core::Operator::Eq, key)];
-        let Some((def, low, high)) = self.side_bounds(&comparisons, &scratch.defs) else {
-            return Ok(None);
+        // A TEXT key is asked as its byte range, encoded into the scratch
+        let (def, low, high, text) = match self.side_bounds(&comparisons, &scratch.defs) {
+            Some((def, low, high)) => (def, low, high, None),
+            None => {
+                let Value::Text(text) = key else {
+                    return Ok(None);
+                };
+                let Some(def) = self.text_probe_def(column, &scratch.defs) else {
+                    return Ok(None);
+                };
+                let split = super::side_index::push_text_range(&mut scratch.key, text.as_bytes());
+                (def, 0, 0, Some(split))
+            }
         };
         // The bloom filter hashes a value's own bits and type: the key it
         // asks for must be stored exactly so, not as -0.0 for 0.0 or as an
@@ -2154,6 +2222,7 @@ impl SegmentedTable {
         let stored_as_asked = match (def.leading().map(|c| c.domain), key) {
             (Some(Domain::Integer), Value::Integer(_))
             | (Some(Domain::Timestamp), Value::Timestamp(_))
+            | (Some(Domain::Text), Value::Text(_))
             | (Some(Domain::Boolean), Value::Boolean(_)) => true,
             (Some(Domain::Float), Value::Float(f)) => *f != 0.0,
             _ => false,
@@ -2173,7 +2242,14 @@ impl SegmentedTable {
             let window = left.min(super::secondary::SIDE_WINDOW);
             let reserve = super::secondary::reader_bytes(window)
                 .saturating_sub(scratch.reader.reserved_bytes());
-            let keys = KeyRange::I64(low, high);
+            let keys = match text {
+                Some(split) => KeyRange::Bytes {
+                    lower: &scratch.key[..split],
+                    upper: Some(&scratch.key[split..]),
+                    capability: Capability::Equality,
+                },
+                None => KeyRange::I64(low, high),
+            };
             let side = match self.side_admits(cs, def, keys, reserve)? {
                 SideAdmission::Empty => continue,
                 SideAdmission::Scan => return Ok(None),
@@ -6555,7 +6631,7 @@ impl Table for SegmentedTable {
         // A key the directories already refuse is found before any key's
         // pages are read
         if let Some(view) = view.as_ref().filter(|_| keys.len() > 1) {
-            if !self.cold_keys_admitted(view, column, keys, &scratch.defs)? {
+            if !self.cold_keys_admitted(view, column, keys, &scratch.defs, &mut scratch.key)? {
                 return Ok(None);
             }
         }
