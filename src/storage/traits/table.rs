@@ -984,6 +984,15 @@ pub trait Table: Send + Sync {
         out.clear();
     }
 
+    /// The same definitions handed to `each` one at a time, in no order,
+    /// with no lock of the table held
+    fn for_each_side_index_def(
+        &self,
+        each: &mut dyn FnMut(crate::storage::volume::side_index::SideIndexDef),
+    ) {
+        let _ = each;
+    }
+
     /// Gives this transaction's local version of `row_id` a volume's copy
     /// of the row as the version it replaces, so the commit removes the old
     /// keys from the indexes that keep sealed rows and a failed commit puts

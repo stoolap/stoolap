@@ -2097,6 +2097,35 @@ pub(crate) fn unique_index_built() {
     UNIQUE_INDEX_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Process-wide: TEXT values looked up in a volume's dictionary for a filter
+static DICTIONARY_SEARCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Dictionary lookups a read's filter made, so far
+pub fn dictionary_searches() -> usize {
+    DICTIONARY_SEARCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn dictionary_searched() {
+    DICTIONARY_SEARCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Process-wide: side walks still to refuse when they take their reader
+static REFUSE_SIDE_WALKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Has the next `count` side walks refused when they take their reader
+pub fn refuse_side_walks(count: usize) {
+    REFUSE_SIDE_WALKS.store(count, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn side_walk_refused() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if REFUSE_SIDE_WALKS.load(Relaxed) == 0 {
+        return false;
+    }
+    REFUSE_SIDE_WALKS.fetch_sub(1, Relaxed);
+    true
+}
+
 pub(crate) fn unique_read_candidates(count: usize) {
     UNIQUE_READ_CANDIDATES.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
 }

@@ -694,12 +694,20 @@ impl VolumeScanner {
         } else {
             None
         };
-        for &(col_name, op, value) in &comparisons {
+        // A side walk names the rows, so the dictionary is not searched
+        let searched = if self.side.is_some() {
+            &[][..]
+        } else {
+            &comparisons[..]
+        };
+        for &(col_name, op, value) in searched {
             if op != crate::core::Operator::Eq {
                 continue;
             }
             if let Value::Text(s) = value {
                 if let Some(col_idx) = self.filter_column(col_name) {
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::dictionary_searched();
                     let dict_id = if let Some(st) = store {
                         st.dict_lookup(col_idx, s.as_str())
                     } else {

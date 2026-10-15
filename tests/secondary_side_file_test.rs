@@ -43,7 +43,7 @@ fn open(dir: &Path, extra: &str) -> Database {
     .unwrap()
 }
 
-/// A table with an index on an integer column, one on a text column
+/// A table with an index on an integer column, a bitmap on a text column
 /// (never a side file's), and none on the timestamp column
 fn create(db: &Database) {
     db.execute(
@@ -52,7 +52,7 @@ fn create(db: &Database) {
     )
     .unwrap();
     db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
-    db.execute("CREATE INDEX idx_t_name ON t(name)", ())
+    db.execute("CREATE INDEX idx_t_name ON t(name) USING BITMAP", ())
         .unwrap();
 }
 
@@ -169,13 +169,13 @@ fn a_seal_writes_a_side_file_of_the_indexed_integer_column_beside_each_volume() 
         let side = side_of(dir.path(), "t", stem);
         assert_eq!(side.directory().columns.len(), 1);
         let identity = db.engine().index_identity("t", "idx_t_k").unwrap();
-        assert!(side.covers(identity, 1, Capability::Equality));
+        assert!(side.covers(identity, &[1], Capability::Equality));
         assert!(
-            !side.covers(identity + 1, 1, Capability::Equality),
+            !side.covers(identity + 1, &[1], Capability::Equality),
             "another index's identity"
         );
         assert!(
-            !side.covers(identity, 2, Capability::Equality),
+            !side.covers(identity, &[2], Capability::Equality),
             "the text column has no side entry"
         );
         let (start, end) = side.equal(identity, 3).unwrap().unwrap();
@@ -473,7 +473,7 @@ fn an_index_recreated_with_the_same_definition_gets_a_new_identity_and_the_old_s
     seal_rows(&db, 1, 2_000);
     let old = identity(&db, "idx_t_k");
     let stem = files(dir.path(), "t", "vol").into_iter().next().unwrap();
-    assert!(side_of(dir.path(), "t", &stem).covers(old, 1, Capability::Equality));
+    assert!(side_of(dir.path(), "t", &stem).covers(old, &[1], Capability::Equality));
     db.execute("DROP INDEX idx_t_k ON t", ()).unwrap();
     assert!(db.engine().index_identity("t", "idx_t_k").is_none());
     assert!(
@@ -500,7 +500,7 @@ fn an_index_recreated_with_the_same_definition_gets_a_new_identity_and_the_old_s
     seal_rows(&db, 2_001, 2_000);
     let covered = files(dir.path(), "t", "vol")
         .into_iter()
-        .filter(|s| side_of(dir.path(), "t", s).covers(new, 1, Capability::Equality))
+        .filter(|s| side_of(dir.path(), "t", s).covers(new, &[1], Capability::Equality))
         .count();
     assert_eq!(covered, 1);
     db.close().unwrap();
@@ -1016,7 +1016,7 @@ fn a_replayed_drop_leaves_the_file_of_the_index_created_after_it() {
     let sides = files(dir.path(), "t", "sidx");
     assert_eq!(sides.len(), 1);
     let side = sides.into_iter().next().unwrap();
-    assert!(side_of(dir.path(), "t", &side).covers(new, 1, Capability::Equality));
+    assert!(side_of(dir.path(), "t", &side).covers(new, &[1], Capability::Equality));
     db.close().unwrap();
     drop(db);
 
@@ -1029,7 +1029,7 @@ fn a_replayed_drop_leaves_the_file_of_the_index_created_after_it() {
         vec![side.clone()],
         "the file survives the replay"
     );
-    assert!(side_of(dir.path(), "t", &side).covers(new, 1, Capability::Equality));
+    assert!(side_of(dir.path(), "t", &side).covers(new, &[1], Capability::Equality));
     assert_eq!(count_where(&db, "SELECT COUNT(*) FROM t WHERE k = 3"), 100);
     db.close().unwrap();
 }
@@ -1061,14 +1061,14 @@ fn dropping_an_index_after_a_column_drop_keeps_the_file_of_the_other_index() {
     let stem = files(dir.path(), "u", "vol").into_iter().next().unwrap();
     db.execute("ALTER TABLE u DROP COLUMN padding", ()).unwrap();
     // k is the schema's first column now and the volume's second
-    assert!(side_of(dir.path(), "u", &stem).covers(k, 2, Capability::Equality));
+    assert!(side_of(dir.path(), "u", &stem).covers(k, &[2], Capability::Equality));
     db.execute("DROP INDEX idx_u_m ON u", ()).unwrap();
     assert_eq!(
         files(dir.path(), "u", "sidx").len(),
         1,
         "the file still serves k"
     );
-    assert!(side_of(dir.path(), "u", &stem).covers(k, 2, Capability::Equality));
+    assert!(side_of(dir.path(), "u", &stem).covers(k, &[2], Capability::Equality));
     assert_eq!(count_where(&db, "SELECT COUNT(*) FROM u WHERE k = 3"), 100);
     db.execute("DROP INDEX idx_u_k ON u", ()).unwrap();
     assert!(files(dir.path(), "u", "sidx").is_empty());
@@ -1111,7 +1111,7 @@ fn a_reopen_after_a_checkpointed_column_drop_keeps_the_side_file() {
     let sides = files(dir.path(), "u", "sidx");
     assert_eq!(sides.len(), 1, "the file survives the reopen");
     let side = sides.into_iter().next().unwrap();
-    assert!(side_of(dir.path(), "u", &side).covers(k, 2, Capability::Equality));
+    assert!(side_of(dir.path(), "u", &side).covers(k, &[2], Capability::Equality));
     assert_eq!(count_where(&db, "SELECT COUNT(*) FROM u WHERE k = 3"), 100);
     db.close().unwrap();
 }

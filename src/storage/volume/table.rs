@@ -45,7 +45,7 @@ use crate::storage::traits::{
 
 use super::manifest::SegmentManager;
 use super::scanner::{RowVecScanner, VolumeScanner};
-use super::side_index::{resolve, Capability, Domain, Resolved, SideIndexDef};
+use super::side_index::{resolve, ByteRange, Capability, Domain, KeyKind, Resolved, SideIndexDef};
 use super::writer::FrozenVolume;
 
 /// What a volume's side file decided for a read: the volume goes through
@@ -77,6 +77,67 @@ enum SideAdmission {
     Empty,
     Scan,
     Probe(Arc<super::secondary::IndexFile>),
+}
+
+/// What a read asks of the volumes' side files, worked out once per read:
+/// the index the comparisons bound and its key range
+struct SideAsk {
+    def: SideIndexDef,
+    keys: AskKeys,
+}
+
+enum AskKeys {
+    /// An ordered i64 entry's keys in `[low, high]`, empty when low is above
+    I64(i64, i64),
+    /// An ordered-bytes entry's keys in a byte range
+    Bytes(ByteRange, Capability),
+}
+
+impl AskKeys {
+    fn range(&self) -> KeyRange<'_> {
+        match self {
+            AskKeys::I64(low, high) => KeyRange::I64(*low, *high),
+            AskKeys::Bytes(range, capability) => KeyRange::Bytes {
+                lower: range.lower(),
+                upper: range.upper(),
+                capability: *capability,
+            },
+        }
+    }
+}
+
+/// The position range `reader`'s entry holds for `keys`
+fn positions_of(
+    reader: &super::secondary::Reader,
+    keys: KeyRange<'_>,
+) -> std::io::Result<(u64, u64)> {
+    match keys {
+        KeyRange::I64(low, high) if low == high => Ok(reader.equal(low)?.unwrap_or((0, 0))),
+        KeyRange::I64(low, high) if low > high => Ok((0, 0)),
+        KeyRange::I64(low, high) => reader.range(low, high),
+        KeyRange::Bytes { lower, upper, .. } => reader.range_bytes(lower, upper),
+    }
+}
+
+/// `AskKeys` borrowed, so a key probe asks with its own reused buffer
+#[derive(Clone, Copy)]
+enum KeyRange<'a> {
+    I64(i64, i64),
+    Bytes {
+        lower: &'a [u8],
+        upper: Option<&'a [u8]>,
+        capability: Capability,
+    },
+}
+
+impl KeyRange<'_> {
+    fn capability(&self) -> Capability {
+        match self {
+            KeyRange::I64(low, high) if low == high => Capability::Equality,
+            KeyRange::I64(..) => Capability::Range,
+            KeyRange::Bytes { capability, .. } => *capability,
+        }
+    }
 }
 
 /// The index serves a volume when the candidates are at most this share
@@ -1630,15 +1691,15 @@ impl SegmentedTable {
     fn side_decision(
         &self,
         cs: &super::manifest::ColdSegment,
-        comparisons: &[(&str, crate::core::Operator, &Value)],
-        identities: &[SideIndexDef],
+        ask: Option<&SideAsk>,
     ) -> Result<SideDecision> {
         use super::secondary::{is_refused, SidePlan, READS};
-        let Some((def, low, high)) = self.side_bounds(comparisons, identities) else {
+        let Some(SideAsk { def, keys }) = ask else {
             return Ok(SideDecision::Scan);
         };
         let reserve = super::secondary::reader_bytes(super::secondary::SIDE_WINDOW);
-        let side = match self.side_admits(cs, def, low, high, reserve)? {
+        let keys = keys.range();
+        let side = match self.side_admits(cs, def, keys, reserve)? {
             SideAdmission::Empty => return Ok(SideDecision::Empty),
             SideAdmission::Scan => return Ok(SideDecision::Scan),
             SideAdmission::Probe(side) => side,
@@ -1656,13 +1717,7 @@ impl SegmentedTable {
             Err(error) => return Err(side_error(error)),
         };
         READS.count(&READS.probes, 1);
-        let range = if low == high {
-            reader.equal(low).map_err(side_error)?.unwrap_or((0, 0))
-        } else if low > high {
-            (0, 0)
-        } else {
-            reader.range(low, high).map_err(side_error)?
-        };
+        let range = positions_of(&reader, keys).map_err(side_error)?;
         let count = range.1 - range.0;
         if count == 0 {
             READS.count(&READS.misses, 1);
@@ -1771,42 +1826,155 @@ impl SegmentedTable {
             return None;
         }
         let schema = self.hot.schema();
-        for def in defs {
-            let Some(component) = def.leading() else {
-                continue;
-            };
-            let Some(name) = schema
-                .columns
-                .get(component.column)
-                .map(|c| c.name_lower.as_str())
-            else {
-                continue;
-            };
-            let (mut low, mut high) = (i64::MIN, i64::MAX);
-            let mut bounded = false;
-            for &(col_name, op, value) in comparisons {
-                if !col_name.eq_ignore_ascii_case(name) {
-                    continue;
-                }
-                // The comparisons all hold, so their key ranges intersect
-                let (l, h) = match resolve(component.domain, op, value) {
-                    Resolved::Key(k) => (k, k),
-                    Resolved::Range(l, h) => (l, h),
-                    Resolved::Empty => (1, 0),
-                    Resolved::Fallback => continue,
-                };
-                bounded = true;
-                low = low.max(l);
-                high = high.min(h);
-            }
-            if bounded {
-                return Some((def, low, high));
-            }
-        }
-        None
+        defs.iter()
+            .find_map(|def| Some((def, Self::i64_bounds(schema, comparisons, def)?)))
+            .map(|(def, (low, high))| (def, low, high))
     }
 
-    /// Whether a volume's side file is asked for `[low, high]` under `def`,
+    /// `side_bounds` for the one index `def`, when its keys are ordered i64
+    fn i64_bounds(
+        schema: &Schema,
+        comparisons: &[(&str, crate::core::Operator, &Value)],
+        def: &SideIndexDef,
+    ) -> Option<(i64, i64)> {
+        if def.kind != KeyKind::OrderedI64 {
+            return None;
+        }
+        let component = def.leading()?;
+        let name = schema
+            .columns
+            .get(component.column as usize)
+            .map(|c| c.name_lower.as_str())?;
+        let (mut low, mut high) = (i64::MIN, i64::MAX);
+        let mut bounded = false;
+        for &(col_name, op, value) in comparisons {
+            if !col_name.eq_ignore_ascii_case(name) {
+                continue;
+            }
+            // The comparisons all hold, so their key ranges intersect
+            let (l, h) = match resolve(component.domain, op, value) {
+                Resolved::Key(k) => (k, k),
+                Resolved::Range(l, h) => (l, h),
+                Resolved::Empty => (1, 0),
+                Resolved::Fallback => continue,
+            };
+            bounded = true;
+            low = low.max(l);
+            high = high.min(h);
+        }
+        bounded.then_some((low, high))
+    }
+
+    /// How far the comparisons fix `def`'s key, by column names alone: the
+    /// leading components set by an equality, and whether the next one is
+    /// compared at all. Nothing is encoded here
+    fn key_shape(
+        schema: &Schema,
+        comparisons: &[(&str, crate::core::Operator, &Value)],
+        def: &SideIndexDef,
+    ) -> (usize, bool) {
+        let compared = |column: u32, equal: bool| {
+            schema.columns.get(column as usize).is_some_and(|c| {
+                comparisons.iter().any(|(name, op, _)| {
+                    (!equal || *op == crate::core::Operator::Eq)
+                        && name.eq_ignore_ascii_case(&c.name_lower)
+                })
+            })
+        };
+        let equal = def
+            .components
+            .iter()
+            .take_while(|c| compared(c.column, true))
+            .count();
+        let next = def
+            .components
+            .get(equal)
+            .is_some_and(|c| compared(c.column, false));
+        (equal, next)
+    }
+
+    /// `def`'s key range `[lower, upper)` under the comparisons and what it
+    /// asks of the entry: equality on the whole key, a range on the
+    /// component after the leading equalities, or those equalities alone
+    /// as a prefix. None when the comparisons bound none of it
+    fn byte_bounds(
+        schema: &Schema,
+        comparisons: &[(&str, crate::core::Operator, &Value)],
+        def: &SideIndexDef,
+    ) -> Option<(ByteRange, Capability)> {
+        use super::side_index::{component_range, encoded_len, push_equal, Encoded};
+        let name_of = |column: u32| {
+            schema
+                .columns
+                .get(column as usize)
+                .map(|c| c.name_lower.as_str())
+        };
+        // The buffer takes both bounds at once: twice the longest key the
+        // comparisons can make
+        let longest = |component: &super::side_index::Component, equal: bool| {
+            let name = name_of(component.column)?;
+            comparisons
+                .iter()
+                .filter(|(column, op, _)| {
+                    (!equal || *op == crate::core::Operator::Eq)
+                        && column.eq_ignore_ascii_case(name)
+                })
+                .map(|&(_, _, value)| encoded_len(component.domain, value))
+                .max()
+        };
+        let mut need = 0;
+        for component in &def.components {
+            match longest(component, true) {
+                Some(len) => need += len,
+                None => {
+                    need += longest(component, false).unwrap_or(0);
+                    break;
+                }
+            }
+        }
+        let mut prefix = Vec::with_capacity(2 * need);
+        let mut equal = 0;
+        for component in &def.components {
+            let Some(name) = name_of(component.column) else {
+                break;
+            };
+            let mut pushed = false;
+            for &(column, op, value) in comparisons {
+                if op != crate::core::Operator::Eq || !column.eq_ignore_ascii_case(name) {
+                    continue;
+                }
+                match push_equal(component.domain, value, &mut prefix) {
+                    Encoded::Pushed => {
+                        pushed = true;
+                        break;
+                    }
+                    Encoded::Empty => return Some((ByteRange::empty(), Capability::Equality)),
+                    Encoded::Fallback => {}
+                }
+            }
+            if !pushed {
+                break;
+            }
+            equal += 1;
+        }
+        if equal == def.components.len() {
+            return Some((ByteRange::starting_with(prefix), Capability::Equality));
+        }
+        let next = def.components[equal];
+        if let Some(name) = name_of(next.column) {
+            let on_next = comparisons
+                .iter()
+                .filter(|(column, _, _)| column.eq_ignore_ascii_case(name))
+                .map(|&(_, op, value)| (op, value));
+            prefix = match component_range(next.domain, prefix, on_next) {
+                Ok(range) => return Some((range, Capability::Range)),
+                Err(prefix) => prefix,
+            };
+        }
+        (equal > 0).then(|| (ByteRange::starting_with(prefix), Capability::Prefix))
+    }
+
+    /// Whether a volume's side file is asked for `keys` under `def`,
     /// decided before any page is read: the file must hold the index's
     /// entry over the volume's column, the directory must not rule the
     /// range out or estimate more candidates than the scan share, and a
@@ -1818,26 +1986,24 @@ impl SegmentedTable {
         &self,
         cs: &super::manifest::ColdSegment,
         def: &SideIndexDef,
-        low: i64,
-        high: i64,
+        keys: KeyRange<'_>,
         reserve: usize,
     ) -> Result<SideAdmission> {
         use super::secondary::READS;
-        let capability = if low == high {
-            Capability::Equality
-        } else {
-            Capability::Range
-        };
+        let capability = keys.capability();
         let Some(side) = cs.side_for(def, capability) else {
             READS.count(&READS.ineligible, 1);
             return Ok(SideAdmission::Scan);
         };
         let identity = def.identity;
         let rows = cs.volume.meta.row_count as u64;
-        let Some(estimate) = side
-            .candidate_estimate(identity, low, high)
-            .map_err(side_error)?
-        else {
+        let estimate = match keys {
+            KeyRange::I64(low, high) => side.candidate_estimate(identity, low, high),
+            KeyRange::Bytes { lower, upper, .. } => {
+                side.byte_candidate_estimate(identity, lower, upper)
+            }
+        };
+        let Some(estimate) = estimate.map_err(side_error)? else {
             READS.count(&READS.misses, 1);
             return Ok(SideAdmission::Empty);
         };
@@ -1846,9 +2012,13 @@ impl SegmentedTable {
             return Ok(SideAdmission::Scan);
         }
         if rows <= super::secondary::POSITIONS_PER_PAGE as u64
-            && !side
-                .pages_admissible(identity, low, high, reserve)
-                .map_err(side_error)?
+            && !match keys {
+                KeyRange::I64(low, high) => side.pages_admissible(identity, low, high, reserve),
+                KeyRange::Bytes { lower, upper, .. } => {
+                    side.byte_pages_admissible(identity, lower, upper, reserve)
+                }
+            }
+            .map_err(side_error)?
         {
             READS.count(&READS.page_scans, 1);
             return Ok(SideAdmission::Scan);
@@ -1856,10 +2026,54 @@ impl SegmentedTable {
         Ok(SideAdmission::Probe(Arc::clone(side)))
     }
 
-    /// The indexes the side files may serve, taken once per read with the
-    /// cold view
-    fn side_identities(&self) -> Vec<SideIndexDef> {
-        self.hot.side_index_defs()
+    /// What the read's comparisons ask of the side files, taken once per
+    /// read with the cold view: the index whose key they fix furthest, an
+    /// ordered i64 one on a tie, the smaller identity among equals. The
+    /// definitions are walked in place, none collected
+    fn side_ask(&self, comparisons: &[(&str, crate::core::Operator, &Value)]) -> Option<SideAsk> {
+        let schema = self.hot.schema();
+        let mut i64_best: Option<(SideIndexDef, i64, i64)> = None;
+        let mut bytes_best: Option<((usize, bool), SideIndexDef)> = None;
+        let before = |def: &SideIndexDef, held: &SideIndexDef| def.identity < held.identity;
+        self.hot.for_each_side_index_def(&mut |def| match def.kind {
+            KeyKind::OrderedI64 => {
+                if let Some((low, high)) = Self::i64_bounds(schema, comparisons, &def) {
+                    if i64_best
+                        .as_ref()
+                        .is_none_or(|(held, ..)| before(&def, held))
+                    {
+                        i64_best = Some((def, low, high));
+                    }
+                }
+            }
+            KeyKind::OrderedBytes => {
+                let shape = Self::key_shape(schema, comparisons, &def);
+                let better = bytes_best.as_ref().is_none_or(|(held_shape, held)| {
+                    shape > *held_shape || (shape == *held_shape && before(&def, held))
+                });
+                if shape > (0, false) && better {
+                    bytes_best = Some((shape, def));
+                }
+            }
+        });
+        let i64_shape = i64_best.as_ref().map(|(_, low, high)| match low.cmp(high) {
+            std::cmp::Ordering::Greater => (usize::MAX, false),
+            std::cmp::Ordering::Equal => (1, false),
+            std::cmp::Ordering::Less => (0, true),
+        });
+        if let Some((_, def)) = bytes_best.filter(|(shape, _)| Some(*shape) > i64_shape) {
+            if let Some((range, capability)) = Self::byte_bounds(schema, comparisons, &def) {
+                return Some(SideAsk {
+                    def,
+                    keys: AskKeys::Bytes(range, capability),
+                });
+            }
+        }
+        let (def, low, high) = i64_best?;
+        Some(SideAsk {
+            def,
+            keys: AskKeys::I64(low, high),
+        })
     }
 
     /// Whether no key of `keys` holds more than the scan share of a volume's
@@ -1959,7 +2173,8 @@ impl SegmentedTable {
             let window = left.min(super::secondary::SIDE_WINDOW);
             let reserve = super::secondary::reader_bytes(window)
                 .saturating_sub(scratch.reader.reserved_bytes());
-            let side = match self.side_admits(cs, def, low, high, reserve)? {
+            let keys = KeyRange::I64(low, high);
+            let side = match self.side_admits(cs, def, keys, reserve)? {
                 SideAdmission::Empty => continue,
                 SideAdmission::Scan => return Ok(None),
                 SideAdmission::Probe(side) => side,
@@ -1973,7 +2188,7 @@ impl SegmentedTable {
                 Err(error) => return Err(side_error(error)),
             };
             READS.count(&READS.probes, 1);
-            let range = reader.equal(low).map_err(side_error)?.unwrap_or((0, 0));
+            let range = positions_of(&reader, keys).map_err(side_error)?;
             let count = range.1 - range.0;
             let rows = cs.volume.meta.row_count as u64;
             let refused = if count == 0 {
@@ -2243,10 +2458,10 @@ impl SegmentedTable {
         let hot_skip_arc = Arc::new(hot_skip);
 
         let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
-        let identities = if comparisons.is_empty() {
-            Vec::new()
+        let ask = if comparisons.is_empty() {
+            None
         } else {
-            self.side_identities()
+            self.side_ask(&comparisons)
         };
         let unique_keys = self.unique_keys_for(&comparisons)?;
         let mut scanners_reverse: Vec<Box<dyn Scanner>> = Vec::with_capacity(view.seg_ids.len());
@@ -2263,7 +2478,7 @@ impl SegmentedTable {
             let (plan, positions) = match self.unique_decision(cs, &unique_keys) {
                 UniqueDecision::Empty => continue,
                 UniqueDecision::Positions(positions) => (None, Some(positions)),
-                UniqueDecision::Pass => match self.side_decision(cs, &comparisons, &identities)? {
+                UniqueDecision::Pass => match self.side_decision(cs, ask.as_ref())? {
                     SideDecision::Empty => continue,
                     SideDecision::Walk(plan) => (Some(plan), None),
                     SideDecision::Scan => (None, None),
@@ -2413,10 +2628,10 @@ impl SegmentedTable {
         let tombstones_ref = tombstones_arc;
 
         // Per-volume row collection closure. Returns Some(vol_rows) or None if pruned.
-        let identities = if comparisons.is_empty() {
-            Vec::new()
+        let ask = if comparisons.is_empty() {
+            None
         } else {
-            self.side_identities()
+            self.side_ask(&comparisons)
         };
         let unique_keys = self.unique_keys_for(&comparisons)?;
         let process_volume =
@@ -2432,13 +2647,11 @@ impl SegmentedTable {
                 let (mut walk, positions) = match self.unique_decision(cs, &unique_keys) {
                     UniqueDecision::Empty => return Ok(None),
                     UniqueDecision::Positions(positions) => (None, Some(positions)),
-                    UniqueDecision::Pass => {
-                        match self.side_decision(cs, &comparisons, &identities)? {
-                            SideDecision::Empty => return Ok(None),
-                            SideDecision::Walk(plan) => (start_walk(&plan)?, None),
-                            SideDecision::Scan => (None, None),
-                        }
-                    }
+                    UniqueDecision::Pass => match self.side_decision(cs, ask.as_ref())? {
+                        SideDecision::Empty => return Ok(None),
+                        SideDecision::Walk(plan) => (start_walk(&plan)?, None),
+                        SideDecision::Scan => (None, None),
+                    },
                 };
                 let positioned = walk.is_some() || positions.is_some();
                 // Load cold volume on demand after zone-map/bloom pruning.
@@ -2467,7 +2680,13 @@ impl SegmentedTable {
 
                 let mut dict_filters: Vec<(usize, u32)> = Vec::new();
                 let store = vol.columns.compressed_store();
-                for &(col_name, op, value) in &comparisons {
+                // A side walk names the rows, so the dictionary is not searched
+                let searched = if walk.is_some() {
+                    &[][..]
+                } else {
+                    &comparisons[..]
+                };
+                for &(col_name, op, value) in searched {
                     if op != crate::core::Operator::Eq {
                         continue;
                     }
@@ -2475,6 +2694,8 @@ impl SegmentedTable {
                     // renamed column under this name
                     if let Some(col_idx) = cs.mapping.volume_column(vol, col_name) {
                         if let Value::Text(s) = value {
+                            #[cfg(feature = "test-failpoints")]
+                            crate::test_failpoints::dictionary_searched();
                             let dict_id = if let Some(st) = store {
                                 st.dict_lookup(col_idx, s.as_str())
                             } else {
@@ -3804,10 +4025,10 @@ impl Table for SegmentedTable {
                 .map(|e| e.collect_comparisons())
                 .unwrap_or_default();
             let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
-            let identities = if comparisons.is_empty() {
-                Vec::new()
+            let ask = if comparisons.is_empty() {
+                None
             } else {
-                self.side_identities()
+                self.side_ask(&comparisons)
             };
             let unique_keys = self.unique_keys_for(&comparisons)?;
 
@@ -3837,7 +4058,7 @@ impl Table for SegmentedTable {
                 let side = if unique.is_some() {
                     SideDecision::Scan
                 } else {
-                    self.side_decision(cs, &comparisons, &identities)?
+                    self.side_decision(cs, ask.as_ref())?
                 };
                 let candidates: Option<(Vec<u32>, super::secondary::Reservation)> = match side {
                     SideDecision::Empty => continue,
@@ -4001,10 +4222,10 @@ impl Table for SegmentedTable {
                 .map(|e| e.collect_comparisons())
                 .unwrap_or_default();
             let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
-            let identities = if comparisons.is_empty() {
-                Vec::new()
+            let ask = if comparisons.is_empty() {
+                None
             } else {
-                self.side_identities()
+                self.side_ask(&comparisons)
             };
             let unique_keys = self.unique_keys_for(&comparisons)?;
 
@@ -4027,13 +4248,11 @@ impl Table for SegmentedTable {
                 let (mut walk, positions) = match self.unique_decision(cs, &unique_keys) {
                     UniqueDecision::Empty => continue,
                     UniqueDecision::Positions(positions) => (None, Some(positions)),
-                    UniqueDecision::Pass => {
-                        match self.side_decision(cs, &comparisons, &identities)? {
-                            SideDecision::Empty => continue,
-                            SideDecision::Walk(plan) => (start_walk(&plan)?, None),
-                            SideDecision::Scan => (None, None),
-                        }
-                    }
+                    UniqueDecision::Pass => match self.side_decision(cs, ask.as_ref())? {
+                        SideDecision::Empty => continue,
+                        SideDecision::Walk(plan) => (start_walk(&plan)?, None),
+                        SideDecision::Scan => (None, None),
+                    },
                 };
 
                 // Load cold volume on demand after pruning.
