@@ -185,11 +185,15 @@ pub fn push_text(out: &mut Vec<u8>, text: &[u8]) {
     out.extend_from_slice(&[0, 0]);
 }
 
-/// Whether `push_text` writes `text` within the longest key a key page
-/// holds, found without encoding it
-pub fn text_key_fits(text: &[u8]) -> bool {
+/// The bytes `push_text` writes for `text`, found without encoding it; None
+/// when they pass the longest key a key page holds
+pub fn text_key_len(text: &[u8]) -> Option<usize> {
     let limit = super::secondary::MAX_BYTE_KEY;
-    text.len() + 3 <= limit && text.len() + 3 + text.iter().filter(|&&b| b == 0).count() <= limit
+    if text.len() + 3 > limit {
+        return None;
+    }
+    let len = text.len() + 3 + text.iter().filter(|&&b| b == 0).count();
+    (len <= limit).then_some(len)
 }
 
 /// A TEXT key and after it the bound just above it, so that `[key, bound)`

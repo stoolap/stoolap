@@ -2182,6 +2182,75 @@ impl ReaderSpace {
     }
 }
 
+/// A probe's encoded TEXT key, kept between probes: its bytes are charged
+/// to the page ledger at their capacity, admitted before they grow, and
+/// released with the buffer
+#[derive(Default)]
+pub struct KeyBuffer {
+    bytes: Vec<u8>,
+    reservation: Option<Reservation>,
+}
+
+impl KeyBuffer {
+    /// The key last encoded
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The bytes the ledger holds for this buffer
+    pub fn reserved_bytes(&self) -> usize {
+        self.reservation.as_ref().map_or(0, Reservation::bytes)
+    }
+
+    /// Room for `len` bytes, admitted to the ledger before the buffer grows;
+    /// false when the ledger refuses
+    fn admit(&mut self, len: usize) -> bool {
+        self.bytes.clear();
+        if self.bytes.capacity() < len {
+            let more = len.saturating_sub(self.reserved_bytes());
+            if more > 0 {
+                let Some(grown) = INDEX_PAGES.try_reserve(more) else {
+                    return false;
+                };
+                match self.reservation.as_mut() {
+                    Some(reservation) => reservation.absorb(grown),
+                    None => self.reservation = Some(grown),
+                }
+            }
+            self.bytes.reserve_exact(len);
+        }
+        // The allocator may hand out more than asked; what is owned is charged
+        let owned = self.bytes.capacity();
+        if owned > self.reserved_bytes() {
+            match self.reservation.as_mut() {
+                Some(reservation) => reservation.grow(owned - reservation.bytes()),
+                None => self.reservation = Some(INDEX_PAGES.reserve(owned)),
+            }
+        }
+        true
+    }
+
+    /// Encodes `text`, whose key takes `len` bytes; false when the ledger
+    /// refuses the room
+    pub fn text(&mut self, text: &[u8], len: usize) -> bool {
+        if !self.admit(len) {
+            return false;
+        }
+        super::side_index::push_text(&mut self.bytes, text);
+        true
+    }
+
+    /// Encodes `text`, whose key takes `len` bytes, and after it the bound
+    /// just above it; gives where the bound starts, None when the ledger
+    /// refuses the room
+    pub fn text_range(&mut self, text: &[u8], len: usize) -> Option<usize> {
+        if !self.admit(2 * len) {
+            return None;
+        }
+        Some(super::side_index::push_text_range(&mut self.bytes, text))
+    }
+}
+
 /// A reader with its own working space: the cursor window and one page
 /// of each kind, so an admitted walk completes whatever the cache admits.
 /// It holds its file, so a scanner can carry it across its rows.
@@ -5802,6 +5871,43 @@ mod tests {
             INDEX_PAGES.stats().charged_bytes,
             baseline,
             "released with the buffers"
+        );
+    }
+
+    #[test]
+    fn a_key_buffer_is_charged_while_it_holds_its_bytes() {
+        use super::super::side_index::text_key_len;
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        INDEX_PAGES.clear();
+        let baseline = INDEX_PAGES.stats().charged_bytes;
+        let long = "k".repeat(MAX_BYTE_KEY - 3);
+        let len = text_key_len(long.as_bytes()).unwrap();
+        let mut key = KeyBuffer::default();
+        assert_eq!(key.text_range(long.as_bytes(), len), Some(len));
+        let held = INDEX_PAGES.stats().charged_bytes - baseline;
+        assert!(held >= 2 * len, "the key and its bound are charged");
+        assert_eq!(key.reserved_bytes(), held);
+        assert_eq!(key.bytes.capacity(), held, "charged at its capacity");
+
+        // A shorter key reuses the bytes and their charge
+        assert!(key.text(b"short", text_key_len(b"short").unwrap()));
+        assert_eq!(key.bytes(), &[1, b's', b'h', b'o', b'r', b't', 0, 0]);
+        assert_eq!(INDEX_PAGES.stats().charged_bytes - baseline, held);
+
+        // A second buffer under a budget the first fills is refused, and
+        // allocates nothing
+        INDEX_PAGES.set_budget_bytes((baseline + held) as u64);
+        let mut other = KeyBuffer::default();
+        assert_eq!(other.text_range(long.as_bytes(), len), None);
+        assert!(!other.text(long.as_bytes(), len));
+        assert_eq!((other.bytes.capacity(), other.reserved_bytes()), (0, 0));
+        INDEX_PAGES.set_budget_bytes(DEFAULT_BUDGET_BYTES);
+
+        drop(key);
+        assert_eq!(
+            INDEX_PAGES.stats().charged_bytes,
+            baseline,
+            "released with the buffer"
         );
     }
 

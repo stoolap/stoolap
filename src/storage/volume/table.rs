@@ -2102,7 +2102,7 @@ impl SegmentedTable {
         column: &str,
         keys: &[Value],
         defs: &[SideIndexDef],
-        buf: &mut Vec<u8>,
+        buf: &mut super::secondary::KeyBuffer,
     ) -> Result<bool> {
         let Some(first) = keys.iter().find(|key| !key.is_null()) else {
             return Ok(true);
@@ -2151,7 +2151,7 @@ impl SegmentedTable {
         view: &super::manifest::ColdSnapshot,
         def: &SideIndexDef,
         keys: &[Value],
-        buf: &mut Vec<u8>,
+        buf: &mut super::secondary::KeyBuffer,
     ) -> Result<bool> {
         for (_, cs) in view.volumes() {
             let Some(side) = cs.side_for(def, Capability::Equality) else {
@@ -2171,16 +2171,18 @@ impl SegmentedTable {
                 continue;
             }
             for key in keys {
-                // A key no page holds is no heavy key
+                // A key no page holds is no heavy key; a key the ledger
+                // cannot hold is refused as a heavy one is
                 if let Value::Text(text) = key {
-                    if !super::side_index::text_key_fits(text.as_bytes()) {
+                    let Some(len) = super::side_index::text_key_len(text.as_bytes()) else {
                         continue;
+                    };
+                    if !buf.text(text.as_bytes(), len) {
+                        return Ok(false);
                     }
-                    buf.clear();
-                    super::side_index::push_text(buf, text.as_bytes());
                     #[cfg(any(test, feature = "test-failpoints"))]
-                    crate::test_failpoints::text_probe_key_held(buf.capacity());
-                    if refused_by(buf) {
+                    crate::test_failpoints::text_probe_key_held(buf.reserved_bytes());
+                    if refused_by(buf.bytes()) {
                         return Ok(false);
                     }
                 }
@@ -2218,12 +2220,14 @@ impl SegmentedTable {
                 let Some(def) = self.text_probe_def(column, &scratch.defs) else {
                     return Ok(None);
                 };
-                if !super::side_index::text_key_fits(text.as_bytes()) {
+                let Some(len) = super::side_index::text_key_len(text.as_bytes()) else {
                     return Ok(None);
-                }
-                let split = super::side_index::push_text_range(&mut scratch.key, text.as_bytes());
+                };
+                let Some(split) = scratch.key.text_range(text.as_bytes(), len) else {
+                    return Ok(None);
+                };
                 #[cfg(any(test, feature = "test-failpoints"))]
-                crate::test_failpoints::text_probe_key_held(scratch.key.capacity());
+                crate::test_failpoints::text_probe_key_held(scratch.key.reserved_bytes());
                 (def, 0, 0, Some(split))
             }
         };
@@ -2255,8 +2259,8 @@ impl SegmentedTable {
                 .saturating_sub(scratch.reader.reserved_bytes());
             let keys = match text {
                 Some(split) => KeyRange::Bytes {
-                    lower: &scratch.key[..split],
-                    upper: Some(&scratch.key[split..]),
+                    lower: &scratch.key.bytes()[..split],
+                    upper: Some(&scratch.key.bytes()[split..]),
                     capability: Capability::Equality,
                 },
                 None => KeyRange::I64(low, high),
