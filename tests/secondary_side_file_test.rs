@@ -847,6 +847,7 @@ fn closing_a_scanner_releases_its_side_reader() {
         vec![ColumnInput {
             column: 1,
             identity: 77,
+            domain: stoolap::storage::volume::side_index::Domain::Integer,
             pairs: Box::new((0..20_000u32).map(|p| (p, 1i64))),
         }],
         4 * 1024 * 1024,

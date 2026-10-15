@@ -18,13 +18,16 @@
 
 use smallvec::SmallVec;
 
-use crate::core::DataType;
+use crate::core::value::cmp_i64_f64;
+use crate::core::{DataType, Operator, Value};
 
 /// The value domain one key component is encoded in
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Domain {
     Integer,
     Timestamp,
+    Float,
+    Boolean,
 }
 
 impl Domain {
@@ -33,6 +36,34 @@ impl Domain {
         match data_type {
             DataType::Integer => Some(Self::Integer),
             DataType::Timestamp => Some(Self::Timestamp),
+            DataType::Float => Some(Self::Float),
+            DataType::Boolean => Some(Self::Boolean),
+            _ => None,
+        }
+    }
+
+    /// The domain a column's B-tree index is held in by a side file: a
+    /// BOOLEAN key is not, its two values mostly falling to the scan
+    pub fn admitted(data_type: DataType) -> Option<Self> {
+        Self::of(data_type).filter(|domain| *domain != Self::Boolean)
+    }
+
+    /// The domain's byte in a version 6 directory entry
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Integer => 1,
+            Self::Timestamp => 2,
+            Self::Float => 3,
+            Self::Boolean => 4,
+        }
+    }
+
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Integer),
+            2 => Some(Self::Timestamp),
+            3 => Some(Self::Float),
+            4 => Some(Self::Boolean),
             _ => None,
         }
     }
@@ -43,6 +74,177 @@ impl Domain {
 pub enum KeyKind {
     /// One i64 per distinct key, in order
     OrderedI64,
+}
+
+impl KeyKind {
+    /// The kind's byte in a version 6 directory entry
+    pub fn code(self) -> u8 {
+        match self {
+            Self::OrderedI64 => 1,
+        }
+    }
+
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::OrderedI64),
+            _ => None,
+        }
+    }
+}
+
+/// What the build of an entry came to, as the file records it
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The entry holds its keys and serves reads
+    Built,
+    /// The index cannot be held for this volume: no pages, never served,
+    /// not built again until the volume or the definition changes
+    Unsupported,
+}
+
+impl Outcome {
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Built => 0,
+            Self::Unsupported => 1,
+        }
+    }
+
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Built),
+            1 => Some(Self::Unsupported),
+            _ => None,
+        }
+    }
+}
+
+/// The i64 key of a FLOAT value, ordered as the floats are: 0.0 and -0.0
+/// are one key. NaN has no key; the caller keeps it out
+pub fn float_key(f: f64) -> i64 {
+    debug_assert!(!f.is_nan());
+    let bits = if f == 0.0 { 0 } else { f.to_bits() as i64 };
+    if bits < 0 {
+        bits ^ i64::MAX
+    } else {
+        bits
+    }
+}
+
+/// The FLOAT value a key stands for; the key of -0.0 stands for -0.0
+pub fn float_of_key(key: i64) -> f64 {
+    let bits = if key < 0 { key ^ i64::MAX } else { key };
+    f64::from_bits(bits as u64)
+}
+
+/// What a comparison of a key column with a value asks of the entry
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolved {
+    Key(i64),
+    /// Every key in `[low, high]`
+    Range(i64, i64),
+    /// No row's value meets the comparison
+    Empty,
+    /// The keys cannot answer it; the scan does
+    Fallback,
+}
+
+/// The keys of a `domain` column meeting `column op value`, decided with
+/// the executor's exact comparison: a bound with no exact key in the domain
+/// moves to the nearest key on the side the comparison keeps
+pub fn resolve(domain: Domain, op: Operator, value: &Value) -> Resolved {
+    let range = |low: Option<i64>, high: Option<i64>| match (low, high) {
+        (Some(low), Some(high)) if low <= high => Resolved::Range(low, high),
+        _ => Resolved::Empty,
+    };
+    // The keys meeting `key op k` for an exact key k
+    let exact = |k: i64| match op {
+        Operator::Eq => Resolved::Key(k),
+        Operator::Lt => range(Some(i64::MIN), k.checked_sub(1)),
+        Operator::Lte => range(Some(i64::MIN), Some(k)),
+        Operator::Gt => range(k.checked_add(1), Some(i64::MAX)),
+        Operator::Gte => range(Some(k), Some(i64::MAX)),
+        _ => Resolved::Fallback,
+    };
+    match (domain, value) {
+        (Domain::Integer, Value::Integer(i)) => exact(*i),
+        (Domain::Integer, Value::Float(f)) => integer_against_float(op, *f),
+        (Domain::Timestamp, Value::Timestamp(ts)) => match ts.timestamp_nanos_opt() {
+            Some(nanos) => exact(nanos),
+            None => Resolved::Fallback,
+        },
+        (Domain::Float, Value::Float(f)) if f.is_nan() => Resolved::Fallback,
+        (Domain::Float, Value::Float(f)) => exact(float_key(*f)),
+        (Domain::Float, Value::Integer(i)) => float_against_integer(op, *i),
+        (Domain::Boolean, Value::Boolean(b)) => exact(*b as i64),
+        _ => Resolved::Fallback,
+    }
+}
+
+/// `int_column op f`: the integers meeting it, by `cmp_i64_f64`
+fn integer_against_float(op: Operator, f: f64) -> Resolved {
+    if f.is_nan() {
+        return Resolved::Fallback;
+    }
+    // The least integer >= f and the greatest integer <= f, when they exist
+    const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+    let ceil = if f < -TWO_63 {
+        Some(i64::MIN)
+    } else if f.ceil() >= TWO_63 {
+        None
+    } else {
+        Some(f.ceil() as i64)
+    };
+    let floor = if f >= TWO_63 {
+        Some(i64::MAX)
+    } else if f < -TWO_63 {
+        None
+    } else {
+        Some(f.floor() as i64)
+    };
+    let integral = ceil.zip(floor).is_some_and(|(c, l)| c == l);
+    let range = |low: Option<i64>, high: Option<i64>| match (low, high) {
+        (Some(low), Some(high)) if low <= high => Resolved::Range(low, high),
+        _ => Resolved::Empty,
+    };
+    match op {
+        Operator::Eq if integral => Resolved::Key(floor.unwrap_or_default()),
+        Operator::Eq => Resolved::Empty,
+        Operator::Lt if integral => range(Some(i64::MIN), floor.and_then(|k| k.checked_sub(1))),
+        Operator::Lt | Operator::Lte => range(Some(i64::MIN), floor),
+        Operator::Gt if integral => range(ceil.and_then(|k| k.checked_add(1)), Some(i64::MAX)),
+        Operator::Gt | Operator::Gte => range(ceil, Some(i64::MAX)),
+        _ => Resolved::Fallback,
+    }
+}
+
+/// `float_column op i`: the float keys meeting it. `i as f64` rounds to the
+/// nearest float, and `cmp_i64_f64` says which side of `i` it landed on;
+/// adjacent floats have adjacent keys
+fn float_against_integer(op: Operator, i: i64) -> Resolved {
+    use std::cmp::Ordering;
+    let f = i as f64;
+    let k = float_key(f);
+    // How `f` stands to `i`: Less when it rounded down
+    let Some(side) = cmp_i64_f64(i, f).map(Ordering::reverse) else {
+        return Resolved::Fallback;
+    };
+    let range = |low: Option<i64>, high: Option<i64>| match (low, high) {
+        (Some(low), Some(high)) if low <= high => Resolved::Range(low, high),
+        _ => Resolved::Empty,
+    };
+    match (op, side) {
+        (Operator::Eq, Ordering::Equal) => Resolved::Key(k),
+        (Operator::Eq, _) => Resolved::Empty,
+        (Operator::Lt, Ordering::Less) | (Operator::Lte, Ordering::Less | Ordering::Equal) => {
+            range(Some(i64::MIN), Some(k))
+        }
+        (Operator::Lt | Operator::Lte, _) => range(Some(i64::MIN), k.checked_sub(1)),
+        (Operator::Gt, Ordering::Greater)
+        | (Operator::Gte, Ordering::Greater | Ordering::Equal) => range(Some(k), Some(i64::MAX)),
+        (Operator::Gt | Operator::Gte, _) => range(k.checked_add(1), Some(i64::MAX)),
+        _ => Resolved::Fallback,
+    }
 }
 
 /// What a read asks of an entry
@@ -90,4 +292,197 @@ pub fn schema_entries(defs: &[SideIndexDef]) -> Vec<(usize, u64)> {
     defs.iter()
         .filter_map(|def| Some((def.leading()?.column, def.identity)))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cmp::Ordering;
+
+    const P53: f64 = 9_007_199_254_740_992.0;
+    const P63: f64 = 9_223_372_036_854_775_808.0;
+
+    fn floats() -> Vec<f64> {
+        let mut out = vec![
+            0.0,
+            -0.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MIN_POSITIVE,
+            -f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            -f64::from_bits(1),
+            1.5,
+            -1.5,
+            5.0,
+            5.5,
+            P53,
+            P53 + 2.0,
+            -P53,
+            P63,
+            -P63,
+            f64::MAX,
+            f64::MIN,
+        ];
+        out.extend((-20..=20).map(|i| i as f64 * 0.75));
+        out
+    }
+
+    fn integers() -> Vec<i64> {
+        let mut out = vec![
+            i64::MIN,
+            i64::MIN + 1,
+            i64::MAX,
+            i64::MAX - 1,
+            9_007_199_254_740_992,
+            9_007_199_254_740_993,
+            -9_007_199_254_740_993,
+        ];
+        out.extend(-20..=20);
+        out
+    }
+
+    fn queries() -> Vec<Value> {
+        let mut out: Vec<Value> = floats().into_iter().map(Value::Float).collect();
+        out.push(Value::Float(f64::NAN));
+        out.extend(integers().into_iter().map(Value::Integer));
+        out
+    }
+
+    const OPS: [Operator; 5] = [
+        Operator::Eq,
+        Operator::Lt,
+        Operator::Lte,
+        Operator::Gt,
+        Operator::Gte,
+    ];
+
+    fn holds(op: Operator, ordering: Ordering) -> bool {
+        match op {
+            Operator::Eq => ordering == Ordering::Equal,
+            Operator::Lt => ordering == Ordering::Less,
+            Operator::Lte => ordering != Ordering::Greater,
+            Operator::Gt => ordering == Ordering::Greater,
+            Operator::Gte => ordering != Ordering::Less,
+            _ => unreachable!(),
+        }
+    }
+
+    /// The keys a resolution selects among `keys`, or None for a fallback
+    fn selected(resolved: Resolved, keys: &[i64]) -> Option<Vec<bool>> {
+        Some(match resolved {
+            Resolved::Key(k) => keys.iter().map(|&key| key == k).collect(),
+            Resolved::Range(low, high) => {
+                keys.iter().map(|&key| low <= key && key <= high).collect()
+            }
+            Resolved::Empty => vec![false; keys.len()],
+            Resolved::Fallback => return None,
+        })
+    }
+
+    #[test]
+    fn float_keys_keep_the_order_and_merge_the_zeros() {
+        let mut values = floats();
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        for pair in values.windows(2) {
+            let (a, b) = (float_key(pair[0]), float_key(pair[1]));
+            match pair[0].partial_cmp(&pair[1]).unwrap() {
+                Ordering::Equal => assert_eq!(a, b, "{pair:?}"),
+                _ => assert!(a < b, "{pair:?}"),
+            }
+        }
+        assert_eq!(float_key(-0.0), float_key(0.0));
+        for f in floats() {
+            if f != 0.0 {
+                assert_eq!(float_of_key(float_key(f)).to_bits(), f.to_bits());
+            }
+        }
+        // Adjacent floats have adjacent keys, so a key one below is the
+        // float just below
+        assert_eq!(float_key(1.0) - 1, float_key(1.0f64.next_down()));
+    }
+
+    #[test]
+    fn a_float_column_resolves_as_the_exact_comparison() {
+        let column = floats();
+        let keys: Vec<i64> = column.iter().map(|&f| float_key(f)).collect();
+        for value in queries() {
+            for op in OPS {
+                let resolved = resolve(Domain::Float, op, &value);
+                let Some(got) = selected(resolved, &keys) else {
+                    assert!(
+                        matches!(value, Value::Float(f) if f.is_nan()),
+                        "only NaN falls back: {op:?} {value:?}"
+                    );
+                    continue;
+                };
+                let want: Vec<bool> = column
+                    .iter()
+                    .map(|&f| {
+                        let ordering = match value {
+                            Value::Float(q) => f.partial_cmp(&q).unwrap(),
+                            Value::Integer(q) => cmp_i64_f64(q, f).unwrap().reverse(),
+                            _ => unreachable!(),
+                        };
+                        holds(op, ordering)
+                    })
+                    .collect();
+                assert_eq!(got, want, "f {op:?} {value:?}: {resolved:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_integer_column_resolves_as_the_exact_comparison() {
+        let column = integers();
+        for value in queries() {
+            for op in OPS {
+                let resolved = resolve(Domain::Integer, op, &value);
+                let Some(got) = selected(resolved, &column) else {
+                    assert!(
+                        matches!(value, Value::Float(f) if f.is_nan()),
+                        "only NaN falls back: {op:?} {value:?}"
+                    );
+                    continue;
+                };
+                let want: Vec<bool> = column
+                    .iter()
+                    .map(|&i| {
+                        let ordering = match value {
+                            Value::Float(q) => cmp_i64_f64(i, q).unwrap(),
+                            Value::Integer(q) => i.cmp(&q),
+                            _ => unreachable!(),
+                        };
+                        holds(op, ordering)
+                    })
+                    .collect();
+                assert_eq!(got, want, "i {op:?} {value:?}: {resolved:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn values_the_keys_cannot_answer_fall_back() {
+        let text = Value::text("5");
+        assert_eq!(
+            resolve(Domain::Integer, Operator::Eq, &text),
+            Resolved::Fallback
+        );
+        assert_eq!(
+            resolve(Domain::Timestamp, Operator::Eq, &text),
+            Resolved::Fallback
+        );
+        assert_eq!(
+            resolve(Domain::Float, Operator::Eq, &Value::Float(f64::NAN)),
+            Resolved::Fallback
+        );
+        assert_eq!(
+            resolve(Domain::Integer, Operator::Ne, &Value::Integer(5)),
+            Resolved::Fallback
+        );
+        assert_eq!(
+            resolve(Domain::Boolean, Operator::Eq, &Value::Boolean(true)),
+            Resolved::Key(1)
+        );
+    }
 }

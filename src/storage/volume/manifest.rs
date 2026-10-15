@@ -86,6 +86,10 @@ impl ColdSegment {
         if super::side_index::Domain::of(stored) != Some(component.domain) {
             return None;
         }
+        let entry_domain = side.directory().entry(def.identity)?.domain;
+        if entry_domain.is_some_and(|domain| domain != component.domain) {
+            return None;
+        }
         side.covers(def.identity, physical, capability)
             .then_some(side)
     }
