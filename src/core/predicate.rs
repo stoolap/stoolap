@@ -147,6 +147,8 @@ pub struct PredicateSet {
     numbers_in_text: ValueSet,
     has_null: bool,
     has_numbers: bool,
+    /// A member that is neither TEXT nor NULL
+    has_non_text: bool,
     /// A TEXT member that is not a number: UNKNOWN against any number
     has_unreadable_text: bool,
     /// A FLOAT member that is NaN: UNKNOWN against any TEXT read as a number
@@ -157,6 +159,7 @@ impl PredicateSet {
     pub fn new(members: CompactArc<ValueSet>, has_null: bool) -> Self {
         let mut numbers_in_text = ValueSet::default();
         let mut has_numbers = false;
+        let mut has_non_text = false;
         let mut has_unreadable_text = false;
         let mut has_nan = false;
         for member in members.iter() {
@@ -174,12 +177,14 @@ impl PredicateSet {
                 },
                 _ => {}
             }
+            has_non_text |= !matches!(member, Value::Text(_) | Value::Null(_));
         }
         Self {
             members,
             numbers_in_text,
             has_null,
             has_numbers,
+            has_non_text,
             has_unreadable_text,
             has_nan,
         }
@@ -208,9 +213,9 @@ impl PredicateSet {
         self.has_unreadable_text || !self.numbers_in_text.is_empty()
     }
 
-    /// Whether a member is a number
-    pub fn has_numbers(&self) -> bool {
-        self.has_numbers
+    /// Whether a member is neither TEXT nor NULL
+    pub fn has_non_text(&self) -> bool {
+        self.has_non_text
     }
 
     /// The members as stored, for callers that read them as values

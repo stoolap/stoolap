@@ -125,11 +125,12 @@ type InSubqueryCacheEntry = (
     MemberKinds,
 );
 
-/// Whether a list of values holds a TEXT and whether it holds a number
+/// Whether a list of values holds a TEXT and whether it holds a value that
+/// is neither TEXT nor NULL
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MemberKinds {
     pub texts: bool,
-    pub numbers: bool,
+    pub non_texts: bool,
 }
 
 thread_local! {
@@ -210,8 +211,7 @@ pub fn cache_in_subquery(key: String, stamp: SubqueryStamp, values: Vec<Value>) 
         match value {
             Value::Null(_) => return,
             Value::Text(_) => kinds.texts = true,
-            Value::Integer(_) | Value::Float(_) => kinds.numbers = true,
-            _ => {}
+            _ => kinds.non_texts = true,
         }
     }
     IN_SUBQUERY_CACHE.with(|cache| {
