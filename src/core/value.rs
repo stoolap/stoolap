@@ -1351,6 +1351,12 @@ thread_local! {
         const { std::cell::RefCell::new(([None, None], 0)) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Parses that went through chrono's formats on this thread
+    static TS_FORMAT_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// `parse_timestamp` with a per-thread memo, for per-row comparison paths
 fn parse_timestamp_for_compare(s: &str) -> Option<DateTime<Utc>> {
     TS_COMPARE_PARSE_CACHE.with(|cache| {
@@ -1371,7 +1377,46 @@ fn parse_timestamp_for_compare(s: &str) -> Option<DateTime<Utc>> {
 /// Parse a timestamp string with multiple format support
 pub fn parse_timestamp(s: &str) -> Result<DateTime<Utc>> {
     let s = s.trim();
+    match parse_iso_fast(s.as_bytes()) {
+        Some(ndt) => Ok(Utc.from_utc_datetime(&ndt)),
+        None => parse_timestamp_formats(s),
+    }
+}
 
+/// `YYYY-MM-DD`, alone or with ` ` or `T`, `HH:MM:SS` and up to nine
+/// fraction digits, read without chrono's format parser. None for anything
+/// else, out-of-range fields and a leap second included: the formats decide
+fn parse_iso_fast(b: &[u8]) -> Option<NaiveDateTime> {
+    let num = |range: std::ops::Range<usize>| -> Option<u32> {
+        b.get(range)?.iter().try_fold(0u32, |acc, &c| {
+            c.is_ascii_digit().then(|| acc * 10 + (c - b'0') as u32)
+        })
+    };
+    if b.len() < 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let date = NaiveDate::from_ymd_opt(num(0..4)? as i32, num(5..7)?, num(8..10)?)?;
+    if b.len() == 10 {
+        return date.and_hms_opt(0, 0, 0);
+    }
+    if b.len() < 19 || !matches!(b[10], b' ' | b'T') || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let (hour, minute, second) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    let nanos = match &b[19..] {
+        [] => 0,
+        [b'.', digits @ ..] if (1..=9).contains(&digits.len()) => {
+            num(20..b.len())? * 10u32.pow(9 - digits.len() as u32)
+        }
+        _ => return None,
+    };
+    date.and_hms_nano_opt(hour, minute, second, nanos)
+}
+
+/// `parse_timestamp` through chrono's parser, one format after another
+fn parse_timestamp_formats(s: &str) -> Result<DateTime<Utc>> {
+    #[cfg(test)]
+    TS_FORMAT_PARSES.with(|count| count.set(count.get() + 1));
     // Try each timestamp format
     for format in TIMESTAMP_FORMATS {
         if let Ok(dt) = DateTime::parse_from_str(s, format) {
@@ -1553,6 +1598,67 @@ mod tests {
     // =========================================================================
     // Constructor tests
     // =========================================================================
+
+    #[test]
+    fn a_fast_timestamp_parse_answers_as_the_formats() {
+        let mut fast = 0;
+        for s in [
+            "2024-01-02 03:04:05",
+            "2024-01-02T03:04:05",
+            "2024-01-02",
+            "2024-02-29",
+            "2024-02-29 23:59:59",
+            "0000-01-01 00:00:00",
+            "9999-12-31 23:59:59.999999999",
+            "2024-01-02 03:04:05.5",
+            "2024-01-02 03:04:05.123456",
+            "2024-01-02T03:04:05.000000001",
+            "2024-01-02 03:04:05.1234567890",
+            "2024-01-02 03:04:05.",
+            "2024-01-02 03:04:60",
+            "2024-01-02 24:00:00",
+            "2024-01-02 23:60:00",
+            "2023-02-29",
+            "2024-13-01",
+            "2024-00-10",
+            "2024-04-31 00:00:00",
+            "2024-1-02",
+            "2024-01-02 3:04:05",
+            "2024-01-02 03:04",
+            "2024-01-02T03:04:05Z",
+            "2024-01-02T03:04:05+02:00",
+            "2024-01-02 03:04:05 ",
+            "2024/01/02 03:04:05",
+            "+202-01-02",
+            "20a4-01-02",
+        ] {
+            let Some(got) = parse_iso_fast(s.trim().as_bytes()) else {
+                continue;
+            };
+            fast += 1;
+            assert_eq!(
+                Ok(Utc.from_utc_datetime(&got)),
+                parse_timestamp_formats(s.trim()),
+                "{s}"
+            );
+        }
+        assert_eq!(fast, 11, "the common forms take the fast parse");
+    }
+
+    #[test]
+    fn a_common_timestamp_text_skips_the_format_parser() {
+        let before = TS_FORMAT_PARSES.with(|count| count.get());
+        for s in [
+            "2024-01-02 03:04:05",
+            "2024-01-02T03:04:05.25",
+            "2024-01-02",
+        ] {
+            parse_timestamp(s).unwrap();
+        }
+        assert_eq!(TS_FORMAT_PARSES.with(|count| count.get()), before);
+        parse_timestamp("2024-01-02T03:04:05Z").unwrap();
+        assert_eq!(TS_FORMAT_PARSES.with(|count| count.get()), before + 1);
+    }
 
     #[test]
     fn test_constructors() {
