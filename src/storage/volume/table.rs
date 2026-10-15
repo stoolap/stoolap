@@ -2674,6 +2674,10 @@ impl SegmentedTable {
                         Self::prune_volume(&loaded, &cs.mapping, &comparisons, &bloom_hashes)?;
                     let (s, e) =
                         Self::narrow_to_equalities(&loaded, &cs.mapping, &comparisons, s, e)?;
+                    // Narrowings that share no row leave nothing to scan
+                    if s >= e {
+                        continue;
+                    }
                     (&loaded, s, e)
                 }
             } else {
@@ -2860,6 +2864,10 @@ impl SegmentedTable {
                             Self::prune_volume(&loaded, &cs.mapping, &comparisons, &bloom_hashes)?;
                         let (s, e) =
                             Self::narrow_to_equalities(&loaded, &cs.mapping, &comparisons, s, e)?;
+                        // Narrowings that share no row leave nothing to scan
+                        if s >= e {
+                            return Ok(None);
+                        }
                         (&loaded, s, e)
                     }
                 } else {

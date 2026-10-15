@@ -141,6 +141,42 @@ fn an_equality_on_a_sorted_column_scans_only_its_rows() {
 }
 
 #[cfg(feature = "test-failpoints")]
+#[test]
+fn equalities_on_two_sorted_columns_with_no_common_row_skip_a_loaded_cold_volume() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    db.execute(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL, s TEXT)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO c SELECT value, value, value, 'x' FROM generate_series(1, 100)",
+        (),
+    )
+    .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    for (sql, want) in [
+        (
+            "SELECT id FROM c WHERE a = 10 AND b = 20 AND s = 'x'",
+            vec![],
+        ),
+        (
+            "SELECT id FROM c WHERE a >= 50 AND b <= 10 AND s = 'x'",
+            vec![],
+        ),
+        (
+            "SELECT id FROM c WHERE a = 10 AND b = 10 AND s = 'x'",
+            vec![10],
+        ),
+    ] {
+        assert_eq!(db.engine().cold_volumes_for_test("c"), (1, 1), "{sql}");
+        assert_eq!(ids(&db, sql, vec![]), want, "{sql}");
+    }
+}
+
+#[cfg(feature = "test-failpoints")]
 fn probes(db: &Database) -> i64 {
     let rows = db.query("PRAGMA INDEX_READ_STATS", ()).unwrap();
     let at = rows.columns().iter().position(|c| c == "probes").unwrap();
