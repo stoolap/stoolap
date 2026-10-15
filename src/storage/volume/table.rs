@@ -5060,7 +5060,9 @@ impl Table for SegmentedTable {
                 return Ok(None);
             };
             for v in hot_values {
-                distinct.insert(v);
+                if !v.is_null() {
+                    distinct.insert(v);
+                }
             }
 
             // Build skip set: hot row_ids + tombstones + pending tombstones
@@ -5163,7 +5165,6 @@ impl Table for SegmentedTable {
 
             // Column resolution uses mapping (handles renames/drops) not col_name.
             let default_val = self.column_default(col_idx);
-            let has_non_null_default = !default_val.is_null();
             for (seg_id, cs) in volumes.iter() {
                 let vol = &cs.volume;
                 let row_ids = vol.row_ids()?;
@@ -5192,10 +5193,8 @@ impl Table for SegmentedTable {
                         continue;
                     }
                     if let Some(col) = column {
-                        if !col.is_null(i) {
-                            distinct.insert(col.get_value(i));
-                        }
-                    } else if has_non_null_default {
+                        distinct.insert(col.get_value(i));
+                    } else {
                         distinct.insert(default_val.clone());
                     }
                 }
@@ -5265,7 +5264,6 @@ impl Table for SegmentedTable {
 
             let schema = self.hot.schema();
             let default_val = self.column_default(col_idx);
-            let has_non_null_default = !default_val.is_null();
 
             for (seg_id, cs) in volumes.iter() {
                 let vol = &cs.volume;
@@ -5284,13 +5282,15 @@ impl Table for SegmentedTable {
                     // the dictionary itself IS the distinct value set for this volume
                     let can_use_dict = no_tombstones && cs.visible.is_none() && hot_skip.is_empty();
 
-                    if can_use_dict {
+                    if let Some(zone) = vol.meta.zone_maps.get(pi).filter(|_| can_use_dict) {
                         if let Some(dict_arc) = vol.get_column_dictionary(pi)? {
                             for entry in dict_arc.iter() {
                                 distinct.insert(Value::text(entry.as_str()));
                             }
-                            // Check for NULLs via zone map null_count
-                            // (dictionary values are non-null, but the column may have null rows)
+                            // The dictionary holds no NULL; every row is visible here
+                            if zone.null_count > 0 {
+                                distinct.insert(Value::null(schema.columns[col_idx].data_type));
+                            }
                             continue;
                         }
                     }
@@ -5316,11 +5316,9 @@ impl Table for SegmentedTable {
                         if !no_tombstones && self.is_row_tombstoned(&tombstones_arc, rid) {
                             continue;
                         }
-                        if !col.is_null(i) {
-                            distinct.insert(col.get_value(i));
-                        }
+                        distinct.insert(col.get_value(i));
                     }
-                } else if has_non_null_default {
+                } else {
                     // Column was added after this volume was sealed — use default
                     let row_ids = vol.row_ids()?;
                     let has_visible = (0..vol.meta.row_count).any(|i| {
@@ -5387,7 +5385,6 @@ impl Table for SegmentedTable {
                 .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
 
             let default_val = self.column_default(col_idx);
-            let has_non_null_default = !default_val.is_null();
             for (_seg_id, cs) in volumes.iter() {
                 let vol = &cs.volume;
                 let mapping = &cs.mapping;
@@ -5419,14 +5416,9 @@ impl Table for SegmentedTable {
                         continue;
                     }
                     let val = if let Some(col) = column {
-                        if col.is_null(i) {
-                            continue;
-                        }
                         col.get_value(i)
-                    } else if has_non_null_default {
-                        default_val.clone()
                     } else {
-                        continue;
+                        default_val.clone()
                     };
                     let row = reader.row(i, mapping)?;
                     groups.entry(val).or_default().push((rid, row));
@@ -5481,7 +5473,7 @@ impl Table for SegmentedTable {
                 .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
 
             let default_val = self.column_default(col_idx);
-            let has_non_null_default = !default_val.is_null();
+            let wants_null = partition_value.is_null();
             for (seg_id, cs) in volumes.iter() {
                 let vol = &cs.volume;
                 let mapping = &cs.mapping;
@@ -5495,15 +5487,17 @@ impl Table for SegmentedTable {
                     None
                 };
                 // Skip volume if missing column and default doesn't match target
-                if phys_col.is_none() && (!has_non_null_default || &default_val != partition_value)
-                {
+                if phys_col.is_none() && &default_val != partition_value {
                     continue;
                 }
                 // Zone-map prune on partition column (metadata, works for cold)
-                if let Some(pc) = phys_col {
-                    if pc < vol.meta.zone_maps.len()
-                        && !vol.meta.zone_maps[pc].may_contain_eq(partition_value)
-                    {
+                if let Some(zone) = phys_col.and_then(|pc| vol.meta.zone_maps.get(pc)) {
+                    let may_hold = if wants_null {
+                        zone.null_count > 0
+                    } else {
+                        zone.may_contain_eq(partition_value)
+                    };
+                    if !may_hold {
                         continue;
                     }
                 }
@@ -5539,7 +5533,7 @@ impl Table for SegmentedTable {
                     }
                     let matches = if let Some(col) = column {
                         if col.is_null(i) {
-                            false
+                            wants_null
                         } else {
                             &col.get_value(i) == partition_value
                         }

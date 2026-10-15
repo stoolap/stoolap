@@ -1295,7 +1295,8 @@ pub trait Table: Send + Sync {
         Ok(None) // Default implementation - override in concrete tables
     }
 
-    /// Compute distinct non-null values for a column by exploiting cold volume
+    /// Compute distinct values for a column, NULL included when a visible row
+    /// holds it, by exploiting cold volume
     /// metadata. For dictionary-encoded TEXT columns with no tombstones, this
     /// extracts dictionary entries directly (O(unique values) per volume, no
     /// row scan). Falls back to None when the fast path is not applicable.
@@ -1304,7 +1305,7 @@ pub trait Table: Send + Sync {
     /// * `col_idx` - Schema column index
     ///
     /// # Returns
-    /// Some(Vec<Value>) with distinct non-null values, or None if fast path unavailable
+    /// Some(Vec<Value>) with distinct values, or None if fast path unavailable
     ///
     /// # Errors
     /// Returns a storage error if the required rows or columns cannot be read.
