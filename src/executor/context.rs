@@ -18,6 +18,7 @@
 //! parameter handling, transaction state, and query options.
 
 use crate::common::time_compat::Instant;
+use crate::storage::mvcc::registry::StatementView;
 use crate::storage::traits::transaction::StatementTable;
 use lru::LruCache;
 use rustc_hash::FxHashMap;
@@ -1050,6 +1051,9 @@ pub struct ExecutionContext {
     /// One transaction for every fetch of a statement that has no explicit
     /// transaction, so its reads share a snapshot
     statement_snapshot: Option<StatementSnapshot>,
+    /// The commits a read committed statement's reads see, taken once for
+    /// the statement; None reads the newest committed state
+    statement_view: Option<Arc<StatementView>>,
 }
 
 /// Type alias for CTE data: (columns, rows) with Arc for zero-copy sharing
@@ -1086,6 +1090,7 @@ impl ExecutionContext {
             cte_data: None,
             transaction_id: None,
             statement_snapshot: None,
+            statement_view: None,
         }
     }
 
@@ -1247,6 +1252,7 @@ impl ExecutionContext {
             cte_data: self.cte_data.clone(),
             transaction_id: self.transaction_id,
             statement_snapshot: self.statement_snapshot.clone(),
+            statement_view: self.statement_view.clone(),
         }
     }
 
@@ -1268,6 +1274,7 @@ impl ExecutionContext {
             cte_data: self.cte_data.clone(),
             transaction_id: self.transaction_id,
             statement_snapshot: self.statement_snapshot.clone(),
+            statement_view: self.statement_view.clone(),
         }
     }
 
@@ -1314,6 +1321,7 @@ impl ExecutionContext {
             cte_data: self.cte_data.clone(),    // Arc clone = cheap
             transaction_id: self.transaction_id,
             statement_snapshot: self.statement_snapshot.clone(),
+            statement_view: self.statement_view.clone(),
         }
     }
 
@@ -1367,6 +1375,7 @@ impl ExecutionContext {
             cte_data: Some(cte_data),
             transaction_id: self.transaction_id,
             statement_snapshot: self.statement_snapshot.clone(),
+            statement_view: self.statement_view.clone(),
         }
     }
 
@@ -1393,6 +1402,18 @@ impl ExecutionContext {
         ctx
     }
 
+    /// The statement view the statement's reads see, if it has one
+    pub fn statement_view(&self) -> Option<&Arc<StatementView>> {
+        self.statement_view.as_ref()
+    }
+
+    /// A copy of this context whose reads see `view`
+    pub fn with_statement_view(&self, view: Arc<StatementView>) -> Self {
+        let mut ctx = self.clone();
+        ctx.statement_view = Some(view);
+        ctx
+    }
+
     pub fn with_transaction_id(&self, txn_id: u64) -> Self {
         Self {
             params: self.params.clone(),
@@ -1409,6 +1430,7 @@ impl ExecutionContext {
             cte_data: self.cte_data.clone(),
             transaction_id: Some(txn_id),
             statement_snapshot: self.statement_snapshot.clone(),
+            statement_view: self.statement_view.clone(),
         }
     }
 
@@ -1742,6 +1764,76 @@ mod tests {
         assert_eq!(ctx.param_count(), 0);
         assert!(ctx.auto_commit());
         assert!(!ctx.is_cancelled());
+    }
+
+    fn ids(table: &dyn crate::storage::traits::Table) -> Vec<i64> {
+        let mut ids: Vec<i64> = table
+            .collect_all_rows(None)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn table_of_one_row(name: &str) -> crate::api::Database {
+        let db = crate::api::Database::open(&format!("memory://{name}")).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
+        db
+    }
+
+    #[test]
+    fn a_statement_table_at_a_view_reads_the_commits_complete_before_it() {
+        use crate::storage::traits::Engine;
+        let db = table_of_one_row("ctx_statement_table_at_view");
+        let view = db.engine().registry().capture_view();
+        db.execute("INSERT INTO t VALUES (2)", ()).unwrap();
+        let txn = db.engine().begin_transaction().unwrap();
+        let at_view = txn.get_statement_table_at("t", Some(&view)).unwrap();
+        assert_eq!(
+            ids(&*at_view),
+            vec![1],
+            "the view excludes the later insert"
+        );
+        let newest = txn.get_statement_table_at("t", None).unwrap();
+        assert_eq!(ids(&*newest), vec![1, 2]);
+    }
+
+    #[test]
+    fn a_snapshot_transaction_takes_no_statement_table_at_a_view() {
+        use crate::storage::traits::Engine;
+        let db = table_of_one_row("ctx_statement_table_at_view_snapshot");
+        let view = db.engine().registry().capture_view();
+        let txn = db
+            .engine()
+            .begin_transaction_with_level(crate::core::IsolationLevel::SnapshotIsolation)
+            .unwrap();
+        assert!(txn.get_statement_table_at("t", Some(&view)).is_err());
+        assert!(txn.get_statement_table_at("t", None).is_ok());
+    }
+
+    #[test]
+    fn a_statement_view_is_kept_by_the_contexts_made_from_it() {
+        let db = table_of_one_row("ctx_statement_view_kept");
+        let view = db.engine().registry().capture_view();
+        let ctx = ExecutionContext::new().with_statement_view(Arc::clone(&view));
+        let derived = [
+            ctx.with_incremented_view_depth(),
+            ctx.with_incremented_query_depth(),
+            ctx.with_outer_row(FxHashMap::default(), CompactArc::new(Vec::new())),
+            ctx.with_cte_data(Arc::new(CteDataMap::default())),
+            ctx.with_transaction_id(1),
+            ctx.clone(),
+        ];
+        for derived in &derived {
+            assert!(derived
+                .statement_view()
+                .is_some_and(|kept| Arc::ptr_eq(kept, &view)));
+        }
+        assert!(ExecutionContext::new().statement_view().is_none());
     }
 
     #[test]

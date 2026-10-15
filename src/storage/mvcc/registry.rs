@@ -402,6 +402,16 @@ impl StatementView {
     }
 }
 
+impl std::fmt::Debug for StatementView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StatementView")
+            .field("seq", &self.seq)
+            .field("in_flight", &self.in_flight)
+            .field("base", &self.base)
+            .finish()
+    }
+}
+
 impl Drop for StatementView {
     fn drop(&mut self) {
         let mut txns = self.registry.transactions.lock();
