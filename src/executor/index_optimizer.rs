@@ -1296,8 +1296,8 @@ impl Executor {
         let cached = cache_slot
             .as_ref()
             .and_then(|(key, stamp)| get_cached_in_subquery_with_kinds(key, stamp));
-        let (mut values, has_texts, has_numbers) = if let Some((cached, kinds)) = cached {
-            (cached, kinds.texts, kinds.numbers)
+        let (mut values, has_texts, has_non_texts) = if let Some((cached, kinds)) = cached {
+            (cached, kinds.texts, kinds.non_texts)
         } else {
             let subquery_ctx = ctx.with_incremented_query_depth();
             #[cfg(any(test, feature = "test-failpoints"))]
@@ -1306,7 +1306,7 @@ impl Executor {
 
             // Collect all values from the first column
             let mut values = Vec::new();
-            let (mut has_null, mut texts, mut numbers) = (false, false, false);
+            let (mut has_null, mut texts, mut non_texts) = (false, false, false);
             while result.next() {
                 let row = result.row();
                 if !row.is_empty() {
@@ -1317,8 +1317,7 @@ impl Executor {
                     match value {
                         Value::Null(_) => has_null = true,
                         Value::Text(_) => texts = true,
-                        Value::Integer(_) | Value::Float(_) => numbers = true,
-                        _ => {}
+                        _ => non_texts = true,
                     }
                     values.push(value);
                 }
@@ -1336,12 +1335,12 @@ impl Executor {
             if let Some((key, stamp)) = cache_slot {
                 cache_in_subquery(key, stamp, values.clone());
             }
-            (values, texts, numbers)
+            (values, texts, non_texts)
         };
 
         // The members as the comparison reads them against the column. A
         // member UNKNOWN to every number leaves NOT IN true for no row; a
-        // TEXT column is read by a scan for a set holding a number
+        // TEXT column is read by a scan for a set holding a non-TEXT member
         let mut text_scan = false;
         match schema.get_column_type(&column_name) {
             Some(DataType::Integer | DataType::Float) if has_texts => {
@@ -1360,7 +1359,7 @@ impl Executor {
                 }
                 values = numbers;
             }
-            Some(DataType::Text) if !is_negated && has_numbers => text_scan = true,
+            Some(DataType::Text) if !is_negated && has_non_texts => text_scan = true,
             _ => {}
         }
 
@@ -2121,7 +2120,8 @@ impl Executor {
 
         // The members as the comparison reads them against the column. A
         // member UNKNOWN to every number leaves NOT IN true for no row and is
-        // no match to NOT EXISTS; a TEXT column is not probed for a number
+        // no match to NOT EXISTS; a TEXT column is not probed for a non-TEXT
+        // member
         let values: CompactArc<ValueSet> = match schema.get_column_type(&column_name) {
             Some(DataType::Integer | DataType::Float) if values.has_text() => {
                 let (numbers, unknown) = numeric_members(values.members().iter());
@@ -2139,7 +2139,7 @@ impl Executor {
                 }
                 CompactArc::new(numbers.into_iter().collect::<ValueSet>())
             }
-            Some(DataType::Text) if values.has_numbers() => return Ok(None),
+            Some(DataType::Text) if values.has_non_text() => return Ok(None),
             _ => CompactArc::clone(values.members()),
         };
 

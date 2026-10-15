@@ -145,6 +145,48 @@ fn a_nested_conjunct_beside_an_in_subquery_is_kept() {
     );
 }
 
+#[test]
+fn a_boolean_member_on_a_text_column_answers_as_the_scan() {
+    let _serial = serial();
+    for index in ["USING BTREE", "USING HASH"] {
+        for seal in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+            for table in ["t", "plain"] {
+                db.execute(
+                    &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, k TEXT)"),
+                    (),
+                )
+                .unwrap();
+                db.execute(&format!("INSERT INTO {table} VALUES (1, 'true')"), ())
+                    .unwrap();
+            }
+            db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, v BOOLEAN)", ())
+                .unwrap();
+            db.execute("INSERT INTO b VALUES (1, TRUE)", ()).unwrap();
+            db.execute(&format!("CREATE INDEX t_k ON t(k) {index}"), ())
+                .unwrap();
+            if seal {
+                db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+            }
+            for sql in [
+                "SELECT id FROM {t} WHERE k IN (SELECT TRUE)",
+                "SELECT id FROM {t} WHERE EXISTS (SELECT 1 FROM b WHERE b.v = {t}.k)",
+            ] {
+                let want = ids(&db, &sql.replace("{t}", "plain"));
+                // The second run reads the members from the subquery cache
+                for run in 0..2 {
+                    assert_eq!(
+                        ids(&db, &sql.replace("{t}", "t")),
+                        want,
+                        "{sql}, {index}, sealed: {seal}, run {run}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Row 1 has the first timestamp and every other row the second, sealed
 /// into a volume whose side file covers ts
 fn sealed_timestamps(dir: &tempfile::TempDir) -> Database {
