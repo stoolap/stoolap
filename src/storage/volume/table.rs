@@ -45,7 +45,7 @@ use crate::storage::traits::{
 
 use super::manifest::SegmentManager;
 use super::scanner::{RowVecScanner, VolumeScanner};
-use super::side_index::{Capability, SideIndexDef};
+use super::side_index::{resolve, Capability, Domain, Resolved, SideIndexDef};
 use super::writer::FrozenVolume;
 
 /// What a volume's side file decided for a read: the volume goes through
@@ -1758,72 +1758,50 @@ impl SegmentedTable {
         UniqueDecision::Pass
     }
 
-    /// The index whose column the comparisons bound, with the key range:
-    /// one equality, or a lower and an upper bound. None when they bound no
-    /// indexed column, or a bound has no exact key (a timestamp outside the
-    /// range nanoseconds hold), and the scan decides.
+    /// The index whose column the comparisons bound, with the key range they
+    /// leave, empty (low above high) when no value meets them. A comparison
+    /// the keys cannot answer is left to the filter; None when none bounds
+    /// an indexed column, and the scan decides.
     fn side_bounds<'d>(
         &self,
         comparisons: &[(&str, crate::core::Operator, &Value)],
         defs: &'d [SideIndexDef],
     ) -> Option<(&'d SideIndexDef, i64, i64)> {
-        use crate::core::Operator;
         if defs.is_empty() || comparisons.is_empty() {
             return None;
         }
-        let key = |value: &Value| match value {
-            Value::Integer(i) => Some(Some(*i)),
-            Value::Timestamp(ts) => Some(ts.timestamp_nanos_opt()),
-            _ => None,
-        };
         let schema = self.hot.schema();
         for def in defs {
-            let Some(column) = def.leading().map(|c| c.column) else {
+            let Some(component) = def.leading() else {
                 continue;
             };
-            let Some(name) = schema.columns.get(column).map(|c| c.name_lower.as_str()) else {
+            let Some(name) = schema
+                .columns
+                .get(component.column)
+                .map(|c| c.name_lower.as_str())
+            else {
                 continue;
             };
-            let (mut eq, mut low, mut high) = (None, None, None);
+            let (mut low, mut high) = (i64::MIN, i64::MAX);
             let mut bounded = false;
             for &(col_name, op, value) in comparisons {
                 if !col_name.eq_ignore_ascii_case(name) {
                     continue;
                 }
-                let k = match key(value) {
-                    Some(Some(k)) => k,
-                    Some(None) => return None,
-                    None => continue,
+                // The comparisons all hold, so their key ranges intersect
+                let (l, h) = match resolve(component.domain, op, value) {
+                    Resolved::Key(k) => (k, k),
+                    Resolved::Range(l, h) => (l, h),
+                    Resolved::Empty => (1, 0),
+                    Resolved::Fallback => continue,
                 };
                 bounded = true;
-                match op {
-                    Operator::Eq => eq = Some(k),
-                    Operator::Gt => {
-                        low = Some(
-                            low.map_or(k.saturating_add(1), |l: i64| l.max(k.saturating_add(1))),
-                        )
-                    }
-                    Operator::Gte => low = Some(low.map_or(k, |l: i64| l.max(k))),
-                    Operator::Lt => {
-                        high = Some(
-                            high.map_or(k.saturating_sub(1), |h: i64| h.min(k.saturating_sub(1))),
-                        )
-                    }
-                    Operator::Lte => high = Some(high.map_or(k, |h: i64| h.min(k))),
-                    _ => {}
-                }
+                low = low.max(l);
+                high = high.min(h);
             }
-            if !bounded {
-                continue;
+            if bounded {
+                return Some((def, low, high));
             }
-            let (low, high) = match (eq, low, high) {
-                (Some(k), _, _) => (k, k),
-                (None, Some(l), Some(h)) => (l, h),
-                (None, Some(l), None) => (l, i64::MAX),
-                (None, None, Some(h)) => (i64::MIN, h),
-                (None, None, None) => continue,
-            };
-            return Some((def, low, high));
         }
         None
     }
@@ -1917,14 +1895,15 @@ impl SegmentedTable {
             }
             // The share the reads refuse by: of the volume's rows, NULLs too
             let rows = cs.volume.meta.row_count as u64;
+            let domain = def.leading().map(|c| c.domain);
             let refused = keys.iter().any(|key| {
-                let key = match key {
-                    Value::Integer(i) => Some(*i),
-                    Value::Timestamp(ts) => ts.timestamp_nanos_opt(),
-                    _ => None,
+                let key = match domain.map(|d| resolve(d, crate::core::Operator::Eq, key)) {
+                    Some(Resolved::Key(k)) => k,
+                    _ => return false,
                 };
-                key.and_then(|key| heavy.binary_search_by_key(&key, |(k, _)| *k).ok())
-                    .is_some_and(|at| heavy[at].1 * SIDE_SCAN_SHARE > rows.max(1))
+                heavy
+                    .binary_search_by_key(&key, |(k, _)| *k)
+                    .is_ok_and(|at| heavy[at].1 * SIDE_SCAN_SHARE > rows.max(1))
             });
             if refused {
                 return Ok(false);
@@ -1955,9 +1934,18 @@ impl SegmentedTable {
         let Some((def, low, high)) = self.side_bounds(&comparisons, &scratch.defs) else {
             return Ok(None);
         };
-        let bloom = [Some(super::column::ColumnBloomFilter::hash_value_static(
-            key,
-        ))];
+        // The bloom filter hashes a value's own bits and type: the key it
+        // asks for must be stored exactly so, not as -0.0 for 0.0 or as an
+        // INTEGER for a FLOAT
+        let stored_as_asked = match (def.leading().map(|c| c.domain), key) {
+            (Some(Domain::Integer), Value::Integer(_))
+            | (Some(Domain::Timestamp), Value::Timestamp(_))
+            | (Some(Domain::Boolean), Value::Boolean(_)) => true,
+            (Some(Domain::Float), Value::Float(f)) => *f != 0.0,
+            _ => false,
+        };
+        let bloom =
+            [stored_as_asked.then(|| super::column::ColumnBloomFilter::hash_value_static(key))];
         let start = out.len();
         for (_, cs) in view.volumes() {
             let (skip, _, _) = Self::prune_volume(&cs.volume, &cs.mapping, &comparisons, &bloom)?;

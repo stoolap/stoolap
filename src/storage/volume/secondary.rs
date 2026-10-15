@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A paged secondary index over one integer column of a sealed volume.
+//! A paged secondary index over the keyed columns of a sealed volume.
 //!
-//! The side file holds, per indexed column, the distinct keys in order and
+//! The side file holds, per index entry, the distinct keys in order and
 //! for each key the ascending row positions that hold it, in pages bounded
 //! in bytes: a key page carries keys with the position index each key ends
 //! at, a position page carries positions. A small directory names the pages
@@ -37,11 +37,15 @@
 //! ```text
 //! [magic "STSX"][version u32][generation u64]        16 bytes
 //! pages, each [n u32][entries][crc32 u32]
-//! directory: [column count u32] then per column
-//!   [col u32][key tag u8][n_keys u64][n_positions u64][key pages u32][pos pages u32]
+//! directory: [entry count u32] then per entry
+//!   [identity u64][kind u8][outcome u8][component count u32]
+//!   per component [physical column u32][domain u8]
+//!   [n_keys u64][n_positions u64][key pages u32][pos pages u32]
 //!   key pages: [first_key i64][last_key i64][offset u64][len u32][key_start u64][pos_start u64]
 //!   pos pages: [offset u64][len u32][pos_start u64]
-//!   heavy keys (version 5): [count u8] then [key i64][positions u64] by key
+//!   heavy keys: [count u8] then [key i64][positions u64] by key
+//!   (version 5 and 4 entries open with [col u32][key tag u8][identity u64]
+//!   instead; version 4 has no heavy keys)
 //! footer: [directory offset u64][directory len u32][directory crc32 u32][magic]
 //! ```
 //!
@@ -55,12 +59,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
-use super::side_index::{Capability, KeyKind};
+use super::side_index::{float_key, float_of_key, Capability, Domain, KeyKind, Outcome};
 use super::writer::VolumeFile;
 const MAGIC: [u8; 4] = *b"STSX";
-/// Version 5 adds each column's heavy keys to the directory; version 4
-/// files are still read, without them
-const VERSION: u32 = 5;
+/// Version 6 records each entry's key kind, outcome and components with
+/// their domains. Version 5 files are still read, and version 4 files
+/// without their heavy keys
+const VERSION: u32 = 6;
+const VERSION_WITH_HEAVY_KEYS: u32 = 5;
 const VERSION_WITHOUT_HEAVY_KEYS: u32 = 4;
 const KEY_I64: u8 = 1;
 /// A key holding more than one in this many of a volume's rows is read by
@@ -75,7 +81,13 @@ const HEADER_LEN: u64 = 16;
 const FOOTER_LEN: u64 = 20;
 const KEY_DIR_ENTRY: usize = 44;
 const POS_DIR_ENTRY: usize = 20;
+/// A version 4 or 5 entry before its pages
 const COLUMN_ENTRY: usize = 37;
+/// A version 6 entry's identity, kind, outcome and component count, each
+/// component, and its key and page counts
+const ENTRY_HEAD: usize = 14;
+const COMPONENT_ENTRY: usize = 5;
+const ENTRY_COUNTS: usize = 24;
 pub const SIDE_EXT: &str = "sidx";
 
 /// The byte bound of one page, header and checksum included.
@@ -844,6 +856,11 @@ pub struct ColumnDirectory {
     /// their counts, by key ascending: every key past that share of the
     /// volume's rows is among them. None in a version 4 file
     pub heavy_keys: Option<Vec<(i64, u64)>>,
+    pub kind: KeyKind,
+    pub outcome: Outcome,
+    /// The domain the keys are encoded in; None in a version 4 or 5 file,
+    /// whose keys are in the volume's integer or timestamp column's domain
+    pub domain: Option<Domain>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -898,7 +915,9 @@ impl Directory {
             .columns
             .iter()
             .map(|c| {
-                COLUMN_ENTRY
+                ENTRY_HEAD
+                    + COMPONENT_ENTRY
+                    + ENTRY_COUNTS
                     + c.key_pages.len() * KEY_DIR_ENTRY
                     + c.pos_pages.len() * POS_DIR_ENTRY
                     + 1
@@ -907,12 +926,17 @@ impl Directory {
             .sum::<usize>()
     }
 
+    /// Encodes the directory in the current version's layout
     fn encode_into(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&(self.columns.len() as u32).to_le_bytes());
         for c in &self.columns {
-            out.extend_from_slice(&c.column.to_le_bytes());
-            out.push(KEY_I64);
+            debug_assert!(c.domain.is_some(), "a built entry records its domain");
             out.extend_from_slice(&c.identity.to_le_bytes());
+            out.push(c.kind.code());
+            out.push(c.outcome.code());
+            out.extend_from_slice(&1u32.to_le_bytes());
+            out.extend_from_slice(&c.column.to_le_bytes());
+            out.push(c.domain.map_or(0, Domain::code));
             out.extend_from_slice(&c.n_keys.to_le_bytes());
             out.extend_from_slice(&c.n_positions.to_le_bytes());
             out.extend_from_slice(&(c.key_pages.len() as u32).to_le_bytes());
@@ -962,20 +986,30 @@ impl Directory {
         charges.push(INDEX_DIRECTORIES.charge(count * std::mem::size_of::<ColumnDirectory>()));
         let mut columns = Vec::with_capacity(count);
         for _ in 0..count {
-            if data.len() < pos + COLUMN_ENTRY {
-                return Err(invalid("directory truncated"));
-            }
-            let column = read_u32(data, &mut pos)?;
-            let tag = data[pos];
-            pos += 1;
-            if tag != KEY_I64 {
-                return Err(invalid("key type unsupported"));
-            }
-            let identity = read_u64(data, &mut pos)?;
+            let (column, identity, kind, outcome, domain) = if version == VERSION {
+                Self::decode_head(data, &mut pos)?
+            } else {
+                if data.len() < pos + COLUMN_ENTRY {
+                    return Err(invalid("directory truncated"));
+                }
+                let column = read_u32(data, &mut pos)?;
+                let tag = data[pos];
+                pos += 1;
+                if tag != KEY_I64 {
+                    return Err(invalid("key type unsupported"));
+                }
+                let identity = read_u64(data, &mut pos)?;
+                (column, identity, KeyKind::OrderedI64, Outcome::Built, None)
+            };
             let n_keys = read_u64(data, &mut pos)?;
             let n_positions = read_u64(data, &mut pos)?;
             let key_pages = read_u32(data, &mut pos)? as usize;
             let pos_pages = read_u32(data, &mut pos)? as usize;
+            if outcome == Outcome::Unsupported
+                && (n_keys != 0 || n_positions != 0 || key_pages != 0 || pos_pages != 0)
+            {
+                return Err(invalid("an unsupported entry holds keys"));
+            }
             if data.len() < pos + key_pages * KEY_DIR_ENTRY + pos_pages * POS_DIR_ENTRY {
                 return Err(invalid("directory shorter than its page counts"));
             }
@@ -1047,6 +1081,9 @@ impl Directory {
                 if keys.windows(2).any(|w| w[0].0 >= w[1].0) {
                     return Err(invalid("heavy keys are not in order"));
                 }
+                if outcome == Outcome::Unsupported && !keys.is_empty() {
+                    return Err(invalid("an unsupported entry holds keys"));
+                }
                 Some(keys)
             };
             columns.push(ColumnDirectory {
@@ -1057,6 +1094,9 @@ impl Directory {
                 key_pages: kp,
                 pos_pages: pp,
                 heavy_keys,
+                kind,
+                outcome,
+                domain,
             });
         }
         if pos != data.len() {
@@ -1069,6 +1109,34 @@ impl Directory {
             },
             charges,
         ))
+    }
+
+    /// A version 6 entry's identity, kind, outcome and components, as the
+    /// physical column and domain of its one component. An unknown kind,
+    /// outcome or domain is refused, and the volume is scanned
+    fn decode_head(
+        data: &[u8],
+        pos: &mut usize,
+    ) -> std::io::Result<(u32, u64, KeyKind, Outcome, Option<Domain>)> {
+        if data.len() < *pos + ENTRY_HEAD {
+            return Err(invalid("directory truncated"));
+        }
+        let identity = read_u64(data, pos)?;
+        let kind = KeyKind::from_code(data[*pos]).ok_or_else(|| invalid("key kind unknown"))?;
+        let outcome =
+            Outcome::from_code(data[*pos + 1]).ok_or_else(|| invalid("entry outcome unknown"))?;
+        *pos += 2;
+        // An ordered i64 key has exactly one component
+        if read_u32(data, pos)? != 1 {
+            return Err(invalid("components do not fit the key kind"));
+        }
+        if data.len() < *pos + COMPONENT_ENTRY {
+            return Err(invalid("directory truncated"));
+        }
+        let column = read_u32(data, pos)?;
+        let domain = Domain::from_code(data[*pos]).ok_or_else(|| invalid("domain unknown"))?;
+        *pos += 1;
+        Ok((column, identity, kind, outcome, Some(domain)))
     }
 }
 
@@ -1133,7 +1201,10 @@ impl IndexFile {
             return Err(invalid("bad magic"));
         }
         let version = u32::from_le_bytes(header[4..8].try_into().expect("4 bytes"));
-        if version != VERSION && version != VERSION_WITHOUT_HEAVY_KEYS {
+        if !matches!(
+            version,
+            VERSION | VERSION_WITH_HEAVY_KEYS | VERSION_WITHOUT_HEAVY_KEYS
+        ) {
             return Err(invalid("version unsupported"));
         }
         let generation = u64::from_le_bytes(header[8..16].try_into().expect("8 bytes"));
@@ -1179,12 +1250,14 @@ impl IndexFile {
         &self.file
     }
 
-    /// Whether the file holds an entry for the index definition with
-    /// `identity`, built over physical column `physical`, whose keys
-    /// provide `capability`
+    /// Whether the file holds a built entry for the index definition with
+    /// `identity`, over physical column `physical`, whose keys provide
+    /// `capability`
     pub fn covers(&self, identity: u64, physical: usize, capability: Capability) -> bool {
         self.directory.entry(identity).is_some_and(|c| {
-            c.column as usize == physical && KeyKind::OrderedI64.provides(capability)
+            c.outcome == Outcome::Built
+                && c.column as usize == physical
+                && c.kind.provides(capability)
         })
     }
 
@@ -1281,8 +1354,18 @@ impl IndexFile {
         };
         let share_of = |page: usize| -> u64 {
             let p = &col.key_pages[page];
+            let (low, high) = (low.max(p.first_key), high.min(p.last_key));
+            // Float keys are far from linear in their values: the share is
+            // taken over the values when the page spans a finite range
+            if col.domain == Some(Domain::Float) {
+                let span = float_of_key(p.last_key) - float_of_key(p.first_key);
+                if span.is_finite() && span > 0.0 {
+                    let overlap = float_of_key(high) - float_of_key(low);
+                    return (positions_of(page) as f64 * (overlap / span)) as u64;
+                }
+            }
             let span = (p.last_key as i128 - p.first_key as i128 + 1) as u128;
-            let overlap = (high.min(p.last_key) as i128 - low.max(p.first_key) as i128 + 1) as u128;
+            let overlap = (high as i128 - low as i128 + 1) as u128;
             (positions_of(page) as u128 * overlap / span) as u64
         };
         let estimate = if last - first == 1 {
@@ -1940,6 +2023,8 @@ pub struct ColumnInput<'a> {
     pub column: u32,
     /// The identity of the index definition the column is built for
     pub identity: u64,
+    /// The domain the pairs' keys are encoded in
+    pub domain: Domain,
     pub pairs: Box<dyn Iterator<Item = (u32, i64)> + 'a>,
 }
 
@@ -2431,7 +2516,8 @@ fn build_side_file_staged(
                 std::fs::remove_file(input)?;
             }
         }
-        let (column_dir, next_offset, metas) = writer.finish()?;
+        let (mut column_dir, next_offset, metas) = writer.finish()?;
+        column_dir.domain = Some(input.domain);
         meta_charges.push(metas);
         report.keys += column_dir.n_keys;
         report.positions += column_dir.n_positions;
@@ -2779,6 +2865,9 @@ impl<'a, 'b, W: Write> PageWriter<'a, 'b, W> {
             key_pages: std::mem::take(&mut self.key_pages),
             pos_pages: std::mem::take(&mut self.pos_pages),
             heavy_keys: Some(heavy_keys),
+            kind: KeyKind::OrderedI64,
+            outcome: Outcome::Built,
+            domain: None,
         };
         let budget = self.metas.budget;
         let metas = std::mem::replace(&mut self.metas, Charge { bytes: 0, budget });
@@ -2815,19 +2904,52 @@ pub fn least_workspace(rows: usize, columns: usize) -> usize {
     MIN_WORKSPACE_BYTES + columns * (metadata_allowance(rows) + COLUMN_SLOT_BYTES)
 }
 
-fn integer_keys(data: &super::column::ColumnData) -> Option<(&[i64], &[bool])> {
-    match data {
-        super::column::ColumnData::Int64 { values, nulls }
-        | super::column::ColumnData::TimestampNanos { values, nulls } => Some((values, nulls)),
-        _ => None,
-    }
+/// The key row `i` of a column is held under
+enum RowKey {
+    Key(i64),
+    /// A NULL, or a NaN in a FLOAT column: the row has no key
+    Absent,
+    /// Past the column's values
+    Short,
+    /// A column no key kind holds
+    Unindexable,
 }
 
-/// The `(position, key)` pairs of an integer or timestamp column of
-/// `volume`, null rows left out: a column already decoded is read in
-/// place, else one row group at a time through the group cache. A decode
-/// or type error ends the pairs and is left in `failure`, so the build's
-/// caller can tell a short input from a complete one.
+fn row_key(data: &super::column::ColumnData, i: usize) -> RowKey {
+    use super::column::ColumnData;
+    let null = |nulls: &[bool]| nulls.get(i).copied().unwrap_or(false);
+    let key = match data {
+        ColumnData::Int64 { values, nulls } | ColumnData::TimestampNanos { values, nulls } => {
+            if null(nulls) {
+                return RowKey::Absent;
+            }
+            values.get(i).copied()
+        }
+        ColumnData::Float64 { values, nulls } => {
+            if null(nulls) {
+                return RowKey::Absent;
+            }
+            match values.get(i) {
+                Some(f) if f.is_nan() => return RowKey::Absent,
+                f => f.map(|&f| float_key(f)),
+            }
+        }
+        ColumnData::Boolean { values, nulls } => {
+            if null(nulls) {
+                return RowKey::Absent;
+            }
+            values.get(i).map(|&b| b as i64)
+        }
+        _ => return RowKey::Unindexable,
+    };
+    key.map_or(RowKey::Short, RowKey::Key)
+}
+
+/// The `(position, key)` pairs of a keyed column of `volume`, rows without
+/// a key left out: a column already decoded is read in place, else one row
+/// group at a time through the group cache. A decode or type error ends the
+/// pairs and is left in `failure`, so the build's caller can tell a short
+/// input from a complete one.
 fn volume_pairs<'a>(
     volume: &'a super::writer::FrozenVolume,
     column: usize,
@@ -2839,14 +2961,18 @@ fn volume_pairs<'a>(
         None
     };
     let pairs: Box<dyn Iterator<Item = (u32, i64)> + 'a> = match volume.columns.resident(column) {
-        Some(data) => match integer_keys(data) {
-            Some((values, nulls)) => Box::new(
-                (0..rows.min(values.len()))
-                    .filter(move |&i| !nulls.get(i).copied().unwrap_or(false))
-                    .map(move |i| (i as u32, values[i])),
-            ),
-            None => Box::new(std::iter::from_fn(move || fail("column is not indexable"))),
-        },
+        Some(data) if matches!(row_key(data, 0), RowKey::Unindexable) => {
+            Box::new(std::iter::from_fn(move || fail("column is not indexable")))
+        }
+        Some(data) => Box::new(
+            (0..rows)
+                .map(move |i| (i, row_key(data, i)))
+                .take_while(|(_, key)| !matches!(key, RowKey::Short))
+                .filter_map(|(i, key)| match key {
+                    RowKey::Key(key) => Some((i as u32, key)),
+                    _ => None,
+                }),
+        ),
         None => match volume.columns.compressed_store() {
             None => Box::new(std::iter::from_fn(move || {
                 fail("column data is not loaded")
@@ -2899,22 +3025,16 @@ impl Iterator for GroupPairs<'_> {
             let position = self.next;
             self.next += 1;
             let decoded = &self.current.as_ref()?.1;
-            let Some((values, nulls)) = integer_keys(decoded) else {
-                self.failure.set(Some(invalid("column is not indexable")));
-                self.next = self.rows;
-                return None;
-            };
             let i = position - group * self.group_size;
-            if nulls.get(i).copied().unwrap_or(false) {
-                continue;
-            }
-            let Some(&key) = values.get(i) else {
-                self.failure
-                    .set(Some(invalid("row group shorter than its rows")));
-                self.next = self.rows;
-                return None;
+            let error = match row_key(decoded, i) {
+                RowKey::Key(key) => return Some((position as u32, key)),
+                RowKey::Absent => continue,
+                RowKey::Short => "row group shorter than its rows",
+                RowKey::Unindexable => "column is not indexable",
             };
-            return Some((position as u32, key));
+            self.failure.set(Some(invalid(error)));
+            self.next = self.rows;
+            return None;
         }
         self.current = None;
         None
@@ -3089,10 +3209,14 @@ pub fn stage_side_for(
     let failure = std::cell::Cell::new(None);
     let columns = identities
         .iter()
-        .map(|&(column, identity)| ColumnInput {
-            column: column as u32,
-            identity,
-            pairs: Box::new(volume_pairs(volume, column, &failure)),
+        .filter_map(|&(column, identity)| {
+            let domain = Domain::of(*volume.meta.column_types.get(column)?)?;
+            Some(ColumnInput {
+                column: column as u32,
+                identity,
+                domain,
+                pairs: Box::new(volume_pairs(volume, column, &failure)),
+            })
         })
         .collect();
     let generation = next_generation();
@@ -3384,6 +3508,7 @@ mod tests {
             vec![ColumnInput {
                 column: 1,
                 identity: 1,
+                domain: Domain::Integer,
                 pairs: Box::new(pairs.into_iter()),
             }],
             workspace,
@@ -3495,29 +3620,83 @@ mod tests {
     }
 
     #[test]
-    fn a_version_4_directory_reads_without_heavy_keys() {
-        let directory = Directory {
-            generation: 7,
-            columns: vec![ColumnDirectory {
-                column: 1,
-                identity: 3,
-                n_keys: 0,
-                n_positions: 0,
-                key_pages: Vec::new(),
-                pos_pages: Vec::new(),
-                heavy_keys: Some(Vec::new()),
-            }],
-        };
-        let mut current = Vec::new();
-        directory.encode_into(&mut current);
+    fn version_4_and_5_directories_still_read() {
+        // One empty entry as version 5 wrote it: column 1, the i64 tag,
+        // identity 3, no keys or pages, no heavy keys
+        let mut v5 = 1u32.to_le_bytes().to_vec();
+        v5.extend_from_slice(&1u32.to_le_bytes());
+        v5.push(KEY_I64);
+        v5.extend_from_slice(&3u64.to_le_bytes());
+        v5.extend_from_slice(&[0u8; 24]);
+        v5.push(0);
         // Version 4 wrote the same entry without the heavy key count
-        let older = &current[..current.len() - 1];
-        let (read, _) = Directory::decode(VERSION_WITHOUT_HEAVY_KEYS, 7, older, 1 << 20).unwrap();
+        let v4 = &v5[..v5.len() - 1];
+        let (read, _) = Directory::decode(VERSION_WITHOUT_HEAVY_KEYS, 7, v4, 1 << 20).unwrap();
         assert_eq!(read.columns[0].heavy_keys, None);
-        let (read, _) = Directory::decode(VERSION, 7, &current, 1 << 20).unwrap();
-        assert_eq!(read.columns[0].heavy_keys, Some(Vec::new()));
-        assert!(Directory::decode(VERSION, 7, older, 1 << 20).is_err());
-        assert!(Directory::decode(VERSION_WITHOUT_HEAVY_KEYS, 7, &current, 1 << 20).is_err());
+        let (read, _) = Directory::decode(VERSION_WITH_HEAVY_KEYS, 7, &v5, 1 << 20).unwrap();
+        let entry = &read.columns[0];
+        assert_eq!(entry.heavy_keys, Some(Vec::new()));
+        assert_eq!((entry.column, entry.identity), (1, 3));
+        assert_eq!(entry.kind, KeyKind::OrderedI64);
+        assert_eq!(entry.outcome, Outcome::Built);
+        assert_eq!(entry.domain, None, "a version 5 entry records no domain");
+        assert!(Directory::decode(VERSION_WITH_HEAVY_KEYS, 7, v4, 1 << 20).is_err());
+        assert!(Directory::decode(VERSION_WITHOUT_HEAVY_KEYS, 7, &v5, 1 << 20).is_err());
+        assert!(Directory::decode(VERSION, 7, &v5, 1 << 20).is_err());
+    }
+
+    #[test]
+    fn a_version_6_directory_records_kind_outcome_and_domain() {
+        let entry = |outcome, n_keys| ColumnDirectory {
+            column: 2,
+            identity: 9,
+            n_keys,
+            n_positions: 0,
+            key_pages: Vec::new(),
+            pos_pages: Vec::new(),
+            heavy_keys: Some(Vec::new()),
+            kind: KeyKind::OrderedI64,
+            outcome,
+            domain: Some(Domain::Float),
+        };
+        let encode = |columns| {
+            let mut out = Vec::new();
+            Directory {
+                generation: 7,
+                columns,
+            }
+            .encode_into(&mut out);
+            out
+        };
+        let built = encode(vec![entry(Outcome::Built, 0)]);
+        let (read, _) = Directory::decode(VERSION, 7, &built, 1 << 20).unwrap();
+        assert_eq!(read.columns, vec![entry(Outcome::Built, 0)]);
+        let unsupported = encode(vec![entry(Outcome::Unsupported, 0)]);
+        let (read, _) = Directory::decode(VERSION, 7, &unsupported, 1 << 20).unwrap();
+        assert_eq!(read.columns[0].outcome, Outcome::Unsupported);
+        assert!(
+            Directory::decode(
+                VERSION,
+                7,
+                &encode(vec![entry(Outcome::Unsupported, 1)]),
+                1 << 20
+            )
+            .is_err(),
+            "an unsupported entry holds no keys"
+        );
+        // The entry count, the identity, then the kind, outcome and the
+        // component's domain bytes
+        for (at, what) in [(12, "kind"), (13, "outcome"), (22, "domain")] {
+            let mut bad = built.clone();
+            bad[at] = 0xEE;
+            assert!(
+                Directory::decode(VERSION, 7, &bad, 1 << 20).is_err(),
+                "an unknown {what} is refused"
+            );
+        }
+        let mut two_components = built.clone();
+        two_components[14..18].copy_from_slice(&2u32.to_le_bytes());
+        assert!(Directory::decode(VERSION, 7, &two_components, 1 << 20).is_err());
     }
 
     #[test]
@@ -3713,6 +3892,7 @@ mod tests {
             vec![ColumnInput {
                 column: 1,
                 identity: 1,
+                domain: Domain::Integer,
                 pairs: Box::new(std::iter::empty()),
             }],
             MIN_WORKSPACE_BYTES - 1,
@@ -3740,6 +3920,7 @@ mod tests {
             vec![ColumnInput {
                 column: 1,
                 identity: 1,
+                domain: Domain::Integer,
                 pairs: Box::new(scattered(1_200_000, 1_200_001)),
             }],
             workspace,
@@ -3782,6 +3963,7 @@ mod tests {
                 .map(|c| ColumnInput {
                     column: c,
                     identity: u64::from(c),
+                    domain: Domain::Integer,
                     pairs: Box::new(scattered(400_000, 65_521 + c as u64)),
                 })
                 .collect(),
@@ -3821,6 +4003,7 @@ mod tests {
             vec![ColumnInput {
                 column: 1,
                 identity: 1,
+                domain: Domain::Integer,
                 pairs: Box::new(Unbounded(scattered(4_194_304, 4_194_301))),
             }],
             MIN_WORKSPACE_BYTES,
@@ -3853,6 +4036,7 @@ mod tests {
             vec![ColumnInput {
                 column: 1,
                 identity: 1,
+                domain: Domain::Integer,
                 pairs: Box::new(scattered(4_194_304, 4_194_301)),
             }],
             MIN_WORKSPACE_BYTES + metadata_allowance(4_194_304),
@@ -3884,6 +4068,7 @@ mod tests {
             vec![ColumnInput {
                 column: 1,
                 identity: 1,
+                domain: Domain::Integer,
                 pairs: Box::new(scattered(100_000, 100_003)),
             }],
             MIN_WORKSPACE_BYTES + metadata_allowance(100_000),
@@ -3923,6 +4108,7 @@ mod tests {
             vec![ColumnInput {
                 column: 1,
                 identity: 1,
+                domain: Domain::Integer,
                 pairs: Box::new(std::iter::empty()),
             }],
             WORKSPACE,
@@ -3945,6 +4131,7 @@ mod tests {
             vec![ColumnInput {
                 column: 1,
                 identity: 1,
+                domain: Domain::Integer,
                 pairs: Box::new(Unbounded(scattered(4_194_304, 4_194_301))),
             }],
             MIN_WORKSPACE_BYTES,
@@ -3980,6 +4167,7 @@ mod tests {
                 .map(|c| ColumnInput {
                     column: c,
                     identity: u64::from(c),
+                    domain: Domain::Integer,
                     pairs: Box::new(std::iter::empty()),
                 })
                 .collect::<Vec<_>>()
@@ -4065,6 +4253,7 @@ mod tests {
             vec![ColumnInput {
                 column: 1,
                 identity: 1,
+                domain: Domain::Integer,
                 pairs: Box::new(pairs.clone().into_iter()),
             }],
             MIN_WORKSPACE_BYTES + metadata_allowance(300_000),
@@ -4091,6 +4280,7 @@ mod tests {
             vec![ColumnInput {
                 column: 1,
                 identity: 1,
+                domain: Domain::Integer,
                 pairs: Box::new(pairs.into_iter()),
             }],
             WORKSPACE,
@@ -4470,6 +4660,7 @@ mod tests {
             vec![ColumnInput {
                 column: 1,
                 identity: 1,
+                domain: Domain::Integer,
                 pairs: Box::new(scattered(1000, 97)),
             }],
             WORKSPACE,
@@ -4504,11 +4695,13 @@ mod tests {
                 ColumnInput {
                     column: 1,
                     identity: 41,
+                    domain: Domain::Integer,
                     pairs: Box::new(scattered(1000, 97)),
                 },
                 ColumnInput {
                     column: 2,
                     identity: 0,
+                    domain: Domain::Integer,
                     pairs: Box::new(scattered(1000, 89)),
                 },
             ],
@@ -4545,6 +4738,83 @@ mod tests {
         assert!(err.to_string().contains("version"), "{err}");
     }
 
+    /// Rewrites a built file's directory in the version 5 layout, as the
+    /// release before version 6 wrote it
+    fn rewrite_as_version_5(path: &Path) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let footer = bytes.len() - FOOTER_LEN as usize;
+        let dir_offset = u64::from_le_bytes(bytes[footer..footer + 8].try_into().unwrap());
+        let dir_len = u32::from_le_bytes(bytes[footer + 8..footer + 12].try_into().unwrap());
+        let start = dir_offset as usize;
+        let (directory, _) = Directory::decode(
+            VERSION,
+            0,
+            &bytes[start..start + dir_len as usize],
+            dir_offset,
+        )
+        .unwrap();
+        let mut dir = (directory.columns.len() as u32).to_le_bytes().to_vec();
+        for c in &directory.columns {
+            dir.extend_from_slice(&c.column.to_le_bytes());
+            dir.push(KEY_I64);
+            dir.extend_from_slice(&c.identity.to_le_bytes());
+            dir.extend_from_slice(&c.n_keys.to_le_bytes());
+            dir.extend_from_slice(&c.n_positions.to_le_bytes());
+            dir.extend_from_slice(&(c.key_pages.len() as u32).to_le_bytes());
+            dir.extend_from_slice(&(c.pos_pages.len() as u32).to_le_bytes());
+            for p in &c.key_pages {
+                for v in [p.first_key as u64, p.last_key as u64, p.offset] {
+                    dir.extend_from_slice(&v.to_le_bytes());
+                }
+                dir.extend_from_slice(&p.len.to_le_bytes());
+                dir.extend_from_slice(&p.key_start.to_le_bytes());
+                dir.extend_from_slice(&p.pos_start.to_le_bytes());
+            }
+            for p in &c.pos_pages {
+                dir.extend_from_slice(&p.offset.to_le_bytes());
+                dir.extend_from_slice(&p.len.to_le_bytes());
+                dir.extend_from_slice(&p.pos_start.to_le_bytes());
+            }
+            let heavy = c.heavy_keys.as_deref().unwrap_or_default();
+            dir.push(heavy.len() as u8);
+            for (key, count) in heavy {
+                dir.extend_from_slice(&key.to_le_bytes());
+                dir.extend_from_slice(&count.to_le_bytes());
+            }
+        }
+        bytes.truncate(start);
+        bytes[4..8].copy_from_slice(&VERSION_WITH_HEAVY_KEYS.to_le_bytes());
+        let crc = crc32fast::hash(&dir);
+        let len = dir.len() as u32;
+        bytes.extend_from_slice(&dir);
+        bytes.extend_from_slice(&dir_offset.to_le_bytes());
+        bytes.extend_from_slice(&len.to_le_bytes());
+        bytes.extend_from_slice(&crc.to_le_bytes());
+        bytes.extend_from_slice(&MAGIC);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn a_version_5_file_is_still_served() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sidx");
+        build(&path, scattered(20_000, 977).collect(), WORKSPACE);
+        let built = Arc::new(IndexFile::open(&path, 41).unwrap());
+        let key = (5 * 104_729) % 977;
+        let want = built.equal(1, key).unwrap().expect("the key is present");
+        let want_positions = all_positions_of(&built, 1, want);
+        drop(built);
+        rewrite_as_version_5(&path);
+        let old = Arc::new(IndexFile::open(&path, 42).unwrap());
+        let entry = old.directory().entry(1).unwrap();
+        assert_eq!(entry.domain, None, "a version 5 entry records no domain");
+        assert!(old.covers(1, 1, Capability::Equality));
+        assert!(old.covers(1, 1, Capability::Range));
+        let got = old.equal(1, key).unwrap().expect("the key is present");
+        assert_eq!(all_positions_of(&old, 1, got), want_positions);
+    }
+
     #[test]
     fn two_indexes_on_one_column_are_read_apart() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -4557,11 +4827,13 @@ mod tests {
                 ColumnInput {
                     column: 1,
                     identity: 7,
+                    domain: Domain::Integer,
                     pairs: Box::new((0..100u32).map(|p| (p, p as i64))),
                 },
                 ColumnInput {
                     column: 1,
                     identity: 9,
+                    domain: Domain::Integer,
                     pairs: Box::new((0..100u32).map(|p| (99 - p, 1000 + p as i64))),
                 },
             ],

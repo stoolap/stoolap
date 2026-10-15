@@ -5402,8 +5402,8 @@ impl VersionStore {
     }
 
     /// The indexes a volume's side file holds entries for: each
-    /// single-column B-tree index on an INTEGER or TIMESTAMP column other
-    /// than the primary key, by identity. An index the catalog has not
+    /// single-column B-tree index on an INTEGER, TIMESTAMP or FLOAT column
+    /// other than the primary key, by identity. An index the catalog has not
     /// issued an identity to is left out: nothing can be built or served
     /// for it.
     pub fn side_index_defs(&self) -> Vec<SideIndexDef> {
@@ -5439,7 +5439,7 @@ impl VersionStore {
             if pk == Some(column) {
                 continue;
             }
-            let Some(domain) = Domain::of(schema.columns[column].data_type) else {
+            let Some(domain) = Domain::admitted(schema.columns[column].data_type) else {
                 continue;
             };
             result.push(SideIndexDef {

@@ -449,6 +449,7 @@ fn a_built_file_left_unattached_is_attached_at_reopen() {
         vec![ColumnInput {
             column: 1,
             identity,
+            domain: stoolap::storage::volume::side_index::Domain::Integer,
             pairs: Box::new((0..ROWS as u32).map(|i| (i, key_of(i as i64 + 1)))),
         }],
         4 * 1024 * 1024,

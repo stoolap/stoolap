@@ -460,7 +460,7 @@ fn prepare_cold(
         .iter()
         .filter_map(|def| {
             let column = def.leading()?.column;
-            crate::storage::volume::side_index::Domain::of(schema.columns[column].data_type)?;
+            crate::storage::volume::side_index::Domain::admitted(schema.columns[column].data_type)?;
             Some((column, def.identity))
         })
         .collect();
