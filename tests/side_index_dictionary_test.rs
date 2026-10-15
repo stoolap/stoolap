@@ -21,7 +21,7 @@
 use std::sync::Mutex;
 
 use stoolap::core::Value;
-use stoolap::test_failpoints::{dictionary_searches, refuse_side_walks};
+use stoolap::test_failpoints::{dictionary_searches, refuse_side_walks, rows_materialized};
 use stoolap::Database;
 
 /// The counters and the refusal are process-wide
@@ -112,7 +112,12 @@ fn check(db: &Database, phase: &str) {
         let want = ids(db, &sql.replace(" t ", " u "), &params);
         assert_eq!(want.len(), 2, "{sql}");
         let (probes, searches) = (stat(db, "probes"), dictionary_searches());
+        let built = rows_materialized();
         assert_eq!(ids(db, &sql, &params), want, "{phase}: {sql}");
+        assert!(
+            rows_materialized() - built <= want.len(),
+            "{phase}: a candidate the TEXT condition drops is not built: {sql}"
+        );
         assert!(
             stat(db, "probes") > probes,
             "{phase}: side file read: {sql}"
