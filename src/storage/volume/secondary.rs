@@ -59,7 +59,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
-use super::side_index::{float_key, float_of_key, Capability, Domain, KeyKind, Outcome};
+use super::side_index::{
+    float_key, float_of_key, Capability, Domain, KeyKind, Outcome, SideTarget,
+};
 use super::writer::VolumeFile;
 const MAGIC: [u8; 4] = *b"STSX";
 /// Version 6 records each entry's key kind, outcome and components with
@@ -88,6 +90,8 @@ const COLUMN_ENTRY: usize = 37;
 const ENTRY_HEAD: usize = 14;
 const COMPONENT_ENTRY: usize = 5;
 const ENTRY_COUNTS: usize = 24;
+/// An ordered-bytes key page's entry less its two boundaries' bytes
+const BYTE_DIR_ENTRY: usize = 32;
 pub const SIDE_EXT: &str = "sidx";
 
 /// The byte bound of one page, header and checksum included.
@@ -99,6 +103,8 @@ const KEY_ENTRY: usize = 12;
 const POS_ENTRY: usize = 4;
 /// Keys one key page holds at most, and positions one position page holds
 pub const KEYS_PER_PAGE: usize = (PAGE_BYTES - PAGE_OVERHEAD) / KEY_ENTRY;
+/// Ordered-bytes keys one key page holds at most, each a byte at least
+const BYTE_KEYS_PER_PAGE: usize = (PAGE_BYTES - PAGE_OVERHEAD) / (BYTE_KEY_OVERHEAD + 1);
 pub const POSITIONS_PER_PAGE: usize = (PAGE_BYTES - PAGE_OVERHEAD) / POS_ENTRY;
 
 /// The side file next to a volume file.
@@ -597,9 +603,16 @@ impl IndexPages {
                 number: number as u32,
             };
             if !cache.pages.contains_key(&key) {
-                let len = file.directory.page_location(identity, kind, number)?.1 as usize;
+                let (_, len, ordered_bytes) =
+                    file.directory.page_location(identity, kind, number)?;
+                let len = len as usize;
                 let entries = len.saturating_sub(PAGE_OVERHEAD);
                 parsed += match kind {
+                    PageKind::Keys if ordered_bytes => {
+                        entries
+                            + entries / (BYTE_KEY_OVERHEAD + 1)
+                                * (std::mem::size_of::<u32>() + std::mem::size_of::<u64>())
+                    }
                     PageKind::Keys => {
                         entries / KEY_ENTRY
                             * (std::mem::size_of::<i64>() + std::mem::size_of::<u64>())
@@ -674,8 +687,8 @@ impl IndexPages {
                 return Ok(page);
             }
         }
-        let (offset, len) = file.directory.page_location(identity, kind, number)?;
-        let page = Arc::new(Page::read(file, kind, offset, len)?);
+        let (offset, len, ordered_bytes) = file.directory.page_location(identity, kind, number)?;
+        let page = Arc::new(Page::read(file, kind, ordered_bytes, offset, len)?);
         self.loads.fetch_add(1, Ordering::Relaxed);
         let replaced = {
             let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -732,7 +745,66 @@ pub enum PageContent {
         keys: Vec<i64>,
         ends: Vec<u64>,
     },
+    /// Ordered-bytes keys in order, their bytes back to back from `starts`,
+    /// and for each the position index it ends at
+    ByteKeys {
+        data: Vec<u8>,
+        starts: Vec<u32>,
+        ends: Vec<u64>,
+    },
     Positions(Vec<u32>),
+}
+
+/// Key `i` of an ordered-bytes key page
+fn byte_key<'a>(data: &'a [u8], starts: &[u32], i: usize) -> &'a [u8] {
+    let end = starts.get(i + 1).map_or(data.len(), |&s| s as usize);
+    &data[starts[i] as usize..end]
+}
+
+/// The bytes one ordered-bytes key page entry takes besides its key: the
+/// key's length and the position index it ends at
+const BYTE_KEY_OVERHEAD: usize = 6;
+
+/// Parses ordered-bytes key page entries into the buffers given, checking
+/// that they fill the page and ascend
+fn parse_byte_keys(
+    n: usize,
+    entries: &[u8],
+    data: &mut Vec<u8>,
+    starts: &mut Vec<u32>,
+    ends: &mut Vec<u64>,
+) -> std::io::Result<()> {
+    data.clear();
+    starts.clear();
+    ends.clear();
+    let mut at = 0usize;
+    for _ in 0..n {
+        let len = entries
+            .get(at..at + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+            .ok_or_else(|| invalid("key page shorter than its count"))?;
+        let key = entries
+            .get(at + 2..at + 2 + len)
+            .ok_or_else(|| invalid("key page shorter than its count"))?;
+        let end = entries
+            .get(at + 2 + len..at + BYTE_KEY_OVERHEAD + len)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64)
+            .ok_or_else(|| invalid("key page shorter than its count"))?;
+        starts.push(data.len() as u32);
+        data.extend_from_slice(key);
+        ends.push(end);
+        at += BYTE_KEY_OVERHEAD + len;
+    }
+    if at != entries.len() {
+        return Err(invalid("key page length does not match its count"));
+    }
+    let ascending = (1..n).all(|i| {
+        byte_key(data, starts, i - 1) < byte_key(data, starts, i) && ends[i - 1] < ends[i]
+    });
+    if !ascending {
+        return Err(invalid("key page is not in order"));
+    }
+    Ok(())
 }
 
 /// A page's entry count and entries once its length and checksum hold
@@ -753,13 +825,35 @@ impl Page {
     /// Reads and parses one page: the raw bytes are reserved for the read
     /// and released after the parse; the parsed vectors are reserved at
     /// their capacity before they are allocated and stay with the page.
-    fn read(file: &IndexFile, kind: PageKind, offset: u64, len: u32) -> std::io::Result<Self> {
+    fn read(
+        file: &IndexFile,
+        kind: PageKind,
+        ordered_bytes: bool,
+        offset: u64,
+        len: u32,
+    ) -> std::io::Result<Self> {
         let raw_reservation = INDEX_PAGES
             .try_reserve(len as usize)
             .ok_or_else(|| refused("a page's raw bytes"))?;
         let raw = file.read_page(offset, len)?;
         let (n, entries) = verified_entries(&raw)?;
         let (content, bytes, reservation) = match kind {
+            PageKind::Keys if ordered_bytes => {
+                let bytes =
+                    entries.len() + n * (std::mem::size_of::<u32>() + std::mem::size_of::<u64>());
+                let reservation = INDEX_PAGES
+                    .try_reserve(bytes)
+                    .ok_or_else(|| refused("a key page"))?;
+                let mut data = Vec::with_capacity(entries.len());
+                let mut starts = Vec::with_capacity(n);
+                let mut ends = Vec::with_capacity(n);
+                parse_byte_keys(n, entries, &mut data, &mut starts, &mut ends)?;
+                (
+                    PageContent::ByteKeys { data, starts, ends },
+                    bytes,
+                    reservation,
+                )
+            }
             PageKind::Keys => {
                 if entries.len() != n * KEY_ENTRY {
                     return Err(invalid("key page length does not match its count"));
@@ -841,6 +935,74 @@ pub struct PosPageMeta {
     pub pos_start: u64,
 }
 
+/// A key page of an ordered-bytes entry: its boundaries as spans of the
+/// entry's arena, its location, and where its keys and positions start
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BytePageMeta {
+    lower: (u32, u16),
+    upper: (u32, u16),
+    offset: u64,
+    len: u32,
+    pub key_start: u64,
+    pub pos_start: u64,
+}
+
+/// The key pages and heavy keys of an ordered-bytes entry, their bytes in
+/// one arena. A page's lower boundary is the shortest string above the
+/// previous page's last key and at most its own first key, so boundaries
+/// strictly ascend; its upper boundary is its last key whole
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BytePages {
+    arena: Vec<u8>,
+    pages: Vec<BytePageMeta>,
+    heavy: Vec<(u32, u16, u64)>,
+}
+
+impl BytePages {
+    fn span(&self, (at, len): (u32, u16)) -> &[u8] {
+        &self.arena[at as usize..at as usize + len as usize]
+    }
+
+    pub fn len(&self) -> usize {
+        self.pages.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pages.is_empty()
+    }
+
+    pub fn lower(&self, page: usize) -> &[u8] {
+        self.span(self.pages[page].lower)
+    }
+
+    pub fn upper(&self, page: usize) -> &[u8] {
+        self.span(self.pages[page].upper)
+    }
+
+    pub fn page(&self, page: usize) -> &BytePageMeta {
+        &self.pages[page]
+    }
+
+    /// The heavy keys with their counts, by key ascending
+    pub fn heavy(&self) -> impl Iterator<Item = (&[u8], u64)> {
+        self.heavy
+            .iter()
+            .map(|&(at, len, count)| (self.span((at, len)), count))
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8]) -> (u32, u16) {
+        let at = self.arena.len() as u32;
+        self.arena.extend_from_slice(bytes);
+        (at, bytes.len() as u16)
+    }
+
+    fn bytes(&self) -> usize {
+        self.arena.capacity()
+            + self.pages.capacity() * std::mem::size_of::<BytePageMeta>()
+            + self.heavy.capacity() * std::mem::size_of::<(u32, u16, u64)>()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDirectory {
     pub column: u32,
@@ -861,6 +1023,11 @@ pub struct ColumnDirectory {
     /// The domain the keys are encoded in; None in a version 4 or 5 file,
     /// whose keys are in the volume's integer or timestamp column's domain
     pub domain: Option<Domain>,
+    /// Every component's physical column and domain, in key order: the
+    /// first is `column` and `domain`. Empty in a version 4 or 5 file
+    pub components: Vec<(u32, Domain)>,
+    /// The key pages and heavy keys of an ordered-bytes entry
+    pub bytes: BytePages,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -879,19 +1046,26 @@ impl Directory {
         self.columns.iter().find(|c| c.identity == identity)
     }
 
+    /// Where page `kind`/`number` of the entry for `identity` lies, and
+    /// whether its keys are ordered bytes
     fn page_location(
         &self,
         identity: u64,
         kind: PageKind,
         number: usize,
-    ) -> std::io::Result<(u64, u32)> {
+    ) -> std::io::Result<(u64, u32, bool)> {
         let col = self
             .entry(identity)
             .ok_or_else(|| invalid("index has no entry"))?;
+        let ordered_bytes = col.kind == KeyKind::OrderedBytes;
         match kind {
+            PageKind::Keys if ordered_bytes => {
+                col.bytes.pages.get(number).map(|p| (p.offset, p.len))
+            }
             PageKind::Keys => col.key_pages.get(number).map(|p| (p.offset, p.len)),
             PageKind::Positions => col.pos_pages.get(number).map(|p| (p.offset, p.len)),
         }
+        .map(|(offset, len)| (offset, len, ordered_bytes))
         .ok_or_else(|| invalid("page number out of range"))
     }
 
@@ -901,6 +1075,8 @@ impl Directory {
             .iter()
             .map(|c| {
                 c.key_pages.capacity() * std::mem::size_of::<KeyPageMeta>()
+                    + c.bytes.bytes()
+                    + c.components.capacity() * std::mem::size_of::<(u32, Domain)>()
                     + c.pos_pages.capacity() * std::mem::size_of::<PosPageMeta>()
                     + c.heavy_keys
                         .as_ref()
@@ -915,13 +1091,18 @@ impl Directory {
             .columns
             .iter()
             .map(|c| {
+                let bytes = &c.bytes;
                 ENTRY_HEAD
-                    + COMPONENT_ENTRY
+                    + entry_components(c).count() * COMPONENT_ENTRY
                     + ENTRY_COUNTS
                     + c.key_pages.len() * KEY_DIR_ENTRY
+                    + (0..bytes.len())
+                        .map(|p| BYTE_DIR_ENTRY + bytes.lower(p).len() + bytes.upper(p).len())
+                        .sum::<usize>()
                     + c.pos_pages.len() * POS_DIR_ENTRY
                     + 1
                     + c.heavy_keys.as_ref().map_or(0, Vec::len) * HEAVY_ENTRY
+                    + bytes.heavy().map(|(key, _)| 10 + key.len()).sum::<usize>()
             })
             .sum::<usize>()
     }
@@ -934,12 +1115,15 @@ impl Directory {
             out.extend_from_slice(&c.identity.to_le_bytes());
             out.push(c.kind.code());
             out.push(c.outcome.code());
-            out.extend_from_slice(&1u32.to_le_bytes());
-            out.extend_from_slice(&c.column.to_le_bytes());
-            out.push(c.domain.map_or(0, Domain::code));
+            out.extend_from_slice(&(entry_components(c).count() as u32).to_le_bytes());
+            for (column, domain) in entry_components(c) {
+                out.extend_from_slice(&column.to_le_bytes());
+                out.push(domain);
+            }
+            let key_pages = c.key_pages.len().max(c.bytes.len());
             out.extend_from_slice(&c.n_keys.to_le_bytes());
             out.extend_from_slice(&c.n_positions.to_le_bytes());
-            out.extend_from_slice(&(c.key_pages.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(key_pages as u32).to_le_bytes());
             out.extend_from_slice(&(c.pos_pages.len() as u32).to_le_bytes());
             for p in &c.key_pages {
                 out.extend_from_slice(&p.first_key.to_le_bytes());
@@ -949,10 +1133,29 @@ impl Directory {
                 out.extend_from_slice(&p.key_start.to_le_bytes());
                 out.extend_from_slice(&p.pos_start.to_le_bytes());
             }
+            for (number, p) in c.bytes.pages.iter().enumerate() {
+                for bound in [c.bytes.lower(number), c.bytes.upper(number)] {
+                    out.extend_from_slice(&(bound.len() as u16).to_le_bytes());
+                    out.extend_from_slice(bound);
+                }
+                out.extend_from_slice(&p.offset.to_le_bytes());
+                out.extend_from_slice(&p.len.to_le_bytes());
+                out.extend_from_slice(&p.key_start.to_le_bytes());
+                out.extend_from_slice(&p.pos_start.to_le_bytes());
+            }
             for p in &c.pos_pages {
                 out.extend_from_slice(&p.offset.to_le_bytes());
                 out.extend_from_slice(&p.len.to_le_bytes());
                 out.extend_from_slice(&p.pos_start.to_le_bytes());
+            }
+            if c.kind == KeyKind::OrderedBytes {
+                out.push(c.bytes.heavy.len() as u8);
+                for (key, count) in c.bytes.heavy() {
+                    out.extend_from_slice(&(key.len() as u16).to_le_bytes());
+                    out.extend_from_slice(key);
+                    out.extend_from_slice(&count.to_le_bytes());
+                }
+                continue;
             }
             // Only a build encodes, and a build always lists them
             debug_assert!(
@@ -986,8 +1189,13 @@ impl Directory {
         charges.push(INDEX_DIRECTORIES.charge(count * std::mem::size_of::<ColumnDirectory>()));
         let mut columns = Vec::with_capacity(count);
         for _ in 0..count {
-            let (column, identity, kind, outcome, domain) = if version == VERSION {
-                Self::decode_head(data, &mut pos)?
+            let (column, identity, kind, outcome, domain, components) = if version == VERSION {
+                let head = Self::decode_head(data, &mut pos)?;
+                charges.push(
+                    INDEX_DIRECTORIES
+                        .charge(head.5.capacity() * std::mem::size_of::<(u32, Domain)>()),
+                );
+                head
             } else {
                 if data.len() < pos + COLUMN_ENTRY {
                     return Err(invalid("directory truncated"));
@@ -999,7 +1207,8 @@ impl Directory {
                     return Err(invalid("key type unsupported"));
                 }
                 let identity = read_u64(data, &mut pos)?;
-                (column, identity, KeyKind::OrderedI64, Outcome::Built, None)
+                let legacy = (KeyKind::OrderedI64, Outcome::Built, None, Vec::new());
+                (column, identity, legacy.0, legacy.1, legacy.2, legacy.3)
             };
             let n_keys = read_u64(data, &mut pos)?;
             let n_positions = read_u64(data, &mut pos)?;
@@ -1010,6 +1219,14 @@ impl Directory {
             {
                 return Err(invalid("an unsupported entry holds keys"));
             }
+            let (key_pages_i64, mut bytes) = if kind == KeyKind::OrderedBytes {
+                let bytes =
+                    Self::decode_byte_pages(data, &mut pos, key_pages, file_len, &mut charges)?;
+                (0, bytes)
+            } else {
+                (key_pages, BytePages::default())
+            };
+            let key_pages = key_pages_i64;
             if data.len() < pos + key_pages * KEY_DIR_ENTRY + pos_pages * POS_DIR_ENTRY {
                 return Err(invalid("directory shorter than its page counts"));
             }
@@ -1061,7 +1278,13 @@ impl Directory {
             {
                 return Err(invalid("directory pages are not in order"));
             }
-            let heavy_keys = if version == VERSION_WITHOUT_HEAVY_KEYS {
+            let heavy_keys = if kind == KeyKind::OrderedBytes {
+                Self::decode_byte_heavy(data, &mut pos, &mut bytes, &mut charges)?;
+                if outcome == Outcome::Unsupported && !bytes.heavy.is_empty() {
+                    return Err(invalid("an unsupported entry holds keys"));
+                }
+                None
+            } else if version == VERSION_WITHOUT_HEAVY_KEYS {
                 None
             } else {
                 let count = *data
@@ -1097,6 +1320,8 @@ impl Directory {
                 kind,
                 outcome,
                 domain,
+                components,
+                bytes,
             });
         }
         if pos != data.len() {
@@ -1111,13 +1336,21 @@ impl Directory {
         ))
     }
 
-    /// A version 6 entry's identity, kind, outcome and components, as the
-    /// physical column and domain of its one component. An unknown kind,
+    /// A version 6 entry's identity, kind, outcome and components, the
+    /// first component also as `column` and `domain`. An unknown kind,
     /// outcome or domain is refused, and the volume is scanned
+    #[allow(clippy::type_complexity)]
     fn decode_head(
         data: &[u8],
         pos: &mut usize,
-    ) -> std::io::Result<(u32, u64, KeyKind, Outcome, Option<Domain>)> {
+    ) -> std::io::Result<(
+        u32,
+        u64,
+        KeyKind,
+        Outcome,
+        Option<Domain>,
+        Vec<(u32, Domain)>,
+    )> {
         if data.len() < *pos + ENTRY_HEAD {
             return Err(invalid("directory truncated"));
         }
@@ -1126,18 +1359,160 @@ impl Directory {
         let outcome =
             Outcome::from_code(data[*pos + 1]).ok_or_else(|| invalid("entry outcome unknown"))?;
         *pos += 2;
-        // An ordered i64 key has exactly one component
-        if read_u32(data, pos)? != 1 {
+        let count = read_u32(data, pos)? as usize;
+        // An ordered i64 key has exactly one component, ordered bytes one or more
+        let fits = match kind {
+            KeyKind::OrderedI64 => count == 1,
+            KeyKind::OrderedBytes => count >= 1,
+        };
+        if !fits || data.len().saturating_sub(*pos) / COMPONENT_ENTRY < count {
             return Err(invalid("components do not fit the key kind"));
         }
-        if data.len() < *pos + COMPONENT_ENTRY {
-            return Err(invalid("directory truncated"));
+        let mut components = Vec::with_capacity(count);
+        for _ in 0..count {
+            let column = read_u32(data, pos)?;
+            let domain = Domain::from_code(data[*pos]).ok_or_else(|| invalid("domain unknown"))?;
+            *pos += 1;
+            components.push((column, domain));
         }
-        let column = read_u32(data, pos)?;
-        let domain = Domain::from_code(data[*pos]).ok_or_else(|| invalid("domain unknown"))?;
-        *pos += 1;
-        Ok((column, identity, kind, outcome, Some(domain)))
+        let (column, domain) = components[0];
+        Ok((column, identity, kind, outcome, Some(domain), components))
     }
+
+    /// The key page entries of an ordered-bytes entry: their boundaries'
+    /// bytes are counted first, so the arena is charged before it is made
+    fn decode_byte_pages(
+        data: &[u8],
+        pos: &mut usize,
+        pages: usize,
+        file_len: u64,
+        charges: &mut Vec<Held>,
+    ) -> std::io::Result<BytePages> {
+        let mut scan = *pos;
+        let mut bound_bytes = 0usize;
+        for _ in 0..pages {
+            for _ in 0..2 {
+                let len = data
+                    .get(scan..scan + 2)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+                    .ok_or_else(|| invalid("directory truncated"))?;
+                bound_bytes += len;
+                scan += 2 + len;
+            }
+            scan += BYTE_DIR_ENTRY - 4;
+            if scan > data.len() {
+                return Err(invalid("directory shorter than its page counts"));
+            }
+        }
+        charges.push(
+            INDEX_DIRECTORIES.charge(bound_bytes + pages * std::mem::size_of::<BytePageMeta>()),
+        );
+        let mut bytes = BytePages {
+            arena: Vec::with_capacity(bound_bytes),
+            pages: Vec::with_capacity(pages),
+            heavy: Vec::new(),
+        };
+        for _ in 0..pages {
+            let mut bound = || -> std::io::Result<(u32, u16)> {
+                let len = u16::from_le_bytes([data[*pos], data[*pos + 1]]) as usize;
+                *pos += 2;
+                let span = bytes.push_bytes(&data[*pos..*pos + len]);
+                *pos += len;
+                Ok(span)
+            };
+            let lower = bound()?;
+            let upper = bound()?;
+            let offset = read_u64(data, pos)?;
+            let len = read_u32(data, pos)?;
+            let key_start = read_u64(data, pos)?;
+            let pos_start = read_u64(data, pos)?;
+            if offset + len as u64 > file_len || len as usize > PAGE_BYTES {
+                return Err(invalid("key page entry out of bounds"));
+            }
+            bytes.pages.push(BytePageMeta {
+                lower,
+                upper,
+                offset,
+                len,
+                key_start,
+                pos_start,
+            });
+        }
+        let ordered = (0..pages).all(|p| bytes.lower(p) <= bytes.upper(p))
+            && (1..pages).all(|p| {
+                bytes.upper(p - 1) < bytes.lower(p)
+                    && bytes.page(p - 1).pos_start <= bytes.page(p).pos_start
+            });
+        if !ordered {
+            return Err(invalid("directory pages are not in order"));
+        }
+        Ok(bytes)
+    }
+
+    /// The heavy keys of an ordered-bytes entry, into its arena
+    fn decode_byte_heavy(
+        data: &[u8],
+        pos: &mut usize,
+        bytes: &mut BytePages,
+        charges: &mut Vec<Held>,
+    ) -> std::io::Result<()> {
+        let count = *data
+            .get(*pos)
+            .ok_or_else(|| invalid("directory truncated"))? as usize;
+        *pos += 1;
+        if count > HEAVY_SLOTS {
+            return Err(invalid("heavy keys out of bounds"));
+        }
+        let mut scan = *pos;
+        let mut key_bytes = 0usize;
+        for _ in 0..count {
+            let len = data
+                .get(scan..scan + 2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+                .ok_or_else(|| invalid("heavy keys out of bounds"))?;
+            key_bytes += len;
+            scan += 2 + len + 8;
+        }
+        if scan > data.len() {
+            return Err(invalid("heavy keys out of bounds"));
+        }
+        charges.push(
+            INDEX_DIRECTORIES.charge(key_bytes + count * std::mem::size_of::<(u32, u16, u64)>()),
+        );
+        bytes.arena.reserve_exact(key_bytes);
+        bytes.heavy.reserve_exact(count);
+        for _ in 0..count {
+            let len = u16::from_le_bytes([data[*pos], data[*pos + 1]]) as usize;
+            *pos += 2;
+            let (at, len) = bytes.push_bytes(&data[*pos..*pos + len]);
+            *pos += len as usize;
+            let count = read_u64(data, pos)?;
+            bytes.heavy.push((at, len, count));
+        }
+        let mut keys = bytes.heavy();
+        let mut previous = keys.next().map(|(key, _)| key);
+        for (key, _) in keys {
+            if previous.is_some_and(|p| p >= key) {
+                return Err(invalid("heavy keys are not in order"));
+            }
+            previous = Some(key);
+        }
+        Ok(())
+    }
+}
+
+/// An entry's components as the directory records them: its own list, or
+/// the one column of an entry read from an older file
+fn entry_components(c: &ColumnDirectory) -> impl Iterator<Item = (u32, u8)> + '_ {
+    let single = c
+        .components
+        .is_empty()
+        .then(|| (c.column, c.domain.map_or(0, Domain::code)));
+    single.into_iter().chain(
+        c.components
+            .iter()
+            .map(|&(column, domain)| (column, domain.code())),
+    )
 }
 
 fn read_u64(data: &[u8], pos: &mut usize) -> std::io::Result<u64> {
@@ -1251,13 +1626,28 @@ impl IndexFile {
     }
 
     /// Whether the file holds a built entry for the index definition with
-    /// `identity`, over physical column `physical`, whose keys provide
-    /// `capability`
-    pub fn covers(&self, identity: u64, physical: usize, capability: Capability) -> bool {
+    /// `identity`, over the physical columns `physical` in key order, whose
+    /// keys provide `capability`
+    pub fn covers(&self, identity: u64, physical: &[usize], capability: Capability) -> bool {
         self.directory.entry(identity).is_some_and(|c| {
             c.outcome == Outcome::Built
-                && c.column as usize == physical
+                && entry_components(c)
+                    .map(|(column, _)| column as usize)
+                    .eq(physical.iter().copied())
                 && c.kind.provides(capability)
+        })
+    }
+
+    /// Whether the file records `target`'s entry, built or unsupported, of
+    /// its kind over its columns and domains; an entry of a version 4 or 5
+    /// file records no domain and is taken at the volume's
+    pub fn records(&self, target: &SideTarget) -> bool {
+        self.directory.entry(target.identity).is_some_and(|c| {
+            c.kind == target.kind
+                && entry_components(c).eq(target.components.iter().map(|&(column, domain)| {
+                    let recorded = if c.domain.is_none() { 0 } else { domain.code() };
+                    (column as u32, recorded)
+                }))
         })
     }
 
@@ -1426,6 +1816,71 @@ impl IndexFile {
         )
     }
 
+    /// The exact position index range of an ordered-bytes entry's keys in
+    /// `[lower, upper)`; reads the boundary key pages through the cache alone
+    pub fn range_bytes(
+        &self,
+        identity: u64,
+        lower: &[u8],
+        upper: Option<&[u8]>,
+    ) -> std::io::Result<(u64, u64)> {
+        range_bytes_with(
+            &Cached {
+                file: self,
+                identity,
+            },
+            lower,
+            upper,
+        )
+    }
+
+    /// `candidate_estimate` for an ordered-bytes entry's `[lower, upper)`
+    pub fn byte_candidate_estimate(
+        &self,
+        identity: u64,
+        lower: &[u8],
+        upper: Option<&[u8]>,
+    ) -> std::io::Result<Option<u64>> {
+        let col = self
+            .directory
+            .entry(identity)
+            .ok_or_else(|| invalid("index has no entry"))?;
+        Ok(byte_candidate_estimate(col, lower, upper))
+    }
+
+    /// `pages_admissible` for an ordered-bytes entry's `[lower, upper)`
+    pub fn byte_pages_admissible(
+        &self,
+        identity: u64,
+        lower: &[u8],
+        upper: Option<&[u8]>,
+        reserve: usize,
+    ) -> std::io::Result<bool> {
+        let col = self
+            .directory
+            .entry(identity)
+            .ok_or_else(|| invalid("index has no entry"))?;
+        let bytes = &col.bytes;
+        let (first, last) = byte_pages_touched(bytes, lower, upper);
+        if first >= last {
+            return Ok(true);
+        }
+        let start = bytes.page(first).pos_start;
+        let end = bytes
+            .pages
+            .get(last)
+            .map_or(col.n_positions, |p| p.pos_start);
+        let pos_first = col
+            .pos_pages
+            .partition_point(|p| p.pos_start <= start)
+            .saturating_sub(1);
+        let pos_last = col.pos_pages.partition_point(|p| p.pos_start < end);
+        let pages = (first..last)
+            .map(|n| (PageKind::Keys, n))
+            .chain((pos_first..pos_last).map(|n| (PageKind::Positions, n)));
+        INDEX_PAGES.admits(self, identity, pages, reserve)
+    }
+
     /// A cursor over the positions at index range `[start, end)` of the
     /// entry for `identity`, yielding them in windows of at most `window`
     /// positions, each window sorted ascending; the window is the cursor's
@@ -1479,10 +1934,22 @@ impl IndexFile {
         space: &mut ReaderSpace,
     ) -> std::io::Result<Reader> {
         let window = window.max(1);
+        // Only the key page buffers of the entry's own kind are taken
+        let ordered_bytes = self
+            .directory
+            .entry(identity)
+            .is_some_and(|c| c.kind == KeyKind::OrderedBytes);
+        let (keys, data, starts) = if ordered_bytes {
+            (0, PAGE_BYTES, BYTE_KEYS_PER_PAGE)
+        } else {
+            (KEYS_PER_PAGE, 0, 0)
+        };
         let wanted = space.buffer.capacity().max(window) * POS_ENTRY
             + space.raw.capacity().max(PAGE_BYTES)
-            + space.keys.capacity().max(KEYS_PER_PAGE) * std::mem::size_of::<i64>()
-            + space.ends.capacity().max(KEYS_PER_PAGE) * std::mem::size_of::<u64>()
+            + space.keys.capacity().max(keys) * std::mem::size_of::<i64>()
+            + space.data.capacity().max(data)
+            + space.starts.capacity().max(starts) * std::mem::size_of::<u32>()
+            + space.ends.capacity().max(keys.max(starts)) * std::mem::size_of::<u64>()
             + space.positions.capacity().max(POSITIONS_PER_PAGE) * std::mem::size_of::<u32>();
         let held = space.reservation.as_ref().map_or(0, Reservation::bytes);
         if wanted > held {
@@ -1501,10 +1968,17 @@ impl IndexFile {
         space.buffer.reserve_exact(window);
         space.raw.clear();
         space.raw.reserve_exact(PAGE_BYTES);
-        space.keys.clear();
-        space.keys.reserve_exact(KEYS_PER_PAGE);
+        if ordered_bytes {
+            space.data.clear();
+            space.data.reserve_exact(data);
+            space.starts.clear();
+            space.starts.reserve_exact(starts);
+        } else {
+            space.keys.clear();
+            space.keys.reserve_exact(keys);
+        }
         space.ends.clear();
-        space.ends.reserve_exact(KEYS_PER_PAGE);
+        space.ends.reserve_exact(keys.max(starts));
         space.positions.clear();
         space.positions.reserve_exact(POSITIONS_PER_PAGE);
         // The allocator may hand out more than asked; what is owned is charged
@@ -1512,6 +1986,18 @@ impl IndexFile {
         if owned > reservation.bytes() {
             reservation.grow(owned - reservation.bytes());
         }
+        let key_page = if ordered_bytes {
+            PageContent::ByteKeys {
+                data: std::mem::take(&mut space.data),
+                starts: std::mem::take(&mut space.starts),
+                ends: std::mem::take(&mut space.ends),
+            }
+        } else {
+            PageContent::Keys {
+                keys: std::mem::take(&mut space.keys),
+                ends: std::mem::take(&mut space.ends),
+            }
+        };
         Ok(Reader {
             file: Arc::clone(self),
             identity,
@@ -1521,10 +2007,7 @@ impl IndexFile {
             buffer: std::mem::take(&mut space.buffer),
             own: std::cell::RefCell::new(OwnPages {
                 raw: std::mem::take(&mut space.raw),
-                keys: PageContent::Keys {
-                    keys: std::mem::take(&mut space.keys),
-                    ends: std::mem::take(&mut space.ends),
-                },
+                keys: key_page,
                 positions: PageContent::Positions(std::mem::take(&mut space.positions)),
                 pages: 0,
             }),
@@ -1543,6 +2026,9 @@ pub struct ReaderSpace {
     buffer: Vec<u32>,
     raw: Vec<u8>,
     keys: Vec<i64>,
+    /// An ordered-bytes key page's bytes and key starts
+    data: Vec<u8>,
+    starts: Vec<u32>,
     ends: Vec<u64>,
     positions: Vec<u32>,
     reservation: Option<Reservation>,
@@ -1554,6 +2040,8 @@ impl ReaderSpace {
         self.buffer.capacity() * POS_ENTRY
             + self.raw.capacity()
             + self.keys.capacity() * std::mem::size_of::<i64>()
+            + self.data.capacity()
+            + self.starts.capacity() * std::mem::size_of::<u32>()
             + self.ends.capacity() * std::mem::size_of::<u64>()
             + self.positions.capacity() * std::mem::size_of::<u32>()
     }
@@ -1603,23 +2091,27 @@ impl Reader {
             ..
         } = self;
         let own = own.into_inner();
-        let (keys, ends) = match own.keys {
-            PageContent::Keys { keys, ends } => (keys, ends),
-            PageContent::Positions(_) => (Vec::new(), Vec::new()),
-        };
-        let positions = match own.positions {
-            PageContent::Positions(positions) => positions,
-            PageContent::Keys { .. } => Vec::new(),
-        };
-        // Whatever the space held before is replaced, its own charge released
-        *space = ReaderSpace {
-            buffer,
-            raw: own.raw,
-            keys,
-            ends,
-            positions,
-            reservation: Some(_reservation),
-        };
+        // The other kind's key buffers stay in the space, covered by the
+        // reservation the reader took; the reader's replace what the space
+        // held, which `reader_in` emptied
+        match own.keys {
+            PageContent::Keys { keys, ends } => {
+                space.keys = keys;
+                space.ends = ends;
+            }
+            PageContent::ByteKeys { data, starts, ends } => {
+                space.data = data;
+                space.starts = starts;
+                space.ends = ends;
+            }
+            PageContent::Positions(_) => {}
+        }
+        if let PageContent::Positions(positions) = own.positions {
+            space.positions = positions;
+        }
+        space.buffer = buffer;
+        space.raw = own.raw;
+        space.reservation = Some(_reservation);
     }
 
     /// The position index range `[start, end)` of `key`, or None when the
@@ -1632,6 +2124,12 @@ impl Reader {
     /// boundary key pages.
     pub fn range(&self, low: i64, high: i64) -> std::io::Result<(u64, u64)> {
         range_with(self, low, high)
+    }
+
+    /// The exact position index range of ordered-bytes keys in
+    /// `[lower, upper)`; reads the boundary key pages
+    pub fn range_bytes(&self, lower: &[u8], upper: Option<&[u8]>) -> std::io::Result<(u64, u64)> {
+        range_bytes_with(self, lower, upper)
     }
 
     /// The upper bound the directory alone gives on the positions of keys
@@ -1700,15 +2198,22 @@ impl Pages for Reader {
             Err(error) if is_refused(&error) => {}
             Err(error) => return Err(error),
         }
-        let (offset, len) = self
-            .file
-            .directory
-            .page_location(self.identity, kind, number)?;
+        let (offset, len, ordered_bytes) =
+            self.file
+                .directory
+                .page_location(self.identity, kind, number)?;
         let mut own = self.own.borrow_mut();
         let own = &mut *own;
         self.file.read_page_into(offset, len, &mut own.raw)?;
         let (n, entries) = verified_entries(&own.raw)?;
         let content = match kind {
+            PageKind::Keys if ordered_bytes => {
+                let PageContent::ByteKeys { data, starts, ends } = &mut own.keys else {
+                    return Err(invalid("expected an ordered-bytes key page"));
+                };
+                parse_byte_keys(n, entries, data, starts, ends)?;
+                &own.keys
+            }
             PageKind::Keys => {
                 if entries.len() != n * KEY_ENTRY {
                     return Err(invalid("key page length does not match its count"));
@@ -1871,6 +2376,100 @@ fn range_with(pages: &impl Pages, low: i64, high: i64) -> std::io::Result<(u64, 
         })??
     };
     Ok((start, end.max(start)))
+}
+
+/// The key pages an ordered-bytes probe of `[lower, upper)` touches, as
+/// `first..last`, empty when none; no upper bound reaches the last page
+fn byte_pages_touched(bytes: &BytePages, lower: &[u8], upper: Option<&[u8]>) -> (usize, usize) {
+    let n = bytes.len();
+    let first = partition(n, |p| bytes.upper(p) < lower);
+    let last = upper.map_or(n, |upper| partition(n, |p| bytes.lower(p) < upper));
+    (first, last)
+}
+
+/// The least index in `0..n` where `before` turns false, `before` being
+/// true on a prefix of the indexes
+fn partition(n: usize, before: impl Fn(usize) -> bool) -> usize {
+    let (mut low, mut high) = (0, n);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if before(mid) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    low
+}
+
+/// The exact position index range of ordered-bytes keys in
+/// `[lower, upper)`, no upper bound meaning every key from `lower` on;
+/// reads the boundary key pages
+fn range_bytes_with(
+    pages: &impl Pages,
+    lower: &[u8],
+    upper: Option<&[u8]>,
+) -> std::io::Result<(u64, u64)> {
+    let col = column_of(pages)?;
+    let bytes = &col.bytes;
+    let (first, last) = byte_pages_touched(bytes, lower, upper);
+    if first >= last {
+        return Ok((0, 0));
+    }
+    // The position index the first key at or above `bound` on `page`
+    // starts at
+    let start_in = |page: usize, bound: &[u8]| -> std::io::Result<u64> {
+        let pos_start = bytes.page(page).pos_start;
+        pages.with_page(PageKind::Keys, page, |content| {
+            let PageContent::ByteKeys { data, starts, ends } = content else {
+                return Err(invalid("expected an ordered-bytes key page"));
+            };
+            let i = partition(starts.len(), |i| byte_key(data, starts, i) < bound);
+            Ok(if i == 0 { pos_start } else { ends[i - 1] })
+        })?
+    };
+    let start = if lower <= bytes.lower(first) {
+        bytes.page(first).pos_start
+    } else {
+        start_in(first, lower)?
+    };
+    let end = match upper {
+        Some(upper) if upper <= bytes.upper(last - 1) => start_in(last - 1, upper)?,
+        _ => bytes
+            .pages
+            .get(last)
+            .map_or(col.n_positions, |p| p.pos_start),
+    };
+    Ok((start, end.max(start)))
+}
+
+/// What the directory alone says of the positions of ordered-bytes keys in
+/// `[lower, upper)`: None when no key page touches it; else the positions
+/// of the pages inside it exactly and one key's share of each boundary
+/// page, one at least. The boundary pages' exact count decides after
+fn byte_candidate_estimate(
+    col: &ColumnDirectory,
+    lower: &[u8],
+    upper: Option<&[u8]>,
+) -> Option<u64> {
+    let bytes = &col.bytes;
+    let (first, last) = byte_pages_touched(bytes, lower, upper);
+    if first >= last {
+        return None;
+    }
+    let per_key = |page: usize| {
+        let next = bytes.pages.get(page + 1);
+        let positions = next.map_or(col.n_positions, |p| p.pos_start) - bytes.page(page).pos_start;
+        let keys = next.map_or(col.n_keys, |p| p.key_start) - bytes.page(page).key_start;
+        positions / keys.max(1)
+    };
+    let estimate = if last - first == 1 {
+        per_key(first)
+    } else {
+        let interior = bytes.page(last - 1).pos_start - bytes.page(first + 1).pos_start;
+        per_key(first) + interior + per_key(last - 1)
+    };
+    Some(estimate.max(1))
 }
 
 /// Fills `buffer` with the next window of at most `window` positions of
@@ -2379,7 +2978,19 @@ pub fn build_side_file(
     columns: Vec<ColumnInput<'_>>,
     workspace_bytes: usize,
 ) -> std::io::Result<BuildReport> {
-    let (report, temps) = build_side_file_staged(path, generation, columns, workspace_bytes)?;
+    build_side_file_with(path, generation, columns, Vec::new(), workspace_bytes)
+}
+
+/// `build_side_file` with ordered-bytes entries after the i64 ones
+pub fn build_side_file_with(
+    path: &Path,
+    generation: u64,
+    columns: Vec<ColumnInput<'_>>,
+    bytes: Vec<BytesInput<'_>>,
+    workspace_bytes: usize,
+) -> std::io::Result<BuildReport> {
+    let (report, temps) =
+        build_side_file_staged(path, generation, columns, bytes, workspace_bytes)?;
     std::fs::rename(temps.tmp_path(), path)?;
     temps.finished();
     Ok(report)
@@ -2391,6 +3002,7 @@ fn build_side_file_staged(
     path: &Path,
     generation: u64,
     columns: Vec<ColumnInput<'_>>,
+    bytes: Vec<BytesInput<'_>>,
     workspace_bytes: usize,
 ) -> std::io::Result<(BuildReport, TempFiles)> {
     if workspace_bytes < MIN_WORKSPACE_BYTES {
@@ -2411,7 +3023,8 @@ fn build_side_file_staged(
     // and so do the directory's columns and their metadata charges, one
     // slot per input column, taken before either vector is allocated
     let fixed = budget.take(OUT_BUFFER_BYTES + WRITER_BYTES, "output and page buffers")?;
-    let per_column = budget.take(columns.len() * COLUMN_SLOT_BYTES, "the directory's columns")?;
+    let entries = columns.len() + bytes.len();
+    let per_column = budget.take(entries * COLUMN_SLOT_BYTES, "the directory's columns")?;
     let temps = TempFiles::new(path, generation)?;
     let tmp = temps.tmp_path();
     let temps = temps;
@@ -2422,109 +3035,32 @@ fn build_side_file_staged(
     let mut offset = HEADER_LEN;
     let mut directory = Directory {
         generation,
-        columns: Vec::with_capacity(columns.len()),
+        columns: Vec::with_capacity(entries),
     };
     // The reservations of the columns' page metadata, kept while the
     // directory is
-    let mut meta_charges: Vec<Charge<'_>> = Vec::with_capacity(columns.len());
+    let mut meta_charges: Vec<Charge<'_>> = Vec::with_capacity(entries);
+    let first_byte_slot = columns.len();
     for (ci, input) in columns.into_iter().enumerate() {
-        // What this column may spend: the workspace less what earlier
-        // columns still hold, less a merge's fixed costs, less the page
-        // metadata this column will need (a quarter of the rest when the
-        // input gives no bound)
-        let hint = input.pairs.size_hint().1;
-        let left = budget.left();
-        let after_sink = left.checked_sub(OUT_BUFFER_BYTES).ok_or_else(|| {
-            workspace_exceeded(
-                "a merge output buffer",
-                OUT_BUFFER_BYTES,
-                budget.used.get(),
-                workspace_bytes,
-            )
-        })?;
-        let allowance = match hint {
-            Some(rows) => metadata_allowance(rows),
-            None => after_sink / 4,
-        };
-        let for_runs = after_sink.checked_sub(allowance).ok_or_else(|| {
-            workspace_exceeded(
-                "page metadata",
-                allowance,
-                budget.used.get(),
-                workspace_bytes,
-            )
-        })?;
-        // The sort run and a cascade merge's inputs are alive together, so
-        // the merge inputs take at most half of what is left and the run
-        // the rest
-        let per_input = MERGE_READ_BYTES + MERGE_INPUT_BYTES;
-        let fan_in = ((for_runs / 2) / per_input).clamp(MIN_FAN_IN, MAX_FAN_IN);
-        let free = for_runs.saturating_sub(fan_in * per_input);
-        let run_capacity = free / PAIR_BYTES;
-        if run_capacity < MIN_RUN_PAIRS {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "side index build: {left} bytes of workspace left for column {} cannot hold {fan_in} merge inputs and a sort run of {MIN_RUN_PAIRS} pairs beside its page metadata of {allowance} bytes",
-                    input.column
-                ),
-            ));
-        }
-        // A run holds what the workspace allows, or fewer when the input
-        // says it is smaller, so a small column reserves what it needs
-        let run_len = run_capacity.min(hint.unwrap_or(run_capacity).max(MIN_RUN_PAIRS));
-        let run_charge = budget.take(run_len * PAIR_BYTES, "a sort run")?;
-        let mut pairs: Vec<(i64, u32)> = Vec::with_capacity(run_len);
-        let mut runs = Runs::new(&temps, ci, fan_in);
-        for (pos, key) in input.pairs {
-            if pairs.len() == run_len {
-                pairs.sort_unstable();
-                let run = runs.next_path(0);
-                spill(&run, &pairs, &budget)?;
-                report.runs_spilled += 1;
-                runs.added(0, &budget, &mut report)?;
-                pairs.clear();
-            }
-            pairs.push((key, pos));
-        }
-        pairs.sort_unstable();
-        let mut writer = PageWriter::new(&mut out, offset, input.column, input.identity, &budget);
-        if runs.live == 0 {
-            for &(key, pos) in &pairs {
-                writer.push(key, pos)?;
-            }
-            drop(pairs);
-            drop(run_charge);
-        } else {
-            let run = runs.next_path(0);
-            spill(&run, &pairs, &budget)?;
-            report.runs_spilled += 1;
-            runs.added(0, &budget, &mut report)?;
-            drop(pairs);
-            drop(run_charge);
-            let inputs = runs.settle(&budget, &mut report)?;
-            let names = budget.take(
-                inputs.iter().map(|p| p.capacity()).sum::<usize>()
-                    + inputs.capacity() * std::mem::size_of::<PathBuf>(),
-                "run names",
-            )?;
-            merge_runs(&inputs, &budget, &mut report, |key, pos| {
-                writer.push(key, pos)
-            })?;
-            drop(names);
-            for input in &inputs {
-                std::fs::remove_file(input)?;
-            }
-        }
-        let (mut column_dir, next_offset, metas) = writer.finish()?;
-        column_dir.domain = Some(input.domain);
+        let (column_dir, next_offset, metas) =
+            build_i64_entry(&mut out, offset, input, &temps, ci, &budget, &mut report)?;
         meta_charges.push(metas);
-        report.keys += column_dir.n_keys;
-        report.positions += column_dir.n_positions;
-        report.key_pages += column_dir.key_pages.len();
-        report.pos_pages += column_dir.pos_pages.len();
         directory.columns.push(column_dir);
         offset = next_offset;
+    }
+    for (bi, input) in bytes.into_iter().enumerate() {
+        let slot = first_byte_slot + bi;
+        let (entry, next_offset, metas) =
+            build_byte_entry(&mut out, offset, input, &temps, slot, &budget, &mut report)?;
+        meta_charges.push(metas);
+        directory.columns.push(entry);
+        offset = next_offset;
+    }
+    for entry in &directory.columns {
+        report.keys += entry.n_keys;
+        report.positions += entry.n_positions;
+        report.key_pages += entry.key_pages.len() + entry.bytes.len();
+        report.pos_pages += entry.pos_pages.len();
     }
     let dir_len = directory.encoded_len();
     let dir_charge = budget.take(dir_len, "the encoded directory")?;
@@ -2550,6 +3086,110 @@ fn build_side_file_staged(
     report.workspace_peak = budget.peak.get();
     report.build_ns = started.elapsed().as_nanos() as u64;
     Ok((report, temps))
+}
+
+/// Builds one ordered i64 entry into `out` at `offset` within what the
+/// budget has left: pairs sorted in runs that fit, spilled and merged in a
+/// fan-in the budget bounds
+fn build_i64_entry<'b>(
+    out: &mut BufWriter<std::fs::File>,
+    offset: u64,
+    input: ColumnInput<'_>,
+    temps: &TempFiles,
+    ci: usize,
+    budget: &'b Budget,
+    report: &mut BuildReport,
+) -> std::io::Result<(ColumnDirectory, u64, Charge<'b>)> {
+    let workspace_bytes = budget.workspace;
+    // What this column may spend: the workspace less what earlier
+    // columns still hold, less a merge's fixed costs, less the page
+    // metadata this column will need (a quarter of the rest when the
+    // input gives no bound)
+    let hint = input.pairs.size_hint().1;
+    let left = budget.left();
+    let after_sink = left.checked_sub(OUT_BUFFER_BYTES).ok_or_else(|| {
+        workspace_exceeded(
+            "a merge output buffer",
+            OUT_BUFFER_BYTES,
+            budget.used.get(),
+            workspace_bytes,
+        )
+    })?;
+    let allowance = match hint {
+        Some(rows) => metadata_allowance(rows),
+        None => after_sink / 4,
+    };
+    let for_runs = after_sink.checked_sub(allowance).ok_or_else(|| {
+        workspace_exceeded(
+            "page metadata",
+            allowance,
+            budget.used.get(),
+            workspace_bytes,
+        )
+    })?;
+    // The sort run and a cascade merge's inputs are alive together, so
+    // the merge inputs take at most half of what is left and the run
+    // the rest
+    let per_input = MERGE_READ_BYTES + MERGE_INPUT_BYTES;
+    let fan_in = ((for_runs / 2) / per_input).clamp(MIN_FAN_IN, MAX_FAN_IN);
+    let free = for_runs.saturating_sub(fan_in * per_input);
+    let run_capacity = free / PAIR_BYTES;
+    if run_capacity < MIN_RUN_PAIRS {
+        return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "side index build: {left} bytes of workspace left for column {} cannot hold {fan_in} merge inputs and a sort run of {MIN_RUN_PAIRS} pairs beside its page metadata of {allowance} bytes",
+                    input.column
+                ),
+            ));
+    }
+    // A run holds what the workspace allows, or fewer when the input
+    // says it is smaller, so a small column reserves what it needs
+    let run_len = run_capacity.min(hint.unwrap_or(run_capacity).max(MIN_RUN_PAIRS));
+    let run_charge = budget.take(run_len * PAIR_BYTES, "a sort run")?;
+    let mut pairs: Vec<(i64, u32)> = Vec::with_capacity(run_len);
+    let mut runs = Runs::new(temps, ci, fan_in);
+    for (pos, key) in input.pairs {
+        if pairs.len() == run_len {
+            pairs.sort_unstable();
+            let run = runs.next_path(0);
+            spill(&run, &pairs, budget)?;
+            report.runs_spilled += 1;
+            runs.added(0, budget, report)?;
+            pairs.clear();
+        }
+        pairs.push((key, pos));
+    }
+    pairs.sort_unstable();
+    let mut writer = PageWriter::new(out, offset, input.column, input.identity, budget);
+    if runs.live == 0 {
+        for &(key, pos) in &pairs {
+            writer.push(key, pos)?;
+        }
+        drop(pairs);
+        drop(run_charge);
+    } else {
+        let run = runs.next_path(0);
+        spill(&run, &pairs, budget)?;
+        report.runs_spilled += 1;
+        runs.added(0, budget, report)?;
+        drop(pairs);
+        drop(run_charge);
+        let inputs = runs.settle(budget, report)?;
+        let names = budget.take(
+            inputs.iter().map(|p| p.capacity()).sum::<usize>()
+                + inputs.capacity() * std::mem::size_of::<PathBuf>(),
+            "run names",
+        )?;
+        merge_runs(&inputs, budget, report, |key, pos| writer.push(key, pos))?;
+        drop(names);
+        for input in &inputs {
+            std::fs::remove_file(input)?;
+        }
+    }
+    let (mut column_dir, next_offset, metas) = writer.finish()?;
+    column_dir.domain = Some(input.domain);
+    Ok((column_dir, next_offset, metas))
 }
 
 #[cfg(test)]
@@ -2610,6 +3250,229 @@ fn merge_runs(
         }
     }
     Ok(())
+}
+
+/// A sorted run of ordered-bytes keys being filled: the records back to
+/// back as `[len u16][key][pos u32]` and where each starts
+struct ByteRun {
+    records: Vec<u8>,
+    starts: Vec<u32>,
+}
+
+impl ByteRun {
+    fn key_pos(&self, start: u32) -> (&[u8], u32) {
+        let at = start as usize;
+        let len = u16::from_le_bytes([self.records[at], self.records[at + 1]]) as usize;
+        let key = &self.records[at + 2..at + 2 + len];
+        let pos = &self.records[at + 2 + len..at + BYTE_KEY_OVERHEAD + len];
+        (key, u32::from_le_bytes([pos[0], pos[1], pos[2], pos[3]]))
+    }
+
+    /// Orders the records by key, then position
+    fn sort(&mut self) {
+        let mut starts = std::mem::take(&mut self.starts);
+        starts.sort_unstable_by(|&a, &b| self.key_pos(a).cmp(&self.key_pos(b)));
+        self.starts = starts;
+    }
+
+    fn spill(&self, run: &Path, budget: &Budget) -> std::io::Result<()> {
+        let _buffer = budget.take(OUT_BUFFER_BYTES, "a spill buffer")?;
+        let mut out = BufWriter::with_capacity(OUT_BUFFER_BYTES, std::fs::File::create(run)?);
+        for &start in &self.starts {
+            let at = start as usize;
+            let len = u16::from_le_bytes([self.records[at], self.records[at + 1]]) as usize;
+            out.write_all(&self.records[at..at + BYTE_KEY_OVERHEAD + len])?;
+        }
+        out.flush()
+    }
+
+    fn clear(&mut self) {
+        self.records.clear();
+        self.starts.clear();
+    }
+}
+
+/// Reads one spilled ordered-bytes record into `key`, giving its position
+fn next_byte_record(
+    reader: &mut std::io::BufReader<std::fs::File>,
+    key: &mut Vec<u8>,
+) -> std::io::Result<Option<u32>> {
+    if reader.fill_buf()?.is_empty() {
+        return Ok(None);
+    }
+    let mut len = [0u8; 2];
+    reader.read_exact(&mut len)?;
+    key.clear();
+    key.resize(u16::from_le_bytes(len) as usize, 0);
+    reader.read_exact(key)?;
+    let mut pos = [0u8; 4];
+    reader.read_exact(&mut pos)?;
+    Ok(Some(u32::from_le_bytes(pos)))
+}
+
+/// Merges spilled ordered-bytes runs in key order into `emit`; the heap's
+/// key buffers are filled again in place, so the merge allocates them once
+fn merge_byte_runs(
+    runs: &[PathBuf],
+    budget: &Budget,
+    report: &mut BuildReport,
+    mut emit: impl FnMut(&[u8], u32) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let _inputs = budget.take(
+        runs.len() * (MERGE_READ_BYTES + PAGE_BYTES + MERGE_INPUT_BYTES),
+        "merge inputs",
+    )?;
+    report.max_fan_in = report.max_fan_in.max(runs.len());
+    let mut readers = Vec::with_capacity(runs.len());
+    for run in runs {
+        readers.push(std::io::BufReader::with_capacity(
+            MERGE_READ_BYTES,
+            std::fs::File::open(run)?,
+        ));
+    }
+    let mut heap = std::collections::BinaryHeap::with_capacity(runs.len());
+    for (i, reader) in readers.iter_mut().enumerate() {
+        let mut key = Vec::with_capacity(PAGE_BYTES);
+        if let Some(pos) = next_byte_record(reader, &mut key)? {
+            heap.push(std::cmp::Reverse((key, pos, i)));
+        }
+    }
+    while let Some(std::cmp::Reverse((mut key, pos, i))) = heap.pop() {
+        emit(&key, pos)?;
+        if let Some(pos) = next_byte_record(&mut readers[i], &mut key)? {
+            heap.push(std::cmp::Reverse((key, pos, i)));
+        }
+    }
+    Ok(())
+}
+
+/// Builds one ordered-bytes entry into `out` at `offset` within what the
+/// budget has left: keys sorted in runs that fit, spilled and merged in a
+/// fan-in the budget bounds. A key too long for a key page makes the index
+/// unsupported for this volume: its runs go and the entry holds no keys
+#[allow(clippy::too_many_arguments)]
+fn build_byte_entry<'b, W: Write>(
+    out: &mut W,
+    offset: u64,
+    mut input: BytesInput<'_>,
+    temps: &TempFiles,
+    slot: usize,
+    budget: &'b Budget,
+    report: &mut BuildReport,
+) -> std::io::Result<(ColumnDirectory, u64, Charge<'b>)> {
+    let left = budget.left();
+    let after_sink = left.saturating_sub(OUT_BUFFER_BYTES + 3 * PAGE_BYTES);
+    let for_runs = after_sink - after_sink / 4;
+    let per_input = MERGE_READ_BYTES + PAGE_BYTES + MERGE_INPUT_BYTES;
+    let fan_in = ((for_runs / 2) / per_input).clamp(MIN_FAN_IN, MAX_FAN_IN);
+    let free = for_runs.saturating_sub(fan_in * per_input + PAGE_BYTES);
+    let starts_cap = free / 4 / std::mem::size_of::<u32>();
+    let records_cap = free - free / 4;
+    if records_cap < PAGE_BYTES || starts_cap < MIN_RUN_PAIRS {
+        return Err(workspace_exceeded(
+            "an ordered-bytes sort run",
+            PAGE_BYTES,
+            budget.used.get(),
+            budget.workspace,
+        ));
+    }
+    let run_charge = budget.take(records_cap + starts_cap * 4 + PAGE_BYTES, "a sort run")?;
+    let mut run = ByteRun {
+        records: Vec::with_capacity(records_cap),
+        starts: Vec::with_capacity(starts_cap),
+    };
+    let mut key = Vec::with_capacity(PAGE_BYTES);
+    let mut spilled: Vec<PathBuf> = Vec::new();
+    // Run names are handed out once each: a merge leaves runs alive
+    let mut runs_named = 0usize;
+    let mut unsupported = false;
+    while let Some(pos) = input.keys.next_key(&mut key) {
+        if PAGE_OVERHEAD + BYTE_KEY_OVERHEAD + key.len() > PAGE_BYTES {
+            unsupported = true;
+            break;
+        }
+        if run.records.len() + BYTE_KEY_OVERHEAD + key.len() > records_cap
+            || run.starts.len() == starts_cap
+        {
+            run.sort();
+            let path = temps.run_path(slot, 0, runs_named);
+            runs_named += 1;
+            run.spill(&path, budget)?;
+            report.runs_spilled += 1;
+            spilled.push(path);
+            run.clear();
+            while spilled.len() >= fan_in {
+                // Merging the oldest runs keeps the files alive under the fan-in
+                let merged = temps.run_path(slot, 1, report.merge_passes);
+                let group: Vec<PathBuf> = spilled.drain(..fan_in).collect();
+                let mut sink =
+                    BufWriter::with_capacity(OUT_BUFFER_BYTES, std::fs::File::create(&merged)?);
+                merge_byte_runs(&group, budget, report, |k, p| {
+                    sink.write_all(&(k.len() as u16).to_le_bytes())?;
+                    sink.write_all(k)?;
+                    sink.write_all(&p.to_le_bytes())
+                })?;
+                sink.flush()?;
+                report.merge_passes += 1;
+                for path in &group {
+                    std::fs::remove_file(path)?;
+                }
+                spilled.insert(0, merged);
+            }
+        }
+        run.starts.push(run.records.len() as u32);
+        run.records
+            .extend_from_slice(&(key.len() as u16).to_le_bytes());
+        run.records.extend_from_slice(&key);
+        run.records.extend_from_slice(&pos.to_le_bytes());
+    }
+    if unsupported {
+        drop(run);
+        drop(run_charge);
+        for path in &spilled {
+            std::fs::remove_file(path)?;
+        }
+        let (column, domain) = input.components[0];
+        let entry = ColumnDirectory {
+            column,
+            identity: input.identity,
+            n_keys: 0,
+            n_positions: 0,
+            key_pages: Vec::new(),
+            pos_pages: Vec::new(),
+            heavy_keys: None,
+            kind: KeyKind::OrderedBytes,
+            outcome: Outcome::Unsupported,
+            domain: Some(domain),
+            components: input.components,
+            bytes: BytePages::default(),
+        };
+        return Ok((entry, offset, Charge { bytes: 0, budget }));
+    }
+    run.sort();
+    let mut writer = PageWriter::for_bytes(out, offset, input.identity, input.components, budget)?;
+    if spilled.is_empty() {
+        for &start in &run.starts {
+            let (key, pos) = run.key_pos(start);
+            writer.push_bytes(key, pos)?;
+        }
+        drop(run);
+        drop(run_charge);
+    } else {
+        let path = temps.run_path(slot, 0, runs_named);
+        run.spill(&path, budget)?;
+        report.runs_spilled += 1;
+        spilled.push(path);
+        drop(run);
+        drop(run_charge);
+        merge_byte_runs(&spilled, budget, report, |key, pos| {
+            writer.push_bytes(key, pos)
+        })?;
+        for path in &spilled {
+            std::fs::remove_file(path)?;
+        }
+    }
+    writer.finish()
 }
 
 struct RunSink {
@@ -2685,9 +3548,56 @@ struct PageWriter<'a, 'b, W: Write> {
     /// The smallest count in `heaviest` once it is full: a key with no
     /// more is passed by without a look at the list
     lightest: u64,
+    /// The key pages of an ordered-bytes entry, when the writer writes one
+    bytes: Option<Box<ByteKeyState>>,
+}
+
+/// What a writer of ordered-bytes keys keeps: the key being counted, the
+/// key page being filled, the boundaries and heavy keys gathered so far
+struct ByteKeyState {
+    components: Vec<(u32, Domain)>,
+    current: Vec<u8>,
+    has_current: bool,
+    /// The key page's entries so far, and where its last one starts
+    entries: Vec<u8>,
+    count: u32,
+    last_at: usize,
+    /// The last key of the page written before
+    previous_last: Vec<u8>,
+    pages: BytePages,
+    heaviest: Vec<(Vec<u8>, u64)>,
+    lightest: u64,
 }
 
 impl<'a, 'b, W: Write> PageWriter<'a, 'b, W> {
+    /// A writer of an ordered-bytes entry over `components`, its key
+    /// buffers taken from the budget
+    fn for_bytes(
+        out: &'a mut W,
+        offset: u64,
+        identity: u64,
+        components: Vec<(u32, Domain)>,
+        budget: &'b Budget,
+    ) -> std::io::Result<Self> {
+        let mut writer = Self::new(out, offset, components[0].0, identity, budget);
+        writer
+            .metas
+            .grow(3 * PAGE_BYTES, "ordered-bytes key buffers")?;
+        writer.bytes = Some(Box::new(ByteKeyState {
+            components,
+            current: Vec::with_capacity(PAGE_BYTES),
+            has_current: false,
+            entries: Vec::with_capacity(PAGE_BYTES),
+            count: 0,
+            last_at: 0,
+            previous_last: Vec::with_capacity(PAGE_BYTES),
+            pages: BytePages::default(),
+            heaviest: Vec::new(),
+            lightest: 0,
+        }));
+        Ok(writer)
+    }
+
     fn new(out: &'a mut W, offset: u64, column: u32, identity: u64, budget: &'b Budget) -> Self {
         Self {
             out,
@@ -2710,7 +3620,160 @@ impl<'a, 'b, W: Write> PageWriter<'a, 'b, W> {
             heaviest: Vec::new(),
             heaviest_charge: Charge { bytes: 0, budget },
             lightest: 0,
+            bytes: None,
         }
+    }
+
+    /// `push` for an ordered-bytes key, which must fit a key page
+    fn push_bytes(&mut self, key: &[u8], pos: u32) -> std::io::Result<()> {
+        let state = self
+            .bytes
+            .as_mut()
+            .ok_or_else(|| invalid("a writer of i64 keys given bytes"))?;
+        if !state.has_current || state.current.as_slice() != key {
+            if state.has_current {
+                if state.current.as_slice() > key {
+                    return Err(invalid("pairs out of order"));
+                }
+                self.close_byte_key()?;
+            }
+            let state = self.bytes.as_mut().expect("checked above");
+            state.current.clear();
+            state.current.extend_from_slice(key);
+            state.has_current = true;
+        }
+        if self.pos_page.len() == POSITIONS_PER_PAGE {
+            self.flush_pos_page()?;
+        }
+        self.pos_page.push(pos);
+        self.n_positions += 1;
+        Ok(())
+    }
+
+    fn close_byte_key(&mut self) -> std::io::Result<()> {
+        if self.n_positions > u32::MAX as u64 {
+            return Err(invalid("more positions than a volume can hold"));
+        }
+        let entry = BYTE_KEY_OVERHEAD + self.bytes.as_ref().map_or(0, |s| s.current.len());
+        if entry + PAGE_OVERHEAD > PAGE_BYTES {
+            return Err(invalid("a key does not fit a key page"));
+        }
+        if self
+            .bytes
+            .as_ref()
+            .is_some_and(|s| PAGE_OVERHEAD + s.entries.len() + entry > PAGE_BYTES)
+        {
+            self.flush_byte_page()?;
+        }
+        let count = self.n_positions - self.closed_end;
+        self.closed_end = self.n_positions;
+        self.n_keys += 1;
+        let n_positions = self.n_positions;
+        let state = self.bytes.as_mut().expect("a bytes writer");
+        state.last_at = state.entries.len();
+        state
+            .entries
+            .extend_from_slice(&(state.current.len() as u16).to_le_bytes());
+        state.entries.extend_from_slice(&state.current);
+        state
+            .entries
+            .extend_from_slice(&(n_positions as u32).to_le_bytes());
+        state.count += 1;
+        if state.heaviest.len() < HEAVY_SLOTS {
+            self.heaviest_charge
+                .grow(state.current.len() + 32, "heavy keys")?;
+            state.heaviest.push((state.current.clone(), count));
+            if state.heaviest.len() == HEAVY_SLOTS {
+                state.lightest = state.heaviest.iter().map(|(_, c)| *c).min().unwrap_or(0);
+            }
+        } else if count > state.lightest {
+            let lightest = state.lightest;
+            if let Some(slot) = state.heaviest.iter_mut().find(|(_, c)| *c == lightest) {
+                if slot.0.capacity() < state.current.len() {
+                    self.heaviest_charge
+                        .grow(state.current.len() - slot.0.capacity(), "heavy keys")?;
+                }
+                slot.0.clear();
+                slot.0.extend_from_slice(&state.current);
+                slot.1 = count;
+            }
+            state.lightest = state.heaviest.iter().map(|(_, c)| *c).min().unwrap_or(0);
+        }
+        Ok(())
+    }
+
+    /// Writes the ordered-bytes key page being filled, recording its
+    /// boundaries: the shortest string above the page before's last key and
+    /// at most this page's first key, and this page's last key whole
+    fn flush_byte_page(&mut self) -> std::io::Result<()> {
+        let Some(state) = self.bytes.as_mut() else {
+            return Ok(());
+        };
+        if state.count == 0 {
+            return Ok(());
+        }
+        self.body.clear();
+        self.body.extend_from_slice(&state.count.to_le_bytes());
+        self.body.extend_from_slice(&state.entries);
+        let key_at = |entries: &[u8], at: usize| -> (usize, usize) {
+            let len = u16::from_le_bytes([entries[at], entries[at + 1]]) as usize;
+            (at + 2, at + 2 + len)
+        };
+        let (first_start, first_end) = key_at(&state.entries, 0);
+        let (last_start, last_end) = key_at(&state.entries, state.last_at);
+        let first = &state.entries[first_start..first_end];
+        let last = &state.entries[last_start..last_end];
+        let lower_len = if state.pages.is_empty() {
+            0
+        } else {
+            let common = first
+                .iter()
+                .zip(&state.previous_last)
+                .take_while(|(a, b)| a == b)
+                .count();
+            (common + 1).min(first.len())
+        };
+        let more = lower_len + last.len();
+        if state.pages.arena.capacity() < state.pages.arena.len() + more {
+            let grown = (state.pages.arena.capacity() * 2).max(state.pages.arena.len() + more);
+            self.metas
+                .grow(grown - state.pages.arena.capacity(), "page boundaries")?;
+            state
+                .pages
+                .arena
+                .reserve_exact(grown - state.pages.arena.len());
+        }
+        Self::reserve_meta(&mut self.metas, &mut state.pages.pages)?;
+        let lower = state.pages.push_bytes(&first[..lower_len]);
+        let upper = state.pages.push_bytes(last);
+        state.previous_last.clear();
+        state.previous_last.extend_from_slice(last);
+        let count = state.count as u64;
+        let end = u32::from_le_bytes(
+            state.entries[last_end..last_end + 4]
+                .try_into()
+                .expect("4 bytes"),
+        ) as u64;
+        state.entries.clear();
+        state.count = 0;
+        let crc = crc32fast::hash(&self.body);
+        self.out.write_all(&self.body)?;
+        self.out.write_all(&crc.to_le_bytes())?;
+        let offset = self.offset;
+        let len = (self.body.len() + 4) as u32;
+        self.offset += len as u64;
+        let state = self.bytes.as_mut().expect("a bytes writer");
+        state.pages.pages.push(BytePageMeta {
+            lower,
+            upper,
+            offset,
+            len,
+            key_start: self.key_page_first_key_index,
+            pos_start: self.key_page_pos_start,
+        });
+        self.key_page_first_key_index += count;
+        self.key_page_pos_start = end;
+        Ok(())
     }
 
     fn push(&mut self, key: i64, pos: u32) -> std::io::Result<()> {
@@ -2844,6 +3907,9 @@ impl<'a, 'b, W: Write> PageWriter<'a, 'b, W> {
     /// of the directory's vectors, which the caller keeps for as long as
     /// it keeps them
     fn finish(mut self) -> std::io::Result<(ColumnDirectory, u64, Charge<'b>)> {
+        if self.bytes.is_some() {
+            return self.finish_bytes();
+        }
         if let Some(key) = self.current.take() {
             self.close_key(key)?;
         }
@@ -2868,6 +3934,52 @@ impl<'a, 'b, W: Write> PageWriter<'a, 'b, W> {
             kind: KeyKind::OrderedI64,
             outcome: Outcome::Built,
             domain: None,
+            components: Vec::new(),
+            bytes: BytePages::default(),
+        };
+        let budget = self.metas.budget;
+        let metas = std::mem::replace(&mut self.metas, Charge { bytes: 0, budget });
+        Ok((column, self.offset, metas))
+    }
+
+    /// `finish` for an ordered-bytes entry
+    fn finish_bytes(mut self) -> std::io::Result<(ColumnDirectory, u64, Charge<'b>)> {
+        if self.bytes.as_ref().is_some_and(|s| s.has_current) {
+            self.close_byte_key()?;
+        }
+        self.flush_pos_page()?;
+        self.flush_byte_page()?;
+        let n_positions = self.n_positions;
+        let mut state = self.bytes.take().expect("a bytes writer");
+        state
+            .heaviest
+            .retain(|(_, count)| count * SCAN_SHARE > n_positions);
+        state.heaviest.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let key_bytes: usize = state.heaviest.iter().map(|(key, _)| key.len()).sum();
+        self.metas.grow(
+            key_bytes + state.heaviest.len() * std::mem::size_of::<(u32, u16, u64)>(),
+            "heavy keys",
+        )?;
+        let mut pages = std::mem::take(&mut state.pages);
+        pages.arena.reserve_exact(key_bytes);
+        pages.heavy.reserve_exact(state.heaviest.len());
+        for (key, count) in &state.heaviest {
+            let (at, len) = pages.push_bytes(key);
+            pages.heavy.push((at, len, *count));
+        }
+        let column = ColumnDirectory {
+            column: self.column,
+            identity: self.identity,
+            n_keys: self.n_keys,
+            n_positions: self.n_positions,
+            key_pages: Vec::new(),
+            pos_pages: std::mem::take(&mut self.pos_pages),
+            heavy_keys: None,
+            kind: KeyKind::OrderedBytes,
+            outcome: Outcome::Built,
+            domain: Some(state.components[0].1),
+            components: std::mem::take(&mut state.components),
+            bytes: pages,
         };
         let budget = self.metas.budget;
         let metas = std::mem::replace(&mut self.metas, Charge { bytes: 0, budget });
@@ -2892,17 +4004,29 @@ const BUILD_SHARE_BYTES: usize = 16 * 1024 * 1024;
 /// The workspace one build of the engine takes: its share of the builds
 /// budget less the `input` decode admitted beside it, and at least what
 /// `rows` rows of `columns` columns need
-pub fn workspace_for(rows: usize, columns: usize, input: usize) -> usize {
+pub fn workspace_for(rows: usize, entries: (usize, usize), input: usize) -> usize {
     let share = (INDEX_BUILDS.stats().budget_bytes as usize).min(BUILD_SHARE_BYTES);
     share
         .saturating_sub(input)
-        .max(least_workspace(rows, columns))
+        .max(least_workspace(rows, entries))
 }
 
-/// The least workspace a build of `rows` rows of `columns` columns needs
-pub fn least_workspace(rows: usize, columns: usize) -> usize {
-    MIN_WORKSPACE_BYTES + columns * (metadata_allowance(rows) + COLUMN_SLOT_BYTES)
+/// The least workspace a build of `rows` rows needs for `entries`, its i64
+/// and its ordered-bytes entries
+pub fn least_workspace(rows: usize, (i64_entries, byte_entries): (usize, usize)) -> usize {
+    MIN_WORKSPACE_BYTES
+        + i64_entries * (metadata_allowance(rows) + COLUMN_SLOT_BYTES)
+        + byte_entries * (BYTE_ENTRY_BYTES + COLUMN_SLOT_BYTES)
 }
+
+/// What an ordered-bytes entry's build takes at its least: its key buffers,
+/// a sort run of a few pages, two merge inputs with key buffers, and room
+/// for its boundaries
+const BYTE_ENTRY_BYTES: usize = 4 * PAGE_BYTES
+    + OUT_BUFFER_BYTES
+    + MIN_FAN_IN * (MERGE_READ_BYTES + PAGE_BYTES + MERGE_INPUT_BYTES)
+    + 4 * PAGE_BYTES
+    + MIN_RUN_PAIRS * std::mem::size_of::<u32>() * 4;
 
 /// The key row `i` of a column is held under
 enum RowKey {
@@ -3041,6 +4165,143 @@ impl Iterator for GroupPairs<'_> {
     }
 }
 
+/// Where an ordered-bytes entry's build takes its keys: each call writes the
+/// next keyed row's key into `out` and gives its position, None at the end
+pub trait KeySource {
+    fn next_key(&mut self, out: &mut Vec<u8>) -> Option<u32>;
+}
+
+/// An ordered-bytes entry to build: the index's identity, its components'
+/// physical columns and domains in key order, and where its keys come from
+pub struct BytesInput<'a> {
+    pub identity: u64,
+    pub components: Vec<(u32, Domain)>,
+    pub keys: Box<dyn KeySource + 'a>,
+}
+
+/// How one cell went into a key
+enum Cell {
+    Pushed,
+    Null,
+    /// A column no key holds, or a row past its group
+    Failed(&'static str),
+}
+
+fn push_cell(data: &super::column::ColumnData, i: usize, out: &mut Vec<u8>) -> Cell {
+    use super::column::ColumnData;
+    use super::side_index::{push_bool, push_f64, push_i64, push_text};
+    let short = Cell::Failed("row group shorter than its rows");
+    match data {
+        ColumnData::Int64 { values, nulls } | ColumnData::TimestampNanos { values, nulls } => {
+            match (nulls.get(i), values.get(i)) {
+                (Some(true), _) => Cell::Null,
+                (_, Some(&v)) => {
+                    push_i64(out, v);
+                    Cell::Pushed
+                }
+                _ => short,
+            }
+        }
+        ColumnData::Float64 { values, nulls } => match (nulls.get(i), values.get(i)) {
+            (Some(true), _) => Cell::Null,
+            (_, Some(&f)) => {
+                push_f64(out, f);
+                Cell::Pushed
+            }
+            _ => short,
+        },
+        ColumnData::Boolean { values, nulls } => match (nulls.get(i), values.get(i)) {
+            (Some(true), _) => Cell::Null,
+            (_, Some(&b)) => {
+                push_bool(out, b);
+                Cell::Pushed
+            }
+            _ => short,
+        },
+        ColumnData::Dictionary {
+            ids,
+            dictionary,
+            nulls,
+        } => match (nulls.get(i), ids.get(i)) {
+            (Some(true), _) => Cell::Null,
+            (_, Some(&id)) => match dictionary.get(id as usize) {
+                Some(text) => {
+                    push_text(out, text.as_bytes());
+                    Cell::Pushed
+                }
+                None => Cell::Failed("dictionary id out of range"),
+            },
+            _ => short,
+        },
+        _ => Cell::Failed("column is not indexable"),
+    }
+}
+
+/// The ordered-bytes keys of a volume's rows over `columns`: decoded
+/// columns are read in place, the rest one row group of each at a time. A
+/// single-column key leaves NULL rows out; a composite keeps them, the NULL
+/// component marked. A decode or type error ends the keys into `failure`
+struct VolumeKeys<'a> {
+    volume: &'a super::writer::FrozenVolume,
+    columns: Vec<usize>,
+    groups: Vec<Option<(usize, Arc<super::column::ColumnData>)>>,
+    rows: usize,
+    next: usize,
+    failure: &'a std::cell::Cell<Option<std::io::Error>>,
+}
+
+impl VolumeKeys<'_> {
+    fn fail(&mut self, error: std::io::Error) -> Option<u32> {
+        self.failure.set(Some(error));
+        self.next = self.rows;
+        None
+    }
+}
+
+impl KeySource for VolumeKeys<'_> {
+    fn next_key(&mut self, out: &mut Vec<u8>) -> Option<u32> {
+        let single = self.columns.len() == 1;
+        'rows: while self.next < self.rows {
+            let row = self.next;
+            self.next += 1;
+            out.clear();
+            for c in 0..self.columns.len() {
+                let column = self.columns[c];
+                let cell = if let Some(data) = self.volume.columns.resident(column) {
+                    push_cell(data, row, out)
+                } else {
+                    let Some(store) = self.volume.columns.compressed_store() else {
+                        return self.fail(invalid("column data is not loaded"));
+                    };
+                    let size = store.group_size().max(1);
+                    let group = row / size;
+                    if self.groups[c].as_ref().is_none_or(|(g, _)| *g != group) {
+                        // The group done with goes before the next is decoded
+                        self.groups[c] = None;
+                        match store.group_column(column, group) {
+                            Ok(decoded) => self.groups[c] = Some((group, decoded)),
+                            Err(error) => return self.fail(error),
+                        }
+                    }
+                    let (_, data) = self.groups[c].as_ref()?;
+                    push_cell(data, row - group * size, out)
+                };
+                match cell {
+                    Cell::Pushed => {}
+                    Cell::Null if single => continue 'rows,
+                    Cell::Null => super::side_index::push_null(out),
+                    Cell::Failed(what) => return self.fail(invalid(what)),
+                }
+            }
+            return Some(row as u32);
+        }
+        for group in &mut self.groups {
+            *group = None;
+        }
+        None
+    }
+}
+
 /// What decoding one row group of `column` allocates at most, beyond the
 /// build's own workspace: the compressed block read, its decompressed
 /// bytes and the decoded column, one group at a time. Nothing for a
@@ -3082,9 +4343,8 @@ impl Iterator for Bounded<'_> {
     }
 }
 
-/// Builds the side file of the volume at `volume_path` for `identities`,
-/// each a physical column and the identity of the index it is built for, and
-/// opens it. The build's workspace and the decode of its input are
+/// Builds the side file of the volume at `volume_path` for the entries
+/// `identities` names, and opens it. The build's workspace and the decode of its input are
 /// admitted together against the builds budget. `Ok(None)` leaves the
 /// volume uncovered: no identities, an admission the budget refused
 /// (counted by the ledger), or a side file that could not be written or
@@ -3095,7 +4355,7 @@ pub fn build_side_for(
     volume: &super::writer::FrozenVolume,
     volume_path: &Path,
     file_id: u64,
-    identities: &[(usize, u64)],
+    identities: &[SideTarget],
 ) -> std::io::Result<Option<Arc<IndexFile>>> {
     match stage_side_for(volume, volume_path, file_id, identities, None)? {
         SideBuild::Built(staged) => match staged.publish(&side_path(volume_path), file_id) {
@@ -3178,21 +4438,34 @@ pub fn stage_side_for(
     volume: &super::writer::FrozenVolume,
     volume_path: &Path,
     file_id: u64,
-    identities: &[(usize, u64)],
+    identities: &[SideTarget],
     cap: Option<usize>,
 ) -> std::io::Result<SideBuild> {
     if identities.is_empty() {
         return Ok(SideBuild::Refused);
     }
     let side = side_path(volume_path);
+    // Entries are built one after another; an ordered-bytes entry decodes
+    // a group of each of its columns at once
     let input = identities
         .iter()
-        .map(|&(column, _)| decode_allowance(volume, column))
+        .map(|target| {
+            target
+                .components
+                .iter()
+                .map(|&(column, _)| decode_allowance(volume, column))
+                .sum::<usize>()
+        })
         .max()
         .unwrap_or(0);
-    let mut workspace = workspace_for(volume.meta.row_count, identities.len(), input);
+    let byte_entries = identities
+        .iter()
+        .filter(|t| t.kind == KeyKind::OrderedBytes)
+        .count();
+    let entries = (identities.len() - byte_entries, byte_entries);
+    let mut workspace = workspace_for(volume.meta.row_count, entries, input);
     if let Some(cap) = cap {
-        let least = least_workspace(volume.meta.row_count, identities.len());
+        let least = least_workspace(volume.meta.row_count, entries);
         if input + least > cap {
             INDEX_BUILDS.count_refused();
             return Ok(SideBuild::Refused);
@@ -3209,18 +4482,41 @@ pub fn stage_side_for(
     let failure = std::cell::Cell::new(None);
     let columns = identities
         .iter()
-        .filter_map(|&(column, identity)| {
-            let domain = Domain::of(*volume.meta.column_types.get(column)?)?;
+        .filter(|target| target.kind == KeyKind::OrderedI64)
+        .filter_map(|target| {
+            let &[(column, domain)] = target.components.as_slice() else {
+                return None;
+            };
             Some(ColumnInput {
                 column: column as u32,
-                identity,
+                identity: target.identity,
                 domain,
                 pairs: Box::new(volume_pairs(volume, column, &failure)),
             })
         })
         .collect();
+    let bytes = identities
+        .iter()
+        .filter(|target| target.kind == KeyKind::OrderedBytes)
+        .map(|target| BytesInput {
+            identity: target.identity,
+            components: target
+                .components
+                .iter()
+                .map(|&(column, domain)| (column as u32, domain))
+                .collect(),
+            keys: Box::new(VolumeKeys {
+                volume,
+                columns: target.components.iter().map(|&(c, _)| c).collect(),
+                groups: vec![None; target.components.len()],
+                rows: volume.meta.row_count,
+                next: 0,
+                failure: &failure,
+            }),
+        })
+        .collect();
     let generation = next_generation();
-    let built = build_side_file_staged(&side, generation, columns, workspace);
+    let built = build_side_file_staged(&side, generation, columns, bytes, workspace);
     if let Some(error) = failure.take() {
         // The volume could not be read: whatever was written goes
         return Err(error);
@@ -3268,19 +4564,16 @@ pub fn retire_side_of(volume_path: &Path) {
 }
 
 /// Whether any entry of `side` still stands for an index the catalog has
-/// now, `current` being the physical columns and identities it builds
-pub fn still_covers(side: &IndexFile, current: &[(usize, u64)]) -> bool {
-    current
-        .iter()
-        .any(|&(physical, identity)| side.covers(identity, physical, Capability::Equality))
+/// now, `current` being the entries it builds
+pub fn still_covers(side: &IndexFile, current: &[SideTarget]) -> bool {
+    current.iter().any(|target| side.records(target))
 }
 
-/// Whether `side` holds an entry for every physical column and identity in
-/// `wanted`: what a backfill asks of a volume's file before leaving it alone
-pub fn covers_all(side: &IndexFile, wanted: &[(usize, u64)]) -> bool {
-    wanted
-        .iter()
-        .all(|&(physical, identity)| side.covers(identity, physical, Capability::Equality))
+/// Whether `side` records every entry in `wanted`, built or found
+/// unsupported: what a backfill asks of a volume's file before leaving it
+/// alone
+pub fn covers_all(side: &IndexFile, wanted: &[SideTarget]) -> bool {
+    wanted.iter().all(|target| side.records(target))
 }
 
 // =============================================================================
@@ -3389,6 +4682,10 @@ impl SidePlan {
     /// Starts the walk: takes the reader's working reservation now. Refused
     /// (`is_refused`), the volume goes through the scan.
     pub fn walk(&self, window: usize) -> std::io::Result<SideWalk> {
+        #[cfg(feature = "test-failpoints")]
+        if crate::test_failpoints::side_walk_refused() {
+            return Err(refused("a side walk's reader, by the test"));
+        }
         let mut reader = self.file.reader(self.identity, window)?;
         reader.walk(self.range);
         Ok(SideWalk { reader, at: 0 })
@@ -3658,6 +4955,8 @@ mod tests {
             kind: KeyKind::OrderedI64,
             outcome,
             domain: Some(Domain::Float),
+            components: vec![(2, Domain::Float)],
+            bytes: BytePages::default(),
         };
         let encode = |columns| {
             let mut out = Vec::new();
@@ -4709,18 +6008,18 @@ mod tests {
         )
         .unwrap();
         let file = IndexFile::open(&path, 15).unwrap();
-        assert!(file.covers(41, 1, Capability::Equality));
-        assert!(file.covers(41, 1, Capability::Range));
+        assert!(file.covers(41, &[1], Capability::Equality));
+        assert!(file.covers(41, &[1], Capability::Range));
         assert!(
-            !file.covers(42, 1, Capability::Equality),
+            !file.covers(42, &[1], Capability::Equality),
             "another index's identity"
         );
         assert!(
-            !file.covers(41, 3, Capability::Equality),
+            !file.covers(41, &[3], Capability::Equality),
             "the entry is over another column"
         );
         assert!(
-            !file.covers(0, 2, Capability::Equality),
+            !file.covers(0, &[2], Capability::Equality),
             "an entry without an identity covers nothing"
         );
         // Every open of the same path reads through the one handle
@@ -4809,8 +6108,8 @@ mod tests {
         let old = Arc::new(IndexFile::open(&path, 42).unwrap());
         let entry = old.directory().entry(1).unwrap();
         assert_eq!(entry.domain, None, "a version 5 entry records no domain");
-        assert!(old.covers(1, 1, Capability::Equality));
-        assert!(old.covers(1, 1, Capability::Range));
+        assert!(old.covers(1, &[1], Capability::Equality));
+        assert!(old.covers(1, &[1], Capability::Range));
         let got = old.equal(1, key).unwrap().expect("the key is present");
         assert_eq!(all_positions_of(&old, 1, got), want_positions);
     }
@@ -4841,8 +6140,8 @@ mod tests {
         )
         .unwrap();
         let file = Arc::new(IndexFile::open(&path, 31).unwrap());
-        assert!(file.covers(7, 1, Capability::Equality));
-        assert!(file.covers(9, 1, Capability::Equality));
+        assert!(file.covers(7, &[1], Capability::Equality));
+        assert!(file.covers(9, &[1], Capability::Equality));
         // The first entry's pages are cached before the second is read
         let a = file.equal(7, 5).unwrap().expect("key 5 in the first index");
         assert_eq!(all_positions_of(&file, 7, a), [5]);
@@ -4910,6 +6209,14 @@ mod tests {
         (volume, path)
     }
 
+    fn integer_target(column: usize, identity: u64) -> [SideTarget; 1] {
+        [SideTarget {
+            identity,
+            kind: KeyKind::OrderedI64,
+            components: smallvec::smallvec![(column, Domain::Integer)],
+        }]
+    }
+
     #[test]
     fn the_input_s_decode_is_admitted_with_the_build_and_the_allocation_stays_within_it() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -4926,7 +6233,7 @@ mod tests {
         let input = decode_allowance(&volume, 1);
         assert!(input > 131_072 * 8, "{input} bytes for a group's decode");
         INDEX_BUILDS.set_budget_bytes((baseline.charged_bytes + input / 2) as u64);
-        let refused = build_side_for(&volume, &path, 1, &[(1, identity)]).unwrap();
+        let refused = build_side_for(&volume, &path, 1, &integer_target(1, identity)).unwrap();
         assert!(refused.is_none());
         assert_eq!(INDEX_BUILDS.stats().refused, baseline.refused + 1);
         assert!(!side_path(&path).exists());
@@ -4937,7 +6244,7 @@ mod tests {
         INDEX_BUILDS.reset_peak();
         #[cfg(not(feature = "jemalloc"))]
         let mark = counting::mark();
-        let side = build_side_for(&volume, &path, 1, &[(1, identity)])
+        let side = build_side_for(&volume, &path, 1, &integer_target(1, identity))
             .unwrap()
             .expect("built");
         let admitted = INDEX_BUILDS.stats().peak_bytes - baseline.charged_bytes;
@@ -4981,7 +6288,7 @@ mod tests {
             .set_len(0)
             .unwrap();
         let failed_before = BUILDS_FAILED.load(Ordering::Relaxed);
-        let err = match build_side_for(&volume, &path, 1, &[(1, identity)]) {
+        let err = match build_side_for(&volume, &path, 1, &integer_target(1, identity)) {
             Err(err) => err,
             Ok(_) => panic!("a volume that cannot be read built a side file"),
         };

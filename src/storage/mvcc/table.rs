@@ -4059,6 +4059,13 @@ impl Table for MVCCTable {
         self.version_store.side_index_defs()
     }
 
+    fn for_each_side_index_def(
+        &self,
+        each: &mut dyn FnMut(crate::storage::volume::side_index::SideIndexDef),
+    ) {
+        self.version_store.for_each_side_index_def(each)
+    }
+
     fn side_index_defs_into(
         &self,
         out: &mut Vec<crate::storage::volume::side_index::SideIndexDef>,

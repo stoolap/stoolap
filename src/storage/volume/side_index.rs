@@ -19,7 +19,7 @@
 use smallvec::SmallVec;
 
 use crate::core::value::cmp_i64_f64;
-use crate::core::{DataType, Operator, Value};
+use crate::core::{DataType, IndexType, Operator, Value};
 
 /// The value domain one key component is encoded in
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +28,7 @@ pub enum Domain {
     Timestamp,
     Float,
     Boolean,
+    Text,
 }
 
 impl Domain {
@@ -38,14 +39,9 @@ impl Domain {
             DataType::Timestamp => Some(Self::Timestamp),
             DataType::Float => Some(Self::Float),
             DataType::Boolean => Some(Self::Boolean),
+            DataType::Text => Some(Self::Text),
             _ => None,
         }
-    }
-
-    /// The domain a column's B-tree index is held in by a side file: a
-    /// BOOLEAN key is not, its two values mostly falling to the scan
-    pub fn admitted(data_type: DataType) -> Option<Self> {
-        Self::of(data_type).filter(|domain| *domain != Self::Boolean)
     }
 
     /// The domain's byte in a version 6 directory entry
@@ -55,6 +51,7 @@ impl Domain {
             Self::Timestamp => 2,
             Self::Float => 3,
             Self::Boolean => 4,
+            Self::Text => 5,
         }
     }
 
@@ -64,6 +61,7 @@ impl Domain {
             2 => Some(Self::Timestamp),
             3 => Some(Self::Float),
             4 => Some(Self::Boolean),
+            5 => Some(Self::Text),
             _ => None,
         }
     }
@@ -72,8 +70,12 @@ impl Domain {
 /// How an entry stores its keys
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyKind {
-    /// One i64 per distinct key, in order
+    /// One i64 per distinct key, in order: a single INTEGER, TIMESTAMP,
+    /// FLOAT or BOOLEAN component
     OrderedI64,
+    /// One ordered byte string per distinct key: a TEXT component, or
+    /// several components of any domain
+    OrderedBytes,
 }
 
 impl KeyKind {
@@ -81,12 +83,14 @@ impl KeyKind {
     pub fn code(self) -> u8 {
         match self {
             Self::OrderedI64 => 1,
+            Self::OrderedBytes => 2,
         }
     }
 
     pub fn from_code(code: u8) -> Option<Self> {
         match code {
             1 => Some(Self::OrderedI64),
+            2 => Some(Self::OrderedBytes),
             _ => None,
         }
     }
@@ -135,6 +139,282 @@ pub fn float_key(f: f64) -> i64 {
 pub fn float_of_key(key: i64) -> f64 {
     let bits = if key < 0 { key ^ i64::MAX } else { key };
     f64::from_bits(bits as u64)
+}
+
+// Ordered bytes: each component a tag, then its value's bytes, so that the
+// bytes of two keys compare as the keys do and a component ends where the
+// next begins. NULL sorts first, NaN after every number
+const TAG_NULL: u8 = 0x00;
+const TAG_VALUE: u8 = 0x01;
+const TAG_NAN: u8 = 0x02;
+const SIGN: u64 = 1 << 63;
+
+pub fn push_null(out: &mut Vec<u8>) {
+    out.push(TAG_NULL);
+}
+
+/// An INTEGER or TIMESTAMP component, or a FLOAT one by its key
+pub fn push_i64(out: &mut Vec<u8>, key: i64) {
+    out.push(TAG_VALUE);
+    out.extend_from_slice(&(key as u64 ^ SIGN).to_be_bytes());
+}
+
+pub fn push_f64(out: &mut Vec<u8>, f: f64) {
+    if f.is_nan() {
+        out.push(TAG_NAN);
+    } else {
+        push_i64(out, float_key(f));
+    }
+}
+
+pub fn push_bool(out: &mut Vec<u8>, b: bool) {
+    out.push(TAG_VALUE);
+    out.push(b as u8);
+}
+
+/// A TEXT component: its bytes with each 0x00 escaped as 0x00 0xFF, ended
+/// by 0x00 0x00, so a shorter string sorts before its extensions
+pub fn push_text(out: &mut Vec<u8>, text: &[u8]) {
+    out.push(TAG_VALUE);
+    for &byte in text {
+        out.push(byte);
+        if byte == 0 {
+            out.push(0xFF);
+        }
+    }
+    out.extend_from_slice(&[0, 0]);
+}
+
+/// A component holding the resolved key `key` of `domain`
+pub fn push_key(out: &mut Vec<u8>, domain: Domain, key: i64) {
+    match domain {
+        Domain::Boolean => push_bool(out, key != 0),
+        _ => push_i64(out, key),
+    }
+}
+
+/// How a query value went into a key component
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Encoded {
+    Pushed,
+    /// No value of the domain equals it
+    Empty,
+    /// The keys cannot answer it
+    Fallback,
+}
+
+/// Appends the component a `domain` column holds when `column = value`
+pub fn push_equal(domain: Domain, value: &Value, out: &mut Vec<u8>) -> Encoded {
+    if domain == Domain::Text {
+        return match value {
+            Value::Text(text) => {
+                push_text(out, text.as_bytes());
+                Encoded::Pushed
+            }
+            _ => Encoded::Fallback,
+        };
+    }
+    match resolve(domain, Operator::Eq, value) {
+        Resolved::Key(key) => {
+            push_key(out, domain, key);
+            Encoded::Pushed
+        }
+        Resolved::Empty => Encoded::Empty,
+        _ => Encoded::Fallback,
+    }
+}
+
+/// The bytes a `domain` component holding `value` takes, at most; zero for
+/// a value the component cannot hold
+pub fn encoded_len(domain: Domain, value: &Value) -> usize {
+    match (domain, value) {
+        (Domain::Text, Value::Text(text)) => {
+            let bytes = text.as_bytes();
+            3 + bytes.len() + bytes.iter().filter(|&&b| b == 0).count()
+        }
+        (Domain::Text, _) => 0,
+        (Domain::Boolean, _) => 2,
+        _ => 9,
+    }
+}
+
+/// A key range `[lower, upper)` in one buffer: the lower bound, then the
+/// upper one, absent when no key is above the range
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ByteRange {
+    bytes: Vec<u8>,
+    split: usize,
+    bounded: bool,
+}
+
+impl ByteRange {
+    pub fn lower(&self) -> &[u8] {
+        &self.bytes[..self.split]
+    }
+
+    pub fn upper(&self) -> Option<&[u8]> {
+        self.bounded.then(|| &self.bytes[self.split..])
+    }
+
+    /// A range no key falls in
+    pub fn empty() -> Self {
+        Self {
+            bytes: vec![0xFF],
+            split: 1,
+            bounded: true,
+        }
+    }
+
+    /// The keys that start with `prefix`, built in its own buffer, which
+    /// holds twice its bytes when it is allocated so
+    pub fn starting_with(mut prefix: Vec<u8>) -> Self {
+        let split = prefix.len();
+        prefix.extend_from_within(..split);
+        let bounded = successor_from(&mut prefix, split);
+        Self {
+            bytes: prefix,
+            split,
+            bounded,
+        }
+    }
+}
+
+/// `successor` of the bytes past `from`, leaving those before it
+fn successor_from(bytes: &mut Vec<u8>, from: usize) -> bool {
+    while bytes.len() > from {
+        let at = bytes.len() - 1;
+        if bytes[at] < 0xFF {
+            bytes[at] += 1;
+            return true;
+        }
+        bytes.pop();
+    }
+    false
+}
+
+/// The keys that start with `prefix` and whose next component, of `domain`,
+/// meets every comparison the keys can answer, built on the prefix's own
+/// buffer. The prefix back when no comparison can be answered, an empty
+/// range when they leave no value. NULL and NaN components fall outside
+/// every range, as no comparison holds for them
+pub fn component_range<'v>(
+    domain: Domain,
+    mut prefix: Vec<u8>,
+    comparisons: impl Iterator<Item = (Operator, &'v Value)>,
+) -> Result<ByteRange, Vec<u8>> {
+    let at = prefix.len();
+    // The range is chosen first and encoded once
+    let (lower, upper): (Edge<'v>, Edge<'v>);
+    if domain == Domain::Text {
+        let mut low: Option<(&[u8], bool)> = None;
+        let mut high: Option<(&[u8], bool)> = None;
+        let mut bounded = false;
+        for (op, value) in comparisons {
+            let Value::Text(text) = value else {
+                continue;
+            };
+            let text = text.as_bytes();
+            match op {
+                Operator::Gt | Operator::Gte => {
+                    let bound = (text, op == Operator::Gt);
+                    low = Some(low.map_or(bound, |l| l.max(bound)));
+                }
+                Operator::Lt | Operator::Lte => {
+                    let bound = (text, op == Operator::Lte);
+                    high = Some(high.map_or(bound, |h| h.min(bound)));
+                }
+                _ => continue,
+            }
+            bounded = true;
+        }
+        if !bounded {
+            return Err(prefix);
+        }
+        lower = low.map(|(text, past)| (Bound::Text(text), past));
+        upper = high.map(|(text, past)| (Bound::Text(text), past));
+    } else {
+        let (mut low, mut high) = match domain {
+            Domain::Boolean => (0, 1),
+            _ => (i64::MIN, i64::MAX),
+        };
+        let mut bounded = false;
+        for (op, value) in comparisons {
+            if op == Operator::Eq {
+                continue;
+            }
+            let (l, h) = match resolve(domain, op, value) {
+                Resolved::Key(k) => (k, k),
+                Resolved::Range(l, h) => (l, h),
+                Resolved::Empty => return Ok(ByteRange::empty()),
+                Resolved::Fallback => continue,
+            };
+            bounded = true;
+            low = low.max(l);
+            high = high.min(h);
+        }
+        if !bounded {
+            return Err(prefix);
+        }
+        if low > high {
+            return Ok(ByteRange::empty());
+        }
+        lower = Some((Bound::Key(low), false));
+        upper = Some((Bound::Key(high), true));
+    }
+    let push = |out: &mut Vec<u8>, bound: Option<(Bound<'_>, bool)>, empty: u8| -> bool {
+        match bound {
+            None => {
+                out.push(empty);
+                false
+            }
+            Some((Bound::Text(text), past)) => {
+                push_text(out, text);
+                past
+            }
+            Some((Bound::Key(key), past)) => {
+                push_key(out, domain, key);
+                past
+            }
+        }
+    };
+    // A missing bound is every value: from the first value tag to NaN
+    if push(&mut prefix, lower, TAG_VALUE) {
+        let past = successor_from(&mut prefix, at);
+        debug_assert!(past, "a value's key has a successor");
+    }
+    let split = prefix.len();
+    prefix.extend_from_within(..at);
+    let bounded = !push(&mut prefix, upper, TAG_NAN) || successor_from(&mut prefix, split + at);
+    Ok(ByteRange {
+        bytes: prefix,
+        split,
+        bounded,
+    })
+}
+
+/// A chosen range bound before it is encoded
+#[derive(Clone, Copy)]
+enum Bound<'v> {
+    Text(&'v [u8]),
+    Key(i64),
+}
+
+/// A range's end, if bounded: the bound, and whether the end lies just
+/// above it, past every key equal to its value
+type Edge<'v> = Option<(Bound<'v>, bool)>;
+
+/// Turns `prefix` into the least byte string above every string it starts:
+/// the last byte below 0xFF goes up by one and what follows it goes. False
+/// when no such string exists, every byte being 0xFF
+pub fn successor(prefix: &mut Vec<u8>) -> bool {
+    while let Some(last) = prefix.last_mut() {
+        if *last < 0xFF {
+            *last += 1;
+            return true;
+        }
+        prefix.pop();
+    }
+    false
 }
 
 /// What a comparison of a key column with a value asks of the entry
@@ -252,12 +532,15 @@ fn float_against_integer(op: Operator, i: i64) -> Resolved {
 pub enum Capability {
     Equality,
     Range,
+    /// Equality on the key's leading components, whole components only
+    Prefix,
 }
 
 impl KeyKind {
     pub fn provides(self, capability: Capability) -> bool {
         match self {
             KeyKind::OrderedI64 => matches!(capability, Capability::Equality | Capability::Range),
+            KeyKind::OrderedBytes => true,
         }
     }
 }
@@ -265,7 +548,7 @@ impl KeyKind {
 /// One column of a key, by its schema position
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Component {
-    pub column: usize,
+    pub column: u32,
     pub domain: Domain,
 }
 
@@ -275,8 +558,30 @@ pub struct SideIndexDef {
     /// The LSN of the catalog record that created the index; never zero
     pub identity: u64,
     /// The key's columns in key order, never empty
-    pub components: SmallVec<[Component; 2]>,
+    pub components: SmallVec<[Component; 4]>,
     pub kind: KeyKind,
+    pub index_type: IndexType,
+}
+
+/// The kind a side file holds an index of `index_type` over `components`
+/// in: a B-tree on one numeric or time column, a TEXT B-tree or hash, or a
+/// key of several keyed columns. None for any other index
+pub fn kind_for(index_type: IndexType, components: &[Component]) -> Option<KeyKind> {
+    match components {
+        [] => None,
+        [one] => match (one.domain, index_type) {
+            (Domain::Text, IndexType::BTree | IndexType::Hash) => Some(KeyKind::OrderedBytes),
+            (Domain::Integer | Domain::Timestamp | Domain::Float, IndexType::BTree) => {
+                Some(KeyKind::OrderedI64)
+            }
+            _ => None,
+        },
+        _ => matches!(
+            index_type,
+            IndexType::BTree | IndexType::Hash | IndexType::MultiColumn
+        )
+        .then_some(KeyKind::OrderedBytes),
+    }
 }
 
 impl SideIndexDef {
@@ -286,11 +591,28 @@ impl SideIndexDef {
     }
 }
 
-/// The physical columns and identities of the entries a volume written in
-/// the current schema is built with: its physical columns are the schema's
-pub fn schema_entries(defs: &[SideIndexDef]) -> Vec<(usize, u64)> {
+/// An entry to build into one volume's side file: the index's identity, its
+/// key kind, and its key's physical columns with their domains, in key order
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SideTarget {
+    pub identity: u64,
+    pub kind: KeyKind,
+    pub components: SmallVec<[(usize, Domain); 2]>,
+}
+
+/// The entries a volume written in the current schema is built with: its
+/// physical columns are the schema's
+pub fn schema_entries(defs: &[SideIndexDef]) -> Vec<SideTarget> {
     defs.iter()
-        .filter_map(|def| Some((def.leading()?.column, def.identity)))
+        .map(|def| SideTarget {
+            identity: def.identity,
+            kind: def.kind,
+            components: def
+                .components
+                .iter()
+                .map(|c| (c.column as usize, c.domain))
+                .collect(),
+        })
         .collect()
 }
 

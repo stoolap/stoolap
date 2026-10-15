@@ -78,20 +78,32 @@ impl ColdSegment {
         capability: super::side_index::Capability,
     ) -> Option<&Arc<super::secondary::IndexFile>> {
         let side = self.side.as_ref()?;
-        let [component] = def.components.as_slice() else {
-            return None;
-        };
-        let physical = self.physical_column(component.column)?;
-        let stored = self.volume.meta.column_types.get(physical).copied()?;
-        if super::side_index::Domain::of(stored) != Some(component.domain) {
-            return None;
-        }
-        let entry_domain = side.directory().entry(def.identity)?.domain;
-        if entry_domain.is_some_and(|domain| domain != component.domain) {
+        let entry = side.directory().entry(def.identity)?;
+        let recorded = entry.components.len().max(1);
+        if entry.outcome != super::side_index::Outcome::Built
+            || entry.kind != def.kind
+            || !entry.kind.provides(capability)
+            || recorded != def.components.len()
+        {
             return None;
         }
-        side.covers(def.identity, physical, capability)
-            .then_some(side)
+        for (at, component) in def.components.iter().enumerate() {
+            let column = self.physical_column(component.column as usize)?;
+            let stored = self.volume.meta.column_types.get(column).copied()?;
+            if super::side_index::Domain::of(stored) != Some(component.domain) {
+                return None;
+            }
+            // A version 6 entry records its components' domains; an older
+            // one is taken at the volume's
+            let (held, domain) = match entry.components.get(at) {
+                Some(&(held, domain)) => (held, Some(domain)),
+                None => (entry.column, entry.domain),
+            };
+            if held as usize != column || domain.is_some_and(|d| d != component.domain) {
+                return None;
+            }
+        }
+        Some(side)
     }
 
     /// The physical column holding schema column `column` in this volume,

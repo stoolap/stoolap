@@ -6096,15 +6096,25 @@ impl MVCCEngine {
         // of, and a dropped one, are no business of its side file
         let wanted_of = |cs: &crate::storage::volume::manifest::ColdSegment,
                          defs: &[crate::storage::volume::side_index::SideIndexDef]|
-         -> Vec<(usize, u64)> {
+         -> Vec<crate::storage::volume::side_index::SideTarget> {
             defs.iter()
                 .filter_map(|def| {
-                    let component = def.leading()?;
-                    let physical = cs.physical_column(component.column)?;
-                    let stored = *cs.volume.meta.column_types.get(physical)?;
-                    (crate::storage::volume::side_index::Domain::of(stored)
-                        == Some(component.domain))
-                    .then_some((physical, def.identity))
+                    let components = def
+                        .components
+                        .iter()
+                        .map(|component| {
+                            let physical = cs.physical_column(component.column as usize)?;
+                            let stored = *cs.volume.meta.column_types.get(physical)?;
+                            (crate::storage::volume::side_index::Domain::of(stored)
+                                == Some(component.domain))
+                            .then_some((physical, component.domain))
+                        })
+                        .collect::<Option<_>>()?;
+                    Some(crate::storage::volume::side_index::SideTarget {
+                        identity: def.identity,
+                        kind: def.kind,
+                        components,
+                    })
                 })
                 .collect()
         };

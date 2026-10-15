@@ -5401,11 +5401,10 @@ impl VersionStore {
         result
     }
 
-    /// The indexes a volume's side file holds entries for: each
-    /// single-column B-tree index on an INTEGER, TIMESTAMP or FLOAT column
-    /// other than the primary key, by identity. An index the catalog has not
-    /// issued an identity to is left out: nothing can be built or served
-    /// for it.
+    /// The indexes a volume's side file holds entries for, as `kind_for`
+    /// admits them, other than the primary key, by identity. An index the
+    /// catalog has not issued an identity to is left out: nothing can be
+    /// built or served for it.
     pub fn side_index_defs(&self) -> Vec<SideIndexDef> {
         let mut result = Vec::new();
         self.side_index_defs_into(&mut result);
@@ -5414,41 +5413,71 @@ impl VersionStore {
 
     /// The same definitions, into a buffer the caller keeps
     pub fn side_index_defs_into(&self, result: &mut Vec<SideIndexDef>) {
-        use crate::core::types::IndexType;
-        use crate::storage::volume::side_index::{Component, Domain, KeyKind};
         result.clear();
+        self.side_index_defs_in(result);
+        result.sort_unstable_by_key(|def| def.identity);
+    }
+
+    /// The same definitions handed to `each` one at a time, in no order,
+    /// once the index locks are let go; a table of four such indexes or
+    /// fewer collects them on the stack
+    pub fn for_each_side_index_def(&self, mut each: impl FnMut(SideIndexDef)) {
+        let mut defs: smallvec::SmallVec<[SideIndexDef; 4]> = smallvec::SmallVec::new();
+        self.side_index_defs_in(&mut defs);
+        for def in defs {
+            each(def);
+        }
+    }
+
+    /// The definitions, added to `out` under the index locks
+    fn side_index_defs_in(&self, out: &mut impl Extend<SideIndexDef>) {
+        use crate::core::types::IndexType;
+        use crate::storage::volume::side_index::{kind_for, Component, Domain};
         let schema = self.schema();
         let pk = schema.pk_column_index();
         let indexes = self.indexes.read();
         let identities = self.index_identities.read();
-        for (index_name, idx) in indexes.iter() {
-            if idx.index_type() != IndexType::BTree || idx.column_names().len() != 1 {
+        'indexes: for (index_name, idx) in indexes.iter() {
+            let index_type = idx.index_type();
+            if !matches!(
+                index_type,
+                IndexType::BTree | IndexType::Hash | IndexType::MultiColumn
+            ) {
                 continue;
             }
             let Some(&identity) = identities.get(index_name.as_str()) else {
                 continue;
             };
-            let name = &idx.column_names()[0];
-            let Some(column) = schema
-                .columns
-                .iter()
-                .position(|c| c.name_lower.eq_ignore_ascii_case(name))
-            else {
-                continue;
-            };
-            if pk == Some(column) {
+            let mut components: smallvec::SmallVec<[Component; 4]> = smallvec::SmallVec::new();
+            for name in idx.column_names() {
+                let Some(column) = schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name_lower.eq_ignore_ascii_case(name))
+                else {
+                    continue 'indexes;
+                };
+                let Some(domain) = Domain::of(schema.columns[column].data_type) else {
+                    continue 'indexes;
+                };
+                components.push(Component {
+                    column: column as u32,
+                    domain,
+                });
+            }
+            if components.len() == 1 && pk == Some(components[0].column as usize) {
                 continue;
             }
-            let Some(domain) = Domain::admitted(schema.columns[column].data_type) else {
+            let Some(kind) = kind_for(index_type, &components) else {
                 continue;
             };
-            result.push(SideIndexDef {
+            out.extend(std::iter::once(SideIndexDef {
                 identity,
-                components: smallvec![Component { column, domain }],
-                kind: KeyKind::OrderedI64,
-            });
+                components,
+                kind,
+                index_type,
+            }));
         }
-        result.sort_unstable_by_key(|def| def.identity);
     }
 
     // =========================================================================

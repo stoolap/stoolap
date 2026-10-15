@@ -4289,10 +4289,11 @@ impl Executor {
         else {
             return false;
         };
-        table
-            .side_index_defs()
-            .iter()
-            .any(|def| def.leading().is_some_and(|c| c.column == at))
+        // Only an ordered i64 entry answers a key probe
+        table.side_index_defs().iter().any(|def| {
+            def.kind == crate::storage::volume::side_index::KeyKind::OrderedI64
+                && def.leading().is_some_and(|c| c.column as usize == at)
+        })
     }
 
     /// Check if index-nested-loop should be preferred over anti-join for NOT EXISTS.

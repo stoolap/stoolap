@@ -27,6 +27,7 @@ use crate::storage::mvcc::version_store::HotCast;
 use crate::storage::traits::Index;
 use crate::storage::volume::manifest::{ColdSnapshot, SegmentManager, SegmentMeta};
 use crate::storage::volume::secondary::IndexFile;
+use crate::storage::volume::side_index::{kind_for, Component, Domain, SideTarget};
 use crate::storage::volume::writer::{self, ColumnMapping, FrozenVolume};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::PathBuf;
@@ -455,13 +456,27 @@ fn prepare_cold(
         .collect();
     // Taken under the old schema: an index whose column the change takes to
     // a type no side file holds covers no output
-    let identities: Vec<(usize, u64)> = store
+    let identities: Vec<SideTarget> = store
         .side_index_defs()
         .iter()
         .filter_map(|def| {
-            let column = def.leading()?.column;
-            crate::storage::volume::side_index::Domain::admitted(schema.columns[column].data_type)?;
-            Some((column, def.identity))
+            // The rewritten volume holds each column in its new type
+            let components: smallvec::SmallVec<[Component; 4]> = def
+                .components
+                .iter()
+                .map(|c| {
+                    let domain = Domain::of(schema.columns[c.column as usize].data_type)?;
+                    Some(Component { domain, ..*c })
+                })
+                .collect::<Option<_>>()?;
+            Some(SideTarget {
+                identity: def.identity,
+                kind: kind_for(def.index_type, &components)?,
+                components: components
+                    .iter()
+                    .map(|c| (c.column as usize, c.domain))
+                    .collect(),
+            })
         })
         .collect();
     let unversioned = mgr.has_unversioned_renames();
@@ -547,7 +562,7 @@ fn rewrite_volume(
     source_schema_version: u64,
     source_meta: Option<&SegmentMeta>,
     unique: &[Vec<usize>],
-    identities: &[(usize, u64)],
+    identities: &[SideTarget],
     compress: bool,
 ) -> Result<Rewrite> {
     let mapping = writer::compute_rewrite_mapping(
