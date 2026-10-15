@@ -1112,11 +1112,11 @@ impl MVCCTable {
                     continue;
                 }
 
-                // Range query - but skip Hash indexes (they don't support range queries)
+                // Range query - but skip Hash and Bitmap indexes (they don't support range queries)
                 if min_val.is_some() || max_val.is_some() {
-                    // Hash indexes don't support range queries - skip them
-                    // and let the query fall back to a full scan
-                    if matches!(index.index_type(), IndexType::Hash) {
+                    // They answer a range with no ids, which reads as no
+                    // match: skip them and let the query fall back to a scan
+                    if matches!(index.index_type(), IndexType::Hash | IndexType::Bitmap) {
                         continue;
                     }
 
