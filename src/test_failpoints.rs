@@ -2126,6 +2126,18 @@ pub(crate) fn text_probe_key_held(bytes: usize) {
     TEXT_PROBE_KEY_BYTES.fetch_max(bytes, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Process-wide: rows a volume scanner built for its filter
+static ROWS_MATERIALIZED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Rows a volume scanner built for its filter, so far
+pub fn rows_materialized() -> usize {
+    ROWS_MATERIALIZED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn row_materialized() {
+    ROWS_MATERIALIZED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Process-wide: side walks still to refuse when they take their reader
 static REFUSE_SIDE_WALKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 

@@ -42,6 +42,9 @@ enum TypedTarget {
     Int64(i64),
     Float64(f64),
     Bool(bool),
+    /// Compared with a dictionary row's string, byte by byte as the filter
+    /// does; boxed so the target stays as small as the numeric ones
+    Text(Box<crate::common::SmartString>),
 }
 
 /// A predicate that can be evaluated directly on typed column data.
@@ -902,6 +905,12 @@ impl VolumeScanner {
                 {
                     TypedTarget::Float64(*v as f64)
                 }
+                // A column the dictionary filter already checks by id is left to it
+                (Value::Text(s), crate::core::DataType::Text)
+                    if !self.dict_filters.iter().any(|&(ci, _)| ci == col_idx) =>
+                {
+                    TypedTarget::Text(Box::new(s.clone()))
+                }
                 _ => continue,
             };
             self.typed_predicates.push(ColumnPredicate {
@@ -1022,6 +1031,20 @@ impl VolumeScanner {
                         _ => true,
                     }
                 }
+                // Only a dictionary column holds the strings; any other passes
+                TypedTarget::Text(target) if col.dict_ids().is_some() => {
+                    let val = col.get_str(local);
+                    match pred.op {
+                        crate::core::Operator::Eq => val == target.as_str(),
+                        crate::core::Operator::Ne => val != target.as_str(),
+                        crate::core::Operator::Gt => val > target.as_str(),
+                        crate::core::Operator::Gte => val >= target.as_str(),
+                        crate::core::Operator::Lt => val < target.as_str(),
+                        crate::core::Operator::Lte => val <= target.as_str(),
+                        _ => true,
+                    }
+                }
+                TypedTarget::Text(_) => true,
             };
             if !matches {
                 return Ok(false);
@@ -1256,6 +1279,8 @@ impl VolumeScanner {
     /// rejects the row.
     #[inline(always)]
     fn materialize_row(&mut self, idx: usize) -> Result<bool> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::row_materialized();
         if self.group_cache.is_some() {
             return self.materialize_row_from_cache(idx);
         }
