@@ -2108,8 +2108,13 @@ impl Executor {
                 let outer_tables = vec![table_name.to_string()];
 
                 // Try EXISTS semi-join optimization
-                let exists_optimized =
-                    self.try_optimize_exists_to_semi_join(where_clause, ctx, &outer_tables, None)?;
+                let exists_optimized = self.try_optimize_exists_to_semi_join(
+                    where_clause,
+                    ctx,
+                    &outer_tables,
+                    None,
+                    None,
+                )?;
 
                 // Try IN semi-join optimization (on EXISTS result or original)
                 let expr_for_in = exists_optimized.as_ref().unwrap_or(where_clause.as_ref());
@@ -2910,8 +2915,13 @@ impl Executor {
                 let outer_tables = vec![table_name.to_string()];
 
                 // Try EXISTS semi-join optimization
-                let exists_optimized =
-                    self.try_optimize_exists_to_semi_join(where_clause, ctx, &outer_tables, None)?;
+                let exists_optimized = self.try_optimize_exists_to_semi_join(
+                    where_clause,
+                    ctx,
+                    &outer_tables,
+                    None,
+                    None,
+                )?;
 
                 // Try IN semi-join optimization (on EXISTS result or original)
                 let expr_for_in = exists_optimized.as_ref().unwrap_or(where_clause.as_ref());

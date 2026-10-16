@@ -4224,10 +4224,11 @@ impl Executor {
     /// - Index lookup gets candidate row_ids for correlation
     /// - Rows are fetched in batches and predicate is evaluated with early exit
     /// - This is O(LIMIT × avg_rows_per_key × predicate_selectivity) which is still efficient
-    fn should_use_index_nested_loop(
+    pub(crate) fn should_use_index_nested_loop(
         &self,
         info: &SemiJoinInfo,
         outer_limit: Option<i64>,
+        outer_rows: Option<usize>,
         ctx: &ExecutionContext,
     ) -> bool {
         // Use index-nested-loop for small LIMIT queries WITHOUT additional predicates.
@@ -4254,20 +4255,23 @@ impl Executor {
         }
 
         // For pure correlation (no additional predicate), check if index NL is worth it
-        if let Some(limit) = outer_limit {
-            if limit > 0 && limit <= SMALL_LIMIT_THRESHOLD {
-                return self
-                    .with_correlated_probe_table(ctx, &info.inner_table, |table| {
-                        Ok(Some(Self::exists_probes(table, &info.inner_column)))
-                    })
-                    .ok()
-                    .flatten()
-                    .unwrap_or(false);
-            }
+        let small_limit =
+            outer_limit.is_some_and(|limit| limit > 0 && limit <= SMALL_LIMIT_THRESHOLD);
+        if !small_limit && outer_rows.is_none() {
+            return false;
         }
-
-        // For larger queries or no index, use semi-join
-        false
+        // A probe per outer row costs about what the semi-join pays for
+        // fourteen inner rows
+        self.with_correlated_probe_table(ctx, &info.inner_table, |table| {
+            let few_outer =
+                outer_rows.is_some_and(|rows| rows.saturating_mul(16) <= table.row_count_hint());
+            Ok(Some(
+                (small_limit || few_outer) && Self::exists_probes(table, &info.inner_column),
+            ))
+        })
+        .ok()
+        .flatten()
+        .unwrap_or(false)
     }
 
     /// Whether an EXISTS on `column` probes the table the statement sees
@@ -4393,6 +4397,8 @@ impl Executor {
             }
         }
 
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::inner_table_read_whole();
         // Build SELECT inner_column FROM inner_table WHERE non_correlated_predicates
         // Use dummy_token_clone() to avoid allocations - token literal is not used during execution
         let inner_col_expr = Expression::Identifier(Identifier::new(
@@ -4488,6 +4494,32 @@ impl Executor {
         }
     }
 
+    /// The inner rows of a NOT EXISTS anti-join, read through the statement's
+    /// own view of the inner table with `inner_filter` applied, and the
+    /// position of the correlation column. None when the statement cannot read
+    /// the inner name as a table that way
+    pub(crate) fn anti_join_inner_rows(
+        &self,
+        info: &SemiJoinInfo,
+        inner_filter: Option<&dyn crate::storage::expression::Expression>,
+        ctx: &ExecutionContext,
+    ) -> Result<Option<(crate::core::RowVec, usize)>> {
+        self.with_correlated_probe_table(ctx, &info.inner_table, |table| {
+            let column = info.inner_column.to_lowercase();
+            let Some(at) = table
+                .schema()
+                .column_names_lower_arc()
+                .iter()
+                .position(|c| c == &column)
+            else {
+                return Ok(None);
+            };
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::inner_table_read_whole();
+            Ok(Some((table.collect_all_rows(inner_filter)?, at)))
+        })
+    }
+
     /// Execute NOT EXISTS as a true anti-join using HashJoinOperator.
     ///
     /// This is more efficient than the InHashSet approach because:
@@ -4500,7 +4532,8 @@ impl Executor {
     /// * `info` - SemiJoinInfo extracted from the NOT EXISTS subquery
     /// * `outer_rows` - Pre-materialized outer table rows
     /// * `outer_columns` - Column names for outer table
-    /// * `_ctx` - Execution context (not used but kept for API consistency)
+    /// * `inner_all_rows` - The inner rows, from `anti_join_inner_rows`
+    /// * `inner_key_source_idx` - The correlation column's position in them
     ///
     /// # Returns
     /// Rows from outer table that have NO match in inner table (anti-join result)
@@ -4509,35 +4542,9 @@ impl Executor {
         info: &SemiJoinInfo,
         outer_rows: CompactArc<Vec<crate::core::Row>>,
         outer_columns: &[String],
-        inner_filter: Option<&dyn crate::storage::expression::Expression>,
-        _ctx: &ExecutionContext,
+        inner_all_rows: crate::core::RowVec,
+        inner_key_source_idx: usize,
     ) -> Result<crate::core::RowVec> {
-        // Direct table access - much faster than going through execute_select
-        let txn = self.engine.begin_transaction()?;
-        let inner_table = txn.get_statement_table(&info.inner_table)?;
-
-        // Get inner table rows with filter pushed down to storage layer
-        let inner_all_rows = inner_table.collect_all_rows(inner_filter)?;
-
-        // Find the inner column index for join key extraction
-        // Use schema's cached lowercase column names to avoid computing to_lowercase()
-        let inner_schema = inner_table.schema();
-        let inner_columns = inner_schema.column_names_arc();
-        let inner_columns_lower = inner_schema.column_names_lower_arc();
-
-        let inner_key_source_idx = {
-            let search_col = info.inner_column.to_lowercase();
-            inner_columns_lower
-                .iter()
-                .position(|c| c == &search_col)
-                .ok_or_else(|| {
-                    Error::internal(format!(
-                        "Anti-join inner key column '{}' not found in table columns: {:?}",
-                        info.inner_column, inner_columns
-                    ))
-                })?
-        };
-
         // Extract only the join key values (deduplicated) and convert to single-column rows
         // Use a HashSet for deduplication to minimize the build side
         // Cap initial capacity to avoid over-allocation when many rows have few unique keys
@@ -4713,19 +4720,21 @@ impl Executor {
     /// The `outer_limit` parameter helps decide between strategies:
     /// - With small LIMIT + index: prefer index-nested-loop (per-row probing with early termination)
     /// - Without LIMIT: prefer semi-join (scan inner once, hash lookup per outer row)
+    /// - With `outer_rows` few against the inner table's: prefer index-nested-loop
     pub fn try_optimize_exists_to_semi_join(
         &self,
         expr: &Expression,
         ctx: &ExecutionContext,
         outer_tables: &[String],
         outer_limit: Option<i64>,
+        outer_rows: Option<usize>,
     ) -> Result<Option<Expression>> {
         match expr {
             Expression::Exists(exists) => {
                 if let Some(info) = Self::try_extract_semi_join_info(exists, false, outer_tables) {
                     // Check if index-nested-loop would be more efficient
                     // (index exists + no additional predicates, OR index exists + small LIMIT)
-                    if self.should_use_index_nested_loop(&info, outer_limit, ctx) {
+                    if self.should_use_index_nested_loop(&info, outer_limit, outer_rows, ctx) {
                         return Ok(None); // Skip semi-join, use index probing per row
                     }
                     // Semi-join optimization: execute inner query once, collect into hash set
@@ -4745,7 +4754,7 @@ impl Executor {
                     if let Some(info) = Self::try_extract_semi_join_info(exists, true, outer_tables)
                     {
                         // Check if index-nested-loop would be more efficient
-                        if self.should_use_index_nested_loop(&info, outer_limit, ctx) {
+                        if self.should_use_index_nested_loop(&info, outer_limit, outer_rows, ctx) {
                             return Ok(None); // Skip semi-join, use index probing per row
                         }
                         let hash_set = self.execute_semi_join_optimization(&info, ctx)?;
@@ -4766,12 +4775,14 @@ impl Executor {
                     ctx,
                     outer_tables,
                     outer_limit,
+                    outer_rows,
                 )?;
                 let right_opt = self.try_optimize_exists_to_semi_join(
                     &infix.right,
                     ctx,
                     outer_tables,
                     outer_limit,
+                    outer_rows,
                 )?;
 
                 match (left_opt, right_opt) {
@@ -4810,12 +4821,14 @@ impl Executor {
                     ctx,
                     outer_tables,
                     outer_limit,
+                    outer_rows,
                 )?;
                 let right_opt = self.try_optimize_exists_to_semi_join(
                     &infix.right,
                     ctx,
                     outer_tables,
                     outer_limit,
+                    outer_rows,
                 )?;
 
                 match (left_opt, right_opt) {
