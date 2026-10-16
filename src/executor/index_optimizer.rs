@@ -1342,11 +1342,18 @@ impl Executor {
             if let Some(err) = result.last_error() {
                 return Err(err);
             }
-            // A negated set holding a NULL keeps no row, which the rows
-            // outside the set cannot say; the evaluator answers that. A
-            // cached list never holds one, so only a fresh list is asked
+            // NOT IN a set holding NULL is TRUE for no row, and the IN is a top-level conjunct
             if is_negated && has_null {
-                return Ok(None);
+                let output_columns = CompactArc::new(self.get_output_column_names(
+                    &stmt.columns,
+                    all_columns,
+                    table_alias,
+                ));
+                let result = ExecutorResult::with_arc_columns(
+                    CompactArc::clone(&output_columns),
+                    RowVec::new(),
+                );
+                return Ok(Some((Box::new(result), output_columns, true)));
             }
             // Cache for future use
             if let Some((key, stamp)) = cache_slot {
