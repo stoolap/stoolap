@@ -308,6 +308,7 @@ impl Program {
                 | Op::Regexp(_)
                 | Op::InSet(_)
                 | Op::NotInSet(_)
+                | Op::QuantifiedSet(_)
                 | Op::Cast(_)
                 | Op::ReadAsColumn(_)
                 | Op::TruncateToDate

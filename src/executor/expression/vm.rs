@@ -1417,6 +1417,12 @@ impl ExprVM {
                     pc += 1;
                 }
 
+                Op::QuantifiedSet(set) => {
+                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    self.stack.push(truth(set.answer(&v)));
+                    pc += 1;
+                }
+
                 Op::Between => {
                     let high = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let low = self.stack.pop().unwrap_or_else(Value::null_unknown);

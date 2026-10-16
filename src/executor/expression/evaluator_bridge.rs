@@ -204,6 +204,16 @@ fn hash_expression<H: std::hash::Hasher>(expr: &Expression, hasher: &mut H) {
                 v.hash(hasher);
             }
         }
+        Expression::QuantifiedSet(quantified) => {
+            quantified.operator.hash(hasher);
+            quantified.all.hash(hasher);
+            quantified.has_null.hash(hasher);
+            hash_expression(&quantified.left, hasher);
+            quantified.members.len().hash(hasher);
+            for v in quantified.members.iter() {
+                v.hash(hasher);
+            }
+        }
         Expression::Between(between) => {
             between.not.hash(hasher);
             hash_expression(&between.expr, hasher);
@@ -1904,6 +1914,16 @@ impl<'a> CompiledEvaluator<'a> {
                     members
                 };
                 for value in members {
+                    value.hash(hasher);
+                }
+            }
+            Expression::QuantifiedSet(quantified) => {
+                quantified.operator.hash(hasher);
+                quantified.all.hash(hasher);
+                quantified.has_null.hash(hasher);
+                Self::hash_expression(&quantified.left, hasher);
+                quantified.members.len().hash(hasher);
+                for value in quantified.members.iter() {
                     value.hash(hasher);
                 }
             }

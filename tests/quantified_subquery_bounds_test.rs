@@ -146,3 +146,61 @@ fn test_numeric_members_keep_their_answers() {
         assert_eq!(tri(&db, predicate), expected, "{predicate} over 2^53, 1.5");
     }
 }
+
+#[test]
+fn test_a_left_value_of_another_type_reads_each_member_by_the_contract() {
+    let db = setup("quantified_timestamp_left");
+    members(&db, "INTEGER", &["9", "10"]);
+    let left = "CAST('2025-01-01' AS TIMESTAMP)";
+    for (op, quantifier, joined) in [
+        ("<", "ANY", "OR"),
+        ("<", "ALL", "AND"),
+        (">", "ANY", "OR"),
+        (">", "ALL", "AND"),
+    ] {
+        let quantified = format!("{left} {op} {quantifier} (SELECT v FROM m)");
+        let one_by_one = format!("({left} {op} 9) {joined} ({left} {op} 10)");
+        assert_eq!(
+            tri(&db, &quantified),
+            tri(&db, &one_by_one),
+            "{quantified} answers as {one_by_one}"
+        );
+    }
+}
+
+#[test]
+fn test_a_large_text_set_compares_without_a_deep_expression() {
+    let db = setup("quantified_large_text");
+    db.execute("CREATE TABLE m (id INTEGER PRIMARY KEY, v TEXT)", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO m SELECT value, CAST(value AS TEXT) FROM generate_series(1, 50000)",
+        (),
+    )
+    .unwrap();
+    assert_eq!(tri(&db, "0 < ANY (SELECT v FROM m)"), Some(true));
+    assert_eq!(tri(&db, "0 > ALL (SELECT v FROM m)"), Some(false));
+    assert_eq!(tri(&db, "50001 > ALL (SELECT v FROM m)"), Some(true));
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_the_left_value_is_evaluated_once_per_row() {
+    let db = setup("quantified_volatile_left");
+    // RANDOM() is never below '0', so the second member is reached too
+    members(&db, "TEXT", &["'0'", "'2'"]);
+    let draws = stoolap::test_failpoints::random_draws();
+    let found = db
+        .query(
+            "SELECT id FROM one WHERE RANDOM() < ANY (SELECT v FROM m)",
+            (),
+        )
+        .unwrap()
+        .count();
+    assert_eq!(found, 1, "RANDOM() is below '2'");
+    assert_eq!(
+        stoolap::test_failpoints::random_draws() - draws,
+        1,
+        "one draw for the one row, compared with every member"
+    );
+}

@@ -7767,6 +7767,7 @@ impl Executor {
             E::Distinct(d) => Self::filter_has_subquery(&d.expr),
             E::In(i) => Self::filter_has_subquery(&i.left) || Self::filter_has_subquery(&i.right),
             E::InHashSet(i) => Self::filter_has_subquery(&i.column),
+            E::QuantifiedSet(q) => Self::filter_has_subquery(&q.left),
             E::Between(b) => {
                 Self::filter_has_subquery(&b.expr)
                     || Self::filter_has_subquery(&b.lower)

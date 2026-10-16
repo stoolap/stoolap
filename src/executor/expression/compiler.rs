@@ -31,7 +31,7 @@ use crate::common::SmartString;
 use crate::common::StringMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::ops::{CompareOp, CompiledPattern, IntervalStep, IntervalUnit, Op};
+use super::ops::{CompareOp, CompiledPattern, IntervalStep, IntervalUnit, Op, QuantifiedMembers};
 use super::program::{Program, ProgramBuilder};
 use super::vm::{ExecuteContext, ExprVM};
 use crate::core::predicate::PredicateSet;
@@ -644,6 +644,30 @@ impl<'a> ExprCompiler<'a> {
                 } else {
                     builder.emit(Op::InSet(set));
                 }
+            }
+
+            Expression::QuantifiedSet(quantified) => {
+                let op = match quantified.operator.as_str() {
+                    "=" => CompareOp::Eq,
+                    "<>" | "!=" => CompareOp::Ne,
+                    "<" => CompareOp::Lt,
+                    "<=" => CompareOp::Le,
+                    ">" => CompareOp::Gt,
+                    ">=" => CompareOp::Ge,
+                    other => {
+                        return Err(CompileError::UnsupportedExpression(format!(
+                            "{} ANY or ALL",
+                            other
+                        )))
+                    }
+                };
+                self.compile_expr(&quantified.left, builder)?;
+                builder.emit(Op::QuantifiedSet(CompactArc::new(QuantifiedMembers::new(
+                    op,
+                    quantified.all,
+                    CompactArc::clone(&quantified.members),
+                    quantified.has_null,
+                ))));
             }
 
             // === BETWEEN EXPRESSION ===

@@ -80,6 +80,8 @@ pub enum Expression {
     /// Pre-computed IN expression with HashSet (for semi-join optimization)
     /// Uses Arc for cheap cloning in parallel execution
     InHashSet(InHashSetExpression),
+    /// `x op ANY` or `x op ALL` over a subquery's members, read once
+    QuantifiedSet(Box<QuantifiedSetExpression>),
     /// BETWEEN expression
     Between(BetweenExpression),
     /// LIKE expression (with optional ESCAPE clause)
@@ -138,6 +140,7 @@ impl fmt::Display for Expression {
             Expression::AllAny(e) => write!(f, "{}", e),
             Expression::In(e) => write!(f, "{}", e),
             Expression::InHashSet(e) => write!(f, "{}", e),
+            Expression::QuantifiedSet(e) => write!(f, "{}", e),
             Expression::Between(e) => write!(f, "{}", e),
             Expression::Like(e) => write!(f, "{}", e),
             Expression::ScalarSubquery(e) => write!(f, "{}", e),
@@ -181,6 +184,7 @@ impl Expression {
             Expression::AllAny(e) => e.token.position,
             Expression::In(e) => e.token.position,
             Expression::InHashSet(e) => e.token.position,
+            Expression::QuantifiedSet(e) => e.token.position,
             Expression::Between(e) => e.token.position,
             Expression::Like(e) => e.token.position,
             Expression::ScalarSubquery(e) => e.token.position,
@@ -754,6 +758,47 @@ impl fmt::Display for InHashSetExpression {
         } else {
             write!(f, "{} IN (<{} values>)", self.column, self.values.len())
         }
+    }
+}
+
+/// `left op ANY` or `left op ALL` over members a subquery yielded: the left
+/// value is evaluated once and compared with each member by the comparison
+/// contract, so the expression stays one node however many members there are
+#[derive(Debug, Clone)]
+pub struct QuantifiedSetExpression {
+    pub token: Token,
+    pub left: Box<Expression>,
+    /// One of `<`, `<=`, `>`, `>=`, `=`, `<>`
+    pub operator: SmartString,
+    /// ALL rather than ANY
+    pub all: bool,
+    /// The members other than NULL
+    pub members: CompactArc<Vec<crate::core::Value>>,
+    /// Whether the subquery also yielded a NULL
+    pub has_null: bool,
+}
+
+impl PartialEq for QuantifiedSetExpression {
+    fn eq(&self, other: &Self) -> bool {
+        self.all == other.all
+            && self.has_null == other.has_null
+            && self.operator == other.operator
+            && CompactArc::ptr_eq(&self.members, &other.members)
+            && self.left == other.left
+    }
+}
+
+impl fmt::Display for QuantifiedSetExpression {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let quantifier = if self.all { "ALL" } else { "ANY" };
+        write!(
+            f,
+            "{} {} {} (<{} values>)",
+            self.left,
+            self.operator,
+            quantifier,
+            self.members.len() + usize::from(self.has_null)
+        )
     }
 }
 

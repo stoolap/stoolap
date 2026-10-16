@@ -2259,6 +2259,9 @@ impl Executor {
             Expression::InHashSet(in_set) => {
                 self.count_cte_references_in_expr(&in_set.column, ref_counts);
             }
+            Expression::QuantifiedSet(quantified) => {
+                self.count_cte_references_in_expr(&quantified.left, ref_counts);
+            }
             Expression::ValuesSource(values) => {
                 for value in values.rows.iter().flatten() {
                     self.count_cte_references_in_expr(value, ref_counts);
