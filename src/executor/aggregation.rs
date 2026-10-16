@@ -4704,8 +4704,8 @@ impl Executor {
                                     // Check FILTER clause first - skip row if filter is false
                                     if let Some(ref filter_program) = compiled_filters[i] {
                                         if let Some(ref mut vm) = expr_vm {
-                                            match vm.execute_cow(filter_program, &exec_ctx) {
-                                                Ok(Value::Boolean(true)) => {}
+                                            match vm.execute_cow(filter_program, &exec_ctx)? {
+                                                Value::Boolean(true) => {}
                                                 _ => continue,
                                             }
                                         } else {

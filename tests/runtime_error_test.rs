@@ -77,6 +77,14 @@ fn a_runtime_error_in_a_select_fails_it_wherever_it_sits() {
         format!("SELECT g, SUM({BIG} + n) FROM v GROUP BY ROLLUP(g)"),
         format!("SELECT g, COUNT(*) FILTER (WHERE {BIG} + n > 0) FROM v GROUP BY ROLLUP(g)"),
         format!("SELECT COUNT(*) FROM v GROUP BY ROLLUP({BIG} + n)"),
+        format!(
+            "SELECT g, COUNT(*) FILTER (WHERE {BIG} + n > 0) FROM v GROUP BY GROUPING SETS ((g))"
+        ),
+        format!("SELECT g, SUM({BIG} + n) FROM v GROUP BY GROUPING SETS ((g))"),
+        format!("SELECT ROW_NUMBER() OVER (), {BIG} + n FROM v"),
+        format!("SELECT {BIG} + ROW_NUMBER() OVER () FROM v"),
+        format!("SELECT ROW_NUMBER() OVER (ORDER BY {BIG} + n) FROM v"),
+        format!("SELECT ROW_NUMBER() OVER (PARTITION BY {BIG} + n) FROM v"),
         format!("SELECT STRING_AGG(CAST(n AS TEXT), ',' ORDER BY {BIG} + n) FROM v"),
         format!("SELECT g, STRING_AGG(CAST(n AS TEXT), ',' ORDER BY {BIG} + n) FROM v GROUP BY g"),
         format!("SELECT SUM({BIG} + n) OVER () FROM v"),
@@ -218,6 +226,28 @@ fn a_runtime_error_in_a_write_fails_it_and_changes_no_row() {
         got => wrong.push(format!(
             "an upsert whose CHECK fails to evaluate left {got:?}"
         )),
+    }
+    // A failing DEFAULT runs only for a column the INSERT leaves out
+    for (n, sql) in [
+        "INSERT INTO d (id, x) VALUES (10, 7)",
+        "INSERT INTO d (id, x) VALUES (11, 7), (12, 8)",
+        "INSERT INTO d (id, x) VALUES (10, 7) ON DUPLICATE KEY UPDATE x = 9",
+        "INSERT INTO d (id, x) SELECT id + 20, n FROM v",
+        "INSERT INTO d (id, x) VALUES (30, 7)",
+        "INSERT INTO d (id, x) VALUES (31, 7)",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if let Err(e) = db.execute(sql, ()) {
+            wrong.push(format!("{n}: {sql}: {e}, want it to succeed"));
+        }
+    }
+    if db
+        .execute("INSERT INTO d (id, x) VALUES (40, DEFAULT)", ())
+        .is_ok()
+    {
+        wrong.push("an explicit DEFAULT that fails: succeeded".to_string());
     }
     assert!(
         wrong.is_empty(),

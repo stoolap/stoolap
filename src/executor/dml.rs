@@ -736,6 +736,11 @@ impl Executor {
                     .collect();
             }
         }
+        // Columns the INSERT names; only the rest run their defaults
+        let mut provided = vec![false; schema_column_count];
+        for &idx in &column_indices {
+            provided[idx] = true;
+        }
 
         // Pre-compute FK info for parent validation (CompactArc ref-count bump, not deep clone)
         let fk_schema = if !table.schema().foreign_keys.is_empty() {
@@ -810,13 +815,17 @@ impl Executor {
                 // This matches the behavior of regular INSERT
                 let mut row_values = Vec::with_capacity(schema_column_count);
                 for i in 0..schema_column_count {
-                    row_values.push(match &default_programs[i] {
-                        // Non-literal defaults run per row (RANDOM() must
-                        // differ per row); constant defaults clone
-                        Some((program, target)) => vm
-                            .execute_cow(program, &base_exec_ctx)?
-                            .into_coerce_to_type(*target),
-                        None => default_values[i].clone(),
+                    // A named column is filled below; a default it would
+                    // replace must not run, so it cannot fail the row
+                    row_values.push(if provided[i] {
+                        Value::null_unknown()
+                    } else {
+                        eval_default_slot(
+                            &mut vm,
+                            &base_exec_ctx,
+                            &default_programs[i],
+                            &default_values[i],
+                        )?
                     });
                 }
 
@@ -1084,19 +1093,30 @@ impl Executor {
                 // Build row values - need Vec for error handling paths
                 let mut row_values = Vec::with_capacity(schema_column_count);
                 for i in 0..schema_column_count {
-                    row_values.push(match &default_programs[i] {
-                        // Non-literal defaults run per row (RANDOM() must
-                        // differ per row); constant defaults clone
-                        Some((program, target)) => vm
-                            .execute_cow(program, &base_exec_ctx)?
-                            .into_coerce_to_type(*target),
-                        None => default_values[i].clone(),
+                    // A named column is filled below; a default it would
+                    // replace must not run, so it cannot fail the row
+                    row_values.push(if provided[i] {
+                        Value::null_unknown()
+                    } else {
+                        eval_default_slot(
+                            &mut vm,
+                            &base_exec_ctx,
+                            &default_programs[i],
+                            &default_values[i],
+                        )?
                     });
                 }
                 // Fill in provided values using pre-computed indices with type coercion
                 for (i, expr) in value_row.iter().enumerate() {
-                    // Handle DEFAULT keyword - skip this column to use pre-initialized default
+                    // DEFAULT keyword: the column's default, run now
                     if matches!(expr, Expression::Default(_)) {
+                        let idx = column_indices[i];
+                        row_values[idx] = eval_default_slot(
+                            &mut vm,
+                            &base_exec_ctx,
+                            &default_programs[idx],
+                            &default_values[idx],
+                        )?;
                         continue;
                     }
                     // OPTIMIZATION: Try to extract literal value directly without VM compilation
@@ -1284,20 +1304,31 @@ impl Executor {
                 // Build row values - initialize with DEFAULT values for missing columns
                 let mut row_values = Vec::with_capacity(schema_column_count);
                 for i in 0..schema_column_count {
-                    row_values.push(match &default_programs[i] {
-                        // Non-literal defaults run per row (RANDOM() must
-                        // differ per row); constant defaults clone
-                        Some((program, target)) => vm
-                            .execute_cow(program, &base_exec_ctx)?
-                            .into_coerce_to_type(*target),
-                        None => default_values[i].clone(),
+                    // A named column is filled below; a default it would
+                    // replace must not run, so it cannot fail the row
+                    row_values.push(if provided[i] {
+                        Value::null_unknown()
+                    } else {
+                        eval_default_slot(
+                            &mut vm,
+                            &base_exec_ctx,
+                            &default_programs[i],
+                            &default_values[i],
+                        )?
                     });
                 }
 
                 // Fill in provided values using pre-computed indices with type coercion
                 for (i, expr) in value_row.iter().enumerate() {
-                    // Handle DEFAULT keyword - skip this column to use pre-initialized default
+                    // DEFAULT keyword: the column's default, run now
                     if matches!(expr, Expression::Default(_)) {
+                        let idx = column_indices[i];
+                        row_values[idx] = eval_default_slot(
+                            &mut vm,
+                            &base_exec_ctx,
+                            &default_programs[idx],
+                            &default_values[idx],
+                        )?;
                         continue;
                     }
                     // OPTIMIZATION: Try to extract literal value directly without VM compilation
