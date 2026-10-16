@@ -4845,22 +4845,43 @@ impl Executor {
                             } else {
                                 right_alias.as_deref().unwrap_or(&table_name)
                             };
-                            // A literal list, which the IN list path reads before
-                            // a large table's scan streams; integer keys only, the
-                            // literals the list builder writes exactly
+                            // A literal list for the IN list path: integer keys narrow
+                            // any column, others only one of their own type, NaN none
+                            let mut inner_type = None;
+                            let mut inner_type = || {
+                                *inner_type.get_or_insert_with(|| {
+                                    let inner_expr = if swapped {
+                                        &join_source.left
+                                    } else {
+                                        &join_source.right
+                                    };
+                                    let name = inner_col.rsplit('.').next().unwrap_or(&inner_col);
+                                    self.base_table_side_schema(inner_expr, ctx)
+                                        .and_then(|schema| schema.get_column_type(name))
+                                })
+                            };
                             let keys = Self::find_column_index_by_name(&outer_col, &columns)
                                 .and_then(|idx| {
                                     let mut seen = ValueSet::default();
                                     let mut keys = Vec::new();
                                     for key in rows.iter().filter_map(|row| row.get(idx)) {
-                                        match key {
-                                            Value::Integer(_) => {
-                                                if seen.insert(key.clone()) {
-                                                    keys.push(key.clone());
-                                                }
+                                        let narrows = match key {
+                                            Value::Null(_) => continue,
+                                            Value::Integer(_) => true,
+                                            Value::Text(_) => inner_type() == Some(DataType::Text),
+                                            Value::Float(f) => {
+                                                !f.is_nan() && inner_type() == Some(DataType::Float)
                                             }
-                                            Value::Null(_) => {}
-                                            _ => return None,
+                                            Value::Timestamp(_) => {
+                                                inner_type() == Some(DataType::Timestamp)
+                                            }
+                                            _ => false,
+                                        };
+                                        if !narrows {
+                                            return None;
+                                        }
+                                        if seen.insert(key.clone()) {
+                                            keys.push(key.clone());
                                         }
                                     }
                                     Some(keys)
@@ -12148,9 +12169,9 @@ impl Executor {
         Self::in_list_expression(col_expr, values)
     }
 
-    /// `col_expr IN (values...)`, the values written as literals; None for
-    /// no values, or for a value no literal here writes exactly, such as a
-    /// timestamp, which would otherwise match nothing
+    /// `col_expr IN (values...)`, the values written as literals, a
+    /// timestamp as a typed one to the nanosecond; None for no values, or
+    /// for a value no literal here writes exactly
     fn in_list_expression(col_expr: Expression, values: &[Value]) -> Option<Expression> {
         if values.is_empty() {
             return None;
@@ -12175,6 +12196,14 @@ impl Executor {
                     value: s.as_str().into(),
                     type_hint: None,
                 }),
+                Value::Timestamp(t) => {
+                    let text = t.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+                    Expression::StringLiteral(StringLiteral {
+                        token: Token::new(TokenType::String, &text, Position::default()),
+                        value: text.as_str().into(),
+                        type_hint: Some("TIMESTAMP".into()),
+                    })
+                }
                 Value::Boolean(b) => Expression::BooleanLiteral(BooleanLiteral {
                     token: Token::new(
                         TokenType::Keyword,
