@@ -498,6 +498,26 @@ impl SegmentedTable {
         self.snapshot_seq.is_some() || self.view.is_some()
     }
 
+    /// Whether the hot store's index on `column`, the one its bounds read,
+    /// is a B-tree
+    fn hot_btree_on(&self, column: &str) -> bool {
+        self.hot
+            .get_index_on_column(column)
+            .is_some_and(|index| index.index_type() == IndexType::BTree)
+    }
+
+    /// Whether every row the volumes' zone maps count is a row they show:
+    /// no tombstone, dead copy, overlap or copy a newer volume hides
+    fn zone_maps_count_shown_rows(&self) -> bool {
+        self.segment_mgr.seal_overlap() == 0
+            && self.segment_mgr.is_tombstone_set_empty()
+            && !self.segment_mgr.has_dead_copies()
+            && self
+                .segment_mgr
+                .deduped_row_count()
+                .is_ok_and(|rows| rows == self.segment_mgr.total_row_count())
+    }
+
     /// Runs `read`, a shortcut over the newest committed state, while no
     /// commit publishes across it: one that moves a row between the hot and
     /// the sealed reads would tear the answer. Under a view, only while the
@@ -7028,9 +7048,16 @@ impl Table for SegmentedTable {
             if let Some(result) = self.unsealed(|hot| hot.get_index_min_value(column_name)) {
                 return result;
             }
+            // Only a B-tree gives the hot rows' bound
+            if !self.zone_maps_count_shown_rows() || !self.hot_btree_on(column_name) {
+                return None;
+            }
             let hot_min = self.hot.get_index_min_value(column_name);
             #[cfg(feature = "test-failpoints")]
-            crate::test_failpoints::index_bound_hot_read();
+            {
+                crate::test_failpoints::index_bound_hot_read();
+                crate::test_failpoints::hot_and_cold_reads_split();
+            }
             let segments = self.segment_mgr.segments_raw();
             let mut vol_min: Option<Value> = None;
             for cs in segments.values() {
@@ -7069,7 +7096,8 @@ impl Table for SegmentedTable {
                 (None, None) => None,
             }
         };
-        self.clear_of_destruction(|| Ok(read())).ok().flatten()
+        // A seal published between the hot and the volume reads repeats both
+        self.settled_across_seals(|| Ok(read())).ok().flatten()
     }
 
     fn get_index_max_value(&self, column_name: &str) -> Option<Value> {
@@ -7077,9 +7105,16 @@ impl Table for SegmentedTable {
             if let Some(result) = self.unsealed(|hot| hot.get_index_max_value(column_name)) {
                 return result;
             }
+            // Only a B-tree gives the hot rows' bound
+            if !self.zone_maps_count_shown_rows() || !self.hot_btree_on(column_name) {
+                return None;
+            }
             let hot_max = self.hot.get_index_max_value(column_name);
             #[cfg(feature = "test-failpoints")]
-            crate::test_failpoints::index_bound_hot_read();
+            {
+                crate::test_failpoints::index_bound_hot_read();
+                crate::test_failpoints::hot_and_cold_reads_split();
+            }
             let segments = self.segment_mgr.segments_raw();
             let mut vol_max: Option<Value> = None;
             for cs in segments.values() {
@@ -7089,6 +7124,10 @@ impl Table for SegmentedTable {
                 let pi = cs.mapping.volume_column(vol, column_name)?;
                 if pi >= vol.meta.zone_maps.len() {
                     continue;
+                }
+                // The zone map leaves NaN out, and a NaN would beat it
+                if vol.meta.nan_count(pi) != Some(0) {
+                    return None;
                 }
                 let zm_max = &vol.meta.zone_maps[pi].max;
                 if !zm_max.is_null() {
@@ -7118,7 +7157,8 @@ impl Table for SegmentedTable {
                 (None, None) => None,
             }
         };
-        self.clear_of_destruction(|| Ok(read())).ok().flatten()
+        // A seal published between the hot and the volume reads repeats both
+        self.settled_across_seals(|| Ok(read())).ok().flatten()
     }
 
     // =========================================================================

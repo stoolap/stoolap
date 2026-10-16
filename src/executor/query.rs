@@ -2583,6 +2583,16 @@ impl Executor {
         // - SELECT SUM(col), MIN(col), MAX(col) FROM table
         // Must check before any row collection happens
         if classification.has_aggregation && !classification.has_window_functions {
+            // MIN or MAX of an indexed column alone, with no WHERE or GROUP BY,
+            // reads the index's bound instead of every row
+            if !classification.has_where && !classification.has_group_by && stmt.having.is_none() {
+                if let Some((result, columns)) =
+                    self.try_min_max_index_optimization(stmt, &*table, &all_columns)?
+                {
+                    return Ok((result, columns, false, None));
+                }
+            }
+
             // First try global aggregation pushdown (no GROUP BY, no WHERE)
             if let Some(result) =
                 self.try_aggregation_pushdown(table.as_ref(), stmt, ctx, classification)?
@@ -2815,21 +2825,6 @@ impl Executor {
                     );
                     return Ok((Box::new(result), output_columns, true, None));
                 }
-            }
-        }
-
-        // FAST PATH: MIN/MAX index optimization
-        // For queries like `SELECT MIN(col) FROM table` or `SELECT MAX(col) FROM table`
-        // without WHERE or GROUP BY, use the index directly (O(1) instead of O(n))
-        if storage_expr.is_none()
-            && !needs_memory_filter
-            && !classification.has_group_by
-            && stmt.having.is_none()
-        {
-            if let Some((result, columns)) =
-                self.try_min_max_index_optimization(stmt, &*table, &all_columns)?
-            {
-                return Ok((result, columns, false, None));
             }
         }
 

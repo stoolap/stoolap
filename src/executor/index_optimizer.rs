@@ -165,6 +165,8 @@ impl Executor {
         }
 
         if let Some(val) = value {
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::min_max_index_answered();
             // Build result - wrap columns in CompactArc once for zero-copy sharing
             let col_name = alias.unwrap_or_else(|| format!("{}({})", func.function, column_name));
             let columns = CompactArc::new(vec![col_name]);

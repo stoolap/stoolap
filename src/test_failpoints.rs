@@ -1680,6 +1680,7 @@ thread_local! {
     static HOT_TOP_K_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ORDERED_VALUES_SORTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static INNER_TABLE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MIN_MAX_INDEX_ANSWERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static EQUALITY_CANDIDATE_IDS_COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static CORRELATED_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static BTREE_WALK_CHUNK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
@@ -2417,6 +2418,15 @@ pub fn ordered_values_sorted_count() -> usize {
 
 pub(crate) fn ordered_values_sorted(count: usize) {
     ORDERED_VALUES_SORTED.with(|n| n.set(n.get() + count));
+}
+
+/// MIN and MAX aggregates this thread answered from an index's bound, so far
+pub fn min_max_index_answers() -> usize {
+    MIN_MAX_INDEX_ANSWERS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn min_max_index_answered() {
+    MIN_MAX_INDEX_ANSWERS.with(|n| n.set(n.get() + 1));
 }
 
 /// Semi-join sets and anti-joins this thread built by reading the inner
