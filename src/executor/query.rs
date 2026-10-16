@@ -978,38 +978,30 @@ impl Executor {
                                     // A key the projection already put in a
                                     // column is read from it
                                     if let Some(idx) = try_map_to_column(ob) {
-                                        return row
+                                        return Ok(row
                                             .get(idx)
                                             .cloned()
-                                            .unwrap_or_else(Value::null_unknown);
+                                            .unwrap_or_else(Value::null_unknown));
                                     }
                                     // Try processing correlated subqueries first
                                     if Self::has_correlated_subqueries(&ob.expression) {
-                                        match self.process_correlated_expression(
+                                        let processed_expr = self.process_correlated_expression(
                                             &ob.expression,
                                             &correlated_ctx,
-                                        ) {
-                                            Ok(processed_expr) => {
-                                                let mut corr_eval =
-                                                    CompiledEvaluator::new(&self.function_registry);
-                                                corr_eval.init_columns(&columns);
-                                                corr_eval.set_row_array(row);
-                                                corr_eval = corr_eval.with_context(&correlated_ctx);
-                                                corr_eval
-                                                    .evaluate(&processed_expr)
-                                                    .unwrap_or(Value::null_unknown())
-                                            }
-                                            Err(_) => Value::null_unknown(),
-                                        }
+                                        )?;
+                                        let mut corr_eval =
+                                            CompiledEvaluator::new(&self.function_registry);
+                                        corr_eval.init_columns(&columns);
+                                        corr_eval.set_row_array(row);
+                                        corr_eval = corr_eval.with_context(&correlated_ctx);
+                                        corr_eval.evaluate(&processed_expr)
                                     } else {
-                                        evaluator
-                                            .evaluate(order_expr)
-                                            .unwrap_or_else(|_| Value::null_unknown())
+                                        evaluator.evaluate(order_expr)
                                     }
                                 })
-                                .collect()
+                                .collect::<Result<Vec<Value>>>()
                         })
-                        .collect()
+                        .collect::<Result<_>>()?
                 } else {
                     // A key the projection already put in a column is read
                     // from it: the row no longer carries what it was
@@ -1023,27 +1015,28 @@ impl Executor {
                         .order_by
                         .iter()
                         .zip(order_exprs.iter())
-                        .map(|(ob, order_expr)| match try_map_to_column(ob) {
-                            Some(idx) => (Some(idx), None),
-                            None => (None, evaluator.compile_cached(order_expr).ok()),
+                        .map(|(ob, order_expr)| {
+                            Ok(match try_map_to_column(ob) {
+                                Some(idx) => (Some(idx), None),
+                                None => (None, Some(evaluator.compile_cached(order_expr)?)),
+                            })
                         })
-                        .collect();
+                        .collect::<Result<_>>()?;
                     rows.iter()
                         .map(|(_, row)| {
                             key_sources
                                 .iter()
                                 .map(|source| match source {
-                                    (Some(idx), _) => {
-                                        row.get(*idx).cloned().unwrap_or_else(Value::null_unknown)
-                                    }
-                                    (None, Some(p)) => evaluator
-                                        .evaluate_program(p, row)
-                                        .unwrap_or_else(|_| Value::null_unknown()),
-                                    (None, None) => Value::null_unknown(),
+                                    (Some(idx), _) => Ok(row
+                                        .get(*idx)
+                                        .cloned()
+                                        .unwrap_or_else(Value::null_unknown)),
+                                    (None, Some(p)) => evaluator.evaluate_program(p, row),
+                                    (None, None) => Ok(Value::null_unknown()),
                                 })
-                                .collect()
+                                .collect::<Result<Vec<Value>>>()
                         })
-                        .collect()
+                        .collect::<Result<_>>()?
                 };
 
                 // Create indices and sort them based on sort_keys
@@ -9666,18 +9659,12 @@ impl Executor {
 
                 // Evaluate computed ORDER BY expressions
                 for expr in &computed_order_by {
-                    let value = evaluator
-                        .evaluate(expr)
-                        .unwrap_or_else(|_| Value::null_unknown());
-                    values.push(value);
+                    values.push(evaluator.evaluate(expr)?);
                 }
 
                 // Evaluate computed DISTINCT ON expressions
                 for expr in &computed_distinct_on {
-                    let value = evaluator
-                        .evaluate(expr)
-                        .unwrap_or_else(|_| Value::null_unknown());
-                    values.push(value);
+                    values.push(evaluator.evaluate(expr)?);
                 }
 
                 projected.push((row_id as i64, Row::from_values(values)));

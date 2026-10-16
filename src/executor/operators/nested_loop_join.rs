@@ -46,6 +46,8 @@ pub struct NestedLoopJoinOperator {
 
     // Compiled filter (created in open())
     filter: Option<JoinFilter>,
+    // Set when the filter read an error as false; JoinFilter::take_error has it
+    condition_failed: bool,
 
     // Output schema
     schema: Vec<ColumnInfo>,
@@ -104,6 +106,7 @@ impl NestedLoopJoinOperator {
             join_type,
             condition,
             filter: None,
+            condition_failed: false,
             schema,
             left_col_count,
             right_col_count,
@@ -125,6 +128,15 @@ impl NestedLoopJoinOperator {
     pub fn with_filter(mut self, filter: JoinFilter) -> Self {
         self.filter = Some(filter);
         self
+    }
+
+    /// Err with the first error the join condition read as false
+    #[inline]
+    fn filter_failed(&self) -> Result<()> {
+        match &self.filter {
+            Some(filter) if self.condition_failed => Err(filter.failure()),
+            _ => Ok(()),
+        }
     }
 
     /// Create a NULL row for the left side (uses cached values).
@@ -193,6 +205,10 @@ impl Operator for NestedLoopJoinOperator {
                 &right_cols,
                 global_registry(),
             )?);
+        }
+        // An error a join on this thread left behind is not this one's
+        if let Some(filter) = &self.filter {
+            let _ = filter.take_error();
         }
 
         // Materialize right side (inner loop must be restarted for each left row)
@@ -277,13 +293,14 @@ impl Operator for NestedLoopJoinOperator {
 
                 // Check join condition
                 let matches = if let Some(ref filter) = self.filter {
-                    filter.matches(left_row, right_row)
+                    filter.matches(left_row, right_row, &mut self.condition_failed)
                 } else {
                     // CROSS JOIN or no condition
                     is_cross || self.condition.is_none()
                 };
 
                 if matches {
+                    self.filter_failed()?;
                     self.left_had_match = true;
 
                     // Mark right row as matched for OUTER joins
@@ -297,6 +314,7 @@ impl Operator for NestedLoopJoinOperator {
             }
 
             // Exhausted right side for current left row
+            self.filter_failed()?;
             // Handle LEFT/FULL OUTER: emit left row with NULLs if no match
             if is_left_outer && !self.left_had_match {
                 let left_row = self.current_left_row.take().unwrap();

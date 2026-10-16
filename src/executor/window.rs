@@ -4019,8 +4019,8 @@ impl Executor {
             let mut eval =
                 ExpressionEval::compile(&wf_info.arguments[0], columns)?.with_context(ctx);
             rows.iter()
-                .map(|(_, row)| eval.eval(row).unwrap_or_else(|_| Value::null_unknown()))
-                .collect()
+                .map(|(_, row)| eval.eval(row))
+                .collect::<Result<_>>()?
         } else {
             vec![]
         };

@@ -1460,9 +1460,7 @@ impl PreparedProjection {
                 values.push(match output {
                     Output::Column(i) => row.get(*i).cloned().unwrap_or_else(Value::null_unknown),
                     Output::Program(program) => vm.execute(program, &exec)?,
-                    Output::Key(program) => vm
-                        .execute(program, &exec)
-                        .unwrap_or_else(|_| Value::null_unknown()),
+                    Output::Key(program) => vm.execute(program, &exec)?,
                     Output::AliasKey(_) => Value::null_unknown(),
                 });
             }
@@ -1476,9 +1474,7 @@ impl PreparedProjection {
                         ctx.transaction_id(),
                     );
                     exec.row2 = Some(&out);
-                    let key = vm
-                        .execute(program, &exec)
-                        .unwrap_or_else(|_| Value::null_unknown());
+                    let key = vm.execute(program, &exec)?;
                     out.set(position, key)?;
                 }
             }

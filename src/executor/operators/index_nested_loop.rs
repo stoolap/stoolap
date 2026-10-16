@@ -37,6 +37,16 @@ use smallvec::SmallVec;
 
 use super::hash_join::JoinType;
 
+/// Err with the first error the residual filter read as false, once
+/// `matches` set `failed`
+#[inline]
+fn residual_failed(filter: &Option<JoinFilter>, failed: bool) -> Result<()> {
+    match filter {
+        Some(filter) if failed => Err(filter.failure()),
+        _ => Ok(()),
+    }
+}
+
 /// Index Nested Loop Join lookup strategy.
 /// Determines how to find matching rows in the inner (right) table.
 #[derive(Clone)]
@@ -224,6 +234,8 @@ pub struct IndexNestedLoopJoinOperator {
 
     // Optional projection pushdown: create projected rows during combine
     projection: Option<JoinProjection>,
+    // Set when the residual filter read an error as false
+    condition_failed: bool,
 
     // Current state
     current_outer_row: Option<Row>,
@@ -359,6 +371,7 @@ impl IndexNestedLoopJoinOperator {
             schema,
             inner_col_count,
             projection: None,
+            condition_failed: false,
             current_outer_row: None,
             current_inner_rows: RowVec::new(),
             current_inner_idx: 0,
@@ -721,6 +734,10 @@ impl Operator for IndexNestedLoopJoinOperator {
             &self.lookup_strategy,
             self.inner_key_idx,
         );
+        // An error a join on this thread left behind is not this one's
+        if let Some(filter) = &self.residual_filter {
+            let _ = filter.take_error();
+        }
 
         // Get first outer row
         self.advance_outer()?;
@@ -761,13 +778,14 @@ impl Operator for IndexNestedLoopJoinOperator {
                     // SAFETY: inner_idx < inner_len checked by while condition
                     let inner_entry = unsafe { self.current_inner_rows.get_unchecked(inner_idx) };
                     if let Some(ref filter) = self.residual_filter {
-                        filter.matches(outer_row, &inner_entry.1)
+                        filter.matches(outer_row, &inner_entry.1, &mut self.condition_failed)
                     } else {
                         true
                     }
                 };
 
                 if passes_filter {
+                    residual_failed(&self.residual_filter, self.condition_failed)?;
                     self.outer_had_match = true;
                     // SAFETY: inner_idx < inner_len, bounds already checked
                     let inner_row = std::mem::take(unsafe {
@@ -798,6 +816,7 @@ impl Operator for IndexNestedLoopJoinOperator {
             }
 
             // Exhausted inner rows for current outer row
+            residual_failed(&self.residual_filter, self.condition_failed)?;
             // Handle LEFT OUTER: emit outer row with NULLs if no match
             if is_left_outer && !self.outer_had_match {
                 let outer_row = self.current_outer_row.take().unwrap();
@@ -1160,6 +1179,11 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
         // iterated directly (the old I64Map was built only to iterate)
         let mut matched_outers: Vec<bool> = vec![false; outer_rows.len()];
 
+        // An error a join on this thread left behind is not this one's
+        if let Some(filter) = &self.residual_filter {
+            let _ = filter.take_error();
+        }
+        let mut condition_failed = false;
         for (row_id, inner_row) in inner_rows_batch.iter() {
             if let Some(outer_indices) = key_to_outer_indices.get(*row_id) {
                 for &outer_idx in outer_indices {
@@ -1181,7 +1205,7 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
 
                     // Apply residual filter if present
                     let passes_filter = if let Some(ref filter) = self.residual_filter {
-                        filter.matches(outer_row, inner_row)
+                        filter.matches(outer_row, inner_row, &mut condition_failed)
                     } else {
                         true
                     };
@@ -1193,6 +1217,7 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
                 }
             }
         }
+        residual_failed(&self.residual_filter, condition_failed)?;
 
         // Handle LEFT OUTER JOIN - emit unmatched outer rows with NULLs
         if is_left_join {

@@ -882,14 +882,12 @@ impl JoinFilter {
         self
     }
 
-    /// Check if a pair of rows satisfies the join condition.
+    /// Check if a pair of rows satisfies the join condition. An error in it
+    /// reads as false, sets `failed` and is kept on this thread until
+    /// `take_error`
     #[inline]
-    pub fn matches(&self, left_row: &Row, right_row: &Row) -> bool {
-        thread_local! {
-            static VM: std::cell::RefCell<ExprVM> = std::cell::RefCell::new(ExprVM::new());
-        }
-
-        VM.with(|vm| {
+    pub fn matches(&self, left_row: &Row, right_row: &Row, failed: &mut bool) -> bool {
+        JOIN_VM.with(|vm| {
             let mut ctx = ExecuteContext::for_join(left_row, right_row);
 
             // Apply params if present (required for parameter placeholders like $1, $2)
@@ -904,12 +902,39 @@ impl JoinFilter {
             // Use try_borrow_mut to avoid panic on recursive calls (e.g., nested subqueries).
             // If the VM is already borrowed, create a temporary one for this call.
             if let Ok(mut borrowed_vm) = vm.try_borrow_mut() {
-                borrowed_vm.execute_bool(&self.program, &ctx)
+                let matched = borrowed_vm.execute_bool(&self.program, &ctx);
+                if borrowed_vm.has_bool_error() {
+                    *failed = true;
+                }
+                matched
             } else {
                 // Fallback: create a fresh VM for recursive calls
                 let mut temp_vm = ExprVM::new();
-                temp_vm.execute_bool(&self.program, &ctx)
+                let matched = temp_vm.execute_bool(&self.program, &ctx);
+                if let Some(e) = temp_vm.take_bool_error() {
+                    JOIN_FALLBACK_ERROR.with(|slot| {
+                        slot.borrow_mut().get_or_insert(e);
+                    });
+                    *failed = true;
+                }
+                matched
             }
+        })
+    }
+
+    /// The first error a condition on this thread read as false since the
+    /// last call. A join clears it when it opens
+    pub fn take_error(&self) -> Option<crate::core::Error> {
+        JOIN_FALLBACK_ERROR
+            .with(|slot| slot.borrow_mut().take())
+            .or_else(|| JOIN_VM.with(|vm| vm.try_borrow_mut().ok()?.take_bool_error()))
+    }
+
+    /// The error behind a `failed` flag that `matches` set
+    #[cold]
+    pub fn failure(&self) -> crate::core::Error {
+        self.take_error().unwrap_or_else(|| {
+            crate::core::Error::internal("a join condition failed without an error")
         })
     }
 
@@ -917,6 +942,14 @@ impl JoinFilter {
     pub fn program(&self) -> &SharedProgram {
         &self.program
     }
+}
+
+thread_local! {
+    /// The VM join conditions run in on this thread
+    static JOIN_VM: std::cell::RefCell<ExprVM> = std::cell::RefCell::new(ExprVM::new());
+    /// An error from a join condition run on a temporary VM, for `take_error`
+    static JOIN_FALLBACK_ERROR: std::cell::RefCell<Option<crate::core::Error>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 // Static assertions to verify JoinFilter implements Send + Sync.
@@ -2183,7 +2216,7 @@ impl<'a> CompiledEvaluator<'a> {
         ctx = ctx.with_transaction_id(self.transaction_id);
 
         // Execute and convert to bool
-        Ok(self.vm.execute_bool(&program, &ctx))
+        self.vm.execute_bool_checked(&program, &ctx)
     }
 }
 

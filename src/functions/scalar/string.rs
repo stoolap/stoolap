@@ -332,7 +332,7 @@ impl ScalarFunction for SubstringFunction {
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
         validate_arg_count!(args, "SUBSTRING", 2, 3);
 
-        if args[0].is_null() {
+        if args.iter().any(Value::is_null) {
             return Ok(Value::null_unknown());
         }
 

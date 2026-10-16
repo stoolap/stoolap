@@ -205,6 +205,15 @@ fn try_parse_single_having_condition(
     None
 }
 
+/// Keeps the first evaluation error of a per-row loop for after it, and
+/// stands a NULL in for the value; out of line so the loop stays lean
+#[cold]
+#[inline(never)]
+fn keep_first_error(slot: &mut Option<crate::core::Error>, e: crate::core::Error) -> Value {
+    slot.get_or_insert(e);
+    Value::null_unknown()
+}
+
 /// Extract numeric value from expression
 fn extract_numeric_value(expr: &Expression) -> Option<f64> {
     match expr {
@@ -1220,10 +1229,10 @@ impl Executor {
         let source_programs: Vec<Option<super::expression::SharedProgram>> = column_sources
             .iter()
             .map(|s| match s {
-                ColumnSource::Expression(expr) => evaluator.compile_cached(expr).ok(),
-                _ => None,
+                ColumnSource::Expression(expr) => evaluator.compile_cached(expr).map(Some),
+                _ => Ok(None),
             })
-            .collect();
+            .collect::<Result<_>>()?;
 
         for (id, row) in agg_rows {
             // Use CompactVec directly to avoid Vec→CompactVec conversion
@@ -1239,9 +1248,7 @@ impl Executor {
                         }
                     }
                     ColumnSource::Expression(_) => match &source_programs[src_idx] {
-                        Some(p) => evaluator
-                            .evaluate_program(p, &row)
-                            .unwrap_or(Value::null_unknown()),
+                        Some(p) => evaluator.evaluate_program(p, &row)?,
                         None => Value::null_unknown(),
                     },
                     ColumnSource::CorrelatedExpression(expr) => {
@@ -1264,24 +1271,20 @@ impl Executor {
                         );
 
                         // Process the correlated expression with the outer row context
-                        let result = match self.process_correlated_expression(expr, &correlated_ctx)
-                        {
-                            Ok(processed_expr) => {
+                        let result = self
+                            .process_correlated_expression(expr, &correlated_ctx)
+                            .and_then(|processed_expr| {
                                 // Evaluate the processed expression
                                 let mut corr_eval = CompiledEvaluator::new(&self.function_registry)
                                     .with_context(&correlated_ctx);
                                 corr_eval.init_columns(&agg_columns);
                                 corr_eval.set_row_array(&row);
-                                corr_eval
-                                    .evaluate(&processed_expr)
-                                    .unwrap_or(Value::null_unknown())
-                            }
-                            Err(_) => Value::null_unknown(),
-                        };
+                                corr_eval.evaluate(&processed_expr)
+                            });
 
                         // Take back map for reuse
                         outer_row_map = correlated_ctx.outer_row.take().unwrap_or_default();
-                        result
+                        result?
                     }
                     ColumnSource::GroupingFlag(idx) => {
                         // Look up the grouping flag from the hidden __grouping_N__ columns
@@ -2324,7 +2327,7 @@ impl Executor {
                                         Ok(Value::Boolean(true)) => {} // Continue with accumulation
                                         Ok(Value::Boolean(false)) | Ok(Value::Null(_)) => continue, // Skip this row
                                         Ok(_) => continue, // Non-boolean treated as false
-                                        Err(_) => continue, // Error treated as false
+                                        Err(e) => return Err(e),
                                     }
                                 } else {
                                     // Can't evaluate filter without VM - skip
@@ -2367,23 +2370,11 @@ impl Executor {
                                     if let Some(ref mut vm) = expr_vm {
                                         let mut sort_keys =
                                             Vec::with_capacity(compiled_order_by[i].len());
-                                        let mut all_ok = true;
                                         for order_program in &compiled_order_by[i] {
-                                            match vm.execute_cow(order_program, &exec_ctx) {
-                                                Ok(key) => sort_keys.push(key),
-                                                Err(_) => {
-                                                    all_ok = false;
-                                                    break;
-                                                }
-                                            }
+                                            sort_keys
+                                                .push(vm.execute_cow(order_program, &exec_ctx)?);
                                         }
-                                        if all_ok {
-                                            func.accumulate_with_sort_key(
-                                                v,
-                                                sort_keys,
-                                                agg.distinct,
-                                            );
-                                        }
+                                        func.accumulate_with_sort_key(v, sort_keys, agg.distinct);
                                     } else {
                                         // No VM - fall back to regular accumulate
                                         func.accumulate(v, agg.distinct);
@@ -3944,7 +3935,9 @@ impl Executor {
                 });
             }
         } else {
-            // Slow path: need to evaluate expressions, use buffer
+            // Slow path: need to evaluate expressions, use buffer. A key that
+            // fails is returned after the loop; an early return in it is slower
+            let mut key_error = None;
             for (row_idx, (_, row)) in rows.iter().enumerate() {
                 key_buffer.clear();
 
@@ -3967,8 +3960,10 @@ impl Executor {
                             if let (Some(ref mut vm), Some(ref program)) =
                                 (&mut expr_vm, &compiled_group_by_exprs[i])
                             {
-                                vm.execute_cow(program, &exec_ctx)
-                                    .unwrap_or_else(|_| Value::null_unknown())
+                                match vm.execute_cow(program, &exec_ctx) {
+                                    Ok(value) => value,
+                                    Err(e) => keep_first_error(&mut key_error, e),
+                                }
                             } else {
                                 Value::null_unknown()
                             }
@@ -4019,6 +4014,9 @@ impl Executor {
                         current_group_count += 1;
                     }
                 }
+            }
+            if let Some(e) = key_error {
+                return Err(e);
             }
         }
 
@@ -4275,7 +4273,7 @@ impl Executor {
                                         Ok(Value::Boolean(true)) => {} // Continue with accumulation
                                         Ok(Value::Boolean(false)) | Ok(Value::Null(_)) => continue, // Skip this row
                                         Ok(_) => continue, // Non-boolean treated as false
-                                        Err(_) => continue, // Error treated as false
+                                        Err(e) => return Err(e),
                                     }
                                 } else {
                                     // Can't evaluate filter without VM - skip
@@ -4319,23 +4317,11 @@ impl Executor {
                                     if let Some(ref mut vm) = expr_vm {
                                         let mut sort_keys =
                                             Vec::with_capacity(compiled_agg_order_by[i].len());
-                                        let mut all_ok = true;
                                         for order_program in &compiled_agg_order_by[i] {
-                                            match vm.execute_cow(order_program, &exec_ctx) {
-                                                Ok(key) => sort_keys.push(key),
-                                                Err(_) => {
-                                                    all_ok = false;
-                                                    break;
-                                                }
-                                            }
+                                            sort_keys
+                                                .push(vm.execute_cow(order_program, &exec_ctx)?);
                                         }
-                                        if all_ok {
-                                            func.accumulate_with_sort_key(
-                                                v,
-                                                sort_keys,
-                                                agg.distinct,
-                                            );
-                                        }
+                                        func.accumulate_with_sort_key(v, sort_keys, agg.distinct);
                                     } else {
                                         // No VM - fall back to regular accumulate
                                         func.accumulate(v, agg.distinct);
@@ -4551,8 +4537,8 @@ impl Executor {
                             // Check FILTER clause first - skip row if filter is false
                             if let Some(ref filter_program) = compiled_filters[i] {
                                 if let Some(ref mut vm) = expr_vm {
-                                    match vm.execute_cow(filter_program, &exec_ctx) {
-                                        Ok(Value::Boolean(true)) => {}
+                                    match vm.execute_cow(filter_program, &exec_ctx)? {
+                                        Value::Boolean(true) => {}
                                         _ => continue,
                                     }
                                 } else {
@@ -4562,10 +4548,8 @@ impl Executor {
 
                             if let Some(ref expr_program) = compiled_agg_expressions[i] {
                                 if let Some(ref mut vm) = expr_vm {
-                                    if let Ok(val) = vm.execute_cow(expr_program, &exec_ctx) {
-                                        expr_values[i] = val;
-                                        func.accumulate(&expr_values[i], agg.distinct);
-                                    }
+                                    expr_values[i] = vm.execute_cow(expr_program, &exec_ctx)?;
+                                    func.accumulate(&expr_values[i], agg.distinct);
                                 }
                             } else {
                                 let value_ref = if let Some(col_idx) = agg_col_indices[i] {
@@ -4637,8 +4621,7 @@ impl Executor {
                                     if let (Some(ref mut vm), Some(ref program)) =
                                         (&mut expr_vm, &compiled_group_by_exprs[col_idx])
                                     {
-                                        vm.execute_cow(program, &exec_ctx)
-                                            .unwrap_or_else(|_| Value::null_unknown())
+                                        vm.execute_cow(program, &exec_ctx)?
                                     } else {
                                         Value::null_unknown()
                                     }
@@ -4732,11 +4715,9 @@ impl Executor {
 
                                     if let Some(ref expr_program) = compiled_agg_expressions[i] {
                                         if let Some(ref mut vm) = expr_vm {
-                                            if let Ok(val) = vm.execute_cow(expr_program, &exec_ctx)
-                                            {
-                                                expr_values[i] = val;
-                                                func.accumulate(&expr_values[i], agg.distinct);
-                                            }
+                                            expr_values[i] =
+                                                vm.execute_cow(expr_program, &exec_ctx)?;
+                                            func.accumulate(&expr_values[i], agg.distinct);
                                         }
                                     } else {
                                         let value_ref = if let Some(col_idx) = agg_col_indices[i] {

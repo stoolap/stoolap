@@ -197,14 +197,13 @@ fn eval_default_slot(
     exec_ctx: &super::expression::ExecuteContext,
     program: &Option<(super::expression::SharedProgram, DataType)>,
     template_val: &Value,
-) -> Value {
-    match program {
-        Some((program, target)) => match vm.execute_cow(program, exec_ctx) {
-            Ok(v) => v.into_coerce_to_type(*target),
-            Err(_) => Value::null_unknown(),
-        },
+) -> Result<Value> {
+    Ok(match program {
+        Some((program, target)) => vm
+            .execute_cow(program, exec_ctx)?
+            .into_coerce_to_type(*target),
         None => template_val.clone(),
-    }
+    })
 }
 
 /// Per-statement default machinery: constant defaults land in the value
@@ -814,10 +813,9 @@ impl Executor {
                     row_values.push(match &default_programs[i] {
                         // Non-literal defaults run per row (RANDOM() must
                         // differ per row); constant defaults clone
-                        Some((program, target)) => match vm.execute_cow(program, &base_exec_ctx) {
-                            Ok(v) => v.into_coerce_to_type(*target),
-                            Err(_) => Value::null_unknown(),
-                        },
+                        Some((program, target)) => vm
+                            .execute_cow(program, &base_exec_ctx)?
+                            .into_coerce_to_type(*target),
                         None => default_values[i].clone(),
                     });
                 }
@@ -1089,10 +1087,9 @@ impl Executor {
                     row_values.push(match &default_programs[i] {
                         // Non-literal defaults run per row (RANDOM() must
                         // differ per row); constant defaults clone
-                        Some((program, target)) => match vm.execute_cow(program, &base_exec_ctx) {
-                            Ok(v) => v.into_coerce_to_type(*target),
-                            Err(_) => Value::null_unknown(),
-                        },
+                        Some((program, target)) => vm
+                            .execute_cow(program, &base_exec_ctx)?
+                            .into_coerce_to_type(*target),
                         None => default_values[i].clone(),
                     });
                 }
@@ -1290,10 +1287,9 @@ impl Executor {
                     row_values.push(match &default_programs[i] {
                         // Non-literal defaults run per row (RANDOM() must
                         // differ per row); constant defaults clone
-                        Some((program, target)) => match vm.execute_cow(program, &base_exec_ctx) {
-                            Ok(v) => v.into_coerce_to_type(*target),
-                            Err(_) => Value::null_unknown(),
-                        },
+                        Some((program, target)) => vm
+                            .execute_cow(program, &base_exec_ctx)?
+                            .into_coerce_to_type(*target),
                         None => default_values[i].clone(),
                     });
                 }
@@ -1696,7 +1692,7 @@ impl Executor {
                             &base_exec_ctx,
                             &default_programs[col_idx],
                             default_val,
-                        ));
+                        )?);
                     }
                 }
 
@@ -1761,7 +1757,7 @@ impl Executor {
                                 &base_exec_ctx,
                                 &default_programs[col_idx],
                                 default_val,
-                            ));
+                            )?);
                         } else {
                             // OPTIMIZATION: literals and bound parameters
                             // resolve directly (avoids VM compilation)
@@ -1791,7 +1787,7 @@ impl Executor {
                             &base_exec_ctx,
                             &default_programs[col_idx],
                             default_val,
-                        ));
+                        )?);
                     }
                 }
 
@@ -2300,7 +2296,7 @@ impl Executor {
                             } else {
                                 evaluator.evaluate_bool(mem_where)
                             };
-                            if !matches!(held, Ok(true)) {
+                            if !held? {
                                 continue;
                             }
                         }
@@ -2397,7 +2393,7 @@ impl Executor {
                         } else {
                             evaluator.evaluate_bool(where_clause)
                         };
-                        if !matches!(held, Ok(true)) {
+                        if !held? {
                             outer_row_map = correlated_ctx.outer_row.take().unwrap_or_default();
                             continue;
                         }
@@ -2416,22 +2412,20 @@ impl Executor {
                             CompiledEvaluator::new(function_registry).with_context(&correlated_ctx);
                         eval.init_columns_arc(CompactArc::clone(&column_names));
                         eval.set_row_array(row);
-                        eval.evaluate(&processed_expr).ok()
+                        eval.evaluate(&processed_expr)?
                     } else {
-                        evaluator.evaluate(expr).ok()
+                        evaluator.evaluate(expr)?
                     };
 
-                    if let Some(new_value) = evaluated {
-                        let coerced = new_value.coerce_to_type(*col_type);
-                        validate_coercion(
-                            &new_value,
-                            &coerced,
-                            &schema.columns[*idx].name,
-                            *col_type,
-                            *vec_dims,
-                        )?;
-                        new_values.push((*idx, coerced));
-                    }
+                    let coerced = evaluated.coerce_to_type(*col_type);
+                    validate_coercion(
+                        &evaluated,
+                        &coerced,
+                        &schema.columns[*idx].name,
+                        *col_type,
+                        *vec_dims,
+                    )?;
+                    new_values.push((*idx, coerced));
                 }
 
                 // Take back the map for reuse (zero-copy transfer)
@@ -2627,7 +2621,7 @@ impl Executor {
                     // In-memory WHERE filtering shares the row context
                     if needs_memory_filter {
                         if let Some(ref program) = memory_where_program {
-                            if !vm.execute_bool(program, &exec_ctx) {
+                            if !vm.execute_bool_checked(program, &exec_ctx)? {
                                 return Ok((row, false));
                             }
                         } else if let Some(ref where_expr) = memory_where_clause {
@@ -2652,7 +2646,7 @@ impl Executor {
                             } else {
                                 evaluator.evaluate_bool(where_expr)
                             };
-                            if !matches!(held, Ok(true)) {
+                            if !held? {
                                 return Ok((row, false));
                             }
                         }
@@ -3160,10 +3154,10 @@ impl Executor {
                             evaluator.set_outer_row_owned(
                                 correlated_ctx.outer_row.take().unwrap_or_default(),
                             );
-                            let result = evaluator.evaluate_bool(&processed).unwrap_or(false);
+                            let result = evaluator.evaluate_bool(&processed);
                             // Take back map for reuse instead of clearing
                             outer_row_map = evaluator.take_outer_row();
-                            result
+                            result?
                         } else if let Some(ref program) = memory_where_program {
                             let mut exec_ctx =
                                 ExecuteContext::new(row).with_transaction_id(transaction_id);
@@ -3173,9 +3167,9 @@ impl Executor {
                             if !named_params.is_empty() {
                                 exec_ctx = exec_ctx.with_named_params(named_params);
                             }
-                            delete_vm.execute_bool(program, &exec_ctx)
+                            delete_vm.execute_bool_checked(program, &exec_ctx)?
                         } else {
-                            matches!(evaluator.evaluate_bool(where_expr), Ok(true))
+                            evaluator.evaluate_bool(where_expr)?
                         }
                     } else {
                         true
@@ -3673,25 +3667,25 @@ impl Executor {
 
                 let mut updates = Vec::with_capacity(effective.compiled_updates.len());
                 for (idx, col_type, vec_dims, program) in &effective.compiled_updates {
-                    if let Ok(v) = vm.execute_cow(program, &exec_ctx) {
-                        let coerced = v.into_coerce_to_type(*col_type);
-                        // Validate vector dimensions
-                        if *col_type == DataType::Vector && *vec_dims > 0 {
-                            if let Value::Extension(data) = &coerced {
-                                if data.first() == Some(&(DataType::Vector as u8)) {
-                                    let got_dim =
-                                        u16::try_from((data.len() - 1) / 4).unwrap_or(u16::MAX);
-                                    if got_dim != *vec_dims {
-                                        return Err(Error::VectorDimensionMismatch {
-                                            expected: *vec_dims,
-                                            got: got_dim,
-                                        });
-                                    }
+                    let coerced = vm
+                        .execute_cow(program, &exec_ctx)?
+                        .into_coerce_to_type(*col_type);
+                    // Validate vector dimensions
+                    if *col_type == DataType::Vector && *vec_dims > 0 {
+                        if let Value::Extension(data) = &coerced {
+                            if data.first() == Some(&(DataType::Vector as u8)) {
+                                let got_dim =
+                                    u16::try_from((data.len() - 1) / 4).unwrap_or(u16::MAX);
+                                if got_dim != *vec_dims {
+                                    return Err(Error::VectorDimensionMismatch {
+                                        expected: *vec_dims,
+                                        got: got_dim,
+                                    });
                                 }
                             }
                         }
-                        updates.push((*idx, coerced));
                     }
+                    updates.push((*idx, coerced));
                 }
                 updates
             };
@@ -3704,21 +3698,20 @@ impl Executor {
                     if *check_idx == idx && !new_value.is_null() {
                         let check_row = Row::from_values(vec![new_value.clone()]);
                         let check_ctx = ExecuteContext::new(&check_row);
-                        if let Ok(result) = vm.execute_cow(program, &check_ctx) {
-                            let is_truthy = match &result {
-                                Value::Boolean(b) => *b,
-                                Value::Null(_) => true, // NULL passes CHECK (SQL standard)
-                                Value::Integer(i) => *i != 0,
-                                Value::Float(f) => *f != 0.0,
-                                Value::Text(s) => !s.is_empty(),
-                                _ => true, // Timestamp, Extension, etc. are truthy
-                            };
-                            if !is_truthy {
-                                return Err(Error::CheckConstraintViolation {
-                                    column: col_name.to_string(),
-                                    expression: check_expr.to_string(),
-                                });
-                            }
+                        let result = vm.execute_cow(program, &check_ctx)?;
+                        let is_truthy = match &result {
+                            Value::Boolean(b) => *b,
+                            Value::Null(_) => true, // NULL passes CHECK (SQL standard)
+                            Value::Integer(i) => *i != 0,
+                            Value::Float(f) => *f != 0.0,
+                            Value::Text(s) => !s.is_empty(),
+                            _ => true, // Timestamp, Extension, etc. are truthy
+                        };
+                        if !is_truthy {
+                            return Err(Error::CheckConstraintViolation {
+                                column: col_name.to_string(),
+                                expression: check_expr.to_string(),
+                            });
                         }
                     }
                 }

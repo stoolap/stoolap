@@ -624,6 +624,8 @@ pub struct ExprMappedResult {
     params: Option<crate::common::CompactArc<crate::ParamVec>>,
     named_params: Option<std::sync::Arc<rustc_hash::FxHashMap<String, Value>>>,
     transaction_id: Option<u64>,
+    /// Pending error from a projection, reported by `last_error`
+    pending_error: Option<crate::core::Error>,
 }
 
 // SAFETY: ExprMappedResult is Send because all fields are Send:
@@ -683,6 +685,7 @@ impl ExprMappedResult {
             params: None,
             named_params: None,
             transaction_id: None,
+            pending_error: None,
         })
     }
 
@@ -753,11 +756,13 @@ impl QueryResult for ExprMappedResult {
                         if let Some(named) = &self.named_params {
                             ctx = ctx.with_named_params(named);
                         }
-                        let value = self
-                            .vm
-                            .execute_cow(program, &ctx)
-                            .unwrap_or(Value::null_unknown());
-                        self.current_row.push_inline(value);
+                        match self.vm.execute_cow(program, &ctx) {
+                            Ok(value) => self.current_row.push_inline(value),
+                            Err(e) => {
+                                self.pending_error = Some(e);
+                                return false;
+                            }
+                        }
                     }
                 }
             }
@@ -804,7 +809,9 @@ impl QueryResult for ExprMappedResult {
     }
 
     fn last_error(&mut self) -> Option<crate::core::Error> {
-        self.inner.last_error()
+        self.pending_error
+            .take()
+            .or_else(|| self.inner.last_error())
     }
 
     fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {

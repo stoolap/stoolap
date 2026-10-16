@@ -265,6 +265,9 @@ pub struct ExprVM {
     /// Cache for dynamic REGEXP patterns (avoids recompilation per row)
     /// Stores (pattern_string, compiled_regex)
     cached_regexp: Option<(SmartString, regex::Regex)>,
+
+    /// The error `execute_bool` read as false, kept for `take_bool_error`
+    bool_error: Option<crate::core::Error>,
 }
 
 impl ExprVM {
@@ -277,6 +280,7 @@ impl ExprVM {
             cached_like: None,
             cached_glob: None,
             cached_regexp: None,
+            bool_error: None,
         }
     }
 
@@ -289,6 +293,7 @@ impl ExprVM {
             cached_like: None,
             cached_glob: None,
             cached_regexp: None,
+            bool_error: None,
         }
     }
 
@@ -1596,9 +1601,7 @@ impl ExprVM {
                     self.args_buffer.clear();
                     self.args_buffer.extend(self.stack.drain(start..));
 
-                    let result = func
-                        .evaluate(&self.args_buffer)
-                        .unwrap_or_else(|_| Value::null_unknown());
+                    let result = func.evaluate(&self.args_buffer)?;
                     self.stack.push(result);
                     pc += 1;
                 }
@@ -2327,9 +2330,7 @@ impl ExprVM {
                         self.args_buffer.push(cow_val.into_owned());
                     }
 
-                    let result = func
-                        .evaluate(&self.args_buffer)
-                        .unwrap_or_else(|_| Value::null_unknown());
+                    let result = func.evaluate(&self.args_buffer)?;
                     stack.push(Cow::Owned(result));
                     pc += 1;
                 }
@@ -2791,9 +2792,31 @@ impl ExprVM {
         match self.execute_cow(program, ctx) {
             Ok(Value::Boolean(b)) => b,
             Ok(Value::Integer(i)) => i != 0,
-            Ok(Value::Null(_)) => false,
-            _ => false,
+            Ok(_) => false,
+            Err(e) => self.stash_bool_error(e),
         }
+    }
+
+    /// Keeps the first error `execute_bool` read as false, for
+    /// `take_bool_error`; out of line so the boolean path stays lean
+    #[cold]
+    #[inline(never)]
+    fn stash_bool_error(&mut self, e: crate::core::Error) -> bool {
+        self.bool_error.get_or_insert(e);
+        false
+    }
+
+    /// The error `execute_bool` read as false since the last call, if any
+    #[inline]
+    pub fn take_bool_error(&mut self) -> Option<crate::core::Error> {
+        self.bool_error.take()
+    }
+
+    /// Whether `execute_bool` has read an error as false since the last
+    /// `take_bool_error`; cheaper than taking it
+    #[inline]
+    pub fn has_bool_error(&self) -> bool {
+        self.bool_error.is_some()
     }
 
     /// Like execute_bool but returns errors instead of swallowing them.
