@@ -167,6 +167,46 @@ fn min_and_max_through_an_index_answer_as_without_it() {
 }
 
 #[test]
+fn min_and_max_after_sealed_extremes_are_updated_and_sealed_again() {
+    let mut wrong = Vec::new();
+    for ty in ["INTEGER", "TEXT", "FLOAT", "TIMESTAMP"] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&format!(
+            "file://{}?checkpoint_interval=0",
+            dir.path().display()
+        ))
+        .unwrap();
+        twin(&db, ty, "BTREE");
+        both(
+            &db,
+            &format!(
+                "INSERT INTO {{t}} VALUES (1, {}), (2, {}), (3, {})",
+                key(ty, 0),
+                key(ty, 5),
+                key(ty, 10)
+            ),
+        );
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        both(
+            &db,
+            &format!("UPDATE {{t}} SET c = {} WHERE id = 1", key(ty, 3)),
+        );
+        both(
+            &db,
+            &format!("UPDATE {{t}} SET c = {} WHERE id = 3", key(ty, 7)),
+        );
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        check(&db, &format!("{ty} resealed"), &mut wrong);
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+#[test]
 fn min_and_max_with_nan_answer_as_without_an_index() {
     let mut wrong = Vec::new();
     let db = Database::open("memory://min_max_index_nan").unwrap();
@@ -232,4 +272,20 @@ fn min_and_max_of_an_indexed_column_read_the_index() {
         value(&db, sql);
         assert_eq!(min_max_index_answers() - before, 0, "{sql}");
     }
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?checkpoint_interval=0",
+        dir.path().display()
+    ))
+    .unwrap();
+    twin(&db, "INTEGER", "BTREE");
+    both(
+        &db,
+        "INSERT INTO {t} SELECT value, value % 1000 FROM generate_series(1, 5000)",
+    );
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    both(&db, "INSERT INTO {t} VALUES (6000, 7)");
+    let before = min_max_index_answers();
+    value(&db, "SELECT MAX(c) FROM t");
+    assert_eq!(min_max_index_answers() - before, 1, "sealed MAX(c)");
 }

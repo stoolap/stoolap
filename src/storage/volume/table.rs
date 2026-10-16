@@ -506,6 +506,18 @@ impl SegmentedTable {
             .is_some_and(|index| index.index_type() == IndexType::BTree)
     }
 
+    /// Whether every row the volumes' zone maps count is a row they show:
+    /// no tombstone, dead copy, overlap or copy a newer volume hides
+    fn zone_maps_count_shown_rows(&self) -> bool {
+        self.segment_mgr.seal_overlap() == 0
+            && self.segment_mgr.is_tombstone_set_empty()
+            && !self.segment_mgr.has_dead_copies()
+            && self
+                .segment_mgr
+                .deduped_row_count()
+                .is_ok_and(|rows| rows == self.segment_mgr.total_row_count())
+    }
+
     /// Runs `read`, a shortcut over the newest committed state, while no
     /// commit publishes across it: one that moves a row between the hot and
     /// the sealed reads would tear the answer. Under a view, only while the
@@ -7036,9 +7048,8 @@ impl Table for SegmentedTable {
             if let Some(result) = self.unsealed(|hot| hot.get_index_min_value(column_name)) {
                 return result;
             }
-            // A zone map still counts the rows tombstoned since the seal, and
-            // only a B-tree gives the hot rows' bound
-            if !self.segment_mgr.tombstone_set_arc().is_empty() || !self.hot_btree_on(column_name) {
+            // Only a B-tree gives the hot rows' bound
+            if !self.zone_maps_count_shown_rows() || !self.hot_btree_on(column_name) {
                 return None;
             }
             let hot_min = self.hot.get_index_min_value(column_name);
@@ -7090,9 +7101,8 @@ impl Table for SegmentedTable {
             if let Some(result) = self.unsealed(|hot| hot.get_index_max_value(column_name)) {
                 return result;
             }
-            // A zone map still counts the rows tombstoned since the seal, and
-            // only a B-tree gives the hot rows' bound
-            if !self.segment_mgr.tombstone_set_arc().is_empty() || !self.hot_btree_on(column_name) {
+            // Only a B-tree gives the hot rows' bound
+            if !self.zone_maps_count_shown_rows() || !self.hot_btree_on(column_name) {
                 return None;
             }
             let hot_max = self.hot.get_index_max_value(column_name);
