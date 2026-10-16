@@ -271,14 +271,19 @@ impl PushdownRule for QuantifiedSetRule {
         let Some(column) = extract_column_name(&quantified.left) else {
             return PushdownResult::CannotPush;
         };
-        // Only an INTEGER column orders in storage as the contract does; a FLOAT may hold NaN
-        let column_type = ctx.column_type(&column);
-        if column_type != Some(crate::core::DataType::Integer) {
-            return PushdownResult::CannotPush;
-        }
         let Some(op) = QuantifiedMembers::operator(&quantified.operator) else {
             return PushdownResult::CannotPush;
         };
+        // The contract orders NaN above every number, storage fails it everywhere: alike only for < and <=
+        let column_type = ctx.column_type(&column);
+        let orders_alike = match column_type {
+            Some(crate::core::DataType::Integer) => true,
+            Some(crate::core::DataType::Float) => matches!(op, CompareOp::Lt | CompareOp::Le),
+            _ => false,
+        };
+        if !orders_alike {
+            return PushdownResult::CannotPush;
+        }
         let Some(bound) = QuantifiedMembers::bound(op, quantified.all, &quantified.members) else {
             return PushdownResult::CannotPush;
         };

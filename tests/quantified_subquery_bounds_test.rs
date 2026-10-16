@@ -342,7 +342,13 @@ fn test_a_nan_left_value_answers_alike_on_join_and_single_table() {
     ] {
         db.execute(sql, ()).unwrap();
     }
-    for predicate in ["a.v > ANY (SELECT v FROM m)", "a.v < ALL (SELECT v FROM m)"] {
+    for predicate in [
+        "a.v > ANY (SELECT v FROM m)",
+        "a.v >= ALL (SELECT v FROM m)",
+        "a.v < ALL (SELECT v FROM m)",
+        "a.v <= ANY (SELECT v FROM m)",
+        "NOT (a.v < ALL (SELECT v FROM m))",
+    ] {
         assert_eq!(
             rows(
                 &db,
@@ -352,4 +358,39 @@ fn test_a_nan_left_value_answers_alike_on_join_and_single_table() {
             "{predicate}: the join answers as the single table does"
         );
     }
+}
+
+#[test]
+fn test_two_sets_keep_two_aggregates() {
+    let db = Database::open("memory://quantified_aggregate_identity").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, s TEXT)",
+        "CREATE TABLE m1 (id INTEGER PRIMARY KEY, x INTEGER)",
+        "CREATE TABLE m2 (id INTEGER PRIMARY KEY, x INTEGER)",
+        "CREATE TABLE mt (id INTEGER PRIMARY KEY, x TEXT)",
+        "INSERT INTO t VALUES (1, 10, '10')",
+        "INSERT INTO m1 VALUES (1, 5)",
+        "INSERT INTO m2 VALUES (1, 15)",
+        "INSERT INTO mt VALUES (1, '5')",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT SUM(CASE WHEN v > ANY (SELECT x FROM m1) THEN 1 ELSE 0 END), \
+             SUM(CASE WHEN v > ANY (SELECT x FROM m2) THEN 1 ELSE 0 END) FROM t"
+        ),
+        rows(&db, "SELECT 1, 0"),
+        "10 is above 5 and not above 15"
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT SUM(CASE WHEN s > ANY (SELECT x FROM m1) THEN 1 ELSE 0 END), \
+             SUM(CASE WHEN s > ANY (SELECT x FROM mt) THEN 1 ELSE 0 END) FROM t"
+        ),
+        rows(&db, "SELECT 1, 0"),
+        "'10' reads as 10 against 5, and sorts below '5' as text"
+    );
 }

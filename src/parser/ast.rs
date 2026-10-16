@@ -804,15 +804,34 @@ impl PartialEq for QuantifiedSetExpression {
 
 impl fmt::Display for QuantifiedSetExpression {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use crate::core::{DataType, Value};
         let quantifier = if self.all { "ALL" } else { "ANY" };
-        write!(
-            f,
-            "{} {} {} (<{} values>)",
-            self.left,
-            self.operator,
-            quantifier,
-            self.members.len() + usize::from(self.has_null)
-        )
+        write!(f, "{} {} {} (", self.left, self.operator, quantifier)?;
+        // Each member as a typed literal, so two sets differ in text when they differ in members
+        for (i, member) in self.members.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            match member {
+                Value::Text(s) => write!(f, "'{}'", s.replace('\'', "''"))?,
+                Value::Boolean(b) => f.write_str(if *b { "TRUE" } else { "FALSE" })?,
+                Value::Timestamp(_) => write!(f, "TIMESTAMP '{}'", member)?,
+                Value::Extension(_) => {
+                    let type_name = match member.data_type() {
+                        DataType::Vector => "VECTOR",
+                        _ => "JSON",
+                    };
+                    let text = member.to_string().replace('\'', "''");
+                    write!(f, "CAST('{}' AS {})", text, type_name)?
+                }
+                _ => write!(f, "{}", member)?,
+            }
+        }
+        if self.has_null {
+            let separator = if self.members.is_empty() { "" } else { ", " };
+            write!(f, "{}NULL", separator)?;
+        }
+        f.write_str(")")
     }
 }
 

@@ -592,7 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn test_quantified_set_on_an_integer_column_pushes_its_bound() {
+    fn test_quantified_set_pushes_its_bound_where_storage_orders_alike() {
         let schema = test_schema();
         let members = vec![Value::integer(25), Value::integer(40)];
         for (op, all, passes) in [
@@ -630,5 +630,11 @@ mod tests {
                 "{column}: left to the memory filter"
             );
         }
+        let expr = make_quantified("price", "<", false, vec![Value::integer(25)], false);
+        let (storage_expr, needs_mem) = try_pushdown(&expr, &schema, None);
+        assert!(
+            storage_expr.is_some() && !needs_mem,
+            "a NaN price fails < in storage and in the contract alike"
+        );
     }
 }
