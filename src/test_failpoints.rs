@@ -2365,6 +2365,7 @@ pub fn reset_all() {
     UNIQUE_INDEX_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     STATEMENT_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_ROUND_PREPARED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    IN_MEMBER_PROBED_HOOK.with(|slot| *slot.borrow_mut() = None);
     SEAL_VOLUMES_BUILT_HOOK.with(|slot| *slot.borrow_mut() = None);
     COMPACTION_OUTPUTS_BUILT_HOOK.with(|slot| *slot.borrow_mut() = None);
     COMPACTION_PLANNED_HOOK.with(|slot| *slot.borrow_mut() = None);
