@@ -608,6 +608,17 @@ impl Executor {
             lines.push(format!("{}  Columns: {} column(s)", prefix, col_count));
         }
 
+        if select
+            .where_clause
+            .as_deref()
+            .is_some_and(Self::has_subqueries)
+        {
+            match self.prepared_family(select, None) {
+                Ok(()) => lines.push(format!("{}  Prepared: yes", prefix)),
+                Err(reason) => lines.push(format!("{}  Prepared: no ({})", prefix, reason)),
+            }
+        }
+
         // FROM clause with access plan
         // Check for vector search fast path first
         let vector_plan = if let Some(ref table_expr) = select.table_expr {

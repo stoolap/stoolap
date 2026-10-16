@@ -120,6 +120,17 @@ use super::window::{WindowPreGroupedState, WindowPreSortedState};
 use super::Executor;
 use crate::optimizer::bloom::BloomFilterBuilder;
 
+/// The layout an ORDER BY or DISTINCT ON projection produces
+pub(super) struct OrderByProjection<'e> {
+    pub(super) col_index_map_lower: StringMap<usize>,
+    /// The column each SELECT expression reads, when it is a plain column
+    pub(super) select_column_indices: Vec<Option<usize>>,
+    pub(super) extra_order_indices: Vec<usize>,
+    pub(super) computed_order_by: Vec<&'e Expression>,
+    pub(super) computed_distinct_on: Vec<&'e Expression>,
+    pub(super) extra_names: Vec<String>,
+}
+
 /// Pre-computed column name mappings for correlated subqueries.
 /// Uses CompactArc<str> for zero-cost cloning in the per-row inner loop.
 struct ColumnKeyMapping {
@@ -445,11 +456,17 @@ impl Executor {
             None => get_classification(stmt),
         };
 
+        // A statement of the prepared family runs on that path and no other
+        let in_family = classification.where_has_subqueries
+            && (self.holds_prepared_select(compiled, ctx)
+                || self.prepared_family(stmt, Some(ctx)).is_ok());
+
         // Correlated probes read the statement's tables through one transaction
         let snapshot_ctx;
         let ctx = if (classification.where_has_correlated_subqueries
             || classification.select_has_correlated_subqueries
-            || classification.order_by_has_correlated_subqueries)
+            || classification.order_by_has_correlated_subqueries
+            || in_family)
             && ctx.statement_snapshot().is_none()
             && self.active_transaction.lock().unwrap().is_none()
         {
@@ -617,8 +634,13 @@ impl Executor {
             };
             &branch_stmt
         };
-        let (mut result, columns, limit_offset_applied, deferred_projection) =
-            self.execute_select_internal(branch, ctx, &classification, compiled)?;
+        let (mut result, columns, limit_offset_applied, deferred_projection) = if in_family {
+            let (result, columns, applied) =
+                self.execute_prepared_select(stmt, ctx, compiled, limit, offset)?;
+            (result, columns, applied, None)
+        } else {
+            self.execute_select_internal(branch, ctx, &classification, compiled)?
+        };
 
         // Apply set operations (UNION, INTERSECT, EXCEPT)
         // Pass limit+offset to enable early termination for UNION ALL
@@ -3812,6 +3834,10 @@ impl Executor {
 
                         // For correlated subqueries, process per-row with outer context
                         if has_correlated {
+                            #[cfg(feature = "test-failpoints")]
+                            crate::test_failpoints::general_path_reached(
+                                crate::test_failpoints::GeneralPath::CorrelatedScan,
+                            );
                             // OPTIMIZATION: Clear and reuse outer_row_map instead of creating new
                             outer_row_map.clear();
 
@@ -9584,6 +9610,115 @@ impl Executor {
             None => std::borrow::Cow::Borrowed(select_exprs),
         };
 
+        let OrderByProjection {
+            col_index_map_lower,
+            select_column_indices,
+            extra_order_indices,
+            computed_order_by,
+            computed_distinct_on,
+            extra_names,
+        } = self.order_by_projection(&select_exprs, order_by, distinct_on, all_columns);
+
+        // Check if we can use fast path (all simple column refs, no computed DISTINCT ON)
+        let all_simple = select_column_indices.iter().all(|idx| idx.is_some())
+            && computed_distinct_on.is_empty()
+            && computed_order_by.is_empty();
+
+        if all_simple {
+            // Fast path
+            let mut projected = RowVec::with_capacity(rows.len());
+            let num_select_cols = select_column_indices.len();
+            let num_extra_cols = extra_order_indices.len();
+
+            for (row_id, row) in rows.drain_rows().enumerate() {
+                let mut values = Vec::with_capacity(num_select_cols + num_extra_cols);
+                // Add SELECT columns
+                for idx in &select_column_indices {
+                    values.push(
+                        row.get(idx.unwrap())
+                            .cloned()
+                            .unwrap_or(Value::null_unknown()),
+                    );
+                }
+                // Add extra ORDER BY columns
+                for &idx in &extra_order_indices {
+                    values.push(row.get(idx).cloned().unwrap_or(Value::null_unknown()));
+                }
+                projected.push((row_id as i64, Row::from_values(values)));
+            }
+
+            // Output column names will be computed in caller
+            Ok((projected, extra_names))
+        } else {
+            // Slow path: Use Evaluator for complex expressions
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::general_path_reached(
+                crate::test_failpoints::GeneralPath::ProjectionEvaluator,
+            );
+            let mut projected = RowVec::with_capacity(rows.len());
+
+            // Create evaluator once and reuse for all rows
+            let mut evaluator = CompiledEvaluator::new(&self.function_registry);
+            evaluator = evaluator.with_context(ctx);
+            evaluator.init_columns(all_columns);
+
+            let total_extra =
+                extra_order_indices.len() + computed_order_by.len() + computed_distinct_on.len();
+
+            // OPTIMIZATION: Reuse col_index_map_lower for O(1) lookup
+            for (row_id, row) in rows.drain_rows().enumerate() {
+                let mut values = Vec::with_capacity(select_exprs.len() + total_extra);
+
+                evaluator.set_row_array(&row);
+
+                // Evaluate SELECT expressions
+                for expr in select_exprs.iter() {
+                    let value = self.evaluate_select_expr(
+                        &mut evaluator,
+                        expr,
+                        &row,
+                        &col_index_map_lower,
+                    )?;
+                    values.push(value);
+                }
+
+                // Add extra ORDER BY columns
+                for &idx in &extra_order_indices {
+                    values.push(row.get(idx).cloned().unwrap_or(Value::null_unknown()));
+                }
+
+                // Evaluate computed ORDER BY expressions
+                for expr in &computed_order_by {
+                    let value = evaluator
+                        .evaluate(expr)
+                        .unwrap_or_else(|_| Value::null_unknown());
+                    values.push(value);
+                }
+
+                // Evaluate computed DISTINCT ON expressions
+                for expr in &computed_distinct_on {
+                    let value = evaluator
+                        .evaluate(expr)
+                        .unwrap_or_else(|_| Value::null_unknown());
+                    values.push(value);
+                }
+
+                projected.push((row_id as i64, Row::from_values(values)));
+            }
+
+            Ok((projected, extra_names))
+        }
+    }
+
+    /// Which columns an ORDER BY or DISTINCT ON projection reads by index,
+    /// which it computes, and the names of what it appends after the SELECT
+    pub(super) fn order_by_projection<'e>(
+        &self,
+        select_exprs: &'e [Expression],
+        order_by: &'e [crate::parser::ast::OrderByExpression],
+        distinct_on: &'e [Expression],
+        all_columns: &[String],
+    ) -> OrderByProjection<'e> {
         // Build column index map ONCE with FxHashMap for O(1) lookup
         let col_index_map_lower = build_column_index_map(all_columns);
 
@@ -9789,90 +9924,13 @@ impl Executor {
         extra_names.extend(computed_order_by.iter().map(|expr| expr.to_string()));
         extra_names.extend(computed_distinct_on.iter().map(|expr| expr.to_string()));
 
-        // Check if we can use fast path (all simple column refs, no computed DISTINCT ON)
-        let all_simple = select_column_indices.iter().all(|idx| idx.is_some())
-            && computed_distinct_on.is_empty()
-            && computed_order_by.is_empty();
-
-        if all_simple {
-            // Fast path
-            let mut projected = RowVec::with_capacity(rows.len());
-            let num_select_cols = select_column_indices.len();
-            let num_extra_cols = extra_order_indices.len();
-
-            for (row_id, row) in rows.drain_rows().enumerate() {
-                let mut values = Vec::with_capacity(num_select_cols + num_extra_cols);
-                // Add SELECT columns
-                for idx in &select_column_indices {
-                    values.push(
-                        row.get(idx.unwrap())
-                            .cloned()
-                            .unwrap_or(Value::null_unknown()),
-                    );
-                }
-                // Add extra ORDER BY columns
-                for &idx in &extra_order_indices {
-                    values.push(row.get(idx).cloned().unwrap_or(Value::null_unknown()));
-                }
-                projected.push((row_id as i64, Row::from_values(values)));
-            }
-
-            // Output column names will be computed in caller
-            Ok((projected, extra_names))
-        } else {
-            // Slow path: Use Evaluator for complex expressions
-            let mut projected = RowVec::with_capacity(rows.len());
-
-            // Create evaluator once and reuse for all rows
-            let mut evaluator = CompiledEvaluator::new(&self.function_registry);
-            evaluator = evaluator.with_context(ctx);
-            evaluator.init_columns(all_columns);
-
-            let total_extra =
-                extra_order_indices.len() + computed_order_by.len() + computed_distinct_on.len();
-
-            // OPTIMIZATION: Reuse col_index_map_lower for O(1) lookup
-            for (row_id, row) in rows.drain_rows().enumerate() {
-                let mut values = Vec::with_capacity(select_exprs.len() + total_extra);
-
-                evaluator.set_row_array(&row);
-
-                // Evaluate SELECT expressions
-                for expr in select_exprs.iter() {
-                    let value = self.evaluate_select_expr(
-                        &mut evaluator,
-                        expr,
-                        &row,
-                        &col_index_map_lower,
-                    )?;
-                    values.push(value);
-                }
-
-                // Add extra ORDER BY columns
-                for &idx in &extra_order_indices {
-                    values.push(row.get(idx).cloned().unwrap_or(Value::null_unknown()));
-                }
-
-                // Evaluate computed ORDER BY expressions
-                for expr in &computed_order_by {
-                    let value = evaluator
-                        .evaluate(expr)
-                        .unwrap_or_else(|_| Value::null_unknown());
-                    values.push(value);
-                }
-
-                // Evaluate computed DISTINCT ON expressions
-                for expr in &computed_distinct_on {
-                    let value = evaluator
-                        .evaluate(expr)
-                        .unwrap_or_else(|_| Value::null_unknown());
-                    values.push(value);
-                }
-
-                projected.push((row_id as i64, Row::from_values(values)));
-            }
-
-            Ok((projected, extra_names))
+        OrderByProjection {
+            col_index_map_lower,
+            select_column_indices,
+            extra_order_indices,
+            computed_order_by,
+            computed_distinct_on,
+            extra_names,
         }
     }
 
@@ -11270,7 +11328,7 @@ impl Executor {
     /// In SQL, WHERE is evaluated before SELECT, so WHERE references table columns,
     /// not SELECT aliases. When an alias name matches a real column name, the column
     /// must take priority in WHERE context. Pass `base_columns` to exclude such aliases.
-    fn build_alias_map_excluding<'a>(
+    pub(super) fn build_alias_map_excluding<'a>(
         columns: &'a [Expression],
         base_columns: Option<&[String]>,
     ) -> FxHashMap<String, &'a Expression> {
@@ -11315,7 +11373,7 @@ impl Executor {
     }
 
     /// Substitute column aliases in an expression with their underlying expressions
-    fn substitute_aliases(
+    pub(super) fn substitute_aliases(
         expr: &Expression,
         alias_map: &FxHashMap<String, &Expression>,
     ) -> Expression {

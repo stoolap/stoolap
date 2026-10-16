@@ -68,6 +68,14 @@ fn extract_literal_with_ctx(expr: &ast::Expression, ctx: &PushdownContext<'_>) -
     if contains_non_deterministic_volatile(expr) {
         return None;
     }
+    #[cfg(feature = "test-failpoints")]
+    if matches!(expr, ast::Expression::Infix(_) | ast::Expression::Prefix(_))
+        || matches!(expr, ast::Expression::FunctionCall(fc) if fc.arguments.is_empty())
+    {
+        crate::test_failpoints::general_path_reached(
+            crate::test_failpoints::GeneralPath::PushdownConstant,
+        );
+    }
     match expr {
         ast::Expression::Infix(_) | ast::Expression::Prefix(_) => {
             crate::executor::expression::try_eval_constant_expr_with_context(expr, ctx.exec_ctx)

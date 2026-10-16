@@ -67,6 +67,7 @@ mod explain;
 mod foreign_key;
 mod index_optimizer;
 mod pk_fast_path;
+mod prepared_select;
 pub mod pushdown;
 mod query;
 mod query_classification;

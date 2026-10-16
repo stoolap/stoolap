@@ -1276,6 +1276,99 @@ pub(crate) fn alter_ddl_guard_next() {
     run_hook(&ALTER_DDL_GUARD_HOOK);
 }
 
+thread_local! {
+    static PREPARED_SCALAR_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Process-wide: statements prepared for the prepared family
+static PREPARED_SELECTS_BUILT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Process-wide: scalar subqueries run by a prepared statement
+static PREPARED_SCALAR_RUNS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Process-wide: projections run by a prepared statement
+static PREPARED_PROJECTION_RUNS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Statements prepared for the prepared family, so far
+pub fn prepared_selects_built() -> usize {
+    PREPARED_SELECTS_BUILT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn prepared_select_built() {
+    PREPARED_SELECTS_BUILT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Scalar subqueries run by a prepared statement, so far
+pub fn prepared_scalar_runs() -> usize {
+    PREPARED_SCALAR_RUNS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Run once on this thread when its next prepared scalar subquery is
+/// about to read its table
+pub fn before_prepared_scalar(hook: impl FnOnce() + 'static) {
+    PREPARED_SCALAR_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn prepared_scalar_next() {
+    PREPARED_SCALAR_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    run_hook(&PREPARED_SCALAR_HOOK);
+}
+
+/// Projections run by a prepared statement, so far
+pub fn prepared_projection_runs() -> usize {
+    PREPARED_PROJECTION_RUNS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn prepared_projection_ran() {
+    PREPARED_PROJECTION_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Process-wide: values RANDOM() has drawn
+static RANDOM_DRAWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Values RANDOM() has drawn, so far
+pub fn random_draws() -> usize {
+    RANDOM_DRAWS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn random_drawn() {
+    RANDOM_DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A mechanism of the general SELECT path that the prepared family no
+/// longer reaches
+#[derive(Clone, Copy, Debug)]
+pub enum GeneralPath {
+    /// The single-table scan's per-row branch for a correlated WHERE
+    CorrelatedScan,
+    /// `process_correlated_where`
+    CorrelatedWhere,
+    /// Outer references bound into a subquery before it runs
+    OuterBinding,
+    /// `substitute_outer_references` in either form
+    OuterSubstitution,
+    /// A constant the pushdown evaluates itself
+    PushdownConstant,
+    /// The projection's `CompiledEvaluator` for computed columns
+    ProjectionEvaluator,
+}
+
+/// Process-wide: how often each general path mechanism ran
+static GENERAL_PATH_HITS: [std::sync::atomic::AtomicUsize; 6] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 6];
+
+/// How often `path` ran, so far
+pub fn general_path_hits(path: GeneralPath) -> usize {
+    GENERAL_PATH_HITS[path as usize].load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn general_path_reached(path: GeneralPath) {
+    GENERAL_PATH_HITS[path as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 type HookSlot = RefCell<Option<Box<dyn FnOnce()>>>;
 
 fn run_hook(slot: &'static std::thread::LocalKey<HookSlot>) {

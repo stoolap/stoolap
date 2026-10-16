@@ -506,7 +506,8 @@ impl Executor {
                 | CompiledExecution::ConflictInsert(_)
                 | CompiledExecution::CountDistinct(_)
                 | CompiledExecution::CountStar(_)
-                | CompiledExecution::JoinResidual(_) => return None,
+                | CompiledExecution::JoinResidual(_)
+                | CompiledExecution::PreparedSelect(_) => return None,
             }
         }
 
@@ -658,7 +659,8 @@ impl Executor {
             | CompiledExecution::ConflictInsert(_)
             | CompiledExecution::CountDistinct(_)
             | CompiledExecution::CountStar(_)
-            | CompiledExecution::JoinResidual(_) => return None,
+            | CompiledExecution::JoinResidual(_)
+            | CompiledExecution::PreparedSelect(_) => return None,
         }
 
         // Do full pattern detection (same as try_fast_pk_lookup)

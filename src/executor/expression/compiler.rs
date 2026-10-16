@@ -114,6 +114,9 @@ pub struct CompileContext<'a> {
 
     /// Column aliases
     column_aliases: StringMap<String>,
+
+    /// Ids a prepared statement gave its scalar subqueries, by node address
+    subquery_ids: Option<&'a FxHashMap<usize, u16>>,
 }
 
 impl<'a> CompileContext<'a> {
@@ -150,6 +153,7 @@ impl<'a> CompileContext<'a> {
             functions,
             expression_aliases: StringMap::new(),
             column_aliases: StringMap::new(),
+            subquery_ids: None,
         }
     }
 
@@ -206,6 +210,13 @@ impl<'a> CompileContext<'a> {
     /// Add column aliases
     pub fn with_column_aliases(mut self, aliases: StringMap<String>) -> Self {
         self.column_aliases = aliases;
+        self
+    }
+
+    /// Compile each listed scalar subquery to its prepared id; any other
+    /// scalar subquery is then a compile error
+    pub fn with_subquery_ids(mut self, ids: &'a FxHashMap<usize, u16>) -> Self {
+        self.subquery_ids = Some(ids);
         self
     }
 
@@ -633,11 +644,17 @@ impl<'a> ExprCompiler<'a> {
             }
 
             // === SUBQUERIES ===
-            Expression::ScalarSubquery(_) => {
-                // Subqueries are handled via the subquery executor
-                // For now, emit a placeholder that will be resolved at runtime
-                builder.emit(Op::ExecScalarSubquery(0));
-            }
+            Expression::ScalarSubquery(sq) => match self.ctx.subquery_ids {
+                Some(ids) => {
+                    let key = &*sq.subquery as *const SelectStatement as usize;
+                    let id = ids.get(&key).ok_or_else(|| {
+                        CompileError::InvalidExpression("unprepared scalar subquery".to_string())
+                    })?;
+                    builder.emit(Op::ExecScalarSubquery(*id));
+                }
+                // Without prepared ids the caller substitutes the result first
+                None => builder.emit(Op::ExecScalarSubquery(0)),
+            },
 
             Expression::Exists(exists) => {
                 let _ = exists; // Subquery index would be resolved during planning
