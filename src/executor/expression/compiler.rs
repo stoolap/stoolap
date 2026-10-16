@@ -647,20 +647,12 @@ impl<'a> ExprCompiler<'a> {
             }
 
             Expression::QuantifiedSet(quantified) => {
-                let op = match quantified.operator.as_str() {
-                    "=" => CompareOp::Eq,
-                    "<>" | "!=" => CompareOp::Ne,
-                    "<" => CompareOp::Lt,
-                    "<=" => CompareOp::Le,
-                    ">" => CompareOp::Gt,
-                    ">=" => CompareOp::Ge,
-                    other => {
-                        return Err(CompileError::UnsupportedExpression(format!(
-                            "{} ANY or ALL",
-                            other
-                        )))
-                    }
-                };
+                let op = QuantifiedMembers::operator(&quantified.operator).ok_or_else(|| {
+                    CompileError::UnsupportedExpression(format!(
+                        "{} ANY or ALL",
+                        quantified.operator
+                    ))
+                })?;
                 self.compile_expr(&quantified.left, builder)?;
                 builder.emit(Op::QuantifiedSet(CompactArc::new(QuantifiedMembers::new(
                     op,

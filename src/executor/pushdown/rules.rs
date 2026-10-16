@@ -17,7 +17,7 @@
 //! Each rule handles a specific type of expression and converts it to
 //! a storage-layer expression when possible.
 
-use crate::core::Value;
+use crate::core::{Operator, Value};
 use crate::functions::global_registry;
 use crate::parser::ast::{self as ast, InfixOperator, PrefixOperator};
 use crate::storage::expression::{
@@ -245,6 +245,59 @@ impl PushdownRule for ComparisonRule {
         let mut expr = ComparisonExpr::new(column, operator, value);
         expr.prepare_for_schema(ctx.schema);
         PushdownResult::Converted(Box::new(expr))
+    }
+}
+
+// =============================================================================
+// Quantified Rule: col op ANY / ALL (members) as col op bound
+// =============================================================================
+
+pub struct QuantifiedSetRule;
+
+impl PushdownRule for QuantifiedSetRule {
+    fn name(&self) -> &'static str {
+        "quantified_set"
+    }
+
+    fn try_convert(&self, expr: &ast::Expression, ctx: &PushdownContext<'_>) -> PushdownResult {
+        use crate::executor::expression::{CompareOp, QuantifiedMembers};
+        let ast::Expression::QuantifiedSet(quantified) = expr else {
+            return PushdownResult::NotApplicable;
+        };
+        // With a NULL member a FALSE comparison is UNKNOWN, which NOT reads otherwise
+        if quantified.has_null {
+            return PushdownResult::CannotPush;
+        }
+        let Some(column) = extract_column_name(&quantified.left) else {
+            return PushdownResult::CannotPush;
+        };
+        // Only a number column orders as the bound does for every value it holds
+        let column_type = ctx.column_type(&column);
+        if !matches!(
+            column_type,
+            Some(crate::core::DataType::Integer | crate::core::DataType::Float)
+        ) {
+            return PushdownResult::CannotPush;
+        }
+        let Some(op) = QuantifiedMembers::operator(&quantified.operator) else {
+            return PushdownResult::CannotPush;
+        };
+        let Some(bound) = QuantifiedMembers::bound(op, quantified.all, &quantified.members) else {
+            return PushdownResult::CannotPush;
+        };
+        let Some(bound) = super::coerce_constant(column_type, bound) else {
+            return PushdownResult::CannotPush;
+        };
+        let operator = match op {
+            CompareOp::Lt => Operator::Lt,
+            CompareOp::Le => Operator::Lte,
+            CompareOp::Gt => Operator::Gt,
+            CompareOp::Ge => Operator::Gte,
+            CompareOp::Eq | CompareOp::Ne => return PushdownResult::CannotPush,
+        };
+        let mut comparison = ComparisonExpr::new(column, operator, bound);
+        comparison.prepare_for_schema(ctx.schema);
+        PushdownResult::Converted(Box::new(comparison))
     }
 }
 

@@ -49,7 +49,7 @@ pub use evaluator_bridge::{
     compute_expression_hash, try_eval_constant_expr, CompiledEvaluator, ExpressionEval, JoinFilter,
     MultiExpressionEval, RowFilter, SharedProgram,
 };
-pub use ops::{CompareOp, Op};
+pub use ops::{CompareOp, Op, QuantifiedMembers};
 pub use program::{Constant, Program};
 pub use vm::{ExecuteContext, ExprVM, SubqueryExecutor};
 

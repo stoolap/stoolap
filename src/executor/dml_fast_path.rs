@@ -905,6 +905,7 @@ impl Executor {
             | Expression::SubquerySource(_)
             | Expression::In(_)
             | Expression::InHashSet(_)
+            | Expression::QuantifiedSet(_)
             | Expression::CteReference(_) => true,
             Expression::Infix(i) => {
                 Self::expr_contains_subquery(&i.left) || Self::expr_contains_subquery(&i.right)

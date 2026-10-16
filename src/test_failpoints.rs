@@ -862,6 +862,16 @@ pub(crate) fn index_filled_from_cold() {
 
 thread_local! {
     static IN_SUBQUERY_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static QUANTIFIED_MEMBER_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Members an ANY or ALL compared one by one on this thread, so far
+pub fn quantified_member_comparisons() -> usize {
+    QUANTIFIED_MEMBER_COMPARISONS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn quantified_member_compared() {
+    QUANTIFIED_MEMBER_COMPARISONS.with(|n| n.set(n.get() + 1));
 }
 
 /// IN subqueries this thread ran to take their members, so far

@@ -778,6 +778,20 @@ pub struct QuantifiedSetExpression {
     pub has_null: bool,
 }
 
+impl QuantifiedSetExpression {
+    /// The same comparison over `left` in place of its own
+    pub fn with_left(&self, left: Expression) -> Expression {
+        Expression::QuantifiedSet(Box::new(QuantifiedSetExpression {
+            token: self.token.clone(),
+            left: Box::new(left),
+            operator: self.operator.clone(),
+            all: self.all,
+            members: CompactArc::clone(&self.members),
+            has_null: self.has_null,
+        }))
+    }
+}
+
 impl PartialEq for QuantifiedSetExpression {
     fn eq(&self, other: &Self) -> bool {
         self.all == other.all

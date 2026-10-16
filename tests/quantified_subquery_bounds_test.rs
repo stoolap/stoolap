@@ -204,3 +204,86 @@ fn test_the_left_value_is_evaluated_once_per_row() {
         "one draw for the one row, compared with every member"
     );
 }
+
+#[test]
+fn test_a_join_filter_on_the_right_table_reads_the_right_table() {
+    let db = Database::open("memory://quantified_join_side").unwrap();
+    for sql in [
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)",
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)",
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, v INTEGER)",
+        "INSERT INTO a VALUES (1, 0)",
+        "INSERT INTO b VALUES (1, 10)",
+        "INSERT INTO m VALUES (1, 5)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    for quantifier in ["ANY", "ALL"] {
+        let found: Vec<i64> = db
+            .query(
+                &format!(
+                    "SELECT a.id FROM a JOIN b ON a.id = b.id WHERE b.v > {quantifier} (SELECT v FROM m)"
+                ),
+                (),
+            )
+            .unwrap()
+            .map(|row| row.unwrap().get::<i64>(0).unwrap())
+            .collect();
+        assert_eq!(
+            found,
+            vec![1],
+            "b.v is 10, above 5, whatever a.v holds ({quantifier})"
+        );
+    }
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_a_numeric_text_left_value_compares_with_the_bound_once() {
+    use stoolap::test_failpoints::quantified_member_comparisons;
+    let db = setup("quantified_numeric_text_left");
+    db.execute(
+        "CREATE TABLE k (id INTEGER PRIMARY KEY, s TEXT, ts TIMESTAMP)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO k VALUES (1, '1001', '2025-01-01 00:00:00'), (2, '5', '2025-01-01 00:00:00'), (3, 'abc', '2025-01-01 00:00:00')",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE TABLE m (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO m SELECT value, value FROM generate_series(1, 1000)",
+        (),
+    )
+    .unwrap();
+    let before = quantified_member_comparisons();
+    let found: Vec<i64> = db
+        .query(
+            "SELECT id FROM k WHERE s < ANY (SELECT v FROM m) ORDER BY id",
+            (),
+        )
+        .unwrap()
+        .map(|row| row.unwrap().get::<i64>(0).unwrap())
+        .collect();
+    assert_eq!(
+        found,
+        vec![2],
+        "'5' is below 1000, '1001' is not, 'abc' is UNKNOWN"
+    );
+    assert_eq!(
+        quantified_member_comparisons() - before,
+        0,
+        "a TEXT read as a number takes the bound, not every member"
+    );
+    let before = quantified_member_comparisons();
+    db.query("SELECT id FROM k WHERE ts < ANY (SELECT v FROM m)", ())
+        .unwrap()
+        .for_each(drop);
+    assert!(
+        quantified_member_comparisons() > before,
+        "a TIMESTAMP is not a number: it is compared with the members"
+    );
+}

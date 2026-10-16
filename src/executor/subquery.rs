@@ -1496,6 +1496,9 @@ impl Executor {
                 // The column reference is already resolved, so no outer ref possible here
                 false
             }
+            Expression::QuantifiedSet(quantified) => {
+                Self::expression_has_outer_reference(&quantified.left, inner_tables)
+            }
             // Window functions can have outer refs in partition/order expressions
             Expression::Window(window) => {
                 window
@@ -2987,6 +2990,7 @@ impl Executor {
             Expression::AllAny(a) => one(&a.left) || select(&a.subquery),
             Expression::In(i) => one(&i.left) || one(&i.right),
             Expression::InHashSet(h) => one(&h.column),
+            Expression::QuantifiedSet(q) => one(&q.left),
             Expression::Between(b) => one(&b.expr) || one(&b.lower) || one(&b.upper),
             Expression::Like(l) => {
                 one(&l.left) || one(&l.pattern) || l.escape.as_deref().is_some_and(one)

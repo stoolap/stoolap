@@ -535,6 +535,9 @@ fn contains_context_dependent_function(expr: &Expression) -> bool {
         Expression::Distinct(distinct) => contains_context_dependent_function(&distinct.expr),
         Expression::AllAny(all_any) => contains_context_dependent_function(&all_any.left),
         Expression::InHashSet(in_hash) => contains_context_dependent_function(&in_hash.column),
+        Expression::QuantifiedSet(quantified) => {
+            contains_context_dependent_function(&quantified.left)
+        }
         _ => false,
     }
 }
