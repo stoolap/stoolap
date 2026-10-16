@@ -1185,6 +1185,100 @@ impl Index for BTreeIndex {
         Some(result)
     }
 
+    /// Walks the whole key, so only an empty prefix. Each chunk of row ids is
+    /// copied under the lock into room made before it, and visited after the
+    /// lock is released; a chunk may stop inside a key's ids.
+    fn walk_prefix_ordered(
+        &self,
+        prefix: &[Value],
+        lower: Option<(&Value, bool)>,
+        upper: Option<(&Value, bool)>,
+        ascending: bool,
+        visit: &mut dyn FnMut(i64, &Value) -> bool,
+    ) -> bool {
+        if !prefix.is_empty() || self.closed.load(AtomicOrdering::Acquire) {
+            return false;
+        }
+        let bound = |side: Option<(&Value, bool)>| match side {
+            Some((value, true)) => Bound::Included(CompactArc::new(value.clone())),
+            Some((value, false)) => Bound::Excluded(CompactArc::new(value.clone())),
+            None => Bound::Unbounded,
+        };
+        let (mut start, mut end) = (bound(lower), bound(upper));
+        // The key the last chunk stopped in, and the last id it copied there
+        let mut inside: Option<(CompactArc<Value>, i64)> = None;
+        let mut ids: Vec<i64> = Vec::new();
+        let mut keys: Vec<(CompactArc<Value>, usize)> = Vec::new();
+        let mut chunk = 64usize;
+        loop {
+            ids.clear();
+            keys.clear();
+            ids.reserve_exact(chunk);
+            keys.reserve_exact(chunk);
+            let room = (ids.capacity(), keys.capacity());
+            let mut full = false;
+            {
+                let sorted_values = self.sorted_values.read();
+                let mut take = |key: &CompactArc<Value>, rows: &RowIdSet, after: Option<i64>| {
+                    let before = ids.len();
+                    rows.copy_past_into(after, ascending, chunk - before, &mut ids);
+                    if ids.len() > before {
+                        keys.push((CompactArc::clone(key), ids.len()));
+                    }
+                    ids.len() == chunk
+                };
+                if let Some((key, last)) = &inside {
+                    if let Some(rows) = sorted_values.get(key) {
+                        full = take(key, rows, Some(*last));
+                    }
+                }
+                if !full && ascending {
+                    for (key, rows) in sorted_values.range((start.clone(), Bound::Unbounded)) {
+                        if past_end(key, &end) {
+                            break;
+                        }
+                        if take(key, rows, None) {
+                            full = true;
+                            break;
+                        }
+                    }
+                } else if !full {
+                    for (key, rows) in sorted_values.range((Bound::Unbounded, end.clone())).rev() {
+                        if before_start(key, &start) {
+                            break;
+                        }
+                        if take(key, rows, None) {
+                            full = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            debug_assert_eq!(room, (ids.capacity(), keys.capacity()));
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::btree_walk_chunk(ids.len(), ids.capacity());
+            let mut from = 0;
+            for (key, upto) in &keys {
+                for &row_id in &ids[from..*upto] {
+                    if !visit(row_id, key) {
+                        return true;
+                    }
+                }
+                from = *upto;
+            }
+            let (Some((last, _)), Some(&last_id), true) = (keys.pop(), ids.last(), full) else {
+                return true;
+            };
+            if ascending {
+                start = Bound::Excluded(CompactArc::clone(&last));
+            } else {
+                end = Bound::Excluded(CompactArc::clone(&last));
+            }
+            inside = Some((last, last_id));
+            chunk = (chunk * 2).min(4096);
+        }
+    }
+
     fn get_grouped_row_ids(&self) -> Option<Vec<(Value, Vec<i64>)>> {
         if self.closed.load(AtomicOrdering::Acquire) {
             return None;
@@ -1256,6 +1350,16 @@ pub(crate) fn past_end<K: Ord>(key: &K, end: &Bound<K>) -> bool {
     match end {
         Bound::Included(end) => Ord::cmp(key, end) == std::cmp::Ordering::Greater,
         Bound::Excluded(end) => Ord::cmp(key, end) != std::cmp::Ordering::Less,
+        Bound::Unbounded => false,
+    }
+}
+
+/// Whether `key` lies before `start` in the map's own `Ord`, for a range
+/// walked down from its end alone
+pub(crate) fn before_start<K: Ord>(key: &K, start: &Bound<K>) -> bool {
+    match start {
+        Bound::Included(start) => Ord::cmp(key, start) == std::cmp::Ordering::Less,
+        Bound::Excluded(start) => Ord::cmp(key, start) != std::cmp::Ordering::Greater,
         Bound::Unbounded => false,
     }
 }

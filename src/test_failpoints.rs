@@ -1551,6 +1551,8 @@ thread_local! {
     static SEGMENT_MAP_CLONES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ROW_ID_ORDER_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TOP_K_COLD_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static HOT_TOP_K_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BTREE_WALK_CHUNK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
     static GROUP_CACHE_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GROUP_COLUMN_DECODES: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
     static COLD_MAP_CAPTURED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
@@ -1560,6 +1562,13 @@ thread_local! {
     static STATEMENT_CAPTURED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static COLD_ROUND_PREPARED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static IN_MEMBER_PROBED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static HOT_TOP_K_VISIT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when an index-walking hot top-k scan visits its
+/// next row, before it reads the row
+pub fn on_hot_top_k_visit(hook: impl FnOnce() + 'static) {
+    HOT_TOP_K_VISIT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
 /// Run once on this thread after an index's IN lookup has probed one
@@ -2224,6 +2233,32 @@ pub(crate) fn top_k_cold_row_built() {
     TOP_K_COLD_ROWS.with(|n| n.set(n.get() + 1));
 }
 
+/// The most row ids one chunk of this thread's B-tree walks copied under the
+/// index lock, and the largest room it had for them; resets both
+pub fn take_btree_walk_chunk_max() -> (usize, usize) {
+    BTREE_WALK_CHUNK.with(|c| c.replace((0, 0)))
+}
+
+pub(crate) fn btree_walk_chunk(copied: usize, capacity: usize) {
+    BTREE_WALK_CHUNK.with(|c| {
+        let (most, room) = c.get();
+        c.set((most.max(copied), room.max(capacity)));
+    });
+}
+
+/// Hot rows this thread's index-walking top-k scans visited, so far
+pub fn hot_top_k_visits() -> usize {
+    HOT_TOP_K_VISITS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn hot_top_k_visited() {
+    HOT_TOP_K_VISITS.with(|n| n.set(n.get() + 1));
+    let hook = HOT_TOP_K_VISIT_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// Row groups whose needed columns this thread's volume scanners loaded
 pub fn group_cache_loads() -> usize {
     GROUP_CACHE_LOADS.with(std::cell::Cell::get)
@@ -2366,6 +2401,7 @@ pub fn reset_all() {
     STATEMENT_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_ROUND_PREPARED_HOOK.with(|slot| *slot.borrow_mut() = None);
     IN_MEMBER_PROBED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    HOT_TOP_K_VISIT_HOOK.with(|slot| *slot.borrow_mut() = None);
     SEAL_VOLUMES_BUILT_HOOK.with(|slot| *slot.borrow_mut() = None);
     COMPACTION_OUTPUTS_BUILT_HOOK.with(|slot| *slot.borrow_mut() = None);
     COMPACTION_PLANNED_HOOK.with(|slot| *slot.borrow_mut() = None);

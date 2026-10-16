@@ -231,6 +231,9 @@ fn test_hot_top_k_declines_a_nullable_order_column() {
     for desc in [true, false] {
         check(&db, "WHERE g = 'a' AND k = 'k3'", desc, 3, 0);
         check(&db, "WHERE g = 'a' AND k = 'k3'", desc, 3, 2);
+        check(&db, "WHERE g = 'a' AND k = 'k3' AND t >= 2", desc, 3, 0);
+        check(&db, "WHERE g = 'a' AND k = 'k3' AND t < 9", desc, 3, 0);
+        check(&db, "WHERE g = 'a' AND k = 'k3' AND t < 9", desc, 3, 1);
     }
 }
 

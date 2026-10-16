@@ -569,6 +569,37 @@ impl MVCCTable {
         })
     }
 
+    /// A walk of the order column's own index for a WHERE of bounds on that
+    /// column only, so each visible row it visits is in the answer; it starts
+    /// past the NULL keys
+    fn range_plan(&self, expr: &dyn Expression, column_name: &str) -> Option<PrefixPlan> {
+        let mut leaves = Vec::new();
+        if !collect_conjuncts(expr, &mut leaves) {
+            return None;
+        }
+        let mut lower = None;
+        let mut upper = None;
+        for (name, op, value) in &leaves {
+            if !name.eq_ignore_ascii_case(column_name) || value.is_null() {
+                return None;
+            }
+            let side = match op {
+                crate::core::Operator::Gt | crate::core::Operator::Gte => &mut lower,
+                crate::core::Operator::Lt | crate::core::Operator::Lte => &mut upper,
+                _ => return None,
+            };
+            let inclusive = matches!(op, crate::core::Operator::Gte | crate::core::Operator::Lte);
+            *side = Some(((*value).clone(), inclusive));
+        }
+        let index = self.version_store.get_index_by_column(column_name)?;
+        Some(PrefixPlan {
+            index,
+            prefix: Vec::new(),
+            lower: lower.or(Some((Value::Null(DataType::Null), false))),
+            upper,
+        })
+    }
+
     fn try_index_lookup(&self, expr: &dyn Expression) -> Option<RowIdVec> {
         use crate::core::Operator;
         use crate::storage::index::intersect_sorted_ids;
@@ -3359,7 +3390,10 @@ impl Table for MVCCTable {
         let Some(expr) = where_expr else {
             return Ok(None);
         };
-        let Some(plan) = self.prefix_plan(expr) else {
+        let Some(plan) = self
+            .prefix_plan(expr)
+            .or_else(|| self.range_plan(expr, column_name))
+        else {
             return Ok(None);
         };
         if !plan.index.column_names()[plan.prefix.len()].eq_ignore_ascii_case(column_name) {
@@ -3375,8 +3409,11 @@ impl Table for MVCCTable {
             return Ok(None);
         };
         let column = &schema.columns[col_idx];
-        // NULL and NaN sort by rules the key order does not follow
-        if column.nullable || column.data_type == DataType::Float {
+        // NULL and NaN sort by rules the key order does not follow; a bound on
+        // the column keeps NULL out of a walk of its own B-tree
+        let bounded = plan.lower.is_some() || plan.upper.is_some();
+        let null_free = !column.nullable || (plan.prefix.is_empty() && bounded);
+        if !null_free || column.data_type == DataType::Float {
             return Ok(None);
         }
 
@@ -3401,6 +3438,8 @@ impl Table for MVCCTable {
                 .map(|(value, inclusive)| (value, *inclusive)),
             ascending,
             &mut |row_id, key_value| {
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::hot_top_k_visited();
                 // A version comes back only when it is visible and its
                 // deletion, if any, is not: the raw deleted flag may belong
                 // to an aborted or unfinished transaction
