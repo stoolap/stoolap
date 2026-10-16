@@ -554,7 +554,16 @@ impl Executor {
         };
         // Without an additional predicate, one visible row holding the key answers
         let Some(additional_pred) = correlation.additional_predicate.as_ref() else {
-            if let Some(found) = self.count_correlated_rows(ctx, &correlation, &outer_value, 1)? {
+            // A probe refused earlier in the statement left the semi-join set
+            if let Some(set) = get_exists_probe_fallback(subquery_ptr) {
+                return Ok(Some(set.contains(&outer_value) == Some(true)));
+            }
+            // A key held by more rows than the cap goes to the semi-join set
+            // instead of copying them all for one visible row
+            let cap = EQUALITY_CANDIDATE_CAP;
+            if let Some(found) =
+                self.count_correlated_rows(ctx, &correlation, &outer_value, 1, cap)?
+            {
                 return Ok(Some(found > 0));
             }
             return self.exists_by_probe_fallback(subquery, &correlation, &outer_value, ctx);
@@ -660,7 +669,7 @@ impl Executor {
     /// Whether the inner rows of an EXISTS on the bare correlation hold `key`,
     /// for a probe the table refused: the semi-join set answers, built once
     /// per statement, since running the subquery per outer row would read
-    /// the inner table each time
+    /// the inner table each time. None for a name that is not a table
     fn exists_by_probe_fallback(
         &self,
         subquery: &SelectStatement,
@@ -671,6 +680,13 @@ impl Executor {
         let subquery_ptr = subquery as *const SelectStatement as usize;
         if let Some(set) = get_exists_probe_fallback(subquery_ptr) {
             return Ok(Some(set.contains(key) == Some(true)));
+        }
+        // A CTE or a view may change between runs of the same subquery, a
+        // recursive CTE's rows on every round: those run the subquery
+        let table =
+            self.with_correlated_probe_table(ctx, &correlation.inner_table, |_| Ok(Some(())))?;
+        if table.is_none() {
+            return Ok(None);
         }
         let inner_alias = match subquery.table_expr.as_deref() {
             Some(Expression::TableSource(ts)) => ts.alias.as_ref().map(|a| a.value.to_string()),
@@ -910,7 +926,7 @@ impl Executor {
             return Ok(None);
         }
         Ok(self
-            .count_correlated_rows(ctx, &correlation, &outer_value, usize::MAX)?
+            .count_correlated_rows(ctx, &correlation, &outer_value, usize::MAX, usize::MAX)?
             .map(|count| count as i64))
     }
 
@@ -1266,17 +1282,15 @@ impl Executor {
     }
 
     /// How many inner rows hold `key`, up to `limit`, counted as
-    /// `visit_correlated_rows` would find them
+    /// `visit_correlated_rows` would find them; None past `hot_cap` ids
     fn count_correlated_rows(
         &self,
         ctx: &ExecutionContext,
         correlation: &ExistsCorrelationInfo,
         key: &Value,
         limit: usize,
+        hot_cap: usize,
     ) -> Result<Option<usize>> {
-        // A key held by more rows than the cap answers from the semi-join set
-        // instead of copying them all for one visible row
-        let hot_cap = EQUALITY_CANDIDATE_CAP;
         self.with_correlated_candidates(
             ctx,
             correlation,
@@ -1347,8 +1361,6 @@ impl Executor {
                     &mut buffers.ids,
                     &mut buffers.scratch,
                 )?;
-                #[cfg(feature = "test-failpoints")]
-                crate::test_failpoints::correlated_ids_copied(buffers.ids.len());
                 let answered = match found {
                     Some(CappedEqual::Copied) => Some(answer(
                         table,

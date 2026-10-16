@@ -183,51 +183,87 @@ fn not_exists_sees_its_own_transaction() {
 #[test]
 fn exists_over_a_key_held_by_many_rows_builds_the_semi_join_once() {
     use stoolap::test_failpoints::{
-        correlated_ids_copied_count, exists_subquery_runs, inner_table_reads,
+        equality_candidate_ids_copied_count, exists_subquery_runs, inner_table_reads,
     };
-    let db = Database::open("memory://exists_heavy_key").unwrap();
-    for (table, index) in [("h", true), ("hw", false)] {
+    for using in ["BTREE", "HASH", "BITMAP"] {
+        let db = heavy_key_tables(&format!("exists_heavy_key_{using}"), using);
+        for test in ["EXISTS", "NOT EXISTS"] {
+            let sql = format!(
+                "SELECT o.id FROM o WHERE {test} (SELECT 1 FROM {{i}} WHERE {{i}}.c = o.k)"
+            );
+            let case = format!("{using}: {sql}");
+            let (copied, reads, runs) = (
+                equality_candidate_ids_copied_count(),
+                inner_table_reads(),
+                exists_subquery_runs(),
+            );
+            let got = ids(&db, &sql.replace("{i}", "h"));
+            let copied = equality_candidate_ids_copied_count() - copied;
+            let reads = inner_table_reads() - reads;
+            assert_eq!(got, ids(&db, &sql.replace("{i}", "hw")), "{case}");
+            assert!(copied <= 1024, "{case}: copied {copied} ids");
+            assert!(reads <= 1, "{case}: inner table read whole {reads} times");
+            assert_eq!(exists_subquery_runs() - runs, 0, "{case}: subqueries run");
+        }
+    }
+}
+
+/// `h` indexed `using` and its twin `hw`, 8000 rows with 5000 on key 7;
+/// `o` asks key 7 on most of its 8 rows
+#[cfg(feature = "test-failpoints")]
+fn heavy_key_tables(name: &str, using: &str) -> Database {
+    let db = Database::open(&format!("memory://{name}")).unwrap();
+    for table in ["h", "hw"] {
         db.execute(
             &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, c INTEGER)"),
             (),
         )
         .unwrap();
-        if index {
-            db.execute("CREATE INDEX h_c ON h(c) USING BTREE", ())
-                .unwrap();
-        }
         db.execute(
             &format!(
                 "INSERT INTO {table} SELECT value, CASE WHEN value <= 5000 THEN 7 \
-                 ELSE value END FROM generate_series(1, 8000)"
+                 ELSE value % 900 END FROM generate_series(1, 8000)"
             ),
             (),
         )
         .unwrap();
     }
+    db.execute(&format!("CREATE INDEX h_c ON h(c) USING {using}"), ())
+        .unwrap();
     db.execute("CREATE TABLE o (id INTEGER PRIMARY KEY, k INTEGER)", ())
         .unwrap();
     db.execute(
-        "INSERT INTO o VALUES (1, 7), (2, 7), (3, 7), (4, 7), (5, 6000), (6, 9), (7, 7), (8, 7)",
+        "INSERT INTO o VALUES (1, 7), (2, 7), (3, 7), (4, 7), (5, 600), (6, 9000), (7, 7), (8, 7)",
         (),
     )
     .unwrap();
-    for test in ["EXISTS", "NOT EXISTS"] {
-        let sql =
-            format!("SELECT o.id FROM o WHERE {test} (SELECT 1 FROM {{i}} WHERE {{i}}.c = o.k)");
-        let (copied, reads, runs) = (
-            correlated_ids_copied_count(),
-            inner_table_reads(),
-            exists_subquery_runs(),
-        );
-        let got = ids(&db, &sql.replace("{i}", "h"));
-        let copied = correlated_ids_copied_count() - copied;
-        let reads = inner_table_reads() - reads;
-        assert_eq!(got, ids(&db, &sql.replace("{i}", "hw")), "{sql}");
-        assert!(copied <= 1024, "{sql}: copied {copied} ids");
-        assert!(reads <= 1, "{sql}: inner table read whole {reads} times");
-        assert_eq!(exists_subquery_runs() - runs, 0, "{sql}: subqueries run");
-    }
+    db
+}
+
+/// The EXISTS cap leaves a correlated COUNT to count a key of any size
+/// through the index
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_correlated_count_still_counts_a_key_held_by_many_rows_from_the_index() {
+    use stoolap::test_failpoints::equality_candidate_ids_copied_count;
+    let db = heavy_key_tables("count_heavy_key", "BTREE");
+    let sql = "SELECT o.id, (SELECT COUNT(*) FROM {i} WHERE {i}.c = o.k) FROM o \
+               ORDER BY o.id LIMIT 1";
+    let count = |table: &str| -> i64 {
+        db.query(&sql.replace("{i}", table), ())
+            .unwrap()
+            .map(|r| r.unwrap().get::<i64>(1).unwrap())
+            .next()
+            .unwrap()
+    };
+    let want = count("hw");
+    let copied = equality_candidate_ids_copied_count();
+    assert_eq!(count("h"), want);
+    let copied = equality_candidate_ids_copied_count() - copied;
+    assert!(
+        copied >= 5000,
+        "the count read the key's ids from the index: {copied}"
+    );
 }
 
 /// Inside a transaction that changed the inner table its index answers no
@@ -249,4 +285,27 @@ fn exists_after_local_changes_asks_no_probe() {
         assert_eq!(exists_subquery_runs() - runs, 0, "{sql}: subqueries run");
     }
     db.execute("ROLLBACK", ()).unwrap();
+}
+
+/// An EXISTS over a recursive CTE sees the rows of the round that asks
+#[test]
+fn exists_over_a_recursive_cte_sees_each_round() {
+    let db = Database::open("memory://exists_recursive_cte").unwrap();
+    let rows: Vec<(i64, bool)> = db
+        .query(
+            "WITH RECURSIVE r(n, seen) AS ( \
+               SELECT 1, TRUE \
+               UNION ALL \
+               SELECT c.n + 1, EXISTS (SELECT 1 FROM r q WHERE q.n = c.n) \
+               FROM r c WHERE c.n < 3 \
+             ) SELECT n, seen FROM r ORDER BY n",
+            (),
+        )
+        .unwrap()
+        .map(|r| {
+            let r = r.unwrap();
+            (r.get::<i64>(0).unwrap(), r.get::<bool>(1).unwrap())
+        })
+        .collect();
+    assert_eq!(rows, vec![(1, true), (2, true), (3, true)]);
 }
