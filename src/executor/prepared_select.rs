@@ -26,6 +26,7 @@ use smallvec::SmallVec;
 use crate::api::params::ParamVec;
 use crate::common::{CompactArc, SmartString};
 use crate::core::{DataType, Error, Operator, Result, Row, RowVec, Schema, Value};
+use crate::functions::FunctionRegistry;
 use crate::parser::ast::*;
 use crate::parser::token::{Position, Token, TokenType};
 use crate::storage::expression::{AndExpr, ComparisonExpr, Expression as StorageExpr};
@@ -562,15 +563,140 @@ fn rebuild(
     })
 }
 
-/// Whether a call anywhere in `expr` draws a new value each time it runs,
-/// through every operand the family's forms have
-fn volatile(expr: &Expression) -> bool {
-    if contains_non_deterministic_volatile(expr) {
-        return true;
+/// The type name a value compared with a column of `data_type` is read as
+/// where the scan converts the value and the VM alone would not
+fn scan_type_name(data_type: DataType) -> Option<&'static str> {
+    match data_type {
+        DataType::Boolean => Some("BOOLEAN"),
+        DataType::Timestamp => Some("TIMESTAMP"),
+        DataType::Json => Some("JSON"),
+        DataType::Vector => Some("VECTOR"),
+        _ => None,
+    }
+}
+
+/// `expr` read as `type_name`, moved, so a subquery mark keeps its address
+fn read_as(expr: &mut Expression, type_name: &str) {
+    let token = Token::new(TokenType::Keyword, "CAST", Position::default());
+    let placeholder = Expression::NullLiteral(NullLiteral {
+        token: token.clone(),
+    });
+    let value = std::mem::replace(expr, placeholder);
+    *expr = Expression::Cast(CastExpression {
+        token,
+        expr: Box::new(value),
+        type_name: SmartString::from(type_name),
+    });
+}
+
+/// Every comparison in a WHERE program that sets a value against a column
+/// of `schema` reads the value as the scan does: converted to the column's
+/// type, so the program and a pushed comparison give one answer
+fn compare_as_scan(expr: &mut Expression, schema: &Schema) {
+    let column_type = |e: &Expression| match e {
+        Expression::Identifier(id) => schema
+            .column_index_map()
+            .get(id.value_lower.as_str())
+            .and_then(|&i| scan_type_name(schema.columns[i].data_type)),
+        _ => None,
+    };
+    for_each_child_mut(expr, &mut |child| compare_as_scan(child, schema));
+    match expr {
+        Expression::Infix(infix) if is_comparison(infix.op_type) => {
+            match (column_type(&infix.left), column_type(&infix.right)) {
+                (Some(t), None) if !mentions_column(&infix.right) => read_as(&mut infix.right, t),
+                (None, Some(t)) if !mentions_column(&infix.left) => read_as(&mut infix.left, t),
+                _ => {}
+            }
+        }
+        Expression::Between(between) => {
+            if let Some(t) = column_type(&between.expr) {
+                for bound in [&mut between.lower, &mut between.upper] {
+                    if !mentions_column(bound) {
+                        read_as(bound, t);
+                    }
+                }
+            }
+        }
+        Expression::In(in_expr) => {
+            if let Some(t) = column_type(&in_expr.left) {
+                let elements = match &mut *in_expr.right {
+                    Expression::List(list) => &mut list.elements,
+                    Expression::ExpressionList(list) => &mut list.expressions,
+                    _ => return,
+                };
+                for element in elements.iter_mut().filter(|e| !mentions_column(e)) {
+                    read_as(element, t);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Each direct operand of an expression of the family's forms, mutably
+fn for_each_child_mut(expr: &mut Expression, f: &mut impl FnMut(&mut Expression)) {
+    match expr {
+        Expression::Infix(infix) => {
+            f(&mut infix.left);
+            f(&mut infix.right);
+        }
+        Expression::Prefix(prefix) => f(&mut prefix.right),
+        Expression::Between(between) => {
+            f(&mut between.expr);
+            f(&mut between.lower);
+            f(&mut between.upper);
+        }
+        Expression::In(in_expr) => {
+            f(&mut in_expr.left);
+            match &mut *in_expr.right {
+                Expression::List(list) => list.elements.iter_mut().for_each(f),
+                Expression::ExpressionList(list) => list.expressions.iter_mut().for_each(f),
+                other => f(other),
+            }
+        }
+        Expression::Like(like) => {
+            f(&mut like.left);
+            f(&mut like.pattern);
+            if let Some(escape) = like.escape.as_deref_mut() {
+                f(escape);
+            }
+        }
+        Expression::Case(case) => {
+            if let Some(value) = case.value.as_deref_mut() {
+                f(value);
+            }
+            for when in case.when_clauses.iter_mut() {
+                f(&mut when.condition);
+                f(&mut when.then_result);
+            }
+            if let Some(else_value) = case.else_value.as_deref_mut() {
+                f(else_value);
+            }
+        }
+        Expression::Cast(cast) => f(&mut cast.expr),
+        Expression::FunctionCall(call) => call.arguments.iter_mut().for_each(f),
+        _ => {}
+    }
+}
+
+/// Whether a call anywhere in `expr` draws a new value each time it runs:
+/// one the registry holds non-deterministic, apart from the clock reads the
+/// pushdown also takes as fixed for a statement
+fn volatile(expr: &Expression, registry: &FunctionRegistry) -> bool {
+    if let Expression::FunctionCall(call) = expr {
+        let statement_clock = ["NOW", "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP"]
+            .iter()
+            .any(|f| call.function.eq_ignore_ascii_case(f));
+        if contains_non_deterministic_volatile(expr)
+            || (!statement_clock && !registry.is_deterministic(&call.function))
+        {
+            return true;
+        }
     }
     let mut found = false;
     let _ = for_each_child(expr, &mut |child| {
-        found |= volatile(child);
+        found |= volatile(child, registry);
         Ok(())
     });
     found
@@ -849,6 +975,8 @@ enum Output {
     Program(SharedProgram),
     /// An ORDER BY or DISTINCT ON key, NULL where it fails, as on the general path
     Key(SharedProgram),
+    /// A key that reads SELECT aliases from the projected row, as its second row
+    AliasKey(SharedProgram),
 }
 
 /// The SELECT list, then the columns and expressions ORDER BY appends for the sort
@@ -995,7 +1123,10 @@ impl Builder<'_> {
                 let left = chain.reads(&infix.left)?;
                 let right = chain.reads(&infix.right)?;
                 let hoist = |value: &Expression, reads: Reads| {
-                    reads & 1 == 0 && reads.count_ones() <= 1 && !is_leaf(value) && !volatile(value)
+                    reads & 1 == 0
+                        && reads.count_ones() <= 1
+                        && !is_leaf(value)
+                        && !volatile(value, &self.executor.function_registry)
                 };
                 let sides = [(&infix.left, left), (&infix.right, right)];
                 if let Some(index) = sides.iter().position(|(value, reads)| hoist(value, *reads)) {
@@ -1105,8 +1236,11 @@ impl Builder<'_> {
 
         let own = CompileContext::new(&scope.columns, registry).with_subquery_ids(&work.ids);
         let projection = compile_with(&own, &projection)?;
-        let filter = match &filter {
-            Some(filter) => Some(compile_with(&own, filter)?),
+        let filter = match filter {
+            Some(mut filter) => {
+                compare_as_scan(&mut filter, &schema);
+                Some(compile_with(&own, &filter)?)
+            }
             None => None,
         };
         let holes = if work.holes.is_empty() {
@@ -1235,10 +1369,18 @@ impl PreparedProjection {
         for expr in &plan.computed_order_by {
             outputs.push(Output::Key(compile(expr)?));
         }
-        // A key reading a SELECT alias is computed from what the alias
-        // names, under the key's own text, which is how the sort finds it
+        // A key reading a SELECT alias reads the value the projection gave
+        // it, under the key's own text, which is how the sort finds it
         let mut extra_names = plan.extra_names;
         let alias_map = Executor::build_alias_map_excluding(&stmt.columns, Some(columns));
+        let projected_names: Vec<String> = select_exprs
+            .iter()
+            .map(|e| match e {
+                Expression::Aliased(a) => a.alias.value_lower.to_string(),
+                _ => String::new(),
+            })
+            .collect();
+        let alias_ctx = std::cell::OnceCell::new();
         for ob in &stmt.order_by {
             let key = &ob.expression;
             if is_leaf(key) || !names_any(key, &|name| alias_map.contains_key(name)) {
@@ -1248,9 +1390,10 @@ impl PreparedProjection {
             if extra_names.contains(&name) {
                 continue;
             }
-            outputs.push(Output::Key(compile(&Executor::substitute_aliases(
-                key, &alias_map,
-            ))?));
+            let ctx = alias_ctx.get_or_init(|| {
+                CompileContext::new(columns, registry).with_second_row(&projected_names)
+            });
+            outputs.push(Output::AliasKey(compile_with(ctx, key)?));
             extra_names.push(name);
         }
         Ok((Self { outputs }, extra_names))
@@ -1274,9 +1417,26 @@ impl PreparedProjection {
                     Output::Key(program) => vm
                         .execute(program, &exec)
                         .unwrap_or_else(|_| Value::null_unknown()),
+                    Output::AliasKey(_) => Value::null_unknown(),
                 });
             }
-            projected.push((row_id as i64, Row::from_values(values)));
+            let mut out = Row::from_values(values);
+            for (position, output) in self.outputs.iter().enumerate() {
+                if let Output::AliasKey(program) = output {
+                    let mut exec = ExecuteContext::with_common_params(
+                        &row,
+                        ctx.params(),
+                        Some(ctx.named_params()),
+                        ctx.transaction_id(),
+                    );
+                    exec.row2 = Some(&out);
+                    let key = vm
+                        .execute(program, &exec)
+                        .unwrap_or_else(|_| Value::null_unknown());
+                    out.set(position, key)?;
+                }
+            }
+            projected.push((row_id as i64, out));
         }
         Ok(projected)
     }
@@ -1327,8 +1487,9 @@ impl PreparedSelect {
             }
             rewritten.push(part);
         }
-        let where_clause = conjunction(rewritten)
+        let mut where_clause = conjunction(rewritten)
             .ok_or_else(|| Error::internal("a prepared statement without WHERE"))?;
+        compare_as_scan(&mut where_clause, schema);
         let own = CompileContext::new(&scope.columns, registry).with_subquery_ids(&work.ids);
         let compile = |expr: &Expression| compile_with(&own, expr);
         let where_program = compile(&where_clause)?;
@@ -1416,7 +1577,10 @@ impl Builder<'_> {
         let mut value_work = Rewritten::default();
         let rewritten_value = self.rewrite(chain, None, value, &mut value_work)?;
         work.ids.extend(value_work.ids);
-        let value = if !value_work.reads_row && !is_leaf(value) && !volatile(value) {
+        let value = if !value_work.reads_row
+            && !is_leaf(value)
+            && !volatile(value, &self.executor.function_registry)
+        {
             let slot = self.slot();
             run_slots.push((slot, rewritten_value));
             slot_parameter(slot)

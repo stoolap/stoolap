@@ -1450,3 +1450,163 @@ fn test_an_order_by_key_reading_an_alias_is_prepared() {
     );
     assert_eq!((found.0, found.1), (expected.0, expected.1));
 }
+
+#[test]
+fn test_a_boolean_or_timestamp_column_reads_a_text_value_as_the_scan_does() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_scan_compare").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, b BOOLEAN)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, TRUE)", ()).unwrap();
+    db.execute(
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, b BOOLEAN, ts TIMESTAMP)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO u VALUES (1, TRUE, '2024-01-02 03:04:05')", ())
+        .unwrap();
+    for (inner, param) in [
+        ("u.b = $1 AND TRUE", "true"),
+        ("u.b = $1 OR u.id = 99", "true"),
+        ("NOT (u.b <> $1)", "true"),
+        ("u.b IN ($1)", "true"),
+        ("u.ts = $1 AND TRUE", "2024-01-02 03:04:05"),
+        ("u.ts BETWEEN $1 AND $1", "2024-01-02 03:04:05"),
+    ] {
+        let sql = format!("SELECT t.id FROM t WHERE t.id = (SELECT u.id FROM u WHERE {inner})");
+        let (found, runs) = ids(&db, &sql, (param,));
+        assert!(runs >= 1, "{sql} ran prepared");
+        assert_eq!(
+            found,
+            vec![1],
+            "{inner} with TEXT {param}, as the scan compares it"
+        );
+    }
+    let outer =
+        "SELECT t.id FROM t WHERE t.b = $1 AND t.id = (SELECT u.id FROM u WHERE u.id = t.id)";
+    assert_eq!(
+        ids(&db, outer, ("true",)).0,
+        vec![1],
+        "the statement's own WHERE follows the same rule"
+    );
+}
+
+#[test]
+fn test_an_order_by_alias_key_reads_the_projected_value() {
+    let _guard = serial();
+    let db = setup("prepared_order_alias_value");
+    let sql = "SELECT RANDOM() AS r FROM t WHERE id = (SELECT id FROM u WHERE u.id = t.id) \
+               ORDER BY r + 0";
+    let draws = random_draws();
+    let found: Vec<f64> = db
+        .query(sql, ())
+        .unwrap()
+        .map(|row| row.unwrap().get::<f64>(0).unwrap())
+        .collect();
+    assert_eq!(found.len(), 5, "one row per u row");
+    assert_eq!(
+        random_draws() - draws,
+        5,
+        "RANDOM() runs once per row, for r"
+    );
+    assert!(
+        found.windows(2).all(|w| w[0] <= w[1]),
+        "the rows are ordered by their own r: {found:?}"
+    );
+}
+
+#[test]
+fn test_an_order_by_alias_inside_cast() {
+    let _guard = serial();
+    let db = setup("prepared_order_alias_cast");
+    let cast = "SELECT a AS x FROM t WHERE id = (SELECT id FROM u WHERE u.id = t.id) \
+                ORDER BY CAST(x AS INTEGER) DESC";
+    let before = general_path_hits(GeneralPath::OrderByEvaluator);
+    let found: Vec<i64> = db
+        .query(cast, ())
+        .unwrap()
+        .map(|row| row.unwrap().get::<i64>(0).unwrap())
+        .collect();
+    assert_eq!(found, vec![60, 50, 30, 20, 10], "an alias inside CAST");
+    assert_eq!(general_path_hits(GeneralPath::OrderByEvaluator) - before, 0);
+}
+
+mod registered_volatile {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use stoolap::core::{Result, Value};
+    use stoolap::executor::Executor;
+    use stoolap::functions::registry::FunctionRegistry;
+    use stoolap::functions::{
+        FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
+    };
+    use stoolap::storage::mvcc::engine::MVCCEngine;
+
+    static TICKS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Returns its argument and counts its calls; registered non-deterministic
+    #[derive(Default)]
+    struct Tick;
+
+    impl ScalarFunction for Tick {
+        fn name(&self) -> &str {
+            "TICK"
+        }
+        fn info(&self) -> FunctionInfo {
+            FunctionInfo::new(
+                "TICK",
+                FunctionType::Scalar,
+                "test volatile",
+                FunctionSignature::new(
+                    FunctionDataType::Integer,
+                    vec![FunctionDataType::Any],
+                    1,
+                    1,
+                ),
+            )
+            .non_deterministic()
+        }
+        fn evaluate(&self, args: &[Value]) -> Result<Value> {
+            TICKS.fetch_add(1, Ordering::Relaxed);
+            Ok(args[0].clone())
+        }
+        fn clone_box(&self) -> Box<dyn ScalarFunction> {
+            Box::new(Tick)
+        }
+    }
+
+    #[test]
+    fn test_a_registered_volatile_function_runs_per_inner_row() {
+        let _guard = super::serial();
+        let mut engine = MVCCEngine::in_memory();
+        stoolap::storage::traits::Engine::open(&mut engine).unwrap();
+        let registry = FunctionRegistry::new();
+        registry.register_scalar::<Tick>();
+        let executor = Executor::with_function_registry(Arc::new(engine), Arc::new(registry));
+        for sql in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
+            "INSERT INTO t VALUES (1, 10)",
+            "CREATE TABLE m (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+            "INSERT INTO m VALUES (1, 1, 1), (2, 1, 2), (3, 1, 3), (4, 1, 4), (5, 1, 5)",
+        ] {
+            executor.execute(sql).unwrap();
+        }
+        let before = TICKS.load(Ordering::Relaxed);
+        let mut rows = executor
+            .execute(
+                "SELECT id FROM t WHERE id = 1 \
+                 AND a > (SELECT v FROM m WHERE m.k = t.id AND m.v = TICK(t.id) + 2)",
+            )
+            .unwrap();
+        let mut found = Vec::new();
+        while rows.next() {
+            found.push(rows.row().get(0).cloned());
+        }
+        assert_eq!(found, vec![Some(Value::Integer(1))]);
+        assert_eq!(
+            TICKS.load(Ordering::Relaxed) - before,
+            5,
+            "TICK runs once per inner row reaching the filter, not once per call"
+        );
+    }
+}
