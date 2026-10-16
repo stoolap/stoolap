@@ -1014,15 +1014,19 @@ impl Executor {
 
     /// The view a read committed statement's reads see, taken before its
     /// first read; None when the statement already has one, reads nothing
-    /// through one, or runs in a snapshot, which reads at its own point.
-    /// A statement snapshot the context carries is such a point
+    /// through one, or runs in a snapshot, which reads at its own point. A
+    /// statement snapshot the context carries gives its view, or is such a
+    /// point unless it reads each commit as it lands
     pub(crate) fn statement_view(
         &self,
         reads: bool,
         ctx: &ExecutionContext,
         active_txn_id: Option<i64>,
     ) -> Option<crate::storage::mvcc::registry::StatementView> {
-        if ctx.statement_view().is_some() || ctx.statement_snapshot().is_some() || !reads {
+        let at_its_point = ctx
+            .statement_snapshot()
+            .is_some_and(|snapshot| !snapshot.reads_latest());
+        if ctx.statement_view().is_some() || at_its_point || !reads {
             return None;
         }
         let level = match active_txn_id {

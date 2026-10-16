@@ -1448,17 +1448,18 @@ impl ExecutionContext {
         ctx
     }
 
-    /// The statement view the statement's reads see, if it has one
+    /// The statement view the statement's reads see, if it has one: its own,
+    /// else the one its statement snapshot reads through
     pub fn statement_view(&self) -> Option<&StatementView> {
-        self.statement_view.as_ref()
+        self.statement_view
+            .as_ref()
+            .or_else(|| self.statement_snapshot.as_ref()?.view())
     }
 
     /// Err once a truncate or drop overtook the statement's view: what the
     /// statement read through it may be gone
     pub(crate) fn view_held(&self) -> crate::core::Result<()> {
-        self.statement_view
-            .as_ref()
-            .map_or(Ok(()), StatementView::held)
+        self.statement_view().map_or(Ok(()), StatementView::held)
     }
 
     /// A copy of this context whose reads see `view`
@@ -1493,7 +1494,7 @@ impl ExecutionContext {
     }
 
     /// The view a scan of `table` at this depth reads through: none for the
-    /// DML target a query selects, else the statement's or its snapshot's
+    /// DML target a query selects, else the statement's
     pub(crate) fn scan_view(&self, table: &str) -> Option<&StatementView> {
         let target = self.newest_target.as_ref().is_some_and(|(name, depth)| {
             *depth == self.query_depth && name.eq_ignore_ascii_case(table)
@@ -1501,9 +1502,7 @@ impl ExecutionContext {
         if target {
             None
         } else {
-            self.statement_view
-                .as_ref()
-                .or_else(|| self.statement_snapshot.as_ref()?.view())
+            self.statement_view()
         }
     }
 

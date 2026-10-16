@@ -219,3 +219,90 @@ fn a_statement_snapshot_the_caller_gave_reads_at_its_own_point() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+/// A table `s` of `(1, 10)`, an executor on it and a context reading through
+/// a read committed statement snapshot that has `view`, if any
+fn snapshot_context(
+    name: &str,
+    view: bool,
+) -> (Database, stoolap::Executor, stoolap::ExecutionContext) {
+    use stoolap::executor::context::StatementSnapshot;
+    use stoolap::storage::traits::Engine;
+    let db = Database::open(&format!("memory://statement_view_snapshot_{name}")).unwrap();
+    db.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO s VALUES (1, 10)", ()).unwrap();
+    let engine = db.engine();
+    let snapshot = StatementSnapshot::new(
+        engine.begin_transaction().unwrap(),
+        stoolap::core::IsolationLevel::ReadCommitted,
+        view.then(|| engine.registry().capture_view()),
+    );
+    let executor = stoolap::Executor::new(std::sync::Arc::clone(engine));
+    let ctx = stoolap::ExecutionContext::new().with_statement_snapshot(snapshot);
+    (db, executor, ctx)
+}
+
+fn first_column(
+    executor: &stoolap::Executor,
+    sql: &str,
+    ctx: &stoolap::ExecutionContext,
+) -> stoolap::Result<Vec<i64>> {
+    let mut result = executor.execute_with_context(sql, ctx)?;
+    let mut out = Vec::new();
+    while result.next() {
+        out.push(result.row().get(0).and_then(|v| v.as_int64()).unwrap());
+    }
+    Ok(out)
+}
+
+#[test]
+fn a_read_committed_snapshot_without_a_view_reads_its_statement_through_one() {
+    let (db, executor, ctx) = snapshot_context("no_view", false);
+    let committed = Rc::new(Cell::new(false));
+    let (other, flag) = (db.clone(), Rc::clone(&committed));
+    stoolap::test_failpoints::after_select_table_opened(move || {
+        stoolap::test_failpoints::after_select_table_opened(move || {
+            other
+                .execute("UPDATE s SET v = 20 WHERE id = 1", ())
+                .unwrap();
+            flag.set(true);
+        });
+    });
+    let seen = first_column(
+        &executor,
+        "SELECT SUM(v) FROM s UNION ALL SELECT SUM(v) FROM s",
+        &ctx,
+    );
+    assert!(committed.get(), "the commit did not land between the sides");
+    assert_eq!(seen.unwrap(), [10, 10], "both sides read one view");
+}
+
+#[test]
+fn a_snapshot_view_a_truncate_overtook_ends_the_statement_with_the_error() {
+    let (db, executor, ctx) = snapshot_context("overtaken", true);
+    db.execute("TRUNCATE TABLE s", ()).unwrap();
+    let seen = first_column(&executor, "SELECT v FROM s ORDER BY v", &ctx);
+    assert!(
+        matches!(seen, Err(stoolap::Error::ViewOvertaken)),
+        "a view the caller gave is not taken again: {seen:?}"
+    );
+}
+
+#[test]
+fn a_dml_under_a_snapshot_view_selects_its_target_from_the_newest_state() {
+    let (db, executor, ctx) = snapshot_context("dml_target", true);
+    db.execute("INSERT INTO s VALUES (2, 20)", ()).unwrap();
+    executor
+        .execute_with_context("UPDATE s SET v = v + 1 WHERE v + id > 0", &ctx)
+        .unwrap();
+    let rows: Vec<(i64, i64)> = db
+        .query("SELECT id, v FROM s ORDER BY id", ())
+        .unwrap()
+        .map(|row| {
+            let row = row.unwrap();
+            (row.get(0).unwrap(), row.get(1).unwrap())
+        })
+        .collect();
+    assert_eq!(rows, [(1, 11), (2, 21)], "the target is the newest rows");
+}
