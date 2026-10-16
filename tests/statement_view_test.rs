@@ -175,3 +175,47 @@ fn test_read_committed_update_target_in_transaction_reads_the_newest_state() {
     db.execute("COMMIT", ()).unwrap();
     assert_eq!(updated_ids(&db), vec![7]);
 }
+
+#[test]
+fn a_statement_snapshot_the_caller_gave_reads_at_its_own_point() {
+    use stoolap::core::IsolationLevel;
+    use stoolap::executor::context::StatementSnapshot;
+    use stoolap::storage::traits::Engine;
+    let db = setup("memory://statement_view_given_snapshot");
+    db.execute("INSERT INTO u VALUES (8, 1)", ()).unwrap();
+    let engine = db.engine();
+    let snapshot = StatementSnapshot::new(
+        engine
+            .begin_transaction_with_level(IsolationLevel::SnapshotIsolation)
+            .unwrap(),
+        IsolationLevel::SnapshotIsolation,
+        None,
+    );
+    let viewed = StatementSnapshot::new(
+        engine.begin_transaction().unwrap(),
+        IsolationLevel::ReadCommitted,
+        Some(engine.registry().capture_view()),
+    );
+    // Row 8 shows a later outer scan, row 2 a later subquery
+    db.execute("INSERT INTO t VALUES (8, 80, 1)", ()).unwrap();
+    db.execute("UPDATE u SET v = 0 WHERE id = 2", ()).unwrap();
+    let executor = stoolap::Executor::new(std::sync::Arc::clone(engine));
+    let mut wrong = Vec::new();
+    for (name, snapshot) in [("snapshot", snapshot), ("view", viewed)] {
+        let ctx = stoolap::ExecutionContext::new().with_statement_snapshot(snapshot);
+        let seen: stoolap::Result<Vec<i64>> =
+            executor
+                .execute_with_context(QUERY, &ctx)
+                .map(|mut result| {
+                    let mut ids = Vec::new();
+                    while result.next() {
+                        ids.push(result.row().get(0).and_then(|v| v.as_int64()).unwrap());
+                    }
+                    ids
+                });
+        if seen.as_deref() != Ok(&[1]) {
+            wrong.push(format!("{name}: {seen:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

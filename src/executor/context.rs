@@ -1493,7 +1493,7 @@ impl ExecutionContext {
     }
 
     /// The view a scan of `table` at this depth reads through: none for the
-    /// DML target a query selects, else the statement's
+    /// DML target a query selects, else the statement's or its snapshot's
     pub(crate) fn scan_view(&self, table: &str) -> Option<&StatementView> {
         let target = self.newest_target.as_ref().is_some_and(|(name, depth)| {
             *depth == self.query_depth && name.eq_ignore_ascii_case(table)
@@ -1501,7 +1501,9 @@ impl ExecutionContext {
         if target {
             None
         } else {
-            self.statement_view.as_ref()
+            self.statement_view
+                .as_ref()
+                .or_else(|| self.statement_snapshot.as_ref()?.view())
         }
     }
 
