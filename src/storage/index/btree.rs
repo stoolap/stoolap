@@ -824,6 +824,9 @@ impl Index for BTreeIndex {
         } else {
             Bound::Excluded(max_arc)
         };
+        if bounds_hold_nothing(&min_bound, &max_bound) {
+            return Ok(Vec::new());
+        }
 
         // Estimate capacity based on range
         let capacity = sorted_values.len() / 4;
@@ -937,6 +940,9 @@ impl Index for BTreeIndex {
         } else {
             Bound::Excluded(max_arc)
         };
+        if bounds_hold_nothing(&min_bound, &max_bound) {
+            return;
+        }
 
         for (_, rows) in sorted_values.range((min_bound, max_bound)) {
             rows.copy_into(buffer);
@@ -1240,6 +1246,21 @@ impl Index for BTreeIndex {
     fn close(&mut self) -> Result<()> {
         self.closed.store(true, AtomicOrdering::Release);
         self.clear()
+    }
+}
+
+/// Whether range bounds cross, or meet with one side open: they hold no key,
+/// and `BTreeMap::range` panics on some of them
+pub(crate) fn bounds_hold_nothing<K: Ord>(start: &Bound<K>, end: &Bound<K>) -> bool {
+    match (start, end) {
+        (
+            Bound::Included(low) | Bound::Excluded(low),
+            Bound::Included(high) | Bound::Excluded(high),
+        ) => {
+            let open = matches!(start, Bound::Excluded(_)) || matches!(end, Bound::Excluded(_));
+            low > high || (low == high && open)
+        }
+        _ => false,
     }
 }
 
