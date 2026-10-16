@@ -377,7 +377,7 @@ A SELECT of one shape is prepared once per cached plan instead of rebuilt for ev
 - every value a subquery reads from an enclosing query becomes a parameter of the subquery, so the subquery's own comparisons narrow its scan, through its primary key or an index
 - a name resolves to the nearest scope that has it: a qualified name `q.c` to the nearest query whose table or alias is `q`, an unqualified name to the subquery's own table first and then to each enclosing query outward
 - a qualifier that names no scope is an error, as is a column its table does not have, and a named parameter the statement is given no value for
-- a value compared with a `BOOLEAN`, `TIMESTAMP`, `JSON` or `VECTOR` column is read as the column's type, the way an index or table scan reads it, whether or not the scan takes the comparison: `b = 'true'` matches a `TRUE` row. A `JSON` or `VECTOR` comparison is never handed to the scan
+- a value compared with a column that is not `TEXT` is read as the column's type, the way an index or table scan reads it, whether or not the scan takes the comparison: `b = 'true'` matches a `TRUE` row of a `BOOLEAN` column, and `i = TRUE` matches `1` in an `INTEGER` one. A `TEXT` that is no number, compared with a number column, stays `TEXT` and the comparison is unknown. A `JSON` or `VECTOR` comparison is never handed to the scan
 - a subquery that reads no enclosing query runs at most once per execution, and only when a row needs it: a `CASE` arm or the right side of an `OR` that no row reaches does not run it. A subquery compared directly with a column in a top-level `AND` of the statement runs once before the scan, so the scan can use the column's index
 
 ## Examples

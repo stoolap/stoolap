@@ -700,6 +700,11 @@ pub enum Op {
     /// Stack: [value] -> [casted_value]
     Cast(DataType),
 
+    /// Read a value compared with a column of this type as the scan reads
+    /// it; a TEXT that is no number stays TEXT for a numeric column
+    /// Stack: [value] -> [value as the column's type]
+    ReadAsColumn(DataType),
+
     /// Truncate timestamp to date (midnight)
     /// Used for CAST(timestamp AS DATE) - truncates time component to 00:00:00
     /// Stack: [value] -> [timestamp_at_midnight]
@@ -986,6 +991,7 @@ impl std::fmt::Debug for Op {
             Op::Greatest(n) => write!(f, "Greatest({})", n),
             Op::Least(n) => write!(f, "Least({})", n),
             Op::Cast(dt) => write!(f, "Cast({:?})", dt),
+            Op::ReadAsColumn(dt) => write!(f, "ReadAsColumn({:?})", dt),
             Op::TruncateToDate => write!(f, "TruncateToDate"),
             Op::CaseStart => write!(f, "CaseStart"),
             Op::CaseWhen(target) => write!(f, "CaseWhen(jump={})", target),

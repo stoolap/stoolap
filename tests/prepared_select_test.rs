@@ -1747,3 +1747,109 @@ fn test_a_quoted_dotted_alias_reads_the_projected_value() {
         "\"x.y\" is the alias, not a qualified name"
     );
 }
+
+#[test]
+fn test_a_repeated_alias_reads_its_last_projection() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_repeated_alias").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 20)", ())
+        .unwrap();
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1), (2)", ()).unwrap();
+    let sql = "SELECT a AS x, -a AS x FROM t WHERE id = (SELECT id FROM u WHERE u.id = t.id) \
+               ORDER BY CAST(x AS INTEGER)";
+    let (found, runs) = ids(&db, sql, ());
+    assert!(runs >= 1, "ran prepared");
+    assert_eq!(found, vec![20, 10], "x in an expression is the last x, -a");
+}
+
+#[test]
+fn test_an_alias_binding_cannot_meet_a_column_name() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_alias_binding_name").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, \"\u{1}0\" INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10, 99), (2, 20, 0)", ())
+        .unwrap();
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1), (2)", ()).unwrap();
+    let sql = "SELECT a AS z FROM t WHERE id = (SELECT id FROM u WHERE u.id = t.id) \
+               ORDER BY CAST(z AS INTEGER) DESC";
+    let (found, runs) = ids(&db, sql, ());
+    assert!(runs >= 1, "ran prepared");
+    assert_eq!(
+        found,
+        vec![20, 10],
+        "z is a, whatever the table's columns are named"
+    );
+}
+
+#[test]
+fn test_a_numeric_column_reads_a_boolean_value_as_the_scan_does() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_numeric_boolean").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, i INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1, 1)", ()).unwrap();
+    for inner in ["i = TRUE", "i = TRUE OR id = 99", "(i = TRUE) = TRUE"] {
+        let sql = format!("SELECT id FROM t WHERE id = (SELECT id FROM u WHERE {inner})");
+        let (found, runs) = ids(&db, &sql, ());
+        assert!(runs >= 1, "{sql} ran prepared");
+        assert_eq!(found, vec![1], "{inner}: TRUE read as the INTEGER 1");
+    }
+}
+
+#[test]
+fn test_order_by_columns_do_not_show_beside_a_star() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_star_order").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1)", ()).unwrap();
+    for order in ["1", "t.id", "id + 0"] {
+        let sql = format!(
+            "SELECT * FROM t WHERE id = (SELECT id FROM u WHERE u.id = t.id) ORDER BY {order}"
+        );
+        let rows = db.query(&sql, ()).unwrap();
+        assert_eq!(
+            rows.columns().to_vec(),
+            vec!["id".to_string()],
+            "ORDER BY {order}"
+        );
+        let widths: Vec<usize> = rows.map(|row| row.unwrap().len()).collect();
+        assert_eq!(widths, vec![1], "ORDER BY {order}");
+    }
+}
+
+#[test]
+fn test_a_quoted_dotted_column_name_is_the_column() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_dotted_column").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
+    db.execute(
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, v INTEGER, \"x.y\" INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO u VALUES (1, 7, 7)", ()).unwrap();
+    let sql = "SELECT t.id FROM t WHERE t.id = \
+               (SELECT u.id FROM u WHERE u.id = t.id AND u.v = ABS(\"x.y\"))";
+    let (found, runs) = ids(&db, sql, ());
+    assert!(runs >= 1, "ran prepared");
+    assert_eq!(found, vec![1], "\"x.y\" is u's column");
+}

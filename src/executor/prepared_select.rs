@@ -51,11 +51,13 @@ const MAX_SCOPES: usize = 32;
 /// Why a statement runs on the general path instead of the prepared one
 pub(crate) type OutOfFamily = &'static str;
 
-/// The rows, their columns, and whether LIMIT and OFFSET were applied
+/// The rows, their columns, whether LIMIT and OFFSET were applied, and how
+/// many of the columns the statement shows
 type PreparedOutput = (
     Box<dyn crate::storage::traits::QueryResult>,
     CompactArc<Vec<String>>,
     bool,
+    usize,
 );
 
 /// The classifier's walk over one statement
@@ -322,6 +324,15 @@ impl Chain<'_> {
     /// `id` by the name rules: the nearest scope with that column, or None
     /// for a name the compiler reads as a literal
     fn bare(&self, id: &Identifier) -> Result<Resolved> {
+        if !id.quoted && matches!(id.value_lower.as_str(), "true" | "false") {
+            return Ok(None);
+        }
+        // A name is a column's whole name before its dot is a qualifier's
+        for (depth, scope) in self.scopes.iter().enumerate() {
+            if let Some(index) = scope.lower.iter().position(|c| *c == id.value_lower) {
+                return Ok(Some((depth, index)));
+            }
+        }
         if let Some(dot) = id.value_lower.rfind('.') {
             let resolved = self.qualified(
                 &id.value_lower[..dot],
@@ -332,14 +343,6 @@ impl Chain<'_> {
                 Err(_) if id.quoted => Ok(None),
                 other => other.map(Some),
             };
-        }
-        if !id.quoted && matches!(id.value_lower.as_str(), "true" | "false") {
-            return Ok(None);
-        }
-        for (depth, scope) in self.scopes.iter().enumerate() {
-            if let Some(index) = scope.lower.iter().position(|c| *c == id.value_lower) {
-                return Ok(Some((depth, index)));
-            }
         }
         if id.quoted {
             return Ok(None);
@@ -563,49 +566,25 @@ fn rebuild(
     })
 }
 
-/// The type name a value compared with a column of `data_type` is read as
-/// where the scan converts the value and the VM alone would not
-fn scan_type_name(data_type: DataType) -> Option<&'static str> {
-    match data_type {
-        DataType::Boolean => Some("BOOLEAN"),
-        DataType::Timestamp => Some("TIMESTAMP"),
-        DataType::Json => Some("JSON"),
-        DataType::Vector => Some("VECTOR"),
-        _ => None,
-    }
-}
-
-/// `expr` read as `type_name`, moved, so a subquery mark keeps its address
-fn read_as(expr: &mut Expression, type_name: &str) {
-    let token = Token::new(TokenType::Keyword, "CAST", Position::default());
-    let placeholder = Expression::NullLiteral(NullLiteral {
-        token: token.clone(),
-    });
-    let value = std::mem::replace(expr, placeholder);
-    *expr = Expression::Cast(CastExpression {
-        token,
-        expr: Box::new(value),
-        type_name: SmartString::from(type_name),
-    });
-}
-
-/// `key` with each bare name of an alias in `positions` spelled as the
-/// second row's name for that alias's position
-fn bind_aliases(key: &Expression, positions: &FxHashMap<&str, usize>) -> Result<Expression> {
+/// Each bare name in `key` of an alias in `positions`, by node address, to
+/// that alias's position on the projected row
+fn bind_aliases(
+    key: &Expression,
+    positions: &FxHashMap<&str, u16>,
+    out: &mut FxHashMap<usize, u16>,
+) {
     match key {
-        Expression::Identifier(id) => Ok(match positions.get(id.value_lower.as_str()) {
-            Some(i) => {
-                let name = format!("\u{1}{i}");
-                let mut bound = Identifier::new(
-                    Token::new(TokenType::Identifier, &name, Position::default()),
-                    name.as_str(),
-                );
-                bound.quoted = true;
-                Expression::Identifier(bound)
+        Expression::Identifier(id) => {
+            if let Some(&i) = positions.get(id.value_lower.as_str()) {
+                out.insert(id as *const Identifier as usize, i);
             }
-            None => key.clone(),
-        }),
-        other => rebuild(other, &mut |child| bind_aliases(child, positions)),
+        }
+        other => {
+            let _ = for_each_child(other, &mut |child| {
+                bind_aliases(child, positions, out);
+                Ok(())
+            });
+        }
     }
 }
 
@@ -649,95 +628,58 @@ fn reads_row_column(expr: &Expression) -> bool {
     }
 }
 
-/// Every comparison in a WHERE program that sets a value against a column
-/// of `schema` reads the value as the scan does: converted to the column's
-/// type, so the program and a pushed comparison give one answer
-fn compare_as_scan(expr: &mut Expression, schema: &Schema) {
+/// Every value a WHERE program compares with a column of `schema`, by node
+/// address, to the column's type: the program reads it as the scan reads a
+/// pushed comparison's value, so both give one answer. A TEXT column's
+/// values are left alone, as the scan pushes no number against one
+fn compare_as_scan(expr: &Expression, schema: &Schema, out: &mut FxHashMap<usize, DataType>) {
     let column_type = |e: &Expression| match e {
         Expression::Identifier(id) => schema
             .column_index_map()
             .get(id.value_lower.as_str())
-            .and_then(|&i| scan_type_name(schema.columns[i].data_type)),
+            .map(|&i| schema.columns[i].data_type)
+            .filter(|t| !matches!(t, DataType::Text | DataType::Null)),
         _ => None,
     };
-    for_each_child_mut(expr, &mut |child| compare_as_scan(child, schema));
+    let mut read_as = |value: &Expression, t: DataType| {
+        // A literal of the column's own type, or NULL, already reads as the scan's
+        let as_is = extract_literal_value(value).is_some_and(|v| v.is_null() || v.data_type() == t);
+        if !as_is && !reads_row_column(value) {
+            out.insert(value as *const Expression as usize, t);
+        }
+    };
     match expr {
         Expression::Infix(infix) if is_comparison(infix.op_type) => {
             match (column_type(&infix.left), column_type(&infix.right)) {
-                (Some(t), None) if !reads_row_column(&infix.right) => read_as(&mut infix.right, t),
-                (None, Some(t)) if !reads_row_column(&infix.left) => read_as(&mut infix.left, t),
+                (Some(t), None) => read_as(&infix.right, t),
+                (None, Some(t)) => read_as(&infix.left, t),
                 _ => {}
             }
         }
         Expression::Between(between) => {
             if let Some(t) = column_type(&between.expr) {
-                for bound in [&mut between.lower, &mut between.upper] {
-                    if !reads_row_column(bound) {
-                        read_as(bound, t);
-                    }
-                }
+                read_as(&between.lower, t);
+                read_as(&between.upper, t);
             }
         }
         Expression::In(in_expr) => {
             if let Some(t) = column_type(&in_expr.left) {
-                let elements = match &mut *in_expr.right {
-                    Expression::List(list) => &mut list.elements,
-                    Expression::ExpressionList(list) => &mut list.expressions,
-                    _ => return,
+                let elements = match &*in_expr.right {
+                    Expression::List(list) => &list.elements[..],
+                    Expression::ExpressionList(list) => &list.expressions[..],
+                    _ => &[],
                 };
-                for element in elements.iter_mut().filter(|e| !reads_row_column(e)) {
+                for element in elements {
                     read_as(element, t);
                 }
             }
         }
         _ => {}
     }
-}
-
-/// Each direct operand of an expression of the family's forms, mutably
-fn for_each_child_mut(expr: &mut Expression, f: &mut impl FnMut(&mut Expression)) {
-    match expr {
-        Expression::Infix(infix) => {
-            f(&mut infix.left);
-            f(&mut infix.right);
-        }
-        Expression::Prefix(prefix) => f(&mut prefix.right),
-        Expression::Between(between) => {
-            f(&mut between.expr);
-            f(&mut between.lower);
-            f(&mut between.upper);
-        }
-        Expression::In(in_expr) => {
-            f(&mut in_expr.left);
-            match &mut *in_expr.right {
-                Expression::List(list) => list.elements.iter_mut().for_each(f),
-                Expression::ExpressionList(list) => list.expressions.iter_mut().for_each(f),
-                other => f(other),
-            }
-        }
-        Expression::Like(like) => {
-            f(&mut like.left);
-            f(&mut like.pattern);
-            if let Some(escape) = like.escape.as_deref_mut() {
-                f(escape);
-            }
-        }
-        Expression::Case(case) => {
-            if let Some(value) = case.value.as_deref_mut() {
-                f(value);
-            }
-            for when in case.when_clauses.iter_mut() {
-                f(&mut when.condition);
-                f(&mut when.then_result);
-            }
-            if let Some(else_value) = case.else_value.as_deref_mut() {
-                f(else_value);
-            }
-        }
-        Expression::Cast(cast) => f(&mut cast.expr),
-        Expression::FunctionCall(call) => call.arguments.iter_mut().for_each(f),
-        _ => {}
-    }
+    let _ = for_each_child(expr, &mut |child| {
+        compare_as_scan(child, schema, out);
+        Ok(())
+    });
 }
 
 /// Whether a call anywhere in `expr` draws a new value each time it runs:
@@ -886,6 +828,8 @@ pub struct PreparedSelect {
     subqueries: Vec<PreparedScalarSubquery>,
     projection: PreparedProjection,
     output_columns: CompactArc<Vec<String>>,
+    /// The output columns the statement shows; the sort's keys follow them
+    visible: usize,
 }
 
 /// A scalar subquery over one table, prepared as its own scope: every
@@ -1300,13 +1244,16 @@ impl Builder<'_> {
             None => None,
         };
 
-        let own = CompileContext::new(&scope.columns, registry).with_subquery_ids(&work.ids);
+        let mut read_as = FxHashMap::default();
+        if let Some(filter) = &filter {
+            compare_as_scan(filter, &schema, &mut read_as);
+        }
+        let own = CompileContext::new(&scope.columns, registry)
+            .with_subquery_ids(&work.ids)
+            .with_read_as(&read_as);
         let projection = compile_with(&own, &projection)?;
-        let filter = match filter {
-            Some(mut filter) => {
-                compare_as_scan(&mut filter, &schema);
-                Some(compile_with(&own, &filter)?)
-            }
+        let filter = match &filter {
+            Some(filter) => Some(compile_with(&own, filter)?),
             None => None,
         };
         let holes = if work.holes.is_empty() {
@@ -1439,35 +1386,36 @@ impl PreparedProjection {
         // it, under the key's own text, which is how the sort finds it
         let mut extra_names = plan.extra_names;
         let alias_map = Executor::build_alias_map_excluding(&stmt.columns, Some(columns));
-        // Each alias is bound to its position under a name no column, alias
-        // or qualifier can spell, so a dotted alias registers no qualifier
-        let mut positions: FxHashMap<&str, usize> = FxHashMap::default();
-        let projected_names: Vec<String> = select_exprs
-            .iter()
-            .enumerate()
-            .map(|(i, e)| match e {
-                Expression::Aliased(a) if alias_map.contains_key(a.alias.value_lower.as_str()) => {
-                    positions.entry(a.alias.value_lower.as_str()).or_insert(i);
-                    format!("\u{1}{i}")
+        // Each alias reference is bound to its position by node, not by name,
+        // so no column name can meet it; a repeated alias is its last use,
+        // as the general path's evaluator over the output columns reads it
+        let mut positions: FxHashMap<&str, u16> = FxHashMap::default();
+        for (i, e) in select_exprs.iter().enumerate() {
+            if let Expression::Aliased(a) = e {
+                if alias_map.contains_key(a.alias.value_lower.as_str()) {
+                    let i = u16::try_from(i)
+                        .map_err(|_| Error::internal("too many SELECT expressions"))?;
+                    positions.insert(a.alias.value_lower.as_str(), i);
                 }
-                _ => String::new(),
-            })
-            .collect();
-        let alias_ctx = std::cell::OnceCell::new();
-        for ob in &stmt.order_by {
-            let key = &ob.expression;
-            if is_leaf(key) || !names_any(key, &|name| alias_map.contains_key(name)) {
-                continue;
             }
+        }
+        let keys: Vec<&Expression> = stmt
+            .order_by
+            .iter()
+            .map(|ob| &ob.expression)
+            .filter(|key| !is_leaf(key) && names_any(key, &|name| positions.contains_key(name)))
+            .collect();
+        let mut bindings = FxHashMap::default();
+        for key in &keys {
+            bind_aliases(key, &positions, &mut bindings);
+        }
+        let alias_ctx = CompileContext::new(columns, registry).with_row2_bindings(&bindings);
+        for key in keys {
             let name = key.to_string();
             if extra_names.contains(&name) {
                 continue;
             }
-            let ctx = alias_ctx.get_or_init(|| {
-                CompileContext::new(columns, registry).with_second_row(&projected_names)
-            });
-            let bound = bind_aliases(key, &positions)?;
-            outputs.push(Output::AliasKey(compile_with(ctx, &bound)?));
+            outputs.push(Output::AliasKey(compile_with(&alias_ctx, key)?));
             extra_names.push(name);
         }
         Ok((Self { outputs }, extra_names))
@@ -1561,10 +1509,13 @@ impl PreparedSelect {
             }
             rewritten.push(part);
         }
-        let mut where_clause = conjunction(rewritten)
+        let where_clause = conjunction(rewritten)
             .ok_or_else(|| Error::internal("a prepared statement without WHERE"))?;
-        compare_as_scan(&mut where_clause, schema);
-        let own = CompileContext::new(&scope.columns, registry).with_subquery_ids(&work.ids);
+        let mut read_as = FxHashMap::default();
+        compare_as_scan(&where_clause, schema, &mut read_as);
+        let own = CompileContext::new(&scope.columns, registry)
+            .with_subquery_ids(&work.ids)
+            .with_read_as(&read_as);
         let compile = |expr: &Expression| compile_with(&own, expr);
         let where_program = compile(&where_clause)?;
         let run_slots = run_slots
@@ -1588,6 +1539,7 @@ impl PreparedSelect {
         }
         let mut output_columns =
             executor.get_output_column_names(&stmt.columns, &scope.columns, Some(scope_name));
+        let visible = output_columns.len();
         output_columns.extend(extra_names);
         let subqueries = builder
             .subqueries
@@ -1606,6 +1558,7 @@ impl PreparedSelect {
             subqueries,
             projection,
             output_columns: CompactArc::new(output_columns),
+            visible,
         })
     }
 }
@@ -1860,7 +1813,7 @@ impl Executor {
                     CompactArc::clone(&output_columns),
                     RowVec::new(),
                 );
-                return Ok((Box::new(result), output_columns, true));
+                return Ok((Box::new(result), output_columns, true, prepared.visible));
             }
         }
 
@@ -1895,7 +1848,12 @@ impl Executor {
         crate::test_failpoints::prepared_projection_ran();
         let rows = prepared.projection.project(rows, ctx)?;
         let result = ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), rows);
-        Ok((Box::new(result), output_columns, limit_applied))
+        Ok((
+            Box::new(result),
+            output_columns,
+            limit_applied,
+            prepared.visible,
+        ))
     }
 }
 

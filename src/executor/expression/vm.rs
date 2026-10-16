@@ -1690,6 +1690,13 @@ impl ExprVM {
                     pc += 1;
                 }
 
+                Op::ReadAsColumn(column_type) => {
+                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    self.stack
+                        .push(crate::executor::pushdown::read_as_column(*column_type, v));
+                    pc += 1;
+                }
+
                 Op::TruncateToDate => {
                     let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let result = match &v {

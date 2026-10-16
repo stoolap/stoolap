@@ -634,9 +634,12 @@ impl Executor {
             };
             &branch_stmt
         };
+        // A prepared statement knows how many columns it shows, a star included
+        let mut prepared_visible = None;
         let (mut result, columns, limit_offset_applied, deferred_projection) = if in_family {
-            let (result, columns, applied) =
+            let (result, columns, applied, visible) =
                 self.execute_prepared_select(stmt, ctx, compiled, limit, offset)?;
+            prepared_visible = Some(visible);
             (result, columns, applied, None)
         } else {
             self.execute_select_internal(branch, ctx, &classification, compiled)?
@@ -657,17 +660,18 @@ impl Executor {
         // Beside a star the count is unknown, but the only columns past
         // the visible ones are then the window functions ORDER BY had
         // computed for it, so those are counted off the end
-        let expected_columns = match self.count_select_columns(stmt) {
-            0 if classification.has_window_functions => {
-                let hidden = Self::hidden_order_by_windows(stmt).len();
-                if hidden > 0 {
-                    columns.len().saturating_sub(hidden)
-                } else {
-                    0
+        let expected_columns =
+            match prepared_visible.unwrap_or_else(|| self.count_select_columns(stmt)) {
+                0 if classification.has_window_functions => {
+                    let hidden = Self::hidden_order_by_windows(stmt).len();
+                    if hidden > 0 {
+                        columns.len().saturating_sub(hidden)
+                    } else {
+                        0
+                    }
                 }
-            }
-            counted => counted,
-        };
+                counted => counted,
+            };
 
         // Apply DISTINCT (skip for DISTINCT ON — it's applied after ORDER BY)
         // When ORDER BY references columns not in SELECT, we add extra columns for sorting.
