@@ -201,8 +201,9 @@ fn a_hot_delete_by_primary_key_allocates_no_more_than_before() {
     );
 }
 
-/// Measured on 897038e4 (main with #371), the shape above
-const HOT_PK_DELETE_ALLOCATIONS: usize = 29;
+/// Measured on 897038e4 (main with #371), the shape above, plus the one
+/// removal history record a commit that takes index entries out publishes
+const HOT_PK_DELETE_ALLOCATIONS: usize = 30;
 
 #[test]
 fn a_delete_finds_the_rows_its_transaction_changed_with_no_allocation_under_the_lock() {
