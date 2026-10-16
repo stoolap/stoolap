@@ -26,7 +26,7 @@ use std::borrow::Cow;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
-use super::ops::{CompareOp, CompiledPattern, Op};
+use super::ops::{CompareOp, CompiledPattern, IntervalStep, IntervalUnit, Op};
 use super::program::Program;
 use crate::common::{CompactArc, SmartString};
 use crate::core::predicate::{number_against_text, sql_compare, sql_distinct, sql_eq};
@@ -1341,6 +1341,41 @@ impl ExprVM {
                         }
                         _ if ts.is_null() || days.is_null() => Value::Null(DataType::Timestamp),
                         _ => Value::Null(DataType::Timestamp),
+                    };
+                    self.stack.push(result);
+                    pc += 1;
+                }
+
+                Op::ScaleInterval(step, count) => {
+                    let result = match self.pop_interval_multiplier(*count)? {
+                        Some(k) => Value::Text(SmartString::from_string(Self::interval_text(
+                            *step,
+                            Self::scale_interval(*step, k)?,
+                        ))),
+                        None => Value::Null(DataType::Text),
+                    };
+                    self.stack.push(result);
+                    pc += 1;
+                }
+
+                Op::TimestampAddScaledInterval(step, subtract, count) => {
+                    let k = self.pop_interval_multiplier(*count)?;
+                    let ts = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let result = match &ts {
+                        Value::Timestamp(t) => match k {
+                            Some(k) => {
+                                let interval = Self::scale_interval(*step, k)?;
+                                Self::shift_timestamp(*t, interval, *subtract)?
+                            }
+                            None => Value::Null(DataType::Timestamp),
+                        },
+                        _ if ts.is_null() => Value::Null(DataType::Timestamp),
+                        _ => {
+                            return Err(crate::core::Error::Type(format!(
+                                "cannot add an INTERVAL to {:?}",
+                                ts.data_type()
+                            )))
+                        }
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -3589,6 +3624,140 @@ impl ExprVM {
         }
     }
 
+    /// An INTERVAL multiplier: Ok for a whole number, Err for a fractional
+    /// one, None for NULL; any other type is an error
+    fn interval_multiplier(n: &Value) -> Result<Option<std::result::Result<i64, f64>>> {
+        match n {
+            v if v.is_null() => Ok(None),
+            Value::Integer(k) => Ok(Some(Ok(*k))),
+            Value::Float(f) => Ok(Some(Err(*f))),
+            v => Err(crate::core::Error::Type(format!(
+                "cannot multiply an INTERVAL by {:?}",
+                v.data_type()
+            ))),
+        }
+    }
+
+    /// Pops `count` INTERVAL multipliers and returns their product, taken in
+    /// the order they were pushed; None when one is NULL. Every one is
+    /// checked, NULL or not
+    fn pop_interval_multiplier(
+        &mut self,
+        count: u8,
+    ) -> Result<Option<std::result::Result<i64, f64>>> {
+        let as_f64 = |k: std::result::Result<i64, f64>| k.map_or_else(|f| f, |i| i as f64);
+        let start = self.stack.len().saturating_sub(usize::from(count));
+        let mut product = Some(Ok(1i64));
+        for n in &self.stack[start..] {
+            product = match (product, Self::interval_multiplier(n)?) {
+                (None, _) | (_, None) => None,
+                (Some(Ok(a)), Some(Ok(b))) => Some(Ok(a.checked_mul(b).ok_or_else(|| {
+                    crate::core::Error::Type(format!(
+                        "INTERVAL multiplier {a} times {b} is out of range"
+                    ))
+                })?)),
+                (Some(a), Some(b)) => Some(Err(as_f64(a) * as_f64(b))),
+            };
+        }
+        self.stack.truncate(start);
+        Ok(product)
+    }
+
+    /// `step` times `k`. A fixed unit is counted in microseconds, rounded;
+    /// a calendar unit takes whole multiples only
+    fn scale_interval(
+        step: IntervalStep,
+        k: std::result::Result<i64, f64>,
+    ) -> Result<IntervalValue> {
+        let n = || k.map_or_else(|f| f.to_string(), |i| i.to_string());
+        let out_of_range = || {
+            crate::core::Error::Type(format!(
+                "INTERVAL '{} {}' times {} is out of range",
+                step.quantity,
+                step.unit.name(),
+                n()
+            ))
+        };
+        if let Some(per) = step.unit.months() {
+            let k = match k {
+                Ok(k) => k,
+                Err(f) if f.fract() == 0.0 && f.abs() < 9.2e18 => f as i64,
+                Err(_) => {
+                    return Err(crate::core::Error::Type(format!(
+                        "a {} INTERVAL takes only a whole multiple, not {}",
+                        step.unit.name(),
+                        n()
+                    )))
+                }
+            };
+            let months = step
+                .quantity
+                .checked_mul(per)
+                .and_then(|m| m.checked_mul(k));
+            return months.map(IntervalValue::Months).ok_or_else(out_of_range);
+        }
+        let unit = step
+            .quantity
+            .checked_mul(step.unit.micros())
+            .ok_or_else(out_of_range)?;
+        let micros = match k {
+            Ok(k) => unit.checked_mul(k).ok_or_else(out_of_range)?,
+            Err(f) => {
+                let x = (unit as f64 * f).round();
+                if !x.is_finite() || x.abs() >= 9.2e18 {
+                    return Err(out_of_range());
+                }
+                x as i64
+            }
+        };
+        Ok(IntervalValue::Duration(chrono::Duration::microseconds(
+            micros,
+        )))
+    }
+
+    /// `interval` as text `parse_interval` reads back: in `step`'s unit when
+    /// it is a whole count of it, else in the largest exact sub-day unit
+    fn interval_text(step: IntervalStep, interval: IntervalValue) -> String {
+        match interval {
+            IntervalValue::Months(m) if step.unit == IntervalUnit::Year && m % 12 == 0 => {
+                format!("{} year", m / 12)
+            }
+            IntervalValue::Months(m) => format!("{m} month"),
+            IntervalValue::Duration(d) => {
+                let micros = d.num_microseconds().unwrap_or(0);
+                let unit = [step.unit, IntervalUnit::Second, IntervalUnit::Millisecond]
+                    .into_iter()
+                    .find(|u| micros % u.micros() == 0)
+                    .unwrap_or(IntervalUnit::Microsecond);
+                format!("{} {}", micros / unit.micros(), unit.name())
+            }
+        }
+    }
+
+    /// `t` moved by `interval`, backwards when `subtract`
+    fn shift_timestamp(
+        t: chrono::DateTime<chrono::Utc>,
+        interval: IntervalValue,
+        subtract: bool,
+    ) -> Result<Value> {
+        let moved = match interval {
+            IntervalValue::Duration(d) => {
+                if subtract {
+                    t.checked_sub_signed(d)
+                } else {
+                    t.checked_add_signed(d)
+                }
+            }
+            IntervalValue::Months(m) => {
+                let m = if subtract { m.checked_neg() } else { Some(m) };
+                m.and_then(|m| Self::calendar_add_months(t, m))
+            }
+        };
+        moved.map(Value::Timestamp).ok_or_else(|| {
+            crate::core::Error::Type(format!("{t} moved by an INTERVAL is out of range"))
+        })
+    }
+
     /// Calendar-aware month addition preserving time-of-day and nanoseconds.
     fn calendar_add_months(
         ts: chrono::DateTime<chrono::Utc>,
@@ -3596,7 +3765,8 @@ impl ExprVM {
     ) -> Option<chrono::DateTime<chrono::Utc>> {
         use chrono::{Datelike, NaiveDate, Timelike};
 
-        let total_months = (ts.year() as i64) * 12 + (ts.month() as i64) - 1 + months;
+        let total_months =
+            ((ts.year() as i64) * 12 + (ts.month() as i64) - 1).checked_add(months)?;
         let new_year_i64 = total_months.div_euclid(12);
         let new_month = (total_months.rem_euclid(12) + 1) as u32;
 
@@ -3655,47 +3825,22 @@ impl ExprVM {
         }
 
         let value: i64 = parts[0].parse().ok()?;
-        let unit = parts[1];
-
-        // Case-insensitive unit matching without allocation
-        // Handle both singular and plural forms
-        if unit.eq_ignore_ascii_case("year") || unit.eq_ignore_ascii_case("years") {
-            Some(IntervalValue::Months(value * 12))
-        } else if unit.eq_ignore_ascii_case("month") || unit.eq_ignore_ascii_case("months") {
-            Some(IntervalValue::Months(value))
-        } else if unit.eq_ignore_ascii_case("week") || unit.eq_ignore_ascii_case("weeks") {
-            Some(IntervalValue::Duration(chrono::Duration::weeks(value)))
-        } else if unit.eq_ignore_ascii_case("day") || unit.eq_ignore_ascii_case("days") {
-            Some(IntervalValue::Duration(chrono::Duration::days(value)))
-        } else if unit.eq_ignore_ascii_case("hour") || unit.eq_ignore_ascii_case("hours") {
-            Some(IntervalValue::Duration(chrono::Duration::hours(value)))
-        } else if unit.eq_ignore_ascii_case("minute")
-            || unit.eq_ignore_ascii_case("minutes")
-            || unit.eq_ignore_ascii_case("min")
-        {
-            Some(IntervalValue::Duration(chrono::Duration::minutes(value)))
-        } else if unit.eq_ignore_ascii_case("second")
-            || unit.eq_ignore_ascii_case("seconds")
-            || unit.eq_ignore_ascii_case("sec")
-        {
-            Some(IntervalValue::Duration(chrono::Duration::seconds(value)))
-        } else if unit.eq_ignore_ascii_case("millisecond")
-            || unit.eq_ignore_ascii_case("milliseconds")
-            || unit.eq_ignore_ascii_case("ms")
-        {
-            Some(IntervalValue::Duration(chrono::Duration::milliseconds(
-                value,
-            )))
-        } else if unit.eq_ignore_ascii_case("microsecond")
-            || unit.eq_ignore_ascii_case("microseconds")
-            || unit.eq_ignore_ascii_case("us")
-        {
-            Some(IntervalValue::Duration(chrono::Duration::microseconds(
-                value,
-            )))
-        } else {
-            None
-        }
+        let unit = IntervalUnit::parse(parts[1])?;
+        Some(match unit {
+            IntervalUnit::Year => IntervalValue::Months(value * 12),
+            IntervalUnit::Month => IntervalValue::Months(value),
+            IntervalUnit::Week => IntervalValue::Duration(chrono::Duration::weeks(value)),
+            IntervalUnit::Day => IntervalValue::Duration(chrono::Duration::days(value)),
+            IntervalUnit::Hour => IntervalValue::Duration(chrono::Duration::hours(value)),
+            IntervalUnit::Minute => IntervalValue::Duration(chrono::Duration::minutes(value)),
+            IntervalUnit::Second => IntervalValue::Duration(chrono::Duration::seconds(value)),
+            IntervalUnit::Millisecond => {
+                IntervalValue::Duration(chrono::Duration::milliseconds(value))
+            }
+            IntervalUnit::Microsecond => {
+                IntervalValue::Duration(chrono::Duration::microseconds(value))
+            }
+        })
     }
 
     /// Parse the "[-]N days HH:MM:SS" and "[-]HH:MM:SS" strings written by

@@ -31,7 +31,7 @@ use crate::common::SmartString;
 use crate::common::StringMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::ops::{CompareOp, CompiledPattern, Op};
+use super::ops::{CompareOp, CompiledPattern, IntervalStep, IntervalUnit, Op};
 use super::program::{Program, ProgramBuilder};
 use super::vm::{ExecuteContext, ExprVM};
 use crate::core::predicate::PredicateSet;
@@ -39,6 +39,7 @@ use crate::core::{DataType, Row, Value, ValueSet};
 use crate::executor::utils::{expression_to_string, string_to_datatype};
 use crate::functions::{global_registry, FunctionRegistry};
 use crate::parser::ast::*;
+use smallvec::SmallVec;
 
 /// Compilation error
 #[derive(Debug, Clone)]
@@ -72,6 +73,35 @@ impl std::fmt::Display for CompileError {
 }
 
 impl std::error::Error for CompileError {}
+
+/// An INTERVAL literal, negated or not, alone or times the expressions in `by`
+struct IntervalOperand<'a> {
+    literal: &'a IntervalLiteral,
+    negated: bool,
+    by: SmallVec<[&'a Expression; 2]>,
+}
+
+impl IntervalOperand<'_> {
+    fn step(&self) -> Result<IntervalStep, CompileError> {
+        let unit = self
+            .literal
+            .value
+            .split_whitespace()
+            .nth(1)
+            .and_then(IntervalUnit::parse)
+            .ok_or_else(|| {
+                CompileError::TypeError(format!("unknown INTERVAL unit in {}", self.literal))
+            })?;
+        let quantity = if self.negated {
+            self.literal.quantity.checked_neg().ok_or_else(|| {
+                CompileError::TypeError(format!("-{} is out of range", self.literal))
+            })?
+        } else {
+            self.literal.quantity
+        };
+        Ok(IntervalStep { quantity, unit })
+    }
+}
 
 /// Result of column resolution - indicates which row the column is from
 #[derive(Debug, Clone, Copy)]
@@ -627,9 +657,13 @@ impl<'a> ExprCompiler<'a> {
             }
 
             // === INTERVAL ===
-            Expression::IntervalLiteral(interval) => {
-                let s = format!("{} {}", interval.quantity, interval.unit);
-                builder.emit(Op::LoadConst(Value::Text(SmartString::from_string(s))));
+            Expression::IntervalLiteral(literal) => {
+                let operand = IntervalOperand {
+                    literal,
+                    negated: false,
+                    by: SmallVec::new(),
+                };
+                self.compile_interval(&operand, builder)?;
             }
 
             // === SUBQUERIES ===
@@ -774,33 +808,47 @@ impl<'a> ExprCompiler<'a> {
 
             // Arithmetic operators
             InfixOperator::Add => {
-                self.compile_expr(&infix.left, builder)?;
-                self.compile_expr(&infix.right, builder)?;
-                builder.emit(Op::Add);
+                if !self.compile_interval_shift(infix, false, builder)? {
+                    self.compile_expr(&infix.left, builder)?;
+                    self.compile_expr(&infix.right, builder)?;
+                    builder.emit(Op::Add);
+                }
             }
 
             InfixOperator::Subtract => {
-                self.compile_expr(&infix.left, builder)?;
-                self.compile_expr(&infix.right, builder)?;
-                builder.emit(Op::Sub);
+                if !self.compile_interval_shift(infix, true, builder)? {
+                    self.compile_expr(&infix.left, builder)?;
+                    self.compile_expr(&infix.right, builder)?;
+                    builder.emit(Op::Sub);
+                }
             }
 
             InfixOperator::Multiply => {
-                self.compile_expr(&infix.left, builder)?;
-                self.compile_expr(&infix.right, builder)?;
-                builder.emit(Op::Mul);
+                if let Some(operand) = Self::interval_product(infix)? {
+                    self.compile_interval(&operand, builder)?;
+                } else {
+                    self.compile_expr(&infix.left, builder)?;
+                    self.compile_expr(&infix.right, builder)?;
+                    builder.emit(Op::Mul);
+                }
             }
 
-            InfixOperator::Divide => {
+            InfixOperator::Divide | InfixOperator::Modulo => {
+                if Self::interval_operand(&infix.left)?.is_some()
+                    || Self::interval_operand(&infix.right)?.is_some()
+                {
+                    return Err(CompileError::TypeError(format!(
+                        "an INTERVAL takes no {}",
+                        infix.operator
+                    )));
+                }
                 self.compile_expr(&infix.left, builder)?;
                 self.compile_expr(&infix.right, builder)?;
-                builder.emit(Op::Div);
-            }
-
-            InfixOperator::Modulo => {
-                self.compile_expr(&infix.left, builder)?;
-                self.compile_expr(&infix.right, builder)?;
-                builder.emit(Op::Mod);
+                builder.emit(if matches!(infix.op_type, InfixOperator::Divide) {
+                    Op::Div
+                } else {
+                    Op::Mod
+                });
             }
 
             // String concatenation - optimize chained || into single ConcatN
@@ -1057,6 +1105,9 @@ impl<'a> ExprCompiler<'a> {
         prefix: &PrefixExpression,
         builder: &mut ProgramBuilder,
     ) -> Result<(), CompileError> {
+        if let Some(operand) = Self::interval_sign(prefix)? {
+            return self.compile_interval(&operand, builder);
+        }
         self.compile_expr(&prefix.right, builder)?;
 
         match prefix.operator.to_uppercase().as_str() {
@@ -1073,6 +1124,140 @@ impl<'a> ExprCompiler<'a> {
         }
 
         Ok(())
+    }
+
+    /// `expr` as an interval operand; None when it holds no INTERVAL literal
+    /// at its top, Err when it multiplies two of them
+    fn interval_operand(expr: &Expression) -> Result<Option<IntervalOperand<'_>>, CompileError> {
+        match expr {
+            Expression::IntervalLiteral(literal) => Ok(Some(IntervalOperand {
+                literal,
+                negated: false,
+                by: SmallVec::new(),
+            })),
+            Expression::Prefix(prefix) => Self::interval_sign(prefix),
+            Expression::Infix(infix) if matches!(infix.op_type, InfixOperator::Multiply) => {
+                Self::interval_product(infix)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn interval_sign(
+        prefix: &PrefixExpression,
+    ) -> Result<Option<IntervalOperand<'_>>, CompileError> {
+        let negate = match prefix.op_type {
+            PrefixOperator::Negate => true,
+            PrefixOperator::Plus => false,
+            _ => return Ok(None),
+        };
+        Ok(Self::interval_operand(&prefix.right)?.map(|mut operand| {
+            operand.negated ^= negate;
+            operand
+        }))
+    }
+
+    fn interval_product(
+        infix: &InfixExpression,
+    ) -> Result<Option<IntervalOperand<'_>>, CompileError> {
+        match (
+            Self::interval_operand(&infix.left)?,
+            Self::interval_operand(&infix.right)?,
+        ) {
+            (Some(_), Some(_)) => Err(CompileError::TypeError(
+                "an INTERVAL cannot be multiplied by an INTERVAL".to_string(),
+            )),
+            (Some(mut operand), None) => {
+                operand.by.push(&infix.right);
+                Ok(Some(operand))
+            }
+            (None, Some(mut operand)) => {
+                operand.by.push(&infix.left);
+                Ok(Some(operand))
+            }
+            (None, None) => Ok(None),
+        }
+    }
+
+    /// Emits an interval operand's value: the literal's text, or the
+    /// product of its multipliers scaled into interval text
+    fn compile_interval(
+        &self,
+        operand: &IntervalOperand<'_>,
+        builder: &mut ProgramBuilder,
+    ) -> Result<(), CompileError> {
+        if !operand.by.is_empty() {
+            let step = operand.step()?;
+            let count = self.compile_multipliers(operand, builder)?;
+            builder.emit(Op::ScaleInterval(step, count));
+            return Ok(());
+        }
+        let text = if operand.negated {
+            let step = operand.step()?;
+            format!("{} {}", step.quantity, step.unit.name())
+        } else {
+            format!("{} {}", operand.literal.quantity, operand.literal.unit)
+        };
+        builder.emit(Op::LoadConst(Value::Text(SmartString::from_string(text))));
+        Ok(())
+    }
+
+    /// Emits each multiplier and returns their count; the interval op
+    /// checks and multiplies them, so a non-number is never a NULL
+    fn compile_multipliers(
+        &self,
+        operand: &IntervalOperand<'_>,
+        builder: &mut ProgramBuilder,
+    ) -> Result<u8, CompileError> {
+        let count = u8::try_from(operand.by.len()).map_err(|_| {
+            CompileError::UnsupportedExpression(format!(
+                "{} multipliers of one INTERVAL",
+                operand.by.len()
+            ))
+        })?;
+        for multiplier in &operand.by {
+            self.compile_expr(multiplier, builder)?;
+        }
+        Ok(count)
+    }
+
+    /// Compiles `infix`, a `+` or, with `subtract`, a `-`, when one side is
+    /// an interval operand; false when neither is
+    fn compile_interval_shift(
+        &self,
+        infix: &InfixExpression,
+        subtract: bool,
+        builder: &mut ProgramBuilder,
+    ) -> Result<bool, CompileError> {
+        let (base, operand) = match (
+            Self::interval_operand(&infix.left)?,
+            Self::interval_operand(&infix.right)?,
+        ) {
+            (None, None) => return Ok(false),
+            (Some(_), Some(_)) => {
+                return Err(CompileError::TypeError(format!(
+                    "an INTERVAL takes no {} with another INTERVAL",
+                    infix.operator
+                )))
+            }
+            (None, Some(operand)) => (&infix.left, operand),
+            (Some(operand), None) if !subtract => (&infix.right, operand),
+            (Some(_), None) => {
+                return Err(CompileError::TypeError(
+                    "nothing can be subtracted from an INTERVAL".to_string(),
+                ))
+            }
+        };
+        self.compile_expr(base, builder)?;
+        if operand.by.is_empty() {
+            self.compile_interval(&operand, builder)?;
+            builder.emit(if subtract { Op::Sub } else { Op::Add });
+        } else {
+            let step = operand.step()?;
+            let count = self.compile_multipliers(&operand, builder)?;
+            builder.emit(Op::TimestampAddScaledInterval(step, subtract, count));
+        }
+        Ok(true)
     }
 
     /// Compile an IN expression
@@ -1816,5 +2001,47 @@ mod tests {
         let program = compiler.compile(&expr).unwrap();
         assert!(!program.is_empty());
         println!("{}", program.disassemble());
+    }
+
+    #[test]
+    fn a_timestamp_moved_by_an_interval_product_compiles_to_one_op() {
+        let columns = vec!["ts".to_string(), "n".to_string()];
+        let ctx = CompileContext::with_global_registry(&columns);
+        let compiler = ExprCompiler::new(&ctx);
+        for (sql, subtract) in [
+            ("ts + n * INTERVAL '1 hour'", false),
+            ("n * INTERVAL '1 hour' + ts", false),
+            ("ts - INTERVAL '1 hour' * n", true),
+        ] {
+            let expr = crate::parser::Parser::new(sql)
+                .parse_expression(crate::parser::precedence::Precedence::Lowest)
+                .unwrap();
+            let program = compiler.compile(&expr).unwrap();
+            let shifts: Vec<_> = program
+                .ops()
+                .iter()
+                .filter_map(|op| match op {
+                    Op::TimestampAddScaledInterval(step, s, 1) => Some((*step, *s)),
+                    _ => None,
+                })
+                .collect();
+            let step = IntervalStep {
+                quantity: 1,
+                unit: IntervalUnit::Hour,
+            };
+            assert_eq!(
+                shifts,
+                [(step, subtract)],
+                "{sql}: {}",
+                program.disassemble()
+            );
+            assert!(
+                !program
+                    .ops()
+                    .iter()
+                    .any(|op| matches!(op, Op::ScaleInterval(_, _) | Op::Mul)),
+                "{sql}: no interval text per row"
+            );
+        }
     }
 }

@@ -271,6 +271,9 @@ impl Program {
                 Op::Between | Op::NotBetween | Op::LikeDynamicEscapeExpr(_) => -2,
                 // Pop the value and its items, push 1
                 Op::InList(count) => -i32::try_from(*count).unwrap_or(i32::MAX),
+                // Pop the factors (and the timestamp), push 1
+                Op::ScaleInterval(_, count) => 1 - i32::from(*count),
+                Op::TimestampAddScaledInterval(_, _, count) => -i32::from(*count),
 
                 // Dynamic pattern ops: Pop 2, push 1 (-1)
                 Op::LikeDynamic(_)

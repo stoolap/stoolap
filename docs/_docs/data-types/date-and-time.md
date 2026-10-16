@@ -182,8 +182,8 @@ SELECT NOW() - INTERVAL '30 minutes';
 - `hour` or `hours` - For hour-based intervals
 - `day` or `days` - For day-based intervals
 - `week` or `weeks` - For week-based intervals (7 days)
-- `month` or `months` - For month-based intervals (approximated as 30 days)
-- `year` or `years` - For year-based intervals (approximated as 365 days)
+- `month` or `months` - Calendar months; the day is clamped to the last day of the target month
+- `year` or `years` - Calendar years (12 months)
 
 ### INTERVAL Examples
 
@@ -205,6 +205,39 @@ FROM events;
 SELECT event_date + INTERVAL '90 seconds' FROM events;
 SELECT event_date + INTERVAL '2 weeks' FROM events;
 ```
+
+### Multiplying and Negating an INTERVAL
+
+An INTERVAL literal can be multiplied by a number, a column or a parameter, and negated:
+
+```sql
+-- One reading per minute, starting at a fixed time
+SELECT TIMESTAMP '2025-01-01 00:00:00' + value * INTERVAL '1 minute'
+FROM generate_series(0, 59);
+
+-- Shift by a per-row amount
+SELECT start_time + retries * INTERVAL '30 seconds' FROM jobs;
+
+-- Fractional multiples of fixed units are rounded to the microsecond
+SELECT TIMESTAMP '2025-01-01 00:00:00' + 1.5 * INTERVAL '1 hour';  -- 01:30:00
+
+-- Calendar units take whole multiples
+SELECT TIMESTAMP '2025-01-31 00:00:00' + 3 * INTERVAL '1 month';   -- 2025-04-30
+
+-- Negation
+SELECT NOW() + -INTERVAL '1 hour';
+
+-- On its own, a product is interval text
+SELECT 3 * INTERVAL '1 second';    -- '3 second'
+SELECT 1.5 * INTERVAL '1 hour';    -- '5400 second'
+```
+
+A NULL multiplier gives NULL. These are errors:
+
+- dividing an INTERVAL or taking its remainder (`INTERVAL '1 hour' / 2`, `% 2`);
+- adding, subtracting or multiplying two INTERVALs, or subtracting a value from an INTERVAL;
+- a fractional multiple of `month` or `year` (`1.5 * INTERVAL '1 month'`);
+- a multiplier that is not a number, and a result out of range.
 
 ### Timestamp Literals
 
