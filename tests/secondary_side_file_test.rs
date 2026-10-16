@@ -1115,3 +1115,38 @@ fn a_reopen_after_a_checkpointed_column_drop_keeps_the_side_file() {
     assert_eq!(count_where(&db, "SELECT COUNT(*) FROM u WHERE k = 3"), 100);
     db.close().unwrap();
 }
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_backup_snapshot_reads_index_identities_with_a_writer_queued_on_the_index_map() {
+    use std::sync::{mpsc, Arc};
+    use std::time::{Duration, Instant};
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE INDEX t_k ON t (k)", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1)", ()).unwrap();
+    let store = db.engine().get_version_store("t").unwrap();
+    let (finished, done) = mpsc::channel();
+    let snapshotting = db.clone();
+    std::thread::spawn(move || {
+        stoolap::test_failpoints::on_index_visited(move || {
+            let dropping = Arc::clone(&store);
+            std::thread::spawn(move || drop(dropping.remove_index("t_k")));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !store.index_map_writer_queued() {
+                assert!(Instant::now() < deadline, "the drop never queued");
+                std::thread::yield_now();
+            }
+        });
+        let taken = snapshotting.execute("PRAGMA SNAPSHOT", ());
+        finished.send(taken.map(|_| ())).unwrap();
+    });
+    let taken = done.recv_timeout(Duration::from_secs(20));
+    assert!(
+        matches!(taken, Ok(Ok(()))),
+        "the snapshot finished with the drop queued on the index map: {taken:?}"
+    );
+}

@@ -1169,6 +1169,7 @@ pub fn take_read_paths() -> Vec<&'static str> {
 thread_local! {
     static FK_CHILD_PROBE_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static CORRELATED_FETCH_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static INDEX_VISITED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static ADD_COLUMN_PUBLISHED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static SNAPSHOT_SCHEMA_WRITTEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static JOIN_INDEX_CHOSEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
@@ -1332,6 +1333,16 @@ pub fn before_correlated_fetch(hook: impl FnOnce() + 'static) {
 
 pub(crate) fn correlated_fetch_next() {
     run_hook(&CORRELATED_FETCH_HOOK);
+}
+
+/// Run once on this thread when its next walk of a store's index map,
+/// holding the map's read lock, reaches an index
+pub fn on_index_visited(hook: impl FnOnce() + 'static) {
+    INDEX_VISITED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn index_visited() {
+    run_hook(&INDEX_VISITED_HOOK);
 }
 
 /// Run once on this thread when its next ADD COLUMN has published the
@@ -2632,6 +2643,7 @@ pub fn reset_all() {
     READ_PATHS.with(|paths| paths.borrow_mut().clear());
     FK_CHILD_PROBE_HOOK.with(|slot| *slot.borrow_mut() = None);
     CORRELATED_FETCH_HOOK.with(|slot| *slot.borrow_mut() = None);
+    INDEX_VISITED_HOOK.with(|slot| *slot.borrow_mut() = None);
     ADD_COLUMN_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = None);
     SNAPSHOT_SCHEMA_WRITTEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     JOIN_INDEX_CHOSEN_HOOK.with(|slot| *slot.borrow_mut() = None);

@@ -5082,7 +5082,7 @@ impl MVCCEngine {
             // Collect indexes
             let mut index_entries: Vec<Vec<u8>> = Vec::new();
             for (table_name, store) in stores.iter() {
-                let _ = store.for_each_index(|index| {
+                let _ = store.for_each_index(|index, identity| {
                     if index.index_type() == crate::core::IndexType::PrimaryKey {
                         return Ok(());
                     }
@@ -5098,7 +5098,7 @@ impl MVCCEngine {
                         hnsw_ef_construction: index.hnsw_ef_construction(),
                         hnsw_ef_search: index.default_ef_search().map(|v| v as u16),
                         hnsw_distance_metric: index.hnsw_distance_metric(),
-                        identity: store.index_identity(index.name()),
+                        identity,
                     };
                     index_entries.push(meta.serialize());
                     Ok(())
@@ -5594,7 +5594,7 @@ impl MVCCEngine {
             let stores = self.version_stores.read().unwrap();
             let mut indexes = Vec::new();
             for (table_name, store) in stores.iter() {
-                let _ = store.for_each_index(|index| {
+                let _ = store.for_each_index(|index, identity| {
                     if index.index_type() == crate::core::IndexType::PrimaryKey {
                         return Ok(());
                     }
@@ -5612,7 +5612,7 @@ impl MVCCEngine {
                             hnsw_ef_construction: index.hnsw_ef_construction(),
                             hnsw_ef_search: index.default_ef_search().map(|v| v as u16),
                             hnsw_distance_metric: index.hnsw_distance_metric(),
-                            identity: store.index_identity(index.name()),
+                            identity,
                         },
                     ));
                     Ok(())
@@ -6471,7 +6471,7 @@ impl MVCCEngine {
             let mut entries = Vec::new();
             for table_name in &table_names_for_indexes {
                 if let Some(store) = stores.get(table_name) {
-                    let _ = store.for_each_index(|index| {
+                    let _ = store.for_each_index(|index, identity| {
                         // Skip PK indexes, they are auto-created from schema
                         if index.index_type() == crate::core::IndexType::PrimaryKey {
                             return Ok(());
@@ -6488,7 +6488,7 @@ impl MVCCEngine {
                             hnsw_ef_construction: index.hnsw_ef_construction(),
                             hnsw_ef_search: index.default_ef_search().map(|v| v as u16),
                             hnsw_distance_metric: index.hnsw_distance_metric(),
-                            identity: store.index_identity(index.name()),
+                            identity,
                         };
                         entries.push((
                             table_name.clone(),
@@ -9804,12 +9804,17 @@ impl TransactionEngineOperations for EngineOperations {
         if let Some(txn_tables) = cache.get(txn_id) {
             let stores = self.version_stores().read().unwrap();
             for (table_name, txn_store) in txn_tables.iter() {
-                if !txn_store.read().unwrap().has_local_changes() {
+                let Some(version_store) = stores.get(table_name.as_str()) else {
                     continue;
+                };
+                {
+                    let store = txn_store.read().unwrap();
+                    if !store.has_local_changes() {
+                        continue;
+                    }
+                    store.note_commit_seq(commit_seq);
                 }
-                if let Some(version_store) = stores.get(table_name.as_str()) {
-                    hold.add(version_store, Arc::clone(txn_store), commit_seq);
-                }
+                hold.add(version_store, Arc::clone(txn_store), commit_seq);
             }
         }
         hold

@@ -848,9 +848,6 @@ impl PublishHold {
         commit_seq: i64,
     ) {
         self.guards.push(version_store.begin_publish(commit_seq));
-        if let Ok(store) = txn_store.read() {
-            store.note_commit_seq(commit_seq);
-        }
         self.stores.push(txn_store);
     }
 
@@ -1024,6 +1021,26 @@ impl Removals {
     }
 }
 
+/// An index of a store and its definition's identity: the LSN of the WAL
+/// record that created it, None until the catalog issues it. A side file
+/// column is served only while it matches; the removal history names keys by it
+pub(crate) struct IndexEntry {
+    pub(crate) index: Arc<dyn Index>,
+    identity: Option<u64>,
+}
+
+/// A store's indexes and, at the same positions, their identities
+type IndexesWithIdentities = (SmallVec<[Arc<dyn Index>; 4]>, SmallVec<[Option<u64>; 4]>);
+
+impl IndexEntry {
+    fn new(index: Arc<dyn Index>) -> Self {
+        Self {
+            index,
+            identity: None,
+        }
+    }
+}
+
 /// The removals of the commits publishing on a store, and of those that
 /// ended, kept within a byte budget for the views that do not see them
 struct RemovalHistory {
@@ -1069,12 +1086,9 @@ pub struct VersionStore {
     table_name: SmartString,
     /// Table schema (Arc for zero-cost cloning on read)
     schema: RwLock<CompactArc<Schema>>,
-    /// Indexes on this table (FxHashMap for fast string key lookups)
-    indexes: RwLock<FxHashMap<String, Arc<dyn Index>>>,
-    /// Each index definition's identity, by index name: the LSN of the
-    /// WAL record that created it. A side file column carries the identity
-    /// it was built for, and is served only while it matches
-    index_identities: RwLock<FxHashMap<String, u64>>,
+    /// Indexes on this table (FxHashMap for fast string key lookups), each
+    /// with its definition's identity
+    indexes: RwLock<FxHashMap<String, IndexEntry>>,
     /// Whether this store has been closed
     closed: AtomicBool,
     /// Auto-increment counter for tables without explicit PK
@@ -1280,7 +1294,6 @@ impl VersionStore {
             table_name: table_name.into(),
             schema: RwLock::new(CompactArc::new(schema)),
             indexes: RwLock::new(FxHashMap::default()),
-            index_identities: RwLock::new(FxHashMap::default()),
             closed: AtomicBool::new(false),
             auto_increment_counter: AtomicI64::new(0),
             uncommitted_writes: RwLock::new(new_i64_map()),
@@ -1320,7 +1333,6 @@ impl VersionStore {
             table_name: table_name.into(),
             schema: RwLock::new(CompactArc::new(schema)),
             indexes: RwLock::new(FxHashMap::default()),
-            index_identities: RwLock::new(FxHashMap::default()),
             closed: AtomicBool::new(false),
             auto_increment_counter: AtomicI64::new(0),
             uncommitted_writes: RwLock::new(new_i64_map()),
@@ -1559,7 +1571,7 @@ impl VersionStore {
             .indexes
             .read()
             .iter()
-            .map(|(name, index)| (name.clone(), Arc::clone(index)))
+            .map(|(name, entry)| (name.clone(), Arc::clone(&entry.index)))
             .collect();
         let mut removed = Vec::new();
         let mut rebound = Vec::new();
@@ -1581,23 +1593,22 @@ impl VersionStore {
         // The removal history keeps no rebinding but a rename's
         self.note_index_removal();
         self.publishing.fetch_add(1, Ordering::SeqCst);
-        let taken: Vec<Arc<dyn Index>> = {
+        let taken: Vec<IndexEntry> = {
             let mut indexes = self.indexes.write();
             let taken = removed
                 .iter()
                 .filter_map(|name| indexes.remove(name))
                 .collect();
             for (name, index) in rebound {
-                indexes.insert(name, index);
+                match indexes.get_mut(&name) {
+                    Some(entry) => entry.index = index,
+                    None => {
+                        indexes.insert(name, IndexEntry::new(index));
+                    }
+                }
             }
             taken
         };
-        {
-            let mut identities = self.index_identities.write();
-            for name in &removed {
-                identities.remove(name);
-            }
-        }
         self.publish_epoch.fetch_add(1, Ordering::SeqCst);
         self.index_epoch.fetch_add(2, Ordering::SeqCst);
         self.publishing.fetch_sub(1, Ordering::SeqCst);
@@ -1861,7 +1872,13 @@ impl VersionStore {
             let mut current = self.indexes.write();
             indexes
                 .into_iter()
-                .filter_map(|(name, index)| current.insert(name, index))
+                .filter_map(|(name, index)| match current.get_mut(&name) {
+                    Some(entry) => Some(std::mem::replace(&mut entry.index, index)),
+                    None => {
+                        current.insert(name, IndexEntry::new(index));
+                        None
+                    }
+                })
                 .collect()
         };
         self.publish_epoch.fetch_add(1, Ordering::SeqCst);
@@ -3538,7 +3555,7 @@ impl VersionStore {
             else {
                 return;
             };
-            history.publishing.swap_remove(at);
+            let held = history.publishing.swap_remove(at);
             let stamp = self
                 .visibility_checker
                 .as_ref()
@@ -3546,9 +3563,7 @@ impl VersionStore {
             history.appended += removals.entries as u64;
             history.bytes += removals.bytes;
             let appended = history.appended;
-            history
-                .ended
-                .push_back((stamp, appended, Arc::clone(removals)));
+            history.ended.push_back((stamp, appended, held));
             while history.bytes > REMOVAL_HISTORY_BYTES {
                 let Some((stamp, _, oldest)) = history.ended.pop_front() else {
                     break;
@@ -3733,8 +3748,8 @@ impl VersionStore {
 
         // 5. Clear all indexes
         let indexes = self.indexes.read();
-        for index in indexes.values() {
-            let _ = index.clear();
+        for entry in indexes.values() {
+            let _ = entry.index.clear();
         }
 
         // 6. Reset auto-increment counter so new rows start at 1
@@ -5557,7 +5572,7 @@ impl VersionStore {
         let indexes = self.indexes.read();
         indexes
             .iter()
-            .filter(|(_, idx)| idx.index_type() != crate::core::IndexType::PrimaryKey)
+            .filter(|(_, entry)| entry.index.index_type() != crate::core::IndexType::PrimaryKey)
             .map(|(name, _)| name.clone())
             .collect()
     }
@@ -5569,15 +5584,19 @@ impl VersionStore {
         !indexes.is_empty()
     }
 
-    /// Iterate over all indexes, calling the provided function for each
+    /// Iterate over all indexes, calling the provided function for each with
+    /// its definition's identity, under the index map's read lock: `f` must
+    /// not take that lock again, as a writer queued behind it would wait on it
     /// OPTIMIZATION: Avoids collecting index names and allows early exit on error
     pub fn for_each_index<F>(&self, mut f: F) -> crate::core::Result<()>
     where
-        F: FnMut(&Arc<dyn Index>) -> crate::core::Result<()>,
+        F: FnMut(&Arc<dyn Index>, Option<u64>) -> crate::core::Result<()>,
     {
         let indexes = self.indexes.read();
-        for index in indexes.values() {
-            f(index)?;
+        for entry in indexes.values() {
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::index_visited();
+            f(&entry.index, entry.identity)?;
         }
         Ok(())
     }
@@ -5596,9 +5615,9 @@ impl VersionStore {
         F: FnMut(&str, &Arc<dyn Index>) -> crate::core::Result<()>,
     {
         let indexes = self.indexes.read();
-        for (name, index) in indexes.iter() {
-            if index.is_unique() {
-                f(name, index)?;
+        for (name, entry) in indexes.iter() {
+            if entry.index.is_unique() {
+                f(name, &entry.index)?;
             }
         }
         Ok(())
@@ -5611,10 +5630,10 @@ impl VersionStore {
         parking_lot::Mutex::lock_arc(&self.upsert_mutex)
     }
 
-    /// Add an index
+    /// Add an index, with no identity until the catalog issues one
     pub fn add_index(&self, name: String, index: Arc<dyn Index>) {
         let mut indexes = self.indexes.write();
-        indexes.insert(name, index);
+        indexes.insert(name, IndexEntry::new(index));
         // Built from the newest rows: a view that misses a commit before it
         // does not find its rows by it
         self.note_index_removal();
@@ -5624,33 +5643,36 @@ impl VersionStore {
     /// Remove an index
     pub fn remove_index(&self, name: &str) -> Option<Arc<dyn Index>> {
         let mut indexes = self.indexes.write();
-        let removed = indexes.remove(name);
-        drop(indexes);
-        self.index_identities.write().remove(name);
-        removed
+        indexes.remove(name).map(|entry| entry.index)
     }
 
     /// Records the identity the catalog issued to `name`'s definition,
-    /// under the name exactly as the index map keys it
+    /// under the name exactly as the index map keys it; an index not in the
+    /// map, as one whose build failed, takes none
     pub fn set_index_identity(&self, name: &str, identity: u64) {
-        self.index_identities
-            .write()
-            .insert(name.to_string(), identity);
+        if let Some(entry) = self.indexes.write().get_mut(name) {
+            entry.identity = Some(identity);
+        }
     }
 
     /// The identity of `name`'s definition, None for an index the catalog
     /// has not issued one to yet
     pub fn index_identity(&self, name: &str) -> Option<u64> {
-        self.index_identities.read().get(name).copied()
+        self.indexes.read().get(name)?.identity
     }
 
     /// The name the removal history gives `index`'s keys: its identity, or
     /// one fixed name for the primary key, which no rename or cast reaches
     pub(crate) fn history_identity(&self, index: &dyn Index) -> Option<u64> {
+        Self::history_name_of(index, || self.index_identity(index.name()))
+    }
+
+    /// [`Self::history_identity`] with the map's identity for `index` given
+    fn history_name_of(index: &dyn Index, identity: impl FnOnce() -> Option<u64>) -> Option<u64> {
         if index.index_type() == crate::core::IndexType::PrimaryKey {
             return Some(u64::MAX);
         }
-        self.index_identity(index.name())
+        identity()
     }
 
     /// Binds every index on column `old` to its new name `new`, each keeping
@@ -5663,8 +5685,9 @@ impl VersionStore {
         let mut indexes = self.indexes.write();
         let renamed: Vec<(String, Arc<dyn Index>)> = indexes
             .iter()
-            .filter(|(_, index)| index.column_names().iter().any(is_old))
-            .map(|(name, index)| {
+            .filter(|(_, entry)| entry.index.column_names().iter().any(is_old))
+            .map(|(name, entry)| {
+                let index = &entry.index;
                 let columns: Vec<String> = index
                     .column_names()
                     .iter()
@@ -5684,7 +5707,9 @@ impl VersionStore {
         }
         self.publishing.fetch_add(1, Ordering::SeqCst);
         for (name, index) in renamed {
-            indexes.insert(name, index);
+            if let Some(entry) = indexes.get_mut(&name) {
+                entry.index = index;
+            }
         }
         self.publish_epoch.fetch_add(1, Ordering::SeqCst);
         self.index_epoch.fetch_add(2, Ordering::SeqCst);
@@ -5694,16 +5719,16 @@ impl VersionStore {
     /// Get an index by name
     pub fn get_index(&self, name: &str) -> Option<Arc<dyn Index>> {
         let indexes = self.indexes.read();
-        indexes.get(name).cloned()
+        indexes.get(name).map(|entry| Arc::clone(&entry.index))
     }
 
     /// Get an index by column name (single-column indexes only)
     pub fn get_index_by_column(&self, column_name: &str) -> Option<Arc<dyn Index>> {
         let indexes = self.indexes.read();
-        for index in indexes.values() {
-            let column_names = index.column_names();
+        for entry in indexes.values() {
+            let column_names = entry.index.column_names();
             if column_names.len() == 1 && column_names[0].eq_ignore_ascii_case(column_name) {
-                return Some(index.clone());
+                return Some(Arc::clone(&entry.index));
             }
         }
         None
@@ -5727,7 +5752,7 @@ impl VersionStore {
         // Create a set of predicate columns for O(1) lookup
         let pred_set: FxHashSet<&str> = predicate_columns.iter().copied().collect();
 
-        for index in indexes.values() {
+        for index in indexes.values().map(|entry| &entry.index) {
             let index_columns = index.column_names();
             if index_columns.len() < 2 {
                 continue; // Skip single-column indexes
@@ -5763,14 +5788,29 @@ impl VersionStore {
     #[inline]
     pub fn get_all_indexes(&self) -> SmallVec<[Arc<dyn Index>; 4]> {
         let indexes = self.indexes.read();
-        indexes.values().cloned().collect()
+        indexes
+            .values()
+            .map(|entry| Arc::clone(&entry.index))
+            .collect()
+    }
+
+    /// Every index and, at the same position, its definition's identity,
+    /// read under the one lock that holds both
+    fn indexes_with_identities(&self) -> IndexesWithIdentities {
+        let indexes = self.indexes.read();
+        let mut out = (SmallVec::new(), SmallVec::new());
+        for entry in indexes.values() {
+            out.0.push(Arc::clone(&entry.index));
+            out.1.push(entry.identity);
+        }
+        out
     }
 
     /// Borrow the indexes map under a read lock — no Arc clones, no allocations.
     #[inline]
-    pub fn indexes_read(
+    pub(crate) fn indexes_read(
         &self,
-    ) -> parking_lot::RwLockReadGuard<'_, FxHashMap<String, Arc<dyn Index>>> {
+    ) -> parking_lot::RwLockReadGuard<'_, FxHashMap<String, IndexEntry>> {
         self.indexes.read()
     }
 
@@ -5783,7 +5823,7 @@ impl VersionStore {
             .map(|i| &schema.columns[i].name_lower);
         let indexes = self.indexes.read();
         let mut result = Vec::new();
-        for idx in indexes.values() {
+        for idx in indexes.values().map(|entry| &entry.index) {
             if !idx.is_unique() {
                 continue;
             }
@@ -5841,8 +5881,8 @@ impl VersionStore {
         let schema = self.schema();
         let pk = schema.pk_column_index();
         let indexes = self.indexes.read();
-        let identities = self.index_identities.read();
-        'indexes: for (index_name, idx) in indexes.iter() {
+        'indexes: for entry in indexes.values() {
+            let idx = &entry.index;
             let index_type = idx.index_type();
             if !matches!(
                 index_type,
@@ -5850,7 +5890,7 @@ impl VersionStore {
             ) {
                 continue;
             }
-            let Some(&identity) = identities.get(index_name.as_str()) else {
+            let Some(identity) = entry.identity else {
                 continue;
             };
             let mut components: smallvec::SmallVec<[Component; 4]> = smallvec::SmallVec::new();
@@ -6012,7 +6052,7 @@ impl VersionStore {
         // Update indexes with the new row data (if not deleted)
         if !is_deleted {
             let indexes = self.indexes.read();
-            for index in indexes.values() {
+            for index in indexes.values().map(|entry| &entry.index) {
                 let column_ids = index.column_ids();
                 if column_ids.is_empty() {
                     continue;
@@ -6063,7 +6103,7 @@ impl VersionStore {
         // Remove from indexes using old row data
         if let Some(old_data) = old_row {
             let indexes = self.indexes.read();
-            for index in indexes.values() {
+            for index in indexes.values().map(|entry| &entry.index) {
                 let column_ids = index.column_ids();
                 if column_ids.is_empty() {
                     continue;
@@ -6377,6 +6417,7 @@ impl VersionStore {
         // HNSW indexes loaded from graph are included — HnswInner::insert skips duplicate row_ids
         let index_infos: Vec<(Vec<usize>, Arc<dyn Index>)> = indexes
             .values()
+            .map(|entry| &entry.index)
             .filter_map(|idx| {
                 let col_ids = idx.column_ids();
                 if col_ids.is_empty() {
@@ -6461,6 +6502,7 @@ impl VersionStore {
         // Collect only HNSW indexes with their column indices
         let hnsw_infos: Vec<(Vec<usize>, Arc<dyn Index>)> = indexes
             .values()
+            .map(|entry| &entry.index)
             .filter(|idx| idx.index_type() == crate::core::IndexType::Hnsw)
             .filter_map(|idx| {
                 let col_ids = idx.column_ids();
@@ -6659,6 +6701,7 @@ impl VersionStore {
             .indexes
             .read()
             .values()
+            .map(|entry| &entry.index)
             .filter(|idx| idx.index_type() != crate::core::IndexType::Hnsw)
             .cloned()
             .collect();
@@ -6812,7 +6855,7 @@ impl VersionStore {
         {
             let indexes = self.indexes.read();
 
-            for index in indexes.values() {
+            for index in indexes.values().map(|entry| &entry.index) {
                 let column_ids = index.column_ids();
                 if column_ids.is_empty() {
                     continue;
@@ -7947,12 +7990,13 @@ impl TransactionVersionStore {
         }
     }
 
-    /// How the history names the keys taken out of `index`
-    fn history_name(&self, index: &dyn Index) -> HistoryName {
+    /// How the history names the keys taken out of `index`, whose identity
+    /// the index map gave as `identity`
+    fn history_name(index: &dyn Index, identity: Option<u64>) -> HistoryName {
         if index.index_type() == crate::core::IndexType::Hnsw {
             return HistoryName::Unread;
         }
-        match self.parent_store.history_identity(index) {
+        match VersionStore::history_name_of(index, || identity) {
             Some(identity) => HistoryName::Named(identity),
             None => HistoryName::Unnamed,
         }
@@ -8807,9 +8851,9 @@ impl TransactionVersionStore {
             return Ok(());
         }
 
-        // Get all indexes - early exit if none
-        let indexes: SmallVec<[Arc<dyn Index>; 4]> =
-            self.parent_store.get_all_indexes().into_iter().collect();
+        // Get all indexes, each with its identity at the same position - early
+        // exit if none
+        let (indexes, identities) = self.parent_store.indexes_with_identities();
         // The set taken binds the positions of the layout the rows are in
         self.parent_store.check_layout(self.layout_bound())?;
         if indexes.is_empty() {
@@ -8821,13 +8865,13 @@ impl TransactionVersionStore {
         // FAST PATH: Single-row commit (most common case for auto-commit INSERT/UPDATE/DELETE)
         // Uses SmallVec to avoid heap allocation for 1-2 column indexes
         if local_versions.len() == 1 {
-            return self.update_indexes_single_row(&indexes);
+            return self.update_indexes_single_row(&indexes, &identities);
         }
 
         // BATCH PATH: Multi-row commit
         // Sort indexes by name for deterministic lock ordering (prevents deadlocks)
-        let mut indexes: Vec<_> = indexes.into_vec();
-        indexes.sort_by(|a, b| a.name().cmp(b.name()));
+        let mut indexes: SmallVec<[_; 4]> = indexes.into_iter().zip(identities).collect();
+        indexes.sort_by(|a, b| a.0.name().cmp(b.0.name()));
 
         let num_indexes = indexes.len();
 
@@ -8856,7 +8900,7 @@ impl TransactionVersionStore {
             let sealed = entry.is_some_and(|entry| entry.sealed);
             membership |= is_deleted || old_row.is_none() || sealed;
 
-            for (idx, index) in indexes.iter().enumerate() {
+            for (idx, (index, _)) in indexes.iter().enumerate() {
                 let column_ids = index.column_ids();
                 if column_ids.is_empty() {
                     continue;
@@ -8956,19 +9000,23 @@ impl TransactionVersionStore {
             .collect();
         if remove_batches.iter().any(Option::is_some) {
             let mut removals = Removals::new(self.commit_seq.load(Ordering::Relaxed));
-            let covered = indexes.iter().zip(&remove_batches).all(|(index, list)| {
-                let Some(list) = list else {
-                    return true;
-                };
-                match self.history_name(&**index) {
-                    HistoryName::Named(identity) => {
-                        removals.push_batch(identity, Arc::clone(list));
-                        true
+            let covered = indexes
+                .iter()
+                .zip(&remove_batches)
+                .all(|((index, identity), list)| {
+                    let identity = *identity;
+                    let Some(list) = list else {
+                        return true;
+                    };
+                    match Self::history_name(&**index, identity) {
+                        HistoryName::Named(identity) => {
+                            removals.push_batch(identity, Arc::clone(list));
+                            true
+                        }
+                        HistoryName::Unread => true,
+                        HistoryName::Unnamed => false,
                     }
-                    HistoryName::Unread => true,
-                    HistoryName::Unnamed => false,
-                }
-            });
+                });
             self.publish_removals(removals, covered);
         } else if add_batches.iter().any(|batch| !batch.is_empty()) {
             self.parent_store.note_index_change();
@@ -8979,7 +9027,7 @@ impl TransactionVersionStore {
 
         // PHASE 1: Pre-validate ALL unique indexes before modifying ANY index
         // This prevents index pollution when a later index fails
-        for (idx, index) in indexes.iter().enumerate() {
+        for (idx, (index, _)) in indexes.iter().enumerate() {
             if !index.is_unique() || add_batches[idx].is_empty() {
                 continue;
             }
@@ -9071,7 +9119,7 @@ impl TransactionVersionStore {
         let mut completed_removals: Vec<usize> = Vec::new();
         let mut completed_additions: Vec<usize> = Vec::new();
 
-        for (idx, index) in indexes.iter().enumerate() {
+        for (idx, (index, _)) in indexes.iter().enumerate() {
             // Remove old entries first (for UPDATE correctness)
             if !removed_at(idx).is_empty() {
                 let batch: Vec<(i64, &[crate::core::Value])> = removed_at(idx)
@@ -9102,7 +9150,7 @@ impl TransactionVersionStore {
                             .iter()
                             .map(|(row_id, values)| (*row_id, values.as_slice()))
                             .collect();
-                        let _ = indexes[rollback_idx].remove_batch_slice(&rollback_batch);
+                        let _ = indexes[rollback_idx].0.remove_batch_slice(&rollback_batch);
                     }
 
                     // 2. Re-add removals we made to earlier indexes
@@ -9113,7 +9161,7 @@ impl TransactionVersionStore {
                                 .map(|(row_id, values)| (*row_id, values.as_slice()))
                                 .collect();
                         // Rollback additions - ignore errors as we're in error recovery
-                        let _ = indexes[rollback_idx].add_batch_slice(&rollback_batch);
+                        let _ = indexes[rollback_idx].0.add_batch_slice(&rollback_batch);
                     }
 
                     return Err(e);
@@ -9123,7 +9171,7 @@ impl TransactionVersionStore {
         }
 
         let mut undo = self.index_undo.lock();
-        for (idx, index) in indexes.iter().enumerate() {
+        for (idx, (index, _)) in indexes.iter().enumerate() {
             if add_batches[idx].is_empty() && remove_batches[idx].is_none() {
                 continue;
             }
@@ -9141,7 +9189,11 @@ impl TransactionVersionStore {
     ///
     /// Uses SmallVec to avoid heap allocation for indexes with 1-2 columns (most common case).
     /// Applies changes immediately without batching overhead.
-    fn update_indexes_single_row(&self, indexes: &[Arc<dyn Index>]) -> Result<(), Error> {
+    fn update_indexes_single_row(
+        &self,
+        indexes: &[Arc<dyn Index>],
+        identities: &[Option<u64>],
+    ) -> Result<(), Error> {
         let local_versions = self.local_versions.as_ref().unwrap();
 
         // Get the single row entry
@@ -9170,13 +9222,15 @@ impl TransactionVersionStore {
         if is_deleted || old_row.is_some() {
             let mut removals = Removals::new(self.commit_seq.load(Ordering::Relaxed));
             let mut covered = true;
-            for index in indexes {
+            let mut key_moved = false;
+            for (index, &identity) in indexes.iter().zip(identities) {
                 let Some(key) =
                     Self::single_row_removal(&**index, old_row, new_row, is_deleted, sealed)
                 else {
                     continue;
                 };
-                match self.history_name(&**index) {
+                key_moved = true;
+                match Self::history_name(&**index, identity) {
                     HistoryName::Named(identity) => removals.push_row(identity, row_id, key),
                     HistoryName::Unread => {}
                     HistoryName::Unnamed => covered = false,
@@ -9184,6 +9238,10 @@ impl TransactionVersionStore {
             }
             if !removals.is_empty() || !covered {
                 self.publish_removals(removals, covered);
+            }
+            // A hot UPDATE that moves no key changes no index entry
+            if !key_moved && !is_deleted && !sealed {
+                return Ok(());
             }
         }
 
@@ -9487,7 +9545,11 @@ impl TransactionVersionStore {
     fn let_go(&mut self) {
         // A store dropped with its commit's records still held lets them
         // go; a commit that became visible let them go already
-        self.release_applied();
+        drop(std::mem::take(self.applied.get_mut()));
+        if let Some(removals) = self.removals.get_mut().take() {
+            self.parent_store.end_removals(&removals);
+        }
+        self.index_undo.get_mut().clear();
         // Release any row claims still held by this transaction.
         // This is a safety net for cases where drop happens without explicit
         // commit/rollback (e.g., transaction panics, implicit drop on scope exit).
