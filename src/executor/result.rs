@@ -620,6 +620,10 @@ pub struct ExprMappedResult {
     output_columns: Vec<String>,
     /// Pre-computed lowercase source columns (avoids per-row to_lowercase())
     source_columns_lower: Vec<String>,
+    /// The statement's parameters and transaction, for the projections
+    params: Option<crate::common::CompactArc<crate::ParamVec>>,
+    named_params: Option<std::sync::Arc<rustc_hash::FxHashMap<String, Value>>>,
+    transaction_id: Option<u64>,
 }
 
 // SAFETY: ExprMappedResult is Send because all fields are Send:
@@ -676,7 +680,19 @@ impl ExprMappedResult {
             current_row: Row::with_capacity(capacity),
             output_columns,
             source_columns_lower,
+            params: None,
+            named_params: None,
+            transaction_id: None,
         })
+    }
+
+    /// The projections see `ctx`'s parameters and transaction
+    pub fn with_context(mut self, ctx: &super::context::ExecutionContext) -> Self {
+        self.params = (!ctx.params().is_empty()).then(|| ctx.params_arc().clone());
+        self.named_params =
+            (!ctx.named_params().is_empty()).then(|| std::sync::Arc::clone(ctx.named_params_arc()));
+        self.transaction_id = ctx.transaction_id();
+        self
     }
 
     /// Create with default function registry (static lifetime)
@@ -729,7 +745,14 @@ impl QueryResult for ExprMappedResult {
                         }
                     }
                     CompiledProjection::Compiled(program) => {
-                        let ctx = ExecuteContext::new(source_row);
+                        let mut ctx = ExecuteContext::new(source_row)
+                            .with_transaction_id(self.transaction_id);
+                        if let Some(params) = &self.params {
+                            ctx = ctx.with_params(params);
+                        }
+                        if let Some(named) = &self.named_params {
+                            ctx = ctx.with_named_params(named);
+                        }
                         let value = self
                             .vm
                             .execute_cow(program, &ctx)

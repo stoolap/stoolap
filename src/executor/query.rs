@@ -3265,11 +3265,10 @@ impl Executor {
                 );
                 let output_columns = CompactArc::new(output_columns);
 
-                result = Box::new(ExprMappedResult::new(
-                    result,
-                    stmt.columns.clone(),
-                    (*output_columns).clone(),
-                )?);
+                result = Box::new(
+                    ExprMappedResult::new(result, stmt.columns.clone(), (*output_columns).clone())?
+                        .with_context(ctx),
+                );
 
                 return Ok((result, output_columns, false, None));
             }
@@ -6862,11 +6861,14 @@ impl Executor {
                 }
             }
 
-            Box::new(ExprMappedResult::with_defaults(
-                result,
-                stmt.columns.clone(),
-                final_output_columns.clone(),
-            )?)
+            Box::new(
+                ExprMappedResult::with_defaults(
+                    result,
+                    stmt.columns.clone(),
+                    final_output_columns.clone(),
+                )?
+                .with_context(ctx),
+            )
         } else {
             // Simple column references only: use fast StreamingProjectionResult
             Box::new(StreamingProjectionResult::new(

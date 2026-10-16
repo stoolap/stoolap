@@ -1147,7 +1147,8 @@ impl Executor {
 
         // Evaluate each row
         let mut final_rows = RowVec::with_capacity(agg_rows.len());
-        let mut evaluator = CompiledEvaluator::new(crate::functions::registry::global_registry());
+        let mut evaluator =
+            CompiledEvaluator::new(crate::functions::registry::global_registry()).with_context(ctx);
         evaluator.init_columns(&agg_columns);
 
         // Add aggregate expression aliases so COALESCE(SUM(val), 0) can find the "sum(val)" column
