@@ -115,6 +115,29 @@ pub(crate) fn pk_equality_id(expr: &dyn Expression, schema: &Schema) -> Option<i
     }
 }
 
+/// Whether two members of an IN list may name the same rows: an equal pair,
+/// or members of different types an index may read as one key
+fn may_repeat_rows(values: &[Value]) -> bool {
+    let mut kinds = values
+        .iter()
+        .filter(|v| !v.is_null())
+        .map(std::mem::discriminant);
+    let Some(first) = kinds.next() else {
+        return false;
+    };
+    if kinds.any(|kind| kind != first) {
+        return true;
+    }
+    if values.len() <= 32 {
+        return values
+            .iter()
+            .enumerate()
+            .any(|(i, v)| values[i + 1..].contains(v));
+    }
+    let mut seen = FxHashSet::with_capacity_and_hasher(values.len(), Default::default());
+    values.iter().any(|v| !seen.insert(v))
+}
+
 impl MVCCTable {
     /// Creates a new MVCC table with an owned transaction version store
     /// (wraps it in a shared `TxnTableStore` internally)
@@ -829,10 +852,14 @@ impl MVCCTable {
                         // Use the efficient get_row_ids_in method
                         let values = in_list.get_values();
                         let mut row_ids = index.get_row_ids_in(values);
-                        // Members the column reads as equal name the same rows
-                        if values.len() > 1 {
-                            row_ids.sort_unstable();
-                            row_ids.dedup();
+                        // Members the column reads as equal name the same rows;
+                        // the rows keep the members' order
+                        if may_repeat_rows(values) {
+                            let mut seen = FxHashSet::with_capacity_and_hasher(
+                                row_ids.len(),
+                                Default::default(),
+                            );
+                            row_ids.retain(|id| seen.insert(*id));
                         }
                         return Some(row_ids);
                     }
