@@ -1695,18 +1695,32 @@ impl Executor {
 
         // The members as an equality against the column reads each, so the
         // index is asked for the column's own keys; a number against a TEXT
-        // column is left to the scan
+        // column, or a member with no reading, leaves the list to the scan,
+        // as the pushed-down IN does. Other column types keep their members
         if !is_negated {
             let column_type = schema.get_column_type(&column_name);
-            if column_type == Some(DataType::Text) && has_number(values.iter()) {
-                return Ok(None);
+            match column_type {
+                Some(DataType::Text) if has_number(values.iter()) => return Ok(None),
+                Some(
+                    DataType::Integer
+                    | DataType::Float
+                    | DataType::Text
+                    | DataType::Timestamp
+                    | DataType::Boolean,
+                ) => {
+                    let coerced: Option<Vec<Value>> = values
+                        .into_iter()
+                        .map(|member| {
+                            crate::executor::pushdown::coerce_constant(column_type, member)
+                        })
+                        .collect();
+                    let Some(coerced) = coerced else {
+                        return Ok(None);
+                    };
+                    values = coerced;
+                }
+                _ => {}
             }
-            values = values
-                .into_iter()
-                .filter_map(|member| {
-                    crate::executor::pushdown::coerce_constant(column_type, member)
-                })
-                .collect();
         }
 
         // A secondary index probe collects every matching row id for every

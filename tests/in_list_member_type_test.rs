@@ -99,3 +99,59 @@ fn members_of_another_type_answer_as_without_an_index_hot_and_sealed() {
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     check(&db, "sealed");
 }
+
+#[test]
+fn a_member_with_no_reading_or_a_json_column_answers_as_without_an_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = format!("file://{}", dir.path().display());
+    for dsn in ["memory://a_member_with_no_reading", file.as_str()] {
+        let db = Database::open(dsn).unwrap();
+        for (table, ty, index, stored) in [
+            ("ints_plain", "INTEGER", "", "1"),
+            ("ints_btree", "INTEGER", "BTREE", "1"),
+            ("ints_hash", "INTEGER", "HASH", "1"),
+            ("jsons_plain", "JSON", "", "'{}'"),
+            ("jsons_hash", "JSON", "HASH", "'{}'"),
+        ] {
+            db.execute(
+                &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, k {ty})"),
+                (),
+            )
+            .unwrap();
+            if !index.is_empty() {
+                db.execute(
+                    &format!("CREATE INDEX {table}_k ON {table}(k) USING {index}"),
+                    (),
+                )
+                .unwrap();
+            }
+            db.execute(&format!("INSERT INTO {table} VALUES (1, {stored})"), ())
+                .unwrap();
+        }
+        for (sql, tables) in [
+            (
+                "SELECT id FROM {t} WHERE k IN (TRUE, 'bad')",
+                &["ints_btree", "ints_hash"][..],
+            ),
+            (
+                "SELECT id FROM {t} WHERE k IN ('{}') AND id % 2 = 1",
+                &["jsons_hash"][..],
+            ),
+        ] {
+            let plain = if sql.contains("'{}'") {
+                "jsons_plain"
+            } else {
+                "ints_plain"
+            };
+            let want = ids(&db, &sql.replace("{t}", plain));
+            for table in tables {
+                assert_eq!(
+                    ids(&db, &sql.replace("{t}", table)),
+                    want,
+                    "{dsn}: {}",
+                    sql.replace("{t}", table)
+                );
+            }
+        }
+    }
+}
