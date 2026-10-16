@@ -658,9 +658,9 @@ impl Executor {
     }
 
     /// Whether the inner rows of an EXISTS on the bare correlation hold `key`,
-    /// for a probe the table refused: a table with sealed rows answers from
-    /// the semi-join set, built once per statement, since running the
-    /// subquery would scan its volumes. None for any other table
+    /// for a probe the table refused: the semi-join set answers, built once
+    /// per statement, since running the subquery per outer row would read
+    /// the inner table each time
     fn exists_by_probe_fallback(
         &self,
         subquery: &SelectStatement,
@@ -669,17 +669,8 @@ impl Executor {
         ctx: &ExecutionContext,
     ) -> Result<Option<bool>> {
         let subquery_ptr = subquery as *const SelectStatement as usize;
-        if let Some(known) = get_exists_probe_fallback(subquery_ptr) {
-            return Ok(known.map(|set| set.contains(key) == Some(true)));
-        }
-        let sealed = self
-            .with_correlated_probe_table(ctx, &correlation.inner_table, |table| {
-                Ok(Some(table.has_sealed_rows()))
-            })?
-            .unwrap_or(false);
-        if !sealed {
-            cache_exists_probe_fallback(subquery_ptr, None);
-            return Ok(None);
+        if let Some(set) = get_exists_probe_fallback(subquery_ptr) {
+            return Ok(Some(set.contains(key) == Some(true)));
         }
         let inner_alias = match subquery.table_expr.as_deref() {
             Some(Expression::TableSource(ts)) => ts.alias.as_ref().map(|a| a.value.to_string()),
@@ -696,7 +687,7 @@ impl Executor {
         };
         let set = self.execute_semi_join_optimization(&info, ctx)?;
         let found = set.contains(key) == Some(true);
-        cache_exists_probe_fallback(subquery_ptr, Some(set));
+        cache_exists_probe_fallback(subquery_ptr, set);
         Ok(Some(found))
     }
 
@@ -1250,21 +1241,28 @@ impl Executor {
         token: LayoutToken,
         mut visit: impl FnMut(&Row) -> Result<bool>,
     ) -> Result<Option<bool>> {
-        self.with_correlated_candidates(ctx, correlation, key, |table, ids, key_idx, _, rows| {
-            // `visit` reads by the positions of the table `token` names
-            check_compiled_token(table, token)?;
-            let all = ConstBoolExpr::true_expr();
-            for chunk in ids.chunks(VISIBILITY_CHECK_BATCH_SIZE) {
-                rows.clear();
-                table.fetch_rows_by_ids_into(chunk, &all, rows)?;
-                for (_, row) in rows.iter() {
-                    if row.get(key_idx) == Some(key) && visit(row)? {
-                        return Ok(true);
+        let hot_cap = usize::MAX;
+        self.with_correlated_candidates(
+            ctx,
+            correlation,
+            key,
+            hot_cap,
+            |table, ids, key_idx, _, rows| {
+                // `visit` reads by the positions of the table `token` names
+                check_compiled_token(table, token)?;
+                let all = ConstBoolExpr::true_expr();
+                for chunk in ids.chunks(VISIBILITY_CHECK_BATCH_SIZE) {
+                    rows.clear();
+                    table.fetch_rows_by_ids_into(chunk, &all, rows)?;
+                    for (_, row) in rows.iter() {
+                        if row.get(key_idx) == Some(key) && visit(row)? {
+                            return Ok(true);
+                        }
                     }
                 }
-            }
-            Ok(false)
-        })
+                Ok(false)
+            },
+        )
     }
 
     /// How many inner rows hold `key`, up to `limit`, counted as
@@ -1276,24 +1274,37 @@ impl Executor {
         key: &Value,
         limit: usize,
     ) -> Result<Option<usize>> {
-        self.with_correlated_candidates(ctx, correlation, key, |table, ids, key_idx, epoch, _| {
-            table.count_equal_candidates(ids, key_idx, key, limit, Some(epoch))
-        })
+        // A key held by more rows than the cap answers from the semi-join set
+        // instead of copying them all for one visible row
+        let hot_cap = EQUALITY_CANDIDATE_CAP;
+        self.with_correlated_candidates(
+            ctx,
+            correlation,
+            key,
+            hot_cap,
+            |table, ids, key_idx, epoch, _| {
+                table.count_equal_candidates(ids, key_idx, key, limit, Some(epoch))
+            },
+        )
     }
 
     /// Runs `answer` over the inner table, the ids its index holds for `key`,
     /// the key's column and the index epoch, read through the statement's
-    /// view. None when the table cannot answer that way or the epoch moved
+    /// view. None when the table cannot answer that way, the key holds more
+    /// ids than the cap (`hot_cap` while no row is sealed), or the epoch moved
     fn with_correlated_candidates<T>(
         &self,
         ctx: &ExecutionContext,
         correlation: &ExistsCorrelationInfo,
         key: &Value,
+        hot_cap: usize,
         answer: impl FnOnce(&dyn Table, &[i64], usize, u64, &mut RowVec) -> Result<T>,
     ) -> Result<Option<T>> {
         self.with_correlated_probe_table(ctx, &correlation.inner_table, |table| {
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::correlated_fetch_next();
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::correlated_probe_asked();
             let Some(epoch) = table.index_view_epoch() else {
                 return Ok(None);
             };
@@ -1327,7 +1338,7 @@ impl Executor {
                 let cap = if table.has_sealed_rows() {
                     EQUALITY_CANDIDATE_CAP
                 } else {
-                    usize::MAX
+                    hot_cap
                 };
                 let found = table.equality_candidates(
                     &correlation.inner_column,
@@ -1336,6 +1347,8 @@ impl Executor {
                     &mut buffers.ids,
                     &mut buffers.scratch,
                 )?;
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::correlated_ids_copied(buffers.ids.len());
                 let answered = match found {
                     Some(CappedEqual::Copied) => Some(answer(
                         table,
@@ -4276,15 +4289,16 @@ impl Executor {
 
     /// Whether an EXISTS on `column` probes the table the statement sees
     fn exists_probes(table: &dyn Table, column: &str) -> bool {
+        // The table vouches for its indexes; one with local changes or an
+        // older snapshot refuses every probe
+        if table.index_view_epoch().is_none() {
+            return false;
+        }
         // An index the table keeps whole
         if table.lookup_index_on_column(column).is_some() {
             return true;
         }
-        // Sealed rows answer through side files, while the table vouches for
-        // its indexes; one with local changes or an older snapshot refuses all
-        if table.index_view_epoch().is_none() {
-            return false;
-        }
+        // Sealed rows answer through side files
         let Some(at) = table
             .schema()
             .columns

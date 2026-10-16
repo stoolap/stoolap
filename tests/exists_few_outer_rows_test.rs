@@ -175,3 +175,78 @@ fn not_exists_sees_its_own_transaction() {
         );
     }
 }
+
+/// A key held by more inner rows than a probe copies answers from the
+/// semi-join set, built at most once, instead of copying every row of the
+/// key per outer row
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn exists_over_a_key_held_by_many_rows_builds_the_semi_join_once() {
+    use stoolap::test_failpoints::{
+        correlated_ids_copied_count, exists_subquery_runs, inner_table_reads,
+    };
+    let db = Database::open("memory://exists_heavy_key").unwrap();
+    for (table, index) in [("h", true), ("hw", false)] {
+        db.execute(
+            &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, c INTEGER)"),
+            (),
+        )
+        .unwrap();
+        if index {
+            db.execute("CREATE INDEX h_c ON h(c) USING BTREE", ())
+                .unwrap();
+        }
+        db.execute(
+            &format!(
+                "INSERT INTO {table} SELECT value, CASE WHEN value <= 5000 THEN 7 \
+                 ELSE value END FROM generate_series(1, 8000)"
+            ),
+            (),
+        )
+        .unwrap();
+    }
+    db.execute("CREATE TABLE o (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO o VALUES (1, 7), (2, 7), (3, 7), (4, 7), (5, 6000), (6, 9), (7, 7), (8, 7)",
+        (),
+    )
+    .unwrap();
+    for test in ["EXISTS", "NOT EXISTS"] {
+        let sql =
+            format!("SELECT o.id FROM o WHERE {test} (SELECT 1 FROM {{i}} WHERE {{i}}.c = o.k)");
+        let (copied, reads, runs) = (
+            correlated_ids_copied_count(),
+            inner_table_reads(),
+            exists_subquery_runs(),
+        );
+        let got = ids(&db, &sql.replace("{i}", "h"));
+        let copied = correlated_ids_copied_count() - copied;
+        let reads = inner_table_reads() - reads;
+        assert_eq!(got, ids(&db, &sql.replace("{i}", "hw")), "{sql}");
+        assert!(copied <= 1024, "{sql}: copied {copied} ids");
+        assert!(reads <= 1, "{sql}: inner table read whole {reads} times");
+        assert_eq!(exists_subquery_runs() - runs, 0, "{sql}: subqueries run");
+    }
+}
+
+/// Inside a transaction that changed the inner table its index answers no
+/// probe, so the semi-join is chosen and no probe is asked
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn exists_after_local_changes_asks_no_probe() {
+    use stoolap::test_failpoints::{correlated_probes_asked, exists_subquery_runs};
+    let db = Database::open("memory://exists_local_changes").unwrap();
+    create(&db);
+    db.execute("BEGIN", ()).unwrap();
+    db.execute("DELETE FROM t WHERE c = 194", ()).unwrap();
+    for test in ["EXISTS", "NOT EXISTS"] {
+        let sql =
+            format!("SELECT few.id FROM few WHERE {test} (SELECT 1 FROM t WHERE t.c = few.k)");
+        let (asked, runs) = (correlated_probes_asked(), exists_subquery_runs());
+        ids(&db, &sql);
+        assert_eq!(correlated_probes_asked() - asked, 0, "{sql}: probes asked");
+        assert_eq!(exists_subquery_runs() - runs, 0, "{sql}: subqueries run");
+    }
+    db.execute("ROLLBACK", ()).unwrap();
+}

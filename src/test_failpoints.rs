@@ -1554,6 +1554,8 @@ thread_local! {
     static HOT_TOP_K_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ORDERED_VALUES_SORTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static INNER_TABLE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CORRELATED_IDS_COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CORRELATED_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static BTREE_WALK_CHUNK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
     static GROUP_CACHE_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GROUP_COLUMN_DECODES: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
@@ -2265,6 +2267,25 @@ pub fn inner_table_reads() -> usize {
 
 pub(crate) fn inner_table_read_whole() {
     INNER_TABLE_READS.with(|n| n.set(n.get() + 1));
+}
+
+/// Inner row ids this thread's correlated EXISTS probes copied from an
+/// index, so far
+pub fn correlated_ids_copied_count() -> usize {
+    CORRELATED_IDS_COPIED.with(std::cell::Cell::get)
+}
+
+pub(crate) fn correlated_ids_copied(count: usize) {
+    CORRELATED_IDS_COPIED.with(|n| n.set(n.get() + count));
+}
+
+/// Correlated EXISTS probes this thread asked an inner table for, so far
+pub fn correlated_probes_asked() -> usize {
+    CORRELATED_PROBES.with(std::cell::Cell::get)
+}
+
+pub(crate) fn correlated_probe_asked() {
+    CORRELATED_PROBES.with(|n| n.set(n.get() + 1));
 }
 
 /// Hot rows this thread's index-walking top-k scans visited, so far
