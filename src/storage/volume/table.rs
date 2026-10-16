@@ -498,6 +498,14 @@ impl SegmentedTable {
         self.snapshot_seq.is_some() || self.view.is_some()
     }
 
+    /// Whether the hot store's index on `column`, the one its bounds read,
+    /// is a B-tree
+    fn hot_btree_on(&self, column: &str) -> bool {
+        self.hot
+            .get_index_on_column(column)
+            .is_some_and(|index| index.index_type() == IndexType::BTree)
+    }
+
     /// Runs `read`, a shortcut over the newest committed state, while no
     /// commit publishes across it: one that moves a row between the hot and
     /// the sealed reads would tear the answer. Under a view, only while the
@@ -7028,6 +7036,11 @@ impl Table for SegmentedTable {
             if let Some(result) = self.unsealed(|hot| hot.get_index_min_value(column_name)) {
                 return result;
             }
+            // A zone map still counts the rows tombstoned since the seal, and
+            // only a B-tree gives the hot rows' bound
+            if !self.segment_mgr.tombstone_set_arc().is_empty() || !self.hot_btree_on(column_name) {
+                return None;
+            }
             let hot_min = self.hot.get_index_min_value(column_name);
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::index_bound_hot_read();
@@ -7077,6 +7090,11 @@ impl Table for SegmentedTable {
             if let Some(result) = self.unsealed(|hot| hot.get_index_max_value(column_name)) {
                 return result;
             }
+            // A zone map still counts the rows tombstoned since the seal, and
+            // only a B-tree gives the hot rows' bound
+            if !self.segment_mgr.tombstone_set_arc().is_empty() || !self.hot_btree_on(column_name) {
+                return None;
+            }
             let hot_max = self.hot.get_index_max_value(column_name);
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::index_bound_hot_read();
@@ -7089,6 +7107,10 @@ impl Table for SegmentedTable {
                 let pi = cs.mapping.volume_column(vol, column_name)?;
                 if pi >= vol.meta.zone_maps.len() {
                     continue;
+                }
+                // The zone map leaves NaN out, and a NaN would beat it
+                if vol.meta.nan_count(pi) != Some(0) {
+                    return None;
                 }
                 let zm_max = &vol.meta.zone_maps[pi].max;
                 if !zm_max.is_null() {
