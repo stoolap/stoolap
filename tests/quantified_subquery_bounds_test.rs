@@ -583,4 +583,15 @@ fn test_a_name_holding_an_apostrophe_still_reads_its_aggregate() {
             "{quoted}: a name with an apostrophe reads as one without"
         );
     }
+    db.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v TEXT)", ())
+        .unwrap();
+    db.execute("INSERT INTO s VALUES (1, 'B')", ()).unwrap();
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT MAX(v || 'A'), MAX(v || 'a') AS lo, COALESCE(MAX(v || 'a'), '') FROM s"
+        ),
+        rows(&db, "SELECT 'BA', 'Ba', 'Ba'"),
+        "the aggregate over 'a' is found by its own case, not through the one over 'A'"
+    );
 }

@@ -833,11 +833,27 @@ impl Executor {
 
         // Build column index map for aggregate result columns
         let mut agg_col_index_map = build_column_index_map(&agg_columns);
-        // A name holding a TEXT literal is also keyed with the literal's own case
-        for (i, name) in agg_columns.iter().enumerate() {
-            if name.contains('\'') {
-                agg_col_index_map.insert(fold_expression_name(name), i);
-            }
+        // An expression name holding a TEXT literal is keyed by the literal's own case only
+        let expression_names: Vec<(usize, &String)> = agg_columns
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| name.contains('\''))
+            .filter(|(_, name)| {
+                let lower = name.to_lowercase();
+                let aliased = stmt.columns.iter().any(
+                    |c| matches!(c, Expression::Aliased(a) if a.alias.value_lower.as_str() == lower),
+                );
+                let grouped = group_by_columns
+                    .iter()
+                    .any(|g| matches!(g, GroupByItem::Column(c) if c.to_lowercase() == lower));
+                !aliased && !grouped
+            })
+            .collect();
+        for (_, name) in &expression_names {
+            agg_col_index_map.remove(name.to_lowercase().as_str());
+        }
+        for (i, name) in expression_names {
+            agg_col_index_map.insert(fold_expression_name(name), i);
         }
 
         // Build additional mappings for aggregate expressions to handle deduplication
