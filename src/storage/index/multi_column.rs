@@ -1078,11 +1078,11 @@ impl Index for MultiColumnIndex {
         } else {
             Bound::Excluded(max_key.clone())
         };
-        if super::btree::bounds_hold_nothing(&start, &end) {
-            return Ok(results);
-        }
 
-        for (key, row_ids) in sorted_values.range((start, end)) {
+        for (key, row_ids) in sorted_values.range((start, Bound::Unbounded)) {
+            if super::btree::past_end(key, &end) {
+                break;
+            }
             let mut matches = true;
 
             // Post-check for PARTIAL key bounds only.

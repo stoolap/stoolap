@@ -95,9 +95,10 @@ fn crossing_bounds_hold_nothing_hot_and_sealed() {
     check(&db);
 }
 
-/// The index API answers the same bounds as SQL does
+/// The index API answers the same bounds as SQL does, and bounds of other
+/// types or NULL in the index's own order
 #[test]
-fn crossing_bounds_hold_nothing_through_the_index_api() {
+fn range_bounds_through_the_index_api_follow_the_index_order() {
     use stoolap::core::{DataType, Value};
     use stoolap::storage::index::{BTreeIndex, MultiColumnIndex};
     use stoolap::storage::traits::Index;
@@ -141,5 +142,48 @@ fn crossing_bounds_hold_nothing_through_the_index_api() {
         assert!(ids.is_empty(), "btree get_row_ids_in_range {case}");
         let found = multi.find_range(&[int(1), int(low)], &[int(1), int(high)], low_in, high_in);
         assert!(found.unwrap().is_empty(), "multi find_range {case}");
+    }
+
+    // Bounds are taken in the index's own order, where NULL is first and
+    // each type ranks whole: Integer(2) .. Text("10") holds 10
+    let text = |s: &str| Value::text(s);
+    let null = Value::Null(DataType::Integer);
+    for (low, high, holds_ten) in [
+        (int(2), text("10"), true),
+        (text("10"), int(2), false),
+        (int(5), null.clone(), false),
+        (null.clone(), int(50), true),
+    ] {
+        let case = format!("{low:?} ..= {high:?}");
+        let found: Vec<i64> = btree
+            .find_range(
+                std::slice::from_ref(&low),
+                std::slice::from_ref(&high),
+                true,
+                true,
+            )
+            .unwrap()
+            .iter()
+            .map(|e| e.row_id)
+            .collect();
+        assert_eq!(found.contains(&10), holds_ten, "btree find_range {case}");
+        let ids = btree.get_row_ids_in_range(
+            std::slice::from_ref(&low),
+            std::slice::from_ref(&high),
+            true,
+            true,
+        );
+        assert_eq!(
+            ids.contains(&10),
+            holds_ten,
+            "btree get_row_ids_in_range {case}"
+        );
+        let found: Vec<i64> = multi
+            .find_range(&[int(1), low.clone()], &[int(1), high.clone()], true, true)
+            .unwrap()
+            .iter()
+            .map(|e| e.row_id)
+            .collect();
+        assert_eq!(found.contains(&10), holds_ten, "multi find_range {case}");
     }
 }
