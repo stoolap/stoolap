@@ -103,6 +103,22 @@ fn shapes() -> Vec<(&'static str, String, String)> {
         ("2 * ({z} * INTERVAL '1 hour')", "NULL".to_string()),
         ("ts + 2 * ({z} * INTERVAL '1 hour')", "NULL".to_string()),
         ("{f} * ({n} * INTERVAL '1 hour')", text("16200 second")),
+        (
+            "2 * (9223372036854775807 * (0 * INTERVAL '1 microsecond'))",
+            text("0 microsecond"),
+        ),
+        (
+            "ts + 2 * (9223372036854775807 * (0 * INTERVAL '1 microsecond'))",
+            ts("2024-01-31T00:00:00"),
+        ),
+        (
+            "2 * (9223372036854775807 * ({z} * INTERVAL '1 hour'))",
+            "NULL".to_string(),
+        ),
+        (
+            "ts - 2 * (9223372036854775807 * ({z} * INTERVAL '1 hour'))",
+            "NULL".to_string(),
+        ),
         ("-INTERVAL '1 hour'", text("-1 hour")),
         ("2 * ({n} * INTERVAL '1 hour')", text("6 hour")),
     ]

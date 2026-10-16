@@ -3638,17 +3638,18 @@ impl ExprVM {
         }
     }
 
-    /// Pops `count` INTERVAL multipliers and returns their product, None
-    /// when one is NULL. Every one is checked, NULL or not
+    /// Pops `count` INTERVAL multipliers and returns their product, taken in
+    /// the order they were pushed; None when one is NULL. Every one is
+    /// checked, NULL or not
     fn pop_interval_multiplier(
         &mut self,
         count: u8,
     ) -> Result<Option<std::result::Result<i64, f64>>> {
         let as_f64 = |k: std::result::Result<i64, f64>| k.map_or_else(|f| f, |i| i as f64);
+        let start = self.stack.len().saturating_sub(usize::from(count));
         let mut product = Some(Ok(1i64));
-        for _ in 0..count {
-            let n = self.stack.pop().unwrap_or_else(Value::null_unknown);
-            product = match (product, Self::interval_multiplier(&n)?) {
+        for n in &self.stack[start..] {
+            product = match (product, Self::interval_multiplier(n)?) {
                 (None, _) | (_, None) => None,
                 (Some(Ok(a)), Some(Ok(b))) => Some(Ok(a.checked_mul(b).ok_or_else(|| {
                     crate::core::Error::Type(format!(
@@ -3658,6 +3659,7 @@ impl ExprVM {
                 (Some(a), Some(b)) => Some(Err(as_f64(a) * as_f64(b))),
             };
         }
+        self.stack.truncate(start);
         Ok(product)
     }
 
