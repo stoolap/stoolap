@@ -1559,6 +1559,20 @@ thread_local! {
 thread_local! {
     static STATEMENT_CAPTURED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static COLD_ROUND_PREPARED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static IN_MEMBER_PROBED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread after an index's IN lookup has probed one
+/// member and before it probes the next
+pub fn after_in_member_probed(hook: impl FnOnce() + 'static) {
+    IN_MEMBER_PROBED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn in_member_probed() {
+    let hook = IN_MEMBER_PROBED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 /// Run once on this thread when its next statement snapshot is captured
