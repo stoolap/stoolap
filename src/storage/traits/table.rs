@@ -1219,6 +1219,7 @@ pub trait Table: Send + Sync {
     /// # Arguments
     /// * `column_name` - The indexed column to order by
     /// * `ascending` - True for ASC, false for DESC
+    /// * `nulls_first` - Whether the column's NULLs come before its values
     /// * `limit` - Maximum number of rows to return
     /// * `offset` - Number of rows to skip
     ///
@@ -1228,10 +1229,11 @@ pub trait Table: Send + Sync {
         &self,
         column_name: &str,
         ascending: bool,
+        nulls_first: bool,
         limit: usize,
         offset: usize,
     ) -> Result<Option<RowVec>> {
-        let _ = (column_name, ascending, limit, offset);
+        let _ = (column_name, ascending, nulls_first, limit, offset);
         Ok(None) // Default implementation - override in concrete tables
     }
 

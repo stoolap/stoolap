@@ -1130,6 +1130,7 @@ impl Index for BTreeIndex {
     fn get_row_ids_ordered(
         &self,
         ascending: bool,
+        nulls_first: bool,
         limit: usize,
         offset: usize,
     ) -> Option<Vec<i64>> {
@@ -1139,50 +1140,26 @@ impl Index for BTreeIndex {
 
         let sorted_values = self.sorted_values.read();
 
-        // Pre-allocate with expected capacity
-        let mut result = Vec::with_capacity(limit.min(128));
-        let mut skipped = 0;
-
-        // Iterate in the requested order using BTreeMap's natural ordering
-        if ascending {
-            // Forward iteration (ascending order)
-            'outer: for row_ids in sorted_values.values() {
-                for row_id in row_ids.iter() {
-                    // Handle offset
-                    if skipped < offset {
-                        skipped += 1;
-                        continue;
-                    }
-
-                    result.push(row_id);
-
-                    // Check limit
-                    if result.len() >= limit {
-                        break 'outer;
-                    }
-                }
+        // NULL is the first key of the map: in the map's order when the
+        // caller wants it there, otherwise moved to the other end
+        let null_rows = sorted_values
+            .first_key_value()
+            .filter(|(key, _)| key.is_null())
+            .map(|(_, row_ids)| row_ids);
+        let keys = sorted_values.values();
+        let others = sorted_values.len().saturating_sub(1);
+        Some(match (null_rows, ascending, nulls_first) {
+            (Some(nulls), true, false) => {
+                ordered_row_ids(keys.skip(1).chain(Some(nulls)), limit, offset)
             }
-        } else {
-            // Reverse iteration (descending order)
-            'outer: for row_ids in sorted_values.values().rev() {
-                for row_id in row_ids.iter() {
-                    // Handle offset
-                    if skipped < offset {
-                        skipped += 1;
-                        continue;
-                    }
-
-                    result.push(row_id);
-
-                    // Check limit
-                    if result.len() >= limit {
-                        break 'outer;
-                    }
-                }
-            }
-        }
-
-        Some(result)
+            (Some(nulls), false, true) => ordered_row_ids(
+                Some(nulls).into_iter().chain(keys.rev().take(others)),
+                limit,
+                offset,
+            ),
+            (_, true, _) => ordered_row_ids(keys, limit, offset),
+            (_, false, _) => ordered_row_ids(keys.rev(), limit, offset),
+        })
     }
 
     /// Walks the whole key, so only an empty prefix. Each chunk of row ids is
@@ -1341,6 +1318,35 @@ impl Index for BTreeIndex {
         self.closed.store(true, AtomicOrdering::Release);
         self.clear()
     }
+}
+
+/// The row ids of `keys` in order, past the first `offset`, up to `limit`
+fn ordered_row_ids<'a>(
+    keys: impl Iterator<Item = &'a RowIdSet>,
+    limit: usize,
+    offset: usize,
+) -> Vec<i64> {
+    // Pre-allocate with expected capacity
+    let mut result = Vec::with_capacity(limit.min(128));
+    let mut skipped = 0;
+
+    'outer: for row_ids in keys {
+        for row_id in row_ids.iter() {
+            // Handle offset
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+
+            result.push(row_id);
+
+            // Check limit
+            if result.len() >= limit {
+                break 'outer;
+            }
+        }
+    }
+    result
 }
 
 /// Whether `key` lies past `end` in the map's own `Ord`. A range is walked

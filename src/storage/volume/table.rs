@@ -6019,11 +6019,12 @@ impl Table for SegmentedTable {
         &self,
         column_name: &str,
         ascending: bool,
+        nulls_first: bool,
         limit: usize,
         offset: usize,
     ) -> Result<Option<RowVec>> {
         if let Some(result) = self.unsealed(|hot| {
-            hot.collect_rows_ordered_by_index(column_name, ascending, limit, offset)
+            hot.collect_rows_ordered_by_index(column_name, ascending, nulls_first, limit, offset)
         }) {
             return result;
         }
@@ -6055,24 +6056,26 @@ impl Table for SegmentedTable {
             crate::test_failpoints::merged_read_began();
             // 1. Collect hot rows in PK order. Only materialize `needed` rows
             //    (not all hot rows). The skip set uses row IDs only (no materialization).
-            let hot_rows =
-                match self
-                    .hot
-                    .collect_rows_ordered_by_index(column_name, ascending, needed, 0)?
-                {
-                    Some(rows) => rows,
-                    None => {
-                        // Local changes prevent ordered iteration — fall back to collect + sort.
-                        let mut rows = self.hot.collect_all_rows(None)?;
-                        if ascending {
-                            rows.sort_unstable_by_key(|&(id, _)| id);
-                        } else {
-                            rows.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
-                        }
-                        rows.truncate(needed);
-                        rows
+            let hot_rows = match self.hot.collect_rows_ordered_by_index(
+                column_name,
+                ascending,
+                nulls_first,
+                needed,
+                0,
+            )? {
+                Some(rows) => rows,
+                None => {
+                    // Local changes prevent ordered iteration — fall back to collect + sort.
+                    let mut rows = self.hot.collect_all_rows(None)?;
+                    if ascending {
+                        rows.sort_unstable_by_key(|&(id, _)| id);
+                    } else {
+                        rows.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
                     }
-                };
+                    rows.truncate(needed);
+                    rows
+                }
+            };
 
             // 2. Build skip set from ALL hot row IDs (no Row materialization).
             //    Hot rows shadow cold rows regardless of whether they're in the merge set.
@@ -9625,7 +9628,7 @@ mod tests {
         // not in the order the rows were added
         let first = |ascending: bool| -> Vec<i64> {
             table
-                .collect_rows_ordered_by_index("id", ascending, 3, 0)
+                .collect_rows_ordered_by_index("id", ascending, !ascending, 3, 0)
                 .unwrap()
                 .expect("the merge path answers a primary key order")
                 .iter()

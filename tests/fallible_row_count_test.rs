@@ -274,7 +274,7 @@ fn ordered_rows_propagate_cold_reload_failure() {
         |table| {
             format!(
                 "{:?}",
-                table.collect_rows_ordered_by_index("id", true, 2, 0)
+                table.collect_rows_ordered_by_index("id", true, false, 2, 0)
             )
         },
         surviving_rows(),

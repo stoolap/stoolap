@@ -387,6 +387,7 @@ pub trait Index: Send + Sync {
     ///
     /// # Arguments
     /// * `ascending` - If true, return in ascending order; if false, descending
+    /// * `nulls_first` - Whether the rows whose key is NULL come before the others
     /// * `limit` - Maximum number of row IDs to return
     /// * `offset` - Number of row IDs to skip before returning
     ///
@@ -395,6 +396,7 @@ pub trait Index: Send + Sync {
     fn get_row_ids_ordered(
         &self,
         _ascending: bool,
+        _nulls_first: bool,
         _limit: usize,
         _offset: usize,
     ) -> Option<Vec<i64>> {
