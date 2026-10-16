@@ -612,7 +612,7 @@ impl Executor {
                         base_columns,
                         &col_index_map,
                         ctx,
-                    );
+                    )?;
                     order_by_cache.push((cache_key, precomputed));
                 }
             }
@@ -811,11 +811,10 @@ impl Executor {
             for (row_idx, (_, base_row)) in base_rows.iter().enumerate() {
                 // Evaluate base expressions and update their column values
                 if let Some(ref mut eval) = base_eval {
-                    if let Ok(base_results) = eval.eval_all(base_row) {
-                        for (eval_idx, (item_idx, _)) in base_expr_items.iter().enumerate() {
-                            if eval_idx < base_results.len() {
-                                column_data[*item_idx][row_idx] = base_results[eval_idx].clone();
-                            }
+                    let base_results = eval.eval_all(base_row)?;
+                    for (eval_idx, (item_idx, _)) in base_expr_items.iter().enumerate() {
+                        if eval_idx < base_results.len() {
+                            column_data[*item_idx][row_idx] = base_results[eval_idx].clone();
                         }
                     }
                 }
@@ -834,11 +833,10 @@ impl Executor {
                         }
 
                         ext_results.clear();
-                        if eval.eval_into(&ext_row, &mut ext_results).is_ok() {
-                            for (eval_idx, (item_idx, _)) in ext_expr_items.iter().enumerate() {
-                                if eval_idx < ext_results.len() {
-                                    column_data[*item_idx][row_idx] = ext_results[eval_idx].clone();
-                                }
+                        eval.eval_into(&ext_row, &mut ext_results)?;
+                        for (eval_idx, (item_idx, _)) in ext_expr_items.iter().enumerate() {
+                            if eval_idx < ext_results.len() {
+                                column_data[*item_idx][row_idx] = ext_results[eval_idx].clone();
                             }
                         }
                     }
@@ -934,7 +932,7 @@ impl Executor {
                         base_columns,
                         &col_index_map,
                         ctx,
-                    );
+                    )?;
                     order_by_cache.push((cache_key, precomputed));
                 }
             }
@@ -1208,7 +1206,7 @@ impl Executor {
                             base_columns,
                             &col_index_map,
                             ctx,
-                        );
+                        )?;
                         order_by_cache.push((cache_key, precomputed));
                     }
                 }
@@ -3383,17 +3381,17 @@ impl Executor {
         columns: &[String],
         col_index_map: &StringMap<usize>,
         ctx: &ExecutionContext,
-    ) -> ColumnarOrderByValues {
+    ) -> Result<ColumnarOrderByValues> {
         let num_rows = rows.len();
         let num_cols = order_by.len();
 
         if num_cols == 0 || num_rows == 0 {
-            return ColumnarOrderByValues {
+            return Ok(ColumnarOrderByValues {
                 columns: vec![],
                 ascending: vec![],
                 nulls_first: vec![],
                 num_rows: 0,
-            };
+            });
         }
 
         // Extract ascending flags once (not per row!)
@@ -3427,32 +3425,13 @@ impl Executor {
                 order_by.iter().map(|ob| ob.expression.clone()).collect();
 
             // Compile all expressions with aliases
-            match MultiExpressionEval::compile_with_aliases(&order_exprs, columns, &agg_aliases) {
-                Ok(eval) => {
-                    let mut eval = eval.with_context(ctx);
-                    for (_, row) in rows {
-                        match eval.eval_all(row) {
-                            Ok(values) => {
-                                for (col_idx, value) in values.into_iter().enumerate() {
-                                    if col_idx < result_columns.len() {
-                                        result_columns[col_idx].push(value);
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                for col in result_columns.iter_mut() {
-                                    col.push(Value::null_unknown());
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(_) => {
-                    // Compilation failed - fill with nulls
-                    for _ in 0..num_rows {
-                        for col in result_columns.iter_mut() {
-                            col.push(Value::null_unknown());
-                        }
+            let mut eval =
+                MultiExpressionEval::compile_with_aliases(&order_exprs, columns, &agg_aliases)?
+                    .with_context(ctx);
+            for (_, row) in rows {
+                for (col_idx, value) in eval.eval_all(row)?.into_iter().enumerate() {
+                    if col_idx < result_columns.len() {
+                        result_columns[col_idx].push(value);
                     }
                 }
             }
@@ -3498,12 +3477,12 @@ impl Executor {
             }
         }
 
-        ColumnarOrderByValues {
+        Ok(ColumnarOrderByValues {
             columns: result_columns,
             ascending: ascending_flags,
             nulls_first: nulls_first_flags,
             num_rows,
-        }
+        })
     }
 
     /// Check if rows are already pre-sorted by the window ORDER BY column
@@ -4019,8 +3998,8 @@ impl Executor {
             let mut eval =
                 ExpressionEval::compile(&wf_info.arguments[0], columns)?.with_context(ctx);
             rows.iter()
-                .map(|(_, row)| eval.eval(row).unwrap_or_else(|_| Value::null_unknown()))
-                .collect()
+                .map(|(_, row)| eval.eval(row))
+                .collect::<Result<_>>()?
         } else {
             vec![]
         };

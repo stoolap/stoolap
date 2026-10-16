@@ -289,8 +289,9 @@ impl ScalarFunction for ModFunction {
         let any_float = matches!(args[0], Value::Float(_)) || matches!(args[1], Value::Float(_));
         if !any_float {
             if let (Some(a), Some(b)) = (value_to_i64(&args[0]), value_to_i64(&args[1])) {
+                // A zero divisor gives NULL, as the % operator does
                 if b == 0 {
-                    return Err(Error::invalid_argument("MOD: division by zero"));
+                    return Ok(Value::null_unknown());
                 }
                 return Ok(Value::Integer(a % b));
             }
@@ -303,7 +304,7 @@ impl ScalarFunction for ModFunction {
             .ok_or_else(|| Error::invalid_argument("MOD second argument must be a number"))?;
 
         if b == 0.0 {
-            return Err(Error::invalid_argument("MOD: division by zero"));
+            return Ok(Value::null_unknown());
         }
 
         Ok(Value::Float(a % b))

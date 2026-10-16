@@ -405,6 +405,7 @@ impl ScalarFunction for JsonExtractFunction {
         // Get path
         let path = match &args[1] {
             Value::Text(s) => s.to_string(),
+            Value::Null(_) => return Ok(Value::null_unknown()),
             _ => {
                 return Err(Error::invalid_argument(
                     "JSON_EXTRACT second argument must be a path string",
