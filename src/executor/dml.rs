@@ -1435,19 +1435,7 @@ impl Executor {
         // Check if there's an active explicit transaction
         let mut active_tx = self.active_transaction.lock().unwrap();
         let statement_rollback = StatementRollback::new(&self.engine, active_tx.as_ref());
-        // Its query and subqueries read through one view; the target keeps the newest
-        let ctx_with_view;
-        let ctx = match self.statement_view(
-            super::insert_reads_through_a_view(stmt),
-            ctx,
-            (*active_tx).as_ref().map(|t| t.transaction.id()),
-        ) {
-            Some(view) => {
-                ctx_with_view = ctx.with_statement_view(view);
-                &ctx_with_view
-            }
-            None => ctx,
-        };
+        let active_txn_id = (*active_tx).as_ref().map(|t| t.transaction.id());
 
         let (mut table, should_auto_commit, standalone_tx) =
             if let Some(ref mut tx_state) = *active_tx {
@@ -1503,6 +1491,7 @@ impl Executor {
             default_programs,
             default_row_template,
             compiled_checks,
+            reads_through_view,
         ) = if let Some(cached) = cached_insert {
             // Use cached values (Arc clone is cheap)
             (
@@ -1513,6 +1502,7 @@ impl Executor {
                 cached.default_programs,
                 cached.default_row_template,
                 cached.compiled_checks,
+                cached.reads_through_view,
             )
         } else {
             // Compile and cache
@@ -1574,6 +1564,7 @@ impl Executor {
                 };
 
             // Store in cache for next execution
+            let reads_through_view = super::insert_reads_through_a_view(stmt);
             let compiled = CompiledInsert {
                 table_name: SmartString::new(table_name),
                 column_indices: Arc::new(column_indices.clone()),
@@ -1585,6 +1576,7 @@ impl Executor {
                 compiled_checks: Arc::new(compiled_checks.clone()),
                 cached_epoch: current_epoch,
                 token,
+                reads_through_view,
             };
 
             // Update the cache
@@ -1600,7 +1592,19 @@ impl Executor {
                 Arc::new(default_programs),
                 Arc::new(default_row_template),
                 Arc::new(compiled_checks),
+                reads_through_view,
             )
+        };
+
+        // Its query and subqueries read through one view, taken before them;
+        // the target keeps the newest
+        let ctx_with_view;
+        let ctx = match self.statement_view(reads_through_view, ctx, active_txn_id) {
+            Some(view) => {
+                ctx_with_view = ctx.with_statement_view(view);
+                &ctx_with_view
+            }
+            None => ctx,
         };
 
         // Pre-compute FK info for parent validation (CompactArc ref-count bump, not deep clone)

@@ -1023,10 +1023,13 @@ impl Executor {
         ctx: &ExecutionContext,
         active_txn_id: Option<i64>,
     ) -> Option<crate::storage::mvcc::registry::StatementView> {
+        if !reads || ctx.statement_view().is_some() {
+            return None;
+        }
         let at_its_point = ctx
             .statement_snapshot()
             .is_some_and(|snapshot| !snapshot.reads_latest());
-        if ctx.statement_view().is_some() || at_its_point || !reads {
+        if at_its_point {
             return None;
         }
         let level = match active_txn_id {

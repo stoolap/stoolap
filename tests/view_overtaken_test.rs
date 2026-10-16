@@ -244,6 +244,26 @@ fn a_statement_a_truncate_overtakes_keeps_nothing_it_wrote() {
 }
 
 #[test]
+fn a_cached_insert_select_takes_its_view_again() {
+    let db = memory("cached_insert_select");
+    db.execute("CREATE TABLE kept (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    let sql = "INSERT INTO kept SELECT id, v FROM t";
+    // The first run compiles the plan the second takes
+    db.execute(sql, ()).unwrap();
+    db.execute("DELETE FROM kept", ()).unwrap();
+    let ran = after_the_view(&db, TRUNCATE_OTHER);
+    let outcome = db.execute(sql, ());
+    assert!(ran.get(), "the cached run took no view");
+    assert!(
+        matches!(outcome, Err(Error::ViewOvertaken)),
+        "the cached run went on: {outcome:?}"
+    );
+    let rows = values(db.query("SELECT id FROM kept", ())).unwrap();
+    assert!(rows.is_empty(), "the cached run kept {rows:?}");
+}
+
+#[test]
 fn the_runs_of_an_overtaken_select_share_its_first_deadline() {
     let db = memory("deadline");
     // The first view is overtaken 250 ms in; the second run's view takes as

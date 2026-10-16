@@ -237,6 +237,9 @@ pub struct CompiledInsert {
     pub cached_epoch: u64,
     /// The table instance and layout the indices and templates describe
     pub token: LayoutToken,
+    /// Whether the statement reads beyond its target, so its reads go
+    /// through a statement view: a query source or a subquery
+    pub reads_through_view: bool,
 }
 
 /// Compiled parts of an INSERT that handles conflicts (ON DUPLICATE KEY
