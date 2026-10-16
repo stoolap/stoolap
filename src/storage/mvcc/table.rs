@@ -828,7 +828,12 @@ impl MVCCTable {
                     if let Some(index) = self.version_store.get_index_by_column(col_name) {
                         // Use the efficient get_row_ids_in method
                         let values = in_list.get_values();
-                        let row_ids = index.get_row_ids_in(values);
+                        let mut row_ids = index.get_row_ids_in(values);
+                        // Members the column reads as equal name the same rows
+                        if values.len() > 1 {
+                            row_ids.sort_unstable();
+                            row_ids.dedup();
+                        }
                         return Some(row_ids);
                     }
                 }
