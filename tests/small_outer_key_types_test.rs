@@ -194,6 +194,63 @@ fn float_keys_at_the_edges_answer_as_their_control() {
     );
 }
 
+/// The semi-join reduction filters a derived inner side by the keys it
+/// read; a TIMESTAMP member of that filter stays a TIMESTAMP
+#[test]
+fn a_timestamp_key_filters_a_derived_inner_side_as_a_timestamp() {
+    let _serial = serial();
+    let mut wrong = Vec::new();
+    for seal in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&format!(
+            "file://{}?sync_mode=none&checkpoint_on_close=off&checkpoint_interval=0",
+            dir.path().display()
+        ))
+        .unwrap();
+        for sql in [
+            "CREATE TABLE s (id INTEGER PRIMARY KEY, k TIMESTAMP)",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, k TIMESTAMP)",
+            "INSERT INTO s VALUES (1, TIMESTAMP '2024-01-01 00:00:01.25')",
+            "INSERT INTO t VALUES (1, TIMESTAMP '2024-01-01 00:00:01.25')",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        if seal {
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        for (sql, want) in [
+            (
+                "SELECT s.id, COUNT(r.k) FROM s \
+                 LEFT JOIN (SELECT k FROM t WHERE id > 0) r ON s.k = r.k \
+                 GROUP BY s.id LIMIT 1",
+                vec![vec![1, 1]],
+            ),
+            (
+                "SELECT s.id, COUNT(*) FROM s \
+                 JOIN (SELECT k FROM t WHERE id > 0) r ON s.k = r.k \
+                 GROUP BY s.id LIMIT 1",
+                vec![vec![1, 1]],
+            ),
+            (
+                "SELECT COUNT(*) FROM (SELECT k FROM t WHERE id > 0) r \
+                 WHERE r.k IN (TIMESTAMP '2024-01-01T00:00:01.25Z')",
+                vec![vec![1]],
+            ),
+        ] {
+            let got = rows(&db, sql);
+            if got != want {
+                wrong.push(format!("sealed {seal}: {sql}: gave {got:?}, want {want:?}"));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
 #[cfg(feature = "test-failpoints")]
 mod counted {
     use super::*;
