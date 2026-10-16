@@ -48,6 +48,10 @@ use super::Executor;
 /// Scopes one chain may hold: a block's own table and every enclosing one
 const MAX_SCOPES: usize = 32;
 
+/// The qualifier of a column the resolver bound: NUL, which the lexer
+/// takes in no name, so no table or column can spell it
+const RESOLVED: &str = "\u{0}";
+
 /// Why a statement runs on the general path instead of the prepared one
 pub(crate) type OutOfFamily = &'static str;
 
@@ -382,24 +386,24 @@ impl Chain<'_> {
     }
 
     /// The column `index` of the scope at `depth`, as a name its own
-    /// programs compile against, quoted as it was written: the compiler
-    /// reads a quoted name in an IN list or a pattern as TEXT
-    fn column(&self, depth: usize, index: usize, quoted: bool) -> Expression {
-        let name = &self.scopes[depth].columns[index];
-        let mut id = Identifier::new(
-            Token::new(TokenType::Identifier, name, Position::default()),
-            name.as_str(),
-        );
-        id.value_lower = SmartString::from(self.scopes[depth].lower[index].as_str());
-        id.quoted = quoted;
-        Expression::Identifier(id)
-    }
-
-    /// The column `index` of the statement's own table as a star brings it
-    /// in, quoted only where its name would read as a boolean literal
-    fn star_column(&self, index: usize) -> Expression {
-        let quoted = matches!(self.scopes[0].lower[index].as_str(), "true" | "false");
-        self.column(0, index, quoted)
+    /// programs compile against. Qualified by a name no table can have, so
+    /// the compiler reads it as a column wherever it stands, never a literal
+    fn column(&self, depth: usize, index: usize) -> Expression {
+        let ident = |value: &str, lower: &str| {
+            let mut id = Identifier::new(
+                Token::new(TokenType::Identifier, value, Position::default()),
+                value,
+            );
+            id.value_lower = SmartString::from(lower);
+            id
+        };
+        Expression::QualifiedIdentifier(QualifiedIdentifier {
+            qualifier: ident(RESOLVED, RESOLVED),
+            name: ident(
+                &self.scopes[depth].columns[index],
+                &self.scopes[depth].lower[index],
+            ),
+        })
     }
 
     /// What `expr` reads; a scalar subquery counts as reading this row
@@ -424,7 +428,7 @@ impl Chain<'_> {
     /// spelled as that scope's own column
     fn in_scope(&self, expr: &Expression) -> Result<Expression> {
         match self.resolve(expr)? {
-            Some((depth, index)) => Ok(self.column(depth, index, written_quoted(expr))),
+            Some((depth, index)) => Ok(self.column(depth, index)),
             None => rebuild(expr, &mut |child| self.in_scope(child)),
         }
     }
@@ -574,12 +578,13 @@ fn rebuild(
     })
 }
 
-/// Whether a column reference was written in double quotes
-fn written_quoted(expr: &Expression) -> bool {
+/// The lowercase name of a column the resolver bound, as `column` spells it
+fn bound_column(expr: &Expression) -> Option<&str> {
     match expr {
-        Expression::Identifier(id) => id.quoted,
-        Expression::QualifiedIdentifier(q) => q.name.quoted,
-        _ => false,
+        Expression::QualifiedIdentifier(q) if q.qualifier.value_lower == RESOLVED => {
+            Some(q.name.value_lower.as_str())
+        }
+        _ => None,
     }
 }
 
@@ -614,9 +619,8 @@ fn scan_compares(data_type: DataType) -> bool {
 /// Whether every column `expr` reads is one the scan compares
 fn scans_whole(expr: &Expression, schema: &Schema) -> bool {
     match expr {
-        Expression::Identifier(id) => schema
-            .column_index_map()
-            .get(id.value_lower.as_str())
+        Expression::QualifiedIdentifier(_) => bound_column(expr)
+            .and_then(|name| schema.column_index_map().get(name))
             .is_none_or(|&i| scan_compares(schema.columns[i].data_type)),
         other => {
             let mut whole = true;
@@ -649,13 +653,11 @@ fn reads_row_column(expr: &Expression) -> bool {
 /// address, to the column's type: the program reads it as the scan reads a
 /// pushed comparison's value, so both give one answer
 fn compare_as_scan(expr: &Expression, schema: &Schema, out: &mut FxHashMap<usize, DataType>) {
-    let column_type = |e: &Expression| match e {
-        Expression::Identifier(id) => schema
-            .column_index_map()
-            .get(id.value_lower.as_str())
+    let column_type = |e: &Expression| {
+        bound_column(e)
+            .and_then(|name| schema.column_index_map().get(name))
             .map(|&i| schema.columns[i].data_type)
-            .filter(|t| *t != DataType::Null),
-        _ => None,
+            .filter(|t| *t != DataType::Null)
     };
     let mut read_as = |value: &Expression, t: DataType| {
         // A literal of the column's own type, or NULL, already reads as the scan's
@@ -910,7 +912,7 @@ impl PreparedComparison {
             (&infix.left, &infix.right, operator),
             (&infix.right, &infix.left, flip_operator(operator)),
         ] {
-            let Expression::Identifier(column) = &**column else {
+            let Some(column) = bound_column(column) else {
                 continue;
             };
             let value = match value.as_ref() {
@@ -920,12 +922,12 @@ impl PreparedComparison {
                 Expression::Parameter(p) if p.index > 0 => PreparedValue::Slot(p.index - 1),
                 other => PreparedValue::Const(extract_literal_value(other)?),
             };
-            let index = *schema.column_index_map().get(column.value_lower.as_str())?;
+            let index = *schema.column_index_map().get(column)?;
             if !scan_compares(schema.columns[index].data_type) {
                 return None;
             }
             return Some(Self {
-                column: column.value.to_string(),
+                column: schema.columns[index].name.clone(),
                 index,
                 data_type: schema.columns[index].data_type,
                 operator,
@@ -1083,11 +1085,11 @@ impl Builder<'_> {
                     None => Ok(expr.clone()),
                     Some((0, index)) => {
                         work.reads_row = true;
-                        Ok(chain.column(0, index, written_quoted(expr)))
+                        Ok(chain.column(0, index))
                     }
                     Some((depth, index)) => {
                         let slot = self.slot();
-                        let value = chain.column(depth, index, written_quoted(expr));
+                        let value = chain.column(depth, index);
                         if depth == 1 {
                             work.reads_parent = true;
                             work.holes.push((slot, value));
@@ -1364,7 +1366,7 @@ impl PreparedProjection {
         for column in &stmt.columns {
             match column {
                 Expression::Star(_) => {
-                    select_exprs.extend((0..columns.len()).map(|i| chain.star_column(i)))
+                    select_exprs.extend((0..columns.len()).map(|i| chain.column(0, i)))
                 }
                 Expression::QualifiedStar(star) => {
                     if star.qualifier.to_lowercase() != scope.name.as_str() {
@@ -1373,7 +1375,7 @@ impl PreparedProjection {
                             star.qualifier
                         )));
                     }
-                    select_exprs.extend((0..columns.len()).map(|i| chain.star_column(i)))
+                    select_exprs.extend((0..columns.len()).map(|i| chain.column(0, i)))
                 }
                 other => {
                     check_names(chain, unaliased(other), &[])?;

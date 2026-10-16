@@ -1961,3 +1961,48 @@ fn test_a_star_shows_every_column_whatever_the_names() {
         assert_eq!(found, vec![vec![1, 10, 20]], "{star}");
     }
 }
+
+#[test]
+fn test_rewritten_columns_never_read_as_literals() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_rewritten_literals").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, other INTEGER, s TEXT, pat TEXT)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO t VALUES (7, 7, 'abc', 'a%')", ())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, \"true\" INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO u VALUES (7, 7)", ()).unwrap();
+    for (shape, sql) in [
+        (
+            "u.true",
+            "SELECT t.id FROM t WHERE t.id = (SELECT u.true FROM u WHERE u.id = t.id)",
+        ),
+        (
+            "u.\"true\"",
+            "SELECT t.id FROM t WHERE t.id = (SELECT u.\"true\" FROM u WHERE u.id = t.id)",
+        ),
+        (
+            "t.\"other\" in IN",
+            "SELECT id FROM t WHERE id = (SELECT id FROM u WHERE u.id = t.id) AND id IN (t.\"other\")",
+        ),
+        (
+            "t.\"pat\" in LIKE",
+            "SELECT id FROM t WHERE id = (SELECT id FROM u WHERE u.id = t.id) AND s LIKE t.\"pat\"",
+        ),
+        (
+            "\"other\" in IN",
+            "SELECT id FROM t WHERE id = (SELECT id FROM u WHERE u.id = t.id) AND id IN (\"other\")",
+        ),
+    ] {
+        let (found, runs) = ids(&db, sql, ());
+        assert!(runs >= 1, "{shape} ran prepared");
+        assert_eq!(found, vec![7], "{shape}: a column, not a literal");
+    }
+}
