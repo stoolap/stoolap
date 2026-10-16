@@ -2500,12 +2500,16 @@ impl Executor {
         // join sees the rows that transaction moved or inserted
         let snapshot = match ctx.statement_snapshot() {
             Some(snapshot) => snapshot.clone(),
-            None => self.new_statement_snapshot(crate::core::IsolationLevel::ReadCommitted)?,
+            None => self.new_statement_snapshot(
+                crate::core::IsolationLevel::ReadCommitted,
+                ctx.statement_view(),
+            )?,
         };
-        let table: Box<dyn Table> = match self.join_table(&snapshot, &table_name) {
-            Ok(t) => t,
-            Err(_) => return Ok(None),
-        };
+        let table: Box<dyn Table> =
+            match self.join_table(&snapshot, &table_name, ctx.statement_view()) {
+                Ok(t) => t,
+                Err(_) => return Ok(None),
+            };
         let schema = table.schema();
 
         // Check if table column is the PRIMARY KEY (direct row_id lookup)

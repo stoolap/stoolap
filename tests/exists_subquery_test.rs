@@ -758,3 +758,33 @@ fn test_not_exists_on_a_primary_key_skips_a_committed_delete() {
     assert_eq!(ids(query), [20]);
     db.execute("ROLLBACK", ()).unwrap();
 }
+
+#[test]
+fn test_not_exists_anti_join_sees_the_transaction_writes() {
+    let db = Database::open("memory://exists_anti_join_transaction").unwrap();
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (10), (20), (30)", ())
+        .unwrap();
+    db.execute("CREATE TABLE o (id INTEGER PRIMARY KEY, uid INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO o VALUES (1, 10), (2, 20)", ())
+        .unwrap();
+    let query = "SELECT id FROM u WHERE NOT EXISTS (SELECT 1 FROM o WHERE o.uid = u.id)";
+    let ids = || -> Vec<i64> {
+        let mut ids: Vec<i64> = db
+            .query(query, ())
+            .unwrap()
+            .map(|r| r.unwrap().get::<i64>(0).unwrap())
+            .collect();
+        ids.sort_unstable();
+        ids
+    };
+    assert_eq!(ids(), [30]);
+    db.execute("BEGIN", ()).unwrap();
+    db.execute("INSERT INTO o VALUES (3, 30)", ()).unwrap();
+    db.execute("DELETE FROM o WHERE id = 1", ()).unwrap();
+    assert_eq!(ids(), [10], "the inner side reads the transaction's writes");
+    db.execute("ROLLBACK", ()).unwrap();
+    assert_eq!(ids(), [30]);
+}

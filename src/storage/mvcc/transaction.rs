@@ -115,7 +115,7 @@ pub trait TransactionEngineOperations: Send + Sync {
         txn_id: i64,
         table_name: &str,
         gate: Option<&GateRef>,
-        view: Option<Arc<StatementView>>,
+        view: Option<StatementView>,
     ) -> Result<Box<dyn Table>>;
 
     /// Create a new table
@@ -862,14 +862,14 @@ impl Transaction for MvccTransaction {
         &self,
         name: &str,
         _access: StatementAccess,
-        view: Arc<StatementView>,
+        view: StatementView,
     ) -> Result<Box<dyn Table>> {
         self.check_view_allowed()?;
         let ops = self.get_engine_ops()?;
         ops.get_table_for_transaction(self.id, name, None, Some(view))
     }
 
-    fn get_table_with_view(&self, name: &str, view: Arc<StatementView>) -> Result<Box<dyn Table>> {
+    fn get_table_with_view(&self, name: &str, view: StatementView) -> Result<Box<dyn Table>> {
         self.check_view_allowed()?;
         let ops = self.get_engine_ops()?;
         let gate = self.gate.get_or_init(|| {

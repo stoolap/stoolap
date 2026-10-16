@@ -17,6 +17,7 @@
 //! This module provides the function registry for looking up and managing
 //! SQL functions (aggregate, scalar, and window functions).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::common::StringMap;
@@ -90,6 +91,10 @@ pub struct FunctionRegistry {
     tvf_functions: RwLock<StringMap<TvfFactory>>,
     /// Function info cache
     function_info: RwLock<StringMap<FunctionInfo>>,
+    /// Set once the built-in functions are in, and once a function is
+    /// registered after them: a statement calling one may not run twice safely
+    built: AtomicBool,
+    extended: AtomicBool,
 }
 
 impl Default for FunctionRegistry {
@@ -107,6 +112,8 @@ impl FunctionRegistry {
             window_functions: RwLock::new(StringMap::new()),
             tvf_functions: RwLock::new(StringMap::new()),
             function_info: RwLock::new(StringMap::new()),
+            built: AtomicBool::new(false),
+            extended: AtomicBool::new(false),
         };
 
         // Register built-in aggregate functions
@@ -265,7 +272,19 @@ impl FunctionRegistry {
             Arc::new(|| Box::new(GenerateSeriesFunction)),
         );
 
+        registry.built.store(true, Ordering::Release);
         registry
+    }
+
+    /// Whether a function was registered after the built-in ones
+    pub fn has_registered_functions(&self) -> bool {
+        self.extended.load(Ordering::Acquire)
+    }
+
+    fn note_registration(&self) {
+        if self.built.load(Ordering::Acquire) {
+            self.extended.store(true, Ordering::Release);
+        }
     }
 
     /// Register an aggregate function
@@ -285,6 +304,7 @@ impl FunctionRegistry {
         info: FunctionInfo,
         factory: AggregateFnFactory,
     ) {
+        self.note_registration();
         self.aggregate_functions
             .write()
             .unwrap()
@@ -304,6 +324,7 @@ impl FunctionRegistry {
     }
 
     fn register_scalar_inner(&self, name: String, info: FunctionInfo, factory: ScalarFnFactory) {
+        self.note_registration();
         self.scalar_functions
             .write()
             .unwrap()
@@ -323,6 +344,7 @@ impl FunctionRegistry {
     }
 
     fn register_window_inner(&self, name: String, info: FunctionInfo, factory: WindowFnFactory) {
+        self.note_registration();
         self.window_functions
             .write()
             .unwrap()
@@ -404,6 +426,7 @@ impl FunctionRegistry {
 
     /// Register a table-valued function
     pub fn register_tvf(&self, name: &str, factory: TvfFactory) {
+        self.note_registration();
         let mut funcs = self.tvf_functions.write().unwrap();
         funcs.insert(name.to_string(), factory);
     }

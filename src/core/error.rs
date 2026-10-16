@@ -85,6 +85,10 @@ pub enum Error {
     #[error("table '{table}' schema changed; retry the statement")]
     SchemaChanged { table: String },
 
+    /// A truncate or drop took rows away from under a statement's view
+    #[error("a truncate or drop overtook the statement's view; retry the statement")]
+    ViewOvertaken,
+
     /// Table column count mismatch
     #[error("table columns don't match, expected {expected}, got {got}")]
     TableColumnsNotMatch { expected: usize, got: usize },

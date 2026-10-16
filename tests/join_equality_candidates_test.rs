@@ -790,10 +790,9 @@ mod hot_index {
         );
     }
 
-    /// A commit inside the probe moves the index epoch: the probe is not
-    /// trusted, and the join answers from the hash path instead of probing on
-    #[test]
-    fn a_commit_inside_the_probe_sends_the_join_to_the_hash_path() {
+    /// The probes of the join, and its rows, while another handle runs `sql`
+    /// inside the first probe
+    fn probed_around(sql: &'static str) -> (usize, Vec<(i64, Option<i64>, i64)>) {
         let dir = tempfile::tempdir().unwrap();
         let db = file_db(&dir);
         users_in(&db, 2000);
@@ -804,21 +803,42 @@ mod hot_index {
         let other = db.clone();
         stoolap::test_failpoints::after_join_probe_admitted(move || {
             counter.fetch_add(1, Ordering::SeqCst);
-            other
-                .execute("INSERT INTO users VALUES (5000, 'even', 20)", ())
-                .unwrap();
+            other.execute(sql, ()).unwrap();
             probes::count(counter);
         });
-        let sql = "SELECT p.id, u.id, p.age FROM people p \
+        let join = "SELECT p.id, u.id, p.age FROM people p \
             INNER JOIN users u ON p.age = u.age LIMIT 1000";
-        let got = triples(&db, sql);
+        let got = triples(&db, join);
         probes::stop();
-        assert_eq!(
-            probed.load(Ordering::SeqCst),
-            1,
-            "no probe after the commit"
-        );
-        assert_eq!(got.len(), 69, "both keys, with the committed row");
-        assert!(got.contains(&(1, Some(5000), 20)));
+        (probed.load(Ordering::SeqCst), got)
+    }
+
+    /// An index built inside the probe moves the index token: the probe is
+    /// not trusted, and the join answers from the hash path
+    #[test]
+    fn a_commit_inside_the_probe_sends_the_join_to_the_hash_path() {
+        let (probed, got) = probed_around("CREATE INDEX idx_users_name ON users(name)");
+        assert_eq!(probed, 1, "no probe after the index was built");
+        assert_eq!(got.len(), 68, "both keys");
+    }
+
+    /// A commit taking an entry out inside the probe leaves the probe to the
+    /// index: the removal history gives back the row the view still sees
+    #[test]
+    fn a_commit_taking_a_row_out_inside_the_probe_lets_the_join_probe_on() {
+        let (probed, got) = probed_around("DELETE FROM users WHERE id = 62");
+        assert_eq!(probed, 2, "the second key probed too");
+        assert_eq!(got.len(), 68, "both keys, with the row the view sees");
+        assert!(got.contains(&(1, Some(62), 20)));
+    }
+
+    /// A commit only adding an entry inside the probe leaves the probe to the
+    /// index, whose rows are read through the view
+    #[test]
+    fn a_commit_adding_a_row_inside_the_probe_lets_the_join_probe_on() {
+        let (probed, got) = probed_around("INSERT INTO users VALUES (5000, 'even', 20)");
+        assert_eq!(probed, 2, "the second key probed too");
+        assert_eq!(got.len(), 68, "both keys, without the row after the view");
+        assert!(!got.contains(&(1, Some(5000), 20)));
     }
 }

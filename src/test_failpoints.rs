@@ -1169,6 +1169,7 @@ pub fn take_read_paths() -> Vec<&'static str> {
 thread_local! {
     static FK_CHILD_PROBE_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static CORRELATED_FETCH_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static INDEX_VISITED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static ADD_COLUMN_PUBLISHED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static SNAPSHOT_SCHEMA_WRITTEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static JOIN_INDEX_CHOSEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
@@ -1334,6 +1335,16 @@ pub(crate) fn correlated_fetch_next() {
     run_hook(&CORRELATED_FETCH_HOOK);
 }
 
+/// Run once on this thread when its next walk of a store's index map,
+/// holding the map's read lock, reaches an index
+pub fn on_index_visited(hook: impl FnOnce() + 'static) {
+    INDEX_VISITED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn index_visited() {
+    run_hook(&INDEX_VISITED_HOOK);
+}
+
 /// Run once on this thread when its next ADD COLUMN has published the
 /// schema and has not yet recorded the change or laid out the rows
 pub fn after_add_column_published(hook: impl FnOnce() + 'static) {
@@ -1342,6 +1353,121 @@ pub fn after_add_column_published(hook: impl FnOnce() + 'static) {
 
 pub(crate) fn add_column_published() {
     run_hook(&ADD_COLUMN_PUBLISHED_HOOK);
+}
+
+thread_local! {
+    static STATEMENT_VIEW_TAKEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next statement has taken its view and
+/// has not yet read through it
+pub fn after_statement_view_taken(hook: impl FnOnce() + 'static) {
+    STATEMENT_VIEW_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn statement_view_taken() {
+    STATEMENT_VIEWS_TAKEN.with(|n| n.set(n.get() + 1));
+    run_hook(&STATEMENT_VIEW_TAKEN_HOOK);
+}
+
+thread_local! {
+    static STATEMENT_VIEWS_TAKEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Statement views the executor took on this thread so far
+pub fn statement_views_taken() -> usize {
+    STATEMENT_VIEWS_TAKEN.with(|n| n.get())
+}
+
+thread_local! {
+    static REMOVAL_HISTORY_READS: std::cell::Cell<[usize; 4]> = const { std::cell::Cell::new([0; 4]) };
+    static REMOVAL_HISTORY_READ_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static COMMIT_INDEX_REMOVED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next index probe under a view has the
+/// index's answer and has not yet read the removal history
+pub fn before_removal_history_read(hook: impl FnOnce() + 'static) {
+    REMOVAL_HISTORY_READ_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn removal_history_read_next() {
+    run_hook(&REMOVAL_HISTORY_READ_HOOK);
+}
+
+/// Run once on this thread when its next single-row commit has taken a
+/// moved key out of an index and has not yet added the new one
+pub fn after_commit_index_removed(hook: impl FnOnce() + 'static) {
+    COMMIT_INDEX_REMOVED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn commit_index_removed() {
+    run_hook(&COMMIT_INDEX_REMOVED_HOOK);
+}
+
+pub(crate) fn removal_history_read(outcome: usize) {
+    REMOVAL_HISTORY_READS.with(|reads| {
+        let mut counts = reads.get();
+        counts[outcome] += 1;
+        reads.set(counts);
+    });
+}
+
+/// Removal history reads on this thread so far: not needed, answered,
+/// declined for an evicted record, declined for the probe budget
+pub fn removal_history_reads() -> [usize; 4] {
+    REMOVAL_HISTORY_READS.with(|reads| reads.get())
+}
+
+thread_local! {
+    static VIEW_INDEX_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static JOIN_VIEW_KEY_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    static EQUALITY_CANDIDATE_ANSWERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn equality_candidates_answered() {
+    EQUALITY_CANDIDATE_ANSWERS.with(|n| n.set(n.get() + 1));
+}
+
+/// A file table's equality candidate probes on this thread that gave the
+/// full set of ids
+pub fn equality_candidate_answers() -> usize {
+    EQUALITY_CANDIDATE_ANSWERS.with(|n| n.get())
+}
+
+pub(crate) fn view_index_lookup_answered() {
+    VIEW_INDEX_LOOKUPS.with(|n| n.set(n.get() + 1));
+}
+
+/// Index lookups a scan answered under a statement view on this thread
+pub fn view_index_lookups() -> usize {
+    VIEW_INDEX_LOOKUPS.with(|n| n.get())
+}
+
+pub(crate) fn join_view_keys_scanned() {
+    JOIN_VIEW_KEY_SCANS.with(|n| n.set(n.get() + 1));
+}
+
+/// Index joins on this thread that read their inner keys by a scan
+pub fn join_view_key_scans() -> usize {
+    JOIN_VIEW_KEY_SCANS.with(|n| n.get())
+}
+
+thread_local! {
+    static LAST_VIEW_LEASE_HOOK: HookSlot = RefCell::new(None);
+}
+
+/// Run once on this thread when it drops the last handle of a view, before
+/// it unregisters the view
+pub fn on_last_view_lease_released(hook: impl FnOnce() + 'static) {
+    LAST_VIEW_LEASE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn last_view_lease_released() {
+    run_hook(&LAST_VIEW_LEASE_HOOK);
 }
 
 thread_local! {
@@ -1897,6 +2023,40 @@ pub fn after_arena_window_opened(hook: impl FnOnce() + 'static) {
 
 pub(crate) fn arena_window_opened() {
     run_hook(&ARENA_WINDOW_HOOK);
+}
+
+thread_local! {
+    static GROUPED_SLOT_HOOK: HookSlot = RefCell::new(None);
+    static GROUPED_SLOT_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GROUPED_SLOTS_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run once on this thread when its next grouped pass over the arena
+/// reaches slot `at`; the slots it enters from then on are counted
+pub fn on_grouped_slot(at: usize, hook: impl FnOnce() + 'static) {
+    GROUPED_SLOTS_AFTER.with(|n| n.set(None));
+    GROUPED_SLOT_AT.with(|n| n.set(at));
+    GROUPED_SLOT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// The slots the grouped pass entered after its hook ran, the hook's own
+/// slot included; None when the hook did not run
+pub fn grouped_slots_after_hook() -> Option<usize> {
+    GROUPED_SLOTS_AFTER.with(|n| n.get())
+}
+
+pub(crate) fn grouped_slot_reached(idx: usize) {
+    if let Some(n) = GROUPED_SLOTS_AFTER.with(|n| n.get()) {
+        GROUPED_SLOTS_AFTER.with(|c| c.set(Some(n + 1)));
+        return;
+    }
+    if GROUPED_SLOT_AT.with(|n| n.get()) != idx {
+        return;
+    }
+    if let Some(hook) = GROUPED_SLOT_HOOK.with(|slot| slot.borrow_mut().take()) {
+        hook();
+        GROUPED_SLOTS_AFTER.with(|c| c.set(Some(1)));
+    }
 }
 
 /// Run once on this thread when its commit, rollback, drop or savepoint
@@ -2483,6 +2643,7 @@ pub fn reset_all() {
     READ_PATHS.with(|paths| paths.borrow_mut().clear());
     FK_CHILD_PROBE_HOOK.with(|slot| *slot.borrow_mut() = None);
     CORRELATED_FETCH_HOOK.with(|slot| *slot.borrow_mut() = None);
+    INDEX_VISITED_HOOK.with(|slot| *slot.borrow_mut() = None);
     ADD_COLUMN_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = None);
     SNAPSHOT_SCHEMA_WRITTEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     JOIN_INDEX_CHOSEN_HOOK.with(|slot| *slot.borrow_mut() = None);

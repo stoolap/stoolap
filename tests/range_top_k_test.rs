@@ -234,7 +234,8 @@ fn a_key_moved_behind_the_walk_is_still_answered() {
     db.execute("DELETE FROM r WHERE t < 100", ()).unwrap();
     let fired = std::rc::Rc::new(std::cell::Cell::new(false));
     let fired_in_hook = std::rc::Rc::clone(&fired);
-    // The walk starts at 100; the row moves to 50, behind it
+    // The walk starts at 100; the row moves to 50, behind it, in a commit
+    // after the statement's view
     stoolap::test_failpoints::on_hot_top_k_visit(move || {
         other
             .execute("UPDATE r SET t = 50 WHERE id = 1", ())
@@ -243,7 +244,16 @@ fn a_key_moved_behind_the_walk_is_still_answered() {
     });
     let got = column(&db, "SELECT t FROM r WHERE t >= 40 ORDER BY t LIMIT 1");
     assert!(fired.get(), "the walk visited a row");
-    assert_eq!(got, vec!["Some(Integer(50))".to_string()]);
+    assert_eq!(
+        got,
+        vec!["Some(Integer(100))".to_string()],
+        "the rows the statement's view sees"
+    );
+    assert_eq!(
+        column(&db, "SELECT t FROM r WHERE t >= 40 ORDER BY t LIMIT 1"),
+        vec!["Some(Integer(50))".to_string()],
+        "the next statement sees the moved row"
+    );
 }
 
 /// 30000 rows, 20000 of them on one key, so the walk's chunks stop inside it

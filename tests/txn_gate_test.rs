@@ -648,6 +648,7 @@ fn a_table_from_a_statement_snapshot_admits_through_the_gate() {
     let snapshot = StatementSnapshot::new(
         db.engine().begin_transaction().unwrap(),
         stoolap::core::IsolationLevel::ReadCommitted,
+        None,
     );
     let mut handle = snapshot.get_table("t").unwrap();
     let (hook, paused) = pause();

@@ -131,6 +131,39 @@ impl TextNumbers {
     }
 }
 
+/// The inner rows' ids by key, read through the table as the statement
+/// sees it: the probes' answer from the first probe of the shared index
+/// that could not be checked against what the statement sees
+struct ViewKeys(ValueMap<SmallVec<[i64; 2]>>);
+
+impl ViewKeys {
+    fn scan(table: &dyn Table, column: usize) -> Result<Self> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::join_view_keys_scanned();
+        let width = table.schema().columns.len();
+        let columns: Vec<usize> = (0..width).collect();
+        let mut needed = vec![false; width];
+        needed[column] = true;
+        let mut scanner = table.scan_needed(&columns, &needed, None)?;
+        let mut by_key: ValueMap<SmallVec<[i64; 2]>> = ValueMap::default();
+        while scanner.next() {
+            let row_id = scanner.current_row_id();
+            if let Some(key) = scanner.row().get(column).filter(|key| !key.is_null()) {
+                by_key.entry(key.clone()).or_default().push(row_id);
+            }
+        }
+        if let Some(error) = scanner.err() {
+            return Err(error.clone());
+        }
+        scanner.close()?;
+        Ok(Self(by_key))
+    }
+
+    fn row_ids(&self, key: &Value) -> &[i64] {
+        self.0.get(key).map_or(&[], |ids| ids.as_slice())
+    }
+}
+
 /// Specifies which side (outer or inner) a projected column comes from.
 /// A projected value out of a row that is being consumed. A source used
 /// more than once must be cloned every time; moving it would hand the
@@ -228,6 +261,8 @@ pub struct IndexNestedLoopJoinOperator {
     local_rows: Option<LocalRows>,
     // The inner TEXT keys read as numbers, taken when a number first meets them
     text_numbers: Option<TextNumbers>,
+    // The inner keys as the statement sees them, once a probe was not
+    view_keys: Option<ViewKeys>,
 }
 
 /// The transaction's uncommitted rows of the inner table: every row it
@@ -341,6 +376,7 @@ impl IndexNestedLoopJoinOperator {
             probe_scratch: ProbeScratch::default(),
             local_rows: None,
             text_numbers: None,
+            view_keys: None,
         }
     }
 
@@ -501,12 +537,25 @@ impl IndexNestedLoopJoinOperator {
         }
 
         // Get row IDs based on lookup strategy into buffer
-        match &self.lookup_strategy {
+        let checked = match &self.lookup_strategy {
+            IndexLookupStrategy::SecondaryIndex(_) | IndexLookupStrategy::TableEquality { .. }
+                if self.view_keys.is_some() =>
+            {
+                false
+            }
             IndexLookupStrategy::SecondaryIndex(index) => {
+                let epoch = self.inner_table.committed_candidate_epoch();
                 index.get_row_ids_equal_into(
                     std::slice::from_ref(key_value),
                     &mut self.row_id_buffer,
                 );
+                epoch.is_some()
+                    && self.inner_table.add_removed_equal(
+                        &**index,
+                        key_value,
+                        &mut self.row_id_buffer,
+                    )
+                    && self.inner_table.committed_candidate_epoch() == epoch
             }
             IndexLookupStrategy::TableEquality { column } => {
                 let found = self.inner_table.equality_candidates(
@@ -516,11 +565,7 @@ impl IndexNestedLoopJoinOperator {
                     &mut self.row_id_buffer,
                     &mut self.probe_scratch,
                 )?;
-                if found != Some(CappedEqual::Copied) {
-                    self.row_id_buffer.clear();
-                    self.needs_fallback = true;
-                    return Ok(());
-                }
+                found == Some(CappedEqual::Copied)
             }
             IndexLookupStrategy::PrimaryKey => {
                 match key_value {
@@ -534,6 +579,24 @@ impl IndexNestedLoopJoinOperator {
                     }
                     _ => {} // Non-numeric PK values can't match
                 }
+                true
+            }
+        };
+
+        // A probe not checked against what the statement sees is answered by
+        // the keys read through the table, for this outer row and the rest
+        if !checked {
+            self.row_id_buffer.clear();
+            let Some(idx) = self.inner_key_idx else {
+                self.needs_fallback = true;
+                return Ok(());
+            };
+            if self.view_keys.is_none() {
+                self.view_keys = Some(ViewKeys::scan(&*self.inner_table, idx)?);
+            }
+            if let Some(keys) = &self.view_keys {
+                self.row_id_buffer
+                    .extend_from_slice(keys.row_ids(key_value));
             }
         }
 
@@ -961,6 +1024,7 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
         // per distinct row id)
         let mut key_to_outer_indices: I64Map<SmallVec<[usize; 2]>> = I64Map::new();
         let mut text_numbers: Option<TextNumbers> = None;
+        let mut view_keys: Option<ViewKeys> = None;
 
         while let Some(row_ref) = self.outer.next()? {
             let outer_row = row_ref.into_owned();
@@ -1014,10 +1078,35 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
             self.row_id_buffer.clear();
             match &self.lookup_strategy {
                 IndexLookupStrategy::SecondaryIndex(index) => {
-                    index.get_row_ids_equal_into(
-                        std::slice::from_ref(&key_value),
-                        &mut self.row_id_buffer,
-                    );
+                    let checked = view_keys.is_none() && {
+                        let epoch = self.inner_table.committed_candidate_epoch();
+                        index.get_row_ids_equal_into(
+                            std::slice::from_ref(&key_value),
+                            &mut self.row_id_buffer,
+                        );
+                        epoch.is_some()
+                            && self.inner_table.add_removed_equal(
+                                &**index,
+                                &key_value,
+                                &mut self.row_id_buffer,
+                            )
+                            && self.inner_table.committed_candidate_epoch() == epoch
+                    };
+                    // One probe not checked against what the statement sees
+                    // leaves this one and the rest to the keys read through it
+                    if !checked {
+                        self.row_id_buffer.clear();
+                        let idx = self.inner_key_idx.ok_or_else(|| {
+                            crate::core::Error::internal("an index join without its inner key")
+                        })?;
+                        if view_keys.is_none() {
+                            view_keys = Some(ViewKeys::scan(&*self.inner_table, idx)?);
+                        }
+                        if let Some(keys) = &view_keys {
+                            self.row_id_buffer
+                                .extend_from_slice(keys.row_ids(&key_value));
+                        }
+                    }
                 }
                 // Only the streaming join can end early and be run again
                 IndexLookupStrategy::TableEquality { .. } => {

@@ -556,6 +556,13 @@ impl Executor {
         };
 
         // Execute using full SELECT executor (gets all optimizations)
+        let target_ctx;
+        let ctx = if ctx.statement_view().is_some() {
+            target_ctx = ctx.with_newest_target(table_name);
+            &target_ctx
+        } else {
+            ctx
+        };
         let mut result = self.execute_select(&select_stmt, ctx)?;
 
         // Collect row_ids from result
@@ -591,14 +598,26 @@ impl Executor {
 
         // INSERT is dispatched before the dispatcher puts the transaction
         // id in the context, so the expressions are given it here
+        let active_txn_id = (*active_tx).as_ref().map(|t| t.transaction.id());
         let ctx_with_txn;
-        let ctx = match (*active_tx).as_ref().map(|t| t.transaction.id()) {
+        let ctx = match active_txn_id {
             Some(txn_id) => {
                 ctx_with_txn = ctx.with_transaction_id(txn_id as u64);
                 &ctx_with_txn
             }
             None => ctx,
         };
+        // Its query and subqueries read through one view; the target keeps the newest
+        let ctx_with_view;
+        let ctx =
+            match self.statement_view(super::insert_reads_through_a_view(stmt), ctx, active_txn_id)
+            {
+                Some(view) => {
+                    ctx_with_view = ctx.with_statement_view(view);
+                    &ctx_with_view
+                }
+                None => ctx,
+            };
 
         let statement_rollback = StatementRollback::new(&self.engine, active_tx.as_ref());
 
@@ -1006,6 +1025,8 @@ impl Executor {
                 None
             };
 
+            // A statement whose reads a truncate or drop overtook commits nothing
+            ctx.view_held()?;
             // Commit if this is a standalone (auto-commit) transaction
             if should_auto_commit {
                 if let Some(mut tx) = standalone_tx {
@@ -1353,6 +1374,8 @@ impl Executor {
             None
         };
 
+        // A statement whose reads a truncate or drop overtook commits nothing
+        ctx.view_held()?;
         // Commit if this is a standalone (auto-commit) transaction
         if should_auto_commit {
             if let Some(mut tx) = standalone_tx {
@@ -1412,6 +1435,7 @@ impl Executor {
         // Check if there's an active explicit transaction
         let mut active_tx = self.active_transaction.lock().unwrap();
         let statement_rollback = StatementRollback::new(&self.engine, active_tx.as_ref());
+        let active_txn_id = (*active_tx).as_ref().map(|t| t.transaction.id());
 
         let (mut table, should_auto_commit, standalone_tx) =
             if let Some(ref mut tx_state) = *active_tx {
@@ -1467,6 +1491,7 @@ impl Executor {
             default_programs,
             default_row_template,
             compiled_checks,
+            reads_through_view,
         ) = if let Some(cached) = cached_insert {
             // Use cached values (Arc clone is cheap)
             (
@@ -1477,6 +1502,7 @@ impl Executor {
                 cached.default_programs,
                 cached.default_row_template,
                 cached.compiled_checks,
+                cached.reads_through_view,
             )
         } else {
             // Compile and cache
@@ -1538,6 +1564,7 @@ impl Executor {
                 };
 
             // Store in cache for next execution
+            let reads_through_view = super::insert_reads_through_a_view(stmt);
             let compiled = CompiledInsert {
                 table_name: SmartString::new(table_name),
                 column_indices: Arc::new(column_indices.clone()),
@@ -1549,6 +1576,7 @@ impl Executor {
                 compiled_checks: Arc::new(compiled_checks.clone()),
                 cached_epoch: current_epoch,
                 token,
+                reads_through_view,
             };
 
             // Update the cache
@@ -1564,7 +1592,19 @@ impl Executor {
                 Arc::new(default_programs),
                 Arc::new(default_row_template),
                 Arc::new(compiled_checks),
+                reads_through_view,
             )
+        };
+
+        // Its query and subqueries read through one view, taken before them;
+        // the target keeps the newest
+        let ctx_with_view;
+        let ctx = match self.statement_view(reads_through_view, ctx, active_txn_id) {
+            Some(view) => {
+                ctx_with_view = ctx.with_statement_view(view);
+                &ctx_with_view
+            }
+            None => ctx,
         };
 
         // Pre-compute FK info for parent validation (CompactArc ref-count bump, not deep clone)
@@ -1804,6 +1844,8 @@ impl Executor {
             ));
         }
 
+        // A statement whose reads a truncate or drop overtook commits nothing
+        ctx.view_held()?;
         // Commit if this is a standalone (auto-commit) transaction
         if should_auto_commit {
             if let Some(mut tx) = standalone_tx {
@@ -2789,6 +2831,8 @@ impl Executor {
             ));
         }
 
+        // A statement whose reads a truncate or drop overtook commits nothing
+        ctx.view_held()?;
         // Commit if this is a standalone (auto-commit) transaction
         if should_auto_commit {
             // Commit the transaction - it will commit all tables via commit_all_tables()
@@ -3323,6 +3367,8 @@ impl Executor {
             ));
         }
 
+        // A statement whose reads a truncate or drop overtook commits nothing
+        ctx.view_held()?;
         // Commit if this is a standalone (auto-commit) transaction
         if should_auto_commit {
             // Commit the transaction - it will commit all tables via commit_all_tables()
@@ -3399,6 +3445,8 @@ impl Executor {
         // WAL is recorded AFTER success to prevent phantom records on failure.
         // If a crash occurs between truncate and WAL write, recovery restores
         // the pre-truncate state from the snapshot — the user simply retries.
+        // A view taken before the rows go, or while they go, is overtaken
+        let _destruction = self.engine.registry_ref().begin_destruction();
         let rows_affected = table.truncate()?;
 
         // Record TRUNCATE to WAL for persistence (only after successful truncate)
@@ -3843,6 +3891,8 @@ impl Executor {
         standalone_tx: Option<Box<dyn Transaction>>,
     ) -> Result<Box<dyn QueryResult>> {
         let result = self.build_returning_result(returning, source_rows, column_names, ctx)?;
+        // A statement whose reads a truncate or drop overtook commits nothing
+        ctx.view_held()?;
         if let Some(mut tx) = standalone_tx {
             tx.commit()?;
         }

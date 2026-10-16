@@ -61,7 +61,7 @@ pub struct MVCCTable {
     gate: Option<GateRef>,
     /// The statement view this handle's reads are held to; None reads the
     /// newest committed state, as writes do
-    view: Option<Arc<StatementView>>,
+    view: Option<StatementView>,
     /// Scans that fell through to the full visible-row walk
     #[cfg(test)]
     full_scans: std::sync::atomic::AtomicU64,
@@ -74,6 +74,118 @@ struct PrefixPlan {
     prefix: Vec<Value>,
     lower: Option<(Value, bool)>,
     upper: Option<(Value, bool)>,
+}
+
+/// The removed entries an index lookup under a statement view adds to each
+/// index answer, read after that answer. A decline sends the lookup to the
+/// scan: an answer it marks may lack rows the view sees
+pub(crate) struct HistoryProbe<'a> {
+    store: &'a VersionStore,
+    view: &'a StatementView,
+    declined: std::cell::Cell<bool>,
+}
+
+impl<'a> HistoryProbe<'a> {
+    pub(crate) fn new(store: &'a VersionStore, view: &'a StatementView) -> Self {
+        Self {
+            store,
+            view,
+            declined: std::cell::Cell::new(false),
+        }
+    }
+
+    pub(crate) fn declined(&self) -> bool {
+        self.declined.get()
+    }
+
+    /// Hands `found` the rows whose key in `index` satisfies `matches` and
+    /// left it in a commit the view does not see
+    pub(crate) fn add_to(
+        &self,
+        index: &dyn crate::storage::traits::Index,
+        matches: &dyn Fn(&[Value]) -> bool,
+        found: &mut dyn FnMut(i64),
+    ) {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::removal_history_read_next();
+        let mut removals = smallvec::SmallVec::new();
+        if !self.store.removals_unseen(self.view, &mut removals) {
+            self.declined.set(true);
+            return;
+        }
+        if removals.is_empty() {
+            return;
+        }
+        let Some(identity) = self.store.history_identity(index) else {
+            self.declined.set(true);
+            return;
+        };
+        for removals in &removals {
+            removals.each_matching(identity, matches, found);
+        }
+    }
+
+    /// `add_to` into an index answer, kept sorted and unique by row id once
+    /// it grows, as the lookup's intersections need
+    fn merge(
+        &self,
+        index: &dyn crate::storage::traits::Index,
+        ids: &mut RowIdVec,
+        matches: &dyn Fn(&[Value]) -> bool,
+    ) {
+        let before = ids.len();
+        self.add_to(index, matches, &mut |row_id| ids.push(row_id));
+        if ids.len() > before {
+            ids.sort_unstable();
+            ids.dedup();
+        }
+    }
+}
+
+/// Whether a key's first value equals `value`, as the indexes order values
+fn first_equals(key: &[Value], value: &Value) -> bool {
+    key.first()
+        .is_some_and(|first| first.cmp(value) == std::cmp::Ordering::Equal)
+}
+
+/// A bound on a column's values with its inclusiveness, None for no bound
+type KeyBound<'a> = Option<(&'a Value, bool)>;
+
+/// Whether `value` lies within the bounds
+fn within(value: &Value, lower: KeyBound<'_>, upper: KeyBound<'_>) -> bool {
+    use std::cmp::Ordering;
+    let above = lower.is_none_or(|(bound, inclusive)| match value.cmp(bound) {
+        Ordering::Greater => true,
+        Ordering::Equal => inclusive,
+        Ordering::Less => false,
+    });
+    let below = upper.is_none_or(|(bound, inclusive)| match value.cmp(bound) {
+        Ordering::Less => true,
+        Ordering::Equal => inclusive,
+        Ordering::Greater => false,
+    });
+    above && below
+}
+
+/// Whether a key's leading values equal `prefix`
+fn starts_with(key: &[Value], prefix: &[Value]) -> bool {
+    key.len() >= prefix.len()
+        && key
+            .iter()
+            .zip(prefix)
+            .all(|(value, wanted)| value.cmp(wanted) == std::cmp::Ordering::Equal)
+}
+
+/// The bounds a single comparison sets on a column
+fn operator_bounds(operator: crate::core::Operator, value: &Value) -> (KeyBound<'_>, KeyBound<'_>) {
+    use crate::core::Operator;
+    match operator {
+        Operator::Gt => (Some((value, false)), None),
+        Operator::Gte => (Some((value, true)), None),
+        Operator::Lt => (None, Some((value, false))),
+        Operator::Lte => (None, Some((value, true))),
+        _ => (Some((value, true)), Some((value, true))),
+    }
 }
 
 /// The comparisons of an AND tree; false when a leaf is not a comparison
@@ -169,7 +281,7 @@ impl MVCCTable {
 
     /// The handle's reads see `view`: the commits complete when it was
     /// taken, and this transaction's own writes
-    pub(crate) fn with_view(mut self, view: Option<Arc<StatementView>>) -> Self {
+    pub(crate) fn with_view(mut self, view: Option<StatementView>) -> Self {
         self.view = view;
         self
     }
@@ -179,15 +291,8 @@ impl MVCCTable {
     fn reader(&self) -> Reader<'_> {
         Reader {
             txn_id: self.txn_id,
-            view: self.view.as_deref(),
+            view: self.view.as_ref(),
         }
-    }
-
-    /// Whether this handle may see versions older than the store's newest
-    /// committed ones: under a snapshot or a statement view
-    #[inline]
-    fn reads_back_in_time(&self) -> bool {
-        self.view.is_some() || self.version_store.needs_snapshot_isolation(self.txn_id)
     }
 
     /// Returns the transaction ID
@@ -600,7 +705,30 @@ impl MVCCTable {
         })
     }
 
+    /// The ids the indexes give for `expr`; under a statement view only while
+    /// no change the removal history does not cover ran, with every entry a
+    /// commit the view does not see took out added back from the history.
+    /// Every caller reads the rows through the view and applies `expr` again
     fn try_index_lookup(&self, expr: &dyn Expression) -> Option<RowIdVec> {
+        let Some(view) = self.view.as_ref() else {
+            return self.index_lookup(expr, None);
+        };
+        let epoch = self.committed_candidate_epoch()?;
+        let history = HistoryProbe::new(&self.version_store, view);
+        let row_ids = self.index_lookup(expr, Some(&history))?;
+        if history.declined() || self.committed_candidate_epoch() != Some(epoch) {
+            return None;
+        }
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::view_index_lookup_answered();
+        Some(row_ids)
+    }
+
+    fn index_lookup(
+        &self,
+        expr: &dyn Expression,
+        history: Option<&HistoryProbe<'_>>,
+    ) -> Option<RowIdVec> {
         use crate::core::Operator;
         use crate::storage::index::intersect_sorted_ids;
 
@@ -614,7 +742,7 @@ impl MVCCTable {
             }
 
             if let Some(index) = self.version_store.get_index_by_column(col_name) {
-                return self.query_index_with_operator(&*index, operator, value);
+                return self.query_index_with_operator(&*index, operator, value, history);
             }
         }
 
@@ -746,12 +874,23 @@ impl MVCCTable {
                                 }
                                 let min_inclusive = matches!(lower_op, Operator::Gte);
                                 let max_inclusive = matches!(upper_op, Operator::Lte);
-                                let row_ids = index.get_row_ids_in_range(
+                                let mut row_ids = index.get_row_ids_in_range(
                                     std::slice::from_ref(lower_val),
                                     std::slice::from_ref(upper_val),
                                     min_inclusive,
                                     max_inclusive,
                                 );
+                                if let Some(history) = history {
+                                    history.merge(&*index, &mut row_ids, &|key| {
+                                        key.first().is_some_and(|first| {
+                                            within(
+                                                first,
+                                                Some((lower_val, min_inclusive)),
+                                                Some((upper_val, max_inclusive)),
+                                            )
+                                        })
+                                    });
+                                }
                                 // Return result even if empty - we successfully used the index
                                 // Empty result is valid (no rows match the range)
                                 return Some(row_ids);
@@ -860,10 +999,18 @@ impl MVCCTable {
                         // Use the efficient get_row_ids_in method
                         let values = in_list.get_values();
                         let mut row_ids = index.get_row_ids_in(values);
+                        let probed = row_ids.len();
+                        if let Some(history) = history {
+                            history.add_to(
+                                &*index,
+                                &|key| values.iter().any(|value| first_equals(key, value)),
+                                &mut |row_id| row_ids.push(row_id),
+                            );
+                        }
                         // Members the column reads as equal name the same rows,
-                        // and so does a row moved between two members' probes;
-                        // the rows keep the members' order
-                        if values.len() > 1 {
+                        // and so does a row moved between two members' probes
+                        // or kept in the history; the rows keep the members' order
+                        if values.len() > 1 || row_ids.len() > probed {
                             let mut seen = FxHashSet::with_capacity_and_hasher(
                                 row_ids.len(),
                                 Default::default(),
@@ -894,14 +1041,21 @@ impl MVCCTable {
 
                 // Use index range query
                 if let Ok(entries) = index.find_range(
-                    &[min_value],
-                    &[max_value],
+                    std::slice::from_ref(&min_value),
+                    std::slice::from_ref(&max_value),
                     true,  // include min
                     false, // exclude max
                 ) {
                     let mut row_ids = RowIdVec::with_capacity(entries.len());
                     for entry in entries {
                         row_ids.push(entry.row_id);
+                    }
+                    if let Some(history) = history {
+                        history.merge(&*index, &mut row_ids, &|key| {
+                            key.first().is_some_and(|first| {
+                                within(first, Some((&min_value, true)), Some((&max_value, false)))
+                            })
+                        });
                     }
                     return Some(row_ids);
                 }
@@ -1041,6 +1195,11 @@ impl MVCCTable {
                     } else {
                         multi_idx.get_row_ids_equal(&values)
                     };
+                    // The prefix's removed rows cover the trailing range's too
+                    let mut row_ids = row_ids;
+                    if let Some(history) = history {
+                        history.merge(&*multi_idx, &mut row_ids, &|key| starts_with(key, &values));
+                    }
 
                     if !row_ids.is_empty() {
                         // Multi-column index gave us results - check if we need to apply
@@ -1080,8 +1239,13 @@ impl MVCCTable {
                                     if let Some((_, val)) =
                                         ops.iter().find(|(op, _)| matches!(op, Operator::Eq))
                                     {
-                                        let ids =
+                                        let mut ids =
                                             single_idx.get_row_ids_equal(std::slice::from_ref(val));
+                                        if let Some(history) = history {
+                                            history.merge(&*single_idx, &mut ids, &|key| {
+                                                first_equals(key, val)
+                                            });
+                                        }
                                         if ids.is_empty() {
                                             return Some(RowIdVec::new());
                                         }
@@ -1143,7 +1307,10 @@ impl MVCCTable {
                         continue;
                     }
                     // OPTIMIZATION: Use from_ref to avoid clone
-                    let row_ids = index.get_row_ids_equal(std::slice::from_ref(val));
+                    let mut row_ids = index.get_row_ids_equal(std::slice::from_ref(val));
+                    if let Some(history) = history {
+                        history.merge(&*index, &mut row_ids, &|key| first_equals(key, val));
+                    }
                     if row_ids.is_empty() {
                         // If any index returns empty, the AND result is empty
                         return Some(RowIdVec::new());
@@ -1161,7 +1328,7 @@ impl MVCCTable {
                         continue;
                     }
 
-                    let row_ids =
+                    let mut row_ids =
                         if let (Some((min, min_inc)), Some((max, max_inc))) = (min_val, max_val) {
                             // OPTIMIZATION: Use from_ref to avoid clone
                             index.get_row_ids_in_range(
@@ -1176,7 +1343,7 @@ impl MVCCTable {
                             } else {
                                 Operator::Gt
                             };
-                            self.query_index_with_operator(&*index, op, val)
+                            self.query_index_with_operator(&*index, op, val, None)
                                 .unwrap_or_default()
                         } else if let Some((val, inclusive)) = max_val {
                             let op = if inclusive {
@@ -1184,11 +1351,17 @@ impl MVCCTable {
                             } else {
                                 Operator::Lt
                             };
-                            self.query_index_with_operator(&*index, op, val)
+                            self.query_index_with_operator(&*index, op, val, None)
                                 .unwrap_or_default()
                         } else {
                             RowIdVec::new()
                         };
+                    if let Some(history) = history {
+                        history.merge(&*index, &mut row_ids, &|key| {
+                            key.first()
+                                .is_some_and(|first| within(first, min_val, max_val))
+                        });
+                    }
 
                     if row_ids.is_empty() {
                         // If any index returns empty, the AND result is empty
@@ -1236,13 +1409,17 @@ impl MVCCTable {
         index: &dyn crate::storage::traits::Index,
         operator: crate::core::Operator,
         value: &Value,
+        history: Option<&HistoryProbe<'_>>,
     ) -> Option<RowIdVec> {
         use crate::core::Operator;
 
         match operator {
             Operator::Eq => {
-                let quiet = self.version_store.publish_epoch_if_quiet();
-                let row_ids = index.get_row_ids_equal(std::slice::from_ref(value));
+                let quiet = self.committed_candidate_epoch();
+                let mut row_ids = index.get_row_ids_equal(std::slice::from_ref(value));
+                if let Some(history) = history {
+                    history.merge(index, &mut row_ids, &|key| first_equals(key, value));
+                }
                 if !row_ids.is_empty() {
                     return Some(row_ids);
                 }
@@ -1251,12 +1428,11 @@ impl MVCCTable {
                 // the index at commit), no snapshot older than the keys the
                 // index holds (a commit moves a key out of it while the
                 // snapshot still sees the row under the old one), and no
-                // commit publishing meanwhile (it updates the index before
-                // its versions are visible). Otherwise the scan decides.
+                // commit taking an entry out meanwhile (it updates the index
+                // before its versions are visible). Otherwise the scan decides.
                 let settled = quiet.is_some()
-                    && self.version_store.publish_epoch_if_quiet() == quiet
-                    && !self.txn_versions.read().unwrap().has_local_changes()
-                    && !self.reads_back_in_time();
+                    && self.committed_candidate_epoch() == quiet
+                    && !self.txn_versions.read().unwrap().has_local_changes();
                 settled.then_some(row_ids)
             }
             Operator::Gt | Operator::Gte | Operator::Lt | Operator::Lte => {
@@ -1267,6 +1443,12 @@ impl MVCCTable {
                 let mut row_ids = RowIdVec::with_capacity(entries.len());
                 for entry in entries {
                     row_ids.push(entry.row_id);
+                }
+                if let Some(history) = history {
+                    let (lower, upper) = operator_bounds(operator, value);
+                    history.merge(index, &mut row_ids, &|key| {
+                        key.first().is_some_and(|first| within(first, lower, upper))
+                    });
                 }
                 if row_ids.is_empty() {
                     None
@@ -1883,15 +2065,19 @@ impl MVCCTable {
         if txn_versions.has_local_changes() {
             return None;
         }
-        // Under snapshot isolation or a view, committed_row_count includes rows
-        // committed after the reader's point, so the O(1) count would be wrong.
-        if self.reads_back_in_time() {
+        // A commit moves the count as it publishes, before it is visible,
+        // and the count includes rows a snapshot does not see. Under a view
+        // only commits that add or remove rows move it
+        if self.version_store.needs_snapshot_isolation(self.txn_id) {
             return None;
         }
-        // A commit moves the count as it publishes, before it is visible
-        let quiet = self.version_store.publish_epoch_if_quiet()?;
+        let token = || match self.view.as_ref() {
+            Some(view) => self.version_store.membership_token(view),
+            None => self.version_store.publish_epoch_if_quiet(),
+        };
+        let quiet = token()?;
         let count = self.version_store.committed_row_count();
-        (self.version_store.publish_epoch_if_quiet() == Some(quiet)).then_some(count)
+        (token() == Some(quiet)).then_some(count)
     }
 
     /// Collect all visible rows, optionally filtered
@@ -2566,6 +2752,7 @@ impl MVCCTable {
         let indexes = self.version_store.indexes_read();
         indexes
             .values()
+            .map(|entry| &entry.index)
             .filter(|index| index.is_unique())
             .any(|index| {
                 let column_ids = index.column_ids();
@@ -2695,6 +2882,75 @@ impl MVCCTable {
             }
         }
         Ok(())
+    }
+}
+
+impl MVCCTable {
+    /// The ids `index` itself holds for `key`, under `equality_candidates`'s cap
+    fn index_equality_candidates(
+        &self,
+        index: &dyn Index,
+        column: &str,
+        key: &Value,
+        max: usize,
+        out: &mut Vec<i64>,
+    ) -> Result<Option<crate::storage::traits::CappedEqual>> {
+        match index.index_type() {
+            IndexType::BTree => {
+                #[cfg(feature = "test-failpoints")]
+                let start = out.len();
+                let found =
+                    index.get_row_ids_equal_capped_into(std::slice::from_ref(key), max, out);
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::equality_candidate_ids_copied(out.len() - start);
+                Ok(found)
+            }
+            IndexType::Hash | IndexType::Bitmap | IndexType::PrimaryKey => {
+                // These match the stored value exactly, so the key takes the column's type
+                let Some(data_type) = self
+                    .cached_schema
+                    .columns
+                    .iter()
+                    .find(|c| c.name_lower.eq_ignore_ascii_case(column))
+                    .map(|c| c.data_type)
+                else {
+                    return Ok(None);
+                };
+                let stored = match (data_type, key) {
+                    (DataType::Integer, Value::Float(f)) => {
+                        match crate::executor::Executor::lossless_float_key(*f) {
+                            Some(i) => Value::Integer(i),
+                            None => return Ok(Some(crate::storage::traits::CappedEqual::Copied)),
+                        }
+                    }
+                    (DataType::Float, Value::Integer(i)) => {
+                        match crate::core::value::lossless_f64_from_i64(*i) {
+                            Some(f) => Value::Float(f),
+                            None => return Ok(Some(crate::storage::traits::CappedEqual::Copied)),
+                        }
+                    }
+                    (data_type, key) if key.data_type() == data_type => key.clone(),
+                    _ => return Ok(None),
+                };
+                // An index that caps before it copies answers here
+                let stored = std::slice::from_ref(&stored);
+                let start = out.len();
+                if let Some(found) = index.get_row_ids_equal_capped_into(stored, max, out) {
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::equality_candidate_ids_copied(out.len() - start);
+                    return Ok(Some(found));
+                }
+                index.get_row_ids_equal_into(stored, out);
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::equality_candidate_ids_copied(out.len() - start);
+                if out.len() - start > max {
+                    out.truncate(start);
+                    return Ok(Some(crate::storage::traits::CappedEqual::OverCap));
+                }
+                Ok(Some(crate::storage::traits::CappedEqual::Copied))
+            }
+            _ => Ok(None),
+        }
     }
 }
 
@@ -3382,9 +3638,8 @@ impl Table for MVCCTable {
         if needed == 0 {
             return Ok(Some(RowVec::new()));
         }
-        // Rows this transaction wrote are not in the shared indexes yet, and
-        // a snapshot or view may see older versions than the keys the index holds
-        if self.txn_versions.read().unwrap().has_local_changes() || self.reads_back_in_time() {
+        // Rows this transaction wrote are not in the shared indexes yet
+        if self.txn_versions.read().unwrap().has_local_changes() {
             return Ok(None);
         }
         let Some(expr) = where_expr else {
@@ -3419,8 +3674,10 @@ impl Table for MVCCTable {
 
         // A commit updates the indexes before its versions are visible, and
         // a key moved by it may sit anywhere in the walk: the walk stands
-        // down while a commit publishes, or if one did meanwhile
-        let Some(epoch) = self.version_store.publish_epoch_if_quiet() else {
+        // down while one changes an entry, or if one did meanwhile. A
+        // snapshot, or a view that misses such a commit, may see older
+        // versions than the keys the index holds
+        let Some(epoch) = self.committed_index_epoch() else {
             return Ok(None);
         };
         let mut rows = RowVec::with_capacity(needed.min(1024));
@@ -3461,7 +3718,7 @@ impl Table for MVCCTable {
                 rows.len() < needed
             },
         );
-        if !walked || stale || self.version_store.publish_epoch_if_quiet() != Some(epoch) {
+        if !walked || stale || self.committed_index_epoch() != Some(epoch) {
             return Ok(None);
         }
         self.check_read()?;
@@ -3556,14 +3813,67 @@ impl Table for MVCCTable {
     }
 
     fn index_view_epoch(&self) -> Option<u64> {
-        if self.txn_versions.read().unwrap().has_local_changes() || self.reads_back_in_time() {
+        let epoch = self.committed_index_epoch()?;
+        if self.txn_versions.read().unwrap().has_local_changes() {
             return None;
         }
-        self.version_store.publish_epoch_if_quiet()
+        Some(epoch)
+    }
+
+    fn committed_index_epoch(&self) -> Option<u64> {
+        if self.version_store.needs_snapshot_isolation(self.txn_id) {
+            return None;
+        }
+        // Under a view only the commits that changed an entry matter: the
+        // rows the indexes name are read through the view
+        match self.view.as_ref() {
+            Some(view) => self.version_store.index_token(view),
+            None => self.version_store.publish_epoch_if_quiet(),
+        }
+    }
+
+    fn candidate_view_epoch(&self) -> Option<u64> {
+        let epoch = self.committed_candidate_epoch()?;
+        (!self.has_local_changes()).then_some(epoch)
+    }
+
+    fn committed_candidate_epoch(&self) -> Option<u64> {
+        if self.version_store.needs_snapshot_isolation(self.txn_id) {
+            return None;
+        }
+        match self.view.as_ref() {
+            Some(view) => self.version_store.candidate_token(view),
+            None => self.version_store.publish_epoch_if_quiet(),
+        }
+    }
+
+    fn add_removed_equal(&self, index: &dyn Index, key: &Value, out: &mut Vec<i64>) -> bool {
+        let Some(view) = self.view.as_ref() else {
+            return true;
+        };
+        let history = HistoryProbe::new(&self.version_store, view);
+        let before = out.len();
+        history.add_to(index, &|stored| first_equals(stored, key), &mut |row_id| {
+            out.push(row_id)
+        });
+        if out.len() > before {
+            out.sort_unstable();
+            out.dedup();
+        }
+        !history.declined()
     }
 
     fn publish_epoch_if_quiet(&self) -> Option<u64> {
         self.version_store.publish_epoch_if_quiet()
+    }
+
+    #[inline]
+    fn sees_newest(&self) -> bool {
+        !self.version_store.needs_snapshot_isolation(self.txn_id)
+            && self
+                .view
+                .as_ref()
+                .is_none_or(|view| self.version_store.view_sees_newest(view))
     }
 
     fn walk_btree_groups(
@@ -4021,65 +4331,39 @@ impl Table for MVCCTable {
         out: &mut Vec<i64>,
         _scratch: &mut crate::storage::traits::ProbeScratch,
     ) -> Result<Option<crate::storage::traits::CappedEqual>> {
+        use crate::storage::traits::CappedEqual;
         let Some(index) = self.version_store.get_index_by_column(column) else {
             return Ok(None);
         };
-        match index.index_type() {
-            IndexType::BTree => {
-                #[cfg(feature = "test-failpoints")]
-                let start = out.len();
-                let found =
-                    index.get_row_ids_equal_capped_into(std::slice::from_ref(key), max, out);
-                #[cfg(feature = "test-failpoints")]
-                crate::test_failpoints::equality_candidate_ids_copied(out.len() - start);
-                Ok(found)
-            }
-            IndexType::Hash | IndexType::Bitmap | IndexType::PrimaryKey => {
-                // These match the stored value exactly, so the key takes the column's type
-                let Some(data_type) = self
-                    .cached_schema
-                    .columns
-                    .iter()
-                    .find(|c| c.name_lower.eq_ignore_ascii_case(column))
-                    .map(|c| c.data_type)
-                else {
-                    return Ok(None);
-                };
-                let stored = match (data_type, key) {
-                    (DataType::Integer, Value::Float(f)) => {
-                        match crate::executor::Executor::lossless_float_key(*f) {
-                            Some(i) => Value::Integer(i),
-                            None => return Ok(Some(crate::storage::traits::CappedEqual::Copied)),
-                        }
-                    }
-                    (DataType::Float, Value::Integer(i)) => {
-                        match crate::core::value::lossless_f64_from_i64(*i) {
-                            Some(f) => Value::Float(f),
-                            None => return Ok(Some(crate::storage::traits::CappedEqual::Copied)),
-                        }
-                    }
-                    (data_type, key) if key.data_type() == data_type => key.clone(),
-                    _ => return Ok(None),
-                };
-                // An index that caps before it copies answers here
-                let stored = std::slice::from_ref(&stored);
-                let start = out.len();
-                if let Some(found) = index.get_row_ids_equal_capped_into(stored, max, out) {
-                    #[cfg(feature = "test-failpoints")]
-                    crate::test_failpoints::equality_candidate_ids_copied(out.len() - start);
-                    return Ok(Some(found));
-                }
-                index.get_row_ids_equal_into(stored, out);
-                #[cfg(feature = "test-failpoints")]
-                crate::test_failpoints::equality_candidate_ids_copied(out.len() - start);
-                if out.len() - start > max {
-                    out.truncate(start);
-                    return Ok(Some(crate::storage::traits::CappedEqual::OverCap));
-                }
-                Ok(Some(crate::storage::traits::CappedEqual::Copied))
-            }
-            _ => Ok(None),
+        let start = out.len();
+        let found = self.index_equality_candidates(&*index, column, key, max, out)?;
+        let (Some(view), Some(CappedEqual::Copied)) = (self.view.as_ref(), found) else {
+            return Ok(found);
+        };
+        // A lossless conversion of the key is equal to it as the indexes order values
+        let history = HistoryProbe::new(&self.version_store, view);
+        let mut removed: Vec<i64> = Vec::new();
+        history.add_to(
+            &*index,
+            &|stored| first_equals(stored, key),
+            &mut |row_id| removed.push(row_id),
+        );
+        if history.declined() {
+            out.truncate(start);
+            return Ok(None);
         }
+        if removed.is_empty() {
+            return Ok(found);
+        }
+        removed.extend_from_slice(&out[start..]);
+        removed.sort_unstable();
+        removed.dedup();
+        out.truncate(start);
+        if removed.len() > max {
+            return Ok(Some(CappedEqual::OverCap));
+        }
+        out.extend_from_slice(&removed);
+        Ok(found)
     }
 
     fn count_equal_candidates(
@@ -4160,7 +4444,7 @@ impl Table for MVCCTable {
             .map(|i| &self.cached_schema.columns[i].name_lower);
         let mut unique = smallvec::SmallVec::<[Arc<dyn Index>; 4]>::new();
         let indexes = self.version_store.indexes_read();
-        for idx in indexes.values() {
+        for idx in indexes.values().map(|entry| &entry.index) {
             if !idx.is_unique() {
                 continue;
             }
@@ -4188,7 +4472,7 @@ impl Table for MVCCTable {
             .pk_column_index()
             .map(|i| &self.cached_schema.columns[i].name_lower);
         let indexes = self.version_store.indexes_read();
-        indexes.values().any(|idx| {
+        indexes.values().map(|entry| &entry.index).any(|idx| {
             if !idx.is_unique() {
                 return false;
             }
@@ -4510,6 +4794,12 @@ impl Table for MVCCTable {
             }
         }
 
+        // The index order holds for the rows only while the index holds what
+        // this statement sees
+        let Some(epoch) = self.index_view_epoch() else {
+            return Ok(None);
+        };
+
         // Check if column has an index
         let Some(index) = self.version_store.get_index_by_column(column_name) else {
             return Ok(None);
@@ -4560,6 +4850,9 @@ impl Table for MVCCTable {
             // If we got all needed rows, return them
             // If not, we may need to fetch more (rare case with many invisible rows)
             if !rows.is_empty() {
+                if self.index_view_epoch() != Some(epoch) {
+                    return Ok(None);
+                }
                 self.check_read()?;
                 return Ok(Some(rows));
             }
@@ -4628,13 +4921,18 @@ impl Table for MVCCTable {
 
                     // Check if we've reached the limit
                     if rows.len() >= limit {
-                        self.check_read()?;
-                        return Ok(Some(rows));
+                        break;
                     }
                 }
             }
+            if rows.len() >= limit {
+                break;
+            }
         }
 
+        if self.index_view_epoch() != Some(epoch) {
+            return Ok(None);
+        }
         self.check_read()?;
         Ok(Some(rows))
     }
@@ -4675,13 +4973,11 @@ impl Table for MVCCTable {
         &self,
         column_name: &str,
     ) -> Result<Option<Vec<(Value, RowVec)>>> {
-        // If transaction has local changes, fall back to regular path
-        {
-            let txn_versions = self.txn_versions.read().unwrap();
-            if txn_versions.has_local_changes() {
-                return Ok(None);
-            }
-        }
+        // The index keys group the rows only while it holds what this
+        // statement sees
+        let Some(epoch) = self.index_view_epoch() else {
+            return Ok(None);
+        };
 
         // Check if column has an index
         let Some(index) = self.version_store.get_index_by_column(column_name) else {
@@ -4721,41 +5017,43 @@ impl Table for MVCCTable {
             }
         }
 
+        if self.index_view_epoch() != Some(epoch) {
+            return Ok(None);
+        }
         self.check_read()?;
         Ok(Some(result))
     }
 
     fn get_partition_values(&self, column_name: &str) -> Result<Option<Vec<Value>>> {
-        // Only use index-based distinct values if no uncommitted local changes
-        // (local changes are in txn_versions, not reflected in the index)
-        let txn_versions = self.txn_versions.read().unwrap();
-        if txn_versions.has_local_changes() {
+        // The index keys are the values only while it holds what this
+        // statement sees
+        let Some(epoch) = self.index_view_epoch() else {
             return Ok(None);
-        }
-        drop(txn_versions);
+        };
 
         // Get index for the column
         let Some(index) = self.version_store.get_index_by_column(column_name) else {
             return Ok(None);
         };
         // Return all distinct values from the index
-        Ok(Some(index.get_all_values()))
+        let values = index.get_all_values();
+        Ok((self.index_view_epoch() == Some(epoch)).then_some(values))
     }
 
     fn get_partition_count(&self, column_name: &str) -> Result<Option<usize>> {
-        // Only use index-based count if no uncommitted local changes
-        let txn_versions = self.txn_versions.read().unwrap();
-        if txn_versions.has_local_changes() {
+        // The index keys are the values only while it holds what this
+        // statement sees
+        let Some(epoch) = self.index_view_epoch() else {
             return Ok(None);
-        }
-        drop(txn_versions);
+        };
 
         // Get index for the column
         let Some(index) = self.version_store.get_index_by_column(column_name) else {
             return Ok(None);
         };
         // Return count of distinct non-null values without cloning
-        Ok(index.get_distinct_count_excluding_null())
+        let count = index.get_distinct_count_excluding_null();
+        Ok(count.filter(|_| self.index_view_epoch() == Some(epoch)))
     }
 
     fn get_rows_for_partition_value(
@@ -4763,13 +5061,11 @@ impl Table for MVCCTable {
         column_name: &str,
         partition_value: &Value,
     ) -> Result<Option<RowVec>> {
-        // If transaction has local changes, fall back to regular path
-        {
-            let txn_versions = self.txn_versions.read().unwrap();
-            if txn_versions.has_local_changes() {
-                return Ok(None);
-            }
-        }
+        // The index names the partition's rows only while it holds what this
+        // statement sees
+        let Some(epoch) = self.index_view_epoch() else {
+            return Ok(None);
+        };
 
         // Get index for the column
         let index = match self.version_store.get_index_by_column(column_name) {
@@ -4793,6 +5089,9 @@ impl Table for MVCCTable {
             }
         }
 
+        if self.index_view_epoch() != Some(epoch) {
+            return Ok(None);
+        }
         self.check_read()?;
         Ok(Some(rows))
     }

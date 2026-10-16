@@ -148,6 +148,10 @@ const SIDE_SCAN_SHARE: u64 = super::secondary::SCAN_SHARE;
 /// compaction or eviction left unread before it gives up
 pub(crate) const COLD_READ_RETRIES: usize = 3;
 
+/// Times a count without a view is taken from the two layers' counts before
+/// it counts the rows: each try waits for no commit
+const ROW_COUNT_TRIES: usize = 8;
+
 /// A side file read that failed is the statement's error
 fn side_error(error: std::io::Error) -> crate::core::Error {
     crate::core::Error::internal(format!("side index read failed: {error}"))
@@ -434,7 +438,7 @@ pub struct SegmentedTable {
     snapshot_seq: Option<u64>,
     /// The statement view this handle's reads are held to, the same one its
     /// hot table reads through: a tombstone counts only when it sees the commit
-    view: Option<Arc<StatementView>>,
+    view: Option<StatementView>,
     schema_generation: u64,
     /// The transaction's gate, which admits each statement once for both
     /// layers; the hot table it owns has none
@@ -482,7 +486,7 @@ impl SegmentedTable {
     }
 
     /// The table's cold reads see `view`, which its hot table reads through
-    pub(crate) fn with_view(mut self, view: Option<Arc<StatementView>>) -> Self {
+    pub(crate) fn with_view(mut self, view: Option<StatementView>) -> Self {
         self.view = view;
         self
     }
@@ -492,6 +496,40 @@ impl SegmentedTable {
     #[inline]
     fn reads_back_in_time(&self) -> bool {
         self.snapshot_seq.is_some() || self.view.is_some()
+    }
+
+    /// Runs `read`, a shortcut over the newest committed state, while no
+    /// commit publishes across it: one that moves a row between the hot and
+    /// the sealed reads would tear the answer. Under a view, only while the
+    /// view sees every commit the table published. None stands down
+    fn read_newest<T>(&self, read: impl FnOnce() -> Result<Option<T>>) -> Result<Option<T>> {
+        if self.snapshot_seq.is_some() {
+            return Ok(None);
+        }
+        let Some(epoch) = self.hot.publish_epoch_if_quiet() else {
+            return Ok(None);
+        };
+        if self.view.is_some() && !self.hot.sees_newest() {
+            return Ok(None);
+        }
+        let answer = read()?;
+        Ok(answer.filter(|_| self.hot.publish_epoch_if_quiet() == Some(epoch)))
+    }
+
+    /// `clear_of_destruction` for a shortcut over the newest committed state
+    fn newest_clear_of_destruction<T>(
+        &self,
+        read: impl FnMut() -> Result<Option<T>>,
+    ) -> Result<Option<T>> {
+        self.read_newest(|| self.clear_of_destruction(read))
+    }
+
+    /// `across_seals` for a shortcut over the newest committed state
+    fn newest_across_seals<T>(
+        &self,
+        read: impl FnMut(u64) -> Result<Option<Option<T>>>,
+    ) -> Result<Option<T>> {
+        self.read_newest(|| self.across_seals(read))
     }
 
     /// Create a segmented table with no segments (equivalent to plain MVCCTable).
@@ -530,6 +568,13 @@ impl SegmentedTable {
             || self.segment_mgr.destructions_begun() != begun
     }
 
+    /// Err once a truncate or drop overtook the handle's view: reading again
+    /// through it would read what the destruction left. Without a view the
+    /// read is taken again on the newest state
+    fn view_held(&self) -> Result<()> {
+        self.view.as_ref().map_or(Ok(()), StatementView::held)
+    }
+
     /// Waits, holding no lock, until no truncate is taking rows away
     fn wait_out_destruction(&self) {
         let mut noted = false;
@@ -549,6 +594,7 @@ impl SegmentedTable {
         loop {
             let begun = self.segment_mgr.destructions_begun();
             if self.segment_mgr.is_destruction_in_progress() {
+                self.view_held()?;
                 self.wait_out_destruction();
                 continue;
             }
@@ -556,6 +602,7 @@ impl SegmentedTable {
             if !self.destruction_since(begun) {
                 return Ok(out);
             }
+            self.view_held()?;
             self.wait_out_destruction();
         }
     }
@@ -573,6 +620,7 @@ impl SegmentedTable {
         loop {
             let before = Self::settled_generation(&self.segment_mgr);
             if self.segment_mgr.is_destruction_in_progress() {
+                self.view_held()?;
                 self.wait_out_destruction();
                 continue;
             }
@@ -581,6 +629,9 @@ impl SegmentedTable {
             let after = Self::settled_generation(&self.segment_mgr);
             if !destroyed && before == after {
                 return Ok(collected);
+            }
+            if destroyed {
+                self.view_held()?;
             }
             self.wait_out_destruction();
         }
@@ -596,6 +647,7 @@ impl SegmentedTable {
             let begun = self.segment_mgr.destructions_begun();
             let generation = Self::settled_generation(&self.segment_mgr);
             if self.segment_mgr.is_destruction_in_progress() {
+                self.view_held()?;
                 self.wait_out_destruction();
                 continue;
             }
@@ -603,6 +655,7 @@ impl SegmentedTable {
                 if !self.destruction_since(begun) {
                     return Ok(out);
                 }
+                self.view_held()?;
             }
             self.wait_out_destruction();
         }
@@ -1765,7 +1818,7 @@ impl SegmentedTable {
     ) -> Result<Vec<UniqueKey<'a>>> {
         use crate::core::DataType;
         if comparisons.is_empty()
-            || self.reads_back_in_time()
+            || self.snapshot_seq.is_some()
             || !self.hot.has_unique_non_pk_indexes()
         {
             return Ok(Vec::new());
@@ -4609,23 +4662,45 @@ impl Table for SegmentedTable {
     fn row_count(&self) -> Result<usize> {
         // Snapshot isolation: deduped_row_count and the fast path subtract ALL
         // tombstones, but a snapshot may not see newer ones. Use full scan.
+        // A view that sees every commit takes the fast path
         if self.reads_back_in_time() {
+            if let Some(count) = self.fast_row_count()? {
+                return Ok(count);
+            }
             return self.collect_all_rows(None).map(|rows| rows.len());
         }
         // During seal, rows temporarily exist in both hot and cold.
         // Use the same O(1) formula with overlap correction. The count
         // may be off by a few rows during the brief overlap window, but
         // this avoids an O(total_rows) HashSet collection that made ALL
-        // queries slow during checkpoint.
-        self.clear_of_destruction(|| {
-            let _seal_guard = self.segment_mgr.acquire_seal_read();
-            let seg = self.segment_mgr.deduped_row_count()?;
-            #[cfg(feature = "test-failpoints")]
-            crate::test_failpoints::hot_and_cold_reads_split();
-            let pending = self.segment_mgr.pending_tombstone_count(self.txn_id());
-            let overlap = self.segment_mgr.seal_overlap();
-            Ok(seg.saturating_sub(pending) + self.hot.row_count()?.saturating_sub(overlap))
-        })
+        // queries slow during checkpoint. A commit moving a row between the
+        // two counts would tear the sum: they answer only when no commit
+        // published across them, else the rows are counted
+        let counted = self.clear_of_destruction(|| {
+            for _ in 0..ROW_COUNT_TRIES {
+                let Some(epoch) = self.hot.publish_epoch_if_quiet() else {
+                    std::thread::yield_now();
+                    continue;
+                };
+                let count = {
+                    let _seal_guard = self.segment_mgr.acquire_seal_read();
+                    let seg = self.segment_mgr.deduped_row_count()?;
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::hot_and_cold_reads_split();
+                    let pending = self.segment_mgr.pending_tombstone_count(self.txn_id());
+                    let overlap = self.segment_mgr.seal_overlap();
+                    seg.saturating_sub(pending) + self.hot.row_count()?.saturating_sub(overlap)
+                };
+                if self.hot.publish_epoch_if_quiet() == Some(epoch) {
+                    return Ok(Some(count));
+                }
+            }
+            Ok(None)
+        })?;
+        match counted {
+            Some(count) => Ok(count),
+            None => self.collect_all_rows(None).map(|rows| rows.len()),
+        }
     }
 
     fn row_count_hint(&self) -> usize {
@@ -4636,13 +4711,9 @@ impl Table for SegmentedTable {
     }
 
     fn fast_row_count(&self) -> Result<Option<usize>> {
-        // Snapshot isolation: deduped_row_count subtracts ALL tombstones, but
-        // this snapshot may not see newer tombstones. Fall back to scan which
-        // correctly filters by snapshot_seq.
-        if self.reads_back_in_time() {
-            return Ok(None);
-        }
-        self.clear_of_destruction(|| {
+        // deduped_row_count subtracts ALL tombstones, newer ones a snapshot
+        // or a view may not see among them
+        self.newest_clear_of_destruction(|| {
             let _seal_guard = self.segment_mgr.acquire_seal_read();
             let Some(hot_count) = self.hot.fast_row_count()? else {
                 return Ok(None);
@@ -4668,12 +4739,8 @@ impl Table for SegmentedTable {
     fn sum_column(&self, col_idx: usize) -> Result<Option<(f64, usize)>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.sum_column");
-        // Snapshot isolation: cold aggregation uses tombstones without snapshot
-        // filtering. Bail so the executor falls back to full scan.
-        if self.reads_back_in_time() {
-            return Ok(None);
-        }
-        self.clear_of_destruction(|| {
+        // The volume stats count rows a snapshot or a view may not see
+        self.newest_clear_of_destruction(|| {
             let _seal_guard = self.segment_mgr.acquire_seal_read();
             let hot_result = self.hot.sum_column(col_idx)?;
             #[cfg(feature = "test-failpoints")]
@@ -4853,10 +4920,7 @@ impl Table for SegmentedTable {
     fn min_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.min_column");
-        if self.reads_back_in_time() {
-            return Ok(None);
-        }
-        self.clear_of_destruction(|| {
+        self.newest_clear_of_destruction(|| {
             let _seal_guard = self.segment_mgr.acquire_seal_read();
             let hot_result = self.hot.min_column(col_idx)?;
             #[cfg(feature = "test-failpoints")]
@@ -5177,10 +5241,7 @@ impl Table for SegmentedTable {
     fn max_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.max_column");
-        if self.reads_back_in_time() {
-            return Ok(None);
-        }
-        self.clear_of_destruction(|| {
+        self.newest_clear_of_destruction(|| {
             let _seal_guard = self.segment_mgr.acquire_seal_read();
             let hot_result = self.hot.max_column(col_idx)?;
             #[cfg(feature = "test-failpoints")]
@@ -5496,10 +5557,7 @@ impl Table for SegmentedTable {
     // =========================================================================
 
     fn get_partition_count(&self, column_name: &str) -> Result<Option<usize>> {
-        if self.reads_back_in_time() {
-            return Ok(None);
-        }
-        self.clear_of_destruction(|| {
+        self.newest_clear_of_destruction(|| {
             let _seal_guard = self.segment_mgr.acquire_seal_read();
             if !self.segment_mgr.has_segments() {
                 return self.hot.get_partition_count(column_name);
@@ -5526,6 +5584,8 @@ impl Table for SegmentedTable {
                     distinct.insert(v);
                 }
             }
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::hot_and_cold_reads_split();
 
             // Build skip set: hot row_ids + tombstones + pending tombstones
             let volumes = self.segment_mgr.get_volumes_newest_first()?;
@@ -5583,7 +5643,7 @@ impl Table for SegmentedTable {
     }
 
     fn get_partition_values(&self, column_name: &str) -> Result<Option<Vec<Value>>> {
-        if self.reads_back_in_time() {
+        if self.snapshot_seq.is_some() {
             return Ok(None);
         }
         if let Some(result) = self.unsealed(|hot| hot.get_partition_values(column_name)) {
@@ -5593,7 +5653,7 @@ impl Table for SegmentedTable {
         if self.segment_mgr.seal_overlap() > 0 {
             return Ok(None);
         }
-        self.across_seals(|generation| {
+        self.newest_across_seals(|generation| {
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::merged_read_began();
 
@@ -5668,15 +5728,12 @@ impl Table for SegmentedTable {
     }
 
     fn compute_distinct_values(&self, col_idx: usize) -> Result<Option<Vec<Value>>> {
-        // Bail for snapshot isolation — tombstone visibility is snapshot-dependent
-        if self.reads_back_in_time() {
-            return Ok(None);
-        }
         // Bail during seal overlap — hot and cold may have duplicates
         if self.segment_mgr.seal_overlap() > 0 {
             return Ok(None);
         }
-        self.across_seals(|generation| {
+        // Tombstone visibility depends on a snapshot's or a view's point
+        self.newest_across_seals(|generation| {
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::merged_read_began();
 
@@ -5811,10 +5868,7 @@ impl Table for SegmentedTable {
         &self,
         column_name: &str,
     ) -> Result<Option<Vec<(Value, RowVec)>>> {
-        if self.reads_back_in_time() {
-            return Ok(None);
-        }
-        self.clear_of_destruction(|| {
+        self.newest_clear_of_destruction(|| {
             let _seal_guard = self.segment_mgr.acquire_seal_read();
             if !self.segment_mgr.has_segments() {
                 return self.hot.collect_rows_grouped_by_partition(column_name);
@@ -5829,12 +5883,14 @@ impl Table for SegmentedTable {
                 return Ok(None);
             };
 
-            // Start from hot grouped data
+            // Start from hot grouped data; a hot side that cannot answer,
+            // with local writes among others, leaves the whole to the scan
             let mut groups: ValueMap<RowVec> = ValueMap::default();
-            if let Some(hot_groups) = self.hot.collect_rows_grouped_by_partition(column_name)? {
-                for (val, rows) in hot_groups {
-                    groups.insert(val, rows);
-                }
+            let Some(hot_groups) = self.hot.collect_rows_grouped_by_partition(column_name)? else {
+                return Ok(None);
+            };
+            for (val, rows) in hot_groups {
+                groups.insert(val, rows);
             }
 
             // Build hot_skip: hot row_ids + tombstones + pending tombstones
@@ -5897,10 +5953,7 @@ impl Table for SegmentedTable {
         column_name: &str,
         partition_value: &Value,
     ) -> Result<Option<RowVec>> {
-        if self.reads_back_in_time() {
-            return Ok(None);
-        }
-        self.clear_of_destruction(|| {
+        self.newest_clear_of_destruction(|| {
             let _seal_guard = self.segment_mgr.acquire_seal_read();
             if !self.segment_mgr.has_segments() {
                 return self
@@ -5918,11 +5971,14 @@ impl Table for SegmentedTable {
                 None => return Ok(None),
             };
 
-            // Get hot rows for this partition value
-            let mut result = self
+            // Get hot rows for this partition value; a hot side that cannot
+            // answer, with local writes among others, leaves it to the scan
+            let Some(mut result) = self
                 .hot
                 .get_rows_for_partition_value(column_name, partition_value)?
-                .unwrap_or_default();
+            else {
+                return Ok(None);
+            };
 
             // Build hot_skip: hot row_ids + tombstones + pending tombstones
             // Lazy: prune by zone maps on the partition column before loading cold volumes.
@@ -6029,9 +6085,9 @@ impl Table for SegmentedTable {
             return result;
         }
 
-        // Snapshot isolation: the merge path doesn't filter by snapshot_seq.
-        // Fall back to the full scan + sort path which handles MVCC correctly.
-        if self.reads_back_in_time() {
+        // The merge path reads the newest committed state: a snapshot, or a
+        // view that misses a commit, takes the full scan + sort path
+        if self.snapshot_seq.is_some() {
             return Ok(None);
         }
 
@@ -6051,7 +6107,7 @@ impl Table for SegmentedTable {
             return Ok(Some(RowVec::new()));
         }
 
-        self.across_seals(|generation| {
+        self.newest_across_seals(|generation| {
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::merged_read_began();
             // 1. Collect hot rows in PK order. Only materialize `needed` rows
@@ -6328,6 +6384,10 @@ impl Table for SegmentedTable {
         self.hot.index_view_epoch()
     }
 
+    fn publish_epoch_if_quiet(&self) -> Option<u64> {
+        self.hot.publish_epoch_if_quiet()
+    }
+
     fn count_equal_candidates(
         &self,
         row_ids: &[i64],
@@ -6365,7 +6425,7 @@ impl Table for SegmentedTable {
     ) -> Result<Option<RowVec>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.scan_top_k");
-        if self.reads_back_in_time() {
+        if self.snapshot_seq.is_some() {
             return Ok(None);
         }
         // Without volumes the hot store answers alone, from its index or not
@@ -6408,7 +6468,7 @@ impl Table for SegmentedTable {
             return Ok(None);
         }
 
-        self.across_seals(|generation| {
+        self.newest_across_seals(|generation| {
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::merged_read_began();
             // The hot store answers from an index when it can; then only its
@@ -6753,14 +6813,16 @@ impl Table for SegmentedTable {
         scratch: &mut crate::storage::traits::ProbeScratch,
     ) -> Result<Option<crate::storage::traits::CappedEqual>> {
         use crate::storage::traits::CappedEqual;
-        if self.reads_back_in_time() {
+        if self.snapshot_seq.is_some() {
             return Ok(None);
         }
         let generation = self.segment_mgr.seal_generation();
         if self.segment_mgr.is_destruction_in_progress() {
             return Ok(None);
         }
-        let Some(epoch) = self.hot.index_view_epoch() else {
+        // Every caller reads the candidates through the view and checks
+        // their keys again
+        let Some(epoch) = self.hot.candidate_view_epoch() else {
             return Ok(None);
         };
         let start = out.len();
@@ -6811,7 +6873,7 @@ impl Table for SegmentedTable {
         }
         if self.segment_mgr.is_destruction_in_progress()
             || self.segment_mgr.seal_generation() != generation
-            || self.hot.index_view_epoch() != Some(epoch)
+            || self.hot.candidate_view_epoch() != Some(epoch)
         {
             out.truncate(start);
             return Ok(None);
@@ -6819,6 +6881,8 @@ impl Table for SegmentedTable {
         // An updated row keeps its old copy in a volume until compaction, so
         // its id can come from two places; the fetch reads the newest copy
         Self::dedup_from(out, start);
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::equality_candidates_answered();
         Ok(Some(CappedEqual::Copied))
     }
 
@@ -6829,7 +6893,7 @@ impl Table for SegmentedTable {
         max_bytes: usize,
         f: &mut dyn FnMut(&Value, GroupIds<'_>) -> Result<bool>,
     ) -> Result<Option<()>> {
-        if self.reads_back_in_time() {
+        if self.snapshot_seq.is_some() {
             return Ok(None);
         }
         // Sampled before either check below. A publication that starts and
@@ -7256,11 +7320,8 @@ impl Table for SegmentedTable {
     ) -> Result<Option<Vec<Value>>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.compute_filtered_aggregates");
-        // Bail out: snapshot isolation requires tombstone filtering by snapshot_seq
-        if self.reads_back_in_time() {
-            return Ok(None);
-        }
-        self.clear_of_destruction(|| {
+        // The volume stats count rows a snapshot or a view may not see
+        self.newest_clear_of_destruction(|| {
             let _seal_guard = self.segment_mgr.acquire_seal_read();
             // Bail out: during seal, hot+cold overlap makes aggregation unreliable
             if self.segment_mgr.seal_overlap() > 0 {
@@ -8176,14 +8237,11 @@ impl Table for SegmentedTable {
     ) -> Result<Option<Vec<GroupedAggregateResult>>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.compute_grouped_aggregates");
-        if self.reads_back_in_time() {
-            return Ok(None);
-        }
         // Multi-column GROUP BY: fall back to the full executor path.
         if group_by_indices.len() != 1 {
             return Ok(None);
         }
-        self.clear_of_destruction(|| {
+        self.newest_clear_of_destruction(|| {
             let _seal_guard = self.segment_mgr.acquire_seal_read();
             if !self.segment_mgr.has_segments() {
                 return self
@@ -9156,6 +9214,10 @@ mod tests {
     impl Table for MockHotTable {
         fn name(&self) -> &str {
             "test"
+        }
+        // No commit ever publishes to the mock
+        fn publish_epoch_if_quiet(&self) -> Option<u64> {
+            Some(0)
         }
         fn schema(&self) -> &Schema {
             &self.schema

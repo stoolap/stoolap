@@ -872,9 +872,27 @@ fn a_join_planned_on_an_index_runs_on_the_table_it_opens() {
         "ALTER TABLE c RENAME COLUMN k TO id",
         "ALTER TABLE c ADD COLUMN k INTEGER DEFAULT 9",
     ];
+    // The planned index moves to `old_k`: read by it, the join finds the 3
+    // rows of the old key 9 instead of the 30 the new column holds
+    let renamed_away: &[&str] = &[
+        "ALTER TABLE c RENAME COLUMN k TO old_k",
+        "ALTER TABLE c ADD COLUMN k INTEGER DEFAULT 9",
+    ];
     let streaming = "SELECT p.id, c.id FROM p JOIN c ON c.k = p.v WHERE c.a > 0 LIMIT 100";
     let batch = "SELECT p.id, c.id FROM p JOIN c ON c.k = p.v WHERE c.a > 0";
-    let cases: [(&str, &[&str], &[&str], &str); 6] = [
+    let cases: [(&str, &[&str], &[&str], &str); 8] = [
+        (
+            "key renamed away, LIMIT",
+            JOIN_SECONDARY,
+            renamed_away,
+            streaming,
+        ),
+        (
+            "key renamed away, no LIMIT",
+            JOIN_SECONDARY,
+            renamed_away,
+            batch,
+        ),
         (
             "column replaced, LIMIT",
             JOIN_SECONDARY,
@@ -915,10 +933,12 @@ fn a_join_planned_on_an_index_runs_on_the_table_it_opens() {
     };
     let mut report = Vec::new();
     for (n, (label, setup, change, sql)) in cases.into_iter().enumerate() {
+        // The statement's view is taken before the change: it reads the new
+        // schema, and the rows as they were before the change's UPDATE
         let expected = {
             let e = Database::open(&format!("memory://readers_join_index_expected_{n}")).unwrap();
             join_setup(&e, "memory", setup);
-            for sql in change {
+            for sql in change.iter().filter(|sql| !sql.starts_with("UPDATE")) {
                 e.execute(sql, ()).unwrap();
             }
             sorted(rows(&e, sql)).unwrap()
@@ -1225,88 +1245,52 @@ fn an_older_handle_meets_its_transactions_rows_written_after_a_drop() {
 }
 
 /// An index MIN or MAX over hot and sealed rows read its hot bound, then
-/// two renames hand the column's name to another column
+/// two renames hand the column's name to another column: the table gives
+/// no bound rather than one made of two columns. Asked of the table, since
+/// a statement reaches this bound only when the aggregate pushdown declines
 #[test]
 fn an_index_bound_reads_one_column_across_renames() {
-    use stoolap::IsolationLevel;
     let _guard = fp::FailpointGuard::new();
     let dir = tempfile::tempdir().unwrap();
-    let renames: &[&str] = &[
-        "ALTER TABLE t RENAME COLUMN a TO old_a",
-        "ALTER TABLE t RENAME COLUMN b TO a",
-    ];
-    // (statement, sealed row, hot row): the mixed answer is neither view
-    type Pair = (i64, i64);
-    let cases: [(&str, Pair, Pair); 2] = [
-        ("SELECT MIN(a) FROM t LIMIT 1", (20, 1), (10, 0)),
-        ("SELECT MAX(a) FROM t LIMIT 1", (20, 1), (10, 30)),
-    ];
-    let setup = |db: &Database, dsn: &str, sealed: (i64, i64), hot: (i64, i64)| {
+    let mut wrong = Vec::new();
+    // (bound, hot row's b): the mixed bound, the hot a against the sealed
+    // b, is 1 for MIN and 10 for MAX, neither column's own
+    for (n, (bound, hot_b)) in [("MIN", 0), ("MAX", 30)].into_iter().enumerate() {
+        let db = Database::open(&format!(
+            "file://{}/index_bound_{n}{OPTS}",
+            dir.path().display()
+        ))
+        .unwrap();
         for sql in [
             "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)".to_string(),
             "CREATE INDEX ia ON t(a)".into(),
             "CREATE INDEX ib ON t(b)".into(),
-            format!("INSERT INTO t VALUES (1, {}, {})", sealed.0, sealed.1),
+            "INSERT INTO t VALUES (1, 20, 1)".into(),
+            "PRAGMA CHECKPOINT".into(),
+            format!("INSERT INTO t VALUES (2, 10, {hot_b})"),
         ] {
             db.execute(&sql, ()).unwrap();
         }
-        if dsn.starts_with("file") {
-            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
-        }
-        db.execute(
-            &format!("INSERT INTO t VALUES (2, {}, {})", hot.0, hot.1),
-            (),
-        )
-        .unwrap();
-    };
-    let mut report = Vec::new();
-    for (n, (sql, sealed, hot)) in cases.into_iter().enumerate() {
-        let e = Database::open(&format!("memory://readers_index_bound_expected_{n}")).unwrap();
-        setup(&e, "memory", sealed, hot);
-        let old = rows(&e, sql).unwrap();
-        for sql in renames {
-            e.execute(sql, ()).unwrap();
-        }
-        let new = rows(&e, sql).unwrap();
-        // Only sealed rows take the volume bound
-        for (engine, dsn) in engines(&dir, "index_bound") {
-            if engine != "file sealed" {
-                continue;
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let (other, flag) = (db.clone(), std::rc::Rc::clone(&fired));
+        fp::after_index_bound_hot(move || {
+            for sql in [
+                "ALTER TABLE t RENAME COLUMN a TO old_a",
+                "ALTER TABLE t RENAME COLUMN b TO a",
+            ] {
+                other.execute(sql, ()).unwrap();
             }
-            let db = Database::open(&dsn).unwrap();
-            setup(&db, &dsn, sealed, hot);
-            let other = db.clone();
-            let reader = db.clone();
-            let (got, fired, paths) = on_thread(
-                fp::after_index_bound_hot,
-                move || {
-                    for sql in renames {
-                        other.execute(sql, ()).unwrap();
-                    }
-                },
-                move || {
-                    let mut tx = reader.begin_with_isolation(IsolationLevel::SnapshotIsolation)?;
-                    tx.query(sql, ())?
-                        .map(|r| {
-                            r.map(|r| {
-                                vec![r
-                                    .get_value(0)
-                                    .cloned()
-                                    .unwrap_or(Value::Null(DataType::Null))]
-                            })
-                        })
-                        .collect()
-                },
-            );
-            report.push(either(
-                &format!("{engine}: {sql}"),
-                got,
-                &old,
-                &new,
-                fired,
-                &paths,
-            ));
+            flag.set(true);
+        });
+        let tx = stoolap::storage::traits::Engine::begin_transaction(&**db.engine()).unwrap();
+        let table = tx.get_table("t").unwrap();
+        let got = match bound {
+            "MIN" => table.get_index_min_value("a"),
+            _ => table.get_index_max_value("a"),
+        };
+        if !fired.get() || got.is_some() {
+            wrong.push(format!("{bound}: renamed {}, bound {got:?}", fired.get()));
         }
     }
-    finish(report);
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }

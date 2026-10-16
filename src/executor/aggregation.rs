@@ -1147,7 +1147,8 @@ impl Executor {
 
         // Evaluate each row
         let mut final_rows = RowVec::with_capacity(agg_rows.len());
-        let mut evaluator = CompiledEvaluator::new(crate::functions::registry::global_registry());
+        let mut evaluator =
+            CompiledEvaluator::new(crate::functions::registry::global_registry()).with_context(ctx);
         evaluator.init_columns(&agg_columns);
 
         // Add aggregate expression aliases so COALESCE(SUM(val), 0) can find the "sum(val)" column
@@ -6890,7 +6891,7 @@ impl Executor {
                 CompiledExecution::CountDistinct(cd) => {
                     // Fast path: validate epoch and execute directly
                     if self.engine.schema_epoch() == cd.cached_epoch {
-                        return Some(self.execute_compiled_count_distinct(cd));
+                        return self.execute_compiled_count_distinct(cd).transpose();
                     }
                     // Schema changed - fall through to recompile
                 }
@@ -6904,18 +6905,36 @@ impl Executor {
         self.compile_and_execute_count_distinct(stmt, compiled)
     }
 
-    /// Execute using pre-compiled COUNT(DISTINCT col) info
+    /// Execute using pre-compiled COUNT(DISTINCT col) info; None when the
+    /// index cannot answer for this statement and the regular path does
     fn execute_compiled_count_distinct(
         &self,
         cd: &CompiledCountDistinct,
-    ) -> Result<Box<dyn QueryResult>> {
-        // Get table and count distinct values directly
-        let tx = self.engine.begin_transaction()?;
-        let table = tx.get_statement_table(&cd.table_name)?;
-
-        let count = table
-            .get_partition_count(&cd.column_name)?
-            .ok_or_else(|| crate::core::Error::internal("Index no longer available for column"))?;
+    ) -> Result<Option<Box<dyn QueryResult>>> {
+        // Under read committed the table's own distinct count is the latest
+        // committed one: it answers only when no commit published across its
+        // reads. Else the count is read through a view
+        let quiet_count = || -> Result<Option<usize>> {
+            let tx = self.engine.begin_transaction()?;
+            let table = tx.get_statement_table_at(&cd.table_name, None)?;
+            table.get_partition_count(&cd.column_name)
+        };
+        let read_committed =
+            self.engine.get_isolation_level() == crate::core::IsolationLevel::ReadCommitted;
+        let count = match read_committed.then(quiet_count).transpose()?.flatten() {
+            Some(count) => count,
+            None => {
+                let view = self.autocommit_view();
+                let tx = self.engine.begin_transaction()?;
+                let table = tx.get_statement_table_at(&cd.table_name, view.as_ref())?;
+                let Some(count) = table.get_partition_count(&cd.column_name)? else {
+                    return Ok(None);
+                };
+                view.as_ref()
+                    .map_or(Ok(()), crate::storage::mvcc::registry::StatementView::held)?;
+                count
+            }
+        };
 
         // Build result
         let mut result_values = CompactVec::with_capacity(1);
@@ -6924,10 +6943,10 @@ impl Executor {
         let mut rows = RowVec::with_capacity(1);
         rows.push((0, row));
 
-        Ok(Box::new(ExecutorResult::new(
+        Ok(Some(Box::new(ExecutorResult::new(
             vec![cd.result_column_name.clone()],
             rows,
-        )))
+        ))))
     }
 
     /// Compile and execute COUNT(DISTINCT col), caching the compiled state
@@ -6951,7 +6970,7 @@ impl Executor {
             }
             CompiledExecution::CountDistinct(cd) => {
                 if self.engine.schema_epoch() == cd.cached_epoch {
-                    return Some(self.execute_compiled_count_distinct(cd));
+                    return self.execute_compiled_count_distinct(cd).transpose();
                 }
                 // Schema changed, continue to recompile
             }
@@ -7081,7 +7100,7 @@ impl Executor {
             }
         };
 
-        let table = match tx.get_statement_table(&table_name) {
+        let table = match tx.get_statement_table_at(&table_name, self.autocommit_view().as_ref()) {
             Ok(t) => t,
             Err(_) => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
@@ -7092,6 +7111,8 @@ impl Executor {
         // Cache only an available count; storage failures must reach the caller.
         let count = match table.get_partition_count(&column_name) {
             Ok(Some(c)) => c,
+            // An index that cannot answer for this statement may for the next
+            Ok(None) if table.get_index_on_column(&column_name).is_some() => return None,
             Ok(None) => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
                 return None;
@@ -7178,11 +7199,28 @@ impl Executor {
         &self,
         cs: &crate::executor::query_cache::CompiledCountStar,
     ) -> Result<Box<dyn QueryResult>> {
-        // Get table and count rows directly
-        let tx = self.engine.begin_transaction()?;
-        let table = tx.get_statement_table(&cs.table_name)?;
-
-        let count = table.row_count()?;
+        // Under read committed the table's own count is the latest committed
+        // one: it answers only when no commit published across its reads.
+        // Else the count is read through a view
+        let quiet_count = || -> Result<Option<usize>> {
+            let tx = self.engine.begin_transaction()?;
+            let table = tx.get_statement_table_at(&cs.table_name, None)?;
+            table.fast_row_count()
+        };
+        let read_committed =
+            self.engine.get_isolation_level() == crate::core::IsolationLevel::ReadCommitted;
+        let count = match read_committed.then(quiet_count).transpose()?.flatten() {
+            Some(count) => count,
+            None => {
+                let view = self.autocommit_view();
+                let tx = self.engine.begin_transaction()?;
+                let table = tx.get_statement_table_at(&cs.table_name, view.as_ref())?;
+                let count = table.row_count()?;
+                view.as_ref()
+                    .map_or(Ok(()), crate::storage::mvcc::registry::StatementView::held)?;
+                count
+            }
+        };
 
         // Build result
         let mut result_values = CompactVec::with_capacity(1);
@@ -7391,7 +7429,8 @@ impl Executor {
             }
         };
 
-        let table = match tx.get_statement_table(&table_name) {
+        let view = self.autocommit_view();
+        let table = match tx.get_statement_table_at(&table_name, view.as_ref()) {
             Ok(t) => t,
             Err(_) => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
@@ -7399,8 +7438,13 @@ impl Executor {
             }
         };
 
-        // Get the count
-        let count = match table.row_count() {
+        // Get the count; a truncate or drop that overtook the view leaves it
+        // to the run again
+        let count = match table.row_count().and_then(|count| {
+            view.as_ref()
+                .map_or(Ok(()), crate::storage::mvcc::registry::StatementView::held)
+                .map(|()| count)
+        }) {
             Ok(count) => count,
             Err(error) => return Some(Err(error)),
         };

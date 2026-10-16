@@ -41,7 +41,7 @@ use super::context::{
     get_cached_exists_schema, get_cached_in_subquery, get_cached_in_subquery_set,
     get_cached_scalar_subquery, get_cached_semi_join, get_exists_probe_fallback,
     subquery_cache_tables, BatchAggregateLookupInfo, CacheTables, ExecutionContext,
-    ExistsCorrelationInfo, SemiJoinOrigin, StatementSnapshot, SubqueryStamp,
+    ExistsCorrelationInfo, SemiJoinOrigin, SubqueryStamp,
 };
 use super::expression::compute_expression_hash;
 use super::index_optimizer::SetTest;
@@ -1223,16 +1223,18 @@ impl Executor {
         // A statement inside an explicit transaction carries its id
         if ctx.transaction_id().is_none() {
             if let Some(snapshot) = ctx.statement_snapshot() {
-                return Ok(snapshot.with_probe_table(name, f)?.flatten());
+                return Self::probe_through_snapshot(snapshot, ctx, name, f);
             }
         }
         let active = self.active_transaction.lock().unwrap();
         let table = match active.as_ref() {
-            Some(tx) => tx.transaction.get_statement_table(name),
+            Some(tx) => tx
+                .transaction
+                .get_statement_table_at(name, ctx.statement_view()),
             None => {
                 drop(active);
                 return match ctx.statement_snapshot() {
-                    Some(snapshot) => Ok(snapshot.with_probe_table(name, f)?.flatten()),
+                    Some(snapshot) => Self::probe_through_snapshot(snapshot, ctx, name, f),
                     None => Ok(None),
                 };
             }
@@ -1243,6 +1245,24 @@ impl Executor {
             Err(Error::TableNotFound(_)) => Ok(None),
             table => f(&*table?),
         }
+    }
+
+    /// [`Self::with_correlated_probe_table`] through `snapshot`. The tables
+    /// it keeps for the probes read through its own view, so a view the
+    /// statement took over a snapshot without one opens its table for itself
+    fn probe_through_snapshot<T>(
+        snapshot: &super::context::StatementSnapshot,
+        ctx: &ExecutionContext,
+        name: &str,
+        f: impl FnOnce(&dyn Table) -> Result<Option<T>>,
+    ) -> Result<Option<T>> {
+        if snapshot.view().is_none() && ctx.statement_view().is_some() {
+            return match snapshot.statement_table_at(name, ctx.statement_view()) {
+                Err(Error::TableNotFound(_)) => Ok(None),
+                table => f(&*table?),
+            };
+        }
+        Ok(snapshot.with_probe_table(name, f)?.flatten())
     }
 
     /// Visits the inner rows whose correlation column holds `key`, found by
@@ -2943,18 +2963,20 @@ impl Executor {
         }
         let tables = subquery_cache_tables(subquery)?;
         let key = Self::subquery_cache_key(subquery, ctx)?;
-        let stamp = self.subquery_cache_stamp(&tables)?;
+        let stamp = self.subquery_cache_stamp(&tables, ctx.statement_view())?;
         Some((key, stamp))
     }
 
     /// Whether a subquery under `ctx` reads committed rows no older than a
-    /// stamp taken before its read: no explicit transaction, and no
-    /// statement snapshot that keeps the rows of its start
+    /// stamp taken before its read: no explicit transaction and no statement
+    /// snapshot that keeps the rows of its start. A statement view answers
+    /// only through a stamp it sees whole
     fn reads_cacheable_rows(ctx: &ExecutionContext) -> bool {
         ctx.transaction_id().is_none()
-            && ctx
-                .statement_snapshot()
-                .is_none_or(StatementSnapshot::reads_latest)
+            && ctx.statement_snapshot().is_none_or(|snapshot| {
+                snapshot.reads_latest()
+                    || snapshot.view().is_some() && ctx.statement_view().is_some()
+            })
     }
 
     /// Whether the answer of `stmt` may change from one statement to the
@@ -4401,10 +4423,11 @@ impl Executor {
                 .non_correlated_where
                 .as_deref()
                 .is_none_or(|filter| expr_tables(filter, &mut filter_tables).is_some());
+        let view = ctx.statement_view();
         let cache_stamp = if !checkable {
             None
         } else if filter_tables.is_empty() {
-            self.subquery_cache_stamp(&[info.inner_table.as_str()])
+            self.subquery_cache_stamp(&[info.inner_table.as_str()], view)
         } else {
             let inner = info.inner_table.as_str();
             let names: smallvec::SmallVec<[&str; 4]> = std::iter::once(inner)
@@ -4415,7 +4438,7 @@ impl Executor {
                         .filter(|&table| !table.eq_ignore_ascii_case(inner)),
                 )
                 .collect();
-            self.subquery_cache_stamp(&names)
+            self.subquery_cache_stamp(&names, view)
         };
         if let Some(stamp) = &cache_stamp {
             if let Some(cached) = get_cached_semi_join(&origin, cache_key, stamp) {
