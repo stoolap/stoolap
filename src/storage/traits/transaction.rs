@@ -17,8 +17,6 @@
 
 use rustc_hash::FxHashMap;
 
-use std::sync::Arc;
-
 use crate::core::{IsolationLevel, Result, Schema, SchemaColumn};
 use crate::storage::expression::Expression;
 use crate::storage::mvcc::registry::StatementView;
@@ -130,7 +128,7 @@ pub trait Transaction: Send {
         &self,
         name: &str,
         _access: StatementAccess,
-        view: Arc<StatementView>,
+        view: StatementView,
     ) -> Result<Box<dyn Table>> {
         self.get_table_with_view(name, view)
     }
@@ -139,7 +137,7 @@ pub trait Transaction: Send {
     /// taken, and this transaction's own writes. It is for reading only; a
     /// write takes its handle from `get_table`, which reads the newest state.
     /// A snapshot transaction is refused: it reads at its own point
-    fn get_table_with_view(&self, name: &str, view: Arc<StatementView>) -> Result<Box<dyn Table>>;
+    fn get_table_with_view(&self, name: &str, view: StatementView) -> Result<Box<dyn Table>>;
 
     /// Lists all table names
     fn list_tables(&self) -> Result<Vec<String>>;
@@ -271,7 +269,7 @@ pub(crate) trait StatementTable {
     fn get_statement_table_at(
         &self,
         name: &str,
-        view: Option<&Arc<StatementView>>,
+        view: Option<&StatementView>,
     ) -> Result<Box<dyn Table>>;
 }
 
@@ -285,12 +283,10 @@ impl<T: Transaction + ?Sized> StatementTable for T {
     fn get_statement_table_at(
         &self,
         name: &str,
-        view: Option<&Arc<StatementView>>,
+        view: Option<&StatementView>,
     ) -> Result<Box<dyn Table>> {
         match view {
-            Some(view) => {
-                self.get_table_ungated_with_view(name, StatementAccess(()), Arc::clone(view))
-            }
+            Some(view) => self.get_table_ungated_with_view(name, StatementAccess(()), view.clone()),
             None => self.get_table_ungated(name, StatementAccess(())),
         }
     }

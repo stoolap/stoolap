@@ -180,6 +180,44 @@ fn changes_session(statement: &Statement) -> bool {
     )
 }
 
+/// Whether `statement` reads committed rows beyond the target it writes: a
+/// SELECT, or DML with a query, a subquery or a CTE. Its reads then go
+/// through one statement view; the write and its target keep the newest
+fn reads_through_a_view(statement: &Statement) -> bool {
+    use crate::parser::ast::Expression;
+    let any = |exprs: &[Expression]| exprs.iter().any(Executor::has_subqueries);
+    let maybe =
+        |expr: &Option<Box<Expression>>| expr.as_deref().is_some_and(Executor::has_subqueries);
+    match statement {
+        Statement::Select(_) => true,
+        Statement::Insert(stmt) => insert_reads_through_a_view(stmt),
+        Statement::Update(stmt) => {
+            stmt.with.is_some()
+                || maybe(&stmt.where_clause)
+                || stmt.updates.values().any(Executor::has_subqueries)
+                || any(&stmt.returning)
+        }
+        Statement::Delete(stmt) => {
+            stmt.with.is_some() || maybe(&stmt.where_clause) || any(&stmt.returning)
+        }
+        _ => false,
+    }
+}
+
+/// [`reads_through_a_view`] for an INSERT: a query source, or a subquery in
+/// its values, its conflict update or its RETURNING
+pub(crate) fn insert_reads_through_a_view(stmt: &crate::parser::ast::InsertStatement) -> bool {
+    let any = |exprs: &[crate::parser::ast::Expression]| exprs.iter().any(Executor::has_subqueries);
+    stmt.select.is_some()
+        || stmt.values.iter().any(|row| any(row))
+        || any(&stmt.update_expressions)
+        || stmt
+            .update_where
+            .as_deref()
+            .is_some_and(Executor::has_subqueries)
+        || any(&stmt.returning)
+}
+
 /// SQL Query Executor
 ///
 /// The executor is the main entry point for executing SQL statements.
@@ -202,7 +240,19 @@ pub struct Executor {
     active_transaction: Mutex<Option<ActiveTransaction>>,
     /// Query planner for cost-based optimization (lazily initialized)
     query_planner: std::sync::OnceLock<QueryPlanner>,
+    /// The memory of views this executor took, for a capture to take again
+    /// once no handle holds it; never locked across a capture
+    view_spares: parking_lot::Mutex<
+        smallvec::SmallVec<[Arc<crate::storage::mvcc::registry::ViewState>; VIEW_SPARES]>,
+    >,
 }
+
+/// The view memories an executor keeps for its next statements
+const VIEW_SPARES: usize = 4;
+
+/// The runs a SELECT gets, the first included, when a truncate or drop
+/// overtakes its view
+const STATEMENT_RUNS: usize = 3;
 
 impl Executor {
     /// Create a new executor with the given storage engine
@@ -218,6 +268,7 @@ impl Executor {
             statement_gate: RwLock::new(()),
             active_transaction: Mutex::new(None),
             query_planner: std::sync::OnceLock::new(),
+            view_spares: parking_lot::Mutex::new(smallvec::SmallVec::new()),
         }
     }
 
@@ -237,6 +288,7 @@ impl Executor {
             statement_gate: RwLock::new(()),
             active_transaction: Mutex::new(None),
             query_planner: std::sync::OnceLock::new(),
+            view_spares: parking_lot::Mutex::new(smallvec::SmallVec::new()),
         }
     }
 
@@ -253,6 +305,7 @@ impl Executor {
             statement_gate: RwLock::new(()),
             active_transaction: Mutex::new(None),
             query_planner: std::sync::OnceLock::new(),
+            view_spares: parking_lot::Mutex::new(smallvec::SmallVec::new()),
         }
     }
 
@@ -327,8 +380,7 @@ impl Executor {
     /// It parses the query and executes each statement in order.
     /// Uses the query cache to avoid re-parsing identical queries.
     pub fn execute(&self, sql: &str) -> Result<Box<dyn QueryResult>> {
-        let ctx = ExecutionContext::new();
-        self.execute_cached(sql, &ctx)
+        self.execute_cached(sql, std::borrow::Cow::Owned(ExecutionContext::new()))
     }
 
     /// Execute a SQL query with positional parameters
@@ -337,8 +389,10 @@ impl Executor {
     /// Uses the query cache for efficient re-execution of parameterized queries.
     /// Note: Callers should try try_fast_path_with_params() first before calling this.
     pub fn execute_with_params(&self, sql: &str, params: ParamVec) -> Result<Box<dyn QueryResult>> {
-        let ctx = ExecutionContext::with_params(params);
-        self.execute_cached(sql, &ctx)
+        self.execute_cached(
+            sql,
+            std::borrow::Cow::Owned(ExecutionContext::with_params(params)),
+        )
     }
 
     /// Try fast path execution with borrowed params slice
@@ -384,7 +438,7 @@ impl Executor {
         params: FxHashMap<String, Value>,
     ) -> Result<Box<dyn QueryResult>> {
         let ctx = ExecutionContext::with_named_params(params);
-        self.execute_cached(sql, &ctx)
+        self.execute_cached(sql, std::borrow::Cow::Owned(ctx))
     }
 
     /// Execute a SQL query with a full execution context
@@ -394,7 +448,17 @@ impl Executor {
         sql: &str,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        self.execute_cached(sql, ctx)
+        self.execute_cached(sql, std::borrow::Cow::Borrowed(ctx))
+    }
+
+    /// [`Self::execute_with_context`] for a context the caller gives up: a
+    /// statement's view goes into it without a copy
+    pub(crate) fn execute_with_owned_context(
+        &self,
+        sql: &str,
+        ctx: ExecutionContext,
+    ) -> Result<Box<dyn QueryResult>> {
+        self.execute_cached(sql, std::borrow::Cow::Owned(ctx))
     }
 
     /// Execute a SQL query using the query cache
@@ -402,7 +466,11 @@ impl Executor {
     /// This method first checks the cache for a previously parsed statement.
     /// If found, it uses the cached AST. Otherwise, it parses the query
     /// and caches the result for future use.
-    fn execute_cached(&self, sql: &str, ctx: &ExecutionContext) -> Result<Box<dyn QueryResult>> {
+    fn execute_cached(
+        &self,
+        sql: &str,
+        ctx: std::borrow::Cow<'_, ExecutionContext>,
+    ) -> Result<Box<dyn QueryResult>> {
         // Try to get from cache
         if let Some(cached) = self.query_cache.get(sql) {
             // Validate parameter count if query has parameters
@@ -422,7 +490,7 @@ impl Executor {
             // the txn-state capture so the hot prepared-INSERT path takes
             // the transaction mutex only once.
             if let Statement::Insert(stmt) = cached.statement.as_ref() {
-                return self.execute_insert_with_compiled_cache(stmt, ctx, &cached.compiled);
+                return self.execute_insert_with_compiled_cache(stmt, &ctx, &cached.compiled);
             }
 
             // Capture transaction state once for the rest of the statement:
@@ -431,9 +499,9 @@ impl Executor {
             // cached statements.
             let active_txn_id = self.gated_txn_id(&gate);
 
-            if let Some(result) = self.try_compiled_fast_paths(
+            if let Some(result) = self.compiled_fast_paths_until_held(
                 cached.statement.as_ref(),
-                ctx,
+                &ctx,
                 &cached.compiled,
                 active_txn_id.is_some(),
             ) {
@@ -469,14 +537,14 @@ impl Executor {
             let gate = self.enter(changes_session(&stmt_arc));
 
             if let Statement::Insert(stmt) = stmt_arc.as_ref() {
-                return self.execute_insert_with_compiled_cache(stmt, ctx, &cached_plan.compiled);
+                return self.execute_insert_with_compiled_cache(stmt, &ctx, &cached_plan.compiled);
             }
 
             let active_txn_id = self.gated_txn_id(&gate);
 
-            if let Some(result) = self.try_compiled_fast_paths(
+            if let Some(result) = self.compiled_fast_paths_until_held(
                 stmt_arc.as_ref(),
-                ctx,
+                &ctx,
                 &cached_plan.compiled,
                 active_txn_id.is_some(),
             ) {
@@ -496,7 +564,7 @@ impl Executor {
         // One gate for the whole program, so no other statement on this
         // session runs between its statements
         let _gate = self.enter(true);
-        self.run_program(&program, ctx)
+        self.run_program(&program, &ctx)
     }
 
     /// Current explicit-transaction id, if one is active.
@@ -526,6 +594,53 @@ impl Executor {
     /// Inside an explicit transaction (`in_txn`) only the PK lookup runs, read
     /// through the transaction; the COUNT and UPDATE/DELETE probes read
     /// committed state only and must not fire.
+    ///
+    /// A SELECT whose own view a truncate or drop overtook runs again, under
+    /// the same bound as the regular path
+    #[inline]
+    fn compiled_fast_paths_until_held(
+        &self,
+        statement: &Statement,
+        ctx: &ExecutionContext,
+        compiled: &Arc<std::sync::RwLock<query_cache::CompiledExecution>>,
+        in_txn: bool,
+    ) -> Option<Result<Box<dyn QueryResult>>> {
+        let mut runs = 1;
+        loop {
+            let result = self.try_compiled_fast_paths(statement, ctx, compiled, in_txn);
+            let again = matches!(result, Some(Err(Error::ViewOvertaken)))
+                && runs < STATEMENT_RUNS
+                && matches!(statement, Statement::Select(_))
+                && ctx.statement_view().is_none()
+                && !self.function_registry.has_registered_functions();
+            if !again {
+                return result;
+            }
+            if let Err(e) = self.wait_out_destruction(ctx) {
+                return Some(Err(e));
+            }
+            runs += 1;
+        }
+    }
+
+    /// Waits, holding no lock, until no truncate or drop is taking rows
+    /// away, so a view taken next is not overtaken from its start. A
+    /// cancelled or timed out statement stops waiting
+    fn wait_out_destruction(&self, ctx: &ExecutionContext) -> Result<()> {
+        let registry = self.engine.registry_ref();
+        let mut noted = false;
+        while registry.destruction_running() {
+            ctx.check_cancelled()?;
+            if !noted {
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::destruction_waited();
+                noted = true;
+            }
+            std::thread::yield_now();
+        }
+        ctx.check_cancelled()
+    }
+
     #[inline]
     fn try_compiled_fast_paths(
         &self,
@@ -540,7 +655,9 @@ impl Executor {
                 {
                     return Some(result);
                 }
-                if in_txn {
+                // The counts read committed state: a view the context holds
+                // is read through by the regular path
+                if in_txn || ctx.statement_view().is_some() {
                     return None;
                 }
                 if let Some(result) = self.try_fast_count_distinct_compiled(stmt, compiled) {
@@ -596,31 +713,46 @@ impl Executor {
     }
 
     /// The stamp a semantic cache read of `table_name` happens under now, or
-    /// None while a commit is publishing to it or its table is being replaced
-    fn semantic_cache_stamp(&self, table_name: &str) -> Option<semantic_cache::CacheStamp> {
+    /// None while a commit is publishing to it, its table is being replaced,
+    /// or `view` misses a commit it published: a stamp names the newest state.
+    /// `read` takes what it needs of the table's store in the same state
+    fn semantic_cache_stamp<R>(
+        &self,
+        table_name: &str,
+        view: Option<&crate::storage::mvcc::registry::StatementView>,
+        read: impl FnOnce(&crate::storage::mvcc::version_store::VersionStore) -> R,
+    ) -> Option<(semantic_cache::CacheStamp, R)> {
         let schema = self.engine.schema_epoch();
         let store = self.engine.get_version_store(table_name).ok()?;
         let publish = store.publish_epoch_if_quiet()?;
+        if view.is_some_and(|view| !store.view_sees_newest(view)) {
+            return None;
+        }
+        let read = read(&store);
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::cache_stamp_publish_read();
         // DDL bumps the schema epoch after swapping the store, so an unchanged
         // epoch means the publish epoch belongs to this table's store
         (self.engine.schema_epoch() == schema)
-            .then_some(semantic_cache::CacheStamp { publish, schema })
+            .then_some((semantic_cache::CacheStamp { publish, schema }, read))
     }
 
     /// The stamp a cached subquery result over `tables` is read under now,
-    /// or None while a commit is publishing to one of them or one of them is
-    /// not a table of this engine
+    /// or None while a commit is publishing to one of them, one of them is
+    /// not a table of this engine, or `view` misses a commit one published
     pub(crate) fn subquery_cache_stamp<T: AsRef<str>>(
         &self,
         tables: &[T],
+        view: Option<&crate::storage::mvcc::registry::StatementView>,
     ) -> Option<context::SubqueryStamp> {
         let schema = self.engine.schema_epoch();
         let mut publish = smallvec::SmallVec::with_capacity(tables.len());
         for table in tables {
             let store = self.engine.get_version_store(table.as_ref()).ok()?;
             publish.push(store.publish_epoch_if_quiet()?);
+            if view.is_some_and(|view| !store.view_sees_newest(view)) {
+                return None;
+            }
         }
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::cache_stamp_publish_read();
@@ -685,7 +817,13 @@ impl Executor {
         statement: &Statement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        self.execute_statement_inner(statement, ctx, self.active_txn_id(), None, None)
+        self.execute_statement_inner(
+            statement,
+            std::borrow::Cow::Borrowed(ctx),
+            self.active_txn_id(),
+            None,
+            None,
+        )
     }
 
     /// Execute a single statement with pre-captured transaction state.
@@ -698,7 +836,7 @@ impl Executor {
     fn execute_statement_inner(
         &self,
         statement: &Statement,
-        ctx: &ExecutionContext,
+        ctx: std::borrow::Cow<'_, ExecutionContext>,
         active_txn_id: Option<i64>,
         plan_classification: Option<
             &std::sync::OnceLock<Arc<query_classification::QueryClassification>>,
@@ -711,15 +849,116 @@ impl Executor {
         }
         // If there's an active transaction, inject the transaction ID into the context
         // This enables CURRENT_TRANSACTION_ID() function to return the correct value
-        let ctx_with_txn;
-        let ctx = match active_txn_id {
-            Some(txn_id) => {
-                ctx_with_txn = ctx.with_transaction_id(txn_id as u64);
-                &ctx_with_txn
+        // and the statement's view goes into the same context: one the caller
+        // owns takes both in place, a borrowed one is copied once
+        let select = matches!(statement, Statement::Select(_));
+        // A timed SELECT's deadline counts from before its first view
+        let started = (select && ctx.timeout_ms() > 0).then(std::time::Instant::now);
+        // A whole answer the semantic cache holds needs no view
+        let mut semantic_miss = None;
+        if let (Statement::Select(stmt), None, Some(slot)) =
+            (statement, active_txn_id, plan_classification)
+        {
+            let classification =
+                slot.get_or_init(|| query_classification::get_classification(stmt));
+            match self.semantic_cache_before_view(stmt, &ctx, classification)? {
+                query::EarlySemantic::Hit(result) => return Ok(result),
+                query::EarlySemantic::Miss(miss) => semantic_miss = Some(miss),
+                query::EarlySemantic::NotTried => {}
             }
-            None => ctx,
+        }
+        let view = self.statement_view(reads_through_a_view(statement), &ctx, active_txn_id);
+        let took_view = view.is_some();
+        let ctx = match (active_txn_id, view) {
+            (None, None) => ctx,
+            (txn_id, view) => {
+                let mut owned = ctx.into_owned();
+                if let Some(txn_id) = txn_id {
+                    owned = owned.into_transaction_id(txn_id as u64);
+                }
+                if let Some(view) = view {
+                    owned = owned.into_statement_view(view);
+                    if let Some(miss) = semantic_miss {
+                        owned = owned.into_semantic_miss(miss);
+                    }
+                }
+                std::borrow::Cow::Owned(owned)
+            }
         };
+        if select {
+            let started = started.filter(|_| took_view);
+            return self.select_until_held(
+                statement,
+                ctx,
+                took_view,
+                started,
+                plan_classification,
+                compiled,
+            );
+        }
+        self.dispatch_statement(statement, &ctx, plan_classification, compiled)
+    }
 
+    /// A SELECT, run again with a fresh view when a truncate or drop
+    /// overtakes the one it took: at most three runs in all, inside the
+    /// deadline of the first. A view the caller gave, or one a function
+    /// registered after the built-ins may not survive running twice, ends
+    /// it with the error instead
+    fn select_until_held(
+        &self,
+        statement: &Statement,
+        mut ctx: std::borrow::Cow<'_, ExecutionContext>,
+        took_view: bool,
+        started: Option<std::time::Instant>,
+        plan_classification: Option<
+            &std::sync::OnceLock<Arc<query_classification::QueryClassification>>,
+        >,
+        compiled: Option<&std::sync::RwLock<query_cache::CompiledExecution>>,
+    ) -> Result<Box<dyn QueryResult>> {
+        let mut _deadline = None;
+        for attempt in 1..=STATEMENT_RUNS {
+            let result = self.dispatch_statement(statement, &ctx, plan_classification, compiled);
+            // A result read whole through an overtaken view may hold what went
+            let overtaken = match &result {
+                Err(Error::ViewOvertaken) => true,
+                Ok(_) => ctx.view_held().is_err(),
+                Err(_) => false,
+            };
+            if !overtaken {
+                return result;
+            }
+            drop(result);
+            if !took_view
+                || attempt == STATEMENT_RUNS
+                || self.function_registry.has_registered_functions()
+            {
+                return Err(Error::ViewOvertaken);
+            }
+            if let (Some(started), None) = (started, &_deadline) {
+                let spent = started.elapsed().as_millis() as u64;
+                let Some(left) = ctx.timeout_ms().checked_sub(spent).filter(|&ms| ms > 0) else {
+                    return Err(Error::QueryCancelled);
+                };
+                _deadline = TimeoutGuard::for_ms(&ctx, left);
+            }
+            self.wait_out_destruction(&ctx)?;
+            let statement_ctx = ctx.to_mut();
+            drop(statement_ctx.take_statement_view());
+            statement_ctx.set_statement_view(self.capture_view());
+        }
+        Err(Error::ViewOvertaken)
+    }
+
+    /// Runs `statement` in `ctx`, which holds its transaction and its view
+    fn dispatch_statement(
+        &self,
+        statement: &Statement,
+        ctx: &ExecutionContext,
+        plan_classification: Option<
+            &std::sync::OnceLock<Arc<query_classification::QueryClassification>>,
+        >,
+        compiled: Option<&std::sync::RwLock<query_cache::CompiledExecution>>,
+    ) -> Result<Box<dyn QueryResult>> {
         match statement {
             // DDL statements
             Statement::CreateTable(stmt) => self.execute_create_table(stmt, ctx),
@@ -771,6 +1010,54 @@ impl Executor {
             Statement::Vacuum(stmt) => self.execute_vacuum(stmt, ctx),
             Statement::Copy(stmt) => self.execute_copy(stmt, ctx),
         }
+    }
+
+    /// The view a read committed statement's reads see, taken before its
+    /// first read; None when the statement already has one, reads nothing
+    /// through one, or runs in a snapshot, which reads at its own point
+    pub(crate) fn statement_view(
+        &self,
+        reads: bool,
+        ctx: &ExecutionContext,
+        active_txn_id: Option<i64>,
+    ) -> Option<crate::storage::mvcc::registry::StatementView> {
+        if ctx.statement_view().is_some() || !reads {
+            return None;
+        }
+        let level = match active_txn_id {
+            Some(txn_id) => self.engine.registry_ref().get_isolation_level(txn_id),
+            None => self.engine.get_isolation_level(),
+        };
+        (level == crate::core::IsolationLevel::ReadCommitted).then(|| self.capture_view())
+    }
+
+    /// A view of the commits complete now, in the memory of one this executor
+    /// took before when no handle holds that any more
+    pub(crate) fn capture_view(&self) -> crate::storage::mvcc::registry::StatementView {
+        let spare = {
+            let mut spares = self.view_spares.lock();
+            let free = spares
+                .iter_mut()
+                .position(|state| Arc::get_mut(state).is_some());
+            free.map(|at| spares.swap_remove(at))
+        };
+        let view = self.engine.registry_ref().capture_view_reusing(spare);
+        {
+            let mut spares = self.view_spares.lock();
+            if spares.len() < VIEW_SPARES {
+                spares.push(view.spare());
+            }
+        }
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::statement_view_taken();
+        view
+    }
+
+    /// A view of the commits complete now, for an autocommit read under read
+    /// committed; None under snapshot isolation, which reads at its own point
+    pub(crate) fn autocommit_view(&self) -> Option<crate::storage::mvcc::registry::StatementView> {
+        (self.engine.get_isolation_level() == crate::core::IsolationLevel::ReadCommitted)
+            .then(|| self.capture_view())
     }
 
     /// Install an external storage transaction as the active transaction.
@@ -846,6 +1133,24 @@ impl Executor {
         plan: &CachedPlanRef,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        self.execute_plan_in(plan, std::borrow::Cow::Borrowed(ctx))
+    }
+
+    /// [`Self::execute_with_cached_plan`] for a context the caller gives up:
+    /// a statement's view goes into it without a copy
+    pub(crate) fn execute_with_cached_plan_owned(
+        &self,
+        plan: &CachedPlanRef,
+        ctx: ExecutionContext,
+    ) -> Result<Box<dyn QueryResult>> {
+        self.execute_plan_in(plan, std::borrow::Cow::Owned(ctx))
+    }
+
+    fn execute_plan_in(
+        &self,
+        plan: &CachedPlanRef,
+        ctx: std::borrow::Cow<'_, ExecutionContext>,
+    ) -> Result<Box<dyn QueryResult>> {
         // Validate parameter count
         if plan.has_params {
             let provided = ctx.params().len();
@@ -862,13 +1167,13 @@ impl Executor {
         // INSERT handles the active transaction itself; dispatch before the
         // txn-state capture so prepared INSERT takes the mutex only once.
         if let Statement::Insert(stmt) = plan.statement.as_ref() {
-            return self.execute_insert_with_compiled_cache(stmt, ctx, &plan.compiled);
+            return self.execute_insert_with_compiled_cache(stmt, &ctx, &plan.compiled);
         }
 
         let active_txn_id = self.gated_txn_id(&gate);
-        if let Some(result) = self.try_compiled_fast_paths(
+        if let Some(result) = self.compiled_fast_paths_until_held(
             plan.statement.as_ref(),
-            ctx,
+            &ctx,
             &plan.compiled,
             active_txn_id.is_some(),
         ) {
@@ -1050,6 +1355,33 @@ mod tests {
         let engine = MVCCEngine::in_memory();
         engine.open_engine().unwrap();
         Executor::new(Arc::new(engine))
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[test]
+    fn a_view_memory_is_taken_again_only_once_its_last_handle_unregistered() {
+        type Memory = *const crate::storage::mvcc::registry::ViewState;
+        let executor = std::rc::Rc::new(create_test_executor());
+        let first = executor.capture_view();
+        let first_memory: Memory = Arc::as_ptr(&first.spare());
+        let seen = std::rc::Rc::new(std::cell::Cell::new(None::<Memory>));
+        let (inner, slot) = (std::rc::Rc::clone(&executor), std::rc::Rc::clone(&seen));
+        crate::test_failpoints::on_last_view_lease_released(move || {
+            let second = inner.capture_view();
+            slot.set(Some(Arc::as_ptr(&second.spare())));
+        });
+        drop(first);
+        let second_memory = seen.get().expect("the last handle's release ran the hook");
+        assert_ne!(
+            second_memory, first_memory,
+            "a capture took the memory of a view still registered"
+        );
+        let third = executor.capture_view();
+        assert_eq!(
+            Arc::as_ptr(&third.spare()),
+            first_memory,
+            "a capture took new memory though the first view's was free"
+        );
     }
 
     #[test]

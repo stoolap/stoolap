@@ -186,7 +186,12 @@ fn a_row_updated_during_a_seal_does_not_come_back_from_its_sealed_copy() {
         expected,
         "once the seal is done"
     );
-    assert_eq!(rows, expected, "row 15 no longer matches, inside the seal");
+    // The statement's view was taken before the update
+    let viewed: Vec<(i64, i64)> = (1..=20).map(|id| (id, id)).collect();
+    assert_eq!(
+        rows, viewed,
+        "row 15 once, as the view saw it, inside the seal"
+    );
 }
 
 #[test]

@@ -32,6 +32,7 @@ use crate::common::{CompactArc, SmartString};
 use crate::core::{Error, Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::{Expression, SelectStatement};
 use crate::storage::expression::ConstBoolExpr;
+use crate::storage::mvcc::registry::StatementView;
 use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::traits::transaction::StatementTable;
 use crate::storage::traits::{Engine, QueryResult};
@@ -128,7 +129,7 @@ impl Executor {
             self.extract_pk_lookup_info(table_name, where_clause, &stmt.columns, ctx)?;
 
         // Execute the fast-path lookup
-        or_normal_path(self.execute_pk_lookup(lookup_info, in_txn))
+        or_normal_path(self.execute_pk_lookup(lookup_info, in_txn, ctx.statement_view()))
     }
 
     /// True for `SELECT *` or a list of plain column names; anything else
@@ -338,41 +339,90 @@ impl Executor {
 
     /// The row with id `pk_value`: committed state outside a transaction,
     /// else what the active transaction sees through a handle taken for this
-    /// statement, refused as SchemaChanged unless it holds layout `token`
+    /// statement, refused as SchemaChanged unless it holds layout `token`.
+    /// A view the statement already took, `taken`, holds the read to it
     fn fetch_pk_row(
         &self,
         table_name: &str,
         pk_value: i64,
         token: LayoutToken,
         in_txn: bool,
+        taken: Option<&crate::storage::mvcc::registry::StatementView>,
     ) -> Result<RowVec> {
+        let read_committed = |level| level == crate::core::IsolationLevel::ReadCommitted;
         if !in_txn {
-            return self
-                .engine
-                .fetch_rows_by_ids(table_name, &[pk_value], token);
+            if taken.is_none() {
+                // Under read committed a committed, live head is this row's
+                // latest committed state whatever else publishes to the table
+                let latest = if read_committed(self.engine.get_isolation_level()) {
+                    self.engine.fetch_latest_row(table_name, pk_value, token)?
+                } else {
+                    self.engine
+                        .fetch_rows_by_ids_settled(table_name, &[pk_value], token, true)?
+                };
+                if let Some(rows) = latest {
+                    return Ok(rows);
+                }
+            }
+            // A commit is publishing to the table: read the commits complete
+            // now through a view, or at a snapshot's own point
+            let view = taken.cloned().or_else(|| self.autocommit_view());
+            if let Some(view) = view.as_ref() {
+                if let Some(rows) =
+                    self.engine
+                        .fetch_hot_rows_at(table_name, &[pk_value], token, view)?
+                {
+                    view.held()?;
+                    return Ok(rows);
+                }
+            }
+            let tx = self.engine.begin_transaction()?;
+            let table = tx.get_statement_table_at(table_name, view.as_ref())?;
+            check_compiled_token(&*table, token)?;
+            let rows = table.fetch_rows_by_ids(&[pk_value], &ConstBoolExpr::true_expr())?;
+            view.as_ref().map_or(Ok(()), StatementView::held)?;
+            return Ok(rows);
         }
-        let table = {
+        let (table, view) = {
             let active = self
                 .active_transaction
                 .lock()
                 .map_err(|_| Error::internal("active transaction lock poisoned"))?;
             // A missing transaction or table is the normal path's to report
-            let table = active
-                .as_ref()
-                .and_then(|tx| tx.transaction.get_statement_table(table_name).ok());
-            table.ok_or_else(|| Error::SchemaChanged {
+            let found = active.as_ref().and_then(|tx| {
+                let level = self
+                    .engine
+                    .registry()
+                    .get_isolation_level(tx.transaction.id());
+                let view = match taken {
+                    Some(view) => Some(view.clone()),
+                    None => read_committed(level).then(|| self.capture_view()),
+                };
+                tx.transaction
+                    .get_statement_table_at(table_name, view.as_ref())
+                    .ok()
+                    .map(|table| (table, view))
+            });
+            found.ok_or_else(|| Error::SchemaChanged {
                 table: table_name.to_string(),
             })?
         };
         check_compiled_token(&*table, token)?;
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("exec.pk_lookup_in_transaction");
-        table.fetch_rows_by_ids(&[pk_value], &ConstBoolExpr::true_expr())
+        let rows = table.fetch_rows_by_ids(&[pk_value], &ConstBoolExpr::true_expr())?;
+        view.as_ref().map_or(Ok(()), StatementView::held)?;
+        Ok(rows)
     }
 
     /// Execute the fast-path PK lookup
-    fn execute_pk_lookup(&self, info: PkLookupInfo, in_txn: bool) -> Result<Box<dyn QueryResult>> {
-        let rows = self.fetch_pk_row(&info.table_name, info.pk_value, info.token, in_txn)?;
+    fn execute_pk_lookup(
+        &self,
+        info: PkLookupInfo,
+        in_txn: bool,
+        taken: Option<&crate::storage::mvcc::registry::StatementView>,
+    ) -> Result<Box<dyn QueryResult>> {
+        let rows = self.fetch_pk_row(&info.table_name, info.pk_value, info.token, in_txn, taken)?;
 
         // Extract Row values and normalize to current schema (handles ADD/DROP COLUMN)
         let result_rows: RowVec = rows
@@ -438,9 +488,12 @@ impl Executor {
                         let pk_value = self.extract_pk_value_fast(&lookup.pk_value_source, ctx)?;
                         #[cfg(feature = "test-failpoints")]
                         crate::test_failpoints::compiled_epoch_checked();
-                        return or_normal_path(
-                            self.execute_compiled_pk_lookup(lookup, pk_value, in_txn),
-                        );
+                        return or_normal_path(self.execute_compiled_pk_lookup(
+                            lookup,
+                            pk_value,
+                            in_txn,
+                            ctx.statement_view(),
+                        ));
                     }
                     // Epoch changed - some DDL occurred, need to recompile
                     // Fall through to recompile path
@@ -527,7 +580,7 @@ impl Executor {
                     // Fast path: extract value from slice directly
                     let pk_value =
                         Self::extract_pk_value_from_slice(&lookup.pk_value_source, params)?;
-                    or_normal_path(self.execute_compiled_pk_lookup(lookup, pk_value, false))
+                    or_normal_path(self.execute_compiled_pk_lookup(lookup, pk_value, false, None))
                 } else {
                     // Epoch changed - need recompile, use normal path
                     None
@@ -544,8 +597,9 @@ impl Executor {
         lookup: &CompiledPkLookup,
         pk_value: i64,
         in_txn: bool,
+        taken: Option<&crate::storage::mvcc::registry::StatementView>,
     ) -> Result<Box<dyn QueryResult>> {
-        let rows = self.fetch_pk_row(&lookup.table_name, pk_value, lookup.token, in_txn)?;
+        let rows = self.fetch_pk_row(&lookup.table_name, pk_value, lookup.token, in_txn, taken)?;
         // Normalize rows to current schema (handles ADD/DROP COLUMN)
         // Pre-allocate with capacity 1 for single PK lookup (avoids realloc)
         let mut result_rows = RowVec::with_capacity(1);
@@ -587,9 +641,12 @@ impl Executor {
                 // Re-validate epoch: another thread may have compiled before DDL
                 if self.engine.schema_epoch() == lookup.cached_epoch {
                     let pk_value = self.extract_pk_value_fast(&lookup.pk_value_source, ctx)?;
-                    return or_normal_path(
-                        self.execute_compiled_pk_lookup(lookup, pk_value, in_txn),
-                    );
+                    return or_normal_path(self.execute_compiled_pk_lookup(
+                        lookup,
+                        pk_value,
+                        in_txn,
+                        ctx.statement_view(),
+                    ));
                 }
                 // Epoch changed since last compilation - fall through to recompile
             }
@@ -684,6 +741,7 @@ impl Executor {
                         token,
                     },
                     in_txn,
+                    ctx.statement_view(),
                 ))
             }
             None => {

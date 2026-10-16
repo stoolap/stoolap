@@ -145,10 +145,14 @@ impl Executor {
             _ => return Ok(None),
         };
 
-        // The index knows nothing of this transaction's own writes
+        // The index knows nothing of this transaction's own writes, and holds
+        // what the statement sees only while the table vouches for it
         if table.has_local_changes() {
             return Ok(None);
         }
+        let Some(epoch) = table.index_view_epoch() else {
+            return Ok(None);
+        };
 
         // Try to get value from index
         let value = if func.function == "MIN" {
@@ -156,6 +160,9 @@ impl Executor {
         } else {
             table.get_index_max_value(&column_name)
         };
+        if table.index_view_epoch() != Some(epoch) {
+            return Ok(None);
+        }
 
         if let Some(val) = value {
             // Build result - wrap columns in CompactArc once for zero-copy sharing
@@ -1281,6 +1288,9 @@ impl Executor {
         // when no LIMIT applies here
         let index = if !is_pk_column {
             match table.lookup_index_on_column(&column_name) {
+                // The index holds neither the transaction's own writes nor,
+                // once a commit the statement misses landed, its keys
+                Some(_) if table.index_view_epoch().is_none() => return Ok(None),
                 Some(idx) => Some(idx),
                 None if !is_negated
                     && Self::in_members_eligible(table, &column_name)
@@ -1498,6 +1508,7 @@ impl Executor {
             // NOT IN with non-PK index: fall back to normal scan
             return Ok(None);
         } else if let Some(ref idx) = index {
+            let epoch = table.index_view_epoch();
             // Index probe for each value - use _into to avoid intermediate allocations
             for value in &values {
                 // A NULL member equals nothing, so it is not looked up
@@ -1505,6 +1516,9 @@ impl Executor {
                     continue;
                 }
                 idx.get_row_ids_equal_into(std::slice::from_ref(value), &mut all_row_ids);
+            }
+            if epoch.is_none() || table.index_view_epoch() != epoch {
+                return Ok(None);
             }
         }
 
@@ -1809,6 +1823,9 @@ impl Executor {
                 }
             }
         } else if let Some(ref idx) = index {
+            // The index holds neither the transaction's own writes nor, once
+            // a commit the statement misses landed, its keys
+            let epoch = table.index_view_epoch();
             // Index probe for each value - use _into to avoid intermediate allocations
             for value in &values {
                 // A NULL member equals nothing, so it is not looked up
@@ -1816,6 +1833,9 @@ impl Executor {
                     continue;
                 }
                 idx.get_row_ids_equal_into(std::slice::from_ref(value), &mut all_row_ids);
+            }
+            if epoch.is_none() || table.index_view_epoch() != epoch {
+                return Ok(None);
             }
         }
 
@@ -2274,6 +2294,9 @@ impl Executor {
                 }
             }
         } else if let Some(ref idx) = index {
+            // The index holds neither the transaction's own writes nor, once
+            // a commit the statement misses landed, its keys
+            let epoch = table.index_view_epoch();
             // Index probe for each value - use _into to avoid intermediate allocations
             for value in values.iter() {
                 // Early termination check
@@ -2287,6 +2310,9 @@ impl Executor {
                     continue;
                 }
                 idx.get_row_ids_equal_into(std::slice::from_ref(value), &mut all_row_ids);
+            }
+            if epoch.is_none() || table.index_view_epoch() != epoch {
+                return Ok(None);
             }
         }
 

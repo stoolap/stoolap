@@ -792,11 +792,49 @@ pub trait Table: Send + Sync {
         None
     }
 
+    /// `index_view_epoch` for a probe whose rows are read through the
+    /// statement's view and checked against the key again: the indexes name
+    /// every row it sees under a key, maybe with rows it does not
+    fn candidate_view_epoch(&self) -> Option<u64> {
+        None
+    }
+
     /// The committed store's publish epoch while no commit is publishing;
     /// equal values before and after a read mean no version was published
     /// in between. None when the table cannot tell
     fn publish_epoch_if_quiet(&self) -> Option<u64> {
         None
+    }
+
+    /// Whether this handle sees the newest committed state: no snapshot, and
+    /// no statement view or one that sees every commit the table published.
+    /// Holds for a read between two equal `publish_epoch_if_quiet` answers
+    /// when asked after the first. False when the table cannot tell
+    fn sees_newest(&self) -> bool {
+        false
+    }
+
+    /// The publish epoch while the shared indexes hold the committed keys
+    /// this handle sees: `publish_epoch_if_quiet` when `sees_newest` holds.
+    /// The transaction's own writes are the caller's to merge. A probe made
+    /// under it answers when the same epoch holds after it
+    fn committed_index_epoch(&self) -> Option<u64> {
+        None
+    }
+
+    /// `committed_index_epoch` for a probe whose rows are checked against
+    /// the key again, as `candidate_view_epoch` is
+    fn committed_candidate_epoch(&self) -> Option<u64> {
+        None
+    }
+
+    /// Adds to `out`, after a probe of `index` for `key`, the rows a commit
+    /// the statement's view does not see took out under that key, keeping
+    /// `out` sorted and unique once it grows; false when the table cannot
+    /// give them all, and the probe answers nothing
+    fn add_removed_equal(&self, index: &dyn Index, key: &Value, out: &mut Vec<i64>) -> bool {
+        let _ = (index, key, out);
+        false
     }
 
     /// Runs `f` over the groups of a B-tree or primary-key index on

@@ -462,17 +462,10 @@ fn destructive_ddl_keeps_captured_files_without_restoring_them_on_reopen() {
                 "captured files must survive destructive DDL"
             );
         });
-        // A read the destructive DDL overtook is taken again: after a drop,
-        // on the dropped table, and after a truncate, on what was added since
+        // A read the destructive DDL overtook starts again with a new view:
+        // it reads the table as it is once the DDL is done
         let answer = db.query_one::<i64, _>("SELECT k FROM t ORDER BY k", ());
-        if drop_table {
-            assert!(
-                matches!(answer, Err(stoolap::Error::NoRowsReturned)),
-                "{answer:?}"
-            );
-        } else {
-            assert_eq!(answer.unwrap(), 20);
-        }
+        assert_eq!(answer.unwrap(), 20, "drop_table={drop_table}");
         let after = vol_files(dir.path());
         assert!(old_names.is_disjoint(&after));
         let value: i64 = db.query_one("SELECT k FROM t ORDER BY k", ()).unwrap();

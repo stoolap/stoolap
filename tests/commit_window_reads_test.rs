@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A read committed read of the hot store while another handle's commit
-//! publishes sees the state before that commit
+//! A read committed read while another handle's commit publishes sees the
+//! state before that commit, in the hot store and in the volumes
 
 #![cfg(feature = "test-failpoints")]
 
+use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -93,7 +94,16 @@ fn table(db: &Database) {
         .unwrap();
 }
 
-fn check(db: &Database) {
+fn open_file(dir: &Path) -> Database {
+    Database::open(&format!(
+        "file://{}?checkpoint_interval=3600",
+        dir.display()
+    ))
+    .unwrap()
+}
+
+/// The rows are sealed before each commit when `sealed`
+fn check(db: &Database, sealed: bool) {
     let mut wrong = Vec::new();
     for sql in [
         "UPDATE t SET v = 99 WHERE id = 1",
@@ -103,6 +113,9 @@ fn check(db: &Database) {
             (Stop::BeforeMarker, "marker"),
             (Stop::BeforeVisible, "visible"),
         ] {
+            if sealed {
+                db.engine().seal_for_test().unwrap();
+            }
             let before = answers(db);
             let during = answers_while_committing(db, sql, stop);
             for (seen, expected) in during.iter().zip(&before) {
@@ -124,5 +137,13 @@ fn check(db: &Database) {
 fn a_hot_read_during_a_commit_sees_the_state_before_it() {
     let db = Database::open("memory://commit_window_reads_hot").unwrap();
     table(&db);
-    check(&db);
+    check(&db, false);
+}
+
+#[test]
+fn a_cold_read_during_a_commit_sees_the_state_before_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_file(dir.path());
+    table(&db);
+    check(&db, true);
 }

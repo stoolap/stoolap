@@ -167,7 +167,7 @@ pub struct VolumeScanner {
     pub snapshot_seq: Option<u64>,
     /// The statement view of the read: a tombstone counts only when it sees
     /// the commit
-    pub view: Option<Arc<StatementView>>,
+    pub view: Option<StatementView>,
     /// Typed pre-filter predicates extracted from the WHERE clause.
     /// Evaluated directly on column data without Value construction.
     typed_predicates: Vec<ColumnPredicate>,
@@ -1585,7 +1585,14 @@ impl VolumeScanner {
 impl Scanner for VolumeScanner {
     fn next(&mut self) -> bool {
         match self.next_row() {
-            Ok(has_row) => has_row,
+            Ok(true) => true,
+            Ok(false) => {
+                // A truncate or drop under the view leaves the scan without its end
+                if self.view.as_ref().is_some_and(StatementView::overtaken) {
+                    self.error = Some(Error::ViewOvertaken);
+                }
+                false
+            }
             Err(error) => {
                 self.error = Some(error);
                 self.has_current = false;

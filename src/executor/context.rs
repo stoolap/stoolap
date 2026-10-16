@@ -911,9 +911,12 @@ pub struct StatementSnapshot(Arc<SnapshotState>);
 
 struct SnapshotState {
     transaction: Mutex<Box<dyn crate::storage::traits::Transaction>>,
-    /// Whether its reads see each commit as it lands (READ COMMITTED), so
-    /// a result read through it is no older than a stamp taken before the read
+    /// Whether its reads see each commit as it lands (READ COMMITTED with
+    /// no statement view), so a result read through it is no older than a
+    /// stamp taken before the read
     reads_latest: bool,
+    /// The statement view its tables are read through
+    view: Option<StatementView>,
     /// The first table the statement's correlated probes read, read without a lock
     first_probe_table: std::sync::OnceLock<ProbeTable>,
     /// Any further tables they read, taken once each
@@ -923,14 +926,17 @@ struct SnapshotState {
 type ProbeTable = (SmartString, Box<dyn crate::storage::traits::Table>);
 
 impl StatementSnapshot {
-    /// The statement's reads through `transaction`, begun at `isolation`
+    /// The statement's reads through `transaction`, begun at `isolation`,
+    /// and through `view` when the statement has one
     pub fn new(
         transaction: Box<dyn crate::storage::traits::Transaction>,
         isolation: crate::core::IsolationLevel,
+        view: Option<StatementView>,
     ) -> Self {
         Self(Arc::new(SnapshotState {
             transaction: Mutex::new(transaction),
-            reads_latest: isolation == crate::core::IsolationLevel::ReadCommitted,
+            reads_latest: isolation == crate::core::IsolationLevel::ReadCommitted && view.is_none(),
+            view,
             first_probe_table: std::sync::OnceLock::new(),
             probe_tables: Mutex::new(SmallVec::new()),
         }))
@@ -939,6 +945,11 @@ impl StatementSnapshot {
     /// Whether its reads see each commit as it lands
     pub(crate) fn reads_latest(&self) -> bool {
         self.0.reads_latest
+    }
+
+    /// The statement view its tables are read through
+    pub(crate) fn view(&self) -> Option<&StatementView> {
+        self.0.view.as_ref()
     }
 
     pub fn get_table(
@@ -952,16 +963,26 @@ impl StatementSnapshot {
             .get_table(name)
     }
 
-    /// The table the executor's own statements use, without the write gate
+    /// The table the executor's own statements use, without the write gate,
+    /// read through the statement's view when it has one
     pub(crate) fn statement_table(
         &self,
         name: &str,
+    ) -> crate::core::Result<Box<dyn crate::storage::traits::Table>> {
+        self.statement_table_at(name, self.0.view.as_ref())
+    }
+
+    /// The table read through `view`, None reading the newest committed state
+    pub(crate) fn statement_table_at(
+        &self,
+        name: &str,
+        view: Option<&StatementView>,
     ) -> crate::core::Result<Box<dyn crate::storage::traits::Table>> {
         self.0
             .transaction
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get_statement_table(name)
+            .get_statement_table_at(name, view)
     }
 
     /// Runs `f` on the table every correlated probe of the statement reads,
@@ -1052,7 +1073,23 @@ pub struct ExecutionContext {
     statement_snapshot: Option<StatementSnapshot>,
     /// The commits a read committed statement's reads see, taken once for
     /// the statement; None reads the newest committed state
-    statement_view: Option<Arc<StatementView>>,
+    statement_view: Option<StatementView>,
+    /// A DML target selected through a query: the scan of this table at
+    /// this query depth reads the newest state, the query's subqueries the view
+    newest_target: Option<(SmartString, usize)>,
+    /// A semantic cache miss at the statement's start, for its scan
+    semantic_miss: Option<SemanticMiss>,
+}
+
+/// What a semantic cache lookup that missed before the statement's view
+/// leaves the scan of that statement: its WHERE, simplified once, and no
+/// second lookup
+#[derive(Debug, Clone)]
+pub(crate) struct SemanticMiss {
+    /// The address of the `SelectStatement` the lookup was for
+    pub(crate) statement: usize,
+    /// The simplified WHERE, when simplifying changed it
+    pub(crate) simplified: Option<Arc<crate::parser::ast::Expression>>,
 }
 
 /// Type alias for CTE data: (columns, rows) with Arc for zero-copy sharing
@@ -1090,6 +1127,8 @@ impl ExecutionContext {
             transaction_id: None,
             statement_snapshot: None,
             statement_view: None,
+            newest_target: None,
+            semantic_miss: None,
         }
     }
 
@@ -1252,6 +1291,8 @@ impl ExecutionContext {
             transaction_id: self.transaction_id,
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
+            newest_target: self.newest_target.clone(),
+            semantic_miss: None,
         }
     }
 
@@ -1274,6 +1315,8 @@ impl ExecutionContext {
             transaction_id: self.transaction_id,
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
+            newest_target: self.newest_target.clone(),
+            semantic_miss: None,
         }
     }
 
@@ -1321,6 +1364,8 @@ impl ExecutionContext {
             transaction_id: self.transaction_id,
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
+            newest_target: self.newest_target.clone(),
+            semantic_miss: None,
         }
     }
 
@@ -1375,6 +1420,8 @@ impl ExecutionContext {
             transaction_id: self.transaction_id,
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
+            newest_target: self.newest_target.clone(),
+            semantic_miss: None,
         }
     }
 
@@ -1402,15 +1449,78 @@ impl ExecutionContext {
     }
 
     /// The statement view the statement's reads see, if it has one
-    pub fn statement_view(&self) -> Option<&Arc<StatementView>> {
+    pub fn statement_view(&self) -> Option<&StatementView> {
         self.statement_view.as_ref()
     }
 
+    /// Err once a truncate or drop overtook the statement's view: what the
+    /// statement read through it may be gone
+    pub(crate) fn view_held(&self) -> crate::core::Result<()> {
+        self.statement_view
+            .as_ref()
+            .map_or(Ok(()), StatementView::held)
+    }
+
     /// A copy of this context whose reads see `view`
-    pub fn with_statement_view(&self, view: Arc<StatementView>) -> Self {
+    pub fn with_statement_view(&self, view: StatementView) -> Self {
+        self.clone().into_statement_view(view)
+    }
+
+    /// This context, a statement's own copy, with its reads seeing `view`
+    pub(crate) fn into_statement_view(mut self, view: StatementView) -> Self {
+        self.statement_view = Some(view);
+        self
+    }
+
+    /// Lets go of the statement's view, in its own copy, before it takes
+    /// another: the old one goes first, so it keeps nothing past this
+    pub(crate) fn take_statement_view(&mut self) -> Option<StatementView> {
+        self.statement_view.take()
+    }
+
+    /// Sets the statement's view, in its own copy
+    pub(crate) fn set_statement_view(&mut self, view: StatementView) {
+        self.statement_view = Some(view);
+    }
+
+    /// A copy of this context in which the query run at this depth selects
+    /// the rows of `table` a DML writes: its scan of the table reads the
+    /// newest state, as the write does
+    pub(crate) fn with_newest_target(&self, table: &str) -> Self {
         let mut ctx = self.clone();
-        ctx.statement_view = Some(view);
+        ctx.newest_target = Some((SmartString::from(table), self.query_depth));
         ctx
+    }
+
+    /// The view a scan of `table` at this depth reads through: none for the
+    /// DML target a query selects, else the statement's
+    pub(crate) fn scan_view(&self, table: &str) -> Option<&StatementView> {
+        let target = self.newest_target.as_ref().is_some_and(|(name, depth)| {
+            *depth == self.query_depth && name.eq_ignore_ascii_case(table)
+        });
+        if target {
+            None
+        } else {
+            self.statement_view.as_ref()
+        }
+    }
+
+    /// The semantic cache miss the start of `statement` left, if it is the
+    /// statement this context's lookup was for
+    pub(crate) fn semantic_miss(
+        &self,
+        statement: &crate::parser::ast::SelectStatement,
+    ) -> Option<&SemanticMiss> {
+        let address = statement as *const _ as usize;
+        self.semantic_miss
+            .as_ref()
+            .filter(|miss| miss.statement == address)
+    }
+
+    /// This context, a statement's own copy, carrying the miss `miss`
+    pub(crate) fn into_semantic_miss(mut self, miss: SemanticMiss) -> Self {
+        self.semantic_miss = Some(miss);
+        self
     }
 
     pub fn with_transaction_id(&self, txn_id: u64) -> Self {
@@ -1430,7 +1540,15 @@ impl ExecutionContext {
             transaction_id: Some(txn_id),
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
+            newest_target: self.newest_target.clone(),
+            semantic_miss: self.semantic_miss.clone(),
         }
+    }
+
+    /// This context, a statement's own copy, run in transaction `txn_id`
+    pub(crate) fn into_transaction_id(mut self, txn_id: u64) -> Self {
+        self.transaction_id = Some(txn_id);
+        self
     }
 
     /// Check for cancellation and return an error if cancelled
@@ -1640,7 +1758,11 @@ impl TimeoutGuard {
     /// Create a new timeout guard that will cancel the query after timeout_ms.
     /// Returns None if timeout_ms is 0 (no timeout).
     pub fn new(ctx: &ExecutionContext) -> Option<Self> {
-        let timeout_ms = ctx.timeout_ms();
+        Self::for_ms(ctx, ctx.timeout_ms())
+    }
+
+    /// A guard cancelling `ctx`'s query `timeout_ms` from now; None for 0
+    pub(crate) fn for_ms(ctx: &ExecutionContext, timeout_ms: u64) -> Option<Self> {
         if timeout_ms == 0 {
             return None;
         }
@@ -1818,7 +1940,7 @@ mod tests {
     fn a_statement_view_is_kept_by_the_contexts_made_from_it() {
         let db = table_of_one_row("ctx_statement_view_kept");
         let view = db.engine().registry().capture_view();
-        let ctx = ExecutionContext::new().with_statement_view(Arc::clone(&view));
+        let ctx = ExecutionContext::new().with_statement_view(view.clone());
         let derived = [
             ctx.with_incremented_view_depth(),
             ctx.with_incremented_query_depth(),
@@ -1830,7 +1952,7 @@ mod tests {
         for derived in &derived {
             assert!(derived
                 .statement_view()
-                .is_some_and(|kept| Arc::ptr_eq(kept, &view)));
+                .is_some_and(|kept| Arc::ptr_eq(&kept.spare(), &view.spare())));
         }
         assert!(ExecutionContext::new().statement_view().is_none());
     }

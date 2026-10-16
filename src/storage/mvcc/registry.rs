@@ -321,6 +321,8 @@ struct TxnTable {
     committing: SmallVec<[i64; 4]>,
     /// The statement views alive now
     views: SmallVec<[LiveView; 4]>,
+    /// The id the next statement view takes
+    next_view_id: u64,
     /// The commit sequences of committed ids the status table holds no slot
     /// for, kept until no live view or base can ask about them
     slotless: I64Map<i64>,
@@ -332,6 +334,7 @@ impl TxnTable {
             map: I64Map::with_capacity(capacity),
             committing: SmallVec::new(),
             views: SmallVec::new(),
+            next_view_id: 0,
             slotless: I64Map::new(),
         }
     }
@@ -370,10 +373,10 @@ struct LiveView {
     base: i64,
 }
 
-/// One statement's view of the commits: those complete at its start, read
-/// through `is_visible_at`. Registered while it lives, so maintenance keeps
-/// what it reads and the commit metadata it asks about
-pub struct StatementView {
+/// The memory of a statement view. Its leases are the [`StatementView`]
+/// handles out; one memory is taken again only once no `Arc` of it is left
+/// but the caller's, which the last lease keeps until it has unregistered
+pub struct ViewState {
     registry: Arc<TransactionRegistry>,
     id: u64,
     /// The sequence the view was taken at
@@ -382,42 +385,103 @@ pub struct StatementView {
     in_flight: SmallVec<[i64; 4]>,
     /// Every id below this finished before the view was taken
     base: i64,
+    /// The registry's destruction epoch when the view was taken, and whether
+    /// a truncate or drop was taking rows away then
+    destructions: u64,
+    destroying: bool,
+    leases: AtomicUsize,
+}
+
+/// One statement's view of the commits: those complete at its start, read
+/// through `is_visible_at`. Registered while a handle lives, so maintenance
+/// keeps what it reads and the commit metadata it asks about
+pub struct StatementView {
+    state: Arc<ViewState>,
 }
 
 impl StatementView {
     /// The sequence the view was taken at
     pub fn seq(&self) -> i64 {
-        self.seq
+        self.state.seq
+    }
+
+    /// Whether a truncate or drop took rows away since the view was taken,
+    /// or while it was: what the view reads may be gone
+    #[inline]
+    pub fn overtaken(&self) -> bool {
+        self.state.destroying
+            || self
+                .state
+                .registry
+                .destruction_epoch
+                .load(Ordering::Acquire)
+                != self.state.destructions
+    }
+
+    /// Err once the view is overtaken: what was read through it may be gone
+    pub fn held(&self) -> crate::core::Result<()> {
+        if self.overtaken() {
+            return Err(crate::core::Error::ViewOvertaken);
+        }
+        Ok(())
     }
 
     /// Every commit at or below this sequence is visible to the view
     pub fn floor(&self) -> i64 {
-        self.in_flight.iter().min().map_or(self.seq, |&s| s - 1)
+        self.state
+            .in_flight
+            .iter()
+            .min()
+            .map_or(self.state.seq, |&s| s - 1)
     }
 
     /// Whether a commit that completed with `commit_seq` is visible to the view
     #[inline]
     pub fn sees_commit(&self, commit_seq: i64) -> bool {
-        commit_seq <= self.seq && !self.in_flight.contains(&commit_seq)
+        commit_seq <= self.state.seq && !self.state.in_flight.contains(&commit_seq)
+    }
+
+    /// The memory under this view, for a later capture to take again once
+    /// every handle is gone; it reads nothing through it
+    pub(crate) fn spare(&self) -> Arc<ViewState> {
+        Arc::clone(&self.state)
+    }
+}
+
+impl Clone for StatementView {
+    fn clone(&self) -> Self {
+        self.state.leases.fetch_add(1, Ordering::Relaxed);
+        Self {
+            state: Arc::clone(&self.state),
+        }
     }
 }
 
 impl std::fmt::Debug for StatementView {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StatementView")
-            .field("seq", &self.seq)
-            .field("in_flight", &self.in_flight)
-            .field("base", &self.base)
+            .field("seq", &self.state.seq)
+            .field("in_flight", &self.state.in_flight)
+            .field("base", &self.state.base)
             .finish()
     }
 }
 
 impl Drop for StatementView {
     fn drop(&mut self) {
-        let mut txns = self.registry.transactions.lock();
-        if let Some(position) = txns.views.iter().position(|view| view.id == self.id) {
+        // The last handle unregisters before its Arc goes, so no capture
+        // takes this memory again while it is still listed
+        if self.state.leases.fetch_sub(1, Ordering::Release) != 1 {
+            return;
+        }
+        fence(Ordering::Acquire);
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::last_view_lease_released();
+        let registry = &self.state.registry;
+        let mut txns = registry.transactions.lock();
+        if let Some(position) = txns.views.iter().position(|view| view.id == self.state.id) {
             txns.views.swap_remove(position);
-            self.registry.live_views.fetch_sub(1, Ordering::Release);
+            registry.live_views.fetch_sub(1, Ordering::Release);
         }
     }
 }
@@ -469,11 +533,34 @@ pub struct TransactionRegistry {
     /// Written before `base`, read after it.
     aborted_floor: AtomicI64,
 
-    /// The number the next statement view takes
-    next_view_id: AtomicU64,
-
     /// The number of live statement views; written under the transactions lock
     live_views: AtomicUsize,
+
+    /// Moves as a truncate or drop begins and again as it ends; written
+    /// under the transactions lock, read by a view checking it still holds
+    destruction_epoch: AtomicU64,
+
+    /// Truncates and drops taking rows away now; written under the
+    /// transactions lock, read there by a capture and outside it by a wait
+    destructions_active: AtomicU32,
+}
+
+/// A truncate or drop taking rows away, from `begin_destruction` until this
+/// drops on any exit: a view taken inside it, or before it, is overtaken
+pub struct ViewDestruction {
+    registry: Arc<TransactionRegistry>,
+}
+
+impl Drop for ViewDestruction {
+    fn drop(&mut self) {
+        let _txns = self.registry.transactions.lock();
+        self.registry
+            .destructions_active
+            .fetch_sub(1, Ordering::Release);
+        self.registry
+            .destruction_epoch
+            .fetch_add(1, Ordering::Release);
+    }
 }
 
 impl TransactionRegistry {
@@ -497,8 +584,9 @@ impl TransactionRegistry {
             status: TxnStatusTable::new(),
             base: AtomicI64::new(1),
             aborted_floor: AtomicI64::new(0),
-            next_view_id: AtomicU64::new(0),
             live_views: AtomicUsize::new(0),
+            destruction_epoch: AtomicU64::new(0),
+            destructions_active: AtomicU32::new(0),
         }
     }
 
@@ -1164,23 +1252,77 @@ impl TransactionRegistry {
     /// own writes, and nothing that completes later. Registered under the
     /// lock commits take their sequence in, so maintenance and the status
     /// table keep what it reads until it drops
-    pub fn capture_view(self: &Arc<Self>) -> Arc<StatementView> {
-        let id = self.next_view_id.fetch_add(1, Ordering::Relaxed);
+    pub fn capture_view(self: &Arc<Self>) -> StatementView {
+        self.capture_view_reusing(None)
+    }
+
+    /// Whether a truncate or drop is taking rows away now: a view taken while
+    /// one is would be overtaken from the start
+    pub fn destruction_running(&self) -> bool {
+        self.destructions_active.load(Ordering::Acquire) > 0
+    }
+
+    /// Marks a truncate or drop taking rows away until the guard drops. Taken
+    /// before the rows go, under the lock views are taken in
+    pub fn begin_destruction(self: &Arc<Self>) -> ViewDestruction {
+        let txns = self.transactions.lock();
+        self.destructions_active.fetch_add(1, Ordering::Release);
+        self.destruction_epoch.fetch_add(1, Ordering::Release);
+        drop(txns);
+        ViewDestruction {
+            registry: Arc::clone(self),
+        }
+    }
+
+    /// [`Self::capture_view`] into the memory `spare` when it is this
+    /// registry's and no other `Arc` of it is left, else into new memory.
+    /// The capture and its registration are the same either way
+    pub fn capture_view_reusing(self: &Arc<Self>, spare: Option<Arc<ViewState>>) -> StatementView {
+        let mut spare = spare.filter(|state| Arc::ptr_eq(&state.registry, self));
         let mut txns = self.transactions.lock();
+        let id = txns.next_view_id;
+        txns.next_view_id += 1;
         let base = self.base.load(Ordering::Acquire);
         let seq = self.next_sequence.load(Ordering::Acquire);
-        let in_flight: SmallVec<[i64; 4]> = txns.committing.iter().copied().collect();
-        let floor = in_flight.iter().min().map_or(seq, |&s| s - 1);
+        // Both move only under this lock, so the view orders with each truncate or drop
+        let destructions = self.destruction_epoch.load(Ordering::Acquire);
+        let destroying = self.destructions_active.load(Ordering::Acquire) > 0;
+        let (floor, fresh) = match spare.as_mut().and_then(Arc::get_mut) {
+            Some(state) => {
+                state.id = id;
+                state.seq = seq;
+                state.base = base;
+                state.destructions = destructions;
+                state.destroying = destroying;
+                state.in_flight.clear();
+                state.in_flight.extend(txns.committing.iter().copied());
+                *state.leases.get_mut() = 1;
+                let floor = state.in_flight.iter().min().map_or(seq, |&s| s - 1);
+                (floor, None)
+            }
+            None => {
+                let in_flight: SmallVec<[i64; 4]> = txns.committing.iter().copied().collect();
+                let floor = in_flight.iter().min().map_or(seq, |&s| s - 1);
+                (floor, Some(in_flight))
+            }
+        };
         txns.views.push(LiveView { id, floor, base });
         self.live_views.fetch_add(1, Ordering::Release);
         drop(txns);
-        Arc::new(StatementView {
-            registry: Arc::clone(self),
-            id,
-            seq,
-            in_flight,
-            base,
-        })
+        let state = match (spare, fresh) {
+            (Some(state), None) => state,
+            (_, in_flight) => Arc::new(ViewState {
+                registry: Arc::clone(self),
+                id,
+                seq,
+                in_flight: in_flight.unwrap_or_default(),
+                base,
+                destructions,
+                destroying,
+                leases: AtomicUsize::new(1),
+            }),
+        };
+        StatementView { state }
     }
 
     /// The sequence maintenance may act below: a commit with a lower sequence
@@ -1211,7 +1353,7 @@ impl TransactionRegistry {
 
     /// Whether `version_txn_id`'s version is visible to a statement of
     /// `viewer_txn_id` under `view`
-    #[inline]
+    #[inline(always)]
     pub fn is_visible_at(
         &self,
         version_txn_id: i64,
@@ -1225,7 +1367,7 @@ impl TransactionRegistry {
             return false;
         }
         // Finished before the view was taken: committed or aborted for good
-        if version_txn_id < view.base {
+        if version_txn_id < view.state.base {
             return self.check_committed(version_txn_id);
         }
         match self.status.get(version_txn_id) {
@@ -1526,7 +1668,7 @@ impl VisibilityChecker for TransactionRegistry {
         TransactionRegistry::is_visible(self, version_txn_id, viewing_txn_id)
     }
 
-    #[inline]
+    #[inline(always)]
     fn is_visible_at(
         &self,
         version_txn_id: i64,
@@ -2221,6 +2363,104 @@ mod tests {
     }
 
     #[test]
+    fn a_view_is_overtaken_by_a_destruction_begun_after_it_or_running_when_taken() {
+        let registry = Arc::new(TransactionRegistry::new());
+        let before = registry.capture_view();
+        assert!(!before.overtaken(), "nothing destroyed yet");
+        let first = registry.begin_destruction();
+        assert!(before.overtaken(), "a destruction begun after the view");
+        let during = registry.capture_view();
+        assert!(
+            during.overtaken(),
+            "taken while rows are going, before the epoch moves again"
+        );
+        let second = registry.begin_destruction();
+        drop(first);
+        let overlapped = registry.capture_view();
+        drop(second);
+        assert!(during.overtaken(), "taken while rows were going");
+        assert!(overlapped.overtaken(), "taken while the second still ran");
+        assert!(
+            before.overtaken(),
+            "stays overtaken after the destruction ends"
+        );
+        let after = registry.capture_view();
+        assert!(!after.overtaken(), "taken once both ended");
+        let failed = || -> Result<(), ()> {
+            let _destruction = registry.begin_destruction();
+            Err(())
+        };
+        assert!(failed().is_err());
+        assert!(
+            after.overtaken(),
+            "a destruction that failed still moved the epoch"
+        );
+        assert!(
+            !registry.capture_view().overtaken(),
+            "a failed destruction ends its window on the error exit"
+        );
+    }
+
+    #[test]
+    fn a_view_memory_taken_again_keeps_its_room_for_more_commits_in_flight_than_fit_inline() {
+        let registry = Arc::new(TransactionRegistry::new());
+        for _ in 0..6 {
+            let (txn, _) = registry.begin_transaction();
+            registry.start_commit(txn);
+        }
+        let view = registry.capture_view();
+        assert!(
+            view.state.in_flight.spilled(),
+            "six commits in flight spill"
+        );
+        assert_eq!(view.state.in_flight.len(), 6);
+        let room = view.state.in_flight.as_ptr();
+        let spare = view.spare();
+        drop(view);
+        let again = registry.capture_view_reusing(Some(spare));
+        assert_eq!(again.state.in_flight.len(), 6);
+        assert_eq!(
+            again.state.in_flight.as_ptr(),
+            room,
+            "the memory taken again keeps its spilled room"
+        );
+    }
+
+    #[test]
+    fn a_view_copied_across_threads_unregisters_once_when_its_last_copy_goes() {
+        let registry = Arc::new(TransactionRegistry::new());
+        let other = registry.capture_view();
+        let view = registry.capture_view();
+        let mut copies: Vec<StatementView> = (0..8).map(|_| view.clone()).collect();
+        drop(view);
+        let last = copies.pop().unwrap();
+        let start = Arc::new(std::sync::Barrier::new(copies.len()));
+        let threads: Vec<_> = copies
+            .into_iter()
+            .map(|copy| {
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    drop(copy);
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let listed = || registry.transactions.lock().views.len();
+        assert_eq!(listed(), 2, "a view one copy still holds is registered");
+        std::thread::spawn(move || drop(last)).join().unwrap();
+        assert_eq!(listed(), 1, "the view went, the other stayed");
+        assert_eq!(registry.live_views.load(Ordering::Acquire), 1);
+        drop(other);
+        assert_eq!(
+            (listed(), registry.live_views.load(Ordering::Acquire)),
+            (0, 0)
+        );
+    }
+
+    #[test]
     fn a_view_hides_a_commit_in_flight_and_shows_one_completed_above_it() {
         let registry = Arc::new(TransactionRegistry::new());
         let (a, _) = registry.begin_transaction();
@@ -2317,7 +2557,10 @@ mod tests {
         let y_seq = registry.commit_transaction(y);
         let (viewer, _) = registry.begin_transaction();
         let view = registry.capture_view();
-        assert!(view.base <= x, "the old transaction holds the base below x");
+        assert!(
+            view.state.base <= x,
+            "the old transaction holds the base below x"
+        );
         assert!(
             registry.is_visible_at(x, viewer, &view),
             "x completed at {x_seq}"

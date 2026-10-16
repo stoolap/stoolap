@@ -726,7 +726,7 @@ impl Database {
             .timeout_ms(timeout_ms)
             .build();
 
-        let result = executor.execute_with_context(sql, &ctx)?;
+        let result = executor.execute_with_owned_context(sql, ctx)?;
         Ok(result.rows_affected())
     }
 
@@ -757,7 +757,7 @@ impl Database {
             .timeout_ms(timeout_ms)
             .build();
 
-        let result = executor.execute_with_context(sql, &ctx)?;
+        let result = executor.execute_with_owned_context(sql, ctx)?;
         Ok(Rows::new(result))
     }
 
@@ -1019,7 +1019,7 @@ impl Database {
         } else {
             ExecutionContext::with_params(param_values)
         };
-        let result = executor.execute_with_cached_plan(plan, &ctx)?;
+        let result = executor.execute_with_cached_plan_owned(plan, ctx)?;
         Ok(result.rows_affected())
     }
 
@@ -1032,7 +1032,7 @@ impl Database {
         } else {
             ExecutionContext::with_params(param_values)
         };
-        let result = executor.execute_with_cached_plan(plan, &ctx)?;
+        let result = executor.execute_with_cached_plan_owned(plan, ctx)?;
         Ok(Rows::new(result))
     }
 
@@ -1040,7 +1040,7 @@ impl Database {
     pub fn execute_named_plan(&self, plan: &CachedPlanRef, params: NamedParams) -> Result<i64> {
         let executor = &self.inner.executor;
         let ctx = ExecutionContext::with_named_params(params.into_inner());
-        let result = executor.execute_with_cached_plan(plan, &ctx)?;
+        let result = executor.execute_with_cached_plan_owned(plan, ctx)?;
         Ok(result.rows_affected())
     }
 
@@ -1048,7 +1048,7 @@ impl Database {
     pub fn query_named_plan(&self, plan: &CachedPlanRef, params: NamedParams) -> Result<Rows> {
         let executor = &self.inner.executor;
         let ctx = ExecutionContext::with_named_params(params.into_inner());
-        let result = executor.execute_with_cached_plan(plan, &ctx)?;
+        let result = executor.execute_with_cached_plan_owned(plan, ctx)?;
         Ok(Rows::new(result))
     }
 

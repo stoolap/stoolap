@@ -161,7 +161,7 @@ impl Statement {
         let db = self.get_db()?;
         if let Some(plan) = &self.plan {
             let ctx = ExecutionContext::with_params(params.into_params());
-            let result = db.executor().execute_with_cached_plan(plan, &ctx)?;
+            let result = db.executor().execute_with_cached_plan_owned(plan, ctx)?;
             Ok(result.rows_affected())
         } else {
             db.execute(&self.sql, params)
@@ -186,7 +186,7 @@ impl Statement {
         let db = self.get_db()?;
         if let Some(plan) = &self.plan {
             let ctx = ExecutionContext::with_params(params.into_params());
-            let result = db.executor().execute_with_cached_plan(plan, &ctx)?;
+            let result = db.executor().execute_with_cached_plan_owned(plan, ctx)?;
             Ok(Rows::new(result))
         } else {
             db.query(&self.sql, params)

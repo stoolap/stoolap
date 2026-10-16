@@ -1183,11 +1183,12 @@ impl Executor {
                 break;
             }
 
-            // Fetch rows for this partition only (KEY OPTIMIZATION!)
+            // Fetch rows for this partition only (KEY OPTIMIZATION!); a
+            // table that cannot answer for one leaves the query to the scan
             let partition_rows =
                 match table.get_rows_for_partition_value(partition_col, &partition_value)? {
                     Some(rows) => rows,
-                    None => continue,
+                    None => return Ok(None),
                 };
 
             if partition_rows.is_empty() {

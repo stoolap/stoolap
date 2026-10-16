@@ -21,7 +21,6 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::time::Duration;
 
 use stoolap::core::{Operator, Value};
@@ -71,9 +70,9 @@ fn while_committing(
 }
 
 /// A read-only transaction and its table of `t` read through `view`
-fn through(db: &Database, view: &Arc<StatementView>) -> (Box<dyn Transaction>, Box<dyn Table>) {
+fn through(db: &Database, view: &StatementView) -> (Box<dyn Transaction>, Box<dyn Table>) {
     let txn = db.engine().begin_transaction().unwrap();
-    let table = txn.get_table_with_view("t", Arc::clone(view)).unwrap();
+    let table = txn.get_table_with_view("t", view.clone()).unwrap();
     (txn, table)
 }
 
@@ -446,4 +445,158 @@ fn a_seal_between_two_reads_of_a_view_changes_nothing_it_reads() {
     db.engine().seal_for_test().unwrap();
     assert_eq!(state(&*table), before, "a view with nothing in flight");
     assert_eq!(before, vec![(1, 99), (2, 20), (3, 30)]);
+}
+
+#[cfg(not(feature = "test-filedb"))]
+#[test]
+fn a_grouped_arena_pass_stops_soon_after_a_commit_begins_publishing() {
+    let db = Database::open("memory://statement_view_reads_grouped_stop").unwrap();
+    db.execute(
+        "CREATE TABLE g (id INTEGER PRIMARY KEY, k INTEGER NOT NULL)",
+        (),
+    )
+    .unwrap();
+    let values: Vec<String> = (1..=5000).map(|id| format!("({id}, {})", id % 7)).collect();
+    db.execute(&format!("INSERT INTO g VALUES {}", values.join(",")), ())
+        .unwrap();
+    let sql = "SELECT k, COUNT(*) FROM g GROUP BY k ORDER BY k";
+    let rows = |db: &Database| -> Vec<(i64, i64)> {
+        db.query(sql, ())
+            .unwrap()
+            .map(|row| {
+                let row = row.unwrap();
+                (row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap())
+            })
+            .collect()
+    };
+    let expected = rows(&db);
+    let store = db.engine().get_version_store("g").unwrap();
+    let hold = Rc::new(RefCell::new(None));
+    let handle = Rc::clone(&hold);
+    stoolap::test_failpoints::on_grouped_slot(100, move || {
+        *handle.borrow_mut() = Some(store.begin_publish(0));
+    });
+    let seen = rows(&db);
+    let after = stoolap::test_failpoints::grouped_slots_after_hook();
+    drop(hold.borrow_mut().take().expect("the pass reached the slot"));
+    assert_eq!(seen, expected, "the fallback answers the same");
+    let after = after.expect("the grouped pass reached the slot");
+    assert!(
+        after <= 1024,
+        "the pass went on for {after} slots after the commit began publishing"
+    );
+}
+
+/// Versions the maintenance passes reclaim from `t` now
+#[cfg(not(feature = "test-filedb"))]
+fn reclaimed(db: &Database) -> usize {
+    let store = db.engine().get_version_store("t").unwrap();
+    store.trim_history_past_limit()
+        + store.cleanup_old_previous_versions_with_retention(Duration::ZERO) as usize
+}
+
+/// `t`'s rows through `view`, read with no transaction or table kept open after
+#[cfg(not(feature = "test-filedb"))]
+fn state_through(db: &Database, view: &StatementView) -> Vec<(i64, i64)> {
+    let (_txn, table) = through(db, view);
+    state(&*table)
+}
+
+/// The versions maintenance reclaims while a view lives across updates of
+/// the rows `ids` on another handle, once it is dropped, and once more
+#[cfg(not(feature = "test-filedb"))]
+fn long_lived_view(name: &str, ids: Vec<i64>) -> (usize, usize, usize) {
+    let db = Database::open(&format!("memory://statement_view_reads_long_{name}")).unwrap();
+    create(&db);
+    db.execute(
+        "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60), (7, 70)",
+        (),
+    )
+    .unwrap();
+    let before = state(
+        &*db.engine()
+            .begin_transaction()
+            .unwrap()
+            .get_table("t")
+            .unwrap(),
+    );
+    let view = db.engine().registry().capture_view();
+    let (done_tx, done_rx) = mpsc::channel();
+    let writer = db.clone();
+    std::thread::spawn(move || {
+        for id in ids {
+            writer
+                .execute("UPDATE t SET v = v + 1 WHERE id = $1", (id,))
+                .unwrap();
+        }
+        done_tx.send(()).unwrap();
+    });
+    done_rx
+        .recv_timeout(WATCHDOG)
+        .expect("the writes complete while the view lives");
+    assert_eq!(
+        state_through(&db, &view),
+        before,
+        "{name}: the view after the writes"
+    );
+    let alive = reclaimed(&db);
+    assert_eq!(
+        state_through(&db, &view),
+        before,
+        "{name}: the view after maintenance"
+    );
+    drop(view);
+    (alive, reclaimed(&db), reclaimed(&db))
+}
+
+#[cfg(not(feature = "test-filedb"))]
+#[test]
+fn a_long_lived_view_keeps_its_rows_through_writes_and_frees_them_when_dropped() {
+    assert_eq!(
+        long_lived_view("same_row", vec![1; 20]),
+        (0, 20, 0),
+        "one row updated 20 times: reclaimed while the view lives, once dropped, then again"
+    );
+    assert_eq!(
+        long_lived_view("other_rows", (1..=7).collect()),
+        (0, 7, 0),
+        "seven rows updated once: reclaimed while the view lives, once dropped, then again"
+    );
+}
+
+#[test]
+fn a_lazy_result_keeps_its_view_through_later_statements_and_its_executors_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_file(dir.path());
+    create(&db);
+    fill(&db, true);
+    let executor = stoolap::Executor::new(std::sync::Arc::clone(db.engine()));
+    let mut result = executor.execute("SELECT id, v FROM t").unwrap();
+    let registered = || db.engine().registry().min_reader_seq().is_some();
+    assert!(registered(), "the result holds its view");
+    let mut seen = Vec::new();
+    assert!(result.next(), "a first row");
+    seen.push(pair(0, result.row()));
+    for sql in CHANGES {
+        db.execute(sql, ()).unwrap();
+    }
+    let taken = stoolap::test_failpoints::statement_views_taken();
+    for _ in 0..8 {
+        let mut later = executor.execute("SELECT v FROM t WHERE v > 0").unwrap();
+        while later.next() {}
+    }
+    assert_eq!(
+        stoolap::test_failpoints::statement_views_taken() - taken,
+        8,
+        "each later statement takes a view, its memory reused while the result holds its own"
+    );
+    drop(executor);
+    assert!(registered(), "the result holds its view past its executor");
+    while result.next() {
+        seen.push(pair(0, result.row()));
+    }
+    seen.sort_unstable();
+    assert_eq!(seen, BEFORE, "the result read through its view");
+    drop(result);
+    assert!(!registered(), "the view went with its last holder");
 }

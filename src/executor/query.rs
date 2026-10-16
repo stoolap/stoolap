@@ -71,7 +71,22 @@ type SelectResult = Result<SelectOutput>;
 /// whether the limit and offset were applied, and the layout of a table
 type OuterFetch = (Box<dyn QueryResult>, Vec<String>, bool, Option<LayoutToken>);
 
-use super::context::{clear_statement_caches, ExecutionContext, StatementSnapshot, TimeoutGuard};
+/// A semantic cache answer and its output columns
+type CachedAnswer = (Box<dyn QueryResult>, CompactArc<Vec<String>>);
+
+/// What a semantic cache lookup before a statement's view came to
+pub(crate) enum EarlySemantic {
+    /// The statement's whole answer
+    Hit(Box<dyn QueryResult>),
+    /// A miss, which the statement's scan takes over
+    Miss(SemanticMiss),
+    /// Not a statement the lookup can answer alone
+    NotTried,
+}
+
+use super::context::{
+    clear_statement_caches, ExecutionContext, SemanticMiss, StatementSnapshot, TimeoutGuard,
+};
 use super::expression::{
     compile_expression, CompiledEvaluator, ExecuteContext, ExprVM, ExpressionEval, JoinFilter,
     RowFilter, SharedProgram,
@@ -433,11 +448,8 @@ impl Executor {
             && ctx.statement_snapshot().is_none()
             && self.active_transaction.lock().unwrap().is_none()
         {
-            let isolation = self.engine.get_isolation_level();
-            let snapshot = StatementSnapshot::new(
-                self.engine.begin_transaction_with_level(isolation)?,
-                isolation,
-            );
+            let snapshot = self
+                .new_statement_snapshot(self.engine.get_isolation_level(), ctx.statement_view())?;
             snapshot_ctx = ctx.with_statement_snapshot(snapshot);
             &snapshot_ctx
         } else {
@@ -2314,6 +2326,123 @@ impl Executor {
         Ok(None)
     }
 
+    /// The semantic cache answer to a read committed autocommit `SELECT *`
+    /// over one base table, looked up before the statement takes its view.
+    /// Only a statement nothing completes or reshapes after its scan is tried
+    pub(crate) fn semantic_cache_before_view(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        classification: &QueryClassification,
+    ) -> Result<EarlySemantic> {
+        let source = match stmt.table_expr.as_deref() {
+            Some(Expression::TableSource(source)) if source.as_of.is_none() => source,
+            _ => return Ok(EarlySemantic::NotTried),
+        };
+        let Some(where_expr) = stmt.where_clause.as_deref() else {
+            return Ok(EarlySemantic::NotTried);
+        };
+        if !classification.semantic_cacheable()
+            || classification.has_offset
+            || classification.has_cte
+            || classification.has_set_operations
+            || classification.has_having
+            || classification.has_distinct_on
+            || ctx.statement_view().is_some()
+            || ctx.statement_snapshot().is_some()
+            || ctx.outer_row().is_some()
+            || ctx.timeout_ms() > 0
+            || ctx.query_depth > 0
+            || expression_contains_aggregate(where_expr)
+            || self.engine.get_isolation_level() != crate::core::IsolationLevel::ReadCommitted
+        {
+            return Ok(EarlySemantic::NotTried);
+        }
+        let table_name = source.name.value_lower.as_str();
+        if ctx.has_cte_by_lower(table_name) || self.engine.get_view_lowercase(table_name)?.is_some()
+        {
+            return Ok(EarlySemantic::NotTried);
+        }
+        ctx.check_cancelled()?;
+        let miss = SemanticMiss {
+            statement: stmt as *const _ as usize,
+            simplified: ExpressionSimplifier::new()
+                .try_simplify(where_expr)
+                .map(Arc::new),
+        };
+        let Some((stamp, all_columns)) =
+            self.semantic_cache_stamp(table_name, None, |store| store.schema().column_names_arc())
+        else {
+            return Ok(EarlySemantic::Miss(miss));
+        };
+        let alias = source
+            .alias
+            .as_ref()
+            .map_or(table_name, |alias| alias.value_lower.as_str());
+        let predicate = miss.simplified.as_deref().unwrap_or(where_expr);
+        match self.semantic_cache_answer(
+            table_name,
+            stmt,
+            &all_columns,
+            Some(alias),
+            predicate,
+            stamp,
+        )? {
+            Some((result, _)) => Ok(EarlySemantic::Hit(result)),
+            None => Ok(EarlySemantic::Miss(miss)),
+        }
+    }
+
+    /// The cached rows of `SELECT *` over `table_name` filtered by
+    /// `where_expr` under `stamp`, with their output columns; None on a miss
+    fn semantic_cache_answer(
+        &self,
+        table_name: &str,
+        stmt: &SelectStatement,
+        all_columns: &[String],
+        table_alias: Option<&str>,
+        where_expr: &Expression,
+        stamp: super::semantic_cache::CacheStamp,
+    ) -> Result<Option<CachedAnswer>> {
+        use super::semantic_cache::{CacheLookupResult, SemanticCache};
+        let output_columns = || {
+            CompactArc::new(self.get_output_column_names(&stmt.columns, all_columns, table_alias))
+        };
+        match self
+            .semantic_cache
+            .lookup(table_name, all_columns, Some(where_expr), stamp)
+        {
+            CacheLookupResult::ExactHit(rows) => {
+                // Zero-copy sharing of the cached rows
+                let columns = output_columns();
+                let result =
+                    ExecutorResult::with_arc_columns_shared_rows(CompactArc::clone(&columns), rows);
+                Ok(Some((Box::new(result), columns)))
+            }
+            CacheLookupResult::SubsumptionHit {
+                rows,
+                filter,
+                columns,
+            } => {
+                let filtered: RowVec = SemanticCache::filter_rows(
+                    (*rows).clone(),
+                    &filter,
+                    &columns,
+                    &self.function_registry,
+                )?
+                .into_iter()
+                .enumerate()
+                .map(|(i, row)| (i as i64, row))
+                .collect();
+                let columns = output_columns();
+                let result =
+                    ExecutorResult::with_arc_columns(CompactArc::clone(&columns), filtered);
+                Ok(Some((Box::new(result), columns)))
+            }
+            CacheLookupResult::Miss => Ok(None),
+        }
+    }
+
     /// Execute a simple table scan
     fn execute_simple_table_scan(
         &self,
@@ -2331,35 +2460,30 @@ impl Executor {
         let in_explicit_transaction = active_tx.is_some();
 
         // Only a cacheable SELECT * takes a stamp: no transaction, parameters
-        // or row-shaping clauses. Taken before the transaction or snapshot the
-        // scan reads under, so a cached result is never older than its stamp
-        let cache_stamp = if !in_explicit_transaction
+        // or row-shaping clauses, and a view that sees the stamped state.
+        // Taken before the transaction or snapshot the scan reads under, so
+        // a cached result is never older than its stamp
+        let cacheable = !in_explicit_transaction
             && ctx.statement_snapshot().is_none()
             && ctx.outer_row().is_none()
             && table_source.as_of.is_none()
-            && classification.is_select_star
             && stmt.where_clause.is_some()
-            && !classification.has_aggregation
-            && !classification.has_window_functions
-            && !classification.has_group_by
-            && !classification.where_has_subqueries
-            && !classification.where_has_parameters
-            && !classification.has_nondeterministic_functions
-            && !classification.has_order_by
-            && !classification.has_distinct
-            && !classification.has_limit
-        {
-            self.semantic_cache_stamp(table_name)
+            && classification.semantic_cacheable();
+        let cache_stamp = if cacheable {
+            self.semantic_cache_stamp(table_name, ctx.scan_view(table_name), |_| ())
+                .map(|(stamp, ())| stamp)
         } else {
             None
         };
+        // The statement's start looked the cache up and simplified the WHERE
+        let early_miss = ctx.semantic_miss(stmt).filter(|_| cacheable);
 
         // Get table from active transaction or create a new one
         let (table, _standalone_tx) = if let Some(ref tx_state) = *active_tx {
             // Use the active transaction - this allows seeing uncommitted changes
             let table = tx_state
                 .transaction
-                .get_statement_table(table_name)
+                .get_statement_table_at(table_name, ctx.scan_view(table_name))
                 .map_err(|e| {
                     if matches!(e, Error::TableNotFound(_)) {
                         Error::TableOrViewNotFound(table_name.to_string())
@@ -2386,13 +2510,15 @@ impl Executor {
                         classification,
                     );
                 }
-                let table = snapshot.statement_table(table_name).map_err(|e| {
-                    if matches!(e, Error::TableNotFound(_)) {
-                        Error::TableOrViewNotFound(table_name.to_string())
-                    } else {
-                        e
-                    }
-                })?;
+                let table = snapshot
+                    .statement_table_at(table_name, ctx.scan_view(table_name))
+                    .map_err(|e| {
+                        if matches!(e, Error::TableNotFound(_)) {
+                            Error::TableOrViewNotFound(table_name.to_string())
+                        } else {
+                            e
+                        }
+                    })?;
                 (table, None)
             } else {
                 let tx = self.engine.begin_transaction()?;
@@ -2409,13 +2535,15 @@ impl Executor {
                     );
                 }
 
-                let table = tx.get_statement_table(table_name).map_err(|e| {
-                    if matches!(e, Error::TableNotFound(_)) {
-                        Error::TableOrViewNotFound(table_name.to_string())
-                    } else {
-                        e
-                    }
-                })?;
+                let table = tx
+                    .get_statement_table_at(table_name, ctx.scan_view(table_name))
+                    .map_err(|e| {
+                        if matches!(e, Error::TableNotFound(_)) {
+                            Error::TableOrViewNotFound(table_name.to_string())
+                        } else {
+                            e
+                        }
+                    })?;
                 (table, Some(tx))
             }
         };
@@ -2540,7 +2668,11 @@ impl Executor {
         // This can eliminate redundant comparisons (e.g., 1=1 -> true, true AND x -> x)
         // Uses try_simplify() to avoid cloning expressions that can't be simplified (like EXISTS)
         let (simplified_where, where_to_use): (Option<Expression>, Option<&Expression>) =
-            if let Some(where_expr) = where_to_use {
+            if let (Some(miss), Some(where_expr), None) =
+                (early_miss, where_to_use, &resolved_where_clause)
+            {
+                (None, Some(miss.simplified.as_deref().unwrap_or(where_expr)))
+            } else if let Some(where_expr) = where_to_use {
                 let mut simplifier = ExpressionSimplifier::new();
                 // try_simplify returns None if no changes, avoiding unnecessary cloning
                 if let Some(simplified) = simplifier.try_simplify(where_expr) {
@@ -2582,63 +2714,18 @@ impl Executor {
         // SEMANTIC CACHE: a stamp exists only for an eligible query
         let cache_eligible = cache_stamp.is_some() && where_to_use.is_some();
 
-        // Try cache lookup for eligible queries
-        if let Some(stamp) = cache_stamp.filter(|_| cache_eligible) {
+        // Try cache lookup for eligible queries the statement's start did not
+        if let Some(stamp) = cache_stamp.filter(|_| cache_eligible && early_miss.is_none()) {
             if let Some(where_expr) = where_to_use {
-                use super::semantic_cache::CacheLookupResult;
-
-                match self
-                    .semantic_cache
-                    .lookup(table_name, &all_columns, Some(where_expr), stamp)
-                {
-                    CacheLookupResult::ExactHit(rows_arc) => {
-                        // Exact cache hit - return cached rows with zero-copy sharing
-                        let output_columns = CompactArc::new(self.get_output_column_names(
-                            &stmt.columns,
-                            &all_columns,
-                            table_alias.as_deref(),
-                        ));
-                        let result = ExecutorResult::with_arc_columns_shared_rows(
-                            CompactArc::clone(&output_columns),
-                            rows_arc,
-                        );
-                        return Ok((Box::new(result), output_columns, false, None));
-                    }
-                    CacheLookupResult::SubsumptionHit {
-                        rows: rows_arc,
-                        filter,
-                        columns,
-                    } => {
-                        // Subsumption hit - filter cached rows
-                        // Clone the Vec since we need to filter (creates new Vec anyway)
-                        use super::semantic_cache::SemanticCache;
-                        let filtered_vec = SemanticCache::filter_rows(
-                            (*rows_arc).clone(),
-                            &filter,
-                            &columns,
-                            &self.function_registry,
-                        )?;
-                        // Convert Vec<Row> to RowVec
-                        let filtered_rows: RowVec = filtered_vec
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, row)| (i as i64, row))
-                            .collect();
-                        let output_columns = CompactArc::new(self.get_output_column_names(
-                            &stmt.columns,
-                            &all_columns,
-                            table_alias.as_deref(),
-                        ));
-                        let result = ExecutorResult::with_arc_columns(
-                            CompactArc::clone(&output_columns),
-                            filtered_rows,
-                        );
-                        return Ok((Box::new(result), output_columns, false, None));
-                    }
-                    CacheLookupResult::Miss => {
-                        // Cache miss - continue with normal execution
-                        // Result will be inserted into cache below
-                    }
+                if let Some((result, output_columns)) = self.semantic_cache_answer(
+                    table_name,
+                    stmt,
+                    &all_columns,
+                    table_alias.as_deref(),
+                    where_expr,
+                    stamp,
+                )? {
+                    return Ok((result, output_columns, false, None));
                 }
             }
         }
@@ -4732,9 +4819,10 @@ impl Executor {
                 // continuation finds that a commit moved rows under it
                 let mut snapshot = match ctx.statement_snapshot() {
                     Some(snapshot) => snapshot.clone(),
-                    None => {
-                        self.new_statement_snapshot(crate::core::IsolationLevel::ReadCommitted)?
-                    }
+                    None => self.new_statement_snapshot(
+                        crate::core::IsolationLevel::ReadCommitted,
+                        ctx.statement_view(),
+                    )?,
                 };
                 let mut ctx_join = ctx.with_statement_snapshot(snapshot.clone());
                 if small_outer {
@@ -5148,6 +5236,7 @@ impl Executor {
                             }
                             snapshot = self.new_statement_snapshot(
                                 crate::core::IsolationLevel::SnapshotIsolation,
+                                ctx.statement_view(),
                             )?;
                             ctx_join = ctx.with_statement_snapshot(snapshot.clone());
                             consistent = true;
@@ -7552,7 +7641,9 @@ impl Executor {
         name: &str,
     ) -> Result<Box<dyn crate::storage::traits::Table>> {
         if let Some(active) = self.active_transaction.lock().unwrap().as_ref() {
-            return active.transaction.get_statement_table(name);
+            return active
+                .transaction
+                .get_statement_table_at(name, snapshot.view());
         }
         snapshot.statement_table(name)
     }
@@ -7597,13 +7688,25 @@ impl Executor {
         Ok(holds.then_some(table))
     }
 
-    /// One transaction for every read of a statement
+    /// One transaction for every read of a statement. Under the statement's
+    /// view its reads already keep one point, so the view stands in for a
+    /// snapshot isolation that is asked for
     pub(super) fn new_statement_snapshot(
         &self,
         isolation: crate::core::IsolationLevel,
+        view: Option<&crate::storage::mvcc::registry::StatementView>,
     ) -> Result<StatementSnapshot> {
+        let isolation = if view.is_some() {
+            crate::core::IsolationLevel::ReadCommitted
+        } else {
+            isolation
+        };
         let transaction = self.engine.begin_transaction_with_level(isolation)?;
-        Ok(StatementSnapshot::new(transaction, isolation))
+        Ok(StatementSnapshot::new(
+            transaction,
+            isolation,
+            view.cloned(),
+        ))
     }
 
     /// True when a filter carries a subquery anywhere inside it. The grouped
@@ -7733,7 +7836,10 @@ impl Executor {
         // explicit transaction the outer side is read whole
         let mut snapshot = match ctx.statement_snapshot() {
             Some(snapshot) => snapshot.clone(),
-            None => self.new_statement_snapshot(crate::core::IsolationLevel::ReadCommitted)?,
+            None => self.new_statement_snapshot(
+                crate::core::IsolationLevel::ReadCommitted,
+                ctx.statement_view(),
+            )?,
         };
         let mut ctx_join = ctx.with_statement_snapshot(snapshot.clone());
         let in_explicit_transaction = self.active_transaction.lock().unwrap().is_some();
@@ -8079,8 +8185,10 @@ impl Executor {
                 outer_result = more;
                 continue;
             }
-            snapshot =
-                self.new_statement_snapshot(crate::core::IsolationLevel::SnapshotIsolation)?;
+            snapshot = self.new_statement_snapshot(
+                crate::core::IsolationLevel::SnapshotIsolation,
+                ctx.statement_view(),
+            )?;
             ctx_join = ctx.with_statement_snapshot(snapshot.clone());
             consistent = true;
             groups.clear();
@@ -12594,7 +12702,7 @@ mod tests {
             writer.execute("UPDATE t SET v = 10 WHERE id = 1").unwrap();
         });
         let snapshot = executor
-            .new_statement_snapshot(crate::core::IsolationLevel::SnapshotIsolation)
+            .new_statement_snapshot(crate::core::IsolationLevel::SnapshotIsolation, None)
             .unwrap();
         let rows = snapshot
             .get_table("t")

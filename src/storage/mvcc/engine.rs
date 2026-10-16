@@ -2656,6 +2656,11 @@ impl MVCCEngine {
         Arc::clone(&self.registry)
     }
 
+    /// The registry, borrowed: a statement's view is taken through it
+    pub(crate) fn registry_ref(&self) -> &Arc<TransactionRegistry> {
+        &self.registry
+    }
+
     /// The transactions holding an entry in the store cache
     #[cfg(feature = "test-failpoints")]
     pub fn txn_store_entries(&self) -> usize {
@@ -3189,6 +3194,8 @@ impl MVCCEngine {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
+        // A view taken before the rows go, or while they go, is overtaken
+        let _destruction = self.registry.begin_destruction();
 
         let table_name = name.to_lowercase();
 
@@ -8428,11 +8435,46 @@ impl Engine for MVCCEngine {
         row_ids: &[i64],
         token: crate::storage::mvcc::version_store::LayoutToken,
     ) -> Result<crate::core::RowVec> {
+        self.fetch_rows_by_ids_settled(table_name, row_ids, token, false)
+            .map(Option::unwrap_or_default)
+    }
+}
+
+impl MVCCEngine {
+    /// The rows `row_ids` name in the latest committed state. When `settled`,
+    /// None unless no commit published to the table across the read: a
+    /// commit that has published its rows or tombstones and is not visible
+    /// yet would leave a row half read
+    pub(crate) fn fetch_rows_by_ids_settled(
+        &self,
+        table_name: &str,
+        row_ids: &[i64],
+        token: crate::storage::mvcc::version_store::LayoutToken,
+        settled: bool,
+    ) -> Result<Option<crate::core::RowVec>> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
-
         let store = self.get_version_store(table_name)?;
+        let epoch = store.publish_epoch_if_quiet();
+        self.fetch_rows_by_ids_in(table_name, &store, row_ids, token, settled, epoch)
+    }
+
+    /// [`Self::fetch_rows_by_ids_settled`] from `store`, found by
+    /// `table_name`, whose publish epoch the caller read as `epoch`
+    #[inline(always)]
+    fn fetch_rows_by_ids_in(
+        &self,
+        table_name: &str,
+        store: &Arc<VersionStore>,
+        row_ids: &[i64],
+        token: crate::storage::mvcc::version_store::LayoutToken,
+        settled: bool,
+        epoch: Option<u64>,
+    ) -> Result<Option<crate::core::RowVec>> {
+        if settled && epoch.is_none() {
+            return Ok(None);
+        }
         let read_txn_id = INVALID_TRANSACTION_ID + 1;
         let mut result = store.get_visible_versions_batch(row_ids, read_txn_id.into());
 
@@ -8477,7 +8519,7 @@ impl Engine for MVCCEngine {
             }
             // The manager was found by name: the table under it must still
             // be the store the schema came from
-            if !Arc::ptr_eq(&self.get_version_store(table_name)?, &store) {
+            if !Arc::ptr_eq(&self.get_version_store(table_name)?, store) {
                 return Err(Error::SchemaChanged {
                     table: table_name.to_string(),
                 });
@@ -8485,7 +8527,60 @@ impl Engine for MVCCEngine {
         }
         // The rows were captured in the layout the caller resolved for
         store.check_token(token)?;
-        Ok(result)
+        if settled && store.publish_epoch_if_quiet() != epoch {
+            return Ok(None);
+        }
+        Ok(Some(result))
+    }
+
+    /// Row `row_id` in the latest committed state: its hot version as the
+    /// chain holds it whatever publishes, one row being read whole; a row
+    /// not hot is read settled with the volumes. None sends the caller to a view
+    pub(crate) fn fetch_latest_row(
+        &self,
+        table_name: &str,
+        row_id: i64,
+        token: crate::storage::mvcc::version_store::LayoutToken,
+    ) -> Result<Option<crate::core::RowVec>> {
+        if !self.is_open() {
+            return Err(Error::EngineNotOpen);
+        }
+        let store = self.get_version_store(table_name)?;
+        let hot = store.get_visible_versions_batch(&[row_id], (INVALID_TRANSACTION_ID + 1).into());
+        if !hot.is_empty() {
+            store.check_token(token)?;
+            return Ok(Some(hot));
+        }
+        let epoch = store.publish_epoch_if_quiet();
+        if epoch.is_none() {
+            return Ok(None);
+        }
+        self.fetch_rows_by_ids_in(table_name, &store, &[row_id], token, true, epoch)
+    }
+
+    /// The rows `row_ids` name as `view` sees them in the hot store; None
+    /// when one is not there, so the caller reads the cold rows too
+    pub(crate) fn fetch_hot_rows_at(
+        &self,
+        table_name: &str,
+        row_ids: &[i64],
+        token: crate::storage::mvcc::version_store::LayoutToken,
+        view: &crate::storage::mvcc::registry::StatementView,
+    ) -> Result<Option<crate::core::RowVec>> {
+        if !self.is_open() {
+            return Err(Error::EngineNotOpen);
+        }
+        let store = self.get_version_store(table_name)?;
+        let reader = crate::storage::mvcc::version_store::Reader {
+            txn_id: INVALID_TRANSACTION_ID + 1,
+            view: Some(view),
+        };
+        let result = store.get_visible_versions_batch(row_ids, reader);
+        if result.len() < row_ids.len() {
+            return Ok(None);
+        }
+        store.check_token(token)?;
+        Ok(Some(result))
     }
 }
 
@@ -8994,7 +9089,7 @@ impl TransactionEngineOperations for EngineOperations {
         txn_id: i64,
         table_name: &str,
         gate: Option<&super::txn_gate::GateRef>,
-        view: Option<Arc<super::registry::StatementView>>,
+        view: Option<super::registry::StatementView>,
     ) -> Result<Box<dyn Table>> {
         // Use Cow to avoid allocation when table_name is already lowercase (common case)
         let table_name_lower = to_lowercase_cow(table_name);
@@ -9143,6 +9238,8 @@ impl TransactionEngineOperations for EngineOperations {
 
     fn drop_table(&self, name: &str) -> Result<()> {
         let table_name_lower = name.to_lowercase();
+        // A view taken before the rows go, or while they go, is overtaken
+        let _destruction = self.registry.begin_destruction();
 
         // Remove schema and clean up FK references in child tables
         {

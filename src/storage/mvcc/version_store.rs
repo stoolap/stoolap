@@ -552,11 +552,59 @@ fn accumulate_sum(int_sum: &mut i128, float_sum: &mut f64, count: &mut usize, va
     }
 }
 
+/// The type a SUM column declares, tested first by [`accumulate_sum_led`]
+const SUM_ANY: u8 = 0;
+const SUM_INTEGER: u8 = 1;
+const SUM_FLOAT: u8 = 2;
+const SUM_BOOLEAN: u8 = 3;
+
+/// [`accumulate_sum`] with the declared type `LEAD` and NULL tested first
+/// and any other value out of line, so the order holds whatever order a
+/// match over every type compiles to
+#[inline(always)]
+fn accumulate_sum_led<const LEAD: u8>(
+    int_sum: &mut i128,
+    float_sum: &mut f64,
+    count: &mut usize,
+    val: &Value,
+) {
+    match (LEAD, val) {
+        (SUM_ANY, _) => accumulate_sum(int_sum, float_sum, count, val),
+        (SUM_INTEGER, Value::Integer(i)) => {
+            *int_sum += *i as i128;
+            *count += 1;
+        }
+        (SUM_FLOAT, Value::Float(f)) => {
+            *float_sum += *f;
+            *count += 1;
+        }
+        (SUM_BOOLEAN, Value::Boolean(b)) => {
+            *int_sum += *b as i128;
+            *count += 1;
+        }
+        (_, Value::Null(_)) => {}
+        _ => {
+            (*int_sum, *float_sum, *count) =
+                accumulate_sum_other((*int_sum, *float_sum, *count), val)
+        }
+    }
+}
+
+/// [`accumulate_sum`] for a value of another type than its column declares.
+/// The sums go by value: an address taken would keep them out of registers
+#[inline(never)]
+fn accumulate_sum_other(sums: (i128, f64, usize), val: &Value) -> (i128, f64, usize) {
+    let (mut int_sum, mut float_sum, mut count) = sums;
+    accumulate_sum(&mut int_sum, &mut float_sum, &mut count, val);
+    (int_sum, float_sum, count)
+}
+
 /// SUM's accumulators over the live heads whose transaction `visible`
 /// accepts, asked once per run of heads from one transaction. Kept out of
-/// line, so the caller's state does not crowd the loop's registers
+/// line, so the caller's state does not crowd the loop's registers. `LEAD`
+/// is the column's declared type, see [`accumulate_sum_led`]
 #[inline(never)]
-fn sum_live_heads(
+fn sum_live_heads<const LEAD: u8>(
     meta: &[crate::storage::mvcc::arena::ArenaRowMeta],
     data: &[CompactArc<[Value]>],
     col_idx: usize,
@@ -575,7 +623,7 @@ fn sum_live_heads(
         }
         if last_visible {
             if let Some(val) = row.get(col_idx) {
-                accumulate_sum(&mut int_sum, &mut float_sum, &mut count, val);
+                accumulate_sum_led::<LEAD>(&mut int_sum, &mut float_sum, &mut count, val);
             }
         }
     }
@@ -800,6 +848,9 @@ impl PublishHold {
         commit_seq: i64,
     ) {
         self.guards.push(version_store.begin_publish(commit_seq));
+        if let Ok(store) = txn_store.read() {
+            store.note_commit_seq(commit_seq);
+        }
         self.stores.push(txn_store);
     }
 
@@ -856,8 +907,146 @@ enum IndexUndo {
     Batch {
         index: Arc<dyn Index>,
         added: Vec<(i64, Vec<Value>)>,
-        removed: Vec<(i64, Vec<Value>)>,
+        removed: Option<RemoveList>,
     },
+}
+
+/// The batch path's remove list for one index, shared by its undo and the
+/// removal history
+type RemoveList = Arc<Vec<(i64, Vec<Value>)>>;
+
+/// Bytes of ended removals a store keeps for older views
+const REMOVAL_HISTORY_BYTES: usize = 1 << 20;
+
+/// Removed entries an index probe under a view reads back at most; past
+/// it the probe declines and the statement scans
+const REMOVAL_PROBE_CAP: usize = 256;
+
+/// The keys one commit takes out of the hot indexes, published before the
+/// first goes: a view that does not see the commit finds its rows by them
+pub struct Removals {
+    seq: i64,
+    entries: usize,
+    bytes: usize,
+    lists: SmallVec<[(u64, RemovedKeys); 2]>,
+}
+
+enum RemovedKeys {
+    Row(i64, SmallVec<[Value; 2]>),
+    Batch(RemoveList),
+}
+
+/// How the removal history names an index's keys
+enum HistoryName {
+    /// By the identity the store keeps across a rename
+    Named(u64),
+    /// Not at all: no probe reads these keys back (HNSW)
+    Unread,
+    /// It cannot: the index has no identity yet
+    Unnamed,
+}
+
+/// What `key` holds in memory: 16 bytes a value, the heap of a long text
+/// or of an extension value (JSON, vectors), and the spilled storage of
+/// `capacity` values
+fn key_bytes(key: &[Value], capacity: usize) -> usize {
+    let heap: usize = key
+        .iter()
+        .map(|value| match value {
+            Value::Text(text) if text.is_heap() => text.len(),
+            Value::Extension(payload) => payload.len(),
+            _ => 0,
+        })
+        .sum();
+    capacity * std::mem::size_of::<Value>() + heap
+}
+
+impl Removals {
+    pub(crate) fn new(seq: i64) -> Self {
+        Self {
+            seq,
+            entries: 0,
+            bytes: std::mem::size_of::<Self>(),
+            lists: SmallVec::new(),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries == 0
+    }
+
+    fn push_row(&mut self, identity: u64, row_id: i64, key: SmallVec<[Value; 2]>) {
+        let spilled = if key.spilled() { key.capacity() } else { 0 };
+        self.bytes += std::mem::size_of::<(u64, RemovedKeys)>() + key_bytes(&key, spilled);
+        self.entries += 1;
+        self.lists.push((identity, RemovedKeys::Row(row_id, key)));
+    }
+
+    fn push_batch(&mut self, identity: u64, list: RemoveList) {
+        let entry = std::mem::size_of::<(i64, Vec<Value>)>();
+        self.bytes += std::mem::size_of::<(u64, RemovedKeys)>()
+            + list.capacity() * entry
+            + list
+                .iter()
+                .map(|(_, key)| key_bytes(key, key.capacity()))
+                .sum::<usize>();
+        self.entries += list.len();
+        self.lists.push((identity, RemovedKeys::Batch(list)));
+    }
+
+    /// Hands `found` the row ids whose key in the index `identity`
+    /// satisfies `matches`
+    pub(crate) fn each_matching(
+        &self,
+        identity: u64,
+        matches: &dyn Fn(&[Value]) -> bool,
+        found: &mut dyn FnMut(i64),
+    ) {
+        for (list_identity, keys) in &self.lists {
+            if *list_identity != identity {
+                continue;
+            }
+            match keys {
+                RemovedKeys::Row(row_id, key) => {
+                    if matches(key) {
+                        found(*row_id);
+                    }
+                }
+                RemovedKeys::Batch(list) => {
+                    for (row_id, key) in list.iter() {
+                        if matches(key) {
+                            found(*row_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The removals of the commits publishing on a store, and of those that
+/// ended, kept within a byte budget for the views that do not see them
+struct RemovalHistory {
+    publishing: SmallVec<[Arc<Removals>; 2]>,
+    /// Each ended record with the sequence current when it ended and the
+    /// entries appended up to and with it
+    ended: std::collections::VecDeque<(i64, u64, Arc<Removals>)>,
+    appended: u64,
+    bytes: usize,
+    /// The largest stamp of a record dropped for the budget
+    evicted_stamp: i64,
+}
+
+impl Default for RemovalHistory {
+    fn default() -> Self {
+        Self {
+            publishing: SmallVec::new(),
+            ended: std::collections::VecDeque::new(),
+            appended: 0,
+            bytes: 0,
+            evicted_stamp: i64::MIN,
+        }
+    }
 }
 
 /// VersionStore tracks the latest committed version of each row for a table
@@ -923,6 +1112,23 @@ pub struct VersionStore {
     /// The largest commit sequence that began publishing here, set before
     /// its first change; a view at or above it sees every head as it stands
     newest_commit_seq: AtomicI64,
+    /// `newest_commit_seq` as a commit that changes an index entry reads it,
+    /// before the change: a view at or above it finds its rows by the indexes
+    index_seq: AtomicI64,
+    /// The same for a change that takes an entry out of an index, or builds
+    /// one: a view at or above it finds every row it sees among the entries
+    index_removal_seq: AtomicI64,
+    /// The largest commit sequence whose removals the history holds: a view
+    /// at or above it needs none of them
+    removal_seq: AtomicI64,
+    /// The entries commits took out of the hot indexes, for older views
+    removal_history: RwLock<RemovalHistory>,
+    /// The same for a commit that adds or removes a row, or moves a sealed
+    /// one hot: a view at or above it counts the rows as the store does
+    membership_seq: AtomicI64,
+    /// Odd while something other than a commit changes the indexes or the
+    /// rows wholesale (a truncate, a cast, a rebinding), moved after it
+    index_epoch: AtomicU64,
     /// Moved by every column added or dropped: the rows are laid out as
     /// the schema says from then on, and a transaction that wrote under
     /// the layout before cannot commit its rows
@@ -1087,6 +1293,12 @@ impl VersionStore {
             publishing: AtomicUsize::new(0),
             publish_epoch: AtomicU64::new(0),
             newest_commit_seq: AtomicI64::new(0),
+            index_seq: AtomicI64::new(0),
+            index_removal_seq: AtomicI64::new(0),
+            removal_seq: AtomicI64::new(0),
+            removal_history: RwLock::new(RemovalHistory::default()),
+            membership_seq: AtomicI64::new(0),
+            index_epoch: AtomicU64::new(0),
             layout: AtomicU64::new(0),
             pending_cut: Mutex::new(None),
             store_id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
@@ -1121,6 +1333,12 @@ impl VersionStore {
             publishing: AtomicUsize::new(0),
             publish_epoch: AtomicU64::new(0),
             newest_commit_seq: AtomicI64::new(0),
+            index_seq: AtomicI64::new(0),
+            index_removal_seq: AtomicI64::new(0),
+            removal_seq: AtomicI64::new(0),
+            removal_history: RwLock::new(RemovalHistory::default()),
+            membership_seq: AtomicI64::new(0),
+            index_epoch: AtomicU64::new(0),
             layout: AtomicU64::new(0),
             pending_cut: Mutex::new(None),
             store_id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
@@ -1360,6 +1578,8 @@ impl VersionStore {
         if removed.is_empty() && rebound.is_empty() {
             return;
         }
+        // The removal history keeps no rebinding but a rename's
+        self.note_index_removal();
         self.publishing.fetch_add(1, Ordering::SeqCst);
         let taken: Vec<Arc<dyn Index>> = {
             let mut indexes = self.indexes.write();
@@ -1379,6 +1599,7 @@ impl VersionStore {
             }
         }
         self.publish_epoch.fetch_add(1, Ordering::SeqCst);
+        self.index_epoch.fetch_add(2, Ordering::SeqCst);
         self.publishing.fetch_sub(1, Ordering::SeqCst);
         drop(taken);
     }
@@ -1617,6 +1838,8 @@ impl VersionStore {
             arena,
             indexes,
         } = cast;
+        // The history's keys keep the old type: older views leave the indexes
+        self.note_index_removal();
         self.publishing.fetch_add(1, Ordering::SeqCst);
         {
             let mut versions = self.versions.write();
@@ -1642,6 +1865,7 @@ impl VersionStore {
                 .collect()
         };
         self.publish_epoch.fetch_add(1, Ordering::SeqCst);
+        self.index_epoch.fetch_add(2, Ordering::SeqCst);
         self.publishing.fetch_sub(1, Ordering::SeqCst);
         drop(replaced);
     }
@@ -3249,6 +3473,164 @@ impl VersionStore {
         Some(self.publish_epoch.load(Ordering::SeqCst))
     }
 
+    /// Whether `view` sees every commit that published here. Asked after a
+    /// quiet epoch and before the same epoch is read again, it holds for the
+    /// newest committed state read in between
+    pub fn view_sees_newest(&self, view: &StatementView) -> bool {
+        self.newest_commit_seq.load(Ordering::SeqCst) <= view.floor()
+    }
+
+    /// Notes, before a commit changes an index entry, that it does
+    pub fn note_index_change(&self) {
+        let seq = self.newest_commit_seq.load(Ordering::SeqCst);
+        self.index_seq.fetch_max(seq, Ordering::SeqCst);
+    }
+
+    /// Notes, before a change takes an entry out of an index or builds one,
+    /// that it does: the entries may then miss a row an older view sees
+    pub fn note_index_removal(&self) {
+        let seq = self.newest_commit_seq.load(Ordering::SeqCst);
+        self.index_removal_seq.fetch_max(seq, Ordering::SeqCst);
+        self.index_seq.fetch_max(seq, Ordering::SeqCst);
+    }
+
+    /// Notes, before a commit adds or removes a row, that it does
+    pub fn note_membership_change(&self) {
+        let seq = self.newest_commit_seq.load(Ordering::SeqCst);
+        self.membership_seq.fetch_max(seq, Ordering::SeqCst);
+    }
+
+    /// The token under which the indexes hold the keys `view` sees: no
+    /// wholesale change running, and every commit that changed an entry
+    /// visible to it. A probe answers when the same token holds after it
+    pub fn index_token(&self, view: &StatementView) -> Option<u64> {
+        self.token(&self.index_seq, view)
+    }
+
+    /// The token under which the indexes name every row `view` sees under
+    /// a key, and maybe rows it does not: a probe's rows are read through
+    /// the view and their keys checked again
+    pub fn candidate_token(&self, view: &StatementView) -> Option<u64> {
+        self.token(&self.index_removal_seq, view)
+    }
+
+    /// Publishes, before a commit takes its first entry out of an index, the
+    /// keys it takes out
+    pub(crate) fn publish_removals(&self, removals: &Arc<Removals>) {
+        self.removal_seq.fetch_max(removals.seq, Ordering::SeqCst);
+        self.removal_history
+            .write()
+            .publishing
+            .push(Arc::clone(removals));
+    }
+
+    /// Moves a commit's removals, once it is visible or undone with its
+    /// entries put back, among the ended ones, stamped with the sequence
+    /// current under the lock, and drops the oldest past the budget
+    pub(crate) fn end_removals(&self, removals: &Arc<Removals>) {
+        let mut dropped: SmallVec<[Arc<Removals>; 2]> = SmallVec::new();
+        {
+            let mut history = self.removal_history.write();
+            let Some(at) = history
+                .publishing
+                .iter()
+                .position(|held| Arc::ptr_eq(held, removals))
+            else {
+                return;
+            };
+            history.publishing.swap_remove(at);
+            let stamp = self
+                .visibility_checker
+                .as_ref()
+                .map_or(i64::MAX, |checker| checker.get_current_sequence());
+            history.appended += removals.entries as u64;
+            history.bytes += removals.bytes;
+            let appended = history.appended;
+            history
+                .ended
+                .push_back((stamp, appended, Arc::clone(removals)));
+            while history.bytes > REMOVAL_HISTORY_BYTES {
+                let Some((stamp, _, oldest)) = history.ended.pop_front() else {
+                    break;
+                };
+                history.bytes -= oldest.bytes;
+                history.evicted_stamp = history.evicted_stamp.max(stamp);
+                dropped.push(oldest);
+            }
+        }
+        // The keys go outside the lock
+        drop(dropped);
+    }
+
+    /// Hands `out` the removals of the commits `view` does not see, and says
+    /// whether those are all of them within the probe budget
+    pub(crate) fn removals_unseen(
+        &self,
+        view: &StatementView,
+        out: &mut SmallVec<[Arc<Removals>; 4]>,
+    ) -> bool {
+        if self.removal_seq.load(Ordering::SeqCst) <= view.floor() {
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::removal_history_read(0);
+            return true;
+        }
+        let history = self.removal_history.read();
+        if history.evicted_stamp >= view.seq() {
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::removal_history_read(2);
+            return false;
+        }
+        let from = history
+            .ended
+            .partition_point(|(stamp, _, _)| *stamp < view.seq());
+        let before = match from {
+            0 => history
+                .ended
+                .front()
+                .map_or(history.appended, |(_, upto, first)| {
+                    upto - first.entries as u64
+                }),
+            _ => history.ended[from - 1].1,
+        };
+        let publishing: usize = history
+            .publishing
+            .iter()
+            .filter(|removals| !view.sees_commit(removals.seq))
+            .map(|removals| removals.entries)
+            .sum();
+        if publishing + (history.appended - before) as usize > REMOVAL_PROBE_CAP {
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::removal_history_read(3);
+            return false;
+        }
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::removal_history_read(1);
+        out.extend(
+            history
+                .publishing
+                .iter()
+                .chain(history.ended.range(from..).map(|(_, _, removals)| removals))
+                .filter(|removals| !view.sees_commit(removals.seq))
+                .cloned(),
+        );
+        true
+    }
+
+    /// The token under which the committed row count is `view`'s
+    pub fn membership_token(&self, view: &StatementView) -> Option<u64> {
+        self.token(&self.membership_seq, view)
+    }
+
+    fn token(&self, seq: &AtomicI64, view: &StatementView) -> Option<u64> {
+        let epoch = self.index_epoch.load(Ordering::SeqCst);
+        (epoch.is_multiple_of(2) && seq.load(Ordering::SeqCst) <= view.floor()).then_some(epoch)
+    }
+
+    /// Marks a wholesale change of the indexes or rows begun or ended
+    fn move_index_epoch(&self) {
+        self.index_epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
     /// The epoch a pass over the arena's heads may answer `reader` under, or
     /// None when the chains must be walked: rows are claimed, the reader
     /// reads a snapshot, a commit is publishing, or its view excludes a
@@ -3323,10 +3705,12 @@ impl VersionStore {
         impl Drop for Publishing<'_> {
             fn drop(&mut self) {
                 self.0.publish_epoch.fetch_add(1, Ordering::SeqCst);
+                self.0.move_index_epoch();
                 self.0.publishing.fetch_sub(1, Ordering::SeqCst);
             }
         }
         self.publishing.fetch_add(1, Ordering::SeqCst);
+        self.move_index_epoch();
         let _publishing = Publishing(self);
 
         // Hold versions(W) while clearing BOTH versions AND arena atomically.
@@ -4584,13 +4968,20 @@ impl VersionStore {
         // LOCK ORDERING: Check uncommitted_writes BEFORE acquiring arena to maintain
         // consistent ordering with truncate_all (uncommitted_writes → arena).
         if let Some(epoch) = self.arena_window(&checker, reader) {
+            let declared = self.schema.read().columns.get(col_idx).map(|c| c.data_type);
             let arena_guard = self.arena.read_guard();
-            let (int_sum, float_sum, count) = sum_live_heads(
-                arena_guard.meta(),
-                arena_guard.data(),
-                col_idx,
-                |version_txn_id| checker.is_visible(version_txn_id, txn_id),
-            );
+            let (meta, data) = (arena_guard.meta(), arena_guard.data());
+            let visible = |version_txn_id| checker.is_visible(version_txn_id, txn_id);
+            let (int_sum, float_sum, count) = match declared {
+                Some(DataType::Integer) => {
+                    sum_live_heads::<SUM_INTEGER>(meta, data, col_idx, visible)
+                }
+                Some(DataType::Float) => sum_live_heads::<SUM_FLOAT>(meta, data, col_idx, visible),
+                Some(DataType::Boolean) => {
+                    sum_live_heads::<SUM_BOOLEAN>(meta, data, col_idx, visible)
+                }
+                _ => sum_live_heads::<SUM_ANY>(meta, data, col_idx, visible),
+            };
             if !arena_guard.is_empty() && self.publish_epoch_if_quiet() == Some(epoch) {
                 return (int_sum as f64 + float_sum, count);
             }
@@ -5224,6 +5615,10 @@ impl VersionStore {
     pub fn add_index(&self, name: String, index: Arc<dyn Index>) {
         let mut indexes = self.indexes.write();
         indexes.insert(name, index);
+        // Built from the newest rows: a view that misses a commit before it
+        // does not find its rows by it
+        self.note_index_removal();
+        self.index_epoch.fetch_add(2, Ordering::SeqCst);
     }
 
     /// Remove an index
@@ -5247,6 +5642,15 @@ impl VersionStore {
     /// has not issued one to yet
     pub fn index_identity(&self, name: &str) -> Option<u64> {
         self.index_identities.read().get(name).copied()
+    }
+
+    /// The name the removal history gives `index`'s keys: its identity, or
+    /// one fixed name for the primary key, which no rename or cast reaches
+    pub(crate) fn history_identity(&self, index: &dyn Index) -> Option<u64> {
+        if index.index_type() == crate::core::IndexType::PrimaryKey {
+            return Some(u64::MAX);
+        }
+        self.index_identity(index.name())
     }
 
     /// Binds every index on column `old` to its new name `new`, each keeping
@@ -5283,6 +5687,7 @@ impl VersionStore {
             indexes.insert(name, index);
         }
         self.publish_epoch.fetch_add(1, Ordering::SeqCst);
+        self.index_epoch.fetch_add(2, Ordering::SeqCst);
         self.publishing.fetch_sub(1, Ordering::SeqCst);
     }
 
@@ -6853,6 +7258,10 @@ impl VersionStore {
             }
         }
 
+        // Slots between checks that no commit began publishing: its answer
+        // would be dropped, so the pass stops and lets the commit take the arena
+        const EPOCH_STRIDE: usize = 1024;
+
         // Pre-acquire arena lock ONCE
         let arena_guard = self.arena.read_guard();
         let arena_data = arena_guard.data();
@@ -6995,81 +7404,42 @@ impl VersionStore {
             // Asked once per run of heads from one transaction
             let (mut last_txn_id, mut last_visible) = (0i64, false);
 
-            for (idx, meta) in arena_meta.iter().enumerate() {
-                // Visibility check (standard pattern: check creation, then deletion)
-                if meta.txn_id == 0 {
-                    continue;
+            for (stride, metas) in arena_meta.chunks(EPOCH_STRIDE).enumerate() {
+                if self.publish_epoch_if_quiet() != Some(epoch) {
+                    drop(arena_guard);
+                    return None;
                 }
-                if meta.txn_id != last_txn_id {
-                    last_txn_id = meta.txn_id;
-                    last_visible = checker.is_visible(meta.txn_id, txn_id);
-                }
-                if !last_visible {
-                    continue;
-                }
-                if meta.deleted_at_txn_id != 0 && checker.is_visible(meta.deleted_at_txn_id, txn_id)
-                {
-                    continue;
-                }
+                for (offset, meta) in metas.iter().enumerate() {
+                    let idx = stride * EPOCH_STRIDE + offset;
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::grouped_slot_reached(idx);
+                    // Visibility check (standard pattern: check creation, then deletion)
+                    if meta.txn_id == 0 {
+                        continue;
+                    }
+                    if meta.txn_id != last_txn_id {
+                        last_txn_id = meta.txn_id;
+                        last_visible = checker.is_visible(meta.txn_id, txn_id);
+                    }
+                    if !last_visible {
+                        continue;
+                    }
+                    if meta.deleted_at_txn_id != 0
+                        && checker.is_visible(meta.deleted_at_txn_id, txn_id)
+                    {
+                        continue;
+                    }
 
-                let row_data = match arena_data.get(idx) {
-                    Some(data) => data,
-                    None => continue,
-                };
-
-                let row_slice = row_data.as_ref();
-                let val = if col_idx < row_slice.len() {
-                    &row_slice[col_idx]
-                } else {
-                    // NULL - track separately without GroupKey allocation
-                    let ordinal = match null_group {
-                        Some(ordinal) => ordinal,
-                        None => {
-                            *null_group.insert(new_group(&mut accums, &mut group_count, n_aggs))
-                        }
+                    let row_data = match arena_data.get(idx) {
+                        Some(data) => data,
+                        None => continue,
                     };
-                    let base = ordinal as usize * n_aggs;
-                    update_accums(&mut accums[base..base + n_aggs], aggregates, row_slice);
-                    continue;
-                };
 
-                // Try to extract i64 key for primitive types.
-                // Only route to int_groups when the type matches key_type.
-                // Mixed-type columns route mismatched types to other_groups
-                // to avoid reconstructing Float bits as Integer or vice versa.
-                let i64_key = match val {
-                    Value::Integer(i) => {
-                        if key_type == 255 {
-                            key_type = 0;
-                        }
-                        if key_type == 0 {
-                            Some(*i)
-                        } else {
-                            None // Type mismatch → other_groups
-                        }
-                    }
-                    Value::Float(f) => {
-                        if key_type == 255 {
-                            key_type = 1;
-                        }
-                        if key_type == 1 {
-                            Some(key_from_f64(grouping_float(*f)))
-                        } else {
-                            None // Type mismatch → other_groups
-                        }
-                    }
-                    Value::Boolean(b) => {
-                        if key_type == 255 {
-                            key_type = 2;
-                        }
-                        if key_type == 2 {
-                            Some(if *b { 1 } else { 0 })
-                        } else {
-                            None // Type mismatch → other_groups
-                        }
-                    }
-                    Value::Null(_) => {
-                        // NULL value in the column - track separately
+                    let row_slice = row_data.as_ref();
+                    let val = if col_idx < row_slice.len() {
+                        &row_slice[col_idx]
+                    } else {
+                        // NULL - track separately without GroupKey allocation
                         let ordinal = match null_group {
                             Some(ordinal) => ordinal,
                             None => {
@@ -7079,27 +7449,88 @@ impl VersionStore {
                         let base = ordinal as usize * n_aggs;
                         update_accums(&mut accums[base..base + n_aggs], aggregates, row_slice);
                         continue;
-                    }
-                    _ => None,
-                };
+                    };
 
-                let ordinal = if let Some(key) = i64_key {
-                    match int_groups.entry(key) {
-                        Entry::Occupied(existing) => *existing.into_mut(),
-                        Entry::Vacant(slot) => {
-                            *slot.insert(new_group(&mut accums, &mut group_count, n_aggs))
+                    // Try to extract i64 key for primitive types.
+                    // Only route to int_groups when the type matches key_type.
+                    // Mixed-type columns route mismatched types to other_groups
+                    // to avoid reconstructing Float bits as Integer or vice versa.
+                    let i64_key = match val {
+                        Value::Integer(i) => {
+                            if key_type == 255 {
+                                key_type = 0;
+                            }
+                            if key_type == 0 {
+                                Some(*i)
+                            } else {
+                                None // Type mismatch → other_groups
+                            }
                         }
-                    }
-                } else {
-                    match other_groups.entry(GroupKey::Single(CompactArc::new(val.clone()))) {
-                        std::collections::hash_map::Entry::Occupied(existing) => *existing.get(),
-                        std::collections::hash_map::Entry::Vacant(slot) => {
-                            *slot.insert(new_group(&mut accums, &mut group_count, n_aggs))
+                        Value::Float(f) => {
+                            if key_type == 255 {
+                                key_type = 1;
+                            }
+                            if key_type == 1 {
+                                Some(key_from_f64(grouping_float(*f)))
+                            } else {
+                                None // Type mismatch → other_groups
+                            }
                         }
-                    }
-                };
-                let base = ordinal as usize * n_aggs;
-                update_accums(&mut accums[base..base + n_aggs], aggregates, row_slice);
+                        Value::Boolean(b) => {
+                            if key_type == 255 {
+                                key_type = 2;
+                            }
+                            if key_type == 2 {
+                                Some(if *b { 1 } else { 0 })
+                            } else {
+                                None // Type mismatch → other_groups
+                            }
+                        }
+                        Value::Null(_) => {
+                            // NULL value in the column - track separately
+                            let ordinal = match null_group {
+                                Some(ordinal) => ordinal,
+                                None => *null_group.insert(new_group(
+                                    &mut accums,
+                                    &mut group_count,
+                                    n_aggs,
+                                )),
+                            };
+                            let base = ordinal as usize * n_aggs;
+                            update_accums(&mut accums[base..base + n_aggs], aggregates, row_slice);
+                            continue;
+                        }
+                        _ => None,
+                    };
+
+                    let ordinal = if let Some(key) = i64_key {
+                        match int_groups.entry(key) {
+                            Entry::Occupied(existing) => *existing.into_mut(),
+                            Entry::Vacant(slot) => {
+                                *slot.insert(new_group(&mut accums, &mut group_count, n_aggs))
+                            }
+                        }
+                    } else {
+                        match other_groups.entry(GroupKey::Single(CompactArc::new(val.clone()))) {
+                            std::collections::hash_map::Entry::Occupied(existing) => {
+                                *existing.get()
+                            }
+                            std::collections::hash_map::Entry::Vacant(slot) => {
+                                *slot.insert(new_group(&mut accums, &mut group_count, n_aggs))
+                            }
+                        }
+                    };
+                    let base = ordinal as usize * n_aggs;
+                    update_accums(&mut accums[base..base + n_aggs], aggregates, row_slice);
+                }
+            }
+
+            // The groups own their keys and values: build the results
+            // outside the lock, and only if no commit published across the pass
+            let held = self.publish_epoch_if_quiet() == Some(epoch);
+            drop(arena_guard);
+            if !held {
+                return None;
             }
 
             // Convert to results
@@ -7158,43 +7589,59 @@ impl VersionStore {
                 });
             }
 
-            return (self.publish_epoch_if_quiet() == Some(epoch)).then_some(results);
+            return Some(results);
         }
 
         // SLOW PATH: Multi-column GROUP BY (currently not used from try_storage_aggregation)
         let mut groups: GroupKeyMap<Vec<Accum>> = GroupKeyMap::default();
 
-        for (idx, meta) in arena_meta.iter().enumerate() {
-            // Visibility check (standard pattern: check creation, then deletion)
-            if meta.txn_id == 0 || !checker.is_visible(meta.txn_id, txn_id) {
-                continue;
+        for (stride, metas) in arena_meta.chunks(EPOCH_STRIDE).enumerate() {
+            if self.publish_epoch_if_quiet() != Some(epoch) {
+                drop(arena_guard);
+                return None;
             }
-            if meta.deleted_at_txn_id != 0 && checker.is_visible(meta.deleted_at_txn_id, txn_id) {
-                continue;
+            for (offset, meta) in metas.iter().enumerate() {
+                let idx = stride * EPOCH_STRIDE + offset;
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::grouped_slot_reached(idx);
+                // Visibility check (standard pattern: check creation, then deletion)
+                if meta.txn_id == 0 || !checker.is_visible(meta.txn_id, txn_id) {
+                    continue;
+                }
+                if meta.deleted_at_txn_id != 0 && checker.is_visible(meta.deleted_at_txn_id, txn_id)
+                {
+                    continue;
+                }
+
+                let row_data = match arena_data.get(idx) {
+                    Some(data) => data,
+                    None => continue,
+                };
+                let row_slice = row_data.as_ref();
+
+                let key_values: Vec<CompactArc<Value>> = group_by_indices
+                    .iter()
+                    .map(|&col_idx| {
+                        if col_idx < row_slice.len() {
+                            CompactArc::new(row_slice[col_idx].clone())
+                        } else {
+                            CompactArc::new(Value::Null(DataType::Null))
+                        }
+                    })
+                    .collect();
+                let group_key = GroupKey::Multi(key_values);
+
+                let accums = groups
+                    .entry(group_key)
+                    .or_insert_with(|| vec![Accum::default(); aggregates.len()]);
+                update_accums(accums, aggregates, row_slice);
             }
+        }
 
-            let row_data = match arena_data.get(idx) {
-                Some(data) => data,
-                None => continue,
-            };
-            let row_slice = row_data.as_ref();
-
-            let key_values: Vec<CompactArc<Value>> = group_by_indices
-                .iter()
-                .map(|&col_idx| {
-                    if col_idx < row_slice.len() {
-                        CompactArc::new(row_slice[col_idx].clone())
-                    } else {
-                        CompactArc::new(Value::Null(DataType::Null))
-                    }
-                })
-                .collect();
-            let group_key = GroupKey::Multi(key_values);
-
-            let accums = groups
-                .entry(group_key)
-                .or_insert_with(|| vec![Accum::default(); aggregates.len()]);
-            update_accums(accums, aggregates, row_slice);
+        let held = self.publish_epoch_if_quiet() == Some(epoch);
+        drop(arena_guard);
+        if !held {
+            return None;
         }
 
         // Convert to results
@@ -7211,7 +7658,7 @@ impl VersionStore {
             });
         }
 
-        (self.publish_epoch_if_quiet() == Some(epoch)).then_some(results)
+        Some(results)
     }
 }
 
@@ -7251,6 +7698,11 @@ pub struct TransactionVersionStore {
     write_set: Option<I64Map<WriteSetEntry>>,
     /// Index updates applied by commit, until the commit is visible or undone
     index_undo: Mutex<SmallVec<[IndexUndo; 2]>>,
+    /// The keys the commit published before taking them out of the indexes,
+    /// until it is visible or undone
+    removals: Mutex<Option<Arc<Removals>>>,
+    /// The commit's sequence, 0 until the commit gives it
+    commit_seq: AtomicI64,
     /// What commit's application of each version left for its undo, until
     /// the commit is visible or undone
     applied: Mutex<SmallVec<[Applied; 2]>>,
@@ -7388,6 +7840,8 @@ impl TransactionVersionStore {
             txn_id,
             write_set: None,
             index_undo: Mutex::new(SmallVec::new()),
+            removals: Mutex::new(None),
+            commit_seq: AtomicI64::new(0),
             applied: Mutex::new(SmallVec::new()),
             bound: SmallVec::new(),
             writing: None,
@@ -7400,7 +7854,14 @@ impl TransactionVersionStore {
     /// Lets go of what the commit kept for its undo, once it is visible
     pub fn release_applied(&self) {
         drop(std::mem::take(&mut *self.applied.lock()));
+        self.end_removals();
         self.index_undo.lock().clear();
+    }
+
+    /// The sequence the commit of this transaction publishes under, given
+    /// before the commit touches an index
+    pub fn note_commit_seq(&self, commit_seq: i64) {
+        self.commit_seq.store(commit_seq, Ordering::Relaxed);
     }
 
     pub fn undo_publication(&self) {
@@ -7447,7 +7908,7 @@ impl TransactionVersionStore {
                             .collect();
                         let _ = index.remove_batch_slice(&batch);
                     }
-                    if !removed.is_empty() {
+                    if let Some(removed) = removed.as_ref().filter(|list| !list.is_empty()) {
                         let batch: Vec<(i64, &[Value])> = removed
                             .iter()
                             .map(|(row_id, values)| (*row_id, values.as_slice()))
@@ -7456,6 +7917,44 @@ impl TransactionVersionStore {
                     }
                 }
             }
+        }
+        // With the entries back, the keys stay readable to older views
+        self.end_removals();
+    }
+
+    /// Moves this commit's published removals among the ended ones
+    fn end_removals(&self) {
+        if let Some(removals) = self.removals.lock().take() {
+            self.parent_store.end_removals(&removals);
+        }
+    }
+
+    /// Publishes the keys the commit takes out of the indexes, before any
+    /// goes. Keys the history cannot name keep older views off the indexes
+    fn publish_removals(&self, removals: Removals, covered: bool) {
+        if !covered || removals.seq <= 0 || self.parent_store.visibility_checker.is_none() {
+            self.parent_store.note_index_removal();
+            return;
+        }
+        self.parent_store.note_index_change();
+        if removals.is_empty() {
+            return;
+        }
+        let removals = Arc::new(removals);
+        self.parent_store.publish_removals(&removals);
+        if let Some(earlier) = self.removals.lock().replace(removals) {
+            self.parent_store.end_removals(&earlier);
+        }
+    }
+
+    /// How the history names the keys taken out of `index`
+    fn history_name(&self, index: &dyn Index) -> HistoryName {
+        if index.index_type() == crate::core::IndexType::Hnsw {
+            return HistoryName::Unread;
+        }
+        match self.parent_store.history_identity(index) {
+            Some(identity) => HistoryName::Named(identity),
+            None => HistoryName::Unnamed,
         }
     }
 
@@ -8314,6 +8813,8 @@ impl TransactionVersionStore {
         // The set taken binds the positions of the layout the rows are in
         self.parent_store.check_layout(self.layout_bound())?;
         if indexes.is_empty() {
+            // Without an index to tell inserts from updates, any row counts
+            self.parent_store.note_membership_change();
             return Ok(());
         }
 
@@ -8335,6 +8836,7 @@ impl TransactionVersionStore {
             (0..num_indexes).map(|_| Vec::new()).collect();
         let mut remove_batches: Vec<Vec<(i64, Vec<crate::core::Value>)>> =
             (0..num_indexes).map(|_| Vec::new()).collect();
+        let mut membership = false;
 
         // Collect index updates for each row
         for (row_id, versions) in local_versions.iter() {
@@ -8352,6 +8854,7 @@ impl TransactionVersionStore {
                 .and_then(|entry| entry.read_version.as_ref())
                 .map(|rv| &rv.data);
             let sealed = entry.is_some_and(|entry| entry.sealed);
+            membership |= is_deleted || old_row.is_none() || sealed;
 
             for (idx, index) in indexes.iter().enumerate() {
                 let column_ids = index.column_ids();
@@ -8444,6 +8947,36 @@ impl TransactionVersionStore {
             }
         }
 
+        if membership {
+            self.parent_store.note_membership_change();
+        }
+        let remove_batches: SmallVec<[Option<RemoveList>; 4]> = remove_batches
+            .into_iter()
+            .map(|batch| (!batch.is_empty()).then(|| Arc::new(batch)))
+            .collect();
+        if remove_batches.iter().any(Option::is_some) {
+            let mut removals = Removals::new(self.commit_seq.load(Ordering::Relaxed));
+            let covered = indexes.iter().zip(&remove_batches).all(|(index, list)| {
+                let Some(list) = list else {
+                    return true;
+                };
+                match self.history_name(&**index) {
+                    HistoryName::Named(identity) => {
+                        removals.push_batch(identity, Arc::clone(list));
+                        true
+                    }
+                    HistoryName::Unread => true,
+                    HistoryName::Unnamed => false,
+                }
+            });
+            self.publish_removals(removals, covered);
+        } else if add_batches.iter().any(|batch| !batch.is_empty()) {
+            self.parent_store.note_index_change();
+        }
+        let removed_at = |idx: usize| -> &[(i64, Vec<crate::core::Value>)] {
+            remove_batches[idx].as_deref().map_or(&[], Vec::as_slice)
+        };
+
         // PHASE 1: Pre-validate ALL unique indexes before modifying ANY index
         // This prevents index pollution when a later index fails
         for (idx, index) in indexes.iter().enumerate() {
@@ -8454,10 +8987,8 @@ impl TransactionVersionStore {
             // Build a set of row_ids being removed for O(1) conflict resolution
             // For unique indexes, if a row_id is being removed, its current value is being removed.
             // We don't need to track values - just knowing the row_id is sufficient.
-            let removals_set: crate::common::I64Set = remove_batches[idx]
-                .iter()
-                .map(|(row_id, _)| *row_id)
-                .collect();
+            let removals_set: crate::common::I64Set =
+                removed_at(idx).iter().map(|(row_id, _)| *row_id).collect();
 
             // Check for intra-batch duplicates first
             let mut seen: ahash::AHashMap<&[crate::core::Value], i64> =
@@ -8542,8 +9073,8 @@ impl TransactionVersionStore {
 
         for (idx, index) in indexes.iter().enumerate() {
             // Remove old entries first (for UPDATE correctness)
-            if !remove_batches[idx].is_empty() {
-                let batch: Vec<(i64, &[crate::core::Value])> = remove_batches[idx]
+            if !removed_at(idx).is_empty() {
+                let batch: Vec<(i64, &[crate::core::Value])> = removed_at(idx)
                     .iter()
                     .map(|(row_id, values)| (*row_id, values.as_slice()))
                     .collect();
@@ -8576,11 +9107,11 @@ impl TransactionVersionStore {
 
                     // 2. Re-add removals we made to earlier indexes
                     for &rollback_idx in &completed_removals {
-                        let rollback_batch: Vec<(i64, &[crate::core::Value])> = remove_batches
-                            [rollback_idx]
-                            .iter()
-                            .map(|(row_id, values)| (*row_id, values.as_slice()))
-                            .collect();
+                        let rollback_batch: Vec<(i64, &[crate::core::Value])> =
+                            removed_at(rollback_idx)
+                                .iter()
+                                .map(|(row_id, values)| (*row_id, values.as_slice()))
+                                .collect();
                         // Rollback additions - ignore errors as we're in error recovery
                         let _ = indexes[rollback_idx].add_batch_slice(&rollback_batch);
                     }
@@ -8593,13 +9124,13 @@ impl TransactionVersionStore {
 
         let mut undo = self.index_undo.lock();
         for (idx, index) in indexes.iter().enumerate() {
-            if add_batches[idx].is_empty() && remove_batches[idx].is_empty() {
+            if add_batches[idx].is_empty() && remove_batches[idx].is_none() {
                 continue;
             }
             undo.push(IndexUndo::Batch {
                 index: Arc::clone(index),
                 added: std::mem::take(&mut add_batches[idx]),
-                removed: std::mem::take(&mut remove_batches[idx]),
+                removed: remove_batches[idx].clone(),
             });
         }
 
@@ -8631,6 +9162,30 @@ impl TransactionVersionStore {
             .and_then(|entry| entry.read_version.as_ref())
             .map(|rv| &rv.data);
         let sealed = entry.is_some_and(|entry| entry.sealed);
+        if is_deleted || old_row.is_none() || sealed {
+            self.parent_store.note_membership_change();
+            self.parent_store.note_index_change();
+        }
+        // The keys the row leaves the indexes with go to the history first
+        if is_deleted || old_row.is_some() {
+            let mut removals = Removals::new(self.commit_seq.load(Ordering::Relaxed));
+            let mut covered = true;
+            for index in indexes {
+                let Some(key) =
+                    Self::single_row_removal(&**index, old_row, new_row, is_deleted, sealed)
+                else {
+                    continue;
+                };
+                match self.history_name(&**index) {
+                    HistoryName::Named(identity) => removals.push_row(identity, row_id, key),
+                    HistoryName::Unread => {}
+                    HistoryName::Unnamed => covered = false,
+                }
+            }
+            if !removals.is_empty() || !covered {
+                self.publish_removals(removals, covered);
+            }
+        }
 
         // Every index call made so far, with the key it was made with, for
         // rollback on error and for the undo log on success
@@ -8691,7 +9246,10 @@ impl TransactionVersionStore {
 
                     // Remove old, add new; the removal is in completed_ops,
                     // so a failed add re-adds it through the rollback
+                    self.parent_store.note_index_change();
                     let _ = index.remove(&old_values, row_id, row_id);
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::commit_index_removed();
                     completed_ops.push((idx, false, old_values));
 
                     if let Err(e) = index.add(&new_values, row_id, row_id) {
@@ -8748,6 +9306,54 @@ impl TransactionVersionStore {
         }
 
         Ok(())
+    }
+
+    /// The key `index` loses when the row commits, as the single-row update
+    /// decides it, or None when it loses none
+    fn single_row_removal(
+        index: &dyn Index,
+        old_row: Option<&Row>,
+        new_row: &Row,
+        is_deleted: bool,
+        sealed: bool,
+    ) -> Option<SmallVec<[Value; 2]>> {
+        let column_ids = index.column_ids();
+        if column_ids.is_empty() {
+            return None;
+        }
+        let kept_sealed = index.index_type() == crate::core::IndexType::Hnsw;
+        if sealed && !kept_sealed && is_deleted {
+            return None;
+        }
+        let old_row = if sealed && !kept_sealed {
+            None
+        } else {
+            old_row
+        };
+        let source = match (old_row, is_deleted) {
+            (Some(old), false) => {
+                let changed = column_ids
+                    .iter()
+                    .any(|&col_id| old.get(col_id as usize) != new_row.get(col_id as usize));
+                if !changed {
+                    return None;
+                }
+                old
+            }
+            (old, true) => old.unwrap_or(new_row),
+            (None, false) => return None,
+        };
+        Some(
+            column_ids
+                .iter()
+                .map(|&col_id| {
+                    source
+                        .get(col_id as usize)
+                        .cloned()
+                        .unwrap_or(Value::Null(DataType::Null))
+                })
+                .collect(),
+        )
     }
 
     /// Rollback helper for single-row operations
@@ -8991,6 +9597,58 @@ mod tests {
             self.asked.fetch_add(1, Ordering::Relaxed);
             txn_id % 2 == 1 && txn_id < 200
         }
+    }
+
+    /// Answers the current sequence, counting the questions asked while the
+    /// store's removal history was not locked
+    struct LockWatchingChecker {
+        store: std::sync::OnceLock<std::sync::Weak<VersionStore>>,
+        asked: std::sync::atomic::AtomicUsize,
+        asked_unlocked: std::sync::atomic::AtomicUsize,
+    }
+
+    impl VisibilityChecker for LockWatchingChecker {
+        fn is_visible(&self, version_txn_id: i64, viewing_txn_id: i64) -> bool {
+            version_txn_id <= viewing_txn_id
+        }
+
+        fn get_current_sequence(&self) -> i64 {
+            if let Some(store) = self.store.get().and_then(std::sync::Weak::upgrade) {
+                self.asked.fetch_add(1, Ordering::Relaxed);
+                if store.removal_history.try_write().is_some() {
+                    self.asked_unlocked.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            7
+        }
+    }
+
+    #[test]
+    fn an_ended_removal_is_stamped_under_the_history_lock() {
+        let checker = Arc::new(LockWatchingChecker {
+            store: std::sync::OnceLock::new(),
+            asked: std::sync::atomic::AtomicUsize::new(0),
+            asked_unlocked: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let store = Arc::new(VersionStore::with_visibility_checker(
+            "t".to_string(),
+            test_schema(),
+            Arc::clone(&checker) as Arc<dyn VisibilityChecker>,
+        ));
+        assert!(checker.store.set(Arc::downgrade(&store)).is_ok());
+        let mut removals = Removals::new(5);
+        removals.push_row(1, 1, smallvec::smallvec![Value::from(1)]);
+        let removals = Arc::new(removals);
+        store.publish_removals(&removals);
+        store.end_removals(&removals);
+        assert_eq!(
+            (
+                checker.asked.load(Ordering::Relaxed),
+                checker.asked_unlocked.load(Ordering::Relaxed)
+            ),
+            (1, 0),
+            "the stamp is read under the lock that orders the ended records"
+        );
     }
 
     /// Rows 1.. written by `txns` in order, classified under a snapshot:
@@ -9332,6 +9990,49 @@ mod tests {
 
         assert_eq!(keys, vec![10, 20]);
         assert!(results.iter().all(|r| r.aggregate_values.is_empty()));
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[test]
+    fn test_multi_column_grouped_pass_stops_soon_after_a_commit_begins_publishing() {
+        use crate::core::DataType;
+
+        let schema = crate::core::SchemaBuilder::new("multi_stop")
+            .column("id", DataType::Integer, false, true)
+            .column("a", DataType::Integer, true, false)
+            .column("b", DataType::Integer, true, false)
+            .build();
+        let store = Arc::new(VersionStore::with_visibility_checker(
+            "multi_stop".to_string(),
+            schema,
+            Arc::new(ReadCommittedChecker),
+        ));
+        let mut txn = TransactionVersionStore::new(Arc::clone(&store), 1);
+        for id in 1..=5000i64 {
+            let row = Row::from(vec![
+                Value::from(id),
+                Value::from(id % 3),
+                Value::from(id % 5),
+            ]);
+            txn.put(id, row, false).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let hold = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (publisher, handle) = (Arc::clone(&store), std::rc::Rc::clone(&hold));
+        crate::test_failpoints::on_grouped_slot(100, move || {
+            *handle.borrow_mut() = Some(publisher.begin_publish(0));
+        });
+        let results =
+            store.compute_grouped_aggregates(2.into(), &[1, 2], &[(AggregateOp::CountStar, 0)]);
+        let after = crate::test_failpoints::grouped_slots_after_hook();
+        drop(hold.borrow_mut().take().expect("the pass reached the slot"));
+        assert!(results.is_none(), "a pass a commit published into answers");
+        let after = after.expect("the multi-column pass reached the slot");
+        assert!(
+            after <= 1024,
+            "the pass went on for {after} slots after the commit began publishing"
+        );
     }
 
     #[test]
@@ -10042,6 +10743,37 @@ mod tests {
         let (sum, count) = store.sum_column(2.into(), 0);
         assert_eq!(sum, 150.0); // 10 + 20 + 30 + 40 + 50
         assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn test_arena_sum_counts_values_of_another_type_than_the_column_declares() {
+        use crate::core::DataType;
+
+        let schema = crate::core::SchemaBuilder::new("mixed_sum")
+            .column("id", DataType::Integer, false, true)
+            .column("f", DataType::Float, true, false)
+            .column("i", DataType::Integer, true, false)
+            .build();
+        let store = Arc::new(VersionStore::with_visibility_checker(
+            "mixed_sum".to_string(),
+            schema,
+            Arc::new(ReadCommittedChecker),
+        ));
+        let mut txn = TransactionVersionStore::new(Arc::clone(&store), 1);
+        let rows = [
+            (Value::Integer(5), Value::Float(2.5)),
+            (Value::Float(1.5), Value::Integer(4)),
+            (Value::Null(DataType::Float), Value::Boolean(true)),
+            (Value::Boolean(true), Value::Null(DataType::Integer)),
+        ];
+        for (id, (f, i)) in rows.into_iter().enumerate() {
+            let row = Row::from(vec![Value::from(id as i64 + 1), f, i]);
+            txn.put(id as i64 + 1, row, false).unwrap();
+        }
+        txn.commit().unwrap();
+
+        assert_eq!(store.sum_column(2.into(), 1), (7.5, 3), "a FLOAT column");
+        assert_eq!(store.sum_column(2.into(), 2), (7.5, 3), "an INTEGER column");
     }
 
     #[test]
