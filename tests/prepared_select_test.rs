@@ -1725,3 +1725,25 @@ fn test_json_comparisons_give_one_answer() {
         );
     }
 }
+
+#[test]
+fn test_a_quoted_dotted_alias_reads_the_projected_value() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_quoted_dotted_alias").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 20)", ())
+        .unwrap();
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1), (2)", ()).unwrap();
+    let sql = "SELECT a AS \"x.y\", id FROM t WHERE id = (SELECT id FROM u WHERE u.id = t.id) \
+               ORDER BY CAST(\"x.y\" AS INTEGER) DESC, id";
+    let (found, runs) = ids(&db, sql, ());
+    assert!(runs >= 1, "ran prepared");
+    assert_eq!(
+        found,
+        vec![20, 10],
+        "\"x.y\" is the alias, not a qualified name"
+    );
+}

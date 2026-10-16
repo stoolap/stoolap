@@ -589,6 +589,26 @@ fn read_as(expr: &mut Expression, type_name: &str) {
     });
 }
 
+/// `key` with each bare name of an alias in `positions` spelled as the
+/// second row's name for that alias's position
+fn bind_aliases(key: &Expression, positions: &FxHashMap<&str, usize>) -> Result<Expression> {
+    match key {
+        Expression::Identifier(id) => Ok(match positions.get(id.value_lower.as_str()) {
+            Some(i) => {
+                let name = format!("\u{1}{i}");
+                let mut bound = Identifier::new(
+                    Token::new(TokenType::Identifier, &name, Position::default()),
+                    name.as_str(),
+                );
+                bound.quoted = true;
+                Expression::Identifier(bound)
+            }
+            None => key.clone(),
+        }),
+        other => rebuild(other, &mut |child| bind_aliases(child, positions)),
+    }
+}
+
 /// Whether the scan compares values of `data_type` by the program's rule;
 /// a JSON or VECTOR comparison is left to the program
 fn scan_compares(data_type: DataType) -> bool {
@@ -1419,12 +1439,16 @@ impl PreparedProjection {
         // it, under the key's own text, which is how the sort finds it
         let mut extra_names = plan.extra_names;
         let alias_map = Executor::build_alias_map_excluding(&stmt.columns, Some(columns));
-        // A dotted alias would register as a qualified column of the second row
+        // Each alias is bound to its position under a name no column, alias
+        // or qualifier can spell, so a dotted alias registers no qualifier
+        let mut positions: FxHashMap<&str, usize> = FxHashMap::default();
         let projected_names: Vec<String> = select_exprs
             .iter()
-            .map(|e| match e {
-                Expression::Aliased(a) if !a.alias.value_lower.contains('.') => {
-                    a.alias.value_lower.to_string()
+            .enumerate()
+            .map(|(i, e)| match e {
+                Expression::Aliased(a) if alias_map.contains_key(a.alias.value_lower.as_str()) => {
+                    positions.entry(a.alias.value_lower.as_str()).or_insert(i);
+                    format!("\u{1}{i}")
                 }
                 _ => String::new(),
             })
@@ -1442,7 +1466,8 @@ impl PreparedProjection {
             let ctx = alias_ctx.get_or_init(|| {
                 CompileContext::new(columns, registry).with_second_row(&projected_names)
             });
-            outputs.push(Output::AliasKey(compile_with(ctx, key)?));
+            let bound = bind_aliases(key, &positions)?;
+            outputs.push(Output::AliasKey(compile_with(ctx, &bound)?));
             extra_names.push(name);
         }
         Ok((Self { outputs }, extra_names))
