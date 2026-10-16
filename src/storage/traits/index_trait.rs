@@ -380,6 +380,12 @@ pub trait Index: Send + Sync {
         None // Default implementation - override in concrete indexes
     }
 
+    /// About how many distinct keys the index holds, NULL included, when it
+    /// knows without counting them; None when it does not
+    fn distinct_keys_hint(&self) -> Option<usize> {
+        None
+    }
+
     /// Returns row IDs in sorted order by index value (for ORDER BY optimization)
     ///
     /// This enables efficient ORDER BY queries by iterating through the B-tree

@@ -866,6 +866,11 @@ impl Index for HashIndex {
         Some(count)
     }
 
+    /// One entry per key hash: keys whose hashes collide count once
+    fn distinct_keys_hint(&self) -> Option<usize> {
+        Some(self.hash_to_values.read().len())
+    }
+
     fn clear(&self) -> Result<()> {
         self.row_to_hash.write().clear();
         self.hash_to_values.write().clear();

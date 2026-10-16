@@ -861,6 +861,10 @@ impl Index for BitmapIndex {
         bitmaps.keys().map(|arc| (**arc).clone()).collect()
     }
 
+    fn distinct_keys_hint(&self) -> Option<usize> {
+        Some(self.bitmaps.read().len())
+    }
+
     fn clear(&self) -> Result<()> {
         self.bitmaps.write().clear();
         self.row_to_value.write().clear();
