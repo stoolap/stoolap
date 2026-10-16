@@ -34,6 +34,13 @@ fn serial() -> MutexGuard<'static, ()> {
 /// keeps in memory, so its scan streams; `u` holds the same rows without
 /// an index; `s` is the small outer side
 fn sealed(dir: &tempfile::TempDir) -> Database {
+    let db = hot(dir, 120000);
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db
+}
+
+/// The tables of `sealed` with `rows` rows, all of them hot
+fn hot(dir: &tempfile::TempDir, rows: i64) -> Database {
     let db = Database::open(&format!(
         "file://{}?sync_mode=none&checkpoint_on_close=off&checkpoint_interval=0",
         dir.path().display()
@@ -49,7 +56,7 @@ fn sealed(dir: &tempfile::TempDir) -> Database {
             &format!(
                 "INSERT INTO {table} SELECT g.value, \
                  CASE WHEN g.value % 10 = 0 THEN 777 ELSE g.value % 1000 END, g.value \
-                 FROM generate_series(1, 120000) g"
+                 FROM generate_series(1, {rows}) g"
             ),
             (),
         )
@@ -66,7 +73,6 @@ fn sealed(dir: &tempfile::TempDir) -> Database {
         (),
     )
     .unwrap();
-    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     db
 }
 
@@ -112,12 +118,22 @@ fn a_join_without_an_index_answers_as_its_control() {
 #[test]
 fn null_keys_moved_keys_and_own_rows_answer_as_the_control() {
     let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let db = sealed(&dir);
+    for seal in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = if seal {
+            sealed(&dir)
+        } else {
+            hot(&dir, 120000)
+        };
+        null_keys_moved_keys_and_own_rows(&db);
+    }
+}
+
+fn null_keys_moved_keys_and_own_rows(db: &Database) {
     db.execute("INSERT INTO s VALUES (4, NULL, 40)", ())
         .unwrap();
     let join = "WITH c AS (SELECT k FROM s) SELECT t.id FROM c JOIN t ON t.k = c.k";
-    same_as_control(&db, join);
+    same_as_control(db, join);
     for table in ["t", "u"] {
         db.execute(
             &format!("UPDATE {table} SET k = 999999 WHERE id = 1001"),
@@ -127,14 +143,14 @@ fn null_keys_moved_keys_and_own_rows_answer_as_the_control() {
         db.execute(&format!("UPDATE {table} SET k = 5 WHERE id = 1002"), ())
             .unwrap();
     }
-    let moved = same_as_control(&db, join);
+    let moved = same_as_control(db, join);
     assert!(!moved.contains(&vec![1001]) && moved.contains(&vec![1002]));
     db.execute("BEGIN", ()).unwrap();
     for table in ["t", "u"] {
         db.execute(&format!("INSERT INTO {table} VALUES (190001, 2, 0)"), ())
             .unwrap();
     }
-    assert!(same_as_control(&db, join).contains(&vec![190001]));
+    assert!(same_as_control(db, join).contains(&vec![190001]));
     db.execute("ROLLBACK", ()).unwrap();
 }
 
@@ -264,6 +280,40 @@ mod counted {
         assert_eq!(counts.reads, (0, 0));
         assert_eq!(counts.sides, 2, "a side ran more than once");
         assert_eq!(found, same_as_control(&db, sql));
+    }
+
+    /// A hot table large enough for the largest small outer, 64 rows for
+    /// each of its rows, narrows like a sealed one; a smaller hot table keeps
+    /// the standard join however few the keys
+    #[test]
+    fn a_hot_table_narrows_only_when_large() {
+        let _serial = serial();
+        for (rows, keys, narrows) in [(120000, 3, true), (120000, 200, true), (10000, 3, false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = hot(&dir, rows);
+            db.execute(
+                &format!(
+                    "INSERT INTO s SELECT 100 + g.value, 100 + g.value, 0 \
+                     FROM generate_series(1, {}) g",
+                    keys - 3
+                ),
+                (),
+            )
+            .unwrap();
+            for sql in [
+                "SELECT t.id, s.w FROM s JOIN t ON t.k = s.k",
+                "WITH c AS (SELECT k FROM s) SELECT t.id FROM c JOIN t ON t.k = c.k",
+                "SELECT t.id, s.w FROM s JOIN t ON t.k = s.k WHERE t.v > 500",
+            ] {
+                let (found, counts) = run(&db, sql);
+                let case = format!("{rows} rows, {keys} keys: {sql}");
+                assert_eq!(counts.narrowed, usize::from(narrows), "{case}");
+                let reads = if narrows { (1, 0) } else { (0, 0) };
+                assert_eq!(counts.reads, reads, "{case}");
+                assert_eq!(counts.sides, 2, "a side ran more than once: {case}");
+                assert_eq!(found, same_as_control(&db, sql), "{case}");
+            }
+        }
     }
 
     #[test]

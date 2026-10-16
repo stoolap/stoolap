@@ -270,6 +270,11 @@ struct ReductionPass {
 /// narrow its inner side by the inner table's candidates
 const SMALL_OUTER_ROWS: usize = 1024;
 
+/// Inner rows a table without sealed rows must hold per row of the largest
+/// small outer before a small outer narrows it: a key read costs about what
+/// its scan pays for 17 rows, 45 under a pushed filter
+const HOT_INNER_ROWS_PER_KEY: usize = 64;
+
 /// A small outer side the join ran and handed on to the standard join
 struct PreparedSide {
     rows: PreparedRows,
@@ -11988,7 +11993,8 @@ impl Executor {
         // A table that keeps rows outside its index still answers a bounded
         // probe from it while it can, deciding per probe; only a join the
         // executor bounds with a limit asks it, at execution and in EXPLAIN,
-        // or one whose outer side may be small, on a table with sealed rows
+        // or one whose outer side may be small: on a table with sealed rows,
+        // or a hot one large enough for the largest small outer
         // A narrowing key must be the outer side's; an inner column's name is unsure
         let outer_is_sure = left_alias.is_some()
             || outer_col.contains('.')
@@ -11996,7 +12002,9 @@ impl Executor {
                 .columns
                 .iter()
                 .any(|c| c.name_lower.eq_ignore_ascii_case(&outer_col));
-        if (bounded || (small_outer && outer_is_sure && table.has_sealed_rows()))
+        let narrows = table.has_sealed_rows()
+            || table.row_count_hint() >= SMALL_OUTER_ROWS.saturating_mul(HOT_INNER_ROWS_PER_KEY);
+        if (bounded || (small_outer && outer_is_sure && narrows))
             && crate::executor::utils::probes_by_equality(&*table, &inner_col_unqualified)
         {
             return Some((
