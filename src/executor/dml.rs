@@ -736,8 +736,10 @@ impl Executor {
                     .collect();
             }
         }
-        // Columns the INSERT names; only the rest run their defaults
-        let mut provided = vec![false; schema_column_count];
+        // Columns the INSERT names; only the rest run their defaults. Inline,
+        // so a statement allocates nothing for it
+        let mut provided: smallvec::SmallVec<[bool; 32]> =
+            smallvec::smallvec![false; schema_column_count];
         for &idx in &column_indices {
             provided[idx] = true;
         }
