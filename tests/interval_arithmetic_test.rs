@@ -100,6 +100,9 @@ fn shapes() -> Vec<(&'static str, String, String)> {
         ("{n} * INTERVAL '1 month'", text("3 month")),
         ("2.0 * INTERVAL '1 month'", text("2 month")),
         ("{z} * INTERVAL '1 hour'", "NULL".to_string()),
+        ("2 * ({z} * INTERVAL '1 hour')", "NULL".to_string()),
+        ("ts + 2 * ({z} * INTERVAL '1 hour')", "NULL".to_string()),
+        ("{f} * ({n} * INTERVAL '1 hour')", text("16200 second")),
         ("-INTERVAL '1 hour'", text("-1 hour")),
         ("2 * ({n} * INTERVAL '1 hour')", text("6 hour")),
     ]
@@ -273,8 +276,28 @@ fn interval_operators_without_a_meaning_are_errors() {
         "SELECT id FROM v WHERE ts + 9223372036854775807 * INTERVAL '1 month' IS NULL".to_string(),
         "SELECT id FROM v WHERE ts + CAST('NaN' AS FLOAT) * INTERVAL '1 hour' IS NULL".to_string(),
         "SELECT id FROM v WHERE n + n * INTERVAL '1 hour' IS NULL".to_string(),
+        "SELECT TRUE * INTERVAL '1 hour'".to_string(),
+        "SELECT 2 * ('abc' * INTERVAL '1 hour')".to_string(),
+        "SELECT 2 * (TRUE * INTERVAL '1 hour')".to_string(),
+        "SELECT id FROM v WHERE ts + 2 * ('abc' * INTERVAL '1 hour') IS NULL".to_string(),
+        "SELECT id FROM v WHERE ts - n * (TRUE * INTERVAL '1 hour') IS NULL".to_string(),
+        "SELECT 2 * (9223372036854775807 * INTERVAL '1 microsecond')".to_string(),
     ] {
         let got = value(&db, &sql, vec![]);
+        if !got.starts_with("ERR") {
+            wrong.push(format!("{sql}: gave {got}, want an error"));
+        }
+    }
+    for (sql, param) in [
+        ("SELECT $1 * INTERVAL '1 hour'", Value::text("abc")),
+        ("SELECT 2 * ($1 * INTERVAL '1 hour')", Value::text("abc")),
+        ("SELECT 2 * ($1 * INTERVAL '1 hour')", Value::Boolean(true)),
+        (
+            "SELECT id FROM v WHERE ts + 2 * ($1 * INTERVAL '1 hour') IS NULL",
+            Value::text("abc"),
+        ),
+    ] {
+        let got = value(&db, sql, vec![param]);
         if !got.starts_with("ERR") {
             wrong.push(format!("{sql}: gave {got}, want an error"));
         }

@@ -1346,24 +1346,27 @@ impl ExprVM {
                     pc += 1;
                 }
 
-                Op::ScaleInterval(step) => {
-                    let n = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match Self::scale_interval(*step, &n)? {
-                        Some(interval) => Value::Text(SmartString::from_string(
-                            Self::interval_text(*step, interval),
-                        )),
+                Op::ScaleInterval(step, count) => {
+                    let result = match self.pop_interval_multiplier(*count)? {
+                        Some(k) => Value::Text(SmartString::from_string(Self::interval_text(
+                            *step,
+                            Self::scale_interval(*step, k)?,
+                        ))),
                         None => Value::Null(DataType::Text),
                     };
                     self.stack.push(result);
                     pc += 1;
                 }
 
-                Op::TimestampAddScaledInterval(step, subtract) => {
-                    let n = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                Op::TimestampAddScaledInterval(step, subtract, count) => {
+                    let k = self.pop_interval_multiplier(*count)?;
                     let ts = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let result = match &ts {
-                        Value::Timestamp(t) => match Self::scale_interval(*step, &n)? {
-                            Some(interval) => Self::shift_timestamp(*t, interval, *subtract)?,
+                        Value::Timestamp(t) => match k {
+                            Some(k) => {
+                                let interval = Self::scale_interval(*step, k)?;
+                                Self::shift_timestamp(*t, interval, *subtract)?
+                            }
                             None => Value::Null(DataType::Timestamp),
                         },
                         _ if ts.is_null() => Value::Null(DataType::Timestamp),
@@ -3621,26 +3624,57 @@ impl ExprVM {
         }
     }
 
-    /// `step` times `n`, None for a NULL `n`. A fixed unit is counted in
-    /// microseconds, rounded; a calendar unit takes whole multiples only
-    fn scale_interval(step: IntervalStep, n: &Value) -> Result<Option<IntervalValue>> {
+    /// An INTERVAL multiplier: Ok for a whole number, Err for a fractional
+    /// one, None for NULL; any other type is an error
+    fn interval_multiplier(n: &Value) -> Result<Option<std::result::Result<i64, f64>>> {
+        match n {
+            v if v.is_null() => Ok(None),
+            Value::Integer(k) => Ok(Some(Ok(*k))),
+            Value::Float(f) => Ok(Some(Err(*f))),
+            v => Err(crate::core::Error::Type(format!(
+                "cannot multiply an INTERVAL by {:?}",
+                v.data_type()
+            ))),
+        }
+    }
+
+    /// Pops `count` INTERVAL multipliers and returns their product, None
+    /// when one is NULL. Every one is checked, NULL or not
+    fn pop_interval_multiplier(
+        &mut self,
+        count: u8,
+    ) -> Result<Option<std::result::Result<i64, f64>>> {
+        let as_f64 = |k: std::result::Result<i64, f64>| k.map_or_else(|f| f, |i| i as f64);
+        let mut product = Some(Ok(1i64));
+        for _ in 0..count {
+            let n = self.stack.pop().unwrap_or_else(Value::null_unknown);
+            product = match (product, Self::interval_multiplier(&n)?) {
+                (None, _) | (_, None) => None,
+                (Some(Ok(a)), Some(Ok(b))) => Some(Ok(a.checked_mul(b).ok_or_else(|| {
+                    crate::core::Error::Type(format!(
+                        "INTERVAL multiplier {a} times {b} is out of range"
+                    ))
+                })?)),
+                (Some(a), Some(b)) => Some(Err(as_f64(a) * as_f64(b))),
+            };
+        }
+        Ok(product)
+    }
+
+    /// `step` times `k`. A fixed unit is counted in microseconds, rounded;
+    /// a calendar unit takes whole multiples only
+    fn scale_interval(
+        step: IntervalStep,
+        k: std::result::Result<i64, f64>,
+    ) -> Result<IntervalValue> {
+        let n = || k.map_or_else(|f| f.to_string(), |i| i.to_string());
         let out_of_range = || {
             crate::core::Error::Type(format!(
-                "INTERVAL '{} {}' times {n} is out of range",
+                "INTERVAL '{} {}' times {} is out of range",
                 step.quantity,
-                step.unit.name()
+                step.unit.name(),
+                n()
             ))
-        };
-        let k = match n {
-            v if v.is_null() => return Ok(None),
-            Value::Integer(k) => Ok(*k),
-            Value::Float(f) => Err(*f),
-            v => {
-                return Err(crate::core::Error::Type(format!(
-                    "cannot multiply an INTERVAL by {:?}",
-                    v.data_type()
-                )))
-            }
         };
         if let Some(per) = step.unit.months() {
             let k = match k {
@@ -3648,8 +3682,9 @@ impl ExprVM {
                 Err(f) if f.fract() == 0.0 && f.abs() < 9.2e18 => f as i64,
                 Err(_) => {
                     return Err(crate::core::Error::Type(format!(
-                        "a {} INTERVAL takes only a whole multiple, not {n}",
-                        step.unit.name()
+                        "a {} INTERVAL takes only a whole multiple, not {}",
+                        step.unit.name(),
+                        n()
                     )))
                 }
             };
@@ -3657,9 +3692,7 @@ impl ExprVM {
                 .quantity
                 .checked_mul(per)
                 .and_then(|m| m.checked_mul(k));
-            return months
-                .map(|m| Some(IntervalValue::Months(m)))
-                .ok_or_else(out_of_range);
+            return months.map(IntervalValue::Months).ok_or_else(out_of_range);
         }
         let unit = step
             .quantity
@@ -3675,8 +3708,8 @@ impl ExprVM {
                 x as i64
             }
         };
-        Ok(Some(IntervalValue::Duration(
-            chrono::Duration::microseconds(micros),
+        Ok(IntervalValue::Duration(chrono::Duration::microseconds(
+            micros,
         )))
     }
 

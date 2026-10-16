@@ -687,14 +687,14 @@ pub enum Op {
     /// Stack: [timestamp, days] -> [timestamp]
     TimestampSubDays,
 
-    /// An INTERVAL literal times a number, as interval text
-    /// Stack: [number] -> [interval_text]
-    ScaleInterval(IntervalStep),
+    /// An INTERVAL literal times the product of `count` numbers, as interval text
+    /// Stack: [number; count] -> [interval_text]
+    ScaleInterval(IntervalStep, u8),
 
-    /// Add an INTERVAL literal times a number to a timestamp, or subtract it
-    /// when the flag is set
-    /// Stack: [timestamp, number] -> [timestamp]
-    TimestampAddScaledInterval(IntervalStep, bool),
+    /// Add an INTERVAL literal times the product of `count` numbers to a
+    /// timestamp, or subtract it when the flag is set
+    /// Stack: [timestamp, number; count] -> [timestamp]
+    TimestampAddScaledInterval(IntervalStep, bool, u8),
 
     // =========================================================================
     // VECTOR DISTANCE OPERATIONS
@@ -1048,10 +1048,12 @@ impl std::fmt::Debug for Op {
             Op::TimestampDiff => write!(f, "TimestampDiff"),
             Op::TimestampAddDays => write!(f, "TimestampAddDays"),
             Op::TimestampSubDays => write!(f, "TimestampSubDays"),
-            Op::ScaleInterval(step) => write!(f, "ScaleInterval({:?})", step),
-            Op::TimestampAddScaledInterval(step, subtract) => {
-                write!(f, "TimestampAddScaledInterval({:?}, {})", step, subtract)
-            }
+            Op::ScaleInterval(step, count) => write!(f, "ScaleInterval({:?}, {})", step, count),
+            Op::TimestampAddScaledInterval(step, subtract, count) => write!(
+                f,
+                "TimestampAddScaledInterval({:?}, {}, {})",
+                step, subtract, count
+            ),
             Op::VectorDistanceL2 => write!(f, "VectorDistanceL2"),
             Op::VectorDistanceCosine => write!(f, "VectorDistanceCosine"),
             Op::VectorDistanceIP => write!(f, "VectorDistanceIP"),

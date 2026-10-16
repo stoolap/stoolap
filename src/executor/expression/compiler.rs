@@ -1188,8 +1188,8 @@ impl<'a> ExprCompiler<'a> {
     ) -> Result<(), CompileError> {
         if !operand.by.is_empty() {
             let step = operand.step()?;
-            self.compile_multipliers(operand, builder)?;
-            builder.emit(Op::ScaleInterval(step));
+            let count = self.compile_multipliers(operand, builder)?;
+            builder.emit(Op::ScaleInterval(step, count));
             return Ok(());
         }
         let text = if operand.negated {
@@ -1202,18 +1202,23 @@ impl<'a> ExprCompiler<'a> {
         Ok(())
     }
 
+    /// Emits each multiplier and returns their count; the interval op
+    /// checks and multiplies them, so a non-number is never a NULL
     fn compile_multipliers(
         &self,
         operand: &IntervalOperand<'_>,
         builder: &mut ProgramBuilder,
-    ) -> Result<(), CompileError> {
-        for (i, multiplier) in operand.by.iter().enumerate() {
+    ) -> Result<u8, CompileError> {
+        let count = u8::try_from(operand.by.len()).map_err(|_| {
+            CompileError::UnsupportedExpression(format!(
+                "{} multipliers of one INTERVAL",
+                operand.by.len()
+            ))
+        })?;
+        for multiplier in &operand.by {
             self.compile_expr(multiplier, builder)?;
-            if i > 0 {
-                builder.emit(Op::Mul);
-            }
         }
-        Ok(())
+        Ok(count)
     }
 
     /// Compiles `infix`, a `+` or, with `subtract`, a `-`, when one side is
@@ -1249,8 +1254,8 @@ impl<'a> ExprCompiler<'a> {
             builder.emit(if subtract { Op::Sub } else { Op::Add });
         } else {
             let step = operand.step()?;
-            self.compile_multipliers(&operand, builder)?;
-            builder.emit(Op::TimestampAddScaledInterval(step, subtract));
+            let count = self.compile_multipliers(&operand, builder)?;
+            builder.emit(Op::TimestampAddScaledInterval(step, subtract, count));
         }
         Ok(true)
     }
@@ -2016,7 +2021,7 @@ mod tests {
                 .ops()
                 .iter()
                 .filter_map(|op| match op {
-                    Op::TimestampAddScaledInterval(step, s) => Some((*step, *s)),
+                    Op::TimestampAddScaledInterval(step, s, 1) => Some((*step, *s)),
                     _ => None,
                 })
                 .collect();
@@ -2034,7 +2039,7 @@ mod tests {
                 !program
                     .ops()
                     .iter()
-                    .any(|op| matches!(op, Op::ScaleInterval(_))),
+                    .any(|op| matches!(op, Op::ScaleInterval(_, _) | Op::Mul)),
                 "{sql}: no interval text per row"
             );
         }
