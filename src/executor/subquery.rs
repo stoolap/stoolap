@@ -1848,15 +1848,24 @@ impl Executor {
         // - x < ANY (values) → x < MAX(values)
         // - x <= ANY (values) → x <= MAX(values)
 
-        // Find min and max
-        let min_val = non_null_values
+        // TEXT sorts as text but compares as a number against one: only all-INTEGER or NaN-free FLOAT members reduce
+        let ordered = non_null_values
             .iter()
-            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .cloned();
-        let max_val = non_null_values
-            .iter()
-            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .cloned();
+            .all(|v| matches!(v, crate::core::Value::Integer(_)))
+            || non_null_values
+                .iter()
+                .all(|v| matches!(v, crate::core::Value::Float(f) if !f.is_nan()));
+        let (min_val, max_val) = if ordered {
+            let order = |a: &&&crate::core::Value, b: &&&crate::core::Value| {
+                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+            };
+            (
+                non_null_values.iter().min_by(order).cloned(),
+                non_null_values.iter().max_by(order).cloned(),
+            )
+        } else {
+            (None, None)
+        };
 
         let comparison_value = match (all_any.all_any_type, op) {
             // ALL with > or >= needs MAX (must be greater than all = greater than max)
