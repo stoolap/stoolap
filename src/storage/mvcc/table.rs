@@ -4469,6 +4469,7 @@ impl Table for MVCCTable {
         &self,
         column_name: &str,
         ascending: bool,
+        nulls_first: bool,
         limit: usize,
         offset: usize,
     ) -> Result<Option<RowVec>> {
@@ -4514,7 +4515,9 @@ impl Table for MVCCTable {
             .saturating_mul(2)
             .saturating_add(100);
 
-        if let Some(ordered_row_ids) = index.get_row_ids_ordered(ascending, batch_size, 0) {
+        if let Some(ordered_row_ids) =
+            index.get_row_ids_ordered(ascending, nulls_first, batch_size, 0)
+        {
             // Fast path: B-tree index supports ordered iteration
             let mut rows = RowVec::with_capacity(limit.min(100));
             let mut skipped = 0;
@@ -4561,14 +4564,17 @@ impl Table for MVCCTable {
             return Ok(None);
         }
 
-        // Sort values using partial_cmp (Value implements PartialOrd)
+        // Sort values in the total order of Value, which the column's values,
+        // all of one type, share with SQL; NULL goes where the query puts it
         let mut sorted_values = all_values;
-        sorted_values.sort_by(|a, b| {
-            if ascending {
-                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-            } else {
-                b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
-            }
+        sorted_values.sort_by(|a, b| match (a.is_null(), b.is_null()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) if nulls_first => std::cmp::Ordering::Less,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) if nulls_first => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) if ascending => a.cmp(b),
+            (false, false) => b.cmp(a),
         });
 
         // Collect rows by iterating through sorted values

@@ -760,6 +760,7 @@ impl Index for PkIndex {
     fn get_row_ids_ordered(
         &self,
         ascending: bool,
+        _nulls_first: bool,
         limit: usize,
         offset: usize,
     ) -> Option<Vec<i64>> {
@@ -1128,14 +1129,17 @@ mod tests {
         }
 
         assert_eq!(
-            idx.get_row_ids_ordered(true, 100, 0).unwrap(),
+            idx.get_row_ids_ordered(true, false, 100, 0).unwrap(),
             vec![1, 2, 5, 8, 9]
         );
         assert_eq!(
-            idx.get_row_ids_ordered(false, 100, 0).unwrap(),
+            idx.get_row_ids_ordered(false, true, 100, 0).unwrap(),
             vec![9, 8, 5, 2, 1]
         );
-        assert_eq!(idx.get_row_ids_ordered(true, 2, 1).unwrap(), vec![2, 5]);
+        assert_eq!(
+            idx.get_row_ids_ordered(true, false, 2, 1).unwrap(),
+            vec![2, 5]
+        );
     }
 
     #[test]
@@ -1256,15 +1260,15 @@ mod tests {
 
         // Ordered traversal across hybrid
         assert_eq!(
-            idx.get_row_ids_ordered(true, 100, 0).unwrap(),
+            idx.get_row_ids_ordered(true, false, 100, 0).unwrap(),
             vec![5, 100, 20_000_000, 50_000_000]
         );
         assert_eq!(
-            idx.get_row_ids_ordered(false, 100, 0).unwrap(),
+            idx.get_row_ids_ordered(false, true, 100, 0).unwrap(),
             vec![50_000_000, 20_000_000, 100, 5]
         );
         assert_eq!(
-            idx.get_row_ids_ordered(true, 2, 1).unwrap(),
+            idx.get_row_ids_ordered(true, false, 2, 1).unwrap(),
             vec![100, 20_000_000]
         );
     }

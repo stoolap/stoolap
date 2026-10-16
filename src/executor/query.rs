@@ -3993,6 +3993,7 @@ impl Executor {
                         if let Some(sorted_rows) = table.collect_rows_ordered_by_index(
                             &col_name,
                             ascending,
+                            !ascending,
                             fetch_limit,
                             0,
                         )? {

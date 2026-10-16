@@ -292,10 +292,17 @@ impl Executor {
             0
         };
 
+        // NULLS LAST for ASC and NULLS FIRST for DESC unless the query says
+        let nulls_first = order_by.nulls_first.unwrap_or(!ascending);
+
         // Try to use index-ordered scan
-        if let Some(rows) =
-            table.collect_rows_ordered_by_index(&column_name, ascending, limit, offset)?
-        {
+        if let Some(rows) = table.collect_rows_ordered_by_index(
+            &column_name,
+            ascending,
+            nulls_first,
+            limit,
+            offset,
+        )? {
             // Project rows according to SELECT expressions
             let projected_rows = self.project_rows(&stmt.columns, rows, all_columns, ctx)?;
 
