@@ -492,7 +492,21 @@ impl<'a> ExprCompiler<'a> {
             }
 
             Expression::StringLiteral(lit) => {
-                builder.emit(Op::LoadConst(string_literal_value(lit)));
+                // Handle type hints (DATE, TIMESTAMP, etc.)
+                let value = if let Some(ref hint) = lit.type_hint {
+                    match hint.to_uppercase().as_str() {
+                        "TIMESTAMP" | "DATETIME" => crate::core::value::parse_timestamp(&lit.value)
+                            .map(Value::Timestamp)
+                            .unwrap_or_else(|_| Value::Text(lit.value.clone())),
+                        "DATE" => crate::core::value::parse_timestamp(&lit.value)
+                            .map(Value::Timestamp)
+                            .unwrap_or_else(|_| Value::Text(lit.value.clone())),
+                        _ => Value::Text(lit.value.clone()),
+                    }
+                } else {
+                    Value::Text(lit.value.clone())
+                };
+                builder.emit(Op::LoadConst(value));
             }
 
             Expression::BooleanLiteral(lit) => {
@@ -1962,24 +1976,12 @@ fn is_column_free(expr: &Expression) -> bool {
     }
 }
 
-/// The value a string literal stands for: a timestamp when a TIMESTAMP,
-/// DATETIME or DATE hint's text parses as one, else the text
-fn string_literal_value(lit: &StringLiteral) -> Value {
-    let hint = lit.type_hint.as_deref().map(str::to_uppercase);
-    match hint.as_deref() {
-        Some("TIMESTAMP" | "DATETIME" | "DATE") => crate::core::value::parse_timestamp(&lit.value)
-            .map(Value::Timestamp)
-            .unwrap_or_else(|_| Value::Text(lit.value.clone())),
-        _ => Value::Text(lit.value.clone()),
-    }
-}
-
 /// Try to evaluate a constant expression at compile time
 fn try_eval_constant(expr: &Expression) -> Option<Value> {
     match expr {
         Expression::IntegerLiteral(lit) => Some(Value::Integer(lit.value)),
         Expression::FloatLiteral(lit) => Some(Value::Float(lit.value)),
-        Expression::StringLiteral(lit) => Some(string_literal_value(lit)),
+        Expression::StringLiteral(lit) => Some(Value::Text(lit.value.clone())),
         Expression::BooleanLiteral(lit) => Some(Value::Boolean(lit.value)),
         Expression::NullLiteral(_) => Some(Value::null_unknown()),
         Expression::Identifier(id) if id.quoted => Some(Value::Text(id.value.clone())),

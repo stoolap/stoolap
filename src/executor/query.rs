@@ -12142,7 +12142,9 @@ impl Executor {
         column_name: &str,
         values: &[Value],
     ) -> Option<Expression> {
-        if values.is_empty() {
+        // A timestamp member compiled into a filter over a derived side reads
+        // as TEXT and matches nothing, so those keys keep the unfiltered read
+        if values.is_empty() || values.iter().any(|v| matches!(v, Value::Timestamp(_))) {
             return None;
         }
 

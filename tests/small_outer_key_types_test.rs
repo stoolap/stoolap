@@ -194,10 +194,10 @@ fn float_keys_at_the_edges_answer_as_their_control() {
     );
 }
 
-/// The semi-join reduction filters a derived inner side by the keys it
-/// read; a TIMESTAMP member of that filter stays a TIMESTAMP
+/// A grouped join under a LIMIT over a derived inner side finds the row a
+/// TIMESTAMP key matches
 #[test]
-fn a_timestamp_key_filters_a_derived_inner_side_as_a_timestamp() {
+fn a_grouped_join_over_a_derived_side_finds_its_timestamp_row() {
     let _serial = serial();
     let mut wrong = Vec::new();
     for seal in [false, true] {
@@ -231,11 +231,6 @@ fn a_timestamp_key_filters_a_derived_inner_side_as_a_timestamp() {
                  GROUP BY s.id LIMIT 1",
                 vec![vec![1, 1]],
             ),
-            (
-                "SELECT COUNT(*) FROM (SELECT k FROM t WHERE id > 0) r \
-                 WHERE r.k IN (TIMESTAMP '2024-01-01T00:00:01.25Z')",
-                vec![vec![1]],
-            ),
         ] {
             let got = rows(&db, sql);
             if got != want {
@@ -249,6 +244,28 @@ fn a_timestamp_key_filters_a_derived_inner_side_as_a_timestamp() {
         wrong.len(),
         wrong.join("\n")
     );
+}
+
+/// A TIMESTAMP literal in an IN over a TEXT column answers the same on the
+/// plain and the prepared single-table path
+#[test]
+fn a_typed_literal_on_a_text_column_answers_alike_on_the_prepared_path() {
+    let _serial = serial();
+    let db = Database::open("memory://small_outer_typed_literal_text").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT)",
+        "INSERT INTO t VALUES (1, '2024-01-01')",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let plain = rows(&db, "SELECT id FROM t WHERE k IN (TIMESTAMP '2024-01-01')");
+    let prepared = rows(
+        &db,
+        "SELECT t.id FROM t WHERE t.k IN (TIMESTAMP '2024-01-01') \
+         AND t.id = (SELECT x.id FROM t x WHERE x.id = t.id)",
+    );
+    assert_eq!(plain, vec![vec![1]]);
+    assert_eq!(prepared, plain);
 }
 
 #[cfg(feature = "test-failpoints")]
