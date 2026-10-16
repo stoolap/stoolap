@@ -823,6 +823,7 @@ impl Executor {
             | Expression::QualifiedStar(_)
             | Expression::Default(_)
             | Expression::InHashSet(_)
+            | Expression::QuantifiedSet(_)
             | Expression::TableSource(_)
             | Expression::JoinSource(_)
             | Expression::SubquerySource(_)

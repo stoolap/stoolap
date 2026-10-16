@@ -326,6 +326,7 @@ pub(crate) fn expr_tables(expr: &Expression, tables: &mut CacheTables) -> Option
             expr_tables(&i.right, tables)
         }
         Expression::InHashSet(h) => expr_tables(&h.column, tables),
+        Expression::QuantifiedSet(q) => expr_tables(&q.left, tables),
         Expression::Between(b) => {
             expr_tables(&b.expr, tables)?;
             expr_tables(&b.lower, tables)?;

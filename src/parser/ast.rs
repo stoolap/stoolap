@@ -80,6 +80,8 @@ pub enum Expression {
     /// Pre-computed IN expression with HashSet (for semi-join optimization)
     /// Uses Arc for cheap cloning in parallel execution
     InHashSet(InHashSetExpression),
+    /// `x op ANY` or `x op ALL` over a subquery's members, read once
+    QuantifiedSet(Box<QuantifiedSetExpression>),
     /// BETWEEN expression
     Between(BetweenExpression),
     /// LIKE expression (with optional ESCAPE clause)
@@ -138,6 +140,7 @@ impl fmt::Display for Expression {
             Expression::AllAny(e) => write!(f, "{}", e),
             Expression::In(e) => write!(f, "{}", e),
             Expression::InHashSet(e) => write!(f, "{}", e),
+            Expression::QuantifiedSet(e) => write!(f, "{}", e),
             Expression::Between(e) => write!(f, "{}", e),
             Expression::Like(e) => write!(f, "{}", e),
             Expression::ScalarSubquery(e) => write!(f, "{}", e),
@@ -181,6 +184,7 @@ impl Expression {
             Expression::AllAny(e) => e.token.position,
             Expression::In(e) => e.token.position,
             Expression::InHashSet(e) => e.token.position,
+            Expression::QuantifiedSet(e) => e.token.position,
             Expression::Between(e) => e.token.position,
             Expression::Like(e) => e.token.position,
             Expression::ScalarSubquery(e) => e.token.position,
@@ -754,6 +758,80 @@ impl fmt::Display for InHashSetExpression {
         } else {
             write!(f, "{} IN (<{} values>)", self.column, self.values.len())
         }
+    }
+}
+
+/// `left op ANY` or `left op ALL` over members a subquery yielded: the left
+/// value is evaluated once and compared with each member by the comparison
+/// contract, so the expression stays one node however many members there are
+#[derive(Debug, Clone)]
+pub struct QuantifiedSetExpression {
+    pub token: Token,
+    pub left: Box<Expression>,
+    /// One of `<`, `<=`, `>`, `>=`, `=`, `<>`
+    pub operator: SmartString,
+    /// ALL rather than ANY
+    pub all: bool,
+    /// The members other than NULL
+    pub members: CompactArc<Vec<crate::core::Value>>,
+    /// Whether the subquery also yielded a NULL
+    pub has_null: bool,
+}
+
+impl QuantifiedSetExpression {
+    /// The same comparison over `left` in place of its own
+    pub fn with_left(&self, left: Expression) -> Expression {
+        Expression::QuantifiedSet(Box::new(QuantifiedSetExpression {
+            token: self.token.clone(),
+            left: Box::new(left),
+            operator: self.operator.clone(),
+            all: self.all,
+            members: CompactArc::clone(&self.members),
+            has_null: self.has_null,
+        }))
+    }
+}
+
+impl PartialEq for QuantifiedSetExpression {
+    fn eq(&self, other: &Self) -> bool {
+        self.all == other.all
+            && self.has_null == other.has_null
+            && self.operator == other.operator
+            && CompactArc::ptr_eq(&self.members, &other.members)
+            && self.left == other.left
+    }
+}
+
+impl fmt::Display for QuantifiedSetExpression {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use crate::core::{DataType, Value};
+        let quantifier = if self.all { "ALL" } else { "ANY" };
+        write!(f, "{} {} {} (", self.left, self.operator, quantifier)?;
+        // Each member as a typed literal, so two sets differ in text when they differ in members
+        for (i, member) in self.members.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            match member {
+                Value::Text(s) => write!(f, "'{}'", s.replace('\'', "''"))?,
+                Value::Boolean(b) => f.write_str(if *b { "TRUE" } else { "FALSE" })?,
+                Value::Timestamp(_) => write!(f, "TIMESTAMP '{}'", member)?,
+                Value::Extension(_) => {
+                    let type_name = match member.data_type() {
+                        DataType::Vector => "VECTOR",
+                        _ => "JSON",
+                    };
+                    let text = member.to_string().replace('\'', "''");
+                    write!(f, "CAST('{}' AS {})", text, type_name)?
+                }
+                _ => write!(f, "{}", member)?,
+            }
+        }
+        if self.has_null {
+            let separator = if self.members.is_empty() { "" } else { ", " };
+            write!(f, "{}NULL", separator)?;
+        }
+        f.write_str(")")
     }
 }
 

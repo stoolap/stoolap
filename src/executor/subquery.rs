@@ -1496,6 +1496,9 @@ impl Executor {
                 // The column reference is already resolved, so no outer ref possible here
                 false
             }
+            Expression::QuantifiedSet(quantified) => {
+                Self::expression_has_outer_reference(&quantified.left, inner_tables)
+            }
             // Window functions can have outer refs in partition/order expressions
             Expression::Window(window) => {
                 window
@@ -1838,84 +1841,18 @@ impl Executor {
             })));
         }
 
-        // For comparison operators, we can optimize using MIN/MAX:
-        // - x > ALL (values) → x > MAX(values)
-        // - x >= ALL (values) → x >= MAX(values)
-        // - x < ALL (values) → x < MIN(values)
-        // - x <= ALL (values) → x <= MIN(values)
-        // - x > ANY (values) → x > MIN(values)
-        // - x >= ANY (values) → x >= MIN(values)
-        // - x < ANY (values) → x < MAX(values)
-        // - x <= ANY (values) → x <= MAX(values)
-
-        // Find min and max
-        let min_val = non_null_values
-            .iter()
-            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .cloned();
-        let max_val = non_null_values
-            .iter()
-            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .cloned();
-
-        let comparison_value = match (all_any.all_any_type, op) {
-            // ALL with > or >= needs MAX (must be greater than all = greater than max)
-            (AllAnyType::All, ">") | (AllAnyType::All, ">=") => max_val,
-            // ALL with < or <= needs MIN (must be less than all = less than min)
-            (AllAnyType::All, "<") | (AllAnyType::All, "<=") => min_val,
-            // ANY with > or >= needs MIN (greater than at least one = greater than min)
-            (AllAnyType::Any, ">") | (AllAnyType::Any, ">=") => min_val,
-            // ANY with < or <= needs MAX (less than at least one = less than max)
-            (AllAnyType::Any, "<") | (AllAnyType::Any, "<=") => max_val,
-            // For other cases, fall back to building compound expression
-            _ => None,
-        };
-
-        if let Some(cmp_val) = comparison_value {
-            // Build simple comparison: left op value
-            return Ok(with_unknown(Expression::Infix(InfixExpression::new(
-                all_any.token.clone(),
-                all_any.left.clone(),
-                op.to_string(),
-                Box::new(value_to_expression(cmp_val)),
-            ))));
-        }
-
-        // Fallback: build compound expression with AND/OR
-        // This handles cases like = ALL (must equal all values, which is only possible if all same)
-        let logical_op = match all_any.all_any_type {
-            AllAnyType::All => "AND",
-            AllAnyType::Any => "OR",
-        };
-
-        // Build: (left op v1) AND/OR (left op v2) AND/OR ...
-        let mut result_expr: Option<Expression> = None;
-
-        for value_expr in value_exprs {
-            let comparison = Expression::Infix(InfixExpression::new(
-                all_any.token.clone(),
-                all_any.left.clone(),
-                op.to_string(),
-                Box::new(value_expr),
-            ));
-
-            result_expr = Some(match result_expr {
-                None => comparison,
-                Some(prev) => Expression::Infix(InfixExpression::new(
-                    all_any.token.clone(),
-                    Box::new(prev),
-                    logical_op.to_string(),
-                    Box::new(comparison),
-                )),
-            });
-        }
-
-        Ok(with_unknown(result_expr.unwrap_or_else(|| {
-            Expression::BooleanLiteral(BooleanLiteral {
-                token: dummy_token("TRUE", TokenType::Keyword),
-                value: true,
-            })
-        })))
+        // Any other operator: one node, its left value evaluated once and
+        // compared with each member by the comparison contract
+        Ok(Expression::QuantifiedSet(Box::new(
+            QuantifiedSetExpression {
+                token: all_any.token.clone(),
+                left: all_any.left.clone(),
+                operator: SmartString::from(op),
+                all: matches!(all_any.all_any_type, AllAnyType::All),
+                members: CompactArc::new(non_null_values.into_iter().cloned().collect()),
+                has_null,
+            },
+        )))
     }
 
     /// Execute a scalar subquery and return its single value.
@@ -3053,6 +2990,7 @@ impl Executor {
             Expression::AllAny(a) => one(&a.left) || select(&a.subquery),
             Expression::In(i) => one(&i.left) || one(&i.right),
             Expression::InHashSet(h) => one(&h.column),
+            Expression::QuantifiedSet(q) => one(&q.left),
             Expression::Between(b) => one(&b.expr) || one(&b.lower) || one(&b.upper),
             Expression::Like(l) => {
                 one(&l.left) || one(&l.pattern) || l.escape.as_deref().is_some_and(one)

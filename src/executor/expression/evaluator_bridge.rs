@@ -40,6 +40,7 @@ static EMPTY_PARAMS: std::sync::LazyLock<CompactArc<ParamVec>> =
 static EMPTY_NAMED_PARAMS: std::sync::LazyLock<Arc<FxHashMap<String, Value>>> =
     std::sync::LazyLock::new(|| Arc::new(FxHashMap::default()));
 use crate::common::{CompactArc, StringMap};
+use crate::executor::utils::fold_expression_name;
 use lru::LruCache;
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHasher};
@@ -97,6 +98,17 @@ fn compute_cache_key(expr: &Expression, columns: &[String]) -> (u64, u64) {
     columns.hash(&mut h2);
 
     (h1.finish(), h2.finish())
+}
+
+/// Key each alias by its literal case, then by its lowercase name where
+/// no other alias holds that key
+fn insert_alias_keys(map: &mut StringMap<u16>, aliases: &[(String, usize)]) {
+    for (name, idx) in aliases {
+        map.insert(fold_expression_name(name), *idx as u16);
+    }
+    for (name, idx) in aliases {
+        map.entry(name.to_lowercase()).or_insert(*idx as u16);
+    }
 }
 
 /// Compute a u64 hash of an expression without string allocation.
@@ -201,6 +213,16 @@ fn hash_expression<H: std::hash::Hasher>(expr: &Expression, hasher: &mut H) {
             let mut sorted: Vec<&crate::core::Value> = in_hash.values.members().iter().collect();
             sorted.sort_by(|a, b| crate::executor::utils::compare_values(a, b));
             for v in sorted {
+                v.hash(hasher);
+            }
+        }
+        Expression::QuantifiedSet(quantified) => {
+            quantified.operator.hash(hasher);
+            quantified.all.hash(hasher);
+            quantified.has_null.hash(hasher);
+            hash_expression(&quantified.left, hasher);
+            quantified.members.len().hash(hasher);
+            for v in quantified.members.iter() {
                 v.hash(hasher);
             }
         }
@@ -525,6 +547,9 @@ fn contains_context_dependent_function(expr: &Expression) -> bool {
         Expression::Distinct(distinct) => contains_context_dependent_function(&distinct.expr),
         Expression::AllAny(all_any) => contains_context_dependent_function(&all_any.left),
         Expression::InHashSet(in_hash) => contains_context_dependent_function(&in_hash.column),
+        Expression::QuantifiedSet(quantified) => {
+            contains_context_dependent_function(&quantified.left)
+        }
         _ => false,
     }
 }
@@ -627,10 +652,8 @@ impl RowFilter {
         columns: &[String],
         aliases: &[(String, usize)],
     ) -> Result<Self> {
-        let alias_map: StringMap<u16> = aliases
-            .iter()
-            .map(|(name, idx)| (name.to_lowercase(), *idx as u16))
-            .collect();
+        let mut alias_map = StringMap::new();
+        insert_alias_keys(&mut alias_map, aliases);
 
         let ctx = CompileContext::with_global_registry(columns).with_expression_aliases(alias_map);
         let compiler = ExprCompiler::new(&ctx);
@@ -1035,10 +1058,8 @@ impl ExpressionEval {
         columns: &[String],
         aliases: &[(String, usize)],
     ) -> Result<Self> {
-        let alias_map: StringMap<u16> = aliases
-            .iter()
-            .map(|(name, idx)| (name.to_lowercase(), *idx as u16))
-            .collect();
+        let mut alias_map = StringMap::new();
+        insert_alias_keys(&mut alias_map, aliases);
 
         Self::compile_with_options(
             expr,
@@ -1319,10 +1340,8 @@ impl MultiExpressionEval {
         columns: &[String],
         aliases: &[(String, usize)],
     ) -> Result<Self> {
-        let alias_map: StringMap<u16> = aliases
-            .iter()
-            .map(|(name, idx)| (name.to_lowercase(), *idx as u16))
-            .collect();
+        let mut alias_map = StringMap::new();
+        insert_alias_keys(&mut alias_map, aliases);
 
         let ctx = CompileContext::with_global_registry(columns).with_expression_aliases(alias_map);
         let compiler = ExprCompiler::new(&ctx);
@@ -1654,20 +1673,14 @@ impl<'a> CompiledEvaluator<'a> {
 
     /// Add aggregate expression aliases for HAVING clause evaluation
     pub fn add_aggregate_aliases(&mut self, aliases: &[(String, usize)]) {
-        for (expr_name, idx) in aliases {
-            let lower = expr_name.to_lowercase();
-            self.expression_aliases.insert(lower, *idx as u16);
-        }
+        insert_alias_keys(&mut self.expression_aliases, aliases);
         // Invalidate local cache since compilation context changed
         self.local_cache.clear();
     }
 
     /// Add expression aliases for HAVING clause with GROUP BY expressions
     pub fn add_expression_aliases(&mut self, aliases: &[(String, usize)]) {
-        for (expr_str, idx) in aliases {
-            let lower = expr_str.to_lowercase();
-            self.expression_aliases.insert(lower, *idx as u16);
-        }
+        insert_alias_keys(&mut self.expression_aliases, aliases);
         // Invalidate local cache since compilation context changed
         self.local_cache.clear();
     }
@@ -1904,6 +1917,16 @@ impl<'a> CompiledEvaluator<'a> {
                     members
                 };
                 for value in members {
+                    value.hash(hasher);
+                }
+            }
+            Expression::QuantifiedSet(quantified) => {
+                quantified.operator.hash(hasher);
+                quantified.all.hash(hasher);
+                quantified.has_null.hash(hasher);
+                Self::hash_expression(&quantified.left, hasher);
+                quantified.members.len().hash(hasher);
+                for value in quantified.members.iter() {
                     value.hash(hasher);
                 }
             }

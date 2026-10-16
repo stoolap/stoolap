@@ -45,7 +45,7 @@ use super::expression::{ExpressionEval, RowFilter};
 use super::query_cache::{CompiledCountDistinct, CompiledExecution};
 use super::query_classification::QueryClassification;
 use super::result::ExecutorResult;
-use super::utils::{build_column_index_map, hash_value_into};
+use super::utils::{build_column_index_map, fold_expression_name, hash_value_into};
 use super::Executor;
 use crate::core::value::grouping_float;
 
@@ -833,6 +833,29 @@ impl Executor {
 
         // Build column index map for aggregate result columns
         let mut agg_col_index_map = build_column_index_map(&agg_columns);
+        // A name with an apostrophe is keyed by its literal case; its lowercase key only fills a gap
+        let mut lowercase_fallbacks: Vec<(String, usize)> = Vec::new();
+        for (i, name) in agg_columns.iter().enumerate() {
+            let folded = fold_expression_name(name);
+            let lower = name.to_lowercase();
+            if folded != lower {
+                agg_col_index_map.remove(lower.as_str());
+                lowercase_fallbacks.push((lower, i));
+            }
+        }
+        for (i, name) in agg_columns.iter().enumerate() {
+            if name.contains('\'') {
+                agg_col_index_map.insert(fold_expression_name(name), i);
+            }
+        }
+        let find_alias = |map: &StringMap<usize>, alias: &str| {
+            map.get(alias).copied().or_else(|| {
+                lowercase_fallbacks
+                    .iter()
+                    .find(|(name, _)| name == alias)
+                    .map(|&(_, i)| i)
+            })
+        };
 
         // Build additional mappings for aggregate expressions to handle deduplication
         // When aggregates are deduplicated (e.g., SUM(value) and SUM(value) AS total),
@@ -842,15 +865,16 @@ impl Executor {
             if let Expression::Aliased(aliased) = col_expr {
                 if let Expression::FunctionCall(func) = aliased.expression.as_ref() {
                     if is_aggregate_function(&func.function) {
-                        let expr_name: String = self.get_aggregate_column_name(func).to_lowercase();
+                        let expr_name: String =
+                            fold_expression_name(&self.get_aggregate_column_name(func));
                         let alias_lower: String = aliased.alias.value_lower.to_string();
                         // If the alias exists in the map but the expression doesn't, add the expression
-                        if let Some(&idx) = agg_col_index_map.get(&alias_lower) {
+                        if let Some(idx) = find_alias(&agg_col_index_map, &alias_lower) {
                             agg_col_index_map.entry(expr_name).or_insert(idx);
                         }
                         // If the expression exists in the map but the alias doesn't, add the alias
                         if let Some(&idx) = agg_col_index_map
-                            .get(&self.get_aggregate_column_name(func).to_lowercase())
+                            .get(&fold_expression_name(&self.get_aggregate_column_name(func)))
                         {
                             agg_col_index_map.entry(alias_lower).or_insert(idx);
                         }
@@ -858,7 +882,8 @@ impl Executor {
                 }
             } else if let Expression::FunctionCall(func) = col_expr {
                 if is_aggregate_function(&func.function) {
-                    let expr_name: String = self.get_aggregate_column_name(func).to_lowercase();
+                    let expr_name: String =
+                        fold_expression_name(&self.get_aggregate_column_name(func));
                     // Check if any aliased version exists for this expression
                     for other_col in &stmt.columns {
                         if let Expression::Aliased(other_aliased) = other_col {
@@ -866,12 +891,15 @@ impl Executor {
                                 other_aliased.expression.as_ref()
                             {
                                 if is_aggregate_function(&other_func.function) {
-                                    let other_expr: String =
-                                        self.get_aggregate_column_name(other_func).to_lowercase();
+                                    let other_expr: String = fold_expression_name(
+                                        &self.get_aggregate_column_name(other_func),
+                                    );
                                     if other_expr == expr_name {
                                         let alias_lower: String =
                                             other_aliased.alias.value_lower.to_string();
-                                        if let Some(&idx) = agg_col_index_map.get(&alias_lower) {
+                                        if let Some(idx) =
+                                            find_alias(&agg_col_index_map, &alias_lower)
+                                        {
                                             agg_col_index_map
                                                 .entry(expr_name.clone())
                                                 .or_insert(idx);
@@ -883,6 +911,9 @@ impl Executor {
                     }
                 }
             }
+        }
+        for (lower, i) in lowercase_fallbacks {
+            agg_col_index_map.entry(lower).or_insert(i);
         }
 
         // Check if we have any expressions that need post-processing
@@ -925,12 +956,13 @@ impl Executor {
                     }
                     Expression::Aliased(a) => a.alias.value_lower.to_string(),
                     Expression::FunctionCall(func) if is_aggregate_function(&func.function) => {
-                        self.get_aggregate_column_name(func).to_lowercase()
+                        fold_expression_name(&self.get_aggregate_column_name(func))
                     }
                     // Anything else matches only as a GROUP BY expression column
-                    _ => self.expression_to_string(col_expr).to_lowercase(),
+                    _ => fold_expression_name(&self.expression_to_string(col_expr)),
                 };
-                if i >= agg_columns.len() || agg_columns[i].to_lowercase() != expected_name {
+                if i >= agg_columns.len() || fold_expression_name(&agg_columns[i]) != expected_name
+                {
                     columns_match = false;
                     break;
                 }
@@ -983,7 +1015,8 @@ impl Executor {
                     if is_aggregate_function(&func.function) {
                         let col_name = self.get_aggregate_column_name(func);
                         final_columns.push(col_name.clone());
-                        column_sources.push(ColumnSource::AggColumn(col_name.to_lowercase()));
+                        column_sources
+                            .push(ColumnSource::AggColumn(fold_expression_name(&col_name)));
                     } else if func.function.eq_ignore_ascii_case("GROUPING") {
                         // GROUPING() function - map to the appropriate grouping flag column
                         final_columns.push(self.get_aggregate_column_name(func));
@@ -1007,7 +1040,7 @@ impl Executor {
                     } else {
                         // Non-aggregate function: a GROUP BY expression column is
                         // read as it is, anything else is evaluated
-                        let expr_lower = self.expression_to_string(col_expr).to_lowercase();
+                        let expr_lower = fold_expression_name(&self.expression_to_string(col_expr));
                         final_columns.push(format!("{}(...)", func.function));
                         if agg_col_index_map.contains_key(&expr_lower) && !is_correlated {
                             column_sources.push(ColumnSource::AggColumn(expr_lower));
@@ -1036,7 +1069,8 @@ impl Executor {
                             {
                                 // Aliased aggregate - look up by expression name (e.g., "SUM(value)")
                                 // not by alias, since aggregates may be deduplicated
-                                let agg_name = self.get_aggregate_column_name(func).to_lowercase();
+                                let agg_name =
+                                    fold_expression_name(&self.get_aggregate_column_name(func));
                                 if agg_col_index_map.contains_key(&agg_name) {
                                     column_sources.push(ColumnSource::AggColumn(agg_name));
                                 } else if agg_col_index_map.contains_key(&alias_lower) {
@@ -1085,7 +1119,7 @@ impl Executor {
                                 // otherwise evaluate
                                 let expr_str =
                                     self.expression_to_string(aliased.expression.as_ref());
-                                let expr_lower = expr_str.to_lowercase();
+                                let expr_lower = fold_expression_name(&expr_str);
                                 if agg_col_index_map.contains_key(&expr_lower) {
                                     column_sources.push(ColumnSource::AggColumn(expr_lower));
                                 } else {
@@ -1100,7 +1134,7 @@ impl Executor {
                 Expression::Case(_) => {
                     // Unnamed CASE - check if expression string matches an agg column
                     let expr_str = self.expression_to_string(col_expr);
-                    let expr_lower = expr_str.to_lowercase();
+                    let expr_lower = fold_expression_name(&expr_str);
                     final_columns.push(expr_str);
                     if agg_col_index_map.contains_key(&expr_lower) && !is_correlated {
                         // CASE is a GROUP BY column - use existing value
@@ -1559,7 +1593,7 @@ impl Executor {
                 .unwrap_or_default();
             (
                 agg.name.to_uppercase(),
-                agg.column.to_lowercase(),
+                fold_expression_name(&agg.column),
                 agg.distinct,
                 filter_sig,
             )
@@ -1662,6 +1696,9 @@ impl Executor {
             }
             Expression::Cast(cast) => {
                 self.extract_aggregates_from_expr(&cast.expr, aggregations, non_agg_columns)?;
+            }
+            Expression::QuantifiedSet(set) => {
+                self.extract_aggregates_from_expr(&set.left, aggregations, non_agg_columns)?;
             }
             // An aggregate a window function takes as its argument, or
             // partitions or orders by, is computed like any other
@@ -7523,6 +7560,7 @@ fn substitute_group_aliases(expr: &mut Expression, aliases: &[(&Expression, &Ide
         }
         Expression::Prefix(prefix) => substitute_group_aliases(&mut prefix.right, aliases),
         Expression::Cast(cast) => substitute_group_aliases(&mut cast.expr, aliases),
+        Expression::QuantifiedSet(set) => substitute_group_aliases(&mut set.left, aliases),
         Expression::FunctionCall(func) if !is_aggregate_function(&func.function) => {
             for arg in func.arguments.iter_mut() {
                 substitute_group_aliases(arg, aliases);

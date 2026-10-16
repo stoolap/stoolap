@@ -823,6 +823,7 @@ impl QueryClassification {
             }
             Expression::Aliased(aliased) => Self::expression_has_parameters(&aliased.expression),
             Expression::Cast(cast) => Self::expression_has_parameters(&cast.expr),
+            Expression::QuantifiedSet(set) => Self::expression_has_parameters(&set.left),
             _ => false,
         }
     }
@@ -908,6 +909,9 @@ impl QueryClassification {
             }
             Expression::InHashSet(in_hash) => {
                 Self::expression_has_nondeterministic_functions(&in_hash.column)
+            }
+            Expression::QuantifiedSet(quantified) => {
+                Self::expression_has_nondeterministic_functions(&quantified.left)
             }
             _ => false,
         }
@@ -1505,6 +1509,12 @@ fn hash_expression_structure<H: std::hash::Hasher>(expr: &Expression, hasher: &m
         Expression::InHashSet(in_hash) => {
             hash_expression_structure(&in_hash.column, hasher);
             in_hash.values.len().hash(hasher);
+        }
+        Expression::QuantifiedSet(quantified) => {
+            hash_expression_structure(&quantified.left, hasher);
+            quantified.operator.hash(hasher);
+            quantified.all.hash(hasher);
+            quantified.members.len().hash(hasher);
         }
         Expression::ScalarSubquery(subquery) => {
             hash_subquery_structure(&subquery.subquery, hasher);

@@ -25,7 +25,7 @@ use std::sync::Arc;
 use crate::common::CompactArc;
 use memchr::memmem;
 
-use crate::core::predicate::PredicateSet;
+use crate::core::predicate::{sql_compare, sql_eq, PredicateSet};
 use crate::core::{DataType, Value};
 use crate::functions::{NativeFn1, ScalarFunction};
 
@@ -726,6 +726,10 @@ pub enum Op {
     /// Stack: [value, item_1, ..., item_n] -> [bool]
     InList(u32), // item count
 
+    /// `value op ANY` or `value op ALL` over members a subquery yielded
+    /// Stack: [value] -> [bool]
+    QuantifiedSet(CompactArc<QuantifiedMembers>),
+
     /// BETWEEN check: value BETWEEN low AND high
     /// Stack: [value, low, high] -> [bool]
     Between,
@@ -926,6 +930,127 @@ pub enum Op {
     ReturnNull(DataType),
 }
 
+/// The members of `value op ANY` or `value op ALL`, each compared with the
+/// value by the comparison contract
+#[derive(Debug)]
+pub struct QuantifiedMembers {
+    op: CompareOp,
+    all: bool,
+    members: CompactArc<Vec<Value>>,
+    has_null: bool,
+    /// The member that decides for a numeric value, when every member is
+    /// INTEGER, or every one FLOAT without NaN, so their order is the
+    /// comparison's: the largest for `< ANY` and `> ALL`, the smallest else
+    bound: Option<Value>,
+}
+
+impl QuantifiedMembers {
+    /// `members` holds no NULL; `has_null` says whether the subquery yielded one
+    pub fn new(op: CompareOp, all: bool, members: CompactArc<Vec<Value>>, has_null: bool) -> Self {
+        let bound = Self::bound(op, all, &members);
+        Self {
+            op,
+            all,
+            members,
+            has_null,
+            bound,
+        }
+    }
+
+    /// The member a numeric value is compared with in place of every
+    /// member, when one exists: see the field of that name
+    pub fn bound(op: CompareOp, all: bool, members: &[Value]) -> Option<Value> {
+        let ordered = members.iter().all(|v| matches!(v, Value::Integer(_)))
+            || members
+                .iter()
+                .all(|v| matches!(v, Value::Float(f) if !f.is_nan()));
+        let largest = matches!(
+            (op, all),
+            (CompareOp::Lt | CompareOp::Le, false) | (CompareOp::Gt | CompareOp::Ge, true)
+        );
+        match op {
+            CompareOp::Eq | CompareOp::Ne => None,
+            _ if !ordered => None,
+            _ if largest => members.iter().max_by(|a, b| a.cmp(b)).cloned(),
+            _ => members.iter().min_by(|a, b| a.cmp(b)).cloned(),
+        }
+    }
+
+    /// The operator a quantified comparison is written with
+    pub fn operator(written: &str) -> Option<CompareOp> {
+        Some(match written {
+            "=" => CompareOp::Eq,
+            "<>" | "!=" => CompareOp::Ne,
+            "<" => CompareOp::Lt,
+            "<=" => CompareOp::Le,
+            ">" => CompareOp::Gt,
+            ">=" => CompareOp::Ge,
+            _ => return None,
+        })
+    }
+
+    /// The three-valued answer for `value`; the members are never empty
+    pub fn answer(&self, value: &Value) -> Option<bool> {
+        // A decided member settles it: TRUE for ANY, FALSE for ALL
+        let decides = !self.all;
+        let mut unknown = self.has_null;
+        // Against numeric members a TEXT reads as its number, once, or is UNKNOWN to all
+        let parsed;
+        let number = match (value, self.bound.is_some()) {
+            (Value::Integer(_) | Value::Float(_), true) => Some(value),
+            (Value::Text(text), true) => {
+                parsed = crate::core::predicate::parse_sql_number(text)?;
+                Some(&parsed)
+            }
+            _ => None,
+        };
+        let by_contract = |member: &Value, value: &Value| {
+            // A NaN against a number passes only <>, as a column against a constant does
+            if is_nan_pair(value, member) {
+                return Some(self.op == CompareOp::Ne);
+            }
+            match self.op {
+                CompareOp::Eq => sql_eq(value, member),
+                CompareOp::Ne => sql_eq(value, member).map(|eq| !eq),
+                CompareOp::Lt => sql_compare(value, member).map(|o| o.is_lt()),
+                CompareOp::Le => sql_compare(value, member).map(|o| o.is_le()),
+                CompareOp::Gt => sql_compare(value, member).map(|o| o.is_gt()),
+                CompareOp::Ge => sql_compare(value, member).map(|o| o.is_ge()),
+            }
+        };
+        match self.bound.as_ref().zip(number) {
+            Some((bound, number)) => match by_contract(bound, number) {
+                Some(result) if result == decides => return Some(decides),
+                Some(_) => {}
+                None => unknown = true,
+            },
+            None => {
+                for member in self.members.iter() {
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::quantified_member_compared();
+                    match by_contract(member, value) {
+                        Some(result) if result == decides => return Some(decides),
+                        Some(_) => {}
+                        None => unknown = true,
+                    }
+                }
+            }
+        }
+        if unknown {
+            None
+        } else {
+            Some(!decides)
+        }
+    }
+}
+
+/// Two numbers of which one is a NaN FLOAT
+fn is_nan_pair(a: &Value, b: &Value) -> bool {
+    let number = |v: &Value| matches!(v, Value::Integer(_) | Value::Float(_));
+    let nan = |v: &Value| matches!(v, Value::Float(f) if f.is_nan());
+    number(a) && number(b) && (nan(a) || nan(b))
+}
+
 /// Comparison operator for ALL/ANY subqueries
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompareOp {
@@ -1074,6 +1199,7 @@ impl std::fmt::Debug for Op {
                 )
             }
             Op::InList(count) => write!(f, "InList({})", count),
+            Op::QuantifiedSet(set) => write!(f, "QuantifiedSet({})", set.members.len()),
             Op::Between => write!(f, "Between"),
             Op::NotBetween => write!(f, "NotBetween"),
             Op::InTupleSet {

@@ -211,6 +211,7 @@ impl PushdownRegistry {
 
         // Comparison operators (most common, should be fast)
         registry.register(Box::new(ComparisonRule));
+        registry.register(Box::new(QuantifiedSetRule));
 
         // Function expressions (LENGTH(col) > 5, etc.)
         registry.register(Box::new(FunctionRule));
@@ -571,5 +572,70 @@ mod tests {
         expr.prepare_for_schema(&schema);
         // id=1 OR LENGTH("Alice")>5 should be true (1=1, so left side is true)
         assert!(expr.evaluate(&test_row()).unwrap());
+    }
+
+    fn make_quantified(
+        column: &str,
+        op: &str,
+        all: bool,
+        members: Vec<Value>,
+        has_null: bool,
+    ) -> ast::Expression {
+        ast::Expression::QuantifiedSet(Box::new(ast::QuantifiedSetExpression {
+            token: dummy_token(),
+            left: Box::new(make_ident(column)),
+            operator: op.into(),
+            all,
+            members: crate::common::CompactArc::new(members),
+            has_null,
+        }))
+    }
+
+    #[test]
+    fn test_quantified_set_on_a_number_column_pushes_its_bound() {
+        let schema = test_schema();
+        let members = vec![Value::integer(25), Value::integer(40)];
+        for (op, all, passes) in [
+            (">", true, false),
+            (">", false, true),
+            ("<", false, true),
+            ("<", true, false),
+        ] {
+            let expr = make_quantified("age", op, all, members.clone(), false);
+            let (storage_expr, needs_mem) = try_pushdown(&expr, &schema, None);
+            let mut storage_expr = storage_expr.expect("pushed as a comparison with the bound");
+            assert!(
+                !needs_mem,
+                "age {op} {} needs no memory filter",
+                if all { "ALL" } else { "ANY" }
+            );
+            storage_expr.prepare_for_schema(&schema);
+            assert_eq!(
+                storage_expr.evaluate(&test_row()).unwrap(),
+                passes,
+                "30 {op} {} (25, 40)",
+                if all { "ALL" } else { "ANY" }
+            );
+        }
+        for (column, members, has_null) in [
+            ("age", vec![Value::integer(25)], true),
+            ("name", vec![Value::integer(25)], false),
+            ("age", vec![Value::text("25")], false),
+        ] {
+            let expr = make_quantified(column, ">", false, members, has_null);
+            let (storage_expr, needs_mem) = try_pushdown(&expr, &schema, None);
+            assert!(
+                storage_expr.is_none() && needs_mem,
+                "{column}: left to the memory filter"
+            );
+        }
+        for op in ["<", "<=", ">", ">="] {
+            let expr = make_quantified("price", op, false, vec![Value::integer(25)], false);
+            let (storage_expr, needs_mem) = try_pushdown(&expr, &schema, None);
+            assert!(
+                storage_expr.is_some() && !needs_mem,
+                "price {op} ANY: a NaN price fails it in storage and in the VM alike"
+            );
+        }
     }
 }

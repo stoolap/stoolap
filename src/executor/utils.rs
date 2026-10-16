@@ -427,6 +427,10 @@ fn substitute_outer_references_inner(
                 })
             })
         }
+        Expression::QuantifiedSet(quantified) => {
+            substitute_outer_references_inner(&quantified.left, outer_row, scope)
+                .map(|left| quantified.with_left(left))
+        }
         Expression::Cast(cast) => substitute_outer_references_inner(&cast.expr, outer_row, scope)
             .map(|expr| {
                 Expression::Cast(CastExpression {
@@ -667,6 +671,24 @@ fn substitute_in_table_expr(
 // ============================================================================
 // Column Index Utilities
 // ============================================================================
+
+/// The name of an expression column, lowercased outside its quoted TEXT
+/// literals: names match in any case, literals only in their own
+pub fn fold_expression_name(name: &str) -> String {
+    let mut folded = String::with_capacity(name.len());
+    let mut quoted = false;
+    for c in name.chars() {
+        if c == '\'' {
+            quoted = !quoted;
+        }
+        if quoted {
+            folded.push(c);
+        } else {
+            folded.extend(c.to_lowercase());
+        }
+    }
+    folded
+}
 
 /// Build a column name to index map for fast column lookups.
 /// Column names are lowercased for case-insensitive matching.
@@ -966,6 +988,7 @@ pub(crate) fn collect_column_names(
             collect_column_names(&i.left, out) && collect_column_names(&i.right, out)
         }
         Expression::InHashSet(h) => collect_column_names(&h.column, out),
+        Expression::QuantifiedSet(q) => collect_column_names(&q.left, out),
         Expression::Between(b) => {
             collect_column_names(&b.expr, out)
                 && collect_column_names(&b.lower, out)
@@ -1411,6 +1434,9 @@ fn collect_table_qualifiers_impl(expr: &Expression, qualifiers: &mut FxHashSet<S
         Expression::InHashSet(in_set) => {
             collect_table_qualifiers_impl(&in_set.column, qualifiers);
         }
+        Expression::QuantifiedSet(quantified) => {
+            collect_table_qualifiers_impl(&quantified.left, qualifiers);
+        }
         Expression::Between(between) => {
             collect_table_qualifiers_impl(&between.expr, qualifiers);
             collect_table_qualifiers_impl(&between.lower, qualifiers);
@@ -1539,6 +1565,9 @@ pub fn strip_table_qualifier(expr: &Expression, table_alias: &str) -> Expression
             values: in_set.values.clone(),
             not: in_set.not,
         }),
+        Expression::QuantifiedSet(quantified) => {
+            quantified.with_left(strip_table_qualifier(&quantified.left, table_alias))
+        }
         Expression::Between(between) => Expression::Between(BetweenExpression {
             token: between.token.clone(),
             expr: Box::new(strip_table_qualifier(&between.expr, table_alias)),
@@ -1628,6 +1657,9 @@ pub fn add_table_qualifier(expr: &Expression, table_alias: &str) -> Expression {
             values: in_set.values.clone(),
             not: in_set.not,
         }),
+        Expression::QuantifiedSet(quantified) => {
+            quantified.with_left(add_table_qualifier(&quantified.left, table_alias))
+        }
         Expression::Between(between) => Expression::Between(BetweenExpression {
             token: between.token.clone(),
             expr: Box::new(add_table_qualifier(&between.expr, table_alias)),
@@ -1694,6 +1726,7 @@ pub fn expression_contains_aggregate(expr: &Expression) -> bool {
         }
         Expression::Prefix(prefix) => expression_contains_aggregate(&prefix.right),
         Expression::Cast(cast) => expression_contains_aggregate(&cast.expr),
+        Expression::QuantifiedSet(set) => expression_contains_aggregate(&set.left),
         Expression::Case(case) => {
             for when_clause in &case.when_clauses {
                 if expression_contains_aggregate(&when_clause.condition)
