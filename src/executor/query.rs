@@ -3437,38 +3437,12 @@ impl Executor {
                                 table_alias.as_deref(),
                             ));
 
-                            // Apply LIMIT if present
-                            let final_rows = if let Some(limit_expr) = &stmt.limit {
-                                if let Expression::IntegerLiteral(lit) = limit_expr.as_ref() {
-                                    let limit = lit.value as usize;
-                                    let offset = stmt
-                                        .offset
-                                        .as_ref()
-                                        .and_then(|o| {
-                                            if let Expression::IntegerLiteral(lit) = o.as_ref() {
-                                                Some(lit.value as usize)
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .unwrap_or(0);
-                                    projected_rows
-                                        .into_iter()
-                                        .skip(offset)
-                                        .take(limit)
-                                        .collect()
-                                } else {
-                                    projected_rows
-                                }
-                            } else {
-                                projected_rows
-                            };
-
+                            // LIMIT and OFFSET, parameters included, are the caller's to apply
                             let result = ExecutorResult::with_arc_columns(
                                 CompactArc::clone(&output_columns),
-                                final_rows,
+                                projected_rows,
                             );
-                            return Ok((Box::new(result), output_columns, true, None));
+                            return Ok((Box::new(result), output_columns, false, None));
                         }
                     }
 
