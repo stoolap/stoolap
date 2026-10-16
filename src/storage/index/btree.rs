@@ -1185,6 +1185,91 @@ impl Index for BTreeIndex {
         Some(result)
     }
 
+    /// Walks the whole key, so only an empty prefix. Each chunk of keys is
+    /// copied under the lock and visited after it is released.
+    fn walk_prefix_ordered(
+        &self,
+        prefix: &[Value],
+        lower: Option<(&Value, bool)>,
+        upper: Option<(&Value, bool)>,
+        ascending: bool,
+        visit: &mut dyn FnMut(i64, &Value) -> bool,
+    ) -> bool {
+        if !prefix.is_empty() || self.closed.load(AtomicOrdering::Acquire) {
+            return false;
+        }
+        let bound = |side: Option<(&Value, bool)>| match side {
+            Some((value, true)) => Bound::Included(CompactArc::new(value.clone())),
+            Some((value, false)) => Bound::Excluded(CompactArc::new(value.clone())),
+            None => Bound::Unbounded,
+        };
+        let (mut start, mut end) = (bound(lower), bound(upper));
+        // Bounds that cross, or meet with one side open, hold nothing
+        if let (
+            Bound::Included(low) | Bound::Excluded(low),
+            Bound::Included(high) | Bound::Excluded(high),
+        ) = (&start, &end)
+        {
+            let open = matches!(start, Bound::Excluded(_)) || matches!(end, Bound::Excluded(_));
+            if low > high || (low == high && open) {
+                return true;
+            }
+        }
+        let mut ids: Vec<i64> = Vec::new();
+        let mut keys: Vec<(CompactArc<Value>, usize)> = Vec::new();
+        let mut chunk = 64usize;
+        loop {
+            ids.clear();
+            keys.clear();
+            let mut exhausted = true;
+            {
+                let sorted_values = self.sorted_values.read();
+                let mut take = |(key, rows): (&CompactArc<Value>, &RowIdSet)| {
+                    rows.copy_into(&mut ids);
+                    keys.push((CompactArc::clone(key), ids.len()));
+                    ids.len() < chunk
+                };
+                let range = sorted_values.range((start.clone(), end.clone()));
+                if ascending {
+                    for entry in range {
+                        if !take(entry) {
+                            exhausted = false;
+                            break;
+                        }
+                    }
+                } else {
+                    for entry in range.rev() {
+                        if !take(entry) {
+                            exhausted = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            let mut from = 0;
+            for (key, upto) in &keys {
+                for &row_id in &ids[from..*upto] {
+                    if !visit(row_id, key) {
+                        return true;
+                    }
+                }
+                from = *upto;
+            }
+            let Some((last, _)) = keys.pop() else {
+                return true;
+            };
+            if exhausted {
+                return true;
+            }
+            if ascending {
+                start = Bound::Excluded(last);
+            } else {
+                end = Bound::Excluded(last);
+            }
+            chunk = (chunk * 2).min(4096);
+        }
+    }
+
     fn get_grouped_row_ids(&self) -> Option<Vec<(Value, Vec<i64>)>> {
         if self.closed.load(AtomicOrdering::Acquire) {
             return None;
