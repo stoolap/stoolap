@@ -138,6 +138,25 @@ fn cached_and_prepared_entries_run_again_alike() {
 }
 
 #[test]
+fn a_count_compiled_on_its_first_run_runs_again_when_overtaken() {
+    let mut wrong = Vec::new();
+    for (n, sql) in ["SELECT COUNT(*) FROM t", "SELECT COUNT(DISTINCT v) FROM t"]
+        .into_iter()
+        .enumerate()
+    {
+        let db = memory(&format!("first_count_{n}"));
+        db.execute("CREATE INDEX t_v ON t (v)", ()).unwrap();
+        let ran = after_the_view(&db, TRUNCATE_AND_ADD);
+        let seen = values(db.query(sql, ()));
+        assert!(ran.get(), "{sql}: the truncate did not land after the view");
+        if seen.as_deref() != Ok(&[1]) {
+            wrong.push(format!("{sql}: {seen:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
 fn a_compiled_pk_lookup_in_a_transaction_runs_again() {
     let db = memory("compiled_pk");
     let executor = Executor::new(Arc::clone(db.engine()));

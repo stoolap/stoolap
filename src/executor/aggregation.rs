@@ -7428,7 +7428,8 @@ impl Executor {
             }
         };
 
-        let table = match tx.get_statement_table_at(&table_name, self.autocommit_view().as_ref()) {
+        let view = self.autocommit_view();
+        let table = match tx.get_statement_table_at(&table_name, view.as_ref()) {
             Ok(t) => t,
             Err(_) => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
@@ -7436,8 +7437,13 @@ impl Executor {
             }
         };
 
-        // Get the count
-        let count = match table.row_count() {
+        // Get the count; a truncate or drop that overtook the view leaves it
+        // to the run again
+        let count = match table.row_count().and_then(|count| {
+            view.as_ref()
+                .map_or(Ok(()), crate::storage::mvcc::registry::StatementView::held)
+                .map(|()| count)
+        }) {
             Ok(count) => count,
             Err(error) => return Some(Err(error)),
         };
