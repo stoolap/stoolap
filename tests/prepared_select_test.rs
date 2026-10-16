@@ -1575,13 +1575,55 @@ mod registered_volatile {
         }
     }
 
+    /// TICK under the name of the built-in NOW
+    #[derive(Default)]
+    struct NowTick;
+
+    impl ScalarFunction for NowTick {
+        fn name(&self) -> &str {
+            "NOW"
+        }
+        fn info(&self) -> FunctionInfo {
+            let mut info = Tick.info();
+            info.name = "NOW".to_string();
+            info
+        }
+        fn evaluate(&self, args: &[Value]) -> Result<Value> {
+            Tick.evaluate(args)
+        }
+        fn clone_box(&self) -> Box<dyn ScalarFunction> {
+            Box::new(NowTick)
+        }
+    }
+
     #[test]
     fn test_a_registered_volatile_function_runs_per_inner_row() {
         let _guard = super::serial();
-        let mut engine = MVCCEngine::in_memory();
-        stoolap::storage::traits::Engine::open(&mut engine).unwrap();
         let registry = FunctionRegistry::new();
         registry.register_scalar::<Tick>();
+        assert_eq!(
+            calls_per_run(registry, "TICK"),
+            5,
+            "TICK runs once per inner row reaching the filter, not once per call"
+        );
+    }
+
+    #[test]
+    fn test_a_registered_function_named_like_a_clock_runs_per_inner_row() {
+        let _guard = super::serial();
+        let registry = FunctionRegistry::new();
+        registry.register_scalar::<NowTick>();
+        assert_eq!(
+            calls_per_run(registry, "NOW"),
+            5,
+            "a NOW the registry holds non-deterministic is not the built-in clock"
+        );
+    }
+
+    /// Calls of `function` in one run that finds the third of five inner rows
+    fn calls_per_run(registry: FunctionRegistry, function: &str) -> usize {
+        let mut engine = MVCCEngine::in_memory();
+        stoolap::storage::traits::Engine::open(&mut engine).unwrap();
         let executor = Executor::with_function_registry(Arc::new(engine), Arc::new(registry));
         for sql in [
             "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
@@ -1593,20 +1635,93 @@ mod registered_volatile {
         }
         let before = TICKS.load(Ordering::Relaxed);
         let mut rows = executor
-            .execute(
+            .execute(&format!(
                 "SELECT id FROM t WHERE id = 1 \
-                 AND a > (SELECT v FROM m WHERE m.k = t.id AND m.v = TICK(t.id) + 2)",
-            )
+                 AND a > (SELECT v FROM m WHERE m.k = t.id AND m.v = {function}(t.id) + 2)"
+            ))
             .unwrap();
         let mut found = Vec::new();
         while rows.next() {
             found.push(rows.row().get(0).cloned());
         }
         assert_eq!(found, vec![Some(Value::Integer(1))]);
+        TICKS.load(Ordering::Relaxed) - before
+    }
+}
+
+#[test]
+fn test_a_subquery_value_against_a_boolean_column_reads_as_the_column() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_subquery_typed").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, b BOOLEAN)", ())
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1, TRUE)", ()).unwrap();
+    db.execute("CREATE TABLE w (id INTEGER PRIMARY KEY, s TEXT)", ())
+        .unwrap();
+    db.execute("INSERT INTO w VALUES (1, 'true')", ()).unwrap();
+    let sql = "SELECT t.id FROM t WHERE t.id = \
+               (SELECT u.id FROM u WHERE u.b = (SELECT w.s FROM w WHERE w.id = 1))";
+    let old = "SELECT t.id FROM t WHERE t.id = \
+               (SELECT u.id FROM u WHERE u.b = (SELECT w.s FROM w WHERE w.id = 1) ORDER BY u.id)";
+    assert_eq!(ids(&db, old, ()).0, vec![1], "the general path");
+    let (found, runs) = ids(&db, sql, ());
+    assert!(runs >= 1, "ran prepared");
+    assert_eq!(found, vec![1], "the subquery's TEXT read as BOOLEAN");
+}
+
+#[test]
+fn test_a_dotted_output_alias_is_no_qualifier() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_dotted_alias").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (100, 9)", ())
+        .unwrap();
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1), (100)", ()).unwrap();
+    let sql =
+        "SELECT a AS \"t.id\", a AS x FROM t WHERE id = (SELECT id FROM u WHERE u.id = t.id) \
+               ORDER BY x + t.id";
+    let (found, _) = ids(&db, sql, ());
+    assert_eq!(
+        found,
+        vec![10, 9],
+        "t.id is the table's id: 10 + 1 before 9 + 100"
+    );
+}
+
+#[test]
+fn test_json_comparisons_give_one_answer() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_json_compare").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, j JSON)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, '{\"x\":1}')", ())
+        .unwrap();
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, j JSON)", ())
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1, '{\"x\":1}')", ())
+        .unwrap();
+    let param = "{\"x\":1}";
+    let mut answers = Vec::new();
+    for inner in ["u.j = $1", "(u.j = $1) = TRUE"] {
+        let sql = format!("SELECT t.id FROM t WHERE t.id = (SELECT u.id FROM u WHERE {inner})");
+        let (found, runs) = ids(&db, &sql, (param,));
+        assert!(runs >= 1, "{sql} ran prepared");
+        answers.push((inner, found));
+    }
+    let outer =
+        "SELECT t.id FROM t WHERE t.j = $1 AND t.id = (SELECT u.id FROM u WHERE u.id = t.id)";
+    answers.push(("statement", ids(&db, outer, (param,)).0));
+    for (shape, found) in &answers {
         assert_eq!(
-            TICKS.load(Ordering::Relaxed) - before,
-            5,
-            "TICK runs once per inner row reaching the filter, not once per call"
+            found,
+            &vec![1],
+            "{shape}: a JSON column equal to the same text"
         );
     }
 }

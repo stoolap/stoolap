@@ -589,6 +589,46 @@ fn read_as(expr: &mut Expression, type_name: &str) {
     });
 }
 
+/// Whether the scan compares values of `data_type` by the program's rule;
+/// a JSON or VECTOR comparison is left to the program
+fn scan_compares(data_type: DataType) -> bool {
+    !matches!(data_type, DataType::Json | DataType::Vector)
+}
+
+/// Whether every column `expr` reads is one the scan compares
+fn scans_whole(expr: &Expression, schema: &Schema) -> bool {
+    match expr {
+        Expression::Identifier(id) => schema
+            .column_index_map()
+            .get(id.value_lower.as_str())
+            .is_none_or(|&i| scan_compares(schema.columns[i].data_type)),
+        other => {
+            let mut whole = true;
+            let _ = for_each_child(other, &mut |child| {
+                whole &= scans_whole(child, schema);
+                Ok(())
+            });
+            whole
+        }
+    }
+}
+
+/// Whether `expr` reads a column of the row its program runs over; a
+/// subquery's value is a value, whatever its own block reads
+fn reads_row_column(expr: &Expression) -> bool {
+    match expr {
+        Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => true,
+        other => {
+            let mut reads = false;
+            let _ = for_each_child(other, &mut |child| {
+                reads |= reads_row_column(child);
+                Ok(())
+            });
+            reads
+        }
+    }
+}
+
 /// Every comparison in a WHERE program that sets a value against a column
 /// of `schema` reads the value as the scan does: converted to the column's
 /// type, so the program and a pushed comparison give one answer
@@ -604,15 +644,15 @@ fn compare_as_scan(expr: &mut Expression, schema: &Schema) {
     match expr {
         Expression::Infix(infix) if is_comparison(infix.op_type) => {
             match (column_type(&infix.left), column_type(&infix.right)) {
-                (Some(t), None) if !mentions_column(&infix.right) => read_as(&mut infix.right, t),
-                (None, Some(t)) if !mentions_column(&infix.left) => read_as(&mut infix.left, t),
+                (Some(t), None) if !reads_row_column(&infix.right) => read_as(&mut infix.right, t),
+                (None, Some(t)) if !reads_row_column(&infix.left) => read_as(&mut infix.left, t),
                 _ => {}
             }
         }
         Expression::Between(between) => {
             if let Some(t) = column_type(&between.expr) {
                 for bound in [&mut between.lower, &mut between.upper] {
-                    if !mentions_column(bound) {
+                    if !reads_row_column(bound) {
                         read_as(bound, t);
                     }
                 }
@@ -625,7 +665,7 @@ fn compare_as_scan(expr: &mut Expression, schema: &Schema) {
                     Expression::ExpressionList(list) => &mut list.expressions,
                     _ => return,
                 };
-                for element in elements.iter_mut().filter(|e| !mentions_column(e)) {
+                for element in elements.iter_mut().filter(|e| !reads_row_column(e)) {
                     read_as(element, t);
                 }
             }
@@ -685,9 +725,12 @@ fn for_each_child_mut(expr: &mut Expression, f: &mut impl FnMut(&mut Expression)
 /// pushdown also takes as fixed for a statement
 fn volatile(expr: &Expression, registry: &FunctionRegistry) -> bool {
     if let Expression::FunctionCall(call) = expr {
-        let statement_clock = ["NOW", "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP"]
-            .iter()
-            .any(|f| call.function.eq_ignore_ascii_case(f));
+        // Only the built-in clocks: a registry that took functions of its
+        // own may hold another function under one of these names
+        let statement_clock = !registry.has_registered_functions()
+            && ["NOW", "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP"]
+                .iter()
+                .any(|f| call.function.eq_ignore_ascii_case(f));
         if contains_non_deterministic_volatile(expr)
             || (!statement_clock && !registry.is_deterministic(&call.function))
         {
@@ -892,6 +935,9 @@ impl PreparedComparison {
                 other => PreparedValue::Const(extract_literal_value(other)?),
             };
             let index = *schema.column_index_map().get(column.value_lower.as_str())?;
+            if !scan_compares(schema.columns[index].data_type) {
+                return None;
+            }
             return Some(Self {
                 column: column.value.to_string(),
                 index,
@@ -1373,10 +1419,13 @@ impl PreparedProjection {
         // it, under the key's own text, which is how the sort finds it
         let mut extra_names = plan.extra_names;
         let alias_map = Executor::build_alias_map_excluding(&stmt.columns, Some(columns));
+        // A dotted alias would register as a qualified column of the second row
         let projected_names: Vec<String> = select_exprs
             .iter()
             .map(|e| match e {
-                Expression::Aliased(a) => a.alias.value_lower.to_string(),
+                Expression::Aliased(a) if !a.alias.value_lower.contains('.') => {
+                    a.alias.value_lower.to_string()
+                }
                 _ => String::new(),
             })
             .collect();
@@ -1482,7 +1531,7 @@ impl PreparedSelect {
         let mut pushed = Vec::new();
         for part in parts {
             let part = builder.statement_conjunct(&chain, part, &mut work, &mut run_slots)?;
-            if !mentions_subquery(&part) && !needs_folding(&part) {
+            if !mentions_subquery(&part) && !needs_folding(&part) && scans_whole(&part, schema) {
                 pushed.push(part.clone());
             }
             rewritten.push(part);
