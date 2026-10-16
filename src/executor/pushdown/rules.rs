@@ -271,12 +271,9 @@ impl PushdownRule for QuantifiedSetRule {
         let Some(column) = extract_column_name(&quantified.left) else {
             return PushdownResult::CannotPush;
         };
-        // Only a number column orders as the bound does for every value it holds
+        // Only an INTEGER column orders in storage as the contract does; a FLOAT may hold NaN
         let column_type = ctx.column_type(&column);
-        if !matches!(
-            column_type,
-            Some(crate::core::DataType::Integer | crate::core::DataType::Float)
-        ) {
+        if column_type != Some(crate::core::DataType::Integer) {
             return PushdownResult::CannotPush;
         }
         let Some(op) = QuantifiedMembers::operator(&quantified.operator) else {

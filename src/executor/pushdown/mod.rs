@@ -592,7 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn test_quantified_set_on_a_number_column_pushes_its_bound() {
+    fn test_quantified_set_on_an_integer_column_pushes_its_bound() {
         let schema = test_schema();
         let members = vec![Value::integer(25), Value::integer(40)];
         for (op, all, passes) in [
@@ -621,6 +621,7 @@ mod tests {
             ("age", vec![Value::integer(25)], true),
             ("name", vec![Value::integer(25)], false),
             ("age", vec![Value::text("25")], false),
+            ("price", vec![Value::integer(25)], false),
         ] {
             let expr = make_quantified(column, ">", false, members, has_null);
             let (storage_expr, needs_mem) = try_pushdown(&expr, &schema, None);

@@ -1663,6 +1663,9 @@ impl Executor {
             Expression::Cast(cast) => {
                 self.extract_aggregates_from_expr(&cast.expr, aggregations, non_agg_columns)?;
             }
+            Expression::QuantifiedSet(set) => {
+                self.extract_aggregates_from_expr(&set.left, aggregations, non_agg_columns)?;
+            }
             // An aggregate a window function takes as its argument, or
             // partitions or orders by, is computed like any other
             Expression::Window(window) => {
@@ -7523,6 +7526,7 @@ fn substitute_group_aliases(expr: &mut Expression, aliases: &[(&Expression, &Ide
         }
         Expression::Prefix(prefix) => substitute_group_aliases(&mut prefix.right, aliases),
         Expression::Cast(cast) => substitute_group_aliases(&mut cast.expr, aliases),
+        Expression::QuantifiedSet(set) => substitute_group_aliases(&mut set.left, aliases),
         Expression::FunctionCall(func) if !is_aggregate_function(&func.function) => {
             for arg in func.arguments.iter_mut() {
                 substitute_group_aliases(arg, aliases);

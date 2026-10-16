@@ -287,3 +287,69 @@ fn test_a_numeric_text_left_value_compares_with_the_bound_once() {
         "a TIMESTAMP is not a number: it is compared with the members"
     );
 }
+
+fn rows(db: &Database, sql: &str) -> Vec<Vec<String>> {
+    db.query(sql, ())
+        .unwrap()
+        .map(|row| {
+            let row = row.unwrap();
+            (0..row.len())
+                .map(|i| format!("{:?}", row.get_value(i).unwrap()))
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn test_an_aggregate_on_the_left_is_computed() {
+    let db = Database::open("memory://quantified_aggregate_left").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, v INTEGER)",
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, x INTEGER)",
+        "INSERT INTO t VALUES (1, 1, 2, 10), (2, 2, 1, 20), (3, 0, 0, 30)",
+        "INSERT INTO m VALUES (1, 5)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT COUNT(*), SUM(v) > ANY (SELECT x FROM m), SUM(v) < ALL (SELECT x FROM m) FROM t"
+        ),
+        rows(&db, "SELECT 3, TRUE, FALSE"),
+        "SUM(v) is 60, above 5"
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT a + b AS g, COUNT(*), a + b > ANY (SELECT x FROM m) FROM t GROUP BY a + b ORDER BY g"
+        ),
+        rows(&db, "SELECT 0, 1, FALSE UNION ALL SELECT 3, 2, FALSE"),
+        "the group key a + b is rebound inside the comparison"
+    );
+}
+
+#[test]
+fn test_a_nan_left_value_answers_alike_on_join_and_single_table() {
+    let db = Database::open("memory://quantified_nan_left").unwrap();
+    for sql in [
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, v FLOAT)",
+        "CREATE TABLE b (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, v FLOAT)",
+        "INSERT INTO a VALUES (1, CAST('NaN' AS FLOAT))",
+        "INSERT INTO b VALUES (1)",
+        "INSERT INTO m VALUES (1, 1.0)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    for predicate in ["a.v > ANY (SELECT v FROM m)", "a.v < ALL (SELECT v FROM m)"] {
+        assert_eq!(
+            rows(
+                &db,
+                &format!("SELECT a.id FROM a JOIN b ON a.id = b.id WHERE {predicate}")
+            ),
+            rows(&db, &format!("SELECT a.id FROM a WHERE {predicate}")),
+            "{predicate}: the join answers as the single table does"
+        );
+    }
+}

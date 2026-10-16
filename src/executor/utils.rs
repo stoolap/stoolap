@@ -1708,6 +1708,7 @@ pub fn expression_contains_aggregate(expr: &Expression) -> bool {
         }
         Expression::Prefix(prefix) => expression_contains_aggregate(&prefix.right),
         Expression::Cast(cast) => expression_contains_aggregate(&cast.expr),
+        Expression::QuantifiedSet(set) => expression_contains_aggregate(&set.left),
         Expression::Case(case) => {
             for when_clause in &case.when_clauses {
                 if expression_contains_aggregate(&when_clause.condition)
