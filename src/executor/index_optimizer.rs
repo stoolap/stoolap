@@ -1693,16 +1693,20 @@ impl Executor {
             return Ok(None);
         }
 
-        // The members as the comparison reads them against the column; a
-        // number against a TEXT column is left to the scan
+        // The members as an equality against the column reads each, so the
+        // index is asked for the column's own keys; a number against a TEXT
+        // column is left to the scan
         if !is_negated {
-            match schema.get_column_type(&column_name) {
-                Some(DataType::Integer | DataType::Float) => {
-                    values = numeric_members(values.iter()).0;
-                }
-                Some(DataType::Text) if has_number(values.iter()) => return Ok(None),
-                _ => {}
+            let column_type = schema.get_column_type(&column_name);
+            if column_type == Some(DataType::Text) && has_number(values.iter()) {
+                return Ok(None);
             }
+            values = values
+                .into_iter()
+                .filter_map(|member| {
+                    crate::executor::pushdown::coerce_constant(column_type, member)
+                })
+                .collect();
         }
 
         // A secondary index probe collects every matching row id for every

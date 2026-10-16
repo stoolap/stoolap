@@ -102,35 +102,43 @@ impl<'a> PushdownContext<'a> {
     /// comparison's own rule. None, so nothing is pushed, for unreadable TEXT
     /// against a numeric column and for a number against a TEXT column.
     pub fn coerce_to_column_type(&self, column: &str, value: Value) -> Option<Value> {
-        use crate::core::DataType;
-        let column_type = self.column_type(column);
-        let value = match (column_type, value) {
-            (Some(DataType::Integer | DataType::Float), Value::Text(text)) => {
-                crate::core::predicate::parse_sql_number(&text)?
-            }
-            (Some(DataType::Text), Value::Integer(_) | Value::Float(_)) => return None,
-            (_, value) => value,
-        };
-        Some(match (column_type, &value) {
-            (Some(crate::core::DataType::Integer), Value::Float(f)) => {
-                match crate::executor::Executor::lossless_float_key(*f) {
-                    Some(i) => Value::Integer(i),
-                    None => value,
-                }
-            }
-            // Same rule in the other direction: `i as f64` rounds above
-            // 2^53, so a large integer constant against a FLOAT column
-            // stays an Integer and compares exactly downstream.
-            (Some(crate::core::DataType::Float), Value::Integer(i)) => {
-                match crate::core::value::lossless_f64_from_i64(*i) {
-                    Some(f) => Value::Float(f),
-                    None => value,
-                }
-            }
-            (Some(col_type), _) => value.into_coerce_to_type(col_type),
-            (None, _) => value,
-        })
+        coerce_constant(self.column_type(column), value)
     }
+}
+
+/// A constant as an equality against a column of `column_type` reads it,
+/// by the rules `PushdownContext::coerce_to_column_type` states
+pub(crate) fn coerce_constant(
+    column_type: Option<crate::core::DataType>,
+    value: Value,
+) -> Option<Value> {
+    use crate::core::DataType;
+    let value = match (column_type, value) {
+        (Some(DataType::Integer | DataType::Float), Value::Text(text)) => {
+            crate::core::predicate::parse_sql_number(&text)?
+        }
+        (Some(DataType::Text), Value::Integer(_) | Value::Float(_)) => return None,
+        (_, value) => value,
+    };
+    Some(match (column_type, &value) {
+        (Some(DataType::Integer), Value::Float(f)) => {
+            match crate::executor::Executor::lossless_float_key(*f) {
+                Some(i) => Value::Integer(i),
+                None => value,
+            }
+        }
+        // Same rule in the other direction: `i as f64` rounds above
+        // 2^53, so a large integer constant against a FLOAT column
+        // stays an Integer and compares exactly downstream.
+        (Some(DataType::Float), Value::Integer(i)) => {
+            match crate::core::value::lossless_f64_from_i64(*i) {
+                Some(f) => Value::Float(f),
+                None => value,
+            }
+        }
+        (Some(col_type), _) => value.into_coerce_to_type(col_type),
+        (None, _) => value,
+    })
 }
 
 /// Trait for pushdown rules
