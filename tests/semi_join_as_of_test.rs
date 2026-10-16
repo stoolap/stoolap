@@ -28,11 +28,15 @@ fn setup(name: &str) -> Database {
     db
 }
 
+/// The ids the statement gives, sorted here so no ORDER BY shapes its plan
 fn ids(db: &Database, sql: &str) -> Vec<i64> {
-    db.query(sql, ())
+    let mut found: Vec<i64> = db
+        .query(sql, ())
         .unwrap()
         .map(|row| row.unwrap().get::<i64>(0).unwrap())
-        .collect()
+        .collect();
+    found.sort_unstable();
+    found
 }
 
 const BEFORE: &str = "AS OF TIMESTAMP '1970-01-01 00:00:00'";
@@ -67,11 +71,11 @@ fn test_not_exists_reads_the_inner_table_as_of() {
         ids(
             &db,
             &format!(
-                "SELECT id FROM p WHERE NOT EXISTS (SELECT 1 FROM c {BEFORE} WHERE c.p_id = p.id) ORDER BY id"
+                "SELECT id FROM p WHERE NOT EXISTS (SELECT 1 FROM c {BEFORE} WHERE c.p_id = p.id)"
             )
         ),
         vec![1, 2, 3],
-        "the anti-join reads the children as of then"
+        "the anti-join, which an ORDER BY would rule out, reads the children as of then"
     );
     assert_eq!(
         ids(
