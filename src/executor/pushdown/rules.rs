@@ -143,6 +143,7 @@ pub(crate) fn contains_non_deterministic_volatile(expr: &ast::Expression) -> boo
             contains_non_deterministic_volatile(&in_expr.left)
                 || contains_non_deterministic_volatile(&in_expr.right)
         }
+        ast::Expression::QuantifiedSet(set) => contains_non_deterministic_volatile(&set.left),
         ast::Expression::List(list) => list
             .elements
             .iter()

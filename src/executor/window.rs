@@ -1716,6 +1716,9 @@ impl Executor {
                 Self::collect_all_windows_in_expression(&i.left, out);
                 Self::collect_all_windows_in_expression(&i.right, out);
             }
+            Expression::QuantifiedSet(set) => {
+                Self::collect_all_windows_in_expression(&set.left, out);
+            }
             Expression::Like(l) => {
                 Self::collect_all_windows_in_expression(&l.left, out);
                 Self::collect_all_windows_in_expression(&l.pattern, out);
@@ -1869,6 +1872,9 @@ impl Executor {
                 )),
                 not: i.not,
             }),
+            Expression::QuantifiedSet(set) => set.with_left(
+                Self::replace_windows_with_identifiers(&set.left, wf_names, counter),
+            ),
             Expression::Like(l) => Expression::Like(LikeExpression {
                 token: l.token.clone(),
                 left: Box::new(Self::replace_windows_with_identifiers(

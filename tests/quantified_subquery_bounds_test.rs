@@ -394,3 +394,77 @@ fn test_two_sets_keep_two_aggregates() {
         "'10' reads as 10 against 5, and sorts below '5' as text"
     );
 }
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_a_volatile_left_value_is_not_frozen_by_dml_pushdown() {
+    let db = Database::open("memory://quantified_volatile_dml").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, active BOOLEAN, hit INTEGER)",
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, v FLOAT)",
+        "INSERT INTO t SELECT value, TRUE, 0 FROM generate_series(1, 100)",
+        "INSERT INTO m VALUES (1, 0.5)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let draws = stoolap::test_failpoints::random_draws();
+    db.execute(
+        "UPDATE t SET hit = 1 WHERE active = NOT (RANDOM() < ANY (SELECT v FROM m))",
+        (),
+    )
+    .unwrap();
+    assert!(
+        stoolap::test_failpoints::random_draws() - draws >= 100,
+        "RANDOM() is drawn for each of the 100 rows, not once for the statement"
+    );
+}
+
+#[test]
+fn test_a_parameter_on_the_left_keeps_a_join_side_out_of_the_cache() {
+    let db = Database::open("memory://quantified_parameter_join").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, a INTEGER)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, tid INTEGER)",
+        "CREATE TABLE w (id INTEGER PRIMARY KEY, v INTEGER)",
+        "INSERT INTO t VALUES (1, 10, 1), (2, 20, 2)",
+        "INSERT INTO u VALUES (1, 1), (2, 2)",
+        "INSERT INTO w VALUES (1, 5)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    assert_eq!(rows(&db, "SELECT * FROM t WHERE x > 5").len(), 2);
+    let found: Vec<i64> = db
+        .query(
+            "SELECT t.id FROM t JOIN u ON t.id = u.tid WHERE t.x > 5 AND t.a + $1 > ANY (SELECT v FROM w) ORDER BY t.id",
+            (10,),
+        )
+        .unwrap()
+        .map(|row| row.unwrap().get::<i64>(0).unwrap())
+        .collect();
+    assert_eq!(found, vec![1, 2], "a + 10 is above 5 on both rows");
+}
+
+#[test]
+fn test_a_window_on_the_left_beside_another_window_is_computed() {
+    let db = Database::open("memory://quantified_window_left").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, x INTEGER)",
+        "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
+        "INSERT INTO m VALUES (1, 1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn, \
+             ROW_NUMBER() OVER (ORDER BY a) > ANY (SELECT x FROM m) FROM t ORDER BY a"
+        ),
+        rows(
+            &db,
+            "SELECT 10, 1, FALSE UNION ALL SELECT 20, 2, TRUE UNION ALL SELECT 30, 3, TRUE"
+        ),
+        "the row number above 1 passes"
+    );
+}

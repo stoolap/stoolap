@@ -823,6 +823,7 @@ impl QueryClassification {
             }
             Expression::Aliased(aliased) => Self::expression_has_parameters(&aliased.expression),
             Expression::Cast(cast) => Self::expression_has_parameters(&cast.expr),
+            Expression::QuantifiedSet(set) => Self::expression_has_parameters(&set.left),
             _ => false,
         }
     }
