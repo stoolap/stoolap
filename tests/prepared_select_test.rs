@@ -19,8 +19,9 @@ use std::rc::Rc;
 use std::sync::{Mutex, MutexGuard};
 
 use stoolap::test_failpoints::{
-    after_select_table_opened, before_prepared_scalar, general_path_hits, prepared_projection_runs,
-    prepared_scalar_runs, prepared_selects_built, random_draws, GeneralPath,
+    after_prepared_plan_taken, after_select_table_opened, before_prepared_scalar,
+    general_path_hits, prepared_projection_runs, prepared_scalar_runs, prepared_selects_built,
+    random_draws, GeneralPath,
 };
 use stoolap::{Database, Params};
 
@@ -96,13 +97,14 @@ fn prepared_line(db: &Database, sql: &str) -> String {
         .unwrap_or_default()
 }
 
-const ALL_GENERAL: [GeneralPath; 6] = [
+const ALL_GENERAL: [GeneralPath; 7] = [
     GeneralPath::CorrelatedScan,
     GeneralPath::CorrelatedWhere,
     GeneralPath::OuterBinding,
     GeneralPath::OuterSubstitution,
     GeneralPath::PushdownConstant,
     GeneralPath::ProjectionEvaluator,
+    GeneralPath::OrderByEvaluator,
 ];
 
 fn general_hits() -> Vec<usize> {
@@ -1325,4 +1327,126 @@ fn test_comparison_contract() {
     ] {
         assert_eq!(tri(&db, &cmp), expected, "{cmp}");
     }
+}
+
+#[test]
+fn test_an_inner_layout_changed_after_the_plan_was_taken() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_inner_layout").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10)", ()).unwrap();
+    db.execute(
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, pad INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO u VALUES (1, 0, 5)", ()).unwrap();
+    let sql = "SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id)";
+    assert_eq!(ids(&db, sql, ()).0, vec![1], "the plan is prepared");
+    let writer = db.clone();
+    let done = Rc::new(Cell::new(false));
+    let flag = Rc::clone(&done);
+    after_prepared_plan_taken(move || {
+        writer.execute("ALTER TABLE u DROP COLUMN pad", ()).unwrap();
+        flag.set(true);
+    });
+    let found = ids(&db, sql, ()).0;
+    assert!(done.get(), "the column dropped inside the statement");
+    assert_eq!(found, vec![1], "v is read where the table now holds it");
+}
+
+#[test]
+fn test_a_whole_pushed_inner_where_is_not_checked_again() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_pushed_whole").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
+    db.execute(
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, b BOOLEAN, ts TIMESTAMP)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO u VALUES (1, TRUE, '2024-01-02 03:04:05')", ())
+        .unwrap();
+    for (inner, param) in [("u.b = $1", "true"), ("u.ts = $1", "2024-01-02 03:04:05")] {
+        let sql = format!("SELECT t.id FROM t WHERE t.id = (SELECT u.id FROM u WHERE {inner})");
+        let old = format!(
+            "SELECT t.id FROM t WHERE t.id = (SELECT u.id FROM u WHERE {inner} ORDER BY u.id)"
+        );
+        let expected = ids(&db, &old, (param,)).0;
+        assert_eq!(
+            expected,
+            vec![1],
+            "the general path keeps the row for {inner}"
+        );
+        let (found, runs) = ids(&db, &sql, (param,));
+        assert!(runs >= 1, "{sql} ran prepared");
+        assert_eq!(found, expected, "{inner} with TEXT {param}");
+    }
+}
+
+#[test]
+fn test_a_missing_positional_parameter_is_an_error() {
+    let _guard = serial();
+    let db = setup("prepared_missing_positional");
+    let sql = "SELECT id FROM t WHERE id = (SELECT id FROM u WHERE u.id = t.id AND u.id = $1)";
+    let (err, runs) = error(&db, sql, ());
+    assert!(err.contains("requires 1 parameters"), "{err}");
+    assert_eq!(runs, 0, "nothing ran with a slot standing in for $1");
+}
+
+#[test]
+fn test_a_named_parameter_under_an_alias_must_have_a_value() {
+    let _guard = serial();
+    let db = setup("prepared_named_alias");
+    let sql = "SELECT :missing AS x FROM t WHERE id = (SELECT id FROM u WHERE u.id = t.id)";
+    let (err, _) = error(&db, sql, ());
+    assert!(err.contains(":missing"), "{err}");
+}
+
+#[test]
+fn test_a_volatile_escape_runs_per_inner_row() {
+    let _guard = serial();
+    let db = setup("prepared_volatile_escape");
+    db.execute(
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, k INTEGER, keep BOOLEAN, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO m VALUES (1, 1, TRUE, 1), (2, 1, TRUE, 2), (3, 1, TRUE, 3), (4, 1, TRUE, 4), (5, 1, TRUE, 5)",
+        (),
+    )
+    .unwrap();
+    let sql = "SELECT id FROM t WHERE id = 1 AND a > (SELECT v FROM m WHERE m.k = t.id \
+               AND m.keep = ('x' LIKE 'x' ESCAPE CASE WHEN RANDOM() < 2 THEN '!' ELSE '?' END) \
+               AND m.v + 0 = 3)";
+    let draws = random_draws();
+    assert_eq!(ids(&db, sql, ()), (vec![1], 1));
+    assert_eq!(
+        random_draws() - draws,
+        5,
+        "the ESCAPE is drawn once per inner row, not once per call"
+    );
+}
+
+#[test]
+fn test_an_order_by_key_reading_an_alias_is_prepared() {
+    let _guard = serial();
+    let db = setup("prepared_order_alias");
+    let sql = "SELECT id, a AS x FROM t WHERE (SELECT v FROM u WHERE u.id = t.id) IS NOT NULL \
+               ORDER BY x % 3, id";
+    let old = "SELECT id, a AS x FROM t WHERE (SELECT v FROM u WHERE u.id = t.id ORDER BY v) \
+               IS NOT NULL ORDER BY x % 3, id";
+    let expected = pairs(&db, old);
+    let before = general_path_hits(GeneralPath::OrderByEvaluator);
+    let found = pairs(&db, sql);
+    assert_eq!(
+        general_path_hits(GeneralPath::OrderByEvaluator) - before,
+        0,
+        "the sort reads the key the projection computed"
+    );
+    assert_eq!((found.0, found.1), (expected.0, expected.1));
 }

@@ -562,6 +562,20 @@ fn rebuild(
     })
 }
 
+/// Whether a call anywhere in `expr` draws a new value each time it runs,
+/// through every operand the family's forms have
+fn volatile(expr: &Expression) -> bool {
+    if contains_non_deterministic_volatile(expr) {
+        return true;
+    }
+    let mut found = false;
+    let _ = for_each_child(expr, &mut |child| {
+        found |= volatile(child);
+        Ok(())
+    });
+    found
+}
+
 fn is_leaf(expr: &Expression) -> bool {
     matches!(
         expr,
@@ -693,8 +707,13 @@ struct PreparedScalarSubquery {
     /// The inner table's name as the catalog knows it
     table: SmartString,
     column_indices: Vec<usize>,
-    /// The WHERE's conjuncts the scan can take; the filter checks them again
+    /// The table's schema the programs read positions of
+    schema: CompactArc<Schema>,
+    /// The WHERE's conjuncts the scan can take
     pushdown: Vec<PreparedComparison>,
+    /// Every conjunct is one the scan takes: a call that pushes them all
+    /// has the scan's answer, as the general path does, and skips the filter
+    pushed_whole: bool,
     filter: Option<SharedProgram>,
     projection: SharedProgram,
     /// The subquery whose row this one runs for; None for the statement's row
@@ -846,6 +865,8 @@ struct Builder<'e> {
     /// Indexed by subquery id; None while that subquery is being prepared
     subqueries: Vec<Option<PreparedScalarSubquery>>,
     named: Vec<SmartString>,
+    /// The highest positional parameter the statement reads, one-based
+    max_param: usize,
 }
 
 /// A value a block reads from a scope beyond its parent: its slot, the
@@ -874,10 +895,13 @@ impl Builder<'_> {
 
     fn note_named(&mut self, expr: &Expression) {
         if let Expression::Parameter(p) = expr {
-            if let Some(name) = p.name.strip_prefix(':') {
-                if !self.named.iter().any(|n| n == name) {
-                    self.named.push(SmartString::from(name));
+            match p.name.strip_prefix(':') {
+                Some(name) => {
+                    if !self.named.iter().any(|n| n == name) {
+                        self.named.push(SmartString::from(name));
+                    }
                 }
+                None => self.max_param = self.max_param.max(p.index),
             }
         }
     }
@@ -971,10 +995,7 @@ impl Builder<'_> {
                 let left = chain.reads(&infix.left)?;
                 let right = chain.reads(&infix.right)?;
                 let hoist = |value: &Expression, reads: Reads| {
-                    reads & 1 == 0
-                        && reads.count_ones() <= 1
-                        && !is_leaf(value)
-                        && !contains_non_deterministic_volatile(value)
+                    reads & 1 == 0 && reads.count_ones() <= 1 && !is_leaf(value) && !volatile(value)
                 };
                 let sides = [(&infix.left, left), (&infix.right, right)];
                 if let Some(index) = sides.iter().position(|(value, reads)| hoist(value, *reads)) {
@@ -1063,6 +1084,7 @@ impl Builder<'_> {
             .as_deref()
             .map(|w| with_aliases(w, &sq.columns, &scope.columns));
         let mut pushdown = Vec::new();
+        let mut pushed_whole = true;
         let filter = match &where_clause {
             Some(where_clause) => {
                 let mut parts = Vec::new();
@@ -1070,8 +1092,9 @@ impl Builder<'_> {
                 let mut rewritten = Vec::with_capacity(parts.len());
                 for part in parts {
                     let part = self.rewrite_conjunct(&chain, id, part, &mut work)?;
-                    if let Some(comparison) = PreparedComparison::from_conjunct(&part, &schema) {
-                        pushdown.push(comparison);
+                    match PreparedComparison::from_conjunct(&part, &schema) {
+                        Some(comparison) => pushdown.push(comparison),
+                        None => pushed_whole = false,
                     }
                     rewritten.push(part);
                 }
@@ -1099,7 +1122,9 @@ impl Builder<'_> {
         self.subqueries[id as usize] = Some(PreparedScalarSubquery {
             table: ts.name.value_lower.clone(),
             column_indices: (0..scope.columns.len()).collect(),
+            schema: CompactArc::clone(&schema),
             pushdown,
+            pushed_whole,
             filter,
             projection,
             parent,
@@ -1210,7 +1235,25 @@ impl PreparedProjection {
         for expr in &plan.computed_order_by {
             outputs.push(Output::Key(compile(expr)?));
         }
-        Ok((Self { outputs }, plan.extra_names))
+        // A key reading a SELECT alias is computed from what the alias
+        // names, under the key's own text, which is how the sort finds it
+        let mut extra_names = plan.extra_names;
+        let alias_map = Executor::build_alias_map_excluding(&stmt.columns, Some(columns));
+        for ob in &stmt.order_by {
+            let key = &ob.expression;
+            if is_leaf(key) || !names_any(key, &|name| alias_map.contains_key(name)) {
+                continue;
+            }
+            let name = key.to_string();
+            if extra_names.contains(&name) {
+                continue;
+            }
+            outputs.push(Output::Key(compile(&Executor::substitute_aliases(
+                key, &alias_map,
+            ))?));
+            extra_names.push(name);
+        }
+        Ok((Self { outputs }, extra_names))
     }
 
     fn project(&self, mut rows: RowVec, ctx: &ExecutionContext) -> Result<RowVec> {
@@ -1263,6 +1306,7 @@ impl PreparedSelect {
             next_slot: param_count,
             subqueries: Vec::new(),
             named: Vec::new(),
+            max_param: 0,
         };
         let where_clause = stmt
             .where_clause
@@ -1298,7 +1342,14 @@ impl PreparedSelect {
             .iter()
             .chain(stmt.order_by.iter().map(|ob| &ob.expression))
         {
-            builder.note_names(column);
+            builder.note_names(unaliased(column));
+        }
+        // Slots are numbered after the values given, so a value not given would read one
+        if builder.max_param > param_count {
+            return Err(Error::internal(format!(
+                "Query requires {} parameters but only {} provided",
+                builder.max_param, param_count
+            )));
         }
         let mut output_columns =
             executor.get_output_column_names(&stmt.columns, &scope.columns, Some(scope_name));
@@ -1365,10 +1416,7 @@ impl Builder<'_> {
         let mut value_work = Rewritten::default();
         let rewritten_value = self.rewrite(chain, None, value, &mut value_work)?;
         work.ids.extend(value_work.ids);
-        let value = if !value_work.reads_row
-            && !is_leaf(value)
-            && !contains_non_deterministic_volatile(value)
-        {
+        let value = if !value_work.reads_row && !is_leaf(value) && !volatile(value) {
             let slot = self.slot();
             run_slots.push((slot, rewritten_value));
             slot_parameter(slot)
@@ -1437,6 +1485,7 @@ impl Executor {
         table: &dyn Table,
         scope_name: &SmartString,
         ctx: &ExecutionContext,
+        fresh: bool,
     ) -> Result<Arc<PreparedSelect>> {
         let epoch = self.engine.schema_epoch();
         let columns = table.schema().column_names_arc();
@@ -1445,7 +1494,7 @@ impl Executor {
                 && p.param_count == ctx.params().len()
                 && (CompactArc::ptr_eq(&p.columns, &columns) || p.columns == columns)
         };
-        if let Some(slot) = compiled {
+        if let Some(slot) = compiled.filter(|_| !fresh) {
             if let Ok(guard) = slot.read() {
                 if let CompiledExecution::PreparedSelect(p) = &*guard {
                     if fits(p) {
@@ -1518,7 +1567,24 @@ impl Executor {
             .alias
             .as_ref()
             .map_or(&ts.name.value_lower, |alias| &alias.value_lower);
-        let prepared = self.prepared_for(compiled, stmt, &*table, scope_name, ctx)?;
+        let inner_ctx = ctx.with_incremented_query_depth();
+        // A column change between taking the plan and opening a subquery's
+        // table prepares again, against the table as it now is
+        let mut fresh = false;
+        let (prepared, tables) = loop {
+            let prepared = self.prepared_for(compiled, stmt, &*table, scope_name, ctx, fresh)?;
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::prepared_plan_taken();
+            if let Some(tables) = PreparedRunner::open_tables(self, &prepared, &inner_ctx)? {
+                break (prepared, tables);
+            }
+            if fresh {
+                return Err(Error::internal(
+                    "a table's columns changed while the statement prepared",
+                ));
+            }
+            fresh = true;
+        };
         for name in &prepared.named {
             if !ctx.named_params().contains_key(name.as_str()) {
                 return Err(Error::invalid_argument(format!(
@@ -1528,7 +1594,7 @@ impl Executor {
             }
         }
 
-        let mut runner = PreparedRunner::new(self, &prepared, ctx);
+        let mut runner = PreparedRunner::new(&prepared, ctx, inner_ctx, tables);
         if !prepared.run_slots.is_empty() {
             let values = runner.run_slot_values()?;
             for (slot, value) in values {
@@ -1599,7 +1665,6 @@ impl Executor {
 /// parameter buffer: the statement's parameters, then every slot, its
 /// parent's values copied in before its own holes are filled
 pub(crate) struct PreparedRunner<'a> {
-    executor: &'a Executor,
     prepared: &'a PreparedSelect,
     /// The statement's parameters, then its run slots; the other slots NULL
     base: ParamVec,
@@ -1609,8 +1674,8 @@ pub(crate) struct PreparedRunner<'a> {
     ctx: ExecutionContext,
     buffers: Vec<RefCell<ParamVec>>,
     vms: Vec<RefCell<ExprVM>>,
-    /// Each subquery's table, opened on its first call
-    tables: Vec<RefCell<Option<Box<dyn Table>>>>,
+    /// Each subquery's table, opened before the run reads a row
+    tables: Vec<Box<dyn Table>>,
     /// Each subquery's pushed comparisons, owned by this run
     bound: Vec<RefCell<Option<BoundPushdown>>>,
     /// Each uncorrelated subquery's value, once computed
@@ -1618,24 +1683,42 @@ pub(crate) struct PreparedRunner<'a> {
 }
 
 impl<'a> PreparedRunner<'a> {
+    /// Every subquery's table as `inner_ctx` reads it, or None when one no
+    /// longer holds the columns its programs were prepared for
+    fn open_tables(
+        executor: &Executor,
+        prepared: &PreparedSelect,
+        inner_ctx: &ExecutionContext,
+    ) -> Result<Option<Vec<Box<dyn Table>>>> {
+        let mut tables = Vec::with_capacity(prepared.subqueries.len());
+        for sq in &prepared.subqueries {
+            let table = executor.prepared_table(&sq.table, inner_ctx)?;
+            if table.schema().columns != sq.schema.columns {
+                return Ok(None);
+            }
+            tables.push(table);
+        }
+        Ok(Some(tables))
+    }
+
     fn new(
-        executor: &'a Executor,
         prepared: &'a PreparedSelect,
         ctx: &'a ExecutionContext,
+        inner_ctx: ExecutionContext,
+        tables: Vec<Box<dyn Table>>,
     ) -> Self {
         let mut base: ParamVec = ctx.params().iter().cloned().collect();
         base.resize(prepared.slot_count, Value::null_unknown());
         let count = prepared.subqueries.len();
         Self {
-            executor,
             prepared,
             buffers: (0..count).map(|_| RefCell::new(base.clone())).collect(),
             base,
             named: ctx.named_params(),
             transaction_id: ctx.transaction_id(),
-            ctx: ctx.with_incremented_query_depth(),
+            ctx: inner_ctx,
             vms: (0..count).map(|_| RefCell::new(ExprVM::new())).collect(),
-            tables: (0..count).map(|_| RefCell::new(None)).collect(),
+            tables,
             bound: (0..count).map(|_| RefCell::new(None)).collect(),
             values: (0..count).map(|_| RefCell::new(None)).collect(),
         }
@@ -1727,21 +1810,17 @@ impl SubqueryExecutor for PreparedRunner<'_> {
         }
         // Read-only from here on: a nested subquery copies these values
         let params = self.buffers[index].borrow();
-        let mut table = self.tables[index].borrow_mut();
-        if table.is_none() {
-            *table = Some(self.executor.prepared_table(&sq.table, &self.ctx)?);
-        }
-        let table = table
-            .as_deref()
-            .ok_or_else(|| Error::internal("prepared subquery table not opened"))?;
+        let table = &*self.tables[index];
         // The scanner keeps what it needs of the expression, so the next
         // call may rebind it once this scan is set up
-        let mut scanner = if self.bind_pushdown(index, &params) {
+        let pushed = self.bind_pushdown(index, &params);
+        let mut scanner = if pushed {
             let bound = self.bound[index].borrow();
             table.scan(&sq.column_indices, bound.as_ref().map(BoundPushdown::expr))?
         } else {
             table.scan(&sq.column_indices, None)?
         };
+        let filter = sq.filter.as_ref().filter(|_| !(pushed && sq.pushed_whole));
         let mut value = None;
         while scanner.next() {
             let exec = ExecuteContext::with_common_params(
@@ -1751,7 +1830,7 @@ impl SubqueryExecutor for PreparedRunner<'_> {
                 self.transaction_id,
             )
             .with_subquery_executor(self);
-            if let Some(filter) = &sq.filter {
+            if let Some(filter) = filter {
                 if !vm.execute_bool_checked(filter, &exec)? {
                     continue;
                 }

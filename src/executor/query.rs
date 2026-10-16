@@ -876,6 +876,10 @@ impl Executor {
                 }
 
                 // Create evaluator for ORDER BY expressions
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::general_path_reached(
+                    crate::test_failpoints::GeneralPath::OrderByEvaluator,
+                );
                 let mut evaluator = CompiledEvaluator::new(&self.function_registry);
                 evaluator = evaluator.with_context(ctx);
                 evaluator.init_columns(&columns);

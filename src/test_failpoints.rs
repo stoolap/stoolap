@@ -1278,6 +1278,17 @@ pub(crate) fn alter_ddl_guard_next() {
 
 thread_local! {
     static PREPARED_SCALAR_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static PREPARED_PLAN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next prepared statement has taken its
+/// plan and has not yet opened the tables its subqueries read
+pub fn after_prepared_plan_taken(hook: impl FnOnce() + 'static) {
+    PREPARED_PLAN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn prepared_plan_taken() {
+    run_hook(&PREPARED_PLAN_HOOK);
 }
 
 /// Process-wide: statements prepared for the prepared family
@@ -1354,11 +1365,13 @@ pub enum GeneralPath {
     PushdownConstant,
     /// The projection's `CompiledEvaluator` for computed columns
     ProjectionEvaluator,
+    /// The sort's `CompiledEvaluator` for ORDER BY keys no column holds
+    OrderByEvaluator,
 }
 
 /// Process-wide: how often each general path mechanism ran
-static GENERAL_PATH_HITS: [std::sync::atomic::AtomicUsize; 6] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; 6];
+static GENERAL_PATH_HITS: [std::sync::atomic::AtomicUsize; 7] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 7];
 
 /// How often `path` ran, so far
 pub fn general_path_hits(path: GeneralPath) -> usize {
