@@ -80,3 +80,29 @@ fn duplicate_members_return_each_row_once_hot_and_sealed() {
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     check(&db, "sealed");
 }
+
+#[cfg(all(feature = "test-failpoints", not(feature = "test-filedb")))]
+#[test]
+fn a_row_moved_between_two_member_probes_returns_once() {
+    let db = Database::open("memory://a_row_moved_between_two_member_probes").unwrap();
+    let other = db.clone();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER NOT NULL)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX t_k ON t(k) USING BTREE", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (6, 3), (7, 1), (8, 2)", ())
+        .unwrap();
+    let moved = std::rc::Rc::new(std::cell::Cell::new(false));
+    let moved_in_hook = std::rc::Rc::clone(&moved);
+    stoolap::test_failpoints::after_in_member_probed(move || {
+        other
+            .execute("UPDATE t SET k = 2 WHERE id = 7", ())
+            .unwrap();
+        moved_in_hook.set(true);
+    });
+    assert_eq!(ids(&db, "SELECT id FROM t WHERE k IN (1, 2)"), vec![7, 8]);
+    assert!(moved.get(), "the row moved between the two probes");
+}

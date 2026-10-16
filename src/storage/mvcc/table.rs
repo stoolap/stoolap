@@ -829,10 +829,15 @@ impl MVCCTable {
                         // Use the efficient get_row_ids_in method
                         let values = in_list.get_values();
                         let mut row_ids = index.get_row_ids_in(values);
-                        // Members the column reads as equal name the same rows
+                        // Members the column reads as equal name the same rows,
+                        // and so does a row moved between two members' probes;
+                        // the rows keep the members' order
                         if values.len() > 1 {
-                            row_ids.sort_unstable();
-                            row_ids.dedup();
+                            let mut seen = FxHashSet::with_capacity_and_hasher(
+                                row_ids.len(),
+                                Default::default(),
+                            );
+                            row_ids.retain(|id| seen.insert(*id));
                         }
                         return Some(row_ids);
                     }

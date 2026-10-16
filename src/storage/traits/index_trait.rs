@@ -333,6 +333,8 @@ pub trait Index: Send + Sync {
         // Default implementation: do multiple equality lookups
         for value in value_list {
             self.get_row_ids_equal_into(std::slice::from_ref(value), buffer);
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::in_member_probed();
         }
     }
 
