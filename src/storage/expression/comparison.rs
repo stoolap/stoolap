@@ -134,6 +134,13 @@ impl ComparisonExpr {
         }
     }
 
+    /// The same expression prepared for a schema in which `column` sits at
+    /// `index`, which the caller resolved already
+    pub fn with_column_index(mut self, index: usize) -> Self {
+        self.col_index = Some(index);
+        self
+    }
+
     /// Create an equality expression (column = value)
     pub fn eq(column: impl Into<String>, value: Value) -> Self {
         Self::new(column, Operator::Eq, value)
@@ -436,6 +443,12 @@ impl Expression for ComparisonExpr {
 
     fn is_prepared(&self) -> bool {
         self.col_index.is_some()
+    }
+
+    fn set_comparison_value(&mut self, value: Value) -> bool {
+        self.value = ComparisonValue::from_value(&value);
+        self.original_value = value;
+        true
     }
 
     fn get_column_name(&self) -> Option<&str> {

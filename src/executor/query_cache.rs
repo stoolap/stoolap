@@ -348,6 +348,8 @@ pub enum CompiledExecution {
     CountStar(CompiledCountStar),
     /// The rest of an index join's ON clause (general SELECT path)
     JoinResidual(CompiledJoinResidual),
+    /// A statement of the prepared family (general SELECT path)
+    PreparedSelect(Arc<super::prepared_select::PreparedSelect>),
 }
 
 /// Default cache size (number of cached plans)

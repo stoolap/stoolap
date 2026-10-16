@@ -54,6 +54,14 @@ impl AndExpr {
         self.is_prepared = false;
     }
 
+    /// Replace the compared value of the child comparison at `index`; the
+    /// children and their preparation stay as they are
+    pub fn set_comparison_value_at(&mut self, index: usize, value: crate::core::Value) -> bool {
+        self.expressions
+            .get_mut(index)
+            .is_some_and(|child| child.set_comparison_value(value))
+    }
+
     /// Get the number of child expressions
     pub fn len(&self) -> usize {
         self.expressions.len()

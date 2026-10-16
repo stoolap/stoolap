@@ -162,6 +162,10 @@ pub fn substitute_outer_references(
     expr: &Expression,
     outer_row: &FxHashMap<CompactArc<str>, Value>,
 ) -> Expression {
+    #[cfg(feature = "test-failpoints")]
+    crate::test_failpoints::general_path_reached(
+        crate::test_failpoints::GeneralPath::OuterSubstitution,
+    );
     // Use the internal function that returns Option for copy-on-write semantics
     substitute_outer_references_inner(expr, outer_row, None).unwrap_or_else(|| expr.clone())
 }
@@ -200,6 +204,10 @@ pub fn substitute_outer_references_in_scope(
     outer_row: &FxHashMap<CompactArc<str>, Value>,
     scope: &InnerScope<'_>,
 ) -> Expression {
+    #[cfg(feature = "test-failpoints")]
+    crate::test_failpoints::general_path_reached(
+        crate::test_failpoints::GeneralPath::OuterSubstitution,
+    );
     substitute_outer_references_inner(expr, outer_row, Some(scope)).unwrap_or_else(|| expr.clone())
 }
 

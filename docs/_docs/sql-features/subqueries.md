@@ -363,6 +363,23 @@ For correlated subqueries (those that reference the outer query):
 
 This means correlated subqueries may be executed multiple times (once per outer row), so they can be slower for large datasets. Consider using JOINs for better performance when possible.
 
+### Prepared Scalar Subqueries
+
+A SELECT of one shape is prepared once per cached plan instead of rebuilt for every outer row. The shape:
+
+- `FROM` one table (not a view, CTE, join or derived table, no `AS OF`), and a `WHERE` that holds at least one scalar subquery and no `EXISTS`, `IN (subquery)`, `ANY` or `ALL`
+- no `WITH`, `DISTINCT`, `GROUP BY`, `HAVING`, window functions or set operations; no subquery or aggregate in the SELECT list or `ORDER BY`; `LIMIT` and `OFFSET` as literals or parameters
+- each subquery reads one table and selects one expression, with an optional `WHERE`; it may hold further scalar subqueries, up to 32 scopes in one chain, and no aggregate, `ORDER BY`, `LIMIT` or `DISTINCT`
+- the expressions are columns, literals, parameters, arithmetic, comparisons, `AND`, `OR`, `NOT`, `IS [NOT] NULL`, `IS [NOT] DISTINCT FROM`, `BETWEEN`, `IN (list)`, `LIKE`, `CASE`, `CAST` and scalar function calls
+
+`EXPLAIN` shows `Prepared: yes` for such a statement, or `Prepared: no (reason)` for a WHERE with a subquery that does not fit. For a prepared statement:
+
+- every value a subquery reads from an enclosing query becomes a parameter of the subquery, so the subquery's own comparisons narrow its scan, through its primary key or an index
+- a name resolves to the nearest scope that has it: a qualified name `q.c` to the nearest query whose table or alias is `q`, an unqualified name to the subquery's own table first and then to each enclosing query outward
+- a qualifier that names no scope is an error, as is a column its table does not have, and a named parameter the statement is given no value for
+- a value compared with a column, or tested against one with `IS [NOT] DISTINCT FROM`, is read as the column's type, the way an index or table scan reads it, whether or not the scan takes the comparison: `b = 'true'` matches a `TRUE` row of a `BOOLEAN` column, `i = TRUE` matches `1` in an `INTEGER` one, and `s = TRUE` matches `'true'` in a `TEXT` one. A `TEXT` that is no number against a number column, and a number against a `TEXT` column, stay as they are and compare by the numeric rules above. A `JSON` or `VECTOR` comparison is never handed to the scan
+- a subquery that reads no enclosing query runs at most once per execution, and only when a row needs it: a `CASE` arm or the right side of an `OR` that no row reaches does not run it. A subquery compared directly with a column in a top-level `AND` of the statement runs once before the scan, so the scan can use the column's index
+
 ## Examples
 
 ### Example 1: Delete Orders from High-Value Customers

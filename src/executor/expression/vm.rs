@@ -194,12 +194,8 @@ impl<'a> ExecuteContext<'a> {
 
 /// Trait for executing subqueries
 pub trait SubqueryExecutor {
-    /// Execute a scalar subquery and return the result
-    fn execute_scalar(
-        &self,
-        subquery_index: u16,
-        outer_row: Option<&FxHashMap<CompactArc<str>, Value>>,
-    ) -> Result<Value>;
+    /// Execute a scalar subquery for the row being evaluated and return its value
+    fn execute_scalar(&self, subquery_index: u16, row: &Row) -> Result<Value>;
 
     /// Execute EXISTS subquery
     fn execute_exists(
@@ -1729,6 +1725,13 @@ impl ExprVM {
                     pc += 1;
                 }
 
+                Op::ReadAsColumn(column_type) => {
+                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    self.stack
+                        .push(crate::executor::pushdown::read_as_column(*column_type, v));
+                    pc += 1;
+                }
+
                 Op::TruncateToDate => {
                     let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let result = match &v {
@@ -1904,9 +1907,7 @@ impl ExprVM {
                 // =============================================================
                 Op::ExecScalarSubquery(idx) => {
                     let result = if let Some(executor) = ctx.subquery_executor {
-                        executor
-                            .execute_scalar(*idx, ctx.outer_row)
-                            .unwrap_or_else(|_| Value::null_unknown())
+                        executor.execute_scalar(*idx, ctx.row)?
                     } else {
                         Value::null_unknown()
                     };

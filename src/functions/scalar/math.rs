@@ -874,6 +874,8 @@ impl ScalarFunction for RandomFunction {
             )));
         }
 
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::random_drawn();
         // Use thread-local RNG for proper randomness
         let random = rand::rng().random::<f64>();
 

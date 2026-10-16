@@ -3599,6 +3599,10 @@ impl Executor {
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Option<SelectStatement> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::general_path_reached(
+            crate::test_failpoints::GeneralPath::OuterBinding,
+        );
         let outer_row = ctx.outer_row()?;
         // With no table to own it, every qualified name reads as an outer
         // one, so this asks whether there is anything at all to bind before
@@ -3838,6 +3842,10 @@ impl Executor {
         expr: &Expression,
         ctx: &ExecutionContext,
     ) -> Result<Expression> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::general_path_reached(
+            crate::test_failpoints::GeneralPath::CorrelatedWhere,
+        );
         match expr {
             Expression::Exists(exists) => {
                 // Execute EXISTS with outer row context

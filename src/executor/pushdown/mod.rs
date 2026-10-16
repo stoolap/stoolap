@@ -106,6 +106,23 @@ impl<'a> PushdownContext<'a> {
     }
 }
 
+/// A value compared with a column of `column_type` as the scan reads it,
+/// for a program that compares it itself. What the scan takes no reading
+/// of stays as it is for the comparison's own rule: a TEXT that is no
+/// number against a numeric column, a number against a TEXT column
+pub(crate) fn read_as_column(column_type: crate::core::DataType, value: Value) -> Value {
+    let unread = match column_type {
+        crate::core::DataType::Text => matches!(value, Value::Integer(_) | Value::Float(_)),
+        t if t.is_numeric() => matches!(&value, Value::Text(s)
+            if crate::core::predicate::parse_sql_number(s).is_none()),
+        _ => false,
+    };
+    if unread {
+        return value;
+    }
+    coerce_constant(Some(column_type), value).unwrap_or_else(Value::null_unknown)
+}
+
 /// A constant as an equality against a column of `column_type` reads it,
 /// by the rules `PushdownContext::coerce_to_column_type` states
 pub(crate) fn coerce_constant(

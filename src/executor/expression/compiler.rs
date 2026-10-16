@@ -144,6 +144,15 @@ pub struct CompileContext<'a> {
 
     /// Column aliases
     column_aliases: StringMap<String>,
+
+    /// Ids a prepared statement gave its scalar subqueries, by node address
+    subquery_ids: Option<&'a FxHashMap<usize, u16>>,
+
+    /// Identifiers read from the second row at a fixed position, by node address
+    row2_bindings: Option<&'a FxHashMap<usize, u16>>,
+
+    /// Values read as the type of the column they are compared with, by node address
+    read_as: Option<&'a FxHashMap<usize, DataType>>,
 }
 
 impl<'a> CompileContext<'a> {
@@ -180,6 +189,9 @@ impl<'a> CompileContext<'a> {
             functions,
             expression_aliases: StringMap::new(),
             column_aliases: StringMap::new(),
+            subquery_ids: None,
+            row2_bindings: None,
+            read_as: None,
         }
     }
 
@@ -236,6 +248,27 @@ impl<'a> CompileContext<'a> {
     /// Add column aliases
     pub fn with_column_aliases(mut self, aliases: StringMap<String>) -> Self {
         self.column_aliases = aliases;
+        self
+    }
+
+    /// Compile each listed scalar subquery to its prepared id; any other
+    /// scalar subquery is then a compile error
+    pub fn with_subquery_ids(mut self, ids: &'a FxHashMap<usize, u16>) -> Self {
+        self.subquery_ids = Some(ids);
+        self
+    }
+
+    /// Compile each listed identifier node to the second row's column at
+    /// its position, whatever its name; other names resolve as usual
+    pub fn with_row2_bindings(mut self, bindings: &'a FxHashMap<usize, u16>) -> Self {
+        self.row2_bindings = Some(bindings);
+        self
+    }
+
+    /// Read each listed expression node's value as the type the scan reads
+    /// a value compared with a column of that type as
+    pub fn with_read_as(mut self, read_as: &'a FxHashMap<usize, DataType>) -> Self {
+        self.read_as = Some(read_as);
         self
     }
 
@@ -414,6 +447,22 @@ impl<'a> ExprCompiler<'a> {
         expr: &Expression,
         builder: &mut ProgramBuilder,
     ) -> Result<(), CompileError> {
+        self.compile_node(expr, builder)?;
+        if let Some(&column_type) = self
+            .ctx
+            .read_as
+            .and_then(|r| r.get(&(expr as *const Expression as usize)))
+        {
+            builder.emit(Op::ReadAsColumn(column_type));
+        }
+        Ok(())
+    }
+
+    fn compile_node(
+        &self,
+        expr: &Expression,
+        builder: &mut ProgramBuilder,
+    ) -> Result<(), CompileError> {
         // Check if this expression matches an expression alias (for HAVING)
         if let Some(idx) = self.ctx.check_expression_alias(expr) {
             builder.emit(Op::LoadAggregateResult(idx));
@@ -470,6 +519,14 @@ impl<'a> ExprCompiler<'a> {
 
             // === IDENTIFIERS ===
             Expression::Identifier(id) => {
+                if let Some(&position) = self
+                    .ctx
+                    .row2_bindings
+                    .and_then(|b| b.get(&(id as *const Identifier as usize)))
+                {
+                    builder.emit(Op::LoadColumn2(position));
+                    return Ok(());
+                }
                 // CURRENT_DATE, CURRENT_TIME, CURRENT_TIMESTAMP are now parsed as
                 // FunctionCall by the parser, so they no longer reach this path.
                 // A double-quoted "true" or "false" names a column, not a literal.
@@ -667,11 +724,17 @@ impl<'a> ExprCompiler<'a> {
             }
 
             // === SUBQUERIES ===
-            Expression::ScalarSubquery(_) => {
-                // Subqueries are handled via the subquery executor
-                // For now, emit a placeholder that will be resolved at runtime
-                builder.emit(Op::ExecScalarSubquery(0));
-            }
+            Expression::ScalarSubquery(sq) => match self.ctx.subquery_ids {
+                Some(ids) => {
+                    let key = &*sq.subquery as *const SelectStatement as usize;
+                    let id = ids.get(&key).ok_or_else(|| {
+                        CompileError::InvalidExpression("unprepared scalar subquery".to_string())
+                    })?;
+                    builder.emit(Op::ExecScalarSubquery(*id));
+                }
+                // Without prepared ids the caller substitutes the result first
+                None => builder.emit(Op::ExecScalarSubquery(0)),
+            },
 
             Expression::Exists(exists) => {
                 let _ = exists; // Subquery index would be resolved during planning
@@ -1287,10 +1350,25 @@ impl<'a> ExprCompiler<'a> {
         let mut all_constant = true;
 
         // Check if right side is a list of constants
+        let constant = |item: &Expression| {
+            let value = try_eval_constant(item)?;
+            Some(
+                match self
+                    .ctx
+                    .read_as
+                    .and_then(|r| r.get(&(item as *const Expression as usize)))
+                {
+                    Some(&column_type) => {
+                        crate::executor::pushdown::read_as_column(column_type, value)
+                    }
+                    None => value,
+                },
+            )
+        };
         match &*in_expr.right {
             Expression::List(list) => {
                 for item in &list.elements {
-                    if let Some(value) = try_eval_constant(item) {
+                    if let Some(value) = constant(item) {
                         if value.is_null() {
                             has_null = true;
                         } else {
@@ -1304,7 +1382,7 @@ impl<'a> ExprCompiler<'a> {
             }
             Expression::ExpressionList(list) => {
                 for item in &list.expressions {
-                    if let Some(value) = try_eval_constant(item) {
+                    if let Some(value) = constant(item) {
                         if value.is_null() {
                             has_null = true;
                         } else {

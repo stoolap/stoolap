@@ -91,6 +91,12 @@ pub trait Expression: Send + Sync + Debug {
     /// Check if this expression has been prepared for a schema
     fn is_prepared(&self) -> bool;
 
+    /// Replace the value a column comparison compares against; false for
+    /// any other expression, which is left as it is
+    fn set_comparison_value(&mut self, _value: crate::core::Value) -> bool {
+        false
+    }
+
     /// Get the column name this expression operates on (if single column)
     fn get_column_name(&self) -> Option<&str> {
         None

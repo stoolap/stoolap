@@ -309,6 +309,7 @@ impl Program {
                 | Op::InSet(_)
                 | Op::NotInSet(_)
                 | Op::Cast(_)
+                | Op::ReadAsColumn(_)
                 | Op::TruncateToDate
                 | Op::ExecScalarSubquery(_)
                 | Op::ExecExists(_)
