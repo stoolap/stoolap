@@ -4555,8 +4555,18 @@ impl Table for MVCCTable {
             }
         }
 
+        // Copying and sorting every distinct value costs more than the scan
+        // the caller falls back to once they pass a sixth of the rows
+        if let Some(distinct) = index.distinct_keys_hint() {
+            if distinct.saturating_mul(6) > self.version_store.committed_row_count() {
+                return Ok(None);
+            }
+        }
+
         // Fallback path: Get all values and sort (for non-B-tree indexes)
         let all_values = index.get_all_values();
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::ordered_values_sorted(all_values.len());
 
         // If the index doesn't support get_all_values (returns empty), return None
         // to let the regular query execution path handle ORDER BY + LIMIT

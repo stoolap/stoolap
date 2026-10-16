@@ -1552,6 +1552,7 @@ thread_local! {
     static ROW_ID_ORDER_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TOP_K_COLD_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static HOT_TOP_K_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ORDERED_VALUES_SORTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static BTREE_WALK_CHUNK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
     static GROUP_CACHE_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GROUP_COLUMN_DECODES: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
@@ -2244,6 +2245,15 @@ pub(crate) fn btree_walk_chunk(copied: usize, capacity: usize) {
         let (most, room) = c.get();
         c.set((most.max(copied), room.max(capacity)));
     });
+}
+
+/// Index values this thread's ORDER BY reads copied to sort them, so far
+pub fn ordered_values_sorted_count() -> usize {
+    ORDERED_VALUES_SORTED.with(std::cell::Cell::get)
+}
+
+pub(crate) fn ordered_values_sorted(count: usize) {
+    ORDERED_VALUES_SORTED.with(|n| n.set(n.get() + count));
 }
 
 /// Hot rows this thread's index-walking top-k scans visited, so far
