@@ -382,16 +382,24 @@ impl Chain<'_> {
     }
 
     /// The column `index` of the scope at `depth`, as a name its own
-    /// programs compile against
-    fn column(&self, depth: usize, index: usize) -> Expression {
+    /// programs compile against, quoted as it was written: the compiler
+    /// reads a quoted name in an IN list or a pattern as TEXT
+    fn column(&self, depth: usize, index: usize, quoted: bool) -> Expression {
         let name = &self.scopes[depth].columns[index];
         let mut id = Identifier::new(
             Token::new(TokenType::Identifier, name, Position::default()),
             name.as_str(),
         );
         id.value_lower = SmartString::from(self.scopes[depth].lower[index].as_str());
-        id.quoted = true;
+        id.quoted = quoted;
         Expression::Identifier(id)
+    }
+
+    /// The column `index` of the statement's own table as a star brings it
+    /// in, quoted only where its name would read as a boolean literal
+    fn star_column(&self, index: usize) -> Expression {
+        let quoted = matches!(self.scopes[0].lower[index].as_str(), "true" | "false");
+        self.column(0, index, quoted)
     }
 
     /// What `expr` reads; a scalar subquery counts as reading this row
@@ -416,7 +424,7 @@ impl Chain<'_> {
     /// spelled as that scope's own column
     fn in_scope(&self, expr: &Expression) -> Result<Expression> {
         match self.resolve(expr)? {
-            Some((depth, index)) => Ok(self.column(depth, index)),
+            Some((depth, index)) => Ok(self.column(depth, index, written_quoted(expr))),
             None => rebuild(expr, &mut |child| self.in_scope(child)),
         }
     }
@@ -566,6 +574,15 @@ fn rebuild(
     })
 }
 
+/// Whether a column reference was written in double quotes
+fn written_quoted(expr: &Expression) -> bool {
+    match expr {
+        Expression::Identifier(id) => id.quoted,
+        Expression::QualifiedIdentifier(q) => q.name.quoted,
+        _ => false,
+    }
+}
+
 /// Each bare name in `key` of an alias in `positions`, by node address, to
 /// that alias's position on the projected row
 fn bind_aliases(
@@ -630,15 +647,14 @@ fn reads_row_column(expr: &Expression) -> bool {
 
 /// Every value a WHERE program compares with a column of `schema`, by node
 /// address, to the column's type: the program reads it as the scan reads a
-/// pushed comparison's value, so both give one answer. A TEXT column's
-/// values are left alone, as the scan pushes no number against one
+/// pushed comparison's value, so both give one answer
 fn compare_as_scan(expr: &Expression, schema: &Schema, out: &mut FxHashMap<usize, DataType>) {
     let column_type = |e: &Expression| match e {
         Expression::Identifier(id) => schema
             .column_index_map()
             .get(id.value_lower.as_str())
             .map(|&i| schema.columns[i].data_type)
-            .filter(|t| !matches!(t, DataType::Text | DataType::Null)),
+            .filter(|t| *t != DataType::Null),
         _ => None,
     };
     let mut read_as = |value: &Expression, t: DataType| {
@@ -649,7 +665,13 @@ fn compare_as_scan(expr: &Expression, schema: &Schema, out: &mut FxHashMap<usize
         }
     };
     match expr {
-        Expression::Infix(infix) if is_comparison(infix.op_type) => {
+        Expression::Infix(infix)
+            if is_comparison(infix.op_type)
+                || matches!(
+                    infix.op_type,
+                    InfixOperator::IsDistinctFrom | InfixOperator::IsNotDistinctFrom
+                ) =>
+        {
             match (column_type(&infix.left), column_type(&infix.right)) {
                 (Some(t), None) => read_as(&infix.right, t),
                 (None, Some(t)) => read_as(&infix.left, t),
@@ -1061,11 +1083,11 @@ impl Builder<'_> {
                     None => Ok(expr.clone()),
                     Some((0, index)) => {
                         work.reads_row = true;
-                        Ok(chain.column(0, index))
+                        Ok(chain.column(0, index, written_quoted(expr)))
                     }
                     Some((depth, index)) => {
                         let slot = self.slot();
-                        let value = chain.column(depth, index);
+                        let value = chain.column(depth, index, written_quoted(expr));
                         if depth == 1 {
                             work.reads_parent = true;
                             work.holes.push((slot, value));
@@ -1342,7 +1364,7 @@ impl PreparedProjection {
         for column in &stmt.columns {
             match column {
                 Expression::Star(_) => {
-                    select_exprs.extend((0..columns.len()).map(|i| chain.column(0, i)))
+                    select_exprs.extend((0..columns.len()).map(|i| chain.star_column(i)))
                 }
                 Expression::QualifiedStar(star) => {
                     if star.qualifier.to_lowercase() != scope.name.as_str() {
@@ -1351,7 +1373,7 @@ impl PreparedProjection {
                             star.qualifier
                         )));
                     }
-                    select_exprs.extend((0..columns.len()).map(|i| chain.column(0, i)))
+                    select_exprs.extend((0..columns.len()).map(|i| chain.star_column(i)))
                 }
                 other => {
                     check_names(chain, unaliased(other), &[])?;
@@ -1537,8 +1559,27 @@ impl PreparedSelect {
                 builder.max_param, param_count
             )));
         }
-        let mut output_columns =
-            executor.get_output_column_names(&stmt.columns, &scope.columns, Some(scope_name));
+        // Over one table `t.*` is `*`, the projection's expansion; the
+        // names' prefix rule for a joined `t.*` would drop columns
+        let mut output_columns = if stmt
+            .columns
+            .iter()
+            .any(|c| matches!(c, Expression::QualifiedStar(_)))
+        {
+            let unqualified: Vec<Expression> = stmt
+                .columns
+                .iter()
+                .map(|c| match c {
+                    Expression::QualifiedStar(star) => Expression::Star(StarExpression {
+                        token: star.token.clone(),
+                    }),
+                    other => other.clone(),
+                })
+                .collect();
+            executor.get_output_column_names(&unqualified, &scope.columns, Some(scope_name))
+        } else {
+            executor.get_output_column_names(&stmt.columns, &scope.columns, Some(scope_name))
+        };
         let visible = output_columns.len();
         output_columns.extend(extra_names);
         let subqueries = builder

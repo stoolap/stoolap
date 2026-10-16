@@ -1853,3 +1853,111 @@ fn test_a_quoted_dotted_column_name_is_the_column() {
     assert!(runs >= 1, "ran prepared");
     assert_eq!(found, vec![1], "\"x.y\" is u's column");
 }
+
+#[test]
+fn test_a_text_column_reads_a_boolean_value_as_the_scan_does() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_text_boolean").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, s TEXT)", ())
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1, 'true')", ()).unwrap();
+    for inner in ["s = $1", "s = $1 OR id = 99"] {
+        let sql = format!("SELECT id FROM t WHERE id = (SELECT id FROM u WHERE {inner})");
+        let (found, runs) = ids(&db, &sql, (true,));
+        assert!(runs >= 1, "{sql} ran prepared");
+        assert_eq!(
+            found,
+            vec![1],
+            "{inner}: BOOLEAN true read as the TEXT 'true'"
+        );
+    }
+}
+
+#[test]
+fn test_columns_in_an_in_list_or_a_pattern_stay_columns() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_columns_in_lists").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, other INTEGER, s TEXT, pat TEXT)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1, 'abc', 'a%')", ())
+        .unwrap();
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, other INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1, 1)", ()).unwrap();
+    for (shape, sql) in [
+        (
+            "statement IN",
+            "SELECT id FROM t WHERE id = (SELECT id FROM u WHERE u.id = t.id) AND id IN (other)",
+        ),
+        (
+            "statement LIKE",
+            "SELECT id FROM t WHERE id = (SELECT id FROM u WHERE u.id = t.id) AND s LIKE pat",
+        ),
+        (
+            "subquery IN",
+            "SELECT id FROM t WHERE id = (SELECT u.id FROM u WHERE u.id = t.id AND u.id IN (u.other))",
+        ),
+    ] {
+        let (found, runs) = ids(&db, sql, ());
+        assert!(runs >= 1, "{shape} ran prepared");
+        assert_eq!(found, vec![1], "{shape}: a column, not its name as TEXT");
+    }
+}
+
+#[test]
+fn test_null_safe_equality_reads_the_value_as_equality_does() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_null_safe_typed").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, i INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1, 1)", ()).unwrap();
+    for (inner, expected) in [
+        ("(u.i = TRUE) = TRUE", vec![1]),
+        ("u.i IS NOT DISTINCT FROM TRUE", vec![1]),
+        ("u.i IS DISTINCT FROM TRUE", vec![]),
+        ("u.i IS DISTINCT FROM 'abc'", vec![1]),
+    ] {
+        let sql = format!("SELECT id FROM t WHERE id = (SELECT id FROM u WHERE {inner})");
+        let (found, runs) = ids(&db, &sql, ());
+        assert!(runs >= 1, "{sql} ran prepared");
+        assert_eq!(found, expected, "{inner}");
+    }
+}
+
+#[test]
+fn test_a_star_shows_every_column_whatever_the_names() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_star_dotted_names").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, \"t.b\" INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10, 20)", ()).unwrap();
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1)", ()).unwrap();
+    for star in ["*", "t.*"] {
+        let sql = format!(
+            "SELECT {star} FROM t WHERE id = (SELECT id FROM u WHERE u.id = t.id) ORDER BY id + 0"
+        );
+        let rows = db.query(&sql, ()).unwrap();
+        assert_eq!(rows.columns().len(), 3, "{star}: {:?}", rows.columns());
+        let found: Vec<Vec<i64>> = rows
+            .map(|row| {
+                let row = row.unwrap();
+                (0..row.len()).map(|i| row.get::<i64>(i).unwrap()).collect()
+            })
+            .collect();
+        assert_eq!(found, vec![vec![1, 10, 20]], "{star}");
+    }
+}
