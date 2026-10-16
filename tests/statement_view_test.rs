@@ -331,7 +331,7 @@ fn the_inner_reads_of_a_read_committed_snapshot_without_a_view_use_the_statement
         (
             "cte",
             "INSERT INTO w VALUES (1, 5)",
-            "WITH c AS (SELECT id FROM s) SELECT c.id FROM c JOIN w ON w.id = c.id",
+            "WITH c(id) AS (SELECT id FROM s) SELECT c.id FROM c JOIN w ON w.id = c.id",
             "DELETE FROM w WHERE id = 1",
         ),
     ];
