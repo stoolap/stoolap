@@ -830,7 +830,10 @@ impl Index for BTreeIndex {
         let mut entries = Vec::with_capacity(capacity);
 
         // Use BTreeMap range for O(log n + k) instead of O(n)
-        for (_, rows) in sorted_values.range((min_bound, max_bound)) {
+        for (key, rows) in sorted_values.range((min_bound, Bound::Unbounded)) {
+            if past_end(key, &max_bound) {
+                break;
+            }
             for row_id in rows.iter() {
                 entries.push(IndexEntry {
                     row_id,
@@ -938,7 +941,10 @@ impl Index for BTreeIndex {
             Bound::Excluded(max_arc)
         };
 
-        for (_, rows) in sorted_values.range((min_bound, max_bound)) {
+        for (key, rows) in sorted_values.range((min_bound, Bound::Unbounded)) {
+            if past_end(key, &max_bound) {
+                break;
+            }
             rows.copy_into(buffer);
         }
     }
@@ -1240,6 +1246,17 @@ impl Index for BTreeIndex {
     fn close(&mut self) -> Result<()> {
         self.closed.store(true, AtomicOrdering::Release);
         self.clear()
+    }
+}
+
+/// Whether `key` lies past `end` in the map's own `Ord`. A range is walked
+/// from its start alone and stopped here: `BTreeMap::range` checks its two
+/// bounds with `PartialOrd`, which for `Value` can disagree with `Ord` and panic
+pub(crate) fn past_end<K: Ord>(key: &K, end: &Bound<K>) -> bool {
+    match end {
+        Bound::Included(end) => Ord::cmp(key, end) == std::cmp::Ordering::Greater,
+        Bound::Excluded(end) => Ord::cmp(key, end) != std::cmp::Ordering::Less,
+        Bound::Unbounded => false,
     }
 }
 
