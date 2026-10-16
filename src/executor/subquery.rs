@@ -554,7 +554,16 @@ impl Executor {
         };
         // Without an additional predicate, one visible row holding the key answers
         let Some(additional_pred) = correlation.additional_predicate.as_ref() else {
-            if let Some(found) = self.count_correlated_rows(ctx, &correlation, &outer_value, 1)? {
+            // A probe refused earlier in the statement left the semi-join set
+            if let Some(set) = get_exists_probe_fallback(subquery_ptr) {
+                return Ok(Some(set.contains(&outer_value) == Some(true)));
+            }
+            // A key held by more rows than the cap goes to the semi-join set
+            // instead of copying them all for one visible row
+            let cap = EQUALITY_CANDIDATE_CAP;
+            if let Some(found) =
+                self.count_correlated_rows(ctx, &correlation, &outer_value, 1, cap)?
+            {
                 return Ok(Some(found > 0));
             }
             return self.exists_by_probe_fallback(subquery, &correlation, &outer_value, ctx);
@@ -658,9 +667,9 @@ impl Executor {
     }
 
     /// Whether the inner rows of an EXISTS on the bare correlation hold `key`,
-    /// for a probe the table refused: a table with sealed rows answers from
-    /// the semi-join set, built once per statement, since running the
-    /// subquery would scan its volumes. None for any other table
+    /// for a probe the table refused: the semi-join set answers, built once
+    /// per statement, since running the subquery per outer row would read
+    /// the inner table each time. None for a name that is not a table
     fn exists_by_probe_fallback(
         &self,
         subquery: &SelectStatement,
@@ -669,16 +678,14 @@ impl Executor {
         ctx: &ExecutionContext,
     ) -> Result<Option<bool>> {
         let subquery_ptr = subquery as *const SelectStatement as usize;
-        if let Some(known) = get_exists_probe_fallback(subquery_ptr) {
-            return Ok(known.map(|set| set.contains(key) == Some(true)));
+        if let Some(set) = get_exists_probe_fallback(subquery_ptr) {
+            return Ok(Some(set.contains(key) == Some(true)));
         }
-        let sealed = self
-            .with_correlated_probe_table(ctx, &correlation.inner_table, |table| {
-                Ok(Some(table.has_sealed_rows()))
-            })?
-            .unwrap_or(false);
-        if !sealed {
-            cache_exists_probe_fallback(subquery_ptr, None);
+        // A CTE or a view may change between runs of the same subquery, a
+        // recursive CTE's rows on every round: those run the subquery
+        let table =
+            self.with_correlated_probe_table(ctx, &correlation.inner_table, |_| Ok(Some(())))?;
+        if table.is_none() {
             return Ok(None);
         }
         let inner_alias = match subquery.table_expr.as_deref() {
@@ -696,7 +703,7 @@ impl Executor {
         };
         let set = self.execute_semi_join_optimization(&info, ctx)?;
         let found = set.contains(key) == Some(true);
-        cache_exists_probe_fallback(subquery_ptr, Some(set));
+        cache_exists_probe_fallback(subquery_ptr, set);
         Ok(Some(found))
     }
 
@@ -919,7 +926,7 @@ impl Executor {
             return Ok(None);
         }
         Ok(self
-            .count_correlated_rows(ctx, &correlation, &outer_value, usize::MAX)?
+            .count_correlated_rows(ctx, &correlation, &outer_value, usize::MAX, usize::MAX)?
             .map(|count| count as i64))
     }
 
@@ -1250,50 +1257,68 @@ impl Executor {
         token: LayoutToken,
         mut visit: impl FnMut(&Row) -> Result<bool>,
     ) -> Result<Option<bool>> {
-        self.with_correlated_candidates(ctx, correlation, key, |table, ids, key_idx, _, rows| {
-            // `visit` reads by the positions of the table `token` names
-            check_compiled_token(table, token)?;
-            let all = ConstBoolExpr::true_expr();
-            for chunk in ids.chunks(VISIBILITY_CHECK_BATCH_SIZE) {
-                rows.clear();
-                table.fetch_rows_by_ids_into(chunk, &all, rows)?;
-                for (_, row) in rows.iter() {
-                    if row.get(key_idx) == Some(key) && visit(row)? {
-                        return Ok(true);
+        let hot_cap = usize::MAX;
+        self.with_correlated_candidates(
+            ctx,
+            correlation,
+            key,
+            hot_cap,
+            |table, ids, key_idx, _, rows| {
+                // `visit` reads by the positions of the table `token` names
+                check_compiled_token(table, token)?;
+                let all = ConstBoolExpr::true_expr();
+                for chunk in ids.chunks(VISIBILITY_CHECK_BATCH_SIZE) {
+                    rows.clear();
+                    table.fetch_rows_by_ids_into(chunk, &all, rows)?;
+                    for (_, row) in rows.iter() {
+                        if row.get(key_idx) == Some(key) && visit(row)? {
+                            return Ok(true);
+                        }
                     }
                 }
-            }
-            Ok(false)
-        })
+                Ok(false)
+            },
+        )
     }
 
     /// How many inner rows hold `key`, up to `limit`, counted as
-    /// `visit_correlated_rows` would find them
+    /// `visit_correlated_rows` would find them; None past `hot_cap` ids
     fn count_correlated_rows(
         &self,
         ctx: &ExecutionContext,
         correlation: &ExistsCorrelationInfo,
         key: &Value,
         limit: usize,
+        hot_cap: usize,
     ) -> Result<Option<usize>> {
-        self.with_correlated_candidates(ctx, correlation, key, |table, ids, key_idx, epoch, _| {
-            table.count_equal_candidates(ids, key_idx, key, limit, Some(epoch))
-        })
+        self.with_correlated_candidates(
+            ctx,
+            correlation,
+            key,
+            hot_cap,
+            |table, ids, key_idx, epoch, _| {
+                table.count_equal_candidates(ids, key_idx, key, limit, Some(epoch))
+            },
+        )
     }
 
     /// Runs `answer` over the inner table, the ids its index holds for `key`,
     /// the key's column and the index epoch, read through the statement's
-    /// view. None when the table cannot answer that way or the epoch moved
+    /// view. None when the table cannot answer that way, the key holds more
+    /// ids than the cap (`hot_cap` while no row is sealed), or the epoch moved
     fn with_correlated_candidates<T>(
         &self,
         ctx: &ExecutionContext,
         correlation: &ExistsCorrelationInfo,
         key: &Value,
+        hot_cap: usize,
         answer: impl FnOnce(&dyn Table, &[i64], usize, u64, &mut RowVec) -> Result<T>,
     ) -> Result<Option<T>> {
         self.with_correlated_probe_table(ctx, &correlation.inner_table, |table| {
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::correlated_fetch_next();
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::correlated_probe_asked();
             let Some(epoch) = table.index_view_epoch() else {
                 return Ok(None);
             };
@@ -1327,7 +1352,7 @@ impl Executor {
                 let cap = if table.has_sealed_rows() {
                     EQUALITY_CANDIDATE_CAP
                 } else {
-                    usize::MAX
+                    hot_cap
                 };
                 let found = table.equality_candidates(
                     &correlation.inner_column,
@@ -4224,10 +4249,11 @@ impl Executor {
     /// - Index lookup gets candidate row_ids for correlation
     /// - Rows are fetched in batches and predicate is evaluated with early exit
     /// - This is O(LIMIT × avg_rows_per_key × predicate_selectivity) which is still efficient
-    fn should_use_index_nested_loop(
+    pub(crate) fn should_use_index_nested_loop(
         &self,
         info: &SemiJoinInfo,
         outer_limit: Option<i64>,
+        outer_rows: Option<usize>,
         ctx: &ExecutionContext,
     ) -> bool {
         // Use index-nested-loop for small LIMIT queries WITHOUT additional predicates.
@@ -4254,33 +4280,37 @@ impl Executor {
         }
 
         // For pure correlation (no additional predicate), check if index NL is worth it
-        if let Some(limit) = outer_limit {
-            if limit > 0 && limit <= SMALL_LIMIT_THRESHOLD {
-                return self
-                    .with_correlated_probe_table(ctx, &info.inner_table, |table| {
-                        Ok(Some(Self::exists_probes(table, &info.inner_column)))
-                    })
-                    .ok()
-                    .flatten()
-                    .unwrap_or(false);
-            }
+        let small_limit =
+            outer_limit.is_some_and(|limit| limit > 0 && limit <= SMALL_LIMIT_THRESHOLD);
+        if !small_limit && outer_rows.is_none() {
+            return false;
         }
-
-        // For larger queries or no index, use semi-join
-        false
+        // A probe per outer row costs about what the semi-join pays for
+        // fourteen inner rows
+        self.with_correlated_probe_table(ctx, &info.inner_table, |table| {
+            let few_outer =
+                outer_rows.is_some_and(|rows| rows.saturating_mul(16) <= table.row_count_hint());
+            Ok(Some(
+                (small_limit || few_outer) && Self::exists_probes(table, &info.inner_column),
+            ))
+        })
+        .ok()
+        .flatten()
+        .unwrap_or(false)
     }
 
     /// Whether an EXISTS on `column` probes the table the statement sees
     fn exists_probes(table: &dyn Table, column: &str) -> bool {
+        // The table vouches for its indexes; one with local changes or an
+        // older snapshot refuses every probe
+        if table.index_view_epoch().is_none() {
+            return false;
+        }
         // An index the table keeps whole
         if table.lookup_index_on_column(column).is_some() {
             return true;
         }
-        // Sealed rows answer through side files, while the table vouches for
-        // its indexes; one with local changes or an older snapshot refuses all
-        if table.index_view_epoch().is_none() {
-            return false;
-        }
+        // Sealed rows answer through side files
         let Some(at) = table
             .schema()
             .columns
@@ -4393,6 +4423,8 @@ impl Executor {
             }
         }
 
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::inner_table_read_whole();
         // Build SELECT inner_column FROM inner_table WHERE non_correlated_predicates
         // Use dummy_token_clone() to avoid allocations - token literal is not used during execution
         let inner_col_expr = Expression::Identifier(Identifier::new(
@@ -4488,6 +4520,32 @@ impl Executor {
         }
     }
 
+    /// The inner rows of a NOT EXISTS anti-join, read through the statement's
+    /// own view of the inner table with `inner_filter` applied, and the
+    /// position of the correlation column. None when the statement cannot read
+    /// the inner name as a table that way
+    pub(crate) fn anti_join_inner_rows(
+        &self,
+        info: &SemiJoinInfo,
+        inner_filter: Option<&dyn crate::storage::expression::Expression>,
+        ctx: &ExecutionContext,
+    ) -> Result<Option<(crate::core::RowVec, usize)>> {
+        self.with_correlated_probe_table(ctx, &info.inner_table, |table| {
+            let column = info.inner_column.to_lowercase();
+            let Some(at) = table
+                .schema()
+                .column_names_lower_arc()
+                .iter()
+                .position(|c| c == &column)
+            else {
+                return Ok(None);
+            };
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::inner_table_read_whole();
+            Ok(Some((table.collect_all_rows(inner_filter)?, at)))
+        })
+    }
+
     /// Execute NOT EXISTS as a true anti-join using HashJoinOperator.
     ///
     /// This is more efficient than the InHashSet approach because:
@@ -4500,7 +4558,8 @@ impl Executor {
     /// * `info` - SemiJoinInfo extracted from the NOT EXISTS subquery
     /// * `outer_rows` - Pre-materialized outer table rows
     /// * `outer_columns` - Column names for outer table
-    /// * `_ctx` - Execution context (not used but kept for API consistency)
+    /// * `inner_all_rows` - The inner rows, from `anti_join_inner_rows`
+    /// * `inner_key_source_idx` - The correlation column's position in them
     ///
     /// # Returns
     /// Rows from outer table that have NO match in inner table (anti-join result)
@@ -4509,35 +4568,9 @@ impl Executor {
         info: &SemiJoinInfo,
         outer_rows: CompactArc<Vec<crate::core::Row>>,
         outer_columns: &[String],
-        inner_filter: Option<&dyn crate::storage::expression::Expression>,
-        _ctx: &ExecutionContext,
+        inner_all_rows: crate::core::RowVec,
+        inner_key_source_idx: usize,
     ) -> Result<crate::core::RowVec> {
-        // Direct table access - much faster than going through execute_select
-        let txn = self.engine.begin_transaction()?;
-        let inner_table = txn.get_statement_table(&info.inner_table)?;
-
-        // Get inner table rows with filter pushed down to storage layer
-        let inner_all_rows = inner_table.collect_all_rows(inner_filter)?;
-
-        // Find the inner column index for join key extraction
-        // Use schema's cached lowercase column names to avoid computing to_lowercase()
-        let inner_schema = inner_table.schema();
-        let inner_columns = inner_schema.column_names_arc();
-        let inner_columns_lower = inner_schema.column_names_lower_arc();
-
-        let inner_key_source_idx = {
-            let search_col = info.inner_column.to_lowercase();
-            inner_columns_lower
-                .iter()
-                .position(|c| c == &search_col)
-                .ok_or_else(|| {
-                    Error::internal(format!(
-                        "Anti-join inner key column '{}' not found in table columns: {:?}",
-                        info.inner_column, inner_columns
-                    ))
-                })?
-        };
-
         // Extract only the join key values (deduplicated) and convert to single-column rows
         // Use a HashSet for deduplication to minimize the build side
         // Cap initial capacity to avoid over-allocation when many rows have few unique keys
@@ -4713,19 +4746,21 @@ impl Executor {
     /// The `outer_limit` parameter helps decide between strategies:
     /// - With small LIMIT + index: prefer index-nested-loop (per-row probing with early termination)
     /// - Without LIMIT: prefer semi-join (scan inner once, hash lookup per outer row)
+    /// - With `outer_rows` few against the inner table's: prefer index-nested-loop
     pub fn try_optimize_exists_to_semi_join(
         &self,
         expr: &Expression,
         ctx: &ExecutionContext,
         outer_tables: &[String],
         outer_limit: Option<i64>,
+        outer_rows: Option<usize>,
     ) -> Result<Option<Expression>> {
         match expr {
             Expression::Exists(exists) => {
                 if let Some(info) = Self::try_extract_semi_join_info(exists, false, outer_tables) {
                     // Check if index-nested-loop would be more efficient
                     // (index exists + no additional predicates, OR index exists + small LIMIT)
-                    if self.should_use_index_nested_loop(&info, outer_limit, ctx) {
+                    if self.should_use_index_nested_loop(&info, outer_limit, outer_rows, ctx) {
                         return Ok(None); // Skip semi-join, use index probing per row
                     }
                     // Semi-join optimization: execute inner query once, collect into hash set
@@ -4745,7 +4780,7 @@ impl Executor {
                     if let Some(info) = Self::try_extract_semi_join_info(exists, true, outer_tables)
                     {
                         // Check if index-nested-loop would be more efficient
-                        if self.should_use_index_nested_loop(&info, outer_limit, ctx) {
+                        if self.should_use_index_nested_loop(&info, outer_limit, outer_rows, ctx) {
                             return Ok(None); // Skip semi-join, use index probing per row
                         }
                         let hash_set = self.execute_semi_join_optimization(&info, ctx)?;
@@ -4766,12 +4801,14 @@ impl Executor {
                     ctx,
                     outer_tables,
                     outer_limit,
+                    outer_rows,
                 )?;
                 let right_opt = self.try_optimize_exists_to_semi_join(
                     &infix.right,
                     ctx,
                     outer_tables,
                     outer_limit,
+                    outer_rows,
                 )?;
 
                 match (left_opt, right_opt) {
@@ -4810,12 +4847,14 @@ impl Executor {
                     ctx,
                     outer_tables,
                     outer_limit,
+                    outer_rows,
                 )?;
                 let right_opt = self.try_optimize_exists_to_semi_join(
                     &infix.right,
                     ctx,
                     outer_tables,
                     outer_limit,
+                    outer_rows,
                 )?;
 
                 match (left_opt, right_opt) {

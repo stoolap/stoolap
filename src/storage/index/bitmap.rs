@@ -832,6 +832,30 @@ impl Index for BitmapIndex {
         }
     }
 
+    fn get_row_ids_equal_capped_into(
+        &self,
+        values: &[Value],
+        max: usize,
+        buffer: &mut Vec<i64>,
+    ) -> Option<crate::storage::traits::CappedEqual> {
+        use crate::storage::traits::CappedEqual;
+        if self.closed.load(AtomicOrdering::Acquire) || values.len() != self.column_ids.len() {
+            return Some(CappedEqual::Copied);
+        }
+        let arc_key = self.value_to_arc_key(values);
+        let bitmaps = self.bitmaps.read();
+        let Some(bitmap) = bitmaps.get(&arc_key) else {
+            return Some(CappedEqual::Copied);
+        };
+        // The count is read before anything is appended, so an over-cap key
+        // costs one lookup and no copy
+        if bitmap.len() > max as u64 {
+            return Some(CappedEqual::OverCap);
+        }
+        buffer.extend(bitmap.iter().map(row_of));
+        Some(CappedEqual::Copied)
+    }
+
     fn get_row_ids_in_range_into(
         &self,
         _min_value: &[Value],

@@ -4026,7 +4026,13 @@ impl Table for MVCCTable {
         };
         match index.index_type() {
             IndexType::BTree => {
-                Ok(index.get_row_ids_equal_capped_into(std::slice::from_ref(key), max, out))
+                #[cfg(feature = "test-failpoints")]
+                let start = out.len();
+                let found =
+                    index.get_row_ids_equal_capped_into(std::slice::from_ref(key), max, out);
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::equality_candidate_ids_copied(out.len() - start);
+                Ok(found)
             }
             IndexType::Hash | IndexType::Bitmap | IndexType::PrimaryKey => {
                 // These match the stored value exactly, so the key takes the column's type
@@ -4057,11 +4063,15 @@ impl Table for MVCCTable {
                 };
                 // An index that caps before it copies answers here
                 let stored = std::slice::from_ref(&stored);
+                let start = out.len();
                 if let Some(found) = index.get_row_ids_equal_capped_into(stored, max, out) {
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::equality_candidate_ids_copied(out.len() - start);
                     return Ok(Some(found));
                 }
-                let start = out.len();
                 index.get_row_ids_equal_into(stored, out);
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::equality_candidate_ids_copied(out.len() - start);
                 if out.len() - start > max {
                     out.truncate(start);
                     return Ok(Some(crate::storage::traits::CappedEqual::OverCap));

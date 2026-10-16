@@ -3263,7 +3263,16 @@ impl Executor {
                             && !classification.has_order_by
                             && !classification.has_distinct
                             && !classification.has_distinct_on;
-                        let use_anti_join = is_pure_not_exists && !has_limit && is_plain_projection;
+                        // Few outer rows probe the inner index each instead
+                        let use_anti_join = is_pure_not_exists
+                            && !has_limit
+                            && is_plain_projection
+                            && !self.should_use_index_nested_loop(
+                                &not_exists_info,
+                                None,
+                                Some(table.row_count_hint()),
+                                ctx,
+                            );
                         // Decided before any row is read: an inner WHERE storage
                         // cannot answer whole leaves NOT EXISTS to the general path
                         let inner_filter = if use_anti_join {
@@ -3272,7 +3281,16 @@ impl Executor {
                             None
                         };
 
-                        if let Some(inner_filter) = inner_filter {
+                        // The inner rows as this statement sees them, or none
+                        // when the inner name is not a table it can read so
+                        let inner = match inner_filter {
+                            Some(filter) => {
+                                self.anti_join_inner_rows(&not_exists_info, filter.as_deref(), ctx)?
+                            }
+                            None => None,
+                        };
+
+                        if let Some((inner_rows, inner_key)) = inner {
                             // Materialize outer table rows
                             let mut outer_rows = table.collect_all_rows(storage_expr.as_deref())?;
 
@@ -3281,8 +3299,8 @@ impl Executor {
                                 &not_exists_info,
                                 CompactArc::new(outer_rows.drain_rows().collect()),
                                 &all_columns,
-                                inner_filter.as_deref(),
-                                ctx,
+                                inner_rows,
+                                inner_key,
                             )?;
 
                             // Project and return result
@@ -3345,6 +3363,7 @@ impl Executor {
                         ctx,
                         &outer_tables,
                         outer_limit,
+                        Some(table.row_count_hint()),
                     )?;
 
                     // 2. Try IN semi-join optimization (on EXISTS result or original)
