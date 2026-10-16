@@ -216,37 +216,7 @@ impl Executor {
                     let is_multi_column = matches!(processed_left, Expression::ExpressionList(_));
 
                     if is_multi_column {
-                        // Multi-column IN: (a, b) IN (SELECT x, y FROM t)
-                        let rows = self.execute_in_subquery_rows(&subquery.subquery, ctx)?;
-
-                        // Pre-allocate with known capacity for better performance
-                        let mut expressions = Vec::with_capacity(rows.len());
-                        let paren_token = dummy_token("(", TokenType::Punctuator);
-
-                        // Convert each row to an ExpressionList (tuple)
-                        for row in rows {
-                            let col_count = row.len();
-                            let mut tuple_exprs = Vec::with_capacity(col_count);
-                            for value in &row {
-                                tuple_exprs.push(value_to_expression(value));
-                            }
-                            expressions.push(Expression::ExpressionList(Box::new(
-                                ExpressionList {
-                                    token: paren_token.clone(),
-                                    expressions: tuple_exprs,
-                                },
-                            )));
-                        }
-
-                        return Ok(Expression::In(InExpression {
-                            token: in_expr.token.clone(),
-                            left: Box::new(processed_left),
-                            right: Box::new(Expression::ExpressionList(Box::new(ExpressionList {
-                                token: paren_token,
-                                expressions,
-                            }))),
-                            not: in_expr.not,
-                        }));
+                        return self.tuple_in(in_expr, processed_left, &subquery.subquery, ctx);
                     } else {
                         // Single-column IN - use InHashSet for O(1) lookups.
                         // A repeated non-correlated subquery reuses the
@@ -1730,6 +1700,36 @@ impl Executor {
             // For other expressions, return as-is
             _ => expr.clone(),
         }
+    }
+
+    /// `(a, b) IN (SELECT x, y ...)` as an IN over the subquery's rows, each a tuple
+    fn tuple_in(
+        &self,
+        in_expr: &InExpression,
+        left: Expression,
+        subquery: &SelectStatement,
+        ctx: &ExecutionContext,
+    ) -> Result<Expression> {
+        let rows = self.execute_in_subquery_rows(subquery, ctx)?;
+        let paren_token = dummy_token("(", TokenType::Punctuator);
+        let expressions = rows
+            .iter()
+            .map(|row| {
+                Expression::ExpressionList(Box::new(ExpressionList {
+                    token: paren_token.clone(),
+                    expressions: row.iter().map(value_to_expression).collect(),
+                }))
+            })
+            .collect();
+        Ok(Expression::In(InExpression {
+            token: in_expr.token.clone(),
+            left: Box::new(left),
+            right: Box::new(Expression::ExpressionList(Box::new(ExpressionList {
+                token: paren_token,
+                expressions,
+            }))),
+            not: in_expr.not,
+        }))
     }
 
     /// Convert ALL/ANY expression to an equivalent expression that the evaluator can handle.
@@ -3906,6 +3906,9 @@ impl Executor {
                 let processed_left = self.process_correlated_where(&in_expr.left, ctx)?;
 
                 if let Expression::ScalarSubquery(subquery) = in_expr.right.as_ref() {
+                    if matches!(processed_left, Expression::ExpressionList(_)) {
+                        return self.tuple_in(in_expr, processed_left, &subquery.subquery, ctx);
+                    }
                     // Use InHashSet for O(1) lookups with FxHash (optimized for Value types with WyMix)
                     let values = self.execute_in_subquery(&subquery.subquery, ctx)?;
                     let hash_set: ValueSet = values.into_iter().collect();
