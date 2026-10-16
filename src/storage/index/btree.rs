@@ -1185,8 +1185,9 @@ impl Index for BTreeIndex {
         Some(result)
     }
 
-    /// Walks the whole key, so only an empty prefix. Each chunk of keys is
-    /// copied under the lock and visited after it is released.
+    /// Walks the whole key, so only an empty prefix. Each chunk of row ids is
+    /// copied under the lock into room made before it, and visited after the
+    /// lock is released; a chunk may stop inside a key's ids.
     fn walk_prefix_ordered(
         &self,
         prefix: &[Value],
@@ -1215,37 +1216,55 @@ impl Index for BTreeIndex {
                 return true;
             }
         }
+        // The key the last chunk stopped in, and the last id it copied there
+        let mut inside: Option<(CompactArc<Value>, i64)> = None;
         let mut ids: Vec<i64> = Vec::new();
         let mut keys: Vec<(CompactArc<Value>, usize)> = Vec::new();
         let mut chunk = 64usize;
         loop {
             ids.clear();
             keys.clear();
-            let mut exhausted = true;
+            ids.reserve_exact(chunk);
+            keys.reserve_exact(chunk);
+            let room = (ids.capacity(), keys.capacity());
+            let mut full = false;
             {
                 let sorted_values = self.sorted_values.read();
-                let mut take = |(key, rows): (&CompactArc<Value>, &RowIdSet)| {
-                    rows.copy_into(&mut ids);
-                    keys.push((CompactArc::clone(key), ids.len()));
-                    ids.len() < chunk
-                };
-                let range = sorted_values.range((start.clone(), end.clone()));
-                if ascending {
-                    for entry in range {
-                        if !take(entry) {
-                            exhausted = false;
-                            break;
-                        }
+                let mut take = |key: &CompactArc<Value>, rows: &RowIdSet, after: Option<i64>| {
+                    let before = ids.len();
+                    rows.copy_past_into(after, ascending, chunk - before, &mut ids);
+                    if ids.len() > before {
+                        keys.push((CompactArc::clone(key), ids.len()));
                     }
-                } else {
-                    for entry in range.rev() {
-                        if !take(entry) {
-                            exhausted = false;
-                            break;
+                    ids.len() == chunk
+                };
+                if let Some((key, last)) = &inside {
+                    if let Some(rows) = sorted_values.get(key) {
+                        full = take(key, rows, Some(*last));
+                    }
+                }
+                if !full {
+                    let range = sorted_values.range((start.clone(), end.clone()));
+                    if ascending {
+                        for (key, rows) in range {
+                            if take(key, rows, None) {
+                                full = true;
+                                break;
+                            }
+                        }
+                    } else {
+                        for (key, rows) in range.rev() {
+                            if take(key, rows, None) {
+                                full = true;
+                                break;
+                            }
                         }
                     }
                 }
             }
+            debug_assert_eq!(room, (ids.capacity(), keys.capacity()));
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::btree_walk_chunk(ids.len(), ids.capacity());
             let mut from = 0;
             for (key, upto) in &keys {
                 for &row_id in &ids[from..*upto] {
@@ -1255,17 +1274,15 @@ impl Index for BTreeIndex {
                 }
                 from = *upto;
             }
-            let Some((last, _)) = keys.pop() else {
+            let (Some((last, _)), Some(&last_id), true) = (keys.pop(), ids.last(), full) else {
                 return true;
             };
-            if exhausted {
-                return true;
-            }
             if ascending {
-                start = Bound::Excluded(last);
+                start = Bound::Excluded(CompactArc::clone(&last));
             } else {
-                end = Bound::Excluded(last);
+                end = Bound::Excluded(CompactArc::clone(&last));
             }
+            inside = Some((last, last_id));
             chunk = (chunk * 2).min(4096);
         }
     }

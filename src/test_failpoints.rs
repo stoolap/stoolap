@@ -1552,6 +1552,7 @@ thread_local! {
     static ROW_ID_ORDER_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TOP_K_COLD_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static HOT_TOP_K_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BTREE_WALK_CHUNK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
     static GROUP_CACHE_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GROUP_COLUMN_DECODES: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
     static COLD_MAP_CAPTURED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
@@ -2230,6 +2231,19 @@ pub fn top_k_cold_rows() -> usize {
 
 pub(crate) fn top_k_cold_row_built() {
     TOP_K_COLD_ROWS.with(|n| n.set(n.get() + 1));
+}
+
+/// The most row ids one chunk of this thread's B-tree walks copied under the
+/// index lock, and the largest room it had for them; resets both
+pub fn take_btree_walk_chunk_max() -> (usize, usize) {
+    BTREE_WALK_CHUNK.with(|c| c.replace((0, 0)))
+}
+
+pub(crate) fn btree_walk_chunk(copied: usize, capacity: usize) {
+    BTREE_WALK_CHUNK.with(|c| {
+        let (most, room) = c.get();
+        c.set((most.max(copied), room.max(capacity)));
+    });
 }
 
 /// Hot rows this thread's index-walking top-k scans visited, so far

@@ -245,3 +245,79 @@ fn a_key_moved_behind_the_walk_is_still_answered() {
     assert!(fired.get(), "the walk visited a row");
     assert_eq!(got, vec!["Some(Integer(50))".to_string()]);
 }
+
+/// 30000 rows, 20000 of them on one key, so the walk's chunks stop inside it
+fn create_heavy_key(db: &Database) {
+    db.execute(
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, t INTEGER NOT NULL, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX r_t ON r(t) USING BTREE", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO r SELECT value, CASE WHEN value % 3 = 0 THEN value % 1000 ELSE 500 END, \
+         value % 100 FROM generate_series(1, 30000)",
+        (),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_range_top_k_through_a_key_held_by_many_rows_matches_the_full_sort() {
+    let db = Database::open("memory://range_top_k_heavy_key").unwrap();
+    create_heavy_key(&db);
+    db.execute("DELETE FROM r WHERE t = 500 AND id % 7 = 0", ())
+        .unwrap();
+    for where_clause in ["t >= 500", "t <= 500", "t > 499 AND t < 501", "t >= 0"] {
+        for desc in [false, true] {
+            for (limit, offset) in [(5, 0), (5000, 100), (25_000, 0)] {
+                check(&db, where_clause, desc, limit, offset);
+                let dir = if desc { "DESC" } else { "ASC" };
+                let query = format!(
+                    "SELECT id FROM r WHERE {where_clause} ORDER BY t {dir} LIMIT {limit} OFFSET {offset}"
+                );
+                let mut got = column(&db, &query);
+                let returned = got.len();
+                got.sort_unstable();
+                got.dedup();
+                assert_eq!(got.len(), returned, "duplicate rows: {query}");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_range_top_k_copies_a_chunk_of_a_key_held_by_many_rows() {
+    use stoolap::test_failpoints::take_btree_walk_chunk_max;
+    let db = Database::open("memory://range_top_k_heavy_key_copies").unwrap();
+    db.execute(
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, t INTEGER NOT NULL)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX r_t ON r(t) USING BTREE", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO r SELECT value, 7 FROM generate_series(1, 100000)",
+        (),
+    )
+    .unwrap();
+    for (dir, limit, most) in [
+        ("", 1, 64),
+        ("DESC", 1, 64),
+        ("", 50_000, 4096),
+        ("DESC", 50_000, 4096),
+    ] {
+        let query = format!("SELECT id FROM r WHERE t >= 7 ORDER BY t {dir} LIMIT {limit}");
+        take_btree_walk_chunk_max();
+        assert_eq!(column(&db, &query).len(), limit, "{query}");
+        let (copied, room) = take_btree_walk_chunk_max();
+        assert!(
+            copied > 0 && copied <= most,
+            "{query}: copied {copied} ids under one lock"
+        );
+        assert!(room <= most, "{query}: room for {room} ids");
+    }
+}

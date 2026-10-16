@@ -146,6 +146,60 @@ impl<const P: usize> IdList<P> {
         }
     }
 
+    /// Appends up to `max` ids past `after` in the walk's direction: above it
+    /// ascending, below it descending, from the first or last id when None
+    pub fn copy_past_into(
+        &self,
+        after: Option<i64>,
+        ascending: bool,
+        max: usize,
+        out: &mut Vec<i64>,
+    ) {
+        let limit = out.len() + max;
+        let take = |page: &[i64], out: &mut Vec<i64>| {
+            let page = match (after, ascending) {
+                (Some(a), true) => &page[page.partition_point(|&id| id <= a)..],
+                (Some(a), false) => &page[..page.partition_point(|&id| id < a)],
+                (None, _) => page,
+            };
+            let room = limit - out.len();
+            if ascending {
+                out.extend_from_slice(&page[..room.min(page.len())]);
+            } else {
+                out.extend(page.iter().rev().take(room));
+            }
+            out.len() < limit
+        };
+        match self {
+            IdList::Inline(ids) => {
+                take(ids, out);
+            }
+            IdList::Paged(paged) => {
+                let from = after.and_then(|a| paged.page_of(a));
+                if ascending {
+                    let start = from.map_or(Bound::Unbounded, Bound::Included);
+                    for page in paged.pages.range((start, Bound::Unbounded)).map(|(_, p)| p) {
+                        if !take(page, out) {
+                            break;
+                        }
+                    }
+                } else {
+                    let end = from.map_or(Bound::Unbounded, Bound::Included);
+                    for page in paged
+                        .pages
+                        .range((Bound::Unbounded, end))
+                        .rev()
+                        .map(|(_, p)| p)
+                    {
+                        if !take(page, out) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Whether `id` was not there
     pub fn insert(&mut self, id: i64) -> bool {
         match self {
