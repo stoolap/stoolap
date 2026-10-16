@@ -833,28 +833,29 @@ impl Executor {
 
         // Build column index map for aggregate result columns
         let mut agg_col_index_map = build_column_index_map(&agg_columns);
-        // An expression name holding a TEXT literal is keyed by the literal's own case only
-        let expression_names: Vec<(usize, &String)> = agg_columns
-            .iter()
-            .enumerate()
-            .filter(|(_, name)| name.contains('\''))
-            .filter(|(_, name)| {
-                let lower = name.to_lowercase();
-                let aliased = stmt.columns.iter().any(
-                    |c| matches!(c, Expression::Aliased(a) if a.alias.value_lower.as_str() == lower),
-                );
-                let grouped = group_by_columns
+        // A name with an apostrophe is keyed by its literal case; its lowercase key only fills a gap
+        let mut lowercase_fallbacks: Vec<(String, usize)> = Vec::new();
+        for (i, name) in agg_columns.iter().enumerate() {
+            let folded = fold_expression_name(name);
+            let lower = name.to_lowercase();
+            if folded != lower {
+                agg_col_index_map.remove(lower.as_str());
+                lowercase_fallbacks.push((lower, i));
+            }
+        }
+        for (i, name) in agg_columns.iter().enumerate() {
+            if name.contains('\'') {
+                agg_col_index_map.insert(fold_expression_name(name), i);
+            }
+        }
+        let find_alias = |map: &StringMap<usize>, alias: &str| {
+            map.get(alias).copied().or_else(|| {
+                lowercase_fallbacks
                     .iter()
-                    .any(|g| matches!(g, GroupByItem::Column(c) if c.to_lowercase() == lower));
-                !aliased && !grouped
+                    .find(|(name, _)| name == alias)
+                    .map(|&(_, i)| i)
             })
-            .collect();
-        for (_, name) in &expression_names {
-            agg_col_index_map.remove(name.to_lowercase().as_str());
-        }
-        for (i, name) in expression_names {
-            agg_col_index_map.insert(fold_expression_name(name), i);
-        }
+        };
 
         // Build additional mappings for aggregate expressions to handle deduplication
         // When aggregates are deduplicated (e.g., SUM(value) and SUM(value) AS total),
@@ -868,7 +869,7 @@ impl Executor {
                             fold_expression_name(&self.get_aggregate_column_name(func));
                         let alias_lower: String = aliased.alias.value_lower.to_string();
                         // If the alias exists in the map but the expression doesn't, add the expression
-                        if let Some(&idx) = agg_col_index_map.get(&alias_lower) {
+                        if let Some(idx) = find_alias(&agg_col_index_map, &alias_lower) {
                             agg_col_index_map.entry(expr_name).or_insert(idx);
                         }
                         // If the expression exists in the map but the alias doesn't, add the alias
@@ -896,7 +897,9 @@ impl Executor {
                                     if other_expr == expr_name {
                                         let alias_lower: String =
                                             other_aliased.alias.value_lower.to_string();
-                                        if let Some(&idx) = agg_col_index_map.get(&alias_lower) {
+                                        if let Some(idx) =
+                                            find_alias(&agg_col_index_map, &alias_lower)
+                                        {
                                             agg_col_index_map
                                                 .entry(expr_name.clone())
                                                 .or_insert(idx);
@@ -908,6 +911,9 @@ impl Executor {
                     }
                 }
             }
+        }
+        for (lower, i) in lowercase_fallbacks {
+            agg_col_index_map.entry(lower).or_insert(i);
         }
 
         // Check if we have any expressions that need post-processing

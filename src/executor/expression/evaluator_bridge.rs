@@ -100,6 +100,17 @@ fn compute_cache_key(expr: &Expression, columns: &[String]) -> (u64, u64) {
     (h1.finish(), h2.finish())
 }
 
+/// Key each alias by its literal case, then by its lowercase name where
+/// no other alias holds that key
+fn insert_alias_keys(map: &mut StringMap<u16>, aliases: &[(String, usize)]) {
+    for (name, idx) in aliases {
+        map.insert(fold_expression_name(name), *idx as u16);
+    }
+    for (name, idx) in aliases {
+        map.entry(name.to_lowercase()).or_insert(*idx as u16);
+    }
+}
+
 /// Compute a u64 hash of an expression without string allocation.
 /// This is O(expression_size) and avoids Debug formatting overhead.
 /// Use this for cache keys instead of format!("{:?}", expr).
@@ -641,10 +652,8 @@ impl RowFilter {
         columns: &[String],
         aliases: &[(String, usize)],
     ) -> Result<Self> {
-        let alias_map: StringMap<u16> = aliases
-            .iter()
-            .map(|(name, idx)| (fold_expression_name(name), *idx as u16))
-            .collect();
+        let mut alias_map = StringMap::new();
+        insert_alias_keys(&mut alias_map, aliases);
 
         let ctx = CompileContext::with_global_registry(columns).with_expression_aliases(alias_map);
         let compiler = ExprCompiler::new(&ctx);
@@ -1049,10 +1058,8 @@ impl ExpressionEval {
         columns: &[String],
         aliases: &[(String, usize)],
     ) -> Result<Self> {
-        let alias_map: StringMap<u16> = aliases
-            .iter()
-            .map(|(name, idx)| (fold_expression_name(name), *idx as u16))
-            .collect();
+        let mut alias_map = StringMap::new();
+        insert_alias_keys(&mut alias_map, aliases);
 
         Self::compile_with_options(
             expr,
@@ -1333,10 +1340,8 @@ impl MultiExpressionEval {
         columns: &[String],
         aliases: &[(String, usize)],
     ) -> Result<Self> {
-        let alias_map: StringMap<u16> = aliases
-            .iter()
-            .map(|(name, idx)| (fold_expression_name(name), *idx as u16))
-            .collect();
+        let mut alias_map = StringMap::new();
+        insert_alias_keys(&mut alias_map, aliases);
 
         let ctx = CompileContext::with_global_registry(columns).with_expression_aliases(alias_map);
         let compiler = ExprCompiler::new(&ctx);
@@ -1668,20 +1673,14 @@ impl<'a> CompiledEvaluator<'a> {
 
     /// Add aggregate expression aliases for HAVING clause evaluation
     pub fn add_aggregate_aliases(&mut self, aliases: &[(String, usize)]) {
-        for (expr_name, idx) in aliases {
-            let lower = fold_expression_name(expr_name);
-            self.expression_aliases.insert(lower, *idx as u16);
-        }
+        insert_alias_keys(&mut self.expression_aliases, aliases);
         // Invalidate local cache since compilation context changed
         self.local_cache.clear();
     }
 
     /// Add expression aliases for HAVING clause with GROUP BY expressions
     pub fn add_expression_aliases(&mut self, aliases: &[(String, usize)]) {
-        for (expr_str, idx) in aliases {
-            let lower = fold_expression_name(expr_str);
-            self.expression_aliases.insert(lower, *idx as u16);
-        }
+        insert_alias_keys(&mut self.expression_aliases, aliases);
         // Invalidate local cache since compilation context changed
         self.local_cache.clear();
     }

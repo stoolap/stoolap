@@ -594,4 +594,24 @@ fn test_a_name_holding_an_apostrophe_still_reads_its_aggregate() {
         rows(&db, "SELECT 'BA', 'Ba', 'Ba'"),
         "the aggregate over 'a' is found by its own case, not through the one over 'A'"
     );
+    for (quoted, plain) in [
+        (
+            "SELECT t.\"a'B\", SUM(v + 0) FROM t GROUP BY t.\"a'B\" ORDER BY 1",
+            "SELECT t.ab, SUM(v + 0) FROM t GROUP BY t.ab ORDER BY 1",
+        ),
+        (
+            "SELECT \"a'b\" + 1, COUNT(*) FROM t GROUP BY \"a'B\" + 1 ORDER BY 1",
+            "SELECT ab + 1, COUNT(*) FROM t GROUP BY AB + 1 ORDER BY 1",
+        ),
+        (
+            "SELECT \"a'B\" + 1, COUNT(*) FROM t GROUP BY \"a'B\" + 1 HAVING \"a'b\" + 1 > 0 ORDER BY 1",
+            "SELECT ab + 1, COUNT(*) FROM t GROUP BY ab + 1 HAVING AB + 1 > 0 ORDER BY 1",
+        ),
+    ] {
+        assert_eq!(
+            rows(&db, quoted),
+            rows(&db, plain),
+            "{quoted}: a grouped name with an apostrophe reads in any case"
+        );
+    }
 }
