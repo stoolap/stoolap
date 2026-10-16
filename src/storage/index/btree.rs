@@ -1205,17 +1205,6 @@ impl Index for BTreeIndex {
             None => Bound::Unbounded,
         };
         let (mut start, mut end) = (bound(lower), bound(upper));
-        // Bounds that cross, or meet with one side open, hold nothing
-        if let (
-            Bound::Included(low) | Bound::Excluded(low),
-            Bound::Included(high) | Bound::Excluded(high),
-        ) = (&start, &end)
-        {
-            let open = matches!(start, Bound::Excluded(_)) || matches!(end, Bound::Excluded(_));
-            if low > high || (low == high && open) {
-                return true;
-            }
-        }
         // The key the last chunk stopped in, and the last id it copied there
         let mut inside: Option<(CompactArc<Value>, i64)> = None;
         let mut ids: Vec<i64> = Vec::new();
@@ -1243,21 +1232,24 @@ impl Index for BTreeIndex {
                         full = take(key, rows, Some(*last));
                     }
                 }
-                if !full {
-                    let range = sorted_values.range((start.clone(), end.clone()));
-                    if ascending {
-                        for (key, rows) in range {
-                            if take(key, rows, None) {
-                                full = true;
-                                break;
-                            }
+                if !full && ascending {
+                    for (key, rows) in sorted_values.range((start.clone(), Bound::Unbounded)) {
+                        if past_end(key, &end) {
+                            break;
                         }
-                    } else {
-                        for (key, rows) in range.rev() {
-                            if take(key, rows, None) {
-                                full = true;
-                                break;
-                            }
+                        if take(key, rows, None) {
+                            full = true;
+                            break;
+                        }
+                    }
+                } else if !full {
+                    for (key, rows) in sorted_values.range((Bound::Unbounded, end.clone())).rev() {
+                        if before_start(key, &start) {
+                            break;
+                        }
+                        if take(key, rows, None) {
+                            full = true;
+                            break;
                         }
                     }
                 }
@@ -1358,6 +1350,16 @@ pub(crate) fn past_end<K: Ord>(key: &K, end: &Bound<K>) -> bool {
     match end {
         Bound::Included(end) => Ord::cmp(key, end) == std::cmp::Ordering::Greater,
         Bound::Excluded(end) => Ord::cmp(key, end) != std::cmp::Ordering::Less,
+        Bound::Unbounded => false,
+    }
+}
+
+/// Whether `key` lies before `start` in the map's own `Ord`, for a range
+/// walked down from its end alone
+pub(crate) fn before_start<K: Ord>(key: &K, start: &Bound<K>) -> bool {
+    match start {
+        Bound::Included(start) => Ord::cmp(key, start) == std::cmp::Ordering::Less,
+        Bound::Excluded(start) => Ord::cmp(key, start) != std::cmp::Ordering::Greater,
         Bound::Unbounded => false,
     }
 }

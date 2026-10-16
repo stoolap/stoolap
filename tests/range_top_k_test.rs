@@ -321,3 +321,52 @@ fn a_range_top_k_copies_a_chunk_of_a_key_held_by_many_rows() {
         assert!(room <= most, "{query}: room for {room} ids");
     }
 }
+
+/// Bounds of other types or NULL are taken in the index's own order, where
+/// NULL is first and each type ranks whole, in both directions
+#[test]
+fn a_btree_walk_takes_its_bounds_in_the_index_order() {
+    use stoolap::core::{DataType, Value};
+    use stoolap::storage::index::BTreeIndex;
+    use stoolap::storage::traits::Index;
+
+    let index = BTreeIndex::new(
+        "b".into(),
+        "r".into(),
+        0,
+        "t".into(),
+        DataType::Integer,
+        false,
+        0,
+    );
+    for id in 1..=900i64 {
+        index.add(&[Value::Integer(id)], id, id).unwrap();
+    }
+    let null = Value::Null(DataType::Integer);
+    for (low, high, holds_ten) in [
+        (Value::Integer(2), Value::text("10"), true),
+        (Value::text("10"), Value::Integer(2), false),
+        (Value::Integer(5), null.clone(), false),
+        (null.clone(), Value::Integer(50), true),
+        (Value::Integer(600), Value::Integer(100), false),
+    ] {
+        for ascending in [true, false] {
+            let mut seen = Vec::new();
+            assert!(index.walk_prefix_ordered(
+                &[],
+                Some((&low, true)),
+                Some((&high, true)),
+                ascending,
+                &mut |row_id, _| {
+                    seen.push(row_id);
+                    true
+                },
+            ));
+            assert_eq!(
+                seen.contains(&10),
+                holds_ten,
+                "{low:?} ..= {high:?} ascending {ascending}"
+            );
+        }
+    }
+}
