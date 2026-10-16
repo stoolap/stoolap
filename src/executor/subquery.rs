@@ -4069,10 +4069,10 @@ impl Executor {
             return None;
         }
 
-        // 1. Check for simple table source (not a join)
+        // 1. One table, not AS OF: the set and the anti-join read the current table
         let (inner_table, inner_alias): (String, Option<String>) =
             match subquery.table_expr.as_ref().map(|b| b.as_ref()) {
-                Some(Expression::TableSource(ts)) => {
+                Some(Expression::TableSource(ts)) if ts.as_of.is_none() => {
                     let alias = ts.alias.as_ref().map(|a| a.value.to_string());
                     (ts.name.value.to_string(), alias)
                 }
