@@ -2364,8 +2364,11 @@ impl Executor {
             return Ok(EarlySemantic::NotTried);
         }
         ctx.check_cancelled()?;
+        let Some(statement) = std::num::NonZeroUsize::new(stmt as *const _ as usize) else {
+            return Ok(EarlySemantic::NotTried);
+        };
         let miss = SemanticMiss {
-            statement: stmt as *const _ as usize,
+            statement,
             simplified: ExpressionSimplifier::new()
                 .try_simplify(where_expr)
                 .map(Arc::new),

@@ -1075,8 +1075,9 @@ pub struct ExecutionContext {
     /// the statement; None reads the newest committed state
     statement_view: Option<StatementView>,
     /// A DML target selected through a query: the scan of this table at
-    /// this query depth reads the newest state, the query's subqueries the view
-    newest_target: Option<(SmartString, usize)>,
+    /// this query depth reads the newest state, the query's subqueries the
+    /// view. Behind an Arc, as few statements set it and every one carries it
+    newest_target: Option<Arc<(SmartString, usize)>>,
     /// A semantic cache miss at the statement's start, for its scan
     semantic_miss: Option<SemanticMiss>,
 }
@@ -1087,7 +1088,7 @@ pub struct ExecutionContext {
 #[derive(Debug, Clone)]
 pub(crate) struct SemanticMiss {
     /// The address of the `SelectStatement` the lookup was for
-    pub(crate) statement: usize,
+    pub(crate) statement: std::num::NonZeroUsize,
     /// The simplified WHERE, when simplifying changed it
     pub(crate) simplified: Option<Arc<crate::parser::ast::Expression>>,
 }
@@ -1489,14 +1490,14 @@ impl ExecutionContext {
     /// newest state, as the write does
     pub(crate) fn with_newest_target(&self, table: &str) -> Self {
         let mut ctx = self.clone();
-        ctx.newest_target = Some((SmartString::from(table), self.query_depth));
+        ctx.newest_target = Some(Arc::new((SmartString::from(table), self.query_depth)));
         ctx
     }
 
     /// The view a scan of `table` at this depth reads through: none for the
     /// DML target a query selects, else the statement's
     pub(crate) fn scan_view(&self, table: &str) -> Option<&StatementView> {
-        let target = self.newest_target.as_ref().is_some_and(|(name, depth)| {
+        let target = self.newest_target.as_deref().is_some_and(|(name, depth)| {
             *depth == self.query_depth && name.eq_ignore_ascii_case(table)
         });
         if target {
@@ -1515,7 +1516,7 @@ impl ExecutionContext {
         let address = statement as *const _ as usize;
         self.semantic_miss
             .as_ref()
-            .filter(|miss| miss.statement == address)
+            .filter(|miss| miss.statement.get() == address)
     }
 
     /// This context, a statement's own copy, carrying the miss `miss`
