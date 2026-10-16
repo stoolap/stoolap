@@ -523,17 +523,64 @@ fn test_sets_differing_in_letter_case_keep_two_aggregates() {
         rows(&db, "SELECT 1"),
         "HAVING reads each aggregate from its own slot"
     );
+    db.execute(
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, g INTEGER, v TEXT)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO u VALUES (1, 1, 'B'), (2, 2, 'b')", ())
+        .unwrap();
     assert_eq!(
         rows(
             &db,
-            "SELECT g, MAX(v || 'a') FROM t GROUP BY g ORDER BY MAX(v || 'A') DESC"
+            "SELECT g, SUM(CASE WHEN v > 'A' THEN 1 ELSE 0 END), SUM(CASE WHEN v > 'a' THEN 1 ELSE 0 END) \
+             FROM u GROUP BY g ORDER BY SUM(CASE WHEN v > 'a' THEN 1 ELSE 0 END) DESC, g"
         ),
-        rows(&db, "SELECT 1, 'Ba'"),
-        "ORDER BY computes the aggregate the SELECT list does not hold"
+        rows(&db, "SELECT 2, 1, 1 UNION ALL SELECT 1, 1, 0"),
+        "ORDER BY reads the aggregate over 'a', which only 'b' passes"
     );
     assert_eq!(
         rows(&db, "SELECT g, COUNT(V), count(v) FROM t GROUP BY G"),
         rows(&db, "SELECT 1, 1, 1"),
         "identifiers still match in any case"
     );
+}
+
+#[test]
+fn test_a_name_holding_an_apostrophe_still_reads_its_aggregate() {
+    let db = Database::open("memory://quantified_apostrophe_names").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER, \"a'B\" INTEGER, ab INTEGER)",
+        "INSERT INTO t VALUES (1, 1, 7, 3, 3), (2, 2, 9, 4, 4)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    for (quoted, plain) in [
+        (
+            "SELECT g, SUM(v) AS \"x'Y\" FROM t GROUP BY g ORDER BY g",
+            "SELECT g, SUM(v) AS xy FROM t GROUP BY g ORDER BY g",
+        ),
+        (
+            "SELECT g + 1 AS \"x'Y\", COUNT(*) FROM t GROUP BY g + 1 ORDER BY 1",
+            "SELECT g + 1 AS xy, COUNT(*) FROM t GROUP BY g + 1 ORDER BY 1",
+        ),
+        (
+            "SELECT g, SUM(v) AS \"x'Y\" FROM t GROUP BY g ORDER BY \"x'Y\" DESC",
+            "SELECT g, SUM(v) AS xy FROM t GROUP BY g ORDER BY xy DESC",
+        ),
+        (
+            "SELECT g, SUM(\"a'B\") FROM t GROUP BY g ORDER BY g",
+            "SELECT g, SUM(ab) FROM t GROUP BY g ORDER BY g",
+        ),
+        (
+            "SELECT \"a'B\", COUNT(*) FROM t GROUP BY \"a'B\" ORDER BY 1",
+            "SELECT ab, COUNT(*) FROM t GROUP BY ab ORDER BY 1",
+        ),
+    ] {
+        assert_eq!(
+            rows(&db, quoted),
+            rows(&db, plain),
+            "{quoted}: a name with an apostrophe reads as one without"
+        );
+    }
 }

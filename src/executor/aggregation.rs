@@ -833,10 +833,7 @@ impl Executor {
 
         // Build column index map for aggregate result columns
         let mut agg_col_index_map = build_column_index_map(&agg_columns);
-        // A name holding a TEXT literal is keyed with the literal's own case
-        for name in agg_columns.iter().filter(|name| name.contains('\'')) {
-            agg_col_index_map.remove(name.to_lowercase().as_str());
-        }
+        // A name holding a TEXT literal is also keyed with the literal's own case
         for (i, name) in agg_columns.iter().enumerate() {
             if name.contains('\'') {
                 agg_col_index_map.insert(fold_expression_name(name), i);
