@@ -651,9 +651,10 @@ pub struct MVCCEngine {
     /// Set when close begins: no pass starts, a running one stops at its
     /// next volume, and close waits for it before letting the files go
     closing: AtomicBool,
-    /// The table and segment a pass last examined, so a volume that cannot
-    /// be built, in any table, does not keep the rest from their turn
-    backfill_cursor: Mutex<Option<(String, u64)>>,
+    /// The table, the side state and the segment a pass last examined, so
+    /// a volume that cannot be built, in any table, does not keep the rest
+    /// from their turn
+    backfill_cursor: Mutex<Option<(String, bool, u64)>>,
     /// Global epoch counter for volume eviction. Incremented each checkpoint
     /// cycle. Volumes whose last_access_epoch < eviction_epoch are idle.
     #[cfg(not(target_arch = "wasm32"))]
@@ -6057,17 +6058,20 @@ impl MVCCEngine {
 
     /// Builds side files for up to `limit` volumes the query path cannot
     /// serve although the catalog indexes one of their columns: sealed
-    /// before the index existed, refused or failed at seal, of the earlier
-    /// format, or built for an index recreated since. One volume at a time,
-    /// each table's candidates oldest first from where the last pass left
-    /// off, each admitted into half the builds budget when the ledger is
-    /// idle, staged beside its volume, and published under the DDL guard
-    /// once it covers every current identity and its segment is still
-    /// registered, at the path the segment's file has then. A pass already
-    /// running, or an engine closing, makes this one a no-op.
+    /// before the index existed, refused or failed at seal, written in an
+    /// earlier format, which a pass rebuilds in the current one, or built
+    /// for an index recreated since. One volume at a time, each table's
+    /// candidates oldest first from where the last pass left off, each
+    /// admitted into half the builds budget when the ledger is idle,
+    /// staged beside its volume, and published under the DDL guard once
+    /// it covers every current identity and its segment is still
+    /// registered, at the path the segment's file has then. A volume with
+    /// no side file at all is built before one whose side file is of an
+    /// earlier format. A pass already running, or an engine closing,
+    /// makes this one a no-op.
     pub fn backfill_side_files(&self, limit: usize) -> Result<BackfillReport> {
         use crate::storage::volume::secondary::{
-            advances, covers_all, side_path_for, stage_side_for, SideBuild, INDEX_BUILDS,
+            advances, serves_all, side_path_for, stage_side_for, SideBuild, INDEX_BUILDS,
         };
         let mut report = BackfillReport::default();
         if self.closing.load(Ordering::Acquire)
@@ -6118,12 +6122,13 @@ impl MVCCEngine {
                 })
                 .collect()
         };
-        // Every candidate of every table first, in table then segment
-        // order, so what is left is counted whole; the sequence starts
-        // after the table and segment the last pass examined and wraps, so
-        // a volume that cannot be built in one table does not hold the
-        // rest, in any table, forever
-        let mut work: Vec<(usize, u64)> = Vec::new();
+        // Every candidate of every table first, in table order, a volume
+        // with no side file before one whose side file is of an earlier
+        // format, each in segment order, so what is left is counted whole;
+        // the sequence starts after the table, side state and segment the
+        // last pass examined and wraps, so a volume that cannot be built
+        // in one table does not hold the rest, in any table, forever
+        let mut work: Vec<(usize, u64, bool)> = Vec::new();
         let mut identities_of: Vec<(Vec<crate::storage::volume::side_index::SideIndexDef>, u64)> =
             Vec::with_capacity(tables.len());
         for (index, (_, store, mgr)) in tables.iter().enumerate() {
@@ -6133,37 +6138,46 @@ impl MVCCEngine {
                 (store.side_index_defs(), mgr.definition_epoch())
             };
             let snapshot = mgr.cold_snapshot();
-            let mut candidates: Vec<u64> = if identities.is_empty() {
+            let mut candidates: Vec<(u64, bool)> = if identities.is_empty() {
                 Vec::new()
             } else {
                 snapshot
                     .seg_ids
                     .iter()
                     .copied()
-                    .filter(|seg_id| {
-                        snapshot.segs.get(seg_id).is_some_and(|cs| {
-                            let wanted = wanted_of(cs, &identities);
-                            !wanted.is_empty()
-                                && !cs
-                                    .side
-                                    .as_ref()
-                                    .is_some_and(|side| covers_all(side, &wanted))
-                        })
+                    .filter_map(|seg_id| {
+                        let cs = snapshot.segs.get(&seg_id)?;
+                        let wanted = wanted_of(cs, &identities);
+                        // A side file of an earlier format records every
+                        // entry, and is a candidate all the same: the pass
+                        // rebuilds it in the current one
+                        let covered = cs.side.is_some();
+                        let served = covered
+                            && cs
+                                .side
+                                .as_ref()
+                                .is_some_and(|side| serves_all(side, &wanted));
+                        (!wanted.is_empty() && !served).then_some((seg_id, covered))
                     })
                     .collect()
             };
-            candidates.sort_unstable();
-            work.extend(candidates.into_iter().map(|id| (index, id)));
+            // The volume the query path cannot serve at all comes first
+            candidates.sort_unstable_by_key(|&(id, covered)| (covered, id));
+            work.extend(
+                candidates
+                    .into_iter()
+                    .map(|(id, covered)| (index, id, covered)),
+            );
             identities_of.push((identities, definition));
         }
-        if let Some((table, segment)) = self.backfill_cursor.lock().unwrap().clone() {
-            let at = work.partition_point(|&(index, id)| {
-                (tables[index].0.as_str(), id) <= (table.as_str(), segment)
+        if let Some((table, covered, segment)) = self.backfill_cursor.lock().unwrap().clone() {
+            let at = work.partition_point(|&(index, id, has_side)| {
+                (tables[index].0.as_str(), has_side, id) <= (table.as_str(), covered, segment)
             });
             work.rotate_left(at);
         }
         let pending = work.len();
-        for (index, seg_id) in work {
+        for (index, seg_id, covered) in work {
             if report.examined >= limit || self.closing.load(Ordering::Acquire) {
                 break;
             }
@@ -6177,7 +6191,7 @@ impl MVCCEngine {
                 break;
             }
             report.examined += 1;
-            *self.backfill_cursor.lock().unwrap() = Some((name.clone(), seg_id));
+            *self.backfill_cursor.lock().unwrap() = Some((name.clone(), covered, seg_id));
             let snapshot = mgr.cold_snapshot();
             let Some(cs) = snapshot.segs.get(&seg_id) else {
                 report.discarded += 1;
