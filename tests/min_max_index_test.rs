@@ -252,6 +252,74 @@ fn min_and_max_under_an_older_snapshot_answer_as_without_an_index() {
     );
 }
 
+/// A seal built before the hot extreme moved publishes the old value's copy
+/// between the bound's hot read and its volume read
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn min_and_max_with_a_seal_publishing_inside_the_bound_answer_as_without_an_index() {
+    use std::sync::mpsc;
+    use stoolap::test_failpoints::{self as fp, FailpointGuard};
+    let _guard = FailpointGuard::new();
+    let mut wrong = Vec::new();
+    // (aggregate, hot value sealed, value it moves to); the sealed row holds 5
+    for (f, sealed, moved) in [("MIN", 0, 9), ("MAX", 10, 1)] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&format!(
+            "file://{}?checkpoint_interval=0",
+            dir.path().display()
+        ))
+        .unwrap();
+        // One table, so the paused seal is this table's
+        for sql in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, c INTEGER)",
+            "CREATE INDEX t_c ON t(c) USING BTREE",
+            "INSERT INTO t VALUES (1, 5)",
+            "PRAGMA CHECKPOINT",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        db.execute(&format!("INSERT INTO t VALUES (2, {sealed})"), ())
+            .unwrap();
+        let (built_tx, built) = mpsc::channel();
+        let (go, go_rx) = mpsc::channel::<()>();
+        let sealer = db.clone();
+        let seal = std::thread::spawn(move || {
+            fp::after_seal_volumes_built(move || {
+                built_tx.send(()).unwrap();
+                let _ = go_rx.recv();
+            });
+            sealer.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        });
+        built.recv().unwrap();
+        db.execute(&format!("UPDATE t SET c = {moved} WHERE id = 2"), ())
+            .unwrap();
+        let seal = std::rc::Rc::new(std::cell::RefCell::new(Some(seal)));
+        let joined = std::rc::Rc::clone(&seal);
+        fp::after_index_bound_hot(move || {
+            go.send(()).unwrap();
+            if let Some(seal) = joined.borrow_mut().take() {
+                seal.join().unwrap();
+            }
+        });
+        let got = value(&db, &format!("SELECT {f}(c) FROM t"));
+        let want = value(&db, &format!("SELECT {f}(x) FROM (SELECT c AS x FROM t) s"));
+        if let Some(seal) = seal.borrow_mut().take() {
+            fp::after_index_bound_hot(|| {});
+            seal.join().unwrap();
+            wrong.push(format!("{f}: the bound never read the hot rows"));
+        }
+        if got != want {
+            wrong.push(format!("{f}: gave {got}, want {want}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn min_and_max_of_an_indexed_column_read_the_index() {

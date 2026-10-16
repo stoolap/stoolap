@@ -7054,7 +7054,10 @@ impl Table for SegmentedTable {
             }
             let hot_min = self.hot.get_index_min_value(column_name);
             #[cfg(feature = "test-failpoints")]
-            crate::test_failpoints::index_bound_hot_read();
+            {
+                crate::test_failpoints::index_bound_hot_read();
+                crate::test_failpoints::hot_and_cold_reads_split();
+            }
             let segments = self.segment_mgr.segments_raw();
             let mut vol_min: Option<Value> = None;
             for cs in segments.values() {
@@ -7093,7 +7096,8 @@ impl Table for SegmentedTable {
                 (None, None) => None,
             }
         };
-        self.clear_of_destruction(|| Ok(read())).ok().flatten()
+        // A seal published between the hot and the volume reads repeats both
+        self.settled_across_seals(|| Ok(read())).ok().flatten()
     }
 
     fn get_index_max_value(&self, column_name: &str) -> Option<Value> {
@@ -7107,7 +7111,10 @@ impl Table for SegmentedTable {
             }
             let hot_max = self.hot.get_index_max_value(column_name);
             #[cfg(feature = "test-failpoints")]
-            crate::test_failpoints::index_bound_hot_read();
+            {
+                crate::test_failpoints::index_bound_hot_read();
+                crate::test_failpoints::hot_and_cold_reads_split();
+            }
             let segments = self.segment_mgr.segments_raw();
             let mut vol_max: Option<Value> = None;
             for cs in segments.values() {
@@ -7150,7 +7157,8 @@ impl Table for SegmentedTable {
                 (None, None) => None,
             }
         };
-        self.clear_of_destruction(|| Ok(read())).ok().flatten()
+        // A seal published between the hot and the volume reads repeats both
+        self.settled_across_seals(|| Ok(read())).ok().flatten()
     }
 
     // =========================================================================
