@@ -592,7 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn test_quantified_set_pushes_its_bound_where_storage_orders_alike() {
+    fn test_quantified_set_on_a_number_column_pushes_its_bound() {
         let schema = test_schema();
         let members = vec![Value::integer(25), Value::integer(40)];
         for (op, all, passes) in [
@@ -621,7 +621,6 @@ mod tests {
             ("age", vec![Value::integer(25)], true),
             ("name", vec![Value::integer(25)], false),
             ("age", vec![Value::text("25")], false),
-            ("price", vec![Value::integer(25)], false),
         ] {
             let expr = make_quantified(column, ">", false, members, has_null);
             let (storage_expr, needs_mem) = try_pushdown(&expr, &schema, None);
@@ -630,11 +629,13 @@ mod tests {
                 "{column}: left to the memory filter"
             );
         }
-        let expr = make_quantified("price", "<", false, vec![Value::integer(25)], false);
-        let (storage_expr, needs_mem) = try_pushdown(&expr, &schema, None);
-        assert!(
-            storage_expr.is_some() && !needs_mem,
-            "a NaN price fails < in storage and in the contract alike"
-        );
+        for op in ["<", "<=", ">", ">="] {
+            let expr = make_quantified("price", op, false, vec![Value::integer(25)], false);
+            let (storage_expr, needs_mem) = try_pushdown(&expr, &schema, None);
+            assert!(
+                storage_expr.is_some() && !needs_mem,
+                "price {op} ANY: a NaN price fails it in storage and in the VM alike"
+            );
+        }
     }
 }

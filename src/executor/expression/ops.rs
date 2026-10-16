@@ -1004,13 +1004,19 @@ impl QuantifiedMembers {
             }
             _ => None,
         };
-        let by_contract = |member: &Value, value: &Value| match self.op {
-            CompareOp::Eq => sql_eq(value, member),
-            CompareOp::Ne => sql_eq(value, member).map(|eq| !eq),
-            CompareOp::Lt => sql_compare(value, member).map(|o| o.is_lt()),
-            CompareOp::Le => sql_compare(value, member).map(|o| o.is_le()),
-            CompareOp::Gt => sql_compare(value, member).map(|o| o.is_gt()),
-            CompareOp::Ge => sql_compare(value, member).map(|o| o.is_ge()),
+        let by_contract = |member: &Value, value: &Value| {
+            // A NaN against a number passes only <>, as a column against a constant does
+            if is_nan_pair(value, member) {
+                return Some(self.op == CompareOp::Ne);
+            }
+            match self.op {
+                CompareOp::Eq => sql_eq(value, member),
+                CompareOp::Ne => sql_eq(value, member).map(|eq| !eq),
+                CompareOp::Lt => sql_compare(value, member).map(|o| o.is_lt()),
+                CompareOp::Le => sql_compare(value, member).map(|o| o.is_le()),
+                CompareOp::Gt => sql_compare(value, member).map(|o| o.is_gt()),
+                CompareOp::Ge => sql_compare(value, member).map(|o| o.is_ge()),
+            }
         };
         match self.bound.as_ref().zip(number) {
             Some((bound, number)) => match by_contract(bound, number) {
@@ -1036,6 +1042,13 @@ impl QuantifiedMembers {
             Some(!decides)
         }
     }
+}
+
+/// Two numbers of which one is a NaN FLOAT
+fn is_nan_pair(a: &Value, b: &Value) -> bool {
+    let number = |v: &Value| matches!(v, Value::Integer(_) | Value::Float(_));
+    let nan = |v: &Value| matches!(v, Value::Float(f) if f.is_nan());
+    number(a) && number(b) && (nan(a) || nan(b))
 }
 
 /// Comparison operator for ALL/ANY subqueries

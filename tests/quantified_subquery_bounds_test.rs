@@ -342,21 +342,31 @@ fn test_a_nan_left_value_answers_alike_on_join_and_single_table() {
     ] {
         db.execute(sql, ()).unwrap();
     }
-    for predicate in [
-        "a.v > ANY (SELECT v FROM m)",
-        "a.v >= ALL (SELECT v FROM m)",
-        "a.v < ALL (SELECT v FROM m)",
-        "a.v <= ANY (SELECT v FROM m)",
-        "NOT (a.v < ALL (SELECT v FROM m))",
+    for (predicate, literal, passes) in [
+        ("a.v > ANY (SELECT v FROM m)", "a.v > 1.0", false),
+        ("a.v >= ALL (SELECT v FROM m)", "a.v >= 1.0", false),
+        ("a.v < ALL (SELECT v FROM m)", "a.v < 1.0", false),
+        ("a.v <= ANY (SELECT v FROM m)", "a.v <= 1.0", false),
+        ("a.v = ALL (SELECT v FROM m)", "a.v = 1.0", false),
+        ("a.v <> ANY (SELECT v FROM m)", "a.v <> 1.0", true),
+        ("NOT (a.v > ANY (SELECT v FROM m))", "NOT (a.v > 1.0)", true),
     ] {
-        assert_eq!(
-            rows(
-                &db,
-                &format!("SELECT a.id FROM a JOIN b ON a.id = b.id WHERE {predicate}")
-            ),
-            rows(&db, &format!("SELECT a.id FROM a WHERE {predicate}")),
-            "{predicate}: the join answers as the single table does"
-        );
+        let expected = if passes {
+            vec![vec!["Integer(1)".to_string()]]
+        } else {
+            vec![]
+        };
+        for sql in [
+            format!("SELECT a.id FROM a WHERE {predicate}"),
+            format!("SELECT a.id FROM a JOIN b ON a.id = b.id WHERE {predicate}"),
+            format!("SELECT a.id FROM a WHERE {literal}"),
+        ] {
+            assert_eq!(
+                rows(&db, &sql),
+                expected,
+                "{sql}: NaN passes only <>, as against the literal 1.0"
+            );
+        }
     }
 }
 
@@ -466,5 +476,64 @@ fn test_a_window_on_the_left_beside_another_window_is_computed() {
             "SELECT 10, 1, FALSE UNION ALL SELECT 20, 2, TRUE UNION ALL SELECT 30, 3, TRUE"
         ),
         "the row number above 1 passes"
+    );
+}
+
+#[test]
+fn test_sets_differing_in_letter_case_keep_two_aggregates() {
+    let db = Database::open("memory://quantified_aggregate_case").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v TEXT)",
+        "CREATE TABLE m1 (id INTEGER PRIMARY KEY, x TEXT)",
+        "CREATE TABLE m2 (id INTEGER PRIMARY KEY, x TEXT)",
+        "INSERT INTO t VALUES (1, 1, 'B')",
+        "INSERT INTO m1 VALUES (1, 'a'), (2, 'B')",
+        "INSERT INTO m2 VALUES (1, 'A'), (2, 'b')",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT SUM(CASE WHEN v > ANY (SELECT x FROM m1 ORDER BY id) THEN 1 ELSE 0 END), \
+             SUM(CASE WHEN v > ANY (SELECT x FROM m2 ORDER BY id) THEN 1 ELSE 0 END) FROM t"
+        ),
+        rows(&db, "SELECT 0, 1"),
+        "'B' is above neither 'a' nor 'B', and above 'A'"
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT g, SUM(CASE WHEN v > ANY (SELECT x FROM m1 ORDER BY id) THEN 1 ELSE 0 END) + 0, \
+             SUM(CASE WHEN v > ANY (SELECT x FROM m2 ORDER BY id) THEN 1 ELSE 0 END) + 0 FROM t GROUP BY g"
+        ),
+        rows(&db, "SELECT 1, 0, 1"),
+        "an aggregate inside an expression reads its own slot"
+    );
+    assert_eq!(
+        rows(&db, "SELECT MAX(v || 'a'), MAX(v || 'A') FROM t"),
+        rows(&db, "SELECT 'Ba', 'BA'"),
+        "a TEXT literal keeps its case in the aggregate identity"
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT g FROM t GROUP BY g HAVING MAX(v || 'a') = 'Ba' AND MAX(v || 'A') = 'BA'"
+        ),
+        rows(&db, "SELECT 1"),
+        "HAVING reads each aggregate from its own slot"
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT g, MAX(v || 'a') FROM t GROUP BY g ORDER BY MAX(v || 'A') DESC"
+        ),
+        rows(&db, "SELECT 1, 'Ba'"),
+        "ORDER BY computes the aggregate the SELECT list does not hold"
+    );
+    assert_eq!(
+        rows(&db, "SELECT g, COUNT(V), count(v) FROM t GROUP BY G"),
+        rows(&db, "SELECT 1, 1, 1"),
+        "identifiers still match in any case"
     );
 }

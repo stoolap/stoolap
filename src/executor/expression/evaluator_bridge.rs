@@ -40,6 +40,7 @@ static EMPTY_PARAMS: std::sync::LazyLock<CompactArc<ParamVec>> =
 static EMPTY_NAMED_PARAMS: std::sync::LazyLock<Arc<FxHashMap<String, Value>>> =
     std::sync::LazyLock::new(|| Arc::new(FxHashMap::default()));
 use crate::common::{CompactArc, StringMap};
+use crate::executor::utils::fold_expression_name;
 use lru::LruCache;
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHasher};
@@ -642,7 +643,7 @@ impl RowFilter {
     ) -> Result<Self> {
         let alias_map: StringMap<u16> = aliases
             .iter()
-            .map(|(name, idx)| (name.to_lowercase(), *idx as u16))
+            .map(|(name, idx)| (fold_expression_name(name), *idx as u16))
             .collect();
 
         let ctx = CompileContext::with_global_registry(columns).with_expression_aliases(alias_map);
@@ -1050,7 +1051,7 @@ impl ExpressionEval {
     ) -> Result<Self> {
         let alias_map: StringMap<u16> = aliases
             .iter()
-            .map(|(name, idx)| (name.to_lowercase(), *idx as u16))
+            .map(|(name, idx)| (fold_expression_name(name), *idx as u16))
             .collect();
 
         Self::compile_with_options(
@@ -1334,7 +1335,7 @@ impl MultiExpressionEval {
     ) -> Result<Self> {
         let alias_map: StringMap<u16> = aliases
             .iter()
-            .map(|(name, idx)| (name.to_lowercase(), *idx as u16))
+            .map(|(name, idx)| (fold_expression_name(name), *idx as u16))
             .collect();
 
         let ctx = CompileContext::with_global_registry(columns).with_expression_aliases(alias_map);
@@ -1668,7 +1669,7 @@ impl<'a> CompiledEvaluator<'a> {
     /// Add aggregate expression aliases for HAVING clause evaluation
     pub fn add_aggregate_aliases(&mut self, aliases: &[(String, usize)]) {
         for (expr_name, idx) in aliases {
-            let lower = expr_name.to_lowercase();
+            let lower = fold_expression_name(expr_name);
             self.expression_aliases.insert(lower, *idx as u16);
         }
         // Invalidate local cache since compilation context changed
@@ -1678,7 +1679,7 @@ impl<'a> CompiledEvaluator<'a> {
     /// Add expression aliases for HAVING clause with GROUP BY expressions
     pub fn add_expression_aliases(&mut self, aliases: &[(String, usize)]) {
         for (expr_str, idx) in aliases {
-            let lower = expr_str.to_lowercase();
+            let lower = fold_expression_name(expr_str);
             self.expression_aliases.insert(lower, *idx as u16);
         }
         // Invalidate local cache since compilation context changed

@@ -36,7 +36,7 @@ use super::program::{Program, ProgramBuilder};
 use super::vm::{ExecuteContext, ExprVM};
 use crate::core::predicate::PredicateSet;
 use crate::core::{DataType, Row, Value, ValueSet};
-use crate::executor::utils::{expression_to_string, string_to_datatype};
+use crate::executor::utils::{expression_to_string, fold_expression_name, string_to_datatype};
 use crate::functions::{global_registry, FunctionRegistry};
 use crate::parser::ast::*;
 use smallvec::SmallVec;
@@ -341,8 +341,17 @@ impl<'a> CompileContext<'a> {
         if self.expression_aliases.is_empty() {
             return None;
         }
-        let expr_str = expression_to_string(expr).to_lowercase();
-        self.expression_aliases.get(&expr_str).copied()
+        let expr_str = expression_to_string(expr);
+        // A literal's own case first, then a map keyed wholly lowercase
+        self.expression_aliases
+            .get(&fold_expression_name(&expr_str))
+            .or_else(|| {
+                expr_str
+                    .contains('\'')
+                    .then(|| self.expression_aliases.get(&expr_str.to_lowercase()))
+                    .flatten()
+            })
+            .copied()
     }
 }
 
