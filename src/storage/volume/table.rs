@@ -219,9 +219,11 @@ struct TopK {
     k: usize,
     col: usize,
     ascending: bool,
-    /// The first k rows, heaped once when the k-th arrives: rows arriving
-    /// worst first would each climb the whole heap
+    /// The first k rows, heaped only when a row better than their worst
+    /// arrives: rows that come best first never need the heap
     filling: Vec<Ranked>,
+    /// Where the worst of `filling` is
+    worst: usize,
     heap: std::collections::BinaryHeap<Ranked>,
 }
 
@@ -232,6 +234,7 @@ impl TopK {
             col,
             ascending,
             filling: Vec::with_capacity(k.saturating_add(1).min(4096)),
+            worst: 0,
             heap: std::collections::BinaryHeap::new(),
         }
     }
@@ -249,33 +252,49 @@ impl TopK {
             row,
             ascending: self.ascending,
         };
-        if self.heap.is_empty() {
+        if self.heap.is_empty() && self.filling.len() < self.k {
+            if self
+                .filling
+                .get(self.worst)
+                .is_none_or(|worst| candidate.cmp(worst) == std::cmp::Ordering::Greater)
+            {
+                self.worst = self.filling.len();
+            }
             self.filling.push(candidate);
-            if self.filling.len() == self.k {
-                self.heap = std::mem::take(&mut self.filling).into();
-            }
-        } else if let Some(worst) = self.heap.peek() {
-            if candidate.cmp(worst) == std::cmp::Ordering::Less {
-                self.heap.pop();
-                self.heap.push(candidate);
-            }
+            return;
         }
+        if self
+            .worst()
+            .is_none_or(|worst| candidate.cmp(worst) != std::cmp::Ordering::Less)
+        {
+            return;
+        }
+        if self.heap.is_empty() {
+            self.heap = std::mem::take(&mut self.filling).into();
+        }
+        self.heap.pop();
+        self.heap.push(candidate);
+    }
+
+    /// The worst of the k rows, once k are held
+    fn worst(&self) -> Option<&Ranked> {
+        if !self.heap.is_empty() {
+            return self.heap.peek();
+        }
+        if self.filling.len() < self.k {
+            return None;
+        }
+        self.filling.get(self.worst)
     }
 
     /// The key a row must beat once k rows are held
     fn worst_key(&self) -> Option<&Value> {
-        if self.heap.len() < self.k {
-            return None;
-        }
-        self.heap.peek().map(|r| &r.key)
+        self.worst().map(|r| &r.key)
     }
 
     /// True once k rows are held and no row bounded by `bound` can beat the worst
     fn cannot_improve(&self, bound: &Value) -> bool {
-        if self.heap.len() < self.k {
-            return false;
-        }
-        match self.heap.peek() {
+        match self.worst() {
             Some(worst) if self.ascending => bound.cmp(&worst.key) == std::cmp::Ordering::Greater,
             Some(worst) => bound.cmp(&worst.key) == std::cmp::Ordering::Less,
             None => false,
@@ -8991,6 +9010,103 @@ mod tests {
     use std::path::PathBuf;
 
     use super::super::manifest::SegmentMeta;
+
+    /// A top-k over `(key, row id)` offers, on column 0
+    fn top_k(k: usize, ascending: bool, offers: &[(i64, i64)]) -> TopK {
+        let mut keep = TopK::new(k, 0, ascending);
+        for &(key, row_id) in offers {
+            keep.offer(row_id, Row::from_values(vec![Value::Integer(key)]));
+        }
+        keep
+    }
+
+    /// The offers' row ids as the full sort orders them: key, then row id
+    fn best_first(ascending: bool, offers: &[(i64, i64)]) -> Vec<(i64, i64)> {
+        let mut sorted = offers.to_vec();
+        sorted.sort_unstable();
+        if !ascending {
+            sorted.reverse();
+        }
+        sorted
+    }
+
+    #[test]
+    fn a_top_k_fed_best_first_builds_no_heap() {
+        for ascending in [true, false] {
+            let offers: Vec<(i64, i64)> = (0..20).map(|i| (i / 3, i)).collect();
+            let offers = best_first(ascending, &offers);
+            let keep = top_k(5, ascending, &offers);
+            assert!(keep.heap.is_empty(), "ascending {ascending}");
+            let want: Vec<i64> = offers[..5].iter().map(|&(_, id)| id).collect();
+            let got: Vec<i64> = keep.into_rows(0).into_iter().map(|(id, _)| id).collect();
+            assert_eq!(got, want, "ascending {ascending}");
+        }
+    }
+
+    #[test]
+    fn a_better_row_after_k_builds_the_heap_once_and_replaces_the_worst() {
+        let mut keep = top_k(3, true, &[(10, 1), (20, 2), (30, 3), (40, 4)]);
+        assert!(keep.heap.is_empty());
+        assert_eq!(keep.worst_key(), Some(&Value::Integer(30)));
+        keep.offer(5, Row::from_values(vec![Value::Integer(15)]));
+        assert_eq!(keep.heap.len(), 3);
+        assert!(keep.filling.is_empty());
+        assert_eq!(keep.worst_key(), Some(&Value::Integer(20)));
+        let got: Vec<i64> = keep.into_rows(0).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(got, [1, 5, 2]);
+    }
+
+    #[test]
+    fn a_top_k_answers_as_the_full_sort_whatever_the_arrival_order() {
+        let mut seed = 11u64;
+        for case in 0..400 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let n = (seed >> 58) as usize;
+            let k = 1 + (seed >> 40) as usize % 12;
+            let ascending = seed & 1 == 0;
+            // Few distinct keys, so equal keys tie on the row id
+            let offers: Vec<(i64, i64)> = (0..n)
+                .map(|i| {
+                    let mix = seed.rotate_left(i as u32 * 7) ^ (i as u64).wrapping_mul(0x9e37);
+                    ((mix % 5) as i64, i as i64)
+                })
+                .collect();
+            let mut keep = TopK::new(k, 0, ascending);
+            for (seen, &(key, row_id)) in offers.iter().enumerate() {
+                keep.offer(row_id, Row::from_values(vec![Value::Integer(key)]));
+                let held = best_first(ascending, &offers[..=seen]);
+                let worst = (held.len() >= k).then(|| Value::Integer(held[k - 1].0));
+                assert_eq!(keep.worst_key(), worst.as_ref(), "case {case} after {seen}");
+                for bound in -1..6 {
+                    let bound = Value::Integer(bound);
+                    let want = worst.as_ref().is_some_and(|worst| {
+                        let order = bound.cmp(worst);
+                        if ascending {
+                            order == std::cmp::Ordering::Greater
+                        } else {
+                            order == std::cmp::Ordering::Less
+                        }
+                    });
+                    assert_eq!(keep.cannot_improve(&bound), want, "case {case}");
+                }
+            }
+            let offset = (seed >> 20) as usize % (k + 1);
+            let want: Vec<i64> = best_first(ascending, &offers)
+                .into_iter()
+                .take(k)
+                .skip(offset)
+                .map(|(_, id)| id)
+                .collect();
+            let got: Vec<i64> = keep
+                .into_rows(offset)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            assert_eq!(got, want, "case {case}: k {k}, ascending {ascending}");
+        }
+    }
 
     /// Helper: create a SegmentManager with one segment from given rows.
     fn make_segment_mgr(schema: &Schema, rows: &[(i64, Row)]) -> Arc<SegmentManager> {
