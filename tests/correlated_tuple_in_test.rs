@@ -80,3 +80,27 @@ fn test_an_uncorrelated_tuple_in_keeps_its_answer() {
         vec![1, 2]
     );
 }
+
+#[test]
+fn test_a_correlated_tuple_in_over_no_rows() {
+    let db = setup("correlated_tuple_in_empty");
+    db.execute("INSERT INTO t VALUES (4, NULL, 10)", ())
+        .unwrap();
+    let inner = "SELECT x, y FROM u WHERE u.k = t.id + 99";
+    assert_eq!(
+        ids(
+            &db,
+            &format!("SELECT id FROM t WHERE (a, b) IN ({inner}) ORDER BY id")
+        ),
+        Vec::<i64>::new(),
+        "IN over no rows is FALSE"
+    );
+    assert_eq!(
+        ids(
+            &db,
+            &format!("SELECT id FROM t WHERE (a, b) NOT IN ({inner}) ORDER BY id")
+        ),
+        vec![1, 2, 3, 4],
+        "NOT IN over no rows is TRUE, a NULL in the outer tuple included"
+    );
+}

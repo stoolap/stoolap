@@ -1711,6 +1711,14 @@ impl Executor {
         ctx: &ExecutionContext,
     ) -> Result<Expression> {
         let rows = self.execute_in_subquery_rows(subquery, ctx)?;
+        // IN over no rows is FALSE and NOT IN TRUE, whatever the left tuple holds
+        if rows.is_empty() {
+            let value = in_expr.not;
+            return Ok(Expression::BooleanLiteral(BooleanLiteral {
+                token: dummy_token(if value { "TRUE" } else { "FALSE" }, TokenType::Keyword),
+                value,
+            }));
+        }
         let paren_token = dummy_token("(", TokenType::Punctuator);
         let expressions = rows
             .iter()
