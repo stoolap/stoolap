@@ -285,6 +285,7 @@ impl Program {
                 | Op::TimestampDiff
                 | Op::TimestampAddDays
                 | Op::TimestampSubDays
+                | Op::TimestampAddScaledInterval(_, _)
                 | Op::VectorDistanceL2
                 | Op::VectorDistanceCosine
                 | Op::VectorDistanceIP => -1,
@@ -307,6 +308,7 @@ impl Program {
                 | Op::NotInSet(_)
                 | Op::Cast(_)
                 | Op::TruncateToDate
+                | Op::ScaleInterval(_)
                 | Op::ExecScalarSubquery(_)
                 | Op::ExecExists(_)
                 | Op::ExecInSubquery(_)
