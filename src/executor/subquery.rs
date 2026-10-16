@@ -1223,7 +1223,7 @@ impl Executor {
         // A statement inside an explicit transaction carries its id
         if ctx.transaction_id().is_none() {
             if let Some(snapshot) = ctx.statement_snapshot() {
-                return Ok(snapshot.with_probe_table(name, f)?.flatten());
+                return Self::probe_through_snapshot(snapshot, ctx, name, f);
             }
         }
         let active = self.active_transaction.lock().unwrap();
@@ -1234,7 +1234,7 @@ impl Executor {
             None => {
                 drop(active);
                 return match ctx.statement_snapshot() {
-                    Some(snapshot) => Ok(snapshot.with_probe_table(name, f)?.flatten()),
+                    Some(snapshot) => Self::probe_through_snapshot(snapshot, ctx, name, f),
                     None => Ok(None),
                 };
             }
@@ -1245,6 +1245,24 @@ impl Executor {
             Err(Error::TableNotFound(_)) => Ok(None),
             table => f(&*table?),
         }
+    }
+
+    /// [`Self::with_correlated_probe_table`] through `snapshot`. The tables
+    /// it keeps for the probes read through its own view, so a view the
+    /// statement took over a snapshot without one opens its table for itself
+    fn probe_through_snapshot<T>(
+        snapshot: &super::context::StatementSnapshot,
+        ctx: &ExecutionContext,
+        name: &str,
+        f: impl FnOnce(&dyn Table) -> Result<Option<T>>,
+    ) -> Result<Option<T>> {
+        if snapshot.view().is_none() && ctx.statement_view().is_some() {
+            return match snapshot.statement_table_at(name, ctx.statement_view()) {
+                Err(Error::TableNotFound(_)) => Ok(None),
+                table => f(&*table?),
+            };
+        }
+        Ok(snapshot.with_probe_table(name, f)?.flatten())
     }
 
     /// Visits the inner rows whose correlation column holds `key`, found by

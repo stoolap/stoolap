@@ -66,27 +66,48 @@ fn ids(db: &Database, sql: &str) -> Vec<i64> {
         .collect()
 }
 
-/// The reference is the full sort with the same tie-break the top-k uses
+/// The reference is the full sort. Rows that tie on `t` may come in any
+/// order, so the answer must hold distinct matching rows whose times are
+/// the reference window's, in its order
 fn check(db: &Database, where_clause: &str, desc: bool, limit: usize, offset: usize) {
     let dir = if desc { "DESC" } else { "ASC" };
-    let reference = ids(
-        db,
-        &format!("SELECT id FROM c {where_clause} ORDER BY t {dir}, id {dir}"),
-    );
-    let expected: Vec<i64> = reference.iter().skip(offset).take(limit).copied().collect();
+    let reference: Vec<(i64, String)> = db
+        .query(
+            &format!("SELECT id, t FROM c {where_clause} ORDER BY t {dir}, id {dir}"),
+            (),
+        )
+        .unwrap()
+        .map(|r| {
+            let r = r.unwrap();
+            (r.get::<i64>(0).unwrap(), format!("{:?}", r.get_value(1)))
+        })
+        .collect();
+    let time_of: std::collections::HashMap<i64, &str> =
+        reference.iter().map(|(id, t)| (*id, t.as_str())).collect();
+    let expected: Vec<&str> = reference
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(|(_, t)| t.as_str())
+        .collect();
     let offset_clause = if offset > 0 {
         format!(" OFFSET {offset}")
     } else {
         String::new()
     };
-    let actual = ids(
-        db,
-        &format!("SELECT id FROM c {where_clause} ORDER BY t {dir} LIMIT {limit}{offset_clause}"),
-    );
-    assert_eq!(
-        actual, expected,
-        "{where_clause} ORDER BY t {dir} LIMIT {limit}{offset_clause}"
-    );
+    let query = format!("{where_clause} ORDER BY t {dir} LIMIT {limit}{offset_clause}");
+    let actual = ids(db, &format!("SELECT id FROM c {query}"));
+    let distinct: std::collections::HashSet<i64> = actual.iter().copied().collect();
+    assert_eq!(distinct.len(), actual.len(), "{query}: a row came twice");
+    let times: Vec<&str> = actual
+        .iter()
+        .map(|id| {
+            *time_of
+                .get(id)
+                .unwrap_or_else(|| panic!("{query}: row {id} does not match"))
+        })
+        .collect();
+    assert_eq!(times, expected, "{query}: the times of the rows");
 }
 
 fn check_all(db: &Database) {

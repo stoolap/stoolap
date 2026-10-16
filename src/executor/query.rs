@@ -4961,6 +4961,7 @@ impl Executor {
                     // Get inner table for schema and row fetching
                     let Some(inner_table) = self.index_join_inner(
                         &snapshot,
+                        ctx,
                         &table_name,
                         &lookup_strategy,
                         &inner_col,
@@ -5141,6 +5142,7 @@ impl Executor {
                                 Some(table) => table,
                                 None => match self.index_join_inner(
                                     &snapshot,
+                                    ctx,
                                     &table_name,
                                     &lookup_strategy,
                                     &inner_col,
@@ -7634,18 +7636,18 @@ impl Executor {
 
     /// The inner table of a join: from the explicit transaction when one is
     /// active, so the join sees what the transaction changed, otherwise from
-    /// the statement snapshot the outer side reads through
+    /// the statement snapshot the outer side reads through; through `view`,
+    /// the statement's
     pub(super) fn join_table(
         &self,
         snapshot: &StatementSnapshot,
         name: &str,
+        view: Option<&crate::storage::mvcc::registry::StatementView>,
     ) -> Result<Box<dyn crate::storage::traits::Table>> {
         if let Some(active) = self.active_transaction.lock().unwrap().as_ref() {
-            return active
-                .transaction
-                .get_statement_table_at(name, snapshot.view());
+            return active.transaction.get_statement_table_at(name, view);
         }
-        snapshot.statement_table(name)
+        snapshot.statement_table_at(name, view)
     }
 
     /// The inner table of an index join for one pass: a later pass reads it
@@ -7654,12 +7656,13 @@ impl Executor {
     fn index_join_inner(
         &self,
         snapshot: &StatementSnapshot,
+        ctx: &ExecutionContext,
         name: &str,
         strategy: &IndexLookupStrategy,
         inner_key_col: &str,
         first: Option<LayoutToken>,
     ) -> Result<Option<Box<dyn crate::storage::traits::Table>>> {
-        let table = self.join_table(snapshot, name)?;
+        let table = self.join_table(snapshot, name, ctx.statement_view())?;
         if first.is_some_and(|token| table.layout_token() != token) {
             return Err(Error::SchemaChanged {
                 table: name.to_string(),
@@ -7877,6 +7880,7 @@ impl Executor {
         };
         let Some(inner_table) = self.index_join_inner(
             &snapshot,
+            ctx,
             &table_name,
             &lookup_strategy,
             &inner_key_col,
@@ -8061,6 +8065,7 @@ impl Executor {
                 Some(table) => table,
                 None => match self.index_join_inner(
                     &snapshot,
+                    ctx,
                     &table_name,
                     &lookup_strategy,
                     &inner_key_col,

@@ -306,3 +306,60 @@ fn a_dml_under_a_snapshot_view_selects_its_target_from_the_newest_state() {
         .collect();
     assert_eq!(rows, [(1, 11), (2, 21)], "the target is the newest rows");
 }
+
+#[test]
+fn the_inner_reads_of_a_read_committed_snapshot_without_a_view_use_the_statements() {
+    let cases: [(&str, &str, &str, &'static str); 4] = [
+        (
+            "probe",
+            "INSERT INTO w VALUES (1, 1)",
+            "SELECT id FROM s WHERE EXISTS (SELECT 1 FROM w WHERE w.x = s.id) ORDER BY id LIMIT 10",
+            "DELETE FROM w WHERE id = 1",
+        ),
+        (
+            "anti",
+            "INSERT INTO w VALUES (2, 0)",
+            "SELECT id FROM s WHERE NOT EXISTS (SELECT 1 FROM w WHERE w.id = s.id)",
+            "INSERT INTO w VALUES (1, 0)",
+        ),
+        (
+            "join",
+            "INSERT INTO w VALUES (1, 5)",
+            "SELECT s.id FROM s JOIN w ON w.id = s.id",
+            "DELETE FROM w WHERE id = 1",
+        ),
+        (
+            "cte",
+            "INSERT INTO w VALUES (1, 5)",
+            "WITH c AS (SELECT id FROM s) SELECT c.id FROM c JOIN w ON w.id = c.id",
+            "DELETE FROM w WHERE id = 1",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, fill, sql, change) in cases {
+        let (db, executor, ctx) = snapshot_context(&format!("inner_{name}"), false);
+        db.execute("CREATE TABLE w (id INTEGER PRIMARY KEY, x INTEGER)", ())
+            .unwrap();
+        db.execute("CREATE INDEX w_x ON w (x)", ()).unwrap();
+        db.execute(fill, ()).unwrap();
+        let committed = Rc::new(Cell::new(false));
+        let (other, flag) = (db.clone(), Rc::clone(&committed));
+        let commit = move || {
+            other.execute(change, ()).unwrap();
+            flag.set(true);
+        };
+        // The probe commits once it reads the inner table, the others once
+        // the outer scan has opened its table
+        if name == "probe" {
+            stoolap::test_failpoints::before_correlated_fetch(commit);
+        } else {
+            stoolap::test_failpoints::after_select_table_opened(commit);
+        }
+        let seen = first_column(&executor, sql, &ctx);
+        assert!(committed.get(), "{name}: the commit did not land inside");
+        if seen.as_deref() != Ok(&[1]) {
+            wrong.push(format!("{name}: {seen:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

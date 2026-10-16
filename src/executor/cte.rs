@@ -2505,10 +2505,11 @@ impl Executor {
                 ctx.statement_view(),
             )?,
         };
-        let table: Box<dyn Table> = match self.join_table(&snapshot, &table_name) {
-            Ok(t) => t,
-            Err(_) => return Ok(None),
-        };
+        let table: Box<dyn Table> =
+            match self.join_table(&snapshot, &table_name, ctx.statement_view()) {
+                Ok(t) => t,
+                Err(_) => return Ok(None),
+            };
         let schema = table.schema();
 
         // Check if table column is the PRIMARY KEY (direct row_id lookup)
