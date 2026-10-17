@@ -146,7 +146,7 @@ fn predicates_keep_their_rules() {
     let nan = Value::Float(f64::NAN);
     assert_eq!(
         rows(&db, "SELECT COUNT(*) FROM t WHERE f = $1", vec![nan]),
-        ["0"]
+        ["3"]
     );
 }
 

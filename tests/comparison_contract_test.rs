@@ -208,14 +208,19 @@ fn test_in_and_between_follow_the_comparison() {
         "the probe as a parameter"
     );
     let nan = Value::Float(f64::NAN);
-    for (sql, params) in [
-        ("SELECT $1 NOT IN ('1')", vec![nan.clone()]),
-        ("SELECT $1 IN ('1', '2')", vec![nan.clone()]),
-        ("SELECT $1 NOT IN ($2)", vec![nan.clone(), Value::text("1")]),
-        ("SELECT '1' IN (SELECT $1)", vec![nan.clone()]),
-        ("SELECT '1' NOT IN ($1)", vec![nan.clone()]),
+    for (sql, params, expected) in [
+        ("SELECT $1 NOT IN ('1')", vec![nan.clone()], T),
+        ("SELECT $1 IN ('1', '2')", vec![nan.clone()], F),
+        (
+            "SELECT $1 NOT IN ($2)",
+            vec![nan.clone(), Value::text("1")],
+            T,
+        ),
+        ("SELECT '1' IN (SELECT $1)", vec![nan.clone()], F),
+        ("SELECT '1' NOT IN ($1)", vec![nan.clone()], T),
+        ("SELECT $1 > '1'", vec![nan.clone()], T),
     ] {
-        assert_eq!(truth(&db, sql, params), U, "{sql} with NaN");
+        assert_eq!(truth(&db, sql, params), expected, "{sql} with NaN");
     }
 }
 

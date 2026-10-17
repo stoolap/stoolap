@@ -98,40 +98,44 @@ fn a_nan_member_at_any_position_keeps_the_other_members() {
         (
             "SELECT id FROM t WHERE f IN ($1, $2)",
             vec![nan.clone(), Value::Float(1.5)],
-            vec![4],
+            vec![3, 4],
         ),
         (
             "SELECT id FROM t WHERE f IN ($1, $2)",
             vec![Value::Float(5.0), nan.clone()],
-            vec![5],
+            vec![3, 5],
         ),
         (
             "SELECT id FROM t WHERE f IN ($1, $2, $3)",
             vec![Value::Float(1.5), nan.clone(), Value::Float(5.0)],
-            vec![4, 5],
+            vec![3, 4, 5],
         ),
         (
             "SELECT id FROM t WHERE f IN ($1, $2)",
             vec![Value::Float(f64::from_bits(NEG_NAN)), Value::Float(0.0)],
-            vec![1, 2],
+            vec![1, 2, 3],
         ),
-        ("SELECT id FROM t WHERE f IN (1.5, $1)", vec![nan], vec![4]),
+        (
+            "SELECT id FROM t WHERE f IN (1.5, $1)",
+            vec![nan],
+            vec![3, 4],
+        ),
     ]);
 }
 
 #[test]
-fn a_list_of_only_nan_matches_nothing() {
+fn a_list_of_only_nan_matches_the_nan_rows() {
     let nan = Value::Float(f64::NAN);
     check(&[
         (
             "SELECT id FROM t WHERE f IN ($1)",
             vec![nan.clone()],
-            vec![],
+            vec![3],
         ),
         (
             "SELECT id FROM t WHERE f IN ($1, $2)",
             vec![nan, Value::Float(f64::from_bits(NEG_NAN))],
-            vec![],
+            vec![3],
         ),
     ]);
 }
@@ -144,12 +148,12 @@ fn a_nan_member_beside_a_null_member() {
         (
             "SELECT id FROM t WHERE f IN ($1, $2, $3)",
             vec![nan.clone(), null.clone(), Value::Float(1.5)],
-            vec![4],
+            vec![3, 4],
         ),
         (
             "SELECT id FROM t WHERE f IN ($1, $2)",
             vec![null, nan],
-            vec![],
+            vec![3],
         ),
     ]);
 }
@@ -161,7 +165,7 @@ fn not_in_with_a_nan_member() {
         (
             "SELECT id FROM t WHERE f NOT IN ($1, $2)",
             vec![nan.clone(), Value::Float(1.5)],
-            vec![1, 2, 3, 5, 6],
+            vec![1, 2, 5, 6],
         ),
         (
             "SELECT id FROM t WHERE f NOT IN ($1, $2)",

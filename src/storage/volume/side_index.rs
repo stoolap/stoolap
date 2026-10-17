@@ -320,8 +320,8 @@ fn successor_from(bytes: &mut Vec<u8>, from: usize) -> bool {
 /// The keys that start with `prefix` and whose next component, of `domain`,
 /// meets every comparison the keys can answer, built on the prefix's own
 /// buffer. The prefix back when no comparison can be answered, an empty
-/// range when they leave no value. NULL and NaN components fall outside
-/// every range, as no comparison holds for them
+/// range when they leave no value. NULL components fall outside every
+/// range; a NaN one is inside every FLOAT range open above
 pub fn component_range<'v>(
     domain: Domain,
     mut prefix: Vec<u8>,
@@ -384,7 +384,11 @@ pub fn component_range<'v>(
             return Ok(ByteRange::empty());
         }
         lower = Some((Bound::Key(low), false));
-        upper = Some((Bound::Key(high), true));
+        upper = if domain == Domain::Float && high == i64::MAX {
+            Some((Bound::Nan, true))
+        } else {
+            Some((Bound::Key(high), true))
+        };
     }
     let push = |out: &mut Vec<u8>, bound: Option<(Bound<'_>, bool)>, empty: u8| -> bool {
         match bound {
@@ -398,6 +402,10 @@ pub fn component_range<'v>(
             }
             Some((Bound::Key(key), past)) => {
                 push_key(out, domain, key);
+                past
+            }
+            Some((Bound::Nan, past)) => {
+                out.push(TAG_NAN);
                 past
             }
         }
@@ -422,6 +430,8 @@ pub fn component_range<'v>(
 enum Bound<'v> {
     Text(&'v [u8]),
     Key(i64),
+    /// A FLOAT NaN, above every number
+    Nan,
 }
 
 /// A range's end, if bounded: the bound, and whether the end lies just
@@ -826,5 +836,28 @@ mod tests {
             resolve(Domain::Boolean, Operator::Eq, &Value::Boolean(true)),
             Resolved::Key(1)
         );
+    }
+
+    #[test]
+    fn a_float_range_open_above_holds_the_nan_components() {
+        let key = |f: f64| {
+            let mut out = Vec::new();
+            push_f64(&mut out, f);
+            out
+        };
+        let inside = |range: &ByteRange, k: &[u8]| {
+            range.lower() <= k && range.upper().is_none_or(|upper| k < upper)
+        };
+        for (op, bound, nan_inside) in [
+            (Operator::Gt, 5.0, true),
+            (Operator::Gte, f64::INFINITY, true),
+            (Operator::Lt, 5.0, false),
+            (Operator::Lte, f64::INFINITY, false),
+        ] {
+            let value = Value::Float(bound);
+            let range = component_range(Domain::Float, Vec::new(), [(op, &value)].into_iter())
+                .unwrap_or_else(|_| panic!("{op:?} {bound} has a range"));
+            assert_eq!(inside(&range, &key(f64::NAN)), nan_inside, "{op:?} {bound}");
+        }
     }
 }

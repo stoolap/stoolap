@@ -253,7 +253,7 @@ impl InListExpr {
             if v.is_null() {
                 continue;
             }
-            // NaN sorts last in compare but fails every `<=`, so it bounds nothing
+            // Zone maps leave NaN out of their bounds, so a NaN member bounds nothing
             if matches!(v, Value::Float(x) if x.is_nan()) {
                 min_val = None;
                 max_val = None;
@@ -322,7 +322,7 @@ impl InListExpr {
         for v in &self.values {
             match v {
                 Value::Float(f) => {
-                    if val == *f {
+                    if crate::core::value::f64_eq(val, *f) {
                         return true;
                     }
                 }
@@ -333,7 +333,7 @@ impl InListExpr {
                 }
                 _ => {
                     if let Some(list_val) = v.as_float64() {
-                        if val == list_val {
+                        if crate::core::value::f64_eq(val, list_val) {
                             return true;
                         }
                     }

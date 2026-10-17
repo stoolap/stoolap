@@ -666,13 +666,14 @@ impl VolumeScanner {
                             _ => continue,
                         };
                         let zm = &rg.zone_maps[col_idx];
+                        let nans = self.volume.meta.nan_count(col_idx) != Some(0);
                         let dominated = match op {
-                            crate::core::Operator::Eq => !zm.may_contain_eq(value),
+                            crate::core::Operator::Eq => !zm.may_contain_eq(value, nans),
                             crate::core::Operator::Gt | crate::core::Operator::Gte => {
-                                !zm.may_contain_gte(value)
+                                !zm.may_contain_gte(value, nans)
                             }
                             crate::core::Operator::Lt | crate::core::Operator::Lte => {
-                                !zm.may_contain_lte(value)
+                                !zm.may_contain_lte(value, nans)
                             }
                             _ => false,
                         };
@@ -1012,14 +1013,15 @@ impl VolumeScanner {
                     }
                 }
                 TypedTarget::Float64(target) => {
+                    use crate::core::value::{f64_eq, f64_ge, f64_gt, f64_le, f64_lt, f64_ne};
                     let val = col.get_f64(local);
                     match pred.op {
-                        crate::core::Operator::Eq => val == *target,
-                        crate::core::Operator::Ne => val != *target,
-                        crate::core::Operator::Gt => val > *target,
-                        crate::core::Operator::Gte => val >= *target,
-                        crate::core::Operator::Lt => val < *target,
-                        crate::core::Operator::Lte => val <= *target,
+                        crate::core::Operator::Eq => f64_eq(val, *target),
+                        crate::core::Operator::Ne => f64_ne(val, *target),
+                        crate::core::Operator::Gt => f64_gt(val, *target),
+                        crate::core::Operator::Gte => f64_ge(val, *target),
+                        crate::core::Operator::Lt => f64_lt(val, *target),
+                        crate::core::Operator::Lte => f64_le(val, *target),
                         _ => true,
                     }
                 }

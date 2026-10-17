@@ -19,7 +19,7 @@
 
 use std::cmp::Ordering;
 
-use super::value::{cmp_i64_f64, Value};
+use super::value::{compare_floats, total_cmp_i64_f64, Value};
 use super::ValueSet;
 use crate::common::CompactArc;
 
@@ -81,9 +81,9 @@ fn is_number(value: &Value) -> bool {
 fn compare_numbers(a: &Value, b: &Value) -> Option<Ordering> {
     match (a, b) {
         (Value::Integer(x), Value::Integer(y)) => Some(x.cmp(y)),
-        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y),
-        (Value::Integer(i), Value::Float(f)) => cmp_i64_f64(*i, *f),
-        (Value::Float(f), Value::Integer(i)) => cmp_i64_f64(*i, *f).map(Ordering::reverse),
+        (Value::Float(x), Value::Float(y)) => Some(compare_floats(*x, *y)),
+        (Value::Integer(i), Value::Float(f)) => Some(total_cmp_i64_f64(*i, *f)),
+        (Value::Float(f), Value::Integer(i)) => Some(total_cmp_i64_f64(*i, *f).reverse()),
         _ => None,
     }
 }
@@ -151,8 +151,6 @@ pub struct PredicateSet {
     has_non_text: bool,
     /// A TEXT member that is not a number: UNKNOWN against any number
     has_unreadable_text: bool,
-    /// A FLOAT member that is NaN: UNKNOWN against any TEXT read as a number
-    has_nan: bool,
 }
 
 impl PredicateSet {
@@ -161,14 +159,9 @@ impl PredicateSet {
         let mut has_numbers = false;
         let mut has_non_text = false;
         let mut has_unreadable_text = false;
-        let mut has_nan = false;
         for member in members.iter() {
             match member {
-                Value::Integer(_) => has_numbers = true,
-                Value::Float(f) => {
-                    has_numbers = true;
-                    has_nan |= f.is_nan();
-                }
+                Value::Integer(_) | Value::Float(_) => has_numbers = true,
                 Value::Text(text) => match parse_sql_number(text) {
                     Some(number) => {
                         numbers_in_text.insert(number);
@@ -186,7 +179,6 @@ impl PredicateSet {
             has_numbers,
             has_non_text,
             has_unreadable_text,
-            has_nan,
         }
     }
 
@@ -241,12 +233,11 @@ impl PredicateSet {
                 if self.numbers_in_text.contains(probe) {
                     return Some(true);
                 }
-                let nan = matches!(probe, Value::Float(f) if f.is_nan());
-                unknown |= self.has_unreadable_text || (nan && !self.numbers_in_text.is_empty());
+                unknown |= self.has_unreadable_text;
             }
             Value::Text(text) if self.has_numbers => match parse_sql_number(text) {
                 Some(number) if self.members.contains(&number) => return Some(true),
-                Some(_) => unknown |= self.has_nan,
+                Some(_) => {}
                 None => unknown = true,
             },
             _ => {}

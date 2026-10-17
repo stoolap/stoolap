@@ -1761,7 +1761,7 @@ impl SegmentedTable {
             .iter()
             .map(|&(_, op, value)| {
                 if op == crate::core::Operator::Eq {
-                    Some(super::column::ColumnBloomFilter::hash_value_static(value))
+                    super::column::ColumnBloomFilter::probe_hash(value)
                 } else {
                     None
                 }
@@ -2066,6 +2066,24 @@ impl SegmentedTable {
         (equal > 0).then(|| (ByteRange::starting_with(prefix), Capability::Prefix))
     }
 
+    /// Whether the volume may hold a NaN under the FLOAT key `def` orders:
+    /// the entry keeps no NaN row, and NaN meets every range open above
+    fn may_hold_unkeyed_nan(cs: &super::manifest::ColdSegment, def: &SideIndexDef) -> bool {
+        let Some(leading) = def.leading().filter(|c| c.domain == Domain::Float) else {
+            return false;
+        };
+        let column = leading.column as usize;
+        let physical = if cs.mapping.is_identity {
+            Some(column)
+        } else {
+            match cs.mapping.sources.get(column) {
+                Some(super::writer::ColSource::Volume(v)) => Some(*v),
+                _ => None,
+            }
+        };
+        physical.is_none_or(|p| cs.volume.meta.nan_count(p) != Some(0))
+    }
+
     /// Whether a volume's side file is asked for `keys` under `def`,
     /// decided before any page is read: the file must hold the index's
     /// entry over the volume's column, the directory must not rule the
@@ -2087,6 +2105,10 @@ impl SegmentedTable {
             READS.count(&READS.ineligible, 1);
             return Ok(SideAdmission::Scan);
         };
+        if matches!(keys, KeyRange::I64(_, i64::MAX)) && Self::may_hold_unkeyed_nan(cs, def) {
+            READS.count(&READS.ineligible, 1);
+            return Ok(SideAdmission::Scan);
+        }
         let identity = def.identity;
         let rows = cs.volume.meta.row_count as u64;
         let estimate = match keys {
@@ -2324,14 +2346,14 @@ impl SegmentedTable {
             }
         };
         // The bloom filter hashes a value's own bits and type: the key it
-        // asks for must be stored exactly so, not as -0.0 for 0.0 or as an
-        // INTEGER for a FLOAT
+        // asks for must be stored exactly so, not as -0.0 for 0.0, as another
+        // NaN or as an INTEGER for a FLOAT
         let stored_as_asked = match (def.leading().map(|c| c.domain), key) {
             (Some(Domain::Integer), Value::Integer(_))
             | (Some(Domain::Timestamp), Value::Timestamp(_))
             | (Some(Domain::Text), Value::Text(_))
             | (Some(Domain::Boolean), Value::Boolean(_)) => true,
-            (Some(Domain::Float), Value::Float(f)) => *f != 0.0,
+            (Some(Domain::Float), Value::Float(f)) => *f != 0.0 && !f.is_nan(),
             _ => false,
         };
         let bloom =
@@ -2448,16 +2470,17 @@ impl SegmentedTable {
         for (comp_idx, &(col_name, op, value)) in comparisons.iter().enumerate() {
             if let Some(col_idx) = mapping.volume_column(vol, col_name) {
                 let zm = &vol.meta.zone_maps[col_idx];
+                let nans = vol.meta.nan_count(col_idx) != Some(0);
                 let dominated =
                     match op {
                         crate::core::Operator::Gt | crate::core::Operator::Gte => {
-                            !zm.may_contain_gte(value)
+                            !zm.may_contain_gte(value, nans)
                         }
                         crate::core::Operator::Lt | crate::core::Operator::Lte => {
-                            !zm.may_contain_lte(value)
+                            !zm.may_contain_lte(value, nans)
                         }
                         crate::core::Operator::Eq => {
-                            !zm.may_contain_eq(value)
+                            !zm.may_contain_eq(value, nans)
                                 || (col_idx < vol.meta.bloom_filters.len()
                                     && bloom_hashes.get(comp_idx).and_then(|h| *h).is_some_and(
                                         |h| !vol.meta.bloom_filters[col_idx].might_contain_hash(h),
@@ -6033,7 +6056,10 @@ impl Table for SegmentedTable {
                     let may_hold = if wants_null {
                         zone.null_count > 0
                     } else {
-                        zone.may_contain_eq(partition_value)
+                        zone.may_contain_eq(
+                            partition_value,
+                            phys_col.and_then(|pc| vol.meta.nan_count(pc)) != Some(0),
+                        )
                     };
                     if !may_hold {
                         continue;
@@ -7942,13 +7968,14 @@ impl Table for SegmentedTable {
                         if pp.phys_col < vol.meta.zone_maps.len() {
                             let zm = &vol.meta.zone_maps[pp.phys_col];
                             let val_for_zm = zm_probe_value(&pp.target, pp.is_timestamp);
+                            let nans = vol.meta.nan_count(pp.phys_col) != Some(0);
                             let can_match = match pp.op {
-                                crate::core::Operator::Eq => zm.may_contain_eq(&val_for_zm),
+                                crate::core::Operator::Eq => zm.may_contain_eq(&val_for_zm, nans),
                                 crate::core::Operator::Gt | crate::core::Operator::Gte => {
-                                    zm.may_contain_gte(&val_for_zm)
+                                    zm.may_contain_gte(&val_for_zm, nans)
                                 }
                                 crate::core::Operator::Lt | crate::core::Operator::Lte => {
-                                    zm.may_contain_lte(&val_for_zm)
+                                    zm.may_contain_lte(&val_for_zm, nans)
                                 }
                                 _ => true,
                             };
@@ -7970,15 +7997,16 @@ impl Table for SegmentedTable {
                                     }
                                     let zm = &rg.zone_maps[pp.phys_col];
                                     let val_for_zm = zm_probe_value(&pp.target, pp.is_timestamp);
+                                    let nans = vol.meta.nan_count(pp.phys_col) != Some(0);
                                     let dominated = match pp.op {
                                         crate::core::Operator::Eq => {
-                                            !zm.may_contain_eq(&val_for_zm)
+                                            !zm.may_contain_eq(&val_for_zm, nans)
                                         }
                                         crate::core::Operator::Gt | crate::core::Operator::Gte => {
-                                            !zm.may_contain_gte(&val_for_zm)
+                                            !zm.may_contain_gte(&val_for_zm, nans)
                                         }
                                         crate::core::Operator::Lt | crate::core::Operator::Lte => {
-                                            !zm.may_contain_lte(&val_for_zm)
+                                            !zm.may_contain_lte(&val_for_zm, nans)
                                         }
                                         _ => false,
                                     };
@@ -9092,13 +9120,14 @@ fn compare_i64(lhs: i64, rhs: i64, op: crate::core::Operator) -> bool {
 /// Compare two f64 values using the given operator.
 #[inline(always)]
 fn compare_f64(lhs: f64, rhs: f64, op: crate::core::Operator) -> bool {
+    use crate::core::value::{f64_eq, f64_ge, f64_gt, f64_le, f64_lt, f64_ne};
     match op {
-        crate::core::Operator::Eq => lhs == rhs,
-        crate::core::Operator::Ne => lhs != rhs,
-        crate::core::Operator::Gt => lhs > rhs,
-        crate::core::Operator::Gte => lhs >= rhs,
-        crate::core::Operator::Lt => lhs < rhs,
-        crate::core::Operator::Lte => lhs <= rhs,
+        crate::core::Operator::Eq => f64_eq(lhs, rhs),
+        crate::core::Operator::Ne => f64_ne(lhs, rhs),
+        crate::core::Operator::Gt => f64_gt(lhs, rhs),
+        crate::core::Operator::Gte => f64_ge(lhs, rhs),
+        crate::core::Operator::Lt => f64_lt(lhs, rhs),
+        crate::core::Operator::Lte => f64_le(lhs, rhs),
         _ => false,
     }
 }

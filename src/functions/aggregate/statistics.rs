@@ -434,7 +434,7 @@ impl AggregateFunction for MedianFunction {
         }
 
         let mut sorted = self.values.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.sort_by(|a, b| crate::core::value::compare_floats(*a, *b));
 
         let n = sorted.len();
         let median = if n.is_multiple_of(2) {

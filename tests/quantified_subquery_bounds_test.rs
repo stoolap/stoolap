@@ -343,13 +343,17 @@ fn test_a_nan_left_value_answers_alike_on_join_and_single_table() {
         db.execute(sql, ()).unwrap();
     }
     for (predicate, literal, passes) in [
-        ("a.v > ANY (SELECT v FROM m)", "a.v > 1.0", false),
-        ("a.v >= ALL (SELECT v FROM m)", "a.v >= 1.0", false),
+        ("a.v > ANY (SELECT v FROM m)", "a.v > 1.0", true),
+        ("a.v >= ALL (SELECT v FROM m)", "a.v >= 1.0", true),
         ("a.v < ALL (SELECT v FROM m)", "a.v < 1.0", false),
         ("a.v <= ANY (SELECT v FROM m)", "a.v <= 1.0", false),
         ("a.v = ALL (SELECT v FROM m)", "a.v = 1.0", false),
         ("a.v <> ANY (SELECT v FROM m)", "a.v <> 1.0", true),
-        ("NOT (a.v > ANY (SELECT v FROM m))", "NOT (a.v > 1.0)", true),
+        (
+            "NOT (a.v > ANY (SELECT v FROM m))",
+            "NOT (a.v > 1.0)",
+            false,
+        ),
     ] {
         let expected = if passes {
             vec![vec!["Integer(1)".to_string()]]
@@ -364,7 +368,7 @@ fn test_a_nan_left_value_answers_alike_on_join_and_single_table() {
             assert_eq!(
                 rows(&db, &sql),
                 expected,
-                "{sql}: NaN passes only <>, as against the literal 1.0"
+                "{sql}: NaN is above 1.0, as against the literal 1.0"
             );
         }
     }

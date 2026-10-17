@@ -174,13 +174,13 @@ impl BetweenExpr {
 
     /// Float cell >= lower bound, exact per bound type
     fn float_cell_lower_ok(&self, val: f64, bound: &Value) -> Option<bool> {
-        use crate::core::value::{i64_le_f64, i64_lt_f64};
+        use crate::core::value::{f64_ge, f64_gt, i64_le_f64, i64_lt_f64};
         Some(match bound {
             Value::Float(lo) => {
                 if self.inclusive {
-                    val >= *lo
+                    f64_ge(val, *lo)
                 } else {
-                    val > *lo
+                    f64_gt(val, *lo)
                 }
             }
             Value::Integer(lo) => {
@@ -193,9 +193,9 @@ impl BetweenExpr {
             _ => {
                 let lo = bound.as_float64()?;
                 if self.inclusive {
-                    val >= lo
+                    f64_ge(val, lo)
                 } else {
-                    val > lo
+                    f64_gt(val, lo)
                 }
             }
         })
@@ -203,13 +203,13 @@ impl BetweenExpr {
 
     /// Float cell <= upper bound, exact per bound type
     fn float_cell_upper_ok(&self, val: f64, bound: &Value) -> Option<bool> {
-        use crate::core::value::{i64_ge_f64, i64_gt_f64};
+        use crate::core::value::{f64_le, f64_lt, i64_ge_f64, i64_gt_f64};
         Some(match bound {
             Value::Float(hi) => {
                 if self.inclusive {
-                    val <= *hi
+                    f64_le(val, *hi)
                 } else {
-                    val < *hi
+                    f64_lt(val, *hi)
                 }
             }
             Value::Integer(hi) => {
@@ -222,9 +222,9 @@ impl BetweenExpr {
             _ => {
                 let hi = bound.as_float64()?;
                 if self.inclusive {
-                    val <= hi
+                    f64_le(val, hi)
                 } else {
-                    val < hi
+                    f64_lt(val, hi)
                 }
             }
         })

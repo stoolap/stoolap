@@ -883,6 +883,15 @@ impl ColumnBloomFilter {
         Self::hash_value(value)
     }
 
+    /// The hash an `=` probe for `value` asks, or None when a value equal to
+    /// it may be stored with other bits: a FLOAT zero (0.0 and -0.0) or NaN
+    pub fn probe_hash(value: &Value) -> Option<u64> {
+        match value {
+            Value::Float(f) if *f == 0.0 || f.is_nan() => None,
+            _ => Some(Self::hash_value(value)),
+        }
+    }
+
     /// Return the logical number of bits in the filter (needed for serialization).
     #[inline]
     pub fn num_bits(&self) -> usize {
@@ -996,11 +1005,17 @@ impl ColumnBloomFilter {
     }
 }
 
+/// `nans` says the zone may hold NaN cells, which its bounds leave out. A NaN
+/// is greater than every number and equal to NaN, so it meets `>=` always and
+/// `<=` or `=` only against a NaN
 impl ZoneMap {
     /// Check if a predicate `column >= value` can possibly match any row.
     /// Returns false if we can definitively skip this volume.
     #[inline]
-    pub fn may_contain_gte(&self, value: &Value) -> bool {
+    pub fn may_contain_gte(&self, value: &Value, nans: bool) -> bool {
+        if nans {
+            return true;
+        }
         if self.max.is_null() {
             return false; // all nulls
         }
@@ -1013,7 +1028,10 @@ impl ZoneMap {
 
     /// Check if a predicate `column <= value` can possibly match any row.
     #[inline]
-    pub fn may_contain_lte(&self, value: &Value) -> bool {
+    pub fn may_contain_lte(&self, value: &Value, nans: bool) -> bool {
+        if nans && is_nan(value) {
+            return true;
+        }
         if self.min.is_null() {
             return false;
         }
@@ -1025,7 +1043,10 @@ impl ZoneMap {
 
     /// Check if a predicate `column = value` can possibly match any row.
     #[inline]
-    pub fn may_contain_eq(&self, value: &Value) -> bool {
+    pub fn may_contain_eq(&self, value: &Value, nans: bool) -> bool {
+        if nans && is_nan(value) {
+            return true;
+        }
         if self.min.is_null() {
             return false;
         }
@@ -1044,9 +1065,13 @@ impl ZoneMap {
 
     /// Check if a predicate `column BETWEEN low AND high` can possibly match.
     #[inline]
-    pub fn may_contain_between(&self, low: &Value, high: &Value) -> bool {
-        self.may_contain_gte(low) && self.may_contain_lte(high)
+    pub fn may_contain_between(&self, low: &Value, high: &Value, nans: bool) -> bool {
+        self.may_contain_gte(low, nans) && self.may_contain_lte(high, nans)
     }
+}
+
+fn is_nan(value: &Value) -> bool {
+    matches!(value, Value::Float(f) if f.is_nan())
 }
 
 #[cfg(test)]
@@ -1292,14 +1317,32 @@ mod tests {
             null_count: 0,
             row_count: 50,
         };
-        assert!(zm.may_contain_gte(&Value::Integer(50))); // 100 >= 50
-        assert!(zm.may_contain_gte(&Value::Integer(100))); // 100 >= 100
-        assert!(!zm.may_contain_gte(&Value::Integer(101))); // 100 < 101
-        assert!(zm.may_contain_lte(&Value::Integer(50))); // 10 <= 50
-        assert!(zm.may_contain_lte(&Value::Integer(10))); // 10 <= 10
-        assert!(!zm.may_contain_lte(&Value::Integer(9))); // 10 > 9
-        assert!(zm.may_contain_eq(&Value::Integer(50)));
-        assert!(!zm.may_contain_eq(&Value::Integer(5)));
-        assert!(!zm.may_contain_eq(&Value::Integer(101)));
+        assert!(zm.may_contain_gte(&Value::Integer(50), false)); // 100 >= 50
+        assert!(zm.may_contain_gte(&Value::Integer(100), false)); // 100 >= 100
+        assert!(!zm.may_contain_gte(&Value::Integer(101), false)); // 100 < 101
+        assert!(zm.may_contain_lte(&Value::Integer(50), false)); // 10 <= 50
+        assert!(zm.may_contain_lte(&Value::Integer(10), false)); // 10 <= 10
+        assert!(!zm.may_contain_lte(&Value::Integer(9), false)); // 10 > 9
+        assert!(zm.may_contain_eq(&Value::Integer(50), false));
+        assert!(!zm.may_contain_eq(&Value::Integer(5), false));
+        assert!(!zm.may_contain_eq(&Value::Integer(101), false));
+    }
+
+    #[test]
+    fn zone_map_keeps_nan_cells_its_bounds_leave_out() {
+        let zm = ZoneMap {
+            min: Value::Float(1.0),
+            max: Value::Float(2.0),
+            null_count: 0,
+            row_count: 3,
+        };
+        let nan = Value::Float(f64::NAN);
+        assert!(zm.may_contain_gte(&Value::Float(5.0), true));
+        assert!(!zm.may_contain_gte(&Value::Float(5.0), false));
+        assert!(zm.may_contain_eq(&nan, true));
+        assert!(!zm.may_contain_eq(&nan, false));
+        assert!(zm.may_contain_lte(&nan, true));
+        assert!(!zm.may_contain_lte(&Value::Float(0.5), true));
+        assert!(!zm.may_contain_eq(&Value::Float(5.0), true));
     }
 }
