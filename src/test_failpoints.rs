@@ -1386,16 +1386,19 @@ pub(crate) fn random_drawn() {
     RANDOM_DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Process-wide: rows table-valued functions have generated
-static TVF_ROWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    /// Rows table-valued functions generated on this thread: a statement
+    /// generates on the thread that runs it, so tests in parallel never meet
+    static TVF_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
-/// Rows table-valued functions have generated, so far
+/// Rows table-valued functions have generated on this thread, so far
 pub fn tvf_rows() -> usize {
-    TVF_ROWS.load(std::sync::atomic::Ordering::Relaxed)
+    TVF_ROWS.with(std::cell::Cell::get)
 }
 
 pub(crate) fn tvf_rows_generated(rows: usize) {
-    TVF_ROWS.fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
+    TVF_ROWS.with(|count| count.set(count.get() + rows));
 }
 
 /// A mechanism of the general SELECT path that the prepared family no
