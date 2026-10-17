@@ -37,7 +37,7 @@ use super::vm::{ExecuteContext, ExprVM};
 use crate::core::predicate::PredicateSet;
 use crate::core::{DataType, Row, Value, ValueSet};
 use crate::executor::expr_key::ExprKey;
-use crate::executor::utils::string_to_datatype;
+use crate::executor::utils::{derived_aggregate_column_name, string_to_datatype};
 use crate::functions::{global_registry, FunctionRegistry};
 use crate::parser::ast::*;
 use smallvec::SmallVec;
@@ -468,20 +468,15 @@ impl<'a> ExprCompiler<'a> {
             builder.emit(Op::LoadAggregateResult(idx));
             return Ok(());
         }
-        // A derived table names an aggregate's column after it; a quote in the name is not matched
-        if let Expression::FunctionCall(func) = expr {
-            if self.ctx.functions.is_aggregate(&func.function) {
-                let name = expr.to_string();
-                if !name.contains('\'') {
-                    if let Some(source) = self.ctx.resolve_column(&name) {
-                        match source {
-                            ColumnSource::Row1(idx) => builder.emit(Op::LoadColumn(idx)),
-                            ColumnSource::Row2(idx) => builder.emit(Op::LoadColumn2(idx)),
-                        }
-                        return Ok(());
-                    }
-                }
+        // A derived table names an aggregate's column after it
+        if let Some(source) =
+            derived_aggregate_column_name(expr).and_then(|name| self.ctx.resolve_column(&name))
+        {
+            match source {
+                ColumnSource::Row1(idx) => builder.emit(Op::LoadColumn(idx)),
+                ColumnSource::Row2(idx) => builder.emit(Op::LoadColumn2(idx)),
             }
+            return Ok(());
         }
 
         // Constant folding: if not already folding and expression is column-free

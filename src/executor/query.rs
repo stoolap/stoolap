@@ -701,10 +701,13 @@ impl Executor {
             // Only aggregates stand in for themselves inside a sort key: a
             // literal or a name there is read as written
             let mut aggregate_slots: FxHashMap<ExprKey, usize> = FxHashMap::default();
-            if !stmt
-                .columns
-                .iter()
-                .any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)))
+            // A set operation's rows come from other branches too, whose
+            // expressions differ from the first branch's at each position
+            if stmt.set_operations.is_empty()
+                && !stmt
+                    .columns
+                    .iter()
+                    .any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)))
             {
                 for (i, col) in stmt.columns.iter().enumerate() {
                     let key = ExprKey::of(col);
@@ -713,8 +716,7 @@ impl Executor {
                         Expression::Aliased(aliased) => aliased.expression.as_ref(),
                         other => other,
                     };
-                    if stmt.set_operations.is_empty()
-                        && matches!(inner, Expression::FunctionCall(f) if self.function_registry.is_aggregate(&f.function))
+                    if matches!(inner, Expression::FunctionCall(f) if self.function_registry.is_aggregate(&f.function))
                     {
                         aggregate_slots.entry(key).or_insert(i);
                     }
@@ -7984,8 +7986,11 @@ impl Executor {
                     .iter()
                     .map(|name| crate::executor::aggregation::GroupByItem::Column(name.clone()))
                     .collect();
-                let slots =
-                    crate::executor::aggregation::aggregate_slot_keys(&group_items, &aggregations);
+                let slots = crate::executor::aggregation::aggregate_slot_keys(
+                    &group_items,
+                    &aggregations,
+                    &stmt.columns,
+                );
                 Some(
                     RowFilter::with_aliases(&processed, &result_columns, &slots)?.with_context(ctx),
                 )

@@ -248,10 +248,12 @@ fn group_by_item_key(item: &GroupByItem) -> ExprKey {
 }
 
 /// The slot of each group item and aggregate in an aggregated row, which
-/// holds the group items first and the aggregates after them
+/// holds the group items first and the aggregates after them; a SELECT
+/// alias names its expression's slot, unless a group column has that name
 pub(crate) fn aggregate_slot_keys(
     group_items: &[GroupByItem],
     aggregations: &[SqlAggregateFunction],
+    select: &[Expression],
 ) -> FxHashMap<ExprKey, usize> {
     let mut slots = FxHashMap::default();
     for (i, item) in group_items.iter().enumerate() {
@@ -259,6 +261,15 @@ pub(crate) fn aggregate_slot_keys(
     }
     for (i, agg) in aggregations.iter().enumerate() {
         slots.entry(agg.key).or_insert(group_items.len() + i);
+    }
+    for col in select {
+        if let Expression::Aliased(aliased) = col {
+            if let Some(&slot) = slots.get(&ExprKey::of(&aliased.expression)) {
+                slots
+                    .entry(ExprKey::column(&aliased.alias.value))
+                    .or_insert(slot);
+            }
+        }
     }
     slots
 }
@@ -523,7 +534,7 @@ impl Executor {
                     });
 
                 // HAVING reads every group item and aggregate from its slot
-                let slots = aggregate_slot_keys(&group_by_columns, &aggregations);
+                let slots = aggregate_slot_keys(&group_by_columns, &aggregations, &stmt.columns);
                 let tmp_result = Box::new(ExecutorResult::new(result_columns.clone(), result_rows));
                 let mut having_result = self.apply_having(
                     tmp_result,
@@ -773,7 +784,7 @@ impl Executor {
         // Names find the result columns that bare names and aliases point at
         let agg_col_index_map = build_column_index_map(&agg_columns);
         // Identities find the slot of each group item and aggregate, however it is named
-        let slot_keys = aggregate_slot_keys(&group_by_columns, aggregations);
+        let slot_keys = aggregate_slot_keys(&group_by_columns, aggregations, &stmt.columns);
         let slot_of = |expr: &Expression| slot_keys.get(&ExprKey::of(expr)).copied();
 
         // Check if we have any expressions that need post-processing
@@ -1326,7 +1337,7 @@ impl Executor {
         };
 
         // Apply HAVING clause filter (in-place)
-        let slots = aggregate_slot_keys(&group_by_columns, &aggregations);
+        let slots = aggregate_slot_keys(&group_by_columns, &aggregations, &stmt.columns);
         let mut result_rows_with_ids = RowVec::with_capacity(result_rows.len());
         if let Some(ref having) = stmt.having {
             let having_filter =

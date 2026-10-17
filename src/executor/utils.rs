@@ -1943,6 +1943,19 @@ pub fn parse_vector_dimension(type_str: &str) -> u16 {
 // Expression Display Utilities
 // ============================================================================
 
+/// The name a derived table gives an aggregate column it leaves unaliased,
+/// unless a quote in it could hide a literal of the other case
+pub fn derived_aggregate_column_name(expr: &Expression) -> Option<String> {
+    let Expression::FunctionCall(func) = expr else {
+        return None;
+    };
+    if !is_aggregate_function(&func.function) {
+        return None;
+    }
+    let name = expression_to_string(expr);
+    (!name.contains('\'')).then_some(name)
+}
+
 /// Convert expression to string representation.
 /// Used for expression alias matching and display purposes.
 pub fn expression_to_string(expr: &Expression) -> String {

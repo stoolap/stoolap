@@ -359,3 +359,48 @@ fn test_distinct_on_keys_differing_in_literal_case_stay_apart() {
         "each row has its own pair of keys",
     );
 }
+
+#[test]
+fn test_a_window_argument_over_a_derived_aggregate_column() {
+    let db = setup("identity_window_derived_argument");
+    same(
+        &db,
+        "SELECT g, FIRST_VALUE(SUM(a)) OVER (ORDER BY g) FROM (SELECT g, SUM(a) FROM t GROUP BY g) s ORDER BY g",
+        "SELECT g, FIRST_VALUE(x) OVER (ORDER BY g) FROM (SELECT g, SUM(a) AS x FROM t GROUP BY g) s ORDER BY g",
+        "SUM(a) as an argument names the derived column",
+    );
+    same(
+        &db,
+        "SELECT g, RANK() OVER (ORDER BY SUM(a + 1)) FROM (SELECT g, SUM(a + 1) FROM t GROUP BY g) s ORDER BY g",
+        "SELECT g, RANK() OVER (ORDER BY x) FROM (SELECT g, SUM(a + 1) AS x FROM t GROUP BY g) s ORDER BY g",
+        "an aggregate over an expression names the derived column too",
+    );
+}
+
+#[test]
+fn test_every_alias_of_a_shared_aggregate_names_it() {
+    let db = setup("identity_shared_aggregate_aliases");
+    same(
+        &db,
+        "SELECT SUM(a) FILTER (WHERE a > 0) AS x, SUM(a) FILTER (WHERE a > 0) AS y FROM t HAVING y > 0",
+        "SELECT 13, 13",
+        "y names the same aggregate as x",
+    );
+    same(
+        &db,
+        "SELECT g, SUM(a) AS x, SUM(a) AS y FROM t GROUP BY g HAVING y > 5 ORDER BY g",
+        "SELECT g, SUM(a), SUM(a) FROM t GROUP BY g HAVING SUM(a) > 5 ORDER BY g",
+        "an alias of a deduplicated aggregate reaches HAVING",
+    );
+}
+
+#[test]
+fn test_a_constant_sort_key_over_a_union() {
+    let db = setup("identity_union_constant_key");
+    same(
+        &db,
+        "SELECT 'a', 2 AS id FROM t WHERE id = 1 UNION ALL SELECT 'b', 1 FROM t WHERE id = 1 ORDER BY 'a', id",
+        "SELECT 'b', 1 UNION ALL SELECT 'a', 2",
+        "the first key is a constant, so id orders",
+    );
+}

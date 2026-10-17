@@ -170,7 +170,7 @@ use super::context::ExecutionContext;
 use super::expr_key::ExprKey;
 use super::expression::{compute_expression_hash, ExpressionEval, MultiExpressionEval};
 use super::result::{ColumnarResult, ExecutorResult};
-use super::utils::build_column_index_map;
+use super::utils::{build_column_index_map, derived_aggregate_column_name};
 use super::Executor;
 
 /// Wrapper for parallel writes to disjoint indices in a Vec<Value>.
@@ -3373,9 +3373,15 @@ impl Executor {
                     .or_else(|| col_index_map.get(qid.name.value_lower.as_str()))
                     .copied()
             }
-            // A group item or aggregate computed before the window reads its slot
-            _ if group_slots.is_empty() => None,
-            _ => group_slots.get(&ExprKey::of(expr)).copied(),
+            // A group item or aggregate computed before the window reads its slot,
+            // and a derived table's aggregate column the name it carries
+            _ => (!group_slots.is_empty())
+                .then(|| group_slots.get(&ExprKey::of(expr)).copied())
+                .flatten()
+                .or_else(|| {
+                    derived_aggregate_column_name(expr)
+                        .and_then(|name| col_index_map.get(name.to_lowercase().as_str()).copied())
+                }),
         }
     }
 
