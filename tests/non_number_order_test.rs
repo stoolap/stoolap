@@ -19,6 +19,7 @@ use stoolap::core::Value;
 use stoolap::Database;
 
 const ORDER: &[&str] = &["<", "<=", ">", ">="];
+const TS: &str = "CAST('2025-01-01 00:00:00' AS TIMESTAMP)";
 
 fn open(db: Database, seal: bool) -> Database {
     db.execute(
@@ -69,7 +70,18 @@ fn predicates() -> Vec<String> {
             out.push(format!("{col} NOT BETWEEN {num} AND 9"));
         }
     }
+    for col in ["z", "zf"] {
+        for op in ORDER {
+            out.push(format!("{col} {op} {TS}"));
+            out.push(format!("{TS} {op} {col}"));
+        }
+        out.push(format!("{col} BETWEEN {TS} AND {TS}"));
+    }
     out
+}
+
+fn ts_param() -> Value {
+    Value::Timestamp(chrono::DateTime::from_timestamp(1_735_689_600, 0).unwrap())
 }
 
 /// Each equality across the number domain and whether it holds: a number
@@ -79,14 +91,14 @@ fn equalities() -> Vec<(String, bool)> {
     for (col, others) in [
         ("b", &["0", "1", "1.5", "z", "zf"][..]),
         ("ts", &["0", "1.5", "z", "zf"][..]),
-        ("z", &["TRUE", "FALSE", "b"][..]),
-        ("zf", &["TRUE", "FALSE", "b"][..]),
+        ("z", &["TRUE", "FALSE", "b", "ts", TS][..]),
+        ("zf", &["TRUE", "FALSE", "b", "ts", TS][..]),
     ] {
         for other in others {
             out.push((format!("{col} = {other}"), false));
             out.push((format!("{other} = {col}"), false));
             out.push((format!("{col} <> {other}"), true));
-            if !matches!(*other, "z" | "zf" | "b") {
+            if !matches!(*other, "z" | "zf" | "b" | "ts") {
                 out.push((format!("{col} IN ({other}, 7)"), false));
                 out.push((format!("{col} NOT IN ({other}, 7)"), true));
             }
@@ -131,6 +143,9 @@ fn check(db: &Database, ctx: &str, wrong: &mut Vec<String>) {
         ("b", Value::Integer(0)),
         ("ts", Value::Integer(0)),
         ("z", Value::Boolean(false)),
+        ("zf", Value::Boolean(true)),
+        ("z", ts_param()),
+        ("zf", ts_param()),
     ] {
         for (sql, want) in [
             (format!("SELECT id FROM t WHERE {col} = $1"), ids(false)),
@@ -187,9 +202,14 @@ fn check_order(db: &Database, ctx: &str, wrong: &mut Vec<String>) {
             wrong.push(format!("{ctx}: {sql}: got {got:?}, want three NULLs"));
         }
     }
-    for col in ["b", "ts"] {
+    for (col, params) in [
+        ("b", vec![Value::Integer(0), Value::Float(1.5)]),
+        ("ts", vec![Value::Integer(0), Value::Float(1.5)]),
+        ("z", vec![ts_param()]),
+        ("zf", vec![ts_param()]),
+    ] {
         for op in ORDER {
-            for param in [Value::Integer(0), Value::Float(1.5)] {
+            for param in &params {
                 for (sql, want) in [
                     (format!("SELECT id FROM t WHERE {col} {op} $1"), &none),
                     (format!("SELECT id FROM t WHERE NOT ({col} {op} $1)"), &none),

@@ -110,7 +110,7 @@ impl<'a> PushdownContext<'a> {
 /// for a program that compares it itself. What the scan takes no reading
 /// of stays as it is for the comparison's own rule: a TEXT that is no
 /// number against a numeric column, a number against a TEXT column, and a
-/// number or BOOLEAN on the other side of the number domain
+/// number, BOOLEAN or TIMESTAMP on the other side of the number domain
 pub(crate) fn read_as_column(column_type: crate::core::DataType, value: Value) -> Value {
     let unread = match column_type {
         crate::core::DataType::Text => matches!(value, Value::Integer(_) | Value::Float(_)),
@@ -126,15 +126,18 @@ pub(crate) fn read_as_column(column_type: crate::core::DataType, value: Value) -
     coerce_constant(Some(column_type), value).unwrap_or_else(Value::null_unknown)
 }
 
-/// A number against a BOOLEAN or TIMESTAMP column, or a BOOLEAN against a
-/// number column: other domains, which the scan reads no value across
+/// A number against a BOOLEAN or TIMESTAMP column, or a BOOLEAN or
+/// TIMESTAMP against a number column: other domains, which the scan reads
+/// no value across
 fn other_domain(column_type: crate::core::DataType, value: &Value) -> bool {
     use crate::core::DataType;
     match column_type {
         DataType::Boolean | DataType::Timestamp => {
             matches!(value, Value::Integer(_) | Value::Float(_))
         }
-        DataType::Integer | DataType::Float => matches!(value, Value::Boolean(_)),
+        DataType::Integer | DataType::Float => {
+            matches!(value, Value::Boolean(_) | Value::Timestamp(_))
+        }
         _ => false,
     }
 }
