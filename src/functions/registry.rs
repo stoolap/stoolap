@@ -68,7 +68,7 @@ use super::window::{
     LeadFunction, NthValueFunction, NtileFunction, PercentRankFunction, RankFunction,
     RowNumberFunction,
 };
-use super::{AggregateFunction, FunctionInfo, ScalarFunction, WindowFunction};
+use super::{AggregateFunction, FunctionInfo, ScalarFunction, Volatility, WindowFunction};
 
 /// Type alias for aggregate function factory
 type AggregateFnFactory = Arc<dyn Fn() -> Box<dyn AggregateFunction> + Send + Sync>;
@@ -463,16 +463,20 @@ impl FunctionRegistry {
         infos.get(&name).cloned()
     }
 
-    /// Check if a function is deterministic (safe to constant-fold).
-    /// Returns false for non-deterministic functions (NOW, RANDOM, SLEEP, etc.)
-    /// and for unknown functions (conservative default).
-    pub fn is_deterministic(&self, name: &str) -> bool {
+    /// How often a call of `name` may answer differently. The transaction id
+    /// the compiler reads itself is one per statement; a name this registry
+    /// does not hold answers per call, as nothing is known of it
+    pub fn volatility(&self, name: &str) -> Volatility {
+        if name.eq_ignore_ascii_case("CURRENT_TRANSACTION_ID") {
+            return Volatility::PerStatement;
+        }
         let infos = self.function_info.read().unwrap();
         if let Some(info) = infos.get(name) {
-            return info.deterministic;
+            return info.volatility;
         }
-        let upper = name.to_uppercase();
-        infos.get(&upper).is_some_and(|info| info.deterministic)
+        infos
+            .get(&name.to_uppercase())
+            .map_or(Volatility::PerCall, |info| info.volatility)
     }
 
     /// List all aggregate function names

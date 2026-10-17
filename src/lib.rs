@@ -145,7 +145,7 @@ pub use storage::{
 pub use functions::{
     AggregateFunction, AvgFunction, CountFunction, FirstFunction, FunctionDataType, FunctionInfo,
     FunctionRegistry, FunctionSignature, FunctionType, LastFunction, MaxFunction, MinFunction,
-    ScalarFunction, SumFunction, WindowFunction,
+    ScalarFunction, SumFunction, Volatility, WindowFunction,
 };
 
 // Re-export specific function implementations

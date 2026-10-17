@@ -112,34 +112,10 @@ impl ConstArg {
     }
 }
 
-/// Conservative determinism check: does this expression yield the same
-/// value every time it is evaluated against the same row? Column
-/// references and bound parameters qualify; RANDOM and friends do not,
-/// and anything unrecognized counts as volatile.
+/// Whether this expression yields the same value every time it is evaluated
+/// against the same row within the statement
 fn expr_is_deterministic(expr: &Expression, registry: &FunctionRegistry) -> bool {
-    match expr {
-        Expression::IntegerLiteral(_)
-        | Expression::FloatLiteral(_)
-        | Expression::StringLiteral(_)
-        | Expression::BooleanLiteral(_)
-        | Expression::NullLiteral(_)
-        | Expression::Identifier(_)
-        | Expression::QualifiedIdentifier(_)
-        | Expression::Parameter(_) => true,
-        Expression::Prefix(prefix) => expr_is_deterministic(&prefix.right, registry),
-        Expression::Infix(infix) => {
-            expr_is_deterministic(&infix.left, registry)
-                && expr_is_deterministic(&infix.right, registry)
-        }
-        Expression::FunctionCall(func) => {
-            registry.is_deterministic(&func.function)
-                && func
-                    .arguments
-                    .iter()
-                    .all(|a| expr_is_deterministic(a, registry))
-        }
-        _ => false,
-    }
+    expression_volatility(expr, registry) != Volatility::PerCall
 }
 use crate::core::{Error, Result, Row, Value};
 
@@ -162,7 +138,7 @@ type OrderByKey = SmallVec<[OrderByItemKey; 2]>;
 type OverClauseKey = (SmallVec<[(u64, String); 2]>, OrderByKey);
 
 use crate::functions::registry::FunctionRegistry;
-use crate::functions::WindowFunction;
+use crate::functions::{Volatility, WindowFunction};
 use crate::parser::ast::*;
 use crate::storage::traits::{QueryResult, Table};
 
@@ -171,6 +147,7 @@ use super::expr_key::ExprKey;
 use super::expression::{compute_expression_hash, ExpressionEval, MultiExpressionEval};
 use super::result::{ColumnarResult, ExecutorResult};
 use super::utils::{build_column_index_map, derived_aggregate_column_name};
+use super::volatility::expression_volatility;
 use super::Executor;
 
 /// Wrapper for parallel writes to disjoint indices in a Vec<Value>.

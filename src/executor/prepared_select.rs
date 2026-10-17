@@ -26,7 +26,7 @@ use smallvec::SmallVec;
 use crate::api::params::ParamVec;
 use crate::common::{CompactArc, SmartString};
 use crate::core::{DataType, Error, Operator, Result, Row, RowVec, Schema, Value};
-use crate::functions::FunctionRegistry;
+use crate::functions::{FunctionRegistry, Volatility};
 use crate::parser::ast::*;
 use crate::parser::token::{Position, Token, TokenType};
 use crate::storage::expression::{AndExpr, ComparisonExpr, Expression as StorageExpr};
@@ -37,12 +37,13 @@ use super::expression::{
     CompileContext, CompileError, ExecuteContext, ExprCompiler, ExprVM, SharedProgram,
     SubqueryExecutor,
 };
-use super::pushdown::{self, coerce_constant, contains_non_deterministic_volatile};
+use super::pushdown::{self, coerce_constant};
 use super::query_cache::CompiledExecution;
 use super::result::ExecutorResult;
 use super::utils::{
     extract_literal_value, flip_operator, infix_to_operator, is_aggregate_function,
 };
+use super::volatility::expression_volatility;
 use super::Executor;
 
 /// Scopes one chain may hold: a block's own table and every enclosing one
@@ -706,29 +707,9 @@ fn compare_as_scan(expr: &Expression, schema: &Schema, out: &mut FxHashMap<usize
     });
 }
 
-/// Whether a call anywhere in `expr` draws a new value each time it runs:
-/// one the registry holds non-deterministic, apart from the clock reads the
-/// pushdown also takes as fixed for a statement
+/// Whether a call anywhere in `expr` draws a new value each time it runs
 fn volatile(expr: &Expression, registry: &FunctionRegistry) -> bool {
-    if let Expression::FunctionCall(call) = expr {
-        // Only the built-in clocks: a registry that took functions of its
-        // own may hold another function under one of these names
-        let statement_clock = !registry.has_registered_functions()
-            && ["NOW", "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP"]
-                .iter()
-                .any(|f| call.function.eq_ignore_ascii_case(f));
-        if contains_non_deterministic_volatile(expr)
-            || (!statement_clock && !registry.is_deterministic(&call.function))
-        {
-            return true;
-        }
-    }
-    let mut found = false;
-    let _ = for_each_child(expr, &mut |child| {
-        found |= volatile(child, registry);
-        Ok(())
-    });
-    found
+    expression_volatility(expr, registry) == Volatility::PerCall
 }
 
 fn is_leaf(expr: &Expression) -> bool {

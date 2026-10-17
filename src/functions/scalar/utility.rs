@@ -87,7 +87,7 @@ impl ScalarFunction for NowFunction {
             "Returns the current date and time",
             FunctionSignature::new(FunctionDataType::DateTime, vec![], 0, 0),
         )
-        .non_deterministic()
+        .per_statement()
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {

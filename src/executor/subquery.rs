@@ -50,9 +50,11 @@ use super::operators::hash_join::{HashJoinOperator, JoinSide, JoinType};
 use super::operators::index_nested_loop::{crosses_inner_key, EQUALITY_CANDIDATE_CAP};
 use super::query_cache::check_compiled_token;
 use super::utils::{dummy_token, dummy_token_clone, number_text_key_pair, value_to_expression};
+use super::volatility::{expression_volatility_in, statement_volatility_in};
 use super::Executor;
 use crate::core::predicate::PredicateSet;
 use crate::core::{DataType, NULL_VALUE};
+use crate::functions::{global_registry, Volatility};
 
 // ============================================================================
 // Constants
@@ -2925,39 +2927,14 @@ impl Executor {
     }
 
     /// Whether the answer of `stmt` may change from one statement to the
-    /// next with the same text: anywhere in it, its subqueries, CTEs,
-    /// derived tables and set operations included, it calls a function the
-    /// registry does not call deterministic (RANDOM, NOW and the like), or
-    /// reads a CTE of the statement it runs in
+    /// next with the same text: anywhere in it it calls a function that is
+    /// not fixed (RANDOM, NOW and the like), or reads a CTE of the statement
+    /// it runs in. The cache is shared by every executor, so the built-in
+    /// registry decides, which takes a function it does not hold as volatile
     pub(crate) fn varies_by_statement(stmt: &SelectStatement, ctx: &ExecutionContext) -> bool {
-        let one = |expr: &Expression| Self::expression_varies_by_statement(expr, ctx);
-        let any = |exprs: &[Expression]| exprs.iter().any(one);
-        let ordered = |order: &[OrderByExpression]| order.iter().any(|o| one(&o.expression));
-        let boxed = |expr: &Option<Box<Expression>>| expr.as_deref().is_some_and(one);
-        any(&stmt.distinct_on)
-            || any(&stmt.columns)
-            || stmt.with.as_ref().is_some_and(|with| {
-                with.ctes
-                    .iter()
-                    .any(|cte| Self::varies_by_statement(&cte.query, ctx))
-            })
-            || boxed(&stmt.table_expr)
-            || boxed(&stmt.where_clause)
-            || any(&stmt.group_by.columns)
-            || matches!(&stmt.group_by.modifier, GroupByModifier::GroupingSets(sets)
-                if sets.iter().any(|set| any(set)))
-            || boxed(&stmt.having)
-            || stmt
-                .window_defs
-                .iter()
-                .any(|window| any(&window.partition_by) || ordered(&window.order_by))
-            || ordered(&stmt.order_by)
-            || boxed(&stmt.limit)
-            || boxed(&stmt.offset)
-            || stmt
-                .set_operations
-                .iter()
-                .any(|op| Self::varies_by_statement(&op.right, ctx))
+        statement_volatility_in(stmt, global_registry(), &|name| {
+            ctx.get_cte_by_lower(name).is_some()
+        }) != Volatility::Fixed
     }
 
     /// [`Self::varies_by_statement`] for one expression
@@ -2965,62 +2942,9 @@ impl Executor {
         expr: &Expression,
         ctx: &ExecutionContext,
     ) -> bool {
-        let one = |expr: &Expression| Self::expression_varies_by_statement(expr, ctx);
-        let select = |stmt: &SelectStatement| Self::varies_by_statement(stmt, ctx);
-        let call = |f: &FunctionCall| {
-            crate::executor::expression::is_non_foldable_function(&f.function)
-                || f.arguments.iter().any(one)
-                || f.order_by.iter().any(|o| one(&o.expression))
-                || f.filter.as_deref().is_some_and(one)
-        };
-        match expr {
-            Expression::FunctionCall(f) => call(f),
-            Expression::Window(w) => {
-                call(&w.function)
-                    || w.partition_by.iter().any(one)
-                    || w.order_by.iter().any(|o| one(&o.expression))
-            }
-            Expression::Prefix(p) => one(&p.right),
-            Expression::Infix(i) => one(&i.left) || one(&i.right),
-            Expression::List(l) => l.elements.iter().any(one),
-            Expression::ExpressionList(l) => l.expressions.iter().any(one),
-            Expression::Distinct(d) => one(&d.expr),
-            Expression::Exists(e) => select(&e.subquery),
-            Expression::ScalarSubquery(s) => select(&s.subquery),
-            Expression::AllAny(a) => one(&a.left) || select(&a.subquery),
-            Expression::In(i) => one(&i.left) || one(&i.right),
-            Expression::InHashSet(h) => one(&h.column),
-            Expression::QuantifiedSet(q) => one(&q.left),
-            Expression::Between(b) => one(&b.expr) || one(&b.lower) || one(&b.upper),
-            Expression::Like(l) => {
-                one(&l.left) || one(&l.pattern) || l.escape.as_deref().is_some_and(one)
-            }
-            Expression::Case(c) => {
-                c.value.as_deref().is_some_and(one)
-                    || c.when_clauses
-                        .iter()
-                        .any(|w| one(&w.condition) || one(&w.then_result))
-                    || c.else_value.as_deref().is_some_and(one)
-            }
-            Expression::Cast(c) => one(&c.expr),
-            Expression::Aliased(a) => one(&a.expression),
-            Expression::JoinSource(j) => {
-                one(&j.left) || one(&j.right) || j.condition.as_deref().is_some_and(one)
-            }
-            Expression::SubquerySource(s) => select(&s.subquery),
-            Expression::ValuesSource(v) => v.rows.iter().flatten().any(one),
-            Expression::FunctionTableSource(f) => {
-                crate::executor::expression::is_non_foldable_function(&f.function.value)
-                    || f.arguments.iter().any(one)
-            }
-            // A CTE's rows are its statement's own
-            Expression::TableSource(t) => {
-                t.as_of.as_ref().is_some_and(|as_of| one(&as_of.value))
-                    || ctx.get_cte_by_lower(&t.name.value_lower).is_some()
-            }
-            Expression::CteReference(_) => true,
-            _ => false,
-        }
+        expression_volatility_in(expr, global_registry(), &|name| {
+            ctx.get_cte_by_lower(name).is_some()
+        }) != Volatility::Fixed
     }
 
     /// Whether a window function, its OVER clause or a named window holds a subquery

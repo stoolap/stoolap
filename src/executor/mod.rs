@@ -76,6 +76,7 @@ mod set_ops;
 mod show;
 mod subquery;
 pub mod utils;
+mod volatility;
 mod window;
 
 use rustc_hash::FxHashMap;
