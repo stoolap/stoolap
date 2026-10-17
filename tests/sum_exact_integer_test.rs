@@ -28,6 +28,8 @@ fn open(db: Database, seal: bool) -> Database {
         "CREATE TABLE w (id INTEGER PRIMARY KEY, i INTEGER)",
         "CREATE TABLE o (id INTEGER PRIMARY KEY, g INTEGER, i INTEGER)",
         "CREATE TABLE p (id INTEGER PRIMARY KEY, i INTEGER)",
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, g INTEGER, i INTEGER)",
+        "INSERT INTO a VALUES (1, 1, 9007199254740992), (2, 1, 9007199254740995)",
         "CREATE TABLE s (id INTEGER PRIMARY KEY, g INTEGER, ts TIMESTAMP)",
         "INSERT INTO s VALUES (1, 1, '2024-01-01 00:00:00'), (2, 1, '2024-01-02 00:00:00')",
     ] {
@@ -176,8 +178,14 @@ fn check(db: &Database, ctx: &str, wrong: &mut Vec<String>) {
         ("o", "SUM(i)", vec!["error".into()]),
         ("s", "SUM(ts)", vec!["i:1|null".into()]),
         ("s", "AVG(ts)", vec!["i:1|null".into()]),
+        (
+            "a",
+            "AVG(i)",
+            vec![format!("i:1|{}", f(9_007_199_254_740_994.0))],
+        ),
     ];
     let global: Vec<(&str, &str, Vec<String>)> = vec![
+        ("a", "AVG(i)", vec![f(9_007_199_254_740_994.0)]),
         ("s", "SUM(ts)", vec!["null".into()]),
         ("s", "AVG(ts)", vec!["null".into()]),
         ("u", "SUM(i)", vec![format!("i:{}", MAX - 8)]),
@@ -219,6 +227,12 @@ fn check(db: &Database, ctx: &str, wrong: &mut Vec<String>) {
         (
             "SELECT g FROM t GROUP BY g HAVING SUM(i) = 9007199254740992 LIMIT 10".to_string(),
             vec![],
+        ),
+        (
+            "SELECT AVG(x) FROM (SELECT 9007199254740990 AS x UNION ALL \
+             SELECT -9007199254740989.0 UNION ALL SELECT 0) d"
+                .to_string(),
+            vec![f(1.0 / 3.0)],
         ),
         (
             "SELECT SUM(i), AVG(i), COUNT(*) FROM p WHERE id + 0 = id".to_string(),

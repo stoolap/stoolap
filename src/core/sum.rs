@@ -93,15 +93,35 @@ impl SumAccumulator {
         })
     }
 
-    /// The average as FLOAT, from the exact sum; NULL with no value
+    /// The average as FLOAT: the exact INTEGER sum divided and rounded
+    /// once, or the FLOAT sum divided; NULL with no value
     pub fn avg(&self) -> Value {
         if self.count == 0 {
             return Value::null_unknown();
         }
-        let n = self.count as i128;
-        let whole = (self.int / n) as f64;
-        let rest = (self.int % n) as f64 + self.float;
-        Value::Float(whole + rest / self.count as f64)
+        if self.has_float {
+            return Value::Float((self.int as f64 + self.float) / self.count as f64);
+        }
+        Value::Float(ratio(self.int, self.count))
+    }
+}
+
+/// `num / den` rounded once to the nearest f64: the quotient keeps at least
+/// 64 bits, and a set low bit stands for any remainder below them
+fn ratio(num: i128, den: u64) -> f64 {
+    let magnitude = num.unsigned_abs();
+    if magnitude == 0 {
+        return 0.0;
+    }
+    let shift = magnitude.leading_zeros();
+    let scaled = magnitude << shift;
+    let den = den as u128;
+    let quotient = (scaled / den) | !scaled.is_multiple_of(den) as u128;
+    let value = quotient as f64 * 2f64.powi(-(shift as i32));
+    if num < 0 {
+        -value
+    } else {
+        value
     }
 }
 
@@ -165,6 +185,28 @@ mod tests {
         assert_eq!(acc.avg(), Value::Float(i64::MAX as f64));
         let acc = of(&[Value::Integer(-3), Value::Integer(-4)]);
         assert_eq!(acc.avg(), Value::Float(-3.5));
+        let acc = of(&[
+            Value::Integer(9_007_199_254_740_992),
+            Value::Integer(9_007_199_254_740_995),
+        ]);
+        assert_eq!(acc.avg(), Value::Float(9_007_199_254_740_994.0));
+        let acc = of(&[
+            Value::Integer(-9_007_199_254_740_992),
+            Value::Integer(-9_007_199_254_740_995),
+        ]);
+        assert_eq!(acc.avg(), Value::Float(-9_007_199_254_740_994.0));
+        let acc = of(&[Value::Integer(i64::MAX), Value::Integer(i64::MAX - 1)]);
+        assert_eq!(acc.avg(), Value::Float(i64::MAX as f64));
+    }
+
+    #[test]
+    fn avg_of_mixed_values_divides_the_float_sum() {
+        let acc = of(&[
+            Value::Integer(9_007_199_254_740_990),
+            Value::Float(-9_007_199_254_740_989.0),
+            Value::Integer(0),
+        ]);
+        assert_eq!(acc.avg(), Value::Float(1.0 / 3.0));
     }
 
     #[test]
