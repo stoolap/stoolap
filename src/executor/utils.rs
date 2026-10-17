@@ -672,24 +672,6 @@ fn substitute_in_table_expr(
 // Column Index Utilities
 // ============================================================================
 
-/// The name of an expression column, lowercased outside its quoted TEXT
-/// literals: names match in any case, literals only in their own
-pub fn fold_expression_name(name: &str) -> String {
-    let mut folded = String::with_capacity(name.len());
-    let mut quoted = false;
-    for c in name.chars() {
-        if c == '\'' {
-            quoted = !quoted;
-        }
-        if quoted {
-            folded.push(c);
-        } else {
-            folded.extend(c.to_lowercase());
-        }
-    }
-    folded
-}
-
 /// Build a column name to index map for fast column lookups.
 /// Column names are lowercased for case-insensitive matching.
 /// Also adds unqualified base names as fallbacks for qualified columns
@@ -1960,6 +1942,73 @@ pub fn parse_vector_dimension(type_str: &str) -> u16 {
 // ============================================================================
 // Expression Display Utilities
 // ============================================================================
+
+/// The name a derived table gives an aggregate column it leaves unaliased,
+/// unless a TEXT literal in it would match a column of the other case
+pub fn derived_aggregate_column_name(expr: &Expression) -> Option<String> {
+    let Expression::FunctionCall(func) = expr else {
+        return None;
+    };
+    if !is_aggregate_function(&func.function) || holds_text_literal(expr) {
+        return None;
+    }
+    Some(expression_to_string(expr))
+}
+
+/// Whether a TEXT literal may sit anywhere in `expr`; a kind not walked here counts as holding one
+fn holds_text_literal(expr: &Expression) -> bool {
+    match expr {
+        Expression::StringLiteral(_) => true,
+        Expression::Identifier(_)
+        | Expression::QualifiedIdentifier(_)
+        | Expression::IntegerLiteral(_)
+        | Expression::FloatLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::NullLiteral(_)
+        | Expression::IntervalLiteral(_)
+        | Expression::Parameter(_)
+        | Expression::Star(_) => false,
+        Expression::FunctionCall(func) => {
+            func.arguments.iter().any(holds_text_literal)
+                || func.filter.as_deref().is_some_and(holds_text_literal)
+                || func
+                    .order_by
+                    .iter()
+                    .any(|o| holds_text_literal(&o.expression))
+        }
+        Expression::Infix(infix) => {
+            holds_text_literal(&infix.left) || holds_text_literal(&infix.right)
+        }
+        Expression::Prefix(prefix) => holds_text_literal(&prefix.right),
+        Expression::Cast(cast) => holds_text_literal(&cast.expr),
+        Expression::Distinct(distinct) => holds_text_literal(&distinct.expr),
+        Expression::Aliased(aliased) => holds_text_literal(&aliased.expression),
+        Expression::Case(case) => {
+            case.value.as_deref().is_some_and(holds_text_literal)
+                || case
+                    .when_clauses
+                    .iter()
+                    .any(|w| holds_text_literal(&w.condition) || holds_text_literal(&w.then_result))
+                || case.else_value.as_deref().is_some_and(holds_text_literal)
+        }
+        Expression::Between(between) => {
+            holds_text_literal(&between.expr)
+                || holds_text_literal(&between.lower)
+                || holds_text_literal(&between.upper)
+        }
+        Expression::In(in_expr) => {
+            holds_text_literal(&in_expr.left) || holds_text_literal(&in_expr.right)
+        }
+        Expression::List(list) => list.elements.iter().any(holds_text_literal),
+        Expression::ExpressionList(list) => list.expressions.iter().any(holds_text_literal),
+        Expression::Like(like) => {
+            holds_text_literal(&like.left)
+                || holds_text_literal(&like.pattern)
+                || like.escape.as_deref().is_some_and(holds_text_literal)
+        }
+        _ => true,
+    }
+}
 
 /// Convert expression to string representation.
 /// Used for expression alias matching and display purposes.

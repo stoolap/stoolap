@@ -167,9 +167,10 @@ use crate::parser::ast::*;
 use crate::storage::traits::{QueryResult, Table};
 
 use super::context::ExecutionContext;
+use super::expr_key::ExprKey;
 use super::expression::{compute_expression_hash, ExpressionEval, MultiExpressionEval};
 use super::result::{ColumnarResult, ExecutorResult};
-use super::utils::build_column_index_map;
+use super::utils::{build_column_index_map, derived_aggregate_column_name};
 use super::Executor;
 
 /// Wrapper for parallel writes to disjoint indices in a Vec<Value>.
@@ -413,6 +414,28 @@ impl Executor {
             ctx,
             base_rows,
             base_columns,
+            &FxHashMap::default(),
+            None,
+            None,
+        )
+    }
+
+    /// Window functions over aggregated rows, whose group items and aggregates
+    /// are found by identity at `group_slots`
+    pub(crate) fn execute_select_with_window_functions_over_groups(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        base_rows: &[(i64, Row)],
+        base_columns: &[String],
+        group_slots: &FxHashMap<ExprKey, usize>,
+    ) -> Result<Box<dyn QueryResult>> {
+        self.execute_select_with_window_functions_internal(
+            stmt,
+            ctx,
+            base_rows,
+            base_columns,
+            group_slots,
             None,
             None,
         )
@@ -434,6 +457,7 @@ impl Executor {
             ctx,
             base_rows,
             base_columns,
+            &FxHashMap::default(),
             pre_sorted,
             None,
         )
@@ -455,18 +479,21 @@ impl Executor {
             ctx,
             base_rows,
             base_columns,
+            &FxHashMap::default(),
             None,
             Some(pre_grouped),
         )
     }
 
     /// Internal implementation with pre-sorted and pre-grouped state parameters
+    #[allow(clippy::too_many_arguments)]
     fn execute_select_with_window_functions_internal(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         base_rows: &[(i64, Row)],
         base_columns: &[String],
+        group_slots: &FxHashMap<ExprKey, usize>,
         pre_sorted: Option<WindowPreSortedState>,
         pre_grouped: Option<WindowPreGroupedState>,
     ) -> Result<Box<dyn QueryResult>> {
@@ -558,6 +585,7 @@ impl Executor {
                                 ctx,
                                 base_rows,
                                 base_columns,
+                                group_slots,
                                 visible_columns,
                                 &window_functions,
                                 limit_val as usize,
@@ -569,25 +597,7 @@ impl Executor {
         }
 
         // Build column index map for base columns
-        let mut col_index_map = build_column_index_map(base_columns);
-
-        // Build a mapping from aggregate expression patterns to their column names
-        // This handles cases like:
-        // - SUM(val) AS grp_sum -> maps "sum(val)" to column index of "grp_sum"
-        // - COALESCE(SUM(val), 0) AS total -> maps "sum(val)" to column index of "total"
-        for col_expr in stmt.columns.iter() {
-            if let Expression::Aliased(aliased) = col_expr {
-                let alias_lower = aliased.alias.value_lower.as_str();
-                if let Some(&idx) = col_index_map.get(alias_lower) {
-                    // Extract all aggregate patterns from this expression (including nested ones)
-                    let patterns =
-                        Self::extract_aggregate_patterns(aliased.expression.as_ref(), self);
-                    for pattern in patterns {
-                        col_index_map.insert(pattern.to_lowercase(), idx);
-                    }
-                }
-            }
-        }
+        let col_index_map = build_column_index_map(base_columns);
 
         // Step 1: Compute all window function values upfront
         // OPTIMIZATION: Use FxHashMap for fastest lookups with trusted keys
@@ -611,6 +621,7 @@ impl Executor {
                         base_rows,
                         base_columns,
                         &col_index_map,
+                        group_slots,
                         ctx,
                     )?;
                     order_by_cache.push((cache_key, precomputed));
@@ -628,6 +639,7 @@ impl Executor {
                 base_rows,
                 base_columns,
                 &col_index_map,
+                group_slots,
                 ctx,
                 pre_sorted.as_ref(),
                 pre_grouped.as_ref(),
@@ -647,6 +659,7 @@ impl Executor {
             base_columns,
             visible_columns,
             &window_functions,
+            group_slots,
         );
 
         for item in &select_items {
@@ -658,10 +671,6 @@ impl Executor {
         // and use ColumnarResult which materializes rows lazily with a single reused buffer.
         // This reduces allocations from O(num_rows) to O(num_columns).
         let num_rows = base_rows.len();
-
-        // Build aliases from col_index_map for expression evaluation
-        let agg_aliases: Vec<(String, usize)> =
-            col_index_map.iter().map(|(k, v)| (k.clone(), *v)).collect();
 
         // Pre-transform expressions with window functions by replacing Window expr with Identifier
         // This is done once, not per row
@@ -718,7 +727,7 @@ impl Executor {
             base_expr_items.iter().map(|(_, e)| (*e).clone()).collect();
         let mut base_eval = if !base_exprs.is_empty() {
             Some(
-                MultiExpressionEval::compile_with_aliases(&base_exprs, base_columns, &agg_aliases)?
+                MultiExpressionEval::compile_with_aliases(&base_exprs, base_columns, group_slots)?
                     .with_context(ctx),
             )
         } else {
@@ -733,7 +742,7 @@ impl Executor {
                 MultiExpressionEval::compile_with_aliases(
                     &ext_exprs,
                     &extended_columns,
-                    &agg_aliases,
+                    group_slots,
                 )?
                 .with_context(ctx),
             )
@@ -892,6 +901,7 @@ impl Executor {
         ctx: &ExecutionContext,
         base_rows: &[(i64, Row)],
         base_columns: &[String],
+        group_slots: &FxHashMap<ExprKey, usize>,
         visible_columns: usize,
         window_functions: &[WindowFunctionInfo],
         limit: usize,
@@ -906,8 +916,14 @@ impl Executor {
         let col_index_map = build_column_index_map(base_columns);
 
         // Build partition map from the primary window function
-        let partitions =
-            Self::build_partition_map(primary_wf, base_rows, base_columns, &col_index_map, ctx)?;
+        let partitions = Self::build_partition_map(
+            primary_wf,
+            base_rows,
+            base_columns,
+            &col_index_map,
+            group_slots,
+            ctx,
+        )?;
 
         // Build result columns from SELECT list
         let select_items = self.parse_select_list_for_window(
@@ -915,6 +931,7 @@ impl Executor {
             base_columns,
             visible_columns,
             window_functions,
+            group_slots,
         );
         let result_columns: Vec<String> =
             select_items.iter().map(|i| i.output_name.clone()).collect();
@@ -931,6 +948,7 @@ impl Executor {
                         base_rows,
                         base_columns,
                         &col_index_map,
+                        group_slots,
                         ctx,
                     )?;
                     order_by_cache.push((cache_key, precomputed));
@@ -968,6 +986,7 @@ impl Executor {
                     base_rows,
                     base_columns,
                     &col_index_map,
+                    group_slots,
                     ctx,
                     None,
                     precomputed_order_by,
@@ -1018,6 +1037,7 @@ impl Executor {
                         precomputed_order_by,
                         base_columns,
                         &col_index_map,
+                        group_slots,
                         ctx,
                         false,
                     )?;
@@ -1138,6 +1158,8 @@ impl Executor {
 
         // Build column index map
         let col_index_map = build_column_index_map(base_columns);
+        // Rows read straight from the table: nothing aggregated precedes the window
+        let group_slots = FxHashMap::default();
 
         // Resolve window functions from registry
         let resolved_wfs: Vec<_> = window_functions
@@ -1159,6 +1181,7 @@ impl Executor {
             base_columns,
             base_columns.len(),
             &window_functions,
+            &group_slots,
         );
         let result_columns: Vec<String> =
             select_items.iter().map(|i| i.output_name.clone()).collect();
@@ -1205,6 +1228,7 @@ impl Executor {
                             &partition_rows,
                             base_columns,
                             &col_index_map,
+                            &group_slots,
                             ctx,
                         )?;
                         order_by_cache.push((cache_key, precomputed));
@@ -1233,6 +1257,7 @@ impl Executor {
                         &partition_rows,
                         base_columns,
                         &col_index_map,
+                        &group_slots,
                         ctx,
                         None,
                         precomputed_order_by,
@@ -1249,6 +1274,7 @@ impl Executor {
                         precomputed_order_by,
                         base_columns,
                         &col_index_map,
+                        &group_slots,
                         ctx,
                         false,
                     )?;
@@ -1351,6 +1377,7 @@ impl Executor {
         base_columns: &[String],
         visible_columns: usize,
         window_functions: &[WindowFunctionInfo],
+        group_slots: &FxHashMap<ExprKey, usize>,
     ) -> Vec<SelectItem> {
         let col_index_map = build_column_index_map(base_columns);
 
@@ -1539,24 +1566,17 @@ impl Executor {
                             ),
                         });
                     } else {
-                        // Check if this is an aggregate function already in base columns
-                        let func_col_name = if func.arguments.is_empty()
-                            || matches!(func.arguments.first(), Some(Expression::Star(_)))
-                        {
-                            format!("{}(*)", func.function)
-                        } else if func.arguments.len() == 1 {
-                            if let Expression::Identifier(id) = &func.arguments[0] {
-                                format!("{}({})", func.function, id.value)
-                            } else {
-                                format!("{}(expr)", func.function)
-                            }
-                        } else {
-                            format!("{}(...)", func.function)
-                        };
-
-                        if let Some(&idx) = col_index_map.get(&func_col_name.to_lowercase()) {
+                        // An aggregate computed before the window reads its slot
+                        if let Some(&idx) = group_slots.get(&ExprKey::of_call(func)) {
+                            let output_name = match func.arguments.as_slice() {
+                                [] | [Expression::Star(_)] => format!("{}(*)", func.function),
+                                [Expression::Identifier(id)] => {
+                                    format!("{}({})", func.function, id.value)
+                                }
+                                _ => format!("expr_{}", items.len()),
+                            };
                             items.push(SelectItem {
-                                output_name: func_col_name,
+                                output_name,
                                 source: SelectItemSource::BaseColumn(idx),
                             });
                         } else {
@@ -1986,6 +2006,7 @@ impl Executor {
         rows: &[(i64, Row)],
         columns: &[String],
         col_index_map: &StringMap<usize>,
+        group_slots: &FxHashMap<ExprKey, usize>,
         ctx: &ExecutionContext,
         pre_grouped: Option<&WindowPreGroupedState>,
         order_by_values: Option<&ColumnarOrderByValues>,
@@ -2008,7 +2029,7 @@ impl Executor {
         }) {
             pg.partition_map.values().cloned().collect()
         } else {
-            Self::build_partition_map(wf_info, rows, columns, col_index_map, ctx)?
+            Self::build_partition_map(wf_info, rows, columns, col_index_map, group_slots, ctx)?
                 .into_values()
                 .collect()
         };
@@ -2105,6 +2126,7 @@ impl Executor {
         rows: &[(i64, Row)],
         columns: &[String],
         col_index_map: &StringMap<usize>,
+        group_slots: &FxHashMap<ExprKey, usize>,
         ctx: &ExecutionContext,
     ) -> Result<FxHashMap<PartitionKey, Vec<usize>>> {
         let mut partitions: FxHashMap<PartitionKey, Vec<usize>> = FxHashMap::default();
@@ -2119,13 +2141,10 @@ impl Executor {
 
         if has_complex_expr && !wf_info.partition_by_exprs.is_empty() {
             // Complex path: use MultiExpressionEval to evaluate expressions per row
-            let agg_aliases: Vec<(String, usize)> =
-                col_index_map.iter().map(|(k, v)| (k.clone(), *v)).collect();
-
             let eval = MultiExpressionEval::compile_with_aliases(
                 &wf_info.partition_by_exprs,
                 columns,
-                &agg_aliases,
+                group_slots,
             )
             .map_err(|e| {
                 Error::internal(format!("Failed to compile PARTITION BY expression: {}", e))
@@ -2183,6 +2202,7 @@ impl Executor {
         rows: &[(i64, Row)],
         columns: &[String],
         col_index_map: &StringMap<usize>,
+        group_slots: &FxHashMap<ExprKey, usize>,
         ctx: &ExecutionContext,
         pre_sorted: Option<&WindowPreSortedState>,
         pre_grouped: Option<&WindowPreGroupedState>,
@@ -2205,6 +2225,7 @@ impl Executor {
                 rows,
                 columns,
                 col_index_map,
+                group_slots,
                 ctx,
                 pre_sorted,
                 cached_order_by,
@@ -2238,6 +2259,7 @@ impl Executor {
             rows,
             columns,
             col_index_map,
+            group_slots,
             ctx,
             pre_grouped,
             precomputed_order_by,
@@ -2258,6 +2280,7 @@ impl Executor {
                 precomputed_order_by,
                 columns,
                 col_index_map,
+                group_slots,
                 ctx,
                 &mut results,
             )?;
@@ -2294,6 +2317,7 @@ impl Executor {
                         precomputed_order_by,
                         columns,
                         col_index_map,
+                        group_slots,
                         ctx,
                         &parallel_results,
                     )
@@ -2310,6 +2334,7 @@ impl Executor {
                     precomputed_order_by,
                     columns,
                     col_index_map,
+                    group_slots,
                     ctx,
                     &parallel_results,
                 )
@@ -2335,6 +2360,7 @@ impl Executor {
                     precomputed_order_by,
                     columns,
                     col_index_map,
+                    group_slots,
                     ctx,
                     &mut results,
                 )?;
@@ -2363,6 +2389,7 @@ impl Executor {
         precomputed_order_by: Option<&ColumnarOrderByValues>,
         columns: &[String],
         col_index_map: &StringMap<usize>,
+        group_slots: &FxHashMap<ExprKey, usize>,
         ctx: &ExecutionContext,
         skip_sorting: bool,
     ) -> Result<(Vec<Value>, Vec<usize>)> {
@@ -2384,7 +2411,7 @@ impl Executor {
 
         // OPTIMIZATION: Pre-compute column index for function argument
         let arg_col_idx: Option<usize> = if !wf_info.arguments.is_empty() {
-            self.resolve_column_index(&wf_info.arguments[0], col_index_map)
+            self.resolve_column_index(&wf_info.arguments[0], col_index_map, group_slots)
         } else {
             None
         };
@@ -2577,6 +2604,7 @@ impl Executor {
         precomputed_order_by: Option<&ColumnarOrderByValues>,
         columns: &[String],
         col_index_map: &StringMap<usize>,
+        group_slots: &FxHashMap<ExprKey, usize>,
         ctx: &ExecutionContext,
         results: &mut [Value],
     ) -> Result<()> {
@@ -2597,7 +2625,7 @@ impl Executor {
 
         // Pre-compute column index for function argument
         let arg_col_idx: Option<usize> = if !wf_info.arguments.is_empty() {
-            self.resolve_column_index(&wf_info.arguments[0], col_index_map)
+            self.resolve_column_index(&wf_info.arguments[0], col_index_map, group_slots)
         } else {
             None
         };
@@ -2782,6 +2810,7 @@ impl Executor {
         precomputed_order_by: Option<&ColumnarOrderByValues>,
         columns: &[String],
         col_index_map: &StringMap<usize>,
+        group_slots: &FxHashMap<ExprKey, usize>,
         ctx: &ExecutionContext,
         results: &ParallelVec,
     ) -> Result<()> {
@@ -2802,7 +2831,7 @@ impl Executor {
 
         // Pre-compute column index for function argument
         let arg_col_idx: Option<usize> = if !wf_info.arguments.is_empty() {
-            self.resolve_column_index(&wf_info.arguments[0], col_index_map)
+            self.resolve_column_index(&wf_info.arguments[0], col_index_map, group_slots)
         } else {
             None
         };
@@ -3330,6 +3359,7 @@ impl Executor {
         &self,
         expr: &Expression,
         col_index_map: &StringMap<usize>,
+        group_slots: &FxHashMap<ExprKey, usize>,
     ) -> Option<usize> {
         match expr {
             Expression::Identifier(id) => col_index_map.get(id.value_lower.as_str()).copied(),
@@ -3343,38 +3373,15 @@ impl Executor {
                     .or_else(|| col_index_map.get(qid.name.value_lower.as_str()))
                     .copied()
             }
-            Expression::FunctionCall(func) => {
-                // Handle aggregate functions that have been computed in GROUP BY
-                // e.g., SUM(val) -> look for column named "SUM(val)"
-                let func_col_name = if func.arguments.is_empty()
-                    || matches!(func.arguments.first(), Some(Expression::Star(_)))
-                {
-                    format!("{}(*)", func.function)
-                } else if func.arguments.len() == 1 {
-                    match &func.arguments[0] {
-                        Expression::Identifier(id) => {
-                            format!("{}({})", func.function, id.value)
-                        }
-                        Expression::QualifiedIdentifier(qid) => {
-                            format!("{}({})", func.function, qid.name.value)
-                        }
-                        _ => format!("{}(expr)", func.function),
-                    }
-                } else {
-                    format!("{}(...)", func.function)
-                };
-
-                // First try exact match (e.g., "sum(val)")
-                if let Some(idx) = col_index_map.get(&func_col_name.to_lowercase()).copied() {
-                    return Some(idx);
-                }
-
-                // If not found and this is an aggregate function, the result might be aliased
-                // In that case, we need the caller to use expression evaluation instead
-                // Return None to trigger the expression evaluation path
-                None
-            }
-            _ => None,
+            // A group item or aggregate computed before the window reads its slot,
+            // and a derived table's aggregate column the name it carries
+            _ => (!group_slots.is_empty())
+                .then(|| group_slots.get(&ExprKey::of(expr)).copied())
+                .flatten()
+                .or_else(|| {
+                    derived_aggregate_column_name(expr)
+                        .and_then(|name| col_index_map.get(name.to_lowercase().as_str()).copied())
+                }),
         }
     }
 
@@ -3386,6 +3393,7 @@ impl Executor {
         rows: &[(i64, Row)],
         columns: &[String],
         col_index_map: &StringMap<usize>,
+        group_slots: &FxHashMap<ExprKey, usize>,
         ctx: &ExecutionContext,
     ) -> Result<ColumnarOrderByValues> {
         let num_rows = rows.len();
@@ -3421,18 +3429,13 @@ impl Executor {
             .collect();
 
         if has_complex_expr {
-            // Build aliases from col_index_map (e.g., "sum(val)" -> column_index)
-            // This allows ORDER BY SUM(val) to resolve to the correct column
-            let agg_aliases: Vec<(String, usize)> =
-                col_index_map.iter().map(|(k, v)| (k.clone(), *v)).collect();
-
             // Extract order_by expressions
             let order_exprs: Vec<Expression> =
                 order_by.iter().map(|ob| ob.expression.clone()).collect();
 
-            // Compile all expressions with aliases
+            // A group item or aggregate in ORDER BY reads its slot
             let mut eval =
-                MultiExpressionEval::compile_with_aliases(&order_exprs, columns, &agg_aliases)?
+                MultiExpressionEval::compile_with_aliases(&order_exprs, columns, group_slots)?
                     .with_context(ctx);
             for (_, row) in rows {
                 for (col_idx, value) in eval.eval_all(row)?.into_iter().enumerate() {
@@ -3976,6 +3979,7 @@ impl Executor {
         rows: &[(i64, Row)],
         columns: &[String],
         col_index_map: &StringMap<usize>,
+        group_slots: &FxHashMap<ExprKey, usize>,
         ctx: &ExecutionContext,
         pre_sorted: Option<&WindowPreSortedState>,
         cached_order_by: Option<&ColumnarOrderByValues>,
@@ -3987,7 +3991,7 @@ impl Executor {
 
         // Get the column index for the aggregate argument
         let mut arg_col_idx: Option<usize> = if !wf_info.arguments.is_empty() && !is_count_star {
-            self.resolve_column_index(&wf_info.arguments[0], col_index_map)
+            self.resolve_column_index(&wf_info.arguments[0], col_index_map, group_slots)
         } else {
             // COUNT(*) has no arguments or Star expression
             None
@@ -4049,7 +4053,7 @@ impl Executor {
         // the shared cache
         let owned_partitions: Option<Vec<Vec<usize>>> = if skip_sorting {
             Some(
-                Self::build_partition_map(wf_info, rows, columns, col_index_map, ctx)?
+                Self::build_partition_map(wf_info, rows, columns, col_index_map, group_slots, ctx)?
                     .into_values()
                     .collect(),
             )
@@ -4063,6 +4067,7 @@ impl Executor {
                 rows,
                 columns,
                 col_index_map,
+                group_slots,
                 ctx,
                 None,
                 cached_order_by,
@@ -4552,112 +4557,6 @@ impl Executor {
             .into_iter()
             .map(|opt| opt.unwrap_or(NULL_VALUE))
             .collect())
-    }
-
-    /// Extract aggregate function patterns from an expression (including nested ones)
-    /// This handles cases like COALESCE(SUM(val), 0) where SUM(val) is nested
-    fn extract_aggregate_patterns(expr: &Expression, executor: &Executor) -> Vec<String> {
-        let mut patterns = Vec::new();
-        Self::collect_aggregate_patterns(expr, executor, &mut patterns);
-        patterns
-    }
-
-    /// Helper to recursively collect aggregate patterns from an expression
-    fn collect_aggregate_patterns(
-        expr: &Expression,
-        executor: &Executor,
-        patterns: &mut Vec<String>,
-    ) {
-        match expr {
-            Expression::FunctionCall(func) => {
-                if executor.function_registry.is_aggregate(&func.function) {
-                    // This is an aggregate function - generate its pattern
-                    let pattern = if func.arguments.is_empty()
-                        || matches!(func.arguments.first(), Some(Expression::Star(_)))
-                    {
-                        format!("{}(*)", func.function)
-                    } else if func.arguments.len() == 1 {
-                        match &func.arguments[0] {
-                            Expression::Identifier(id) => {
-                                format!("{}({})", func.function, id.value)
-                            }
-                            Expression::QualifiedIdentifier(qid) => {
-                                // Generate BOTH qualified and unqualified patterns
-                                // e.g., for SUM(o.amount), add "SUM(amount)" first
-                                let unqualified = format!("{}({})", func.function, qid.name.value);
-                                patterns.push(unqualified);
-                                // Then add qualified pattern "SUM(o.amount)"
-                                format!(
-                                    "{}({}.{})",
-                                    func.function, qid.qualifier.value, qid.name.value
-                                )
-                            }
-                            Expression::Distinct(d) => {
-                                // Handle DISTINCT, e.g., COUNT(DISTINCT val)
-                                match d.expr.as_ref() {
-                                    Expression::Identifier(id) => {
-                                        format!("{}(DISTINCT {})", func.function, id.value)
-                                    }
-                                    Expression::QualifiedIdentifier(qid) => {
-                                        // Generate both qualified and unqualified patterns
-                                        let unqualified = format!(
-                                            "{}(DISTINCT {})",
-                                            func.function, qid.name.value
-                                        );
-                                        patterns.push(unqualified);
-                                        format!(
-                                            "{}(DISTINCT {}.{})",
-                                            func.function, qid.qualifier.value, qid.name.value
-                                        )
-                                    }
-                                    _ => return,
-                                }
-                            }
-                            _ => return,
-                        }
-                    } else {
-                        return;
-                    };
-                    patterns.push(pattern);
-                } else {
-                    // Non-aggregate function - check its arguments for nested aggregates
-                    for arg in &func.arguments {
-                        Self::collect_aggregate_patterns(arg, executor, patterns);
-                    }
-                }
-            }
-            Expression::Infix(infix) => {
-                Self::collect_aggregate_patterns(&infix.left, executor, patterns);
-                Self::collect_aggregate_patterns(&infix.right, executor, patterns);
-            }
-            Expression::Prefix(prefix) => {
-                Self::collect_aggregate_patterns(&prefix.right, executor, patterns);
-            }
-            Expression::Case(case) => {
-                if let Some(ref value) = case.value {
-                    Self::collect_aggregate_patterns(value, executor, patterns);
-                }
-                for when_clause in &case.when_clauses {
-                    Self::collect_aggregate_patterns(&when_clause.condition, executor, patterns);
-                    Self::collect_aggregate_patterns(&when_clause.then_result, executor, patterns);
-                }
-                if let Some(ref else_value) = case.else_value {
-                    Self::collect_aggregate_patterns(else_value, executor, patterns);
-                }
-            }
-            Expression::Cast(cast) => {
-                Self::collect_aggregate_patterns(&cast.expr, executor, patterns);
-            }
-            Expression::Aliased(aliased) => {
-                Self::collect_aggregate_patterns(&aliased.expression, executor, patterns);
-            }
-            Expression::List(list) => {
-                for e in &list.elements {
-                    Self::collect_aggregate_patterns(e, executor, patterns);
-                }
-            }
-            _ => {}
-        }
     }
 }
 
