@@ -27,8 +27,8 @@ use super::{value_to_i64, value_to_string};
 /// length (REPEAT, LPAD, RPAD) or by multiplying its input (REPLACE)
 const MAX_BUILT_BYTES: usize = 10 * 1024 * 1024;
 
-/// An error when `function` would build `bytes` bytes, asked before anything
-/// is allocated
+/// An error when `function` would build `bytes` bytes, asked before the
+/// result or the pad's characters are allocated
 fn check_built_size(function: &str, bytes: usize) -> Result<()> {
     if bytes > MAX_BUILT_BYTES {
         return Err(Error::invalid_argument(format!(
