@@ -193,43 +193,32 @@ impl<'a> ExecuteContext<'a> {
     }
 }
 
-/// Trait for executing subqueries
+/// Runs a prepared plan's subquery blocks for the row being evaluated; a
+/// `None` answer is UNKNOWN, and an error is the statement's error
 pub trait SubqueryExecutor {
-    /// Execute a scalar subquery for the row being evaluated and return its value
+    /// The scalar block's value
     fn execute_scalar(&self, subquery_index: u16, row: &Row) -> Result<Value>;
 
-    /// Execute EXISTS subquery
-    fn execute_exists(
-        &self,
-        subquery_index: u16,
-        outer_row: Option<&FxHashMap<CompactArc<str>, Value>>,
-    ) -> Result<bool>;
+    /// Whether a row passes the block's WHERE
+    fn execute_exists(&self, subquery_index: u16, row: &Row) -> Result<bool>;
 
-    /// Execute IN subquery and check membership
-    fn execute_in(
-        &self,
-        subquery_index: u16,
-        value: &Value,
-        outer_row: Option<&FxHashMap<CompactArc<str>, Value>>,
-    ) -> Result<bool>;
+    /// `value IN (block)`
+    fn execute_in(&self, subquery_index: u16, value: &Value, row: &Row) -> Result<Option<bool>>;
 
-    /// Execute ALL subquery
-    fn execute_all(
+    /// `value op ALL (block)` when `all`, else `value op ANY (block)`
+    fn execute_quantified(
         &self,
         subquery_index: u16,
         value: &Value,
         op: CompareOp,
-        outer_row: Option<&FxHashMap<CompactArc<str>, Value>>,
-    ) -> Result<bool>;
+        all: bool,
+        row: &Row,
+    ) -> Result<Option<bool>>;
+}
 
-    /// Execute ANY subquery
-    fn execute_any(
-        &self,
-        subquery_index: u16,
-        value: &Value,
-        op: CompareOp,
-        outer_row: Option<&FxHashMap<CompactArc<str>, Value>>,
-    ) -> Result<bool>;
+/// A subquery op compiles only into a prepared plan, which runs with its executor
+fn no_subquery_executor() -> crate::core::Error {
+    crate::core::Error::internal("a subquery ran outside its prepared plan")
 }
 
 /// Expression Virtual Machine
@@ -1916,72 +1905,38 @@ impl ExprVM {
                 // SUBQUERY OPERATIONS
                 // =============================================================
                 Op::ExecScalarSubquery(idx) => {
-                    let result = if let Some(executor) = ctx.subquery_executor {
-                        executor.execute_scalar(*idx, ctx.row)?
-                    } else {
-                        Value::null_unknown()
-                    };
-                    self.stack.push(result);
+                    let executor = ctx.subquery_executor.ok_or_else(no_subquery_executor)?;
+                    self.stack.push(executor.execute_scalar(*idx, ctx.row)?);
                     pc += 1;
                 }
 
                 Op::ExecExists(idx) => {
-                    let result = if let Some(executor) = ctx.subquery_executor {
-                        executor
-                            .execute_exists(*idx, ctx.outer_row)
-                            .unwrap_or(false)
-                    } else {
-                        false
-                    };
-                    self.stack.push(Value::Boolean(result));
+                    let executor = ctx.subquery_executor.ok_or_else(no_subquery_executor)?;
+                    let exists = executor.execute_exists(*idx, ctx.row)?;
+                    self.stack.push(Value::Boolean(exists));
                     pc += 1;
                 }
 
+                // The block decides: a NULL value over no rows is FALSE, not UNKNOWN
                 Op::ExecInSubquery(idx) => {
+                    let executor = ctx.subquery_executor.ok_or_else(no_subquery_executor)?;
                     let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = if v.is_null() {
-                        Value::Null(DataType::Boolean)
-                    } else if let Some(executor) = ctx.subquery_executor {
-                        let in_result = executor
-                            .execute_in(*idx, &v, ctx.outer_row)
-                            .unwrap_or(false);
-                        Value::Boolean(in_result)
-                    } else {
-                        Value::Boolean(false)
-                    };
-                    self.stack.push(result);
+                    self.stack
+                        .push(truth(executor.execute_in(*idx, &v, ctx.row)?));
                     pc += 1;
                 }
 
-                Op::ExecAll(idx, compare_op) => {
+                // As IN: a NULL value over no rows is FALSE for ANY and TRUE for ALL
+                Op::ExecQuantified(idx, compare_op, all) => {
+                    let executor = ctx.subquery_executor.ok_or_else(no_subquery_executor)?;
                     let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = if v.is_null() {
-                        Value::Null(DataType::Boolean)
-                    } else if let Some(executor) = ctx.subquery_executor {
-                        let all_result = executor
-                            .execute_all(*idx, &v, *compare_op, ctx.outer_row)
-                            .unwrap_or(false);
-                        Value::Boolean(all_result)
-                    } else {
-                        Value::Boolean(false)
-                    };
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                Op::ExecAny(idx, compare_op) => {
-                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = if v.is_null() {
-                        Value::Null(DataType::Boolean)
-                    } else if let Some(executor) = ctx.subquery_executor {
-                        let any_result = executor
-                            .execute_any(*idx, &v, *compare_op, ctx.outer_row)
-                            .unwrap_or(false);
-                        Value::Boolean(any_result)
-                    } else {
-                        Value::Boolean(false)
-                    };
-                    self.stack.push(result);
+                    self.stack.push(truth(executor.execute_quantified(
+                        *idx,
+                        &v,
+                        *compare_op,
+                        *all,
+                        ctx.row,
+                    )?));
                     pc += 1;
                 }
 
@@ -5666,5 +5621,179 @@ mod tests {
         let ctx = ExecuteContext::new(&row);
         let result = vm.execute(&program, &ctx).unwrap();
         assert!(result.is_null());
+    }
+
+    // =========================================================================
+    // Subquery ops
+    // =========================================================================
+
+    /// A block index, the value asked about, and the quantifier if any
+    type Asked = (u16, Value, Option<(CompareOp, bool)>);
+
+    /// Answers every block with `answer`, or fails, recording what it was asked
+    struct Blocks {
+        answer: Option<bool>,
+        fail: bool,
+        asked: std::cell::RefCell<Vec<Asked>>,
+    }
+
+    impl Blocks {
+        fn answering(answer: Option<bool>) -> Self {
+            Blocks {
+                answer,
+                fail: false,
+                asked: Default::default(),
+            }
+        }
+
+        fn failing() -> Self {
+            Blocks {
+                answer: None,
+                fail: true,
+                asked: Default::default(),
+            }
+        }
+
+        fn result<T>(&self, value: T) -> Result<T> {
+            if self.fail {
+                Err(crate::core::Error::internal("block failed"))
+            } else {
+                Ok(value)
+            }
+        }
+    }
+
+    impl SubqueryExecutor for Blocks {
+        fn execute_scalar(&self, _subquery_index: u16, _row: &Row) -> Result<Value> {
+            self.result(Value::Integer(7))
+        }
+
+        fn execute_exists(&self, _subquery_index: u16, _row: &Row) -> Result<bool> {
+            self.result(self.answer.unwrap_or(false))
+        }
+
+        fn execute_in(
+            &self,
+            subquery_index: u16,
+            value: &Value,
+            _row: &Row,
+        ) -> Result<Option<bool>> {
+            self.asked
+                .borrow_mut()
+                .push((subquery_index, value.clone(), None));
+            self.result(self.answer)
+        }
+
+        fn execute_quantified(
+            &self,
+            subquery_index: u16,
+            value: &Value,
+            op: CompareOp,
+            all: bool,
+            _row: &Row,
+        ) -> Result<Option<bool>> {
+            self.asked
+                .borrow_mut()
+                .push((subquery_index, value.clone(), Some((op, all))));
+            self.result(self.answer)
+        }
+    }
+
+    fn run_with(program: &Program, row: &Row, blocks: &Blocks) -> Result<Value> {
+        let ctx = ExecuteContext::new(row).with_subquery_executor(blocks);
+        ExprVM::new().execute(program, &ctx)
+    }
+
+    #[test]
+    fn test_a_block_answer_reaches_the_stack_three_valued() {
+        let row = Row::from_values(vec![Value::Integer(1)]);
+        for (op, answer, expected) in [
+            (Op::ExecInSubquery(3), Some(true), Value::Boolean(true)),
+            (Op::ExecInSubquery(3), Some(false), Value::Boolean(false)),
+            (Op::ExecInSubquery(3), None, Value::Null(DataType::Boolean)),
+            (
+                Op::ExecQuantified(3, CompareOp::Lt, true),
+                None,
+                Value::Null(DataType::Boolean),
+            ),
+            (
+                Op::ExecQuantified(3, CompareOp::Lt, false),
+                Some(true),
+                Value::Boolean(true),
+            ),
+        ] {
+            let program = Program::new(vec![Op::LoadColumn(0), op.clone(), Op::Return]);
+            let blocks = Blocks::answering(answer);
+            assert_eq!(
+                run_with(&program, &row, &blocks).unwrap(),
+                expected,
+                "{op:?} answering {answer:?}"
+            );
+        }
+        let program = Program::new(vec![
+            Op::LoadColumn(0),
+            Op::ExecInSubquery(3),
+            Op::Not,
+            Op::Return,
+        ]);
+        assert_eq!(
+            run_with(&program, &row, &Blocks::answering(None)).unwrap(),
+            Value::Null(DataType::Boolean),
+            "NOT IN keeps UNKNOWN"
+        );
+    }
+
+    #[test]
+    fn test_a_null_value_is_asked_of_the_block() {
+        let row = Row::from_values(vec![Value::Null(DataType::Integer)]);
+        let blocks = Blocks::answering(Some(false));
+        let program = Program::new(vec![Op::LoadColumn(0), Op::ExecInSubquery(2), Op::Return]);
+        assert_eq!(
+            run_with(&program, &row, &blocks).unwrap(),
+            Value::Boolean(false),
+            "NULL IN (a block with no rows) is FALSE"
+        );
+        let blocks = Blocks::answering(Some(true));
+        let program = Program::new(vec![
+            Op::LoadColumn(0),
+            Op::ExecQuantified(5, CompareOp::Gt, true),
+            Op::Return,
+        ]);
+        assert_eq!(
+            run_with(&program, &row, &blocks).unwrap(),
+            Value::Boolean(true),
+            "NULL > ALL (a block with no rows) is TRUE"
+        );
+        assert_eq!(
+            blocks.asked.borrow().as_slice(),
+            &[(
+                5,
+                Value::Null(DataType::Integer),
+                Some((CompareOp::Gt, true))
+            )],
+            "the block is asked with the value, its operator and its quantifier"
+        );
+    }
+
+    #[test]
+    fn test_a_block_error_is_the_statement_error() {
+        let row = Row::from_values(vec![Value::Integer(1)]);
+        for op in [
+            Op::ExecScalarSubquery(0),
+            Op::ExecExists(0),
+            Op::ExecInSubquery(0),
+            Op::ExecQuantified(0, CompareOp::Eq, false),
+        ] {
+            let program = Program::new(vec![Op::LoadColumn(0), op.clone(), Op::Return]);
+            assert!(
+                run_with(&program, &row, &Blocks::failing()).is_err(),
+                "{op:?}: the block's error is not read as FALSE"
+            );
+            let ctx = ExecuteContext::new(&row);
+            assert!(
+                ExprVM::new().execute(&program, &ctx).is_err(),
+                "{op:?}: a subquery without its prepared plan is an error"
+            );
+        }
     }
 }

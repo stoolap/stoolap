@@ -195,33 +195,31 @@ fn try_extract_simple_value(expr: &Expression, ctx: &ExecutionContext) -> Option
 fn eval_default_slot(
     vm: &mut super::expression::ExprVM,
     exec_ctx: &super::expression::ExecuteContext,
-    program: &Option<(super::expression::SharedProgram, DataType)>,
+    program: &DefaultSlot,
     template_val: &Value,
 ) -> Result<Value> {
     Ok(match program {
-        Some((program, target)) => vm
+        Some((Ok(program), target)) => vm
             .execute_cow(program, exec_ctx)?
             .into_coerce_to_type(*target),
+        Some((Err(e), _)) => return Err(e.clone()),
         None => template_val.clone(),
     })
 }
 
+/// A non-literal default's program, or the error it failed to compile
+/// with, raised only when a row takes the default
+pub(crate) type DefaultSlot = Option<(Result<super::expression::SharedProgram>, DataType)>;
+
 /// Per-statement default machinery: constant defaults land in the value
 /// template; non-literal defaults compile ONCE and execute PER ROW, so
-/// DEFAULT (RANDOM()) differs per row. Parse and compile failures degrade
-/// the slot to NULL, preserving evaluate_default_expr's swallowed-error
-/// behavior for defaults.
-#[allow(clippy::type_complexity)]
-fn build_default_slots(
-    schema: &crate::core::Schema,
-) -> (
-    Vec<Value>,
-    Vec<Option<(super::expression::SharedProgram, DataType)>>,
-) {
+/// DEFAULT (RANDOM()) differs per row. A default that fails to compile is
+/// the error of a row that takes it, as in evaluate_default_expr.
+fn build_default_slots(schema: &crate::core::Schema) -> (Vec<Value>, Vec<DefaultSlot>) {
     use super::expression::compile_expression;
     let n = schema.columns.len();
     let mut values = Vec::with_capacity(n);
-    let mut programs: Vec<Option<(super::expression::SharedProgram, DataType)>> = vec![None; n];
+    let mut programs: Vec<DefaultSlot> = vec![None; n];
     for (i, c) in schema.columns.iter().enumerate() {
         let Some(expr_str) = c.default_expr.as_ref() else {
             values.push(Value::null_unknown());
@@ -245,13 +243,8 @@ fn build_default_slots(
             values.push(lit.into_coerce_to_type(target));
             continue;
         }
-        match compile_expression(expr, &[]) {
-            Ok(program) => {
-                values.push(Value::null_unknown());
-                programs[i] = Some((program, target));
-            }
-            Err(_) => values.push(Value::null_unknown()),
-        }
+        values.push(Value::null_unknown());
+        programs[i] = Some((compile_expression(expr, &[]), target));
     }
     (values, programs)
 }
@@ -673,7 +666,7 @@ impl Executor {
         let all_column_types: Vec<crate::core::DataType>;
         // Per-statement default slots: constant values plus per-row programs
         let default_values: Vec<Value>;
-        let default_programs: Vec<Option<(super::expression::SharedProgram, DataType)>>;
+        let default_programs: Vec<DefaultSlot>;
         let mut insert_plan: InsertPlan<'_>;
         let check_programs: Arc<Vec<CompiledCheck>>;
         let mut check_vm = super::expression::ExprVM::new();
@@ -2535,8 +2528,8 @@ impl Executor {
                         .iter()
                         .filter_map(|(col_name, expr)| {
                             let col_lower = col_name.to_lowercase();
-                            col_map.get(&col_lower).and_then(|&idx| {
-                                compile_expression(expr, &column_names).ok().map(|program| {
+                            col_map.get(&col_lower).map(|&idx| {
+                                compile_expression(expr, &column_names).map(|program| {
                                     (
                                         idx,
                                         schema.columns[idx].data_type,
@@ -2546,15 +2539,15 @@ impl Executor {
                                 })
                             })
                         })
-                        .collect()
+                        .collect::<Result<_>>()?
                 } else {
                     // Compile directly from statement expressions
                     stmt.updates
                         .iter()
                         .filter_map(|(col_name, expr)| {
                             let col_lower: String = col_name.to_lowercase().into();
-                            col_map.get(&col_lower).and_then(|&idx| {
-                                compile_expression(expr, &column_names).ok().map(|program| {
+                            col_map.get(&col_lower).map(|&idx| {
+                                compile_expression(expr, &column_names).map(|program| {
                                     (
                                         idx,
                                         schema.columns[idx].data_type,
@@ -2564,7 +2557,7 @@ impl Executor {
                                 })
                             })
                         })
-                        .collect()
+                        .collect::<Result<_>>()?
                 };
 
             // Column names for coercion errors, captured before the setter
@@ -2582,24 +2575,23 @@ impl Executor {
                         schema.columns[*idx].check_expr.as_ref().and_then(|expr| {
                             let col_name = schema.columns[*idx].name.clone();
                             let expr_text = expr.clone();
-                            compile_expression(
-                                &crate::parser::parse_sql(&format!("SELECT {}", expr))
-                                    .ok()?
-                                    .into_iter()
-                                    .next()
-                                    .and_then(|s| match s {
-                                        crate::parser::ast::Statement::Select(sel) => {
-                                            sel.columns.into_iter().next()
-                                        }
-                                        _ => None,
-                                    })?,
-                                &column_names,
+                            let check = crate::parser::parse_sql(&format!("SELECT {}", expr))
+                                .ok()?
+                                .into_iter()
+                                .next()
+                                .and_then(|s| match s {
+                                    crate::parser::ast::Statement::Select(sel) => {
+                                        sel.columns.into_iter().next()
+                                    }
+                                    _ => None,
+                                })?;
+                            Some(
+                                compile_expression(&check, &column_names)
+                                    .map(|program| (*idx, col_name, expr_text, program)),
                             )
-                            .ok()
-                            .map(|program| (*idx, col_name, expr_text, program))
                         })
                     })
-                    .collect();
+                    .collect::<Result<_>>()?;
 
             // Create VM once and reuse for all rows
             let mut vm = ExprVM::new();

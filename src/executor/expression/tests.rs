@@ -26,6 +26,7 @@ use super::ops::{CompiledPattern, Op};
 use super::program::Program;
 use super::vm::{ExecuteContext, ExprVM};
 use crate::core::{Value, ValueSet};
+use crate::parser::ast::Expression;
 use crate::Row;
 
 #[test]
@@ -476,4 +477,91 @@ fn test_compiled_pattern_case_insensitive() {
     assert!(pattern.matches("testing", true));
     assert!(pattern.matches("TESTING", true));
     assert!(pattern.matches("TeStInG", true));
+}
+
+/// The WHERE of `SELECT * FROM t WHERE {predicate}`
+fn where_of(predicate: &str) -> Expression {
+    let statements =
+        crate::parser::parse_sql(&format!("SELECT * FROM t WHERE {predicate}")).unwrap();
+    match &statements[0] {
+        crate::parser::ast::Statement::Select(select) => {
+            select.where_clause.as_deref().unwrap().clone()
+        }
+        other => panic!("not a SELECT: {other:?}"),
+    }
+}
+
+/// The address of the one subquery block `expr` holds
+fn block_key(expr: &Expression) -> usize {
+    let block = match expr {
+        Expression::Exists(exists) => &exists.subquery,
+        Expression::AllAny(all_any) => &all_any.subquery,
+        Expression::In(in_expr) => match &*in_expr.right {
+            Expression::ScalarSubquery(sq) => &sq.subquery,
+            other => panic!("no block on the right: {other:?}"),
+        },
+        Expression::Prefix(prefix) => return block_key(&prefix.right),
+        other => panic!("no block: {other:?}"),
+    };
+    &**block as *const crate::parser::ast::SelectStatement as usize
+}
+
+#[test]
+fn test_a_prepared_block_compiles_to_its_id() {
+    let columns = vec!["x".to_string()];
+    for (predicate, expected) in [
+        ("x IN (SELECT y FROM u)", vec!["ExecInSubquery(4)"]),
+        (
+            "x NOT IN (SELECT y FROM u)",
+            vec!["ExecInSubquery(4)", "Not"],
+        ),
+        ("EXISTS (SELECT 1 FROM u)", vec!["ExecExists(4)"]),
+        (
+            "x > ALL (SELECT y FROM u)",
+            vec!["ExecQuantified(4, Gt, true)"],
+        ),
+        (
+            "x <= ANY (SELECT y FROM u)",
+            vec!["ExecQuantified(4, Le, false)"],
+        ),
+    ] {
+        let expr = where_of(predicate);
+        let ids: rustc_hash::FxHashMap<usize, u16> = [(block_key(&expr), 4)].into_iter().collect();
+        let ctx = CompileContext::with_global_registry(&columns).with_subquery_ids(&ids);
+        let program = ExprCompiler::new(&ctx).compile(&expr).unwrap();
+        let ops: Vec<String> = program.ops().iter().map(|op| format!("{op:?}")).collect();
+        let at = ops
+            .iter()
+            .position(|op| *op == expected[0])
+            .unwrap_or_else(|| panic!("{predicate}: no {} in {ops:?}", expected[0]));
+        assert_eq!(
+            &ops[at..at + expected.len()],
+            expected.as_slice(),
+            "{predicate}"
+        );
+    }
+}
+
+#[test]
+fn test_a_block_outside_a_prepared_plan_does_not_compile() {
+    let columns = vec!["x".to_string()];
+    let none = rustc_hash::FxHashMap::default();
+    for predicate in [
+        "x IN (SELECT y FROM u)",
+        "EXISTS (SELECT 1 FROM u)",
+        "x > ALL (SELECT y FROM u)",
+        "x = (SELECT y FROM u)",
+    ] {
+        let expr = where_of(predicate);
+        let ctx = CompileContext::with_global_registry(&columns);
+        assert!(
+            ExprCompiler::new(&ctx).compile(&expr).is_err(),
+            "{predicate}: without ids no subquery op is built"
+        );
+        let ctx = CompileContext::with_global_registry(&columns).with_subquery_ids(&none);
+        assert!(
+            ExprCompiler::new(&ctx).compile(&expr).is_err(),
+            "{predicate}: a block the plan did not prepare does not compile"
+        );
+    }
 }

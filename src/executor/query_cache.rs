@@ -209,15 +209,7 @@ pub struct CompiledInsert {
     pub column_names: Arc<Vec<SmartString>>,
     /// Per-row default programs: Some for non-literal defaults, which
     /// must execute per row (DEFAULT (RANDOM()) differs per row)
-    #[allow(clippy::type_complexity)]
-    pub default_programs: Arc<
-        Vec<
-            Option<(
-                crate::executor::expression::SharedProgram,
-                crate::core::DataType,
-            )>,
-        >,
-    >,
+    pub default_programs: Arc<Vec<crate::executor::dml::DefaultSlot>>,
     /// Constant default values for all columns (null_unknown when the
     /// column has no default or a per-row program)
     pub default_row_template: Arc<Vec<crate::core::Value>>,

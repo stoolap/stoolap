@@ -886,17 +886,13 @@ pub enum Op {
     /// Stack: [] -> [bool]
     ExecExists(u16), // Subquery plan index
 
-    /// Execute IN subquery
-    /// Stack: [value] -> [bool]
+    /// Execute IN subquery: TRUE, FALSE or UNKNOWN
+    /// Stack: [value] -> [bool or NULL]
     ExecInSubquery(u16), // Subquery plan index
 
-    /// Execute ALL comparison subquery
-    /// Stack: [value] -> [bool]
-    ExecAll(u16, CompareOp), // Subquery index, comparison operator
-
-    /// Execute ANY comparison subquery
-    /// Stack: [value] -> [bool]
-    ExecAny(u16, CompareOp), // Subquery index, comparison operator
+    /// Execute `value op ALL` (true) or `value op ANY` (false): TRUE, FALSE or UNKNOWN
+    /// Stack: [value] -> [bool or NULL]
+    ExecQuantified(u16, CompareOp, bool), // Subquery index, comparison operator, ALL
 
     // =========================================================================
     // AGGREGATE REFERENCES (post-aggregation)
@@ -987,7 +983,8 @@ impl QuantifiedMembers {
         })
     }
 
-    /// The three-valued answer for `value`; the members are never empty
+    /// The three-valued answer for `value`; over no members at all ANY is
+    /// FALSE and ALL is TRUE, whatever `value` is
     pub fn answer(&self, value: &Value) -> Option<bool> {
         // A decided member settles it: TRUE for ANY, FALSE for ALL
         let decides = !self.all;
@@ -1231,8 +1228,9 @@ impl std::fmt::Debug for Op {
             Op::ExecScalarSubquery(idx) => write!(f, "ExecScalarSubquery({})", idx),
             Op::ExecExists(idx) => write!(f, "ExecExists({})", idx),
             Op::ExecInSubquery(idx) => write!(f, "ExecInSubquery({})", idx),
-            Op::ExecAll(idx, op) => write!(f, "ExecAll({}, {:?})", idx, op),
-            Op::ExecAny(idx, op) => write!(f, "ExecAny({}, {:?})", idx, op),
+            Op::ExecQuantified(idx, op, all) => {
+                write!(f, "ExecQuantified({}, {:?}, {})", idx, op, all)
+            }
             Op::LoadAggregateResult(idx) => write!(f, "LoadAggregateResult({})", idx),
             Op::LoadTransactionId => write!(f, "LoadTransactionId"),
             Op::Nop => write!(f, "Nop"),
@@ -1797,6 +1795,39 @@ mod tests {
     }
 
     #[test]
+    fn test_quantified_members_over_no_rows() {
+        let none = CompactArc::new(Vec::new());
+        for value in [Value::Integer(1), Value::Null(DataType::Integer)] {
+            for op in [CompareOp::Eq, CompareOp::Ne, CompareOp::Lt, CompareOp::Ge] {
+                let any = QuantifiedMembers::new(op, false, CompactArc::clone(&none), false);
+                let all = QuantifiedMembers::new(op, true, CompactArc::clone(&none), false);
+                assert_eq!(
+                    any.answer(&value),
+                    Some(false),
+                    "{value:?} {op:?} ANY of no rows"
+                );
+                assert_eq!(
+                    all.answer(&value),
+                    Some(true),
+                    "{value:?} {op:?} ALL of no rows"
+                );
+                let any_null = QuantifiedMembers::new(op, false, CompactArc::clone(&none), true);
+                let all_null = QuantifiedMembers::new(op, true, CompactArc::clone(&none), true);
+                assert_eq!(
+                    any_null.answer(&value),
+                    None,
+                    "{value:?} {op:?} ANY of one NULL"
+                );
+                assert_eq!(
+                    all_null.answer(&value),
+                    None,
+                    "{value:?} {op:?} ALL of one NULL"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_op_debug_subquery() {
         assert_eq!(
             format!("{:?}", Op::ExecScalarSubquery(0)),
@@ -1805,12 +1836,12 @@ mod tests {
         assert_eq!(format!("{:?}", Op::ExecExists(1)), "ExecExists(1)");
         assert_eq!(format!("{:?}", Op::ExecInSubquery(2)), "ExecInSubquery(2)");
         assert_eq!(
-            format!("{:?}", Op::ExecAll(3, CompareOp::Gt)),
-            "ExecAll(3, Gt)"
+            format!("{:?}", Op::ExecQuantified(3, CompareOp::Gt, true)),
+            "ExecQuantified(3, Gt, true)"
         );
         assert_eq!(
-            format!("{:?}", Op::ExecAny(4, CompareOp::Lt)),
-            "ExecAny(4, Lt)"
+            format!("{:?}", Op::ExecQuantified(4, CompareOp::Lt, false)),
+            "ExecQuantified(4, Lt, false)"
         );
     }
 
