@@ -113,13 +113,16 @@ use super::utils::compute_join_projection;
 use super::utils::{
     add_table_qualifier, build_column_index_map, collect_table_qualifiers, column_families,
     combine_predicates_with_and, dummy_token, expression_contains_aggregate,
-    extract_base_column_name, extract_join_keys_and_residual, filter_references_column,
-    flatten_and_predicates, get_table_alias_from_expr, strip_table_qualifier,
-    substitute_filter_column,
+    extract_and_conditions, extract_base_column_name, extract_join_keys_and_residual,
+    filter_references_column, flatten_and_predicates, flip_operator, get_table_alias_from_expr,
+    infix_to_operator, strip_table_qualifier, substitute_filter_column,
 };
+use super::volatility::expression_volatility;
 use super::window::{WindowPreGroupedState, WindowPreSortedState};
 use super::Executor;
+use crate::functions::{global_registry, Volatility};
 use crate::optimizer::bloom::BloomFilterBuilder;
+use crate::storage::volume::side_index::{resolve_known, Domain, Resolved};
 
 /// The layout an ORDER BY or DISTINCT ON projection produces
 pub(super) struct OrderByProjection<'e> {
@@ -1466,14 +1469,7 @@ impl Executor {
             } else {
                 SmartString::from("value")
             };
-            let mut min_bound: Option<i64> = None;
-            let mut max_bound: Option<i64> = None;
-            Self::collect_range_bounds(filter_expr, &col_name, ctx, &mut min_bound, &mut max_bound);
-            if min_bound.is_some() || max_bound.is_some() {
-                Some((min_bound, max_bound))
-            } else {
-                None
-            }
+            Self::tvf_range_hint(filter_expr, &col_name, ctx)
         });
 
         let (mut result_rows, column_names) =
@@ -1610,7 +1606,6 @@ impl Executor {
 
     /// Extract integer range bounds from the WHERE clause for a TVF.
     /// Returns (min_bound, max_bound) where each is inclusive.
-    /// Only handles simple comparisons on the TVF's output column with integer literals.
     fn extract_tvf_range_hint(
         tvf_source: &FunctionTableSource,
         stmt: &SelectStatement,
@@ -1625,95 +1620,65 @@ impl Executor {
             SmartString::from("value")
         };
 
-        let mut min_bound: Option<i64> = None;
-        let mut max_bound: Option<i64> = None;
-
-        Self::collect_range_bounds(where_clause, &col_name, ctx, &mut min_bound, &mut max_bound);
-
-        if min_bound.is_some() || max_bound.is_some() {
-            Some((min_bound, max_bound))
-        } else {
-            None
-        }
+        Self::tvf_range_hint(where_clause, &col_name, ctx)
     }
 
-    /// Recursively collect range bounds from AND-conjuncted comparison predicates.
-    fn collect_range_bounds(
-        expr: &Expression,
+    /// The inclusive bounds the conjuncts of `filter` on the TVF's column put
+    /// on the integers it generates. A hint: the filter runs on every row
+    /// generated, so a conjunct the bounds cannot answer narrows nothing
+    fn tvf_range_hint(
+        filter: &Expression,
         col_name: &str,
         ctx: &ExecutionContext,
-        min_bound: &mut Option<i64>,
-        max_bound: &mut Option<i64>,
-    ) {
-        match expr {
-            Expression::Infix(infix) if infix.operator == "AND" => {
-                Self::collect_range_bounds(&infix.left, col_name, ctx, min_bound, max_bound);
-                Self::collect_range_bounds(&infix.right, col_name, ctx, min_bound, max_bound);
+    ) -> Option<(Option<i64>, Option<i64>)> {
+        let constant = |expr: &Expression| {
+            if expression_volatility(expr, global_registry()) == Volatility::PerCall {
+                return None;
             }
-            Expression::Infix(infix) => {
-                // Try col OP literal and literal OP col
-                let (is_col_left, literal_val) = if Self::is_tvf_column(&infix.left, col_name) {
-                    (true, Self::try_eval_to_i64(&infix.right, ctx))
-                } else if Self::is_tvf_column(&infix.right, col_name) {
-                    (false, Self::try_eval_to_i64(&infix.left, ctx))
-                } else {
-                    return;
-                };
-
-                let val = match literal_val {
-                    Some(v) => v,
-                    None => return,
-                };
-
-                // Normalize to col OP val form
-                let op = if is_col_left {
-                    infix.operator.as_str()
-                } else {
-                    // Flip: literal OP col → col FLIPPED_OP literal
-                    match infix.operator.as_str() {
-                        ">" => "<",
-                        ">=" => "<=",
-                        "<" => ">",
-                        "<=" => ">=",
-                        "=" => "=",
-                        _ => return,
-                    }
-                };
-
-                match op {
-                    ">=" => {
-                        *min_bound = Some(min_bound.map_or(val, |cur| cur.max(val)));
-                    }
-                    ">" => {
-                        let bound = val.saturating_add(1);
-                        *min_bound = Some(min_bound.map_or(bound, |cur| cur.max(bound)));
-                    }
-                    "<=" => {
-                        *max_bound = Some(max_bound.map_or(val, |cur| cur.min(val)));
-                    }
-                    "<" => {
-                        let bound = val.saturating_sub(1);
-                        *max_bound = Some(max_bound.map_or(bound, |cur| cur.min(bound)));
-                    }
-                    "=" => {
-                        *min_bound = Some(min_bound.map_or(val, |cur| cur.max(val)));
-                        *max_bound = Some(max_bound.map_or(val, |cur| cur.min(val)));
-                    }
-                    _ => {}
+            ExpressionEval::compile(expr, &[])
+                .ok()?
+                .with_context(ctx)
+                .eval_slice(&Row::new())
+                .ok()
+        };
+        let mut comparisons = Vec::new();
+        for conjunct in extract_and_conditions(filter) {
+            match conjunct {
+                Expression::Infix(infix) => {
+                    let Some(op) = infix_to_operator(infix.op_type) else {
+                        continue;
+                    };
+                    let (op, value) = if Self::is_tvf_column(&infix.left, col_name) {
+                        (op, &*infix.right)
+                    } else if Self::is_tvf_column(&infix.right, col_name) {
+                        (flip_operator(op), &*infix.left)
+                    } else {
+                        continue;
+                    };
+                    comparisons.extend(constant(value).map(|value| (op, value)));
                 }
+                Expression::Between(between)
+                    if !between.not && Self::is_tvf_column(&between.expr, col_name) =>
+                {
+                    let (gte, lte) = (crate::core::Operator::Gte, crate::core::Operator::Lte);
+                    comparisons.extend(constant(&between.lower).map(|v| (gte, v)));
+                    comparisons.extend(constant(&between.upper).map(|v| (lte, v)));
+                }
+                _ => {}
             }
-            Expression::Between(between)
-                if !between.not && Self::is_tvf_column(&between.expr, col_name) =>
-            {
-                if let Some(lo) = Self::try_eval_to_i64(&between.lower, ctx) {
-                    *min_bound = Some(min_bound.map_or(lo, |cur| cur.max(lo)));
-                }
-                if let Some(hi) = Self::try_eval_to_i64(&between.upper, ctx) {
-                    *max_bound = Some(max_bound.map_or(hi, |cur| cur.min(hi)));
-                }
-            }
-            _ => {}
         }
+        let known = resolve_known(
+            Domain::Integer,
+            comparisons.iter().map(|(op, value)| (*op, value)),
+        );
+        let (low, high) = match known? {
+            Resolved::Key(k) => (k, k),
+            Resolved::Range(low, high) => (low, high),
+            Resolved::Empty | Resolved::Fallback => return None,
+        };
+        let low = (low > i64::MIN).then_some(low);
+        let high = (high < i64::MAX).then_some(high);
+        (low.is_some() || high.is_some()).then_some((low, high))
     }
 
     /// Check if an expression refers to the TVF's output column.
@@ -1724,39 +1689,6 @@ impl Executor {
                 qi.name.value_lower.eq_ignore_ascii_case(col_name)
             }
             _ => false,
-        }
-    }
-
-    /// Try to extract an exact i64 constant from an expression (for TVF range pushdown).
-    /// Only accepts syntactically visible constants (integer literals, negated integer literals,
-    /// simple arithmetic on integer literals). Never evaluates function calls or other
-    /// potentially volatile expressions — those would be evaluated once here but per-row
-    /// in the real WHERE filter, changing semantics.
-    fn try_eval_to_i64(expr: &Expression, _ctx: &ExecutionContext) -> Option<i64> {
-        match expr {
-            Expression::IntegerLiteral(lit) => Some(lit.value),
-            Expression::Prefix(p) if p.operator == "-" => {
-                if let Expression::IntegerLiteral(lit) = &*p.right {
-                    lit.value.checked_neg()
-                } else {
-                    None
-                }
-            }
-            // Simple constant arithmetic: 2+3, 10-1, 2*5
-            Expression::Infix(inf) => {
-                let l = Self::try_eval_to_i64(&inf.left, _ctx)?;
-                let r = Self::try_eval_to_i64(&inf.right, _ctx)?;
-                match inf.operator.as_str() {
-                    "+" => l.checked_add(r),
-                    "-" => l.checked_sub(r),
-                    "*" => l.checked_mul(r),
-                    "/" if r != 0 => Some(l / r),
-                    _ => None,
-                }
-            }
-            // Everything else (floats, function calls, casts, subqueries, etc.)
-            // is either non-integer or potentially volatile — reject.
-            _ => None,
         }
     }
 

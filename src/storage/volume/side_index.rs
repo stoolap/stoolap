@@ -358,31 +358,20 @@ pub fn component_range<'v>(
         lower = low.map(|(text, past)| (Bound::Text(text), past));
         upper = high.map(|(text, past)| (Bound::Text(text), past));
     } else {
-        let (mut low, mut high) = match domain {
-            Domain::Boolean => (0, 1),
-            _ => (i64::MIN, i64::MAX),
-        };
-        let mut bounded = false;
-        for (op, value) in comparisons {
-            if op == Operator::Eq {
-                continue;
-            }
-            let (l, h) = match resolve(domain, op, value) {
-                Resolved::Key(k) => (k, k),
-                Resolved::Range(l, h) => (l, h),
-                Resolved::Empty => return Ok(ByteRange::empty()),
-                Resolved::Fallback => continue,
-            };
-            bounded = true;
-            low = low.max(l);
-            high = high.min(h);
-        }
-        if !bounded {
+        let Some(known) = resolve_known(domain, comparisons.filter(|(op, _)| *op != Operator::Eq))
+        else {
             return Err(prefix);
-        }
-        if low > high {
-            return Ok(ByteRange::empty());
-        }
+        };
+        let range = match domain {
+            Domain::Boolean => known.intersect(Resolved::Range(0, 1)),
+            _ => known,
+        };
+        let (low, high) = match range {
+            Resolved::Key(k) => (k, k),
+            Resolved::Range(low, high) => (low, high),
+            Resolved::Empty => return Ok(ByteRange::empty()),
+            Resolved::Fallback => return Err(prefix),
+        };
         lower = Some((Bound::Key(low), false));
         upper = if domain == Domain::Float && high == i64::MAX {
             Some((Bound::Nan, true))
@@ -464,6 +453,32 @@ pub enum Resolved {
     Fallback,
 }
 
+impl Resolved {
+    /// The keys meeting both: what a conjunction of the two comparisons asks
+    pub fn intersect(self, other: Resolved) -> Resolved {
+        let bounds = |resolved: Resolved| match resolved {
+            Resolved::Key(k) => Some((k, k)),
+            Resolved::Range(low, high) => Some((low, high)),
+            Resolved::Empty | Resolved::Fallback => None,
+        };
+        match (self, other) {
+            (Resolved::Fallback, _) | (_, Resolved::Fallback) => Resolved::Fallback,
+            (Resolved::Empty, _) | (_, Resolved::Empty) => Resolved::Empty,
+            _ => match bounds(self).zip(bounds(other)) {
+                Some(((low1, high1), (low2, high2))) => {
+                    let (low, high) = (low1.max(low2), high1.min(high2));
+                    match low.cmp(&high) {
+                        std::cmp::Ordering::Less => Resolved::Range(low, high),
+                        std::cmp::Ordering::Equal => Resolved::Key(low),
+                        std::cmp::Ordering::Greater => Resolved::Empty,
+                    }
+                }
+                None => Resolved::Fallback,
+            },
+        }
+    }
+}
+
 /// The keys of a `domain` column meeting `column op value`, decided with
 /// the executor's exact comparison: a bound with no exact key in the domain
 /// moves to the nearest key on the side the comparison keeps
@@ -494,6 +509,34 @@ pub fn resolve(domain: Domain, op: Operator, value: &Value) -> Resolved {
         (Domain::Boolean, Value::Boolean(b)) => exact(*b as i64),
         _ => Resolved::Fallback,
     }
+}
+
+/// The keys of a `domain` column meeting every comparison of a conjunction,
+/// for a read that does not check the rows again: Fallback when one of them
+/// cannot be answered by keys
+pub fn resolve_all<'v>(
+    domain: Domain,
+    comparisons: impl IntoIterator<Item = (Operator, &'v Value)>,
+) -> Resolved {
+    comparisons
+        .into_iter()
+        .fold(Resolved::Range(i64::MIN, i64::MAX), |range, (op, value)| {
+            range.intersect(resolve(domain, op, value))
+        })
+}
+
+/// The keys of a `domain` column meeting every comparison of a conjunction
+/// the keys can answer, for a read that checks the rows again; None when
+/// they answer none of them
+pub fn resolve_known<'v>(
+    domain: Domain,
+    comparisons: impl IntoIterator<Item = (Operator, &'v Value)>,
+) -> Option<Resolved> {
+    comparisons
+        .into_iter()
+        .map(|(op, value)| resolve(domain, op, value))
+        .filter(|resolved| *resolved != Resolved::Fallback)
+        .reduce(Resolved::intersect)
 }
 
 /// `int_column op f`: the integers meeting it, by `cmp_i64_f64`
@@ -859,5 +902,59 @@ mod tests {
                 .unwrap_or_else(|_| panic!("{op:?} {bound} has a range"));
             assert_eq!(inside(&range, &key(f64::NAN)), nan_inside, "{op:?} {bound}");
         }
+    }
+
+    #[test]
+    fn test_a_conjunction_keeps_the_tightest_bound_of_each_side() {
+        let int = |i: i64| Value::Integer(i);
+        let all = |comparisons: &[(Operator, Value)]| {
+            resolve_all(Domain::Integer, comparisons.iter().map(|(op, v)| (*op, v)))
+        };
+        assert_eq!(
+            all(&[(Operator::Gt, int(5)), (Operator::Gt, int(10))]),
+            Resolved::Range(11, i64::MAX)
+        );
+        assert_eq!(
+            all(&[(Operator::Gt, int(10)), (Operator::Gt, int(5))]),
+            Resolved::Range(11, i64::MAX)
+        );
+        assert_eq!(
+            all(&[(Operator::Gt, int(5)), (Operator::Gte, int(8))]),
+            Resolved::Range(8, i64::MAX)
+        );
+        assert_eq!(
+            all(&[(Operator::Gte, Value::Float(2.5))]),
+            Resolved::Range(3, i64::MAX)
+        );
+        assert_eq!(
+            all(&[(Operator::Gt, int(3)), (Operator::Lte, int(4))]),
+            Resolved::Key(4)
+        );
+        assert_eq!(
+            all(&[(Operator::Gt, int(4)), (Operator::Lt, int(5))]),
+            Resolved::Empty
+        );
+        assert_eq!(
+            all(&[
+                (Operator::Gt, int(i64::MAX)),
+                (Operator::Lte, int(i64::MAX))
+            ]),
+            Resolved::Empty,
+            "no integer lies above the largest"
+        );
+        assert_eq!(all(&[(Operator::Lt, int(i64::MIN))]), Resolved::Empty);
+        assert_eq!(
+            all(&[(Operator::Gt, int(5)), (Operator::Ne, int(7))]),
+            Resolved::Fallback,
+            "a comparison the keys cannot answer leaves the conjunction to the scan"
+        );
+        assert_eq!(
+            all(&[(Operator::Gt, int(5)), (Operator::Eq, Value::text("x"))]),
+            Resolved::Fallback
+        );
+        assert_eq!(
+            all(&[(Operator::Eq, int(7)), (Operator::Gte, int(7))]),
+            Resolved::Key(7)
+        );
     }
 }

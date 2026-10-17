@@ -37,6 +37,7 @@ use crate::storage::mvcc::version_store::TxnStoreWrite;
 use crate::storage::mvcc::RowVersion;
 use crate::storage::mvcc::{TransactionVersionStore, TxnTableStore, VersionStore};
 use crate::storage::traits::{Index, PlannedUpdate, QueryResult, ScanPlan, Scanner, Table};
+use crate::storage::volume::side_index::{resolve_all, Domain, Resolved};
 use crate::storage::MemoryResult;
 
 /// Given the index entries found for a key, the index's columns and the
@@ -517,75 +518,35 @@ impl MVCCTable {
         pk_equality_id(expr, schema)
     }
 
-    /// Try to identify a PK range lookup (WHERE id >= X AND id < Y)
-    /// Returns Some(RowIdVec) if this is a PK range query (pooled for efficient memory reuse)
+    /// The row ids of an AND of comparisons on the primary key alone (WHERE
+    /// id >= X AND id < Y), pooled; None when a comparison is on another
+    /// column or the keys cannot answer it
     fn try_pk_range_lookup(&self, expr: &dyn Expression, schema: &Schema) -> Option<RowIdVec> {
-        use crate::core::Operator;
-
         // Get PK column info
         let pk_indices = schema.primary_key_indices();
         if pk_indices.len() != 1 {
             return None;
         }
-        let pk_col_idx = pk_indices[0];
-        let pk_col_name = &schema.columns[pk_col_idx].name;
+        let pk_col_name = &schema.columns[pk_indices[0]].name;
 
-        // Check for AND with two comparisons on PK
-        let and_operands = expr.get_and_operands()?;
-        if and_operands.len() != 2 {
+        expr.get_and_operands()?;
+        let mut leaves = Vec::new();
+        if !collect_conjuncts(expr, &mut leaves)
+            || !leaves
+                .iter()
+                .all(|(column, _, _)| column.eq_ignore_ascii_case(pk_col_name))
+        {
             return None;
         }
-
-        let (info1, info2) = (
-            and_operands[0].get_comparison_info(),
-            and_operands[1].get_comparison_info(),
-        );
-
-        let ((col1, op1, val1), (col2, op2, val2)) = match (info1, info2) {
-            (Some(a), Some(b)) => (a, b),
-            _ => return None,
+        let (start, end) = match resolve_all(
+            Domain::Integer,
+            leaves.iter().map(|(_, op, value)| (*op, *value)),
+        ) {
+            Resolved::Key(k) => (k, k),
+            Resolved::Range(low, high) => (low, high),
+            Resolved::Empty => return Some(RowIdVec::new()),
+            Resolved::Fallback => return None,
         };
-
-        // Both must be on PK column
-        if !col1.eq_ignore_ascii_case(pk_col_name) || !col2.eq_ignore_ascii_case(pk_col_name) {
-            return None;
-        }
-
-        // Extract integer values
-        let (v1, v2) = match (val1, val2) {
-            (Value::Integer(a), Value::Integer(b)) => (*a, *b),
-            _ => return None,
-        };
-
-        // Identify lower and upper bounds
-        let (min_id, min_inclusive, max_id, max_inclusive) = match (op1, op2) {
-            (Operator::Gte, Operator::Lt) => (v1, true, v2, false),
-            (Operator::Gte, Operator::Lte) => (v1, true, v2, true),
-            (Operator::Gt, Operator::Lt) => (v1, false, v2, false),
-            (Operator::Gt, Operator::Lte) => (v1, false, v2, true),
-            (Operator::Lt, Operator::Gte) => (v2, true, v1, false),
-            (Operator::Lt, Operator::Gt) => (v2, false, v1, false),
-            (Operator::Lte, Operator::Gte) => (v2, true, v1, true),
-            (Operator::Lte, Operator::Gt) => (v2, false, v1, true),
-            _ => return None,
-        };
-
-        // Adjust for inclusive/exclusive bounds using saturating arithmetic to prevent overflow
-        let start = if min_inclusive {
-            min_id
-        } else {
-            min_id.saturating_add(1)
-        };
-        let end = if max_inclusive {
-            max_id
-        } else {
-            max_id.saturating_sub(1)
-        };
-
-        // Check for invalid range (start > end means empty result)
-        if start > end {
-            return Some(RowIdVec::new());
-        }
 
         // SAFETY: Limit range size to prevent memory explosion
         // For ranges larger than threshold, return None to fall back to index/full scan
