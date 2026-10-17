@@ -467,3 +467,26 @@ fn test_a_derived_aggregate_over_a_numeric_case() {
         "a CASE without a TEXT literal names the derived column",
     );
 }
+
+#[test]
+fn test_a_derived_aggregate_over_a_parameter() {
+    let db = setup("identity_derived_parameter");
+    let ranks = |sql: &str| -> Vec<(i64, i64)> {
+        db.query(sql, (1,))
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .map(|row| {
+                let row = row.unwrap();
+                (row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap())
+            })
+            .collect()
+    };
+    assert_eq!(
+        ranks(
+            "SELECT g, RANK() OVER (ORDER BY SUM(a + $1)) FROM (SELECT g, SUM(a + $1) FROM t GROUP BY g) s ORDER BY g"
+        ),
+        ranks(
+            "SELECT g, RANK() OVER (ORDER BY x) FROM (SELECT g, SUM(a + $1) AS x FROM t GROUP BY g) s ORDER BY g"
+        ),
+        "a parameter is no TEXT literal in the derived column's name"
+    );
+}

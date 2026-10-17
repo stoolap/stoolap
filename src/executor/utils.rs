@@ -1965,6 +1965,8 @@ fn holds_text_literal(expr: &Expression) -> bool {
         | Expression::FloatLiteral(_)
         | Expression::BooleanLiteral(_)
         | Expression::NullLiteral(_)
+        | Expression::IntervalLiteral(_)
+        | Expression::Parameter(_)
         | Expression::Star(_) => false,
         Expression::FunctionCall(func) => {
             func.arguments.iter().any(holds_text_literal)
