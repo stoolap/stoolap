@@ -702,8 +702,8 @@ impl Executor {
             // literal or a name there is read as written
             let mut aggregate_slots: FxHashMap<ExprKey, usize> = FxHashMap::default();
             // A set operation's rows come from other branches too: there a
-            // column stands for a sort key only when named or computed, never
-            // for a bare constant, and aggregates are not read inside keys
+            // column stands for a sort key only when aliased or an aggregate,
+            // as on main, and aggregates are not read inside keys
             let set_operation = !stmt.set_operations.is_empty();
             if !stmt
                 .columns
@@ -712,7 +712,8 @@ impl Executor {
             {
                 for (i, col) in stmt.columns.iter().enumerate() {
                     if set_operation
-                        && !matches!(col, Expression::Aliased(_) | Expression::FunctionCall(_))
+                        && !matches!(col, Expression::Aliased(_))
+                        && !matches!(col, Expression::FunctionCall(f) if self.function_registry.is_aggregate(&f.function))
                     {
                         continue;
                     }

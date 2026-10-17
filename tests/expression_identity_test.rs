@@ -443,3 +443,27 @@ fn test_a_derived_aggregate_over_a_name_holding_an_apostrophe() {
         "a window argument reads it too",
     );
 }
+
+#[test]
+fn test_a_constant_call_sort_key_over_a_union() {
+    let db = setup("identity_union_constant_call");
+    same(
+        &db,
+        "SELECT ABS(1), 2 AS id FROM t WHERE id = 1 UNION ALL SELECT ABS(2), 1 FROM t WHERE id = 1 ORDER BY ABS(1), id",
+        "SELECT 2, 1 UNION ALL SELECT 1, 2",
+        "ABS(1) is a constant, so id orders",
+    );
+}
+
+#[test]
+fn test_a_derived_aggregate_over_a_numeric_case() {
+    let db = setup("identity_derived_case");
+    same(
+        &db,
+        "SELECT g, RANK() OVER (ORDER BY SUM(CASE WHEN a > 0 THEN a ELSE 0 END)) \
+         FROM (SELECT g, SUM(CASE WHEN a > 0 THEN a ELSE 0 END) FROM t GROUP BY g) s ORDER BY g",
+        "SELECT g, RANK() OVER (ORDER BY x) \
+         FROM (SELECT g, SUM(CASE WHEN a > 0 THEN a ELSE 0 END) AS x FROM t GROUP BY g) s ORDER BY g",
+        "a CASE without a TEXT literal names the derived column",
+    );
+}

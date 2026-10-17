@@ -1980,6 +1980,30 @@ fn holds_text_literal(expr: &Expression) -> bool {
         Expression::Prefix(prefix) => holds_text_literal(&prefix.right),
         Expression::Cast(cast) => holds_text_literal(&cast.expr),
         Expression::Distinct(distinct) => holds_text_literal(&distinct.expr),
+        Expression::Aliased(aliased) => holds_text_literal(&aliased.expression),
+        Expression::Case(case) => {
+            case.value.as_deref().is_some_and(holds_text_literal)
+                || case
+                    .when_clauses
+                    .iter()
+                    .any(|w| holds_text_literal(&w.condition) || holds_text_literal(&w.then_result))
+                || case.else_value.as_deref().is_some_and(holds_text_literal)
+        }
+        Expression::Between(between) => {
+            holds_text_literal(&between.expr)
+                || holds_text_literal(&between.lower)
+                || holds_text_literal(&between.upper)
+        }
+        Expression::In(in_expr) => {
+            holds_text_literal(&in_expr.left) || holds_text_literal(&in_expr.right)
+        }
+        Expression::List(list) => list.elements.iter().any(holds_text_literal),
+        Expression::ExpressionList(list) => list.expressions.iter().any(holds_text_literal),
+        Expression::Like(like) => {
+            holds_text_literal(&like.left)
+                || holds_text_literal(&like.pattern)
+                || like.escape.as_deref().is_some_and(holds_text_literal)
+        }
         _ => true,
     }
 }
