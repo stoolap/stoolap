@@ -7430,26 +7430,33 @@ impl Table for SegmentedTable {
                 };
                 let col_type = schema.columns[col_idx].data_type;
                 let target = match (col_type, value) {
-                (DataType::Integer, Value::Integer(i)) => TypedTarget::Int64(*i),
-                (DataType::Integer, Value::Float(f))
-                    // Float literal on integer column: convert to i64 if exact, bail otherwise
-                    if f.fract() == 0.0 && *f >= i64::MIN as f64 && *f <= i64::MAX as f64 =>
-                {
-                    TypedTarget::Int64(*f as i64)
-                }
-                // A bound nanoseconds cannot hold is left to the general path
-                (DataType::Timestamp, Value::Timestamp(t)) => match t.timestamp_nanos_opt() {
-                    Some(nanos) => TypedTarget::Int64(nanos),
-                    None => return Ok(None),
-                },
-                (DataType::Timestamp, Value::Integer(i)) => TypedTarget::Int64(*i),
-                (DataType::Float, Value::Float(f)) => TypedTarget::Float64(*f),
-                (DataType::Float, Value::Integer(i)) => TypedTarget::Float64(*i as f64),
-                (DataType::Text, Value::Text(s)) if *op == crate::core::Operator::Eq => {
-                    TypedTarget::DictEq(crate::common::SmartString::from(s.as_str()))
-                }
-                _ => return Ok(None), // unsupported type combination
-            };
+                    (DataType::Integer, Value::Integer(i)) => TypedTarget::Int64(*i),
+                    // A float on an integer column, or an integer on a float
+                    // column, is typed only when the other type holds it exactly
+                    (DataType::Integer, Value::Float(f)) => {
+                        match crate::core::value::cmp_i64_f64(*f as i64, *f) {
+                            Some(std::cmp::Ordering::Equal) => TypedTarget::Int64(*f as i64),
+                            _ => return Ok(None),
+                        }
+                    }
+                    // A bound nanoseconds cannot hold is left to the general path
+                    (DataType::Timestamp, Value::Timestamp(t)) => match t.timestamp_nanos_opt() {
+                        Some(nanos) => TypedTarget::Int64(nanos),
+                        None => return Ok(None),
+                    },
+                    (DataType::Timestamp, Value::Integer(i)) => TypedTarget::Int64(*i),
+                    (DataType::Float, Value::Float(f)) => TypedTarget::Float64(*f),
+                    (DataType::Float, Value::Integer(i)) => {
+                        match crate::core::value::lossless_f64_from_i64(*i) {
+                            Some(f) => TypedTarget::Float64(f),
+                            None => return Ok(None),
+                        }
+                    }
+                    (DataType::Text, Value::Text(s)) if *op == crate::core::Operator::Eq => {
+                        TypedTarget::DictEq(crate::common::SmartString::from(s.as_str()))
+                    }
+                    _ => return Ok(None), // unsupported type combination
+                };
                 preds.push(ResolvedPred {
                     schema_col_idx: col_idx,
                     op: *op,
@@ -7945,7 +7952,9 @@ impl Table for SegmentedTable {
                                         compare_f64(*def, *target, pred.op)
                                     }
                                     (TypedTarget::Float64(target), Value::Integer(def)) => {
-                                        compare_f64(*def as f64, *target, pred.op)
+                                        let ord =
+                                            crate::core::value::total_cmp_i64_f64(*def, *target);
+                                        compare_i64(ord as i64, 0, pred.op)
                                     }
                                     (TypedTarget::DictEq(s), Value::Text(def)) => {
                                         s.as_str() == def.as_str()

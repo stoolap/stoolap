@@ -104,15 +104,22 @@ pub fn number_against_text(a: &Value, b: &Value) -> Option<Option<Ordering>> {
 }
 
 /// How `a` orders against `b` in a predicate; None is UNKNOWN: a NULL, a
-/// TEXT that is not a number against a number, or a pair with no order
+/// TEXT that is not a number or a BOOLEAN or TIMESTAMP against a number, or
+/// a pair with no order
 pub fn sql_compare(a: &Value, b: &Value) -> Option<Ordering> {
-    if a.is_null() || b.is_null() {
+    if a.is_null() || b.is_null() || non_number_against_number(a, b) {
         return None;
     }
     match number_against_text(a, b) {
         Some(ordering) => ordering,
         None => a.partial_cmp(b),
     }
+}
+
+/// A BOOLEAN or TIMESTAMP on one side and a number on the other: no order
+fn non_number_against_number(a: &Value, b: &Value) -> bool {
+    let other = |v: &Value| matches!(v, Value::Boolean(_) | Value::Timestamp(_));
+    (is_number(a) && other(b)) || (other(a) && is_number(b))
 }
 
 /// `a = b` in a predicate; None is UNKNOWN. Pairs other than a number

@@ -3235,7 +3235,7 @@ impl ExprVM {
     /// A fused column comparison for a cell the numeric fast arms do not
     /// take, by the same rules as the general interpreter
     #[cold]
-    fn fused_cell(op: &Op, cell: Option<&Value>) -> Option<bool> {
+    pub(crate) fn fused_cell(op: &Op, cell: Option<&Value>) -> Option<bool> {
         let cell = cell.unwrap_or(&NULL_VALUE);
         let value = match op {
             Op::GtColumnConst(_, Value::Integer(t)) => Self::gt_int(cell, *t),
@@ -3291,7 +3291,9 @@ impl ExprVM {
             Value::Integer(v) => Value::Boolean(*v > threshold),
             Value::Float(v) => Value::Boolean(crate::core::value::i64_lt_f64(threshold, *v)),
             Value::Null(_) => Value::Null(DataType::Boolean),
-            Value::Text(_) => Self::text_against(col_val, Value::Integer(threshold), |o| o.is_gt()),
+            Value::Text(_) | Value::Boolean(_) | Value::Timestamp(_) => {
+                Self::text_against(col_val, Value::Integer(threshold), |o| o.is_gt())
+            }
             _ => Value::Boolean(false),
         }
     }
@@ -3303,7 +3305,9 @@ impl ExprVM {
             Value::Float(v) => Value::Boolean(f64_gt(*v, threshold)),
             Value::Integer(v) => Value::Boolean(crate::core::value::i64_gt_f64(*v, threshold)),
             Value::Null(_) => Value::Null(DataType::Boolean),
-            Value::Text(_) => Self::text_against(col_val, Value::Float(threshold), |o| o.is_gt()),
+            Value::Text(_) | Value::Boolean(_) | Value::Timestamp(_) => {
+                Self::text_against(col_val, Value::Float(threshold), |o| o.is_gt())
+            }
             _ => Value::Boolean(false),
         }
     }
@@ -3315,7 +3319,9 @@ impl ExprVM {
             Value::Integer(v) => Value::Boolean(*v < threshold),
             Value::Float(v) => Value::Boolean(crate::core::value::i64_gt_f64(threshold, *v)),
             Value::Null(_) => Value::Null(DataType::Boolean),
-            Value::Text(_) => Self::text_against(col_val, Value::Integer(threshold), |o| o.is_lt()),
+            Value::Text(_) | Value::Boolean(_) | Value::Timestamp(_) => {
+                Self::text_against(col_val, Value::Integer(threshold), |o| o.is_lt())
+            }
             _ => Value::Boolean(false),
         }
     }
@@ -3327,7 +3333,9 @@ impl ExprVM {
             Value::Float(v) => Value::Boolean(f64_lt(*v, threshold)),
             Value::Integer(v) => Value::Boolean(crate::core::value::i64_lt_f64(*v, threshold)),
             Value::Null(_) => Value::Null(DataType::Boolean),
-            Value::Text(_) => Self::text_against(col_val, Value::Float(threshold), |o| o.is_lt()),
+            Value::Text(_) | Value::Boolean(_) | Value::Timestamp(_) => {
+                Self::text_against(col_val, Value::Float(threshold), |o| o.is_lt())
+            }
             _ => Value::Boolean(false),
         }
     }
@@ -3339,7 +3347,9 @@ impl ExprVM {
             Value::Integer(v) => Value::Boolean(*v >= threshold),
             Value::Float(v) => Value::Boolean(crate::core::value::i64_le_f64(threshold, *v)),
             Value::Null(_) => Value::Null(DataType::Boolean),
-            Value::Text(_) => Self::text_against(col_val, Value::Integer(threshold), |o| o.is_ge()),
+            Value::Text(_) | Value::Boolean(_) | Value::Timestamp(_) => {
+                Self::text_against(col_val, Value::Integer(threshold), |o| o.is_ge())
+            }
             _ => Value::Boolean(false),
         }
     }
@@ -3351,7 +3361,9 @@ impl ExprVM {
             Value::Float(v) => Value::Boolean(f64_ge(*v, threshold)),
             Value::Integer(v) => Value::Boolean(crate::core::value::i64_ge_f64(*v, threshold)),
             Value::Null(_) => Value::Null(DataType::Boolean),
-            Value::Text(_) => Self::text_against(col_val, Value::Float(threshold), |o| o.is_ge()),
+            Value::Text(_) | Value::Boolean(_) | Value::Timestamp(_) => {
+                Self::text_against(col_val, Value::Float(threshold), |o| o.is_ge())
+            }
             _ => Value::Boolean(false),
         }
     }
@@ -3363,7 +3375,9 @@ impl ExprVM {
             Value::Integer(v) => Value::Boolean(*v <= threshold),
             Value::Float(v) => Value::Boolean(crate::core::value::i64_ge_f64(threshold, *v)),
             Value::Null(_) => Value::Null(DataType::Boolean),
-            Value::Text(_) => Self::text_against(col_val, Value::Integer(threshold), |o| o.is_le()),
+            Value::Text(_) | Value::Boolean(_) | Value::Timestamp(_) => {
+                Self::text_against(col_val, Value::Integer(threshold), |o| o.is_le())
+            }
             _ => Value::Boolean(false),
         }
     }
@@ -3375,7 +3389,9 @@ impl ExprVM {
             Value::Float(v) => Value::Boolean(f64_le(*v, threshold)),
             Value::Integer(v) => Value::Boolean(crate::core::value::i64_le_f64(*v, threshold)),
             Value::Null(_) => Value::Null(DataType::Boolean),
-            Value::Text(_) => Self::text_against(col_val, Value::Float(threshold), |o| o.is_le()),
+            Value::Text(_) | Value::Boolean(_) | Value::Timestamp(_) => {
+                Self::text_against(col_val, Value::Float(threshold), |o| o.is_le())
+            }
             _ => Value::Boolean(false),
         }
     }
@@ -3438,7 +3454,7 @@ impl ExprVM {
                 Value::Boolean(crate::core::value::i64_le_f64(lo, *v) && f64_le(*v, hi))
             }
             Value::Null(_) => Value::Null(DataType::Boolean),
-            Value::Text(_) => truth(between_cell(
+            Value::Text(_) | Value::Boolean(_) | Value::Timestamp(_) => truth(between_cell(
                 col_val,
                 &Value::Integer(lo),
                 &Value::Float(hi),
@@ -3456,7 +3472,7 @@ impl ExprVM {
                 Value::Boolean(f64_ge(*v, lo) && crate::core::value::i64_ge_f64(hi, *v))
             }
             Value::Null(_) => Value::Null(DataType::Boolean),
-            Value::Text(_) => truth(between_cell(
+            Value::Text(_) | Value::Boolean(_) | Value::Timestamp(_) => truth(between_cell(
                 col_val,
                 &Value::Float(lo),
                 &Value::Integer(hi),
@@ -3474,7 +3490,7 @@ impl ExprVM {
                 crate::core::value::i64_le_f64(low, *v) && crate::core::value::i64_ge_f64(high, *v),
             ),
             Value::Null(_) => Value::Null(DataType::Boolean),
-            Value::Text(_) => truth(between_cell(
+            Value::Text(_) | Value::Boolean(_) | Value::Timestamp(_) => truth(between_cell(
                 col_val,
                 &Value::Integer(low),
                 &Value::Integer(high),
@@ -3492,7 +3508,7 @@ impl ExprVM {
                 crate::core::value::i64_ge_f64(*v, low) && crate::core::value::i64_le_f64(*v, high),
             ),
             Value::Null(_) => Value::Null(DataType::Boolean),
-            Value::Text(_) => truth(between_cell(
+            Value::Text(_) | Value::Boolean(_) | Value::Timestamp(_) => truth(between_cell(
                 col_val,
                 &Value::Float(low),
                 &Value::Float(high),
