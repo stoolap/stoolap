@@ -19,8 +19,6 @@ use crate::functions::{
     AggregateFunction, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType,
 };
 
-use super::DistinctTracker;
-
 /// Helper to extract f64 from Value
 fn value_to_f64(value: &Value) -> Option<f64> {
     match value {
@@ -42,7 +40,6 @@ fn value_to_f64(value: &Value) -> Option<f64> {
 #[derive(Default)]
 pub struct StddevPopFunction {
     values: Vec<f64>,
-    distinct_tracker: Option<DistinctTracker>,
 }
 
 impl AggregateFunction for StddevPopFunction {
@@ -59,18 +56,9 @@ impl AggregateFunction for StddevPopFunction {
         )
     }
 
-    fn accumulate(&mut self, value: &Value, distinct: bool) {
+    fn accumulate(&mut self, value: &Value) {
         if value.is_null() {
             return;
-        }
-
-        if distinct {
-            if self.distinct_tracker.is_none() {
-                self.distinct_tracker = Some(DistinctTracker::default());
-            }
-            if !self.distinct_tracker.as_mut().unwrap().check_and_add(value) {
-                return;
-            }
         }
 
         if let Some(f) = value_to_f64(value) {
@@ -91,7 +79,6 @@ impl AggregateFunction for StddevPopFunction {
 
     fn reset(&mut self) {
         self.values.clear();
-        self.distinct_tracker = None;
     }
 
     fn clone_box(&self) -> Box<dyn AggregateFunction> {
@@ -119,8 +106,8 @@ impl AggregateFunction for StddevFunction {
         )
     }
 
-    fn accumulate(&mut self, value: &Value, distinct: bool) {
-        self.inner.accumulate(value, distinct);
+    fn accumulate(&mut self, value: &Value) {
+        self.inner.accumulate(value);
     }
 
     fn result(&self) -> Result<Value> {
@@ -148,7 +135,6 @@ impl AggregateFunction for StddevFunction {
 #[derive(Default)]
 pub struct StddevSampFunction {
     values: Vec<f64>,
-    distinct_tracker: Option<DistinctTracker>,
 }
 
 impl AggregateFunction for StddevSampFunction {
@@ -165,18 +151,9 @@ impl AggregateFunction for StddevSampFunction {
         )
     }
 
-    fn accumulate(&mut self, value: &Value, distinct: bool) {
+    fn accumulate(&mut self, value: &Value) {
         if value.is_null() {
             return;
-        }
-
-        if distinct {
-            if self.distinct_tracker.is_none() {
-                self.distinct_tracker = Some(DistinctTracker::default());
-            }
-            if !self.distinct_tracker.as_mut().unwrap().check_and_add(value) {
-                return;
-            }
         }
 
         if let Some(f) = value_to_f64(value) {
@@ -198,7 +175,6 @@ impl AggregateFunction for StddevSampFunction {
 
     fn reset(&mut self) {
         self.values.clear();
-        self.distinct_tracker = None;
     }
 
     fn clone_box(&self) -> Box<dyn AggregateFunction> {
@@ -217,7 +193,6 @@ impl AggregateFunction for StddevSampFunction {
 #[derive(Default)]
 pub struct VarPopFunction {
     values: Vec<f64>,
-    distinct_tracker: Option<DistinctTracker>,
 }
 
 impl AggregateFunction for VarPopFunction {
@@ -234,18 +209,9 @@ impl AggregateFunction for VarPopFunction {
         )
     }
 
-    fn accumulate(&mut self, value: &Value, distinct: bool) {
+    fn accumulate(&mut self, value: &Value) {
         if value.is_null() {
             return;
-        }
-
-        if distinct {
-            if self.distinct_tracker.is_none() {
-                self.distinct_tracker = Some(DistinctTracker::default());
-            }
-            if !self.distinct_tracker.as_mut().unwrap().check_and_add(value) {
-                return;
-            }
         }
 
         if let Some(f) = value_to_f64(value) {
@@ -266,7 +232,6 @@ impl AggregateFunction for VarPopFunction {
 
     fn reset(&mut self) {
         self.values.clear();
-        self.distinct_tracker = None;
     }
 
     fn clone_box(&self) -> Box<dyn AggregateFunction> {
@@ -294,8 +259,8 @@ impl AggregateFunction for VarianceFunction {
         )
     }
 
-    fn accumulate(&mut self, value: &Value, distinct: bool) {
-        self.inner.accumulate(value, distinct);
+    fn accumulate(&mut self, value: &Value) {
+        self.inner.accumulate(value);
     }
 
     fn result(&self) -> Result<Value> {
@@ -323,7 +288,6 @@ impl AggregateFunction for VarianceFunction {
 #[derive(Default)]
 pub struct VarSampFunction {
     values: Vec<f64>,
-    distinct_tracker: Option<DistinctTracker>,
 }
 
 impl AggregateFunction for VarSampFunction {
@@ -340,18 +304,9 @@ impl AggregateFunction for VarSampFunction {
         )
     }
 
-    fn accumulate(&mut self, value: &Value, distinct: bool) {
+    fn accumulate(&mut self, value: &Value) {
         if value.is_null() {
             return;
-        }
-
-        if distinct {
-            if self.distinct_tracker.is_none() {
-                self.distinct_tracker = Some(DistinctTracker::default());
-            }
-            if !self.distinct_tracker.as_mut().unwrap().check_and_add(value) {
-                return;
-            }
         }
 
         if let Some(f) = value_to_f64(value) {
@@ -373,7 +328,6 @@ impl AggregateFunction for VarSampFunction {
 
     fn reset(&mut self) {
         self.values.clear();
-        self.distinct_tracker = None;
     }
 
     fn clone_box(&self) -> Box<dyn AggregateFunction> {
@@ -392,7 +346,6 @@ impl AggregateFunction for VarSampFunction {
 #[derive(Default)]
 pub struct MedianFunction {
     values: Vec<f64>,
-    distinct_tracker: Option<DistinctTracker>,
 }
 
 impl AggregateFunction for MedianFunction {
@@ -409,18 +362,9 @@ impl AggregateFunction for MedianFunction {
         )
     }
 
-    fn accumulate(&mut self, value: &Value, distinct: bool) {
+    fn accumulate(&mut self, value: &Value) {
         if value.is_null() {
             return;
-        }
-
-        if distinct {
-            if self.distinct_tracker.is_none() {
-                self.distinct_tracker = Some(DistinctTracker::default());
-            }
-            if !self.distinct_tracker.as_mut().unwrap().check_and_add(value) {
-                return;
-            }
         }
 
         if let Some(f) = value_to_f64(value) {
@@ -450,7 +394,6 @@ impl AggregateFunction for MedianFunction {
 
     fn reset(&mut self) {
         self.values.clear();
-        self.distinct_tracker = None;
     }
 
     fn clone_box(&self) -> Box<dyn AggregateFunction> {
@@ -469,7 +412,7 @@ mod tests {
         // Values: 2, 4, 4, 4, 5, 5, 7, 9
         // Mean = 5, Variance = 4, StdDev = 2
         for v in [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0] {
-            stddev.accumulate(&Value::Float(v), false);
+            stddev.accumulate(&Value::Float(v));
         }
         let result = stddev.result().unwrap();
         if let Value::Float(f) = result {
@@ -482,7 +425,7 @@ mod tests {
     #[test]
     fn test_stddev_pop_single_value() {
         let mut stddev = StddevPopFunction::default();
-        stddev.accumulate(&Value::Float(5.0), false);
+        stddev.accumulate(&Value::Float(5.0));
         // Single value has stddev = 0
         assert_eq!(stddev.result().unwrap(), Value::Float(0.0));
     }
@@ -498,7 +441,7 @@ mod tests {
         // STDDEV is the sample standard deviation (alias for STDDEV_SAMP)
         let mut stddev = StddevFunction::default();
         for v in [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0] {
-            stddev.accumulate(&Value::Float(v), false);
+            stddev.accumulate(&Value::Float(v));
         }
         let result = stddev.result().unwrap();
         if let Value::Float(f) = result {
@@ -515,7 +458,7 @@ mod tests {
         // Values: 2, 4, 4, 4, 5, 5, 7, 9 (n=8)
         // Mean = 5, Sample Variance = 32/7 ≈ 4.571, Sample StdDev ≈ 2.138
         for v in [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0] {
-            stddev.accumulate(&Value::Float(v), false);
+            stddev.accumulate(&Value::Float(v));
         }
         let result = stddev.result().unwrap();
         if let Value::Float(f) = result {
@@ -528,7 +471,7 @@ mod tests {
     #[test]
     fn test_stddev_samp_single_value() {
         let mut stddev = StddevSampFunction::default();
-        stddev.accumulate(&Value::Float(5.0), false);
+        stddev.accumulate(&Value::Float(5.0));
         // Sample stddev requires at least 2 values
         assert!(stddev.result().unwrap().is_null());
     }
@@ -540,7 +483,7 @@ mod tests {
         // Values: 2, 4, 4, 4, 5, 5, 7, 9
         // Mean = 5, Variance = 4
         for v in [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0] {
-            var.accumulate(&Value::Float(v), false);
+            var.accumulate(&Value::Float(v));
         }
         let result = var.result().unwrap();
         if let Value::Float(f) = result {
@@ -555,7 +498,7 @@ mod tests {
         // VARIANCE is the sample variance (alias for VAR_SAMP)
         let mut var = VarianceFunction::default();
         for v in [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0] {
-            var.accumulate(&Value::Float(v), false);
+            var.accumulate(&Value::Float(v));
         }
         let result = var.result().unwrap();
         if let Value::Float(f) = result {
@@ -572,7 +515,7 @@ mod tests {
         // Values: 2, 4, 4, 4, 5, 5, 7, 9 (n=8)
         // Mean = 5, Sample Variance = 32/7 ≈ 4.571
         for v in [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0] {
-            var.accumulate(&Value::Float(v), false);
+            var.accumulate(&Value::Float(v));
         }
         let result = var.result().unwrap();
         if let Value::Float(f) = result {
@@ -585,7 +528,7 @@ mod tests {
     #[test]
     fn test_var_samp_single_value() {
         let mut var = VarSampFunction::default();
-        var.accumulate(&Value::Float(5.0), false);
+        var.accumulate(&Value::Float(5.0));
         // Sample variance requires at least 2 values
         assert!(var.result().unwrap().is_null());
     }
@@ -596,7 +539,7 @@ mod tests {
         let mut median = MedianFunction::default();
         // Values: 1, 3, 5, 7, 9 -> median = 5
         for v in [1.0, 3.0, 5.0, 7.0, 9.0] {
-            median.accumulate(&Value::Float(v), false);
+            median.accumulate(&Value::Float(v));
         }
         assert_eq!(median.result().unwrap(), Value::Float(5.0));
     }
@@ -606,7 +549,7 @@ mod tests {
         let mut median = MedianFunction::default();
         // Values: 1, 3, 5, 7 -> median = (3+5)/2 = 4
         for v in [1.0, 3.0, 5.0, 7.0] {
-            median.accumulate(&Value::Float(v), false);
+            median.accumulate(&Value::Float(v));
         }
         assert_eq!(median.result().unwrap(), Value::Float(4.0));
     }
@@ -616,7 +559,7 @@ mod tests {
         let mut median = MedianFunction::default();
         // Values: 9, 1, 7, 3, 5 -> sorted: 1, 3, 5, 7, 9 -> median = 5
         for v in [9.0, 1.0, 7.0, 3.0, 5.0] {
-            median.accumulate(&Value::Float(v), false);
+            median.accumulate(&Value::Float(v));
         }
         assert_eq!(median.result().unwrap(), Value::Float(5.0));
     }
@@ -624,7 +567,7 @@ mod tests {
     #[test]
     fn test_median_single_value() {
         let mut median = MedianFunction::default();
-        median.accumulate(&Value::Float(42.0), false);
+        median.accumulate(&Value::Float(42.0));
         assert_eq!(median.result().unwrap(), Value::Float(42.0));
     }
 
@@ -638,7 +581,7 @@ mod tests {
     fn test_median_with_integers() {
         let mut median = MedianFunction::default();
         for v in [1, 2, 3, 4, 5] {
-            median.accumulate(&Value::Integer(v), false);
+            median.accumulate(&Value::Integer(v));
         }
         assert_eq!(median.result().unwrap(), Value::Float(3.0));
     }
@@ -646,21 +589,26 @@ mod tests {
     #[test]
     fn test_median_ignores_null() {
         let mut median = MedianFunction::default();
-        median.accumulate(&Value::Float(1.0), false);
-        median.accumulate(&Value::null_unknown(), false);
-        median.accumulate(&Value::Float(3.0), false);
-        median.accumulate(&Value::null_unknown(), false);
-        median.accumulate(&Value::Float(5.0), false);
+        median.accumulate(&Value::Float(1.0));
+        median.accumulate(&Value::null_unknown());
+        median.accumulate(&Value::Float(3.0));
+        median.accumulate(&Value::null_unknown());
+        median.accumulate(&Value::Float(5.0));
         assert_eq!(median.result().unwrap(), Value::Float(3.0));
     }
 
     #[test]
     fn test_median_distinct() {
-        let mut median = MedianFunction::default();
-        median.accumulate(&Value::Float(1.0), true);
-        median.accumulate(&Value::Float(3.0), true);
-        median.accumulate(&Value::Float(3.0), true); // duplicate
-        median.accumulate(&Value::Float(5.0), true);
+        let mut median = super::super::AggregateState::new(
+            Box::new(MedianFunction::default()),
+            true,
+            &[],
+            vec![],
+        );
+        median.accumulate(&Value::Float(1.0));
+        median.accumulate(&Value::Float(3.0));
+        median.accumulate(&Value::Float(3.0)); // duplicate
+        median.accumulate(&Value::Float(5.0));
         // Distinct values: 1, 3, 5 -> median = 3
         assert_eq!(median.result().unwrap(), Value::Float(3.0));
     }
@@ -669,11 +617,11 @@ mod tests {
     #[test]
     fn test_statistics_ignore_nulls() {
         let mut stddev = StddevPopFunction::default();
-        stddev.accumulate(&Value::Float(2.0), false);
-        stddev.accumulate(&Value::null_unknown(), false);
-        stddev.accumulate(&Value::Float(4.0), false);
-        stddev.accumulate(&Value::null_unknown(), false);
-        stddev.accumulate(&Value::Float(6.0), false);
+        stddev.accumulate(&Value::Float(2.0));
+        stddev.accumulate(&Value::null_unknown());
+        stddev.accumulate(&Value::Float(4.0));
+        stddev.accumulate(&Value::null_unknown());
+        stddev.accumulate(&Value::Float(6.0));
         // Mean = 4, Variance = ((2-4)^2 + (4-4)^2 + (6-4)^2) / 3 = 8/3
         let result = stddev.result().unwrap();
         if let Value::Float(f) = result {
@@ -687,11 +635,16 @@ mod tests {
     // Test distinct
     #[test]
     fn test_stddev_distinct() {
-        let mut stddev = StddevPopFunction::default();
-        stddev.accumulate(&Value::Float(2.0), true);
-        stddev.accumulate(&Value::Float(4.0), true);
-        stddev.accumulate(&Value::Float(2.0), true); // duplicate
-        stddev.accumulate(&Value::Float(6.0), true);
+        let mut stddev = super::super::AggregateState::new(
+            Box::new(StddevPopFunction::default()),
+            true,
+            &[],
+            vec![],
+        );
+        stddev.accumulate(&Value::Float(2.0));
+        stddev.accumulate(&Value::Float(4.0));
+        stddev.accumulate(&Value::Float(2.0)); // duplicate
+        stddev.accumulate(&Value::Float(6.0));
         // Distinct values: 2, 4, 6 -> Mean = 4
         let result = stddev.result().unwrap();
         if let Value::Float(f) = result {
@@ -706,8 +659,8 @@ mod tests {
     #[test]
     fn test_stddev_reset() {
         let mut stddev = StddevPopFunction::default();
-        stddev.accumulate(&Value::Float(2.0), false);
-        stddev.accumulate(&Value::Float(4.0), false);
+        stddev.accumulate(&Value::Float(2.0));
+        stddev.accumulate(&Value::Float(4.0));
         stddev.reset();
         assert!(stddev.result().unwrap().is_null());
     }
@@ -715,8 +668,8 @@ mod tests {
     #[test]
     fn test_median_reset() {
         let mut median = MedianFunction::default();
-        median.accumulate(&Value::Float(1.0), false);
-        median.accumulate(&Value::Float(2.0), false);
+        median.accumulate(&Value::Float(1.0));
+        median.accumulate(&Value::Float(2.0));
         median.reset();
         assert!(median.result().unwrap().is_null());
     }

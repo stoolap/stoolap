@@ -252,17 +252,18 @@ pub trait AggregateFunction: Send + Sync {
         // Default: ignore ordering
     }
 
-    /// Accumulate a value into the aggregate
-    fn accumulate(&mut self, value: &Value, distinct: bool);
+    /// Accumulate a value into the aggregate. DISTINCT is not the
+    /// function's concern: `AggregateState` admits each value once
+    fn accumulate(&mut self, value: &Value);
 
     /// Accumulate a value with sort keys for ordered aggregates
     ///
     /// The `sort_keys` are the evaluated ORDER BY expressions for this row.
     /// Default implementation falls back to regular accumulate, ignoring sort keys.
-    fn accumulate_with_sort_key(&mut self, value: &Value, sort_keys: Vec<Value>, distinct: bool) {
+    fn accumulate_with_sort_key(&mut self, value: &Value, sort_keys: Vec<Value>) {
         // Default: ignore sort keys, use regular accumulate
         let _ = sort_keys;
-        self.accumulate(value, distinct);
+        self.accumulate(value);
     }
 
     /// Check if this aggregate supports ORDER BY clause

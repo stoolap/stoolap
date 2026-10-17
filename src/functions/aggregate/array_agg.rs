@@ -19,8 +19,6 @@ use crate::functions::{
     AggregateFunction, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType,
 };
 
-use super::DistinctTracker;
-
 /// Entry for ordered aggregation - stores value with its sort keys
 #[derive(Clone)]
 struct OrderedEntry {
@@ -47,7 +45,6 @@ pub struct ArrayAggFunction {
     order_keys: Vec<crate::functions::AggregateOrder>,
     /// Whether ORDER BY is active
     has_order_by: bool,
-    distinct_tracker: Option<DistinctTracker>,
 }
 
 impl AggregateFunction for ArrayAggFunction {
@@ -77,40 +74,20 @@ impl AggregateFunction for ArrayAggFunction {
         true
     }
 
-    fn accumulate(&mut self, value: &Value, distinct: bool) {
+    fn accumulate(&mut self, value: &Value) {
         // Handle NULL values - ARRAY_AGG includes NULLs by default (standard SQL behavior)
         // but we'll skip them like other aggregates for consistency
         if value.is_null() {
             return;
         }
 
-        // Handle DISTINCT case
-        if distinct {
-            if self.distinct_tracker.is_none() {
-                self.distinct_tracker = Some(DistinctTracker::default());
-            }
-            if !self.distinct_tracker.as_mut().unwrap().check_and_add(value) {
-                return; // Already seen this value
-            }
-        }
-
         self.values.push(value.clone());
     }
 
-    fn accumulate_with_sort_key(&mut self, value: &Value, sort_keys: Vec<Value>, distinct: bool) {
+    fn accumulate_with_sort_key(&mut self, value: &Value, sort_keys: Vec<Value>) {
         // Handle NULL values
         if value.is_null() {
             return;
-        }
-
-        // Handle DISTINCT case
-        if distinct {
-            if self.distinct_tracker.is_none() {
-                self.distinct_tracker = Some(DistinctTracker::default());
-            }
-            if !self.distinct_tracker.as_mut().unwrap().check_and_add(value) {
-                return; // Already seen this value
-            }
         }
 
         self.ordered_entries.push(OrderedEntry {
@@ -174,7 +151,6 @@ impl AggregateFunction for ArrayAggFunction {
     fn reset(&mut self) {
         self.values.clear();
         self.ordered_entries.clear();
-        self.distinct_tracker = None;
         // Note: order_keys and has_order_by are kept as they're configuration
     }
 
@@ -190,37 +166,42 @@ mod tests {
     #[test]
     fn test_array_agg_basic() {
         let mut agg = ArrayAggFunction::default();
-        agg.accumulate(&Value::Integer(1), false);
-        agg.accumulate(&Value::Integer(2), false);
-        agg.accumulate(&Value::Integer(3), false);
+        agg.accumulate(&Value::Integer(1));
+        agg.accumulate(&Value::Integer(2));
+        agg.accumulate(&Value::Integer(3));
         assert_eq!(agg.result().unwrap(), Value::text("[1,2,3]"));
     }
 
     #[test]
     fn test_array_agg_strings() {
         let mut agg = ArrayAggFunction::default();
-        agg.accumulate(&Value::text("a"), false);
-        agg.accumulate(&Value::text("b"), false);
-        agg.accumulate(&Value::text("c"), false);
+        agg.accumulate(&Value::text("a"));
+        agg.accumulate(&Value::text("b"));
+        agg.accumulate(&Value::text("c"));
         assert_eq!(agg.result().unwrap(), Value::text("[\"a\",\"b\",\"c\"]"));
     }
 
     #[test]
     fn test_array_agg_ignores_null() {
         let mut agg = ArrayAggFunction::default();
-        agg.accumulate(&Value::Integer(1), false);
-        agg.accumulate(&Value::null_unknown(), false);
-        agg.accumulate(&Value::Integer(3), false);
+        agg.accumulate(&Value::Integer(1));
+        agg.accumulate(&Value::null_unknown());
+        agg.accumulate(&Value::Integer(3));
         assert_eq!(agg.result().unwrap(), Value::text("[1,3]"));
     }
 
     #[test]
     fn test_array_agg_distinct() {
-        let mut agg = ArrayAggFunction::default();
-        agg.accumulate(&Value::Integer(1), true);
-        agg.accumulate(&Value::Integer(2), true);
-        agg.accumulate(&Value::Integer(1), true); // duplicate
-        agg.accumulate(&Value::Integer(3), true);
+        let mut agg = super::super::AggregateState::new(
+            Box::new(ArrayAggFunction::default()),
+            true,
+            &[],
+            vec![],
+        );
+        agg.accumulate(&Value::Integer(1));
+        agg.accumulate(&Value::Integer(2));
+        agg.accumulate(&Value::Integer(1)); // duplicate
+        agg.accumulate(&Value::Integer(3));
         assert_eq!(agg.result().unwrap(), Value::text("[1,2,3]"));
     }
 
@@ -233,18 +214,18 @@ mod tests {
     #[test]
     fn test_array_agg_mixed_types() {
         let mut agg = ArrayAggFunction::default();
-        agg.accumulate(&Value::text("str"), false);
-        agg.accumulate(&Value::Integer(42), false);
-        agg.accumulate(&Value::Float(3.5), false);
-        agg.accumulate(&Value::Boolean(true), false);
+        agg.accumulate(&Value::text("str"));
+        agg.accumulate(&Value::Integer(42));
+        agg.accumulate(&Value::Float(3.5));
+        agg.accumulate(&Value::Boolean(true));
         assert_eq!(agg.result().unwrap(), Value::text("[\"str\",42,3.5,true]"));
     }
 
     #[test]
     fn test_array_agg_reset() {
         let mut agg = ArrayAggFunction::default();
-        agg.accumulate(&Value::Integer(1), false);
-        agg.accumulate(&Value::Integer(2), false);
+        agg.accumulate(&Value::Integer(1));
+        agg.accumulate(&Value::Integer(2));
         agg.reset();
         assert!(agg.result().unwrap().is_null());
     }

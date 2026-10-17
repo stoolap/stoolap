@@ -7645,17 +7645,13 @@ impl Executor {
                 })
                 .transpose()
         };
-        let mut funcs: Vec<Box<dyn crate::functions::AggregateFunction>> =
+        let mut funcs: Vec<crate::functions::aggregate::AggregateState> =
             Vec::with_capacity(aggregations.len());
         for agg in &aggregations {
-            let mut func = self
-                .function_registry
-                .get_aggregate(&agg.name)
-                .ok_or_else(|| Error::internal(format!("aggregate {} vanished", agg.name)))?;
-            if !agg.extra_args.is_empty() {
-                func.configure(&agg.extra_args);
-            }
-            funcs.push(func);
+            funcs.push(
+                agg.state(&self.function_registry)
+                    .ok_or_else(|| Error::internal(format!("aggregate {} vanished", agg.name)))?,
+            );
         }
         let count_star = Value::Integer(1);
         let op_join_type = OperatorJoinType::parse(join_type);
@@ -7663,7 +7659,7 @@ impl Executor {
 
         // Fold one finished group into an output row; true when HAVING kept it
         let finish = |first: &Row,
-                      funcs: &mut [Box<dyn crate::functions::AggregateFunction>],
+                      funcs: &mut [crate::functions::aggregate::AggregateState],
                       groups: &mut RowVec|
          -> Result<bool> {
             let mut values = Vec::with_capacity(result_columns.len());
@@ -7749,13 +7745,13 @@ impl Executor {
                     }
                     current = Some(row.clone());
                 }
-                for (i, agg) in aggregations.iter().enumerate() {
+                for (i, func) in funcs.iter_mut().enumerate() {
                     let value = match agg_idx[i] {
                         Some(idx) => row.get(idx),
                         None => Some(&count_star),
                     };
                     if let Some(value) = value {
-                        funcs[i].accumulate(value, agg.distinct);
+                        func.accumulate(value);
                     }
                 }
             }
@@ -12017,11 +12013,11 @@ impl Executor {
         // MIN and MAX by the aggregate functions every other path runs, so
         // each type orders and answers as it does there; one per slot, reset
         // for each group
-        let mut functions: Vec<Option<Box<dyn crate::functions::AggregateFunction>>> =
+        let mut functions: Vec<Option<crate::functions::aggregate::AggregateState>> =
             Vec::with_capacity(num_aggs);
         for (agg, sql) in simple_aggs.iter().zip(&aggregations) {
             functions.push(match agg {
-                StreamingAgg::Column(_) => match self.function_registry.get_aggregate(&sql.name) {
+                StreamingAgg::Column(_) => match sql.state(&self.function_registry) {
                     Some(function) => Some(function),
                     None => return Ok(None),
                 },
@@ -12063,7 +12059,7 @@ impl Executor {
                                     if let (Some(value), Some(function)) =
                                         (row.get(*col_idx), functions[i].as_mut())
                                     {
-                                        function.accumulate(value, false);
+                                        function.accumulate(value);
                                     }
                                 }
                             }

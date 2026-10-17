@@ -19,8 +19,6 @@ use crate::functions::{
     AggregateFunction, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType,
 };
 
-use super::DistinctTracker;
-
 /// AVG aggregate function
 ///
 /// Returns the average of all non-NULL values in the specified column,
@@ -28,7 +26,6 @@ use super::DistinctTracker;
 #[derive(Default)]
 pub struct AvgFunction {
     state: SumAccumulator,
-    distinct_tracker: Option<DistinctTracker>,
 }
 
 impl AggregateFunction for AvgFunction {
@@ -45,22 +42,7 @@ impl AggregateFunction for AvgFunction {
         )
     }
 
-    fn accumulate(&mut self, value: &Value, distinct: bool) {
-        // Handle NULL values - AVG ignores NULLs
-        if value.is_null() {
-            return;
-        }
-
-        // Handle DISTINCT case
-        if distinct {
-            if self.distinct_tracker.is_none() {
-                self.distinct_tracker = Some(DistinctTracker::default());
-            }
-            if !self.distinct_tracker.as_mut().unwrap().check_and_add(value) {
-                return; // Already seen this value
-            }
-        }
-
+    fn accumulate(&mut self, value: &Value) {
         // A boolean counts as one or nought, so AVG(v > 100) is the share of
         // rows the condition holds for
         self.state.add(value);
@@ -72,7 +54,6 @@ impl AggregateFunction for AvgFunction {
 
     fn reset(&mut self) {
         self.state = SumAccumulator::default();
-        self.distinct_tracker = None;
     }
 
     fn clone_box(&self) -> Box<dyn AggregateFunction> {
@@ -87,46 +68,47 @@ mod tests {
     #[test]
     fn test_avg_integers() {
         let mut avg = AvgFunction::default();
-        avg.accumulate(&Value::Integer(1), false);
-        avg.accumulate(&Value::Integer(2), false);
-        avg.accumulate(&Value::Integer(3), false);
+        avg.accumulate(&Value::Integer(1));
+        avg.accumulate(&Value::Integer(2));
+        avg.accumulate(&Value::Integer(3));
         assert_eq!(avg.result().unwrap(), Value::Float(2.0));
     }
 
     #[test]
     fn test_avg_floats() {
         let mut avg = AvgFunction::default();
-        avg.accumulate(&Value::Float(1.0), false);
-        avg.accumulate(&Value::Float(2.0), false);
-        avg.accumulate(&Value::Float(3.0), false);
+        avg.accumulate(&Value::Float(1.0));
+        avg.accumulate(&Value::Float(2.0));
+        avg.accumulate(&Value::Float(3.0));
         assert_eq!(avg.result().unwrap(), Value::Float(2.0));
     }
 
     #[test]
     fn test_avg_mixed() {
         let mut avg = AvgFunction::default();
-        avg.accumulate(&Value::Integer(1), false);
-        avg.accumulate(&Value::Float(2.0), false);
-        avg.accumulate(&Value::Integer(3), false);
+        avg.accumulate(&Value::Integer(1));
+        avg.accumulate(&Value::Float(2.0));
+        avg.accumulate(&Value::Integer(3));
         assert_eq!(avg.result().unwrap(), Value::Float(2.0));
     }
 
     #[test]
     fn test_avg_ignores_null() {
         let mut avg = AvgFunction::default();
-        avg.accumulate(&Value::Integer(1), false);
-        avg.accumulate(&Value::null_unknown(), false);
-        avg.accumulate(&Value::Integer(3), false);
+        avg.accumulate(&Value::Integer(1));
+        avg.accumulate(&Value::null_unknown());
+        avg.accumulate(&Value::Integer(3));
         assert_eq!(avg.result().unwrap(), Value::Float(2.0)); // (1 + 3) / 2
     }
 
     #[test]
     fn test_avg_distinct() {
-        let mut avg = AvgFunction::default();
-        avg.accumulate(&Value::Integer(1), true);
-        avg.accumulate(&Value::Integer(1), true); // duplicate
-        avg.accumulate(&Value::Integer(3), true);
-        avg.accumulate(&Value::Integer(3), true); // duplicate
+        let mut avg =
+            super::super::AggregateState::new(Box::new(AvgFunction::default()), true, &[], vec![]);
+        avg.accumulate(&Value::Integer(1));
+        avg.accumulate(&Value::Integer(1)); // duplicate
+        avg.accumulate(&Value::Integer(3));
+        avg.accumulate(&Value::Integer(3)); // duplicate
         assert_eq!(avg.result().unwrap(), Value::Float(2.0)); // (1 + 3) / 2
     }
 
@@ -139,8 +121,8 @@ mod tests {
     #[test]
     fn test_avg_reset() {
         let mut avg = AvgFunction::default();
-        avg.accumulate(&Value::Integer(1), false);
-        avg.accumulate(&Value::Integer(2), false);
+        avg.accumulate(&Value::Integer(1));
+        avg.accumulate(&Value::Integer(2));
         avg.reset();
         assert!(avg.result().unwrap().is_null());
     }
@@ -148,7 +130,7 @@ mod tests {
     #[test]
     fn test_avg_single_value() {
         let mut avg = AvgFunction::default();
-        avg.accumulate(&Value::Integer(42), false);
+        avg.accumulate(&Value::Integer(42));
         assert_eq!(avg.result().unwrap(), Value::Float(42.0));
     }
 }

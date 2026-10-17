@@ -48,7 +48,7 @@ impl AggregateFunction for MinFunction {
         )
     }
 
-    fn accumulate(&mut self, value: &Value, _distinct: bool) {
+    fn accumulate(&mut self, value: &Value) {
         // Handle NULL values - MIN ignores NULLs
         if value.is_null() {
             return;
@@ -103,36 +103,36 @@ mod tests {
     #[test]
     fn test_min_integers() {
         let mut min = MinFunction::default();
-        min.accumulate(&Value::Integer(5), false);
-        min.accumulate(&Value::Integer(2), false);
-        min.accumulate(&Value::Integer(8), false);
+        min.accumulate(&Value::Integer(5));
+        min.accumulate(&Value::Integer(2));
+        min.accumulate(&Value::Integer(8));
         assert_eq!(min.result().unwrap(), Value::Integer(2));
     }
 
     #[test]
     fn test_min_floats() {
         let mut min = MinFunction::default();
-        min.accumulate(&Value::Float(5.5), false);
-        min.accumulate(&Value::Float(2.2), false);
-        min.accumulate(&Value::Float(8.8), false);
+        min.accumulate(&Value::Float(5.5));
+        min.accumulate(&Value::Float(2.2));
+        min.accumulate(&Value::Float(8.8));
         assert_eq!(min.result().unwrap(), Value::Float(2.2));
     }
 
     #[test]
     fn test_min_strings() {
         let mut min = MinFunction::default();
-        min.accumulate(&Value::text("banana"), false);
-        min.accumulate(&Value::text("apple"), false);
-        min.accumulate(&Value::text("cherry"), false);
+        min.accumulate(&Value::text("banana"));
+        min.accumulate(&Value::text("apple"));
+        min.accumulate(&Value::text("cherry"));
         assert_eq!(min.result().unwrap(), Value::text("apple"));
     }
 
     #[test]
     fn test_min_ignores_null() {
         let mut min = MinFunction::default();
-        min.accumulate(&Value::Integer(5), false);
-        min.accumulate(&Value::null_unknown(), false);
-        min.accumulate(&Value::Integer(2), false);
+        min.accumulate(&Value::Integer(5));
+        min.accumulate(&Value::null_unknown());
+        min.accumulate(&Value::Integer(2));
         assert_eq!(min.result().unwrap(), Value::Integer(2));
     }
 
@@ -145,8 +145,8 @@ mod tests {
     #[test]
     fn test_min_reset() {
         let mut min = MinFunction::default();
-        min.accumulate(&Value::Integer(5), false);
-        min.accumulate(&Value::Integer(2), false);
+        min.accumulate(&Value::Integer(5));
+        min.accumulate(&Value::Integer(2));
         min.reset();
         assert!(min.result().unwrap().is_null());
     }
@@ -154,25 +154,25 @@ mod tests {
     #[test]
     fn test_min_single_value() {
         let mut min = MinFunction::default();
-        min.accumulate(&Value::Integer(42), false);
+        min.accumulate(&Value::Integer(42));
         assert_eq!(min.result().unwrap(), Value::Integer(42));
     }
 
     #[test]
     fn test_min_negative() {
         let mut min = MinFunction::default();
-        min.accumulate(&Value::Integer(-5), false);
-        min.accumulate(&Value::Integer(10), false);
-        min.accumulate(&Value::Integer(-10), false);
+        min.accumulate(&Value::Integer(-5));
+        min.accumulate(&Value::Integer(10));
+        min.accumulate(&Value::Integer(-10));
         assert_eq!(min.result().unwrap(), Value::Integer(-10));
     }
 
     #[test]
     fn test_min_booleans() {
         let mut min = MinFunction::default();
-        min.accumulate(&Value::Boolean(true), false);
-        min.accumulate(&Value::Boolean(false), false);
-        min.accumulate(&Value::Boolean(true), false);
+        min.accumulate(&Value::Boolean(true));
+        min.accumulate(&Value::Boolean(false));
+        min.accumulate(&Value::Boolean(true));
         assert_eq!(min.result().unwrap(), Value::Boolean(false));
     }
 }
