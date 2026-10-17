@@ -1234,27 +1234,9 @@ impl Executor {
         None
     }
 
-    /// Extract integer limit value from a SELECT statement (simple cases only)
+    /// LIMIT + OFFSET of a SELECT, when they need no parameter
     fn extract_limit_value(select: &SelectStatement) -> Option<usize> {
-        let limit_expr = select.limit.as_deref()?;
-        match limit_expr {
-            Expression::IntegerLiteral(lit) => {
-                if lit.value >= 0 {
-                    let k = lit.value as usize;
-                    if let Some(ref offset_expr) = select.offset {
-                        if let Expression::IntegerLiteral(off) = &**offset_expr {
-                            if off.value >= 0 {
-                                return Some(k.saturating_add(off.value as usize));
-                            }
-                        }
-                    }
-                    Some(k)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
+        super::row_count::rows_needed(select, &ExecutionContext::new())
     }
 }
 

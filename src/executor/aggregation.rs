@@ -548,25 +548,7 @@ impl Executor {
         // OFFSET is applied after aggregation, so the groups it skips must be
         // built too: the pushed limit is LIMIT + OFFSET
         let aggregation_limit = if can_push_limit {
-            let eval_usize = |expr: &Expression| {
-                let registry = crate::functions::registry::global_registry();
-                let program = compile_over_slots(expr, &[], registry, None, None).ok()?;
-                let row = Row::new();
-                match ExprVM::new()
-                    .execute(&program, &slot_context(&row, ctx))
-                    .ok()?
-                {
-                    crate::core::Value::Integer(n) if n >= 0 => Some(n as usize),
-                    _ => None,
-                }
-            };
-            let limit = stmt.limit.as_deref().and_then(eval_usize);
-            match stmt.offset.as_deref() {
-                None => limit,
-                Some(offset_expr) => {
-                    limit.and_then(|l| eval_usize(offset_expr).map(|o| l.saturating_add(o)))
-                }
-            }
+            super::row_count::rows_needed(stmt, ctx)
         } else {
             None
         };

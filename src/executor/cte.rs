@@ -46,6 +46,7 @@ use super::operators::hash_join::JoinType as OperatorJoinType;
 use super::operators::index_nested_loop::{IndexLookupStrategy, IndexNestedLoopJoinOperator};
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::ExecutorResult;
+use super::row_count::{row_counts, rows_needed};
 use super::utils::{build_column_index_map, extract_join_keys_and_residual, is_sorted_on_keys};
 use super::Executor;
 
@@ -663,15 +664,7 @@ impl Executor {
                 && stmt.where_clause.is_none();
 
             let effective_limit = if can_push_limit {
-                match (&stmt.limit, &stmt.offset) {
-                    (Some(lim), Some(off)) => {
-                        let limit_val = self.evaluate_limit_offset(lim).unwrap_or(u64::MAX);
-                        let offset_val = self.evaluate_limit_offset(off).unwrap_or(0);
-                        Some(limit_val.saturating_add(offset_val))
-                    }
-                    (Some(lim), None) => self.evaluate_limit_offset(lim),
-                    _ => None,
-                }
+                rows_needed(stmt, ctx).map(|rows| rows as u64)
             } else {
                 None
             };
@@ -796,15 +789,7 @@ impl Executor {
 
         // Calculate effective limit (LIMIT + OFFSET since we need offset rows too)
         let effective_limit = if can_push_limit {
-            match (&stmt.limit, &stmt.offset) {
-                (Some(lim), Some(off)) => {
-                    let limit_val = self.evaluate_limit_offset(lim).unwrap_or(u64::MAX);
-                    let offset_val = self.evaluate_limit_offset(off).unwrap_or(0);
-                    Some(limit_val.saturating_add(offset_val))
-                }
-                (Some(lim), None) => self.evaluate_limit_offset(lim),
-                _ => None,
-            }
+            rows_needed(stmt, ctx).map(|rows| rows as u64)
         } else {
             None
         };
@@ -1128,20 +1113,6 @@ impl Executor {
         }
     }
 
-    /// Evaluate a LIMIT or OFFSET expression to a u64 value
-    fn evaluate_limit_offset(&self, expr: &Expression) -> Option<u64> {
-        match expr {
-            Expression::IntegerLiteral(lit) => {
-                if lit.value >= 0 {
-                    Some(lit.value as u64)
-                } else {
-                    None
-                }
-            }
-            _ => None, // For complex expressions, return None (don't push limit)
-        }
-    }
-
     /// Execute a query on CTE result data
     pub(crate) fn execute_query_on_cte_result(
         &self,
@@ -1242,7 +1213,8 @@ impl Executor {
             let mut rows = Self::materialize_result(result)?;
 
             if !skip_order_limit {
-                rows = self.apply_order_by_limit_offset(stmt, &classification, rows, &columns)?;
+                rows =
+                    self.apply_order_by_limit_offset(stmt, ctx, &classification, rows, &columns)?;
             }
             return Ok((columns, rows, !skip_order_limit));
         }
@@ -1255,7 +1227,8 @@ impl Executor {
             let mut rows = Self::materialize_result(result)?;
 
             if !skip_order_limit {
-                rows = self.apply_order_by_limit_offset(stmt, &classification, rows, &columns)?;
+                rows =
+                    self.apply_order_by_limit_offset(stmt, ctx, &classification, rows, &columns)?;
             }
             return Ok((columns, rows, !skip_order_limit));
         }
@@ -1393,35 +1366,7 @@ impl Executor {
             rows
         };
 
-        // Apply LIMIT and OFFSET (using classification for quick check)
-        if classification.has_offset {
-            if let Some(ref offset_expr) = stmt.offset {
-                let offset = match offset_expr.as_ref() {
-                    Expression::IntegerLiteral(lit) => lit.value as usize,
-                    Expression::FloatLiteral(lit) => lit.value as usize,
-                    _ => 0,
-                };
-                // Use drain to avoid extra allocation from skip().collect()
-                if offset > 0 && offset < result_rows.len() {
-                    result_rows.drain(..offset);
-                } else if offset >= result_rows.len() {
-                    result_rows.clear();
-                }
-            }
-        }
-
-        if classification.has_limit {
-            if let Some(ref limit_expr) = stmt.limit {
-                let limit = match limit_expr.as_ref() {
-                    Expression::IntegerLiteral(lit) => lit.value as usize,
-                    Expression::FloatLiteral(lit) => lit.value as usize,
-                    _ => usize::MAX,
-                };
-                if limit < result_rows.len() {
-                    result_rows.truncate(limit);
-                }
-            }
-        }
+        row_counts(stmt, ctx)?.apply(&mut result_rows);
 
         Ok((output_columns, result_rows, true))
     }
@@ -1630,14 +1575,17 @@ impl Executor {
         classification: &QueryClassification,
         join_source: &JoinTableSource,
     ) -> bool {
+        // Decided without the statement's parameters: a LIMIT that needs one
+        // leaves the statement to execute_select
         let limit_applied = match &stmt.limit {
             None => true,
-            Some(limit) => {
+            Some(_) => {
                 let join_type = join_source.join_type.to_uppercase();
                 matches!(join_type.as_str(), "" | "INNER" | "CROSS")
                     && !classification.has_aggregation
                     && stmt.where_clause.is_none()
-                    && self.evaluate_limit_offset(limit).is_some_and(|n| n > 0)
+                    && row_counts(stmt, &ExecutionContext::new())
+                        .is_ok_and(|counts| counts.limit.is_some_and(|limit| limit > 0))
             }
         };
         // The path evaluates ON and WHERE as plain expressions, without the subqueries
@@ -1844,6 +1792,7 @@ impl Executor {
     fn apply_order_by_limit_offset(
         &self,
         stmt: &SelectStatement,
+        ctx: &ExecutionContext,
         classification: &QueryClassification,
         mut rows: RowVec,
         columns: &[String],
@@ -1851,35 +1800,7 @@ impl Executor {
         if classification.has_order_by {
             rows = self.apply_order_by_to_rows(rows, &stmt.order_by, columns)?;
         }
-
-        if classification.has_offset {
-            if let Some(ref offset_expr) = stmt.offset {
-                let offset = match offset_expr.as_ref() {
-                    Expression::IntegerLiteral(lit) => lit.value as usize,
-                    Expression::FloatLiteral(lit) => lit.value as usize,
-                    _ => 0,
-                };
-                if offset > 0 && offset < rows.len() {
-                    rows.drain(..offset);
-                } else if offset >= rows.len() {
-                    rows.clear();
-                }
-            }
-        }
-
-        if classification.has_limit {
-            if let Some(ref limit_expr) = stmt.limit {
-                let limit = match limit_expr.as_ref() {
-                    Expression::IntegerLiteral(lit) => lit.value as usize,
-                    Expression::FloatLiteral(lit) => lit.value as usize,
-                    _ => usize::MAX,
-                };
-                if limit < rows.len() {
-                    rows.truncate(limit);
-                }
-            }
-        }
-
+        row_counts(stmt, ctx)?.apply(&mut rows);
         Ok(rows)
     }
 
@@ -2753,28 +2674,20 @@ impl Executor {
     ) -> StringMap<CtePushdownHint> {
         let mut hints = StringMap::new();
 
-        // Must have a LIMIT on the main query
-        let wanted = match &stmt.limit {
-            Some(lim) => match lim.as_ref() {
-                Expression::IntegerLiteral(lit) if lit.value > 0 => lit.value as u64,
-                _ => return hints,
-            },
-            None => return hints,
-        };
-
-        // Add OFFSET to limit if present; an OFFSET known only at run time, or
-        // a sum past what the pushed LIMIT literal can hold, gives no hint
-        let main_limit = match &stmt.offset {
-            Some(off) => match off.as_ref() {
-                Expression::IntegerLiteral(lit) if lit.value >= 0 => {
-                    match (wanted as i64).checked_add(lit.value) {
-                        Some(sum) => sum as u64,
-                        None => return hints,
-                    }
-                }
-                _ => return hints,
-            },
-            None => wanted,
+        // A positive LIMIT on the main query, plus its OFFSET; a count known
+        // only from the statement's parameters, or a sum past what the
+        // pushed LIMIT literal can hold, gives no hint
+        let Some((wanted, main_limit)) =
+            row_counts(stmt, &ExecutionContext::new())
+                .ok()
+                .and_then(|counts| {
+                    let wanted = counts.limit.filter(|limit| *limit > 0)?;
+                    let sum = wanted.checked_add(counts.offset)?;
+                    i64::try_from(sum).ok()?;
+                    Some((wanted as u64, sum as u64))
+                })
+        else {
+            return hints;
         };
 
         // Check for JOIN pattern in main query

@@ -72,6 +72,7 @@ mod prepared_select;
 pub mod pushdown;
 mod query;
 mod query_classification;
+mod row_count;
 mod set_ops;
 mod show;
 mod subquery;

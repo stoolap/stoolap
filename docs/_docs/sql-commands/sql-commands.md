@@ -41,6 +41,8 @@ FROM table_name
 - **LIMIT**: Maximum rows to return
 - **OFFSET**: Number of rows to skip
 
+LIMIT and OFFSET each take an expression evaluated once for the statement, a literal, a parameter or arithmetic on them. The value must be a whole number of zero or more: an INTEGER, or a FLOAT with no fractional part (`LIMIT 2.0` is `LIMIT 2`). NULL, a negative value, a fractional value such as `LIMIT 2.5`, and any other type are an error.
+
 #### Examples
 
 ```sql

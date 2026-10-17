@@ -548,26 +548,23 @@ impl Executor {
             .iter()
             .all(|wf| self.over_clause_is_shareable(wf));
         if all_over_clauses_shareable && stmt.order_by.is_empty() && stmt.offset.is_none() {
-            if let Some(limit_expr) = &stmt.limit {
-                let has_partition_by = window_functions
-                    .iter()
-                    .any(|wf| !wf.partition_by_exprs.is_empty());
+            let has_partition_by = window_functions
+                .iter()
+                .any(|wf| !wf.partition_by_exprs.is_empty());
 
-                if has_partition_by && Self::all_partitions_match(&window_functions) {
-                    if let Expression::IntegerLiteral(lit) = limit_expr.as_ref() {
-                        let limit_val = lit.value;
-                        if limit_val > 0 {
-                            return self.execute_select_with_window_functions_streaming(
-                                stmt,
-                                ctx,
-                                base_rows,
-                                base_columns,
-                                group_slots,
-                                visible_columns,
-                                &window_functions,
-                                limit_val as usize,
-                            );
-                        }
+            if has_partition_by && Self::all_partitions_match(&window_functions) {
+                if let Some(limit_val) = super::row_count::rows_needed(stmt, ctx) {
+                    if limit_val > 0 {
+                        return self.execute_select_with_window_functions_streaming(
+                            stmt,
+                            ctx,
+                            base_rows,
+                            base_columns,
+                            group_slots,
+                            visible_columns,
+                            &window_functions,
+                            limit_val,
+                        );
                     }
                 }
             }

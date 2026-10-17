@@ -238,19 +238,14 @@ impl Executor {
         Some((pk_value_source, schema, token))
     }
 
-    /// The PK fast path returns at most one row, so a literal LIMIT >= 1
-    /// with no OFFSET cannot change the result. Anything else (LIMIT 0,
-    /// any OFFSET, a parameter or expression limit) must take the full
-    /// execution path.
+    /// The PK fast path returns at most one row, so a LIMIT >= 1 with no
+    /// OFFSET cannot change the result. The decision is kept for the
+    /// statement, so a count that needs a parameter takes the full path,
+    /// as do LIMIT 0 and any OFFSET.
     fn pk_fast_path_limit_ok(stmt: &SelectStatement) -> bool {
-        if stmt.offset.is_some() {
-            return false;
-        }
-        match stmt.limit.as_deref() {
-            None => true,
-            Some(Expression::IntegerLiteral(lit)) => lit.value >= 1,
-            Some(_) => false,
-        }
+        stmt.offset.is_none()
+            && super::row_count::row_counts(stmt, &ExecutionContext::new())
+                .is_ok_and(|counts| counts.limit.is_none_or(|limit| limit >= 1))
     }
 
     /// Extract PK equality structure from WHERE clause without resolving
