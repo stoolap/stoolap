@@ -18,8 +18,8 @@
 //! a storage-layer expression when possible.
 
 use crate::core::{Operator, Value};
-use crate::executor::volatility::expression_volatility;
-use crate::functions::{global_registry, Volatility};
+use crate::executor::volatility::statement_constant;
+use crate::functions::global_registry;
 use crate::parser::ast::{self as ast, InfixOperator, PrefixOperator};
 use crate::storage::expression::{
     AndExpr, BetweenExpr, ComparisonExpr, ConstBoolExpr, Expression as StorageExpr, FunctionArg,
@@ -60,9 +60,9 @@ fn extract_literal_with_ctx(expr: &ast::Expression, ctx: &PushdownContext<'_>) -
         }
     }
 
-    // A column-free expression is frozen for the statement (NOW() - INTERVAL '24 hours'),
-    // unless it answers per call (WHERE id < RANDOM() * 20 rolls for each row)
-    if expression_volatility(expr, global_registry()) == Volatility::PerCall {
+    // A statement constant is frozen (NOW() - INTERVAL '24 hours'); a value that
+    // reads the row or rolls per call is not (WHERE x = "y" || '', id < RANDOM() * 20)
+    if !statement_constant(expr, global_registry()) {
         return None;
     }
     #[cfg(feature = "test-failpoints")]

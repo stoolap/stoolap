@@ -33,7 +33,10 @@ use super::context::{cache_in_subquery, get_cached_in_subquery_with_kinds, Execu
 use super::expression::{ExpressionEval, RowFilter};
 use super::query_classification::QueryClassification;
 use super::result::ExecutorResult;
+use super::utils::{extract_and_conditions, flip_operator, infix_to_operator};
+use super::volatility::statement_constant;
 use super::Executor;
+use crate::storage::volume::side_index::{resolve_all, Domain, Resolved};
 
 /// The most rows a LIMIT's fetch by primary key reads in one batch
 const FETCH_BATCH_ROWS: usize = 1024;
@@ -447,19 +450,12 @@ impl Executor {
             return Ok(None);
         }
 
-        // Extract keyset condition from WHERE clause
-        // Supports: id > X, id >= X, id < X, id <= X
-        let (start_after, start_from, is_pure_keyset) =
-            self.extract_pk_keyset_bounds(where_clause, pk_column, ctx)?;
-
-        // Must have at least one bound AND be a pure keyset predicate
-        // (no additional predicates like `AND status = 'active'`)
-        if start_after.is_none() && start_from.is_none() {
-            return Ok(None);
-        }
-        if !is_pure_keyset {
-            return Ok(None);
-        }
+        // The walk answers the WHERE alone, so it must be comparisons on the
+        // primary key that leave a lower bound only
+        let start_from = match self.pk_keyset_range(where_clause, pk_column, ctx) {
+            Some(Resolved::Range(low, i64::MAX)) if low > i64::MIN => low,
+            _ => return Ok(None),
+        };
 
         // Evaluate limit
         let limit = if let Some(ref limit_expr) = stmt.limit {
@@ -476,8 +472,7 @@ impl Executor {
         };
 
         // Use keyset pagination from storage layer
-        if let Some(rows) = table.collect_rows_pk_keyset(start_after, start_from, ascending, limit)
-        {
+        if let Some(rows) = table.collect_rows_pk_keyset(None, Some(start_from), ascending, limit) {
             // Project rows according to SELECT expressions
             // Use schema cache for lowercase column names
             let all_columns_lower = schema.column_names_lower_arc();
@@ -505,137 +500,47 @@ impl Executor {
         Ok(None)
     }
 
-    /// Extract PK keyset bounds from a WHERE clause
-    ///
-    /// Returns (start_after, start_from, is_pure_keyset) where:
-    /// - start_after is for `id > X` (exclusive bound)
-    /// - start_from is for `id >= X` (inclusive bound)
-    /// - is_pure_keyset is true if the expression ONLY contains keyset predicates
-    ///   (no additional predicates like `AND status = 'active'`)
-    fn extract_pk_keyset_bounds(
+    /// The primary keys a WHERE of comparisons on the primary key alone
+    /// allows, each read by the comparison contract; None when another
+    /// predicate is in it or a compared value is not a statement constant
+    fn pk_keyset_range(
         &self,
         expr: &Expression,
         pk_column: &str,
         ctx: &ExecutionContext,
-    ) -> Result<(Option<i64>, Option<i64>, bool)> {
-        if let Expression::Infix(infix) = expr {
-            let op = infix.operator.as_str();
-
-            // Handle comparison operators
-            match op {
-                ">" | ">=" | "<" | "<=" => {
-                    // Check if left side is the PK column
-                    let left_is_pk = match &*infix.left {
-                        Expression::Identifier(id) => id.value.eq_ignore_ascii_case(pk_column),
-                        Expression::QualifiedIdentifier(qid) => {
-                            qid.name.value.eq_ignore_ascii_case(pk_column)
-                        }
-                        _ => false,
-                    };
-
-                    if left_is_pk {
-                        // pk OP value
-                        if let Some(value) = self.eval_to_i64(&infix.right, ctx) {
-                            return Ok(match op {
-                                ">" => (Some(value), None, true),
-                                ">=" => (None, Some(value), true),
-                                // For < and <=, we'd need end bounds which we don't support yet
-                                _ => (None, None, false),
-                            });
-                        }
-                    } else {
-                        // value OP pk (reversed)
-                        let right_is_pk = match &*infix.right {
-                            Expression::Identifier(id) => id.value.eq_ignore_ascii_case(pk_column),
-                            Expression::QualifiedIdentifier(qid) => {
-                                qid.name.value.eq_ignore_ascii_case(pk_column)
-                            }
-                            _ => false,
-                        };
-
-                        if right_is_pk {
-                            if let Some(value) = self.eval_to_i64(&infix.left, ctx) {
-                                return Ok(match op {
-                                    // value > pk means pk < value (not supported for keyset start)
-                                    // value >= pk means pk <= value (not supported for keyset start)
-                                    "<" => (Some(value), None, true), // value < pk means pk > value
-                                    "<=" => (None, Some(value), true), // value <= pk means pk >= value
-                                    _ => (None, None, false),
-                                });
-                            }
-                        }
-                    }
-                }
-                "AND" => {
-                    // For AND, try to extract bounds from both sides
-                    let (left_after, left_from, left_pure) =
-                        self.extract_pk_keyset_bounds(&infix.left, pk_column, ctx)?;
-                    let (right_after, right_from, right_pure) =
-                        self.extract_pk_keyset_bounds(&infix.right, pk_column, ctx)?;
-
-                    // Combine bounds - take the first non-None from each side
-                    let start_after = left_after.or(right_after);
-                    let start_from = left_from.or(right_from);
-
-                    // Expression is pure keyset only if BOTH sides are pure keyset predicates
-                    // (e.g., `id > 100 AND id < 200` is pure, `id > 100 AND status = 'active'` is not)
-                    let is_pure = left_pure && right_pure;
-
-                    return Ok((start_after, start_from, is_pure));
-                }
-                _ => {}
+    ) -> Option<Resolved> {
+        let is_pk = |expr: &Expression| match expr {
+            Expression::Identifier(id) => id.value.eq_ignore_ascii_case(pk_column),
+            Expression::QualifiedIdentifier(qid) => qid.name.value.eq_ignore_ascii_case(pk_column),
+            _ => false,
+        };
+        let mut comparisons = Vec::new();
+        for conjunct in extract_and_conditions(expr) {
+            let Expression::Infix(infix) = conjunct else {
+                return None;
+            };
+            let op = infix_to_operator(infix.op_type)?;
+            let (op, value) = if is_pk(&infix.left) {
+                (op, &*infix.right)
+            } else if is_pk(&infix.right) {
+                (flip_operator(op), &*infix.left)
+            } else {
+                return None;
+            };
+            if !statement_constant(value, &self.function_registry) {
+                return None;
             }
+            let value = ExpressionEval::compile(value, &[])
+                .ok()?
+                .with_context(ctx)
+                .eval_slice(&Row::new())
+                .ok()?;
+            comparisons.push((op, value));
         }
-
-        // Not a keyset predicate - this is an additional filter
-        Ok((None, None, false))
-    }
-
-    /// Evaluate an expression to an i64 value
-    fn eval_to_i64(&self, expr: &Expression, ctx: &ExecutionContext) -> Option<i64> {
-        match expr {
-            Expression::IntegerLiteral(lit) => Some(lit.value),
-            Expression::FloatLiteral(lit) => Some(lit.value as i64),
-            Expression::Parameter(param) => {
-                // Named parameters (e.g., :name) use get_named_param()
-                // Positional parameters ($1, $2, ...) are 1-indexed, array is 0-indexed
-                if param.name.starts_with(':') {
-                    let name = &param.name[1..];
-                    match ctx.get_named_param(name) {
-                        Some(Value::Integer(i)) => Some(*i),
-                        Some(Value::Float(f)) => Some(*f as i64),
-                        _ => None,
-                    }
-                } else {
-                    let params = ctx.params();
-                    let param_idx = if param.index > 0 {
-                        param.index - 1
-                    } else {
-                        return None;
-                    };
-                    if param_idx < params.len() {
-                        match &params[param_idx] {
-                            Value::Integer(i) => Some(*i),
-                            Value::Float(f) => Some(*f as i64),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    }
-                }
-            }
-            _ => {
-                // Try to evaluate the expression
-                ExpressionEval::compile(expr, &[])
-                    .ok()
-                    .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                    .and_then(|v| match v {
-                        Value::Integer(i) => Some(i),
-                        Value::Float(f) => Some(f as i64),
-                        _ => None,
-                    })
-            }
-        }
+        Some(resolve_all(
+            Domain::Integer,
+            comparisons.iter().map(|(op, value)| (*op, value)),
+        ))
     }
 
     /// Extract window ORDER BY information for optimization

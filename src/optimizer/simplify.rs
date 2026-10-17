@@ -223,8 +223,7 @@ impl ExpressionSimplifier {
         if self.expr_equals(left, right) {
             return Some(left.clone());
         }
-        // Try to merge range predicates: a > 5 AND a > 3 → a > 5
-        self.try_merge_range_predicates(left, right)
+        None
     }
 
     /// Simplify OR expressions
@@ -587,86 +586,6 @@ impl ExpressionSimplifier {
         }
     }
 
-    /// Try to merge overlapping range predicates
-    /// a > 5 AND a > 3 → a > 5
-    /// a < 5 AND a < 10 → a < 5
-    fn try_merge_range_predicates(
-        &self,
-        left: &Expression,
-        right: &Expression,
-    ) -> Option<Expression> {
-        let (left_infix, right_infix) = match (left, right) {
-            (Expression::Infix(l), Expression::Infix(r)) => (l, r),
-            _ => return None,
-        };
-
-        // Check if both are comparisons on the same column
-        let left_col = self.extract_column(&left_infix.left)?;
-        let right_col = self.extract_column(&right_infix.left)?;
-
-        if left_col != right_col {
-            return None;
-        }
-
-        // Check for constant right-hand sides
-        let left_val = self.extract_int_literal(&left_infix.right)?;
-        let right_val = self.extract_int_literal(&right_infix.right)?;
-
-        // Merge based on operator types
-        match (left_infix.op_type, right_infix.op_type) {
-            // a > 5 AND a > 3 → a > 5 (keep larger)
-            (InfixOperator::GreaterThan, InfixOperator::GreaterThan)
-            | (InfixOperator::GreaterEqual, InfixOperator::GreaterEqual) => {
-                if left_val >= right_val {
-                    Some(left.clone())
-                } else {
-                    Some(right.clone())
-                }
-            }
-            // a < 5 AND a < 10 → a < 5 (keep smaller)
-            (InfixOperator::LessThan, InfixOperator::LessThan)
-            | (InfixOperator::LessEqual, InfixOperator::LessEqual) => {
-                if left_val <= right_val {
-                    Some(left.clone())
-                } else {
-                    Some(right.clone())
-                }
-            }
-            // a > 5 AND a >= 5 → a > 5 (stricter)
-            (InfixOperator::GreaterThan, InfixOperator::GreaterEqual) if left_val == right_val => {
-                Some(left.clone())
-            }
-            (InfixOperator::GreaterEqual, InfixOperator::GreaterThan) if left_val == right_val => {
-                Some(right.clone())
-            }
-            // a < 5 AND a <= 5 → a < 5 (stricter)
-            (InfixOperator::LessThan, InfixOperator::LessEqual) if left_val == right_val => {
-                Some(left.clone())
-            }
-            (InfixOperator::LessEqual, InfixOperator::LessThan) if left_val == right_val => {
-                Some(right.clone())
-            }
-            _ => None,
-        }
-    }
-
-    /// Extract column name from identifier expression
-    fn extract_column(&self, expr: &Expression) -> Option<String> {
-        match expr {
-            Expression::Identifier(id) => Some(id.value.to_string()),
-            Expression::QualifiedIdentifier(qid) => Some(qid.name.value.to_string()),
-            _ => None,
-        }
-    }
-
-    /// Extract integer literal value
-    fn extract_int_literal(&self, expr: &Expression) -> Option<i64> {
-        match expr {
-            Expression::IntegerLiteral(lit) => Some(lit.value),
-            _ => None,
-        }
-    }
-
     /// Create a boolean literal expression
     fn make_bool(&self, value: bool) -> Expression {
         Expression::BooleanLiteral(BooleanLiteral {
@@ -866,28 +785,6 @@ mod tests {
         let expr = make_infix(x.clone(), InfixOperator::Multiply, make_int_lit(0));
         let result = simplify_expression(&expr);
         assert!(matches!(result, Expression::Infix(_)));
-    }
-
-    #[test]
-    fn test_range_predicate_merge() {
-        let a = make_identifier("a");
-
-        // a > 5 AND a > 3 → a > 5
-        let left = make_infix(a.clone(), InfixOperator::GreaterThan, make_int_lit(5));
-        let right = make_infix(a.clone(), InfixOperator::GreaterThan, make_int_lit(3));
-        let expr = make_infix(left, InfixOperator::And, right);
-        let result = simplify_expression(&expr);
-
-        // Should keep the stricter condition (a > 5)
-        if let Expression::Infix(infix) = result {
-            if let Expression::IntegerLiteral(lit) = infix.right.as_ref() {
-                assert_eq!(lit.value, 5);
-            } else {
-                panic!("Expected IntegerLiteral(5)");
-            }
-        } else {
-            panic!("Expected Infix expression");
-        }
     }
 
     #[test]
