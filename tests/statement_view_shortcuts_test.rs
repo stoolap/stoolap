@@ -720,7 +720,10 @@ fn a_table_shortcut_without_a_view_drops_an_answer_a_commit_moved_rows_under() {
         let table = tx.get_table("c").unwrap();
         let seen = match shortcut {
             "count" => format!("{:?}", table.fast_row_count().unwrap()),
-            "sum" => format!("{:?}", table.sum_column(1).unwrap()),
+            "sum" => match table.sum_column(1).unwrap() {
+                Some(sum) => format!("{} of {}", sum.sum().unwrap(), sum.count()),
+                None => "None".to_string(),
+            },
             _ => format!("{:?}", table.row_count().unwrap()),
         };
         if !committed.get() {
@@ -731,7 +734,7 @@ fn a_table_shortcut_without_a_view_drops_an_answer_a_commit_moved_rows_under() {
         // The right answers are the totals before and after the commit
         let right: &[&str] = match shortcut {
             "count" => &["None", "Some(2)"],
-            "sum" => &["None", "Some((30.0, 2))", "Some((31.0, 2))"],
+            "sum" => &["None", "30 of 2", "31 of 2"],
             _ => &["2"],
         };
         if !right.contains(&seen.as_str()) {

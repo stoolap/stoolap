@@ -39,10 +39,10 @@ SELECT COUNT(*), COUNT(name) FROM adv_agg WHERE grp = 'B'
 2 1
 
 # Aggregate over entire table (no GROUP BY)
-query IRRI
+query IRRR
 SELECT COUNT(*), MIN(val), MAX(val), SUM(val) FROM adv_agg
 ----
-6 10.000 200.000 410
+6 10.000 200.000 410.000
 
 # Multiple aggregates with different filters via CASE
 query RR

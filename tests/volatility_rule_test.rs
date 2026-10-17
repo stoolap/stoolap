@@ -141,8 +141,8 @@ impl stoolap::functions::AggregateFunction for FixedRandom {
         )
     }
     fn accumulate(&mut self, _value: &Value, _distinct: bool) {}
-    fn result(&self) -> Value {
-        Value::Integer(0)
+    fn result(&self) -> Result<Value> {
+        Ok(Value::Integer(0))
     }
     fn reset(&mut self) {}
     fn clone_box(&self) -> Box<dyn stoolap::functions::AggregateFunction> {

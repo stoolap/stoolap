@@ -27,11 +27,11 @@ SELECT id, name FROM v_eng WHERE salary > 100
 statement ok
 CREATE VIEW v_dept_stats AS SELECT dept, COUNT(*) AS cnt, SUM(salary) AS total FROM view_emp GROUP BY dept
 
-query TIR rowsort
+query TII rowsort
 SELECT * FROM v_dept_stats
 ----
-Eng 2 220.000
-Sales 2 170.000
+Eng 2 220
+Sales 2 170
 
 # View with join
 statement ok

@@ -14,7 +14,7 @@
 
 //! STRING_AGG aggregate function
 
-use crate::core::Value;
+use crate::core::{Result, Value};
 use crate::functions::{
     AggregateFunction, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType,
 };
@@ -161,7 +161,7 @@ impl AggregateFunction for StringAggFunction {
         });
     }
 
-    fn result(&self) -> Value {
+    fn result(&self) -> Result<Value> {
         // Get the values to output, potentially sorted
         let values_to_output: Vec<&str> = if self.has_order_by && !self.ordered_entries.is_empty() {
             // Sort the entries by their sort keys
@@ -180,13 +180,13 @@ impl AggregateFunction for StringAggFunction {
                 .map(|e| e.value.as_str())
                 .collect()
         } else {
-            return Value::null_unknown();
+            return Ok(Value::null_unknown());
         };
 
         if values_to_output.is_empty() {
-            Value::null_unknown()
+            Ok(Value::null_unknown())
         } else {
-            Value::text(values_to_output.join(&self.separator))
+            Ok(Value::text(values_to_output.join(&self.separator)))
         }
     }
 
@@ -248,7 +248,7 @@ impl AggregateFunction for GroupConcatFunction {
             .accumulate_with_sort_key(value, sort_keys, distinct);
     }
 
-    fn result(&self) -> Value {
+    fn result(&self) -> Result<Value> {
         self.inner.result()
     }
 
@@ -271,7 +271,7 @@ mod tests {
         agg.accumulate(&Value::text("a"), false);
         agg.accumulate(&Value::text("b"), false);
         agg.accumulate(&Value::text("c"), false);
-        assert_eq!(agg.result(), Value::text("a,b,c"));
+        assert_eq!(agg.result().unwrap(), Value::text("a,b,c"));
     }
 
     #[test]
@@ -280,7 +280,7 @@ mod tests {
         agg.accumulate(&Value::text("a"), false);
         agg.accumulate(&Value::null_unknown(), false);
         agg.accumulate(&Value::text("c"), false);
-        assert_eq!(agg.result(), Value::text("a,c"));
+        assert_eq!(agg.result().unwrap(), Value::text("a,c"));
     }
 
     #[test]
@@ -290,13 +290,13 @@ mod tests {
         agg.accumulate(&Value::text("b"), true);
         agg.accumulate(&Value::text("a"), true); // duplicate
         agg.accumulate(&Value::text("c"), true);
-        assert_eq!(agg.result(), Value::text("a,b,c"));
+        assert_eq!(agg.result().unwrap(), Value::text("a,b,c"));
     }
 
     #[test]
     fn test_string_agg_empty() {
         let agg = StringAggFunction::default();
-        assert!(agg.result().is_null());
+        assert!(agg.result().unwrap().is_null());
     }
 
     #[test]
@@ -305,7 +305,7 @@ mod tests {
         agg.accumulate(&Value::Integer(1), false);
         agg.accumulate(&Value::Integer(2), false);
         agg.accumulate(&Value::Integer(3), false);
-        assert_eq!(agg.result(), Value::text("1,2,3"));
+        assert_eq!(agg.result().unwrap(), Value::text("1,2,3"));
     }
 
     #[test]
@@ -314,7 +314,7 @@ mod tests {
         agg.accumulate(&Value::text("a"), false);
         agg.accumulate(&Value::text("b"), false);
         agg.reset();
-        assert!(agg.result().is_null());
+        assert!(agg.result().unwrap().is_null());
     }
 
     #[test]
@@ -322,14 +322,14 @@ mod tests {
         let mut agg = GroupConcatFunction::default();
         agg.accumulate(&Value::text("hello"), false);
         agg.accumulate(&Value::text("world"), false);
-        assert_eq!(agg.result(), Value::text("hello,world"));
+        assert_eq!(agg.result().unwrap(), Value::text("hello,world"));
     }
 
     #[test]
     fn test_string_agg_single_value() {
         let mut agg = StringAggFunction::default();
         agg.accumulate(&Value::text("only"), false);
-        assert_eq!(agg.result(), Value::text("only"));
+        assert_eq!(agg.result().unwrap(), Value::text("only"));
     }
 
     #[test]
@@ -339,7 +339,7 @@ mod tests {
         agg.accumulate(&Value::Integer(42), false);
         agg.accumulate(&Value::Float(3.5), false);
         agg.accumulate(&Value::Boolean(true), false);
-        assert_eq!(agg.result(), Value::text("str,42,3.5,true"));
+        assert_eq!(agg.result().unwrap(), Value::text("str,42,3.5,true"));
     }
 
     #[test]
@@ -349,7 +349,7 @@ mod tests {
         agg.accumulate(&Value::text("a"), false);
         agg.accumulate(&Value::text("b"), false);
         agg.accumulate(&Value::text("c"), false);
-        assert_eq!(agg.result(), Value::text("a | b | c"));
+        assert_eq!(agg.result().unwrap(), Value::text("a | b | c"));
     }
 
     #[test]
@@ -359,7 +359,7 @@ mod tests {
         agg.accumulate(&Value::text("1"), false);
         agg.accumulate(&Value::text("2"), false);
         agg.accumulate(&Value::text("3"), false);
-        assert_eq!(agg.result(), Value::text("1-2-3"));
+        assert_eq!(agg.result().unwrap(), Value::text("1-2-3"));
     }
 
     #[test]
@@ -368,6 +368,6 @@ mod tests {
         agg.configure(&[Value::text("; ")]);
         agg.accumulate(&Value::text("hello"), false);
         agg.accumulate(&Value::text("world"), false);
-        assert_eq!(agg.result(), Value::text("hello; world"));
+        assert_eq!(agg.result().unwrap(), Value::text("hello; world"));
     }
 }

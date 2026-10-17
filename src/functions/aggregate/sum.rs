@@ -14,29 +14,20 @@
 
 //! SUM aggregate function
 
-use crate::core::Value;
+use crate::core::{Result, SumAccumulator, Value};
 use crate::functions::{
     AggregateFunction, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType,
 };
 
 use super::DistinctTracker;
 
-/// Sum state - tracks whether we have integers or floats
-#[derive(Default)]
-enum SumState {
-    #[default]
-    Empty,
-    Integer(i64),
-    Float(f64),
-}
-
 /// SUM aggregate function
 ///
-/// Returns the sum of all non-NULL values in the specified column.
-/// Returns int64 for integer inputs, float64 for floating-point inputs.
+/// Returns the sum of all non-NULL values in the specified column: the
+/// exact INTEGER for INTEGER inputs, FLOAT once any input is FLOAT.
 #[derive(Default)]
 pub struct SumFunction {
-    state: SumState,
+    state: SumAccumulator,
     distinct_tracker: Option<DistinctTracker>,
 }
 
@@ -76,50 +67,16 @@ impl AggregateFunction for SumFunction {
         }
 
         // A boolean counts as one or nought, so SUM(v > 100) counts the
-        // rows the condition holds for, the way both reference engines
-        // read it, rather than adding nothing and answering NULL
-        let promoted;
-        let value = if let Value::Boolean(b) = value {
-            promoted = Value::Integer(*b as i64);
-            &promoted
-        } else {
-            value
-        };
-
-        // Extract numeric value
-        match value {
-            Value::Integer(i) => match &mut self.state {
-                SumState::Empty => self.state = SumState::Integer(*i),
-                SumState::Integer(sum) => match sum.checked_add(*i) {
-                    Some(new_sum) => *sum = new_sum,
-                    None => {
-                        // Overflow: promote to float
-                        self.state = SumState::Float(*sum as f64 + *i as f64);
-                    }
-                },
-                SumState::Float(sum) => *sum += *i as f64,
-            },
-            Value::Float(f) => match &mut self.state {
-                SumState::Empty => self.state = SumState::Float(*f),
-                SumState::Integer(sum) => {
-                    self.state = SumState::Float(*sum as f64 + f);
-                }
-                SumState::Float(sum) => *sum += f,
-            },
-            _ => {} // Ignore non-numeric types
-        }
+        // rows the condition holds for
+        self.state.add(value);
     }
 
-    fn result(&self) -> Value {
-        match &self.state {
-            SumState::Empty => Value::null_unknown(),
-            SumState::Integer(sum) => Value::Integer(*sum),
-            SumState::Float(sum) => Value::Float(*sum),
-        }
+    fn result(&self) -> Result<Value> {
+        self.state.sum()
     }
 
     fn reset(&mut self) {
-        self.state = SumState::Empty;
+        self.state = SumAccumulator::default();
         self.distinct_tracker = None;
     }
 
@@ -138,7 +95,7 @@ mod tests {
         sum.accumulate(&Value::Integer(1), false);
         sum.accumulate(&Value::Integer(2), false);
         sum.accumulate(&Value::Integer(3), false);
-        assert_eq!(sum.result(), Value::Integer(6));
+        assert_eq!(sum.result().unwrap(), Value::Integer(6));
     }
 
     #[test]
@@ -147,7 +104,7 @@ mod tests {
         sum.accumulate(&Value::Float(1.5), false);
         sum.accumulate(&Value::Float(2.5), false);
         sum.accumulate(&Value::Float(3.0), false);
-        assert_eq!(sum.result(), Value::Float(7.0));
+        assert_eq!(sum.result().unwrap(), Value::Float(7.0));
     }
 
     #[test]
@@ -156,7 +113,7 @@ mod tests {
         sum.accumulate(&Value::Integer(1), false);
         sum.accumulate(&Value::Float(2.5), false);
         sum.accumulate(&Value::Integer(3), false);
-        assert_eq!(sum.result(), Value::Float(6.5));
+        assert_eq!(sum.result().unwrap(), Value::Float(6.5));
     }
 
     #[test]
@@ -165,7 +122,7 @@ mod tests {
         sum.accumulate(&Value::Integer(1), false);
         sum.accumulate(&Value::null_unknown(), false);
         sum.accumulate(&Value::Integer(3), false);
-        assert_eq!(sum.result(), Value::Integer(4));
+        assert_eq!(sum.result().unwrap(), Value::Integer(4));
     }
 
     #[test]
@@ -175,13 +132,13 @@ mod tests {
         sum.accumulate(&Value::Integer(1), true); // duplicate
         sum.accumulate(&Value::Integer(2), true);
         sum.accumulate(&Value::Integer(2), true); // duplicate
-        assert_eq!(sum.result(), Value::Integer(3)); // 1 + 2
+        assert_eq!(sum.result().unwrap(), Value::Integer(3)); // 1 + 2
     }
 
     #[test]
     fn test_sum_empty() {
         let sum = SumFunction::default();
-        assert!(sum.result().is_null());
+        assert!(sum.result().unwrap().is_null());
     }
 
     #[test]
@@ -190,7 +147,7 @@ mod tests {
         sum.accumulate(&Value::Integer(1), false);
         sum.accumulate(&Value::Integer(2), false);
         sum.reset();
-        assert!(sum.result().is_null());
+        assert!(sum.result().unwrap().is_null());
     }
 
     #[test]
@@ -199,6 +156,6 @@ mod tests {
         sum.accumulate(&Value::Integer(-5), false);
         sum.accumulate(&Value::Integer(10), false);
         sum.accumulate(&Value::Integer(-3), false);
-        assert_eq!(sum.result(), Value::Integer(2));
+        assert_eq!(sum.result().unwrap(), Value::Integer(2));
     }
 }

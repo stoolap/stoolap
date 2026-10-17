@@ -147,13 +147,16 @@ fn state(table: &dyn Table) -> Vec<(i64, i64)> {
         seen.len(),
         "row count of {seen:?}"
     );
-    if let Some((sum, count)) = table.sum_column(1).unwrap() {
+    if let Some(sum) = table.sum_column(1).unwrap() {
         let expected: i64 = seen.iter().map(|(_, v)| v).sum();
-        assert_eq!(
-            (sum as i64, count),
-            (expected, seen.len()),
-            "sum of {seen:?}"
-        );
+        assert_eq!(sum.count(), seen.len() as u64, "count of {seen:?}");
+        if !seen.is_empty() {
+            assert_eq!(
+                sum.sum().unwrap(),
+                Value::Integer(expected),
+                "sum of {seen:?}"
+            );
+        }
     }
     if let Some(min) = table.min_column(1).unwrap() {
         let expected = seen.iter().map(|(_, v)| *v).min().map(Value::Integer);

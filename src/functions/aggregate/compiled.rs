@@ -36,19 +36,10 @@
 //! Expected speedup: 2-5x for aggregation-heavy queries.
 
 use crate::core::value::compare_floats;
-use crate::core::Value;
+use crate::core::{Result, SumAccumulator, Value};
 use crate::functions::AggregateFunction;
 
 use super::DistinctTracker;
-
-/// Sum state for tracking integer vs float sums
-#[derive(Debug, Clone, Default)]
-pub enum SumState {
-    #[default]
-    Empty,
-    Integer(i64),
-    Float(f64),
-}
 
 /// Compiled aggregate function - enum-based specialization for zero virtual dispatch
 ///
@@ -66,21 +57,20 @@ pub enum CompiledAggregate {
     CountDistinct { distinct_tracker: DistinctTracker },
 
     /// SUM(column) - sums numeric values
-    Sum { state: SumState },
+    Sum { state: SumAccumulator },
 
     /// SUM(DISTINCT column) - sums distinct numeric values
     SumDistinct {
-        state: SumState,
+        state: SumAccumulator,
         distinct_tracker: DistinctTracker,
     },
 
     /// AVG(column) - average of numeric values
-    Avg { sum: f64, count: i64 },
+    Avg { state: SumAccumulator },
 
     /// AVG(DISTINCT column) - average of distinct numeric values
     AvgDistinct {
-        sum: f64,
-        count: i64,
+        state: SumAccumulator,
         distinct_tracker: DistinctTracker,
     },
 
@@ -130,19 +120,15 @@ impl std::fmt::Debug for CompiledAggregate {
                 .field("state", state)
                 .field("distinct_tracker", distinct_tracker)
                 .finish(),
-            CompiledAggregate::Avg { sum, count } => f
-                .debug_struct("Avg")
-                .field("sum", sum)
-                .field("count", count)
-                .finish(),
+            CompiledAggregate::Avg { state } => {
+                f.debug_struct("Avg").field("state", state).finish()
+            }
             CompiledAggregate::AvgDistinct {
-                sum,
-                count,
+                state,
                 distinct_tracker,
             } => f
                 .debug_struct("AvgDistinct")
-                .field("sum", sum)
-                .field("count", count)
+                .field("state", state)
                 .field("distinct_tracker", distinct_tracker)
                 .finish(),
             CompiledAggregate::Min { min_value } => {
@@ -195,12 +181,12 @@ impl CompiledAggregate {
     pub fn sum(distinct: bool) -> Self {
         if distinct {
             CompiledAggregate::SumDistinct {
-                state: SumState::Empty,
+                state: SumAccumulator::default(),
                 distinct_tracker: DistinctTracker::default(),
             }
         } else {
             CompiledAggregate::Sum {
-                state: SumState::Empty,
+                state: SumAccumulator::default(),
             }
         }
     }
@@ -209,12 +195,13 @@ impl CompiledAggregate {
     pub fn avg(distinct: bool) -> Self {
         if distinct {
             CompiledAggregate::AvgDistinct {
-                sum: 0.0,
-                count: 0,
+                state: SumAccumulator::default(),
                 distinct_tracker: DistinctTracker::default(),
             }
         } else {
-            CompiledAggregate::Avg { sum: 0.0, count: 0 }
+            CompiledAggregate::Avg {
+                state: SumAccumulator::default(),
+            }
         }
     }
 
@@ -308,42 +295,22 @@ impl CompiledAggregate {
                 }
             }
 
-            // SUM(column) - add numeric values
-            CompiledAggregate::Sum { state } => {
-                if !value.is_null() {
-                    Self::accumulate_sum(state, value);
-                }
+            // SUM and AVG add numeric values, a boolean as one or nought
+            CompiledAggregate::Sum { state } | CompiledAggregate::Avg { state } => {
+                state.add(value);
             }
 
-            // SUM(DISTINCT column) - add distinct numeric values
+            // SUM and AVG over DISTINCT add each distinct value once
             CompiledAggregate::SumDistinct {
+                state,
+                distinct_tracker,
+            }
+            | CompiledAggregate::AvgDistinct {
                 state,
                 distinct_tracker,
             } => {
                 if !value.is_null() && distinct_tracker.check_and_add(value) {
-                    Self::accumulate_sum(state, value);
-                }
-            }
-
-            // AVG(column) - track sum and count
-            CompiledAggregate::Avg { sum, count } => {
-                if let Some(n) = Self::as_f64(value) {
-                    *sum += n;
-                    *count += 1;
-                }
-            }
-
-            // AVG(DISTINCT column) - track sum and count for distinct values
-            CompiledAggregate::AvgDistinct {
-                sum,
-                count,
-                distinct_tracker,
-            } => {
-                if !value.is_null() && distinct_tracker.check_and_add(value) {
-                    if let Some(n) = Self::as_f64(value) {
-                        *sum += n;
-                        *count += 1;
-                    }
+                    state.add(value);
                 }
             }
 
@@ -430,6 +397,60 @@ impl CompiledAggregate {
         }
     }
 
+    /// Whether runs of this aggregate over disjoint rows merge into the run
+    /// over all of them
+    pub fn can_merge(&self) -> bool {
+        matches!(
+            self,
+            CompiledAggregate::CountStar { .. }
+                | CompiledAggregate::Count { .. }
+                | CompiledAggregate::Sum { .. }
+                | CompiledAggregate::Avg { .. }
+                | CompiledAggregate::Min { .. }
+                | CompiledAggregate::Max { .. }
+                | CompiledAggregate::MinInteger { .. }
+                | CompiledAggregate::MaxInteger { .. }
+                | CompiledAggregate::MinFloat { .. }
+                | CompiledAggregate::MaxFloat { .. }
+        )
+    }
+
+    /// Folds a run of the same aggregate over other rows into this one
+    pub fn merge(&mut self, other: &CompiledAggregate) {
+        debug_assert!(
+            self.can_merge() && std::mem::discriminant(self) == std::mem::discriminant(other),
+            "merge needs the same mergeable aggregate on both sides"
+        );
+        let extreme = match other {
+            CompiledAggregate::Min { min_value: v } | CompiledAggregate::Max { max_value: v } => {
+                v.clone()
+            }
+            CompiledAggregate::MinInteger { min_value: v }
+            | CompiledAggregate::MaxInteger { max_value: v } => v.map(Value::Integer),
+            CompiledAggregate::MinFloat { min_value: v }
+            | CompiledAggregate::MaxFloat { max_value: v } => v.map(Value::Float),
+            _ => None,
+        };
+        if let Some(value) = extreme {
+            self.accumulate(&value);
+            return;
+        }
+        match (self, other) {
+            (
+                CompiledAggregate::CountStar { count },
+                CompiledAggregate::CountStar { count: more },
+            )
+            | (CompiledAggregate::Count { count }, CompiledAggregate::Count { count: more }) => {
+                *count += more
+            }
+            (CompiledAggregate::Sum { state }, CompiledAggregate::Sum { state: more })
+            | (CompiledAggregate::Avg { state }, CompiledAggregate::Avg { state: more }) => {
+                state.merge(more)
+            }
+            _ => {}
+        }
+    }
+
     /// Accumulate with DISTINCT flag (for dynamic fallback compatibility)
     #[inline(always)]
     pub fn accumulate_with_distinct(&mut self, value: &Value, distinct: bool) {
@@ -443,8 +464,8 @@ impl CompiledAggregate {
 
     /// Get the result of the aggregation
     #[inline]
-    pub fn result(&self) -> Value {
-        match self {
+    pub fn result(&self) -> Result<Value> {
+        Ok(match self {
             CompiledAggregate::CountStar { count } => Value::Integer(*count),
             CompiledAggregate::Count { count } => Value::Integer(*count),
             CompiledAggregate::CountDistinct { distinct_tracker } => {
@@ -452,20 +473,11 @@ impl CompiledAggregate {
             }
 
             CompiledAggregate::Sum { state } | CompiledAggregate::SumDistinct { state, .. } => {
-                match state {
-                    SumState::Empty => Value::null_unknown(),
-                    SumState::Integer(sum) => Value::Integer(*sum),
-                    SumState::Float(sum) => Value::Float(*sum),
-                }
+                return state.sum();
             }
 
-            CompiledAggregate::Avg { sum, count }
-            | CompiledAggregate::AvgDistinct { sum, count, .. } => {
-                if *count == 0 {
-                    Value::null_unknown()
-                } else {
-                    Value::Float(*sum / *count as f64)
-                }
+            CompiledAggregate::Avg { state } | CompiledAggregate::AvgDistinct { state, .. } => {
+                state.avg()
             }
 
             CompiledAggregate::Min { min_value } => {
@@ -489,8 +501,8 @@ impl CompiledAggregate {
                 .map(Value::Float)
                 .unwrap_or_else(Value::null_unknown),
 
-            CompiledAggregate::Dynamic(func) => func.result(),
-        }
+            CompiledAggregate::Dynamic(func) => return func.result(),
+        })
     }
 
     /// Reset the aggregate state
@@ -500,26 +512,18 @@ impl CompiledAggregate {
             CompiledAggregate::Count { count } => *count = 0,
             CompiledAggregate::CountDistinct { distinct_tracker } => distinct_tracker.reset(),
 
-            CompiledAggregate::Sum { state } => *state = SumState::Empty,
+            CompiledAggregate::Sum { state } | CompiledAggregate::Avg { state } => {
+                *state = SumAccumulator::default()
+            }
             CompiledAggregate::SumDistinct {
                 state,
                 distinct_tracker,
-            } => {
-                *state = SumState::Empty;
-                distinct_tracker.reset();
             }
-
-            CompiledAggregate::Avg { sum, count } => {
-                *sum = 0.0;
-                *count = 0;
-            }
-            CompiledAggregate::AvgDistinct {
-                sum,
-                count,
+            | CompiledAggregate::AvgDistinct {
+                state,
                 distinct_tracker,
             } => {
-                *sum = 0.0;
-                *count = 0;
+                *state = SumAccumulator::default();
                 distinct_tracker.reset();
             }
 
@@ -533,46 +537,6 @@ impl CompiledAggregate {
             CompiledAggregate::MaxFloat { max_value } => *max_value = None,
 
             CompiledAggregate::Dynamic(func) => func.reset(),
-        }
-    }
-
-    /// Helper: accumulate into SumState
-    #[inline(always)]
-    fn accumulate_sum(state: &mut SumState, value: &Value) {
-        // A boolean counts as one or nought, as SUM reads it
-        let promoted;
-        let value = if let Value::Boolean(b) = value {
-            promoted = Value::Integer(*b as i64);
-            &promoted
-        } else {
-            value
-        };
-        match value {
-            Value::Integer(i) => match state {
-                SumState::Empty => *state = SumState::Integer(*i),
-                SumState::Integer(sum) => *sum += i,
-                SumState::Float(sum) => *sum += *i as f64,
-            },
-            Value::Float(f) => match state {
-                SumState::Empty => *state = SumState::Float(*f),
-                SumState::Integer(sum) => {
-                    *state = SumState::Float(*sum as f64 + f);
-                }
-                SumState::Float(sum) => *sum += f,
-            },
-            _ => {} // Ignore non-numeric types
-        }
-    }
-
-    /// Helper: convert Value to f64
-    #[inline(always)]
-    fn as_f64(value: &Value) -> Option<f64> {
-        match value {
-            Value::Integer(i) => Some(*i as f64),
-            Value::Float(f) => Some(*f),
-            // A boolean counts as one or nought, as the aggregate reads it
-            Value::Boolean(b) => Some(*b as i64 as f64),
-            _ => None,
         }
     }
 
@@ -627,12 +591,12 @@ mod tests {
                 min.accumulate(&Value::Float(v));
                 max.accumulate(&Value::Float(v));
             }
-            assert_eq!(min.result(), Value::Float(-2.0), "{order:?}");
-            assert!(is_nan(max.result()), "{order:?}");
+            assert_eq!(min.result().unwrap(), Value::Float(-2.0), "{order:?}");
+            assert!(is_nan(max.result().unwrap()), "{order:?}");
         }
         let mut min = CompiledAggregate::min_float();
         min.accumulate(&Value::Float(f64::NAN));
-        assert!(is_nan(min.result()));
+        assert!(is_nan(min.result().unwrap()));
     }
 
     #[test]
@@ -641,7 +605,7 @@ mod tests {
         agg.accumulate(&Value::Integer(1));
         agg.accumulate(&Value::null_unknown());
         agg.accumulate(&Value::Integer(3));
-        assert_eq!(agg.result(), Value::Integer(3)); // Counts all rows including NULL
+        assert_eq!(agg.result().unwrap(), Value::Integer(3)); // Counts all rows including NULL
     }
 
     #[test]
@@ -650,7 +614,7 @@ mod tests {
         agg.accumulate(&Value::Integer(1));
         agg.accumulate(&Value::null_unknown());
         agg.accumulate(&Value::Integer(3));
-        assert_eq!(agg.result(), Value::Integer(2)); // Skips NULL
+        assert_eq!(agg.result().unwrap(), Value::Integer(2)); // Skips NULL
     }
 
     #[test]
@@ -660,7 +624,7 @@ mod tests {
         agg.accumulate(&Value::Integer(1)); // duplicate
         agg.accumulate(&Value::Integer(2));
         agg.accumulate(&Value::null_unknown()); // NULL ignored
-        assert_eq!(agg.result(), Value::Integer(2));
+        assert_eq!(agg.result().unwrap(), Value::Integer(2));
     }
 
     #[test]
@@ -669,7 +633,7 @@ mod tests {
         agg.accumulate(&Value::Integer(1));
         agg.accumulate(&Value::Integer(2));
         agg.accumulate(&Value::Integer(3));
-        assert_eq!(agg.result(), Value::Integer(6));
+        assert_eq!(agg.result().unwrap(), Value::Integer(6));
     }
 
     #[test]
@@ -677,7 +641,7 @@ mod tests {
         let mut agg = CompiledAggregate::sum(false);
         agg.accumulate(&Value::Float(1.5));
         agg.accumulate(&Value::Float(2.5));
-        assert_eq!(agg.result(), Value::Float(4.0));
+        assert_eq!(agg.result().unwrap(), Value::Float(4.0));
     }
 
     #[test]
@@ -685,7 +649,7 @@ mod tests {
         let mut agg = CompiledAggregate::sum(false);
         agg.accumulate(&Value::Integer(1));
         agg.accumulate(&Value::Float(2.5));
-        assert_eq!(agg.result(), Value::Float(3.5));
+        assert_eq!(agg.result().unwrap(), Value::Float(3.5));
     }
 
     #[test]
@@ -694,7 +658,7 @@ mod tests {
         agg.accumulate(&Value::Integer(1));
         agg.accumulate(&Value::Integer(1)); // duplicate
         agg.accumulate(&Value::Integer(2));
-        assert_eq!(agg.result(), Value::Integer(3)); // 1 + 2
+        assert_eq!(agg.result().unwrap(), Value::Integer(3)); // 1 + 2
     }
 
     #[test]
@@ -703,7 +667,7 @@ mod tests {
         agg.accumulate(&Value::Integer(1));
         agg.accumulate(&Value::Integer(2));
         agg.accumulate(&Value::Integer(3));
-        assert_eq!(agg.result(), Value::Float(2.0));
+        assert_eq!(agg.result().unwrap(), Value::Float(2.0));
     }
 
     #[test]
@@ -712,7 +676,7 @@ mod tests {
         agg.accumulate(&Value::Integer(1));
         agg.accumulate(&Value::Integer(1)); // duplicate
         agg.accumulate(&Value::Integer(3));
-        assert_eq!(agg.result(), Value::Float(2.0)); // (1 + 3) / 2
+        assert_eq!(agg.result().unwrap(), Value::Float(2.0)); // (1 + 3) / 2
     }
 
     #[test]
@@ -721,7 +685,7 @@ mod tests {
         agg.accumulate(&Value::Integer(5));
         agg.accumulate(&Value::Integer(2));
         agg.accumulate(&Value::Integer(8));
-        assert_eq!(agg.result(), Value::Integer(2));
+        assert_eq!(agg.result().unwrap(), Value::Integer(2));
     }
 
     #[test]
@@ -730,7 +694,7 @@ mod tests {
         agg.accumulate(&Value::Integer(5));
         agg.accumulate(&Value::Integer(2));
         agg.accumulate(&Value::Integer(8));
-        assert_eq!(agg.result(), Value::Integer(8));
+        assert_eq!(agg.result().unwrap(), Value::Integer(8));
     }
 
     #[test]
@@ -739,7 +703,7 @@ mod tests {
         agg.accumulate(&Value::Integer(5));
         agg.accumulate(&Value::Integer(2));
         agg.accumulate(&Value::Integer(8));
-        assert_eq!(agg.result(), Value::Integer(2));
+        assert_eq!(agg.result().unwrap(), Value::Integer(2));
     }
 
     #[test]
@@ -748,7 +712,7 @@ mod tests {
         agg.accumulate(&Value::Integer(5));
         agg.accumulate(&Value::Integer(2));
         agg.accumulate(&Value::Integer(8));
-        assert_eq!(agg.result(), Value::Integer(8));
+        assert_eq!(agg.result().unwrap(), Value::Integer(8));
     }
 
     #[test]
@@ -757,7 +721,7 @@ mod tests {
         agg.accumulate(&Value::text("banana"));
         agg.accumulate(&Value::text("apple"));
         agg.accumulate(&Value::text("cherry"));
-        assert_eq!(agg.result(), Value::text("apple"));
+        assert_eq!(agg.result().unwrap(), Value::text("apple"));
     }
 
     #[test]
@@ -766,17 +730,23 @@ mod tests {
         agg.accumulate(&Value::text("banana"));
         agg.accumulate(&Value::text("apple"));
         agg.accumulate(&Value::text("cherry"));
-        assert_eq!(agg.result(), Value::text("cherry"));
+        assert_eq!(agg.result().unwrap(), Value::text("cherry"));
     }
 
     #[test]
     fn test_empty_aggregates() {
-        assert!(CompiledAggregate::sum(false).result().is_null());
-        assert!(CompiledAggregate::avg(false).result().is_null());
-        assert!(CompiledAggregate::min().result().is_null());
-        assert!(CompiledAggregate::max().result().is_null());
-        assert_eq!(CompiledAggregate::count(false).result(), Value::Integer(0));
-        assert_eq!(CompiledAggregate::count_star().result(), Value::Integer(0));
+        assert!(CompiledAggregate::sum(false).result().unwrap().is_null());
+        assert!(CompiledAggregate::avg(false).result().unwrap().is_null());
+        assert!(CompiledAggregate::min().result().unwrap().is_null());
+        assert!(CompiledAggregate::max().result().unwrap().is_null());
+        assert_eq!(
+            CompiledAggregate::count(false).result().unwrap(),
+            Value::Integer(0)
+        );
+        assert_eq!(
+            CompiledAggregate::count_star().result().unwrap(),
+            Value::Integer(0)
+        );
     }
 
     #[test]
@@ -784,12 +754,12 @@ mod tests {
         let mut agg = CompiledAggregate::sum(false);
         agg.accumulate(&Value::Integer(10));
         agg.reset();
-        assert!(agg.result().is_null());
+        assert!(agg.result().unwrap().is_null());
 
         let mut agg = CompiledAggregate::count(false);
         agg.accumulate(&Value::Integer(10));
         agg.reset();
-        assert_eq!(agg.result(), Value::Integer(0));
+        assert_eq!(agg.result().unwrap(), Value::Integer(0));
     }
 
     #[test]

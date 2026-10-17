@@ -14,7 +14,7 @@
 
 //! LAST aggregate function
 
-use crate::core::Value;
+use crate::core::{Result, Value};
 use crate::functions::{
     AggregateFunction, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType,
 };
@@ -90,14 +90,14 @@ impl AggregateFunction for LastFunction {
         }
     }
 
-    fn result(&self) -> Value {
+    fn result(&self) -> Result<Value> {
         if self.has_order_by {
             if let Some(ref entry) = self.best_entry {
-                return entry.value.clone();
+                return Ok(entry.value.clone());
             }
         }
 
-        self.last_value.clone().unwrap_or_else(Value::null_unknown)
+        Ok(self.last_value.clone().unwrap_or_else(Value::null_unknown))
     }
 
     fn reset(&mut self) {
@@ -120,7 +120,7 @@ mod tests {
         last.accumulate(&Value::Integer(1), false);
         last.accumulate(&Value::Integer(2), false);
         last.accumulate(&Value::Integer(3), false);
-        assert_eq!(last.result(), Value::Integer(3));
+        assert_eq!(last.result().unwrap(), Value::Integer(3));
     }
 
     #[test]
@@ -130,13 +130,13 @@ mod tests {
         last.accumulate(&Value::Integer(2), false);
         last.accumulate(&Value::null_unknown(), false);
         last.accumulate(&Value::null_unknown(), false);
-        assert_eq!(last.result(), Value::Integer(2));
+        assert_eq!(last.result().unwrap(), Value::Integer(2));
     }
 
     #[test]
     fn test_last_empty() {
         let last = LastFunction::default();
-        assert!(last.result().is_null());
+        assert!(last.result().unwrap().is_null());
     }
 
     #[test]
@@ -144,7 +144,7 @@ mod tests {
         let mut last = LastFunction::default();
         last.accumulate(&Value::null_unknown(), false);
         last.accumulate(&Value::null_unknown(), false);
-        assert!(last.result().is_null());
+        assert!(last.result().unwrap().is_null());
     }
 
     #[test]
@@ -154,7 +154,7 @@ mod tests {
         last.accumulate(&Value::Integer(2), false);
         last.reset();
         last.accumulate(&Value::Integer(5), false);
-        assert_eq!(last.result(), Value::Integer(5));
+        assert_eq!(last.result().unwrap(), Value::Integer(5));
     }
 
     #[test]
@@ -162,7 +162,7 @@ mod tests {
         let mut last = LastFunction::default();
         last.accumulate(&Value::text("hello"), false);
         last.accumulate(&Value::text("world"), false);
-        assert_eq!(last.result(), Value::text("world"));
+        assert_eq!(last.result().unwrap(), Value::text("world"));
     }
 
     #[test]
@@ -176,7 +176,7 @@ mod tests {
         last.accumulate_with_sort_key(&Value::text("a_val"), vec![Value::Integer(1)], false);
         last.accumulate_with_sort_key(&Value::text("b_val"), vec![Value::Integer(2)], false);
         // ASC order: key 3 is last, so value should be "c_val"
-        assert_eq!(last.result(), Value::text("c_val"));
+        assert_eq!(last.result().unwrap(), Value::text("c_val"));
     }
 
     #[test]
@@ -190,6 +190,6 @@ mod tests {
         last.accumulate_with_sort_key(&Value::text("a_val"), vec![Value::Integer(1)], false);
         last.accumulate_with_sort_key(&Value::text("b_val"), vec![Value::Integer(2)], false);
         // DESC order: key 1 is last, so value should be "a_val"
-        assert_eq!(last.result(), Value::text("a_val"));
+        assert_eq!(last.result().unwrap(), Value::text("a_val"));
     }
 }

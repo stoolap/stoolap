@@ -1552,23 +1552,23 @@ pub trait Table: Send + Sync {
 
     /// Compute SUM of a column without materializing rows (deferred aggregation)
     ///
-    /// Returns (sum, count_non_null) for proper NULL handling.
+    /// Returns the exact sum, which SUM and AVG read their result from.
     /// Returns None if the optimization is not available.
     ///
     /// # Arguments
     /// * `col_idx` - Column index to sum
-    fn sum_column(&self, _col_idx: usize) -> Result<Option<(f64, usize)>> {
+    fn sum_column(&self, _col_idx: usize) -> Result<Option<crate::core::SumAccumulator>> {
         Ok(None) // Default implementation - override in concrete tables
     }
 
     /// Compute AVG of a column without materializing rows (deferred aggregation)
     ///
-    /// Returns (sum, count_non_null) for computing average as sum/count.
+    /// Returns the exact sum, which AVG divides by its count.
     /// Returns None if the optimization is not available.
     ///
     /// # Arguments
     /// * `col_idx` - Column index to average
-    fn avg_column(&self, _col_idx: usize) -> Result<Option<(f64, usize)>> {
+    fn avg_column(&self, _col_idx: usize) -> Result<Option<crate::core::SumAccumulator>> {
         // Default: use sum_column if available
         self.sum_column(_col_idx)
     }

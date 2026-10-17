@@ -14,7 +14,7 @@
 
 //! Statistical aggregate functions: STDDEV, VARIANCE, MEDIAN
 
-use crate::core::Value;
+use crate::core::{Result, Value};
 use crate::functions::{
     AggregateFunction, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType,
 };
@@ -78,15 +78,15 @@ impl AggregateFunction for StddevPopFunction {
         }
     }
 
-    fn result(&self) -> Value {
+    fn result(&self) -> Result<Value> {
         if self.values.is_empty() {
-            return Value::null_unknown();
+            return Ok(Value::null_unknown());
         }
 
         let n = self.values.len() as f64;
         let mean = self.values.iter().sum::<f64>() / n;
         let variance = self.values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
-        Value::Float(variance.sqrt())
+        Ok(Value::Float(variance.sqrt()))
     }
 
     fn reset(&mut self) {
@@ -123,7 +123,7 @@ impl AggregateFunction for StddevFunction {
         self.inner.accumulate(value, distinct);
     }
 
-    fn result(&self) -> Value {
+    fn result(&self) -> Result<Value> {
         self.inner.result()
     }
 
@@ -184,16 +184,16 @@ impl AggregateFunction for StddevSampFunction {
         }
     }
 
-    fn result(&self) -> Value {
+    fn result(&self) -> Result<Value> {
         // Sample stddev requires at least 2 values
         if self.values.len() < 2 {
-            return Value::null_unknown();
+            return Ok(Value::null_unknown());
         }
 
         let n = self.values.len() as f64;
         let mean = self.values.iter().sum::<f64>() / n;
         let variance = self.values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
-        Value::Float(variance.sqrt())
+        Ok(Value::Float(variance.sqrt()))
     }
 
     fn reset(&mut self) {
@@ -253,15 +253,15 @@ impl AggregateFunction for VarPopFunction {
         }
     }
 
-    fn result(&self) -> Value {
+    fn result(&self) -> Result<Value> {
         if self.values.is_empty() {
-            return Value::null_unknown();
+            return Ok(Value::null_unknown());
         }
 
         let n = self.values.len() as f64;
         let mean = self.values.iter().sum::<f64>() / n;
         let variance = self.values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
-        Value::Float(variance)
+        Ok(Value::Float(variance))
     }
 
     fn reset(&mut self) {
@@ -298,7 +298,7 @@ impl AggregateFunction for VarianceFunction {
         self.inner.accumulate(value, distinct);
     }
 
-    fn result(&self) -> Value {
+    fn result(&self) -> Result<Value> {
         self.inner.result()
     }
 
@@ -359,16 +359,16 @@ impl AggregateFunction for VarSampFunction {
         }
     }
 
-    fn result(&self) -> Value {
+    fn result(&self) -> Result<Value> {
         // Sample variance requires at least 2 values
         if self.values.len() < 2 {
-            return Value::null_unknown();
+            return Ok(Value::null_unknown());
         }
 
         let n = self.values.len() as f64;
         let mean = self.values.iter().sum::<f64>() / n;
         let variance = self.values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
-        Value::Float(variance)
+        Ok(Value::Float(variance))
     }
 
     fn reset(&mut self) {
@@ -428,9 +428,9 @@ impl AggregateFunction for MedianFunction {
         }
     }
 
-    fn result(&self) -> Value {
+    fn result(&self) -> Result<Value> {
         if self.values.is_empty() {
-            return Value::null_unknown();
+            return Ok(Value::null_unknown());
         }
 
         let mut sorted = self.values.clone();
@@ -445,7 +445,7 @@ impl AggregateFunction for MedianFunction {
             sorted[n / 2]
         };
 
-        Value::Float(median)
+        Ok(Value::Float(median))
     }
 
     fn reset(&mut self) {
@@ -471,7 +471,7 @@ mod tests {
         for v in [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0] {
             stddev.accumulate(&Value::Float(v), false);
         }
-        let result = stddev.result();
+        let result = stddev.result().unwrap();
         if let Value::Float(f) = result {
             assert!((f - 2.0).abs() < 0.0001);
         } else {
@@ -484,13 +484,13 @@ mod tests {
         let mut stddev = StddevPopFunction::default();
         stddev.accumulate(&Value::Float(5.0), false);
         // Single value has stddev = 0
-        assert_eq!(stddev.result(), Value::Float(0.0));
+        assert_eq!(stddev.result().unwrap(), Value::Float(0.0));
     }
 
     #[test]
     fn test_stddev_pop_empty() {
         let stddev = StddevPopFunction::default();
-        assert!(stddev.result().is_null());
+        assert!(stddev.result().unwrap().is_null());
     }
 
     #[test]
@@ -500,7 +500,7 @@ mod tests {
         for v in [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0] {
             stddev.accumulate(&Value::Float(v), false);
         }
-        let result = stddev.result();
+        let result = stddev.result().unwrap();
         if let Value::Float(f) = result {
             assert!((f - 2.138).abs() < 0.01);
         } else {
@@ -517,7 +517,7 @@ mod tests {
         for v in [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0] {
             stddev.accumulate(&Value::Float(v), false);
         }
-        let result = stddev.result();
+        let result = stddev.result().unwrap();
         if let Value::Float(f) = result {
             assert!((f - 2.138).abs() < 0.01);
         } else {
@@ -530,7 +530,7 @@ mod tests {
         let mut stddev = StddevSampFunction::default();
         stddev.accumulate(&Value::Float(5.0), false);
         // Sample stddev requires at least 2 values
-        assert!(stddev.result().is_null());
+        assert!(stddev.result().unwrap().is_null());
     }
 
     // VAR_POP tests
@@ -542,7 +542,7 @@ mod tests {
         for v in [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0] {
             var.accumulate(&Value::Float(v), false);
         }
-        let result = var.result();
+        let result = var.result().unwrap();
         if let Value::Float(f) = result {
             assert!((f - 4.0).abs() < 0.0001);
         } else {
@@ -557,7 +557,7 @@ mod tests {
         for v in [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0] {
             var.accumulate(&Value::Float(v), false);
         }
-        let result = var.result();
+        let result = var.result().unwrap();
         if let Value::Float(f) = result {
             assert!((f - 4.571).abs() < 0.01);
         } else {
@@ -574,7 +574,7 @@ mod tests {
         for v in [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0] {
             var.accumulate(&Value::Float(v), false);
         }
-        let result = var.result();
+        let result = var.result().unwrap();
         if let Value::Float(f) = result {
             assert!((f - 4.571).abs() < 0.01);
         } else {
@@ -587,7 +587,7 @@ mod tests {
         let mut var = VarSampFunction::default();
         var.accumulate(&Value::Float(5.0), false);
         // Sample variance requires at least 2 values
-        assert!(var.result().is_null());
+        assert!(var.result().unwrap().is_null());
     }
 
     // MEDIAN tests
@@ -598,7 +598,7 @@ mod tests {
         for v in [1.0, 3.0, 5.0, 7.0, 9.0] {
             median.accumulate(&Value::Float(v), false);
         }
-        assert_eq!(median.result(), Value::Float(5.0));
+        assert_eq!(median.result().unwrap(), Value::Float(5.0));
     }
 
     #[test]
@@ -608,7 +608,7 @@ mod tests {
         for v in [1.0, 3.0, 5.0, 7.0] {
             median.accumulate(&Value::Float(v), false);
         }
-        assert_eq!(median.result(), Value::Float(4.0));
+        assert_eq!(median.result().unwrap(), Value::Float(4.0));
     }
 
     #[test]
@@ -618,20 +618,20 @@ mod tests {
         for v in [9.0, 1.0, 7.0, 3.0, 5.0] {
             median.accumulate(&Value::Float(v), false);
         }
-        assert_eq!(median.result(), Value::Float(5.0));
+        assert_eq!(median.result().unwrap(), Value::Float(5.0));
     }
 
     #[test]
     fn test_median_single_value() {
         let mut median = MedianFunction::default();
         median.accumulate(&Value::Float(42.0), false);
-        assert_eq!(median.result(), Value::Float(42.0));
+        assert_eq!(median.result().unwrap(), Value::Float(42.0));
     }
 
     #[test]
     fn test_median_empty() {
         let median = MedianFunction::default();
-        assert!(median.result().is_null());
+        assert!(median.result().unwrap().is_null());
     }
 
     #[test]
@@ -640,7 +640,7 @@ mod tests {
         for v in [1, 2, 3, 4, 5] {
             median.accumulate(&Value::Integer(v), false);
         }
-        assert_eq!(median.result(), Value::Float(3.0));
+        assert_eq!(median.result().unwrap(), Value::Float(3.0));
     }
 
     #[test]
@@ -651,7 +651,7 @@ mod tests {
         median.accumulate(&Value::Float(3.0), false);
         median.accumulate(&Value::null_unknown(), false);
         median.accumulate(&Value::Float(5.0), false);
-        assert_eq!(median.result(), Value::Float(3.0));
+        assert_eq!(median.result().unwrap(), Value::Float(3.0));
     }
 
     #[test]
@@ -662,7 +662,7 @@ mod tests {
         median.accumulate(&Value::Float(3.0), true); // duplicate
         median.accumulate(&Value::Float(5.0), true);
         // Distinct values: 1, 3, 5 -> median = 3
-        assert_eq!(median.result(), Value::Float(3.0));
+        assert_eq!(median.result().unwrap(), Value::Float(3.0));
     }
 
     // Test with NULL handling
@@ -675,7 +675,7 @@ mod tests {
         stddev.accumulate(&Value::null_unknown(), false);
         stddev.accumulate(&Value::Float(6.0), false);
         // Mean = 4, Variance = ((2-4)^2 + (4-4)^2 + (6-4)^2) / 3 = 8/3
-        let result = stddev.result();
+        let result = stddev.result().unwrap();
         if let Value::Float(f) = result {
             let expected = (8.0_f64 / 3.0).sqrt();
             assert!((f - expected).abs() < 0.0001);
@@ -693,7 +693,7 @@ mod tests {
         stddev.accumulate(&Value::Float(2.0), true); // duplicate
         stddev.accumulate(&Value::Float(6.0), true);
         // Distinct values: 2, 4, 6 -> Mean = 4
-        let result = stddev.result();
+        let result = stddev.result().unwrap();
         if let Value::Float(f) = result {
             let expected = (8.0_f64 / 3.0).sqrt();
             assert!((f - expected).abs() < 0.0001);
@@ -709,7 +709,7 @@ mod tests {
         stddev.accumulate(&Value::Float(2.0), false);
         stddev.accumulate(&Value::Float(4.0), false);
         stddev.reset();
-        assert!(stddev.result().is_null());
+        assert!(stddev.result().unwrap().is_null());
     }
 
     #[test]
@@ -718,6 +718,6 @@ mod tests {
         median.accumulate(&Value::Float(1.0), false);
         median.accumulate(&Value::Float(2.0), false);
         median.reset();
-        assert!(median.result().is_null());
+        assert!(median.result().unwrap().is_null());
     }
 }

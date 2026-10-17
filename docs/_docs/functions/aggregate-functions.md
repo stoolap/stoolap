@@ -39,6 +39,8 @@ SELECT SUM(amount) FROM orders;
 SELECT category, SUM(amount) FROM orders GROUP BY category;
 ```
 
+SUM follows the arithmetic of `+`. Over INTEGER values it returns the exact INTEGER sum; a BOOLEAN counts as 1 or 0. A running total may pass beyond the INTEGER range and come back, but a final sum outside it is an `Integer overflow` error, as `a + b` is. Once any value is FLOAT, the sum is FLOAT. NULL values are skipped, and SUM of no values is NULL.
+
 ### AVG
 
 Calculates the average (mean) of numeric values:
@@ -49,6 +51,8 @@ SELECT AVG(price) FROM products;
 -- With grouping
 SELECT category, AVG(price) FROM products GROUP BY category;
 ```
+
+AVG always returns FLOAT. It divides the exact sum that SUM computes, so INTEGER values far beyond 2^53 average without first rounding each one.
 
 ### MIN
 

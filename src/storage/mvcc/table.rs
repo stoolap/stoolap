@@ -5545,7 +5545,7 @@ impl Table for MVCCTable {
             .get_segments_to_scan(column, operator, value)
     }
 
-    fn sum_column(&self, col_idx: usize) -> Result<Option<(f64, usize)>> {
+    fn sum_column(&self, col_idx: usize) -> Result<Option<crate::core::SumAccumulator>> {
         // Only use deferred aggregation if no uncommitted local changes
         // (local changes are in txn_versions, not the main version_store)
         let txn_versions = self.txn_versions.read().unwrap();
@@ -5601,7 +5601,7 @@ impl Table for MVCCTable {
             self.reader(),
             group_by_indices,
             aggregates,
-        );
+        )?;
         self.check_read()?;
         Ok(groups)
     }

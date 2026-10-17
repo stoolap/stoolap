@@ -15,7 +15,7 @@
 //! MIN aggregate function
 
 use crate::core::value::compare_floats;
-use crate::core::Value;
+use crate::core::{Result, Value};
 use crate::functions::{
     AggregateFunction, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType,
 };
@@ -66,8 +66,8 @@ impl AggregateFunction for MinFunction {
         }
     }
 
-    fn result(&self) -> Value {
-        self.min_value.clone().unwrap_or_else(Value::null_unknown)
+    fn result(&self) -> Result<Value> {
+        Ok(self.min_value.clone().unwrap_or_else(Value::null_unknown))
     }
 
     fn reset(&mut self) {
@@ -106,7 +106,7 @@ mod tests {
         min.accumulate(&Value::Integer(5), false);
         min.accumulate(&Value::Integer(2), false);
         min.accumulate(&Value::Integer(8), false);
-        assert_eq!(min.result(), Value::Integer(2));
+        assert_eq!(min.result().unwrap(), Value::Integer(2));
     }
 
     #[test]
@@ -115,7 +115,7 @@ mod tests {
         min.accumulate(&Value::Float(5.5), false);
         min.accumulate(&Value::Float(2.2), false);
         min.accumulate(&Value::Float(8.8), false);
-        assert_eq!(min.result(), Value::Float(2.2));
+        assert_eq!(min.result().unwrap(), Value::Float(2.2));
     }
 
     #[test]
@@ -124,7 +124,7 @@ mod tests {
         min.accumulate(&Value::text("banana"), false);
         min.accumulate(&Value::text("apple"), false);
         min.accumulate(&Value::text("cherry"), false);
-        assert_eq!(min.result(), Value::text("apple"));
+        assert_eq!(min.result().unwrap(), Value::text("apple"));
     }
 
     #[test]
@@ -133,13 +133,13 @@ mod tests {
         min.accumulate(&Value::Integer(5), false);
         min.accumulate(&Value::null_unknown(), false);
         min.accumulate(&Value::Integer(2), false);
-        assert_eq!(min.result(), Value::Integer(2));
+        assert_eq!(min.result().unwrap(), Value::Integer(2));
     }
 
     #[test]
     fn test_min_empty() {
         let min = MinFunction::default();
-        assert!(min.result().is_null());
+        assert!(min.result().unwrap().is_null());
     }
 
     #[test]
@@ -148,14 +148,14 @@ mod tests {
         min.accumulate(&Value::Integer(5), false);
         min.accumulate(&Value::Integer(2), false);
         min.reset();
-        assert!(min.result().is_null());
+        assert!(min.result().unwrap().is_null());
     }
 
     #[test]
     fn test_min_single_value() {
         let mut min = MinFunction::default();
         min.accumulate(&Value::Integer(42), false);
-        assert_eq!(min.result(), Value::Integer(42));
+        assert_eq!(min.result().unwrap(), Value::Integer(42));
     }
 
     #[test]
@@ -164,7 +164,7 @@ mod tests {
         min.accumulate(&Value::Integer(-5), false);
         min.accumulate(&Value::Integer(10), false);
         min.accumulate(&Value::Integer(-10), false);
-        assert_eq!(min.result(), Value::Integer(-10));
+        assert_eq!(min.result().unwrap(), Value::Integer(-10));
     }
 
     #[test]
@@ -173,6 +173,6 @@ mod tests {
         min.accumulate(&Value::Boolean(true), false);
         min.accumulate(&Value::Boolean(false), false);
         min.accumulate(&Value::Boolean(true), false);
-        assert_eq!(min.result(), Value::Boolean(false));
+        assert_eq!(min.result().unwrap(), Value::Boolean(false));
     }
 }

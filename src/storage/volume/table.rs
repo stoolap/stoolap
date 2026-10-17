@@ -32,7 +32,9 @@ use crate::common::{CompactArc, I64Set};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::core::value::compare_floats;
-use crate::core::{DataType, IndexType, Result, Row, RowVec, Schema, Value, ValueMap, ValueSet};
+use crate::core::{
+    DataType, IndexType, Result, Row, RowVec, Schema, SumAccumulator, Value, ValueMap, ValueSet,
+};
 use crate::storage::expression::Expression;
 use crate::storage::index::id_list::GroupIds;
 use crate::storage::mvcc::registry::StatementView;
@@ -4779,7 +4781,7 @@ impl Table for SegmentedTable {
     // Aggregation pushdown
     // =========================================================================
 
-    fn sum_column(&self, col_idx: usize) -> Result<Option<(f64, usize)>> {
+    fn sum_column(&self, col_idx: usize) -> Result<Option<SumAccumulator>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.sum_column");
         // The volume stats count rows a snapshot or a view may not see
@@ -4798,24 +4800,34 @@ impl Table for SegmentedTable {
                 return Ok(None);
             }
 
-            let Some((hot_sum, hot_count)) = hot_result else {
+            let Some(mut total) = hot_result else {
                 return Ok(None);
-            };
-
-            // Pre-compute default contribution for schema-evolved volumes
-            // that are missing this column (added via ALTER TABLE ADD COLUMN).
-            let default_val = self.column_default(col_idx);
-            let default_f64 = match &default_val {
-                Value::Integer(v) => Some(*v as f64),
-                Value::Float(v) => Some(*v),
-                // A boolean counts as one or nought, as SUM reads it
-                Value::Boolean(b) => Some(*b as i64 as f64),
-                _ => None, // NULL or non-numeric default → no contribution
             };
 
             // Resolve column name for per-volume physical index lookup.
             let schema = self.hot.schema();
             // Column resolution uses mapping (handles renames/drops) not col_name.
+
+            // SUM adds INTEGER, FLOAT and BOOLEAN values only, and a value
+            // reads as the type its column declares
+            let declared = schema.columns.get(col_idx).map(|c| c.data_type);
+            if !matches!(
+                declared,
+                Some(DataType::Integer) | Some(DataType::Float) | Some(DataType::Boolean)
+            ) {
+                return Ok(Some(total));
+            }
+            let as_float = declared == Some(DataType::Float);
+
+            // The default stands for `rows` values in a schema-evolved volume
+            // missing this column (added via ALTER TABLE ADD COLUMN)
+            let default_val = self.column_default(col_idx);
+            let add_default = |sum: &mut SumAccumulator, rows: u64| match &default_val {
+                Value::Integer(v) => sum.add_parts(*v as i128 * rows as i128, 0.0, false, rows),
+                Value::Float(v) => sum.add_parts(0, v * rows as f64, true, rows),
+                Value::Boolean(b) => sum.add_parts(*b as i128 * rows as i128, 0.0, false, rows),
+                _ => {}
+            };
 
             // Stats fast path is only safe when there are no tombstones AND no
             // overlapping row_ids between volumes. After UPDATE + seal, tombstones
@@ -4835,15 +4847,11 @@ impl Table for SegmentedTable {
                 && self.segment_mgr.total_row_count() == self.segment_mgr.deduped_row_count()?;
 
             if can_use_stats {
-                // Fast path: use pre-computed volume stats.
-                // Accumulate integer and float parts separately to avoid precision
-                // loss from per-volume i128→f64 conversion. The single final
-                // conversion is exact for sums that fit in 53-bit mantissa.
-                // Use segments_raw (metadata only, no cold volume reload).
+                // Fast path: use pre-computed volume stats, which keep the
+                // exact integer part. Use segments_raw (metadata only, no
+                // cold volume reload).
                 let segs = self.segment_mgr.segments_raw();
-                let mut cold_sum_int: i128 = 0;
-                let mut cold_sum_float: f64 = 0.0;
-                let mut total_count = hot_count;
+                let mut cold = SumAccumulator::default();
                 let mut stats_cover = true;
                 for (seg_id, cs) in segs.iter() {
                     let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
@@ -4862,25 +4870,21 @@ impl Table for SegmentedTable {
                                 stats_cover = false;
                                 break;
                             };
-                            let (int_part, float_part) =
-                                cs.volume.meta.stats.columns[pi].sum_parts();
-                            cold_sum_int += int_part;
-                            cold_sum_float += float_part;
-                            total_count += cs.volume.meta.stats.columns[pi].numeric_count as usize;
+                            let stats = &cs.volume.meta.stats.columns[pi];
+                            let (int_part, float_part) = stats.sum_parts();
+                            cold.add_parts(int_part, float_part, as_float, stats.numeric_count);
                             if nans > 0 {
-                                cold_sum_float = f64::NAN;
-                                total_count += nans as usize;
+                                cold.add_parts(0, f64::NAN, true, nans);
                             }
                         }
-                    } else if let Some(def) = default_f64 {
-                        cold_sum_float += def * cs.volume.meta.row_count as f64;
-                        total_count += cs.volume.meta.row_count;
+                    } else {
+                        add_default(&mut cold, cs.volume.meta.row_count as u64);
                     }
                 }
                 if stats_cover {
-                    let total_sum = hot_sum + cold_sum_int as f64 + cold_sum_float;
+                    total.merge(&cold);
                     self.check_cold()?;
-                    return Ok(Some((total_sum, total_count)));
+                    return Ok(Some(total));
                 }
             }
 
@@ -4892,9 +4896,6 @@ impl Table for SegmentedTable {
             self.hot.collect_hot_row_ids_into(&mut hot_skip);
             self.segment_mgr
                 .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
-
-            let mut total_sum = hot_sum;
-            let mut total_count = hot_count;
 
             for (seg_id, cs) in volumes.iter() {
                 let vol = &cs.volume;
@@ -4931,32 +4932,25 @@ impl Table for SegmentedTable {
                         match col {
                             crate::storage::volume::column::ColumnData::Int64 {
                                 values, ..
-                            } => {
-                                total_sum += values[i] as f64;
-                                total_count += 1;
-                            }
+                            } if as_float => total.add_float(values[i] as f64),
+                            crate::storage::volume::column::ColumnData::Int64 {
+                                values, ..
+                            } => total.add_int(values[i]),
                             crate::storage::volume::column::ColumnData::Float64 {
                                 values, ..
-                            } => {
-                                total_sum += values[i];
-                                total_count += 1;
-                            }
+                            } => total.add_float(values[i]),
                             crate::storage::volume::column::ColumnData::Boolean {
                                 values, ..
-                            } => {
-                                total_sum += if values[i] { 1.0 } else { 0.0 };
-                                total_count += 1;
-                            }
+                            } => total.add_int(values[i] as i64),
                             _ => {}
                         }
-                    } else if let Some(def) = default_f64 {
-                        total_sum += def;
-                        total_count += 1;
+                    } else {
+                        add_default(&mut total, 1);
                     }
                 }
             }
             self.check_cold()?;
-            Ok(Some((total_sum, total_count)))
+            Ok(Some(total))
         })
     }
 
@@ -8209,98 +8203,87 @@ impl Table for SegmentedTable {
             }
 
             // --- Finalize accumulators -------------------------------------------
+            let sum_of = |col_idx: usize, acc: &Accum| {
+                sum_parts(
+                    &schema,
+                    col_idx,
+                    acc.int_sum,
+                    acc.float_sum,
+                    !acc.is_int_agg,
+                    acc.count,
+                )
+            };
             let results: Vec<Value> = aggregates
                 .iter()
                 .zip(accums.iter())
-                .map(|((op, col_idx), acc)| match op {
-                    AggregateOp::Count | AggregateOp::CountStar => Value::Integer(acc.count),
-                    AggregateOp::Sum => {
-                        if acc.count > 0 {
-                            if acc.is_int_agg && acc.float_sum == 0.0 {
-                                // Pure integer sum: check if it fits in i64
-                                if acc.int_sum >= i64::MIN as i128
-                                    && acc.int_sum <= i64::MAX as i128
-                                {
-                                    Value::Integer(acc.int_sum as i64)
-                                } else {
-                                    Value::Float(acc.int_sum as f64)
-                                }
+                .map(|((op, col_idx), acc)| -> Result<Value> {
+                    Ok(match op {
+                        AggregateOp::Count | AggregateOp::CountStar => Value::Integer(acc.count),
+                        AggregateOp::Sum => sum_of(*col_idx, acc).sum()?,
+                        AggregateOp::Avg => sum_of(*col_idx, acc).avg(),
+                        AggregateOp::Min => {
+                            let col_type = if *col_idx < schema.columns.len() {
+                                schema.columns[*col_idx].data_type
                             } else {
-                                Value::Float(acc.int_sum as f64 + acc.float_sum)
-                            }
-                        } else {
-                            Value::Null(DataType::Float)
-                        }
-                    }
-                    AggregateOp::Avg => {
-                        if acc.count > 0 {
-                            Value::Float((acc.int_sum as f64 + acc.float_sum) / acc.count as f64)
-                        } else {
-                            Value::Null(DataType::Float)
-                        }
-                    }
-                    AggregateOp::Min => {
-                        let col_type = if *col_idx < schema.columns.len() {
-                            schema.columns[*col_idx].data_type
-                        } else {
-                            DataType::Null
-                        };
-                        match (acc.min_i64, acc.min_f64) {
-                            (Some(i), None) => match col_type {
-                                DataType::Timestamp => chrono::DateTime::from_timestamp(
-                                    i.div_euclid(1_000_000_000),
-                                    i.rem_euclid(1_000_000_000) as u32,
-                                )
-                                .map(Value::Timestamp)
-                                .unwrap_or(Value::Null(DataType::Timestamp)),
-                                _ => Value::Integer(i),
-                            },
-                            (None, Some(f)) => Value::Float(f),
-                            (Some(i), Some(f)) => {
-                                if Value::Integer(i)
-                                    .compare(&Value::Float(f))
-                                    .is_ok_and(|o| o.is_le())
-                                {
-                                    Value::Integer(i)
-                                } else {
-                                    Value::Float(f)
+                                DataType::Null
+                            };
+                            match (acc.min_i64, acc.min_f64) {
+                                (Some(i), None) => match col_type {
+                                    DataType::Timestamp => chrono::DateTime::from_timestamp(
+                                        i.div_euclid(1_000_000_000),
+                                        i.rem_euclid(1_000_000_000) as u32,
+                                    )
+                                    .map(Value::Timestamp)
+                                    .unwrap_or(Value::Null(DataType::Timestamp)),
+                                    _ => Value::Integer(i),
+                                },
+                                (None, Some(f)) => Value::Float(f),
+                                (Some(i), Some(f)) => {
+                                    if Value::Integer(i)
+                                        .compare(&Value::Float(f))
+                                        .is_ok_and(|o| o.is_le())
+                                    {
+                                        Value::Integer(i)
+                                    } else {
+                                        Value::Float(f)
+                                    }
                                 }
+                                (None, None) => Value::Null(col_type),
                             }
-                            (None, None) => Value::Null(col_type),
                         }
-                    }
-                    AggregateOp::Max => {
-                        let col_type = if *col_idx < schema.columns.len() {
-                            schema.columns[*col_idx].data_type
-                        } else {
-                            DataType::Null
-                        };
-                        match (acc.max_i64, acc.max_f64) {
-                            (Some(i), None) => match col_type {
-                                DataType::Timestamp => chrono::DateTime::from_timestamp(
-                                    i.div_euclid(1_000_000_000),
-                                    i.rem_euclid(1_000_000_000) as u32,
-                                )
-                                .map(Value::Timestamp)
-                                .unwrap_or(Value::Null(DataType::Timestamp)),
-                                _ => Value::Integer(i),
-                            },
-                            (None, Some(f)) => Value::Float(f),
-                            (Some(i), Some(f)) => {
-                                if Value::Integer(i)
-                                    .compare(&Value::Float(f))
-                                    .is_ok_and(|o| o.is_ge())
-                                {
-                                    Value::Integer(i)
-                                } else {
-                                    Value::Float(f)
+                        AggregateOp::Max => {
+                            let col_type = if *col_idx < schema.columns.len() {
+                                schema.columns[*col_idx].data_type
+                            } else {
+                                DataType::Null
+                            };
+                            match (acc.max_i64, acc.max_f64) {
+                                (Some(i), None) => match col_type {
+                                    DataType::Timestamp => chrono::DateTime::from_timestamp(
+                                        i.div_euclid(1_000_000_000),
+                                        i.rem_euclid(1_000_000_000) as u32,
+                                    )
+                                    .map(Value::Timestamp)
+                                    .unwrap_or(Value::Null(DataType::Timestamp)),
+                                    _ => Value::Integer(i),
+                                },
+                                (None, Some(f)) => Value::Float(f),
+                                (Some(i), Some(f)) => {
+                                    if Value::Integer(i)
+                                        .compare(&Value::Float(f))
+                                        .is_ok_and(|o| o.is_ge())
+                                    {
+                                        Value::Integer(i)
+                                    } else {
+                                        Value::Float(f)
+                                    }
                                 }
+                                (None, None) => Value::Null(col_type),
                             }
-                            (None, None) => Value::Null(col_type),
                         }
-                    }
+                    })
                 })
-                .collect();
+                .collect::<Result<_>>()?;
 
             self.check_cold()?;
             Ok(Some(results))
@@ -8400,98 +8383,88 @@ impl Table for SegmentedTable {
                 aggregates: &[(AggregateOp, usize)],
                 accums: &[Accum],
                 schema: &crate::core::Schema,
-            ) -> Vec<Value> {
+            ) -> Result<Vec<Value>> {
+                let sum_of = |col_idx: usize, acc: &Accum| {
+                    sum_parts(
+                        schema,
+                        col_idx,
+                        acc.int_sum,
+                        acc.float_sum,
+                        !acc.is_int_agg,
+                        acc.count,
+                    )
+                };
                 aggregates
                     .iter()
                     .zip(accums.iter())
-                    .map(|((op, col_idx), acc)| match op {
-                        AggregateOp::Count | AggregateOp::CountStar => Value::Integer(acc.count),
-                        AggregateOp::Sum => {
-                            if acc.count > 0 {
-                                if acc.is_int_agg && acc.float_sum == 0.0 {
-                                    if acc.int_sum >= i64::MIN as i128
-                                        && acc.int_sum <= i64::MAX as i128
-                                    {
-                                        Value::Integer(acc.int_sum as i64)
-                                    } else {
-                                        Value::Float(acc.int_sum as f64)
-                                    }
+                    .map(|((op, col_idx), acc)| -> Result<Value> {
+                        Ok(match op {
+                            AggregateOp::Count | AggregateOp::CountStar => {
+                                Value::Integer(acc.count)
+                            }
+                            AggregateOp::Sum => sum_of(*col_idx, acc).sum()?,
+                            AggregateOp::Avg => sum_of(*col_idx, acc).avg(),
+                            AggregateOp::Min => {
+                                let col_type = if *col_idx < schema.columns.len() {
+                                    schema.columns[*col_idx].data_type
                                 } else {
-                                    Value::Float(acc.int_sum as f64 + acc.float_sum)
-                                }
-                            } else {
-                                Value::Null(DataType::Float)
-                            }
-                        }
-                        AggregateOp::Avg => {
-                            if acc.count > 0 {
-                                Value::Float(
-                                    (acc.int_sum as f64 + acc.float_sum) / acc.count as f64,
-                                )
-                            } else {
-                                Value::Null(DataType::Float)
-                            }
-                        }
-                        AggregateOp::Min => {
-                            let col_type = if *col_idx < schema.columns.len() {
-                                schema.columns[*col_idx].data_type
-                            } else {
-                                DataType::Null
-                            };
-                            match (acc.min_i64, acc.min_f64) {
-                                (Some(i), None) => match col_type {
-                                    DataType::Timestamp => chrono::DateTime::from_timestamp(
-                                        i.div_euclid(1_000_000_000),
-                                        i.rem_euclid(1_000_000_000) as u32,
-                                    )
-                                    .map(Value::Timestamp)
-                                    .unwrap_or(Value::Null(DataType::Timestamp)),
-                                    _ => Value::Integer(i),
-                                },
-                                (None, Some(f)) => Value::Float(f),
-                                (Some(i), Some(f)) => {
-                                    if Value::Integer(i)
-                                        .compare(&Value::Float(f))
-                                        .is_ok_and(|o| o.is_le())
-                                    {
-                                        Value::Integer(i)
-                                    } else {
-                                        Value::Float(f)
+                                    DataType::Null
+                                };
+                                match (acc.min_i64, acc.min_f64) {
+                                    (Some(i), None) => match col_type {
+                                        DataType::Timestamp => chrono::DateTime::from_timestamp(
+                                            i.div_euclid(1_000_000_000),
+                                            i.rem_euclid(1_000_000_000) as u32,
+                                        )
+                                        .map(Value::Timestamp)
+                                        .unwrap_or(Value::Null(DataType::Timestamp)),
+                                        _ => Value::Integer(i),
+                                    },
+                                    (None, Some(f)) => Value::Float(f),
+                                    (Some(i), Some(f)) => {
+                                        if Value::Integer(i)
+                                            .compare(&Value::Float(f))
+                                            .is_ok_and(|o| o.is_le())
+                                        {
+                                            Value::Integer(i)
+                                        } else {
+                                            Value::Float(f)
+                                        }
                                     }
+                                    (None, None) => Value::Null(col_type),
                                 }
-                                (None, None) => Value::Null(col_type),
                             }
-                        }
-                        AggregateOp::Max => {
-                            let col_type = if *col_idx < schema.columns.len() {
-                                schema.columns[*col_idx].data_type
-                            } else {
-                                DataType::Null
-                            };
-                            match (acc.max_i64, acc.max_f64) {
-                                (Some(i), None) => match col_type {
-                                    DataType::Timestamp => chrono::DateTime::from_timestamp(
-                                        i.div_euclid(1_000_000_000),
-                                        i.rem_euclid(1_000_000_000) as u32,
-                                    )
-                                    .map(Value::Timestamp)
-                                    .unwrap_or(Value::Null(DataType::Timestamp)),
-                                    _ => Value::Integer(i),
-                                },
-                                (None, Some(f)) => Value::Float(f),
-                                (Some(i), Some(f)) => {
-                                    if Value::Integer(i)
-                                        .compare(&Value::Float(f))
-                                        .is_ok_and(|o| o.is_ge())
-                                    {
-                                        Value::Integer(i)
-                                    } else {
-                                        Value::Float(f)
+                            AggregateOp::Max => {
+                                let col_type = if *col_idx < schema.columns.len() {
+                                    schema.columns[*col_idx].data_type
+                                } else {
+                                    DataType::Null
+                                };
+                                match (acc.max_i64, acc.max_f64) {
+                                    (Some(i), None) => match col_type {
+                                        DataType::Timestamp => chrono::DateTime::from_timestamp(
+                                            i.div_euclid(1_000_000_000),
+                                            i.rem_euclid(1_000_000_000) as u32,
+                                        )
+                                        .map(Value::Timestamp)
+                                        .unwrap_or(Value::Null(DataType::Timestamp)),
+                                        _ => Value::Integer(i),
+                                    },
+                                    (None, Some(f)) => Value::Float(f),
+                                    (Some(i), Some(f)) => {
+                                        if Value::Integer(i)
+                                            .compare(&Value::Float(f))
+                                            .is_ok_and(|o| o.is_ge())
+                                        {
+                                            Value::Integer(i)
+                                        } else {
+                                            Value::Float(f)
+                                        }
                                     }
+                                    (None, None) => Value::Null(col_type),
                                 }
-                                (None, None) => Value::Null(col_type),
                             }
-                        }
+                        })
                     })
                     .collect()
             }
@@ -9100,11 +9073,13 @@ impl Table for SegmentedTable {
             let schema_ref = current_schema;
             let results: Vec<GroupedAggregateResult> = groups
                 .into_values()
-                .map(|(group_values, accums)| GroupedAggregateResult {
-                    group_values,
-                    aggregate_values: finalize_accums(aggregates, &accums, schema_ref),
+                .map(|(group_values, accums)| {
+                    Ok(GroupedAggregateResult {
+                        group_values,
+                        aggregate_values: finalize_accums(aggregates, &accums, schema_ref)?,
+                    })
                 })
-                .collect();
+                .collect::<Result<_>>()?;
 
             self.check_cold()?;
             Ok(Some(results))
@@ -9114,6 +9089,26 @@ impl Table for SegmentedTable {
 
 /// Compare two i64 values using the given operator.
 #[inline(always)]
+/// SUM's parts as the one accumulator holds them: a column of another type
+/// than INTEGER, FLOAT or BOOLEAN adds nothing, as SUM reads it elsewhere
+fn sum_parts(
+    schema: &Schema,
+    col_idx: usize,
+    int: i128,
+    float: f64,
+    has_float: bool,
+    count: i64,
+) -> SumAccumulator {
+    let mut sum = SumAccumulator::default();
+    if matches!(
+        schema.columns.get(col_idx).map(|c| c.data_type),
+        Some(DataType::Integer) | Some(DataType::Float) | Some(DataType::Boolean)
+    ) {
+        sum.add_parts(int, float, has_float, count as u64);
+    }
+    sum
+}
+
 fn compare_i64(lhs: i64, rhs: i64, op: crate::core::Operator) -> bool {
     match op {
         crate::core::Operator::Eq => lhs == rhs,
@@ -9439,23 +9434,14 @@ mod tests {
             }
             Ok(Some(max))
         }
-        fn sum_column(&self, col_idx: usize) -> Result<Option<(f64, usize)>> {
-            let mut sum = 0.0;
-            let mut count = 0;
+        fn sum_column(&self, col_idx: usize) -> Result<Option<SumAccumulator>> {
+            let mut sum = SumAccumulator::default();
             for (_, row) in &self.rows {
-                match row.get(col_idx) {
-                    Some(Value::Integer(i)) => {
-                        sum += *i as f64;
-                        count += 1;
-                    }
-                    Some(Value::Float(f)) => {
-                        sum += *f;
-                        count += 1;
-                    }
-                    _ => {}
+                if let Some(value) = row.get(col_idx) {
+                    sum.add(value);
                 }
             }
-            Ok(Some((sum, count)))
+            Ok(Some(sum))
         }
     }
 
@@ -9614,9 +9600,9 @@ mod tests {
 
         let table = SegmentedTable::new(Box::new(hot), mgr);
 
-        let (sum, count) = table.sum_column(1).unwrap().unwrap();
-        assert_eq!(sum, 530.0);
-        assert_eq!(count, 3);
+        let sum = table.sum_column(1).unwrap().unwrap();
+        assert_eq!(sum.sum().unwrap(), Value::Float(530.0));
+        assert_eq!(sum.count(), 3);
     }
 
     #[test]

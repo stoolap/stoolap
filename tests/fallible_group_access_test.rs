@@ -1211,7 +1211,7 @@ fn fully_hidden_warm_columns_are_not_decoded() {
     use stoolap::storage::traits::Table;
     let table = malformed_warm_table();
     table.segment_manager().add_tombstones(&[1, 2], 1);
-    assert_eq!(table.sum_column(1).unwrap(), Some((0.0, 0)));
+    assert_eq!(table.sum_column(1).unwrap().map(|sum| sum.count()), Some(0));
     assert_eq!(table.get_partition_count("b").unwrap(), Some(0));
     assert!(table.get_partition_values("b").unwrap().unwrap().is_empty());
     assert!(table

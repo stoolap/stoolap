@@ -29,6 +29,7 @@ pub mod predicate;
 pub mod row;
 pub mod row_vec;
 pub mod schema;
+pub mod sum;
 pub mod types;
 pub mod value;
 
@@ -37,6 +38,7 @@ pub use error::{ConflictValues, Error, Result};
 pub use row::Row;
 pub use row_vec::{RowIdVec, RowVec};
 pub use schema::{ForeignKeyConstraint, Schema, SchemaBuilder, SchemaColumn};
+pub use sum::SumAccumulator;
 pub use types::{DataType, ForeignKeyAction, IndexEntry, IndexType, IsolationLevel, Operator};
 pub use value::{parse_timestamp, Value, NULL_VALUE};
 

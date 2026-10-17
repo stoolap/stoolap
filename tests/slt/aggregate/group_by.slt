@@ -15,14 +15,14 @@ B 3
 C 1
 NULL 1
 
-# GROUP BY with SUM (SUM in GROUP BY returns float)
-query TR rowsort
+# GROUP BY with SUM (SUM of an INTEGER column is an INTEGER)
+query TI rowsort
 SELECT category, SUM(value) FROM agg_test GROUP BY category
 ----
-A 30.000
-B 120.000
+A 30
+B 120
 C NULL
-NULL 70.000
+NULL 70
 
 # GROUP BY with AVG (float)
 query TR rowsort
@@ -47,20 +47,20 @@ CREATE TABLE multi_group (id INTEGER PRIMARY KEY, dept TEXT, role TEXT, salary I
 statement ok
 INSERT INTO multi_group VALUES (1, 'Eng', 'Dev', 100), (2, 'Eng', 'Dev', 120), (3, 'Eng', 'Mgr', 150), (4, 'Sales', 'Rep', 80), (5, 'Sales', 'Mgr', 130)
 
-query TTR rowsort
+query TTI rowsort
 SELECT dept, role, SUM(salary) FROM multi_group GROUP BY dept, role
 ----
-Eng Dev 220.000
-Eng Mgr 150.000
-Sales Mgr 130.000
-Sales Rep 80.000
+Eng Dev 220
+Eng Mgr 150
+Sales Mgr 130
+Sales Rep 80
 
 # GROUP BY with HAVING
-query TR rowsort
+query TI rowsort
 SELECT category, SUM(value) FROM agg_test GROUP BY category HAVING SUM(value) > 50
 ----
-B 120.000
-NULL 70.000
+B 120
+NULL 70
 
 # HAVING without GROUP BY (aggregate whole table)
 query I

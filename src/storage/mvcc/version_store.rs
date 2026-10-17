@@ -41,7 +41,7 @@ use crate::common::{
 };
 use crate::core::types::DataType;
 use crate::core::value::grouping_float;
-use crate::core::{Error, Row, RowVec, Schema, Value};
+use crate::core::{Error, Row, RowVec, Schema, SumAccumulator, Value};
 use crate::storage::expression::CompiledFilter;
 use crate::storage::mvcc::arena::{Relayout, RowArena};
 use crate::storage::mvcc::get_fast_timestamp;
@@ -531,86 +531,48 @@ fn kept_delete(reader: Reader<'_>, deleted_at_txn_id: i64) -> i64 {
     }
 }
 
-/// Adds a numeric value to SUM's accumulators
-#[inline(always)]
-fn accumulate_sum(int_sum: &mut i128, float_sum: &mut f64, count: &mut usize, val: &Value) {
-    match val {
-        Value::Integer(i) => {
-            *int_sum += *i as i128;
-            *count += 1;
-        }
-        Value::Float(f) => {
-            *float_sum += *f;
-            *count += 1;
-        }
-        // A boolean counts as one or nought, as SUM reads it
-        Value::Boolean(b) => {
-            *int_sum += *b as i128;
-            *count += 1;
-        }
-        _ => {} // NULL or non-numeric
-    }
-}
-
-/// The type a SUM column declares, tested first by [`accumulate_sum_led`]
+/// The type a SUM column declares, tested first by [`add_led`]
 const SUM_ANY: u8 = 0;
 const SUM_INTEGER: u8 = 1;
 const SUM_FLOAT: u8 = 2;
 const SUM_BOOLEAN: u8 = 3;
 
-/// [`accumulate_sum`] with the declared type `LEAD` and NULL tested first
-/// and any other value out of line, so the order holds whatever order a
-/// match over every type compiles to
+/// [`SumAccumulator::add`] with the declared type `LEAD` and NULL tested
+/// first and any other value out of line, so the order holds whatever order
+/// a match over every type compiles to
 #[inline(always)]
-fn accumulate_sum_led<const LEAD: u8>(
-    int_sum: &mut i128,
-    float_sum: &mut f64,
-    count: &mut usize,
-    val: &Value,
-) {
+fn add_led<const LEAD: u8>(sum: &mut SumAccumulator, val: &Value) {
     match (LEAD, val) {
-        (SUM_ANY, _) => accumulate_sum(int_sum, float_sum, count, val),
-        (SUM_INTEGER, Value::Integer(i)) => {
-            *int_sum += *i as i128;
-            *count += 1;
-        }
-        (SUM_FLOAT, Value::Float(f)) => {
-            *float_sum += *f;
-            *count += 1;
-        }
-        (SUM_BOOLEAN, Value::Boolean(b)) => {
-            *int_sum += *b as i128;
-            *count += 1;
-        }
+        (SUM_ANY, _) => sum.add(val),
+        (SUM_INTEGER, Value::Integer(i)) => sum.add_int(*i),
+        (SUM_FLOAT, Value::Float(f)) => sum.add_float(*f),
+        (SUM_BOOLEAN, Value::Boolean(b)) => sum.add_int(*b as i64),
         (_, Value::Null(_)) => {}
-        _ => {
-            (*int_sum, *float_sum, *count) =
-                accumulate_sum_other((*int_sum, *float_sum, *count), val)
-        }
+        _ => *sum = add_other(*sum, val),
     }
 }
 
-/// [`accumulate_sum`] for a value of another type than its column declares.
-/// The sums go by value: an address taken would keep them out of registers
+/// [`SumAccumulator::add`] for a value of another type than its column
+/// declares. The sum goes by value: an address taken would keep it out of
+/// registers
 #[inline(never)]
-fn accumulate_sum_other(sums: (i128, f64, usize), val: &Value) -> (i128, f64, usize) {
-    let (mut int_sum, mut float_sum, mut count) = sums;
-    accumulate_sum(&mut int_sum, &mut float_sum, &mut count, val);
-    (int_sum, float_sum, count)
+fn add_other(mut sum: SumAccumulator, val: &Value) -> SumAccumulator {
+    sum.add(val);
+    sum
 }
 
-/// SUM's accumulators over the live heads whose transaction `visible`
-/// accepts, asked once per run of heads from one transaction. Kept out of
-/// line, so the caller's state does not crowd the loop's registers. `LEAD`
-/// is the column's declared type, see [`accumulate_sum_led`]
+/// SUM over the live heads whose transaction `visible` accepts, asked once
+/// per run of heads from one transaction. Kept out of line, so the caller's
+/// state does not crowd the loop's registers. `LEAD` is the column's
+/// declared type, see [`add_led`]
 #[inline(never)]
 fn sum_live_heads<const LEAD: u8>(
     meta: &[crate::storage::mvcc::arena::ArenaRowMeta],
     data: &[CompactArc<[Value]>],
     col_idx: usize,
     mut visible: impl FnMut(i64) -> bool,
-) -> (i128, f64, usize) {
-    let (mut int_sum, mut float_sum, mut count) = (0i128, 0.0f64, 0usize);
+) -> SumAccumulator {
+    let mut sum = SumAccumulator::default();
     let mut last_txn_id: i64 = 0;
     let mut last_visible = false;
     for (meta, row) in meta.iter().zip(data) {
@@ -623,11 +585,11 @@ fn sum_live_heads<const LEAD: u8>(
         }
         if last_visible {
             if let Some(val) = row.get(col_idx) {
-                accumulate_sum_led::<LEAD>(&mut int_sum, &mut float_sum, &mut count, val);
+                add_led::<LEAD>(&mut sum, val);
             }
         }
     }
-    (int_sum, float_sum, count)
+    sum
 }
 
 /// Whether any version of `chain` is visible to `txn_id` through `checker`
@@ -4960,22 +4922,16 @@ impl VersionStore {
     ///
     /// OPTIMIZATION: Single-pass approach that combines visibility checking with summing.
     /// Avoids Vec allocation and second iteration over indices.
-    /// Returns (sum, count_non_null) for proper NULL handling.
-    pub fn sum_column(&self, reader: Reader<'_>, col_idx: usize) -> (f64, usize) {
+    /// Returns the exact sum, for SUM and AVG to read.
+    pub fn sum_column(&self, reader: Reader<'_>, col_idx: usize) -> SumAccumulator {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.sum_column");
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => reader.over(&**c),
-            None => return (0.0, 0),
+            None => return SumAccumulator::default(),
         };
         let txn_id = reader.txn_id;
-
-        // OPTIMIZATION: Separate accumulators to avoid i64->f64 conversion per row.
-        // Uses i128 for integer accumulation to prevent overflow (i128 holds sum of
-        // 2^63 rows of i64::MAX without overflow).
-        let mut int_sum = 0i128;
-        let mut float_sum = 0.0f64;
-        let mut count = 0usize;
+        let mut sum = SumAccumulator::default();
 
         // FAST PATH: the arena's heads in a single pass: its sums are dropped
         // whole if a publish overlapped it.
@@ -4987,7 +4943,7 @@ impl VersionStore {
             let arena_guard = self.arena.read_guard();
             let (meta, data) = (arena_guard.meta(), arena_guard.data());
             let visible = |version_txn_id| checker.is_visible(version_txn_id, txn_id);
-            let (int_sum, float_sum, count) = match declared {
+            let heads = match declared {
                 Some(DataType::Integer) => {
                     sum_live_heads::<SUM_INTEGER>(meta, data, col_idx, visible)
                 }
@@ -4998,7 +4954,7 @@ impl VersionStore {
                 _ => sum_live_heads::<SUM_ANY>(meta, data, col_idx, visible),
             };
             if !arena_guard.is_empty() && self.publish_epoch_if_quiet() == Some(epoch) {
-                return (int_sum as f64 + float_sum, count);
+                return heads;
             }
             // arena_guard dropped here — no need to hold it for slow path
         }
@@ -5030,7 +4986,7 @@ impl VersionStore {
                     if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
                         // This version is visible and not deleted - accumulate its value
                         if let Some(val) = e.version.data.get(col_idx) {
-                            accumulate_sum(&mut int_sum, &mut float_sum, &mut count, val);
+                            sum.add(val);
                         }
                     }
                     break; // Always break on first visible version
@@ -5040,7 +4996,7 @@ impl VersionStore {
             }
         }
 
-        (int_sum as f64 + float_sum, count)
+        sum
     }
 
     /// Compute MIN(column) without materializing full rows
@@ -7260,16 +7216,16 @@ impl VersionStore {
         reader: Reader<'_>,
         group_by_indices: &[usize],
         aggregates: &[(AggregateOp, usize)],
-    ) -> Option<Vec<GroupedAggregateResult>> {
+    ) -> crate::core::Result<Option<Vec<GroupedAggregateResult>>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.compute_grouped_aggregates");
         if self.closed.load(Ordering::Acquire) {
-            return Some(Vec::new());
+            return Ok(Some(Vec::new()));
         }
 
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => reader.over(&**c),
-            None => return Some(Vec::new()),
+            None => return Ok(Some(Vec::new())),
         };
         let txn_id = reader.txn_id;
 
@@ -7277,28 +7233,17 @@ impl VersionStore {
         // older version the reader sees, so it runs only inside the arena
         // window and answers only if the window held; None lets the caller
         // fall back to regular GROUP BY aggregation.
-        let epoch = self.arena_window(&checker, reader)?;
+        let Some(epoch) = self.arena_window(&checker, reader) else {
+            return Ok(None);
+        };
 
         // Accumulator for each group: (count, sum, min, max) per aggregate
-        #[derive(Clone)]
+        #[derive(Clone, Default)]
         struct Accum {
             count: i64,
-            int_sum: i128,
-            float_sum: f64,
+            sum: SumAccumulator,
             min: Option<Value>,
             max: Option<Value>,
-        }
-
-        impl Default for Accum {
-            fn default() -> Self {
-                Self {
-                    count: 0,
-                    int_sum: 0,
-                    float_sum: 0.0,
-                    min: None,
-                    max: None,
-                }
-            }
         }
 
         // Slots between checks that no commit began publishing: its answer
@@ -7331,22 +7276,7 @@ impl VersionStore {
                     }
                     AggregateOp::Sum | AggregateOp::Avg => {
                         if *col_idx < row_data.len() {
-                            match &row_data[*col_idx] {
-                                Value::Integer(i) => {
-                                    accum.int_sum += *i as i128;
-                                    accum.count += 1;
-                                }
-                                Value::Float(f) => {
-                                    accum.float_sum += *f;
-                                    accum.count += 1;
-                                }
-                                // A boolean counts as one or nought
-                                Value::Boolean(b) => {
-                                    accum.int_sum += *b as i128;
-                                    accum.count += 1;
-                                }
-                                _ => {}
-                            }
+                            accum.sum.add(&row_data[*col_idx]);
                         }
                     }
                     AggregateOp::Min => {
@@ -7387,30 +7317,20 @@ impl VersionStore {
         fn compute_aggregate_values(
             aggregates: &[(AggregateOp, usize)],
             accums: &[Accum],
-        ) -> Vec<Value> {
+        ) -> crate::core::Result<Vec<Value>> {
             aggregates
                 .iter()
                 .zip(accums.iter())
                 .map(|((op, _), accum)| match op {
-                    AggregateOp::Count | AggregateOp::CountStar => Value::Integer(accum.count),
-                    AggregateOp::Sum => {
-                        if accum.count > 0 {
-                            Value::Float(accum.int_sum as f64 + accum.float_sum)
-                        } else {
-                            Value::Null(DataType::Float)
-                        }
+                    AggregateOp::Count | AggregateOp::CountStar => Ok(Value::Integer(accum.count)),
+                    AggregateOp::Sum => accum.sum.sum(),
+                    AggregateOp::Avg => Ok(accum.sum.avg()),
+                    AggregateOp::Min => {
+                        Ok(accum.min.clone().unwrap_or(Value::Null(DataType::Null)))
                     }
-                    AggregateOp::Avg => {
-                        if accum.count > 0 {
-                            Value::Float(
-                                (accum.int_sum as f64 + accum.float_sum) / accum.count as f64,
-                            )
-                        } else {
-                            Value::Null(DataType::Float)
-                        }
+                    AggregateOp::Max => {
+                        Ok(accum.max.clone().unwrap_or(Value::Null(DataType::Null)))
                     }
-                    AggregateOp::Min => accum.min.clone().unwrap_or(Value::Null(DataType::Null)),
-                    AggregateOp::Max => accum.max.clone().unwrap_or(Value::Null(DataType::Null)),
                 })
                 .collect()
         }
@@ -7450,7 +7370,7 @@ impl VersionStore {
             for (stride, metas) in arena_meta.chunks(EPOCH_STRIDE).enumerate() {
                 if self.publish_epoch_if_quiet() != Some(epoch) {
                     drop(arena_guard);
-                    return None;
+                    return Ok(None);
                 }
                 for (offset, meta) in metas.iter().enumerate() {
                     let idx = stride * EPOCH_STRIDE + offset;
@@ -7573,7 +7493,7 @@ impl VersionStore {
             let held = self.publish_epoch_if_quiet() == Some(epoch);
             drop(arena_guard);
             if !held {
-                return None;
+                return Ok(None);
             }
 
             // Convert to results
@@ -7603,7 +7523,7 @@ impl VersionStore {
                 group_values.push(group_value);
                 results.push(GroupedAggregateResult {
                     group_values,
-                    aggregate_values: compute_aggregate_values(aggregates, slice_of(ordinal)),
+                    aggregate_values: compute_aggregate_values(aggregates, slice_of(ordinal))?,
                 });
             }
 
@@ -7613,7 +7533,7 @@ impl VersionStore {
                 group_values.push(Value::Null(DataType::Null));
                 results.push(GroupedAggregateResult {
                     group_values,
-                    aggregate_values: compute_aggregate_values(aggregates, slice_of(ordinal)),
+                    aggregate_values: compute_aggregate_values(aggregates, slice_of(ordinal))?,
                 });
             }
 
@@ -7628,11 +7548,11 @@ impl VersionStore {
                 }
                 results.push(GroupedAggregateResult {
                     group_values,
-                    aggregate_values: compute_aggregate_values(aggregates, slice_of(ordinal)),
+                    aggregate_values: compute_aggregate_values(aggregates, slice_of(ordinal))?,
                 });
             }
 
-            return Some(results);
+            return Ok(Some(results));
         }
 
         // SLOW PATH: Multi-column GROUP BY (currently not used from try_storage_aggregation)
@@ -7641,7 +7561,7 @@ impl VersionStore {
         for (stride, metas) in arena_meta.chunks(EPOCH_STRIDE).enumerate() {
             if self.publish_epoch_if_quiet() != Some(epoch) {
                 drop(arena_guard);
-                return None;
+                return Ok(None);
             }
             for (offset, meta) in metas.iter().enumerate() {
                 let idx = stride * EPOCH_STRIDE + offset;
@@ -7684,7 +7604,7 @@ impl VersionStore {
         let held = self.publish_epoch_if_quiet() == Some(epoch);
         drop(arena_guard);
         if !held {
-            return None;
+            return Ok(None);
         }
 
         // Convert to results
@@ -7697,11 +7617,11 @@ impl VersionStore {
             };
             results.push(GroupedAggregateResult {
                 group_values,
-                aggregate_values: compute_aggregate_values(aggregates, &accums),
+                aggregate_values: compute_aggregate_values(aggregates, &accums)?,
             });
         }
 
-        Some(results)
+        Ok(Some(results))
     }
 }
 
@@ -10039,6 +9959,7 @@ mod tests {
 
         let results = store
             .compute_grouped_aggregates(2.into(), &[1], &[])
+            .unwrap()
             .expect("arena path should handle an empty aggregate list");
 
         let mut keys: Vec<i64> = results
@@ -10085,8 +10006,9 @@ mod tests {
         crate::test_failpoints::on_grouped_slot(100, move || {
             *handle.borrow_mut() = Some(publisher.begin_publish(0));
         });
-        let results =
-            store.compute_grouped_aggregates(2.into(), &[1, 2], &[(AggregateOp::CountStar, 0)]);
+        let results = store
+            .compute_grouped_aggregates(2.into(), &[1, 2], &[(AggregateOp::CountStar, 0)])
+            .unwrap();
         let after = crate::test_failpoints::grouped_slots_after_hook();
         drop(hold.borrow_mut().take().expect("the pass reached the slot"));
         assert!(results.is_none(), "a pass a commit published into answers");
@@ -10802,9 +10724,9 @@ mod tests {
             store.add_version(i, version);
         }
 
-        let (sum, count) = store.sum_column(2.into(), 0);
-        assert_eq!(sum, 150.0); // 10 + 20 + 30 + 40 + 50
-        assert_eq!(count, 5);
+        let sum = store.sum_column(2.into(), 0);
+        assert_eq!(sum.sum().unwrap(), Value::Integer(150)); // 10 + 20 + 30 + 40 + 50
+        assert_eq!(sum.count(), 5);
     }
 
     #[test]
@@ -10834,8 +10756,11 @@ mod tests {
         }
         txn.commit().unwrap();
 
-        assert_eq!(store.sum_column(2.into(), 1), (7.5, 3), "a FLOAT column");
-        assert_eq!(store.sum_column(2.into(), 2), (7.5, 3), "an INTEGER column");
+        for (col, what) in [(1, "a FLOAT column"), (2, "an INTEGER column")] {
+            let sum = store.sum_column(2.into(), col);
+            assert_eq!(sum.sum().unwrap(), Value::Float(7.5), "{what}");
+            assert_eq!(sum.count(), 3, "{what}");
+        }
     }
 
     #[test]
@@ -10852,9 +10777,9 @@ mod tests {
             store.add_version((i + 1) as i64, version);
         }
 
-        let (sum, count) = store.sum_column(2.into(), 0);
-        assert!((sum - 7.5).abs() < 0.001);
-        assert_eq!(count, 3);
+        let sum = store.sum_column(2.into(), 0);
+        assert_eq!(sum.sum().unwrap(), Value::Float(7.5));
+        assert_eq!(sum.count(), 3);
     }
 
     #[test]

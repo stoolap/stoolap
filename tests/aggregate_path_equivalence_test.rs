@@ -172,10 +172,11 @@ fn open(db: Database, seal: bool, rows: bool) -> Database {
     db
 }
 
-/// A number read by value, so an INTEGER and an equal FLOAT agree
+/// A value with its type, so INTEGER 3 and FLOAT 3.0 differ
 fn render(value: &Value) -> String {
     match value {
-        Value::Float(f) if f.fract() == 0.0 && f.abs() < 1e15 => format!("{}", *f as i64),
+        Value::Integer(n) => format!("i:{n}"),
+        Value::Float(f) => format!("f:{f:?}"),
         other => format!("{other}"),
     }
 }
