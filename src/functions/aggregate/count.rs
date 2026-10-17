@@ -14,7 +14,7 @@
 
 //! COUNT aggregate function
 
-use crate::core::Value;
+use crate::core::{Result, Value};
 use crate::functions::{
     AggregateFunction, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType,
 };
@@ -79,11 +79,11 @@ impl AggregateFunction for CountFunction {
         }
     }
 
-    fn result(&self) -> Value {
+    fn result(&self) -> Result<Value> {
         if let Some(ref tracker) = self.distinct_tracker {
-            Value::Integer(tracker.count() as i64)
+            Ok(Value::Integer(tracker.count() as i64))
         } else {
-            Value::Integer(self.count)
+            Ok(Value::Integer(self.count))
         }
     }
 
@@ -107,7 +107,7 @@ mod tests {
         count.accumulate(&Value::Integer(1), false);
         count.accumulate(&Value::Integer(2), false);
         count.accumulate(&Value::Integer(3), false);
-        assert_eq!(count.result(), Value::Integer(3));
+        assert_eq!(count.result().unwrap(), Value::Integer(3));
     }
 
     #[test]
@@ -116,7 +116,7 @@ mod tests {
         count.accumulate(&Value::text("*"), false);
         count.accumulate(&Value::text("*"), false);
         count.accumulate(&Value::text("*"), false);
-        assert_eq!(count.result(), Value::Integer(3));
+        assert_eq!(count.result().unwrap(), Value::Integer(3));
     }
 
     #[test]
@@ -125,7 +125,7 @@ mod tests {
         count.accumulate(&Value::Integer(1), false);
         count.accumulate(&Value::null_unknown(), false);
         count.accumulate(&Value::Integer(3), false);
-        assert_eq!(count.result(), Value::Integer(2));
+        assert_eq!(count.result().unwrap(), Value::Integer(2));
     }
 
     #[test]
@@ -136,7 +136,7 @@ mod tests {
         count.accumulate(&Value::Integer(2), true);
         count.accumulate(&Value::Integer(2), true); // duplicate
         count.accumulate(&Value::Integer(3), true);
-        assert_eq!(count.result(), Value::Integer(3));
+        assert_eq!(count.result().unwrap(), Value::Integer(3));
     }
 
     #[test]
@@ -145,12 +145,12 @@ mod tests {
         count.accumulate(&Value::Integer(1), false);
         count.accumulate(&Value::Integer(2), false);
         count.reset();
-        assert_eq!(count.result(), Value::Integer(0));
+        assert_eq!(count.result().unwrap(), Value::Integer(0));
     }
 
     #[test]
     fn test_count_empty() {
         let count = CountFunction::default();
-        assert_eq!(count.result(), Value::Integer(0));
+        assert_eq!(count.result().unwrap(), Value::Integer(0));
     }
 }

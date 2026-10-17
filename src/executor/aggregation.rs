@@ -32,7 +32,7 @@ use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 // SmallVec removed - Vec is faster due to spilled() check overhead in hot loops
 
 use crate::common::{CompactArc, CompactVec, I64Map, StringMap};
-use crate::core::{Result, Row, RowVec, Value};
+use crate::core::{Result, Row, RowVec, SumAccumulator, Value};
 use crate::functions::aggregate::CompiledAggregate;
 use crate::functions::AggregateFunction;
 use crate::parser::ast::*;
@@ -2060,14 +2060,19 @@ impl Executor {
             })
             .collect();
 
-        // FAST PATH: Single SUM on integer column without DISTINCT (no expressions)
+        // FAST PATH: a single SUM or AVG over a column, without DISTINCT
         if !has_expression
             && aggregations.len() == 1
-            && aggregations[0].name == "SUM"
+            && matches!(aggregations[0].name.as_str(), "SUM" | "AVG")
             && !aggregations[0].distinct
         {
             if let Some(col_idx) = agg_col_indices[0] {
-                let result = self.fast_sum_column(rows, col_idx);
+                let sum = Self::sum_column_rows(rows, col_idx);
+                let result = if aggregations[0].name == "SUM" {
+                    sum.sum()?
+                } else {
+                    sum.avg()
+                };
                 let result_columns: Vec<String> =
                     aggregations.iter().map(|a| a.get_column_name()).collect();
                 let mut result_rows = RowVec::with_capacity(1);
@@ -2075,26 +2080,6 @@ impl Executor {
                 return Ok((result_columns, result_rows));
             }
         }
-
-        // FAST PATH: Single AVG on column without DISTINCT (no expressions)
-        if !has_expression
-            && aggregations.len() == 1
-            && aggregations[0].name == "AVG"
-            && !aggregations[0].distinct
-        {
-            if let Some(col_idx) = agg_col_indices[0] {
-                let result = self.fast_avg_column(rows, col_idx);
-                let result_columns: Vec<String> =
-                    aggregations.iter().map(|a| a.get_column_name()).collect();
-                let mut result_rows = RowVec::with_capacity(1);
-                result_rows.push((0, Row::from_values(vec![result])));
-                return Ok((result_columns, result_rows));
-            }
-        }
-
-        // Check if any aggregation uses DISTINCT (can't parallelize easily)
-        #[cfg(feature = "parallel")]
-        let has_distinct = aggregations.iter().any(|a| a.distinct);
 
         // Pre-compile filter, expression, and ORDER BY programs for VM-based evaluation
         // CRITICAL: Propagate errors instead of silently ignoring compilation failures
@@ -2146,137 +2131,18 @@ impl Executor {
             None
         };
 
-        // Use parallel processing for large datasets without DISTINCT
-        #[cfg(feature = "parallel")]
-        let use_parallel = rows.len() >= 100_000 && !has_distinct && !has_expression;
-        #[cfg(not(feature = "parallel"))]
-        let use_parallel = false;
+        // Fast path: no expressions, no filters, no order by on any aggregate
+        let can_use_compiled = aggregations.iter().all(|agg| {
+            agg.expression.is_none()
+                && agg.filter.is_none()
+                && agg.order_by.is_empty()
+                && agg.extra_args.is_empty()
+        });
 
-        let result_values: Vec<Value> = if use_parallel {
-            // PARALLEL: Split into chunks and process in parallel
-            #[cfg(feature = "parallel")]
-            let chunk_size = (rows.len() / rayon::current_num_threads()).max(1000);
-            #[cfg(not(feature = "parallel"))]
-            let chunk_size = rows.len();
-            let function_registry = &self.function_registry;
-
-            // Process chunks in parallel, each producing partial aggregates
-            #[cfg(feature = "parallel")]
-            let partial_results: Vec<Vec<Value>> = rows
-                .par_chunks(chunk_size)
-                .map(|chunk| {
-                    let mut agg_funcs: Vec<Option<Box<dyn AggregateFunction>>> = aggregations
-                        .iter()
-                        .map(|agg| function_registry.get_aggregate(&agg.name))
-                        .collect();
-
-                    // Configure aggregate functions with extra arguments (e.g., separator for STRING_AGG)
-                    for (i, agg) in aggregations.iter().enumerate() {
-                        if !agg.extra_args.is_empty() {
-                            if let Some(ref mut func) = agg_funcs[i] {
-                                func.configure(&agg.extra_args);
-                            }
-                        }
-                    }
-
-                    // Pre-create static Value for COUNT(*)
-                    let count_star_value = Value::Integer(1);
-                    for (_, row) in chunk {
-                        for (i, _agg) in aggregations.iter().enumerate() {
-                            if let Some(ref mut func) = agg_funcs[i] {
-                                // OPTIMIZATION: Avoid cloning by using reference directly
-                                let value_ref = if let Some(col_idx) = agg_col_indices[i] {
-                                    row.get(col_idx)
-                                } else {
-                                    Some(&count_star_value) // COUNT(*)
-                                };
-                                if let Some(v) = value_ref {
-                                    func.accumulate(v, false);
-                                }
-                                // Skip if None (missing column) - this is effectively null
-                            }
-                        }
-                    }
-
-                    // Return partial results
-                    agg_funcs
-                        .iter()
-                        .map(|f| {
-                            f.as_ref()
-                                .map(|func| func.result())
-                                .unwrap_or_else(Value::null_unknown)
-                        })
-                        .collect()
-                })
-                .collect();
-            #[cfg(not(feature = "parallel"))]
-            let partial_results: Vec<Vec<Value>> = rows
-                .chunks(chunk_size)
-                .map(|chunk| {
-                    let mut agg_funcs: Vec<Option<Box<dyn AggregateFunction>>> = aggregations
-                        .iter()
-                        .map(|agg| function_registry.get_aggregate(&agg.name))
-                        .collect();
-
-                    // Configure aggregate functions with extra arguments (e.g., separator for STRING_AGG)
-                    for (i, agg) in aggregations.iter().enumerate() {
-                        if !agg.extra_args.is_empty() {
-                            if let Some(ref mut func) = agg_funcs[i] {
-                                func.configure(&agg.extra_args);
-                            }
-                        }
-                    }
-
-                    // Pre-create static Value for COUNT(*)
-                    let count_star_value = Value::Integer(1);
-                    for (_, row) in chunk {
-                        for (i, _agg) in aggregations.iter().enumerate() {
-                            if let Some(ref mut func) = agg_funcs[i] {
-                                // OPTIMIZATION: Avoid cloning by using reference directly
-                                let value_ref = if let Some(col_idx) = agg_col_indices[i] {
-                                    row.get(col_idx)
-                                } else {
-                                    Some(&count_star_value) // COUNT(*)
-                                };
-                                if let Some(v) = value_ref {
-                                    func.accumulate(v, false);
-                                }
-                                // Skip if None (missing column) - this is effectively null
-                            }
-                        }
-                    }
-
-                    // Return partial results
-                    agg_funcs
-                        .iter()
-                        .map(|f| {
-                            f.as_ref()
-                                .map(|func| func.result())
-                                .unwrap_or_else(Value::null_unknown)
-                        })
-                        .collect()
-                })
-                .collect();
-
-            // Merge partial results
-            self.merge_partial_aggregates(aggregations, partial_results)
-        } else {
-            // SEQUENTIAL: Check if we can use the fast compiled path
-            // Fast path: no expressions, no filters, no order by on any aggregate
-            // NOTE: This is conservative - it could potentially be extended to handle:
-            // - Simple column expressions (not computed expressions)
-            // - STRING_AGG with extra_args (separator) by passing to CompiledAggregate
-            // For now, we keep it strict to ensure correctness.
-            let can_use_compiled = aggregations.iter().all(|agg| {
-                agg.expression.is_none()
-                    && agg.filter.is_none()
-                    && agg.order_by.is_empty()
-                    && agg.extra_args.is_empty()
-            });
-
-            if can_use_compiled {
-                // FAST PATH: Use CompiledAggregate for zero virtual dispatch
-                let mut compiled_aggs: Vec<CompiledAggregate> = aggregations
+        let result_values: Vec<Value> = if can_use_compiled {
+            // FAST PATH: Use CompiledAggregate for zero virtual dispatch
+            let compile_all = || -> Vec<CompiledAggregate> {
+                aggregations
                     .iter()
                     .map(|agg| {
                         let is_count_star = agg.name == "COUNT" && agg.column == "*";
@@ -2299,14 +2165,15 @@ impl Executor {
                             )
                         })
                     })
-                    .collect();
+                    .collect()
+            };
 
+            // Hot loop with compiled aggregates - zero virtual dispatch
+            let accumulate_rows = |aggs: &mut [CompiledAggregate], rows: &[(i64, Row)]| {
                 // Pre-create static Value for COUNT(*)
                 let count_star_value = Value::Integer(1);
-
-                // Hot loop with compiled aggregates - zero virtual dispatch
                 for (_, row) in rows {
-                    for i in 0..compiled_aggs.len() {
+                    for (i, agg) in aggs.iter_mut().enumerate() {
                         let value = if let Some(col_idx) = agg_col_indices[i] {
                             row.get(col_idx)
                         } else {
@@ -2314,134 +2181,159 @@ impl Executor {
                         };
 
                         if let Some(v) = value {
-                            compiled_aggs[i].accumulate(v);
+                            agg.accumulate(v);
                         }
                     }
                 }
+            };
 
-                // Collect results
-                compiled_aggs.iter().map(|agg| agg.result()).collect()
-            } else {
-                // SLOW PATH: Original algorithm with dynamic dispatch for complex aggregates
-                let mut agg_funcs: Vec<Option<Box<dyn AggregateFunction>>> = aggregations
-                    .iter()
-                    .map(|agg| self.function_registry.get_aggregate(&agg.name))
+            let mut compiled_aggs = compile_all();
+            // Large inputs split into chunks when every aggregate merges
+            // its chunk runs into the whole
+            #[cfg(feature = "parallel")]
+            if rows.len() >= 100_000 && compiled_aggs.iter().all(CompiledAggregate::can_merge) {
+                let chunk_size = (rows.len() / rayon::current_num_threads()).max(1000);
+                let chunks: Vec<Vec<CompiledAggregate>> = rows
+                    .par_chunks(chunk_size)
+                    .map(|chunk| {
+                        let mut aggs = compile_all();
+                        accumulate_rows(&mut aggs, chunk);
+                        aggs
+                    })
                     .collect();
-
-                // Configure aggregate functions with extra arguments (e.g., separator for STRING_AGG)
-                for (i, agg) in aggregations.iter().enumerate() {
-                    if !agg.extra_args.is_empty() {
-                        if let Some(ref mut func) = agg_funcs[i] {
-                            func.configure(&agg.extra_args);
-                        }
+                for chunk in &chunks {
+                    for (agg, run) in compiled_aggs.iter_mut().zip(chunk) {
+                        agg.merge(run);
                     }
                 }
+            } else {
+                accumulate_rows(&mut compiled_aggs, rows);
+            }
+            #[cfg(not(feature = "parallel"))]
+            accumulate_rows(&mut compiled_aggs, rows);
 
-                // Configure ORDER BY for ordered-set aggregates (ARRAY_AGG, STRING_AGG, etc.)
-                for (i, agg) in aggregations.iter().enumerate() {
-                    if !agg.order_by.is_empty() {
-                        if let Some(ref mut func) = agg_funcs[i] {
-                            func.set_order_by(Self::aggregate_order_keys(&agg.order_by));
-                        }
+            compiled_aggs
+                .iter()
+                .map(|agg| agg.result())
+                .collect::<Result<_>>()?
+        } else {
+            // SLOW PATH: Original algorithm with dynamic dispatch for complex aggregates
+            let mut agg_funcs: Vec<Option<Box<dyn AggregateFunction>>> = aggregations
+                .iter()
+                .map(|agg| self.function_registry.get_aggregate(&agg.name))
+                .collect();
+
+            // Configure aggregate functions with extra arguments (e.g., separator for STRING_AGG)
+            for (i, agg) in aggregations.iter().enumerate() {
+                if !agg.extra_args.is_empty() {
+                    if let Some(ref mut func) = agg_funcs[i] {
+                        func.configure(&agg.extra_args);
                     }
                 }
+            }
 
-                // Pre-create static Value for COUNT(*)
-                let count_star_value = Value::Integer(1);
+            // Configure ORDER BY for ordered-set aggregates (ARRAY_AGG, STRING_AGG, etc.)
+            for (i, agg) in aggregations.iter().enumerate() {
+                if !agg.order_by.is_empty() {
+                    if let Some(ref mut func) = agg_funcs[i] {
+                        func.set_order_by(Self::aggregate_order_keys(&agg.order_by));
+                    }
+                }
+            }
 
-                // Buffer for evaluated expression values (to avoid repeated allocation)
-                let mut expr_values: Vec<Value> = vec![Value::null_unknown(); aggregations.len()];
+            // Pre-create static Value for COUNT(*)
+            let count_star_value = Value::Integer(1);
 
-                for (_, row) in rows {
-                    // Create execution context for this row
-                    // CRITICAL: Include params for parameterized queries
-                    let exec_ctx = ExecuteContext::new(row)
-                        .with_params(ctx.params())
-                        .with_named_params(ctx.named_params());
+            // Buffer for evaluated expression values (to avoid repeated allocation)
+            let mut expr_values: Vec<Value> = vec![Value::null_unknown(); aggregations.len()];
 
-                    for (i, agg) in aggregations.iter().enumerate() {
-                        if let Some(ref mut func) = agg_funcs[i] {
-                            // Check FILTER clause first - skip row if filter is false
-                            if let Some(ref filter_program) = compiled_filters[i] {
-                                if let Some(ref mut vm) = expr_vm {
-                                    match vm.execute_cow(filter_program, &exec_ctx) {
-                                        Ok(Value::Boolean(true)) => {} // Continue with accumulation
-                                        Ok(Value::Boolean(false)) | Ok(Value::Null(_)) => continue, // Skip this row
-                                        Ok(_) => continue, // Non-boolean treated as false
-                                        Err(e) => return Err(e),
-                                    }
-                                } else {
-                                    // Can't evaluate filter without VM - skip
-                                    continue;
-                                }
-                            }
+            for (_, row) in rows {
+                // Create execution context for this row
+                // CRITICAL: Include params for parameterized queries
+                let exec_ctx = ExecuteContext::new(row)
+                    .with_params(ctx.params())
+                    .with_named_params(ctx.named_params());
 
-                            // Get the value to accumulate
-                            let value = if let Some(ref expr_program) = compiled_agg_expressions[i]
-                            {
-                                // Evaluate the expression for this row using VM
-                                if let Some(ref mut vm) = expr_vm {
-                                    match vm.execute_cow(expr_program, &exec_ctx) {
-                                        Ok(val) => {
-                                            expr_values[i] = val;
-                                            Some(&expr_values[i])
-                                        }
-                                        Err(e) => {
-                                            return Err(crate::core::Error::expression_evaluation(
-                                                format!("{}({}): {}", agg.name, agg.column, e),
-                                            ));
-                                        }
-                                    }
-                                } else {
-                                    None
+                for (i, agg) in aggregations.iter().enumerate() {
+                    if let Some(ref mut func) = agg_funcs[i] {
+                        // Check FILTER clause first - skip row if filter is false
+                        if let Some(ref filter_program) = compiled_filters[i] {
+                            if let Some(ref mut vm) = expr_vm {
+                                match vm.execute_cow(filter_program, &exec_ctx) {
+                                    Ok(Value::Boolean(true)) => {} // Continue with accumulation
+                                    Ok(Value::Boolean(false)) | Ok(Value::Null(_)) => continue, // Skip this row
+                                    Ok(_) => continue, // Non-boolean treated as false
+                                    Err(e) => return Err(e),
                                 }
                             } else {
-                                // Simple column reference or COUNT(*)
-                                if let Some(col_idx) = agg_col_indices[i] {
-                                    row.get(col_idx)
-                                } else {
-                                    Some(&count_star_value)
-                                }
-                            };
+                                // Can't evaluate filter without VM - skip
+                                continue;
+                            }
+                        }
 
-                            if let Some(v) = value {
-                                // Check if this aggregate has ORDER BY and supports it
-                                if !compiled_order_by[i].is_empty() && func.supports_order_by() {
-                                    // Evaluate ORDER BY expressions to get sort keys using pre-compiled programs
-                                    if let Some(ref mut vm) = expr_vm {
-                                        let mut sort_keys =
-                                            Vec::with_capacity(compiled_order_by[i].len());
-                                        for order_program in &compiled_order_by[i] {
-                                            sort_keys
-                                                .push(vm.execute_cow(order_program, &exec_ctx)?);
-                                        }
-                                        func.accumulate_with_sort_key(v, sort_keys, agg.distinct);
-                                    } else {
-                                        // No VM - fall back to regular accumulate
-                                        func.accumulate(v, agg.distinct);
+                        // Get the value to accumulate
+                        let value = if let Some(ref expr_program) = compiled_agg_expressions[i] {
+                            // Evaluate the expression for this row using VM
+                            if let Some(ref mut vm) = expr_vm {
+                                match vm.execute_cow(expr_program, &exec_ctx) {
+                                    Ok(val) => {
+                                        expr_values[i] = val;
+                                        Some(&expr_values[i])
                                     }
+                                    Err(e) => {
+                                        return Err(crate::core::Error::expression_evaluation(
+                                            format!("{}({}): {}", agg.name, agg.column, e),
+                                        ));
+                                    }
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            // Simple column reference or COUNT(*)
+                            if let Some(col_idx) = agg_col_indices[i] {
+                                row.get(col_idx)
+                            } else {
+                                Some(&count_star_value)
+                            }
+                        };
+
+                        if let Some(v) = value {
+                            // Check if this aggregate has ORDER BY and supports it
+                            if !compiled_order_by[i].is_empty() && func.supports_order_by() {
+                                // Evaluate ORDER BY expressions to get sort keys using pre-compiled programs
+                                if let Some(ref mut vm) = expr_vm {
+                                    let mut sort_keys =
+                                        Vec::with_capacity(compiled_order_by[i].len());
+                                    for order_program in &compiled_order_by[i] {
+                                        sort_keys.push(vm.execute_cow(order_program, &exec_ctx)?);
+                                    }
+                                    func.accumulate_with_sort_key(v, sort_keys, agg.distinct);
                                 } else {
+                                    // No VM - fall back to regular accumulate
                                     func.accumulate(v, agg.distinct);
                                 }
+                            } else {
+                                func.accumulate(v, agg.distinct);
                             }
                         }
                     }
                 }
-
-                aggregations
-                    .iter()
-                    .enumerate()
-                    .map(|(i, agg)| {
-                        if let Some(ref func) = agg_funcs[i] {
-                            func.result()
-                        } else if agg.name == "COUNT" && agg.column == "*" {
-                            Value::Integer(rows.len() as i64)
-                        } else {
-                            Value::null_unknown()
-                        }
-                    })
-                    .collect()
             }
+
+            aggregations
+                .iter()
+                .enumerate()
+                .map(|(i, agg)| {
+                    if let Some(ref func) = agg_funcs[i] {
+                        func.result()
+                    } else if agg.name == "COUNT" && agg.column == "*" {
+                        Ok(Value::Integer(rows.len() as i64))
+                    } else {
+                        Ok(Value::null_unknown())
+                    }
+                })
+                .collect::<Result<_>>()?
         };
 
         // Build result columns
@@ -2451,136 +2343,6 @@ impl Executor {
         let mut result_rows = RowVec::with_capacity(1);
         result_rows.push((0, Row::from_values(result_values)));
         Ok((result_columns, result_rows))
-    }
-
-    /// Merge partial aggregate results from parallel processing
-    fn merge_partial_aggregates(
-        &self,
-        aggregations: &[SqlAggregateFunction],
-        partial_results: Vec<Vec<Value>>,
-    ) -> Vec<Value> {
-        if partial_results.is_empty() {
-            return aggregations.iter().map(|_| Value::null_unknown()).collect();
-        }
-
-        aggregations
-            .iter()
-            .enumerate()
-            .map(|(i, agg)| {
-                let partials: Vec<&Value> = partial_results.iter().map(|r| &r[i]).collect();
-                self.merge_single_aggregate(&agg.name, partials)
-            })
-            .collect()
-    }
-
-    /// Merge partial results for a single aggregate function
-    fn merge_single_aggregate(&self, func_name: &str, partials: Vec<&Value>) -> Value {
-        // OPTIMIZATION: func_name comes from SqlAggregateFunction.name which is already uppercase
-        match func_name {
-            "COUNT" | "SUM" => {
-                // Sum all partial results
-                let mut total: i64 = 0;
-                let mut has_float = false;
-                let mut total_float: f64 = 0.0;
-
-                for val in partials {
-                    match val {
-                        Value::Integer(n) => {
-                            if has_float {
-                                total_float += *n as f64;
-                            } else {
-                                total += n;
-                            }
-                        }
-                        Value::Float(f) => {
-                            if !has_float {
-                                has_float = true;
-                                total_float = total as f64;
-                            }
-                            total_float += f;
-                        }
-                        _ => {}
-                    }
-                }
-
-                if has_float {
-                    Value::Float(total_float)
-                } else {
-                    Value::Integer(total)
-                }
-            }
-            "AVG" => {
-                // For AVG, we get partial AVGs, but we need SUM/COUNT
-                // This is approximate - for exact results, we'd need to track count separately
-                // For now, just average the partial averages (less accurate for uneven chunks)
-                let mut sum: f64 = 0.0;
-                let mut count = 0;
-
-                for val in &partials {
-                    match val {
-                        Value::Float(f) => {
-                            sum += f;
-                            count += 1;
-                        }
-                        Value::Integer(n) => {
-                            sum += *n as f64;
-                            count += 1;
-                        }
-                        _ => {}
-                    }
-                }
-
-                if count > 0 {
-                    Value::Float(sum / count as f64)
-                } else {
-                    Value::null_unknown()
-                }
-            }
-            "MIN" => {
-                // Take minimum of all partials
-                let mut min_val: Option<Value> = None;
-
-                // OPTIMIZATION: Only clone when value actually changes
-                for val in partials {
-                    if matches!(val, Value::Null(_)) {
-                        continue;
-                    }
-                    match &min_val {
-                        None => min_val = Some(val.clone()),
-                        Some(current) if val < current => min_val = Some(val.clone()),
-                        _ => {} // Keep current, no clone needed
-                    }
-                }
-
-                min_val.unwrap_or_else(Value::null_unknown)
-            }
-            "MAX" => {
-                // Take maximum of all partials
-                let mut max_val: Option<Value> = None;
-
-                // OPTIMIZATION: Only clone when value actually changes
-                for val in partials {
-                    if matches!(val, Value::Null(_)) {
-                        continue;
-                    }
-                    match &max_val {
-                        None => max_val = Some(val.clone()),
-                        Some(current) if val > current => max_val = Some(val.clone()),
-                        _ => {} // Keep current, no clone needed
-                    }
-                }
-
-                max_val.unwrap_or_else(Value::null_unknown)
-            }
-            _ => {
-                // For unknown functions, just take the first non-null
-                partials
-                    .into_iter()
-                    .find(|v| !matches!(v, Value::Null(_)))
-                    .cloned()
-                    .unwrap_or_else(Value::null_unknown)
-            }
-        }
     }
 
     /// Try to use fast single-pass aggregation for simple cases
@@ -2708,12 +2470,8 @@ impl Executor {
         type AggVec<T> = SmallVec<[T; 4]>;
 
         struct FastGroupState {
-            // Running sums stored as f64. Note: f64 can exactly represent integers
-            // up to 2^53 (~9 quadrillion). For sums exceeding this, precision loss
-            // may occur. This matches SQLite's behavior for aggregate functions.
-            agg_values: AggVec<f64>,
-            agg_has_value: AggVec<bool>, // Track if any non-NULL value was seen (for SUM/AVG)
-            counts: AggVec<i64>,         // For COUNT and AVG divisor
+            sums: AggVec<SumAccumulator>,      // For SUM and AVG
+            counts: AggVec<i64>,               // For COUNT
             min_values: AggVec<Option<Value>>, // For MIN
             max_values: AggVec<Option<Value>>, // For MAX
         }
@@ -2818,8 +2576,7 @@ impl Executor {
                         hash,
                         key_values,
                         FastGroupState {
-                            agg_values: smallvec::smallvec![0.0; num_aggs],
-                            agg_has_value: smallvec::smallvec![false; num_aggs],
+                            sums: smallvec::smallvec![SumAccumulator::default(); num_aggs],
                             counts: smallvec::smallvec![0; num_aggs],
                             min_values: smallvec::smallvec![None; num_aggs],
                             max_values: smallvec::smallvec![None; num_aggs],
@@ -2844,19 +2601,7 @@ impl Executor {
                     }
                     SimpleAgg::Sum(col_idx) | SimpleAgg::Avg(col_idx) => {
                         if let Some(value) = row.get(*col_idx) {
-                            match value {
-                                Value::Integer(v) => {
-                                    state.agg_values[i] += *v as f64;
-                                    state.agg_has_value[i] = true;
-                                    state.counts[i] += 1; // For AVG divisor
-                                }
-                                Value::Float(v) => {
-                                    state.agg_values[i] += v;
-                                    state.agg_has_value[i] = true;
-                                    state.counts[i] += 1;
-                                }
-                                _ => {} // Skip non-numeric and NULL
-                            }
+                            state.sums[i].add(value);
                         }
                     }
                     SimpleAgg::Min(col_idx) => {
@@ -2925,23 +2670,12 @@ impl Executor {
                         SimpleAgg::Count | SimpleAgg::CountColumn(_) => {
                             Some(Cow::Owned(Value::Integer(state.counts[cond.agg_index])))
                         }
-                        SimpleAgg::Sum(_) => {
-                            if state.agg_has_value[cond.agg_index] {
-                                Some(Cow::Owned(Value::Float(state.agg_values[cond.agg_index])))
-                            } else {
-                                None // NULL values don't pass comparison
-                            }
-                        }
-                        SimpleAgg::Avg(_) => {
-                            if state.counts[cond.agg_index] > 0 {
-                                Some(Cow::Owned(Value::Float(
-                                    state.agg_values[cond.agg_index]
-                                        / state.counts[cond.agg_index] as f64,
-                                )))
-                            } else {
-                                None
-                            }
-                        }
+                        SimpleAgg::Sum(_) => Some(state.sums[cond.agg_index].sum()?)
+                            .filter(|v| !v.is_null())
+                            .map(Cow::Owned),
+                        SimpleAgg::Avg(_) => Some(state.sums[cond.agg_index].avg())
+                            .filter(|v| !v.is_null())
+                            .map(Cow::Owned),
                         SimpleAgg::Min(_) => {
                             state.min_values[cond.agg_index].as_ref().map(Cow::Borrowed)
                         }
@@ -2975,21 +2709,8 @@ impl Executor {
             for (i, agg) in simple_aggs.iter().enumerate() {
                 let value = match agg {
                     SimpleAgg::Count | SimpleAgg::CountColumn(_) => Value::Integer(state.counts[i]),
-                    SimpleAgg::Sum(_) => {
-                        // SUM returns NULL if no non-NULL values were seen
-                        if state.agg_has_value[i] {
-                            Value::Float(state.agg_values[i])
-                        } else {
-                            Value::null_unknown()
-                        }
-                    }
-                    SimpleAgg::Avg(_) => {
-                        if state.counts[i] > 0 {
-                            Value::Float(state.agg_values[i] / state.counts[i] as f64)
-                        } else {
-                            Value::null_unknown()
-                        }
-                    }
+                    SimpleAgg::Sum(_) => state.sums[i].sum()?,
+                    SimpleAgg::Avg(_) => state.sums[i].avg(),
                     SimpleAgg::Min(_) => state.min_values[i]
                         .take()
                         .unwrap_or_else(Value::null_unknown),
@@ -3029,8 +2750,7 @@ impl Executor {
 
         struct SingleColGroupState {
             key_value: Value,
-            agg_values: AggVec<f64>,
-            agg_has_value: AggVec<bool>,
+            sums: AggVec<SumAccumulator>,
             counts: AggVec<i64>,
             min_values: AggVec<Option<Value>>,
             max_values: AggVec<Option<Value>>,
@@ -3070,8 +2790,7 @@ impl Executor {
 
             #[derive(Clone)]
             struct IntGroupState {
-                agg_values: AggVec<f64>,
-                agg_has_value: AggVec<bool>,
+                sums: AggVec<SumAccumulator>,
                 counts: AggVec<i64>,
                 min_values: AggVec<Option<Value>>,
                 max_values: AggVec<Option<Value>>,
@@ -3084,8 +2803,7 @@ impl Executor {
 
             // OPTIMIZATION: Pre-allocate template state - clone is faster than separate smallvec! calls
             let state_template = IntGroupState {
-                agg_values: smallvec::smallvec![0.0; num_aggs],
-                agg_has_value: smallvec::smallvec![false; num_aggs],
+                sums: smallvec::smallvec![SumAccumulator::default(); num_aggs],
                 counts: smallvec::smallvec![0; num_aggs],
                 min_values: smallvec::smallvec![None; num_aggs],
                 max_values: smallvec::smallvec![None; num_aggs],
@@ -3143,18 +2861,7 @@ impl Executor {
                         }
                         SimpleAgg::Sum(sum_col_idx) | SimpleAgg::Avg(sum_col_idx) => {
                             if let Some(value) = row.get(*sum_col_idx) {
-                                // A boolean counts as one or nought
-                                let numeric = match value {
-                                    Value::Integer(v) => Some(*v as f64),
-                                    Value::Float(v) => Some(*v),
-                                    Value::Boolean(b) => Some(*b as i64 as f64),
-                                    _ => None,
-                                };
-                                if let Some(v) = numeric {
-                                    state.agg_values[i] += v;
-                                    state.agg_has_value[i] = true;
-                                    state.counts[i] += 1;
-                                }
+                                state.sums[i].add(value);
                             }
                         }
                         SimpleAgg::Min(min_col_idx) => {
@@ -3204,30 +2911,19 @@ impl Executor {
             }
 
             // Helper to check HAVING filter
-            let passes_having = |state: &IntGroupState| -> bool {
+            let passes_having = |state: &IntGroupState| -> Result<bool> {
                 if let Some(filter) = having_filter {
                     for cond in &filter.conditions {
                         let agg_value = match &simple_aggs[cond.agg_index] {
                             SimpleAgg::Count | SimpleAgg::CountColumn(_) => {
                                 Some(Cow::Owned(Value::Integer(state.counts[cond.agg_index])))
                             }
-                            SimpleAgg::Sum(_) => {
-                                if state.agg_has_value[cond.agg_index] {
-                                    Some(Cow::Owned(Value::Float(state.agg_values[cond.agg_index])))
-                                } else {
-                                    None
-                                }
-                            }
-                            SimpleAgg::Avg(_) => {
-                                if state.counts[cond.agg_index] > 0 {
-                                    Some(Cow::Owned(Value::Float(
-                                        state.agg_values[cond.agg_index]
-                                            / state.counts[cond.agg_index] as f64,
-                                    )))
-                                } else {
-                                    None
-                                }
-                            }
+                            SimpleAgg::Sum(_) => Some(state.sums[cond.agg_index].sum()?)
+                                .filter(|v| !v.is_null())
+                                .map(Cow::Owned),
+                            SimpleAgg::Avg(_) => Some(state.sums[cond.agg_index].avg())
+                                .filter(|v| !v.is_null())
+                                .map(Cow::Owned),
                             SimpleAgg::Min(_) => {
                                 state.min_values[cond.agg_index].as_ref().map(Cow::Borrowed)
                             }
@@ -3238,19 +2934,19 @@ impl Executor {
                         match agg_value {
                             Some(val) => {
                                 if !cond.matches(&val) {
-                                    return false;
+                                    return Ok(false);
                                 }
                             }
-                            None => return false,
+                            None => return Ok(false),
                         }
                     }
                 }
-                true
+                Ok(true)
             };
 
             // Helper to build row from state
             // Use CompactVec directly to avoid Vec→CompactVec conversion
-            let build_row = |key_value: Value, mut state: IntGroupState| -> Row {
+            let build_row = |key_value: Value, mut state: IntGroupState| -> Result<Row> {
                 let mut values: CompactVec<Value> =
                     CompactVec::with_capacity(1 + simple_aggs.len());
                 values.push(key_value);
@@ -3259,20 +2955,8 @@ impl Executor {
                         SimpleAgg::Count | SimpleAgg::CountColumn(_) => {
                             Value::Integer(state.counts[i])
                         }
-                        SimpleAgg::Sum(_) => {
-                            if state.agg_has_value[i] {
-                                Value::Float(state.agg_values[i])
-                            } else {
-                                Value::null_unknown()
-                            }
-                        }
-                        SimpleAgg::Avg(_) => {
-                            if state.counts[i] > 0 {
-                                Value::Float(state.agg_values[i] / state.counts[i] as f64)
-                            } else {
-                                Value::null_unknown()
-                            }
-                        }
+                        SimpleAgg::Sum(_) => state.sums[i].sum()?,
+                        SimpleAgg::Avg(_) => state.sums[i].avg(),
                         SimpleAgg::Min(_) => state.min_values[i]
                             .take()
                             .unwrap_or_else(Value::null_unknown),
@@ -3282,23 +2966,23 @@ impl Executor {
                     };
                     values.push(value);
                 }
-                Row::from_compact_vec(values)
+                Ok(Row::from_compact_vec(values))
             };
 
             // Build result rows with inline HAVING filter (supports AND combinations)
             let mut result_rows = RowVec::new();
             let mut row_id = 0i64;
             for (key, state) in groups.into_iter() {
-                if passes_having(&state) {
-                    result_rows.push((row_id, build_row(Value::Integer(key), state)));
+                if passes_having(&state)? {
+                    result_rows.push((row_id, build_row(Value::Integer(key), state)?));
                     row_id += 1;
                 }
             }
 
             // Add NULL group if it exists and passes HAVING
             if let Some(ng) = null_group {
-                if passes_having(&ng) {
-                    result_rows.push((row_id, build_row(Value::null_unknown(), ng)));
+                if passes_having(&ng)? {
+                    result_rows.push((row_id, build_row(Value::null_unknown(), ng)?));
                 }
             }
 
@@ -3313,8 +2997,7 @@ impl Executor {
 
             #[derive(Clone)]
             struct StringGroupState {
-                agg_values: AggVec<f64>,
-                agg_has_value: AggVec<bool>,
+                sums: AggVec<SumAccumulator>,
                 counts: AggVec<i64>,
                 min_values: AggVec<Option<Value>>,
                 max_values: AggVec<Option<Value>>,
@@ -3328,8 +3011,7 @@ impl Executor {
 
             // OPTIMIZATION: Pre-allocate template state - clone is faster than separate smallvec! calls
             let state_template = StringGroupState {
-                agg_values: smallvec::smallvec![0.0; num_aggs],
-                agg_has_value: smallvec::smallvec![false; num_aggs],
+                sums: smallvec::smallvec![SumAccumulator::default(); num_aggs],
                 counts: smallvec::smallvec![0; num_aggs],
                 min_values: smallvec::smallvec![None; num_aggs],
                 max_values: smallvec::smallvec![None; num_aggs],
@@ -3390,18 +3072,7 @@ impl Executor {
                         }
                         SimpleAgg::Sum(sum_col_idx) | SimpleAgg::Avg(sum_col_idx) => {
                             if let Some(value) = row.get(*sum_col_idx) {
-                                // A boolean counts as one or nought
-                                let numeric = match value {
-                                    Value::Integer(v) => Some(*v as f64),
-                                    Value::Float(v) => Some(*v),
-                                    Value::Boolean(b) => Some(*b as i64 as f64),
-                                    _ => None,
-                                };
-                                if let Some(v) = numeric {
-                                    state.agg_values[i] += v;
-                                    state.agg_has_value[i] = true;
-                                    state.counts[i] += 1;
-                                }
+                                state.sums[i].add(value);
                             }
                         }
                         SimpleAgg::Min(min_col_idx) => {
@@ -3451,30 +3122,19 @@ impl Executor {
             }
 
             // Helper to check HAVING filter
-            let passes_having = |state: &StringGroupState| -> bool {
+            let passes_having = |state: &StringGroupState| -> Result<bool> {
                 if let Some(filter) = having_filter {
                     for cond in &filter.conditions {
                         let agg_value = match &simple_aggs[cond.agg_index] {
                             SimpleAgg::Count | SimpleAgg::CountColumn(_) => {
                                 Some(Cow::Owned(Value::Integer(state.counts[cond.agg_index])))
                             }
-                            SimpleAgg::Sum(_) => {
-                                if state.agg_has_value[cond.agg_index] {
-                                    Some(Cow::Owned(Value::Float(state.agg_values[cond.agg_index])))
-                                } else {
-                                    None
-                                }
-                            }
-                            SimpleAgg::Avg(_) => {
-                                if state.counts[cond.agg_index] > 0 {
-                                    Some(Cow::Owned(Value::Float(
-                                        state.agg_values[cond.agg_index]
-                                            / state.counts[cond.agg_index] as f64,
-                                    )))
-                                } else {
-                                    None
-                                }
-                            }
+                            SimpleAgg::Sum(_) => Some(state.sums[cond.agg_index].sum()?)
+                                .filter(|v| !v.is_null())
+                                .map(Cow::Owned),
+                            SimpleAgg::Avg(_) => Some(state.sums[cond.agg_index].avg())
+                                .filter(|v| !v.is_null())
+                                .map(Cow::Owned),
                             SimpleAgg::Min(_) => {
                                 state.min_values[cond.agg_index].as_ref().map(Cow::Borrowed)
                             }
@@ -3485,19 +3145,19 @@ impl Executor {
                         match agg_value {
                             Some(val) => {
                                 if !cond.matches(&val) {
-                                    return false;
+                                    return Ok(false);
                                 }
                             }
-                            None => return false,
+                            None => return Ok(false),
                         }
                     }
                 }
-                true
+                Ok(true)
             };
 
             // Helper to build row from state
             // Use CompactVec directly to avoid Vec→CompactVec conversion
-            let build_row = |key_value: Value, mut state: StringGroupState| -> Row {
+            let build_row = |key_value: Value, mut state: StringGroupState| -> Result<Row> {
                 let mut values: CompactVec<Value> =
                     CompactVec::with_capacity(1 + simple_aggs.len());
                 values.push(key_value);
@@ -3506,20 +3166,8 @@ impl Executor {
                         SimpleAgg::Count | SimpleAgg::CountColumn(_) => {
                             Value::Integer(state.counts[i])
                         }
-                        SimpleAgg::Sum(_) => {
-                            if state.agg_has_value[i] {
-                                Value::Float(state.agg_values[i])
-                            } else {
-                                Value::null_unknown()
-                            }
-                        }
-                        SimpleAgg::Avg(_) => {
-                            if state.counts[i] > 0 {
-                                Value::Float(state.agg_values[i] / state.counts[i] as f64)
-                            } else {
-                                Value::null_unknown()
-                            }
-                        }
+                        SimpleAgg::Sum(_) => state.sums[i].sum()?,
+                        SimpleAgg::Avg(_) => state.sums[i].avg(),
                         SimpleAgg::Min(_) => state.min_values[i]
                             .take()
                             .unwrap_or_else(Value::null_unknown),
@@ -3529,23 +3177,23 @@ impl Executor {
                     };
                     values.push(value);
                 }
-                Row::from_compact_vec(values)
+                Ok(Row::from_compact_vec(values))
             };
 
             // Build result rows with inline HAVING filter
             let mut result_rows = RowVec::new();
             let mut row_id = 0i64;
             for (key, state) in groups.into_iter() {
-                if passes_having(&state) {
-                    result_rows.push((row_id, build_row(Value::Text(key), state)));
+                if passes_having(&state)? {
+                    result_rows.push((row_id, build_row(Value::Text(key), state)?));
                     row_id += 1;
                 }
             }
 
             // Add NULL group if it exists and passes HAVING
             if let Some(ng) = null_group {
-                if passes_having(&ng) {
-                    result_rows.push((row_id, build_row(Value::null_unknown(), ng)));
+                if passes_having(&ng)? {
+                    result_rows.push((row_id, build_row(Value::null_unknown(), ng)?));
                 }
             }
 
@@ -3591,8 +3239,7 @@ impl Executor {
                 let key_value = row_value.cloned().unwrap_or_else(Value::null_unknown);
                 bucket.push(SingleColGroupState {
                     key_value,
-                    agg_values: smallvec::smallvec![0.0; num_aggs],
-                    agg_has_value: smallvec::smallvec![false; num_aggs],
+                    sums: smallvec::smallvec![SumAccumulator::default(); num_aggs],
                     counts: smallvec::smallvec![0; num_aggs],
                     min_values: smallvec::smallvec![None; num_aggs],
                     max_values: smallvec::smallvec![None; num_aggs],
@@ -3616,18 +3263,7 @@ impl Executor {
                     }
                     SimpleAgg::Sum(sum_col_idx) | SimpleAgg::Avg(sum_col_idx) => {
                         if let Some(value) = row.get(*sum_col_idx) {
-                            // A boolean counts as one or nought
-                            let numeric = match value {
-                                Value::Integer(v) => Some(*v as f64),
-                                Value::Float(v) => Some(*v),
-                                Value::Boolean(b) => Some(*b as i64 as f64),
-                                _ => None,
-                            };
-                            if let Some(v) = numeric {
-                                state.agg_values[i] += v;
-                                state.agg_has_value[i] = true;
-                                state.counts[i] += 1;
-                            }
+                            state.sums[i].add(value);
                         }
                     }
                     SimpleAgg::Min(min_col_idx) => {
@@ -3692,23 +3328,12 @@ impl Executor {
                         SimpleAgg::Count | SimpleAgg::CountColumn(_) => {
                             Some(Cow::Owned(Value::Integer(state.counts[cond.agg_index])))
                         }
-                        SimpleAgg::Sum(_) => {
-                            if state.agg_has_value[cond.agg_index] {
-                                Some(Cow::Owned(Value::Float(state.agg_values[cond.agg_index])))
-                            } else {
-                                None
-                            }
-                        }
-                        SimpleAgg::Avg(_) => {
-                            if state.counts[cond.agg_index] > 0 {
-                                Some(Cow::Owned(Value::Float(
-                                    state.agg_values[cond.agg_index]
-                                        / state.counts[cond.agg_index] as f64,
-                                )))
-                            } else {
-                                None
-                            }
-                        }
+                        SimpleAgg::Sum(_) => Some(state.sums[cond.agg_index].sum()?)
+                            .filter(|v| !v.is_null())
+                            .map(Cow::Owned),
+                        SimpleAgg::Avg(_) => Some(state.sums[cond.agg_index].avg())
+                            .filter(|v| !v.is_null())
+                            .map(Cow::Owned),
                         SimpleAgg::Min(_) => {
                             state.min_values[cond.agg_index].as_ref().map(Cow::Borrowed)
                         }
@@ -3741,20 +3366,8 @@ impl Executor {
             for (i, agg) in simple_aggs.iter().enumerate() {
                 let value = match agg {
                     SimpleAgg::Count | SimpleAgg::CountColumn(_) => Value::Integer(state.counts[i]),
-                    SimpleAgg::Sum(_) => {
-                        if state.agg_has_value[i] {
-                            Value::Float(state.agg_values[i])
-                        } else {
-                            Value::null_unknown()
-                        }
-                    }
-                    SimpleAgg::Avg(_) => {
-                        if state.counts[i] > 0 {
-                            Value::Float(state.agg_values[i] / state.counts[i] as f64)
-                        } else {
-                            Value::null_unknown()
-                        }
-                    }
+                    SimpleAgg::Sum(_) => state.sums[i].sum()?,
+                    SimpleAgg::Avg(_) => state.sums[i].avg(),
                     SimpleAgg::Min(_) => state.min_values[i]
                         .take()
                         .unwrap_or_else(Value::null_unknown),
@@ -4179,7 +3792,7 @@ impl Executor {
 
                     for (i, agg) in aggregations.iter().enumerate() {
                         let value = if let Some(ref func) = agg_funcs[i] {
-                            func.result()
+                            func.result()?
                         } else if agg.name == "COUNT" && agg.column == "*" {
                             Value::Integer(group.row_indices.len() as i64)
                         } else {
@@ -4188,9 +3801,9 @@ impl Executor {
                         row_values.push(value);
                     }
 
-                    Row::from_compact_vec(row_values)
+                    Ok(Row::from_compact_vec(row_values))
                 })
-                .collect();
+                .collect::<Result<_>>()?;
             #[cfg(not(feature = "parallel"))]
             let rows_vec: Vec<Row> = groups_vec
                 .into_iter()
@@ -4238,7 +3851,7 @@ impl Executor {
 
                     for (i, agg) in aggregations.iter().enumerate() {
                         let value = if let Some(ref func) = agg_funcs[i] {
-                            func.result()
+                            func.result()?
                         } else if agg.name == "COUNT" && agg.column == "*" {
                             Value::Integer(group.row_indices.len() as i64)
                         } else {
@@ -4247,9 +3860,9 @@ impl Executor {
                         row_values.push(value);
                     }
 
-                    Row::from_compact_vec(row_values)
+                    Ok(Row::from_compact_vec(row_values))
                 })
-                .collect();
+                .collect::<Result<_>>()?;
             // Convert to RowVec with sequential IDs
             rows_vec
                 .into_iter()
@@ -4383,7 +3996,7 @@ impl Executor {
 
                 for (i, agg) in aggregations.iter().enumerate() {
                     let value = if let Some(ref func) = agg_funcs[i] {
-                        func.result()
+                        func.result()?
                     } else if agg.name == "COUNT" && agg.column == "*" {
                         Value::Integer(group.row_indices.len() as i64)
                     } else {
@@ -4616,7 +4229,7 @@ impl Executor {
                 }
                 for (i, agg) in aggregations.iter().enumerate() {
                     let value = if let Some(ref func) = agg_funcs[i] {
-                        func.result()
+                        func.result()?
                     } else if agg.name == "COUNT" && agg.column == "*" {
                         Value::Integer(rows.len() as i64)
                     } else {
@@ -4793,7 +4406,7 @@ impl Executor {
 
                         for (i, agg) in aggregations.iter().enumerate() {
                             let value = if let Some(ref func) = agg_funcs[i] {
-                                func.result()
+                                func.result()?
                             } else if agg.name == "COUNT" && agg.column == "*" {
                                 Value::Integer(group.row_indices.len() as i64)
                             } else {
@@ -5048,287 +4661,30 @@ impl Executor {
         )))
     }
 
-    /// Fast SUM implementation that bypasses the generic aggregate function
-    /// Uses loop unrolling for better performance
-    #[inline]
-    fn fast_sum_column(&self, rows: &[(i64, Row)], col_idx: usize) -> Value {
-        if rows.is_empty() {
-            return Value::null_unknown();
-        }
-
-        // Use parallel processing for large datasets
-        #[cfg(feature = "parallel")]
-        if rows.len() >= 10_000 {
-            return self.fast_sum_column_parallel(rows, col_idx);
-        }
-
-        let mut sum_int: i64 = 0;
-        let mut sum_float: f64 = 0.0;
-        let mut has_float = false;
-        let mut has_value = false;
-
-        // Unroll loop by 4 for better CPU pipelining.
-        let (chunks, remainder) = rows.as_chunks::<4>();
-
-        for chunk in chunks {
+    /// The SUM of one column over materialized rows, for SUM and AVG to
+    /// read; large inputs sum their chunks in parallel and merge them
+    fn sum_column_rows(rows: &[(i64, Row)], col_idx: usize) -> SumAccumulator {
+        let sum_chunk = |chunk: &[(i64, Row)]| {
+            let mut sum = SumAccumulator::default();
             for (_, row) in chunk {
-                if let Some(val) = row.get(col_idx) {
-                    match val {
-                        Value::Integer(i) => {
-                            has_value = true;
-                            if has_float {
-                                sum_float += *i as f64;
-                            } else {
-                                sum_int += i;
-                            }
-                        }
-                        // A boolean counts as one or nought
-                        Value::Boolean(b) => {
-                            has_value = true;
-                            if has_float {
-                                sum_float += *b as i64 as f64;
-                            } else {
-                                sum_int += *b as i64;
-                            }
-                        }
-                        Value::Float(f) => {
-                            has_value = true;
-                            if !has_float {
-                                has_float = true;
-                                sum_float = sum_int as f64;
-                            }
-                            sum_float += f;
-                        }
-                        _ => {}
-                    }
+                if let Some(value) = row.get(col_idx) {
+                    sum.add(value);
                 }
             }
-        }
-
-        // Handle remainder
-        for (_, row) in remainder {
-            if let Some(val) = row.get(col_idx) {
-                match val {
-                    Value::Integer(i) => {
-                        has_value = true;
-                        if has_float {
-                            sum_float += *i as f64;
-                        } else {
-                            sum_int += i;
-                        }
-                    }
-                    Value::Boolean(b) => {
-                        has_value = true;
-                        if has_float {
-                            sum_float += *b as i64 as f64;
-                        } else {
-                            sum_int += *b as i64;
-                        }
-                    }
-                    Value::Float(f) => {
-                        has_value = true;
-                        if !has_float {
-                            has_float = true;
-                            sum_float = sum_int as f64;
-                        }
-                        sum_float += f;
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        if !has_value {
-            Value::null_unknown()
-        } else if has_float {
-            Value::Float(sum_float)
-        } else {
-            Value::Integer(sum_int)
-        }
-    }
-
-    /// Parallel SUM implementation using Rayon
-    #[cfg(feature = "parallel")]
-    #[inline]
-    fn fast_sum_column_parallel(&self, rows: &[(i64, Row)], col_idx: usize) -> Value {
-        let chunk_size = (rows.len() / rayon::current_num_threads()).max(1000);
-
-        // Process in parallel, collecting (sum_int, sum_float, has_float, has_value)
-        let results: Vec<(i64, f64, bool, bool)> = rows
-            .par_chunks(chunk_size)
-            .map(|chunk| {
-                let mut sum_int: i64 = 0;
-                let mut sum_float: f64 = 0.0;
-                let mut has_float = false;
-                let mut has_value = false;
-
-                for (_, row) in chunk {
-                    if let Some(val) = row.get(col_idx) {
-                        match val {
-                            Value::Integer(i) => {
-                                has_value = true;
-                                if has_float {
-                                    sum_float += *i as f64;
-                                } else {
-                                    sum_int += i;
-                                }
-                            }
-                            Value::Boolean(b) => {
-                                has_value = true;
-                                if has_float {
-                                    sum_float += *b as i64 as f64;
-                                } else {
-                                    sum_int += *b as i64;
-                                }
-                            }
-                            Value::Float(f) => {
-                                has_value = true;
-                                if !has_float {
-                                    has_float = true;
-                                    sum_float = sum_int as f64;
-                                }
-                                sum_float += f;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-
-                (sum_int, sum_float, has_float, has_value)
-            })
-            .collect();
-
-        // Merge results
-        let mut total_int: i64 = 0;
-        let mut total_float: f64 = 0.0;
-        let mut any_float = false;
-        let mut any_value = false;
-
-        for (si, sf, hf, hv) in results {
-            if hv {
-                any_value = true;
-                if hf || any_float {
-                    any_float = true;
-                    if hf {
-                        total_float += sf;
-                    } else {
-                        total_float += si as f64;
-                    }
-                } else {
-                    total_int += si;
-                }
-            }
-        }
-
-        // If we switched to float mid-way, add the integer total
-        if any_float && total_int != 0 {
-            total_float += total_int as f64;
-        }
-
-        if !any_value {
-            Value::null_unknown()
-        } else if any_float {
-            Value::Float(total_float)
-        } else {
-            Value::Integer(total_int)
-        }
-    }
-
-    /// Fast AVG implementation
-    #[inline]
-    fn fast_avg_column(&self, rows: &[(i64, Row)], col_idx: usize) -> Value {
-        if rows.is_empty() {
-            return Value::null_unknown();
-        }
-
-        // Use parallel processing for large datasets
+            sum
+        };
         #[cfg(feature = "parallel")]
         if rows.len() >= 10_000 {
-            return self.fast_avg_column_parallel(rows, col_idx);
+            let chunk_size = (rows.len() / rayon::current_num_threads()).max(1000);
+            return rows.par_chunks(chunk_size).map(sum_chunk).reduce(
+                SumAccumulator::default,
+                |mut total, part| {
+                    total.merge(&part);
+                    total
+                },
+            );
         }
-
-        let mut sum: f64 = 0.0;
-        let mut count: i64 = 0;
-
-        for (_, row) in rows {
-            if let Some(val) = row.get(col_idx) {
-                match val {
-                    Value::Integer(i) => {
-                        sum += *i as f64;
-                        count += 1;
-                    }
-                    Value::Float(f) => {
-                        sum += f;
-                        count += 1;
-                    }
-                    // A boolean counts as one or nought
-                    Value::Boolean(b) => {
-                        sum += *b as i64 as f64;
-                        count += 1;
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        if count == 0 {
-            Value::null_unknown()
-        } else {
-            Value::Float(sum / count as f64)
-        }
-    }
-
-    /// Parallel AVG implementation
-    #[cfg(feature = "parallel")]
-    #[inline]
-    fn fast_avg_column_parallel(&self, rows: &[(i64, Row)], col_idx: usize) -> Value {
-        let chunk_size = (rows.len() / rayon::current_num_threads()).max(1000);
-
-        // Process in parallel, collecting (sum, count)
-        let results: Vec<(f64, i64)> = rows
-            .par_chunks(chunk_size)
-            .map(|chunk| {
-                let mut sum: f64 = 0.0;
-                let mut count: i64 = 0;
-
-                for (_, row) in chunk {
-                    if let Some(val) = row.get(col_idx) {
-                        match val {
-                            Value::Integer(i) => {
-                                sum += *i as f64;
-                                count += 1;
-                            }
-                            Value::Float(f) => {
-                                sum += f;
-                                count += 1;
-                            }
-                            Value::Boolean(b) => {
-                                sum += *b as i64 as f64;
-                                count += 1;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-
-                (sum, count)
-            })
-            .collect();
-
-        // Merge results
-        let mut total_sum: f64 = 0.0;
-        let mut total_count: i64 = 0;
-
-        for (s, c) in results {
-            total_sum += s;
-            total_count += c;
-        }
-
-        if total_count == 0 {
-            Value::null_unknown()
-        } else {
-            Value::Float(total_sum / total_count as f64)
-        }
+        sum_chunk(rows)
     }
 
     /// Check if an expression is a PURE aggregate function call.
@@ -5478,18 +4834,8 @@ impl Executor {
                 "SUM" => {
                     let col_idx = col_index_map.get(&agg.column_lower).copied();
                     if let Some(idx) = col_idx {
-                        if let Some((sum, count)) = table.sum_column(idx)? {
-                            if count == 0 {
-                                result_values.push(Value::null(crate::core::DataType::Float));
-                            } else {
-                                // Check if result should be integer or float
-                                // For now, return as float if it has decimal part
-                                if sum.fract() == 0.0 && sum.abs() < i64::MAX as f64 {
-                                    result_values.push(Value::Integer(sum as i64));
-                                } else {
-                                    result_values.push(Value::Float(sum));
-                                }
-                            }
+                        if let Some(sum) = table.sum_column(idx)? {
+                            result_values.push(sum.sum()?);
                         } else {
                             return Ok(None); // Pushdown not available
                         }
@@ -5500,12 +4846,8 @@ impl Executor {
                 "AVG" => {
                     let col_idx = col_index_map.get(&agg.column_lower).copied();
                     if let Some(idx) = col_idx {
-                        if let Some((sum, count)) = table.avg_column(idx)? {
-                            if count == 0 {
-                                result_values.push(Value::null(crate::core::DataType::Float));
-                            } else {
-                                result_values.push(Value::Float(sum / count as f64));
-                            }
+                        if let Some(sum) = table.avg_column(idx)? {
+                            result_values.push(sum.avg());
                         } else {
                             return Ok(None); // Pushdown not available
                         }
@@ -5871,38 +5213,14 @@ impl Executor {
                             None
                         }
                     }
-                    "SUM" => {
-                        if let Some(idx) = col_idx {
-                            if let Some((sum, count)) = table.sum_column(idx)? {
-                                if count == 0 {
-                                    Some(Value::null(crate::core::DataType::Float))
-                                } else if sum.fract() == 0.0 && sum.abs() < i64::MAX as f64 {
-                                    Some(Value::Integer(sum as i64))
-                                } else {
-                                    Some(Value::Float(sum))
-                                }
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    }
-                    "AVG" => {
-                        if let Some(idx) = col_idx {
-                            if let Some((sum, count)) = table.avg_column(idx)? {
-                                if count == 0 {
-                                    Some(Value::null(crate::core::DataType::Float))
-                                } else {
-                                    Some(Value::Float(sum / count as f64))
-                                }
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    }
+                    "SUM" => match col_idx {
+                        Some(idx) => table.sum_column(idx)?.map(|sum| sum.sum()).transpose()?,
+                        None => None,
+                    },
+                    "AVG" => match col_idx {
+                        Some(idx) => table.avg_column(idx)?.map(|sum| sum.avg()),
+                        None => None,
+                    },
                     "MIN" => match col_idx {
                         Some(idx) => table.min_column(idx)?.map(|min_opt| {
                             min_opt.unwrap_or_else(|| Value::null(crate::core::DataType::Integer))
@@ -5962,7 +5280,7 @@ impl Executor {
         // SLOW PATH: Fall back to scanner-based streaming
         // Initialize aggregate states
         struct AggState {
-            sum: f64,
+            sum: SumAccumulator,
             count: i64,
             min: Option<Value>,
             max: Option<Value>,
@@ -5972,7 +5290,7 @@ impl Executor {
         let mut states: Vec<AggState> = aggregations
             .iter()
             .map(|agg| AggState {
-                sum: 0.0,
+                sum: SumAccumulator::default(),
                 count: 0,
                 min: None,
                 max: None,
@@ -6032,17 +5350,7 @@ impl Executor {
                     "COUNT" => {
                         state.count += 1;
                     }
-                    "SUM" | "AVG" => {
-                        let num = match value {
-                            Value::Integer(i) => *i as f64,
-                            Value::Float(f) => *f,
-                            // A boolean counts as one or nought
-                            Value::Boolean(b) => *b as i64 as f64,
-                            _ => continue,
-                        };
-                        state.sum += num;
-                        state.count += 1;
-                    }
+                    "SUM" | "AVG" => state.sum.add(value),
                     "MIN" => {
                         let is_smaller = match (&state.min, value) {
                             (None, _) => true,
@@ -6089,22 +5397,8 @@ impl Executor {
 
             let value = match agg.name.as_str() {
                 "COUNT" => Value::Integer(state.count),
-                "SUM" => {
-                    if state.count == 0 {
-                        Value::null(crate::core::DataType::Float)
-                    } else if state.sum.fract() == 0.0 && state.sum.abs() < i64::MAX as f64 {
-                        Value::Integer(state.sum as i64)
-                    } else {
-                        Value::Float(state.sum)
-                    }
-                }
-                "AVG" => {
-                    if state.count == 0 {
-                        Value::null(crate::core::DataType::Float)
-                    } else {
-                        Value::Float(state.sum / state.count as f64)
-                    }
-                }
+                "SUM" => state.sum.sum()?,
+                "AVG" => state.sum.avg(),
                 "MIN" => state
                     .min
                     .clone()
@@ -6306,8 +5600,7 @@ impl Executor {
 
         #[derive(Clone)]
         struct StreamGroupState {
-            agg_values: AggVec<f64>,
-            agg_has_value: AggVec<bool>,
+            sums: AggVec<SumAccumulator>,
             counts: AggVec<i64>,
             min_values: AggVec<Option<Value>>,
             max_values: AggVec<Option<Value>>,
@@ -6315,8 +5608,7 @@ impl Executor {
 
         // Template for new group state
         let state_template = StreamGroupState {
-            agg_values: smallvec::smallvec![0.0; num_aggs],
-            agg_has_value: smallvec::smallvec![false; num_aggs],
+            sums: smallvec::smallvec![SumAccumulator::default(); num_aggs],
             counts: smallvec::smallvec![0; num_aggs],
             min_values: smallvec::smallvec![None; num_aggs],
             max_values: smallvec::smallvec![None; num_aggs],
@@ -6420,24 +5712,7 @@ impl Executor {
                             }
                             SimpleAgg::Sum(col_idx) | SimpleAgg::Avg(col_idx) => {
                                 if let Some(value) = row.get(*col_idx) {
-                                    match value {
-                                        Value::Integer(v) => {
-                                            state.agg_values[i] += *v as f64;
-                                            state.agg_has_value[i] = true;
-                                            state.counts[i] += 1;
-                                        }
-                                        Value::Float(v) => {
-                                            state.agg_values[i] += v;
-                                            state.agg_has_value[i] = true;
-                                            state.counts[i] += 1;
-                                        }
-                                        Value::Boolean(v) => {
-                                            state.agg_values[i] += *v as i64 as f64;
-                                            state.agg_has_value[i] = true;
-                                            state.counts[i] += 1;
-                                        }
-                                        _ => {}
-                                    }
+                                    state.sums[i].add(value);
                                 }
                             }
                             SimpleAgg::Min(col_idx) => {
@@ -6483,7 +5758,7 @@ impl Executor {
             }
 
             // Build result rows
-            let build_row = |key_value: Value, state: StreamGroupState| -> Row {
+            let build_row = |key_value: Value, state: StreamGroupState| -> Result<Row> {
                 let mut values: crate::common::CompactVec<Value> =
                     crate::common::CompactVec::with_capacity(1 + simple_aggs.len());
                 values.push(key_value);
@@ -6492,26 +5767,8 @@ impl Executor {
                         SimpleAgg::Count | SimpleAgg::CountColumn(_) => {
                             Value::Integer(state.counts[i])
                         }
-                        SimpleAgg::Sum(_) => {
-                            if state.agg_has_value[i] {
-                                if state.agg_values[i].fract() == 0.0
-                                    && state.agg_values[i].abs() < i64::MAX as f64
-                                {
-                                    Value::Integer(state.agg_values[i] as i64)
-                                } else {
-                                    Value::Float(state.agg_values[i])
-                                }
-                            } else {
-                                Value::null(crate::core::DataType::Float)
-                            }
-                        }
-                        SimpleAgg::Avg(_) => {
-                            if state.counts[i] > 0 {
-                                Value::Float(state.agg_values[i] / state.counts[i] as f64)
-                            } else {
-                                Value::null(crate::core::DataType::Float)
-                            }
-                        }
+                        SimpleAgg::Sum(_) => state.sums[i].sum()?,
+                        SimpleAgg::Avg(_) => state.sums[i].avg(),
                         SimpleAgg::Min(_) => state.min_values[i]
                             .clone()
                             .unwrap_or_else(|| Value::null(crate::core::DataType::Integer)),
@@ -6521,17 +5778,17 @@ impl Executor {
                     };
                     values.push(value);
                 }
-                Row::from_compact_vec(values)
+                Ok(Row::from_compact_vec(values))
             };
 
             let mut result_rows = RowVec::with_capacity(groups.len() + 1);
             let mut row_id = 0i64;
             for (key, state) in groups.into_iter() {
-                result_rows.push((row_id, build_row(Value::Text(key), state)));
+                result_rows.push((row_id, build_row(Value::Text(key), state)?));
                 row_id += 1;
             }
             if let Some(ng) = null_group {
-                result_rows.push((row_id, build_row(Value::null_unknown(), ng)));
+                result_rows.push((row_id, build_row(Value::null_unknown(), ng)?));
             }
 
             let slots = AggregateSlots {

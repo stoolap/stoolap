@@ -14,7 +14,7 @@
 
 //! ARRAY_AGG aggregate function
 
-use crate::core::Value;
+use crate::core::{Result, Value};
 use crate::functions::{
     AggregateFunction, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType,
 };
@@ -119,7 +119,7 @@ impl AggregateFunction for ArrayAggFunction {
         });
     }
 
-    fn result(&self) -> Value {
+    fn result(&self) -> Result<Value> {
         // Get the values to output, potentially sorted
         let values_to_output: Vec<&Value> = if self.has_order_by && !self.ordered_entries.is_empty()
         {
@@ -136,11 +136,11 @@ impl AggregateFunction for ArrayAggFunction {
             // Has ordered entries but no ORDER BY configured - use insertion order
             self.ordered_entries.iter().map(|e| &e.value).collect()
         } else {
-            return Value::null_unknown();
+            return Ok(Value::null_unknown());
         };
 
         if values_to_output.is_empty() {
-            return Value::null_unknown();
+            return Ok(Value::null_unknown());
         }
 
         // Convert values to JSON array format
@@ -168,7 +168,7 @@ impl AggregateFunction for ArrayAggFunction {
                 }
             })
             .collect();
-        Value::text(format!("[{}]", json_elements.join(",")))
+        Ok(Value::text(format!("[{}]", json_elements.join(","))))
     }
 
     fn reset(&mut self) {
@@ -193,7 +193,7 @@ mod tests {
         agg.accumulate(&Value::Integer(1), false);
         agg.accumulate(&Value::Integer(2), false);
         agg.accumulate(&Value::Integer(3), false);
-        assert_eq!(agg.result(), Value::text("[1,2,3]"));
+        assert_eq!(agg.result().unwrap(), Value::text("[1,2,3]"));
     }
 
     #[test]
@@ -202,7 +202,7 @@ mod tests {
         agg.accumulate(&Value::text("a"), false);
         agg.accumulate(&Value::text("b"), false);
         agg.accumulate(&Value::text("c"), false);
-        assert_eq!(agg.result(), Value::text("[\"a\",\"b\",\"c\"]"));
+        assert_eq!(agg.result().unwrap(), Value::text("[\"a\",\"b\",\"c\"]"));
     }
 
     #[test]
@@ -211,7 +211,7 @@ mod tests {
         agg.accumulate(&Value::Integer(1), false);
         agg.accumulate(&Value::null_unknown(), false);
         agg.accumulate(&Value::Integer(3), false);
-        assert_eq!(agg.result(), Value::text("[1,3]"));
+        assert_eq!(agg.result().unwrap(), Value::text("[1,3]"));
     }
 
     #[test]
@@ -221,13 +221,13 @@ mod tests {
         agg.accumulate(&Value::Integer(2), true);
         agg.accumulate(&Value::Integer(1), true); // duplicate
         agg.accumulate(&Value::Integer(3), true);
-        assert_eq!(agg.result(), Value::text("[1,2,3]"));
+        assert_eq!(agg.result().unwrap(), Value::text("[1,2,3]"));
     }
 
     #[test]
     fn test_array_agg_empty() {
         let agg = ArrayAggFunction::default();
-        assert!(agg.result().is_null());
+        assert!(agg.result().unwrap().is_null());
     }
 
     #[test]
@@ -237,7 +237,7 @@ mod tests {
         agg.accumulate(&Value::Integer(42), false);
         agg.accumulate(&Value::Float(3.5), false);
         agg.accumulate(&Value::Boolean(true), false);
-        assert_eq!(agg.result(), Value::text("[\"str\",42,3.5,true]"));
+        assert_eq!(agg.result().unwrap(), Value::text("[\"str\",42,3.5,true]"));
     }
 
     #[test]
@@ -246,6 +246,6 @@ mod tests {
         agg.accumulate(&Value::Integer(1), false);
         agg.accumulate(&Value::Integer(2), false);
         agg.reset();
-        assert!(agg.result().is_null());
+        assert!(agg.result().unwrap().is_null());
     }
 }

@@ -14,7 +14,7 @@
 
 //! FIRST aggregate function
 
-use crate::core::Value;
+use crate::core::{Result, Value};
 use crate::functions::{
     AggregateFunction, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType,
 };
@@ -92,14 +92,14 @@ impl AggregateFunction for FirstFunction {
         }
     }
 
-    fn result(&self) -> Value {
+    fn result(&self) -> Result<Value> {
         if self.has_order_by {
             if let Some(ref entry) = self.best_entry {
-                return entry.value.clone();
+                return Ok(entry.value.clone());
             }
         }
 
-        self.first_value.clone().unwrap_or_else(Value::null_unknown)
+        Ok(self.first_value.clone().unwrap_or_else(Value::null_unknown))
     }
 
     fn reset(&mut self) {
@@ -122,7 +122,7 @@ mod tests {
         first.accumulate(&Value::Integer(1), false);
         first.accumulate(&Value::Integer(2), false);
         first.accumulate(&Value::Integer(3), false);
-        assert_eq!(first.result(), Value::Integer(1));
+        assert_eq!(first.result().unwrap(), Value::Integer(1));
     }
 
     #[test]
@@ -132,13 +132,13 @@ mod tests {
         first.accumulate(&Value::null_unknown(), false);
         first.accumulate(&Value::Integer(3), false);
         first.accumulate(&Value::Integer(4), false);
-        assert_eq!(first.result(), Value::Integer(3));
+        assert_eq!(first.result().unwrap(), Value::Integer(3));
     }
 
     #[test]
     fn test_first_empty() {
         let first = FirstFunction::default();
-        assert!(first.result().is_null());
+        assert!(first.result().unwrap().is_null());
     }
 
     #[test]
@@ -146,7 +146,7 @@ mod tests {
         let mut first = FirstFunction::default();
         first.accumulate(&Value::null_unknown(), false);
         first.accumulate(&Value::null_unknown(), false);
-        assert!(first.result().is_null());
+        assert!(first.result().unwrap().is_null());
     }
 
     #[test]
@@ -155,7 +155,7 @@ mod tests {
         first.accumulate(&Value::Integer(1), false);
         first.reset();
         first.accumulate(&Value::Integer(5), false);
-        assert_eq!(first.result(), Value::Integer(5));
+        assert_eq!(first.result().unwrap(), Value::Integer(5));
     }
 
     #[test]
@@ -163,7 +163,7 @@ mod tests {
         let mut first = FirstFunction::default();
         first.accumulate(&Value::text("hello"), false);
         first.accumulate(&Value::text("world"), false);
-        assert_eq!(first.result(), Value::text("hello"));
+        assert_eq!(first.result().unwrap(), Value::text("hello"));
     }
 
     #[test]
@@ -177,7 +177,7 @@ mod tests {
         first.accumulate_with_sort_key(&Value::text("a_val"), vec![Value::Integer(1)], false);
         first.accumulate_with_sort_key(&Value::text("b_val"), vec![Value::Integer(2)], false);
         // ASC order: key 1 is first, so value should be "a_val"
-        assert_eq!(first.result(), Value::text("a_val"));
+        assert_eq!(first.result().unwrap(), Value::text("a_val"));
     }
 
     #[test]
@@ -191,6 +191,6 @@ mod tests {
         first.accumulate_with_sort_key(&Value::text("a_val"), vec![Value::Integer(1)], false);
         first.accumulate_with_sort_key(&Value::text("b_val"), vec![Value::Integer(2)], false);
         // DESC order: key 3 is first, so value should be "c_val"
-        assert_eq!(first.result(), Value::text("c_val"));
+        assert_eq!(first.result().unwrap(), Value::text("c_val"));
     }
 }

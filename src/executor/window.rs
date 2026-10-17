@@ -4243,7 +4243,7 @@ impl Executor {
                         if frame_end > prev_end {
                             prev_end = frame_end;
                         }
-                        results[row_idx] = Some(agg_func.result());
+                        results[row_idx] = Some(agg_func.result()?);
                     }
                 } else {
                     for (i, &row_idx) in row_indices.iter().enumerate() {
@@ -4487,7 +4487,7 @@ impl Executor {
                                 is_distinct,
                             );
                         }
-                        results[row_idx] = Some(agg_func.result());
+                        results[row_idx] = Some(agg_func.result()?);
                     }
                 } // end of else (non-incremental path)
             } else {
@@ -4520,7 +4520,7 @@ impl Executor {
                         is_distinct,
                     );
                 }
-                let aggregate_result = agg_func.result();
+                let aggregate_result = agg_func.result()?;
 
                 // Assign the same aggregate result to all rows in the partition
                 for &row_idx in row_indices {

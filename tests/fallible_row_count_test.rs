@@ -174,7 +174,7 @@ fn assert_sum_reload_failure(aggregate: impl Fn(&SegmentedTable) -> String) {
         let expected = table
             .segment_manager()
             .get_volumes_newest_first()
-            .map(|_| Some((0.0, 0_usize)));
+            .map(|_| Some(String::new()));
         assert!(expected
             .as_ref()
             .unwrap_err()
@@ -184,17 +184,23 @@ fn assert_sum_reload_failure(aggregate: impl Fn(&SegmentedTable) -> String) {
     }
     std::fs::write(&path, bytes).unwrap();
     let restored = aggregate(&table);
-    assert!(restored == "Some((20.0, 1))" || restored == "Ok(Some((20.0, 1)))");
+    assert_eq!(restored, "Ok(Some(\"20 of 1\"))");
+}
+
+/// The sum and its count as text, or the error
+fn sum_text(sum: stoolap::Result<Option<stoolap::core::SumAccumulator>>) -> String {
+    let text = sum.map(|sum| sum.map(|sum| format!("{} of {}", sum.sum().unwrap(), sum.count())));
+    format!("{text:?}")
 }
 
 #[test]
 fn sum_propagates_cold_reload_failure() {
-    assert_sum_reload_failure(|table| format!("{:?}", table.sum_column(1)));
+    assert_sum_reload_failure(|table| sum_text(table.sum_column(1)));
 }
 
 #[test]
 fn avg_propagates_cold_reload_failure() {
-    assert_sum_reload_failure(|table| format!("{:?}", table.avg_column(1)));
+    assert_sum_reload_failure(|table| sum_text(table.avg_column(1)));
 }
 
 fn assert_optional_reload_failure(
@@ -426,11 +432,8 @@ fn sum_and_avg_use_resident_stats_without_reloading() {
     let dir = tempfile::tempdir().unwrap();
     let (table, path) = cold_table(dir.path(), false);
     std::fs::remove_file(&path).unwrap();
-    for result in [
-        format!("{:?}", table.sum_column(1)),
-        format!("{:?}", table.avg_column(1)),
-    ] {
-        assert!(result == "Some((30.0, 2))" || result == "Ok(Some((30.0, 2)))");
+    for result in [sum_text(table.sum_column(1)), sum_text(table.avg_column(1))] {
+        assert_eq!(result, "Ok(Some(\"30 of 2\"))");
     }
     assert!(table.segment_manager().segments_raw()[&1].volume.is_cold());
 }

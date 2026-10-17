@@ -8067,7 +8067,7 @@ impl Executor {
                 values.push(first.get(idx).cloned().unwrap_or_else(Value::null_unknown));
             }
             for func in funcs.iter() {
-                values.push(func.result());
+                values.push(func.result()?);
             }
             let row = Row::from_values(values);
             if let Some(having) = &having {
@@ -12337,10 +12337,9 @@ impl Executor {
         #[derive(Clone, Copy)]
         enum StreamingAgg {
             Count,
-            Sum(usize), // column index
-            Avg(usize), // column index (computed as sum/count)
-            Min(usize), // column index
-            Max(usize), // column index
+            Sum(usize),    // SUM over this column index
+            Avg(usize),    // AVG over this column index
+            Column(usize), // MIN or MAX over this column index
         }
 
         let mut simple_aggs: Vec<StreamingAgg> = Vec::with_capacity(aggregations.len());
@@ -12365,15 +12364,11 @@ impl Executor {
                     let col_idx = all_columns
                         .iter()
                         .position(|c| c.eq_ignore_ascii_case(col_name));
-                    match col_idx {
-                        Some(idx) => match func_name.as_str() {
-                            "SUM" => simple_aggs.push(StreamingAgg::Sum(idx)),
-                            "AVG" => simple_aggs.push(StreamingAgg::Avg(idx)),
-                            "MIN" => simple_aggs.push(StreamingAgg::Min(idx)),
-                            "MAX" => simple_aggs.push(StreamingAgg::Max(idx)),
-                            _ => unreachable!(),
-                        },
-                        None => return Ok(None),
+                    match (col_idx, func_name.as_str()) {
+                        (Some(idx), "SUM") => simple_aggs.push(StreamingAgg::Sum(idx)),
+                        (Some(idx), "AVG") => simple_aggs.push(StreamingAgg::Avg(idx)),
+                        (Some(idx), _) => simple_aggs.push(StreamingAgg::Column(idx)),
+                        (None, _) => return Ok(None),
                     }
                 }
                 _ => return Ok(None), // Unsupported aggregate (STDDEV, VARIANCE, etc.)
@@ -12435,33 +12430,27 @@ impl Executor {
         let true_expr = ConstBoolExpr::true_expr();
 
         // MIN and MAX by the aggregate functions every other path runs, so
-        // each type orders and answers as it does there; one per slot,
-        // reset for each group
-        let mut extremes: Vec<Option<Box<dyn crate::functions::AggregateFunction>>> =
+        // each type orders and answers as it does there; one per slot, reset
+        // for each group
+        let mut functions: Vec<Option<Box<dyn crate::functions::AggregateFunction>>> =
             Vec::with_capacity(num_aggs);
-        for agg in &simple_aggs {
-            extremes.push(match agg {
-                StreamingAgg::Min(_) | StreamingAgg::Max(_) => {
-                    let name = if matches!(agg, StreamingAgg::Min(_)) {
-                        "MIN"
-                    } else {
-                        "MAX"
-                    };
-                    match self.function_registry.get_aggregate(name) {
-                        Some(function) => Some(function),
-                        None => return Ok(None),
-                    }
-                }
+        for (agg, sql) in simple_aggs.iter().zip(&aggregations) {
+            functions.push(match agg {
+                StreamingAgg::Column(_) => match self.function_registry.get_aggregate(&sql.name) {
+                    Some(function) => Some(function),
+                    None => return Ok(None),
+                },
                 _ => None,
             });
         }
+        // SUM and AVG by the one accumulator, reset for each group
+        let mut sums = vec![crate::core::SumAccumulator::default(); num_aggs];
 
         let mut aggregate = |group_value: &Value, row_ids: GroupIds<'_>| -> Result<bool> {
-            // Aggregate state: sums for SUM/AVG, counts; MIN and MAX in `extremes`
-            let mut agg_sums = vec![0.0f64; num_aggs];
-            let mut agg_has_value = vec![false; num_aggs];
+            // COUNT(*) counts rows
             let mut counts = vec![0i64; num_aggs];
-            for function in extremes.iter_mut().flatten() {
+            sums.fill(crate::core::SumAccumulator::default());
+            for function in functions.iter_mut().flatten() {
                 function.reset();
             }
 
@@ -12482,24 +12471,12 @@ impl Executor {
                                 }
                                 StreamingAgg::Sum(col_idx) | StreamingAgg::Avg(col_idx) => {
                                     if let Some(value) = row.get(*col_idx) {
-                                        // A boolean counts as one or nought,
-                                        // as the aggregate itself reads it
-                                        let numeric = match value {
-                                            Value::Integer(v) => Some(*v as f64),
-                                            Value::Float(v) => Some(*v),
-                                            Value::Boolean(b) => Some(*b as i64 as f64),
-                                            _ => None,
-                                        };
-                                        if let Some(v) = numeric {
-                                            agg_sums[i] += v;
-                                            counts[i] += 1;
-                                            agg_has_value[i] = true;
-                                        }
+                                        sums[i].add(value);
                                     }
                                 }
-                                StreamingAgg::Min(col_idx) | StreamingAgg::Max(col_idx) => {
+                                StreamingAgg::Column(col_idx) => {
                                     if let (Some(value), Some(function)) =
-                                        (row.get(*col_idx), extremes[i].as_mut())
+                                        (row.get(*col_idx), functions[i].as_mut())
                                     {
                                         function.accumulate(value, false);
                                     }
@@ -12524,23 +12501,12 @@ impl Executor {
             for (i, agg) in simple_aggs.iter().enumerate() {
                 let value = match agg {
                     StreamingAgg::Count => Value::Integer(counts[i]),
-                    StreamingAgg::Sum(_) => {
-                        if agg_has_value[i] {
-                            Value::Float(agg_sums[i])
-                        } else {
-                            Value::null_unknown()
-                        }
-                    }
-                    StreamingAgg::Avg(_) => {
-                        if agg_has_value[i] && counts[i] > 0 {
-                            Value::Float(agg_sums[i] / counts[i] as f64)
-                        } else {
-                            Value::null_unknown()
-                        }
-                    }
-                    StreamingAgg::Min(_) | StreamingAgg::Max(_) => extremes[i]
-                        .as_ref()
-                        .map_or_else(Value::null_unknown, |function| function.result()),
+                    StreamingAgg::Sum(_) => sums[i].sum()?,
+                    StreamingAgg::Avg(_) => sums[i].avg(),
+                    StreamingAgg::Column(_) => match functions[i].as_ref() {
+                        Some(function) => function.result()?,
+                        None => Value::null_unknown(),
+                    },
                 };
                 values.push(value);
             }

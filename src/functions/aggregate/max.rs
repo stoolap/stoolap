@@ -15,7 +15,7 @@
 //! MAX aggregate function
 
 use crate::core::value::compare_floats;
-use crate::core::Value;
+use crate::core::{Result, Value};
 use crate::functions::{
     AggregateFunction, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType,
 };
@@ -66,8 +66,8 @@ impl AggregateFunction for MaxFunction {
         }
     }
 
-    fn result(&self) -> Value {
-        self.max_value.clone().unwrap_or_else(Value::null_unknown)
+    fn result(&self) -> Result<Value> {
+        Ok(self.max_value.clone().unwrap_or_else(Value::null_unknown))
     }
 
     fn reset(&mut self) {
@@ -106,7 +106,7 @@ mod tests {
         max.accumulate(&Value::Integer(5), false);
         max.accumulate(&Value::Integer(2), false);
         max.accumulate(&Value::Integer(8), false);
-        assert_eq!(max.result(), Value::Integer(8));
+        assert_eq!(max.result().unwrap(), Value::Integer(8));
     }
 
     #[test]
@@ -115,7 +115,7 @@ mod tests {
         max.accumulate(&Value::Float(5.5), false);
         max.accumulate(&Value::Float(2.2), false);
         max.accumulate(&Value::Float(8.8), false);
-        assert_eq!(max.result(), Value::Float(8.8));
+        assert_eq!(max.result().unwrap(), Value::Float(8.8));
     }
 
     #[test]
@@ -124,7 +124,7 @@ mod tests {
         max.accumulate(&Value::text("banana"), false);
         max.accumulate(&Value::text("apple"), false);
         max.accumulate(&Value::text("cherry"), false);
-        assert_eq!(max.result(), Value::text("cherry"));
+        assert_eq!(max.result().unwrap(), Value::text("cherry"));
     }
 
     #[test]
@@ -133,13 +133,13 @@ mod tests {
         max.accumulate(&Value::Integer(5), false);
         max.accumulate(&Value::null_unknown(), false);
         max.accumulate(&Value::Integer(2), false);
-        assert_eq!(max.result(), Value::Integer(5));
+        assert_eq!(max.result().unwrap(), Value::Integer(5));
     }
 
     #[test]
     fn test_max_empty() {
         let max = MaxFunction::default();
-        assert!(max.result().is_null());
+        assert!(max.result().unwrap().is_null());
     }
 
     #[test]
@@ -148,14 +148,14 @@ mod tests {
         max.accumulate(&Value::Integer(5), false);
         max.accumulate(&Value::Integer(8), false);
         max.reset();
-        assert!(max.result().is_null());
+        assert!(max.result().unwrap().is_null());
     }
 
     #[test]
     fn test_max_single_value() {
         let mut max = MaxFunction::default();
         max.accumulate(&Value::Integer(42), false);
-        assert_eq!(max.result(), Value::Integer(42));
+        assert_eq!(max.result().unwrap(), Value::Integer(42));
     }
 
     #[test]
@@ -164,7 +164,7 @@ mod tests {
         max.accumulate(&Value::Integer(-5), false);
         max.accumulate(&Value::Integer(-10), false);
         max.accumulate(&Value::Integer(-3), false);
-        assert_eq!(max.result(), Value::Integer(-3));
+        assert_eq!(max.result().unwrap(), Value::Integer(-3));
     }
 
     #[test]
@@ -173,6 +173,6 @@ mod tests {
         max.accumulate(&Value::Boolean(false), false);
         max.accumulate(&Value::Boolean(true), false);
         max.accumulate(&Value::Boolean(false), false);
-        assert_eq!(max.result(), Value::Boolean(true));
+        assert_eq!(max.result().unwrap(), Value::Boolean(true));
     }
 }
