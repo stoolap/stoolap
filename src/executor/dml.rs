@@ -22,6 +22,7 @@
 use crate::common::CompactArc;
 use crate::common::I64Set;
 use crate::common::SmartString;
+use crate::core::integer::integer_neg;
 use crate::core::{DataType, Error, Result, Row, RowVec, Schema, Value, ValueMap};
 use crate::parser::ast::*;
 use crate::storage::expression::{ComparisonExpr, Expression as StorageExpr};
@@ -162,8 +163,9 @@ fn try_extract_literal(expr: &Expression) -> Option<Value> {
         Expression::BooleanLiteral(lit) => Some(Value::Boolean(lit.value)),
         Expression::NullLiteral(_) => Some(Value::null_unknown()),
         // Negative numbers: -5, -3.14
+        // An overflow is left to the VM, which reports it
         Expression::Prefix(prefix) if prefix.operator == "-" => match prefix.right.as_ref() {
-            Expression::IntegerLiteral(lit) => Some(Value::Integer(-lit.value)),
+            Expression::IntegerLiteral(lit) => integer_neg(lit.value).ok().map(Value::Integer),
             Expression::FloatLiteral(lit) => Some(Value::Float(-lit.value)),
             _ => None,
         },
@@ -2876,7 +2878,7 @@ impl Executor {
             Expression::BooleanLiteral(lit) => Some(Value::Boolean(lit.value)),
             Expression::NullLiteral(_) => Some(Value::null_unknown()),
             Expression::Prefix(prefix) if prefix.operator == "-" => match prefix.right.as_ref() {
-                Expression::IntegerLiteral(lit) => Some(Value::Integer(-lit.value)),
+                Expression::IntegerLiteral(lit) => integer_neg(lit.value).ok().map(Value::Integer),
                 Expression::FloatLiteral(lit) => Some(Value::Float(-lit.value)),
                 _ => None,
             },

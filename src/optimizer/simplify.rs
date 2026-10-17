@@ -29,6 +29,7 @@
 
 #![allow(clippy::only_used_in_recursion)]
 
+use crate::core::integer::{integer_neg, integer_op, IntegerOp};
 use crate::parser::ast::{
     BooleanLiteral, Expression, InfixExpression, InfixOperator, IntegerLiteral, PrefixExpression,
     PrefixOperator,
@@ -377,22 +378,14 @@ impl ExpressionSimplifier {
                     None
                 }
             }
-            PrefixOperator::Negate => {
-                // -(-x) → x
-                if let Expression::Prefix(inner) = operand {
-                    if inner.op_type == PrefixOperator::Negate {
-                        Some((*inner.right).clone())
-                    } else {
-                        None
-                    }
+            // -(constant) → constant negated; -(-x) stays, as -x overflows for
+            // the smallest INTEGER
+            PrefixOperator::Negate => match operand {
+                Expression::IntegerLiteral(lit) => {
+                    integer_neg(lit.value).ok().map(|neg| self.make_int(neg))
                 }
-                // -(constant) → constant negated
-                else if let Expression::IntegerLiteral(lit) = operand {
-                    Some(self.make_int(-lit.value))
-                } else {
-                    None
-                }
-            }
+                _ => None,
+            },
             PrefixOperator::Plus => {
                 // +x → x
                 Some(operand.clone())
@@ -562,24 +555,16 @@ impl ExpressionSimplifier {
     ) -> Option<Expression> {
         match (left, right) {
             (Expression::IntegerLiteral(l), Expression::IntegerLiteral(r)) => {
-                let result = match op {
-                    InfixOperator::Add => l.value.checked_add(r.value)?,
-                    InfixOperator::Subtract => l.value.checked_sub(r.value)?,
-                    InfixOperator::Multiply => l.value.checked_mul(r.value)?,
-                    InfixOperator::Divide => {
-                        if r.value == 0 {
-                            return None;
-                        }
-                        l.value.checked_div(r.value)?
-                    }
-                    InfixOperator::Modulo => {
-                        if r.value == 0 {
-                            return None;
-                        }
-                        l.value.checked_rem(r.value)?
-                    }
+                let op = match op {
+                    InfixOperator::Add => IntegerOp::Add,
+                    InfixOperator::Subtract => IntegerOp::Sub,
+                    InfixOperator::Multiply => IntegerOp::Mul,
+                    InfixOperator::Divide => IntegerOp::Div,
+                    InfixOperator::Modulo => IntegerOp::Mod,
                     _ => return None,
                 };
+                // An overflow or a NULL stays for the run, which reports it
+                let result = integer_op(op, l.value, r.value).ok()??;
                 Some(self.make_int(result))
             }
             _ => None,

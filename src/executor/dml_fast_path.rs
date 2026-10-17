@@ -858,9 +858,10 @@ impl Executor {
             }
             Expression::NullLiteral(_) => Some(UpdateValueSource::Literal(Value::null_unknown())),
             Expression::Prefix(prefix) if prefix.operator == "-" => match prefix.right.as_ref() {
-                Expression::IntegerLiteral(lit) => {
-                    Some(UpdateValueSource::Literal(Value::Integer(-lit.value)))
-                }
+                // An overflow is left to the VM, which reports it
+                Expression::IntegerLiteral(lit) => crate::core::integer::integer_neg(lit.value)
+                    .ok()
+                    .map(|neg| UpdateValueSource::Literal(Value::Integer(neg))),
                 Expression::FloatLiteral(lit) => {
                     Some(UpdateValueSource::Literal(Value::Float(-lit.value)))
                 }

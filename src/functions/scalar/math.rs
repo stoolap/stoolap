@@ -14,6 +14,7 @@
 
 //! Math scalar functions
 
+use crate::core::integer::IntegerOp;
 use crate::core::{Error, Result, Value};
 use crate::functions::{
     FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
@@ -55,10 +56,7 @@ impl ScalarFunction for AbsFunction {
         // Try to preserve integer type if possible
         if let Some(i) = value_to_i64(&args[0]) {
             if matches!(args[0], Value::Integer(_)) {
-                return match i.checked_abs() {
-                    Some(abs) => Ok(Value::Integer(abs)),
-                    None => Ok(Value::Null(crate::core::DataType::Integer)), // i64::MIN overflow
-                };
+                return crate::core::integer::integer_abs(i).map(Value::Integer);
             }
         }
 
@@ -290,10 +288,8 @@ impl ScalarFunction for ModFunction {
         if !any_float {
             if let (Some(a), Some(b)) = (value_to_i64(&args[0]), value_to_i64(&args[1])) {
                 // A zero divisor gives NULL, as the % operator does
-                if b == 0 {
-                    return Ok(Value::null_unknown());
-                }
-                return Ok(Value::Integer(a % b));
+                return Ok(crate::core::integer::integer_op(IntegerOp::Mod, a, b)?
+                    .map_or_else(Value::null_unknown, Value::Integer));
             }
         }
 
