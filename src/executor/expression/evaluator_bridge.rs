@@ -40,7 +40,7 @@ static EMPTY_PARAMS: std::sync::LazyLock<CompactArc<ParamVec>> =
 static EMPTY_NAMED_PARAMS: std::sync::LazyLock<Arc<FxHashMap<String, Value>>> =
     std::sync::LazyLock::new(|| Arc::new(FxHashMap::default()));
 use crate::common::{CompactArc, StringMap};
-use crate::executor::utils::fold_expression_name;
+use crate::executor::expr_key::ExprKey;
 use lru::LruCache;
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHasher};
@@ -100,15 +100,12 @@ fn compute_cache_key(expr: &Expression, columns: &[String]) -> (u64, u64) {
     (h1.finish(), h2.finish())
 }
 
-/// Key each alias by its literal case, then by its lowercase name where
-/// no other alias holds that key
-fn insert_alias_keys(map: &mut StringMap<u16>, aliases: &[(String, usize)]) {
-    for (name, idx) in aliases {
-        map.insert(fold_expression_name(name), *idx as u16);
-    }
-    for (name, idx) in aliases {
-        map.entry(name.to_lowercase()).or_insert(*idx as u16);
-    }
+/// Each aliased slot at the width the program loads it with
+fn alias_slots(aliases: &FxHashMap<ExprKey, usize>) -> FxHashMap<ExprKey, u16> {
+    aliases
+        .iter()
+        .map(|(&key, &slot)| (key, slot as u16))
+        .collect()
 }
 
 /// Compute a u64 hash of an expression without string allocation.
@@ -623,39 +620,15 @@ impl RowFilter {
         })
     }
 
-    /// Create a row filter with expression aliases for HAVING clause evaluation.
-    ///
-    /// Expression aliases map expression strings (like "SUM(amount)") to column
-    /// indices in the result row. This is used for HAVING clauses where aggregate
-    /// expressions need to reference pre-computed aggregate results.
-    ///
-    /// # Arguments
-    /// * `expr` - The boolean expression to use as filter
-    /// * `columns` - Column names matching the row schema
-    /// * `aliases` - Slice of (expression_name, column_index) pairs
-    ///
-    /// # Example
-    /// ```ignore
-    /// // For HAVING SUM(amount) > 100, where SUM(amount) is at column 2
-    /// let aliases = vec![("sum(amount)".to_string(), 2)];
-    /// let filter = RowFilter::with_aliases(&having_expr, &columns, &aliases)?;
-    ///
-    /// // Filter rows
-    /// for row in rows {
-    ///     if filter.matches(&row) {
-    ///         // row passes HAVING clause
-    ///     }
-    /// }
-    /// ```
-    pub fn with_aliases(
+    /// Create a row filter whose group items and aggregates are read from
+    /// the row's slot for each expression's identity (for HAVING)
+    pub(crate) fn with_aliases(
         expr: &Expression,
         columns: &[String],
-        aliases: &[(String, usize)],
+        aliases: &FxHashMap<ExprKey, usize>,
     ) -> Result<Self> {
-        let mut alias_map = StringMap::new();
-        insert_alias_keys(&mut alias_map, aliases);
-
-        let ctx = CompileContext::with_global_registry(columns).with_expression_aliases(alias_map);
+        let ctx = CompileContext::with_global_registry(columns)
+            .with_expression_aliases(alias_slots(aliases));
         let compiler = ExprCompiler::new(&ctx);
         let program = compiler
             .compile(expr)
@@ -1036,75 +1009,6 @@ impl ExpressionEval {
         })
     }
 
-    /// Compile with expression aliases for HAVING clause evaluation.
-    ///
-    /// Expression aliases map expression strings (like "SUM(amount)") to column
-    /// indices in the result row. This is used for HAVING clauses where aggregate
-    /// expressions need to reference pre-computed aggregate results.
-    ///
-    /// # Arguments
-    /// * `expr` - The expression to compile
-    /// * `columns` - Column names for the result row
-    /// * `aliases` - Slice of (expression_name, column_index) pairs
-    ///
-    /// # Example
-    /// ```ignore
-    /// // For HAVING SUM(amount) > 100, where SUM(amount) is at column 2
-    /// let aliases = vec![("sum(amount)".to_string(), 2)];
-    /// let eval = ExpressionEval::compile_with_aliases(&having_expr, &columns, &aliases)?;
-    /// ```
-    pub fn compile_with_aliases(
-        expr: &Expression,
-        columns: &[String],
-        aliases: &[(String, usize)],
-    ) -> Result<Self> {
-        let mut alias_map = StringMap::new();
-        insert_alias_keys(&mut alias_map, aliases);
-
-        Self::compile_with_options(
-            expr,
-            columns,
-            None,
-            None,
-            Some(alias_map),
-            global_registry(),
-        )
-    }
-
-    /// Compile with full context options.
-    pub fn compile_with_options(
-        expr: &Expression,
-        columns: &[String],
-        columns2: Option<&[String]>,
-        outer_columns: Option<&[String]>,
-        expression_aliases: Option<StringMap<u16>>,
-        function_registry: &FunctionRegistry,
-    ) -> Result<Self> {
-        let mut ctx = CompileContext::new(columns, function_registry);
-        if let Some(cols2) = columns2 {
-            ctx = ctx.with_second_row(cols2);
-        }
-        if let Some(outer) = outer_columns {
-            ctx = ctx.with_outer_columns(outer);
-        }
-        if let Some(aliases) = expression_aliases {
-            ctx = ctx.with_expression_aliases(aliases);
-        }
-        let compiler = ExprCompiler::new(&ctx);
-        let program = compiler
-            .compile(expr)
-            .map(CompactArc::new)
-            .map_err(|e| Error::internal(format!("Compile error: {}", e)))?;
-        Ok(Self {
-            program,
-            vm: ExprVM::new(),
-            params: EMPTY_PARAMS.clone(),
-            named_params: EMPTY_NAMED_PARAMS.clone(),
-            outer_row: None,
-            transaction_id: None,
-        })
-    }
-
     /// Create from a pre-compiled program.
     pub fn from_program(program: SharedProgram) -> Self {
         Self {
@@ -1325,25 +1229,15 @@ impl MultiExpressionEval {
         })
     }
 
-    /// Compile multiple expressions with expression aliases.
-    ///
-    /// Expression aliases map expression strings (like "SUM(amount)") to column
-    /// indices in the result row. This is used for window function ORDER BY
-    /// clauses where aggregate expressions need to reference pre-computed results.
-    ///
-    /// # Arguments
-    /// * `exprs` - The expressions to compile
-    /// * `columns` - Column names for the result row
-    /// * `aliases` - Slice of (expression_name, column_index) pairs
-    pub fn compile_with_aliases(
+    /// Compile expressions whose group items and aggregates are read from the
+    /// row's slot for each expression's identity (for windows over groups)
+    pub(crate) fn compile_with_aliases(
         exprs: &[Expression],
         columns: &[String],
-        aliases: &[(String, usize)],
+        aliases: &FxHashMap<ExprKey, usize>,
     ) -> Result<Self> {
-        let mut alias_map = StringMap::new();
-        insert_alias_keys(&mut alias_map, aliases);
-
-        let ctx = CompileContext::with_global_registry(columns).with_expression_aliases(alias_map);
+        let ctx = CompileContext::with_global_registry(columns)
+            .with_expression_aliases(alias_slots(aliases));
         let compiler = ExprCompiler::new(&ctx);
 
         let programs = exprs
@@ -1516,7 +1410,7 @@ pub struct CompiledEvaluator<'a> {
     transaction_id: Option<u64>,
 
     /// Expression aliases for HAVING clause
-    expression_aliases: StringMap<u16>,
+    expression_aliases: FxHashMap<ExprKey, u16>,
 
     /// Column aliases
     column_aliases: StringMap<String>,
@@ -1550,7 +1444,7 @@ impl<'a> CompiledEvaluator<'a> {
             named_params: EMPTY_NAMED_PARAMS.clone(),
             outer_row: None,
             transaction_id: None,
-            expression_aliases: StringMap::new(),
+            expression_aliases: FxHashMap::default(),
             column_aliases: StringMap::new(),
             vm: ExprVM::new(),
             local_cache: FxHashMap::default(),
@@ -1672,15 +1566,8 @@ impl<'a> CompiledEvaluator<'a> {
     }
 
     /// Add aggregate expression aliases for HAVING clause evaluation
-    pub fn add_aggregate_aliases(&mut self, aliases: &[(String, usize)]) {
-        insert_alias_keys(&mut self.expression_aliases, aliases);
-        // Invalidate local cache since compilation context changed
-        self.local_cache.clear();
-    }
-
-    /// Add expression aliases for HAVING clause with GROUP BY expressions
-    pub fn add_expression_aliases(&mut self, aliases: &[(String, usize)]) {
-        insert_alias_keys(&mut self.expression_aliases, aliases);
+    pub(crate) fn add_aggregate_aliases(&mut self, aliases: &FxHashMap<ExprKey, usize>) {
+        self.expression_aliases.extend(alias_slots(aliases));
         // Invalidate local cache since compilation context changed
         self.local_cache.clear();
     }

@@ -36,7 +36,8 @@ use super::program::{Program, ProgramBuilder};
 use super::vm::{ExecuteContext, ExprVM};
 use crate::core::predicate::PredicateSet;
 use crate::core::{DataType, Row, Value, ValueSet};
-use crate::executor::utils::{expression_to_string, fold_expression_name, string_to_datatype};
+use crate::executor::expr_key::ExprKey;
+use crate::executor::utils::string_to_datatype;
 use crate::functions::{global_registry, FunctionRegistry};
 use crate::parser::ast::*;
 use smallvec::SmallVec;
@@ -139,8 +140,8 @@ pub struct CompileContext<'a> {
     /// Function registry
     functions: &'a FunctionRegistry,
 
-    /// Expression alias mapping (for HAVING with GROUP BY expressions)
-    expression_aliases: StringMap<u16>,
+    /// The aggregated row's slot of each group item and aggregate, by identity
+    expression_aliases: FxHashMap<ExprKey, u16>,
 
     /// Column aliases
     column_aliases: StringMap<String>,
@@ -187,7 +188,7 @@ impl<'a> CompileContext<'a> {
             row2_tables: FxHashSet::default(),
             outer_columns: None,
             functions,
-            expression_aliases: StringMap::new(),
+            expression_aliases: FxHashMap::default(),
             column_aliases: StringMap::new(),
             subquery_ids: None,
             row2_bindings: None,
@@ -240,7 +241,7 @@ impl<'a> CompileContext<'a> {
     }
 
     /// Add expression aliases (for HAVING clause)
-    pub fn with_expression_aliases(mut self, aliases: StringMap<u16>) -> Self {
+    pub(crate) fn with_expression_aliases(mut self, aliases: FxHashMap<ExprKey, u16>) -> Self {
         self.expression_aliases = aliases;
         self
     }
@@ -341,17 +342,7 @@ impl<'a> CompileContext<'a> {
         if self.expression_aliases.is_empty() {
             return None;
         }
-        let expr_str = expression_to_string(expr);
-        // A literal's own case first, then a map keyed wholly lowercase
-        self.expression_aliases
-            .get(&fold_expression_name(&expr_str))
-            .or_else(|| {
-                expr_str
-                    .contains('\'')
-                    .then(|| self.expression_aliases.get(&expr_str.to_lowercase()))
-                    .flatten()
-            })
-            .copied()
+        self.expression_aliases.get(&ExprKey::of(expr)).copied()
     }
 }
 
@@ -476,6 +467,21 @@ impl<'a> ExprCompiler<'a> {
         if let Some(idx) = self.ctx.check_expression_alias(expr) {
             builder.emit(Op::LoadAggregateResult(idx));
             return Ok(());
+        }
+        // A derived table names an aggregate's column after it; a quote in the name is not matched
+        if let Expression::FunctionCall(func) = expr {
+            if self.ctx.functions.is_aggregate(&func.function) {
+                let name = expr.to_string();
+                if !name.contains('\'') {
+                    if let Some(source) = self.ctx.resolve_column(&name) {
+                        match source {
+                            ColumnSource::Row1(idx) => builder.emit(Op::LoadColumn(idx)),
+                            ColumnSource::Row2(idx) => builder.emit(Op::LoadColumn2(idx)),
+                        }
+                        return Ok(());
+                    }
+                }
+            }
         }
 
         // Constant folding: if not already folding and expression is column-free

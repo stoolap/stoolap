@@ -672,24 +672,6 @@ fn substitute_in_table_expr(
 // Column Index Utilities
 // ============================================================================
 
-/// The name of an expression column, lowercased outside its quoted TEXT
-/// literals: names match in any case, literals only in their own
-pub fn fold_expression_name(name: &str) -> String {
-    let mut folded = String::with_capacity(name.len());
-    let mut quoted = false;
-    for c in name.chars() {
-        if c == '\'' {
-            quoted = !quoted;
-        }
-        if quoted {
-            folded.push(c);
-        } else {
-            folded.extend(c.to_lowercase());
-        }
-    }
-    folded
-}
-
 /// Build a column name to index map for fast column lookups.
 /// Column names are lowercased for case-insensitive matching.
 /// Also adds unqualified base names as fallbacks for qualified columns

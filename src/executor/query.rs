@@ -87,6 +87,7 @@ pub(crate) enum EarlySemantic {
 use super::context::{
     clear_statement_caches, ExecutionContext, SemanticMiss, StatementSnapshot, TimeoutGuard,
 };
+use super::expr_key::ExprKey;
 use super::expression::{
     compile_expression, CompiledEvaluator, ExecuteContext, ExprVM, ExpressionEval, JoinFilter,
     RowFilter, SharedProgram,
@@ -693,32 +694,46 @@ impl Executor {
         // Skip ORDER BY if storage-level optimization already applied sorting + LIMIT/OFFSET
         // classification was already obtained at entry point and passed through
         if !stmt.order_by.is_empty() && !limit_offset_applied {
-            // Helper to format aggregate function call as column name
-            let format_agg_column = |func: &crate::parser::ast::FunctionCall| -> String {
-                if func.arguments.is_empty() {
-                    format!("{}(*)", func.function)
-                } else if let Some(arg) = func.arguments.first() {
-                    match arg {
-                        Expression::Identifier(id) => format!("{}({})", func.function, id.value),
-                        Expression::Star(_) => format!("{}(*)", func.function),
-                        _ => format!("{}(expr)", func.function),
+            // Each column by the identity of what computed it: the SELECT
+            // list in order (unless a star moves the positions), then the
+            // aggregates carried only for this sort
+            let mut column_slots: FxHashMap<ExprKey, usize> = FxHashMap::default();
+            // Only aggregates stand in for themselves inside a sort key: a
+            // literal or a name there is read as written
+            let mut aggregate_slots: FxHashMap<ExprKey, usize> = FxHashMap::default();
+            if !stmt
+                .columns
+                .iter()
+                .any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)))
+            {
+                for (i, col) in stmt.columns.iter().enumerate() {
+                    let key = ExprKey::of(col);
+                    column_slots.entry(key).or_insert(i);
+                    let inner = match col {
+                        Expression::Aliased(aliased) => aliased.expression.as_ref(),
+                        other => other,
+                    };
+                    if stmt.set_operations.is_empty()
+                        && matches!(inner, Expression::FunctionCall(f) if self.function_registry.is_aggregate(&f.function))
+                    {
+                        aggregate_slots.entry(key).or_insert(i);
                     }
-                } else {
-                    format!("{}()", func.function)
                 }
-            };
+            }
+            for (i, name) in columns.iter().enumerate() {
+                if let Some(key) = ExprKey::from_hidden_column_name(name) {
+                    column_slots.entry(key).or_insert(i);
+                    aggregate_slots.entry(key).or_insert(i);
+                }
+            }
 
-            // The projection names a column after the whole expression it
-            // holds. Identifiers inside it are matched whatever their case,
-            // but a string literal is not, so an exact name wins over one
-            // that only reads the same: ABS(g, 'a') and ABS(g, 'A') are two
-            // expressions and get two columns
-            let find_column_named_after = |expr: &Expression| -> Option<usize> {
-                let name = expr.to_string();
-                columns
-                    .iter()
-                    .position(|c| *c == name)
-                    .or_else(|| columns.iter().position(|c| c.eq_ignore_ascii_case(&name)))
+            // An expression the projection put in a column of its own, named
+            // after it, or one the slots above hold
+            let find_column_for = |expr: &Expression| -> Option<usize> {
+                column_slots.get(&ExprKey::of(expr)).copied().or_else(|| {
+                    let name = expr.to_string();
+                    columns.iter().position(|c| *c == name)
+                })
             };
 
             // Check if ORDER BY expression can be mapped to existing column (handles aggregates)
@@ -810,61 +825,15 @@ impl Executor {
                             .position(|c| c.eq_ignore_ascii_case(&qid.name.value_lower))
                     }
                     Expression::IntegerLiteral(lit) => Some((lit.value as usize).saturating_sub(1)),
-                    Expression::FunctionCall(func) => {
-                        // Check if this is an aggregate function that exists as a column
-                        let col_name = format_agg_column(func);
-                        if let Some(pos) = columns
-                            .iter()
-                            .position(|c| c.eq_ignore_ascii_case(&col_name))
-                        {
-                            return Some(pos);
-                        }
-                        // Also check if any SELECT column is an aliased version of this expression
-                        // e.g., SELECT SUM(amount) AS total ... ORDER BY SUM(amount)
-                        for (i, select_expr) in stmt.columns.iter().enumerate() {
-                            if let Expression::Aliased(aliased) = select_expr {
-                                if let Expression::FunctionCall(sel_func) = &*aliased.expression {
-                                    if sel_func.function.eq_ignore_ascii_case(&func.function) {
-                                        // Compare arguments
-                                        let sel_col_name = format_agg_column(sel_func);
-                                        if sel_col_name.eq_ignore_ascii_case(&col_name) {
-                                            return Some(i);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        // A function of anything but a bare column is named
-                        // after the whole call, the way the projection names
-                        // the column it puts an unselected expression in
-                        find_column_named_after(&ob.expression)
-                    }
-                    _ => {
-                        // For any other expression (Infix, Prefix, Cast, etc.),
-                        // check if it matches an aliased SELECT expression
-                        // e.g., ORDER BY val * 2 when SELECT has val * 2 as doubled
-                        let order_expr_str = format!("{}", ob.expression);
-                        for (i, select_expr) in stmt.columns.iter().enumerate() {
-                            if let Expression::Aliased(aliased) = select_expr {
-                                let aliased_expr_str = format!("{}", aliased.expression);
-                                // Compare the string representations of expressions
-                                if order_expr_str == aliased_expr_str {
-                                    return Some(i);
-                                }
-                            }
-                        }
-                        // The projection puts an expression the SELECT list
-                        // leaves out in a column named after it
-                        find_column_named_after(&ob.expression)
-                    }
+                    _ => find_column_for(&ob.expression),
                 }
             };
+            // Mapped once: the correlated path below asks for every row
+            let mapped_columns: Vec<Option<usize>> =
+                stmt.order_by.iter().map(try_map_to_column).collect();
 
             // Check if any ORDER BY expression needs evaluation (not just column refs or position)
-            let has_complex_order_by = stmt
-                .order_by
-                .iter()
-                .any(|ob| try_map_to_column(ob).is_none());
+            let has_complex_order_by = mapped_columns.iter().any(Option::is_none);
 
             // If ORDER BY has complex expressions, evaluate them and sort by keys
             if has_complex_order_by {
@@ -887,6 +856,8 @@ impl Executor {
                 let mut evaluator = CompiledEvaluator::new(&self.function_registry);
                 evaluator = evaluator.with_context(ctx);
                 evaluator.init_columns(&columns);
+                // An aggregate inside a sort key reads the column computing it
+                evaluator.add_aggregate_aliases(&aggregate_slots);
 
                 // Check if any ORDER BY expression contains a correlated subquery
                 // Use cached classification to avoid expensive AST traversal
@@ -974,10 +945,11 @@ impl Executor {
                             stmt.order_by
                                 .iter()
                                 .zip(order_exprs.iter())
-                                .map(|(ob, order_expr)| {
+                                .zip(mapped_columns.iter())
+                                .map(|((ob, order_expr), mapped)| {
                                     // A key the projection already put in a
                                     // column is read from it
-                                    if let Some(idx) = try_map_to_column(ob) {
+                                    if let Some(idx) = *mapped {
                                         return Ok(row
                                             .get(idx)
                                             .cloned()
@@ -1011,12 +983,11 @@ impl Executor {
                     let key_sources: Vec<(
                         Option<usize>,
                         Option<super::expression::SharedProgram>,
-                    )> = stmt
-                        .order_by
+                    )> = order_exprs
                         .iter()
-                        .zip(order_exprs.iter())
-                        .map(|(ob, order_expr)| {
-                            Ok(match try_map_to_column(ob) {
+                        .zip(mapped_columns.iter())
+                        .map(|(order_expr, mapped)| {
+                            Ok(match *mapped {
                                 Some(idx) => (Some(idx), None),
                                 None => (None, Some(evaluator.compile_cached(order_expr)?)),
                             })
@@ -1167,7 +1138,8 @@ impl Executor {
             let order_specs: Vec<(Option<usize>, bool, Option<bool>)> = stmt
                 .order_by
                 .iter()
-                .map(|ob| (try_map_to_column(ob), ob.ascending, ob.nulls_first))
+                .zip(mapped_columns.iter())
+                .map(|(ob, mapped)| (*mapped, ob.ascending, ob.nulls_first))
                 .collect();
 
             // TOP-N OPTIMIZATION: Use bounded heap when LIMIT is present
@@ -1365,11 +1337,19 @@ impl Executor {
                         }
                     }
                     _ => {
-                        // Expression — match by Display representation
-                        let expr_str = expr.to_string();
-                        result_columns
-                            .iter()
-                            .position(|c| c.eq_ignore_ascii_case(&expr_str))
+                        // The SELECT column computing the same expression, else the column named after it
+                        let key = ExprKey::of(expr);
+                        select_exprs
+                            .filter(|sel| {
+                                !sel.iter().any(|s| {
+                                    matches!(s, Expression::Star(_) | Expression::QualifiedStar(_))
+                                })
+                            })
+                            .and_then(|sel| sel.iter().position(|s| ExprKey::of(s) == key))
+                            .or_else(|| {
+                                let expr_str = expr.to_string();
+                                result_columns.iter().position(|c| *c == expr_str)
+                            })
                     }
                 }
             })
@@ -8000,14 +7980,14 @@ impl Executor {
         let having = match &stmt.having {
             Some(having) => {
                 let processed = self.process_where_subqueries(having, ctx)?;
-                let agg_aliases: Vec<(String, usize)> = aggregations
+                let group_items: Vec<crate::executor::aggregation::GroupByItem> = group_names
                     .iter()
-                    .enumerate()
-                    .map(|(i, agg)| (agg.get_expression_name(), group_names.len() + i))
+                    .map(|name| crate::executor::aggregation::GroupByItem::Column(name.clone()))
                     .collect();
+                let slots =
+                    crate::executor::aggregation::aggregate_slot_keys(&group_items, &aggregations);
                 Some(
-                    RowFilter::with_aliases(&processed, &result_columns, &agg_aliases)?
-                        .with_context(ctx),
+                    RowFilter::with_aliases(&processed, &result_columns, &slots)?.with_context(ctx),
                 )
             }
             None => None,
@@ -8238,8 +8218,13 @@ impl Executor {
             outer_result = restarted;
         }
 
-        let (final_columns, final_rows) =
-            self.apply_post_aggregation_expressions(stmt, ctx, result_columns, groups)?;
+        let (final_columns, final_rows) = self.apply_post_aggregation_expressions(
+            stmt,
+            ctx,
+            &aggregations,
+            result_columns,
+            groups,
+        )?;
         let mut rows = final_rows.into_vec();
         rows.drain(..plan.offset.min(rows.len()));
         rows.truncate(plan.limit);

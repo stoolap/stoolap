@@ -39,13 +39,14 @@ use crate::storage::traits::transaction::StatementTable;
 use crate::storage::traits::{Engine, QueryResult};
 
 use super::context::ExecutionContext;
+use super::expr_key::ExprKey;
 #[allow(deprecated)]
 use super::expression::CompiledEvaluator;
 use super::expression::{ExpressionEval, RowFilter};
 use super::query_cache::{CompiledCountDistinct, CompiledExecution};
 use super::query_classification::QueryClassification;
 use super::result::ExecutorResult;
-use super::utils::{build_column_index_map, fold_expression_name, hash_value_into};
+use super::utils::{build_column_index_map, hash_value_into};
 use super::Executor;
 use crate::core::value::grouping_float;
 
@@ -237,61 +238,29 @@ struct GroupingSet {
     active_columns: Vec<bool>,
 }
 
-/// Generate a canonical key for an expression for semantic matching.
-/// This ensures consistent matching regardless of token positions or formatting.
-/// All string-based keys are lowercased for case-insensitive matching.
-fn expression_canonical_key(expr: &Expression) -> String {
-    match expr {
-        Expression::Identifier(id) => id.value_lower.to_string(),
-        Expression::QualifiedIdentifier(qid) => {
-            format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower)
-        }
-        Expression::IntegerLiteral(lit) => format!("$pos:{}", lit.value),
-        Expression::FloatLiteral(lit) => format!("$float:{}", lit.value),
-        Expression::StringLiteral(lit) => format!("$str:{}", lit.value.to_lowercase()),
-        Expression::BooleanLiteral(lit) => format!("$bool:{}", lit.value),
-        Expression::FunctionCall(func) => {
-            // For function calls, build a canonical form
-            let args: Vec<String> = func
-                .arguments
-                .iter()
-                .map(expression_canonical_key)
-                .collect();
-            format!("{}({})", func.function.to_lowercase(), args.join(","))
-        }
-        Expression::Infix(bin) => {
-            // For infix/binary operations, build a canonical form
-            format!(
-                "({} {} {})",
-                expression_canonical_key(&bin.left),
-                bin.operator.to_lowercase(),
-                expression_canonical_key(&bin.right)
-            )
-        }
-        Expression::Prefix(un) => {
-            // For prefix/unary operations
-            format!(
-                "({}{})",
-                un.operator.to_lowercase(),
-                expression_canonical_key(&un.right)
-            )
-        }
-        Expression::Aliased(aliased) => {
-            // For aliased expressions, use the underlying expression
-            expression_canonical_key(&aliased.expression)
-        }
-        // For other complex expressions, use Display but lowercase for consistency
-        _ => format!("{}", expr).to_lowercase(),
+/// The identity of a GROUP BY item
+fn group_by_item_key(item: &GroupByItem) -> ExprKey {
+    match item {
+        GroupByItem::Column(name) => ExprKey::column(name),
+        GroupByItem::Position(pos) => ExprKey::position(*pos),
+        GroupByItem::Expression { expr, .. } => ExprKey::of(expr),
     }
 }
 
-/// Generate a canonical key for a GroupByItem for semantic matching.
-fn group_by_item_canonical_key(item: &GroupByItem) -> String {
-    match item {
-        GroupByItem::Column(name) => name.to_lowercase(),
-        GroupByItem::Position(pos) => format!("$pos:{}", pos),
-        GroupByItem::Expression { expr, .. } => expression_canonical_key(expr),
+/// The slot of each group item and aggregate in an aggregated row, which
+/// holds the group items first and the aggregates after them
+pub(crate) fn aggregate_slot_keys(
+    group_items: &[GroupByItem],
+    aggregations: &[SqlAggregateFunction],
+) -> FxHashMap<ExprKey, usize> {
+    let mut slots = FxHashMap::default();
+    for (i, item) in group_items.iter().enumerate() {
+        slots.entry(group_by_item_key(item)).or_insert(i);
     }
+    for (i, agg) in aggregations.iter().enumerate() {
+        slots.entry(agg.key).or_insert(group_items.len() + i);
+    }
+    slots
 }
 
 /// Represents a GROUP BY item - either a column reference or an expression
@@ -316,6 +285,8 @@ pub enum GroupByItem {
 enum ColumnSource {
     /// Column comes directly from aggregation result
     AggColumn(String),
+    /// The aggregated row's slot holding this group item or aggregate
+    AggSlot(usize),
     /// Column needs to be evaluated from an expression (boxed to reduce enum size)
     Expression(Box<Expression>),
     /// Correlated subquery expression that needs per-row evaluation with outer row context
@@ -370,6 +341,8 @@ pub struct SqlAggregateFunction {
     pub filter: Option<Expression>,
     /// Whether this aggregate is hidden (only used for ORDER BY, not in SELECT)
     pub hidden: bool,
+    /// The identity of the call, shared by every place that writes it alike
+    pub(crate) key: ExprKey,
 }
 
 impl SqlAggregateFunction {
@@ -413,6 +386,7 @@ impl Executor {
         base_rows: RowVec,
         base_columns: &[String],
     ) -> Result<Box<dyn QueryResult>> {
+        let written_stmt = stmt;
         // A subquery inside an aggregate is resolved per input row and read
         // back as a column, since an aggregate cannot resolve one itself
         let lifted_stmt;
@@ -548,37 +522,14 @@ impl Executor {
                         _ => None,
                     });
 
-                // Build aggregate expression aliases for HAVING clause
-                // IMPORTANT: Include ALL aggregates, not just aliased ones,
-                // because CompiledEvaluator needs expression_aliases to match FunctionCall expressions
-                let group_by_count = group_by_columns.len();
-                let agg_aliases: Vec<(String, usize)> = aggregations
-                    .iter()
-                    .enumerate()
-                    .map(|(i, agg)| (agg.get_expression_name(), group_by_count + i))
-                    .collect();
-
-                // Build GROUP BY expression aliases for HAVING clause
-                // This maps expressions like "x + y" to their GROUP BY column indices
-                let expr_aliases: Vec<(String, usize)> = group_by_columns
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, item)| {
-                        if let GroupByItem::Expression { expr, .. } = item {
-                            Some((self.expression_to_string(expr), i))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-
+                // HAVING reads every group item and aggregate from its slot
+                let slots = aggregate_slot_keys(&group_by_columns, &aggregations);
                 let tmp_result = Box::new(ExecutorResult::new(result_columns.clone(), result_rows));
                 let mut having_result = self.apply_having(
                     tmp_result,
                     &processed_having,
                     &result_columns,
-                    &agg_aliases,
-                    &expr_aliases,
+                    &slots,
                     outer_table.as_deref(),
                     ctx,
                 )?;
@@ -615,12 +566,25 @@ impl Executor {
         // Only clone if we need the original data for hidden_aggs processing
         let (final_columns, final_rows) = if hidden_aggs.is_empty() {
             // No hidden aggregates - move data directly (no clone)
-            self.apply_post_aggregation_expressions(stmt, ctx, having_columns, having_rows)?
+            self.apply_post_aggregation_expressions(
+                stmt,
+                ctx,
+                &aggregations,
+                having_columns,
+                having_rows,
+            )?
         } else {
             // Hidden aggregates exist: extract only the needed columns
             // up front, then move the aggregated rows instead of cloning
             // the whole result set
-            let having_col_index_map = build_column_index_map(&having_columns);
+            // Lifting rewrote the aggregates; the sort looks for them as written
+            let written_keys: Option<Vec<ExprKey>> = if std::ptr::eq(stmt, written_stmt) {
+                None
+            } else {
+                let (written, _) = self.parse_aggregations(written_stmt)?;
+                (written.len() == aggregations.len())
+                    .then(|| written.iter().map(|agg| agg.key).collect())
+            };
             let by_index: Vec<(String, Vec<Value>)> = hidden_aggs
                 .iter()
                 .map(|(agg_idx, agg)| {
@@ -633,31 +597,18 @@ impl Executor {
                                 .unwrap_or_else(Value::null_unknown)
                         })
                         .collect();
-                    (agg.get_column_name(), values)
-                })
-                .collect();
-            // Name-based fallback buffers (aggregate deduplicated but
-            // still marked hidden)
-            let by_name: Vec<(String, Vec<Value>)> = hidden_aggs
-                .iter()
-                .filter_map(|(_, agg)| {
-                    let col_name = agg.get_column_name();
-                    having_col_index_map
-                        .get(&col_name.to_lowercase())
-                        .map(|&idx| {
-                            let values = having_rows
-                                .iter()
-                                .map(|(_, row)| {
-                                    row.get(idx).cloned().unwrap_or_else(Value::null_unknown)
-                                })
-                                .collect();
-                            (col_name, values)
-                        })
+                    let key = written_keys.as_ref().map_or(agg.key, |keys| keys[*agg_idx]);
+                    (key.hidden_column_name(), values)
                 })
                 .collect();
 
-            let (mut cols, mut rows) =
-                self.apply_post_aggregation_expressions(stmt, ctx, having_columns, having_rows)?;
+            let (mut cols, mut rows) = self.apply_post_aggregation_expressions(
+                stmt,
+                ctx,
+                &aggregations,
+                having_columns,
+                having_rows,
+            )?;
 
             // Append hidden aggregates to the result for ORDER BY to use
             for (col_name, values) in by_index {
@@ -669,20 +620,6 @@ impl Executor {
                             .cloned()
                             .unwrap_or_else(Value::null_unknown),
                     );
-                }
-            }
-            for (col_name, values) in by_name {
-                // Only add if not already added by index
-                if !cols.iter().any(|c| c.eq_ignore_ascii_case(&col_name)) {
-                    cols.push(col_name);
-                    for (row_idx, (_, row)) in rows.iter_mut().enumerate() {
-                        row.push(
-                            values
-                                .get(row_idx)
-                                .cloned()
-                                .unwrap_or_else(Value::null_unknown),
-                        );
-                    }
                 }
             }
 
@@ -806,6 +743,7 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
+        aggregations: &[SqlAggregateFunction],
         agg_columns: Vec<String>,
         agg_rows: RowVec,
     ) -> Result<(Vec<String>, RowVec)> {
@@ -832,90 +770,11 @@ impl Executor {
         };
         let columns_to_use = processed_columns.as_ref().unwrap_or(&stmt.columns);
 
-        // Build column index map for aggregate result columns
-        let mut agg_col_index_map = build_column_index_map(&agg_columns);
-        // A name with an apostrophe is keyed by its literal case; its lowercase key only fills a gap
-        let mut lowercase_fallbacks: Vec<(String, usize)> = Vec::new();
-        for (i, name) in agg_columns.iter().enumerate() {
-            let folded = fold_expression_name(name);
-            let lower = name.to_lowercase();
-            if folded != lower {
-                agg_col_index_map.remove(lower.as_str());
-                lowercase_fallbacks.push((lower, i));
-            }
-        }
-        for (i, name) in agg_columns.iter().enumerate() {
-            if name.contains('\'') {
-                agg_col_index_map.insert(fold_expression_name(name), i);
-            }
-        }
-        let find_alias = |map: &StringMap<usize>, alias: &str| {
-            map.get(alias).copied().or_else(|| {
-                lowercase_fallbacks
-                    .iter()
-                    .find(|(name, _)| name == alias)
-                    .map(|&(_, i)| i)
-            })
-        };
-
-        // Build additional mappings for aggregate expressions to handle deduplication
-        // When aggregates are deduplicated (e.g., SUM(value) and SUM(value) AS total),
-        // we need to map the expression "sum(value)" to the index even if the column
-        // is named by its alias "total"
-        for col_expr in &stmt.columns {
-            if let Expression::Aliased(aliased) = col_expr {
-                if let Expression::FunctionCall(func) = aliased.expression.as_ref() {
-                    if is_aggregate_function(&func.function) {
-                        let expr_name: String =
-                            fold_expression_name(&self.get_aggregate_column_name(func));
-                        let alias_lower: String = aliased.alias.value_lower.to_string();
-                        // If the alias exists in the map but the expression doesn't, add the expression
-                        if let Some(idx) = find_alias(&agg_col_index_map, &alias_lower) {
-                            agg_col_index_map.entry(expr_name).or_insert(idx);
-                        }
-                        // If the expression exists in the map but the alias doesn't, add the alias
-                        if let Some(&idx) = agg_col_index_map
-                            .get(&fold_expression_name(&self.get_aggregate_column_name(func)))
-                        {
-                            agg_col_index_map.entry(alias_lower).or_insert(idx);
-                        }
-                    }
-                }
-            } else if let Expression::FunctionCall(func) = col_expr {
-                if is_aggregate_function(&func.function) {
-                    let expr_name: String =
-                        fold_expression_name(&self.get_aggregate_column_name(func));
-                    // Check if any aliased version exists for this expression
-                    for other_col in &stmt.columns {
-                        if let Expression::Aliased(other_aliased) = other_col {
-                            if let Expression::FunctionCall(other_func) =
-                                other_aliased.expression.as_ref()
-                            {
-                                if is_aggregate_function(&other_func.function) {
-                                    let other_expr: String = fold_expression_name(
-                                        &self.get_aggregate_column_name(other_func),
-                                    );
-                                    if other_expr == expr_name {
-                                        let alias_lower: String =
-                                            other_aliased.alias.value_lower.to_string();
-                                        if let Some(idx) =
-                                            find_alias(&agg_col_index_map, &alias_lower)
-                                        {
-                                            agg_col_index_map
-                                                .entry(expr_name.clone())
-                                                .or_insert(idx);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        for (lower, i) in lowercase_fallbacks {
-            agg_col_index_map.entry(lower).or_insert(i);
-        }
+        // Names find the result columns that bare names and aliases point at
+        let agg_col_index_map = build_column_index_map(&agg_columns);
+        // Identities find the slot of each group item and aggregate, however it is named
+        let slot_keys = aggregate_slot_keys(&group_by_columns, aggregations);
+        let slot_of = |expr: &Expression| slot_keys.get(&ExprKey::of(expr)).copied();
 
         // Check if we have any expressions that need post-processing
         // This includes CASE, Prefix (-SUM(x)), Infix (SUM(x) + 1), and non-aggregate
@@ -947,27 +806,27 @@ impl Executor {
 
         // Can't return early if we have correlated subqueries - they need per-row evaluation
         if !needs_projection && !has_any_correlated {
-            // Check if columns are in the same order
-            let mut columns_match = true;
-            for (i, col_expr) in columns_to_use.iter().enumerate() {
-                let expected_name: String = match col_expr {
-                    Expression::Identifier(id) => id.value_lower.to_string(),
-                    Expression::QualifiedIdentifier(qid) => {
-                        format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower)
-                    }
-                    Expression::Aliased(a) => a.alias.value_lower.to_string(),
-                    Expression::FunctionCall(func) if is_aggregate_function(&func.function) => {
-                        fold_expression_name(&self.get_aggregate_column_name(func))
-                    }
-                    // Anything else matches only as a GROUP BY expression column
-                    _ => fold_expression_name(&self.expression_to_string(col_expr)),
+            // Each SELECT column already sits in its slot, in order, under the name it shows
+            let columns_match = columns_to_use.iter().enumerate().all(|(i, col_expr)| {
+                let Some(name) = agg_columns.get(i) else {
+                    return false;
                 };
-                if i >= agg_columns.len() || fold_expression_name(&agg_columns[i]) != expected_name
-                {
-                    columns_match = false;
-                    break;
+                match col_expr {
+                    Expression::Identifier(id) => name.to_lowercase() == id.value_lower.as_str(),
+                    Expression::QualifiedIdentifier(qid) => {
+                        name.to_lowercase()
+                            == format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower)
+                    }
+                    Expression::Aliased(a) => name.to_lowercase() == a.alias.value_lower.as_str(),
+                    Expression::FunctionCall(func) if is_aggregate_function(&func.function) => {
+                        slot_of(col_expr) == Some(i)
+                            && self.get_aggregate_column_name(func) == *name
+                    }
+                    _ => {
+                        slot_of(col_expr) == Some(i) && self.expression_to_string(col_expr) == *name
+                    }
                 }
-            }
+            });
             if columns_match {
                 // Columns match exactly, return as-is
                 return Ok((agg_columns, agg_rows));
@@ -1014,10 +873,11 @@ impl Executor {
                 }
                 Expression::FunctionCall(func) => {
                     if is_aggregate_function(&func.function) {
-                        let col_name = self.get_aggregate_column_name(func);
-                        final_columns.push(col_name.clone());
-                        column_sources
-                            .push(ColumnSource::AggColumn(fold_expression_name(&col_name)));
+                        final_columns.push(self.get_aggregate_column_name(func));
+                        column_sources.push(match slot_of(col_expr) {
+                            Some(slot) => ColumnSource::AggSlot(slot),
+                            None => make_source(col_expr, is_correlated),
+                        });
                     } else if func.function.eq_ignore_ascii_case("GROUPING") {
                         // GROUPING() function - map to the appropriate grouping flag column
                         final_columns.push(self.get_aggregate_column_name(func));
@@ -1041,12 +901,10 @@ impl Executor {
                     } else {
                         // Non-aggregate function: a GROUP BY expression column is
                         // read as it is, anything else is evaluated
-                        let expr_lower = fold_expression_name(&self.expression_to_string(col_expr));
                         final_columns.push(format!("{}(...)", func.function));
-                        if agg_col_index_map.contains_key(&expr_lower) && !is_correlated {
-                            column_sources.push(ColumnSource::AggColumn(expr_lower));
-                        } else {
-                            column_sources.push(make_source(col_expr, is_correlated));
+                        match slot_of(col_expr).filter(|_| !is_correlated) {
+                            Some(slot) => column_sources.push(ColumnSource::AggSlot(slot)),
+                            None => column_sources.push(make_source(col_expr, is_correlated)),
                         }
                     }
                 }
@@ -1068,12 +926,9 @@ impl Executor {
                             Expression::FunctionCall(func)
                                 if is_aggregate_function(&func.function) =>
                             {
-                                // Aliased aggregate - look up by expression name (e.g., "SUM(value)")
-                                // not by alias, since aggregates may be deduplicated
-                                let agg_name =
-                                    fold_expression_name(&self.get_aggregate_column_name(func));
-                                if agg_col_index_map.contains_key(&agg_name) {
-                                    column_sources.push(ColumnSource::AggColumn(agg_name));
+                                // Read by identity, not alias: a deduplicated aggregate keeps one name
+                                if let Some(slot) = slot_of(&aliased.expression) {
+                                    column_sources.push(ColumnSource::AggSlot(slot));
                                 } else if agg_col_index_map.contains_key(&alias_lower) {
                                     // Fall back to alias if expression name not found
                                     column_sources.push(ColumnSource::AggColumn(alias_lower));
@@ -1116,13 +971,9 @@ impl Executor {
                                 )));
                             }
                             _ => {
-                                // Try to find it in agg columns by expression string,
-                                // otherwise evaluate
-                                let expr_str =
-                                    self.expression_to_string(aliased.expression.as_ref());
-                                let expr_lower = fold_expression_name(&expr_str);
-                                if agg_col_index_map.contains_key(&expr_lower) {
-                                    column_sources.push(ColumnSource::AggColumn(expr_lower));
+                                // A grouped expression is read from its slot, anything else evaluated
+                                if let Some(slot) = slot_of(&aliased.expression) {
+                                    column_sources.push(ColumnSource::AggSlot(slot));
                                 } else {
                                     column_sources.push(ColumnSource::Expression(Box::new(
                                         aliased.expression.as_ref().clone(),
@@ -1133,52 +984,21 @@ impl Executor {
                     }
                 }
                 Expression::Case(_) => {
-                    // Unnamed CASE - check if expression string matches an agg column
-                    let expr_str = self.expression_to_string(col_expr);
-                    let expr_lower = fold_expression_name(&expr_str);
-                    final_columns.push(expr_str);
-                    if agg_col_index_map.contains_key(&expr_lower) && !is_correlated {
+                    final_columns.push(self.expression_to_string(col_expr));
+                    if let Some(slot) = slot_of(col_expr).filter(|_| !is_correlated) {
                         // CASE is a GROUP BY column - use existing value
-                        column_sources.push(ColumnSource::AggColumn(expr_lower));
+                        column_sources.push(ColumnSource::AggSlot(slot));
                     } else {
                         // CASE with aggregates or correlated - needs evaluation
                         column_sources.push(make_source(col_expr, is_correlated));
                     }
                 }
                 _ => {
-                    // Other expressions
+                    // A grouped expression is read from its slot, anything else evaluated
                     final_columns.push(self.expression_to_string(col_expr));
-                    column_sources.push(make_source(col_expr, is_correlated));
-                }
-            }
-        }
-
-        // A GROUP BY expression selected under an alias names its column by the
-        // alias, so another column built on the same expression cannot find it by
-        // its text. Point such subexpressions at the alias column, matching them
-        // by structure, not by printed text.
-        if matches!(stmt.group_by.modifier, GroupByModifier::None) {
-            let group_aliases: Vec<(&Expression, &Identifier)> = stmt
-                .columns
-                .iter()
-                .filter_map(|col| match col {
-                    Expression::Aliased(aliased)
-                        if agg_col_index_map.contains_key(aliased.alias.value_lower.as_str())
-                            && stmt
-                                .group_by
-                                .columns
-                                .iter()
-                                .any(|g| same_expression(g, &aliased.expression)) =>
-                    {
-                        Some((aliased.expression.as_ref(), &aliased.alias))
-                    }
-                    _ => None,
-                })
-                .collect();
-            if !group_aliases.is_empty() {
-                for source in column_sources.iter_mut() {
-                    if let ColumnSource::Expression(expr) = source {
-                        substitute_group_aliases(expr, &group_aliases);
+                    match slot_of(col_expr).filter(|_| !is_correlated) {
+                        Some(slot) => column_sources.push(ColumnSource::AggSlot(slot)),
+                        None => column_sources.push(make_source(col_expr, is_correlated)),
                     }
                 }
             }
@@ -1195,13 +1015,8 @@ impl Executor {
             CompiledEvaluator::new(crate::functions::registry::global_registry()).with_context(ctx);
         evaluator.init_columns(&agg_columns);
 
-        // Add aggregate expression aliases so COALESCE(SUM(val), 0) can find the "sum(val)" column
-        // when the aggregate is named by its alias (e.g., "raw" from SUM(val) AS raw)
-        let agg_aliases: Vec<(String, usize)> = agg_col_index_map
-            .iter()
-            .map(|(name, &idx)| (name.clone(), idx))
-            .collect();
-        evaluator.add_aggregate_aliases(&agg_aliases);
+        // A group item or aggregate inside an expression reads its slot, whatever names it
+        evaluator.add_aggregate_aliases(&slot_keys);
 
         // Pre-compute outer row column names if we have correlated expressions
         let outer_col_names: Option<CompactArc<Vec<String>>> = if has_correlated_sources {
@@ -1281,6 +1096,9 @@ impl Executor {
                         } else {
                             Value::null_unknown()
                         }
+                    }
+                    ColumnSource::AggSlot(idx) => {
+                        row.get(*idx).cloned().unwrap_or(Value::null_unknown())
                     }
                     ColumnSource::Expression(_) => match &source_programs[src_idx] {
                         Some(p) => evaluator.evaluate_program(p, &row)?,
@@ -1452,9 +1270,15 @@ impl Executor {
             }
             None => (stmt, base_rows, base_columns),
         };
-        let (agg_columns, agg_rows) =
+        let (agg_columns, agg_rows, slots) =
             self.execute_aggregation_for_window(stmt, ctx, base_rows, base_columns)?;
-        self.execute_select_with_window_functions(stmt, ctx, &agg_rows, &agg_columns)
+        self.execute_select_with_window_functions_over_groups(
+            stmt,
+            ctx,
+            &agg_rows,
+            &agg_columns,
+            &slots,
+        )
     }
 
     /// Execute GROUP BY aggregation and return raw columns/rows for window function processing
@@ -1466,7 +1290,7 @@ impl Executor {
         ctx: &ExecutionContext,
         base_rows: &[(i64, Row)],
         base_columns: &[String],
-    ) -> Result<(Vec<String>, RowVec)> {
+    ) -> Result<(Vec<String>, RowVec, FxHashMap<ExprKey, usize>)> {
         // Parse aggregations and group by columns
         let (aggregations, _non_agg_columns) = self.parse_aggregations(stmt)?;
         let group_by_columns = self.parse_group_by(stmt, base_columns)?;
@@ -1502,31 +1326,11 @@ impl Executor {
         };
 
         // Apply HAVING clause filter (in-place)
+        let slots = aggregate_slot_keys(&group_by_columns, &aggregations);
         let mut result_rows_with_ids = RowVec::with_capacity(result_rows.len());
         if let Some(ref having) = stmt.having {
-            // Build aggregate expression aliases for HAVING clause
-            // This maps "SUM(price)" to its column index even if aliased as "total"
-            // IMPORTANT: Include ALL aggregates, not just aliased ones,
-            // because the evaluator needs expression_aliases to match FunctionCall expressions
-            let group_by_count = group_by_columns.len();
-            let mut all_aliases: Vec<(String, usize)> = aggregations
-                .iter()
-                .enumerate()
-                .map(|(i, agg)| (agg.get_expression_name(), group_by_count + i))
-                .collect();
-
-            // Build GROUP BY expression aliases for HAVING clause
-            // This maps expressions like "x + y" to their GROUP BY column indices
-            // allowing HAVING x + y > 20 to work when GROUP BY x + y
-            for (i, item) in group_by_columns.iter().enumerate() {
-                if let GroupByItem::Expression { expr, .. } = item {
-                    all_aliases.push((self.expression_to_string(expr), i));
-                }
-            }
-
-            // Create RowFilter with all aliases and context
             let having_filter =
-                RowFilter::with_aliases(having, &result_columns, &all_aliases)?.with_context(ctx);
+                RowFilter::with_aliases(having, &result_columns, &slots)?.with_context(ctx);
 
             // Filter rows using the pre-compiled filter
             for (id, row) in result_rows {
@@ -1540,7 +1344,7 @@ impl Executor {
             }
         }
 
-        Ok((result_columns, result_rows_with_ids))
+        Ok((result_columns, result_rows_with_ids, slots))
     }
 
     /// Parse aggregate functions from SELECT list
@@ -1555,6 +1359,7 @@ impl Executor {
         for col_expr in &stmt.columns {
             self.extract_aggregates_from_expr(col_expr, &mut aggregations, &mut non_agg_columns)?;
         }
+        let select_count = aggregations.len();
 
         // Also extract aggregates from HAVING clause
         // These need to be computed even if they're not in SELECT
@@ -1584,37 +1389,31 @@ impl Executor {
                 self.extract_aggregates_from_expr(expr, &mut aggregations, &mut non_agg_columns)?;
             }
         }
-        // Mark any new aggregates (from ORDER BY) as hidden, but only if they're truly new
-        // Helper to create a signature string for an aggregate including its filter
-        let make_sig = |agg: &SqlAggregateFunction| -> (String, String, bool, String) {
-            let filter_sig = agg
-                .filter
-                .as_ref()
-                .map(|f| format!("{:?}", f))
-                .unwrap_or_default();
-            (
-                agg.name.to_uppercase(),
-                fold_expression_name(&agg.column),
-                agg.distinct,
-                filter_sig,
-            )
-        };
-
-        // Check by comparing the expression signature to avoid duplicates
+        // An ORDER BY aggregate the SELECT list does not compute is hidden
         for i in visible_count..aggregations.len() {
-            // Check if this aggregate already exists in the visible portion
-            let new_sig = make_sig(&aggregations[i]);
             let already_exists = aggregations[..visible_count]
                 .iter()
-                .any(|existing| make_sig(existing) == new_sig);
+                .any(|existing| existing.key == aggregations[i].key);
             if !already_exists {
                 aggregations[i].hidden = true;
             }
         }
-        // Remove duplicates (aggregates that exist in both SELECT and ORDER BY)
-        // Include the filter in the signature so aggregates with different filters are kept
-        let mut seen: FxHashSet<(String, String, bool, String)> = FxHashSet::default();
-        aggregations.retain(|agg| seen.insert(make_sig(agg)));
+        // A HAVING aggregate the sort reads too is carried to it, unless SELECT holds it
+        for i in select_count..visible_count {
+            let key = aggregations[i].key;
+            if aggregations[visible_count..]
+                .iter()
+                .any(|agg| agg.key == key)
+                && !aggregations[..select_count]
+                    .iter()
+                    .any(|agg| agg.key == key)
+            {
+                aggregations[i].hidden = true;
+            }
+        }
+        // One slot per distinct call, whichever clause wrote it first
+        let mut seen: FxHashSet<ExprKey> = FxHashSet::default();
+        aggregations.retain(|agg| seen.insert(agg.key));
 
         Ok((aggregations, non_agg_columns))
     }
@@ -1654,6 +1453,7 @@ impl Executor {
                         order_by: func.order_by.clone(),
                         filter: func.filter.as_ref().map(|f| (**f).clone()),
                         hidden: false,
+                        key: ExprKey::of_call(func),
                     });
                 } else {
                     // Non-aggregate function: recursively check arguments for nested aggregates
@@ -1754,6 +1554,7 @@ impl Executor {
                         order_by: func.order_by.clone(),
                         filter: func.filter.as_ref().map(|f| (**f).clone()),
                         hidden: false,
+                        key: ExprKey::of_call(func),
                     });
                 } else {
                     // Non-aggregate function: recursively check arguments for nested aggregates
@@ -1884,13 +1685,11 @@ impl Executor {
         let columns_to_parse: Vec<&Expression> =
             if let GroupByModifier::GroupingSets(ref sets) = stmt.group_by.modifier {
                 // Collect all unique columns from all grouping sets
-                // Use canonical key for uniqueness (handles case-insensitivity and structural matching)
                 let mut seen = FxHashSet::default();
                 let mut unique_cols = Vec::new();
                 for set in sets {
                     for expr in set {
-                        let key = expression_canonical_key(expr);
-                        if seen.insert(key) {
+                        if seen.insert(ExprKey::of(expr)) {
                             unique_cols.push(expr);
                         }
                     }
@@ -1987,13 +1786,10 @@ impl Executor {
 
     /// Find the alias for an expression in the SELECT list
     fn find_expression_alias(&self, stmt: &SelectStatement, target_expr: &Expression) -> String {
-        // Check if this expression has an alias in SELECT
+        let target = ExprKey::of(target_expr);
         for col_expr in &stmt.columns {
             if let Expression::Aliased(aliased) = col_expr {
-                // Compare expressions by converting to canonical string representation
-                let aliased_str = self.expression_to_string(&aliased.expression);
-                let target_str = self.expression_to_string(target_expr);
-                if aliased_str == target_str {
+                if ExprKey::of(&aliased.expression) == target {
                     return aliased.alias.value.to_string();
                 }
             }
@@ -4870,23 +4666,17 @@ impl Executor {
         let num_columns = group_by_items.len();
         let mut result = Vec::with_capacity(sets.len());
 
-        // Build a lookup from canonical key to group_by_items index
-        // Uses the same canonical key function for consistent matching
-        let item_to_index: StringMap<usize> = group_by_items
+        let item_to_index: FxHashMap<ExprKey, usize> = group_by_items
             .iter()
             .enumerate()
-            .map(|(i, item)| (group_by_item_canonical_key(item), i))
+            .map(|(i, item)| (group_by_item_key(item), i))
             .collect();
 
         for set in sets {
             let mut active_columns = vec![false; num_columns];
 
             for expr in set {
-                // Get the canonical key for this expression
-                let key = expression_canonical_key(expr);
-
-                // Find the index in group_by_items
-                if let Some(&idx) = item_to_index.get(&key) {
+                if let Some(&idx) = item_to_index.get(&ExprKey::of(expr)) {
                     active_columns[idx] = true;
                 }
             }
@@ -4965,8 +4755,7 @@ impl Executor {
         result: Box<dyn QueryResult>,
         having: &Expression,
         columns: &[String],
-        agg_aliases: &[(String, usize)],
-        expr_aliases: &[(String, usize)],
+        slots: &FxHashMap<ExprKey, usize>,
         outer_table: Option<&str>,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
@@ -4978,10 +4767,6 @@ impl Executor {
             rows.push((row_id, result.take_row()));
             row_id += 1;
         }
-
-        // Combine all aliases for HAVING clause evaluation
-        let mut all_aliases: Vec<(String, usize)> = agg_aliases.to_vec();
-        all_aliases.extend_from_slice(expr_aliases);
 
         // A subquery that reads the group it is asked about is run once per
         // group, with the group's row standing as the outer row, the way a
@@ -5014,7 +4799,7 @@ impl Executor {
                 let correlated_ctx =
                     ctx.with_outer_row(outer_row_map, CompactArc::clone(&columns_arc));
                 let processed = self.process_correlated_where(having, &correlated_ctx)?;
-                let filter = RowFilter::with_aliases(&processed, columns, &all_aliases)?
+                let filter = RowFilter::with_aliases(&processed, columns, slots)?
                     .with_context(&correlated_ctx);
                 if filter.matches_checked(&row)? {
                     filtered_rows.push((new_id, row));
@@ -5028,8 +4813,7 @@ impl Executor {
         }
 
         // Create RowFilter with all aliases and context
-        let having_filter =
-            RowFilter::with_aliases(having, columns, &all_aliases)?.with_context(ctx);
+        let having_filter = RowFilter::with_aliases(having, columns, slots)?.with_context(ctx);
 
         // Filter rows using the pre-compiled filter
         let mut filtered_rows = RowVec::new();
@@ -5931,6 +5715,7 @@ impl Executor {
                 let (final_columns, final_rows) = self.apply_post_aggregation_expressions(
                     stmt,
                     ctx,
+                    &aggregations,
                     agg_result_columns,
                     agg_rows,
                 )?;
@@ -6106,8 +5891,13 @@ impl Executor {
         let agg_row = Row::from_compact_vec(agg_result_values);
         let mut agg_rows = RowVec::with_capacity(1);
         agg_rows.push((0, agg_row));
-        let (final_columns, final_rows) =
-            self.apply_post_aggregation_expressions(stmt, ctx, agg_result_columns, agg_rows)?;
+        let (final_columns, final_rows) = self.apply_post_aggregation_expressions(
+            stmt,
+            ctx,
+            &aggregations,
+            agg_result_columns,
+            agg_rows,
+        )?;
 
         Ok(Some(Box::new(super::result::ExecutorResult::new(
             final_columns,
@@ -7488,86 +7278,6 @@ impl Executor {
             vec![result_column_name],
             rows,
         ))))
-    }
-}
-
-/// Whether two expressions are the same, comparing node kinds, operators,
-/// names and literal values but not tokens or source positions
-fn same_expression(a: &Expression, b: &Expression) -> bool {
-    fn same_identifier(a: &Identifier, b: &Identifier) -> bool {
-        a.quoted == b.quoted
-            && if a.quoted {
-                a.value == b.value
-            } else {
-                a.value_lower == b.value_lower
-            }
-    }
-    match (a, b) {
-        (Expression::Identifier(a), Expression::Identifier(b)) => same_identifier(a, b),
-        (Expression::QualifiedIdentifier(a), Expression::QualifiedIdentifier(b)) => {
-            same_identifier(&a.qualifier, &b.qualifier) && same_identifier(&a.name, &b.name)
-        }
-        (Expression::IntegerLiteral(a), Expression::IntegerLiteral(b)) => a.value == b.value,
-        (Expression::FloatLiteral(a), Expression::FloatLiteral(b)) => {
-            a.value.to_bits() == b.value.to_bits()
-        }
-        (Expression::StringLiteral(a), Expression::StringLiteral(b)) => {
-            a.value == b.value && a.type_hint == b.type_hint
-        }
-        (Expression::BooleanLiteral(a), Expression::BooleanLiteral(b)) => a.value == b.value,
-        (Expression::NullLiteral(_), Expression::NullLiteral(_)) => true,
-        (Expression::Prefix(a), Expression::Prefix(b)) => {
-            a.op_type == b.op_type
-                && a.operator.eq_ignore_ascii_case(&b.operator)
-                && same_expression(&a.right, &b.right)
-        }
-        (Expression::Infix(a), Expression::Infix(b)) => {
-            a.op_type == b.op_type
-                && a.operator.eq_ignore_ascii_case(&b.operator)
-                && same_expression(&a.left, &b.left)
-                && same_expression(&a.right, &b.right)
-        }
-        (Expression::Cast(a), Expression::Cast(b)) => {
-            a.type_name.eq_ignore_ascii_case(&b.type_name) && same_expression(&a.expr, &b.expr)
-        }
-        (Expression::FunctionCall(a), Expression::FunctionCall(b)) => {
-            a.function.eq_ignore_ascii_case(&b.function)
-                && a.is_distinct == b.is_distinct
-                && a.order_by.is_empty()
-                && b.order_by.is_empty()
-                && a.filter.is_none()
-                && b.filter.is_none()
-                && a.arguments.len() == b.arguments.len()
-                && a.arguments
-                    .iter()
-                    .zip(&b.arguments)
-                    .all(|(a, b)| same_expression(a, b))
-        }
-        _ => false,
-    }
-}
-
-/// Replace, in place, every subexpression of `expr` that is the same as an
-/// aliased GROUP BY expression by that alias
-fn substitute_group_aliases(expr: &mut Expression, aliases: &[(&Expression, &Identifier)]) {
-    if let Some((_, alias)) = aliases.iter().find(|(e, _)| same_expression(e, expr)) {
-        *expr = Expression::Identifier((*alias).clone());
-        return;
-    }
-    match expr {
-        Expression::Infix(infix) => {
-            substitute_group_aliases(&mut infix.left, aliases);
-            substitute_group_aliases(&mut infix.right, aliases);
-        }
-        Expression::Prefix(prefix) => substitute_group_aliases(&mut prefix.right, aliases),
-        Expression::Cast(cast) => substitute_group_aliases(&mut cast.expr, aliases),
-        Expression::QuantifiedSet(set) => substitute_group_aliases(&mut set.left, aliases),
-        Expression::FunctionCall(func) if !is_aggregate_function(&func.function) => {
-            for arg in func.arguments.iter_mut() {
-                substitute_group_aliases(arg, aliases);
-            }
-        }
-        _ => {}
     }
 }
 

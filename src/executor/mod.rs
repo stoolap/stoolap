@@ -64,6 +64,7 @@ mod ddl;
 mod dml;
 mod dml_fast_path;
 mod explain;
+mod expr_key;
 mod foreign_key;
 mod index_optimizer;
 mod pk_fast_path;
