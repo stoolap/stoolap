@@ -47,6 +47,8 @@ SELECT false XOR false;  -- false
 | `/` | Division | `SELECT total / count` |
 | `%` | Modulo (remainder) | `SELECT id % 10` |
 
+INTEGER arithmetic is exact. A result outside the INTEGER range is an `Integer overflow` error, for every operator and for `ABS`: `9223372036854775807 + 1`, `-(-9223372036854775807 - 1)`, `(-9223372036854775807 - 1) / -1` and `ABS(-9223372036854775807 - 1)` are errors. Division truncates toward zero (`7 / 2` is 3, `-7 / 2` is -3), and the remainder takes the sign of the dividend (`-7 % 2` is -1). Dividing by zero, with `/`, `%` or `MOD`, returns NULL.
+
 ## Bitwise Operators
 
 | Operator | Description | Example |
@@ -57,6 +59,8 @@ SELECT false XOR false;  -- false
 | `~` | Bitwise NOT | `SELECT ~flags` |
 | `<<` | Left shift | `SELECT 1 << 4` (returns 16) |
 | `>>` | Right shift | `SELECT 16 >> 2` (returns 4) |
+
+A shift moves the bits of the 64-bit INTEGER by 0 to 63 places: `1 << 63` is the smallest INTEGER, and `>>` keeps the sign (`-8 >> 1` is -4). A negative shift amount, or one of 64 or more, is an error.
 
 ## String Operators
 

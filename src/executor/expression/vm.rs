@@ -29,6 +29,7 @@ use smallvec::SmallVec;
 use super::ops::{CompareOp, CompiledPattern, IntervalStep, IntervalUnit, Op};
 use super::program::Program;
 use crate::common::{CompactArc, SmartString};
+use crate::core::integer::{integer_neg, integer_op, IntegerOp};
 use crate::core::predicate::{number_against_text, sql_compare, sql_distinct, sql_eq};
 use crate::core::value::{f64_eq, f64_ge, f64_gt, f64_le, f64_lt, f64_ne};
 use crate::core::{DataType, Result, Row, Value, NULL_VALUE};
@@ -74,14 +75,6 @@ fn between_cell(value: &Value, low: &Value, high: &Value) -> Option<bool> {
 /// Stack capacity for inline storage (avoids heap allocation for simple expressions)
 /// Most expressions need 4-8 stack slots, so 8 covers the common case.
 const STACK_INLINE_CAPACITY: usize = 16;
-
-/// Arithmetic operation type (used for safe wrapping operations)
-#[derive(Clone, Copy)]
-enum ArithmeticOp {
-    Add,
-    Sub,
-    Mul,
-}
 
 /// Execution context for the VM
 ///
@@ -816,7 +809,7 @@ impl ExprVM {
                             // Parse interval string - pass references directly to avoid clone
                             self.timestamp_add_interval(&a, &b, true)
                         }
-                        _ => Self::arithmetic_op(&a, &b, ArithmeticOp::Add, |x, y| x + y)?,
+                        _ => Self::arithmetic_op(&a, &b, IntegerOp::Add, |x, y| x + y)?,
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -841,7 +834,7 @@ impl ExprVM {
                             // Parse interval string - pass references directly to avoid clone
                             self.timestamp_add_interval(&a, &b, false)
                         }
-                        _ => Self::arithmetic_op(&a, &b, ArithmeticOp::Sub, |x, y| x - y)?,
+                        _ => Self::arithmetic_op(&a, &b, IntegerOp::Sub, |x, y| x - y)?,
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -850,7 +843,7 @@ impl ExprVM {
                 Op::Mul => {
                     let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = Self::arithmetic_op(&a, &b, ArithmeticOp::Mul, |x, y| x * y)?;
+                    let result = Self::arithmetic_op(&a, &b, IntegerOp::Mul, |x, y| x * y)?;
                     self.stack.push(result);
                     pc += 1;
                 }
@@ -858,7 +851,7 @@ impl ExprVM {
                 Op::Div => {
                     let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = Self::div_op(&a, &b);
+                    let result = Self::div_op(&a, &b)?;
                     self.stack.push(result);
                     pc += 1;
                 }
@@ -866,7 +859,7 @@ impl ExprVM {
                 Op::Mod => {
                     let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = Self::mod_op(&a, &b);
+                    let result = Self::mod_op(&a, &b)?;
                     self.stack.push(result);
                     pc += 1;
                 }
@@ -874,10 +867,7 @@ impl ExprVM {
                 Op::Neg => {
                     let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let result = match v {
-                        Value::Integer(i) => match i.checked_neg() {
-                            Some(neg) => Value::Integer(neg),
-                            None => Value::Null(DataType::Integer), // i64::MIN overflow
-                        },
+                        Value::Integer(i) => Value::Integer(integer_neg(i)?),
                         Value::Float(f) => Value::Float(-f),
                         Value::Null(dt) => Value::Null(dt),
                         _ => Value::Null(DataType::Null),
@@ -941,7 +931,7 @@ impl ExprVM {
                     let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let result = match (&a, &b) {
                         (Value::Integer(x), Value::Integer(y)) => {
-                            Value::Integer(x.wrapping_shl(*y as u32))
+                            integer_op(IntegerOp::Shl, *x, *y)?.map_or(NULL_VALUE, Value::Integer)
                         }
                         _ if a.is_null() || b.is_null() => Value::Null(DataType::Integer),
                         _ => Value::Null(DataType::Null),
@@ -955,7 +945,7 @@ impl ExprVM {
                     let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let result = match (&a, &b) {
                         (Value::Integer(x), Value::Integer(y)) => {
-                            Value::Integer(x.wrapping_shr(*y as u32))
+                            integer_op(IntegerOp::Shr, *x, *y)?.map_or(NULL_VALUE, Value::Integer)
                         }
                         _ if a.is_null() || b.is_null() => Value::Null(DataType::Integer),
                         _ => Value::Null(DataType::Null),
@@ -3473,25 +3463,13 @@ impl ExprVM {
     }
 
     #[inline]
-    fn arithmetic_op<FF>(a: &Value, b: &Value, int_op: ArithmeticOp, float_op: FF) -> Result<Value>
+    fn arithmetic_op<FF>(a: &Value, b: &Value, int_op: IntegerOp, float_op: FF) -> Result<Value>
     where
         FF: Fn(f64, f64) -> f64,
     {
         match (a, b) {
             (Value::Integer(x), Value::Integer(y)) => {
-                // Use checked operations to detect overflow and return an error
-                let result = match int_op {
-                    ArithmeticOp::Add => x.checked_add(*y),
-                    ArithmeticOp::Sub => x.checked_sub(*y),
-                    ArithmeticOp::Mul => x.checked_mul(*y),
-                };
-                match result {
-                    Some(r) => Ok(Value::Integer(r)),
-                    None => Err(crate::core::Error::Type(format!(
-                        "Integer overflow in arithmetic operation: {} and {}",
-                        x, y
-                    ))),
-                }
+                Ok(integer_op(int_op, *x, *y)?.map_or(NULL_VALUE, Value::Integer))
             }
             (Value::Float(x), Value::Float(y)) => Ok(Value::Float(float_op(*x, *y))),
             (Value::Integer(x), Value::Float(y)) => Ok(Value::Float(float_op(*x as f64, *y))),
@@ -3502,27 +3480,32 @@ impl ExprVM {
     }
 
     #[inline]
-    fn div_op(a: &Value, b: &Value) -> Value {
-        match (a, b) {
-            (Value::Integer(x), Value::Integer(y)) if *y != 0 => Value::Integer(x / y),
+    fn div_op(a: &Value, b: &Value) -> Result<Value> {
+        Ok(match (a, b) {
+            // Division by zero returns NULL
+            (Value::Integer(x), Value::Integer(y)) => {
+                integer_op(IntegerOp::Div, *x, *y)?.map_or(NULL_VALUE, Value::Integer)
+            }
             (Value::Float(x), Value::Float(y)) if *y != 0.0 => Value::Float(x / y),
             (Value::Integer(x), Value::Float(y)) if *y != 0.0 => Value::Float(*x as f64 / y),
             (Value::Float(x), Value::Integer(y)) if *y != 0 => Value::Float(x / *y as f64),
             _ if a.is_null() || b.is_null() => Value::Null(DataType::Float),
-            _ => Value::Null(DataType::Null), // Division by zero returns NULL
-        }
+            _ => Value::Null(DataType::Null),
+        })
     }
 
     #[inline]
-    fn mod_op(a: &Value, b: &Value) -> Value {
-        match (a, b) {
-            (Value::Integer(x), Value::Integer(y)) if *y != 0 => Value::Integer(x % y),
+    fn mod_op(a: &Value, b: &Value) -> Result<Value> {
+        Ok(match (a, b) {
+            (Value::Integer(x), Value::Integer(y)) => {
+                integer_op(IntegerOp::Mod, *x, *y)?.map_or(NULL_VALUE, Value::Integer)
+            }
             (Value::Float(x), Value::Float(y)) if *y != 0.0 => Value::Float(x % y),
             (Value::Integer(x), Value::Float(y)) if *y != 0.0 => Value::Float(*x as f64 % y),
             (Value::Float(x), Value::Integer(y)) if *y != 0 => Value::Float(x % *y as f64),
             _ if a.is_null() || b.is_null() => Value::Null(DataType::Float),
             _ => Value::Null(DataType::Null),
-        }
+        })
     }
 
     /// JSON access helper
