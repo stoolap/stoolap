@@ -41,9 +41,7 @@ use crate::storage::traits::{Engine, QueryResult};
 
 use super::context::ExecutionContext;
 use super::expr_key::ExprKey;
-#[allow(deprecated)]
-use super::expression::CompiledEvaluator;
-use super::expression::{ExprVM, ExpressionEval, Op, RowFilter};
+use super::expression::{ExprVM, Op};
 use super::query_cache::{CompiledCountDistinct, CompiledExecution};
 use super::query_classification::QueryClassification;
 use super::result::ExecutorResult;
@@ -270,6 +268,50 @@ fn try_parse_single_having_condition(
 fn keep_first_error(slot: &mut Option<crate::core::Error>, e: crate::core::Error) -> Value {
     slot.get_or_insert(e);
     Value::null_unknown()
+}
+
+/// A program over aggregate slot rows: `aliases` read a group item or
+/// aggregate from its slot by identity, `outer_columns` the outer row by name
+fn compile_over_slots(
+    expr: &Expression,
+    columns: &[String],
+    registry: &crate::functions::FunctionRegistry,
+    aliases: Option<&FxHashMap<ExprKey, usize>>,
+    outer_columns: Option<&[String]>,
+) -> Result<super::expression::SharedProgram> {
+    let mut compile = super::expression::CompileContext::new(columns, registry);
+    if let Some(aliases) = aliases {
+        compile = compile.with_expression_aliases(
+            aliases
+                .iter()
+                .map(|(&key, &slot)| (key, slot as u16))
+                .collect(),
+        );
+    }
+    if let Some(outer) = outer_columns {
+        compile = compile.with_outer_columns(outer);
+    }
+    super::expression::ExprCompiler::new(&compile)
+        .compile(expr)
+        .map(CompactArc::new)
+        .map_err(|e| crate::core::Error::internal(format!("Compile error: {}", e)))
+}
+
+/// The VM context for one slot row of `ctx`'s statement
+fn slot_context<'a>(
+    row: &'a Row,
+    ctx: &'a ExecutionContext,
+) -> super::expression::ExecuteContext<'a> {
+    let exec = super::expression::ExecuteContext::with_common_params(
+        row,
+        ctx.params(),
+        Some(ctx.named_params()),
+        ctx.transaction_id(),
+    );
+    match ctx.outer_row() {
+        Some(outer) => exec.with_outer_row(outer),
+        None => exec,
+    }
 }
 
 /// Extract numeric value from expression, in its own type
@@ -507,11 +549,16 @@ impl Executor {
         // built too: the pushed limit is LIMIT + OFFSET
         let aggregation_limit = if can_push_limit {
             let eval_usize = |expr: &Expression| {
-                let mut eval = ExpressionEval::compile(expr, &[]).ok()?.with_context(ctx);
-                eval.eval_slice(&Row::new()).ok().and_then(|v| match v {
+                let registry = crate::functions::registry::global_registry();
+                let program = compile_over_slots(expr, &[], registry, None, None).ok()?;
+                let row = Row::new();
+                match ExprVM::new()
+                    .execute(&program, &slot_context(&row, ctx))
+                    .ok()?
+                {
                     crate::core::Value::Integer(n) if n >= 0 => Some(n as usize),
                     _ => None,
-                })
+                }
             };
             let limit = stmt.limit.as_deref().and_then(eval_usize);
             match stmt.offset.as_deref() {
@@ -1127,12 +1174,11 @@ impl Executor {
 
         // Evaluate each row
         let mut final_rows = RowVec::with_capacity(agg_rows.len());
-        let mut evaluator =
-            CompiledEvaluator::new(crate::functions::registry::global_registry()).with_context(ctx);
-        evaluator.init_columns(&agg_columns);
-
-        // A group item or aggregate inside an expression reads its slot, whatever names it
-        evaluator.add_aggregate_aliases(&slot_keys);
+        let mut vm = super::expression::ExprVM::new();
+        // A statement inside a correlated subquery reads the outer row by name
+        let outer_columns: Option<Vec<String>> = ctx
+            .outer_row()
+            .map(|outer| outer.keys().map(|k| k.to_string()).collect());
 
         // Pre-compute outer row column names if we have correlated expressions
         let outer_col_names: Option<CompactArc<Vec<String>>> = if has_correlated_sources {
@@ -1191,11 +1237,19 @@ impl Executor {
         let mut outer_row_map: FxHashMap<CompactArc<str>, Value> =
             FxHashMap::with_capacity_and_hasher(estimated_entries, Default::default());
 
-        // Pre-compile plain expression sources once for the row loop
+        // Plain expression sources compile once for the row loop; a group
+        // item or aggregate inside one reads its slot, whatever names it
         let source_programs: Vec<Option<super::expression::SharedProgram>> = column_sources
             .iter()
             .map(|s| match s {
-                ColumnSource::Expression(expr) => evaluator.compile_cached(expr).map(Some),
+                ColumnSource::Expression(expr) => compile_over_slots(
+                    expr,
+                    &agg_columns,
+                    crate::functions::registry::global_registry(),
+                    Some(&slot_keys),
+                    outer_columns.as_deref(),
+                )
+                .map(Some),
                 _ => Ok(None),
             })
             .collect::<Result<_>>()?;
@@ -1217,7 +1271,7 @@ impl Executor {
                         row.get(*idx).cloned().unwrap_or(Value::null_unknown())
                     }
                     ColumnSource::Expression(_) => match &source_programs[src_idx] {
-                        Some(p) => evaluator.evaluate_program(p, &row)?,
+                        Some(p) => vm.execute_cow(p, &slot_context(&row, ctx))?,
                         None => Value::null_unknown(),
                     },
                     ColumnSource::CorrelatedExpression(expr) => {
@@ -1243,12 +1297,17 @@ impl Executor {
                         let result = self
                             .process_correlated_expression(expr, &correlated_ctx)
                             .and_then(|processed_expr| {
-                                // Evaluate the processed expression
-                                let mut corr_eval = CompiledEvaluator::new(&self.function_registry)
-                                    .with_context(&correlated_ctx);
-                                corr_eval.init_columns(&agg_columns);
-                                corr_eval.set_row_array(&row);
-                                corr_eval.evaluate(&processed_expr)
+                                let outer: Option<Vec<String>> = correlated_ctx
+                                    .outer_row()
+                                    .map(|outer| outer.keys().map(|k| k.to_string()).collect());
+                                let program = compile_over_slots(
+                                    &processed_expr,
+                                    &agg_columns,
+                                    &self.function_registry,
+                                    None,
+                                    outer.as_deref(),
+                                )?;
+                                vm.execute_cow(&program, &slot_context(&row, &correlated_ctx))
                             });
 
                         // Take back map for reuse
@@ -1445,12 +1504,16 @@ impl Executor {
         let slots = aggregate_slot_keys(&group_by_columns, &aggregations, &stmt.columns);
         let mut result_rows_with_ids = RowVec::with_capacity(result_rows.len());
         if let Some(ref having) = stmt.having {
-            let having_filter =
-                RowFilter::with_aliases(having, &result_columns, &slots)?.with_context(ctx);
-
-            // Filter rows using the pre-compiled filter
+            let having_filter = compile_over_slots(
+                having,
+                &result_columns,
+                crate::functions::registry::global_registry(),
+                Some(&slots),
+                None,
+            )?;
+            let mut vm = ExprVM::new();
             for (id, row) in result_rows {
-                if having_filter.matches_checked(&row)? {
+                if vm.execute_bool_checked(&having_filter, &slot_context(&row, ctx))? {
                     result_rows_with_ids.push((id, row));
                 }
             }
@@ -4931,6 +4994,7 @@ impl Executor {
                 .collect();
             let mut filtered_rows = RowVec::new();
             let mut new_id = 0i64;
+            let mut vm = ExprVM::new();
             for (_, row) in rows {
                 let mut outer_row_map: FxHashMap<CompactArc<str>, Value> = FxHashMap::default();
                 for (i, (bare, qualified)) in keys.iter().enumerate() {
@@ -4943,9 +5007,14 @@ impl Executor {
                 let correlated_ctx =
                     ctx.with_outer_row(outer_row_map, CompactArc::clone(&columns_arc));
                 let processed = self.process_correlated_where(having, &correlated_ctx)?;
-                let filter = RowFilter::with_aliases(&processed, columns, slots)?
-                    .with_context(&correlated_ctx);
-                if filter.matches_checked(&row)? {
+                let filter = compile_over_slots(
+                    &processed,
+                    columns,
+                    crate::functions::registry::global_registry(),
+                    Some(slots),
+                    None,
+                )?;
+                if vm.execute_bool_checked(&filter, &slot_context(&row, &correlated_ctx))? {
                     filtered_rows.push((new_id, row));
                     new_id += 1;
                 }
@@ -4956,14 +5025,18 @@ impl Executor {
             )));
         }
 
-        // Create RowFilter with all aliases and context
-        let having_filter = RowFilter::with_aliases(having, columns, slots)?.with_context(ctx);
-
-        // Filter rows using the pre-compiled filter
+        let having_filter = compile_over_slots(
+            having,
+            columns,
+            crate::functions::registry::global_registry(),
+            Some(slots),
+            None,
+        )?;
         let mut filtered_rows = RowVec::new();
         let mut new_id = 0i64;
+        let mut vm = ExprVM::new();
         for (_, row) in rows {
-            if having_filter.matches_checked(&row)? {
+            if vm.execute_bool_checked(&having_filter, &slot_context(&row, ctx))? {
                 filtered_rows.push((new_id, row));
                 new_id += 1;
             }
