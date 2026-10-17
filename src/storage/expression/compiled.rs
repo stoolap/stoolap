@@ -1001,7 +1001,21 @@ impl CompiledFilter {
             .map(|c| c.data_type == crate::core::DataType::Integer)
             .unwrap_or(false);
 
+        let col_is_float = schema
+            .columns
+            .get(col_idx)
+            .is_some_and(|c| c.data_type == crate::core::DataType::Float);
+
         let between_filter = match (low, high) {
+            // Integer bounds against a FLOAT column: IntegerBetween never
+            // matches float cells, so the bounds go float when exact
+            (Value::Integer(min), Value::Integer(max)) if col_is_float => {
+                use crate::core::value::lossless_f64_from_i64;
+                match (lossless_f64_from_i64(*min), lossless_f64_from_i64(*max)) {
+                    (Some(min), Some(max)) => CompiledFilter::FloatBetween { col_idx, min, max },
+                    _ => return CompiledFilter::Dynamic(expr.clone_box()),
+                }
+            }
             (Value::Integer(min), Value::Integer(max)) => CompiledFilter::IntegerBetween {
                 col_idx,
                 min: *min,

@@ -20,6 +20,7 @@
 //! - Grouped aggregation: `SELECT category, SUM(amount) FROM sales GROUP BY category`
 //! - HAVING clause: `SELECT category, SUM(amount) FROM sales GROUP BY category HAVING SUM(amount) > 100`
 
+use std::borrow::Cow;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::RwLock;
 
@@ -60,8 +61,8 @@ struct HavingCondition {
     agg_index: usize,
     /// Comparison operator
     op: ComparisonOp,
-    /// Threshold value
-    threshold: f64,
+    /// Threshold value, an INTEGER or FLOAT as written
+    threshold: Value,
 }
 
 /// Simple HAVING filter for inline application during fast aggregation
@@ -84,23 +85,25 @@ enum ComparisonOp {
 }
 
 impl HavingCondition {
-    /// Check if a value passes this condition, in the total order
-    fn matches(&self, value: f64) -> bool {
-        use crate::core::value::{f64_eq, f64_ge, f64_gt, f64_le, f64_lt, f64_ne};
+    /// Check if a value passes this condition, by the predicate comparison
+    fn matches(&self, value: &Value) -> bool {
+        let Some(ord) = crate::core::predicate::sql_compare(value, &self.threshold) else {
+            return false;
+        };
         match self.op {
-            ComparisonOp::Gt => f64_gt(value, self.threshold),
-            ComparisonOp::Gte => f64_ge(value, self.threshold),
-            ComparisonOp::Lt => f64_lt(value, self.threshold),
-            ComparisonOp::Lte => f64_le(value, self.threshold),
-            ComparisonOp::Eq => f64_eq(value, self.threshold),
-            ComparisonOp::Neq => f64_ne(value, self.threshold),
+            ComparisonOp::Gt => ord.is_gt(),
+            ComparisonOp::Gte => ord.is_ge(),
+            ComparisonOp::Lt => ord.is_lt(),
+            ComparisonOp::Lte => ord.is_le(),
+            ComparisonOp::Eq => ord.is_eq(),
+            ComparisonOp::Neq => ord.is_ne(),
         }
     }
 }
 
 impl SimpleHavingFilter {
     /// Create a filter with a single condition
-    fn single(agg_index: usize, op: ComparisonOp, threshold: f64) -> Self {
+    fn single(agg_index: usize, op: ComparisonOp, threshold: Value) -> Self {
         Self {
             conditions: vec![HavingCondition {
                 agg_index,
@@ -154,7 +157,7 @@ fn try_parse_simple_having(
 fn try_parse_single_having_condition(
     having: &Expression,
     aggregations: &[SqlAggregateFunction],
-) -> Option<(usize, ComparisonOp, f64)> {
+) -> Option<(usize, ComparisonOp, Value)> {
     // Handle comparison: AGG(col) op value
     if let Expression::Infix(binop) = having {
         let (op, threshold) = match binop.operator.as_str() {
@@ -216,13 +219,17 @@ fn keep_first_error(slot: &mut Option<crate::core::Error>, e: crate::core::Error
     Value::null_unknown()
 }
 
-/// Extract numeric value from expression
-fn extract_numeric_value(expr: &Expression) -> Option<f64> {
+/// Extract numeric value from expression, in its own type
+fn extract_numeric_value(expr: &Expression) -> Option<Value> {
     match expr {
-        Expression::IntegerLiteral(lit) => Some(lit.value as f64),
-        Expression::FloatLiteral(lit) => Some(lit.value),
+        Expression::IntegerLiteral(lit) => Some(Value::Integer(lit.value)),
+        Expression::FloatLiteral(lit) => Some(Value::Float(lit.value)),
         Expression::Prefix(unary) if unary.operator == "-" => {
-            extract_numeric_value(&unary.right).map(|v| -v)
+            match extract_numeric_value(&unary.right)? {
+                Value::Integer(i) => i.checked_neg().map(Value::Integer),
+                Value::Float(f) => Some(Value::Float(-f)),
+                _ => None,
+            }
         }
         _ => None,
     }
@@ -2735,35 +2742,35 @@ impl Executor {
                 for cond in &filter.conditions {
                     let agg_value = match &simple_aggs[cond.agg_index] {
                         SimpleAgg::Count | SimpleAgg::CountColumn(_) => {
-                            Some(state.counts[cond.agg_index] as f64)
+                            Some(Cow::Owned(Value::Integer(state.counts[cond.agg_index])))
                         }
                         SimpleAgg::Sum(_) => {
                             if state.agg_has_value[cond.agg_index] {
-                                Some(state.agg_values[cond.agg_index])
+                                Some(Cow::Owned(Value::Float(state.agg_values[cond.agg_index])))
                             } else {
                                 None // NULL values don't pass comparison
                             }
                         }
                         SimpleAgg::Avg(_) => {
                             if state.counts[cond.agg_index] > 0 {
-                                Some(
+                                Some(Cow::Owned(Value::Float(
                                     state.agg_values[cond.agg_index]
                                         / state.counts[cond.agg_index] as f64,
-                                )
+                                )))
                             } else {
                                 None
                             }
                         }
-                        SimpleAgg::Min(_) => state.min_values[cond.agg_index]
-                            .as_ref()
-                            .and_then(|v| v.as_float64()),
-                        SimpleAgg::Max(_) => state.max_values[cond.agg_index]
-                            .as_ref()
-                            .and_then(|v| v.as_float64()),
+                        SimpleAgg::Min(_) => {
+                            state.min_values[cond.agg_index].as_ref().map(Cow::Borrowed)
+                        }
+                        SimpleAgg::Max(_) => {
+                            state.max_values[cond.agg_index].as_ref().map(Cow::Borrowed)
+                        }
                     };
                     match agg_value {
                         Some(val) => {
-                            if !cond.matches(val) {
+                            if !cond.matches(&val) {
                                 passes = false;
                                 break;
                             }
@@ -3021,35 +3028,35 @@ impl Executor {
                     for cond in &filter.conditions {
                         let agg_value = match &simple_aggs[cond.agg_index] {
                             SimpleAgg::Count | SimpleAgg::CountColumn(_) => {
-                                Some(state.counts[cond.agg_index] as f64)
+                                Some(Cow::Owned(Value::Integer(state.counts[cond.agg_index])))
                             }
                             SimpleAgg::Sum(_) => {
                                 if state.agg_has_value[cond.agg_index] {
-                                    Some(state.agg_values[cond.agg_index])
+                                    Some(Cow::Owned(Value::Float(state.agg_values[cond.agg_index])))
                                 } else {
                                     None
                                 }
                             }
                             SimpleAgg::Avg(_) => {
                                 if state.counts[cond.agg_index] > 0 {
-                                    Some(
+                                    Some(Cow::Owned(Value::Float(
                                         state.agg_values[cond.agg_index]
                                             / state.counts[cond.agg_index] as f64,
-                                    )
+                                    )))
                                 } else {
                                     None
                                 }
                             }
-                            SimpleAgg::Min(_) => state.min_values[cond.agg_index]
-                                .as_ref()
-                                .and_then(|v| v.as_float64()),
-                            SimpleAgg::Max(_) => state.max_values[cond.agg_index]
-                                .as_ref()
-                                .and_then(|v| v.as_float64()),
+                            SimpleAgg::Min(_) => {
+                                state.min_values[cond.agg_index].as_ref().map(Cow::Borrowed)
+                            }
+                            SimpleAgg::Max(_) => {
+                                state.max_values[cond.agg_index].as_ref().map(Cow::Borrowed)
+                            }
                         };
                         match agg_value {
                             Some(val) => {
-                                if !cond.matches(val) {
+                                if !cond.matches(&val) {
                                     return false;
                                 }
                             }
@@ -3268,35 +3275,35 @@ impl Executor {
                     for cond in &filter.conditions {
                         let agg_value = match &simple_aggs[cond.agg_index] {
                             SimpleAgg::Count | SimpleAgg::CountColumn(_) => {
-                                Some(state.counts[cond.agg_index] as f64)
+                                Some(Cow::Owned(Value::Integer(state.counts[cond.agg_index])))
                             }
                             SimpleAgg::Sum(_) => {
                                 if state.agg_has_value[cond.agg_index] {
-                                    Some(state.agg_values[cond.agg_index])
+                                    Some(Cow::Owned(Value::Float(state.agg_values[cond.agg_index])))
                                 } else {
                                     None
                                 }
                             }
                             SimpleAgg::Avg(_) => {
                                 if state.counts[cond.agg_index] > 0 {
-                                    Some(
+                                    Some(Cow::Owned(Value::Float(
                                         state.agg_values[cond.agg_index]
                                             / state.counts[cond.agg_index] as f64,
-                                    )
+                                    )))
                                 } else {
                                     None
                                 }
                             }
-                            SimpleAgg::Min(_) => state.min_values[cond.agg_index]
-                                .as_ref()
-                                .and_then(|v| v.as_float64()),
-                            SimpleAgg::Max(_) => state.max_values[cond.agg_index]
-                                .as_ref()
-                                .and_then(|v| v.as_float64()),
+                            SimpleAgg::Min(_) => {
+                                state.min_values[cond.agg_index].as_ref().map(Cow::Borrowed)
+                            }
+                            SimpleAgg::Max(_) => {
+                                state.max_values[cond.agg_index].as_ref().map(Cow::Borrowed)
+                            }
                         };
                         match agg_value {
                             Some(val) => {
-                                if !cond.matches(val) {
+                                if !cond.matches(&val) {
                                     return false;
                                 }
                             }
@@ -3502,35 +3509,35 @@ impl Executor {
                 for cond in &filter.conditions {
                     let agg_value = match &simple_aggs[cond.agg_index] {
                         SimpleAgg::Count | SimpleAgg::CountColumn(_) => {
-                            Some(state.counts[cond.agg_index] as f64)
+                            Some(Cow::Owned(Value::Integer(state.counts[cond.agg_index])))
                         }
                         SimpleAgg::Sum(_) => {
                             if state.agg_has_value[cond.agg_index] {
-                                Some(state.agg_values[cond.agg_index])
+                                Some(Cow::Owned(Value::Float(state.agg_values[cond.agg_index])))
                             } else {
                                 None
                             }
                         }
                         SimpleAgg::Avg(_) => {
                             if state.counts[cond.agg_index] > 0 {
-                                Some(
+                                Some(Cow::Owned(Value::Float(
                                     state.agg_values[cond.agg_index]
                                         / state.counts[cond.agg_index] as f64,
-                                )
+                                )))
                             } else {
                                 None
                             }
                         }
-                        SimpleAgg::Min(_) => state.min_values[cond.agg_index]
-                            .as_ref()
-                            .and_then(|v| v.as_float64()),
-                        SimpleAgg::Max(_) => state.max_values[cond.agg_index]
-                            .as_ref()
-                            .and_then(|v| v.as_float64()),
+                        SimpleAgg::Min(_) => {
+                            state.min_values[cond.agg_index].as_ref().map(Cow::Borrowed)
+                        }
+                        SimpleAgg::Max(_) => {
+                            state.max_values[cond.agg_index].as_ref().map(Cow::Borrowed)
+                        }
                     };
                     match agg_value {
                         Some(val) => {
-                            if !cond.matches(val) {
+                            if !cond.matches(&val) {
                                 passes = false;
                                 break;
                             }
