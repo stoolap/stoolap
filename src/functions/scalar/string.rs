@@ -23,6 +23,38 @@ use crate::validate_arg_count;
 
 use super::{value_to_i64, value_to_string};
 
+/// The most bytes a function may build a string of from a count or a
+/// length (REPEAT, LPAD, RPAD) or by multiplying its input (REPLACE)
+const MAX_BUILT_BYTES: usize = 10 * 1024 * 1024;
+
+/// An error when `function` would build `bytes` bytes, asked before the
+/// result or the pad's characters are allocated
+fn check_built_size(function: &str, bytes: usize) -> Result<()> {
+    if bytes > MAX_BUILT_BYTES {
+        return Err(Error::invalid_argument(format!(
+            "{function} would produce {bytes} bytes, exceeding maximum of {MAX_BUILT_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// The bytes of the first `chars` characters of `s`, all of it when shorter
+fn prefix_bytes(s: &str, chars: usize) -> usize {
+    s.char_indices().nth(chars).map_or(s.len(), |(at, _)| at)
+}
+
+/// The bytes of `count` characters of `pad` repeated, read without allocating:
+/// the padding a length asks for
+fn pad_bytes(pad: &str, count: usize) -> usize {
+    let pad_chars = pad.chars().count();
+    if pad_chars == 0 {
+        return 0;
+    }
+    (count / pad_chars)
+        .saturating_mul(pad.len())
+        .saturating_add(prefix_bytes(pad, count % pad_chars))
+}
+
 // ============================================================================
 // UPPER
 // ============================================================================
@@ -619,8 +651,23 @@ impl ScalarFunction for ReplaceFunction {
         // There is nothing to find in a string that holds no characters,
         // so the subject is returned as it stands
         if from.is_empty() {
+            check_built_size("REPLACE", s.len())?;
             return Ok(Value::Text(SmartString::from_string(s)));
         }
+        // The matches are counted only when the subject's own size does not
+        // settle the result's
+        let result_bytes = if to.len() > from.len() || s.len() > MAX_BUILT_BYTES {
+            let matches = s.matches(from.as_str()).count();
+            if to.len() >= from.len() {
+                s.len()
+                    .saturating_add(matches.saturating_mul(to.len() - from.len()))
+            } else {
+                s.len() - matches * (from.len() - to.len())
+            }
+        } else {
+            s.len()
+        };
+        check_built_size("REPLACE", result_bytes)?;
 
         Ok(Value::Text(SmartString::from_string(s.replace(&from, &to))))
     }
@@ -819,15 +866,7 @@ impl ScalarFunction for RepeatFunction {
             return Ok(Value::Text(SmartString::from("")));
         }
 
-        // Limit to prevent memory exhaustion (max 10MB result)
-        const MAX_RESULT_SIZE: usize = 10 * 1024 * 1024;
-        let result_size = s.len().saturating_mul(n as usize);
-        if result_size > MAX_RESULT_SIZE {
-            return Err(Error::invalid_argument(format!(
-                "REPEAT would produce {} bytes, exceeding maximum of {} bytes",
-                result_size, MAX_RESULT_SIZE
-            )));
-        }
+        check_built_size("REPEAT", s.len().saturating_mul(n as usize))?;
 
         let result = s.repeat(n as usize);
         Ok(Value::Text(SmartString::from_string(result)))
@@ -1173,15 +1212,18 @@ impl ScalarFunction for LpadFunction {
 
         let current_len = s.chars().count();
         if current_len >= target_len {
-            let result: String = s.chars().take(target_len).collect();
-            return Ok(Value::Text(SmartString::from_string(result)));
+            let kept = prefix_bytes(&s, target_len);
+            check_built_size("LPAD", kept)?;
+            return Ok(Value::Text(SmartString::from(&s[..kept])));
         }
 
         let pad_needed = target_len - current_len;
-        let mut result = String::with_capacity(target_len);
+        let padding = pad_bytes(&pad_str, pad_needed);
+        check_built_size("LPAD", s.len().saturating_add(padding))?;
+        let pad_chars: Vec<char> = pad_str.chars().collect();
+        let mut result = String::with_capacity(s.len() + padding);
 
         // Build padding
-        let pad_chars: Vec<char> = pad_str.chars().collect();
         if !pad_chars.is_empty() {
             for pad_idx in 0..pad_needed {
                 result.push(pad_chars[pad_idx % pad_chars.len()]);
@@ -1257,17 +1299,20 @@ impl ScalarFunction for RpadFunction {
 
         let current_len = s.chars().count();
         if current_len >= target_len {
-            let result: String = s.chars().take(target_len).collect();
-            return Ok(Value::Text(SmartString::from_string(result)));
+            let kept = prefix_bytes(&s, target_len);
+            check_built_size("RPAD", kept)?;
+            return Ok(Value::Text(SmartString::from(&s[..kept])));
         }
 
         let pad_needed = target_len - current_len;
+        let padding = pad_bytes(&pad_str, pad_needed);
+        check_built_size("RPAD", s.len().saturating_add(padding))?;
+        let pad_chars: Vec<char> = pad_str.chars().collect();
         // Pre-allocate with capacity to avoid reallocations
-        let mut result = String::with_capacity(s.len() + pad_needed);
+        let mut result = String::with_capacity(s.len() + padding);
         result.push_str(&s);
 
         // Build padding
-        let pad_chars: Vec<char> = pad_str.chars().collect();
         if !pad_chars.is_empty() {
             for pad_idx in 0..pad_needed {
                 result.push(pad_chars[pad_idx % pad_chars.len()]);

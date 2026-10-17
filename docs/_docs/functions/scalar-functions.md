@@ -118,6 +118,8 @@ Repeats a string a specified number of times.
 SELECT REPEAT('ab', 3);                    -- Returns 'ababab'
 ```
 
+REPEAT, LPAD, RPAD and REPLACE build a result of at most 10 MB (10,485,760 bytes). A call that would build more is an error, raised before the result is built: `LPAD('a', 20000000)` and `REPEAT('ab', 6000000)` are errors.
+
 ### LOCATE
 Finds the position of a substring within a string.
 
