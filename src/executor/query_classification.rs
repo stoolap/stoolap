@@ -31,6 +31,8 @@ use lru::LruCache;
 use parking_lot::Mutex;
 use rustc_hash::FxHasher;
 
+use crate::executor::volatility::expression_volatility;
+use crate::functions::Volatility;
 use crate::parser::ast::{Expression, SelectStatement};
 
 /// Maximum number of cached query classifications (LRU eviction)
@@ -828,93 +830,12 @@ impl QueryClassification {
         }
     }
 
-    /// Check if an expression contains non-deterministic functions whose return
-    /// value changes between executions (NOW, CURRENT_DATE, RANDOM, UUID, etc.).
-    /// Queries with these functions must not be served from the semantic cache.
+    /// Whether an expression may answer differently in another statement
+    /// (NOW, RANDOM): such a query is never served from the semantic cache.
+    /// The classification is shared by every executor, so the built-in
+    /// registry decides, which takes a function it does not hold as volatile
     fn expression_has_nondeterministic_functions(expr: &Expression) -> bool {
-        match expr {
-            Expression::FunctionCall(func) => {
-                super::expression::is_non_foldable_function(&func.function)
-                    || func
-                        .arguments
-                        .iter()
-                        .any(Self::expression_has_nondeterministic_functions)
-            }
-            Expression::Prefix(prefix) => {
-                Self::expression_has_nondeterministic_functions(&prefix.right)
-            }
-            Expression::Infix(infix) => {
-                Self::expression_has_nondeterministic_functions(&infix.left)
-                    || Self::expression_has_nondeterministic_functions(&infix.right)
-            }
-            Expression::In(in_expr) => {
-                Self::expression_has_nondeterministic_functions(&in_expr.left)
-                    || Self::expression_has_nondeterministic_functions(&in_expr.right)
-            }
-            Expression::List(list) => list
-                .elements
-                .iter()
-                .any(Self::expression_has_nondeterministic_functions),
-            Expression::ExpressionList(list) => list
-                .expressions
-                .iter()
-                .any(Self::expression_has_nondeterministic_functions),
-            Expression::Between(between) => {
-                Self::expression_has_nondeterministic_functions(&between.expr)
-                    || Self::expression_has_nondeterministic_functions(&between.lower)
-                    || Self::expression_has_nondeterministic_functions(&between.upper)
-            }
-            Expression::Like(like) => {
-                Self::expression_has_nondeterministic_functions(&like.left)
-                    || Self::expression_has_nondeterministic_functions(&like.pattern)
-                    || like
-                        .escape
-                        .as_ref()
-                        .is_some_and(|e| Self::expression_has_nondeterministic_functions(e))
-            }
-            Expression::Case(case) => {
-                case.value
-                    .as_ref()
-                    .is_some_and(|e| Self::expression_has_nondeterministic_functions(e))
-                    || case.when_clauses.iter().any(|w| {
-                        Self::expression_has_nondeterministic_functions(&w.condition)
-                            || Self::expression_has_nondeterministic_functions(&w.then_result)
-                    })
-                    || case
-                        .else_value
-                        .as_ref()
-                        .is_some_and(|e| Self::expression_has_nondeterministic_functions(e))
-            }
-            Expression::Aliased(aliased) => {
-                Self::expression_has_nondeterministic_functions(&aliased.expression)
-            }
-            Expression::Cast(cast) => Self::expression_has_nondeterministic_functions(&cast.expr),
-            Expression::Distinct(distinct) => {
-                Self::expression_has_nondeterministic_functions(&distinct.expr)
-            }
-            Expression::ScalarSubquery(subquery) => {
-                subquery
-                    .subquery
-                    .columns
-                    .iter()
-                    .any(Self::expression_has_nondeterministic_functions)
-                    || subquery
-                        .subquery
-                        .where_clause
-                        .as_ref()
-                        .is_some_and(|w| Self::expression_has_nondeterministic_functions(w))
-            }
-            Expression::AllAny(all_any) => {
-                Self::expression_has_nondeterministic_functions(&all_any.left)
-            }
-            Expression::InHashSet(in_hash) => {
-                Self::expression_has_nondeterministic_functions(&in_hash.column)
-            }
-            Expression::QuantifiedSet(quantified) => {
-                Self::expression_has_nondeterministic_functions(&quantified.left)
-            }
-            _ => false,
-        }
+        expression_volatility(expr, crate::functions::global_registry()) != Volatility::Fixed
     }
 
     /// Check if an expression contains correlated subqueries (references outer columns)

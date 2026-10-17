@@ -275,7 +275,12 @@ impl PushdownRegistry {
             ast::Expression::Infix(infix)
                 if matches!(infix.op_type, ast::InfixOperator::And | ast::InfixOperator::Or)
         );
-        if !is_logical && rules::contains_non_deterministic_volatile(expr) {
+        if !is_logical
+            && crate::executor::volatility::expression_volatility(
+                expr,
+                crate::functions::global_registry(),
+            ) == crate::functions::Volatility::PerCall
+        {
             return (None, true);
         }
 

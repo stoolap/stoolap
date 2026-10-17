@@ -130,6 +130,19 @@ impl FunctionSignature {
     }
 }
 
+/// How often a call may answer differently for the same arguments, least
+/// first: an expression is as volatile as its most volatile part
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Volatility {
+    /// The same answer every time: may be folded once and cached across statements
+    Fixed,
+    /// One answer per statement (the clocks): may be evaluated once per
+    /// statement, never folded into a program or cached across statements
+    PerStatement,
+    /// A new answer per call (RANDOM, SLEEP): evaluated every time it is reached
+    PerCall,
+}
+
 /// Function information
 #[derive(Debug, Clone)]
 pub struct FunctionInfo {
@@ -141,12 +154,8 @@ pub struct FunctionInfo {
     pub description: String,
     /// Signature
     pub signature: FunctionSignature,
-    /// Whether the function is deterministic (same inputs always produce same output,
-    /// no side effects, no dependency on external state like time or transactions).
-    /// Non-deterministic functions (NOW, RANDOM, SLEEP, etc.) must not be
-    /// constant-folded at compile time or served from the semantic query cache.
-    /// Defaults to `true`.
-    pub deterministic: bool,
+    /// How often a call may answer differently; `Fixed` unless marked
+    pub volatility: Volatility,
 }
 
 impl FunctionInfo {
@@ -162,13 +171,19 @@ impl FunctionInfo {
             function_type,
             description: description.into(),
             signature,
-            deterministic: true,
+            volatility: Volatility::Fixed,
         }
     }
 
-    /// Mark this function as non-deterministic
+    /// Mark this function as answering anew on every call
     pub fn non_deterministic(mut self) -> Self {
-        self.deterministic = false;
+        self.volatility = Volatility::PerCall;
+        self
+    }
+
+    /// Mark this function as answering once per statement
+    pub fn per_statement(mut self) -> Self {
+        self.volatility = Volatility::PerStatement;
         self
     }
 

@@ -1107,7 +1107,7 @@ impl ScalarFunction for CurrentDateFunction {
             "Returns the current date (at midnight UTC)",
             FunctionSignature::new(FunctionDataType::Timestamp, vec![], 0, 0),
         )
-        .non_deterministic()
+        .per_statement()
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
@@ -1147,7 +1147,7 @@ impl ScalarFunction for CurrentTimestampFunction {
             "Returns the current timestamp",
             FunctionSignature::new(FunctionDataType::Timestamp, vec![], 0, 0),
         )
-        .non_deterministic()
+        .per_statement()
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
@@ -1182,7 +1182,7 @@ impl ScalarFunction for CurrentTimeFunction {
             "Returns the current time as HH:MM:SS",
             FunctionSignature::new(FunctionDataType::String, vec![], 0, 0),
         )
-        .non_deterministic()
+        .per_statement()
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {

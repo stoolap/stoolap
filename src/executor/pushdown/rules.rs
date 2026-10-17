@@ -18,7 +18,8 @@
 //! a storage-layer expression when possible.
 
 use crate::core::{Operator, Value};
-use crate::functions::global_registry;
+use crate::executor::volatility::expression_volatility;
+use crate::functions::{global_registry, Volatility};
 use crate::parser::ast::{self as ast, InfixOperator, PrefixOperator};
 use crate::storage::expression::{
     AndExpr, BetweenExpr, ComparisonExpr, ConstBoolExpr, Expression as StorageExpr, FunctionArg,
@@ -59,13 +60,9 @@ fn extract_literal_with_ctx(expr: &ast::Expression, ctx: &PushdownContext<'_>) -
         }
     }
 
-    // Try evaluating column-free constant expressions (e.g., NOW() - INTERVAL '24 hours').
-    // Only deterministic expressions are safe to pre-evaluate here. Non-deterministic
-    // functions like RANDOM() must NOT be pushed down as a frozen literal because the
-    // expression must be re-evaluated per row (e.g., WHERE id < RANDOM() * 20).
-    // Deterministic time functions (NOW, CURRENT_DATE) are allowed because they return
-    // a stable value within a single query execution.
-    if contains_non_deterministic_volatile(expr) {
+    // A column-free expression is frozen for the statement (NOW() - INTERVAL '24 hours'),
+    // unless it answers per call (WHERE id < RANDOM() * 20 rolls for each row)
+    if expression_volatility(expr, global_registry()) == Volatility::PerCall {
         return None;
     }
     #[cfg(feature = "test-failpoints")]
@@ -84,75 +81,6 @@ fn extract_literal_with_ctx(expr: &ast::Expression, ctx: &PushdownContext<'_>) -
             crate::executor::expression::try_eval_constant_expr_with_context(expr, ctx.exec_ctx)
         }
         _ => None,
-    }
-}
-
-/// Check if an expression contains volatile (per-call non-deterministic) functions
-/// like RANDOM(), UUID(), RAND(). These must NOT be pre-evaluated for pushdown
-/// because their value must differ per row.
-///
-/// Stable-within-query functions (NOW, CURRENT_DATE, CURRENT_TIMESTAMP) are NOT
-/// considered volatile here — they return the same value for every row in a single
-/// query execution, so pushing them down as a frozen literal is correct.
-pub(crate) fn contains_non_deterministic_volatile(expr: &ast::Expression) -> bool {
-    match expr {
-        ast::Expression::FunctionCall(func) => {
-            let upper = func.function.to_uppercase();
-            let is_volatile = matches!(
-                upper.as_str(),
-                "RANDOM" | "RAND" | "UUID" | "SLEEP" | "EMBED"
-            );
-            is_volatile
-                || func
-                    .arguments
-                    .iter()
-                    .any(contains_non_deterministic_volatile)
-        }
-        ast::Expression::Infix(infix) => {
-            contains_non_deterministic_volatile(&infix.left)
-                || contains_non_deterministic_volatile(&infix.right)
-        }
-        ast::Expression::Prefix(prefix) => contains_non_deterministic_volatile(&prefix.right),
-        ast::Expression::Cast(cast) => contains_non_deterministic_volatile(&cast.expr),
-        ast::Expression::Aliased(aliased) => {
-            contains_non_deterministic_volatile(&aliased.expression)
-        }
-        ast::Expression::Case(case) => {
-            case.value
-                .as_deref()
-                .is_some_and(contains_non_deterministic_volatile)
-                || case.when_clauses.iter().any(|w| {
-                    contains_non_deterministic_volatile(&w.condition)
-                        || contains_non_deterministic_volatile(&w.then_result)
-                })
-                || case
-                    .else_value
-                    .as_deref()
-                    .is_some_and(contains_non_deterministic_volatile)
-        }
-        ast::Expression::Between(between) => {
-            contains_non_deterministic_volatile(&between.expr)
-                || contains_non_deterministic_volatile(&between.lower)
-                || contains_non_deterministic_volatile(&between.upper)
-        }
-        ast::Expression::Like(like) => {
-            contains_non_deterministic_volatile(&like.left)
-                || contains_non_deterministic_volatile(&like.pattern)
-        }
-        ast::Expression::In(in_expr) => {
-            contains_non_deterministic_volatile(&in_expr.left)
-                || contains_non_deterministic_volatile(&in_expr.right)
-        }
-        ast::Expression::QuantifiedSet(set) => contains_non_deterministic_volatile(&set.left),
-        ast::Expression::List(list) => list
-            .elements
-            .iter()
-            .any(contains_non_deterministic_volatile),
-        ast::Expression::ExpressionList(list) => list
-            .expressions
-            .iter()
-            .any(contains_non_deterministic_volatile),
-        _ => false,
     }
 }
 

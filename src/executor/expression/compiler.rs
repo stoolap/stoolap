@@ -38,7 +38,8 @@ use crate::core::predicate::PredicateSet;
 use crate::core::{DataType, Row, Value, ValueSet};
 use crate::executor::expr_key::ExprKey;
 use crate::executor::utils::{derived_aggregate_column_name, string_to_datatype};
-use crate::functions::{global_registry, FunctionRegistry};
+use crate::executor::volatility::expression_volatility;
+use crate::functions::{global_registry, FunctionRegistry, Volatility};
 use crate::parser::ast::*;
 use smallvec::SmallVec;
 
@@ -495,7 +496,7 @@ impl<'a> ExprCompiler<'a> {
         // This optimizes deterministic expressions like ABS(-5) + 1 or UPPER('text').
         // Non-deterministic functions (NOW, RANDOM, etc.) are excluded by is_foldable_expr
         // and handled separately by pushdown's try_eval_constant_expr at query time.
-        if !self.folding.get() && is_foldable_expr(expr) {
+        if !self.folding.get() && is_foldable_expr(expr, self.ctx.functions) {
             if let Some(value) = self.try_fold_constant(expr) {
                 builder.emit(Op::LoadConst(value));
                 return Ok(());
@@ -1596,7 +1597,7 @@ impl<'a> ExprCompiler<'a> {
             None => None,
             Some(Expression::StringLiteral(lit)) => lit.value.chars().next(),
             Some(escape_expr) => {
-                match is_column_free(escape_expr)
+                match may_fold(escape_expr, self.ctx.functions)
                     .then(|| self.try_fold_constant(escape_expr))
                     .flatten()
                 {
@@ -1890,67 +1891,22 @@ impl<'a> ExprCompiler<'a> {
 // HELPER FUNCTIONS
 // ============================================================================
 
-/// Check if a function must NOT be constant-folded.
-///
-/// Looks up the function in the global registry and checks `FunctionInfo.deterministic`.
-/// Functions not in the registry (CURRENT_TRANSACTION_ID, UUID, RAND — handled as
-/// special compiler ops or aliases) are hardcoded here.
-///
-/// Also used by `query_classification.rs` to detect non-deterministic functions
-/// for semantic cache bypass, and by `evaluator_bridge.rs` to reject pushdown
-/// of expressions containing non-deterministic functions.
-pub fn is_non_foldable_function(name: &str) -> bool {
-    let upper = name.to_uppercase();
-
-    // Functions handled as special compiler ops, not in the registry
-    match upper.as_str() {
-        "CURRENT_TRANSACTION_ID" | "UUID" | "RAND" => return true,
-        _ => {}
-    }
-
-    // Registry-based check: non-deterministic functions declare it via FunctionInfo
-    let registry = crate::functions::registry::global_registry();
-    !registry.is_deterministic(&upper)
+/// Whether `expr` is worth folding into a constant and may be: an operator,
+/// call or cast (a literal is a constant already)
+fn is_foldable_expr(expr: &Expression, registry: &FunctionRegistry) -> bool {
+    matches!(
+        expr,
+        Expression::Infix(_)
+            | Expression::Prefix(_)
+            | Expression::FunctionCall(_)
+            | Expression::Cast(_)
+    ) && may_fold(expr, registry)
 }
 
-/// Check if an expression is column-free AND non-trivial (worth folding).
-/// Returns true for expressions like `NOW()`, `1 + 2`, `NOW() - INTERVAL '24 hours'`
-/// that can be evaluated once at compile time instead of per-row.
-/// Simple literals return false (already handled efficiently by LoadConst).
-fn is_foldable_expr(expr: &Expression) -> bool {
-    match expr {
-        // Simple literals are already constants — no folding benefit
-        Expression::IntegerLiteral(_)
-        | Expression::FloatLiteral(_)
-        | Expression::StringLiteral(_)
-        | Expression::BooleanLiteral(_)
-        | Expression::NullLiteral(_) => false,
-
-        // INTERVAL literals alone are already LoadConst — no folding benefit
-        Expression::IntervalLiteral(_) => false,
-
-        // Binary operations: foldable if BOTH sides are column-free
-        Expression::Infix(infix) => is_column_free(&infix.left) && is_column_free(&infix.right),
-
-        // Unary operations: foldable if operand is column-free
-        Expression::Prefix(prefix) => is_column_free(&prefix.right),
-
-        // Function calls: foldable if ALL arguments are column-free
-        // This covers NOW(), CURRENT_DATE, UPPER('text'), ABS(-5), etc.
-        // Excludes context-dependent and non-deterministic-per-call functions
-        Expression::FunctionCall(func) => {
-            if is_non_foldable_function(&func.function) {
-                return false;
-            }
-            func.arguments.iter().all(is_column_free)
-        }
-
-        // CAST: foldable if inner expression is column-free
-        Expression::Cast(cast) => is_column_free(&cast.expr),
-
-        // Everything else: not foldable
-        _ => false,
-    }
+/// Whether `expr` may be folded into a constant: it reads no column and
+/// answers the same every time, as a program outlives its statement
+fn may_fold(expr: &Expression, registry: &FunctionRegistry) -> bool {
+    is_column_free(expr) && expression_volatility(expr, registry) == Volatility::Fixed
 }
 
 /// Check if an expression references no columns (is entirely self-contained).
@@ -1977,13 +1933,7 @@ fn is_column_free(expr: &Expression) -> bool {
         Expression::Prefix(prefix) => is_column_free(&prefix.right),
 
         // Function calls (NOW(), UPPER('text'), etc.)
-        // Exclude context-dependent and non-deterministic-per-call functions
-        Expression::FunctionCall(func) => {
-            if is_non_foldable_function(&func.function) {
-                return false;
-            }
-            func.arguments.iter().all(is_column_free)
-        }
+        Expression::FunctionCall(func) => func.arguments.iter().all(is_column_free),
 
         // CAST
         Expression::Cast(cast) => is_column_free(&cast.expr),
