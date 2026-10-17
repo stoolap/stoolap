@@ -2087,40 +2087,22 @@ impl SubqueryExecutor for PreparedRunner<'_> {
         Ok(value)
     }
 
-    fn execute_exists(
-        &self,
-        _subquery_index: u16,
-        _outer_row: Option<&FxHashMap<CompactArc<str>, Value>>,
-    ) -> Result<bool> {
+    fn execute_exists(&self, _subquery_index: u16, _row: &Row) -> Result<bool> {
         Err(Error::internal("EXISTS is not prepared"))
     }
 
-    fn execute_in(
-        &self,
-        _subquery_index: u16,
-        _value: &Value,
-        _outer_row: Option<&FxHashMap<CompactArc<str>, Value>>,
-    ) -> Result<bool> {
+    fn execute_in(&self, _subquery_index: u16, _value: &Value, _row: &Row) -> Result<Option<bool>> {
         Err(Error::internal("IN is not prepared"))
     }
 
-    fn execute_all(
+    fn execute_quantified(
         &self,
         _subquery_index: u16,
         _value: &Value,
         _op: super::expression::CompareOp,
-        _outer_row: Option<&FxHashMap<CompactArc<str>, Value>>,
-    ) -> Result<bool> {
-        Err(Error::internal("ALL is not prepared"))
-    }
-
-    fn execute_any(
-        &self,
-        _subquery_index: u16,
-        _value: &Value,
-        _op: super::expression::CompareOp,
-        _outer_row: Option<&FxHashMap<CompactArc<str>, Value>>,
-    ) -> Result<bool> {
-        Err(Error::internal("ANY is not prepared"))
+        _all: bool,
+        _row: &Row,
+    ) -> Result<Option<bool>> {
+        Err(Error::internal("ANY or ALL is not prepared"))
     }
 }

@@ -1211,16 +1211,14 @@ fn test_navigation_window_control_argument() {
             .collect::<Vec<_>>(),
         "NTH_VALUE n"
     );
-    // A correlated control argument reads no row either, so it keeps the
-    // answer it has always given rather than failing to compile
-    assert_eq!(
-        rows(
-            &db,
-            "SELECT u.id, NTILE((SELECT MAX(x.user_id) FROM orders x WHERE x.user_id = u.id)) OVER (ORDER BY u.id) FROM users u WHERE u.id <= 4 ORDER BY u.id"
+    // One value per partition, so an argument reading the row is refused
+    assert!(
+        db.query(
+            "SELECT u.id, NTILE((SELECT MAX(x.user_id) FROM orders x WHERE x.user_id = u.id)) OVER (ORDER BY u.id) FROM users u WHERE u.id <= 4 ORDER BY u.id",
+            ()
         )
-        .len(),
-        4,
-        "correlated control argument still runs"
+        .is_err(),
+        "correlated control argument"
     );
 }
 

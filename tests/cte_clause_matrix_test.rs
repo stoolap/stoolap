@@ -275,10 +275,15 @@ fn test_a_second_read_of_a_cte_sees_all_of_it() {
         let sql = format!(
             "WITH c AS (SELECT id, k, v FROM t GROUP BY id, k, v) SELECT {select} FROM {from}{tail} LIMIT 3"
         );
+        // A position no prepared plan takes yet refuses its subquery on both
         let reference = match rows(&tables, &reference_sql, None) {
             Ok(reference) => reference,
             Err(error) => {
-                found.push(format!("{reference_sql}\n    reference error: {error}"));
+                if let Ok(got) = rows(&db, &sql, None) {
+                    found.push(format!(
+                        "{sql}\n    reference error: {error}\n    got    {got:?}"
+                    ));
+                }
                 continue;
             }
         };

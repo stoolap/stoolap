@@ -83,8 +83,7 @@ impl Program {
                 Op::ExecScalarSubquery(_)
                     | Op::ExecExists(_)
                     | Op::ExecInSubquery(_)
-                    | Op::ExecAll(_, _)
-                    | Op::ExecAny(_, _)
+                    | Op::ExecQuantified(_, _, _)
             )
         });
 
@@ -114,8 +113,7 @@ impl Program {
                 Op::ExecScalarSubquery(_)
                     | Op::ExecExists(_)
                     | Op::ExecInSubquery(_)
-                    | Op::ExecAll(_, _)
-                    | Op::ExecAny(_, _)
+                    | Op::ExecQuantified(_, _, _)
             )
         });
 
@@ -239,7 +237,10 @@ impl Program {
                 | Op::IsNotNullColumn(_)
                 | Op::LikeColumn(_, _, _)
                 | Op::InSetColumn(_, _)
-                | Op::BetweenColumnConst(_, _, _) => 1,
+                | Op::BetweenColumnConst(_, _, _)
+                // A subquery's value or existence: push 1
+                | Op::ExecScalarSubquery(_)
+                | Op::ExecExists(_) => 1,
 
                 // Pop 2, push 1 (-1)
                 Op::Eq
@@ -312,11 +313,8 @@ impl Program {
                 | Op::Cast(_)
                 | Op::ReadAsColumn(_)
                 | Op::TruncateToDate
-                | Op::ExecScalarSubquery(_)
-                | Op::ExecExists(_)
                 | Op::ExecInSubquery(_)
-                | Op::ExecAll(_, _)
-                | Op::ExecAny(_, _)
+                | Op::ExecQuantified(_, _, _)
                 | Op::NativeFn1(_) => 0,
 
                 // Multi-column IN: pop N, push 1

@@ -556,11 +556,11 @@ impl Executor {
             }
             lit.value as usize
         } else if let Some(ref offset_expr) = stmt.offset {
-            match ExpressionEval::compile(offset_expr, &[])
-                .ok()
-                .and_then(|eval| eval.with_context(ctx).eval_slice(&Row::new()).ok())
+            match ExpressionEval::compile(offset_expr, &[])?
+                .with_context(ctx)
+                .eval_slice(&Row::new())?
             {
-                Some(Value::Integer(o)) => {
+                Value::Integer(o) => {
                     if o < 0 {
                         return Err(Error::Parse(format!(
                             "OFFSET must be non-negative, got {}",
@@ -569,7 +569,7 @@ impl Executor {
                     }
                     o as usize
                 }
-                Some(Value::Float(f)) => {
+                Value::Float(f) => {
                     let o = f as i64;
                     if o < 0 {
                         return Err(Error::Parse(format!(
@@ -579,13 +579,12 @@ impl Executor {
                     }
                     o as usize
                 }
-                Some(other) => {
+                other => {
                     return Err(Error::Parse(format!(
                         "OFFSET must be an integer, got {:?}",
                         other
                     )));
                 }
-                None => 0,
             }
         } else {
             0
@@ -5033,7 +5032,7 @@ impl Executor {
                     #[cfg(feature = "test-failpoints")]
                     crate::test_failpoints::join_inner_opened();
                     let epoch = self.engine.schema_epoch();
-                    let build_residual_filter = || {
+                    let build_residual_filter = || -> Result<Option<JoinFilter>> {
                         if let Some(guard) = residual_slot.and_then(|slot| slot.read().ok()) {
                             if let CompiledExecution::JoinResidual(kept) = &*guard {
                                 if kept.cached_epoch == epoch
@@ -5043,10 +5042,10 @@ impl Executor {
                                     && kept.outer_cols == outer_cols
                                     && kept.inner_cols == inner_cols
                                 {
-                                    return kept.program.as_ref().map(|program| {
+                                    return Ok(kept.program.as_ref().map(|program| {
                                         JoinFilter::from_program(CompactArc::clone(program))
                                             .with_context(ctx)
-                                    });
+                                    }));
                                 }
                             }
                         }
@@ -5076,16 +5075,17 @@ impl Executor {
                             (None, Some(f)) => Some(f),
                             (None, None) => None,
                         };
-                        let filter = combined.and_then(|expr| {
-                            JoinFilter::new(
-                                &expr,
-                                &outer_cols,
-                                &inner_cols,
-                                &self.function_registry,
-                            )
-                            .ok()
-                            .map(|f| f.with_context(ctx))
-                        });
+                        let filter = combined
+                            .map(|expr| {
+                                JoinFilter::new(
+                                    &expr,
+                                    &outer_cols,
+                                    &inner_cols,
+                                    &self.function_registry,
+                                )
+                                .map(|f| f.with_context(ctx))
+                            })
+                            .transpose()?;
                         if let Some(mut guard) = residual_slot.and_then(|slot| slot.write().ok()) {
                             // A plan with two index joins keeps the first one's
                             // program rather than swapping them every execution
@@ -5105,7 +5105,7 @@ impl Executor {
                                 });
                             }
                         }
-                        filter
+                        Ok(filter)
                     };
 
                     // Execute Index Nested Loop Join using operators
@@ -5174,7 +5174,7 @@ impl Executor {
                                 op_join_type,
                                 outer_idx,
                                 lookup_strategy.clone(),
-                                build_residual_filter(),
+                                build_residual_filter()?,
                             )
                             .with_inner_key(inner_key_idx);
                             if let Some(ref proj) = projection_pushdown {
@@ -5281,7 +5281,7 @@ impl Executor {
                             op_join_type,
                             outer_idx,
                             lookup_strategy.clone(),
-                            build_residual_filter(),
+                            build_residual_filter()?,
                         )
                         .with_inner_key(inner_key_idx);
                         if let Some(ref proj) = projection_pushdown {
@@ -8022,19 +8022,20 @@ impl Executor {
         let pushed_inner = inner_filter.is_some();
         let build_residual_filter = || {
             if pushed_inner {
-                return None;
+                return Ok(None);
             }
-            right_filter.and_then(|rf| {
-                let qualified_rf = add_table_qualifier(rf, inner_alias);
-                JoinFilter::new(
-                    &qualified_rf,
-                    &outer_cols,
-                    &inner_cols,
-                    &self.function_registry,
-                )
-                .ok()
-                .map(|f| f.with_context(ctx))
-            })
+            right_filter
+                .map(|rf| {
+                    let qualified_rf = add_table_qualifier(rf, inner_alias);
+                    JoinFilter::new(
+                        &qualified_rf,
+                        &outer_cols,
+                        &inner_cols,
+                        &self.function_registry,
+                    )
+                    .map(|f| f.with_context(ctx))
+                })
+                .transpose()
         };
         let mut funcs: Vec<Box<dyn crate::functions::AggregateFunction>> =
             Vec::with_capacity(aggregations.len());
@@ -8103,7 +8104,7 @@ impl Executor {
                 op_join_type,
                 outer_key_idx,
                 lookup_strategy.clone(),
-                build_residual_filter(),
+                build_residual_filter()?,
             )
             .with_inner_key(inner_key_idx);
             if let Some(filter) = &inner_filter {

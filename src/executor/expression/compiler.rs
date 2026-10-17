@@ -31,7 +31,7 @@ use crate::common::SmartString;
 use crate::common::StringMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::ops::{CompareOp, CompiledPattern, IntervalStep, IntervalUnit, Op, QuantifiedMembers};
+use super::ops::{CompiledPattern, IntervalStep, IntervalUnit, Op, QuantifiedMembers};
 use super::program::{Program, ProgramBuilder};
 use super::vm::{ExecuteContext, ExprVM};
 use crate::core::predicate::PredicateSet;
@@ -252,8 +252,8 @@ impl<'a> CompileContext<'a> {
         self
     }
 
-    /// Compile each listed scalar subquery to its prepared id; any other
-    /// scalar subquery is then a compile error
+    /// Compile each listed subquery block to its prepared id; any other
+    /// subquery is then a compile error
     pub fn with_subquery_ids(mut self, ids: &'a FxHashMap<usize, u16>) -> Self {
         self.subquery_ids = Some(ids);
         self
@@ -359,6 +359,17 @@ impl<'a> ExprCompiler<'a> {
             ctx,
             folding: Cell::new(false),
         }
+    }
+
+    /// The prepared id of a subquery block. Only a prepared plan compiles one
+    /// into the program; any other caller substitutes its result first
+    fn subquery_id(&self, block: &SelectStatement, form: &str) -> Result<u16, CompileError> {
+        let ids = self.ctx.subquery_ids.ok_or_else(|| {
+            CompileError::UnsupportedExpression(format!("{form} outside a prepared plan"))
+        })?;
+        ids.get(&(block as *const SelectStatement as usize))
+            .copied()
+            .ok_or_else(|| CompileError::InvalidExpression(format!("unprepared {form}")))
     }
 
     /// Compile an expression into a Program
@@ -750,39 +761,28 @@ impl<'a> ExprCompiler<'a> {
             }
 
             // === SUBQUERIES ===
-            Expression::ScalarSubquery(sq) => match self.ctx.subquery_ids {
-                Some(ids) => {
-                    let key = &*sq.subquery as *const SelectStatement as usize;
-                    let id = ids.get(&key).ok_or_else(|| {
-                        CompileError::InvalidExpression("unprepared scalar subquery".to_string())
-                    })?;
-                    builder.emit(Op::ExecScalarSubquery(*id));
-                }
-                // Without prepared ids the caller substitutes the result first
-                None => builder.emit(Op::ExecScalarSubquery(0)),
-            },
+            Expression::ScalarSubquery(sq) => {
+                let id = self.subquery_id(&sq.subquery, "scalar subquery")?;
+                builder.emit(Op::ExecScalarSubquery(id));
+            }
 
             Expression::Exists(exists) => {
-                let _ = exists; // Subquery index would be resolved during planning
-                builder.emit(Op::ExecExists(0));
+                let id = self.subquery_id(&exists.subquery, "EXISTS")?;
+                builder.emit(Op::ExecExists(id));
             }
 
             Expression::AllAny(all_any) => {
+                let id = self.subquery_id(&all_any.subquery, "ANY or ALL")?;
+                let compare_op =
+                    QuantifiedMembers::operator(&all_any.operator).ok_or_else(|| {
+                        CompileError::UnsupportedExpression(format!(
+                            "ANY or ALL with {}",
+                            all_any.operator
+                        ))
+                    })?;
                 self.compile_expr(&all_any.left, builder)?;
-                let compare_op = match all_any.operator.as_str() {
-                    "=" => CompareOp::Eq,
-                    "!=" | "<>" => CompareOp::Ne,
-                    "<" => CompareOp::Lt,
-                    "<=" => CompareOp::Le,
-                    ">" => CompareOp::Gt,
-                    ">=" => CompareOp::Ge,
-                    _ => CompareOp::Eq,
-                };
-                if matches!(all_any.all_any_type, AllAnyType::All) {
-                    builder.emit(Op::ExecAll(0, compare_op));
-                } else {
-                    builder.emit(Op::ExecAny(0, compare_op));
-                }
+                let all = matches!(all_any.all_any_type, AllAnyType::All);
+                builder.emit(Op::ExecQuantified(id, compare_op, all));
             }
 
             // === WINDOW (not supported in VM, requires special handling) ===
@@ -1367,6 +1367,17 @@ impl<'a> ExprCompiler<'a> {
         if !left_columns.is_empty() {
             // Multi-column IN expression
             return self.compile_multi_column_in(in_expr, &left_columns, builder);
+        }
+
+        // The block's members answer, NOT IN keeping UNKNOWN
+        if let Expression::ScalarSubquery(sq) = &*in_expr.right {
+            let id = self.subquery_id(&sq.subquery, "IN (subquery)")?;
+            self.compile_expr(&in_expr.left, builder)?;
+            builder.emit(Op::ExecInSubquery(id));
+            if in_expr.not {
+                builder.emit(Op::Not);
+            }
+            return Ok(());
         }
 
         // Single-value IN expression
