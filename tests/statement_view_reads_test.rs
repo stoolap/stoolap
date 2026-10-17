@@ -297,8 +297,12 @@ fn an_arena_window_taken_across_a_whole_commit_answers_from_the_chains() {
         .join()
         .unwrap();
     });
-    let (sum, count) = table.sum_column(1).unwrap().unwrap();
-    assert_eq!((sum, count), (60.0, 3), "the view excludes the update");
+    let sum = table.sum_column(1).unwrap().unwrap();
+    assert_eq!(
+        (sum.sum().unwrap(), sum.count()),
+        (Value::Integer(60), 3),
+        "the view excludes the update"
+    );
 }
 
 #[test]
@@ -392,8 +396,10 @@ fn an_arena_pass_a_commit_published_into_answers_from_the_chains() {
     db.execute("UPDATE t SET v = 10 WHERE id = 1", ()).unwrap();
     let view = db.engine().registry().capture_view();
     let (_txn, table) = through(&db, &view);
-    let sum =
-        sum_with_a_commit_inside_the_arena_pass(&db, || table.sum_column(1).unwrap().unwrap().0);
+    let sum = sum_with_a_commit_inside_the_arena_pass(&db, || {
+        let sum = table.sum_column(1).unwrap().unwrap().sum().unwrap();
+        sum.as_float64().unwrap()
+    });
     assert_eq!(sum, 60.0, "through a view");
 }
 
