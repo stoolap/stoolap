@@ -863,6 +863,33 @@ pub(crate) fn index_filled_from_cold() {
 thread_local! {
     static IN_SUBQUERY_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static QUANTIFIED_MEMBER_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static AGGREGATE_PATHS_TAKEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The name of every path that builds an aggregate result
+pub fn aggregate_paths() -> Vec<&'static str> {
+    crate::executor::AggregatePath::ALL
+        .iter()
+        .map(|path| path.name())
+        .collect()
+}
+
+/// The aggregate paths that answered on this thread since the last reset
+pub fn aggregate_paths_taken() -> Vec<&'static str> {
+    let taken = AGGREGATE_PATHS_TAKEN.with(std::cell::Cell::get);
+    crate::executor::AggregatePath::ALL
+        .iter()
+        .filter(|path| taken & (1 << **path as u32) != 0)
+        .map(|path| path.name())
+        .collect()
+}
+
+pub fn reset_aggregate_paths() {
+    AGGREGATE_PATHS_TAKEN.with(|taken| taken.set(0));
+}
+
+pub(crate) fn aggregate_path_taken(index: usize) {
+    AGGREGATE_PATHS_TAKEN.with(|taken| taken.set(taken.get() | 1 << index));
 }
 
 /// Members an ANY or ALL compared one by one on this thread, so far
