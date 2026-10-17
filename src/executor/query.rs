@@ -12301,10 +12301,8 @@ impl Executor {
             return Ok(None);
         }
 
-        // Check if GROUP BY is a simple column reference
-        let group_col_name: String = match &stmt.group_by.columns[0] {
-            Expression::Identifier(id) => id.value_lower.to_string(),
-            _ => return Ok(None),
+        let Some(group_col_name) = self.single_group_column(stmt)? else {
+            return Ok(None);
         };
 
         // The aggregate slots, as every aggregate path reads them; the select

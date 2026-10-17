@@ -112,6 +112,31 @@ const CASES: &[(&str, &str, &str, &str)] = &[
          LIMIT 10",
     ),
     (
+        "memory",
+        "storage_grouped",
+        "SELECT g AS n, COUNT(*) AS g FROM t GROUP BY g",
+        "SELECT g AS n, COUNT(*) AS g FROM t WHERE id + 0 = id GROUP BY g",
+    ),
+    (
+        "memory",
+        "streaming_group_by",
+        "SELECT g AS n, COUNT(*) AS g FROM t GROUP BY g HAVING COUNT(*) > 0 LIMIT 10",
+        "SELECT g AS n, COUNT(*) AS g FROM t WHERE id + 0 = id GROUP BY g \
+         HAVING COUNT(*) > 0 LIMIT 10",
+    ),
+    (
+        "memory",
+        "streaming_derived_table",
+        "SELECT s AS n, COUNT(*) AS s FROM (SELECT s FROM t) d GROUP BY s",
+        "SELECT s AS n, COUNT(*) AS s FROM (SELECT s FROM t) d WHERE s = s GROUP BY s",
+    ),
+    (
+        "memory",
+        "storage_grouped",
+        "SELECT a AS g, COUNT(*) FROM t GROUP BY g",
+        "SELECT a AS g, COUNT(*) FROM t WHERE id + 0 = id GROUP BY g",
+    ),
+    (
         "empty",
         "streaming_derived_table",
         "SELECT COUNT(*) AS n, s, COUNT(*) AS m FROM (SELECT s FROM t) d GROUP BY s",

@@ -1781,12 +1781,16 @@ impl Executor {
     ) -> Result<Vec<GroupByItem>> {
         let mut group_items = Vec::new();
 
-        // Build a map of aliases to their expressions from SELECT clause
+        // Build a map of aliases to their expressions from SELECT clause; an
+        // aggregate cannot be grouped, so its alias leaves the name to the source column
         let alias_map: FxHashMap<String, Expression> = stmt
             .columns
             .iter()
             .filter_map(|col| {
                 if let Expression::Aliased(aliased) = col {
+                    if expression_contains_aggregate(&aliased.expression) {
+                        return None;
+                    }
                     Some((
                         aliased.alias.value_lower.to_string(),
                         (*aliased.expression).clone(),
@@ -1898,6 +1902,25 @@ impl Executor {
         }
 
         Ok(group_items)
+    }
+
+    /// The source column a single named GROUP BY item groups by, bound by
+    /// `parse_group_by` as the shared projection binds it
+    pub(crate) fn single_group_column(&self, stmt: &SelectStatement) -> Result<Option<String>> {
+        if !matches!(
+            stmt.group_by.columns.as_slice(),
+            [Expression::Identifier(_) | Expression::QualifiedIdentifier(_)]
+        ) {
+            return Ok(None);
+        }
+        Ok(match self.parse_group_by(stmt, &[])?.as_slice() {
+            [GroupByItem::Column(name)] => Some(name.to_lowercase()),
+            [GroupByItem::Expression {
+                expr: Expression::Identifier(id),
+                ..
+            }] => Some(id.value_lower.to_string()),
+            _ => None,
+        })
     }
 
     /// Find the alias for an expression in the SELECT list
@@ -6083,13 +6106,13 @@ impl Executor {
             return Ok(None);
         }
 
-        // GROUP BY column must be a simple column reference (identifier)
-        let group_col_name = match &stmt.group_by.columns[0] {
-            crate::parser::ast::Expression::Identifier(id) => id.value_lower.to_string(),
-            crate::parser::ast::Expression::QualifiedIdentifier(qid) => {
-                qid.name.value_lower.to_string()
-            }
-            _ => return Ok(None),
+        // The derived table's columns carry no qualifier
+        let group_col_name = match self.single_group_column(stmt)? {
+            Some(name) => match name.rsplit_once('.') {
+                Some((_, column)) => column.to_string(),
+                None => name,
+            },
+            None => return Ok(None),
         };
 
         // Build column index map from result columns
@@ -6513,22 +6536,14 @@ impl Executor {
             .collect();
 
         // Extract group-by column names and indices (in GROUP BY order)
-        let mut group_by_indices: Vec<usize> = Vec::new();
-        let mut group_by_col_names: Vec<String> = Vec::new();
-        for expr in group_by_cols {
-            match expr {
-                Expression::Identifier(ident) => {
-                    let col_name = ident.value.to_lowercase().to_string();
-                    if let Some(&idx) = col_map.get(col_name.as_str()) {
-                        group_by_indices.push(idx);
-                        group_by_col_names.push(col_name);
-                    } else {
-                        return None; // Unknown column
-                    }
-                }
-                _ => return None, // Non-column GROUP BY not supported
-            }
-        }
+        let col_name = match self.single_group_column(stmt) {
+            Ok(Some(name)) => name,
+            Ok(None) => return None,
+            Err(e) => return Some(Err(e)),
+        };
+        let &idx = col_map.get(col_name.as_str())?;
+        let group_by_indices: Vec<usize> = vec![idx];
+        let group_by_col_names: Vec<String> = vec![col_name];
 
         // The SELECT list reads the group column and plain aggregates; the
         // shared end projects the slots onto it, in any order and under any alias

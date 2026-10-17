@@ -151,6 +151,15 @@ fn items_sharing_an_alias_keep_their_own_values() {
             ["1", "7"],
         ),
         ("SELECT SUM(g) AS n, COUNT(*) AS n FROM u", ["7", "1"]),
+        ("SELECT g AS n, COUNT(*) AS g FROM u GROUP BY g", ["7", "1"]),
+        (
+            "SELECT g AS n, COUNT(*) AS g FROM u WHERE id + 0 = id GROUP BY g",
+            ["7", "1"],
+        ),
+        (
+            "SELECT COUNT(*) AS g, g AS n FROM u WHERE id + 0 = id GROUP BY g",
+            ["1", "7"],
+        ),
     ] {
         let got = answer(&db, sql).map(|(_, values)| values);
         if got != Ok(want.iter().map(|s| s.to_string()).collect()) {
