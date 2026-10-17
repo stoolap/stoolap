@@ -109,6 +109,7 @@ use super::result::{
     LimitedResult, OrderedResult, ProjectedResult, RadixOrderSpec, ScannerResult,
     StreamingProjectionResult, TopNResult,
 };
+use super::row_count::{row_counts, rows_needed, static_row_counts, RowCounts};
 use super::utils::compute_join_projection;
 use super::utils::{
     add_table_qualifier, build_column_index_map, collect_table_qualifiers, column_families,
@@ -506,92 +507,7 @@ impl Executor {
         };
 
         // Evaluate LIMIT/OFFSET early (needed for set operations optimization)
-        // Literal fast path: `LIMIT 10` needs no compile/cache/VM round trip
-        let limit = if let Some(Expression::IntegerLiteral(lit)) = stmt.limit.as_deref() {
-            if lit.value < 0 {
-                return Err(Error::Parse(format!(
-                    "LIMIT must be non-negative, got {}",
-                    lit.value
-                )));
-            }
-            Some(lit.value as usize)
-        } else if let Some(ref limit_expr) = stmt.limit {
-            match ExpressionEval::compile(limit_expr, &[])?
-                .with_context(ctx)
-                .eval_slice(&Row::new())?
-            {
-                Value::Integer(l) => {
-                    if l < 0 {
-                        return Err(Error::Parse(format!(
-                            "LIMIT must be non-negative, got {}",
-                            l
-                        )));
-                    }
-                    Some(l as usize)
-                }
-                Value::Float(f) => {
-                    let l = f as i64;
-                    if l < 0 {
-                        return Err(Error::Parse(format!(
-                            "LIMIT must be non-negative, got {}",
-                            l
-                        )));
-                    }
-                    Some(l as usize)
-                }
-                other => {
-                    return Err(Error::Parse(format!(
-                        "LIMIT must be an integer, got {:?}",
-                        other
-                    )));
-                }
-            }
-        } else {
-            None
-        };
-
-        let offset = if let Some(Expression::IntegerLiteral(lit)) = stmt.offset.as_deref() {
-            if lit.value < 0 {
-                return Err(Error::Parse(format!(
-                    "OFFSET must be non-negative, got {}",
-                    lit.value
-                )));
-            }
-            lit.value as usize
-        } else if let Some(ref offset_expr) = stmt.offset {
-            match ExpressionEval::compile(offset_expr, &[])?
-                .with_context(ctx)
-                .eval_slice(&Row::new())?
-            {
-                Value::Integer(o) => {
-                    if o < 0 {
-                        return Err(Error::Parse(format!(
-                            "OFFSET must be non-negative, got {}",
-                            o
-                        )));
-                    }
-                    o as usize
-                }
-                Value::Float(f) => {
-                    let o = f as i64;
-                    if o < 0 {
-                        return Err(Error::Parse(format!(
-                            "OFFSET must be non-negative, got {}",
-                            o
-                        )));
-                    }
-                    o as usize
-                }
-                other => {
-                    return Err(Error::Parse(format!(
-                        "OFFSET must be an integer, got {:?}",
-                        other
-                    )));
-                }
-            }
-        } else {
-            0
-        };
+        let RowCounts { limit, offset } = row_counts(stmt, ctx)?;
 
         // Execute the main query
         // The third return value indicates if LIMIT/OFFSET was already applied (by storage-level pushdown)
@@ -1501,45 +1417,13 @@ impl Executor {
         Ok((result, qualified_columns, bounded))
     }
 
-    /// LIMIT + OFFSET when both are integer literals (OFFSET may be absent),
-    /// for fetch paths that stop early and leave OFFSET to be applied afterwards.
-    fn literal_fetch_limit(stmt: &SelectStatement) -> Option<usize> {
-        let limit = match stmt.limit.as_deref() {
-            Some(Expression::IntegerLiteral(lit)) if lit.value > 0 => lit.value as usize,
-            _ => return None,
-        };
-        match stmt.offset.as_deref() {
-            None => Some(limit),
-            Some(Expression::IntegerLiteral(lit)) if lit.value >= 0 => {
-                Some(limit.saturating_add(lit.value as usize))
-            }
-            Some(_) => None,
-        }
-    }
-
-    /// Extract a simple LIMIT value from a SelectStatement, if present and evaluable.
-    fn extract_limit_hint(stmt: &SelectStatement, ctx: &ExecutionContext) -> Option<usize> {
-        let limit_expr = stmt.limit.as_ref()?;
-        let offset = stmt.offset.as_ref().and_then(|off| {
-            ExpressionEval::compile(off, &[])
-                .ok()?
-                .with_context(ctx)
-                .eval_slice(&Row::new())
-                .ok()
-                .and_then(|v| v.as_int64())
-                .map(|v| v.max(0) as usize)
-        });
-        let limit_val = ExpressionEval::compile(limit_expr, &[])
-            .ok()?
-            .with_context(ctx)
-            .eval_slice(&Row::new())
-            .ok()?
-            .as_int64()?;
-        if limit_val < 0 {
-            return None;
-        }
-        let total = (limit_val as usize).saturating_add(offset.unwrap_or(0));
-        Some(total)
+    /// LIMIT + OFFSET of a positive LIMIT, for fetch paths that stop early and
+    /// leave OFFSET to be applied afterwards; None when either is not a count,
+    /// which the general path reports
+    fn fetch_limit(stmt: &SelectStatement, ctx: &ExecutionContext) -> Option<usize> {
+        let counts = row_counts(stmt, ctx).ok()?;
+        let limit = counts.limit.filter(|limit| *limit > 0)?;
+        Some(limit.saturating_add(counts.offset))
     }
 
     /// Execute a table-valued function source (e.g., generate_series(1, 10))
@@ -1561,7 +1445,7 @@ impl Executor {
             && !classification.has_window_functions
             && !classification.has_set_operations
         {
-            Self::extract_limit_hint(stmt, ctx)
+            rows_needed(stmt, ctx)
         } else {
             None
         };
@@ -2934,55 +2818,8 @@ impl Executor {
             && !needs_memory_filter; // Allow with storage_expr (WHERE on indexed columns)
 
         if can_pushdown_limit {
-            let limit = if let Some(ref limit_expr) = stmt.limit {
-                match ExpressionEval::compile(limit_expr, &[])?
-                    .with_context(ctx)
-                    .eval_slice(&Row::new())?
-                {
-                    Value::Integer(l) if l >= 0 => l as usize,
-                    Value::Integer(l) => {
-                        return Err(Error::Parse(format!(
-                            "LIMIT must be non-negative, got {}",
-                            l
-                        )));
-                    }
-                    Value::Float(f) if f >= 0.0 => f as usize,
-                    Value::Float(f) => {
-                        return Err(Error::Parse(format!(
-                            "LIMIT must be non-negative, got {}",
-                            f
-                        )));
-                    }
-                    _ => usize::MAX,
-                }
-            } else {
-                usize::MAX
-            };
-
-            let offset = if let Some(ref offset_expr) = stmt.offset {
-                match ExpressionEval::compile(offset_expr, &[])?
-                    .with_context(ctx)
-                    .eval_slice(&Row::new())?
-                {
-                    Value::Integer(o) if o >= 0 => o as usize,
-                    Value::Integer(o) => {
-                        return Err(Error::Parse(format!(
-                            "OFFSET must be non-negative, got {}",
-                            o
-                        )));
-                    }
-                    Value::Float(f) if f >= 0.0 => f as usize,
-                    Value::Float(f) => {
-                        return Err(Error::Parse(format!(
-                            "OFFSET must be non-negative, got {}",
-                            f
-                        )));
-                    }
-                    _ => 0,
-                }
-            } else {
-                0
-            };
+            let counts = row_counts(stmt, ctx)?;
+            let (limit, offset) = (counts.limit.unwrap_or(usize::MAX), counts.offset);
 
             // Pass storage_expr to filter while scanning with limit
             // Use unordered version since ORDER BY is already confirmed empty by can_pushdown_limit
@@ -3220,13 +3057,10 @@ impl Executor {
 
                     // Extract limit value for optimization decision
                     // With small LIMIT, index-nested-loop with early termination is faster
-                    let outer_limit = stmt.limit.as_ref().and_then(|limit_expr| {
-                        if let Expression::IntegerLiteral(lit) = limit_expr.as_ref() {
-                            Some(lit.value)
-                        } else {
-                            None
-                        }
-                    });
+                    let outer_limit = row_counts(stmt, ctx)
+                        .ok()
+                        .and_then(|counts| counts.limit)
+                        .and_then(|limit| i64::try_from(limit).ok());
 
                     // ANTI-JOIN OPTIMIZATION: For pure NOT EXISTS without LIMIT, use HashJoinOperator::Anti
                     // This is faster than InHashSet because:
@@ -3433,35 +3267,8 @@ impl Executor {
                     && stmt.distinct_on.is_empty();
 
                 let early_termination_target = if can_early_terminate {
-                    let offset = stmt
-                        .offset
-                        .as_ref()
-                        .and_then(|offset_expr| {
-                            ExpressionEval::compile(offset_expr, &[])
-                                .ok()
-                                .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                                .and_then(|v| {
-                                    if let Value::Integer(o) = v {
-                                        Some(o.max(0) as usize)
-                                    } else {
-                                        None
-                                    }
-                                })
-                        })
-                        .unwrap_or(0);
-
-                    stmt.limit.as_ref().and_then(|limit_expr| {
-                        ExpressionEval::compile(limit_expr, &[])
-                            .ok()
-                            .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                            .and_then(|v| {
-                                if let Value::Integer(l) = v {
-                                    Some((offset, l.max(0) as usize))
-                                } else {
-                                    None
-                                }
-                            })
-                    })
+                    let counts = row_counts(stmt, ctx)?;
+                    counts.limit.map(|limit| (counts.offset, limit))
                 } else {
                     None
                 };
@@ -3625,35 +3432,7 @@ impl Executor {
                 // This turns O(outer_size) EXISTS evaluations into O(LIMIT) evaluations.
                 let early_termination_target: Option<usize> =
                     if has_correlated && stmt.order_by.is_empty() {
-                        let offset = stmt
-                            .offset
-                            .as_ref()
-                            .and_then(|offset_expr| {
-                                ExpressionEval::compile(offset_expr, &[])
-                                    .ok()
-                                    .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                                    .and_then(|v| {
-                                        if let Value::Integer(o) = v {
-                                            Some(o.max(0) as usize)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                            })
-                            .unwrap_or(0);
-
-                        stmt.limit.as_ref().and_then(|limit_expr| {
-                            ExpressionEval::compile(limit_expr, &[])
-                                .ok()
-                                .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                                .and_then(|v| {
-                                    if let Value::Integer(l) = v {
-                                        Some(offset + l.max(0) as usize)
-                                    } else {
-                                        None
-                                    }
-                                })
-                        })
+                        rows_needed(stmt, ctx)
                     } else {
                         None
                     };
@@ -3888,8 +3667,10 @@ impl Executor {
                         // NOTE: Cannot use this optimization if there's a top-level ORDER BY
                         // because we need all rows to sort before applying LIMIT
                         let has_order_by = !stmt.order_by.is_empty();
-                        if !has_order_by && !Self::windows_hold_subquery(stmt) {
-                            if let Some(limit_val) = Self::literal_fetch_limit(stmt) {
+                        // DISTINCT runs after the fetch, so it keeps the LIMIT out too
+                        let distinct = stmt.distinct || !stmt.distinct_on.is_empty();
+                        if !has_order_by && !distinct && !Self::windows_hold_subquery(stmt) {
+                            if let Some(limit_val) = Self::fetch_limit(stmt, ctx) {
                                 // Use lazy partition fetching - returns early!
                                 let result = self
                                     .execute_select_with_window_functions_lazy_partition(
@@ -3976,8 +3757,9 @@ impl Executor {
                         let has_order_by = !stmt.order_by.is_empty();
                         let is_window_safe =
                             Self::is_window_safe_for_limit_pushdown(stmt, &col_name, ascending);
-                        let fetch_limit = if !has_order_by && is_window_safe {
-                            Self::literal_fetch_limit(stmt).unwrap_or(usize::MAX)
+                        let distinct = stmt.distinct || !stmt.distinct_on.is_empty();
+                        let fetch_limit = if !has_order_by && !distinct && is_window_safe {
+                            Self::fetch_limit(stmt, ctx).unwrap_or(usize::MAX)
                         } else {
                             usize::MAX
                         };
@@ -4493,7 +4275,7 @@ impl Executor {
             // This optimization avoids materializing the right side entirely
             // NOTE: Don't use Index NL for aggregation/window queries - they need full results
             // and the current implementation falls through to standard path, causing double execution
-            let pushed_limit = self.pushed_join_limit(stmt, ctx, classification, &join_type);
+            let pushed_limit = self.pushed_join_limit(stmt, Some(ctx), classification, &join_type);
             // An INNER join without a limit narrows its inner side by a table's
             // candidates only for an outer side found small once it runs
             let small_outer = pushed_limit.is_none() && join_type == "INNER";
@@ -5271,43 +5053,13 @@ impl Executor {
                             // limit only the needed rows move; otherwise the
                             // permutation happens in place instead of
                             // deep-cloning every joined row
-                            let offset = stmt
-                                .offset
-                                .as_ref()
-                                .and_then(|e| {
-                                    ExpressionEval::compile(e, &[])
-                                        .ok()
-                                        .and_then(|eval| {
-                                            eval.with_context(ctx).eval_slice(&Row::new()).ok()
-                                        })
-                                        .and_then(|v| match v {
-                                            Value::Integer(n) if n >= 0 => Some(n as usize),
-                                            _ => None,
-                                        })
-                                })
-                                .unwrap_or(0);
+                            let counts = row_counts(stmt, ctx)?;
+                            let offset = counts.offset;
+                            let limit = counts.limit.unwrap_or(usize::MAX);
 
-                            let limit = stmt
-                                .limit
-                                .as_ref()
-                                .and_then(|e| {
-                                    ExpressionEval::compile(e, &[])
-                                        .ok()
-                                        .and_then(|eval| {
-                                            eval.with_context(ctx).eval_slice(&Row::new()).ok()
-                                        })
-                                        .and_then(|v| match v {
-                                            Value::Integer(n) if n >= 0 => Some(n as usize),
-                                            _ => None,
-                                        })
-                                })
-                                .unwrap_or(usize::MAX);
-
-                            // Sorted here; when the statement's LIMIT/OFFSET
-                            // evaluated they are applied below, so the standard
-                            // path must not apply OFFSET a second time
-                            order_limit_applied = (stmt.limit.is_none() || limit != usize::MAX)
-                                && (stmt.offset.is_none() || offset > 0);
+                            // Sorted here, and LIMIT/OFFSET applied below, so
+                            // the standard path must not apply OFFSET again
+                            order_limit_applied = true;
 
                             if offset > 0 || limit != usize::MAX {
                                 final_rows = indices
@@ -5429,31 +5181,13 @@ impl Executor {
                 && stmt.distinct_on.is_empty()
                 && cross_filter.is_none()
             {
-                // Compute limit value
-                let limit = stmt.limit.as_ref().and_then(|limit_expr| {
-                    ExpressionEval::compile(limit_expr, &[])
-                        .ok()
-                        .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                        .and_then(|v| match v {
-                            Value::Integer(n) if (0..=100).contains(&n) => Some(n as u64),
-                            _ => None,
-                        })
-                });
                 // OFFSET rows are skipped after collection, so the
-                // early-termination budget is LIMIT + OFFSET; a
-                // non-evaluable OFFSET disables streaming
-                match &stmt.offset {
-                    None => limit,
-                    Some(off_expr) => limit.and_then(|l| {
-                        ExpressionEval::compile(off_expr, &[])
-                            .ok()
-                            .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                            .and_then(|v| match v {
-                                Value::Integer(n) if n >= 0 => Some(l.saturating_add(n as u64)),
-                                _ => None,
-                            })
-                    }),
-                }
+                // early-termination budget is LIMIT + OFFSET, for a LIMIT of
+                // at most 100
+                row_counts(stmt, ctx).ok().and_then(|counts| {
+                    let limit = counts.limit.filter(|limit| *limit <= 100)?;
+                    Some(limit.saturating_add(counts.offset) as u64)
+                })
             } else {
                 None
             };
@@ -5891,30 +5625,9 @@ impl Executor {
             && stmt.distinct_on.is_empty();
 
         let join_limit = if can_push_limit {
-            let limit = stmt.limit.as_ref().and_then(|limit_expr| {
-                ExpressionEval::compile(limit_expr, &[])
-                    .ok()
-                    .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                    .and_then(|v| match v {
-                        Value::Integer(n) if n >= 0 => Some(n as u64),
-                        _ => None,
-                    })
-            });
-            // OFFSET rows are skipped after collection, so early
-            // termination must gather LIMIT + OFFSET rows; a
-            // non-evaluable OFFSET disables the pushdown
-            match &stmt.offset {
-                None => limit,
-                Some(off_expr) => limit.and_then(|l| {
-                    ExpressionEval::compile(off_expr, &[])
-                        .ok()
-                        .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                        .and_then(|v| match v {
-                            Value::Integer(n) if n >= 0 => Some(l.saturating_add(n as u64)),
-                            _ => None,
-                        })
-                }),
-            }
+            // OFFSET rows are skipped after collection, so early termination
+            // must gather LIMIT + OFFSET rows
+            rows_needed(stmt, ctx).map(|rows| rows as u64)
         } else {
             None
         };
@@ -11390,23 +11103,10 @@ impl Executor {
         stmt: &SelectStatement,
         is_inner: bool,
     ) -> Option<(usize, usize, usize, usize)> {
-        let eval = |e: &Expression| {
-            ExpressionEval::compile(e, &[])
-                .ok()
-                .and_then(|mut eval| eval.eval_slice(&Row::new()).ok())
-                .and_then(|v| match v {
-                    Value::Integer(n) if n >= 0 => Some(n as usize),
-                    _ => None,
-                })
-        };
-        let limit = eval(stmt.limit.as_ref()?)?;
-        if limit == 0 {
-            return None;
-        }
-        let offset = match &stmt.offset {
-            Some(e) => eval(e)?,
-            None => 0,
-        };
+        // The plan is made without the statement's parameters: a count that
+        // is not a literal keeps the reduction off
+        let counts = static_row_counts(stmt)?;
+        let (limit, offset) = (counts.limit.filter(|limit| *limit > 0)?, counts.offset);
         let want = limit.saturating_add(offset);
         let mut cap = want;
         if is_inner {
@@ -11588,11 +11288,12 @@ impl Executor {
     #[allow(clippy::type_complexity)]
     /// The limit the executor pushes into a join of `stmt`: the statement's
     /// LIMIT plus OFFSET when nothing orders, groups or aggregates the joined
-    /// rows and both evaluate; None when the join runs unbounded
+    /// rows and both evaluate; None when the join runs unbounded. Without a
+    /// context, as EXPLAIN asks, only literal counts are read
     pub(crate) fn pushed_join_limit(
         &self,
         stmt: &SelectStatement,
-        ctx: &ExecutionContext,
+        ctx: Option<&ExecutionContext>,
         classification: &QueryClassification,
         join_type: &str,
     ) -> Option<u64> {
@@ -11608,23 +11309,16 @@ impl Executor {
         {
             return None;
         }
-        let evaluate = |expr: &Expression| {
-            ExpressionEval::compile(expr, &[])
-                .ok()
-                .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                .and_then(|v| match v {
-                    Value::Integer(n) if n >= 0 => Some(n as u64),
-                    _ => None,
-                })
-        };
-        let limit = evaluate(stmt.limit.as_ref()?)?;
         // OFFSET rows are skipped after collection, so early termination
-        // must gather LIMIT + OFFSET rows; a non-evaluable OFFSET disables
-        // the pushdown
-        match &stmt.offset {
-            None => Some(limit),
-            Some(offset) => Some(limit.saturating_add(evaluate(offset)?)),
-        }
+        // must gather LIMIT + OFFSET rows
+        let rows = match ctx {
+            Some(ctx) => rows_needed(stmt, ctx)?,
+            None => {
+                let counts = static_row_counts(stmt)?;
+                counts.limit?.saturating_add(counts.offset)
+            }
+        };
+        Some(rows as u64)
     }
 
     /// Whether the grouped index join takes the statement's shape: an INNER
@@ -11701,7 +11395,7 @@ impl Executor {
         }
         if !classification.has_aggregation && !classification.has_window_functions {
             let bounded = self
-                .pushed_join_limit(stmt, &ExecutionContext::new(), &classification, &join_type)
+                .pushed_join_limit(stmt, None, &classification, &join_type)
                 .is_some();
             return JoinIndexUse::Streaming { bounded };
         }
@@ -12305,7 +11999,7 @@ impl Executor {
 
         // With streaming aggregation we can stop once LIMIT + OFFSET groups pass
         // HAVING; OFFSET is applied by the caller and must find its groups here
-        let limit_for_early_exit = Self::extract_limit_hint(stmt, ctx);
+        let limit_for_early_exit = rows_needed(stmt, ctx);
 
         // Use streaming callback to avoid upfront allocation of all groups.
         // This is more efficient because:

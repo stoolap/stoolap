@@ -33,6 +33,7 @@ use super::context::{cache_in_subquery, get_cached_in_subquery_with_kinds, Execu
 use super::expression::{ExpressionEval, RowFilter};
 use super::query_classification::QueryClassification;
 use super::result::ExecutorResult;
+use super::row_count::{row_counts, RowCounts};
 use super::utils::{extract_and_conditions, flip_operator, infix_to_operator};
 use super::volatility::statement_constant;
 use super::Executor;
@@ -277,31 +278,12 @@ impl Executor {
         // Determine sort order
         let ascending = order_by.ascending;
 
-        // Evaluate limit and offset
-        let limit = if let Some(ref limit_expr) = stmt.limit {
-            match ExpressionEval::compile(limit_expr, &[])
-                .ok()
-                .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-            {
-                Some(Value::Integer(l)) => l as usize,
-                Some(Value::Float(f)) => f as usize,
-                _ => return Ok(None),
-            }
-        } else {
+        let RowCounts {
+            limit: Some(limit),
+            offset,
+        } = row_counts(stmt, ctx)?
+        else {
             return Ok(None);
-        };
-
-        let offset = if let Some(ref offset_expr) = stmt.offset {
-            match ExpressionEval::compile(offset_expr, &[])
-                .ok()
-                .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-            {
-                Some(Value::Integer(o)) => o as usize,
-                Some(Value::Float(f)) => f as usize,
-                _ => 0,
-            }
-        } else {
-            0
         };
 
         // NULLS LAST for ASC and NULLS FIRST for DESC unless the query says
@@ -372,22 +354,12 @@ impl Executor {
         }
         let ascending = order_by.ascending;
 
-        let limit = match stmt.limit.as_ref().and_then(|e| {
-            ExpressionEval::compile(e, &[])
-                .ok()
-                .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-        }) {
-            Some(Value::Integer(l)) if l >= 0 => l as usize,
-            _ => return Ok(None),
-        };
-        let offset = match stmt.offset.as_ref().and_then(|e| {
-            ExpressionEval::compile(e, &[])
-                .ok()
-                .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-        }) {
-            Some(Value::Integer(o)) if o >= 0 => o as usize,
-            Some(_) => return Ok(None),
-            None => 0,
+        let RowCounts {
+            limit: Some(limit),
+            offset,
+        } = row_counts(stmt, ctx)?
+        else {
+            return Ok(None);
         };
 
         let Some(rows) = table.scan_top_k(storage_expr, &column_name, ascending, limit, offset)?
@@ -457,17 +429,7 @@ impl Executor {
             _ => return Ok(None),
         };
 
-        // Evaluate limit
-        let limit = if let Some(ref limit_expr) = stmt.limit {
-            match ExpressionEval::compile(limit_expr, &[])
-                .ok()
-                .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-            {
-                Some(Value::Integer(l)) => l as usize,
-                Some(Value::Float(f)) => f as usize,
-                _ => return Ok(None),
-            }
-        } else {
+        let Some(limit) = row_counts(stmt, ctx)?.limit else {
             return Ok(None);
         };
 
@@ -1016,13 +978,7 @@ impl Executor {
     /// evaluates to a count
     fn limit_applies(stmt: &SelectStatement, ctx: &ExecutionContext) -> bool {
         let limit_here = stmt.order_by.is_empty() && !stmt.distinct && stmt.distinct_on.is_empty();
-        limit_here
-            && stmt.limit.as_deref().is_some_and(|limit| {
-                ExpressionEval::compile(limit, &[])
-                    .ok()
-                    .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                    .is_some_and(|value| matches!(value, Value::Integer(n) if n >= 0))
-            })
+        limit_here && row_counts(stmt, ctx).is_ok_and(|counts| counts.limit.is_some())
     }
 
     /// The rows whose `column` is one of `members`, on a table
@@ -1358,39 +1314,8 @@ impl Executor {
                     .collect();
 
                 // Calculate LIMIT + OFFSET to know how many row_ids we need
-                let offset = stmt
-                    .offset
-                    .as_ref()
-                    .and_then(|e| {
-                        ExpressionEval::compile(e, &[])
-                            .ok()
-                            .and_then(|eval| eval.with_context(ctx).eval_slice(&Row::new()).ok())
-                            .and_then(|v| {
-                                if let Value::Integer(o) = v {
-                                    Some(o.max(0) as usize)
-                                } else {
-                                    None
-                                }
-                            })
-                    })
-                    .unwrap_or(0);
-
-                let limit = stmt
-                    .limit
-                    .as_ref()
-                    .and_then(|e| {
-                        ExpressionEval::compile(e, &[])
-                            .ok()
-                            .and_then(|eval| eval.with_context(ctx).eval_slice(&Row::new()).ok())
-                            .and_then(|v| {
-                                if let Value::Integer(l) = v {
-                                    Some(l.max(0) as usize)
-                                } else {
-                                    None
-                                }
-                            })
-                    })
-                    .unwrap_or(usize::MAX);
+                let counts = row_counts(stmt, ctx)?;
+                let (offset, limit) = (counts.offset, counts.limit.unwrap_or(usize::MAX));
 
                 // Stop early only when nothing after this point drops or reorders
                 // rows; the shared tail applies OFFSET and LIMIT once
@@ -1449,29 +1374,8 @@ impl Executor {
         // we can apply LIMIT early to avoid fetching unnecessary rows
         let (early_limit_applied, early_limit, early_offset) =
             if limit_here && remaining_predicate.is_none() && member_rows.is_none() {
-                let offset = if let Some(ref offset_expr) = stmt.offset {
-                    match ExpressionEval::compile(offset_expr, &[])
-                        .ok()
-                        .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                    {
-                        Some(Value::Integer(o)) if o >= 0 => o as usize,
-                        _ => 0,
-                    }
-                } else {
-                    0
-                };
-
-                let limit = if let Some(ref limit_expr) = stmt.limit {
-                    match ExpressionEval::compile(limit_expr, &[])
-                        .ok()
-                        .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                    {
-                        Some(Value::Integer(l)) if l >= 0 => l as usize,
-                        _ => usize::MAX,
-                    }
-                } else {
-                    usize::MAX
-                };
+                let counts = row_counts(stmt, ctx)?;
+                let (offset, limit) = (counts.offset, counts.limit.unwrap_or(usize::MAX));
 
                 // The rows are trimmed after the fetch: a member with no
                 // row, or with a row not visible, counts for nothing
@@ -1529,29 +1433,8 @@ impl Executor {
                 rows.truncate(early_limit);
             }
         } else if limit_here {
-            let offset = if let Some(ref offset_expr) = stmt.offset {
-                match ExpressionEval::compile(offset_expr, &[])
-                    .ok()
-                    .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                {
-                    Some(Value::Integer(o)) if o >= 0 => o as usize,
-                    _ => 0,
-                }
-            } else {
-                0
-            };
-
-            let limit = if let Some(ref limit_expr) = stmt.limit {
-                match ExpressionEval::compile(limit_expr, &[])
-                    .ok()
-                    .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                {
-                    Some(Value::Integer(l)) if l >= 0 => l as usize,
-                    _ => usize::MAX,
-                }
-            } else {
-                usize::MAX
-            };
+            let counts = row_counts(stmt, ctx)?;
+            let (offset, limit) = (counts.offset, counts.limit.unwrap_or(usize::MAX));
 
             if offset > 0 || limit < usize::MAX {
                 rows = rows.into_iter().skip(offset).take(limit).collect();
@@ -1767,29 +1650,8 @@ impl Executor {
         let limit_here = stmt.order_by.is_empty() && !stmt.distinct && stmt.distinct_on.is_empty();
         let (early_limit_applied, early_limit, early_offset) =
             if limit_here && remaining_predicate.is_none() && member_rows.is_none() {
-                let offset = if let Some(ref offset_expr) = stmt.offset {
-                    match ExpressionEval::compile(offset_expr, &[])
-                        .ok()
-                        .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                    {
-                        Some(Value::Integer(o)) if o >= 0 => o as usize,
-                        _ => 0,
-                    }
-                } else {
-                    0
-                };
-
-                let limit = if let Some(ref limit_expr) = stmt.limit {
-                    match ExpressionEval::compile(limit_expr, &[])
-                        .ok()
-                        .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                    {
-                        Some(Value::Integer(l)) if l >= 0 => l as usize,
-                        _ => usize::MAX,
-                    }
-                } else {
-                    usize::MAX
-                };
+                let counts = row_counts(stmt, ctx)?;
+                let (offset, limit) = (counts.offset, counts.limit.unwrap_or(usize::MAX));
 
                 // The rows are trimmed after the fetch: a member with no
                 // row, or with a row not visible, counts for nothing
@@ -1847,29 +1709,8 @@ impl Executor {
                 rows.truncate(early_limit);
             }
         } else if limit_here {
-            let offset = if let Some(ref offset_expr) = stmt.offset {
-                match ExpressionEval::compile(offset_expr, &[])
-                    .ok()
-                    .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                {
-                    Some(Value::Integer(o)) if o >= 0 => o as usize,
-                    _ => 0,
-                }
-            } else {
-                0
-            };
-
-            let limit = if let Some(ref limit_expr) = stmt.limit {
-                match ExpressionEval::compile(limit_expr, &[])
-                    .ok()
-                    .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                {
-                    Some(Value::Integer(l)) if l >= 0 => l as usize,
-                    _ => usize::MAX,
-                }
-            } else {
-                usize::MAX
-            };
+            let counts = row_counts(stmt, ctx)?;
+            let (offset, limit) = (counts.offset, counts.limit.unwrap_or(usize::MAX));
 
             if offset > 0 || limit < usize::MAX {
                 rows = rows.into_iter().skip(offset).take(limit).collect();
@@ -2121,37 +1962,10 @@ impl Executor {
         // EARLY LIMIT CHECK: Compute limit+offset before collecting row_ids
         // This allows us to stop collection early when there's no ORDER BY
         let early_termination_target = if limit_here && remaining_predicate.is_none() {
-            let offset = stmt
-                .offset
-                .as_ref()
-                .and_then(|offset_expr| {
-                    ExpressionEval::compile(offset_expr, &[])
-                        .ok()
-                        .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                        .and_then(|v| {
-                            if let Value::Integer(o) = v {
-                                Some(o.max(0) as usize)
-                            } else {
-                                None
-                            }
-                        })
-                })
-                .unwrap_or(0);
-
-            let limit = stmt.limit.as_ref().and_then(|limit_expr| {
-                ExpressionEval::compile(limit_expr, &[])
-                    .ok()
-                    .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                    .and_then(|v| {
-                        if let Value::Integer(l) = v {
-                            Some(l.max(0) as usize)
-                        } else {
-                            None
-                        }
-                    })
-            });
-
-            limit.map(|l| offset + l)
+            let counts = row_counts(stmt, ctx)?;
+            counts
+                .limit
+                .map(|limit| counts.offset.saturating_add(limit))
         } else {
             None // Can't use early termination with ORDER BY or remaining predicate
         };
@@ -2268,29 +2082,8 @@ impl Executor {
         // we can apply LIMIT early to avoid fetching unnecessary rows
         let (early_limit_applied, early_limit, early_offset) =
             if limit_here && remaining_predicate.is_none() && member_rows.is_none() {
-                let offset = if let Some(ref offset_expr) = stmt.offset {
-                    match ExpressionEval::compile(offset_expr, &[])
-                        .ok()
-                        .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                    {
-                        Some(Value::Integer(o)) if o >= 0 => o as usize,
-                        _ => 0,
-                    }
-                } else {
-                    0
-                };
-
-                let limit = if let Some(ref limit_expr) = stmt.limit {
-                    match ExpressionEval::compile(limit_expr, &[])
-                        .ok()
-                        .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                    {
-                        Some(Value::Integer(l)) if l >= 0 => l as usize,
-                        _ => usize::MAX,
-                    }
-                } else {
-                    usize::MAX
-                };
+                let counts = row_counts(stmt, ctx)?;
+                let (offset, limit) = (counts.offset, counts.limit.unwrap_or(usize::MAX));
 
                 // The rows are trimmed after the fetch: a member with no
                 // row, or with a row not visible, counts for nothing
@@ -2340,29 +2133,8 @@ impl Executor {
                 rows.truncate(early_limit);
             }
         } else if limit_here {
-            let offset = if let Some(ref offset_expr) = stmt.offset {
-                match ExpressionEval::compile(offset_expr, &[])
-                    .ok()
-                    .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                {
-                    Some(Value::Integer(o)) if o >= 0 => o as usize,
-                    _ => 0,
-                }
-            } else {
-                0
-            };
-
-            let limit = if let Some(ref limit_expr) = stmt.limit {
-                match ExpressionEval::compile(limit_expr, &[])
-                    .ok()
-                    .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                {
-                    Some(Value::Integer(l)) if l >= 0 => l as usize,
-                    _ => usize::MAX,
-                }
-            } else {
-                usize::MAX
-            };
+            let counts = row_counts(stmt, ctx)?;
+            let (offset, limit) = (counts.offset, counts.limit.unwrap_or(usize::MAX));
 
             if offset > 0 || limit < usize::MAX {
                 rows = rows.into_iter().skip(offset).take(limit).collect();
@@ -2607,32 +2379,12 @@ impl Executor {
             _ => return Ok(None),
         };
 
-        // Evaluate limit + offset
-        let limit = match &stmt.limit {
-            Some(limit_expr) => {
-                match ExpressionEval::compile(limit_expr, &[])
-                    .ok()
-                    .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                {
-                    Some(Value::Integer(l)) if l >= 0 => l as usize,
-                    Some(Value::Float(f)) if f >= 0.0 => f as usize,
-                    _ => return Ok(None),
-                }
-            }
-            None => return Ok(None),
-        };
-
-        let offset = if let Some(ref offset_expr) = stmt.offset {
-            match ExpressionEval::compile(offset_expr, &[])
-                .ok()
-                .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-            {
-                Some(Value::Integer(o)) if o >= 0 => o as usize,
-                Some(Value::Float(f)) if f >= 0.0 => f as usize,
-                _ => 0,
-            }
-        } else {
-            0
+        let RowCounts {
+            limit: Some(limit),
+            offset,
+        } = row_counts(stmt, ctx)?
+        else {
+            return Ok(None);
         };
 
         let k = limit.saturating_add(offset);

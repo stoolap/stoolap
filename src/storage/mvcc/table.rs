@@ -4737,6 +4737,10 @@ impl Table for MVCCTable {
                 return Ok(None);
             }
         }
+        // The walks below check the limit after taking a row
+        if limit == 0 {
+            return Ok(Some(RowVec::new()));
+        }
 
         // OPTIMIZATION: Handle PRIMARY KEY column specially
         // For INTEGER PRIMARY KEY, the row_id IS the value, so we can iterate
