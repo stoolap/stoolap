@@ -103,12 +103,10 @@ fn compare_values_for_sort(a: &Value, b: &Value) -> Ordering {
         (Value::Null(_), _) => Ordering::Greater,
         (_, Value::Null(_)) => Ordering::Less,
         (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
-        (Value::Float(a), Value::Float(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-        (Value::Integer(a), Value::Float(b)) => {
-            (*a as f64).partial_cmp(b).unwrap_or(Ordering::Equal)
-        }
+        (Value::Float(a), Value::Float(b)) => crate::core::value::compare_floats(*a, *b),
+        (Value::Integer(a), Value::Float(b)) => crate::core::value::total_cmp_i64_f64(*a, *b),
         (Value::Float(a), Value::Integer(b)) => {
-            a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal)
+            crate::core::value::total_cmp_i64_f64(*b, *a).reverse()
         }
         (Value::Text(a), Value::Text(b)) => a.cmp(b),
         (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),

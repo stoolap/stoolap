@@ -939,8 +939,8 @@ pub struct QuantifiedMembers {
     members: CompactArc<Vec<Value>>,
     has_null: bool,
     /// The member that decides for a numeric value, when every member is
-    /// INTEGER, or every one FLOAT without NaN, so their order is the
-    /// comparison's: the largest for `< ANY` and `> ALL`, the smallest else
+    /// INTEGER, or every one FLOAT, so their order is the comparison's: the
+    /// largest for `< ANY` and `> ALL`, the smallest else
     bound: Option<Value>,
 }
 
@@ -961,9 +961,7 @@ impl QuantifiedMembers {
     /// member, when one exists: see the field of that name
     pub fn bound(op: CompareOp, all: bool, members: &[Value]) -> Option<Value> {
         let ordered = members.iter().all(|v| matches!(v, Value::Integer(_)))
-            || members
-                .iter()
-                .all(|v| matches!(v, Value::Float(f) if !f.is_nan()));
+            || members.iter().all(|v| matches!(v, Value::Float(_)));
         let largest = matches!(
             (op, all),
             (CompareOp::Lt | CompareOp::Le, false) | (CompareOp::Gt | CompareOp::Ge, true)
@@ -1004,19 +1002,13 @@ impl QuantifiedMembers {
             }
             _ => None,
         };
-        let by_contract = |member: &Value, value: &Value| {
-            // A NaN against a number passes only <>, as a column against a constant does
-            if is_nan_pair(value, member) {
-                return Some(self.op == CompareOp::Ne);
-            }
-            match self.op {
-                CompareOp::Eq => sql_eq(value, member),
-                CompareOp::Ne => sql_eq(value, member).map(|eq| !eq),
-                CompareOp::Lt => sql_compare(value, member).map(|o| o.is_lt()),
-                CompareOp::Le => sql_compare(value, member).map(|o| o.is_le()),
-                CompareOp::Gt => sql_compare(value, member).map(|o| o.is_gt()),
-                CompareOp::Ge => sql_compare(value, member).map(|o| o.is_ge()),
-            }
+        let by_contract = |member: &Value, value: &Value| match self.op {
+            CompareOp::Eq => sql_eq(value, member),
+            CompareOp::Ne => sql_eq(value, member).map(|eq| !eq),
+            CompareOp::Lt => sql_compare(value, member).map(|o| o.is_lt()),
+            CompareOp::Le => sql_compare(value, member).map(|o| o.is_le()),
+            CompareOp::Gt => sql_compare(value, member).map(|o| o.is_gt()),
+            CompareOp::Ge => sql_compare(value, member).map(|o| o.is_ge()),
         };
         match self.bound.as_ref().zip(number) {
             Some((bound, number)) => match by_contract(bound, number) {
@@ -1042,13 +1034,6 @@ impl QuantifiedMembers {
             Some(!decides)
         }
     }
-}
-
-/// Two numbers of which one is a NaN FLOAT
-fn is_nan_pair(a: &Value, b: &Value) -> bool {
-    let number = |v: &Value| matches!(v, Value::Integer(_) | Value::Float(_));
-    let nan = |v: &Value| matches!(v, Value::Float(f) if f.is_nan());
-    number(a) && number(b) && (nan(a) || nan(b))
 }
 
 /// Comparison operator for ALL/ANY subqueries

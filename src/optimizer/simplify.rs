@@ -523,15 +523,19 @@ impl ExpressionSimplifier {
                 InfixOperator::GreaterEqual => l.value >= r.value,
                 _ => return None,
             }),
-            (Expression::FloatLiteral(l), Expression::FloatLiteral(r)) => Some(match op {
-                InfixOperator::Equal => l.value == r.value,
-                InfixOperator::NotEqual => l.value != r.value,
-                InfixOperator::LessThan => l.value < r.value,
-                InfixOperator::LessEqual => l.value <= r.value,
-                InfixOperator::GreaterThan => l.value > r.value,
-                InfixOperator::GreaterEqual => l.value >= r.value,
-                _ => return None,
-            }),
+            (Expression::FloatLiteral(l), Expression::FloatLiteral(r)) => {
+                use crate::core::value::{f64_eq, f64_ge, f64_gt, f64_le, f64_lt, f64_ne};
+                let (l, r) = (l.value, r.value);
+                Some(match op {
+                    InfixOperator::Equal => f64_eq(l, r),
+                    InfixOperator::NotEqual => f64_ne(l, r),
+                    InfixOperator::LessThan => f64_lt(l, r),
+                    InfixOperator::LessEqual => f64_le(l, r),
+                    InfixOperator::GreaterThan => f64_gt(l, r),
+                    InfixOperator::GreaterEqual => f64_ge(l, r),
+                    _ => return None,
+                })
+            }
             (Expression::StringLiteral(l), Expression::StringLiteral(r)) => Some(match op {
                 InfixOperator::Equal => l.value == r.value,
                 InfixOperator::NotEqual => l.value != r.value,

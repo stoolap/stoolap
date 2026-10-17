@@ -223,16 +223,17 @@ impl ComparisonExpr {
         }
     }
 
-    /// Compare two floats with the configured operator
+    /// Compare two floats with the configured operator, in the total order
     #[inline]
     fn compare_floats(&self, col_val: f64, cmp_val: f64) -> bool {
+        use crate::core::value::{f64_eq, f64_ge, f64_gt, f64_le, f64_lt, f64_ne};
         match self.operator {
-            Operator::Eq => col_val == cmp_val,
-            Operator::Ne => col_val != cmp_val,
-            Operator::Gt => col_val > cmp_val,
-            Operator::Gte => col_val >= cmp_val,
-            Operator::Lt => col_val < cmp_val,
-            Operator::Lte => col_val <= cmp_val,
+            Operator::Eq => f64_eq(col_val, cmp_val),
+            Operator::Ne => f64_ne(col_val, cmp_val),
+            Operator::Gt => f64_gt(col_val, cmp_val),
+            Operator::Gte => f64_ge(col_val, cmp_val),
+            Operator::Lt => f64_lt(col_val, cmp_val),
+            Operator::Lte => f64_le(col_val, cmp_val),
             _ => false,
         }
     }
@@ -337,18 +338,11 @@ impl Expression for ComparisonExpr {
 
             // Cross-type numeric comparisons (integer vs float), exact at
             // the extremes where `i as f64` rounds
-            (ComparisonValue::Integer(cmp_val), Value::Float(col_val)) => {
-                match crate::core::value::cmp_i64_f64(*cmp_val, *col_val) {
-                    Some(ord) => Ok(self.check_ordering(ord.reverse())),
-                    // NaN cell: only <> is true (IEEE), matching the VM arms
-                    None => Ok(self.operator == Operator::Ne),
-                }
-            }
+            (ComparisonValue::Integer(cmp_val), Value::Float(col_val)) => Ok(self.check_ordering(
+                crate::core::value::total_cmp_i64_f64(*cmp_val, *col_val).reverse(),
+            )),
             (ComparisonValue::Float(cmp_val), Value::Integer(col_val)) => {
-                match crate::core::value::cmp_i64_f64(*col_val, *cmp_val) {
-                    Some(ord) => Ok(self.check_ordering(ord)),
-                    None => Ok(self.operator == Operator::Ne),
-                }
+                Ok(self.check_ordering(crate::core::value::total_cmp_i64_f64(*col_val, *cmp_val)))
             }
 
             // Type mismatch
@@ -402,18 +396,11 @@ impl Expression for ComparisonExpr {
             }
             // Cross-type numeric, exact at the extremes where `i as f64`
             // rounds
-            (ComparisonValue::Integer(cmp_val), Value::Float(col_val)) => {
-                match crate::core::value::cmp_i64_f64(*cmp_val, *col_val) {
-                    Some(ord) => self.check_ordering(ord.reverse()),
-                    // NaN cell: only <> is true (IEEE), matching the VM arms
-                    None => self.operator == Operator::Ne,
-                }
-            }
+            (ComparisonValue::Integer(cmp_val), Value::Float(col_val)) => self.check_ordering(
+                crate::core::value::total_cmp_i64_f64(*cmp_val, *col_val).reverse(),
+            ),
             (ComparisonValue::Float(cmp_val), Value::Integer(col_val)) => {
-                match crate::core::value::cmp_i64_f64(*col_val, *cmp_val) {
-                    Some(ord) => self.check_ordering(ord),
-                    None => self.operator == Operator::Ne,
-                }
+                self.check_ordering(crate::core::value::total_cmp_i64_f64(*col_val, *cmp_val))
             }
             _ => false,
         }

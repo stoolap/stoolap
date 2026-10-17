@@ -964,37 +964,64 @@ pub fn lossless_f64_from_i64(i: i64) -> Option<f64> {
     (cmp_i64_f64(i, f) == Some(std::cmp::Ordering::Equal)).then_some(f)
 }
 
-/// Operator wrappers over `cmp_i64_f64`. NaN compares false except `!=`,
-/// matching IEEE semantics of the casts they replace.
+/// `cmp_i64_f64` in the total order, where NaN is greater than every number
+#[inline]
+pub fn total_cmp_i64_f64(i: i64, f: f64) -> std::cmp::Ordering {
+    cmp_i64_f64(i, f).unwrap_or(std::cmp::Ordering::Less)
+}
+
+/// Operator wrappers over `total_cmp_i64_f64`
 #[inline]
 pub fn i64_eq_f64(i: i64, f: f64) -> bool {
-    cmp_i64_f64(i, f) == Some(std::cmp::Ordering::Equal)
+    total_cmp_i64_f64(i, f).is_eq()
 }
 #[inline]
 pub fn i64_ne_f64(i: i64, f: f64) -> bool {
-    cmp_i64_f64(i, f) != Some(std::cmp::Ordering::Equal)
+    total_cmp_i64_f64(i, f).is_ne()
 }
 #[inline]
 pub fn i64_lt_f64(i: i64, f: f64) -> bool {
-    cmp_i64_f64(i, f) == Some(std::cmp::Ordering::Less)
+    total_cmp_i64_f64(i, f).is_lt()
 }
 #[inline]
 pub fn i64_le_f64(i: i64, f: f64) -> bool {
-    matches!(
-        cmp_i64_f64(i, f),
-        Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal)
-    )
+    total_cmp_i64_f64(i, f).is_le()
 }
 #[inline]
 pub fn i64_gt_f64(i: i64, f: f64) -> bool {
-    cmp_i64_f64(i, f) == Some(std::cmp::Ordering::Greater)
+    total_cmp_i64_f64(i, f).is_gt()
 }
 #[inline]
 pub fn i64_ge_f64(i: i64, f: f64) -> bool {
-    matches!(
-        cmp_i64_f64(i, f),
-        Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal)
-    )
+    total_cmp_i64_f64(i, f).is_ge()
+}
+
+/// FLOAT comparison operators in the total order: NaN equals NaN and is
+/// greater than every number. The IEEE test runs first, so a NaN costs a
+/// second test only where IEEE answers false
+#[inline]
+pub fn f64_eq(a: f64, b: f64) -> bool {
+    a == b || (a.is_nan() && b.is_nan())
+}
+#[inline]
+pub fn f64_ne(a: f64, b: f64) -> bool {
+    !f64_eq(a, b)
+}
+#[inline]
+pub fn f64_lt(a: f64, b: f64) -> bool {
+    a < b || (b.is_nan() && !a.is_nan())
+}
+#[inline]
+pub fn f64_le(a: f64, b: f64) -> bool {
+    a <= b || b.is_nan()
+}
+#[inline]
+pub fn f64_gt(a: f64, b: f64) -> bool {
+    f64_lt(b, a)
+}
+#[inline]
+pub fn f64_ge(a: f64, b: f64) -> bool {
+    f64_le(b, a)
 }
 
 /// Maximum i64 value that can be safely hashed as i64 without f64 conversion.

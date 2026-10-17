@@ -50,6 +50,7 @@ use memchr::memmem;
 use chrono::{DateTime, Utc};
 
 use crate::common::CompactArc;
+use crate::core::value::{f64_eq, f64_ge, f64_gt, f64_le, f64_lt, f64_ne};
 use crate::core::{Operator, Row, Schema, Value};
 
 use super::between::BetweenExpr;
@@ -1185,25 +1186,25 @@ impl CompiledFilter {
 
             // Float comparisons
             CompiledFilter::FloatEq { col_idx, value } => {
-                matches!(row.get(*col_idx), Some(Value::Float(f)) if *f == *value)
+                matches!(row.get(*col_idx), Some(Value::Float(f)) if f64_eq(*f, *value))
             }
             CompiledFilter::FloatNe { col_idx, value } => {
-                matches!(row.get(*col_idx), Some(Value::Float(f)) if *f != *value)
+                matches!(row.get(*col_idx), Some(Value::Float(f)) if f64_ne(*f, *value))
             }
             CompiledFilter::FloatGt { col_idx, value } => {
-                matches!(row.get(*col_idx), Some(Value::Float(f)) if *f > *value)
+                matches!(row.get(*col_idx), Some(Value::Float(f)) if f64_gt(*f, *value))
             }
             CompiledFilter::FloatGte { col_idx, value } => {
-                matches!(row.get(*col_idx), Some(Value::Float(f)) if *f >= *value)
+                matches!(row.get(*col_idx), Some(Value::Float(f)) if f64_ge(*f, *value))
             }
             CompiledFilter::FloatLt { col_idx, value } => {
-                matches!(row.get(*col_idx), Some(Value::Float(f)) if *f < *value)
+                matches!(row.get(*col_idx), Some(Value::Float(f)) if f64_lt(*f, *value))
             }
             CompiledFilter::FloatLte { col_idx, value } => {
-                matches!(row.get(*col_idx), Some(Value::Float(f)) if *f <= *value)
+                matches!(row.get(*col_idx), Some(Value::Float(f)) if f64_le(*f, *value))
             }
             CompiledFilter::FloatBetween { col_idx, min, max } => {
-                matches!(row.get(*col_idx), Some(Value::Float(f)) if *f >= *min && *f <= *max)
+                matches!(row.get(*col_idx), Some(Value::Float(f)) if f64_ge(*f, *min) && f64_le(*f, *max))
             }
 
             // String comparisons
@@ -1526,25 +1527,25 @@ impl CompiledFilter {
 
             // Float comparisons
             CompiledFilter::FloatEq { col_idx, value } => {
-                matches!(get_val!(col_idx), Value::Float(f) if *f == *value)
+                matches!(get_val!(col_idx), Value::Float(f) if f64_eq(*f, *value))
             }
             CompiledFilter::FloatNe { col_idx, value } => {
-                matches!(get_val!(col_idx), Value::Float(f) if *f != *value)
+                matches!(get_val!(col_idx), Value::Float(f) if f64_ne(*f, *value))
             }
             CompiledFilter::FloatGt { col_idx, value } => {
-                matches!(get_val!(col_idx), Value::Float(f) if *f > *value)
+                matches!(get_val!(col_idx), Value::Float(f) if f64_gt(*f, *value))
             }
             CompiledFilter::FloatGte { col_idx, value } => {
-                matches!(get_val!(col_idx), Value::Float(f) if *f >= *value)
+                matches!(get_val!(col_idx), Value::Float(f) if f64_ge(*f, *value))
             }
             CompiledFilter::FloatLt { col_idx, value } => {
-                matches!(get_val!(col_idx), Value::Float(f) if *f < *value)
+                matches!(get_val!(col_idx), Value::Float(f) if f64_lt(*f, *value))
             }
             CompiledFilter::FloatLte { col_idx, value } => {
-                matches!(get_val!(col_idx), Value::Float(f) if *f <= *value)
+                matches!(get_val!(col_idx), Value::Float(f) if f64_le(*f, *value))
             }
             CompiledFilter::FloatBetween { col_idx, min, max } => {
-                matches!(get_val!(col_idx), Value::Float(f) if *f >= *min && *f <= *max)
+                matches!(get_val!(col_idx), Value::Float(f) if f64_ge(*f, *min) && f64_le(*f, *max))
             }
 
             // String comparisons

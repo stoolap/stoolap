@@ -848,7 +848,7 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
 pub fn compare_values(a: &Value, b: &Value) -> Ordering {
     match (a, b) {
         (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
-        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        (Value::Float(x), Value::Float(y)) => crate::core::value::compare_floats(*x, *y),
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
         (Value::Boolean(x), Value::Boolean(y)) => x.cmp(y),
         (Value::Null(_), Value::Null(_)) => Ordering::Equal,

@@ -2273,7 +2273,9 @@ impl SegmentManager {
             } else {
                 continue;
             };
-            if pi >= vol.meta.zone_maps.len() || !vol.meta.zone_maps[pi].may_contain_eq(value) {
+            if pi >= vol.meta.zone_maps.len()
+                || !vol.meta.zone_maps[pi].may_contain_eq(value, vol.meta.nan_count(pi) != Some(0))
+            {
                 continue;
             }
             // Zone map passed — need column data. Load cold volumes on demand.
@@ -2413,9 +2415,9 @@ impl SegmentManager {
             return Ok(None);
         }
 
-        let bloom_hashes: smallvec::SmallVec<[u64; 4]> = values
+        let bloom_hashes: smallvec::SmallVec<[Option<u64>; 4]> = values
             .iter()
-            .map(|v| super::column::ColumnBloomFilter::hash_value_static(v))
+            .map(|v| super::column::ColumnBloomFilter::probe_hash(v))
             .collect();
 
         // Track seen row_ids for newest-first dedup across overlapping volumes.
@@ -2468,7 +2470,8 @@ impl SegmentManager {
             let mut zone_skip = false;
             for (i, &vi) in vol_col_indices.iter().enumerate() {
                 if vi < vol.meta.zone_maps.len()
-                    && !vol.meta.zone_maps[vi].may_contain_eq(values[i])
+                    && !vol.meta.zone_maps[vi]
+                        .may_contain_eq(values[i], vol.meta.nan_count(vi) != Some(0))
                 {
                     zone_skip = true;
                     break;
@@ -2482,7 +2485,8 @@ impl SegmentManager {
             let mut bloom_skip = false;
             for (i, &vi) in vol_col_indices.iter().enumerate() {
                 if vi < vol.meta.bloom_filters.len()
-                    && !vol.meta.bloom_filters[vi].might_contain_hash(bloom_hashes[i])
+                    && bloom_hashes[i]
+                        .is_some_and(|h| !vol.meta.bloom_filters[vi].might_contain_hash(h))
                 {
                     bloom_skip = true;
                     break;

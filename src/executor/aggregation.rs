@@ -83,15 +83,16 @@ enum ComparisonOp {
 }
 
 impl HavingCondition {
-    /// Check if a value passes this condition
+    /// Check if a value passes this condition, in the total order
     fn matches(&self, value: f64) -> bool {
+        use crate::core::value::{f64_eq, f64_ge, f64_gt, f64_le, f64_lt, f64_ne};
         match self.op {
-            ComparisonOp::Gt => value > self.threshold,
-            ComparisonOp::Gte => value >= self.threshold,
-            ComparisonOp::Lt => value < self.threshold,
-            ComparisonOp::Lte => value <= self.threshold,
-            ComparisonOp::Eq => (value - self.threshold).abs() < f64::EPSILON,
-            ComparisonOp::Neq => (value - self.threshold).abs() >= f64::EPSILON,
+            ComparisonOp::Gt => f64_gt(value, self.threshold),
+            ComparisonOp::Gte => f64_ge(value, self.threshold),
+            ComparisonOp::Lt => f64_lt(value, self.threshold),
+            ComparisonOp::Lte => f64_le(value, self.threshold),
+            ComparisonOp::Eq => f64_eq(value, self.threshold),
+            ComparisonOp::Neq => f64_ne(value, self.threshold),
         }
     }
 }

@@ -277,13 +277,15 @@ impl RangeExpr {
     /// Check float bounds, each bound in its own type
     #[inline]
     fn check_float(&self, val: f64) -> bool {
-        use crate::core::value::{i64_ge_f64, i64_gt_f64, i64_le_f64, i64_lt_f64};
+        use crate::core::value::{
+            f64_ge, f64_gt, f64_le, f64_lt, i64_ge_f64, i64_gt_f64, i64_le_f64, i64_lt_f64,
+        };
 
         let lower_ok = if self.bounds.min_is_float {
             if self.include_min {
-                val >= self.bounds.float_min
+                f64_ge(val, self.bounds.float_min)
             } else {
-                val > self.bounds.float_min
+                f64_gt(val, self.bounds.float_min)
             }
         } else if self.include_min {
             i64_le_f64(self.bounds.int_min, val)
@@ -296,9 +298,9 @@ impl RangeExpr {
 
         if self.bounds.max_is_float {
             if self.include_max {
-                val <= self.bounds.float_max
+                f64_le(val, self.bounds.float_max)
             } else {
-                val < self.bounds.float_max
+                f64_lt(val, self.bounds.float_max)
             }
         } else if self.include_max {
             i64_ge_f64(self.bounds.int_max, val)

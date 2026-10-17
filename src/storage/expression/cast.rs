@@ -310,13 +310,14 @@ impl Expression for CompoundExpr {
                     _ => return false,
                 };
 
+                use crate::core::value::{f64_eq, f64_ge, f64_gt, f64_le, f64_lt, f64_ne};
                 match self.operator {
-                    Operator::Eq => col_float == comp_float,
-                    Operator::Ne => col_float != comp_float,
-                    Operator::Gt => col_float > comp_float,
-                    Operator::Gte => col_float >= comp_float,
-                    Operator::Lt => col_float < comp_float,
-                    Operator::Lte => col_float <= comp_float,
+                    Operator::Eq => f64_eq(col_float, comp_float),
+                    Operator::Ne => f64_ne(col_float, comp_float),
+                    Operator::Gt => f64_gt(col_float, comp_float),
+                    Operator::Gte => f64_ge(col_float, comp_float),
+                    Operator::Lt => f64_lt(col_float, comp_float),
+                    Operator::Lte => f64_le(col_float, comp_float),
                     _ => false,
                 }
             }
@@ -548,15 +549,7 @@ fn compare_values(a: &Value, b: &Value) -> i32 {
                 0
             }
         }
-        (Value::Float(av), Value::Float(bv)) => {
-            if av < bv {
-                -1
-            } else if av > bv {
-                1
-            } else {
-                0
-            }
-        }
+        (Value::Float(av), Value::Float(bv)) => crate::core::value::compare_floats(*av, *bv) as i32,
         (Value::Text(av), Value::Text(bv)) => {
             if av < bv {
                 -1
@@ -582,24 +575,10 @@ fn compare_values(a: &Value, b: &Value) -> i32 {
         }
         // Mixed numeric types
         (Value::Integer(av), Value::Float(bv)) => {
-            let af = *av as f64;
-            if af < *bv {
-                -1
-            } else if af > *bv {
-                1
-            } else {
-                0
-            }
+            crate::core::value::total_cmp_i64_f64(*av, *bv) as i32
         }
         (Value::Float(av), Value::Integer(bv)) => {
-            let bf = *bv as f64;
-            if *av < bf {
-                -1
-            } else if *av > bf {
-                1
-            } else {
-                0
-            }
+            crate::core::value::total_cmp_i64_f64(*bv, *av).reverse() as i32
         }
         // Fallback to string comparison
         _ => {
