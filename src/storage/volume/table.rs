@@ -7401,6 +7401,9 @@ impl Table for SegmentedTable {
             }
 
             let schema = self.hot.schema().clone();
+            if !typed_aggregates_answer(&schema, aggregates) {
+                return Ok(None);
+            }
 
             // --- Type-resolve predicates -----------------------------------------
             // For each comparison, resolve to (schema_col_idx, operator, typed_target).
@@ -8203,24 +8206,16 @@ impl Table for SegmentedTable {
             }
 
             // --- Finalize accumulators -------------------------------------------
-            let sum_of = |col_idx: usize, acc: &Accum| {
-                sum_parts(
-                    &schema,
-                    col_idx,
-                    acc.int_sum,
-                    acc.float_sum,
-                    !acc.is_int_agg,
-                    acc.count,
-                )
-            };
+            let sum_of =
+                |acc: &Accum| sum_parts(acc.int_sum, acc.float_sum, !acc.is_int_agg, acc.count);
             let results: Vec<Value> = aggregates
                 .iter()
                 .zip(accums.iter())
                 .map(|((op, col_idx), acc)| -> Result<Value> {
                     Ok(match op {
                         AggregateOp::Count | AggregateOp::CountStar => Value::Integer(acc.count),
-                        AggregateOp::Sum => sum_of(*col_idx, acc).sum()?,
-                        AggregateOp::Avg => sum_of(*col_idx, acc).avg(),
+                        AggregateOp::Sum => sum_of(acc).sum()?,
+                        AggregateOp::Avg => sum_of(acc).avg(),
                         AggregateOp::Min => {
                             let col_type = if *col_idx < schema.columns.len() {
                                 schema.columns[*col_idx].data_type
@@ -8384,16 +8379,8 @@ impl Table for SegmentedTable {
                 accums: &[Accum],
                 schema: &crate::core::Schema,
             ) -> Result<Vec<Value>> {
-                let sum_of = |col_idx: usize, acc: &Accum| {
-                    sum_parts(
-                        schema,
-                        col_idx,
-                        acc.int_sum,
-                        acc.float_sum,
-                        !acc.is_int_agg,
-                        acc.count,
-                    )
-                };
+                let sum_of =
+                    |acc: &Accum| sum_parts(acc.int_sum, acc.float_sum, !acc.is_int_agg, acc.count);
                 aggregates
                     .iter()
                     .zip(accums.iter())
@@ -8402,8 +8389,8 @@ impl Table for SegmentedTable {
                             AggregateOp::Count | AggregateOp::CountStar => {
                                 Value::Integer(acc.count)
                             }
-                            AggregateOp::Sum => sum_of(*col_idx, acc).sum()?,
-                            AggregateOp::Avg => sum_of(*col_idx, acc).avg(),
+                            AggregateOp::Sum => sum_of(acc).sum()?,
+                            AggregateOp::Avg => sum_of(acc).avg(),
                             AggregateOp::Min => {
                                 let col_type = if *col_idx < schema.columns.len() {
                                     schema.columns[*col_idx].data_type
@@ -8576,6 +8563,9 @@ impl Table for SegmentedTable {
             }
 
             let current_schema = self.hot.schema();
+            if !typed_aggregates_answer(current_schema, aggregates) {
+                return Ok(None);
+            }
 
             // Build group map: group_key -> (group_key_values, accumulators)
             let mut groups: ValueMap<(Vec<Value>, Vec<Accum>)> = ValueMap::default();
@@ -9089,24 +9079,31 @@ impl Table for SegmentedTable {
 
 /// Compare two i64 values using the given operator.
 #[inline(always)]
-/// SUM's parts as the one accumulator holds them: a column of another type
-/// than INTEGER, FLOAT or BOOLEAN adds nothing, as SUM reads it elsewhere
-fn sum_parts(
-    schema: &Schema,
-    col_idx: usize,
-    int: i128,
-    float: f64,
-    has_float: bool,
-    count: i64,
-) -> SumAccumulator {
+/// SUM's parts as the one accumulator holds them
+fn sum_parts(int: i128, float: f64, has_float: bool, count: i64) -> SumAccumulator {
     let mut sum = SumAccumulator::default();
-    if matches!(
-        schema.columns.get(col_idx).map(|c| c.data_type),
-        Some(DataType::Integer) | Some(DataType::Float) | Some(DataType::Boolean)
-    ) {
-        sum.add_parts(int, float, has_float, count as u64);
-    }
+    sum.add_parts(int, float, has_float, count as u64);
     sum
+}
+
+/// Whether the typed accumulators of the filtered and grouped storage
+/// aggregates answer every call as the general path does; a call they
+/// cannot answer leaves the query to the general path
+fn typed_aggregates_answer(schema: &Schema, aggregates: &[(AggregateOp, usize)]) -> bool {
+    aggregates.iter().all(|&(op, col_idx)| {
+        let data_type = schema.columns.get(col_idx).map(|c| c.data_type);
+        match op {
+            AggregateOp::CountStar | AggregateOp::Count => true,
+            AggregateOp::Sum | AggregateOp::Avg => matches!(
+                data_type,
+                Some(DataType::Integer | DataType::Float | DataType::Boolean)
+            ),
+            AggregateOp::Min | AggregateOp::Max => matches!(
+                data_type,
+                Some(DataType::Integer | DataType::Float | DataType::Timestamp)
+            ),
+        }
+    })
 }
 
 fn compare_i64(lhs: i64, rhs: i64, op: crate::core::Operator) -> bool {
