@@ -46,7 +46,7 @@ use super::operators::hash_join::JoinType as OperatorJoinType;
 use super::operators::index_nested_loop::{IndexLookupStrategy, IndexNestedLoopJoinOperator};
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::ExecutorResult;
-use super::row_count::{row_counts, rows_needed};
+use super::row_count::{row_counts, rows_needed, static_row_counts};
 use super::utils::{build_column_index_map, extract_join_keys_and_residual, is_sorted_on_keys};
 use super::Executor;
 
@@ -1575,8 +1575,8 @@ impl Executor {
         classification: &QueryClassification,
         join_source: &JoinTableSource,
     ) -> bool {
-        // Decided without the statement's parameters: a LIMIT that needs one
-        // leaves the statement to execute_select
+        // Decided without the statement's parameters: a LIMIT that is not a
+        // literal leaves the statement to execute_select
         let limit_applied = match &stmt.limit {
             None => true,
             Some(_) => {
@@ -1584,8 +1584,8 @@ impl Executor {
                 matches!(join_type.as_str(), "" | "INNER" | "CROSS")
                     && !classification.has_aggregation
                     && stmt.where_clause.is_none()
-                    && row_counts(stmt, &ExecutionContext::new())
-                        .is_ok_and(|counts| counts.limit.is_some_and(|limit| limit > 0))
+                    && static_row_counts(stmt)
+                        .is_some_and(|counts| counts.limit.is_some_and(|limit| limit > 0))
             }
         };
         // The path evaluates ON and WHERE as plain expressions, without the subqueries
@@ -2674,19 +2674,15 @@ impl Executor {
     ) -> StringMap<CtePushdownHint> {
         let mut hints = StringMap::new();
 
-        // A positive LIMIT on the main query, plus its OFFSET; a count known
-        // only from the statement's parameters, or a sum past what the
-        // pushed LIMIT literal can hold, gives no hint
-        let Some((wanted, main_limit)) =
-            row_counts(stmt, &ExecutionContext::new())
-                .ok()
-                .and_then(|counts| {
-                    let wanted = counts.limit.filter(|limit| *limit > 0)?;
-                    let sum = wanted.checked_add(counts.offset)?;
-                    i64::try_from(sum).ok()?;
-                    Some((wanted as u64, sum as u64))
-                })
-        else {
+        // A positive literal LIMIT on the main query, plus its OFFSET; any
+        // other count, or a sum past what the pushed LIMIT literal can hold,
+        // gives no hint
+        let Some((wanted, main_limit)) = static_row_counts(stmt).and_then(|counts| {
+            let wanted = counts.limit.filter(|limit| *limit > 0)?;
+            let sum = wanted.checked_add(counts.offset)?;
+            i64::try_from(sum).ok()?;
+            Some((wanted as u64, sum as u64))
+        }) else {
             return hints;
         };
 

@@ -145,3 +145,109 @@ fn test_a_parameter_count_is_read_as_a_literal_one() {
         check(&db, "LIMIT $1", want, || vec![value.clone()]);
     }
 }
+
+/// `w (id, g)` with rows (1, 1), (2, 1), (3, 2), (4, 2); `g` indexed when asked
+fn groups(name: &str, indexed: bool) -> Database {
+    let db = Database::open(&format!("memory://{name}")).unwrap();
+    db.execute("CREATE TABLE w (id INTEGER PRIMARY KEY, g INTEGER)", ())
+        .unwrap();
+    if indexed {
+        db.execute("CREATE INDEX wg ON w(g)", ()).unwrap();
+    }
+    db.execute("INSERT INTO w VALUES (1, 1), (2, 1), (3, 2), (4, 2)", ())
+        .unwrap();
+    db
+}
+
+#[test]
+fn test_a_window_limit_comes_after_distinct() {
+    for indexed in [false, true] {
+        let db = groups(&format!("row_count_window_distinct_{indexed}"), indexed);
+        for clause in ["LIMIT 2", "LIMIT 1 + 1"] {
+            let sql =
+                format!("SELECT DISTINCT g, COUNT(*) OVER (PARTITION BY g) AS n FROM w {clause}");
+            assert_eq!(
+                ids(&db, &sql, ()),
+                Ok(vec![1, 2]),
+                "{sql}, index on g: {indexed}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_a_window_limit_path_reads_the_parameters() {
+    for indexed in [false, true] {
+        let db = groups(&format!("row_count_window_params_{indexed}"), indexed);
+        for clause in ["LIMIT 2", "LIMIT 1 + 1"] {
+            let sql = format!(
+                "SELECT $1 AS p, ROW_NUMBER() OVER (PARTITION BY g ORDER BY id) AS n FROM w {clause}"
+            );
+            assert_eq!(
+                ids(&db, &sql, (42i64,)),
+                Ok(vec![42, 42]),
+                "{sql}, index on g: {indexed}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_a_count_that_needs_a_parameter_is_no_kept_shortcut() {
+    let db = tables("row_count_kept_shortcut");
+    for _ in 0..2 {
+        assert_eq!(
+            ids(
+                &db,
+                "SELECT id FROM t WHERE id = 1 LIMIT COALESCE($1, 1)",
+                (0i64,)
+            ),
+            Ok(vec![]),
+            "LIMIT 0 by its parameter, on every run"
+        );
+    }
+    let db = Database::open("memory://row_count_cte_hint").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2), (3)", ())
+        .unwrap();
+    assert_eq!(
+        ids(
+            &db,
+            "WITH c AS (SELECT id FROM t GROUP BY id) \
+             SELECT c.id FROM c LEFT JOIN u ON u.id = c.id LIMIT COALESCE($1, 1)",
+            (3i64,)
+        )
+        .map(|rows| rows.len()),
+        Ok(3),
+        "the CTE is not cut to the LIMIT the parameter-free reading gives"
+    );
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_explain_evaluates_no_count() {
+    use stoolap::test_failpoints::random_draws;
+    let db = tables("row_count_explain");
+    db.execute(
+        "CREATE TABLE docs (id INTEGER PRIMARY KEY, emb VECTOR(3))",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO docs VALUES (1, '[1,0,0]')", ())
+        .unwrap();
+    for sql in [
+        "EXPLAIN SELECT id FROM docs ORDER BY VEC_DISTANCE_L2(emb, '[1,0,0]') \
+         LIMIT CAST(RANDOM() * 0 AS INTEGER) + 1",
+        "EXPLAIN SELECT t.id FROM t JOIN u ON t.id = u.id LIMIT CAST(RANDOM() * 0 AS INTEGER) + 1",
+    ] {
+        let before = random_draws();
+        let rows = db.query(sql, ()).unwrap();
+        for row in rows {
+            row.unwrap();
+        }
+        assert_eq!(random_draws() - before, 0, "EXPLAIN drew for {sql}");
+    }
+}

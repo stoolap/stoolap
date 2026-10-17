@@ -109,7 +109,7 @@ use super::result::{
     LimitedResult, OrderedResult, ProjectedResult, RadixOrderSpec, ScannerResult,
     StreamingProjectionResult, TopNResult,
 };
-use super::row_count::{row_counts, rows_needed, RowCounts};
+use super::row_count::{row_counts, rows_needed, static_row_counts, RowCounts};
 use super::utils::compute_join_projection;
 use super::utils::{
     add_table_qualifier, build_column_index_map, collect_table_qualifiers, column_families,
@@ -3667,7 +3667,9 @@ impl Executor {
                         // NOTE: Cannot use this optimization if there's a top-level ORDER BY
                         // because we need all rows to sort before applying LIMIT
                         let has_order_by = !stmt.order_by.is_empty();
-                        if !has_order_by && !Self::windows_hold_subquery(stmt) {
+                        // DISTINCT runs after the fetch, so it keeps the LIMIT out too
+                        let distinct = stmt.distinct || !stmt.distinct_on.is_empty();
+                        if !has_order_by && !distinct && !Self::windows_hold_subquery(stmt) {
                             if let Some(limit_val) = Self::fetch_limit(stmt, ctx) {
                                 // Use lazy partition fetching - returns early!
                                 let result = self
@@ -3755,7 +3757,8 @@ impl Executor {
                         let has_order_by = !stmt.order_by.is_empty();
                         let is_window_safe =
                             Self::is_window_safe_for_limit_pushdown(stmt, &col_name, ascending);
-                        let fetch_limit = if !has_order_by && is_window_safe {
+                        let distinct = stmt.distinct || !stmt.distinct_on.is_empty();
+                        let fetch_limit = if !has_order_by && !distinct && is_window_safe {
                             Self::fetch_limit(stmt, ctx).unwrap_or(usize::MAX)
                         } else {
                             usize::MAX
@@ -4272,7 +4275,7 @@ impl Executor {
             // This optimization avoids materializing the right side entirely
             // NOTE: Don't use Index NL for aggregation/window queries - they need full results
             // and the current implementation falls through to standard path, causing double execution
-            let pushed_limit = self.pushed_join_limit(stmt, ctx, classification, &join_type);
+            let pushed_limit = self.pushed_join_limit(stmt, Some(ctx), classification, &join_type);
             // An INNER join without a limit narrows its inner side by a table's
             // candidates only for an outer side found small once it runs
             let small_outer = pushed_limit.is_none() && join_type == "INNER";
@@ -11101,8 +11104,8 @@ impl Executor {
         is_inner: bool,
     ) -> Option<(usize, usize, usize, usize)> {
         // The plan is made without the statement's parameters: a count that
-        // needs one keeps the reduction off
-        let counts = row_counts(stmt, &ExecutionContext::new()).ok()?;
+        // is not a literal keeps the reduction off
+        let counts = static_row_counts(stmt)?;
         let (limit, offset) = (counts.limit.filter(|limit| *limit > 0)?, counts.offset);
         let want = limit.saturating_add(offset);
         let mut cap = want;
@@ -11285,11 +11288,12 @@ impl Executor {
     #[allow(clippy::type_complexity)]
     /// The limit the executor pushes into a join of `stmt`: the statement's
     /// LIMIT plus OFFSET when nothing orders, groups or aggregates the joined
-    /// rows and both evaluate; None when the join runs unbounded
+    /// rows and both evaluate; None when the join runs unbounded. Without a
+    /// context, as EXPLAIN asks, only literal counts are read
     pub(crate) fn pushed_join_limit(
         &self,
         stmt: &SelectStatement,
-        ctx: &ExecutionContext,
+        ctx: Option<&ExecutionContext>,
         classification: &QueryClassification,
         join_type: &str,
     ) -> Option<u64> {
@@ -11307,7 +11311,14 @@ impl Executor {
         }
         // OFFSET rows are skipped after collection, so early termination
         // must gather LIMIT + OFFSET rows
-        rows_needed(stmt, ctx).map(|rows| rows as u64)
+        let rows = match ctx {
+            Some(ctx) => rows_needed(stmt, ctx)?,
+            None => {
+                let counts = static_row_counts(stmt)?;
+                counts.limit?.saturating_add(counts.offset)
+            }
+        };
+        Some(rows as u64)
     }
 
     /// Whether the grouped index join takes the statement's shape: an INNER
@@ -11384,7 +11395,7 @@ impl Executor {
         }
         if !classification.has_aggregation && !classification.has_window_functions {
             let bounded = self
-                .pushed_join_limit(stmt, &ExecutionContext::new(), &classification, &join_type)
+                .pushed_join_limit(stmt, None, &classification, &join_type)
                 .is_some();
             return JoinIndexUse::Streaming { bounded };
         }

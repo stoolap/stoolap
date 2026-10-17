@@ -547,7 +547,13 @@ impl Executor {
         let all_over_clauses_shareable = window_functions
             .iter()
             .all(|wf| self.over_clause_is_shareable(wf));
-        if all_over_clauses_shareable && stmt.order_by.is_empty() && stmt.offset.is_none() {
+        // The streamed rows meet the LIMIT before DISTINCT runs, so DISTINCT keeps it off
+        if all_over_clauses_shareable
+            && stmt.order_by.is_empty()
+            && stmt.offset.is_none()
+            && !stmt.distinct
+            && stmt.distinct_on.is_empty()
+        {
             let has_partition_by = window_functions
                 .iter()
                 .any(|wf| !wf.partition_by_exprs.is_empty());
@@ -1047,9 +1053,9 @@ impl Executor {
                     SelectItemSource::WindowFunction(name) => {
                         CompiledItem::WindowFunction(name.as_str())
                     }
-                    SelectItemSource::Expression(expr) => {
-                        CompiledItem::Expression(ExpressionEval::compile(expr, base_columns)?)
-                    }
+                    SelectItemSource::Expression(expr) => CompiledItem::Expression(
+                        ExpressionEval::compile(expr, base_columns)?.with_context(ctx),
+                    ),
                     SelectItemSource::ExpressionWithWindow(expr, wf_names) => {
                         let mut counter = 0;
                         let transformed =
@@ -1058,7 +1064,8 @@ impl Executor {
                         for wf_name in wf_names {
                             ext_columns.push(wf_name.clone());
                         }
-                        let eval = ExpressionEval::compile(&transformed, &ext_columns)?;
+                        let eval =
+                            ExpressionEval::compile(&transformed, &ext_columns)?.with_context(ctx);
                         let name_refs: Vec<&str> = wf_names.iter().map(|s| s.as_str()).collect();
                         CompiledItem::ExpressionWithWindow(eval, name_refs)
                     }
@@ -1276,9 +1283,9 @@ impl Executor {
                     SelectItemSource::WindowFunction(name) => {
                         CompiledItemLazy::WindowFunction(name.as_str())
                     }
-                    SelectItemSource::Expression(expr) => {
-                        CompiledItemLazy::Expression(ExpressionEval::compile(expr, base_columns)?)
-                    }
+                    SelectItemSource::Expression(expr) => CompiledItemLazy::Expression(
+                        ExpressionEval::compile(expr, base_columns)?.with_context(ctx),
+                    ),
                     SelectItemSource::ExpressionWithWindow(expr, wf_names) => {
                         let mut counter = 0;
                         let transformed =
@@ -1287,7 +1294,8 @@ impl Executor {
                         for wf_name in wf_names {
                             ext_columns.push(wf_name.clone());
                         }
-                        let eval = ExpressionEval::compile(&transformed, &ext_columns)?;
+                        let eval =
+                            ExpressionEval::compile(&transformed, &ext_columns)?.with_context(ctx);
                         let name_refs: Vec<&str> = wf_names.iter().map(|s| s.as_str()).collect();
                         CompiledItemLazy::ExpressionWithWindow(eval, name_refs)
                     }

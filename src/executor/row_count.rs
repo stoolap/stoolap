@@ -57,6 +57,22 @@ pub(crate) fn row_counts(stmt: &SelectStatement, ctx: &ExecutionContext) -> Resu
     })
 }
 
+/// The LIMIT and OFFSET of `stmt` when each is absent or an integer literal,
+/// read without evaluating anything: for a decision made without the
+/// statement's parameters or kept for its later runs, where any other count
+/// takes no shortcut
+pub(crate) fn static_row_counts(stmt: &SelectStatement) -> Option<RowCounts> {
+    let literal = |expr: Option<&Expression>| match expr {
+        None => Some(None),
+        Some(Expression::IntegerLiteral(lit)) => usize::try_from(lit.value).ok().map(Some),
+        Some(_) => None,
+    };
+    Some(RowCounts {
+        limit: literal(stmt.limit.as_deref())?,
+        offset: literal(stmt.offset.as_deref())?.unwrap_or(0),
+    })
+}
+
 /// LIMIT + OFFSET, the rows a read that stops early needs; None without a
 /// LIMIT or when either is not a count, which the path applying them reports
 pub(crate) fn rows_needed(stmt: &SelectStatement, ctx: &ExecutionContext) -> Option<usize> {

@@ -1234,9 +1234,10 @@ impl Executor {
         None
     }
 
-    /// LIMIT + OFFSET of a SELECT, when they need no parameter
+    /// LIMIT + OFFSET of a SELECT, when both are literals: EXPLAIN runs nothing
     fn extract_limit_value(select: &SelectStatement) -> Option<usize> {
-        super::row_count::rows_needed(select, &ExecutionContext::new())
+        let counts = super::row_count::static_row_counts(select)?;
+        Some(counts.limit?.saturating_add(counts.offset))
     }
 }
 

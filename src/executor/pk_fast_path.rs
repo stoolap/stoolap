@@ -240,12 +240,12 @@ impl Executor {
 
     /// The PK fast path returns at most one row, so a LIMIT >= 1 with no
     /// OFFSET cannot change the result. The decision is kept for the
-    /// statement, so a count that needs a parameter takes the full path,
-    /// as do LIMIT 0 and any OFFSET.
+    /// statement, so only a literal LIMIT can take it; LIMIT 0 and any
+    /// OFFSET take the full path.
     fn pk_fast_path_limit_ok(stmt: &SelectStatement) -> bool {
         stmt.offset.is_none()
-            && super::row_count::row_counts(stmt, &ExecutionContext::new())
-                .is_ok_and(|counts| counts.limit.is_none_or(|limit| limit >= 1))
+            && super::row_count::static_row_counts(stmt)
+                .is_some_and(|counts| counts.limit.is_none_or(|limit| limit >= 1))
     }
 
     /// Extract PK equality structure from WHERE clause without resolving
