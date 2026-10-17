@@ -925,8 +925,8 @@ impl Executor {
             Expression::Aliased(aliased) => Self::is_count_star_probe(&aliased.expression),
             Expression::FunctionCall(func) => {
                 func.function.eq_ignore_ascii_case("COUNT")
-                    && func.filter.is_none()
-                    && !func.is_distinct
+                    && super::aggregation::Modifiers::of_call(func)
+                        .within(super::aggregation::Modifiers::NONE)
                     && (func.arguments.is_empty()
                         || matches!(func.arguments.first(), Some(Expression::Star(_))))
             }

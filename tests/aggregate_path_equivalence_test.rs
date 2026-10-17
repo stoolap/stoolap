@@ -144,6 +144,42 @@ const CASES: &[(&str, &str, &str, &str)] = &[
         "SELECT a AS g, COUNT(*) FROM t WHERE id + 0 = id GROUP BY g",
     ),
     (
+        "memory",
+        "index_min_max",
+        "SELECT MIN(g) FROM t",
+        "SELECT MIN(g) FROM t WHERE id + 0 = id",
+    ),
+    (
+        "memory",
+        "index_min_max",
+        "SELECT MAX(t.g) FROM t",
+        "SELECT MAX(t.g) FROM t WHERE id + 0 = id",
+    ),
+    (
+        "memory",
+        "compiled_count_star",
+        "SELECT COUNT(*) AS n FROM t",
+        "SELECT COUNT(*) AS n FROM t WHERE id + 0 = id",
+    ),
+    (
+        "memory",
+        "compiled_count_distinct",
+        "SELECT COUNT(DISTINCT g) FROM t",
+        "SELECT COUNT(DISTINCT g) FROM t WHERE id + 0 = id",
+    ),
+    (
+        "memory",
+        "pushdown",
+        "SELECT COUNT(DISTINCT g), SUM(a) FROM t",
+        "SELECT COUNT(DISTINCT g), SUM(a) FROM t WHERE id + 0 = id",
+    ),
+    (
+        "memory",
+        "streaming_global_scan",
+        "SELECT COUNT(DISTINCT s), COUNT(a) * 2 FROM t",
+        "SELECT COUNT(DISTINCT s), COUNT(a) * 2 FROM t WHERE id + 0 = id",
+    ),
+    (
         "empty",
         "streaming_derived_table",
         "SELECT COUNT(*) AS n, s, COUNT(*) AS m FROM (SELECT s FROM t) d GROUP BY s",

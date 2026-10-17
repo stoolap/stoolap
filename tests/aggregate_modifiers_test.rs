@@ -102,6 +102,16 @@ fn check(db: &Database, ctx: &str, wrong: &mut Vec<String>) {
             "SELECT STRING_AGG(b, ' | ' ORDER BY b) OVER () FROM s",
             &["t:x | y | z"],
         ),
+        ("SELECT MIN(x) FILTER (WHERE x > 10) FROM i", &["i:20"]),
+        ("SELECT MAX(x) FILTER (WHERE x < 25) FROM i", &["i:20"]),
+        (
+            "SELECT COUNT(DISTINCT c) FILTER (WHERE id < 0) FROM i",
+            &["i:0"],
+        ),
+        (
+            "SELECT COUNT(DISTINCT c) FILTER (WHERE id > 1) FROM i",
+            &["i:1"],
+        ),
         ("SELECT COUNT(*) FILTER (WHERE x > 10) FROM i", &["i:2"]),
         ("SELECT COUNT(DISTINCT ts) FROM t", &["i:2"]),
         ("SELECT COUNT(DISTINCT ts), COUNT(*) FROM t", &["i:2|i:3"]),

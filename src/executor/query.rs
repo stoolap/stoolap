@@ -2619,19 +2619,6 @@ impl Executor {
             }
         }
 
-        // FAST PATH: COUNT(*) pushdown optimization
-        // For queries like `SELECT COUNT(*) FROM table` without WHERE or GROUP BY,
-        // use the table's row_count() method instead of scanning all rows
-        if storage_expr.is_none()
-            && !needs_memory_filter
-            && !classification.has_group_by
-            && stmt.having.is_none()
-        {
-            if let Some((result, columns)) = self.try_count_star_optimization(stmt, &*table)? {
-                return Ok((result, columns, false, None));
-            }
-        }
-
         // FAST PATH: Streaming GROUP BY optimization using B-tree index
         // For queries like `SELECT user_id, SUM(amount) FROM orders GROUP BY user_id`
         // where user_id has a B-tree index, we iterate through the index in sorted order
@@ -11352,10 +11339,12 @@ impl Executor {
             return Ok(None);
         }
         let (aggregations, _) = self.parse_aggregations(stmt)?;
+        // The operator reads columns and keeps each call's DISTINCT and
+        // extra arguments in its state
+        let supported = crate::executor::aggregation::Modifiers::DISTINCT
+            .and(crate::executor::aggregation::Modifiers::EXTRA_ARGS);
         if aggregations.iter().any(|agg| {
-            agg.expression.is_some()
-                || agg.filter.is_some()
-                || !agg.order_by.is_empty()
+            !agg.answered_with(supported)
                 || agg.hidden
                 || self.function_registry.get_aggregate(&agg.name).is_none()
         }) {
@@ -11926,12 +11915,7 @@ impl Executor {
         let mut simple_aggs: Vec<StreamingAgg> = Vec::with_capacity(aggregations.len());
         for agg in &aggregations {
             // This walk keeps no distinct state and reads each column whole
-            if agg.distinct
-                || agg.filter.is_some()
-                || agg.expression.is_some()
-                || !agg.order_by.is_empty()
-                || !agg.extra_args.is_empty()
-            {
+            if !agg.answered_with(crate::executor::aggregation::Modifiers::NONE) {
                 return Ok(None);
             }
             let (func_name, col_name) = (&agg.name, &agg.column_lower);

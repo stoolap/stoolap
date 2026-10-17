@@ -29,6 +29,7 @@ use crate::core::{DataType, Result, Row, RowVec, Value, ValueSet};
 use crate::parser::ast::*;
 use crate::storage::traits::{QueryResult, Table};
 
+use super::aggregation::Modifiers;
 use super::context::{cache_in_subquery, get_cached_in_subquery_with_kinds, ExecutionContext};
 use super::expression::{ExpressionEval, RowFilter};
 use super::query_classification::QueryClassification;
@@ -133,8 +134,8 @@ impl Executor {
             return Ok(None);
         }
 
-        // Don't optimize DISTINCT
-        if func.is_distinct {
+        // The index answers a plain call: no DISTINCT, FILTER or other modifier
+        if !Modifiers::of_call(func).within(Modifiers::NONE) {
             return Ok(None);
         }
 
@@ -171,8 +172,9 @@ impl Executor {
         if let Some(val) = value {
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::min_max_index_answered();
+            super::aggregation::AggregatePath::IndexMinMax.taken();
             // Build result - wrap columns in CompactArc once for zero-copy sharing
-            let col_name = alias.unwrap_or_else(|| format!("{}({})", func.function, column_name));
+            let col_name = alias.unwrap_or_else(|| super::utils::function_call_to_string(func));
             let columns = CompactArc::new(vec![col_name]);
             let mut rows = RowVec::with_capacity(1);
             rows.push((0, Row::from_values(vec![val])));
@@ -184,75 +186,6 @@ impl Executor {
         }
 
         Ok(None)
-    }
-
-    /// Try to optimize simple COUNT(*) queries using table row_count
-    ///
-    /// For queries like `SELECT COUNT(*) FROM table` without WHERE or GROUP BY,
-    /// use the table's O(1) row_count() method instead of O(n) scan.
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn try_count_star_optimization(
-        &self,
-        stmt: &SelectStatement,
-        table: &dyn Table,
-    ) -> Result<Option<(Box<dyn QueryResult>, CompactArc<Vec<String>>)>> {
-        // Only optimize single COUNT(*) without DISTINCT
-        if stmt.columns.len() != 1 {
-            return Ok(None);
-        }
-
-        let col_expr = &stmt.columns[0];
-
-        // Extract function info (handle aliased case too)
-        let (func, alias) = match col_expr {
-            Expression::FunctionCall(func) => (func, None),
-            Expression::Aliased(aliased) => {
-                if let Expression::FunctionCall(func) = aliased.expression.as_ref() {
-                    (func, Some(aliased.alias.value.to_string()))
-                } else {
-                    return Ok(None);
-                }
-            }
-            _ => return Ok(None),
-        };
-
-        // Check if it's COUNT
-        // OPTIMIZATION: func.function is already uppercase from parsing
-        if func.function != "COUNT" {
-            return Ok(None);
-        }
-
-        // Don't optimize DISTINCT
-        if func.is_distinct {
-            return Ok(None);
-        }
-
-        // Don't optimize if FILTER clause is present - requires row-by-row evaluation
-        if func.filter.is_some() {
-            return Ok(None);
-        }
-
-        // Must be COUNT(*) - either empty args or Star expression
-        let is_count_star = func.arguments.is_empty()
-            || (func.arguments.len() == 1 && matches!(func.arguments[0], Expression::Star(_)));
-
-        if !is_count_star {
-            return Ok(None);
-        }
-
-        // Use table's row_count method (O(1) instead of O(n))
-        let count = table.row_count()?;
-
-        // Build result - wrap columns in CompactArc once for zero-copy sharing
-        let col_name = alias.unwrap_or_else(|| "COUNT(*)".to_string());
-        let columns = CompactArc::new(vec![col_name]);
-        let mut rows = RowVec::with_capacity(1);
-        rows.push((0, Row::from_values(vec![Value::Integer(count as i64)])));
-        let result: Box<dyn QueryResult> = Box::new(ExecutorResult::with_arc_columns(
-            CompactArc::clone(&columns),
-            rows,
-        ));
-        Ok(Some((result, columns)))
     }
 
     /// Try to optimize ORDER BY + LIMIT using index-ordered scan
