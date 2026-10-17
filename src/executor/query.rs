@@ -117,10 +117,10 @@ use super::utils::{
     filter_references_column, flatten_and_predicates, flip_operator, get_table_alias_from_expr,
     infix_to_operator, strip_table_qualifier, substitute_filter_column,
 };
-use super::volatility::expression_volatility;
+use super::volatility::statement_constant;
 use super::window::{WindowPreGroupedState, WindowPreSortedState};
 use super::Executor;
-use crate::functions::{global_registry, Volatility};
+use crate::functions::global_registry;
 use crate::optimizer::bloom::BloomFilterBuilder;
 use crate::storage::volume::side_index::{resolve_known, Domain, Resolved};
 
@@ -1604,13 +1604,12 @@ impl Executor {
         self.execute_query_on_memory_result(stmt, ctx, columns, result_rows)
     }
 
-    /// Extract integer range bounds from the WHERE clause for a TVF.
-    /// Returns (min_bound, max_bound) where each is inclusive.
+    /// Extract the integer range the WHERE clause allows a TVF to generate
     fn extract_tvf_range_hint(
         tvf_source: &FunctionTableSource,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
-    ) -> Option<(Option<i64>, Option<i64>)> {
+    ) -> Option<Resolved> {
         let where_clause = stmt.where_clause.as_ref()?;
 
         // Determine the TVF value column name (from alias or default "value")
@@ -1623,16 +1622,16 @@ impl Executor {
         Self::tvf_range_hint(where_clause, &col_name, ctx)
     }
 
-    /// The inclusive bounds the conjuncts of `filter` on the TVF's column put
-    /// on the integers it generates. A hint: the filter runs on every row
-    /// generated, so a conjunct the bounds cannot answer narrows nothing
+    /// The integers the conjuncts of `filter` on the TVF's column allow it to
+    /// generate. A hint: the filter runs on every row generated, so a conjunct
+    /// the keys cannot answer narrows nothing; None when none can
     fn tvf_range_hint(
         filter: &Expression,
         col_name: &str,
         ctx: &ExecutionContext,
-    ) -> Option<(Option<i64>, Option<i64>)> {
+    ) -> Option<Resolved> {
         let constant = |expr: &Expression| {
-            if expression_volatility(expr, global_registry()) == Volatility::PerCall {
+            if !statement_constant(expr, global_registry()) {
                 return None;
             }
             ExpressionEval::compile(expr, &[])
@@ -1667,18 +1666,10 @@ impl Executor {
                 _ => {}
             }
         }
-        let known = resolve_known(
+        resolve_known(
             Domain::Integer,
             comparisons.iter().map(|(op, value)| (*op, value)),
-        );
-        let (low, high) = match known? {
-            Resolved::Key(k) => (k, k),
-            Resolved::Range(low, high) => (low, high),
-            Resolved::Empty | Resolved::Fallback => return None,
-        };
-        let low = (low > i64::MIN).then_some(low);
-        let high = (high < i64::MAX).then_some(high);
-        (low.is_some() || high.is_some()).then_some((low, high))
+        )
     }
 
     /// Check if an expression refers to the TVF's output column.
@@ -1697,7 +1688,7 @@ impl Executor {
         tvf_source: &FunctionTableSource,
         ctx: &ExecutionContext,
         limit: Option<usize>,
-        range_hint: Option<(Option<i64>, Option<i64>)>,
+        range_hint: Option<Resolved>,
     ) -> Result<(RowVec, Vec<String>)> {
         use crate::functions::global_registry;
 
@@ -1717,7 +1708,15 @@ impl Executor {
 
         // Apply range clamping for integer series: narrow start/stop based on WHERE bounds.
         // Only safe when: 2-3 integer args, step is 1 or -1 (or defaulted).
-        if let Some((min_bound, max_bound)) = range_hint {
+        if let Some(range) = range_hint {
+            // An empty range clamps the series past both of its ends
+            let (lo, hi) = match range {
+                Resolved::Key(k) => (k, k),
+                Resolved::Range(low, high) => (low, high),
+                Resolved::Empty => (i64::MAX, i64::MIN),
+                Resolved::Fallback => (i64::MIN, i64::MAX),
+            };
+            let (min_bound, max_bound) = (Some(lo), Some(hi));
             if arg_values.len() >= 2 {
                 let all_integer = arg_values.iter().all(|v| matches!(v, Value::Integer(_)));
                 if all_integer {
@@ -1730,6 +1729,11 @@ impl Executor {
                     } else {
                         -1
                     };
+                    // A clamped series keeps its direction: a defaulted step
+                    // would be chosen again from the clamped ends
+                    if arg_values.len() == 2 {
+                        arg_values.push(Value::Integer(step));
+                    }
 
                     // Only clamp for unit step (1 or -1) where bounds align exactly
                     if step == 1 {

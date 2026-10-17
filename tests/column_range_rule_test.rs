@@ -95,3 +95,64 @@ fn test_an_outer_conjunct_beside_an_inner_one_of_the_same_name_is_kept() {
         (6..=20).collect::<Vec<i64>>(),
     );
 }
+
+#[test]
+fn test_a_quoted_column_is_no_constant_bound() {
+    let db = Database::open("memory://range_quoted_column").unwrap();
+    db.execute(
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, x TEXT, y TEXT)",
+        (),
+    )
+    .unwrap();
+    for i in 1..=5 {
+        db.execute(&format!("INSERT INTO s VALUES ({i}, 'p{i}', 'p{i}')"), ())
+            .unwrap();
+    }
+    for sql in [
+        "SELECT id FROM s WHERE x = \"y\" || '' ORDER BY id",
+        "SELECT id FROM s WHERE \"y\" || '' = x ORDER BY id",
+    ] {
+        assert_eq!(ints(&db, sql), vec![1, 2, 3, 4, 5], "{sql}");
+    }
+    assert_eq!(
+        ints(
+            &db,
+            "SELECT \"1\" FROM generate_series(1, 3) AS g(\"1\") WHERE \"1\" = CAST(\"1\" AS INTEGER)"
+        ),
+        vec![1, 2, 3],
+        "both sides read the series' own column"
+    );
+}
+
+#[test]
+fn test_a_narrowed_series_keeps_its_direction() {
+    let db = Database::open("memory://range_series_direction").unwrap();
+    for (sql, want) in [
+        (
+            "SELECT value FROM generate_series(1, 3) WHERE value >= 4",
+            vec![],
+        ),
+        (
+            "SELECT value FROM generate_series(1, 3) WHERE value >= 3.5",
+            vec![],
+        ),
+        (
+            "SELECT value FROM generate_series(3, 1) WHERE value <= 0",
+            vec![],
+        ),
+        (
+            "SELECT value FROM generate_series(1, 5) WHERE value < 3.5",
+            vec![1, 2, 3],
+        ),
+        (
+            "SELECT value FROM generate_series(5, 1) WHERE value >= 3",
+            vec![5, 4, 3],
+        ),
+        (
+            "SELECT value FROM generate_series(1, 10) WHERE value >= 2 AND value <= 1",
+            vec![],
+        ),
+    ] {
+        assert_eq!(ints(&db, sql), want, "{sql}");
+    }
+}

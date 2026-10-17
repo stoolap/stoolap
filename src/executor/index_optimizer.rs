@@ -34,9 +34,8 @@ use super::expression::{ExpressionEval, RowFilter};
 use super::query_classification::QueryClassification;
 use super::result::ExecutorResult;
 use super::utils::{extract_and_conditions, flip_operator, infix_to_operator};
-use super::volatility::expression_volatility;
+use super::volatility::statement_constant;
 use super::Executor;
-use crate::functions::Volatility;
 use crate::storage::volume::side_index::{resolve_all, Domain, Resolved};
 
 /// The most rows a LIMIT's fetch by primary key reads in one batch
@@ -503,7 +502,7 @@ impl Executor {
 
     /// The primary keys a WHERE of comparisons on the primary key alone
     /// allows, each read by the comparison contract; None when another
-    /// predicate is in it or a compared value is not one per statement
+    /// predicate is in it or a compared value is not a statement constant
     fn pk_keyset_range(
         &self,
         expr: &Expression,
@@ -528,7 +527,7 @@ impl Executor {
             } else {
                 return None;
             };
-            if expression_volatility(value, &self.function_registry) == Volatility::PerCall {
+            if !statement_constant(value, &self.function_registry) {
                 return None;
             }
             let value = ExpressionEval::compile(value, &[])

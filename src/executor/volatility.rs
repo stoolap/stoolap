@@ -30,8 +30,23 @@ pub(crate) fn expression_volatility(expr: &Expression, registry: &FunctionRegist
     Walk {
         registry,
         statement_rows: &|_| false,
+        constant: false,
     }
     .expression(expr)
+}
+
+/// Whether `expr` is one value for the whole statement, so it may be
+/// evaluated once with no row: it reads no column, holds no subquery,
+/// aggregate or window, and draws nothing per call. A name counts as a
+/// column even where none is bound, as a quoted one compiles to its text
+pub(crate) fn statement_constant(expr: &Expression, registry: &FunctionRegistry) -> bool {
+    Walk {
+        registry,
+        statement_rows: &|_| false,
+        constant: true,
+    }
+    .expression(expr)
+        != Volatility::PerCall
 }
 
 /// The volatility of everything `stmt` evaluates, its CTEs, set operations
@@ -46,6 +61,7 @@ pub(crate) fn statement_volatility_in(
     Walk {
         registry,
         statement_rows,
+        constant: false,
     }
     .statement(stmt)
 }
@@ -59,6 +75,7 @@ pub(crate) fn expression_volatility_in(
     Walk {
         registry,
         statement_rows,
+        constant: false,
     }
     .expression(expr)
 }
@@ -67,25 +84,39 @@ struct Walk<'a> {
     registry: &'a FunctionRegistry,
     /// Whether a table, by its lowercase name, is a CTE of the running statement
     statement_rows: &'a dyn Fn(&str) -> bool,
+    /// Asked by [`statement_constant`]: what is not one value for the
+    /// statement answers PerCall
+    constant: bool,
 }
 
 impl Walk<'_> {
     fn expression(&self, expr: &Expression) -> Volatility {
         let one = |e: &Expression| self.expression(e);
         let optional = |e: Option<&Expression>| e.map_or(Volatility::Fixed, one);
+        let varies = if self.constant {
+            Volatility::PerCall
+        } else {
+            Volatility::Fixed
+        };
         match expr {
+            // An unquoted TRUE or FALSE compiles to the literal
+            Expression::Identifier(id)
+                if !id.quoted && matches!(id.value_lower.as_str(), "true" | "false") =>
+            {
+                Volatility::Fixed
+            }
             Expression::Identifier(_)
             | Expression::QualifiedIdentifier(_)
-            | Expression::IntegerLiteral(_)
+            | Expression::Star(_)
+            | Expression::QualifiedStar(_)
+            | Expression::Default(_) => varies,
+            Expression::IntegerLiteral(_)
             | Expression::FloatLiteral(_)
             | Expression::StringLiteral(_)
             | Expression::BooleanLiteral(_)
             | Expression::NullLiteral(_)
             | Expression::IntervalLiteral(_)
-            | Expression::Parameter(_)
-            | Expression::Star(_)
-            | Expression::QualifiedStar(_)
-            | Expression::Default(_) => Volatility::Fixed,
+            | Expression::Parameter(_) => Volatility::Fixed,
             Expression::CteReference(_) => Volatility::PerStatement,
             Expression::Prefix(prefix) => one(&prefix.right),
             Expression::Infix(infix) => one(&infix.left).max(one(&infix.right)),
@@ -114,6 +145,7 @@ impl Walk<'_> {
             Expression::Aliased(aliased) => one(&aliased.expression),
             Expression::Window(window) => self
                 .call(&window.function)
+                .max(varies)
                 .max(self.all(&window.partition_by))
                 .max(self.ordered(&window.order_by))
                 .max(self.frame(window.frame.as_ref())),
@@ -190,10 +222,16 @@ impl Walk<'_> {
     /// A block runs once per binding of what it reads: its own calls draw
     /// once per statement at most, seen from outside it
     fn block(&self, stmt: &SelectStatement) -> Volatility {
+        if self.constant {
+            return Volatility::PerCall;
+        }
         self.statement(stmt).min(Volatility::PerStatement)
     }
 
     fn call(&self, call: &FunctionCall) -> Volatility {
+        if self.constant && self.registry.is_aggregate(&call.function) {
+            return Volatility::PerCall;
+        }
         self.registry
             .volatility(&call.function)
             .max(self.all(&call.arguments))
@@ -379,5 +417,37 @@ mod tests {
             Volatility::PerStatement,
             "c is the running statement's CTE"
         );
+    }
+
+    #[test]
+    fn test_a_statement_constant_reads_no_row() {
+        let registry = FunctionRegistry::new();
+        let value = |sql: &str| {
+            let stmt = select(&format!("SELECT {sql}"));
+            stmt.columns.into_iter().next().expect("one column")
+        };
+        for (sql, constant) in [
+            ("1 + 2", true),
+            ("$1 * 2", true),
+            ("CAST('5' AS INTEGER)", true),
+            ("NOW() - INTERVAL '1 day'", true),
+            ("TRUE", true),
+            ("a", false),
+            ("\"a\"", false),
+            ("CAST(\"1\" AS INTEGER)", false),
+            ("t.a + 1", false),
+            ("\"true\"", false),
+            ("RANDOM()", false),
+            ("SUM(1)", false),
+            ("ROW_NUMBER() OVER ()", false),
+            ("(SELECT 1)", false),
+            ("EXISTS (SELECT 1)", false),
+        ] {
+            assert_eq!(
+                statement_constant(&value(sql), &registry),
+                constant,
+                "{sql}"
+            );
+        }
     }
 }
