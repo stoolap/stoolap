@@ -132,3 +132,35 @@ fn every_select_item_of_a_global_aggregate_has_its_column() {
         wrong.join("\n")
     );
 }
+
+#[test]
+fn items_sharing_an_alias_keep_their_own_values() {
+    let db = Database::open("memory://shared_alias_projection").unwrap();
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, g INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1, 7)", ()).unwrap();
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        ("SELECT g AS n, COUNT(*) AS n FROM u GROUP BY g", ["7", "1"]),
+        (
+            "SELECT g AS n, COUNT(*) AS n FROM u WHERE id + 0 = id GROUP BY g",
+            ["7", "1"],
+        ),
+        (
+            "SELECT COUNT(*) AS n, g AS n FROM u WHERE id + 0 = id GROUP BY g",
+            ["1", "7"],
+        ),
+        ("SELECT SUM(g) AS n, COUNT(*) AS n FROM u", ["7", "1"]),
+    ] {
+        let got = answer(&db, sql).map(|(_, values)| values);
+        if got != Ok(want.iter().map(|s| s.to_string()).collect()) {
+            wrong.push(format!("{sql}: got {got:?}, want {want:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}

@@ -12435,13 +12435,36 @@ impl Executor {
         use crate::storage::expression::logical::ConstBoolExpr;
         let true_expr = ConstBoolExpr::true_expr();
 
+        // MIN and MAX by the aggregate functions every other path runs, so
+        // each type orders and answers as it does there; one per slot,
+        // reset for each group
+        let mut extremes: Vec<Option<Box<dyn crate::functions::AggregateFunction>>> =
+            Vec::with_capacity(num_aggs);
+        for agg in &simple_aggs {
+            extremes.push(match agg {
+                StreamingAgg::Min(_) | StreamingAgg::Max(_) => {
+                    let name = if matches!(agg, StreamingAgg::Min(_)) {
+                        "MIN"
+                    } else {
+                        "MAX"
+                    };
+                    match self.function_registry.get_aggregate(name) {
+                        Some(function) => Some(function),
+                        None => return Ok(None),
+                    }
+                }
+                _ => None,
+            });
+        }
+
         let mut aggregate = |group_value: &Value, row_ids: GroupIds<'_>| -> Result<bool> {
-            // Aggregate state: sums for SUM/AVG, min/max values, counts
+            // Aggregate state: sums for SUM/AVG, counts; MIN and MAX in `extremes`
             let mut agg_sums = vec![0.0f64; num_aggs];
-            let mut agg_mins = vec![f64::MAX; num_aggs];
-            let mut agg_maxs = vec![f64::MIN; num_aggs];
             let mut agg_has_value = vec![false; num_aggs];
             let mut counts = vec![0i64; num_aggs];
+            for function in extremes.iter_mut().flatten() {
+                function.reset();
+            }
 
             // Optimization: For COUNT-only aggregates, use row_ids.len() directly
             let row_count = row_ids.len() as i64;
@@ -12475,34 +12498,11 @@ impl Executor {
                                         }
                                     }
                                 }
-                                StreamingAgg::Min(col_idx) => {
-                                    if let Some(value) = row.get(*col_idx) {
-                                        let v = match value {
-                                            Value::Integer(v) => Some(*v as f64),
-                                            Value::Float(v) => Some(*v),
-                                            _ => None,
-                                        };
-                                        if let Some(v) = v {
-                                            if v < agg_mins[i] {
-                                                agg_mins[i] = v;
-                                            }
-                                            agg_has_value[i] = true;
-                                        }
-                                    }
-                                }
-                                StreamingAgg::Max(col_idx) => {
-                                    if let Some(value) = row.get(*col_idx) {
-                                        let v = match value {
-                                            Value::Integer(v) => Some(*v as f64),
-                                            Value::Float(v) => Some(*v),
-                                            _ => None,
-                                        };
-                                        if let Some(v) = v {
-                                            if v > agg_maxs[i] {
-                                                agg_maxs[i] = v;
-                                            }
-                                            agg_has_value[i] = true;
-                                        }
+                                StreamingAgg::Min(col_idx) | StreamingAgg::Max(col_idx) => {
+                                    if let (Some(value), Some(function)) =
+                                        (row.get(*col_idx), extremes[i].as_mut())
+                                    {
+                                        function.accumulate(value, false);
                                     }
                                 }
                             }
@@ -12539,20 +12539,9 @@ impl Executor {
                             Value::null_unknown()
                         }
                     }
-                    StreamingAgg::Min(_) => {
-                        if agg_has_value[i] {
-                            Value::Float(agg_mins[i])
-                        } else {
-                            Value::null_unknown()
-                        }
-                    }
-                    StreamingAgg::Max(_) => {
-                        if agg_has_value[i] {
-                            Value::Float(agg_maxs[i])
-                        } else {
-                            Value::null_unknown()
-                        }
-                    }
+                    StreamingAgg::Min(_) | StreamingAgg::Max(_) => extremes[i]
+                        .as_ref()
+                        .map_or_else(Value::null_unknown, |function| function.result()),
                 };
                 values.push(value);
             }

@@ -92,20 +92,48 @@ const CASES: &[(&str, &str, &str, &str)] = &[
         "SELECT s, MIN(a), MIN(a) AS lo FROM (SELECT s, a FROM t) d GROUP BY s",
         "SELECT s, MIN(a), MIN(a) AS lo FROM (SELECT s, a FROM t) d WHERE s = s GROUP BY s",
     ),
+    (
+        "memory",
+        "storage_grouped",
+        "SELECT g AS n, COUNT(*) AS n FROM t GROUP BY g",
+        "SELECT g AS n, COUNT(*) AS n FROM t WHERE id + 0 = id GROUP BY g",
+    ),
+    (
+        "memory",
+        "streaming_group_by",
+        "SELECT g, COUNT(*) FROM t GROUP BY g HAVING MIN(s) > 0 LIMIT 10",
+        "SELECT g, COUNT(*) FROM t WHERE id + 0 = id GROUP BY g HAVING MIN(s) > 0 LIMIT 10",
+    ),
+    (
+        "memory",
+        "streaming_group_by",
+        "SELECT g, MAX(s), MIN(a) FROM t GROUP BY g HAVING COUNT(*) > 0 LIMIT 10",
+        "SELECT g, MAX(s), MIN(a) FROM t WHERE id + 0 = id GROUP BY g HAVING COUNT(*) > 0 \
+         LIMIT 10",
+    ),
+    (
+        "empty",
+        "streaming_derived_table",
+        "SELECT COUNT(*) AS n, s, COUNT(*) AS m FROM (SELECT s FROM t) d GROUP BY s",
+        "SELECT COUNT(*) AS n, s, COUNT(*) AS m FROM (SELECT s FROM t) d WHERE s = s GROUP BY s",
+    ),
 ];
 
-fn open(db: Database, seal: bool) -> Database {
+fn open(db: Database, seal: bool, rows: bool) -> Database {
     db.execute(
         "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, s TEXT, a INTEGER)",
         (),
     )
     .unwrap();
     db.execute("CREATE INDEX t_g ON t(g)", ()).unwrap();
-    db.execute(
-        "INSERT INTO t VALUES (1, 1, 'x', 1), (2, 1, 'x', 2), (3, 2, 'y', 10), (4, 2, 'y', NULL)",
-        (),
-    )
-    .unwrap();
+    if rows {
+        db.execute(
+            "INSERT INTO t VALUES (1, 1, '1', 1), (2, 1, '1', 2), (3, 2, '2', 10), \
+             (4, 2, '2', NULL)",
+            (),
+        )
+        .unwrap();
+    }
     if seal {
         db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     }
@@ -152,6 +180,12 @@ fn every_aggregate_path_answers_as_the_general_path() {
     let memory = open(
         Database::open("memory://aggregate_path_equivalence").unwrap(),
         false,
+        true,
+    );
+    let empty = open(
+        Database::open("memory://aggregate_path_equivalence_empty").unwrap(),
+        false,
+        false,
     );
     let dir = tempfile::tempdir().unwrap();
     let sealed = open(
@@ -161,11 +195,16 @@ fn every_aggregate_path_answers_as_the_general_path() {
         ))
         .unwrap(),
         true,
+        true,
     );
     let mut wrong = Vec::new();
     let mut covered: Vec<&str> = Vec::new();
     for &(ctx, path, sql, reference) in CASES {
-        let db = if ctx == "sealed" { &sealed } else { &memory };
+        let db = match ctx {
+            "sealed" => &sealed,
+            "empty" => &empty,
+            _ => &memory,
+        };
         let (got, taken) = run(db, sql);
         let (want, reference_taken) = run(db, reference);
         if taken != [path] {

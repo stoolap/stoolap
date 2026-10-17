@@ -1025,9 +1025,12 @@ impl Executor {
                     final_columns.push(aliased.alias.value.to_string());
                     let alias_lower: String = aliased.alias.value_lower.to_string();
 
-                    // First check if the alias matches an aggregation column name
-                    // This handles GROUP BY expression columns like UPPER(name) AS upper_name
-                    if agg_col_index_map.contains_key(&alias_lower) && !is_correlated {
+                    // The item's own identity first: an alias may repeat the
+                    // name another slot carries, as in `g AS n, COUNT(*) AS n`
+                    let slot = slot_of(&aliased.expression).filter(|_| !is_correlated);
+                    if let Some(slot) = slot {
+                        column_sources.push(ColumnSource::AggSlot(slot));
+                    } else if agg_col_index_map.contains_key(&alias_lower) && !is_correlated {
                         column_sources.push(ColumnSource::AggColumn(alias_lower));
                     } else if is_correlated {
                         // For correlated subqueries, use the original expression for per-row eval
@@ -6222,26 +6225,31 @@ impl Executor {
             max_values: smallvec::smallvec![None; num_aggs],
         };
 
+        let mut slot_columns = Vec::with_capacity(1 + aggregations.len());
+        slot_columns.push(source_columns[group_col_idx].clone());
+        slot_columns.extend(aggregations.iter().map(|agg| agg.get_column_name()));
+
         // Sample first row to detect key type
         if !result.next() {
             if let Some(err) = result.last_error() {
                 return Err(err);
             }
-            // Empty result - return empty aggregation
-            let mut result_columns = Vec::with_capacity(1 + aggregations.len());
-            result_columns.push(group_col_name.clone());
-            for agg in &aggregations {
-                let col_name = if let Some(ref alias) = agg.alias {
-                    alias.clone()
-                } else {
-                    agg.get_expression_name()
-                };
-                result_columns.push(col_name);
-            }
-            return Ok(Some(Box::new(super::result::ExecutorResult::new(
-                result_columns,
-                RowVec::new(),
-            ))));
+            // No group: no row, under the columns the shared end names
+            let slots = AggregateSlots {
+                stmt,
+                written_stmt: stmt,
+                aggregations: &aggregations,
+                group_by_count: 1,
+            };
+            return self
+                .finish_aggregation(
+                    AggregatePath::StreamingDerivedTable,
+                    slots,
+                    ctx,
+                    slot_columns,
+                    RowVec::new(),
+                )
+                .map(Some);
         }
 
         let first_row = result.row();
@@ -6376,10 +6384,6 @@ impl Executor {
             if let Some(err) = result.last_error() {
                 return Err(err);
             }
-
-            let mut slot_columns = Vec::with_capacity(1 + aggregations.len());
-            slot_columns.push(source_columns[group_col_idx].clone());
-            slot_columns.extend(aggregations.iter().map(|agg| agg.get_column_name()));
 
             // Build result rows
             let build_row = |key_value: Value, state: StreamGroupState| -> Row {
