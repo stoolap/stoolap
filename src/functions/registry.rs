@@ -25,6 +25,11 @@ use crate::common::StringMap;
 /// Global function registry instance
 static GLOBAL_REGISTRY: OnceLock<FunctionRegistry> = OnceLock::new();
 
+/// The kinds a name may hold a function of, as indexes of its volatilities
+const SCALAR: usize = 0;
+const AGGREGATE: usize = 1;
+const WINDOW: usize = 2;
+
 /// Get the global function registry
 #[inline]
 pub fn global_registry() -> &'static FunctionRegistry {
@@ -91,6 +96,9 @@ pub struct FunctionRegistry {
     tvf_functions: RwLock<StringMap<TvfFactory>>,
     /// Function info cache
     function_info: RwLock<StringMap<FunctionInfo>>,
+    /// The volatility of each kind registered under a name: one name may
+    /// hold a scalar, an aggregate and a window function, each its own
+    volatilities: RwLock<StringMap<[Option<Volatility>; 3]>>,
     /// Set once the built-in functions are in, and once a function is
     /// registered after them: a statement calling one may not run twice safely
     built: AtomicBool,
@@ -112,6 +120,7 @@ impl FunctionRegistry {
             window_functions: RwLock::new(StringMap::new()),
             tvf_functions: RwLock::new(StringMap::new()),
             function_info: RwLock::new(StringMap::new()),
+            volatilities: RwLock::new(StringMap::new()),
             built: AtomicBool::new(false),
             extended: AtomicBool::new(false),
         };
@@ -309,7 +318,20 @@ impl FunctionRegistry {
             .write()
             .unwrap()
             .insert(name.clone(), factory);
+        self.note_volatility(&name, AGGREGATE, info.volatility);
         self.function_info.write().unwrap().insert(name, info);
+    }
+
+    fn note_volatility(&self, name: &str, kind: usize, volatility: Volatility) {
+        let mut volatilities = self.volatilities.write().unwrap();
+        match volatilities.get_mut(name) {
+            Some(kinds) => kinds[kind] = Some(volatility),
+            None => {
+                let mut kinds = [None; 3];
+                kinds[kind] = Some(volatility);
+                volatilities.insert(name.to_string(), kinds);
+            }
+        }
     }
 
     /// Register a scalar function
@@ -329,6 +351,7 @@ impl FunctionRegistry {
             .write()
             .unwrap()
             .insert(name.clone(), factory);
+        self.note_volatility(&name, SCALAR, info.volatility);
         self.function_info.write().unwrap().insert(name, info);
     }
 
@@ -349,6 +372,7 @@ impl FunctionRegistry {
             .write()
             .unwrap()
             .insert(name.clone(), factory);
+        self.note_volatility(&name, WINDOW, info.volatility);
         self.function_info.write().unwrap().insert(name, info);
     }
 
@@ -463,20 +487,22 @@ impl FunctionRegistry {
         infos.get(&name).cloned()
     }
 
-    /// How often a call of `name` may answer differently. The transaction id
-    /// the compiler reads itself is one per statement; a name this registry
-    /// does not hold answers per call, as nothing is known of it
+    /// How often a call of `name` may answer differently: the most volatile
+    /// of the functions the name can run, whichever kind a path resolves it
+    /// to. The transaction id the compiler reads itself is one per statement;
+    /// a name this registry does not hold answers per call
     pub fn volatility(&self, name: &str) -> Volatility {
         if name.eq_ignore_ascii_case("CURRENT_TRANSACTION_ID") {
             return Volatility::PerStatement;
         }
-        let infos = self.function_info.read().unwrap();
-        if let Some(info) = infos.get(name) {
-            return info.volatility;
-        }
-        infos
-            .get(&name.to_uppercase())
-            .map_or(Volatility::PerCall, |info| info.volatility)
+        let volatilities = self.volatilities.read().unwrap();
+        let kinds = match volatilities.get(name) {
+            Some(kinds) => Some(kinds),
+            None => volatilities.get(&name.to_uppercase()),
+        };
+        kinds
+            .and_then(|kinds| kinds.iter().flatten().max().copied())
+            .unwrap_or(Volatility::PerCall)
     }
 
     /// List all aggregate function names
