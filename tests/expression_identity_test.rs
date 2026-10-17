@@ -404,3 +404,42 @@ fn test_a_constant_sort_key_over_a_union() {
         "the first key is a constant, so id orders",
     );
 }
+
+#[test]
+fn test_an_aggregate_sort_key_over_a_union() {
+    let db = setup("identity_union_aggregate_key");
+    same(
+        &db,
+        "SELECT SUM(a) AS s FROM t WHERE id = 1 UNION ALL SELECT SUM(a) FROM t WHERE id = 3 ORDER BY SUM(a) DESC",
+        "SELECT SUM(a) FROM t WHERE id = 3 UNION ALL SELECT SUM(a) FROM t WHERE id = 1",
+        "SUM(a) names the first column of every branch",
+    );
+}
+
+#[test]
+fn test_a_bare_alias_of_a_shared_aggregate_in_select() {
+    let db = setup("identity_bare_shared_alias");
+    same(
+        &db,
+        "SELECT SUM(a) AS x, SUM(a) AS y, y FROM t",
+        "SELECT 13, 13, 13",
+        "y names the aggregate x shares",
+    );
+}
+
+#[test]
+fn test_a_derived_aggregate_over_a_name_holding_an_apostrophe() {
+    let db = setup("identity_derived_apostrophe");
+    same(
+        &db,
+        "SELECT g, RANK() OVER (ORDER BY SUM(\"a'B\")) FROM (SELECT g, SUM(\"a'B\") FROM t GROUP BY g) s ORDER BY g",
+        "SELECT g, RANK() OVER (ORDER BY x) FROM (SELECT g, SUM(\"a'B\") AS x FROM t GROUP BY g) s ORDER BY g",
+        "the apostrophe belongs to a column name, not a literal",
+    );
+    same(
+        &db,
+        "SELECT g, FIRST_VALUE(SUM(\"a'B\")) OVER (ORDER BY g) FROM (SELECT g, SUM(\"a'B\") FROM t GROUP BY g) s ORDER BY g",
+        "SELECT g, FIRST_VALUE(x) OVER (ORDER BY g) FROM (SELECT g, SUM(\"a'B\") AS x FROM t GROUP BY g) s ORDER BY g",
+        "a window argument reads it too",
+    );
+}

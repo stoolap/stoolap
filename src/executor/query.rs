@@ -701,22 +701,29 @@ impl Executor {
             // Only aggregates stand in for themselves inside a sort key: a
             // literal or a name there is read as written
             let mut aggregate_slots: FxHashMap<ExprKey, usize> = FxHashMap::default();
-            // A set operation's rows come from other branches too, whose
-            // expressions differ from the first branch's at each position
-            if stmt.set_operations.is_empty()
-                && !stmt
-                    .columns
-                    .iter()
-                    .any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)))
+            // A set operation's rows come from other branches too: there a
+            // column stands for a sort key only when named or computed, never
+            // for a bare constant, and aggregates are not read inside keys
+            let set_operation = !stmt.set_operations.is_empty();
+            if !stmt
+                .columns
+                .iter()
+                .any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)))
             {
                 for (i, col) in stmt.columns.iter().enumerate() {
+                    if set_operation
+                        && !matches!(col, Expression::Aliased(_) | Expression::FunctionCall(_))
+                    {
+                        continue;
+                    }
                     let key = ExprKey::of(col);
                     column_slots.entry(key).or_insert(i);
                     let inner = match col {
                         Expression::Aliased(aliased) => aliased.expression.as_ref(),
                         other => other,
                     };
-                    if matches!(inner, Expression::FunctionCall(f) if self.function_registry.is_aggregate(&f.function))
+                    if !set_operation
+                        && matches!(inner, Expression::FunctionCall(f) if self.function_registry.is_aggregate(&f.function))
                     {
                         aggregate_slots.entry(key).or_insert(i);
                     }

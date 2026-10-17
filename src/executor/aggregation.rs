@@ -866,7 +866,15 @@ impl Executor {
             match col_expr {
                 Expression::Identifier(id) => {
                     final_columns.push(id.value.to_string());
-                    column_sources.push(ColumnSource::AggColumn(id.value_lower.to_string()));
+                    // A name no result column carries may be another alias of a shared slot
+                    match slot_of(col_expr)
+                        .filter(|_| !agg_col_index_map.contains_key(id.value_lower.as_str()))
+                    {
+                        Some(slot) => column_sources.push(ColumnSource::AggSlot(slot)),
+                        None => {
+                            column_sources.push(ColumnSource::AggColumn(id.value_lower.to_string()))
+                        }
+                    }
                 }
                 Expression::QualifiedIdentifier(qid) => {
                     // Use only the base column name (strip table alias prefix)
