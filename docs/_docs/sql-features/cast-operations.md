@@ -177,6 +177,14 @@ Stoolap performs implicit type conversion in these contexts:
    ```
    A TEXT reads as a number when it has the form `[+-]digits[.digits][e[+-]digits]`, with no spaces. Integral values that fit a 64-bit integer are compared exactly; others are compared as FLOAT. A TEXT that is not a number makes the comparison unknown (NULL), so `1 IS DISTINCT FROM 'abc'` is true and `1 IN ('abc', 2)` is NULL. The same rule applies to `=`, `<>`, `<`, `<=`, `>`, `>=`, `IS [NOT] DISTINCT FROM`, `BETWEEN`, `IN` lists and subqueries, `EXISTS`, and join conditions, whichever plan or index the query uses.
 
+   A BOOLEAN or TIMESTAMP and an INTEGER or FLOAT are different domains, and neither is read as the other: `=` between them is false, `<>` is true, and `<`, `<=`, `>`, `>=` and `BETWEEN` are unknown (NULL), in either operand order, in WHERE, HAVING and the select list alike, whether or not the comparison reaches an index or the table scan. A quoted TEXT is still read as the column's type, so `b = 'false'` and `ts > '2025-01-01'` compare as written.
+   ```sql
+   SELECT TRUE > 0;                                    -- NULL
+   SELECT CAST('2025-01-01' AS TIMESTAMP) >= 0;        -- NULL
+   SELECT TRUE = 1;                                    -- false
+   SELECT * FROM t WHERE b = 0;                        -- no rows, for a BOOLEAN column b
+   ```
+
 3. **Function arguments**: When a function expects specific types
    ```sql
    SELECT ABS('-123');  -- String implicitly converted to number
