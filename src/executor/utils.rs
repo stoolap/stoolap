@@ -1217,7 +1217,7 @@ pub fn expressions_equivalent(a: &Expression, b: &Expression) -> bool {
         }
         (Expression::IntegerLiteral(la), Expression::IntegerLiteral(lb)) => la.value == lb.value,
         (Expression::FloatLiteral(la), Expression::FloatLiteral(lb)) => {
-            (la.value - lb.value).abs() < f64::EPSILON
+            crate::core::value::f64_eq(la.value, lb.value)
         }
         (Expression::StringLiteral(la), Expression::StringLiteral(lb)) => la.value == lb.value,
         (Expression::BooleanLiteral(la), Expression::BooleanLiteral(lb)) => la.value == lb.value,

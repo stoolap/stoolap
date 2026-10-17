@@ -760,3 +760,43 @@ fn test_semantic_cache_invalidation_clears_stats() {
         "Query after INSERT should be a cache miss due to invalidation"
     );
 }
+
+fn ids(db: &Database, sql: &str) -> Vec<i64> {
+    let mut out: Vec<i64> = db
+        .query(sql, ())
+        .unwrap()
+        .map(|row| row.unwrap().get::<i64>(0).unwrap())
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+#[test]
+fn test_float_constants_closer_than_epsilon_are_different_predicates() {
+    for (first, second, want) in [
+        ("f > 1e-300", "f > 2e-300", vec![2, 3, 4]),
+        ("f > 2e-300", "f > 1e-300", vec![1, 2, 3, 4]),
+        ("f = 1e-16", "f = 2e-16", vec![4]),
+        ("f < 2e-300", "f < 1e-300", vec![5]),
+        (
+            "f BETWEEN 1e-300 AND 1e-16",
+            "f BETWEEN 2e-300 AND 1e-16",
+            vec![2, 3],
+        ),
+    ] {
+        let db = create_test_db();
+        db.execute("CREATE TABLE c (id INTEGER PRIMARY KEY, f FLOAT)", ())
+            .unwrap();
+        db.execute(
+            "INSERT INTO c VALUES (1, 1.5e-300), (2, 3e-300), (3, 1e-16), (4, 2e-16), (5, 0.0)",
+            (),
+        )
+        .unwrap();
+        ids(&db, &format!("SELECT * FROM c WHERE {first}"));
+        assert_eq!(
+            ids(&db, &format!("SELECT * FROM c WHERE {second}")),
+            want,
+            "{second} after {first}"
+        );
+    }
+}
