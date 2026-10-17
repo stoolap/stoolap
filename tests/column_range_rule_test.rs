@@ -156,3 +156,74 @@ fn test_a_narrowed_series_keeps_its_direction() {
         assert_eq!(ints(&db, sql), want, "{sql}");
     }
 }
+
+/// Two rows, its two arguments; any other count of arguments is an error
+struct PairRange;
+
+impl stoolap::functions::tvf::TableValuedFunction for PairRange {
+    fn name(&self) -> &str {
+        "PAIR_RANGE"
+    }
+    fn column_names(&self) -> Vec<String> {
+        vec!["value".to_string()]
+    }
+    fn generate(
+        &self,
+        args: &[stoolap::core::Value],
+        _limit: Option<usize>,
+    ) -> stoolap::core::Result<stoolap::core::RowVec> {
+        let [first, second] = args else {
+            return Err(stoolap::core::Error::invalid_argument(
+                "PAIR_RANGE takes two arguments",
+            ));
+        };
+        let mut rows = stoolap::core::RowVec::new();
+        rows.push((0, stoolap::core::Row::from_values(vec![first.clone()])));
+        rows.push((1, stoolap::core::Row::from_values(vec![second.clone()])));
+        Ok(rows)
+    }
+}
+
+#[test]
+fn test_only_a_series_is_narrowed() {
+    stoolap::functions::global_registry()
+        .register_tvf("PAIR_RANGE", std::sync::Arc::new(|| Box::new(PairRange)));
+    let db = Database::open("memory://range_other_tvf").unwrap();
+    assert_eq!(
+        ints(&db, "SELECT value FROM pair_range(1, 3) WHERE value >= 0"),
+        vec![1, 3]
+    );
+    assert_eq!(
+        ints(&db, "SELECT value FROM pair_range(1, 3) WHERE value >= 2"),
+        vec![3],
+        "the bound is no new first argument for a function that is not a series"
+    );
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_a_narrowed_series_generates_only_its_range() {
+    use stoolap::test_failpoints::tvf_rows;
+    let db = Database::open("memory://range_series_generated").unwrap();
+    for (sql, rows, generated) in [
+        (
+            "SELECT value FROM generate_series(1, 1000000) WHERE value >= 2 AND value <= 1",
+            0,
+            0,
+        ),
+        (
+            "SELECT value FROM generate_series(1, 1000000) WHERE value BETWEEN 10 AND 12",
+            3,
+            3,
+        ),
+        (
+            "SELECT value FROM generate_series(1000000, 1) WHERE value < 3.5",
+            3,
+            3,
+        ),
+    ] {
+        let before = tvf_rows();
+        assert_eq!(ints(&db, sql).len(), rows, "{sql}");
+        assert_eq!(tvf_rows() - before, generated, "rows generated for {sql}");
+    }
+}

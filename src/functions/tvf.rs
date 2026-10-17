@@ -113,6 +113,11 @@ pub trait TableValuedFunction: Send + Sync {
     /// that many rows. This enables LIMIT pushdown to avoid generating millions of rows
     /// when only a few are needed.
     fn generate(&self, args: &[Value], limit: Option<usize>) -> Result<RowVec>;
+
+    /// Narrow `args` to the rows whose first column lies in `[low, high]`, an
+    /// empty range when `low > high`. A hint: the WHERE still runs on every
+    /// row, so a function that cannot narrow leaves its arguments
+    fn narrow(&self, _args: &mut Vec<Value>, _low: i64, _high: i64) {}
 }
 
 /// GENERATE_SERIES(start, stop[, step])
@@ -396,6 +401,32 @@ impl TableValuedFunction for GenerateSeriesFunction {
 
     fn column_names(&self) -> Vec<String> {
         vec!["value".to_string()]
+    }
+
+    /// An integer series with a unit step: its ends move inside the range,
+    /// and a defaulted step is made explicit so a moved end keeps the
+    /// direction. Other series generate whole
+    fn narrow(&self, args: &mut Vec<Value>, low: i64, high: i64) {
+        let ends = match args.as_slice() {
+            [Value::Integer(start), Value::Integer(stop)] => {
+                (*start, *stop, if start <= stop { 1 } else { -1 })
+            }
+            [Value::Integer(start), Value::Integer(stop), Value::Integer(step)] => {
+                (*start, *stop, *step)
+            }
+            _ => return,
+        };
+        let (start, stop, step) = ends;
+        let (start, stop) = match step {
+            1 => (start.max(low), stop.min(high)),
+            -1 => (start.min(high), stop.max(low)),
+            _ => return,
+        };
+        *args = vec![
+            Value::Integer(start),
+            Value::Integer(stop),
+            Value::Integer(step),
+        ];
     }
 
     fn generate(&self, args: &[Value], limit: Option<usize>) -> Result<RowVec> {

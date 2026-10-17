@@ -1386,6 +1386,18 @@ pub(crate) fn random_drawn() {
     RANDOM_DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Process-wide: rows table-valued functions have generated
+static TVF_ROWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Rows table-valued functions have generated, so far
+pub fn tvf_rows() -> usize {
+    TVF_ROWS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn tvf_rows_generated(rows: usize) {
+    TVF_ROWS.fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// A mechanism of the general SELECT path that the prepared family no
 /// longer reaches
 #[derive(Clone, Copy, Debug)]

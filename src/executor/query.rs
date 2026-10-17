@@ -1706,65 +1706,20 @@ impl Executor {
             arg_values.push(value);
         }
 
-        // Apply range clamping for integer series: narrow start/stop based on WHERE bounds.
-        // Only safe when: 2-3 integer args, step is 1 or -1 (or defaulted).
         if let Some(range) = range_hint {
-            // An empty range clamps the series past both of its ends
-            let (lo, hi) = match range {
+            // An empty range narrows past both ends
+            let (low, high) = match range {
                 Resolved::Key(k) => (k, k),
                 Resolved::Range(low, high) => (low, high),
                 Resolved::Empty => (i64::MAX, i64::MIN),
                 Resolved::Fallback => (i64::MIN, i64::MAX),
             };
-            let (min_bound, max_bound) = (Some(lo), Some(hi));
-            if arg_values.len() >= 2 {
-                let all_integer = arg_values.iter().all(|v| matches!(v, Value::Integer(_)));
-                if all_integer {
-                    let start = arg_values[0].as_int64().unwrap();
-                    let stop = arg_values[1].as_int64().unwrap();
-                    let step = if arg_values.len() == 3 {
-                        arg_values[2].as_int64().unwrap()
-                    } else if start <= stop {
-                        1
-                    } else {
-                        -1
-                    };
-                    // A clamped series keeps its direction: a defaulted step
-                    // would be chosen again from the clamped ends
-                    if arg_values.len() == 2 {
-                        arg_values.push(Value::Integer(step));
-                    }
-
-                    // Only clamp for unit step (1 or -1) where bounds align exactly
-                    if step == 1 {
-                        if let Some(lo) = min_bound {
-                            if lo > start {
-                                arg_values[0] = Value::Integer(lo);
-                            }
-                        }
-                        if let Some(hi) = max_bound {
-                            if hi < stop {
-                                arg_values[1] = Value::Integer(hi);
-                            }
-                        }
-                    } else if step == -1 {
-                        // Descending: start is the high end, stop is the low end
-                        if let Some(hi) = max_bound {
-                            if hi < start {
-                                arg_values[0] = Value::Integer(hi);
-                            }
-                        }
-                        if let Some(lo) = min_bound {
-                            if lo > stop {
-                                arg_values[1] = Value::Integer(lo);
-                            }
-                        }
-                    }
-                }
-            }
+            tvf.narrow(&mut arg_values, low, high);
         }
 
         let result_rows = tvf.generate(&arg_values, limit)?;
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::tvf_rows_generated(result_rows.len());
 
         let columns: Vec<String> = if !tvf_source.column_aliases.is_empty() {
             tvf_source
