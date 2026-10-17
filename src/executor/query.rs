@@ -12301,7 +12301,7 @@ impl Executor {
             return Ok(None);
         }
 
-        let Some(group_col_name) = self.single_group_column(stmt)? else {
+        let Some((group_col_name, false)) = self.single_group_column(stmt)? else {
             return Ok(None);
         };
 

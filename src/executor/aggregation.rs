@@ -1905,20 +1905,25 @@ impl Executor {
     }
 
     /// The source column a single named GROUP BY item groups by, bound by
-    /// `parse_group_by` as the shared projection binds it
-    pub(crate) fn single_group_column(&self, stmt: &SelectStatement) -> Result<Option<String>> {
-        if !matches!(
-            stmt.group_by.columns.as_slice(),
-            [Expression::Identifier(_) | Expression::QualifiedIdentifier(_)]
-        ) {
-            return Ok(None);
+    /// `parse_group_by` as the shared projection binds it, and whether the
+    /// item carried a qualifier
+    pub(crate) fn single_group_column(
+        &self,
+        stmt: &SelectStatement,
+    ) -> Result<Option<(String, bool)>> {
+        match stmt.group_by.columns.as_slice() {
+            [Expression::Identifier(_)] => {}
+            [Expression::QualifiedIdentifier(qid)] => {
+                return Ok(Some((qid.name.value_lower.to_string(), true)));
+            }
+            _ => return Ok(None),
         }
         Ok(match self.parse_group_by(stmt, &[])?.as_slice() {
-            [GroupByItem::Column(name)] => Some(name.to_lowercase()),
+            [GroupByItem::Column(name)] => Some((name.to_lowercase(), false)),
             [GroupByItem::Expression {
                 expr: Expression::Identifier(id),
                 ..
-            }] => Some(id.value_lower.to_string()),
+            }] => Some((id.value_lower.to_string(), false)),
             _ => None,
         })
     }
@@ -6107,12 +6112,8 @@ impl Executor {
         }
 
         // The derived table's columns carry no qualifier
-        let group_col_name = match self.single_group_column(stmt)? {
-            Some(name) => match name.rsplit_once('.') {
-                Some((_, column)) => column.to_string(),
-                None => name,
-            },
-            None => return Ok(None),
+        let Some((group_col_name, _)) = self.single_group_column(stmt)? else {
+            return Ok(None);
         };
 
         // Build column index map from result columns
@@ -6537,8 +6538,8 @@ impl Executor {
 
         // Extract group-by column names and indices (in GROUP BY order)
         let col_name = match self.single_group_column(stmt) {
-            Ok(Some(name)) => name,
-            Ok(None) => return None,
+            Ok(Some((name, false))) => name,
+            Ok(_) => return None,
             Err(e) => return Some(Err(e)),
         };
         let &idx = col_map.get(col_name.as_str())?;

@@ -132,6 +132,13 @@ const CASES: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "memory",
+        "streaming_derived_table",
+        "SELECT COUNT(*) FROM (SELECT CAST(a AS TEXT) AS \"x.s\", s FROM t) d GROUP BY \"x.s\"",
+        "SELECT COUNT(*) FROM (SELECT CAST(a AS TEXT) AS \"x.s\", s FROM t) d WHERE s = s \
+         GROUP BY \"x.s\"",
+    ),
+    (
+        "memory",
         "storage_grouped",
         "SELECT a AS g, COUNT(*) FROM t GROUP BY g",
         "SELECT a AS g, COUNT(*) FROM t WHERE id + 0 = id GROUP BY g",
