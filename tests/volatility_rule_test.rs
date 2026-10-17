@@ -140,7 +140,7 @@ impl stoolap::functions::AggregateFunction for FixedRandom {
             FunctionSignature::new(FunctionDataType::Integer, vec![], 0, 0),
         )
     }
-    fn accumulate(&mut self, _value: &Value, _distinct: bool) {}
+    fn accumulate(&mut self, _value: &Value) {}
     fn result(&self) -> Result<Value> {
         Ok(Value::Integer(0))
     }

@@ -2010,6 +2010,13 @@ fn holds_text_literal(expr: &Expression) -> bool {
     }
 }
 
+/// A function call as a result column names it: `COUNT(DISTINCT g)`
+pub fn function_call_to_string(func: &crate::parser::ast::FunctionCall) -> String {
+    let args: Vec<String> = func.arguments.iter().map(expression_to_string).collect();
+    let distinct = if func.is_distinct { "DISTINCT " } else { "" };
+    format!("{}({}{})", func.function, distinct, args.join(", "))
+}
+
 /// Convert expression to string representation.
 /// Used for expression alias matching and display purposes.
 pub fn expression_to_string(expr: &Expression) -> String {
@@ -2022,10 +2029,7 @@ pub fn expression_to_string(expr: &Expression) -> String {
         Expression::FloatLiteral(lit) => lit.value.to_string(),
         Expression::StringLiteral(lit) => format!("'{}'", lit.value),
         Expression::BooleanLiteral(lit) => lit.value.to_string(),
-        Expression::FunctionCall(func) => {
-            let args: Vec<String> = func.arguments.iter().map(expression_to_string).collect();
-            format!("{}({})", func.function, args.join(", "))
-        }
+        Expression::FunctionCall(func) => function_call_to_string(func),
         // An operand bound less tightly than its operator keeps its
         // parentheses, or (a + b) * 2 and a + b * 2 would read the same; a
         // right operand of the same precedence keeps them too unless it is

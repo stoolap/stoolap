@@ -19,8 +19,6 @@ use crate::functions::{
     AggregateFunction, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType,
 };
 
-use super::DistinctTracker;
-
 /// COUNT aggregate function
 ///
 /// Returns the number of rows matching the query criteria.
@@ -30,7 +28,6 @@ use super::DistinctTracker;
 #[derive(Default)]
 pub struct CountFunction {
     count: i64,
-    distinct_tracker: Option<DistinctTracker>,
 }
 
 impl AggregateFunction for CountFunction {
@@ -52,44 +49,19 @@ impl AggregateFunction for CountFunction {
         )
     }
 
-    fn accumulate(&mut self, value: &Value, distinct: bool) {
-        // Handle NULL values - COUNT ignores NULLs except for COUNT(*)
-        if value.is_null() {
-            return;
-        }
-
-        // Special case for COUNT(*) which counts rows, not values
-        // We represent this with a special marker
-        if let Value::Text(s) = value {
-            if &**s == "*" {
-                self.count += 1;
-                return;
-            }
-        }
-
-        // Handle DISTINCT case
-        if distinct {
-            if self.distinct_tracker.is_none() {
-                self.distinct_tracker = Some(DistinctTracker::default());
-            }
-            self.distinct_tracker.as_mut().unwrap().check_and_add(value);
-        } else {
-            // Regular COUNT
+    fn accumulate(&mut self, value: &Value) {
+        // COUNT ignores NULLs; COUNT(*) passes a marker for every row
+        if !value.is_null() {
             self.count += 1;
         }
     }
 
     fn result(&self) -> Result<Value> {
-        if let Some(ref tracker) = self.distinct_tracker {
-            Ok(Value::Integer(tracker.count() as i64))
-        } else {
-            Ok(Value::Integer(self.count))
-        }
+        Ok(Value::Integer(self.count))
     }
 
     fn reset(&mut self) {
         self.count = 0;
-        self.distinct_tracker = None;
     }
 
     fn clone_box(&self) -> Box<dyn AggregateFunction> {
@@ -104,46 +76,51 @@ mod tests {
     #[test]
     fn test_count_basic() {
         let mut count = CountFunction::default();
-        count.accumulate(&Value::Integer(1), false);
-        count.accumulate(&Value::Integer(2), false);
-        count.accumulate(&Value::Integer(3), false);
+        count.accumulate(&Value::Integer(1));
+        count.accumulate(&Value::Integer(2));
+        count.accumulate(&Value::Integer(3));
         assert_eq!(count.result().unwrap(), Value::Integer(3));
     }
 
     #[test]
     fn test_count_star() {
         let mut count = CountFunction::default();
-        count.accumulate(&Value::text("*"), false);
-        count.accumulate(&Value::text("*"), false);
-        count.accumulate(&Value::text("*"), false);
+        count.accumulate(&Value::text("*"));
+        count.accumulate(&Value::text("*"));
+        count.accumulate(&Value::text("*"));
         assert_eq!(count.result().unwrap(), Value::Integer(3));
     }
 
     #[test]
     fn test_count_ignores_null() {
         let mut count = CountFunction::default();
-        count.accumulate(&Value::Integer(1), false);
-        count.accumulate(&Value::null_unknown(), false);
-        count.accumulate(&Value::Integer(3), false);
+        count.accumulate(&Value::Integer(1));
+        count.accumulate(&Value::null_unknown());
+        count.accumulate(&Value::Integer(3));
         assert_eq!(count.result().unwrap(), Value::Integer(2));
     }
 
     #[test]
     fn test_count_distinct() {
-        let mut count = CountFunction::default();
-        count.accumulate(&Value::Integer(1), true);
-        count.accumulate(&Value::Integer(1), true); // duplicate
-        count.accumulate(&Value::Integer(2), true);
-        count.accumulate(&Value::Integer(2), true); // duplicate
-        count.accumulate(&Value::Integer(3), true);
+        let mut count = super::super::AggregateState::new(
+            Box::new(CountFunction::default()),
+            true,
+            &[],
+            vec![],
+        );
+        count.accumulate(&Value::Integer(1));
+        count.accumulate(&Value::Integer(1)); // duplicate
+        count.accumulate(&Value::Integer(2));
+        count.accumulate(&Value::Integer(2)); // duplicate
+        count.accumulate(&Value::Integer(3));
         assert_eq!(count.result().unwrap(), Value::Integer(3));
     }
 
     #[test]
     fn test_count_reset() {
         let mut count = CountFunction::default();
-        count.accumulate(&Value::Integer(1), false);
-        count.accumulate(&Value::Integer(2), false);
+        count.accumulate(&Value::Integer(1));
+        count.accumulate(&Value::Integer(2));
         count.reset();
         assert_eq!(count.result().unwrap(), Value::Integer(0));
     }

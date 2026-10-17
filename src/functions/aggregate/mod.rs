@@ -61,7 +61,8 @@ pub use statistics::{
 pub use string_agg::{GroupConcatFunction, StringAggFunction};
 pub use sum::SumFunction;
 
-use crate::core::Value;
+use crate::core::{Result, Value};
+use crate::functions::{AggregateFunction, AggregateOrder};
 use std::cmp::Ordering;
 
 /// Compare two sort keys of an aggregate that orders its own input.
@@ -155,6 +156,88 @@ impl DistinctTracker {
     /// Reset the tracker
     pub fn reset(&mut self) {
         self.seen.clear();
+    }
+}
+
+/// One aggregate call's running state. The call's extra arguments and
+/// ORDER BY are applied once when it is built, and its DISTINCT here, so
+/// every path that runs the call gives the value its modifiers ask for
+pub struct AggregateState {
+    function: Box<dyn AggregateFunction>,
+    distinct: Option<Box<DistinctTracker>>,
+}
+
+impl AggregateState {
+    /// The state of `function` called with these modifiers
+    pub fn new(
+        mut function: Box<dyn AggregateFunction>,
+        distinct: bool,
+        extra_args: &[Value],
+        order_by: Vec<AggregateOrder>,
+    ) -> Self {
+        if !extra_args.is_empty() {
+            function.configure(extra_args);
+        }
+        if !order_by.is_empty() && function.supports_order_by() {
+            function.set_order_by(order_by);
+        }
+        Self {
+            function,
+            distinct: distinct.then(Box::default),
+        }
+    }
+
+    /// Whether the function orders its input by the call's ORDER BY keys
+    pub fn supports_order_by(&self) -> bool {
+        self.function.supports_order_by()
+    }
+
+    /// Whether `value` is the first of its kind under DISTINCT; NULL is
+    /// passed on for the function to skip
+    #[inline]
+    fn admits(&mut self, value: &Value) -> bool {
+        match &mut self.distinct {
+            Some(seen) if !value.is_null() => seen.check_and_add(value),
+            _ => true,
+        }
+    }
+
+    /// Accumulates one input value
+    #[inline]
+    pub fn accumulate(&mut self, value: &Value) {
+        if self.admits(value) {
+            self.function.accumulate(value);
+        }
+    }
+
+    /// Accumulates one input value with the call's ORDER BY keys for it
+    #[inline]
+    pub fn accumulate_with_sort_key(&mut self, value: &Value, sort_keys: Vec<Value>) {
+        if self.admits(value) {
+            self.function.accumulate_with_sort_key(value, sort_keys);
+        }
+    }
+
+    /// The aggregate's value
+    pub fn result(&self) -> Result<Value> {
+        self.function.result()
+    }
+
+    /// Clears the state for the next group or frame
+    pub fn reset(&mut self) {
+        self.function.reset();
+        if let Some(seen) = &mut self.distinct {
+            seen.reset();
+        }
+    }
+}
+
+impl std::fmt::Debug for AggregateState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AggregateState")
+            .field("function", &self.function.name())
+            .field("distinct", &self.distinct.is_some())
+            .finish()
     }
 }
 

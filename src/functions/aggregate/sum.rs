@@ -19,8 +19,6 @@ use crate::functions::{
     AggregateFunction, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType,
 };
 
-use super::DistinctTracker;
-
 /// SUM aggregate function
 ///
 /// Returns the sum of all non-NULL values in the specified column: the
@@ -28,7 +26,6 @@ use super::DistinctTracker;
 #[derive(Default)]
 pub struct SumFunction {
     state: SumAccumulator,
-    distinct_tracker: Option<DistinctTracker>,
 }
 
 impl AggregateFunction for SumFunction {
@@ -50,22 +47,7 @@ impl AggregateFunction for SumFunction {
         )
     }
 
-    fn accumulate(&mut self, value: &Value, distinct: bool) {
-        // Handle NULL values - SUM ignores NULLs
-        if value.is_null() {
-            return;
-        }
-
-        // Handle DISTINCT case
-        if distinct {
-            if self.distinct_tracker.is_none() {
-                self.distinct_tracker = Some(DistinctTracker::default());
-            }
-            if !self.distinct_tracker.as_mut().unwrap().check_and_add(value) {
-                return; // Already seen this value
-            }
-        }
-
+    fn accumulate(&mut self, value: &Value) {
         // A boolean counts as one or nought, so SUM(v > 100) counts the
         // rows the condition holds for
         self.state.add(value);
@@ -77,7 +59,6 @@ impl AggregateFunction for SumFunction {
 
     fn reset(&mut self) {
         self.state = SumAccumulator::default();
-        self.distinct_tracker = None;
     }
 
     fn clone_box(&self) -> Box<dyn AggregateFunction> {
@@ -92,46 +73,47 @@ mod tests {
     #[test]
     fn test_sum_integers() {
         let mut sum = SumFunction::default();
-        sum.accumulate(&Value::Integer(1), false);
-        sum.accumulate(&Value::Integer(2), false);
-        sum.accumulate(&Value::Integer(3), false);
+        sum.accumulate(&Value::Integer(1));
+        sum.accumulate(&Value::Integer(2));
+        sum.accumulate(&Value::Integer(3));
         assert_eq!(sum.result().unwrap(), Value::Integer(6));
     }
 
     #[test]
     fn test_sum_floats() {
         let mut sum = SumFunction::default();
-        sum.accumulate(&Value::Float(1.5), false);
-        sum.accumulate(&Value::Float(2.5), false);
-        sum.accumulate(&Value::Float(3.0), false);
+        sum.accumulate(&Value::Float(1.5));
+        sum.accumulate(&Value::Float(2.5));
+        sum.accumulate(&Value::Float(3.0));
         assert_eq!(sum.result().unwrap(), Value::Float(7.0));
     }
 
     #[test]
     fn test_sum_mixed() {
         let mut sum = SumFunction::default();
-        sum.accumulate(&Value::Integer(1), false);
-        sum.accumulate(&Value::Float(2.5), false);
-        sum.accumulate(&Value::Integer(3), false);
+        sum.accumulate(&Value::Integer(1));
+        sum.accumulate(&Value::Float(2.5));
+        sum.accumulate(&Value::Integer(3));
         assert_eq!(sum.result().unwrap(), Value::Float(6.5));
     }
 
     #[test]
     fn test_sum_ignores_null() {
         let mut sum = SumFunction::default();
-        sum.accumulate(&Value::Integer(1), false);
-        sum.accumulate(&Value::null_unknown(), false);
-        sum.accumulate(&Value::Integer(3), false);
+        sum.accumulate(&Value::Integer(1));
+        sum.accumulate(&Value::null_unknown());
+        sum.accumulate(&Value::Integer(3));
         assert_eq!(sum.result().unwrap(), Value::Integer(4));
     }
 
     #[test]
     fn test_sum_distinct() {
-        let mut sum = SumFunction::default();
-        sum.accumulate(&Value::Integer(1), true);
-        sum.accumulate(&Value::Integer(1), true); // duplicate
-        sum.accumulate(&Value::Integer(2), true);
-        sum.accumulate(&Value::Integer(2), true); // duplicate
+        let mut sum =
+            super::super::AggregateState::new(Box::new(SumFunction::default()), true, &[], vec![]);
+        sum.accumulate(&Value::Integer(1));
+        sum.accumulate(&Value::Integer(1)); // duplicate
+        sum.accumulate(&Value::Integer(2));
+        sum.accumulate(&Value::Integer(2)); // duplicate
         assert_eq!(sum.result().unwrap(), Value::Integer(3)); // 1 + 2
     }
 
@@ -144,8 +126,8 @@ mod tests {
     #[test]
     fn test_sum_reset() {
         let mut sum = SumFunction::default();
-        sum.accumulate(&Value::Integer(1), false);
-        sum.accumulate(&Value::Integer(2), false);
+        sum.accumulate(&Value::Integer(1));
+        sum.accumulate(&Value::Integer(2));
         sum.reset();
         assert!(sum.result().unwrap().is_null());
     }
@@ -153,9 +135,9 @@ mod tests {
     #[test]
     fn test_sum_negative() {
         let mut sum = SumFunction::default();
-        sum.accumulate(&Value::Integer(-5), false);
-        sum.accumulate(&Value::Integer(10), false);
-        sum.accumulate(&Value::Integer(-3), false);
+        sum.accumulate(&Value::Integer(-5));
+        sum.accumulate(&Value::Integer(10));
+        sum.accumulate(&Value::Integer(-3));
         assert_eq!(sum.result().unwrap(), Value::Integer(2));
     }
 }

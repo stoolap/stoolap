@@ -37,9 +37,8 @@
 
 use crate::core::value::compare_floats;
 use crate::core::{Result, SumAccumulator, Value};
-use crate::functions::AggregateFunction;
 
-use super::DistinctTracker;
+use super::{AggregateState, DistinctTracker};
 
 /// Compiled aggregate function - enum-based specialization for zero virtual dispatch
 ///
@@ -92,8 +91,9 @@ pub enum CompiledAggregate {
     /// MAX for floats only (faster path)
     MaxFloat { max_value: Option<f64> },
 
-    /// Fallback to dynamic dispatch for complex aggregates
-    Dynamic(Box<dyn AggregateFunction>),
+    /// Fallback to dynamic dispatch for complex aggregates, with the call's
+    /// modifiers in its state
+    Dynamic(AggregateState),
 }
 
 impl std::fmt::Debug for CompiledAggregate {
@@ -153,9 +153,7 @@ impl std::fmt::Debug for CompiledAggregate {
                 .debug_struct("MaxFloat")
                 .field("max_value", max_value)
                 .finish(),
-            CompiledAggregate::Dynamic(func) => {
-                f.debug_tuple("Dynamic").field(&func.name()).finish()
-            }
+            CompiledAggregate::Dynamic(state) => f.debug_tuple("Dynamic").field(state).finish(),
         }
     }
 }
@@ -235,20 +233,20 @@ impl CompiledAggregate {
         CompiledAggregate::MaxFloat { max_value: None }
     }
 
-    /// Create from a dynamic aggregate function (fallback)
-    pub fn dynamic(func: Box<dyn AggregateFunction>) -> Self {
-        CompiledAggregate::Dynamic(func)
+    /// Create from an aggregate call's state (fallback)
+    pub fn dynamic(state: AggregateState) -> Self {
+        CompiledAggregate::Dynamic(state)
     }
 
     /// Compile from a function name and configuration
     ///
-    /// Returns a compiled aggregate for common functions, or wraps
-    /// the provided dynamic function for complex/rare aggregates.
+    /// Returns a compiled aggregate for common functions, or wraps the
+    /// call's state for complex/rare aggregates.
     pub fn compile(
         name: &str,
         is_count_star: bool,
         distinct: bool,
-        dynamic_fallback: Option<Box<dyn AggregateFunction>>,
+        dynamic_fallback: Option<AggregateState>,
     ) -> Option<Self> {
         if name.eq_ignore_ascii_case("COUNT") {
             if is_count_star {
@@ -391,8 +389,8 @@ impl CompiledAggregate {
             }
 
             // Dynamic fallback
-            CompiledAggregate::Dynamic(func) => {
-                func.accumulate(value, false);
+            CompiledAggregate::Dynamic(state) => {
+                state.accumulate(value);
             }
         }
     }
@@ -451,17 +449,6 @@ impl CompiledAggregate {
         }
     }
 
-    /// Accumulate with DISTINCT flag (for dynamic fallback compatibility)
-    #[inline(always)]
-    pub fn accumulate_with_distinct(&mut self, value: &Value, distinct: bool) {
-        if let CompiledAggregate::Dynamic(func) = self {
-            func.accumulate(value, distinct);
-        } else {
-            // For compiled variants, DISTINCT is handled by the variant type
-            self.accumulate(value);
-        }
-    }
-
     /// Get the result of the aggregation
     #[inline]
     pub fn result(&self) -> Result<Value> {
@@ -501,7 +488,7 @@ impl CompiledAggregate {
                 .map(Value::Float)
                 .unwrap_or_else(Value::null_unknown),
 
-            CompiledAggregate::Dynamic(func) => return func.result(),
+            CompiledAggregate::Dynamic(state) => return state.result(),
         })
     }
 
@@ -536,7 +523,7 @@ impl CompiledAggregate {
             CompiledAggregate::MinFloat { min_value } => *min_value = None,
             CompiledAggregate::MaxFloat { max_value } => *max_value = None,
 
-            CompiledAggregate::Dynamic(func) => func.reset(),
+            CompiledAggregate::Dynamic(state) => state.reset(),
         }
     }
 

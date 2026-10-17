@@ -33,8 +33,7 @@ use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 use crate::common::{CompactArc, CompactVec, I64Map, StringMap};
 use crate::core::{Result, Row, RowVec, SumAccumulator, Value};
-use crate::functions::aggregate::CompiledAggregate;
-use crate::functions::AggregateFunction;
+use crate::functions::aggregate::{AggregateState, CompiledAggregate};
 use crate::parser::ast::*;
 use crate::storage::traits::transaction::StatementTable;
 use crate::storage::traits::{Engine, QueryResult};
@@ -47,7 +46,6 @@ use super::query_classification::QueryClassification;
 use super::result::ExecutorResult;
 use super::utils::{build_column_index_map, hash_value_into};
 use super::Executor;
-use crate::core::value::grouping_float;
 
 // Re-export for backward compatibility
 pub use super::utils::{expression_contains_aggregate, is_aggregate_function};
@@ -64,11 +62,27 @@ pub(crate) enum AggregatePath {
     StorageGrouped,
     StreamingGroupBy,
     StreamingDerivedTable,
+    /// MIN or MAX read from an index
+    IndexMinMax,
+    /// COUNT(*) answered by a cached plan before planning
+    CompiledCountStar,
+    /// COUNT(DISTINCT col) answered by a cached plan from the column's index
+    CompiledCountDistinct,
+}
+
+impl AggregatePath {
+    /// Notes, under test-failpoints, that this path answered; the shortcuts
+    /// that do not end in `finish_aggregation` call it themselves
+    #[inline]
+    pub(crate) fn taken(self) {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::aggregate_path_taken(self as usize);
+    }
 }
 
 #[cfg(any(test, feature = "test-failpoints"))]
 impl AggregatePath {
-    pub(crate) const ALL: [AggregatePath; 8] = [
+    pub(crate) const ALL: [AggregatePath; 11] = [
         AggregatePath::General,
         AggregatePath::Pushdown,
         AggregatePath::FilteredPushdown,
@@ -77,6 +91,9 @@ impl AggregatePath {
         AggregatePath::StorageGrouped,
         AggregatePath::StreamingGroupBy,
         AggregatePath::StreamingDerivedTable,
+        AggregatePath::IndexMinMax,
+        AggregatePath::CompiledCountStar,
+        AggregatePath::CompiledCountDistinct,
     ];
 
     pub(crate) const fn name(self) -> &'static str {
@@ -89,6 +106,9 @@ impl AggregatePath {
             AggregatePath::StorageGrouped => "storage_grouped",
             AggregatePath::StreamingGroupBy => "streaming_group_by",
             AggregatePath::StreamingDerivedTable => "streaming_derived_table",
+            AggregatePath::IndexMinMax => "index_min_max",
+            AggregatePath::CompiledCountStar => "compiled_count_star",
+            AggregatePath::CompiledCountDistinct => "compiled_count_distinct",
         }
     }
 }
@@ -459,34 +479,267 @@ pub struct SqlAggregateFunction {
 }
 
 impl SqlAggregateFunction {
+    /// The modifiers this call carries
+    pub(crate) fn modifiers(&self) -> Modifiers {
+        let mut modifiers = Modifiers::NONE;
+        if self.distinct {
+            modifiers = modifiers.and(Modifiers::DISTINCT);
+        }
+        if self.filter.is_some() {
+            modifiers = modifiers.and(Modifiers::FILTER);
+        }
+        if !self.order_by.is_empty() {
+            modifiers = modifiers.and(Modifiers::ORDER_BY);
+        }
+        if self.expression.is_some() {
+            modifiers = modifiers.and(Modifiers::EXPRESSION);
+        }
+        if !self.extra_args.is_empty() {
+            modifiers = modifiers.and(Modifiers::EXTRA_ARGS);
+        }
+        modifiers
+    }
+
+    /// Whether a path implementing `supported` may answer this call
+    pub(crate) fn answered_with(&self, supported: Modifiers) -> bool {
+        self.modifiers().within(supported)
+    }
+
+    /// The running state of this call, see [`Executor::aggregate_state`]
+    pub(crate) fn state(
+        &self,
+        registry: &crate::functions::FunctionRegistry,
+    ) -> Option<AggregateState> {
+        Executor::aggregate_state(
+            registry,
+            &self.name,
+            self.distinct,
+            &self.extra_args,
+            &self.order_by,
+        )
+    }
+
     /// Get the result column name
     pub fn get_column_name(&self) -> String {
-        if let Some(ref alias) = self.alias {
-            alias.clone()
-        } else if self.column == "*" {
-            format!("{}(*)", self.name)
-        } else if self.extra_args.is_empty() {
-            format!("{}({})", self.name, self.column)
-        } else {
-            // Include extra arguments in column name (e.g., STRING_AGG(name, ' | '))
-            let args_str: Vec<String> = std::iter::once(self.column.clone())
-                .chain(self.extra_args.iter().map(|v| match v {
-                    Value::Text(s) => format!("'{}'", s),
-                    other => other.to_string(),
-                }))
-                .collect();
-            format!("{}({})", self.name, args_str.join(", "))
+        match self.alias {
+            Some(ref alias) => alias.clone(),
+            None => aggregate_call_name(&self.name, self.distinct, &self.column, &self.extra_args),
         }
     }
 
     /// Get the expression name (without alias) for HAVING clause matching
     /// This returns `SUM(price)` even if there's an alias like `AS total`
     pub fn get_expression_name(&self) -> String {
-        if self.column == "*" {
-            format!("{}(*)", self.name)
-        } else {
-            format!("{}({})", self.name, self.column)
+        aggregate_call_name(&self.name, self.distinct, &self.column, &[])
+    }
+}
+
+/// The name an unaliased aggregate call's result column takes, as written:
+/// `COUNT(*)`, `SUM(a)`, `COUNT(DISTINCT g)`, `STRING_AGG(b, ' | ')`
+pub(crate) fn aggregate_call_name(
+    name: &str,
+    distinct: bool,
+    column: &str,
+    extra_args: &[Value],
+) -> String {
+    if column == "*" {
+        return format!("{}(*)", name);
+    }
+    let mut args = String::new();
+    if distinct {
+        args.push_str("DISTINCT ");
+    }
+    args.push_str(column);
+    for arg in extra_args {
+        args.push_str(", ");
+        match arg {
+            Value::Text(s) => {
+                args.push('\'');
+                args.push_str(s);
+                args.push('\'');
+            }
+            other => args.push_str(&other.to_string()),
         }
+    }
+    format!("{}({})", name, args)
+}
+
+/// The modifiers an aggregate call carries. A path that answers aggregates
+/// states the ones it implements, and takes a call only when the call's
+/// modifiers are among them: the one admission rule for every such path
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Modifiers(u8);
+
+impl Modifiers {
+    pub(crate) const NONE: Modifiers = Modifiers(0);
+    pub(crate) const DISTINCT: Modifiers = Modifiers(1);
+    pub(crate) const FILTER: Modifiers = Modifiers(1 << 1);
+    pub(crate) const ORDER_BY: Modifiers = Modifiers(1 << 2);
+    /// The argument is an expression, not a column or `*`
+    pub(crate) const EXPRESSION: Modifiers = Modifiers(1 << 3);
+    /// Arguments after the first, such as a separator
+    pub(crate) const EXTRA_ARGS: Modifiers = Modifiers(1 << 4);
+
+    pub(crate) const fn and(self, other: Modifiers) -> Modifiers {
+        Modifiers(self.0 | other.0)
+    }
+
+    /// Whether every modifier here is among `supported`
+    pub(crate) const fn within(self, supported: Modifiers) -> bool {
+        self.0 & !supported.0 == 0
+    }
+
+    /// The modifiers of a call as the AST writes it, for a path that reads
+    /// the statement before its aggregates are parsed
+    pub(crate) fn of_call(call: &crate::parser::ast::FunctionCall) -> Modifiers {
+        let mut modifiers = Modifiers::NONE;
+        if call.is_distinct {
+            modifiers = modifiers.and(Modifiers::DISTINCT);
+        }
+        if call.filter.is_some() {
+            modifiers = modifiers.and(Modifiers::FILTER);
+        }
+        if !call.order_by.is_empty() {
+            modifiers = modifiers.and(Modifiers::ORDER_BY);
+        }
+        if call.arguments.first().is_some_and(|arg| {
+            !matches!(
+                arg,
+                Expression::Identifier(_)
+                    | Expression::QualifiedIdentifier(_)
+                    | Expression::Star(_)
+            )
+        }) {
+            modifiers = modifiers.and(Modifiers::EXPRESSION);
+        }
+        if call.arguments.len() > 1 {
+            modifiers = modifiers.and(Modifiers::EXTRA_ARGS);
+        }
+        modifiers
+    }
+}
+
+/// The extra arguments of an aggregate call (a STRING_AGG separator), the
+/// literals after its first argument
+pub(crate) fn aggregate_extra_args(args: &[Expression]) -> Vec<Value> {
+    args.iter()
+        .skip(1)
+        .filter_map(|arg| match arg {
+            Expression::StringLiteral(lit) => Some(Value::text(lit.value.as_str())),
+            Expression::IntegerLiteral(lit) => Some(Value::Integer(lit.value)),
+            Expression::FloatLiteral(lit) => Some(Value::Float(lit.value)),
+            Expression::BooleanLiteral(b) => Some(Value::Boolean(b.value)),
+            Expression::NullLiteral(_) => Some(Value::null_unknown()),
+            Expression::Identifier(id) if id.quoted => Some(Value::text(id.value.as_str())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What one aggregate call reads from each input row, compiled once: the
+/// FILTER that decides whether the row counts, the argument expression, and
+/// the keys of the call's own ORDER BY
+pub(crate) struct CallInputs {
+    filter: Option<super::expression::SharedProgram>,
+    argument: Option<super::expression::SharedProgram>,
+    order: Vec<super::expression::SharedProgram>,
+}
+
+impl CallInputs {
+    /// The inputs of every call, compiled over the input row's columns
+    pub(crate) fn compile(
+        aggregations: &[SqlAggregateFunction],
+        columns: &[String],
+    ) -> Result<Vec<CallInputs>> {
+        use super::expression::compile_expression;
+        aggregations
+            .iter()
+            .map(|agg| {
+                Ok(CallInputs {
+                    filter: agg
+                        .filter
+                        .as_ref()
+                        .map(|f| compile_expression(f, columns))
+                        .transpose()?,
+                    argument: agg
+                        .expression
+                        .as_ref()
+                        .map(|e| compile_expression(e, columns))
+                        .transpose()?,
+                    order: agg
+                        .order_by
+                        .iter()
+                        .map(|o| compile_expression(&o.expression, columns))
+                        .collect::<Result<_>>()?,
+                })
+            })
+            .collect()
+    }
+
+    /// Feeds one input row to the call's state. `column` is the call's
+    /// column value, read when it has no argument expression; a VM is made
+    /// on the first program that runs
+    #[inline(always)]
+    pub(crate) fn feed(
+        &self,
+        state: &mut AggregateState,
+        column: Option<&Value>,
+        vm: &mut Option<ExprVM>,
+        row: &super::expression::ExecuteContext<'_>,
+        agg: &SqlAggregateFunction,
+    ) -> Result<()> {
+        if self.filter.is_none() && self.argument.is_none() && self.order.is_empty() {
+            if let Some(value) = column {
+                state.accumulate(value);
+            }
+            return Ok(());
+        }
+        self.feed_programs(state, column, vm, row, agg)
+    }
+
+    /// `feed` for a call with a FILTER, an argument expression or ORDER BY
+    fn feed_programs(
+        &self,
+        state: &mut AggregateState,
+        column: Option<&Value>,
+        vm: &mut Option<ExprVM>,
+        row: &super::expression::ExecuteContext<'_>,
+        agg: &SqlAggregateFunction,
+    ) -> Result<()> {
+        if let Some(filter) = &self.filter {
+            let vm = vm.get_or_insert_with(ExprVM::new);
+            if !matches!(vm.execute_cow(filter, row)?, Value::Boolean(true)) {
+                return Ok(());
+            }
+        }
+        let argument;
+        let value = match &self.argument {
+            Some(program) => {
+                let vm = vm.get_or_insert_with(ExprVM::new);
+                argument = vm.execute_cow(program, row).map_err(|e| {
+                    crate::core::Error::expression_evaluation(format!(
+                        "{}({}): {}",
+                        agg.name, agg.column, e
+                    ))
+                })?;
+                &argument
+            }
+            None => match column {
+                Some(value) => value,
+                None => return Ok(()),
+            },
+        };
+        if !self.order.is_empty() && state.supports_order_by() {
+            let vm = vm.get_or_insert_with(ExprVM::new);
+            let mut keys = Vec::with_capacity(self.order.len());
+            for program in &self.order {
+                keys.push(vm.execute_cow(program, row)?);
+            }
+            state.accumulate_with_sort_key(value, keys);
+        } else {
+            state.accumulate(value);
+        }
+        Ok(())
     }
 }
 
@@ -672,9 +925,7 @@ impl Executor {
         having_columns: Vec<String>,
         having_rows: RowVec,
     ) -> Result<Box<dyn QueryResult>> {
-        #[cfg(feature = "test-failpoints")]
-        crate::test_failpoints::aggregate_path_taken(path as usize);
-        let _ = path;
+        path.taken();
         let AggregateSlots {
             stmt,
             written_stmt,
@@ -1319,12 +1570,7 @@ impl Executor {
 
     /// Get the column name for an aggregate function
     fn get_aggregate_column_name(&self, func: &crate::parser::ast::FunctionCall) -> String {
-        let args_str: Vec<String> = func
-            .arguments
-            .iter()
-            .map(|a| self.expression_to_string(a))
-            .collect();
-        format!("{}({})", func.function, args_str.join(", "))
+        super::utils::function_call_to_string(func)
     }
 
     /// Find the GROUP BY column index for a GROUPING() function call
@@ -1384,6 +1630,26 @@ impl Executor {
                 nulls_first: order.nulls_first,
             })
             .collect()
+    }
+
+    /// The running state of one aggregate call: the registry's function with
+    /// the call's extra arguments, ORDER BY and DISTINCT applied, the one way
+    /// every path builds it; None for a name the registry does not know
+    pub(crate) fn aggregate_state(
+        registry: &crate::functions::FunctionRegistry,
+        name: &str,
+        distinct: bool,
+        extra_args: &[Value],
+        order_by: &[crate::parser::ast::OrderByExpression],
+    ) -> Option<AggregateState> {
+        registry.get_aggregate(name).map(|function| {
+            AggregateState::new(
+                function,
+                distinct,
+                extra_args,
+                Self::aggregate_order_keys(order_by),
+            )
+        })
     }
 
     /// Aggregate, then run the window functions over the aggregate's output.
@@ -1789,33 +2055,7 @@ impl Executor {
             }
         };
 
-        // Extract extra arguments (starting from index 1)
-        let mut extra_args = Vec::new();
-        for arg in args.iter().skip(1) {
-            match arg {
-                Expression::StringLiteral(lit) => {
-                    extra_args.push(Value::text(lit.value.as_str()));
-                }
-                Expression::IntegerLiteral(lit) => {
-                    extra_args.push(Value::Integer(lit.value));
-                }
-                Expression::FloatLiteral(lit) => {
-                    extra_args.push(Value::Float(lit.value));
-                }
-                Expression::BooleanLiteral(b) => {
-                    extra_args.push(Value::Boolean(b.value));
-                }
-                Expression::NullLiteral(_) => {
-                    extra_args.push(Value::null_unknown());
-                }
-                Expression::Identifier(id) if id.quoted => {
-                    extra_args.push(Value::text(id.value.as_str()));
-                }
-                _ => {}
-            }
-        }
-
-        Ok((column, distinct, extra_args, expression))
+        Ok((column, distinct, aggregate_extra_args(args), expression))
     }
 
     /// Parse GROUP BY clause
@@ -2007,19 +2247,11 @@ impl Executor {
         col_index_map: &StringMap<usize>,
         ctx: &ExecutionContext,
     ) -> Result<(Vec<String>, RowVec)> {
-        // Check if any aggregation has an expression (e.g., SUM(val * 2)), ORDER BY, or FILTER
-        let has_expression = aggregations
-            .iter()
-            .any(|a| a.expression.is_some() || !a.order_by.is_empty() || a.filter.is_some());
-
         // FAST PATH: Single COUNT(*) - just return row count directly
-        // Only use fast path when no expressions/filters are involved
-        if !has_expression
-            && aggregations.len() == 1
+        if aggregations.len() == 1
             && aggregations[0].name == "COUNT"
             && aggregations[0].column == "*"
-            && !aggregations[0].distinct
-            && aggregations[0].filter.is_none()
+            && aggregations[0].answered_with(Modifiers::NONE)
         {
             let result_columns: Vec<String> =
                 aggregations.iter().map(|a| a.get_column_name()).collect();
@@ -2042,11 +2274,10 @@ impl Executor {
             })
             .collect();
 
-        // FAST PATH: a single SUM or AVG over a column, without DISTINCT
-        if !has_expression
-            && aggregations.len() == 1
+        // FAST PATH: a single plain SUM or AVG over a column
+        if aggregations.len() == 1
             && matches!(aggregations[0].name.as_str(), "SUM" | "AVG")
-            && !aggregations[0].distinct
+            && aggregations[0].answered_with(Modifiers::NONE)
         {
             if let Some(col_idx) = agg_col_indices[0] {
                 let sum = Self::sum_column_rows(rows, col_idx);
@@ -2063,63 +2294,12 @@ impl Executor {
             }
         }
 
-        // Pre-compile filter, expression, and ORDER BY programs for VM-based evaluation
-        // CRITICAL: Propagate errors instead of silently ignoring compilation failures
-        use super::expression::{compile_expression, ExecuteContext, ExprVM, SharedProgram};
-        let compiled_filters: Vec<Option<SharedProgram>> = if has_expression {
-            aggregations
-                .iter()
-                .map(|agg| {
-                    agg.filter
-                        .as_ref()
-                        .map(|f| compile_expression(f, columns))
-                        .transpose()
-                })
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            vec![None; aggregations.len()]
-        };
-        let compiled_agg_expressions: Vec<Option<SharedProgram>> = if has_expression {
-            aggregations
-                .iter()
-                .map(|agg| {
-                    agg.expression
-                        .as_ref()
-                        .map(|e| compile_expression(e, columns))
-                        .transpose()
-                })
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            vec![None; aggregations.len()]
-        };
-        // Pre-compile ORDER BY expressions for each aggregation
-        // CRITICAL: Propagate errors instead of silently skipping failed compilations
-        let compiled_order_by: Vec<Vec<SharedProgram>> = if has_expression {
-            aggregations
-                .iter()
-                .map(|agg| {
-                    agg.order_by
-                        .iter()
-                        .map(|o| compile_expression(&o.expression, columns))
-                        .collect::<Result<Vec<_>>>()
-                })
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            vec![Vec::new(); aggregations.len()]
-        };
-        let mut expr_vm = if has_expression {
-            Some(ExprVM::new())
-        } else {
-            None
-        };
+        use super::expression::ExecuteContext;
 
-        // Fast path: no expressions, no filters, no order by on any aggregate
-        let can_use_compiled = aggregations.iter().all(|agg| {
-            agg.expression.is_none()
-                && agg.filter.is_none()
-                && agg.order_by.is_empty()
-                && agg.extra_args.is_empty()
-        });
+        // Compiled aggregates read a column and keep DISTINCT in their state
+        let can_use_compiled = aggregations
+            .iter()
+            .all(|agg| agg.answered_with(Modifiers::DISTINCT));
 
         let result_values: Vec<Value> = if can_use_compiled {
             // FAST PATH: Use CompiledAggregate for zero virtual dispatch
@@ -2132,19 +2312,16 @@ impl Executor {
                             &agg.name,
                             is_count_star,
                             agg.distinct,
-                            self.function_registry.get_aggregate(&agg.name),
+                            agg.state(&self.function_registry),
                         )
                         .unwrap_or_else(|| {
                             // Fallback for unknown aggregates
-                            CompiledAggregate::dynamic(
-                                self.function_registry
-                                    .get_aggregate(&agg.name)
-                                    .unwrap_or_else(|| {
-                                        Box::new(
-                                            crate::functions::aggregate::CountFunction::default(),
-                                        )
-                                    }),
-                            )
+                            CompiledAggregate::dynamic(AggregateState::new(
+                                Box::new(crate::functions::aggregate::CountFunction::default()),
+                                agg.distinct,
+                                &[],
+                                Vec::new(),
+                            ))
                         })
                     })
                     .collect()
@@ -2200,34 +2377,15 @@ impl Executor {
                 .collect::<Result<_>>()?
         } else {
             // SLOW PATH: Original algorithm with dynamic dispatch for complex aggregates
-            let mut agg_funcs: Vec<Option<Box<dyn AggregateFunction>>> = aggregations
+            let mut agg_funcs: Vec<Option<AggregateState>> = aggregations
                 .iter()
-                .map(|agg| self.function_registry.get_aggregate(&agg.name))
+                .map(|agg| agg.state(&self.function_registry))
                 .collect();
-
-            // Configure aggregate functions with extra arguments (e.g., separator for STRING_AGG)
-            for (i, agg) in aggregations.iter().enumerate() {
-                if !agg.extra_args.is_empty() {
-                    if let Some(ref mut func) = agg_funcs[i] {
-                        func.configure(&agg.extra_args);
-                    }
-                }
-            }
-
-            // Configure ORDER BY for ordered-set aggregates (ARRAY_AGG, STRING_AGG, etc.)
-            for (i, agg) in aggregations.iter().enumerate() {
-                if !agg.order_by.is_empty() {
-                    if let Some(ref mut func) = agg_funcs[i] {
-                        func.set_order_by(Self::aggregate_order_keys(&agg.order_by));
-                    }
-                }
-            }
+            let inputs = CallInputs::compile(aggregations, columns)?;
+            let mut expr_vm = None;
 
             // Pre-create static Value for COUNT(*)
             let count_star_value = Value::Integer(1);
-
-            // Buffer for evaluated expression values (to avoid repeated allocation)
-            let mut expr_values: Vec<Value> = vec![Value::null_unknown(); aggregations.len()];
 
             for (_, row) in rows {
                 // Create execution context for this row
@@ -2238,67 +2396,11 @@ impl Executor {
 
                 for (i, agg) in aggregations.iter().enumerate() {
                     if let Some(ref mut func) = agg_funcs[i] {
-                        // Check FILTER clause first - skip row if filter is false
-                        if let Some(ref filter_program) = compiled_filters[i] {
-                            if let Some(ref mut vm) = expr_vm {
-                                match vm.execute_cow(filter_program, &exec_ctx) {
-                                    Ok(Value::Boolean(true)) => {} // Continue with accumulation
-                                    Ok(Value::Boolean(false)) | Ok(Value::Null(_)) => continue, // Skip this row
-                                    Ok(_) => continue, // Non-boolean treated as false
-                                    Err(e) => return Err(e),
-                                }
-                            } else {
-                                // Can't evaluate filter without VM - skip
-                                continue;
-                            }
-                        }
-
-                        // Get the value to accumulate
-                        let value = if let Some(ref expr_program) = compiled_agg_expressions[i] {
-                            // Evaluate the expression for this row using VM
-                            if let Some(ref mut vm) = expr_vm {
-                                match vm.execute_cow(expr_program, &exec_ctx) {
-                                    Ok(val) => {
-                                        expr_values[i] = val;
-                                        Some(&expr_values[i])
-                                    }
-                                    Err(e) => {
-                                        return Err(crate::core::Error::expression_evaluation(
-                                            format!("{}({}): {}", agg.name, agg.column, e),
-                                        ));
-                                    }
-                                }
-                            } else {
-                                None
-                            }
-                        } else {
-                            // Simple column reference or COUNT(*)
-                            if let Some(col_idx) = agg_col_indices[i] {
-                                row.get(col_idx)
-                            } else {
-                                Some(&count_star_value)
-                            }
+                        let column = match agg_col_indices[i] {
+                            Some(col_idx) => row.get(col_idx),
+                            None => Some(&count_star_value),
                         };
-
-                        if let Some(v) = value {
-                            // Check if this aggregate has ORDER BY and supports it
-                            if !compiled_order_by[i].is_empty() && func.supports_order_by() {
-                                // Evaluate ORDER BY expressions to get sort keys using pre-compiled programs
-                                if let Some(ref mut vm) = expr_vm {
-                                    let mut sort_keys =
-                                        Vec::with_capacity(compiled_order_by[i].len());
-                                    for order_program in &compiled_order_by[i] {
-                                        sort_keys.push(vm.execute_cow(order_program, &exec_ctx)?);
-                                    }
-                                    func.accumulate_with_sort_key(v, sort_keys, agg.distinct);
-                                } else {
-                                    // No VM - fall back to regular accumulate
-                                    func.accumulate(v, agg.distinct);
-                                }
-                            } else {
-                                func.accumulate(v, agg.distinct);
-                            }
-                        }
+                        inputs[i].feed(func, column, &mut expr_vm, &exec_ctx, agg)?;
                     }
                 }
             }
@@ -2370,12 +2472,7 @@ impl Executor {
         let simple_aggs: Vec<Option<SimpleAgg>> = aggregations
             .iter()
             .map(|agg| {
-                // Must not have DISTINCT, FILTER, ORDER BY, or expression
-                if agg.distinct
-                    || agg.filter.is_some()
-                    || !agg.order_by.is_empty()
-                    || agg.expression.is_some()
-                {
+                if !agg.answered_with(Modifiers::NONE) {
                     return None;
                 }
 
@@ -3411,10 +3508,11 @@ impl Executor {
             return Ok((result.0, result.1, inline_having.is_some()));
         }
 
-        // Check if any aggregation has an expression (e.g., SUM(val * 2)), ORDER BY, or FILTER
-        let has_agg_expression = aggregations
+        // Whether any call reads a program per row: an expression argument,
+        // a FILTER or an ORDER BY
+        let has_agg_expression = !aggregations
             .iter()
-            .any(|a| a.expression.is_some() || !a.order_by.is_empty() || a.filter.is_some());
+            .all(|a| a.answered_with(Modifiers::DISTINCT.and(Modifiers::EXTRA_ARGS)));
 
         // Pre-compute aggregate column indices (once, not per row)
         // OPTIMIZATION: Use pre-computed column_lower instead of calling to_lowercase() each time
@@ -3660,51 +3758,6 @@ impl Executor {
         // Flatten buckets: each bucket may contain multiple groups (hash collisions)
         let groups_vec: Vec<GroupEntry> = groups.into_values().flatten().collect();
 
-        // Pre-compile aggregate filter and expression programs for VM-based evaluation
-        // CRITICAL: Propagate errors instead of silently ignoring compilation failures
-        let compiled_agg_filters: Vec<Option<SharedProgram>> = if has_agg_expression {
-            aggregations
-                .iter()
-                .map(|agg| {
-                    agg.filter
-                        .as_ref()
-                        .map(|f| compile_expression(f, columns))
-                        .transpose()
-                })
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            vec![None; aggregations.len()]
-        };
-        // CRITICAL: Propagate errors instead of silently ignoring compilation failures
-        let compiled_agg_expressions: Vec<Option<SharedProgram>> = if has_agg_expression {
-            aggregations
-                .iter()
-                .map(|agg| {
-                    agg.expression
-                        .as_ref()
-                        .map(|e| compile_expression(e, columns))
-                        .transpose()
-                })
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            vec![None; aggregations.len()]
-        };
-        // Pre-compile ORDER BY expressions for each aggregation
-        // CRITICAL: Propagate errors instead of silently ignoring compilation failures
-        let compiled_agg_order_by: Vec<Vec<SharedProgram>> = if has_agg_expression {
-            aggregations
-                .iter()
-                .map(|agg| {
-                    agg.order_by
-                        .iter()
-                        .map(|o| compile_expression(&o.expression, columns))
-                        .collect::<Result<Vec<_>>>()
-                })
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            vec![Vec::new(); aggregations.len()]
-        };
-
         // Determine if parallel processing is beneficial
         // Don't use parallel processing when expressions are involved (harder to handle)
         // Key insight: parallel creates aggregate functions PER GROUP, so for many small groups
@@ -3732,27 +3785,18 @@ impl Executor {
                 .into_par_iter()
                 .map(|group| {
                     // Each thread creates its own aggregate functions
-                    let mut agg_funcs: Vec<Option<Box<dyn AggregateFunction>>> = aggregations
+                    let mut agg_funcs: Vec<Option<AggregateState>> = aggregations
                         .iter()
-                        .map(|agg| function_registry.get_aggregate(&agg.name))
+                        .map(|agg| agg.state(function_registry))
                         .collect();
-
-                    // Configure aggregate functions with extra arguments (e.g., separator for STRING_AGG)
-                    for (i, agg) in aggregations.iter().enumerate() {
-                        if !agg.extra_args.is_empty() {
-                            if let Some(ref mut func) = agg_funcs[i] {
-                                func.configure(&agg.extra_args);
-                            }
-                        }
-                    }
 
                     // Accumulate values for this group
                     // Pre-create static Value for COUNT(*)
                     let count_star_value = Value::Integer(1);
                     for &row_idx in &group.row_indices {
                         let (_, row) = &rows[row_idx];
-                        for (i, agg) in aggregations.iter().enumerate() {
-                            if let Some(ref mut func) = agg_funcs[i] {
+                        for (i, func) in agg_funcs.iter_mut().enumerate() {
+                            if let Some(func) = func {
                                 // OPTIMIZATION: Avoid cloning by using reference directly
                                 let value_ref = if let Some(col_idx) = agg_col_indices[i] {
                                     row.get(col_idx)
@@ -3760,7 +3804,7 @@ impl Executor {
                                     Some(&count_star_value)
                                 };
                                 if let Some(v) = value_ref {
-                                    func.accumulate(v, agg.distinct);
+                                    func.accumulate(v);
                                 }
                             }
                         }
@@ -3791,27 +3835,18 @@ impl Executor {
                 .into_iter()
                 .map(|group| {
                     // Each thread creates its own aggregate functions
-                    let mut agg_funcs: Vec<Option<Box<dyn AggregateFunction>>> = aggregations
+                    let mut agg_funcs: Vec<Option<AggregateState>> = aggregations
                         .iter()
-                        .map(|agg| function_registry.get_aggregate(&agg.name))
+                        .map(|agg| agg.state(function_registry))
                         .collect();
-
-                    // Configure aggregate functions with extra arguments (e.g., separator for STRING_AGG)
-                    for (i, agg) in aggregations.iter().enumerate() {
-                        if !agg.extra_args.is_empty() {
-                            if let Some(ref mut func) = agg_funcs[i] {
-                                func.configure(&agg.extra_args);
-                            }
-                        }
-                    }
 
                     // Accumulate values for this group
                     // Pre-create static Value for COUNT(*)
                     let count_star_value = Value::Integer(1);
                     for &row_idx in &group.row_indices {
                         let (_, row) = &rows[row_idx];
-                        for (i, agg) in aggregations.iter().enumerate() {
-                            if let Some(ref mut func) = agg_funcs[i] {
+                        for (i, func) in agg_funcs.iter_mut().enumerate() {
+                            if let Some(func) = func {
                                 // OPTIMIZATION: Avoid cloning by using reference directly
                                 let value_ref = if let Some(col_idx) = agg_col_indices[i] {
                                     row.get(col_idx)
@@ -3819,7 +3854,7 @@ impl Executor {
                                     Some(&count_star_value)
                                 };
                                 if let Some(v) = value_ref {
-                                    func.accumulate(v, agg.distinct);
+                                    func.accumulate(v);
                                 }
                             }
                         }
@@ -3853,36 +3888,14 @@ impl Executor {
                 .collect()
         } else {
             // SEQUENTIAL: For small datasets, avoid parallel overhead, or when expressions are involved
-            let mut agg_funcs: Vec<Option<Box<dyn AggregateFunction>>> = aggregations
+            let mut agg_funcs: Vec<Option<AggregateState>> = aggregations
                 .iter()
-                .map(|agg| self.function_registry.get_aggregate(&agg.name))
+                .map(|agg| agg.state(&self.function_registry))
                 .collect();
-
-            // Configure aggregate functions with extra arguments (e.g., separator for STRING_AGG)
-            // This is done once, not per group, as configuration persists across resets
-            for (i, agg) in aggregations.iter().enumerate() {
-                if !agg.extra_args.is_empty() {
-                    if let Some(ref mut func) = agg_funcs[i] {
-                        func.configure(&agg.extra_args);
-                    }
-                }
-            }
-
-            // Configure ORDER BY for ordered-set aggregates (ARRAY_AGG, STRING_AGG, etc.)
-            for (i, agg) in aggregations.iter().enumerate() {
-                if !agg.order_by.is_empty() {
-                    if let Some(ref mut func) = agg_funcs[i] {
-                        func.set_order_by(Self::aggregate_order_keys(&agg.order_by));
-                    }
-                }
-            }
-
-            // Buffer for evaluated expression values (to avoid repeated allocation)
-            let mut expr_values: Vec<Value> = vec![Value::null_unknown(); aggregations.len()];
+            let inputs = CallInputs::compile(aggregations, columns)?;
 
             let mut result_rows_seq = RowVec::with_capacity(groups_vec.len());
-            let mut row_id = 0i64;
-            for group in groups_vec {
+            for (row_id, group) in groups_vec.into_iter().enumerate() {
                 // Reset aggregate functions for this group
                 for f in agg_funcs.iter_mut().flatten() {
                     f.reset();
@@ -3902,70 +3915,11 @@ impl Executor {
 
                     for (i, agg) in aggregations.iter().enumerate() {
                         if let Some(ref mut func) = agg_funcs[i] {
-                            // Check FILTER clause first - skip row if filter is false
-                            if let Some(ref filter_program) = compiled_agg_filters[i] {
-                                if let Some(ref mut vm) = expr_vm {
-                                    match vm.execute_cow(filter_program, &exec_ctx) {
-                                        Ok(Value::Boolean(true)) => {} // Continue with accumulation
-                                        Ok(Value::Boolean(false)) | Ok(Value::Null(_)) => continue, // Skip this row
-                                        Ok(_) => continue, // Non-boolean treated as false
-                                        Err(e) => return Err(e),
-                                    }
-                                } else {
-                                    // Can't evaluate filter without VM - skip
-                                    continue;
-                                }
-                            }
-
-                            // Check if this aggregate has an expression to evaluate
-                            let value = if let Some(ref expr_program) = compiled_agg_expressions[i]
-                            {
-                                // Evaluate the expression for this row using VM
-                                if let Some(ref mut vm) = expr_vm {
-                                    match vm.execute_cow(expr_program, &exec_ctx) {
-                                        Ok(val) => {
-                                            expr_values[i] = val;
-                                            Some(&expr_values[i])
-                                        }
-                                        Err(e) => {
-                                            return Err(crate::core::Error::expression_evaluation(
-                                                format!("{}({}): {}", agg.name, agg.column, e),
-                                            ));
-                                        }
-                                    }
-                                } else {
-                                    None
-                                }
-                            } else {
-                                // Simple column reference or COUNT(*)
-                                if let Some(col_idx) = agg_col_indices[i] {
-                                    row.get(col_idx)
-                                } else {
-                                    Some(&count_star_value)
-                                }
+                            let column = match agg_col_indices[i] {
+                                Some(col_idx) => row.get(col_idx),
+                                None => Some(&count_star_value),
                             };
-
-                            if let Some(v) = value {
-                                // Check if this aggregate has ORDER BY and supports it
-                                if !compiled_agg_order_by[i].is_empty() && func.supports_order_by()
-                                {
-                                    // Evaluate ORDER BY expressions to get sort keys using pre-compiled programs
-                                    if let Some(ref mut vm) = expr_vm {
-                                        let mut sort_keys =
-                                            Vec::with_capacity(compiled_agg_order_by[i].len());
-                                        for order_program in &compiled_agg_order_by[i] {
-                                            sort_keys
-                                                .push(vm.execute_cow(order_program, &exec_ctx)?);
-                                        }
-                                        func.accumulate_with_sort_key(v, sort_keys, agg.distinct);
-                                    } else {
-                                        // No VM - fall back to regular accumulate
-                                        func.accumulate(v, agg.distinct);
-                                    }
-                                } else {
-                                    func.accumulate(v, agg.distinct);
-                                }
-                            }
+                            inputs[i].feed(func, column, &mut expr_vm, &exec_ctx, agg)?;
                         }
                     }
                 }
@@ -3987,8 +3941,7 @@ impl Executor {
                     row_values.push(value);
                 }
 
-                result_rows_seq.push((row_id, Row::from_compact_vec(row_values)));
-                row_id += 1;
+                result_rows_seq.push((row_id as i64, Row::from_compact_vec(row_values)));
             }
             result_rows_seq
         };
@@ -4037,11 +3990,6 @@ impl Executor {
                 }]
             }
         };
-
-        // Check if any aggregation has an expression (e.g., SUM(val * 2)) or ORDER BY
-        let has_agg_expression = aggregations
-            .iter()
-            .any(|a| a.expression.is_some() || !a.order_by.is_empty());
 
         // Pre-compute aggregate column indices
         let agg_col_indices: Vec<Option<usize>> = aggregations
@@ -4096,39 +4044,8 @@ impl Executor {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        // Pre-compile aggregate expressions
-        // CRITICAL: Propagate errors instead of silently ignoring compilation failures
-        let compiled_agg_expressions: Vec<Option<SharedProgram>> = if has_agg_expression {
-            aggregations
-                .iter()
-                .map(|agg| {
-                    agg.expression
-                        .as_ref()
-                        .map(|e| compile_expression(e, columns))
-                        .transpose()
-                })
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            vec![None; aggregations.len()]
-        };
-
-        // Pre-compile FILTER expressions for aggregate functions
-        let has_filters = aggregations.iter().any(|a| a.filter.is_some());
-        let compiled_filters: Vec<Option<SharedProgram>> = if has_filters {
-            aggregations
-                .iter()
-                .map(|agg| {
-                    agg.filter
-                        .as_ref()
-                        .map(|f| compile_expression(f, columns))
-                        .transpose()
-                })
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            vec![None; aggregations.len()]
-        };
-
-        let mut expr_vm = if has_expr_group_by || has_agg_expression || has_filters {
+        let inputs = CallInputs::compile(aggregations, columns)?;
+        let mut expr_vm = if has_expr_group_by {
             Some(ExprVM::new())
         } else {
             None
@@ -4144,22 +4061,12 @@ impl Executor {
 
             if active_count == 0 {
                 // Grand total: aggregate all rows without grouping
-                let mut agg_funcs: Vec<Option<Box<dyn AggregateFunction>>> = aggregations
+                let mut agg_funcs: Vec<Option<AggregateState>> = aggregations
                     .iter()
-                    .map(|agg| self.function_registry.get_aggregate(&agg.name))
+                    .map(|agg| agg.state(&self.function_registry))
                     .collect();
 
-                // Configure aggregate functions
-                for (i, agg) in aggregations.iter().enumerate() {
-                    if !agg.extra_args.is_empty() {
-                        if let Some(ref mut func) = agg_funcs[i] {
-                            func.configure(&agg.extra_args);
-                        }
-                    }
-                }
-
                 let count_star_value = Value::Integer(1);
-                let mut expr_values: Vec<Value> = vec![Value::null_unknown(); aggregations.len()];
 
                 for (_, row) in rows {
                     // Create execution context for this row
@@ -4170,33 +4077,11 @@ impl Executor {
 
                     for (i, agg) in aggregations.iter().enumerate() {
                         if let Some(ref mut func) = agg_funcs[i] {
-                            // Check FILTER clause first - skip row if filter is false
-                            if let Some(ref filter_program) = compiled_filters[i] {
-                                if let Some(ref mut vm) = expr_vm {
-                                    match vm.execute_cow(filter_program, &exec_ctx)? {
-                                        Value::Boolean(true) => {}
-                                        _ => continue,
-                                    }
-                                } else {
-                                    continue;
-                                }
-                            }
-
-                            if let Some(ref expr_program) = compiled_agg_expressions[i] {
-                                if let Some(ref mut vm) = expr_vm {
-                                    expr_values[i] = vm.execute_cow(expr_program, &exec_ctx)?;
-                                    func.accumulate(&expr_values[i], agg.distinct);
-                                }
-                            } else {
-                                let value_ref = if let Some(col_idx) = agg_col_indices[i] {
-                                    row.get(col_idx)
-                                } else {
-                                    Some(&count_star_value)
-                                };
-                                if let Some(v) = value_ref {
-                                    func.accumulate(v, agg.distinct);
-                                }
-                            }
+                            let column = match agg_col_indices[i] {
+                                Some(col_idx) => row.get(col_idx),
+                                None => Some(&count_star_value),
+                            };
+                            inputs[i].feed(func, column, &mut expr_vm, &exec_ctx, agg)?;
                         }
                     }
                 }
@@ -4298,21 +4183,10 @@ impl Executor {
                 }
 
                 // Process each group
-                let mut agg_funcs: Vec<Option<Box<dyn AggregateFunction>>> = aggregations
+                let mut agg_funcs: Vec<Option<AggregateState>> = aggregations
                     .iter()
-                    .map(|agg| self.function_registry.get_aggregate(&agg.name))
+                    .map(|agg| agg.state(&self.function_registry))
                     .collect();
-
-                // Configure aggregate functions
-                for (i, agg) in aggregations.iter().enumerate() {
-                    if !agg.extra_args.is_empty() {
-                        if let Some(ref mut func) = agg_funcs[i] {
-                            func.configure(&agg.extra_args);
-                        }
-                    }
-                }
-
-                let mut expr_values: Vec<Value> = vec![Value::null_unknown(); aggregations.len()];
 
                 // Note: We don't sort groups here for performance.
                 // SQL does not guarantee result order without ORDER BY.
@@ -4337,34 +4211,11 @@ impl Executor {
 
                             for (i, agg) in aggregations.iter().enumerate() {
                                 if let Some(ref mut func) = agg_funcs[i] {
-                                    // Check FILTER clause first - skip row if filter is false
-                                    if let Some(ref filter_program) = compiled_filters[i] {
-                                        if let Some(ref mut vm) = expr_vm {
-                                            match vm.execute_cow(filter_program, &exec_ctx)? {
-                                                Value::Boolean(true) => {}
-                                                _ => continue,
-                                            }
-                                        } else {
-                                            continue;
-                                        }
-                                    }
-
-                                    if let Some(ref expr_program) = compiled_agg_expressions[i] {
-                                        if let Some(ref mut vm) = expr_vm {
-                                            expr_values[i] =
-                                                vm.execute_cow(expr_program, &exec_ctx)?;
-                                            func.accumulate(&expr_values[i], agg.distinct);
-                                        }
-                                    } else {
-                                        let value_ref = if let Some(col_idx) = agg_col_indices[i] {
-                                            row.get(col_idx)
-                                        } else {
-                                            Some(&count_star_value)
-                                        };
-                                        if let Some(v) = value_ref {
-                                            func.accumulate(v, agg.distinct);
-                                        }
-                                    }
+                                    let column = match agg_col_indices[i] {
+                                        Some(col_idx) => row.get(col_idx),
+                                        None => Some(&count_star_value),
+                                    };
+                                    inputs[i].feed(func, column, &mut expr_vm, &exec_ctx, agg)?;
                                 }
                             }
                         }
@@ -4760,14 +4611,14 @@ impl Executor {
             return Ok(None);
         }
 
-        // Check all aggregations are simple (no expression, no ORDER BY, no FILTER)
-        // COUNT(DISTINCT col) is allowed if column has an index
+        // Plain aggregates only; COUNT(DISTINCT col) is answered from its index
         for agg in &aggregations {
-            if agg.expression.is_some() || !agg.order_by.is_empty() || agg.filter.is_some() {
-                return Ok(None);
-            }
-            // COUNT(DISTINCT col) is allowed, other DISTINCT aggregates are not
-            if agg.distinct && agg.name != "COUNT" {
+            let supported = if agg.name == "COUNT" {
+                Modifiers::DISTINCT
+            } else {
+                Modifiers::NONE
+            };
+            if !agg.answered_with(supported) {
                 return Ok(None);
             }
             // Only support COUNT, SUM, MIN, MAX, AVG
@@ -4960,12 +4811,9 @@ impl Executor {
             return Ok(None);
         }
 
-        // Check all aggregations are simple (no expression, no ORDER BY, no FILTER, no DISTINCT)
+        // Plain aggregates only
         for agg in &aggregations {
-            if agg.expression.is_some() || !agg.order_by.is_empty() || agg.filter.is_some() {
-                return Ok(None);
-            }
-            if agg.distinct {
+            if !agg.answered_with(Modifiers::NONE) {
                 return Ok(None);
             }
             match agg.name.as_str() {
@@ -5135,17 +4983,14 @@ impl Executor {
             return Ok(None);
         }
 
-        // Check all aggregations are simple enough for streaming
-        // (no ORDER BY, no FILTER, no DISTINCT except COUNT, no expression arguments)
+        // Plain aggregates only, and COUNT(DISTINCT col)
         for agg in &aggregations {
-            if !agg.order_by.is_empty() || agg.filter.is_some() {
-                return Ok(None);
-            }
-            if agg.distinct && agg.name != "COUNT" {
-                return Ok(None);
-            }
-            // Can't handle expression arguments like SUM(a + b) - need full evaluation
-            if agg.expression.is_some() {
+            let supported = if agg.name == "COUNT" {
+                Modifiers::DISTINCT
+            } else {
+                Modifiers::NONE
+            };
+            if !agg.answered_with(supported) {
                 return Ok(None);
             }
             // Only support COUNT, SUM, MIN, MAX, AVG for streaming
@@ -5177,7 +5022,9 @@ impl Executor {
 
         // FAST PATH: Try deferred aggregation (no row materialization)
         // This bypasses the lazy scanner entirely for simple aggregates
-        let can_use_deferred = aggregations.iter().all(|agg| !agg.distinct);
+        let can_use_deferred = aggregations
+            .iter()
+            .all(|agg| agg.answered_with(Modifiers::NONE));
         if can_use_deferred {
             let mut deferred_values: Vec<Option<Value>> = Vec::with_capacity(aggregations.len());
             let mut all_succeeded = true;
@@ -5266,7 +5113,7 @@ impl Executor {
             count: i64,
             min: Option<Value>,
             max: Option<Value>,
-            distinct_set: Option<ahash::AHashSet<u64>>,
+            distinct_set: Option<crate::functions::aggregate::DistinctTracker>,
         }
 
         let mut states: Vec<AggState> = aggregations
@@ -5276,11 +5123,7 @@ impl Executor {
                 count: 0,
                 min: None,
                 max: None,
-                distinct_set: if agg.distinct {
-                    Some(ahash::AHashSet::new())
-                } else {
-                    None
-                },
+                distinct_set: agg.distinct.then(Default::default),
             })
             .collect();
 
@@ -5309,21 +5152,9 @@ impl Executor {
                     _ => continue, // Skip NULL values
                 };
 
-                // Handle DISTINCT
+                // DISTINCT by the set every DISTINCT aggregate keeps
                 if let Some(ref mut distinct_set) = state.distinct_set {
-                    let hash = {
-                        use std::hash::{Hash, Hasher};
-                        let mut hasher = ahash::AHasher::default();
-                        match value {
-                            Value::Integer(i) => i.hash(&mut hasher),
-                            Value::Float(f) => grouping_float(*f).to_bits().hash(&mut hasher),
-                            Value::Text(s) => s.hash(&mut hasher),
-                            Value::Boolean(b) => b.hash(&mut hasher),
-                            _ => continue,
-                        }
-                        hasher.finish()
-                    };
-                    if !distinct_set.insert(hash) {
+                    if !distinct_set.check_and_add(value) {
                         continue; // Already seen this value
                     }
                 }
@@ -5513,13 +5344,8 @@ impl Executor {
         let simple_aggs: Vec<Option<SimpleAgg>> = aggregations
             .iter()
             .map(|agg| {
-                // Must not have DISTINCT, FILTER, ORDER BY, or expression.
-                // This path has no dedup state, so even COUNT(DISTINCT)
-                // cannot stream here.
-                if agg.filter.is_some() || !agg.order_by.is_empty() || agg.expression.is_some() {
-                    return None;
-                }
-                if agg.distinct {
+                // Plain aggregates only: this path keeps no DISTINCT state
+                if !agg.answered_with(Modifiers::NONE) {
                     return None;
                 }
 
@@ -5890,12 +5716,7 @@ impl Executor {
         }
         let mut aggregates: Vec<(AggregateOp, usize)> = Vec::with_capacity(aggregations.len());
         for agg in &aggregations {
-            if agg.distinct
-                || agg.filter.is_some()
-                || agg.expression.is_some()
-                || !agg.order_by.is_empty()
-                || !agg.extra_args.is_empty()
-            {
+            if !agg.answered_with(Modifiers::NONE) {
                 return None;
             }
             let column = || col_map.get(agg.column_lower.as_str()).copied();
@@ -6033,6 +5854,7 @@ impl Executor {
         let mut rows = RowVec::with_capacity(1);
         rows.push((0, row));
 
+        AggregatePath::CompiledCountDistinct.taken();
         Ok(Some(Box::new(ExecutorResult::new(
             vec![cd.result_column_name.clone()],
             rows,
@@ -6107,20 +5929,24 @@ impl Executor {
                 if !func.is_distinct {
                     return None;
                 }
-                if func.arguments.len() != 1 {
+                if func.arguments.len() != 1
+                    || !Modifiers::of_call(func).within(Modifiers::DISTINCT)
+                {
                     *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
                     return None;
                 }
                 // Get column name from argument
-                let col = match &func.arguments[0] {
-                    Expression::Identifier(ident) => ident.value.to_lowercase(),
+                let (col, result_name) = match &func.arguments[0] {
+                    Expression::Identifier(ident) => (
+                        ident.value.to_lowercase(),
+                        aggregate_call_name("COUNT", true, &ident.value, &[]),
+                    ),
                     _ => {
                         *compiled_guard =
                             CompiledExecution::NotOptimizable(self.engine.schema_epoch());
                         return None;
                     }
                 };
-                let result_name = format!("COUNT(DISTINCT {})", col);
                 (col, result_name)
             }
             Expression::Aliased(aliased) => {
@@ -6138,7 +5964,9 @@ impl Executor {
                         if !func.is_distinct {
                             return None;
                         }
-                        if func.arguments.len() != 1 {
+                        if func.arguments.len() != 1
+                            || !Modifiers::of_call(func).within(Modifiers::DISTINCT)
+                        {
                             *compiled_guard =
                                 CompiledExecution::NotOptimizable(self.engine.schema_epoch());
                             return None;
@@ -6227,6 +6055,7 @@ impl Executor {
         let mut rows = RowVec::with_capacity(1);
         rows.push((0, row));
 
+        AggregatePath::CompiledCountDistinct.taken();
         Some(Ok(Box::new(ExecutorResult::new(
             vec![result_column_name],
             rows,
@@ -6319,6 +6148,7 @@ impl Executor {
         let mut rows = RowVec::with_capacity(1);
         rows.push((0, row));
 
+        AggregatePath::CompiledCountStar.taken();
         Ok(Box::new(ExecutorResult::new(
             vec![cs.result_column_name.clone()],
             rows,
@@ -6394,8 +6224,8 @@ impl Executor {
                 if func.is_distinct {
                     return None;
                 }
-                // Must not have FILTER clause
-                if func.filter.is_some() {
+                // No other modifier; the argument's shape is checked below
+                if !Modifiers::of_call(func).within(Modifiers::EXPRESSION) {
                     *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
                     return None;
                 }
@@ -6449,8 +6279,8 @@ impl Executor {
                         if func.is_distinct {
                             return None;
                         }
-                        // Must not have FILTER clause
-                        if func.filter.is_some() {
+                        // No other modifier; the argument's shape is checked below
+                        if !Modifiers::of_call(func).within(Modifiers::EXPRESSION) {
                             *compiled_guard =
                                 CompiledExecution::NotOptimizable(self.engine.schema_epoch());
                             return None;
@@ -6555,6 +6385,7 @@ impl Executor {
         let mut rows = RowVec::with_capacity(1);
         rows.push((0, row));
 
+        AggregatePath::CompiledCountStar.taken();
         Some(Ok(Box::new(ExecutorResult::new(
             vec![result_column_name],
             rows,

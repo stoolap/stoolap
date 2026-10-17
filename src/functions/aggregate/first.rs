@@ -62,7 +62,7 @@ impl AggregateFunction for FirstFunction {
         true
     }
 
-    fn accumulate(&mut self, value: &Value, _distinct: bool) {
+    fn accumulate(&mut self, value: &Value) {
         if value.is_null() {
             return;
         }
@@ -73,7 +73,7 @@ impl AggregateFunction for FirstFunction {
         }
     }
 
-    fn accumulate_with_sort_key(&mut self, value: &Value, sort_keys: Vec<Value>, _distinct: bool) {
+    fn accumulate_with_sort_key(&mut self, value: &Value, sort_keys: Vec<Value>) {
         if value.is_null() {
             return;
         }
@@ -119,19 +119,19 @@ mod tests {
     #[test]
     fn test_first_basic() {
         let mut first = FirstFunction::default();
-        first.accumulate(&Value::Integer(1), false);
-        first.accumulate(&Value::Integer(2), false);
-        first.accumulate(&Value::Integer(3), false);
+        first.accumulate(&Value::Integer(1));
+        first.accumulate(&Value::Integer(2));
+        first.accumulate(&Value::Integer(3));
         assert_eq!(first.result().unwrap(), Value::Integer(1));
     }
 
     #[test]
     fn test_first_ignores_null() {
         let mut first = FirstFunction::default();
-        first.accumulate(&Value::null_unknown(), false);
-        first.accumulate(&Value::null_unknown(), false);
-        first.accumulate(&Value::Integer(3), false);
-        first.accumulate(&Value::Integer(4), false);
+        first.accumulate(&Value::null_unknown());
+        first.accumulate(&Value::null_unknown());
+        first.accumulate(&Value::Integer(3));
+        first.accumulate(&Value::Integer(4));
         assert_eq!(first.result().unwrap(), Value::Integer(3));
     }
 
@@ -144,25 +144,25 @@ mod tests {
     #[test]
     fn test_first_all_null() {
         let mut first = FirstFunction::default();
-        first.accumulate(&Value::null_unknown(), false);
-        first.accumulate(&Value::null_unknown(), false);
+        first.accumulate(&Value::null_unknown());
+        first.accumulate(&Value::null_unknown());
         assert!(first.result().unwrap().is_null());
     }
 
     #[test]
     fn test_first_reset() {
         let mut first = FirstFunction::default();
-        first.accumulate(&Value::Integer(1), false);
+        first.accumulate(&Value::Integer(1));
         first.reset();
-        first.accumulate(&Value::Integer(5), false);
+        first.accumulate(&Value::Integer(5));
         assert_eq!(first.result().unwrap(), Value::Integer(5));
     }
 
     #[test]
     fn test_first_string() {
         let mut first = FirstFunction::default();
-        first.accumulate(&Value::text("hello"), false);
-        first.accumulate(&Value::text("world"), false);
+        first.accumulate(&Value::text("hello"));
+        first.accumulate(&Value::text("world"));
         assert_eq!(first.result().unwrap(), Value::text("hello"));
     }
 
@@ -173,9 +173,9 @@ mod tests {
             ascending: true,
             nulls_first: None,
         }]);
-        first.accumulate_with_sort_key(&Value::text("c_val"), vec![Value::Integer(3)], false);
-        first.accumulate_with_sort_key(&Value::text("a_val"), vec![Value::Integer(1)], false);
-        first.accumulate_with_sort_key(&Value::text("b_val"), vec![Value::Integer(2)], false);
+        first.accumulate_with_sort_key(&Value::text("c_val"), vec![Value::Integer(3)]);
+        first.accumulate_with_sort_key(&Value::text("a_val"), vec![Value::Integer(1)]);
+        first.accumulate_with_sort_key(&Value::text("b_val"), vec![Value::Integer(2)]);
         // ASC order: key 1 is first, so value should be "a_val"
         assert_eq!(first.result().unwrap(), Value::text("a_val"));
     }
@@ -187,9 +187,9 @@ mod tests {
             ascending: false,
             nulls_first: None,
         }]);
-        first.accumulate_with_sort_key(&Value::text("c_val"), vec![Value::Integer(3)], false);
-        first.accumulate_with_sort_key(&Value::text("a_val"), vec![Value::Integer(1)], false);
-        first.accumulate_with_sort_key(&Value::text("b_val"), vec![Value::Integer(2)], false);
+        first.accumulate_with_sort_key(&Value::text("c_val"), vec![Value::Integer(3)]);
+        first.accumulate_with_sort_key(&Value::text("a_val"), vec![Value::Integer(1)]);
+        first.accumulate_with_sort_key(&Value::text("b_val"), vec![Value::Integer(2)]);
         // DESC order: key 3 is first, so value should be "c_val"
         assert_eq!(first.result().unwrap(), Value::text("c_val"));
     }

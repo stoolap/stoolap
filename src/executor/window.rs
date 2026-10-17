@@ -62,17 +62,16 @@ fn window_argument_value<'a>(
 
 /// One frame of an aggregate that orders its own input
 fn accumulate_ordered_frame(
-    agg_func: &mut Box<dyn crate::functions::AggregateFunction>,
+    agg_func: &mut crate::functions::aggregate::AggregateState,
     frame: &[usize],
     rows: &[(i64, Row)],
     arg_col_idx: Option<usize>,
     expression_values: &[Value],
     keys: &[Vec<Value>],
-    is_distinct: bool,
 ) {
     for &idx in frame {
         let value = window_argument_value(rows, idx, arg_col_idx, expression_values);
-        agg_func.accumulate_with_sort_key(value, keys[idx].clone(), is_distinct);
+        agg_func.accumulate_with_sort_key(value, keys[idx].clone());
     }
 }
 
@@ -3920,6 +3919,24 @@ impl Executor {
         Ok(values)
     }
 
+    /// The running state of an aggregate window call, built as every
+    /// aggregate path builds it; `ordered` when the call's ORDER BY keys are fed
+    fn window_aggregate_state(
+        &self,
+        wf_info: &WindowFunctionInfo,
+        ordered: bool,
+    ) -> Result<crate::functions::aggregate::AggregateState> {
+        let order_by: &[OrderByExpression] = if ordered { &wf_info.call_order_by } else { &[] };
+        Self::aggregate_state(
+            &self.function_registry,
+            &wf_info.name,
+            wf_info.is_distinct,
+            &super::aggregation::aggregate_extra_args(&wf_info.arguments),
+            order_by,
+        )
+        .ok_or_else(|| Error::NotSupported(format!("Unknown aggregate function: {}", wf_info.name)))
+    }
+
     /// The keys the call's own ORDER BY gives each row, empty without one or
     /// for an aggregate that does not order its input
     fn window_call_sort_keys(
@@ -4012,7 +4029,6 @@ impl Executor {
 
         // The keys the call's own ORDER BY gives each row, empty without one
         let sort_keys = self.window_call_sort_keys(wf_info, rows, columns, ctx)?;
-        let is_distinct = wf_info.is_distinct;
         let keys: Option<&[Vec<Value>]> = (!sort_keys.is_empty()).then_some(&sort_keys);
 
         // Use precomputed ORDER BY values from cache if available
@@ -4109,15 +4125,7 @@ impl Executor {
                 };
 
                 // Get aggregate function ONCE, reuse with reset() for each row
-                let mut agg_func = self
-                    .function_registry
-                    .get_aggregate(&wf_info.name)
-                    .ok_or_else(|| {
-                        Error::NotSupported(format!("Unknown aggregate function: {}", wf_info.name))
-                    })?;
-                if keys.is_some() {
-                    agg_func.set_order_by(Self::aggregate_order_keys(&wf_info.call_order_by));
-                }
+                let mut agg_func = self.window_aggregate_state(wf_info, keys.is_some())?;
 
                 // Check if we can use O(n) incremental accumulation instead of O(n²) reset.
                 // Safe when: frame start is UNBOUNDED PRECEDING (frame only grows),
@@ -4232,7 +4240,7 @@ impl Executor {
                                     arg_col_idx,
                                     &expression_values,
                                 );
-                                agg_func.accumulate(value, is_distinct);
+                                agg_func.accumulate(value);
                             }
                         } else {
                             accumulate_ordered_frame(
@@ -4242,7 +4250,6 @@ impl Executor {
                                 arg_col_idx,
                                 &expression_values,
                                 sort_keys.as_slice(),
-                                is_distinct,
                             );
                         }
                         if frame_end > prev_end {
@@ -4479,7 +4486,7 @@ impl Executor {
                                     arg_col_idx,
                                     &expression_values,
                                 );
-                                agg_func.accumulate(value, is_distinct);
+                                agg_func.accumulate(value);
                             }
                         } else {
                             accumulate_ordered_frame(
@@ -4489,7 +4496,6 @@ impl Executor {
                                 arg_col_idx,
                                 &expression_values,
                                 sort_keys.as_slice(),
-                                is_distinct,
                             );
                         }
                         results[row_idx] = Some(agg_func.result()?);
@@ -4497,22 +4503,14 @@ impl Executor {
                 } // end of else (non-incremental path)
             } else {
                 // Without ORDER BY, compute aggregate over entire partition
-                let mut agg_func = self
-                    .function_registry
-                    .get_aggregate(&wf_info.name)
-                    .ok_or_else(|| {
-                        Error::NotSupported(format!("Unknown aggregate function: {}", wf_info.name))
-                    })?;
-                if keys.is_some() {
-                    agg_func.set_order_by(Self::aggregate_order_keys(&wf_info.call_order_by));
-                }
+                let mut agg_func = self.window_aggregate_state(wf_info, keys.is_some())?;
 
                 // Accumulate all values in the partition
                 if keys.is_none() {
                     for &idx in row_indices {
                         let value =
                             window_argument_value(rows, idx, arg_col_idx, &expression_values);
-                        agg_func.accumulate(value, is_distinct);
+                        agg_func.accumulate(value);
                     }
                 } else {
                     accumulate_ordered_frame(
@@ -4522,7 +4520,6 @@ impl Executor {
                         arg_col_idx,
                         &expression_values,
                         sort_keys.as_slice(),
-                        is_distinct,
                     );
                 }
                 let aggregate_result = agg_func.result()?;
