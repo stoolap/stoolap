@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A global aggregate answers with one column per SELECT item, under each
-//! item's own name, however many items name the same aggregate
+//! An aggregate result answers with one column per SELECT item, under each
+//! item's own name, however many items name the same aggregate, and an
+//! expression over a group item or aggregate reads it from its slot
 
 use stoolap::Database;
 
@@ -89,6 +90,16 @@ fn check(db: &Database, ctx: &str, wrong: &mut Vec<String>) {
             s(&["13"]),
         ),
         (
+            "SELECT sum(A) * 2 AS x, SUM(t.a) + 1 AS y, SUM(a) FROM t",
+            s(&["x", "y", "SUM(a)"]),
+            s(&["26", "14", "13"]),
+        ),
+        (
+            "SELECT sum(A) * 2 AS x, SUM(a) FROM t WHERE a > 0",
+            s(&["x", "SUM(a)"]),
+            s(&["26", "13"]),
+        ),
+        (
             "SELECT SUM(a) FROM t WHERE a > 0 ORDER BY COUNT(*)",
             s(&["SUM(a)"]),
             s(&["13"]),
@@ -162,6 +173,56 @@ fn items_sharing_an_alias_keep_their_own_values() {
         ),
     ] {
         let got = answer(&db, sql).map(|(_, values)| values);
+        if got != Ok(want.iter().map(|s| s.to_string()).collect()) {
+            wrong.push(format!("{sql}: got {got:?}, want {want:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+#[test]
+fn an_expression_over_a_group_item_reads_its_slot() {
+    let db = open(
+        Database::open("memory://group_item_projection").unwrap(),
+        false,
+    );
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        (
+            "SELECT (g + 1) * 10 FROM t GROUP BY g + 1",
+            vec!["20", "30"],
+        ),
+        (
+            "SELECT (G+1) * 10, COUNT(*) FROM t GROUP BY g + 1",
+            vec!["20|2", "30|1"],
+        ),
+        (
+            "SELECT UPPER(CAST(g AS TEXT)) || 'x' FROM t GROUP BY UPPER(CAST(g AS TEXT))",
+            vec!["1x", "2x"],
+        ),
+        (
+            "SELECT g + 1 FROM t GROUP BY g + 1 HAVING (g + 1) * 10 > 25",
+            vec!["3"],
+        ),
+    ] {
+        let got = db.query(sql, ()).map_err(|e| e.to_string()).map(|rows| {
+            let mut out: Vec<String> = rows
+                .map(|row| {
+                    let row = row.unwrap();
+                    (0..row.len())
+                        .map(|i| format!("{}", row.get_value(i).unwrap()))
+                        .collect::<Vec<_>>()
+                        .join("|")
+                })
+                .collect();
+            out.sort();
+            out
+        });
         if got != Ok(want.iter().map(|s| s.to_string()).collect()) {
             wrong.push(format!("{sql}: got {got:?}, want {want:?}"));
         }
