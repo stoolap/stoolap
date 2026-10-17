@@ -76,3 +76,41 @@ fn test_a_replace_that_grows_past_the_cap_is_an_error() {
         "{sql}: {got:?}"
     );
 }
+
+#[test]
+fn test_a_result_past_the_cap_is_an_error_on_every_branch() {
+    let db = Database::open("memory://built_string_branches").unwrap();
+    for sql in [
+        "SELECT REPLACE(REPEAT('a', 10485760) || 'b', 'b', 'c')",
+        "SELECT REPLACE(REPEAT('a', 10485760) || 'b', 'x', 'yz')",
+        "SELECT REPLACE(REPEAT('a', 10485760) || 'bb', 'bb', 'c')",
+        "SELECT REPLACE(REPEAT('a', 10485760) || 'b', '', 'c')",
+        "SELECT LPAD(REPEAT('a', 10485760) || 'b', 10485761)",
+        "SELECT RPAD(REPEAT('a', 10485760) || 'b', 10485761)",
+        "SELECT LPAD(REPEAT('a', 10485760) || 'bc', 10485762, 'x')",
+        "SELECT LPAD('a', 9223372036854775807, REPEAT('x', 10485760))",
+        "SELECT RPAD('a', 9223372036854775807, REPEAT('é', 5000000))",
+    ] {
+        let got = built(&db, sql);
+        assert!(
+            got.as_ref().is_err_and(|e| e.contains("exceeding maximum")),
+            "{sql}: {got:?}"
+        );
+    }
+    for (sql, len) in [
+        (
+            "SELECT REPLACE(REPEAT('ab', 5242880) || 'ab', 'ab', 'c')",
+            5_242_881,
+        ),
+        (
+            "SELECT LPAD(REPEAT('a', 10485760) || 'b', 10485760)",
+            10_485_760,
+        ),
+        (
+            "SELECT RPAD(REPEAT('é', 5242880) || 'b', 5242880)",
+            10_485_760,
+        ),
+    ] {
+        assert_eq!(built(&db, sql), Ok(len), "{sql}");
+    }
+}
