@@ -1792,7 +1792,7 @@ fn test_an_alias_binding_cannot_meet_a_column_name() {
 }
 
 #[test]
-fn test_a_numeric_column_reads_a_boolean_value_as_the_scan_does() {
+fn test_a_numeric_column_reads_no_boolean_value() {
     let _guard = serial();
     let db = Database::open("memory://prepared_numeric_boolean").unwrap();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
@@ -1801,11 +1801,16 @@ fn test_a_numeric_column_reads_a_boolean_value_as_the_scan_does() {
     db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, i INTEGER)", ())
         .unwrap();
     db.execute("INSERT INTO u VALUES (1, 1)", ()).unwrap();
-    for inner in ["i = TRUE", "i = TRUE OR id = 99", "(i = TRUE) = TRUE"] {
+    for (inner, expected) in [
+        ("i = TRUE", vec![]),
+        ("i = TRUE OR id = 99", vec![]),
+        ("(i = TRUE) = TRUE", vec![]),
+        ("i <> TRUE", vec![1]),
+    ] {
         let sql = format!("SELECT id FROM t WHERE id = (SELECT id FROM u WHERE {inner})");
         let (found, runs) = ids(&db, &sql, ());
         assert!(runs >= 1, "{sql} ran prepared");
-        assert_eq!(found, vec![1], "{inner}: TRUE read as the INTEGER 1");
+        assert_eq!(found, expected, "{inner}: TRUE is not the INTEGER 1");
     }
 }
 
@@ -1921,9 +1926,9 @@ fn test_null_safe_equality_reads_the_value_as_equality_does() {
         .unwrap();
     db.execute("INSERT INTO u VALUES (1, 1)", ()).unwrap();
     for (inner, expected) in [
-        ("(u.i = TRUE) = TRUE", vec![1]),
-        ("u.i IS NOT DISTINCT FROM TRUE", vec![1]),
-        ("u.i IS DISTINCT FROM TRUE", vec![]),
+        ("(u.i = TRUE) = TRUE", vec![]),
+        ("u.i IS NOT DISTINCT FROM TRUE", vec![]),
+        ("u.i IS DISTINCT FROM TRUE", vec![1]),
         ("u.i IS DISTINCT FROM 'abc'", vec![1]),
     ] {
         let sql = format!("SELECT id FROM t WHERE id = (SELECT id FROM u WHERE {inner})");
