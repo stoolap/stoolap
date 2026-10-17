@@ -232,6 +232,8 @@ Electronics | 3     | 2150.00 | 716.67  | 150.00  | 1200.00
 Clothing    | 3     | 145.00  | 48.33   | 25.00   | 70.00
 ```
 
+A name in GROUP BY may be a SELECT alias: `SELECT a + 1 AS k, COUNT(*) FROM t GROUP BY k` groups by `a + 1`. An alias of an aggregate cannot be grouped by, so in `SELECT g AS n, COUNT(*) AS g FROM t GROUP BY g` the name `g` is the column of `t`.
+
 ## Using HAVING
 
 The HAVING clause filters groups based on aggregate results:

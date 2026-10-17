@@ -54,6 +54,57 @@ use crate::core::value::grouping_float;
 // Re-export for backward compatibility
 pub use super::utils::{expression_contains_aggregate, is_aggregate_function};
 
+/// Every path that builds an aggregate result. Each ends in
+/// `finish_aggregation`, which records the path for the equivalence tests
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AggregatePath {
+    General,
+    Pushdown,
+    FilteredPushdown,
+    StreamingGlobal,
+    StreamingGlobalScan,
+    StorageGrouped,
+    StreamingGroupBy,
+    StreamingDerivedTable,
+}
+
+#[cfg(any(test, feature = "test-failpoints"))]
+impl AggregatePath {
+    pub(crate) const ALL: [AggregatePath; 8] = [
+        AggregatePath::General,
+        AggregatePath::Pushdown,
+        AggregatePath::FilteredPushdown,
+        AggregatePath::StreamingGlobal,
+        AggregatePath::StreamingGlobalScan,
+        AggregatePath::StorageGrouped,
+        AggregatePath::StreamingGroupBy,
+        AggregatePath::StreamingDerivedTable,
+    ];
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            AggregatePath::General => "general",
+            AggregatePath::Pushdown => "pushdown",
+            AggregatePath::FilteredPushdown => "filtered_pushdown",
+            AggregatePath::StreamingGlobal => "streaming_global",
+            AggregatePath::StreamingGlobalScan => "streaming_global_scan",
+            AggregatePath::StorageGrouped => "storage_grouped",
+            AggregatePath::StreamingGroupBy => "streaming_group_by",
+            AggregatePath::StreamingDerivedTable => "streaming_derived_table",
+        }
+    }
+}
+
+/// What the slot rows of an aggregate result stand for
+#[derive(Clone, Copy)]
+pub(crate) struct AggregateSlots<'a> {
+    pub stmt: &'a SelectStatement,
+    /// The statement as written, when lifting subqueries rewrote `stmt`
+    pub written_stmt: &'a SelectStatement,
+    pub aggregations: &'a [SqlAggregateFunction],
+    pub group_by_count: usize,
+}
+
 /// Single condition in a HAVING clause
 #[derive(Clone, Debug)]
 struct HavingCondition {
@@ -68,7 +119,7 @@ struct HavingCondition {
 /// Supports: SUM(col) op value, COUNT(*) op value, COUNT(col) op value
 /// Also supports AND combinations: COUNT(*) > 10 AND SUM(x) > 100
 #[derive(Clone, Debug)]
-struct SimpleHavingFilter {
+pub(crate) struct SimpleHavingFilter {
     /// All conditions that must pass (AND semantics)
     conditions: Vec<HavingCondition>,
 }
@@ -111,6 +162,15 @@ impl SimpleHavingFilter {
         self.conditions.extend(other.conditions);
         self
     }
+
+    /// Whether a group whose aggregate slots hold `aggregates` passes
+    pub(crate) fn passes(&self, aggregates: &[Value]) -> bool {
+        self.conditions.iter().all(|cond| {
+            aggregates
+                .get(cond.agg_index)
+                .is_some_and(|value| cond.matches(value))
+        })
+    }
 }
 
 /// Simple aggregate type for fast aggregation path
@@ -128,7 +188,7 @@ enum SimpleAgg {
 /// Try to parse a simple HAVING clause for inline filtering
 /// Returns None if the HAVING is too complex for inline optimization
 /// Supports: single conditions and AND combinations
-fn try_parse_simple_having(
+pub(crate) fn try_parse_simple_having(
     having: &Expression,
     aggregations: &[SqlAggregateFunction],
 ) -> Option<SimpleHavingFilter> {
@@ -558,6 +618,41 @@ impl Executor {
             (result_columns, result_rows)
         };
 
+        self.finish_aggregation(
+            AggregatePath::General,
+            AggregateSlots {
+                stmt,
+                written_stmt,
+                aggregations: &aggregations,
+                group_by_count: group_by_columns.len(),
+            },
+            ctx,
+            having_columns,
+            having_rows,
+        )
+    }
+
+    /// The one end of every aggregate path: `slot_rows` hold the group
+    /// items, then one value per distinct aggregate; the result projects them
+    /// onto the SELECT list and carries what ORDER BY alone names
+    pub(crate) fn finish_aggregation(
+        &self,
+        path: AggregatePath,
+        slots: AggregateSlots<'_>,
+        ctx: &ExecutionContext,
+        having_columns: Vec<String>,
+        having_rows: RowVec,
+    ) -> Result<Box<dyn QueryResult>> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::aggregate_path_taken(path as usize);
+        let _ = path;
+        let AggregateSlots {
+            stmt,
+            written_stmt,
+            aggregations,
+            group_by_count,
+        } = slots;
+
         // ORDER BY may name a grouped column the SELECT list drops. Capture
         // those columns before projection consumes the aggregate rows; they
         // are appended below and trimmed again after the sort.
@@ -566,7 +661,6 @@ impl Executor {
 
         // Check for hidden aggregates (ORDER BY only) BEFORE cloning
         // These will be removed after sorting by the ProjectedResult wrapper
-        let group_by_count = group_by_columns.len();
         let hidden_aggs: Vec<(usize, &SqlAggregateFunction)> = aggregations
             .iter()
             .enumerate()
@@ -580,7 +674,7 @@ impl Executor {
             self.apply_post_aggregation_expressions(
                 stmt,
                 ctx,
-                &aggregations,
+                aggregations,
                 having_columns,
                 having_rows,
             )?
@@ -616,7 +710,7 @@ impl Executor {
             let (mut cols, mut rows) = self.apply_post_aggregation_expressions(
                 stmt,
                 ctx,
-                &aggregations,
+                aggregations,
                 having_columns,
                 having_rows,
             )?;
@@ -931,9 +1025,12 @@ impl Executor {
                     final_columns.push(aliased.alias.value.to_string());
                     let alias_lower: String = aliased.alias.value_lower.to_string();
 
-                    // First check if the alias matches an aggregation column name
-                    // This handles GROUP BY expression columns like UPPER(name) AS upper_name
-                    if agg_col_index_map.contains_key(&alias_lower) && !is_correlated {
+                    // The item's own identity first: an alias may repeat the
+                    // name another slot carries, as in `g AS n, COUNT(*) AS n`
+                    let slot = slot_of(&aliased.expression).filter(|_| !is_correlated);
+                    if let Some(slot) = slot {
+                        column_sources.push(ColumnSource::AggSlot(slot));
+                    } else if agg_col_index_map.contains_key(&alias_lower) && !is_correlated {
                         column_sources.push(ColumnSource::AggColumn(alias_lower));
                     } else if is_correlated {
                         // For correlated subqueries, use the original expression for per-row eval
@@ -1684,12 +1781,16 @@ impl Executor {
     ) -> Result<Vec<GroupByItem>> {
         let mut group_items = Vec::new();
 
-        // Build a map of aliases to their expressions from SELECT clause
+        // Build a map of aliases to their expressions from SELECT clause; an
+        // aggregate cannot be grouped, so its alias leaves the name to the source column
         let alias_map: FxHashMap<String, Expression> = stmt
             .columns
             .iter()
             .filter_map(|col| {
                 if let Expression::Aliased(aliased) = col {
+                    if expression_contains_aggregate(&aliased.expression) {
+                        return None;
+                    }
                     Some((
                         aliased.alias.value_lower.to_string(),
                         (*aliased.expression).clone(),
@@ -1801,6 +1902,30 @@ impl Executor {
         }
 
         Ok(group_items)
+    }
+
+    /// The source column a single named GROUP BY item groups by, bound by
+    /// `parse_group_by` as the shared projection binds it, and whether the
+    /// item carried a qualifier
+    pub(crate) fn single_group_column(
+        &self,
+        stmt: &SelectStatement,
+    ) -> Result<Option<(String, bool)>> {
+        match stmt.group_by.columns.as_slice() {
+            [Expression::Identifier(_)] => {}
+            [Expression::QualifiedIdentifier(qid)] => {
+                return Ok(Some((qid.name.value_lower.to_string(), true)));
+            }
+            _ => return Ok(None),
+        }
+        Ok(match self.parse_group_by(stmt, &[])?.as_slice() {
+            [GroupByItem::Column(name)] => Some((name.to_lowercase(), false)),
+            [GroupByItem::Expression {
+                expr: Expression::Identifier(id),
+                ..
+            }] => Some((id.value_lower.to_string(), false)),
+            _ => None,
+        })
     }
 
     /// Find the alias for an expression in the SELECT list
@@ -5182,7 +5307,7 @@ impl Executor {
         &self,
         table: &dyn crate::storage::traits::Table,
         stmt: &SelectStatement,
-        _ctx: &super::context::ExecutionContext,
+        ctx: &super::context::ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
     ) -> Result<Option<Box<dyn crate::storage::traits::QueryResult>>> {
         // classification is passed from caller to avoid redundant cache lookups
@@ -5349,14 +5474,17 @@ impl Executor {
             }
         }
 
-        // Build result
         let row = Row::from_compact_vec(result_values);
         let mut rows = RowVec::with_capacity(1);
         rows.push((0, row));
-        Ok(Some(Box::new(super::result::ExecutorResult::new(
-            result_columns,
-            rows,
-        ))))
+        let slots = AggregateSlots {
+            stmt,
+            written_stmt: stmt,
+            aggregations: &aggregations,
+            group_by_count: 0,
+        };
+        self.finish_aggregation(AggregatePath::Pushdown, slots, ctx, result_columns, rows)
+            .map(Some)
     }
 
     /// Try to push filtered aggregation (WHERE + aggregates) directly to the storage layer.
@@ -5544,10 +5672,20 @@ impl Executor {
         let row = Row::from_compact_vec(result_values);
         let mut rows = RowVec::with_capacity(1);
         rows.push((0, row));
-        Ok(Some(Box::new(super::result::ExecutorResult::new(
+        let slots = AggregateSlots {
+            stmt,
+            written_stmt: stmt,
+            aggregations: &aggregations,
+            group_by_count: 0,
+        };
+        self.finish_aggregation(
+            AggregatePath::FilteredPushdown,
+            slots,
+            ctx,
             result_columns,
             rows,
-        ))))
+        )
+        .map(Some)
     }
 
     /// Try to compute global aggregates using streaming (no row materialization).
@@ -5727,22 +5865,24 @@ impl Executor {
                     agg_result_values.push(deferred_values[i].take().unwrap());
                 }
 
-                // Apply post-aggregation expressions if needed
                 let agg_row = Row::from_compact_vec(agg_result_values);
                 let mut agg_rows = RowVec::with_capacity(1);
                 agg_rows.push((0, agg_row));
-                let (final_columns, final_rows) = self.apply_post_aggregation_expressions(
+                let slots = AggregateSlots {
                     stmt,
-                    ctx,
-                    &aggregations,
-                    agg_result_columns,
-                    agg_rows,
-                )?;
-
-                return Ok(Some(Box::new(super::result::ExecutorResult::new(
-                    final_columns,
-                    final_rows,
-                ))));
+                    written_stmt: stmt,
+                    aggregations: &aggregations,
+                    group_by_count: 0,
+                };
+                return self
+                    .finish_aggregation(
+                        AggregatePath::StreamingGlobal,
+                        slots,
+                        ctx,
+                        agg_result_columns,
+                        agg_rows,
+                    )
+                    .map(Some);
             }
         }
 
@@ -5905,23 +6045,23 @@ impl Executor {
             agg_result_values.push(value);
         }
 
-        // Apply post-aggregation expressions if needed
-        // This handles cases like AVG(col) * 100
         let agg_row = Row::from_compact_vec(agg_result_values);
         let mut agg_rows = RowVec::with_capacity(1);
         agg_rows.push((0, agg_row));
-        let (final_columns, final_rows) = self.apply_post_aggregation_expressions(
+        let slots = AggregateSlots {
             stmt,
+            written_stmt: stmt,
+            aggregations: &aggregations,
+            group_by_count: 0,
+        };
+        self.finish_aggregation(
+            AggregatePath::StreamingGlobalScan,
+            slots,
             ctx,
-            &aggregations,
             agg_result_columns,
             agg_rows,
-        )?;
-
-        Ok(Some(Box::new(super::result::ExecutorResult::new(
-            final_columns,
-            final_rows,
-        ))))
+        )
+        .map(Some)
     }
 
     /// Try streaming aggregation for derived tables (FROM subqueries).
@@ -5941,6 +6081,7 @@ impl Executor {
         &self,
         mut result: Box<dyn QueryResult>,
         stmt: &SelectStatement,
+        ctx: &ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
     ) -> Result<Option<Box<dyn QueryResult>>> {
         use crate::common::SmartString;
@@ -5970,13 +6111,9 @@ impl Executor {
             return Ok(None);
         }
 
-        // GROUP BY column must be a simple column reference (identifier)
-        let group_col_name = match &stmt.group_by.columns[0] {
-            crate::parser::ast::Expression::Identifier(id) => id.value_lower.to_string(),
-            crate::parser::ast::Expression::QualifiedIdentifier(qid) => {
-                qid.name.value_lower.to_string()
-            }
-            _ => return Ok(None),
+        // The derived table's columns carry no qualifier
+        let Some((group_col_name, _)) = self.single_group_column(stmt)? else {
+            return Ok(None);
         };
 
         // Build column index map from result columns
@@ -5996,61 +6133,30 @@ impl Executor {
         // Parse aggregations
         let (aggregations, non_agg_columns) = self.parse_aggregations(stmt)?;
 
-        // The rows come out as the GROUP BY column and then the aggregates,
-        // so the select list has to read exactly that, in that order: the
-        // group column first, bare or qualified, then nothing but aggregate
-        // calls, one per aggregate parsed
-        let names_group_column = |expr: &crate::parser::ast::Expression| match expr {
-            crate::parser::ast::Expression::Identifier(id) => {
-                id.value_lower.eq_ignore_ascii_case(&group_col_name)
-            }
-            crate::parser::ast::Expression::QualifiedIdentifier(qid) => {
-                qid.name.value_lower.eq_ignore_ascii_case(&group_col_name)
-            }
-            _ => false,
-        };
-        // The parser folds a repeated aggregate into one and appends the
-        // ones a hidden ORDER BY needs, so each select column is matched to
-        // the aggregate in its own position, by name, argument and DISTINCT
-        let same_aggregate = |expr: &crate::parser::ast::Expression, agg: &SqlAggregateFunction| {
+        // The select list reads the group column, bare or qualified, and
+        // aggregate calls; the shared end projects the slots onto it
+        let readable = |expr: &crate::parser::ast::Expression| {
+            use crate::parser::ast::Expression;
             let inner = match expr {
-                crate::parser::ast::Expression::Aliased(aliased) => aliased.expression.as_ref(),
+                Expression::Aliased(aliased) => aliased.expression.as_ref(),
                 other => other,
             };
-            let crate::parser::ast::Expression::FunctionCall(func) = inner else {
-                return false;
-            };
-            if !crate::executor::utils::is_aggregate_function(&func.function)
-                || !agg.name.eq_ignore_ascii_case(&func.function)
-                || agg.distinct != func.is_distinct
-            {
-                return false;
-            }
-            match func.arguments.first() {
-                None | Some(crate::parser::ast::Expression::Star(_)) => agg.column == "*",
-                Some(arg) => {
-                    let arg_text = crate::executor::utils::expression_to_string(arg);
-                    match &agg.expression {
-                        Some(expr) => {
-                            crate::executor::utils::expression_to_string(expr) == arg_text
-                        }
-                        None => agg.column.eq_ignore_ascii_case(&arg_text),
-                    }
+            match inner {
+                Expression::Identifier(id) => id.value_lower.eq_ignore_ascii_case(&group_col_name),
+                Expression::QualifiedIdentifier(qid) => {
+                    qid.name.value_lower.eq_ignore_ascii_case(&group_col_name)
                 }
+                Expression::FunctionCall(func) => {
+                    crate::executor::utils::is_aggregate_function(&func.function)
+                }
+                _ => false,
             }
         };
-        let shape_matches = stmt.columns.first().is_some_and(names_group_column)
-            && aggregations.len() + 1 == stmt.columns.len()
-            && stmt
-                .columns
+        if !stmt.columns.iter().all(readable)
+            || !non_agg_columns
                 .iter()
-                .skip(1)
-                .zip(&aggregations)
-                .all(|(column, agg)| same_aggregate(column, agg))
-            && non_agg_columns
-                .iter()
-                .all(|column| column.eq_ignore_ascii_case(&group_col_name));
-        if !shape_matches {
+                .all(|column| column.eq_ignore_ascii_case(&group_col_name))
+        {
             return Ok(None);
         }
 
@@ -6143,26 +6249,31 @@ impl Executor {
             max_values: smallvec::smallvec![None; num_aggs],
         };
 
+        let mut slot_columns = Vec::with_capacity(1 + aggregations.len());
+        slot_columns.push(source_columns[group_col_idx].clone());
+        slot_columns.extend(aggregations.iter().map(|agg| agg.get_column_name()));
+
         // Sample first row to detect key type
         if !result.next() {
             if let Some(err) = result.last_error() {
                 return Err(err);
             }
-            // Empty result - return empty aggregation
-            let mut result_columns = Vec::with_capacity(1 + aggregations.len());
-            result_columns.push(group_col_name.clone());
-            for agg in &aggregations {
-                let col_name = if let Some(ref alias) = agg.alias {
-                    alias.clone()
-                } else {
-                    agg.get_expression_name()
-                };
-                result_columns.push(col_name);
-            }
-            return Ok(Some(Box::new(super::result::ExecutorResult::new(
-                result_columns,
-                RowVec::new(),
-            ))));
+            // No group: no row, under the columns the shared end names
+            let slots = AggregateSlots {
+                stmt,
+                written_stmt: stmt,
+                aggregations: &aggregations,
+                group_by_count: 1,
+            };
+            return self
+                .finish_aggregation(
+                    AggregatePath::StreamingDerivedTable,
+                    slots,
+                    ctx,
+                    slot_columns,
+                    RowVec::new(),
+                )
+                .map(Some);
         }
 
         let first_row = result.row();
@@ -6298,18 +6409,6 @@ impl Executor {
                 return Err(err);
             }
 
-            // Build result columns
-            let mut result_columns = Vec::with_capacity(1 + aggregations.len());
-            result_columns.push(group_col_name.clone());
-            for agg in &aggregations {
-                let col_name = if let Some(ref alias) = agg.alias {
-                    alias.clone()
-                } else {
-                    agg.get_expression_name()
-                };
-                result_columns.push(col_name);
-            }
-
             // Build result rows
             let build_row = |key_value: Value, state: StreamGroupState| -> Row {
                 let mut values: crate::common::CompactVec<Value> =
@@ -6362,10 +6461,21 @@ impl Executor {
                 result_rows.push((row_id, build_row(Value::null_unknown(), ng)));
             }
 
-            return Ok(Some(Box::new(super::result::ExecutorResult::new(
-                result_columns,
-                result_rows,
-            ))));
+            let slots = AggregateSlots {
+                stmt,
+                written_stmt: stmt,
+                aggregations: &aggregations,
+                group_by_count: 1,
+            };
+            return self
+                .finish_aggregation(
+                    AggregatePath::StreamingDerivedTable,
+                    slots,
+                    ctx,
+                    slot_columns,
+                    result_rows,
+                )
+                .map(Some);
         }
 
         // Fallback: not eligible for streaming optimization
@@ -6387,6 +6497,7 @@ impl Executor {
         &self,
         table: &dyn crate::storage::traits::Table,
         stmt: &SelectStatement,
+        ctx: &ExecutionContext,
         all_columns: &[String],
         classification: &QueryClassification,
     ) -> Option<Result<Box<dyn QueryResult>>> {
@@ -6426,249 +6537,77 @@ impl Executor {
             .collect();
 
         // Extract group-by column names and indices (in GROUP BY order)
-        let mut group_by_indices: Vec<usize> = Vec::new();
-        let mut group_by_col_names: Vec<String> = Vec::new();
-        for expr in group_by_cols {
+        let col_name = match self.single_group_column(stmt) {
+            Ok(Some((name, false))) => name,
+            Ok(_) => return None,
+            Err(e) => return Some(Err(e)),
+        };
+        let &idx = col_map.get(col_name.as_str())?;
+        let group_by_indices: Vec<usize> = vec![idx];
+        let group_by_col_names: Vec<String> = vec![col_name];
+
+        // The SELECT list reads the group column and plain aggregates; the
+        // shared end projects the slots onto it, in any order and under any alias
+        for col_expr in &stmt.columns {
+            let expr = match col_expr {
+                Expression::Aliased(aliased) => aliased.expression.as_ref(),
+                other => other,
+            };
             match expr {
                 Expression::Identifier(ident) => {
-                    let col_name = ident.value.to_lowercase().to_string();
-                    if let Some(&idx) = col_map.get(col_name.as_str()) {
-                        group_by_indices.push(idx);
-                        group_by_col_names.push(col_name);
-                    } else {
-                        return None; // Unknown column
+                    if !group_by_col_names.contains(&ident.value.to_lowercase().to_string()) {
+                        return None;
                     }
                 }
-                _ => return None, // Non-column GROUP BY not supported
+                Expression::FunctionCall(fc)
+                    if matches!(
+                        fc.function.to_uppercase().as_str(),
+                        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
+                    ) => {}
+                _ => return None,
             }
         }
 
-        // Parse SELECT columns - identify which are group-by columns vs aggregates
-        // Track positions so we can verify GROUP BY columns come first
-        let mut select_group_count = 0;
-        let mut seen_aggregate = false;
-        let mut aggregates: Vec<(AggregateOp, usize)> = Vec::new();
-        let mut result_columns: Vec<String> = Vec::new();
-
-        for col_expr in &stmt.columns {
-            match col_expr {
-                Expression::Identifier(ident) => {
-                    // This must be a GROUP BY column
-                    let col_name_lower = ident.value.to_lowercase().to_string();
-                    if !group_by_col_names.contains(&col_name_lower) {
-                        return None; // Column not in GROUP BY
-                    }
-                    if seen_aggregate {
-                        // GROUP BY columns must come before aggregates for this optimization
-                        return None;
-                    }
-                    select_group_count += 1;
-                    result_columns.push(ident.value.to_string());
-                }
-                Expression::FunctionCall(fc) => {
-                    // Don't support FILTER clause or DISTINCT for this optimization
-                    if fc.filter.is_some() || fc.is_distinct {
-                        return None;
-                    }
-                    seen_aggregate = true;
-                    let func_name = fc.function.to_uppercase();
-                    let (op, col_idx) = match func_name.as_str() {
-                        "COUNT" => {
-                            if fc.arguments.is_empty()
-                                || matches!(fc.arguments.first(), Some(Expression::Star(_)))
-                            {
-                                (AggregateOp::CountStar, 0)
-                            } else if let Some(Expression::Identifier(ident)) = fc.arguments.first()
-                            {
-                                let col_name = ident.value.to_lowercase();
-                                if let Some(&idx) = col_map.get(col_name.as_str()) {
-                                    (AggregateOp::Count, idx)
-                                } else {
-                                    return None;
-                                }
-                            } else {
-                                return None;
-                            }
-                        }
-                        "SUM" => {
-                            if let Some(Expression::Identifier(ident)) = fc.arguments.first() {
-                                let col_name = ident.value.to_lowercase();
-                                if let Some(&idx) = col_map.get(col_name.as_str()) {
-                                    (AggregateOp::Sum, idx)
-                                } else {
-                                    return None;
-                                }
-                            } else {
-                                return None;
-                            }
-                        }
-                        "AVG" => {
-                            if let Some(Expression::Identifier(ident)) = fc.arguments.first() {
-                                let col_name = ident.value.to_lowercase();
-                                if let Some(&idx) = col_map.get(col_name.as_str()) {
-                                    (AggregateOp::Avg, idx)
-                                } else {
-                                    return None;
-                                }
-                            } else {
-                                return None;
-                            }
-                        }
-                        "MIN" => {
-                            if let Some(Expression::Identifier(ident)) = fc.arguments.first() {
-                                let col_name = ident.value.to_lowercase();
-                                if let Some(&idx) = col_map.get(col_name.as_str()) {
-                                    (AggregateOp::Min, idx)
-                                } else {
-                                    return None;
-                                }
-                            } else {
-                                return None;
-                            }
-                        }
-                        "MAX" => {
-                            if let Some(Expression::Identifier(ident)) = fc.arguments.first() {
-                                let col_name = ident.value.to_lowercase();
-                                if let Some(&idx) = col_map.get(col_name.as_str()) {
-                                    (AggregateOp::Max, idx)
-                                } else {
-                                    return None;
-                                }
-                            } else {
-                                return None;
-                            }
-                        }
-                        _ => return None, // Unsupported aggregate
-                    };
-                    aggregates.push((op, col_idx));
-
-                    // Generate column name for result
-                    let col_name = if let Some(Expression::Identifier(ident)) = fc.arguments.first()
-                    {
-                        format!("{}({})", func_name, ident.value)
-                    } else {
-                        format!("{}(*)", func_name)
-                    };
-                    result_columns.push(col_name);
-                }
-                Expression::Aliased(aliased) => {
-                    // Handle aliased identifier (group by column with alias)
-                    if let Expression::Identifier(ident) = aliased.expression.as_ref() {
-                        let col_name_lower = ident.value.to_lowercase().to_string();
-                        if !group_by_col_names.contains(&col_name_lower) {
-                            return None; // Column not in GROUP BY
-                        }
-                        if seen_aggregate {
-                            return None;
-                        }
-                        select_group_count += 1;
-                        result_columns.push(aliased.alias.value.to_string());
-                    }
-                    // Handle aliased aggregate
-                    else if let Expression::FunctionCall(fc) = aliased.expression.as_ref() {
-                        // Don't support FILTER clause or DISTINCT for this optimization
-                        if fc.filter.is_some() || fc.is_distinct {
-                            return None;
-                        }
-                        seen_aggregate = true;
-                        let func_name = fc.function.to_uppercase();
-                        let (op, col_idx) = match func_name.as_str() {
-                            "COUNT" => {
-                                if fc.arguments.is_empty()
-                                    || matches!(fc.arguments.first(), Some(Expression::Star(_)))
-                                {
-                                    (AggregateOp::CountStar, 0)
-                                } else if let Some(Expression::Identifier(ident)) =
-                                    fc.arguments.first()
-                                {
-                                    let col_name = ident.value.to_lowercase();
-                                    if let Some(&idx) = col_map.get(col_name.as_str()) {
-                                        (AggregateOp::Count, idx)
-                                    } else {
-                                        return None;
-                                    }
-                                } else {
-                                    return None;
-                                }
-                            }
-                            "SUM" => {
-                                if let Some(Expression::Identifier(ident)) = fc.arguments.first() {
-                                    let col_name = ident.value.to_lowercase();
-                                    if let Some(&idx) = col_map.get(col_name.as_str()) {
-                                        (AggregateOp::Sum, idx)
-                                    } else {
-                                        return None;
-                                    }
-                                } else {
-                                    return None;
-                                }
-                            }
-                            "AVG" => {
-                                if let Some(Expression::Identifier(ident)) = fc.arguments.first() {
-                                    let col_name = ident.value.to_lowercase();
-                                    if let Some(&idx) = col_map.get(col_name.as_str()) {
-                                        (AggregateOp::Avg, idx)
-                                    } else {
-                                        return None;
-                                    }
-                                } else {
-                                    return None;
-                                }
-                            }
-                            "MIN" => {
-                                if let Some(Expression::Identifier(ident)) = fc.arguments.first() {
-                                    let col_name = ident.value.to_lowercase();
-                                    if let Some(&idx) = col_map.get(col_name.as_str()) {
-                                        (AggregateOp::Min, idx)
-                                    } else {
-                                        return None;
-                                    }
-                                } else {
-                                    return None;
-                                }
-                            }
-                            "MAX" => {
-                                if let Some(Expression::Identifier(ident)) = fc.arguments.first() {
-                                    let col_name = ident.value.to_lowercase();
-                                    if let Some(&idx) = col_map.get(col_name.as_str()) {
-                                        (AggregateOp::Max, idx)
-                                    } else {
-                                        return None;
-                                    }
-                                } else {
-                                    return None;
-                                }
-                            }
-                            _ => return None,
-                        };
-                        aggregates.push((op, col_idx));
-                        result_columns.push(aliased.alias.value.to_string());
-                    } else {
-                        return None; // Other aliased expression not supported
-                    }
-                }
-                _ => return None, // Unsupported expression type
+        // One storage aggregate per slot, ORDER BY's own included
+        let (aggregations, _) = match self.parse_aggregations(stmt) {
+            Ok(parsed) => parsed,
+            Err(error) => return Some(Err(error)),
+        };
+        if aggregations.is_empty() {
+            return None;
+        }
+        let mut aggregates: Vec<(AggregateOp, usize)> = Vec::with_capacity(aggregations.len());
+        for agg in &aggregations {
+            if agg.distinct
+                || agg.filter.is_some()
+                || agg.expression.is_some()
+                || !agg.order_by.is_empty()
+                || !agg.extra_args.is_empty()
+            {
+                return None;
             }
+            let column = || col_map.get(agg.column_lower.as_str()).copied();
+            aggregates.push(match (agg.name.as_str(), agg.column.as_str()) {
+                ("COUNT", "*") => (AggregateOp::CountStar, 0),
+                ("COUNT", _) => (AggregateOp::Count, column()?),
+                ("SUM", _) => (AggregateOp::Sum, column()?),
+                ("AVG", _) => (AggregateOp::Avg, column()?),
+                ("MIN", _) => (AggregateOp::Min, column()?),
+                ("MAX", _) => (AggregateOp::Max, column()?),
+                _ => return None,
+            });
         }
 
-        // Must have at least one aggregate
-        if aggregates.is_empty() {
-            return None;
-        }
-
-        // SELECT must include at least all GROUP BY columns (can have more)
-        // but for simplicity, require exact match with GROUP BY column count
-        if select_group_count != group_by_col_names.len() {
-            return None;
-        }
-
-        // Call storage-level aggregation
         let results = match table.compute_grouped_aggregates(&group_by_indices, &aggregates) {
             Ok(results) => results?,
             Err(error) => return Some(Err(error)),
         };
 
-        // Convert to rows
+        let mut slot_columns: Vec<String> = group_by_indices
+            .iter()
+            .map(|&i| all_columns[i].clone())
+            .collect();
+        slot_columns.extend(aggregations.iter().map(|agg| agg.get_column_name()));
         let mut rows = RowVec::new();
         for (row_id, r) in results.into_iter().enumerate() {
             let mut values = r.group_values;
@@ -6678,8 +6617,19 @@ impl Executor {
                 Row::from_compact_vec(CompactVec::from_vec(values)),
             ));
         }
-
-        Some(Ok(Box::new(ExecutorResult::new(result_columns, rows))))
+        let slots = AggregateSlots {
+            stmt,
+            written_stmt: stmt,
+            aggregations: &aggregations,
+            group_by_count: group_by_indices.len(),
+        };
+        Some(self.finish_aggregation(
+            AggregatePath::StorageGrouped,
+            slots,
+            ctx,
+            slot_columns,
+            rows,
+        ))
     }
 
     /// Try fast COUNT(DISTINCT col) using compiled cache

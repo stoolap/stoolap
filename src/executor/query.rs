@@ -2631,9 +2631,13 @@ impl Executor {
             // Try storage-level GROUP BY aggregation (no WHERE clause)
             // This computes aggregates directly from arena without materializing Row objects
             if classification.has_group_by && !classification.has_where {
-                if let Some(result) =
-                    self.try_storage_aggregation(table.as_ref(), stmt, &all_columns, classification)
-                {
+                if let Some(result) = self.try_storage_aggregation(
+                    table.as_ref(),
+                    stmt,
+                    ctx,
+                    &all_columns,
+                    classification,
+                ) {
                     let result = result?;
                     let columns = CompactArc::new(result.columns().to_vec());
                     return Ok((result, columns, false, None));
@@ -6367,7 +6371,7 @@ impl Executor {
             && !classification.has_window_functions
         {
             if let Some(agg_result) =
-                self.try_streaming_derived_table_aggregation(result, stmt, classification)?
+                self.try_streaming_derived_table_aggregation(result, stmt, ctx, classification)?
             {
                 let out_columns = CompactArc::new(agg_result.columns().to_vec());
                 return Ok((agg_result, out_columns, false, None));
@@ -12259,72 +12263,6 @@ impl Executor {
         })
     }
 
-    /// Extract simple aggregations from SELECT columns
-    /// Returns Vec of (function_name, column_name, optional_alias)
-    fn extract_aggregations_simple(
-        &self,
-        stmt: &SelectStatement,
-    ) -> Vec<(String, String, Option<String>)> {
-        let mut result = Vec::new();
-
-        for col in &stmt.columns {
-            // A FILTER or DISTINCT narrows what the aggregate reads, and the
-            // streaming path below reads the column whole
-            let call = match col {
-                Expression::FunctionCall(fc) => Some(fc),
-                Expression::Aliased(aliased) => match aliased.expression.as_ref() {
-                    Expression::FunctionCall(fc) => Some(fc),
-                    _ => None,
-                },
-                _ => None,
-            };
-            if call.is_some_and(|fc| fc.filter.is_some() || fc.is_distinct) {
-                return Vec::new();
-            }
-            match col {
-                Expression::FunctionCall(fc) => {
-                    let func_upper = fc.function.to_uppercase();
-                    if matches!(func_upper.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") {
-                        let col_name = if fc.arguments.is_empty() {
-                            "*".to_string()
-                        } else if let Some(Expression::Star(_)) = fc.arguments.first() {
-                            "*".to_string()
-                        } else if let Some(Expression::Identifier(id)) = fc.arguments.first() {
-                            id.value_lower.to_string()
-                        } else {
-                            continue; // Skip complex expressions
-                        };
-                        result.push((func_upper.into(), col_name, None));
-                    }
-                }
-                Expression::Aliased(aliased) => {
-                    if let Expression::FunctionCall(fc) = aliased.expression.as_ref() {
-                        let func_upper = fc.function.to_uppercase();
-                        if matches!(func_upper.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") {
-                            let col_name = if fc.arguments.is_empty() {
-                                "*".to_string()
-                            } else if let Some(Expression::Star(_)) = fc.arguments.first() {
-                                "*".to_string()
-                            } else if let Some(Expression::Identifier(id)) = fc.arguments.first() {
-                                id.value_lower.to_string()
-                            } else {
-                                continue; // Skip complex expressions
-                            };
-                            result.push((
-                                func_upper.into(),
-                                col_name,
-                                Some(aliased.alias.value.to_string()),
-                            ));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        result
-    }
-
     /// Streaming GROUP BY optimization using B-tree index
     ///
     /// For queries like `SELECT user_id, SUM(amount) FROM orders GROUP BY user_id`
@@ -12364,27 +12302,34 @@ impl Executor {
             return Ok(None);
         }
 
-        // Check if GROUP BY is a simple column reference
-        let group_col_name: String = match &stmt.group_by.columns[0] {
-            Expression::Identifier(id) => id.value_lower.to_string(),
-            _ => return Ok(None),
+        let Some((group_col_name, false)) = self.single_group_column(stmt)? else {
+            return Ok(None);
         };
 
-        // Extract aggregations from SELECT columns
-        let aggregations = self.extract_aggregations_simple(stmt);
+        // The aggregate slots, as every aggregate path reads them; the select
+        // list may read the group column and aggregate calls only
+        let (aggregations, non_agg_columns) = self.parse_aggregations(stmt)?;
         if aggregations.is_empty() {
             return Ok(None);
         }
-        // The extraction drops DISTINCT flags and this path has no dedup
-        // state, so bail on any DISTINCT aggregate.
-        let has_distinct = stmt.columns.iter().any(|c| match c {
-            Expression::FunctionCall(fc) => fc.is_distinct,
-            Expression::Aliased(a) => {
-                matches!(a.expression.as_ref(), Expression::FunctionCall(fc) if fc.is_distinct)
+        let readable = |expr: &Expression| {
+            let inner = match expr {
+                Expression::Aliased(aliased) => aliased.expression.as_ref(),
+                other => other,
+            };
+            match inner {
+                Expression::Identifier(id) => id.value_lower == group_col_name.as_str(),
+                Expression::FunctionCall(fc) => {
+                    crate::executor::utils::is_aggregate_function(&fc.function)
+                }
+                _ => false,
             }
-            _ => false,
-        });
-        if has_distinct {
+        };
+        if !stmt.columns.iter().all(readable)
+            || !non_agg_columns
+                .iter()
+                .all(|column| column.eq_ignore_ascii_case(&group_col_name))
+        {
             return Ok(None);
         }
 
@@ -12399,7 +12344,17 @@ impl Executor {
         }
 
         let mut simple_aggs: Vec<StreamingAgg> = Vec::with_capacity(aggregations.len());
-        for (func_name, col_name, _alias) in &aggregations {
+        for agg in &aggregations {
+            // This walk keeps no distinct state and reads each column whole
+            if agg.distinct
+                || agg.filter.is_some()
+                || agg.expression.is_some()
+                || !agg.order_by.is_empty()
+                || !agg.extra_args.is_empty()
+            {
+                return Ok(None);
+            }
+            let (func_name, col_name) = (&agg.name, &agg.column_lower);
             match func_name.as_str() {
                 // Only COUNT(*) counts rows; COUNT(col) must skip NULLs,
                 // which this streaming path cannot do.
@@ -12437,68 +12392,25 @@ impl Executor {
             return Ok(None); // Fall back to non-streaming (faster for SUM/AVG/MIN/MAX)
         }
 
-        // Check for simple HAVING filter
-        let having_filter: Option<(usize, f64, bool)> = if let Some(ref having) = stmt.having {
-            // Only support simple comparisons: agg_expr > constant
-            match &**having {
-                Expression::Infix(infix) => {
-                    if infix.operator != ">" && infix.operator != ">=" {
-                        return Ok(None);
-                    }
-                    // Left side should be an aggregate function
-                    let agg_idx = match infix.left.as_ref() {
-                        Expression::FunctionCall(fc) => {
-                            // The walk keeps no distinct state, so an
-                            // aggregate the clause asks to deduplicate before
-                            // it aggregates is not one this walk can evaluate
-                            if fc.is_distinct {
-                                return Ok(None);
-                            }
-                            let func_upper = fc.function.to_uppercase();
-                            // The argument decides which aggregate this is:
-                            // SUM(v) and SUM(w) share a name, and binding by
-                            // the name alone would test the wrong one
-                            let arg = match fc.arguments.first() {
-                                Some(Expression::Star(_)) => "*".to_string(),
-                                Some(Expression::Identifier(id)) => id.value_lower.to_string(),
-                                _ => return Ok(None),
-                            };
-                            aggregations.iter().position(|(name, col, _)| {
-                                name == func_upper.as_str() && col == arg.as_str()
-                            })
-                        }
-                        _ => None,
-                    };
-                    // Right side should be a constant
-                    let threshold = match infix.right.as_ref() {
-                        Expression::IntegerLiteral(n) => Some(n.value as f64),
-                        Expression::FloatLiteral(f) => Some(f.value),
-                        _ => None,
-                    };
-                    match (agg_idx, threshold) {
-                        (Some(idx), Some(thresh)) => Some((idx, thresh, infix.operator == ">=")),
-                        _ => return Ok(None), // Unsupported HAVING
-                    }
-                }
-                _ => return Ok(None),
-            }
-        } else {
-            None
+        // HAVING by the inline filter the other aggregate paths run, so every
+        // group passes or fails by the same comparison
+        let having_filter = match stmt.having.as_deref() {
+            Some(having) => match crate::executor::try_parse_simple_having(having, &aggregations) {
+                Some(filter) => Some(filter),
+                None => return Ok(None),
+            },
+            None => None,
         };
 
-        // Build result columns
-        let mut result_columns = Vec::with_capacity(1 + aggregations.len());
-        result_columns.push(group_col_name.clone());
-        for (func_name, col_name, alias) in &aggregations {
-            let col_name = if let Some(ref a) = alias {
-                a.clone()
-            } else if col_name == "*" {
-                format!("{}(*)", func_name)
-            } else {
-                format!("{}({})", func_name, col_name)
-            };
-            result_columns.push(col_name);
-        }
+        let Some(group_column) = all_columns
+            .iter()
+            .find(|c| c.eq_ignore_ascii_case(&group_col_name))
+        else {
+            return Ok(None);
+        };
+        let mut slot_columns = Vec::with_capacity(1 + aggregations.len());
+        slot_columns.push(group_column.clone());
+        slot_columns.extend(aggregations.iter().map(|agg| agg.get_column_name()));
 
         // Streaming aggregation: iterate through groups in sorted order
         let mut result_rows = RowVec::new();
@@ -12522,13 +12434,36 @@ impl Executor {
         use crate::storage::expression::logical::ConstBoolExpr;
         let true_expr = ConstBoolExpr::true_expr();
 
+        // MIN and MAX by the aggregate functions every other path runs, so
+        // each type orders and answers as it does there; one per slot,
+        // reset for each group
+        let mut extremes: Vec<Option<Box<dyn crate::functions::AggregateFunction>>> =
+            Vec::with_capacity(num_aggs);
+        for agg in &simple_aggs {
+            extremes.push(match agg {
+                StreamingAgg::Min(_) | StreamingAgg::Max(_) => {
+                    let name = if matches!(agg, StreamingAgg::Min(_)) {
+                        "MIN"
+                    } else {
+                        "MAX"
+                    };
+                    match self.function_registry.get_aggregate(name) {
+                        Some(function) => Some(function),
+                        None => return Ok(None),
+                    }
+                }
+                _ => None,
+            });
+        }
+
         let mut aggregate = |group_value: &Value, row_ids: GroupIds<'_>| -> Result<bool> {
-            // Aggregate state: sums for SUM/AVG, min/max values, counts
+            // Aggregate state: sums for SUM/AVG, counts; MIN and MAX in `extremes`
             let mut agg_sums = vec![0.0f64; num_aggs];
-            let mut agg_mins = vec![f64::MAX; num_aggs];
-            let mut agg_maxs = vec![f64::MIN; num_aggs];
             let mut agg_has_value = vec![false; num_aggs];
             let mut counts = vec![0i64; num_aggs];
+            for function in extremes.iter_mut().flatten() {
+                function.reset();
+            }
 
             // Optimization: For COUNT-only aggregates, use row_ids.len() directly
             let row_count = row_ids.len() as i64;
@@ -12562,34 +12497,11 @@ impl Executor {
                                         }
                                     }
                                 }
-                                StreamingAgg::Min(col_idx) => {
-                                    if let Some(value) = row.get(*col_idx) {
-                                        let v = match value {
-                                            Value::Integer(v) => Some(*v as f64),
-                                            Value::Float(v) => Some(*v),
-                                            _ => None,
-                                        };
-                                        if let Some(v) = v {
-                                            if v < agg_mins[i] {
-                                                agg_mins[i] = v;
-                                            }
-                                            agg_has_value[i] = true;
-                                        }
-                                    }
-                                }
-                                StreamingAgg::Max(col_idx) => {
-                                    if let Some(value) = row.get(*col_idx) {
-                                        let v = match value {
-                                            Value::Integer(v) => Some(*v as f64),
-                                            Value::Float(v) => Some(*v),
-                                            _ => None,
-                                        };
-                                        if let Some(v) = v {
-                                            if v > agg_maxs[i] {
-                                                agg_maxs[i] = v;
-                                            }
-                                            agg_has_value[i] = true;
-                                        }
+                                StreamingAgg::Min(col_idx) | StreamingAgg::Max(col_idx) => {
+                                    if let (Some(value), Some(function)) =
+                                        (row.get(*col_idx), extremes[i].as_mut())
+                                    {
+                                        function.accumulate(value, false);
                                     }
                                 }
                             }
@@ -12605,50 +12517,10 @@ impl Executor {
                 }
             }
 
-            // Apply HAVING filter
-            if let Some((agg_idx, threshold, inclusive)) = having_filter {
-                let agg_val = match simple_aggs[agg_idx] {
-                    StreamingAgg::Count => counts[agg_idx] as f64,
-                    StreamingAgg::Sum(_) | StreamingAgg::Avg(_) => {
-                        if agg_has_value[agg_idx] {
-                            match simple_aggs[agg_idx] {
-                                StreamingAgg::Avg(_) if counts[agg_idx] > 0 => {
-                                    agg_sums[agg_idx] / counts[agg_idx] as f64
-                                }
-                                _ => agg_sums[agg_idx],
-                            }
-                        } else {
-                            return Ok(true); // NULL doesn't pass HAVING, continue to next group
-                        }
-                    }
-                    StreamingAgg::Min(_) => {
-                        if agg_has_value[agg_idx] {
-                            agg_mins[agg_idx]
-                        } else {
-                            return Ok(true); // Continue to next group
-                        }
-                    }
-                    StreamingAgg::Max(_) => {
-                        if agg_has_value[agg_idx] {
-                            agg_maxs[agg_idx]
-                        } else {
-                            return Ok(true); // Continue to next group
-                        }
-                    }
-                };
-                let passes = if inclusive {
-                    agg_val >= threshold
-                } else {
-                    agg_val > threshold
-                };
-                if !passes {
-                    return Ok(true); // Continue to next group
-                }
-            }
-
-            // Build result row - only clone group_value when we need to keep it
+            // One value per aggregate slot, then HAVING over them; only a
+            // group that passes clones its group value
             let mut values = Vec::with_capacity(1 + num_aggs);
-            values.push(group_value.clone());
+            values.push(Value::null_unknown());
             for (i, agg) in simple_aggs.iter().enumerate() {
                 let value = match agg {
                     StreamingAgg::Count => Value::Integer(counts[i]),
@@ -12666,23 +12538,19 @@ impl Executor {
                             Value::null_unknown()
                         }
                     }
-                    StreamingAgg::Min(_) => {
-                        if agg_has_value[i] {
-                            Value::Float(agg_mins[i])
-                        } else {
-                            Value::null_unknown()
-                        }
-                    }
-                    StreamingAgg::Max(_) => {
-                        if agg_has_value[i] {
-                            Value::Float(agg_maxs[i])
-                        } else {
-                            Value::null_unknown()
-                        }
-                    }
+                    StreamingAgg::Min(_) | StreamingAgg::Max(_) => extremes[i]
+                        .as_ref()
+                        .map_or_else(Value::null_unknown, |function| function.result()),
                 };
                 values.push(value);
             }
+            if having_filter
+                .as_ref()
+                .is_some_and(|filter| !filter.passes(&values[1..]))
+            {
+                return Ok(true); // Continue to next group
+            }
+            values[0] = group_value.clone();
             result_rows.push((result_row_id, Row::from_values(values)));
             result_row_id += 1;
 
@@ -12716,10 +12584,21 @@ impl Executor {
             result_rows.truncate(keep);
         }
 
-        let result_columns = CompactArc::new(result_columns);
-        let result =
-            ExecutorResult::with_arc_columns(CompactArc::clone(&result_columns), result_rows);
-        Ok(Some((Box::new(result), result_columns)))
+        let slots = crate::executor::AggregateSlots {
+            stmt,
+            written_stmt: stmt,
+            aggregations: &aggregations,
+            group_by_count: 1,
+        };
+        let result = self.finish_aggregation(
+            crate::executor::AggregatePath::StreamingGroupBy,
+            slots,
+            ctx,
+            slot_columns,
+            result_rows,
+        )?;
+        let columns = CompactArc::new(result.columns().to_vec());
+        Ok(Some((result, columns)))
     }
 }
 
