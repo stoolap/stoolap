@@ -552,7 +552,27 @@ Currently, Stoolap supports the following subquery features:
 - ANY/SOME and ALL operators for subquery comparisons
 
 **Not Yet Supported:**
-- None - all major subquery features are supported!
+
+A subquery in these positions is refused with an error rather than answered. Support arrives as each position moves to prepared plans:
+
+- `INSERT ... VALUES`, `ON CONFLICT ... DO UPDATE SET` and `RETURNING`
+- An `UPDATE` that sets one column from a correlated subquery and another from an uncorrelated one
+- A column `DEFAULT` or a `CHECK` constraint (the `DEFAULT` fails only for a row that takes it)
+- `GROUP BY` and `DISTINCT ON` expressions
+- `HAVING` in a query that also has window functions
+- A grouped `SELECT` list that holds both a correlated and an uncorrelated subquery
+- An uncorrelated subquery in the `WHERE` or `SELECT` list of a query over a view, a derived table or a `VALUES` list
+- A correlated subquery in a `JOIN ... ON` condition
+- The argument of `NTILE`, the offset of `LAG` and `LEAD`, or the position of `NTH_VALUE`, when the subquery reads the current row: the argument is one value per partition
+- `LIMIT` and `OFFSET`
+
+The error reads, for example:
+
+```
+Compile error: Unsupported expression: scalar subquery outside a prepared plan
+```
+
+with `EXISTS`, `IN (subquery)` or `ANY or ALL` in place of `scalar subquery` for those forms.
 
 ## Best Practices
 
