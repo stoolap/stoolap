@@ -3235,7 +3235,7 @@ impl ExprVM {
     /// A fused column comparison for a cell the numeric fast arms do not
     /// take, by the same rules as the general interpreter
     #[cold]
-    fn fused_cell(op: &Op, cell: Option<&Value>) -> Option<bool> {
+    pub(crate) fn fused_cell(op: &Op, cell: Option<&Value>) -> Option<bool> {
         let cell = cell.unwrap_or(&NULL_VALUE);
         let value = match op {
             Op::GtColumnConst(_, Value::Integer(t)) => Self::gt_int(cell, *t),

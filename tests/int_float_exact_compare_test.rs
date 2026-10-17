@@ -188,3 +188,62 @@ fn a_column_default_compares_exactly_on_older_volumes() {
         wrong.join("\n")
     );
 }
+
+fn groups(db: &Database, sql: &str) -> Result<Vec<i64>, String> {
+    let mut out = Vec::new();
+    for row in db.query(sql, ()).map_err(|e| e.to_string())? {
+        out.push(
+            row.map_err(|e| e.to_string())?
+                .get::<i64>(0)
+                .map_err(|e| e.to_string())?,
+        );
+    }
+    out.sort_unstable();
+    Ok(out)
+}
+
+#[test]
+fn having_on_an_aggregate_answers_as_on_its_alias_for_every_type() {
+    let db = Database::open("memory://having_alias_types").unwrap();
+    db.execute(
+        "CREATE TABLE h (id INTEGER PRIMARY KEY, g INTEGER, b BOOLEAN, ts TIMESTAMP, \
+         s TEXT, i INTEGER, f FLOAT)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO h VALUES \
+         (1, 1, FALSE, '2025-01-01 00:00:00', '0', 9007199254740993, 0.5), \
+         (2, 2, TRUE, '2025-06-01 00:00:00', 'abc', 1, 1.5), \
+         (3, 2, FALSE, '2025-03-01 00:00:00', '2', -1, -2.0)",
+        (),
+    )
+    .unwrap();
+    let mut wrong = Vec::new();
+    for col in ["b", "ts", "s", "i", "f"] {
+        for agg in ["MIN", "MAX"] {
+            for op in ["=", "<>", "<", "<=", ">", ">="] {
+                for c in ["0", "1", "1.5", "9007199254740992"] {
+                    let inline = format!("SELECT g FROM h GROUP BY g HAVING {agg}({col}) {op} {c}");
+                    let alias =
+                        format!("SELECT g, {agg}({col}) AS m FROM h GROUP BY g HAVING m {op} {c}");
+                    let (a, b) = (groups(&db, &inline), groups(&db, &alias));
+                    if a != b {
+                        wrong.push(format!("{inline}: {a:?}, as alias: {b:?}"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+    assert_eq!(
+        groups(&db, "SELECT g FROM h GROUP BY g HAVING MAX(b) > 0"),
+        Ok(vec![]),
+        "a BOOLEAN is not above a number"
+    );
+}

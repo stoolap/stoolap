@@ -43,7 +43,7 @@ use super::context::ExecutionContext;
 use super::expr_key::ExprKey;
 #[allow(deprecated)]
 use super::expression::CompiledEvaluator;
-use super::expression::{ExpressionEval, RowFilter};
+use super::expression::{ExprVM, ExpressionEval, Op, RowFilter};
 use super::query_cache::{CompiledCountDistinct, CompiledExecution};
 use super::query_classification::QueryClassification;
 use super::result::ExecutorResult;
@@ -59,10 +59,9 @@ pub use super::utils::{expression_contains_aggregate, is_aggregate_function};
 struct HavingCondition {
     /// Index of the aggregate in the aggregations array
     agg_index: usize,
-    /// Comparison operator
-    op: ComparisonOp,
-    /// Threshold value, an INTEGER or FLOAT as written
-    threshold: Value,
+    /// The column-constant comparison the general path compiles this
+    /// condition to, so both answer alike for every aggregate type
+    op: Op,
 }
 
 /// Simple HAVING filter for inline application during fast aggregation
@@ -85,31 +84,25 @@ enum ComparisonOp {
 }
 
 impl HavingCondition {
-    /// Check if a value passes this condition, by the predicate comparison
+    /// Check if a value passes this condition
     fn matches(&self, value: &Value) -> bool {
-        let Some(ord) = crate::core::predicate::sql_compare(value, &self.threshold) else {
-            return false;
-        };
-        match self.op {
-            ComparisonOp::Gt => ord.is_gt(),
-            ComparisonOp::Gte => ord.is_ge(),
-            ComparisonOp::Lt => ord.is_lt(),
-            ComparisonOp::Lte => ord.is_le(),
-            ComparisonOp::Eq => ord.is_eq(),
-            ComparisonOp::Neq => ord.is_ne(),
-        }
+        ExprVM::fused_cell(&self.op, Some(value)) == Some(true)
     }
 }
 
 impl SimpleHavingFilter {
     /// Create a filter with a single condition
     fn single(agg_index: usize, op: ComparisonOp, threshold: Value) -> Self {
+        let op = match op {
+            ComparisonOp::Gt => Op::GtColumnConst(0, threshold),
+            ComparisonOp::Gte => Op::GeColumnConst(0, threshold),
+            ComparisonOp::Lt => Op::LtColumnConst(0, threshold),
+            ComparisonOp::Lte => Op::LeColumnConst(0, threshold),
+            ComparisonOp::Eq => Op::EqColumnConst(0, threshold),
+            ComparisonOp::Neq => Op::NeColumnConst(0, threshold),
+        };
         Self {
-            conditions: vec![HavingCondition {
-                agg_index,
-                op,
-                threshold,
-            }],
+            conditions: vec![HavingCondition { agg_index, op }],
         }
     }
 
