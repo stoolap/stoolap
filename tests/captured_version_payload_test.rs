@@ -18,9 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use stoolap::core::{Row, RowVec, Value};
 use stoolap::storage::expression::ComparisonExpr;
-use stoolap::storage::mvcc::version_store::{
-    AggregateOp, AggregateResult, RowVersion, VersionStore,
-};
+use stoolap::storage::mvcc::version_store::{RowVersion, VersionStore};
 use stoolap::storage::Engine;
 use stoolap::{test_failpoints, Database, IsolationLevel};
 
@@ -158,11 +156,24 @@ captured_rows_test!(captured_filtered_limit, |store, id| store
 
 #[test]
 fn captured_aggregate() {
-    let values = read_across_update("captured_aggregate", |store, id| {
-        store.compute_aggregates(id.into(), &[(AggregateOp::Sum, 1)])
+    let sum = read_across_update("captured_sum", |store, id| {
+        store.sum_column(id.into(), 1).sum().unwrap()
     });
-    assert!(
-        matches!(values.as_slice(), [AggregateResult::Sum(100.0, 1)]),
-        "snapshot must aggregate the captured value, got {values:?}"
+    assert_eq!(
+        sum,
+        Value::Integer(100),
+        "snapshot must sum the captured value"
+    );
+    let min = read_across_update("captured_min", |store, id| store.min_column(id.into(), 1));
+    assert_eq!(
+        min,
+        Some(Value::Integer(100)),
+        "snapshot must read the captured minimum"
+    );
+    let max = read_across_update("captured_max", |store, id| store.max_column(id.into(), 1));
+    assert_eq!(
+        max,
+        Some(Value::Integer(100)),
+        "snapshot must read the captured maximum"
     );
 }

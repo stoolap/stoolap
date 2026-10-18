@@ -74,8 +74,8 @@ pub use transaction::{
     MvccTransaction, SealFenceGuard, TransactionEngineOperations, TransactionState,
 };
 pub use version_store::{
-    clear_version_map_pools, AggregateOp, AggregateResult, RowVersion, SealedIndexCleanup,
-    TransactionVersionStore, TxnTableStore, VersionStore, VisibilityChecker, WriteSetEntry,
+    clear_version_map_pools, AggregateOp, RowVersion, SealedIndexCleanup, TransactionVersionStore,
+    TxnTableStore, VersionStore, VisibilityChecker, WriteSetEntry,
 };
 pub use wal_manager::{
     CheckpointMetadata, WALEntry, WALManager, WALOperationType, DEFAULT_WAL_BUFFER_SIZE,

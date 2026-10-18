@@ -370,9 +370,7 @@ pub fn clear_version_map_pools() {
 /// Capacity hint for transaction version maps - used by pool functions
 const TX_VERSION_MAP_INITIAL_CAPACITY: usize = 16;
 
-/// Aggregate operation type for deferred aggregation
-///
-/// Used with `compute_aggregates()` to perform multiple aggregations in a single pass.
+/// Aggregate operation type for the storage aggregate pushdowns
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AggregateOp {
     Count,
@@ -430,34 +428,6 @@ pub fn aggregate_row(
             run.accumulate(row.get(col_idx).unwrap_or(&ABSENT));
         }
     }
-}
-
-/// Result of an aggregate operation
-#[derive(Clone, Debug)]
-pub enum AggregateResult {
-    /// Count result
-    Count(usize),
-    /// Sum result (sum, count of non-null values)
-    Sum(f64, usize),
-    /// Min result
-    Min(Option<Value>),
-    /// Max result
-    Max(Option<Value>),
-    /// Avg result (sum, count of non-null values) - caller computes sum/count
-    Avg(f64, usize),
-}
-
-/// Internal accumulator for aggregations.
-/// Sum/Avg use split i128 + f64 accumulators: i128 for integers (no overflow),
-/// f64 for floats. Combined as `int as f64 + float` at finalization.
-enum AggregateAccumulator {
-    Count(usize),
-    /// (int_sum, float_sum, count)
-    Sum(i128, f64, usize),
-    Min(Option<Value>),
-    Max(Option<Value>),
-    /// (int_sum, float_sum, count)
-    Avg(i128, f64, usize),
 }
 
 /// Visibility checker trait - will be implemented by TransactionRegistry
@@ -631,6 +601,16 @@ impl<'a> Reader<'a> {
             view: self.view,
         }
     }
+}
+
+/// How a pass over the arena's heads ended
+enum HeadsPass {
+    /// Every head the reader sees was visited
+    Answered,
+    /// The arena holds no rows; the chains may
+    Empty,
+    /// The heads cannot answer for the reader, or a commit published
+    Unheld,
 }
 
 /// A checker answering for one reader: through its view when it has one
@@ -4959,43 +4939,12 @@ impl VersionStore {
             // arena_guard dropped here — no need to hold it for slow path
         }
 
-        // SLOW PATH: Full iteration over version chains (single pass)
-        let versions = self.versions.read().clone();
-
-        // Cache visibility for slow path too
-        let mut last_txn_id: i64 = 0;
-        let mut last_visible: bool = false;
-
-        for chain in versions.values() {
-            let mut current: Option<&VersionChainEntry> = Some(chain);
-
-            while let Some(e) = current {
-                let version_txn_id = e.version.txn_id;
-                let deleted_at_txn_id = e.version.deleted_at_txn_id;
-
-                let is_vis = if version_txn_id == last_txn_id {
-                    last_visible
-                } else {
-                    let vis = checker.is_visible(version_txn_id, txn_id);
-                    last_txn_id = version_txn_id;
-                    last_visible = vis;
-                    vis
-                };
-
-                if is_vis {
-                    if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
-                        // This version is visible and not deleted - accumulate its value
-                        if let Some(val) = e.version.data.get(col_idx) {
-                            sum.add(val);
-                        }
-                    }
-                    break; // Always break on first visible version
-                }
-
-                current = e.prev.as_deref();
+        // SLOW PATH: the version of every chain the reader sees
+        self.visit_visible_chains(&checker, txn_id, |row| {
+            if let Some(val) = row.get(col_idx) {
+                sum.add(val);
             }
-        }
-
+        });
         sum
     }
 
@@ -5005,109 +4954,7 @@ impl VersionStore {
     pub fn min_column(&self, reader: Reader<'_>, col_idx: usize) -> Option<Value> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.min_column");
-        let checker = reader.over(&**self.visibility_checker.as_ref()?);
-        let txn_id = reader.txn_id;
-
-        let mut min_val: Option<Value> = None;
-
-        // Helper to update min value
-        #[inline(always)]
-        fn update_min(min_val: &mut Option<Value>, val: &Value) {
-            if !val.is_null() {
-                match min_val {
-                    None => *min_val = Some(val.clone()),
-                    Some(ref current) => {
-                        if val.cmp(current).is_lt() {
-                            *min_val = Some(val.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        // FAST PATH: the arena's heads in a single pass, with a minimum of its
-        // own: dropped whole if a publish overlapped it.
-        //
-        // LOCK ORDERING: Check uncommitted_writes BEFORE acquiring arena to maintain
-        // consistent ordering with truncate_all (uncommitted_writes → arena).
-        if let Some(epoch) = self.arena_window(&checker, reader) {
-            let arena_guard = self.arena.read_guard();
-            let arena_meta = arena_guard.meta();
-            let arena_data = arena_guard.data();
-            let arena_len = arena_guard.len();
-
-            if arena_len > 0 {
-                // OPTIMIZATION: Cache visibility result for repeated txn_ids
-                let mut last_txn_id: i64 = 0;
-                let mut last_visible: bool = false;
-
-                let mut idx = 0;
-                while idx < arena_len {
-                    let meta = &arena_meta[idx];
-                    if meta.txn_id != 0 && meta.deleted_at_txn_id == 0 {
-                        let version_txn_id = meta.txn_id;
-                        let is_vis = if version_txn_id == last_txn_id {
-                            last_visible
-                        } else {
-                            let vis = checker.is_visible(version_txn_id, txn_id);
-                            last_txn_id = version_txn_id;
-                            last_visible = vis;
-                            vis
-                        };
-
-                        if is_vis {
-                            if let Some(val) = arena_data[idx].get(col_idx) {
-                                update_min(&mut min_val, val);
-                            }
-                        }
-                    }
-                    idx += 1;
-                }
-                if self.publish_epoch_if_quiet() == Some(epoch) {
-                    return min_val;
-                }
-                min_val = None;
-            }
-            // arena_guard dropped here — no need to hold it for slow path
-        }
-
-        // SLOW PATH: Full iteration over version chains (single pass)
-        let versions = self.versions.read().clone();
-
-        // Cache visibility for slow path too
-        let mut last_txn_id: i64 = 0;
-        let mut last_visible: bool = false;
-
-        for chain in versions.values() {
-            let mut current: Option<&VersionChainEntry> = Some(chain);
-
-            while let Some(e) = current {
-                let version_txn_id = e.version.txn_id;
-                let deleted_at_txn_id = e.version.deleted_at_txn_id;
-
-                let is_vis = if version_txn_id == last_txn_id {
-                    last_visible
-                } else {
-                    let vis = checker.is_visible(version_txn_id, txn_id);
-                    last_txn_id = version_txn_id;
-                    last_visible = vis;
-                    vis
-                };
-
-                if is_vis {
-                    if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
-                        if let Some(val) = e.version.data.get(col_idx) {
-                            update_min(&mut min_val, val);
-                        }
-                    }
-                    break; // Always break on first visible version
-                }
-
-                current = e.prev.as_deref();
-            }
-        }
-
-        min_val
+        self.column_extreme(reader, col_idx, CompiledAggregate::min())
     }
 
     /// Compute MAX(column) without materializing full rows
@@ -5116,303 +4963,7 @@ impl VersionStore {
     pub fn max_column(&self, reader: Reader<'_>, col_idx: usize) -> Option<Value> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.max_column");
-        let checker = reader.over(&**self.visibility_checker.as_ref()?);
-        let txn_id = reader.txn_id;
-
-        let mut max_val: Option<Value> = None;
-
-        // Helper to update max value
-        #[inline(always)]
-        fn update_max(max_val: &mut Option<Value>, val: &Value) {
-            if !val.is_null() {
-                match max_val {
-                    None => *max_val = Some(val.clone()),
-                    Some(ref current) => {
-                        if val.cmp(current).is_gt() {
-                            *max_val = Some(val.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        // FAST PATH: the arena's heads in a single pass, with a maximum of its
-        // own: dropped whole if a publish overlapped it.
-        //
-        // LOCK ORDERING: Check uncommitted_writes BEFORE acquiring arena to maintain
-        // consistent ordering with truncate_all (uncommitted_writes → arena).
-        if let Some(epoch) = self.arena_window(&checker, reader) {
-            let arena_guard = self.arena.read_guard();
-            let arena_meta = arena_guard.meta();
-            let arena_data = arena_guard.data();
-            let arena_len = arena_guard.len();
-
-            if arena_len > 0 {
-                // OPTIMIZATION: Cache visibility result for repeated txn_ids
-                let mut last_txn_id: i64 = 0;
-                let mut last_visible: bool = false;
-
-                let mut idx = 0;
-                while idx < arena_len {
-                    let meta = &arena_meta[idx];
-                    if meta.txn_id != 0 && meta.deleted_at_txn_id == 0 {
-                        let version_txn_id = meta.txn_id;
-                        let is_vis = if version_txn_id == last_txn_id {
-                            last_visible
-                        } else {
-                            let vis = checker.is_visible(version_txn_id, txn_id);
-                            last_txn_id = version_txn_id;
-                            last_visible = vis;
-                            vis
-                        };
-
-                        if is_vis {
-                            if let Some(val) = arena_data[idx].get(col_idx) {
-                                update_max(&mut max_val, val);
-                            }
-                        }
-                    }
-                    idx += 1;
-                }
-                if self.publish_epoch_if_quiet() == Some(epoch) {
-                    return max_val;
-                }
-                max_val = None;
-            }
-            // arena_guard dropped here — no need to hold it for slow path
-        }
-
-        // SLOW PATH: Full iteration over version chains (single pass)
-        let versions = self.versions.read().clone();
-
-        // Cache visibility for slow path too
-        let mut last_txn_id: i64 = 0;
-        let mut last_visible: bool = false;
-
-        for chain in versions.values() {
-            let mut current: Option<&VersionChainEntry> = Some(chain);
-
-            while let Some(e) = current {
-                let version_txn_id = e.version.txn_id;
-                let deleted_at_txn_id = e.version.deleted_at_txn_id;
-
-                let is_vis = if version_txn_id == last_txn_id {
-                    last_visible
-                } else {
-                    let vis = checker.is_visible(version_txn_id, txn_id);
-                    last_txn_id = version_txn_id;
-                    last_visible = vis;
-                    vis
-                };
-
-                if is_vis {
-                    if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
-                        if let Some(val) = e.version.data.get(col_idx) {
-                            update_max(&mut max_val, val);
-                        }
-                    }
-                    break; // Always break on first visible version
-                }
-
-                current = e.prev.as_deref();
-            }
-        }
-
-        max_val
-    }
-
-    /// Compute multiple column aggregates in a single pass
-    ///
-    /// This is the most efficient path for queries like:
-    /// `SELECT SUM(a), AVG(b), MIN(c), MAX(d) FROM table`
-    ///
-    /// Returns aggregates in the order requested.
-    pub fn compute_aggregates(
-        &self,
-        reader: Reader<'_>,
-        aggregates: &[(AggregateOp, usize)], // (operation, column_index)
-    ) -> Vec<AggregateResult> {
-        let empty_result = || {
-            aggregates
-                .iter()
-                .map(|(op, _)| match op {
-                    AggregateOp::Count | AggregateOp::CountStar => AggregateResult::Count(0),
-                    AggregateOp::Sum => AggregateResult::Sum(0.0, 0),
-                    AggregateOp::Min => AggregateResult::Min(None),
-                    AggregateOp::Max => AggregateResult::Max(None),
-                    AggregateOp::Avg => AggregateResult::Avg(0.0, 0),
-                })
-                .collect()
-        };
-
-        let checker = match self.visibility_checker.as_ref() {
-            Some(c) => reader.over(&**c),
-            None => return empty_result(),
-        };
-        let txn_id = reader.txn_id;
-
-        // Initialize accumulators
-        let accumulators = || -> Vec<AggregateAccumulator> {
-            aggregates
-                .iter()
-                .map(|(op, _)| match op {
-                    AggregateOp::Count | AggregateOp::CountStar => AggregateAccumulator::Count(0),
-                    AggregateOp::Sum => AggregateAccumulator::Sum(0, 0.0, 0),
-                    AggregateOp::Min => AggregateAccumulator::Min(None),
-                    AggregateOp::Max => AggregateAccumulator::Max(None),
-                    AggregateOp::Avg => AggregateAccumulator::Avg(0, 0.0, 0),
-                })
-                .collect()
-        };
-        let mut results = accumulators();
-
-        // Helper to update accumulator with a value
-        fn update_accumulator(acc: &mut AggregateAccumulator, op: &AggregateOp, val: &Value) {
-            match (acc, op) {
-                (AggregateAccumulator::Count(c), AggregateOp::Count) if !val.is_null() => {
-                    *c += 1;
-                }
-                (AggregateAccumulator::Count(c), AggregateOp::CountStar) => {
-                    *c += 1;
-                }
-                (AggregateAccumulator::Sum(int_sum, float_sum, cnt), AggregateOp::Sum) => match val
-                {
-                    Value::Integer(i) => {
-                        *int_sum += *i as i128;
-                        *cnt += 1;
-                    }
-                    Value::Float(f) => {
-                        *float_sum += *f;
-                        *cnt += 1;
-                    }
-                    Value::Boolean(b) => {
-                        *int_sum += *b as i128;
-                        *cnt += 1;
-                    }
-                    _ => {}
-                },
-                (AggregateAccumulator::Min(min), AggregateOp::Min) if !val.is_null() => match min {
-                    None => *min = Some(val.clone()),
-                    Some(current) => {
-                        if let Ok(std::cmp::Ordering::Less) = val.compare(current) {
-                            *min = Some(val.clone());
-                        }
-                    }
-                },
-                (AggregateAccumulator::Max(max), AggregateOp::Max) if !val.is_null() => match max {
-                    None => *max = Some(val.clone()),
-                    Some(current) => {
-                        if let Ok(std::cmp::Ordering::Greater) = val.compare(current) {
-                            *max = Some(val.clone());
-                        }
-                    }
-                },
-                (AggregateAccumulator::Avg(int_sum, float_sum, cnt), AggregateOp::Avg) => match val
-                {
-                    Value::Integer(i) => {
-                        *int_sum += *i as i128;
-                        *cnt += 1;
-                    }
-                    Value::Float(f) => {
-                        *float_sum += *f;
-                        *cnt += 1;
-                    }
-                    Value::Boolean(b) => {
-                        *int_sum += *b as i128;
-                        *cnt += 1;
-                    }
-                    _ => {}
-                },
-                _ => {}
-            }
-        }
-
-        // Helper macro: accumulate values from a row-like source by column index
-        macro_rules! accumulate_from {
-            ($src:expr, $results:expr, $aggregates:expr) => {
-                for (i, (op, col_idx)) in $aggregates.iter().enumerate() {
-                    if let Some(val) = $src.get(*col_idx) {
-                        update_accumulator(&mut $results[i], op, val);
-                    }
-                }
-            };
-        }
-
-        // FAST PATH: the arena's heads: the accumulators are dropped whole if
-        // a publish overlapped the pass
-        if let Some(epoch) = self.arena_window(&checker, reader) {
-            let arena_guard = self.arena.read_guard();
-            let arena_meta = arena_guard.meta();
-            let arena_data = arena_guard.data();
-            let arena_len = arena_guard.len();
-
-            if arena_len > 0 {
-                // Asked once per run of heads from one transaction
-                let (mut last_txn_id, mut last_visible) = (0i64, false);
-                for (idx, meta) in arena_meta.iter().enumerate() {
-                    if meta.txn_id == 0 || meta.deleted_at_txn_id != 0 {
-                        continue;
-                    }
-                    if meta.txn_id != last_txn_id {
-                        last_txn_id = meta.txn_id;
-                        last_visible = checker.is_visible(meta.txn_id, txn_id);
-                    }
-                    if last_visible {
-                        if let Some(arc_row) = arena_data.get(idx) {
-                            accumulate_from!(arc_row, results, aggregates);
-                        }
-                    }
-                }
-                if self.publish_epoch_if_quiet() != Some(epoch) {
-                    results = accumulators();
-                } else {
-                    return results
-                        .into_iter()
-                        .map(|acc| match acc {
-                            AggregateAccumulator::Count(c) => AggregateResult::Count(c),
-                            AggregateAccumulator::Sum(is, fs, c) => {
-                                AggregateResult::Sum(is as f64 + fs, c)
-                            }
-                            AggregateAccumulator::Min(v) => AggregateResult::Min(v),
-                            AggregateAccumulator::Max(v) => AggregateResult::Max(v),
-                            AggregateAccumulator::Avg(is, fs, c) => {
-                                AggregateResult::Avg(is as f64 + fs, c)
-                            }
-                        })
-                        .collect();
-                }
-            }
-        }
-
-        // SLOW PATH: Read the payload owned by each captured version.
-        let versions = self.snapshot_versions();
-
-        for chain in versions.values() {
-            let mut current: Option<&VersionChainEntry> = Some(chain);
-            while let Some(e) = current {
-                if checker.is_visible(e.version.txn_id, txn_id) {
-                    if e.version.deleted_at_txn_id == 0
-                        || !checker.is_visible(e.version.deleted_at_txn_id, txn_id)
-                    {
-                        accumulate_from!(e.version.data, results, aggregates);
-                    }
-                    break;
-                }
-                current = e.prev.as_ref().map(|b| b.as_ref());
-            }
-        }
-
-        // Convert accumulators to results
-        results
-            .into_iter()
-            .map(|acc| match acc {
-                AggregateAccumulator::Count(c) => AggregateResult::Count(c),
-                AggregateAccumulator::Sum(is, fs, c) => AggregateResult::Sum(is as f64 + fs, c),
-                AggregateAccumulator::Min(v) => AggregateResult::Min(v),
-                AggregateAccumulator::Max(v) => AggregateResult::Max(v),
-                AggregateAccumulator::Avg(is, fs, c) => AggregateResult::Avg(is as f64 + fs, c),
-            })
-            .collect()
+        self.column_extreme(reader, col_idx, CompiledAggregate::max())
     }
 
     /// Returns the count of rows
@@ -7216,47 +6767,57 @@ impl VersionStore {
     ) -> crate::core::Result<Option<GroupedAggregates>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.compute_grouped_aggregates");
+        let mut groups = grouped_aggregates(group_by_indices, aggregates);
         if self.closed.load(Ordering::Acquire) {
-            return Ok(Some(grouped_aggregates(group_by_indices, aggregates)));
+            return Ok(Some(groups));
         }
-
-        let checker = match self.visibility_checker.as_ref() {
-            Some(c) => reader.over(&**c),
-            None => return Ok(Some(grouped_aggregates(group_by_indices, aggregates))),
+        let Some(checker) = self.visibility_checker.as_ref().map(|c| reader.over(&**c)) else {
+            return Ok(Some(groups));
         };
-        let txn_id = reader.txn_id;
+        // None lets the caller fall back to regular GROUP BY aggregation
+        Ok(
+            match self.visit_live_heads(&checker, reader, |row| {
+                aggregate_row(&mut groups, group_by_indices, aggregates, row)
+            }) {
+                HeadsPass::Answered | HeadsPass::Empty => Some(groups),
+                HeadsPass::Unheld => None,
+            },
+        )
+    }
 
-        // Guard: this path reads only the arena's heads. A head may hide an
-        // older version the reader sees, so it runs only inside the arena
-        // window and answers only if the window held; None lets the caller
-        // fall back to regular GROUP BY aggregation.
-        let Some(epoch) = self.arena_window(&checker, reader) else {
-            return Ok(None);
-        };
-
+    /// Runs `visit` over every arena head `reader` sees. A head may hide an
+    /// older version the reader sees, so the pass runs only inside the arena
+    /// window, and answers only if no commit published across it
+    fn visit_live_heads<C: VisibilityChecker + ?Sized>(
+        &self,
+        checker: &ReaderChecker<'_, '_, C>,
+        reader: Reader<'_>,
+        mut visit: impl FnMut(&[Value]),
+    ) -> HeadsPass {
         // Slots between checks that no commit began publishing: its answer
         // would be dropped, so the pass stops and lets the commit take the arena
         const EPOCH_STRIDE: usize = 1024;
 
-        // Pre-acquire arena lock ONCE
+        let Some(epoch) = self.arena_window(checker, reader) else {
+            return HeadsPass::Unheld;
+        };
         let arena_guard = self.arena.read_guard();
-        let arena_data = arena_guard.data();
-        let arena_meta = arena_guard.meta();
-
-        let mut groups = grouped_aggregates(group_by_indices, aggregates);
+        if arena_guard.is_empty() {
+            return HeadsPass::Empty;
+        }
+        let (arena_meta, arena_data) = (arena_guard.meta(), arena_guard.data());
+        let txn_id = reader.txn_id;
         // Asked once per run of heads from one transaction
         let (mut last_txn_id, mut last_visible) = (0i64, false);
 
         for (stride, metas) in arena_meta.chunks(EPOCH_STRIDE).enumerate() {
             if self.publish_epoch_if_quiet() != Some(epoch) {
-                drop(arena_guard);
-                return Ok(None);
+                return HeadsPass::Unheld;
             }
             for (offset, meta) in metas.iter().enumerate() {
                 let idx = stride * EPOCH_STRIDE + offset;
                 #[cfg(feature = "test-failpoints")]
                 crate::test_failpoints::grouped_slot_reached(idx);
-                // Visibility check (standard pattern: check creation, then deletion)
                 if meta.txn_id == 0 {
                     continue;
                 }
@@ -7272,16 +6833,72 @@ impl VersionStore {
                     continue;
                 }
                 if let Some(row) = arena_data.get(idx) {
-                    aggregate_row(&mut groups, group_by_indices, aggregates, row.as_ref());
+                    visit(row.as_ref());
                 }
             }
         }
+        if self.publish_epoch_if_quiet() == Some(epoch) {
+            HeadsPass::Answered
+        } else {
+            HeadsPass::Unheld
+        }
+    }
 
-        // The groups own their keys and values: they answer outside the
-        // lock, and only if no commit published across the pass
-        let held = self.publish_epoch_if_quiet() == Some(epoch);
-        drop(arena_guard);
-        Ok(held.then_some(groups))
+    /// Runs `visit` over the version of every chain `txn_id` sees, read from
+    /// the chains as captured once
+    fn visit_visible_chains<C: VisibilityChecker + ?Sized>(
+        &self,
+        checker: &ReaderChecker<'_, '_, C>,
+        txn_id: i64,
+        mut visit: impl FnMut(&[Value]),
+    ) {
+        let versions = self.snapshot_versions();
+        // Asked once per run of versions from one transaction
+        let (mut last_txn_id, mut last_visible) = (0i64, false);
+        for chain in versions.values() {
+            let mut current: Option<&VersionChainEntry> = Some(chain);
+            while let Some(e) = current {
+                if e.version.txn_id != last_txn_id {
+                    last_txn_id = e.version.txn_id;
+                    last_visible = checker.is_visible(last_txn_id, txn_id);
+                }
+                if last_visible {
+                    let deleted_at = e.version.deleted_at_txn_id;
+                    if deleted_at == 0 || !checker.is_visible(deleted_at, txn_id) {
+                        visit(e.version.data.as_slice());
+                    }
+                    break;
+                }
+                current = e.prev.as_deref();
+            }
+        }
+    }
+
+    /// The MIN or MAX `run` takes over a column of every row `reader` sees
+    fn column_extreme(
+        &self,
+        reader: Reader<'_>,
+        col_idx: usize,
+        mut run: CompiledAggregate,
+    ) -> Option<Value> {
+        let checker = reader.over(&**self.visibility_checker.as_ref()?);
+        let pass = self.visit_live_heads(&checker, reader, |row| {
+            if let Some(value) = row.get(col_idx) {
+                run.accumulate(value);
+            }
+        });
+        if !matches!(pass, HeadsPass::Answered) {
+            run.reset();
+            self.visit_visible_chains(&checker, reader.txn_id, |row| {
+                if let Some(value) = row.get(col_idx) {
+                    run.accumulate(value);
+                }
+            });
+        }
+        match run.result() {
+            Ok(value) if !value.is_null() => Some(value),
+            _ => None,
+        }
     }
 }
 
@@ -10476,7 +10093,7 @@ mod tests {
     }
 
     #[test]
-    fn test_version_store_compute_aggregates() {
+    fn test_version_store_global_aggregates() {
         let checker = Arc::new(TestVisibilityChecker::new());
         let store =
             VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
@@ -10497,41 +10114,23 @@ mod tests {
             (AggregateOp::Avg, 0),
         ];
 
-        let results = store.compute_aggregates(2.into(), &ops);
-        assert_eq!(results.len(), 5);
-
-        // Check count
-        match &results[0] {
-            AggregateResult::Count(c) => assert_eq!(*c, 5),
-            _ => panic!("Expected Count"),
-        }
-
-        // Check sum
-        match &results[1] {
-            AggregateResult::Sum(s, _) => assert_eq!(*s, 150.0),
-            _ => panic!("Expected Sum"),
-        }
-
-        // Check min
-        match &results[2] {
-            AggregateResult::Min(Some(v)) => assert_eq!(*v, Value::from(10)),
-            _ => panic!("Expected Min"),
-        }
-
-        // Check max
-        match &results[3] {
-            AggregateResult::Max(Some(v)) => assert_eq!(*v, Value::from(50)),
-            _ => panic!("Expected Max"),
-        }
-
-        // Check avg (returns sum, count - caller computes sum/count)
-        match &results[4] {
-            AggregateResult::Avg(sum, count) => {
-                let avg = sum / *count as f64;
-                assert!((avg - 30.0).abs() < 0.001);
-            }
-            _ => panic!("Expected Avg"),
-        }
+        let rows = store
+            .compute_grouped_aggregates(2.into(), &[], &ops)
+            .unwrap()
+            .expect("the arena answers")
+            .into_rows()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].1.as_slice(),
+            &[
+                Value::Integer(5),
+                Value::Integer(150),
+                Value::Integer(10),
+                Value::Integer(50),
+                Value::Float(30.0),
+            ]
+        );
     }
 
     #[test]
