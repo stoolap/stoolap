@@ -116,7 +116,7 @@ use super::utils::{
     combine_predicates_with_and, dummy_token, expression_contains_aggregate,
     extract_and_conditions, extract_base_column_name, extract_join_keys_and_residual,
     filter_references_column, flatten_and_predicates, flip_operator, get_table_alias_from_expr,
-    infix_to_operator, strip_table_qualifier, substitute_filter_column,
+    index_join_residual, infix_to_operator, strip_table_qualifier, substitute_filter_column,
 };
 use super::volatility::statement_constant;
 use super::window::{WindowPreGroupedState, WindowPreSortedState};
@@ -192,17 +192,21 @@ fn same_outer_source(
     })
 }
 
-/// Whether a predicate is the equality of the two join keys, in either order
-fn is_key_equality(pred: &Expression, outer_key: &str, inner_key: &str) -> bool {
-    let Expression::Infix(infix) = pred else {
-        return false;
+/// The table an index join can probe on a side that names one: never a table
+/// read AS OF, whose past rows no index holds
+pub(crate) fn index_join_table_name(side: &Expression) -> Option<String> {
+    let table = match side {
+        Expression::TableSource(ts) => ts,
+        Expression::Aliased(aliased) => match aliased.expression.as_ref() {
+            Expression::TableSource(ts) => ts,
+            _ => return None,
+        },
+        _ => return None,
     };
-    if infix.op_type != InfixOperator::Equal {
-        return false;
-    }
-    let left = super::utils::expression_to_string(&infix.left).to_lowercase();
-    let right = super::utils::expression_to_string(&infix.right).to_lowercase();
-    (left == outer_key && right == inner_key) || (left == inner_key && right == outer_key)
+    table
+        .as_of
+        .is_none()
+        .then(|| table.name.value_lower.to_string())
 }
 
 /// Partition WHERE clause predicates for JOIN filter pushdown.
@@ -4249,6 +4253,7 @@ impl Executor {
                 None
             } else {
                 self.check_index_nested_loop_opportunity(
+                    Some(ctx),
                     &join_source.right,
                     on_condition,
                     &join_type,
@@ -4277,6 +4282,7 @@ impl Executor {
                 ) {
                 // Right is subquery/CTE - check if left side has Index NL opportunity
                 let left_as_inner = self.check_index_nested_loop_opportunity(
+                    Some(ctx),
                     &join_source.left,
                     on_condition,
                     &join_type,
@@ -4317,6 +4323,7 @@ impl Executor {
                 // Check if swapping gives Index NL opportunity with PK lookup
                 // (which is more efficient than secondary index lookup)
                 let swapped_info = self.check_index_nested_loop_opportunity(
+                    Some(ctx),
                     &join_source.left, // Left becomes inner (right)
                     on_condition,
                     &join_type,
@@ -4697,14 +4704,13 @@ impl Executor {
                             .map(|rf| add_table_qualifier(rf, inner_alias));
                         // The equality the probe answers is left out, so
                         // only the rest of the clause is asked of each pair
-                        let inner_key = format!("{inner_alias}.{inner_col}").to_lowercase();
-                        let outer_key = outer_col.to_lowercase();
                         let rest = on_condition.and_then(|on| {
-                            combine_predicates_with_and(
-                                flatten_and_predicates(on)
-                                    .into_iter()
-                                    .filter(|pred| !is_key_equality(pred, &outer_key, &inner_key))
-                                    .collect(),
+                            index_join_residual(
+                                on,
+                                &outer_cols,
+                                &inner_cols,
+                                outer_idx,
+                                inner_key_idx,
                             )
                         });
                         let combined = match (rest, inner_filter) {
@@ -7375,10 +7381,15 @@ impl Executor {
         cross_filter: Option<&Expression>,
         plan: &SemijoinReduction,
     ) -> Result<Option<SelectOutput>> {
-        let filters_have_subquery = [left_filter, right_filter, cross_filter]
-            .into_iter()
-            .flatten()
-            .any(Self::filter_has_subquery);
+        let filters_have_subquery = [
+            left_filter,
+            right_filter,
+            cross_filter,
+            join_source.condition.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(Self::filter_has_subquery);
         let Some((aggregations, group_names)) = self.grouped_index_join_applies(
             stmt,
             join_type,
@@ -7390,6 +7401,7 @@ impl Executor {
         };
         let Some((table_name, lookup_strategy, inner_key_col, outer_key_col)) = self
             .check_index_nested_loop_opportunity(
+                Some(ctx),
                 &join_source.right,
                 join_source.condition.as_deref(),
                 join_type,
@@ -7568,21 +7580,29 @@ impl Executor {
                 _ => None,
             }
         });
-        let pushed_inner = inner_filter.is_some();
+        // The probe answers one equality, so the rest of the ON clause and a
+        // right-side filter the fetch did not take are asked of each pair
+        let residual = combine_predicates_with_and(
+            join_source
+                .condition
+                .as_deref()
+                .and_then(|on| {
+                    index_join_residual(on, &outer_cols, &inner_cols, outer_key_idx, inner_key_idx)
+                })
+                .into_iter()
+                .chain(
+                    right_filter
+                        .filter(|_| inner_filter.is_none())
+                        .map(|rf| add_table_qualifier(rf, inner_alias)),
+                )
+                .collect(),
+        );
         let build_residual_filter = || {
-            if pushed_inner {
-                return Ok(None);
-            }
-            right_filter
-                .map(|rf| {
-                    let qualified_rf = add_table_qualifier(rf, inner_alias);
-                    JoinFilter::new(
-                        &qualified_rf,
-                        &outer_cols,
-                        &inner_cols,
-                        &self.function_registry,
-                    )
-                    .map(|f| f.with_context(ctx))
+            residual
+                .as_ref()
+                .map(|expr| {
+                    JoinFilter::new(expr, &outer_cols, &inner_cols, &self.function_registry)
+                        .map(|f| f.with_context(ctx))
                 })
                 .transpose()
         };
@@ -11370,6 +11390,7 @@ impl Executor {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn check_index_nested_loop_opportunity(
         &self,
+        ctx: Option<&ExecutionContext>,
         right_expr: &Expression,
         join_condition: Option<&Expression>,
         join_type: &str,
@@ -11391,24 +11412,11 @@ impl Executor {
 
         // Extract table name and effective alias from right side
         // Supports: TableSource, Aliased TableSource, and simple SubquerySource
-        // Note: Index NL does not support AS OF (temporal) queries - they need full table scan
         let (table_name, effective_alias) = match right_expr {
-            Expression::TableSource(ts) => {
-                // Disable Index NL for temporal (AS OF) queries
-                if ts.as_of.is_some() {
-                    return None;
-                }
-                (ts.name.value_lower.to_string(), None)
-            }
+            Expression::TableSource(_) => (index_join_table_name(right_expr)?, None),
             Expression::Aliased(aliased) => {
                 match aliased.expression.as_ref() {
-                    Expression::TableSource(ts) => {
-                        // Disable Index NL for temporal (AS OF) queries
-                        if ts.as_of.is_some() {
-                            return None;
-                        }
-                        (ts.name.value_lower.to_string(), None)
-                    }
+                    Expression::TableSource(_) => (index_join_table_name(right_expr)?, None),
                     Expression::SubquerySource(sq) => {
                         // Check if subquery is a simple passthrough
                         let underlying = self.extract_simple_subquery_table(&sq.subquery)?;
@@ -11430,8 +11438,10 @@ impl Executor {
 
         let table_name_ref = &table_name;
 
-        // Check if it's a CTE (CTEs don't have indexes)
-        // We can't check CTEs here without context, but we'll verify when we try to get the table
+        // A CTE of the same name hides the table and has no index
+        if ctx.is_some_and(|ctx| ctx.get_cte_by_lower(table_name_ref).is_some()) {
+            return None;
+        }
 
         // Need a join condition
         let condition = join_condition?;

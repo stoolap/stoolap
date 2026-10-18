@@ -39,7 +39,7 @@ use crate::parser::token::{Position, Token, TokenType};
 use crate::storage::traits::{QueryResult, Table};
 
 use super::context::ExecutionContext;
-use super::expression::ExpressionEval;
+use super::expression::{ExpressionEval, JoinFilter};
 use super::join_executor::{JoinExecutor, JoinRequest};
 use super::operator::{ColumnInfo, Operator, QueryResultOperator};
 use super::operators::hash_join::JoinType as OperatorJoinType;
@@ -47,7 +47,7 @@ use super::operators::index_nested_loop::{IndexLookupStrategy, IndexNestedLoopJo
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::ExecutorResult;
 use super::row_count::{row_counts, rows_needed, static_row_counts};
-use super::utils::build_column_index_map;
+use super::utils::{build_column_index_map, index_join_residual};
 use super::Executor;
 
 /// Type alias for CTE data: (columns, rows) with Arc for zero-copy sharing
@@ -2330,14 +2330,8 @@ impl Executor {
             None => return Ok(None),
         };
 
-        // Extract table name from table expression
-        let table_name: String = match table_expr {
-            Expression::TableSource(ts) => ts.name.value_lower.to_string(),
-            Expression::Aliased(aliased) => match aliased.expression.as_ref() {
-                Expression::TableSource(ts) => ts.name.value_lower.to_string(),
-                _ => return Ok(None),
-            },
-            _ => return Ok(None),
+        let Some(table_name) = super::query::index_join_table_name(table_expr) else {
+            return Ok(None);
         };
 
         // Extract join key columns using qualifier matching
@@ -2478,6 +2472,21 @@ impl Executor {
         // Parse join type
         let op_join_type = OperatorJoinType::parse(&join_type);
 
+        // The probe answers one equality, so the rest of the ON clause is
+        // asked of each pair
+        let residual = index_join_residual(
+            condition,
+            &outer_cols,
+            &inner_cols,
+            outer_key_idx,
+            inner_key_idx,
+        )
+        .map(|expr| {
+            JoinFilter::new(&expr, &outer_cols, &inner_cols, &self.function_registry)
+                .map(|f| f.with_context(ctx))
+        })
+        .transpose()?;
+
         // Create the Index Nested Loop Join operator
         let mut join_op: Box<dyn Operator> = Box::new(
             IndexNestedLoopJoinOperator::new(
@@ -2487,7 +2496,7 @@ impl Executor {
                 op_join_type,
                 outer_key_idx,
                 lookup_strategy,
-                None, // No residual filter for now (handled later if needed)
+                residual,
             )
             .with_inner_key(inner_key_idx),
         );

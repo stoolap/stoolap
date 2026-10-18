@@ -981,6 +981,7 @@ impl Executor {
 
             // Check if INLJ is possible (right side has index/PK for join column)
             let inlj_info = self.check_index_nested_loop_opportunity(
+                None,
                 join_right,
                 Some(cond),
                 &join_type_upper,
@@ -1008,6 +1009,7 @@ impl Executor {
                 None
             } else {
                 self.check_index_nested_loop_opportunity(
+                    None,
                     join_left,
                     Some(cond),
                     &join_type_upper,
