@@ -453,7 +453,7 @@ SELECT DATE_ADD('2024-03-15', 10);                   -- Add 10 days (default)
 SELECT DATE_ADD('2024-03-15', 2, 'month');           -- Add 2 months
 ```
 
-Supported units: `year`, `month`, `week`, `day`, `hour`, `minute`, `second`
+Supported units: `year`, `month`, `week`, `day`, `hour`, `minute`, `second`, `millisecond`, `microsecond`, and their plurals and abbreviations. A month clamps the day to the target month's last. A result outside years 0000 to 9999 is an error.
 
 ### DATE_SUB
 Subtracts an interval from a timestamp.

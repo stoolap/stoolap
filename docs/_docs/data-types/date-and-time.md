@@ -22,6 +22,8 @@ CREATE TABLE events (
 );
 ```
 
+A TIMESTAMP lies between `0000-01-01 00:00:00` and `9999-12-31 23:59:59.999999999`. Moving a timestamp by an INTERVAL or a number of days (`+`, `-`, `DATE_ADD`, `DATE_SUB`) to a point outside that range is an error.
+
 ## Supported Date and Time Formats
 
 Based on the implementation, Stoolap recognizes various date and time formats:
@@ -135,7 +137,7 @@ SELECT DATE_ADD('2024-03-15', 2, 'month');        -- Add 2 months
 SELECT DATE_SUB('2024-03-15', 1, 'month');        -- Subtract 1 month
 ```
 
-Supported units: `year`, `month`, `week`, `day`, `hour`, `minute`, `second`
+Supported units: every INTERVAL unit below. A month or year moves the calendar and keeps the time of day, fractions of a second included.
 
 ### DATEDIFF / DATE_DIFF
 
@@ -177,13 +179,17 @@ SELECT NOW() - INTERVAL '30 minutes';
 
 ### Supported INTERVAL Units
 
-- `second` or `seconds` - For second-based intervals
-- `minute` or `minutes` - For minute-based intervals  
+- `microsecond`, `microseconds` or `us`
+- `millisecond`, `milliseconds` or `ms`
+- `second`, `seconds`, `sec` or `secs` - For second-based intervals
+- `minute`, `minutes`, `min` or `mins` - For minute-based intervals
 - `hour` or `hours` - For hour-based intervals
 - `day` or `days` - For day-based intervals
 - `week` or `weeks` - For week-based intervals (7 days)
 - `month` or `months` - Calendar months; the day is clamped to the last day of the target month
 - `year` or `years` - Calendar years (12 months)
+
+Units are read in any case, in an INTERVAL literal, in interval text added to a timestamp, in `DATE_ADD` and in `generate_series`. An INTERVAL literal with any other unit is an error. Interval text from a column or a parameter that is not an interval reads as NULL; its number outside the range is an error.
 
 ### INTERVAL Examples
 
@@ -333,8 +339,6 @@ SELECT * FROM events WHERE event_date >= '2023-05-01';
 ## Limitations
 
 1. **Limited Time Zone Support**: Timestamps are normalized to UTC internally. There are no explicit functions for time zone conversion.
-
-2. **Approximate Month and Year Intervals**: INTERVAL calculations for months and years use approximations (30 days for months, 365 days for years) rather than calendar-aware calculations.
 
 ## Best Practices
 

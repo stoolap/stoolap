@@ -121,8 +121,9 @@ SELECT * FROM generate_series(
 SELECT * FROM generate_series('2024-01-01', '2024-01-29', '1 week');
 -- Returns: Jan 1, Jan 8, Jan 15, Jan 22, Jan 29
 
--- Monthly series (1 month = 30 days)
-SELECT * FROM generate_series('2024-01-01', '2024-04-01', '1 month');
+-- Monthly series on calendar months
+SELECT * FROM generate_series('2024-01-31', '2024-05-31', '1 month');
+-- Returns: Jan 31, Feb 29, Mar 31, Apr 30, May 31
 
 -- Descending date series
 SELECT * FROM generate_series('2024-01-05', '2024-01-01', '-1 day');
@@ -308,4 +309,4 @@ ORDER BY x, y;
 - **Zero step**: A step of zero is an error.
 - **Safety limit**: A maximum of 10,000,000 rows can be generated per call to prevent out-of-memory conditions.
 - **Case insensitive**: `GENERATE_SERIES`, `generate_series`, and `Generate_Series` all work.
-- **Month approximation**: The `month` interval unit is approximated as 30 days. For exact calendar month arithmetic, use application-level logic.
+- **Calendar months**: A `month` or `year` step moves the calendar. Each value is the start moved by a whole number of steps, so a day clamped in a short month does not carry over to the next value.

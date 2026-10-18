@@ -26,10 +26,11 @@ use std::borrow::Cow;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
-use super::ops::{CompareOp, CompiledPattern, IntervalStep, IntervalUnit, Op};
+use super::ops::{CompareOp, CompiledPattern, IntervalStep, Op};
 use super::program::Program;
 use crate::common::{CompactArc, SmartString};
 use crate::core::integer::{integer_neg, integer_op, IntegerOp};
+use crate::core::interval::{self, Interval, IntervalUnit};
 use crate::core::predicate::{number_against_text, sql_compare, sql_distinct, sql_eq};
 use crate::core::value::{f64_eq, f64_ge, f64_gt, f64_le, f64_lt, f64_ne};
 use crate::core::{DataType, Result, Row, Value, NULL_VALUE};
@@ -220,13 +221,6 @@ fn no_subquery_executor() -> crate::core::Error {
 /// The VM is reusable - call execute() with different contexts.
 /// Capacity for reusable args buffer (most functions have <= 4 args)
 const ARGS_BUFFER_CAPACITY: usize = 8;
-
-/// Parsed interval value: either a fixed-length duration or a calendar-relative month count.
-/// Months/years require calendar-aware arithmetic (leap years, variable month lengths).
-enum IntervalValue {
-    Duration(chrono::Duration),
-    Months(i64),
-}
 
 pub struct ExprVM {
     /// Evaluation stack (reused between executions)
@@ -799,15 +793,12 @@ impl ExprVM {
                     let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     // Handle timestamp + interval or timestamp + integer (days)
                     let result = match (&a, &b) {
-                        (Value::Timestamp(t), Value::Integer(days)) => {
-                            Value::Timestamp(*t + chrono::Duration::days(*days))
-                        }
-                        (Value::Integer(days), Value::Timestamp(t)) => {
-                            Value::Timestamp(*t + chrono::Duration::days(*days))
+                        (Value::Timestamp(t), Value::Integer(days))
+                        | (Value::Integer(days), Value::Timestamp(t)) => {
+                            Self::timestamp_add_days(*t, *days, false)?
                         }
                         (Value::Timestamp(_), Value::Text(_)) => {
-                            // Parse interval string - pass references directly to avoid clone
-                            self.timestamp_add_interval(&a, &b, true)
+                            Self::timestamp_add_interval(&a, &b, false)?
                         }
                         _ => Self::arithmetic_op(&a, &b, IntegerOp::Add, |x, y| x + y)?,
                     };
@@ -828,11 +819,10 @@ impl ExprVM {
                             ))
                         }
                         (Value::Timestamp(t), Value::Integer(days)) => {
-                            Value::Timestamp(*t - chrono::Duration::days(*days))
+                            Self::timestamp_add_days(*t, *days, true)?
                         }
                         (Value::Timestamp(_), Value::Text(_)) => {
-                            // Parse interval string - pass references directly to avoid clone
-                            self.timestamp_add_interval(&a, &b, false)
+                            Self::timestamp_add_interval(&a, &b, true)?
                         }
                         _ => Self::arithmetic_op(&a, &b, IntegerOp::Sub, |x, y| x - y)?,
                     };
@@ -1269,7 +1259,7 @@ impl ExprVM {
                 Op::TimestampAddInterval => {
                     let interval = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let ts = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = self.timestamp_add_interval(&ts, &interval, true);
+                    let result = Self::timestamp_add_interval(&ts, &interval, false)?;
                     self.stack.push(result);
                     pc += 1;
                 }
@@ -1277,7 +1267,7 @@ impl ExprVM {
                 Op::TimestampSubInterval => {
                     let interval = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let ts = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = self.timestamp_add_interval(&ts, &interval, false);
+                    let result = Self::timestamp_add_interval(&ts, &interval, true)?;
                     self.stack.push(result);
                     pc += 1;
                 }
@@ -1304,7 +1294,7 @@ impl ExprVM {
                     let ts = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let result = match (&ts, &days) {
                         (Value::Timestamp(t), Value::Integer(d)) => {
-                            Value::Timestamp(*t + chrono::Duration::days(*d))
+                            Self::timestamp_add_days(*t, *d, false)?
                         }
                         _ if ts.is_null() || days.is_null() => Value::Null(DataType::Timestamp),
                         _ => Value::Null(DataType::Timestamp),
@@ -1318,7 +1308,7 @@ impl ExprVM {
                     let ts = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let result = match (&ts, &days) {
                         (Value::Timestamp(t), Value::Integer(d)) => {
-                            Value::Timestamp(*t - chrono::Duration::days(*d))
+                            Self::timestamp_add_days(*t, *d, true)?
                         }
                         _ if ts.is_null() || days.is_null() => Value::Null(DataType::Timestamp),
                         _ => Value::Null(DataType::Timestamp),
@@ -1346,7 +1336,7 @@ impl ExprVM {
                         Value::Timestamp(t) => match k {
                             Some(k) => {
                                 let interval = Self::scale_interval(*step, k)?;
-                                Self::shift_timestamp(*t, interval, *subtract)?
+                                Value::Timestamp(interval::shift(*t, interval, *subtract)?)
                             }
                             None => Value::Null(DataType::Timestamp),
                         },
@@ -3578,39 +3568,26 @@ impl ExprVM {
         }
     }
 
-    /// Add or subtract interval from timestamp
-    fn timestamp_add_interval(&self, ts: &Value, interval: &Value, add: bool) -> Value {
-        let timestamp = match ts {
-            Value::Timestamp(t) => *t,
-            Value::Null(_) => return Value::Null(DataType::Timestamp),
-            _ => return Value::Null(DataType::Timestamp),
+    /// A timestamp moved by interval text, backwards when `subtract`; NULL
+    /// for anything else and for text that is not an interval
+    fn timestamp_add_interval(ts: &Value, interval: &Value, subtract: bool) -> Result<Value> {
+        let (Value::Timestamp(t), Value::Text(text)) = (ts, interval) else {
+            return Ok(Value::Null(DataType::Timestamp));
         };
-
-        let interval_str = match interval {
-            Value::Text(s) => s.as_ref(),
-            Value::Null(_) => return Value::Null(DataType::Timestamp),
-            _ => return Value::Null(DataType::Timestamp),
-        };
-
-        // Parse interval string
-        // Formats: "1 day", "2 hours", "30 minutes", "1 year", "1 month", etc.
-        match self.parse_interval(interval_str) {
-            Some(IntervalValue::Duration(d)) => {
-                if add {
-                    Value::Timestamp(timestamp + d)
-                } else {
-                    Value::Timestamp(timestamp - d)
-                }
-            }
-            Some(IntervalValue::Months(months)) => {
-                let months = if add { months } else { -months };
-                match Self::calendar_add_months(timestamp, months) {
-                    Some(result) => Value::Timestamp(result),
-                    None => Value::Null(DataType::Timestamp),
-                }
-            }
+        Ok(match interval::parse_interval(text)? {
+            Some(interval) => Value::Timestamp(interval::shift(*t, interval, subtract)?),
             None => Value::Null(DataType::Timestamp),
-        }
+        })
+    }
+
+    /// A timestamp moved by a number of days, backwards when `subtract`
+    fn timestamp_add_days(
+        t: chrono::DateTime<chrono::Utc>,
+        days: i64,
+        subtract: bool,
+    ) -> Result<Value> {
+        let days = Interval::of(days, IntervalUnit::Day)?;
+        Ok(Value::Timestamp(interval::shift(t, days, subtract)?))
     }
 
     /// An INTERVAL multiplier: Ok for a whole number, Err for a fractional
@@ -3654,10 +3631,7 @@ impl ExprVM {
 
     /// `step` times `k`. A fixed unit is counted in microseconds, rounded;
     /// a calendar unit takes whole multiples only
-    fn scale_interval(
-        step: IntervalStep,
-        k: std::result::Result<i64, f64>,
-    ) -> Result<IntervalValue> {
+    fn scale_interval(step: IntervalStep, k: std::result::Result<i64, f64>) -> Result<Interval> {
         let n = || k.map_or_else(|f| f.to_string(), |i| i.to_string());
         let out_of_range = || {
             crate::core::Error::Type(format!(
@@ -3683,7 +3657,7 @@ impl ExprVM {
                 .quantity
                 .checked_mul(per)
                 .and_then(|m| m.checked_mul(k));
-            return months.map(IntervalValue::Months).ok_or_else(out_of_range);
+            return months.map(Interval::Months).ok_or_else(out_of_range);
         }
         let unit = step
             .quantity
@@ -3699,20 +3673,18 @@ impl ExprVM {
                 x as i64
             }
         };
-        Ok(IntervalValue::Duration(chrono::Duration::microseconds(
-            micros,
-        )))
+        Ok(Interval::Duration(chrono::Duration::microseconds(micros)))
     }
 
     /// `interval` as text `parse_interval` reads back: in `step`'s unit when
     /// it is a whole count of it, else in the largest exact sub-day unit
-    fn interval_text(step: IntervalStep, interval: IntervalValue) -> String {
+    fn interval_text(step: IntervalStep, interval: Interval) -> String {
         match interval {
-            IntervalValue::Months(m) if step.unit == IntervalUnit::Year && m % 12 == 0 => {
+            Interval::Months(m) if step.unit == IntervalUnit::Year && m % 12 == 0 => {
                 format!("{} year", m / 12)
             }
-            IntervalValue::Months(m) => format!("{m} month"),
-            IntervalValue::Duration(d) => {
+            Interval::Months(m) => format!("{m} month"),
+            Interval::Duration(d) => {
                 let micros = d.num_microseconds().unwrap_or(0);
                 let unit = [step.unit, IntervalUnit::Second, IntervalUnit::Millisecond]
                     .into_iter()
@@ -3721,151 +3693,6 @@ impl ExprVM {
                 format!("{} {}", micros / unit.micros(), unit.name())
             }
         }
-    }
-
-    /// `t` moved by `interval`, backwards when `subtract`
-    fn shift_timestamp(
-        t: chrono::DateTime<chrono::Utc>,
-        interval: IntervalValue,
-        subtract: bool,
-    ) -> Result<Value> {
-        let moved = match interval {
-            IntervalValue::Duration(d) => {
-                if subtract {
-                    t.checked_sub_signed(d)
-                } else {
-                    t.checked_add_signed(d)
-                }
-            }
-            IntervalValue::Months(m) => {
-                let m = if subtract { m.checked_neg() } else { Some(m) };
-                m.and_then(|m| Self::calendar_add_months(t, m))
-            }
-        };
-        moved.map(Value::Timestamp).ok_or_else(|| {
-            crate::core::Error::Type(format!("{t} moved by an INTERVAL is out of range"))
-        })
-    }
-
-    /// Calendar-aware month addition preserving time-of-day and nanoseconds.
-    fn calendar_add_months(
-        ts: chrono::DateTime<chrono::Utc>,
-        months: i64,
-    ) -> Option<chrono::DateTime<chrono::Utc>> {
-        use chrono::{Datelike, NaiveDate, Timelike};
-
-        let total_months =
-            ((ts.year() as i64) * 12 + (ts.month() as i64) - 1).checked_add(months)?;
-        let new_year_i64 = total_months.div_euclid(12);
-        let new_month = (total_months.rem_euclid(12) + 1) as u32;
-
-        let new_year = i32::try_from(new_year_i64).ok()?;
-        if !(1..=9999).contains(&new_year) {
-            return None;
-        }
-
-        // Clamp day to valid range for the new month
-        let max_day = match new_month {
-            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-            4 | 6 | 9 | 11 => 30,
-            2 => {
-                if (new_year % 4 == 0 && new_year % 100 != 0) || (new_year % 400 == 0) {
-                    29
-                } else {
-                    28
-                }
-            }
-            _ => 30,
-        };
-        let day = ts.day().min(max_day);
-
-        // Rebuild date preserving original time including nanoseconds
-        let date = NaiveDate::from_ymd_opt(new_year, new_month, day)?;
-        let time = ts.time();
-        let naive = date.and_hms_nano_opt(
-            time.hour(),
-            time.minute(),
-            time.second(),
-            ts.timestamp_subsec_nanos(),
-        )?;
-        Some(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-            naive,
-            chrono::Utc,
-        ))
-    }
-
-    /// Parsed interval: either a fixed duration or a calendar-relative month count.
-    fn parse_interval(&self, s: &str) -> Option<IntervalValue> {
-        let s = s.trim();
-        if let Some(d) = Self::parse_formatted_duration(s) {
-            return Some(IntervalValue::Duration(d));
-        }
-        let parts: Vec<&str> = s.split_whitespace().collect();
-
-        if parts.len() < 2 {
-            // Try parsing as just a number (days)
-            if let Ok(n) = s.parse::<i64>() {
-                return Some(IntervalValue::Duration(chrono::Duration::days(n)));
-            }
-            return None;
-        }
-        if parts.len() > 2 {
-            return None;
-        }
-
-        let value: i64 = parts[0].parse().ok()?;
-        let unit = IntervalUnit::parse(parts[1])?;
-        Some(match unit {
-            IntervalUnit::Year => IntervalValue::Months(value * 12),
-            IntervalUnit::Month => IntervalValue::Months(value),
-            IntervalUnit::Week => IntervalValue::Duration(chrono::Duration::weeks(value)),
-            IntervalUnit::Day => IntervalValue::Duration(chrono::Duration::days(value)),
-            IntervalUnit::Hour => IntervalValue::Duration(chrono::Duration::hours(value)),
-            IntervalUnit::Minute => IntervalValue::Duration(chrono::Duration::minutes(value)),
-            IntervalUnit::Second => IntervalValue::Duration(chrono::Duration::seconds(value)),
-            IntervalUnit::Millisecond => {
-                IntervalValue::Duration(chrono::Duration::milliseconds(value))
-            }
-            IntervalUnit::Microsecond => {
-                IntervalValue::Duration(chrono::Duration::microseconds(value))
-            }
-        })
-    }
-
-    /// Parse the "[-]N days HH:MM:SS" and "[-]HH:MM:SS" strings written by
-    /// `format_duration_as_interval`.
-    fn parse_formatted_duration(s: &str) -> Option<chrono::TimeDelta> {
-        let (negative, rest) = match s.strip_prefix('-') {
-            Some(rest) => (true, rest),
-            None => (false, s),
-        };
-        let (days, hms) = match rest.split_once(' ') {
-            Some((days, tail)) => {
-                let (unit, hms) = tail.trim_start().split_once(' ')?;
-                if !unit.eq_ignore_ascii_case("days") && !unit.eq_ignore_ascii_case("day") {
-                    return None;
-                }
-                (days.parse::<i64>().ok()?, hms.trim_start())
-            }
-            None => (0, rest),
-        };
-        let mut fields = hms.split(':');
-        let hours = fields.next()?.parse::<i64>().ok()?;
-        let minutes = fields.next()?.parse::<i64>().ok()?;
-        let seconds = fields.next()?.parse::<i64>().ok()?;
-        if fields.next().is_some()
-            || days < 0
-            || hours < 0
-            || !(0..60).contains(&minutes)
-            || !(0..60).contains(&seconds)
-        {
-            return None;
-        }
-        let duration = chrono::TimeDelta::try_days(days)?
-            .checked_add(&chrono::TimeDelta::try_hours(hours)?)?
-            .checked_add(&chrono::TimeDelta::try_minutes(minutes)?)?
-            .checked_add(&chrono::TimeDelta::try_seconds(seconds)?)?;
-        Some(if negative { -duration } else { duration })
     }
 
     /// Format chrono Duration as interval string

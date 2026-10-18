@@ -25,6 +25,7 @@ use std::sync::Arc;
 use crate::common::CompactArc;
 use memchr::memmem;
 
+use crate::core::interval::IntervalUnit;
 use crate::core::predicate::{sql_compare, sql_eq, PredicateSet};
 use crate::core::{DataType, Value};
 use crate::functions::{NativeFn1, ScalarFunction};
@@ -338,92 +339,6 @@ impl CompiledPattern {
             CompiledPattern::Regex(re) => re.is_match(text),
             CompiledPattern::MatchAll => true,
             CompiledPattern::SingleChar => text.chars().count() == 1,
-        }
-    }
-}
-
-/// A unit an INTERVAL counts in
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IntervalUnit {
-    Microsecond,
-    Millisecond,
-    Second,
-    Minute,
-    Hour,
-    Day,
-    Week,
-    Month,
-    Year,
-}
-
-impl IntervalUnit {
-    /// The unit a name spells, singular, plural or abbreviated, in any case
-    pub fn parse(name: &str) -> Option<Self> {
-        use IntervalUnit::*;
-        const NAMES: &[(&str, IntervalUnit)] = &[
-            ("year", Year),
-            ("years", Year),
-            ("month", Month),
-            ("months", Month),
-            ("week", Week),
-            ("weeks", Week),
-            ("day", Day),
-            ("days", Day),
-            ("hour", Hour),
-            ("hours", Hour),
-            ("minute", Minute),
-            ("minutes", Minute),
-            ("min", Minute),
-            ("second", Second),
-            ("seconds", Second),
-            ("sec", Second),
-            ("millisecond", Millisecond),
-            ("milliseconds", Millisecond),
-            ("ms", Millisecond),
-            ("microsecond", Microsecond),
-            ("microseconds", Microsecond),
-            ("us", Microsecond),
-        ];
-        NAMES
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name))
-            .map(|(_, unit)| *unit)
-    }
-
-    /// Months in one unit when it is a calendar unit, else None
-    pub fn months(self) -> Option<i64> {
-        match self {
-            IntervalUnit::Month => Some(1),
-            IntervalUnit::Year => Some(12),
-            _ => None,
-        }
-    }
-
-    /// Microseconds in one unit; zero for the calendar units
-    pub fn micros(self) -> i64 {
-        match self {
-            IntervalUnit::Microsecond => 1,
-            IntervalUnit::Millisecond => 1_000,
-            IntervalUnit::Second => 1_000_000,
-            IntervalUnit::Minute => 60_000_000,
-            IntervalUnit::Hour => 3_600_000_000,
-            IntervalUnit::Day => 86_400_000_000,
-            IntervalUnit::Week => 604_800_000_000,
-            IntervalUnit::Month | IntervalUnit::Year => 0,
-        }
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            IntervalUnit::Microsecond => "microsecond",
-            IntervalUnit::Millisecond => "millisecond",
-            IntervalUnit::Second => "second",
-            IntervalUnit::Minute => "minute",
-            IntervalUnit::Hour => "hour",
-            IntervalUnit::Day => "day",
-            IntervalUnit::Week => "week",
-            IntervalUnit::Month => "month",
-            IntervalUnit::Year => "year",
         }
     }
 }

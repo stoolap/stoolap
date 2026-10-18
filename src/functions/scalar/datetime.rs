@@ -17,6 +17,7 @@
 use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
 
 use crate::common::SmartString;
+use crate::core::interval::{self, Interval, IntervalUnit};
 use crate::core::{parse_timestamp, Error, Result, Value};
 use crate::functions::{
     FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
@@ -819,117 +820,7 @@ impl ScalarFunction for DateAddFunction {
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
         validate_arg_count!(args, "DATE_ADD", 2, 3);
-
-        if args[0].is_null() {
-            return Ok(Value::null_unknown());
-        }
-
-        let ts = match &args[0] {
-            Value::Timestamp(t) => *t,
-            Value::Text(s) => parse_timestamp(s).map_err(|_| {
-                Error::invalid_argument(format!("DATE_ADD could not parse timestamp: {}", s))
-            })?,
-            _ => {
-                return Err(Error::invalid_argument(
-                    "DATE_ADD first argument must be a timestamp or string",
-                ))
-            }
-        };
-
-        let interval = match &args[1] {
-            Value::Integer(i) => *i,
-            Value::Float(f) => crate::core::integer::integer_from_float(*f)?,
-            _ if args[1].is_null() => return Ok(Value::null_unknown()),
-            _ => {
-                return Err(Error::invalid_argument(
-                    "DATE_ADD second argument must be an integer",
-                ))
-            }
-        };
-
-        // Default to "day" when only 2 arguments provided
-        let unit: &str = if args.len() == 2 {
-            "day"
-        } else {
-            match &args[2] {
-                Value::Text(s) => s.as_str(),
-                _ if args[2].is_null() => return Ok(Value::null_unknown()),
-                _ => {
-                    return Err(Error::invalid_argument(
-                        "DATE_ADD third argument must be a string",
-                    ))
-                }
-            }
-        };
-
-        // Match unit case-insensitively without allocation
-        let result = if unit.eq_ignore_ascii_case("year") || unit.eq_ignore_ascii_case("years") {
-            // Check for overflow when adding years
-            let new_year = (ts.year() as i64)
-                .checked_add(interval)
-                .and_then(|y| i32::try_from(y).ok());
-            match new_year {
-                Some(y) if (1..=9999).contains(&y) => Utc
-                    .with_ymd_and_hms(
-                        y,
-                        ts.month(),
-                        ts.day().min(days_in_month(y, ts.month())),
-                        ts.hour(),
-                        ts.minute(),
-                        ts.second(),
-                    )
-                    .single()
-                    .unwrap_or(ts),
-                _ => {
-                    return Err(Error::invalid_argument(
-                        "DATE_ADD year overflow: result year out of valid range (1-9999)"
-                            .to_string(),
-                    ))
-                }
-            }
-        } else if unit.eq_ignore_ascii_case("month") || unit.eq_ignore_ascii_case("months") {
-            // Use i64 arithmetic to avoid overflow, then check bounds
-            let total_months = (ts.year() as i64) * 12 + (ts.month() as i64) - 1 + interval;
-            let new_year_i64 = total_months.div_euclid(12);
-            let new_month = (total_months.rem_euclid(12) + 1) as u32;
-
-            match i32::try_from(new_year_i64) {
-                Ok(new_year) if (1..=9999).contains(&new_year) => Utc
-                    .with_ymd_and_hms(
-                        new_year,
-                        new_month,
-                        ts.day().min(days_in_month(new_year, new_month)),
-                        ts.hour(),
-                        ts.minute(),
-                        ts.second(),
-                    )
-                    .single()
-                    .unwrap_or(ts),
-                _ => {
-                    return Err(Error::invalid_argument(
-                        "DATE_ADD month overflow: result year out of valid range (1-9999)"
-                            .to_string(),
-                    ))
-                }
-            }
-        } else if unit.eq_ignore_ascii_case("day") || unit.eq_ignore_ascii_case("days") {
-            ts + Duration::days(interval)
-        } else if unit.eq_ignore_ascii_case("hour") || unit.eq_ignore_ascii_case("hours") {
-            ts + Duration::hours(interval)
-        } else if unit.eq_ignore_ascii_case("minute") || unit.eq_ignore_ascii_case("minutes") {
-            ts + Duration::minutes(interval)
-        } else if unit.eq_ignore_ascii_case("second") || unit.eq_ignore_ascii_case("seconds") {
-            ts + Duration::seconds(interval)
-        } else if unit.eq_ignore_ascii_case("week") || unit.eq_ignore_ascii_case("weeks") {
-            ts + Duration::weeks(interval)
-        } else {
-            return Err(Error::invalid_argument(format!(
-                "DATE_ADD invalid unit: {}. Valid units are: year(s), month(s), week(s), day(s), hour(s), minute(s), second(s)",
-                unit
-            )));
-        };
-
-        Ok(Value::Timestamp(result))
+        date_shift("DATE_ADD", args, false)
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
@@ -966,16 +857,7 @@ impl ScalarFunction for DateSubFunction {
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
         validate_arg_count!(args, "DATE_SUB", 2, 3);
-
-        // Negate the interval and use DATE_ADD logic
-        let mut modified_args = args.to_vec();
-        if let Value::Integer(i) = &args[1] {
-            modified_args[1] = Value::Integer(-i);
-        } else if let Value::Float(f) = &args[1] {
-            modified_args[1] = Value::Float(-f);
-        }
-
-        DateAddFunction.evaluate(&modified_args)
+        date_shift("DATE_SUB", args, true)
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
@@ -1206,25 +1088,47 @@ impl ScalarFunction for CurrentTimeFunction {
 // Helper functions
 // ============================================================================
 
-/// Returns the number of days in a month
-fn days_in_month(year: i32, month: u32) -> u32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 => {
-            if is_leap_year(year) {
-                29
-            } else {
-                28
-            }
-        }
-        _ => 30, // Fallback
+/// DATE_ADD and DATE_SUB: the timestamp moved by an amount of a unit,
+/// days when the unit is left out; NULL when an argument is NULL
+fn date_shift(name: &str, args: &[Value], subtract: bool) -> Result<Value> {
+    if args.iter().any(Value::is_null) {
+        return Ok(Value::null_unknown());
     }
-}
-
-/// Returns true if the year is a leap year
-fn is_leap_year(year: i32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    let ts = match &args[0] {
+        Value::Timestamp(t) => *t,
+        Value::Text(s) => parse_timestamp(s).map_err(|_| {
+            Error::invalid_argument(format!("{name} could not parse timestamp: {s}"))
+        })?,
+        _ => {
+            return Err(Error::invalid_argument(format!(
+                "{name} first argument must be a timestamp or string"
+            )))
+        }
+    };
+    let amount = match &args[1] {
+        Value::Integer(i) => *i,
+        Value::Float(f) => crate::core::integer::integer_from_float(*f)?,
+        _ => {
+            return Err(Error::invalid_argument(format!(
+                "{name} second argument must be an integer"
+            )))
+        }
+    };
+    let unit = match args.get(2) {
+        None => IntervalUnit::Day,
+        Some(Value::Text(s)) => IntervalUnit::parse(s).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "{name} invalid unit: {s}. Valid units are: year(s), month(s), week(s), day(s), hour(s), minute(s), second(s), millisecond(s), microsecond(s)"
+            ))
+        })?,
+        Some(_) => {
+            return Err(Error::invalid_argument(format!(
+                "{name} third argument must be a string"
+            )))
+        }
+    };
+    let interval = Interval::of(amount, unit)?;
+    Ok(Value::Timestamp(interval::shift(ts, interval, subtract)?))
 }
 
 // ============================================================================

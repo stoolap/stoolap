@@ -17,88 +17,12 @@
 //! Functions that return a set of rows, used in FROM clauses.
 
 use super::{FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction};
+use crate::core::interval::{self, Interval, IntervalUnit};
 use crate::core::{parse_timestamp, Error, Result, Row, RowVec, Value};
 use chrono::{DateTime, Utc};
 
 /// Maximum number of rows a TVF can generate to prevent OOM
 const MAX_TVF_ROWS: usize = 10_000_000;
-
-/// Parse an interval string like "1 day", "2 hours", "30 minutes" into chrono::Duration.
-/// Uses checked arithmetic throughout to avoid panics on extreme values.
-fn parse_interval(s: &str) -> std::result::Result<chrono::Duration, Error> {
-    let s = s.trim();
-    let parts: Vec<&str> = s.split_whitespace().collect();
-
-    let overflow_err = |unit: &str, value: i64| -> Error {
-        Error::invalid_argument(format!("Interval overflow: {} {}", value, unit))
-    };
-
-    if parts.len() < 2 {
-        if let Ok(n) = s.parse::<i64>() {
-            return chrono::Duration::try_days(n).ok_or_else(|| overflow_err("days", n));
-        }
-        return Err(Error::invalid_argument(format!(
-            "Invalid interval format: '{}'. Expected format like '1 day', '2 hours'",
-            s
-        )));
-    }
-
-    if parts.len() > 2 {
-        return Err(Error::invalid_argument(format!(
-            "Compound intervals are not supported: '{}'. Use a single unit (e.g., '1 day' or '26 hours')",
-            s
-        )));
-    }
-
-    let value: i64 = parts[0]
-        .parse()
-        .map_err(|_| Error::invalid_argument(format!("Invalid interval value: '{}'", parts[0])))?;
-    let unit = parts[1];
-
-    if unit.eq_ignore_ascii_case("year") || unit.eq_ignore_ascii_case("years") {
-        let days = value
-            .checked_mul(365)
-            .ok_or_else(|| overflow_err("years", value))?;
-        chrono::Duration::try_days(days).ok_or_else(|| overflow_err("years", value))
-    } else if unit.eq_ignore_ascii_case("month") || unit.eq_ignore_ascii_case("months") {
-        let days = value
-            .checked_mul(30)
-            .ok_or_else(|| overflow_err("months", value))?;
-        chrono::Duration::try_days(days).ok_or_else(|| overflow_err("months", value))
-    } else if unit.eq_ignore_ascii_case("week") || unit.eq_ignore_ascii_case("weeks") {
-        chrono::Duration::try_weeks(value).ok_or_else(|| overflow_err("weeks", value))
-    } else if unit.eq_ignore_ascii_case("day") || unit.eq_ignore_ascii_case("days") {
-        chrono::Duration::try_days(value).ok_or_else(|| overflow_err("days", value))
-    } else if unit.eq_ignore_ascii_case("hour") || unit.eq_ignore_ascii_case("hours") {
-        chrono::Duration::try_hours(value).ok_or_else(|| overflow_err("hours", value))
-    } else if unit.eq_ignore_ascii_case("minute")
-        || unit.eq_ignore_ascii_case("minutes")
-        || unit.eq_ignore_ascii_case("min")
-    {
-        chrono::Duration::try_minutes(value).ok_or_else(|| overflow_err("minutes", value))
-    } else if unit.eq_ignore_ascii_case("second")
-        || unit.eq_ignore_ascii_case("seconds")
-        || unit.eq_ignore_ascii_case("sec")
-    {
-        chrono::Duration::try_seconds(value).ok_or_else(|| overflow_err("seconds", value))
-    } else if unit.eq_ignore_ascii_case("millisecond")
-        || unit.eq_ignore_ascii_case("milliseconds")
-        || unit.eq_ignore_ascii_case("ms")
-    {
-        chrono::Duration::try_milliseconds(value).ok_or_else(|| overflow_err("milliseconds", value))
-    } else if unit.eq_ignore_ascii_case("microsecond")
-        || unit.eq_ignore_ascii_case("microseconds")
-        || unit.eq_ignore_ascii_case("us")
-    {
-        // microseconds always fits in TimeDelta (max ~292,000 years)
-        Ok(chrono::Duration::microseconds(value))
-    } else {
-        Err(Error::invalid_argument(format!(
-            "Unknown interval unit: '{}'. Supported: year, month, week, day, hour, minute, second, millisecond, microsecond",
-            unit
-        )))
-    }
-}
 
 /// Trait for table-valued functions (functions that return a set of rows)
 pub trait TableValuedFunction: Send + Sync {
@@ -255,73 +179,62 @@ impl GenerateSeriesFunction {
         // Step is required for timestamp series
         let step = if args.len() == 3 {
             match &args[2] {
-                Value::Text(s) => parse_interval(s)?,
-                Value::Integer(n) => chrono::Duration::try_days(*n).ok_or_else(|| {
+                Value::Text(s) => interval::parse_interval(s)?.ok_or_else(|| {
                     Error::invalid_argument(format!(
-                        "GENERATE_SERIES timestamp step {} days overflows",
-                        n
+                        "Invalid interval format: '{s}'. Expected format like '1 day', '2 hours'"
                     ))
                 })?,
+                Value::Integer(n) => Interval::of(*n, IntervalUnit::Day)?,
                 _ => {
                     return Err(Error::invalid_argument(
                         "GENERATE_SERIES timestamp step must be an interval string (e.g., '1 day', '2 hours')",
                     ));
                 }
             }
-        } else if start <= stop {
-            chrono::Duration::days(1)
         } else {
-            chrono::Duration::days(-1)
+            Interval::of(if start <= stop { 1 } else { -1 }, IntervalUnit::Day)?
         };
 
-        if step.is_zero() {
+        let direction = step.signum();
+        if direction == 0 {
             return Err(Error::invalid_argument(
                 "GENERATE_SERIES step must not be zero",
             ));
         }
 
         // Empty result on direction mismatch
-        if (step > chrono::Duration::zero() && start > stop)
-            || (step < chrono::Duration::zero() && start < stop)
-        {
+        if (direction > 0 && start > stop) || (direction < 0 && start < stop) {
             return Ok(RowVec::new());
         }
 
         let max_rows = limit.unwrap_or(MAX_TVF_ROWS).min(MAX_TVF_ROWS);
 
-        // Pre-allocate capacity based on estimated count
-        let step_secs = step.num_seconds().abs().max(1);
+        // Pre-allocate capacity based on estimated count, a month as its shortest
+        let step_secs = match step {
+            Interval::Duration(d) => d.num_seconds().abs().max(1),
+            Interval::Months(m) => m.saturating_abs().saturating_mul(28 * 86_400),
+        };
         let range_secs = (stop - start).num_seconds().abs();
         let estimated_count = (range_secs / step_secs) as usize + 1;
 
         let capacity = estimated_count.min(max_rows);
         let mut rows = RowVec::with_capacity(capacity);
-        let mut current = start;
-        let mut row_id = 0i64;
 
-        if step > chrono::Duration::zero() {
-            while current <= stop {
-                rows.push((row_id, Row::from_values(vec![Value::Timestamp(current)])));
-                row_id += 1;
-                if rows.len() >= max_rows {
-                    break;
-                }
-                current = match current.checked_add_signed(step) {
-                    Some(next) => next,
-                    None => break, // overflow → stop generating
-                };
+        // Value k is the start moved by k steps, so a month step does not
+        // carry a clamped day; one outside the TIMESTAMP range lies past stop
+        for k in 0i64.. {
+            let Some(current) = step
+                .times(k)
+                .and_then(|offset| interval::shift(start, offset, false).ok())
+            else {
+                break;
+            };
+            if (direction > 0 && current > stop) || (direction < 0 && current < stop) {
+                break;
             }
-        } else {
-            while current >= stop {
-                rows.push((row_id, Row::from_values(vec![Value::Timestamp(current)])));
-                row_id += 1;
-                if rows.len() >= max_rows {
-                    break;
-                }
-                current = match current.checked_add_signed(step) {
-                    Some(next) => next,
-                    None => break, // overflow → stop generating
-                };
+            rows.push((k, Row::from_values(vec![Value::Timestamp(current)])));
+            if rows.len() >= max_rows {
+                break;
             }
         }
 
@@ -683,30 +596,5 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows.len(), 5);
-    }
-
-    #[test]
-    fn test_parse_interval() {
-        assert_eq!(parse_interval("1 day").unwrap(), chrono::Duration::days(1));
-        assert_eq!(
-            parse_interval("2 hours").unwrap(),
-            chrono::Duration::hours(2)
-        );
-        assert_eq!(
-            parse_interval("30 minutes").unwrap(),
-            chrono::Duration::minutes(30)
-        );
-        assert_eq!(
-            parse_interval("1 week").unwrap(),
-            chrono::Duration::weeks(1)
-        );
-        assert_eq!(
-            parse_interval("-1 day").unwrap(),
-            chrono::Duration::days(-1)
-        );
-        assert!(parse_interval("invalid").is_err());
-        // Compound intervals should error, not silently truncate
-        assert!(parse_interval("1 day 2 hours").is_err());
-        assert!(parse_interval("1 hour 30 minutes").is_err());
     }
 }
