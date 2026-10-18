@@ -106,7 +106,18 @@ pub fn number_against_text(a: &Value, b: &Value) -> Option<Option<Ordering>> {
 /// How `a` orders against `b` in a predicate; None is UNKNOWN: a NULL, a
 /// TEXT that does not read as the other side's type, a BOOLEAN or TIMESTAMP
 /// against a number, a JSON or VECTOR, or two values of other domains
+#[inline(always)]
 pub fn sql_compare(a: &Value, b: &Value) -> Option<Ordering> {
+    if let Some(ordering) = a.plain_cmp(b) {
+        return Some(ordering);
+    }
+    compare_across(a, b)
+}
+
+/// `sql_compare` for a pair that is not of one plain type, kept out of line
+/// so the same-type answer costs no more than the comparison itself
+#[inline(never)]
+fn compare_across(a: &Value, b: &Value) -> Option<Ordering> {
     if a.is_null() || b.is_null() || non_number_against_number(a, b) {
         return None;
     }
@@ -158,7 +169,17 @@ fn read_text_across<'v>(
 /// read as the other side's type, or a JSON or VECTOR against another type.
 /// Two values of other domains, a BOOLEAN or TIMESTAMP against a number
 /// among them, are not equal
+#[inline(always)]
 pub fn sql_eq(a: &Value, b: &Value) -> Option<bool> {
+    if let Some(eq) = a.plain_eq(b) {
+        return Some(eq);
+    }
+    eq_across(a, b)
+}
+
+/// `sql_eq` for a pair that is not of one plain type, kept out of line
+#[inline(never)]
+fn eq_across(a: &Value, b: &Value) -> Option<bool> {
     if a.is_null() || b.is_null() {
         return None;
     }
@@ -401,6 +422,7 @@ impl PredicateSet {
 
     /// `probe IN (members)`; None is UNKNOWN. A set with no member at all,
     /// NULL included, holds nothing, so it is false even for a NULL probe
+    #[inline]
     pub fn contains(&self, probe: &Value) -> Option<bool> {
         if self.members.is_empty() && !self.has_null {
             return Some(false);
@@ -411,14 +433,20 @@ impl PredicateSet {
         if self.members.contains(probe) {
             return Some(true);
         }
-        let probe_kind = kind::of(probe);
-        // A JSON or VECTOR equals only a member of its own kind, which the lookup finds
-        let others = if probe_kind & kind::EXTENSIONS != 0 {
-            !probe_kind
-        } else {
-            kind::EXTENSIONS
-        };
-        let mut unknown = self.has_null || self.kinds & others != 0;
+        // Members all of the probe's kind meet it only as the lookup found
+        if !self.has_null && self.kinds == kind::of(probe) {
+            return Some(false);
+        }
+        self.missed(probe)
+    }
+
+    /// `contains` for a probe the lookup did not find, among members of
+    /// other kinds or a NULL
+    #[inline(never)]
+    fn missed(&self, probe: &Value) -> Option<bool> {
+        // A JSON or VECTOR member is UNKNOWN against any other kind
+        let mut unknown = self.has_null || self.kinds & kind::EXTENSIONS != 0;
+        let read_kinds = kind::BOOLEAN | kind::TIMESTAMP;
         match probe {
             Value::Integer(_) | Value::Float(_) => {
                 if self.numbers_in_text.contains(probe) {
@@ -427,13 +455,13 @@ impl PredicateSet {
                 unknown |= self.has_unreadable_text;
             }
             Value::Boolean(_) | Value::Timestamp(_) if self.kinds & kind::TEXT != 0 => {
-                let reads = self.text_reads(probe_kind);
+                let reads = self.text_reads(matches!(probe, Value::Boolean(_)));
                 if reads.values.contains(probe) {
                     return Some(true);
                 }
                 unknown |= reads.unreadable;
             }
-            Value::Text(text) => {
+            Value::Text(text) if self.has_numbers || self.kinds & read_kinds != 0 => {
                 if self.has_numbers {
                     match parse_sql_number(text) {
                         Some(number) if self.members.contains(&number) => return Some(true),
@@ -454,6 +482,10 @@ impl PredicateSet {
                     }
                 }
             }
+            // Equal only to a member of its own kind, which the lookup finds
+            Value::Extension(_) => {
+                unknown = self.has_null || self.kinds & !kind::of(probe) != 0;
+            }
             _ => {}
         }
         if unknown {
@@ -463,10 +495,10 @@ impl PredicateSet {
         }
     }
 
-    /// The readings of the TEXT members as the type of `probe_kind`, a
-    /// BOOLEAN or a TIMESTAMP, taken on the first call for that type
-    fn text_reads(&self, probe_kind: u8) -> &TextReads {
-        let (slot, reading) = if probe_kind == kind::BOOLEAN {
+    /// The readings of the TEXT members as BOOLEAN (`boolean`) or TIMESTAMP,
+    /// taken on the first call for that type
+    fn text_reads(&self, boolean: bool) -> &TextReads {
+        let (slot, reading) = if boolean {
             (&self.text_reads[0], TextReading::Boolean)
         } else {
             (&self.text_reads[1], TextReading::Timestamp)

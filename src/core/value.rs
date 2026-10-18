@@ -453,12 +453,10 @@ impl Value {
 
     /// Compare values of the same type
     fn compare_same_type(&self, other: &Value) -> Result<Ordering> {
+        if let Some(ordering) = self.plain_cmp(other) {
+            return Ok(ordering);
+        }
         match (self, other) {
-            (Value::Integer(a), Value::Integer(b)) => Ok(a.cmp(b)),
-            (Value::Float(a), Value::Float(b)) => Ok(compare_floats(*a, *b)),
-            (Value::Text(a), Value::Text(b)) => Ok(a.cmp(b)),
-            (Value::Boolean(a), Value::Boolean(b)) => Ok(a.cmp(b)),
-            (Value::Timestamp(a), Value::Timestamp(b)) => Ok(a.cmp(b)),
             (Value::Extension(a), Value::Extension(b)) => {
                 // Extension: tag byte is [0], so same-tag comparison is data equality
                 if a.first() != b.first() {
@@ -472,6 +470,34 @@ impl Value {
                 }
             }
             _ => Err(Error::IncomparableTypes),
+        }
+    }
+
+    /// How two values of one type that is neither NULL nor an extension
+    /// order; None for any other pair
+    #[inline]
+    pub(crate) fn plain_cmp(&self, other: &Value) -> Option<Ordering> {
+        match (self, other) {
+            (Value::Integer(a), Value::Integer(b)) => Some(a.cmp(b)),
+            (Value::Float(a), Value::Float(b)) => Some(compare_floats(*a, *b)),
+            (Value::Text(a), Value::Text(b)) => Some(a.cmp(b)),
+            (Value::Boolean(a), Value::Boolean(b)) => Some(a.cmp(b)),
+            (Value::Timestamp(a), Value::Timestamp(b)) => Some(a.cmp(b)),
+            _ => None,
+        }
+    }
+
+    /// Whether two values of one type that is neither NULL nor an extension
+    /// are equal, as `plain_cmp` orders them; None for any other pair
+    #[inline]
+    pub(crate) fn plain_eq(&self, other: &Value) -> Option<bool> {
+        match (self, other) {
+            (Value::Integer(a), Value::Integer(b)) => Some(a == b),
+            (Value::Float(a), Value::Float(b)) => Some(compare_floats(*a, *b).is_eq()),
+            (Value::Text(a), Value::Text(b)) => Some(a == b),
+            (Value::Boolean(a), Value::Boolean(b)) => Some(a == b),
+            (Value::Timestamp(a), Value::Timestamp(b)) => Some(a == b),
+            _ => None,
         }
     }
 
