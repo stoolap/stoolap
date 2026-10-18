@@ -159,8 +159,8 @@ impl Interval {
 /// outside the range.
 pub fn parse_interval(s: &str) -> Result<Option<Interval>> {
     let s = s.trim();
-    if let Some(d) = parse_formatted_duration(s) {
-        return Ok(Some(Interval::Duration(d)));
+    if let Some(interval) = parse_formatted_duration(s)? {
+        return Ok(Some(interval));
     }
     let mut parts = s.split_whitespace();
     let (quantity, unit) = match (parts.next(), parts.next(), parts.next()) {
@@ -178,39 +178,53 @@ pub fn parse_interval(s: &str) -> Result<Option<Interval>> {
 }
 
 /// Parse the "[-]N days HH:MM:SS" and "[-]HH:MM:SS" strings a TIMESTAMP
-/// difference prints
-fn parse_formatted_duration(s: &str) -> Option<TimeDelta> {
+/// difference prints; an error when it does not fit
+fn parse_formatted_duration(s: &str) -> Result<Option<Interval>> {
     let (negative, rest) = match s.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, s),
     };
     let (days, hms) = match rest.split_once(' ') {
-        Some((days, tail)) => {
-            let (unit, hms) = tail.trim_start().split_once(' ')?;
-            if !unit.eq_ignore_ascii_case("days") && !unit.eq_ignore_ascii_case("day") {
-                return None;
+        Some((days, tail)) => match tail.trim_start().split_once(' ') {
+            Some((unit, hms))
+                if unit.eq_ignore_ascii_case("days") || unit.eq_ignore_ascii_case("day") =>
+            {
+                (Some(days), hms.trim_start())
             }
-            (days.parse::<i64>().ok()?, hms.trim_start())
-        }
-        None => (0, rest),
+            _ => return Ok(None),
+        },
+        None => (None, rest),
     };
     let mut fields = hms.split(':');
-    let hours = fields.next()?.parse::<i64>().ok()?;
-    let minutes = fields.next()?.parse::<i64>().ok()?;
-    let seconds = fields.next()?.parse::<i64>().ok()?;
-    if fields.next().is_some()
-        || days < 0
-        || hours < 0
-        || !(0..60).contains(&minutes)
-        || !(0..60).contains(&seconds)
-    {
-        return None;
+    let (Some(h), Some(m), Some(sec), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return Ok(None);
+    };
+    let days = match days {
+        Some(days) => integer_from_text(days)?,
+        None => Some(0),
+    };
+    let (Some(days), Some(hours), Some(minutes), Some(seconds)) = (
+        days,
+        integer_from_text(h)?,
+        integer_from_text(m)?,
+        integer_from_text(sec)?,
+    ) else {
+        return Ok(None);
+    };
+    if days < 0 || hours < 0 || !(0..60).contains(&minutes) || !(0..60).contains(&seconds) {
+        return Ok(None);
     }
-    let duration = TimeDelta::try_days(days)?
-        .checked_add(&TimeDelta::try_hours(hours)?)?
-        .checked_add(&TimeDelta::try_minutes(minutes)?)?
-        .checked_add(&TimeDelta::try_seconds(seconds)?)?;
-    Some(if negative { -duration } else { duration })
+    let micros = days
+        .checked_mul(IntervalUnit::Day.micros())
+        .zip(hours.checked_mul(IntervalUnit::Hour.micros()))
+        .and_then(|(d, h)| d.checked_add(h))
+        .and_then(|total| total.checked_add(minutes * IntervalUnit::Minute.micros()))
+        .and_then(|total| total.checked_add(seconds * IntervalUnit::Second.micros()))
+        .ok_or_else(|| Error::Type(format!("INTERVAL '{s}' is out of range")))?;
+    let micros = if negative { -micros } else { micros };
+    Ok(Some(Interval::Duration(TimeDelta::microseconds(micros))))
 }
 
 /// `t` moved by `interval`, backwards when `subtract`; an error when the
@@ -283,6 +297,17 @@ mod tests {
         assert!(parse_interval("9223372036854775807 days").is_err());
         assert!(parse_interval("99999999999999999999 days").is_err());
         assert!(parse_interval("9223372036854775807 years").is_err());
+        assert!(parse_interval("106751992 days 00:00:00").is_err());
+        assert!(parse_interval("9223372036854775807 days 00:00:00").is_err());
+        assert!(parse_interval("99999999999999999999 days 00:00:00").is_err());
+        assert!(parse_interval("99999999999999999999:00:00").is_err());
+        assert_eq!(parse_interval("banana days 00:00:00").unwrap(), None);
+        assert_eq!(
+            parse_interval("106751991 days 00:00:00")
+                .unwrap()
+                .and_then(|step| step.times(0)),
+            Some(Interval::Duration(TimeDelta::zero()))
+        );
     }
 
     #[test]

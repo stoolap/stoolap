@@ -74,6 +74,8 @@ fn test_a_result_outside_the_range_is_an_error() {
         "ts + 9223372036854775807",
         "ts + INTERVAL '9223372036854775807 days'",
         "ts + INTERVAL '9223372036854775807 years'",
+        "ts + '9223372036854775807 days 00:00:00'",
+        "ts + '106751992 days 00:00:00'",
     ] {
         fails(&db, &format!("SELECT {expr} FROM t WHERE id = 1"));
         fails(
@@ -223,4 +225,17 @@ fn test_a_series_steps_by_calendar_months() {
         ),
         ["9999-12-30", "9999-12-31"].map(ts).to_vec()
     );
+    assert_eq!(
+        values(
+            "SELECT value FROM generate_series(TIMESTAMP '2024-01-01', TIMESTAMP '2024-01-02', '106751991 days 00:00:00')"
+        ),
+        [ts("2024-01-01")].to_vec()
+    );
+    assert!(db
+        .query(
+            "SELECT value FROM generate_series(TIMESTAMP '2024-01-01', TIMESTAMP '2024-01-02', '106751992 days 00:00:00')",
+            ()
+        )
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        .is_err());
 }
