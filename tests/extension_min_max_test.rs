@@ -32,42 +32,84 @@ fn rows(db: &Database, sql: &str) -> Vec<String> {
     }
 }
 
+const JSON_ROWS: &str = "(1, 1, '{\"k\":1}'), (2, 1, '{\"k\":2}'), (3, 1, '{\"a\":0}'), \
+                         (4, 2, '{\"m\":5}'), (5, 2, '{\"b\":1}')";
+const VECTOR_ROWS: &str = "(1, 1, '[1.0, 2.0]'), (2, 1, '[0.5, 9.0]'), (3, 1, '[3.0, 0.0]'), \
+                           (4, 2, '[2.0, 2.0]'), (5, 2, '[0.25, 1.0]')";
+
+/// (table, a value one row holds)
+const TABLES: &[(&str, &str)] = &[
+    ("j", "CAST('{\"a\":0}' AS JSON)"),
+    ("jb", "CAST('{\"a\":0}' AS JSON)"),
+    ("e", "CAST('[3.0, 0.0]' AS VECTOR)"),
+];
+
 fn create(db: &Database) {
     for sql in [
-        "CREATE TABLE j (id INTEGER PRIMARY KEY, v JSON)",
-        "INSERT INTO j VALUES (1, '{\"k\":1}'), (2, '{\"k\":2}'), (3, '{\"a\":0}')",
-        "CREATE TABLE e (id INTEGER PRIMARY KEY, v VECTOR(2))",
-        "INSERT INTO e VALUES (1, '[1.0, 2.0]'), (2, '[0.5, 9.0]'), (3, '[3.0, 0.0]')",
-        "CREATE TABLE ji (id INTEGER PRIMARY KEY, v JSON)",
-        "CREATE INDEX ji_v ON ji(v)",
-        "INSERT INTO ji VALUES (1, '{\"k\":1}'), (2, '{\"k\":2}'), (3, '{\"a\":0}')",
+        "CREATE TABLE j (id INTEGER PRIMARY KEY, g INTEGER, v JSON)".to_string(),
+        format!("INSERT INTO j VALUES {JSON_ROWS}"),
+        "CREATE TABLE jb (id INTEGER PRIMARY KEY, g INTEGER, v JSON)".to_string(),
+        "CREATE INDEX jb_v ON jb(v) USING BTREE".to_string(),
+        format!("INSERT INTO jb VALUES {JSON_ROWS}"),
+        "CREATE TABLE e (id INTEGER PRIMARY KEY, g INTEGER, v VECTOR(2))".to_string(),
+        format!("INSERT INTO e VALUES {VECTOR_ROWS}"),
     ] {
-        db.execute(sql, ()).unwrap();
+        db.execute(&sql, ()).unwrap();
     }
 }
 
+fn sorted(mut rows: Vec<String>) -> Vec<String> {
+    rows.sort();
+    rows
+}
+
 fn check(db: &Database, ctx: &str, wrong: &mut Vec<String>) {
-    for table in ["j", "e", "ji"] {
+    const V: &str = "CASE WHEN id > 0 THEN v END";
+    for (table, held) in TABLES {
         for (sql, general) in [
             (
                 format!("SELECT MIN(v), MAX(v) FROM {table}"),
-                format!(
-                    "SELECT MIN(CASE WHEN id > 0 THEN v END), \
-                     MAX(CASE WHEN id > 0 THEN v END) FROM {table}"
-                ),
+                format!("SELECT MIN({V}), MAX({V}) FROM {table}"),
+            ),
+            (
+                format!("SELECT MIN(v) FROM {table}"),
+                format!("SELECT MIN({V}) FROM {table}"),
+            ),
+            (
+                format!("SELECT MAX(v) FROM {table}"),
+                format!("SELECT MAX({V}) FROM {table}"),
             ),
             (
                 format!("SELECT MIN(v), MAX(v) FROM {table} WHERE id > 0"),
-                format!(
-                    "SELECT MIN(CASE WHEN id > 0 THEN v END), \
-                     MAX(CASE WHEN id > 0 THEN v END) FROM {table} WHERE id > 0"
-                ),
+                format!("SELECT MIN({V}), MAX({V}) FROM {table} WHERE id > 0"),
+            ),
+            (
+                format!("SELECT g, MIN(v), MAX(v) FROM {table} GROUP BY g"),
+                format!("SELECT g, MIN({V}), MAX({V}) FROM {table} GROUP BY g"),
+            ),
+            (
+                format!("SELECT v FROM {table} ORDER BY v LIMIT 2"),
+                format!("SELECT v FROM {table} ORDER BY {V} LIMIT 2"),
+            ),
+            (
+                format!("SELECT v FROM {table} ORDER BY v DESC LIMIT 2"),
+                format!("SELECT v FROM {table} ORDER BY {V} DESC LIMIT 2"),
             ),
         ] {
             let (got, want) = (rows(db, &sql), rows(db, &general));
+            let (got, want) = if sql.contains("GROUP BY") {
+                (sorted(got), sorted(want))
+            } else {
+                (got, want)
+            };
             if got != want {
                 wrong.push(format!("{ctx}: {sql}: got {got:?}, general {want:?}"));
             }
+        }
+        let sql = format!("SELECT COUNT(*) FROM {table} WHERE v = {held}");
+        let got = rows(db, &sql);
+        if got != ["Integer(1)"] {
+            wrong.push(format!("{ctx}: {sql}: got {got:?}, want [Integer(1)]"));
         }
     }
 }
@@ -91,6 +133,16 @@ fn json_and_vector_min_max_answer_as_the_general_path() {
     }
     let db = Database::open(&dsn).unwrap();
     check(&db, "file reopened", &mut wrong);
+    for table in ["j", "jb"] {
+        db.execute(
+            &format!("INSERT INTO {table} VALUES (6, 2, '{{\"c\":7}}')"),
+            (),
+        )
+        .unwrap();
+    }
+    db.execute("INSERT INTO e VALUES (6, 2, '[9.0, 9.0]')", ())
+        .unwrap();
+    check(&db, "file reopened, sealed and hot", &mut wrong);
     assert!(
         wrong.is_empty(),
         "{} wrong:\n{}",
