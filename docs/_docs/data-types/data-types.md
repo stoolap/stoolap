@@ -264,6 +264,8 @@ INSERT INTO employees VALUES (2, -5, 50000, 'active');
 
 Note: CHECK must be specified as a column constraint (inline with column definition), not as a table-level constraint.
 
+A CHECK runs on a NULL value too, and a CHECK whose result is NULL passes: `CHECK(salary > 0)` takes a NULL salary, while `CHECK(salary IS NOT NULL)` refuses it. A CHECK that fails to evaluate, for example on an overflow, fails the statement.
+
 ## NULL Values
 
 Stoolap fully supports NULL values:
