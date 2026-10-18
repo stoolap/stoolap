@@ -4398,14 +4398,9 @@ impl Executor {
                 // The join condition u.id = o.user_id means:
                 //   Filter "o.user_id IN (1,2,3)" is equivalent to "u.id IN (1,2,3)" for join results
                 // A small outer keeps the filter the standard join gives it
-                // The equivalence holds only for two keys of one family: a TEXT
-                // key's filter does not carry over to a numeric key or back
+                // The equivalence holds only for two keys of one type or both
+                // numbers: a comparison reads a constant against each by its own type
                 let same_family = || {
-                    let family = |data_type| match data_type {
-                        Some(DataType::Text) => Some(true),
-                        Some(DataType::Integer | DataType::Float) => Some(false),
-                        _ => None,
-                    };
                     let column_type = |expr: &Expression, column: &str| {
                         let name = column.rsplit('.').next().unwrap_or(column);
                         self.base_table_side_schema(expr, ctx)
@@ -4416,8 +4411,15 @@ impl Executor {
                     } else {
                         &join_source.right
                     };
-                    let inner = family(column_type(inner_expr, &inner_col));
-                    inner.is_none() || inner == family(column_type(outer_expr, &outer_col))
+                    match (
+                        column_type(inner_expr, &inner_col),
+                        column_type(outer_expr, &outer_col),
+                    ) {
+                        (Some(inner), Some(outer)) => {
+                            inner == outer || (inner.is_numeric() && outer.is_numeric())
+                        }
+                        _ => false,
+                    }
                 };
                 let nl_left_filter = if small_outer {
                     nl_left_filter

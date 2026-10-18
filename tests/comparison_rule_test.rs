@@ -589,7 +589,50 @@ fn join_wrong_answers(db: &Database, keys: &JoinKeys, wrong: &mut Vec<String>) {
             ids(&[]),
         ),
     ];
+    // A filter on one key, which a join may carry to the other
+    let text = keys.right[0];
+    let of_first = if meets {
+        vec![pair(1, Some(1)), pair(1, Some(4))]
+    } else {
+        Vec::new()
+    };
+    let without_first = if meets {
+        vec![pair(1, Some(4)), pair(2, Some(2))]
+    } else {
+        Vec::new()
+    };
+    let filtered = [
+        (
+            format!(
+                "SELECT l.id, r.id FROM l JOIN r ON l.k = r.k WHERE l.k = {text} ORDER BY 1, 2"
+            ),
+            of_first.clone(),
+        ),
+        (
+            format!(
+                "SELECT l.id, r.id FROM r JOIN l ON r.k = l.k WHERE l.k = {text} ORDER BY 1, 2"
+            ),
+            of_first,
+        ),
+        (
+            format!(
+                "SELECT l.id, r.id FROM l JOIN r ON l.k = r.k WHERE r.k <> {text} ORDER BY 1, 2"
+            ),
+            without_first.clone(),
+        ),
+        (
+            format!(
+                "SELECT l.id, r.id FROM r JOIN l ON r.k = l.k WHERE r.k <> {text} ORDER BY 1, 2"
+            ),
+            without_first,
+        ),
+    ];
+    let queries = queries
+        .into_iter()
+        .map(|(sql, want)| (sql.to_string(), want))
+        .chain(filtered);
     for (sql, want) in queries {
+        let sql = sql.as_str();
         let mut got = join_rows(db, sql);
         if !sql.contains("ORDER BY") {
             if let Ok(rows) = got.as_mut() {
