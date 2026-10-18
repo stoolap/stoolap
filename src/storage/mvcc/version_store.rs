@@ -35,13 +35,12 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::common::SmartString;
 
-use crate::common::i64_map::{f64_from_key, key_from_f64};
 use crate::common::{
     new_cow_btree_map, new_i64_map, new_i64_map_with_capacity, CompactArc, CowBTreeMap, I64Map,
 };
 use crate::core::types::DataType;
-use crate::core::value::grouping_float;
-use crate::core::{Error, Row, RowVec, Schema, SumAccumulator, Value};
+use crate::core::{Error, Row, RowVec, Schema, SumAccumulator, Value, NULL_VALUE};
+use crate::functions::aggregate::{CallTemplate, ColumnsKey, CompiledAggregate, GroupedAggregates};
 use crate::storage::expression::CompiledFilter;
 use crate::storage::mvcc::arena::{Relayout, RowArena};
 use crate::storage::mvcc::get_fast_timestamp;
@@ -51,7 +50,6 @@ use crate::storage::mvcc::registry::TransactionRegistry;
 use crate::storage::traits::PlannedUpdate;
 use crate::storage::volume::side_index::SideIndexDef;
 use crate::storage::Index;
-use ahash::AHashMap;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -60,53 +58,6 @@ use smallvec::{smallvec, SmallVec};
 /// Type alias for version lists - uses SmallVec to avoid heap allocation
 /// for the common case of a single version per row within a transaction.
 type VersionList = SmallVec<[RowVersion; 1]>;
-
-/// Group key using CompactArc<Value> to avoid cloning during aggregation.
-/// Uses Arc::clone (O(1) atomic increment) instead of Value::clone (deep copy).
-#[derive(Clone, Debug)]
-pub enum GroupKey {
-    Single(CompactArc<Value>),
-    Multi(Vec<CompactArc<Value>>),
-}
-
-impl PartialEq for GroupKey {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (GroupKey::Single(a), GroupKey::Single(b)) => **a == **b,
-            (GroupKey::Multi(a), GroupKey::Multi(b)) => {
-                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| **x == **y)
-            }
-            _ => false,
-        }
-    }
-}
-
-impl Eq for GroupKey {}
-
-impl std::hash::Hash for GroupKey {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        match self {
-            GroupKey::Single(v) => (**v).hash(state),
-            GroupKey::Multi(vs) => {
-                for v in vs {
-                    (**v).hash(state);
-                }
-            }
-        }
-    }
-}
-
-/// Hash map for GroupKey with randomized hashing (HashDoS resistant)
-type GroupKeyMap<V> = AHashMap<GroupKey, V>;
-
-/// Result of storage-level grouped aggregation
-#[derive(Debug, Clone)]
-pub struct GroupedAggregateResult {
-    /// Group key values
-    pub group_values: Vec<Value>,
-    /// Aggregate results in order of requested aggregates
-    pub aggregate_values: Vec<Value>,
-}
 
 /// Represents a specific version of a row with complete data
 ///
@@ -430,6 +381,55 @@ pub enum AggregateOp {
     Min,
     Max,
     Avg,
+}
+
+impl AggregateOp {
+    /// How every group runs the call, by its compiled implementation
+    pub fn template(self) -> CallTemplate {
+        let make: fn() -> CompiledAggregate = match self {
+            AggregateOp::Count => || CompiledAggregate::count(false),
+            AggregateOp::CountStar => CompiledAggregate::count_star,
+            AggregateOp::Sum => || CompiledAggregate::sum(false),
+            AggregateOp::Avg => || CompiledAggregate::avg(false),
+            AggregateOp::Min => CompiledAggregate::min,
+            AggregateOp::Max => CompiledAggregate::max,
+        };
+        CallTemplate::Compiled(make)
+    }
+}
+
+/// No groups yet of `aggregates` keyed by `group_by_indices`
+pub fn grouped_aggregates(
+    group_by_indices: &[usize],
+    aggregates: &[(AggregateOp, usize)],
+) -> GroupedAggregates {
+    GroupedAggregates::new(
+        aggregates.iter().map(|&(op, _)| op.template()).collect(),
+        group_by_indices.len(),
+    )
+}
+
+/// What a column past a row's end reads
+static ABSENT: Value = NULL_VALUE;
+
+/// Runs one row, read in place, into its group; a column past the row's
+/// end reads NULL
+#[inline(always)]
+pub fn aggregate_row(
+    groups: &mut GroupedAggregates,
+    group_by_indices: &[usize],
+    aggregates: &[(AggregateOp, usize)],
+    row: &[Value],
+) {
+    let key = ColumnsKey {
+        values: row,
+        columns: group_by_indices,
+    };
+    if let Some(group) = groups.group(&key) {
+        for (run, &(_, col_idx)) in groups.aggregates(group).iter_mut().zip(aggregates) {
+            run.accumulate(row.get(col_idx).unwrap_or(&ABSENT));
+        }
+    }
 }
 
 /// Result of an aggregate operation
@@ -7198,34 +7198,31 @@ impl VersionStore {
         versions.get(row_id).map(|entry| entry.version.txn_id)
     }
 
-    /// Compute grouped aggregates directly from arena storage.
-    ///
-    /// This method performs GROUP BY aggregation at the storage level without
-    /// materializing Row objects. It uses Arc::clone for group keys (O(1))
-    /// instead of Value::clone (deep copy), significantly reducing allocations.
+    /// Compute grouped aggregates directly from arena storage, reading each
+    /// row in place: a key value is cloned once, when its group is made
     ///
     /// # Arguments
-    /// * `txn_id` - Transaction ID for visibility checks
+    /// * `reader` - The reader whose snapshot decides visibility
     /// * `group_by_indices` - Column indices to group by
     /// * `aggregates` - List of (operation, column_index) pairs
     ///
     /// # Returns
-    /// Vector of grouped aggregate results, or empty if optimization not possible
+    /// The groups, or None when the arena's heads cannot answer for the reader
     pub fn compute_grouped_aggregates(
         &self,
         reader: Reader<'_>,
         group_by_indices: &[usize],
         aggregates: &[(AggregateOp, usize)],
-    ) -> crate::core::Result<Option<Vec<GroupedAggregateResult>>> {
+    ) -> crate::core::Result<Option<GroupedAggregates>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.compute_grouped_aggregates");
         if self.closed.load(Ordering::Acquire) {
-            return Ok(Some(Vec::new()));
+            return Ok(Some(grouped_aggregates(group_by_indices, aggregates)));
         }
 
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => reader.over(&**c),
-            None => return Ok(Some(Vec::new())),
+            None => return Ok(Some(grouped_aggregates(group_by_indices, aggregates))),
         };
         let txn_id = reader.txn_id;
 
@@ -7237,15 +7234,6 @@ impl VersionStore {
             return Ok(None);
         };
 
-        // Accumulator for each group: (count, sum, min, max) per aggregate
-        #[derive(Clone, Default)]
-        struct Accum {
-            count: i64,
-            sum: SumAccumulator,
-            min: Option<Value>,
-            max: Option<Value>,
-        }
-
         // Slots between checks that no commit began publishing: its answer
         // would be dropped, so the pass stops and lets the commit take the arena
         const EPOCH_STRIDE: usize = 1024;
@@ -7255,308 +7243,9 @@ impl VersionStore {
         let arena_data = arena_guard.data();
         let arena_meta = arena_guard.meta();
 
-        // Helper to update accumulators
-        #[inline(always)]
-        fn update_accums(
-            accums: &mut [Accum],
-            aggregates: &[(AggregateOp, usize)],
-            row_data: &[Value],
-        ) {
-            for (agg_idx, (op, col_idx)) in aggregates.iter().enumerate() {
-                let accum = &mut accums[agg_idx];
-
-                match op {
-                    AggregateOp::CountStar => {
-                        accum.count += 1;
-                    }
-                    AggregateOp::Count => {
-                        if *col_idx < row_data.len() && !row_data[*col_idx].is_null() {
-                            accum.count += 1;
-                        }
-                    }
-                    AggregateOp::Sum | AggregateOp::Avg => {
-                        if *col_idx < row_data.len() {
-                            accum.sum.add(&row_data[*col_idx]);
-                        }
-                    }
-                    AggregateOp::Min => {
-                        if *col_idx < row_data.len() {
-                            let val = &row_data[*col_idx];
-                            if !val.is_null() {
-                                match &accum.min {
-                                    None => accum.min = Some(val.clone()),
-                                    Some(current) => {
-                                        if val.cmp(current).is_lt() {
-                                            accum.min = Some(val.clone());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    AggregateOp::Max => {
-                        if *col_idx < row_data.len() {
-                            let val = &row_data[*col_idx];
-                            if !val.is_null() {
-                                match &accum.max {
-                                    None => accum.max = Some(val.clone()),
-                                    Some(current) => {
-                                        if val.cmp(current).is_gt() {
-                                            accum.max = Some(val.clone());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Helper to compute final aggregate values
-        fn compute_aggregate_values(
-            aggregates: &[(AggregateOp, usize)],
-            accums: &[Accum],
-        ) -> crate::core::Result<Vec<Value>> {
-            aggregates
-                .iter()
-                .zip(accums.iter())
-                .map(|((op, _), accum)| match op {
-                    AggregateOp::Count | AggregateOp::CountStar => Ok(Value::Integer(accum.count)),
-                    AggregateOp::Sum => accum.sum.sum(),
-                    AggregateOp::Avg => Ok(accum.sum.avg()),
-                    AggregateOp::Min => {
-                        Ok(accum.min.clone().unwrap_or(Value::Null(DataType::Null)))
-                    }
-                    AggregateOp::Max => {
-                        Ok(accum.max.clone().unwrap_or(Value::Null(DataType::Null)))
-                    }
-                })
-                .collect()
-        }
-
-        // FAST PATH: Single-column GROUP BY with primitive types (Integer, Float, Boolean)
-        // Uses I64Map directly for ~3x faster hashing and comparison
-        // Avoids GroupKey allocation entirely for primitive types and NULL
-        if group_by_indices.len() == 1 {
-            let col_idx = group_by_indices[0];
-
-            // Track key type: 0=Integer, 1=Float, 2=Boolean, 3=Mixed/Other
-            let mut key_type: u8 = 255; // uninitialized
-                                        // Accumulators live in one flat pool, `n_aggs` per group, and the
-                                        // maps hold the group's ordinal into it. A Vec per group would be
-                                        // one allocation per distinct group, which for a high-cardinality
-                                        // GROUP BY is the dominant cost of the scan.
-            let n_aggs = aggregates.len();
-            let mut accums: Vec<Accum> = Vec::new();
-            let mut group_count: u32 = 0;
-            // The ordinal is counted, not derived from the pool length: an
-            // empty aggregate list is a valid request and would divide by zero.
-            fn new_group(accums: &mut Vec<Accum>, group_count: &mut u32, n_aggs: usize) -> u32 {
-                let ordinal = *group_count;
-                *group_count += 1;
-                accums.resize_with(accums.len() + n_aggs, Accum::default);
-                ordinal
-            }
-            use crate::common::i64_map::Entry;
-            let mut int_groups: I64Map<u32> = I64Map::new();
-            // Separate NULL accumulator - avoids creating GroupKey for NULL
-            let mut null_group: Option<u32> = None;
-            // Only used for String/other types that can't be mapped to i64
-            let mut other_groups: GroupKeyMap<u32> = GroupKeyMap::default();
-            // Asked once per run of heads from one transaction
-            let (mut last_txn_id, mut last_visible) = (0i64, false);
-
-            for (stride, metas) in arena_meta.chunks(EPOCH_STRIDE).enumerate() {
-                if self.publish_epoch_if_quiet() != Some(epoch) {
-                    drop(arena_guard);
-                    return Ok(None);
-                }
-                for (offset, meta) in metas.iter().enumerate() {
-                    let idx = stride * EPOCH_STRIDE + offset;
-                    #[cfg(feature = "test-failpoints")]
-                    crate::test_failpoints::grouped_slot_reached(idx);
-                    // Visibility check (standard pattern: check creation, then deletion)
-                    if meta.txn_id == 0 {
-                        continue;
-                    }
-                    if meta.txn_id != last_txn_id {
-                        last_txn_id = meta.txn_id;
-                        last_visible = checker.is_visible(meta.txn_id, txn_id);
-                    }
-                    if !last_visible {
-                        continue;
-                    }
-                    if meta.deleted_at_txn_id != 0
-                        && checker.is_visible(meta.deleted_at_txn_id, txn_id)
-                    {
-                        continue;
-                    }
-
-                    let row_data = match arena_data.get(idx) {
-                        Some(data) => data,
-                        None => continue,
-                    };
-
-                    let row_slice = row_data.as_ref();
-                    let val = if col_idx < row_slice.len() {
-                        &row_slice[col_idx]
-                    } else {
-                        // NULL - track separately without GroupKey allocation
-                        let ordinal = match null_group {
-                            Some(ordinal) => ordinal,
-                            None => {
-                                *null_group.insert(new_group(&mut accums, &mut group_count, n_aggs))
-                            }
-                        };
-                        let base = ordinal as usize * n_aggs;
-                        update_accums(&mut accums[base..base + n_aggs], aggregates, row_slice);
-                        continue;
-                    };
-
-                    // Try to extract i64 key for primitive types.
-                    // Only route to int_groups when the type matches key_type.
-                    // Mixed-type columns route mismatched types to other_groups
-                    // to avoid reconstructing Float bits as Integer or vice versa.
-                    let i64_key = match val {
-                        Value::Integer(i) => {
-                            if key_type == 255 {
-                                key_type = 0;
-                            }
-                            if key_type == 0 {
-                                Some(*i)
-                            } else {
-                                None // Type mismatch → other_groups
-                            }
-                        }
-                        Value::Float(f) => {
-                            if key_type == 255 {
-                                key_type = 1;
-                            }
-                            if key_type == 1 {
-                                Some(key_from_f64(grouping_float(*f)))
-                            } else {
-                                None // Type mismatch → other_groups
-                            }
-                        }
-                        Value::Boolean(b) => {
-                            if key_type == 255 {
-                                key_type = 2;
-                            }
-                            if key_type == 2 {
-                                Some(if *b { 1 } else { 0 })
-                            } else {
-                                None // Type mismatch → other_groups
-                            }
-                        }
-                        Value::Null(_) => {
-                            // NULL value in the column - track separately
-                            let ordinal = match null_group {
-                                Some(ordinal) => ordinal,
-                                None => *null_group.insert(new_group(
-                                    &mut accums,
-                                    &mut group_count,
-                                    n_aggs,
-                                )),
-                            };
-                            let base = ordinal as usize * n_aggs;
-                            update_accums(&mut accums[base..base + n_aggs], aggregates, row_slice);
-                            continue;
-                        }
-                        _ => None,
-                    };
-
-                    let ordinal = if let Some(key) = i64_key {
-                        match int_groups.entry(key) {
-                            Entry::Occupied(existing) => *existing.into_mut(),
-                            Entry::Vacant(slot) => {
-                                *slot.insert(new_group(&mut accums, &mut group_count, n_aggs))
-                            }
-                        }
-                    } else {
-                        match other_groups.entry(GroupKey::Single(CompactArc::new(val.clone()))) {
-                            std::collections::hash_map::Entry::Occupied(existing) => {
-                                *existing.get()
-                            }
-                            std::collections::hash_map::Entry::Vacant(slot) => {
-                                *slot.insert(new_group(&mut accums, &mut group_count, n_aggs))
-                            }
-                        }
-                    };
-                    let base = ordinal as usize * n_aggs;
-                    update_accums(&mut accums[base..base + n_aggs], aggregates, row_slice);
-                }
-            }
-
-            // The groups own their keys and values: build the results
-            // outside the lock, and only if no commit published across the pass
-            let held = self.publish_epoch_if_quiet() == Some(epoch);
-            drop(arena_guard);
-            if !held {
-                return Ok(None);
-            }
-
-            // Convert to results
-            let has_null = null_group.is_some();
-            let mut results: Vec<GroupedAggregateResult> = Vec::with_capacity(
-                int_groups.len() + other_groups.len() + if has_null { 1 } else { 0 },
-            );
-
-            // The caller appends the aggregate values onto the group values to
-            // build the output row, so the key vector is sized for both here
-            // and that append does not reallocate.
-            let row_width = 1 + n_aggs;
-            let slice_of = |ordinal: u32| {
-                let base = ordinal as usize * n_aggs;
-                &accums[base..base + n_aggs]
-            };
-
-            // Convert int_groups based on key_type
-            for (key, &ordinal) in int_groups.iter() {
-                let group_value = match key_type {
-                    0 => Value::Integer(key),             // Integer
-                    1 => Value::Float(f64_from_key(key)), // Float
-                    2 => Value::Boolean(key != 0),        // Boolean
-                    _ => Value::Integer(key),             // Fallback
-                };
-                let mut group_values = Vec::with_capacity(row_width);
-                group_values.push(group_value);
-                results.push(GroupedAggregateResult {
-                    group_values,
-                    aggregate_values: compute_aggregate_values(aggregates, slice_of(ordinal))?,
-                });
-            }
-
-            // Add NULL group if present
-            if let Some(ordinal) = null_group {
-                let mut group_values = Vec::with_capacity(row_width);
-                group_values.push(Value::Null(DataType::Null));
-                results.push(GroupedAggregateResult {
-                    group_values,
-                    aggregate_values: compute_aggregate_values(aggregates, slice_of(ordinal))?,
-                });
-            }
-
-            // Convert other_groups (strings, etc.), consuming the map so each
-            // key is released as its values are moved out rather than being
-            // held alongside its clone for the rest of the loop.
-            for (group_key, ordinal) in other_groups {
-                let mut group_values = Vec::with_capacity(row_width);
-                match group_key {
-                    GroupKey::Single(v) => group_values.push((*v).clone()),
-                    GroupKey::Multi(vs) => group_values.extend(vs.iter().map(|v| (**v).clone())),
-                }
-                results.push(GroupedAggregateResult {
-                    group_values,
-                    aggregate_values: compute_aggregate_values(aggregates, slice_of(ordinal))?,
-                });
-            }
-
-            return Ok(Some(results));
-        }
-
-        // SLOW PATH: Multi-column GROUP BY (currently not used from try_storage_aggregation)
-        let mut groups: GroupKeyMap<Vec<Accum>> = GroupKeyMap::default();
+        let mut groups = grouped_aggregates(group_by_indices, aggregates);
+        // Asked once per run of heads from one transaction
+        let (mut last_txn_id, mut last_visible) = (0i64, false);
 
         for (stride, metas) in arena_meta.chunks(EPOCH_STRIDE).enumerate() {
             if self.publish_epoch_if_quiet() != Some(epoch) {
@@ -7568,60 +7257,31 @@ impl VersionStore {
                 #[cfg(feature = "test-failpoints")]
                 crate::test_failpoints::grouped_slot_reached(idx);
                 // Visibility check (standard pattern: check creation, then deletion)
-                if meta.txn_id == 0 || !checker.is_visible(meta.txn_id, txn_id) {
+                if meta.txn_id == 0 {
+                    continue;
+                }
+                if meta.txn_id != last_txn_id {
+                    last_txn_id = meta.txn_id;
+                    last_visible = checker.is_visible(meta.txn_id, txn_id);
+                }
+                if !last_visible {
                     continue;
                 }
                 if meta.deleted_at_txn_id != 0 && checker.is_visible(meta.deleted_at_txn_id, txn_id)
                 {
                     continue;
                 }
-
-                let row_data = match arena_data.get(idx) {
-                    Some(data) => data,
-                    None => continue,
-                };
-                let row_slice = row_data.as_ref();
-
-                let key_values: Vec<CompactArc<Value>> = group_by_indices
-                    .iter()
-                    .map(|&col_idx| {
-                        if col_idx < row_slice.len() {
-                            CompactArc::new(row_slice[col_idx].clone())
-                        } else {
-                            CompactArc::new(Value::Null(DataType::Null))
-                        }
-                    })
-                    .collect();
-                let group_key = GroupKey::Multi(key_values);
-
-                let accums = groups
-                    .entry(group_key)
-                    .or_insert_with(|| vec![Accum::default(); aggregates.len()]);
-                update_accums(accums, aggregates, row_slice);
+                if let Some(row) = arena_data.get(idx) {
+                    aggregate_row(&mut groups, group_by_indices, aggregates, row.as_ref());
+                }
             }
         }
 
+        // The groups own their keys and values: they answer outside the
+        // lock, and only if no commit published across the pass
         let held = self.publish_epoch_if_quiet() == Some(epoch);
         drop(arena_guard);
-        if !held {
-            return Ok(None);
-        }
-
-        // Convert to results
-        let mut results: Vec<GroupedAggregateResult> = Vec::with_capacity(groups.len());
-
-        for (group_key, accums) in groups {
-            let group_values = match group_key {
-                GroupKey::Single(v) => vec![(*v).clone()],
-                GroupKey::Multi(vs) => vs.iter().map(|v| (**v).clone()).collect(),
-            };
-            results.push(GroupedAggregateResult {
-                group_values,
-                aggregate_values: compute_aggregate_values(aggregates, &accums)?,
-            });
-        }
-
-        Ok(Some(results))
+        Ok(held.then_some(groups))
     }
 }
 
@@ -9960,11 +9620,13 @@ mod tests {
         let results = store
             .compute_grouped_aggregates(2.into(), &[1], &[])
             .unwrap()
-            .expect("arena path should handle an empty aggregate list");
+            .expect("arena path should handle an empty aggregate list")
+            .into_rows()
+            .unwrap();
 
         let mut keys: Vec<i64> = results
             .iter()
-            .map(|r| match r.group_values.first() {
+            .map(|(_, row)| match row.get(0) {
                 Some(Value::Integer(k)) => *k,
                 other => panic!("unexpected group value {other:?}"),
             })
@@ -9972,7 +9634,7 @@ mod tests {
         keys.sort();
 
         assert_eq!(keys, vec![10, 20]);
-        assert!(results.iter().all(|r| r.aggregate_values.is_empty()));
+        assert!(results.iter().all(|(_, row)| row.len() == 1));
     }
 
     #[cfg(feature = "test-failpoints")]

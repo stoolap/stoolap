@@ -20,20 +20,18 @@
 //! - Grouped aggregation: `SELECT category, SUM(amount) FROM sales GROUP BY category`
 //! - HAVING clause: `SELECT category, SUM(amount) FROM sales GROUP BY category HAVING SUM(amount) > 100`
 
-use std::borrow::Cow;
-use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::RwLock;
 
-use ahash::AHasher;
-use hashbrown::hash_map::RawEntryMut;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
-use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
+use rustc_hash::{FxHashMap, FxHashSet};
 // SmallVec removed - Vec is faster due to spilled() check overhead in hot loops
 
-use crate::common::{CompactArc, CompactVec, I64Map, StringMap};
-use crate::core::{Result, Row, RowVec, SumAccumulator, Value};
-use crate::functions::aggregate::{AggregateState, CompiledAggregate};
+use crate::common::{CompactArc, CompactVec, StringMap};
+use crate::core::{Result, Row, RowVec, Value};
+use crate::functions::aggregate::{
+    AggregateState, CallTemplate, ColumnsKey, CompiledAggregate, GroupKey, GroupedAggregates,
+};
 use crate::parser::ast::*;
 use crate::storage::traits::transaction::StatementTable;
 use crate::storage::traits::{Engine, QueryResult};
@@ -44,7 +42,7 @@ use super::expression::{ExprVM, Op};
 use super::query_cache::{CompiledCountDistinct, CompiledExecution};
 use super::query_classification::QueryClassification;
 use super::result::ExecutorResult;
-use super::utils::{build_column_index_map, hash_value_into};
+use super::utils::build_column_index_map;
 use super::Executor;
 
 // Re-export for backward compatibility
@@ -191,18 +189,6 @@ impl SimpleHavingFilter {
     }
 }
 
-/// Simple aggregate type for fast aggregation path
-/// Supports COUNT, SUM, AVG, MIN, MAX (no DISTINCT, FILTER, ORDER BY, or expressions)
-#[derive(Clone)]
-enum SimpleAgg {
-    Count,              // COUNT(*)
-    CountColumn(usize), // COUNT(col) - counts only non-NULL values
-    Sum(usize),         // SUM(col) - stores column index
-    Avg(usize),         // AVG(col) - stores column index
-    Min(usize),         // MIN(col) - stores column index
-    Max(usize),         // MAX(col) - stores column index
-}
-
 /// Try to parse a simple HAVING clause for inline filtering
 /// Returns None if the HAVING is too complex for inline optimization
 /// Supports: single conditions and AND combinations
@@ -279,15 +265,6 @@ fn try_parse_single_having_condition(
     }
 
     None
-}
-
-/// Keeps the first evaluation error of a per-row loop for after it, and
-/// stands a NULL in for the value; out of line so the loop stays lean
-#[cold]
-#[inline(never)]
-fn keep_first_error(slot: &mut Option<crate::core::Error>, e: crate::core::Error) -> Value {
-    slot.get_or_insert(e);
-    Value::null_unknown()
 }
 
 /// A program over aggregate slot rows: `aliases` read a group item or
@@ -428,28 +405,6 @@ enum ColumnSource {
     GroupingFlag(usize),
 }
 
-/// Compute a hash for a group key (slice of Values)
-/// This avoids allocating Vec<Value> for each row
-/// OPTIMIZATION: Use AHasher for optimal hashing of Value types (strings, floats, JSON, etc.)
-/// Empirically tested to perform better than FxHasher for GROUP BY workloads
-/// Called on every row in GROUP BY, so performance is critical
-#[inline]
-fn hash_group_key(values: &[Value]) -> u64 {
-    let mut hasher = AHasher::default();
-    for v in values {
-        hash_value_into(v, &mut hasher);
-    }
-    hasher.finish()
-}
-
-/// Group entry storing the key values and row indices
-struct GroupEntry {
-    /// The actual key values (stored once per group)
-    key_values: Vec<Value>,
-    /// Indices of rows belonging to this group
-    row_indices: Vec<usize>,
-}
-
 /// Represents an aggregate function call in a SELECT list
 #[derive(Clone, Debug)]
 pub struct SqlAggregateFunction {
@@ -517,6 +472,23 @@ impl SqlAggregateFunction {
             &self.extra_args,
             &self.order_by,
         )
+    }
+
+    /// How every group runs this call
+    pub(crate) fn template(
+        &self,
+        registry: &crate::functions::FunctionRegistry,
+    ) -> Result<CallTemplate> {
+        let function = registry.get_aggregate(&self.name).ok_or_else(|| {
+            crate::core::Error::internal(format!("unknown aggregate function {}", self.name))
+        })?;
+        Ok(CallTemplate::new(
+            function,
+            self.name == "COUNT" && self.column == "*",
+            self.distinct,
+            &self.extra_args,
+            Executor::aggregate_order_keys(&self.order_by),
+        ))
     }
 
     /// Get the result column name
@@ -676,13 +648,13 @@ impl CallInputs {
             .collect()
     }
 
-    /// Feeds one input row to the call's state. `column` is the call's
+    /// Feeds one input row to the call's run. `column` is the call's
     /// column value, read when it has no argument expression; a VM is made
     /// on the first program that runs
     #[inline(always)]
     pub(crate) fn feed(
         &self,
-        state: &mut AggregateState,
+        state: &mut CompiledAggregate,
         column: Option<&Value>,
         vm: &mut Option<ExprVM>,
         row: &super::expression::ExecuteContext<'_>,
@@ -700,7 +672,7 @@ impl CallInputs {
     /// `feed` for a call with a FILTER, an argument expression or ORDER BY
     fn feed_programs(
         &self,
-        state: &mut AggregateState,
+        state: &mut CompiledAggregate,
         column: Option<&Value>,
         vm: &mut Option<ExprVM>,
         row: &super::expression::ExecuteContext<'_>,
@@ -743,7 +715,299 @@ impl CallInputs {
     }
 }
 
+/// The value COUNT(*) is fed for each row
+static COUNT_STAR: Value = Value::Integer(1);
+
+/// Rows at which an aggregation whose calls all merge splits its input
+#[cfg(feature = "parallel")]
+const PARALLEL_ROWS: usize = 100_000;
+
+/// One GROUP BY item as each row is read for it
+enum KeyItem {
+    Column(usize),
+    Program(super::expression::SharedProgram),
+    Null,
+}
+
+/// A group key's items within the key of every item, for a grouping set
+struct Picked<'a> {
+    key: &'a [Value],
+    picks: &'a [usize],
+}
+
+impl GroupKey for Picked<'_> {
+    #[inline(always)]
+    fn width(&self) -> usize {
+        self.picks.len()
+    }
+    #[inline(always)]
+    fn at(&self, i: usize) -> &Value {
+        &self.key[self.picks[i]]
+    }
+}
+
+/// The VM and key buffer one pass over rows reuses
+#[derive(Default)]
+struct FeedState {
+    vm: Option<ExprVM>,
+    key: Vec<Value>,
+}
+
+/// What an aggregation reads from each input row, compiled once over the
+/// input's columns: the group key, and each call's column or inputs
+struct RowFeed<'a> {
+    aggregations: &'a [SqlAggregateFunction],
+    inputs: Vec<CallInputs>,
+    /// Each call's column; None for COUNT(*) and an argument expression
+    columns: Vec<Option<usize>>,
+    items: Vec<KeyItem>,
+    /// The key's columns, when every item is a column
+    key_columns: Option<Vec<usize>>,
+    /// Whether a row runs a program, which the parallel split does not
+    programs: bool,
+}
+
+impl<'a> RowFeed<'a> {
+    fn new(
+        aggregations: &'a [SqlAggregateFunction],
+        group_items: &[GroupByItem],
+        columns: &[String],
+        col_index_map: &StringMap<usize>,
+    ) -> Result<Self> {
+        let items = group_items
+            .iter()
+            .map(|item| {
+                Ok(match item {
+                    GroupByItem::Column(name) => {
+                        match Executor::lookup_column_index(&name.to_lowercase(), col_index_map) {
+                            Some(idx) => KeyItem::Column(idx),
+                            None => KeyItem::Null,
+                        }
+                    }
+                    GroupByItem::Position(pos) => KeyItem::Column(pos.saturating_sub(1)),
+                    GroupByItem::Expression { expr, .. } => {
+                        KeyItem::Program(super::expression::compile_expression(expr, columns)?)
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let key_columns = items
+            .iter()
+            .map(|item| match item {
+                KeyItem::Column(idx) => Some(*idx),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>();
+        let programs = key_columns.is_none()
+            || !aggregations
+                .iter()
+                .all(|a| a.answered_with(Modifiers::DISTINCT.and(Modifiers::EXTRA_ARGS)));
+        Ok(Self {
+            aggregations,
+            inputs: CallInputs::compile(aggregations, columns)?,
+            columns: aggregations
+                .iter()
+                .map(|agg| {
+                    if agg.column == "*" || agg.expression.is_some() {
+                        None
+                    } else {
+                        Executor::lookup_column_index(&agg.column_lower, col_index_map)
+                    }
+                })
+                .collect(),
+            items,
+            key_columns,
+            programs,
+        })
+    }
+
+    /// Reads every item of the row's key into `key`
+    fn read_key(
+        &self,
+        row: &Row,
+        exec: &super::expression::ExecuteContext<'_>,
+        state: &mut FeedState,
+    ) -> Result<()> {
+        state.key.clear();
+        for item in &self.items {
+            let value = match item {
+                KeyItem::Column(idx) => row.get(*idx).cloned().unwrap_or_else(Value::null_unknown),
+                KeyItem::Program(program) => state
+                    .vm
+                    .get_or_insert_with(ExprVM::new)
+                    .execute_cow(program, exec)?,
+                KeyItem::Null => Value::null_unknown(),
+            };
+            state.key.push(value);
+        }
+        Ok(())
+    }
+
+    /// Feeds the row to the runs of every call in its group
+    #[inline]
+    fn feed(
+        &self,
+        runs: &mut [CompiledAggregate],
+        row: &Row,
+        exec: &super::expression::ExecuteContext<'_>,
+        vm: &mut Option<ExprVM>,
+    ) -> Result<()> {
+        for (i, run) in runs.iter_mut().enumerate() {
+            let column = match self.columns[i] {
+                Some(idx) => row.get(idx),
+                None => Some(&COUNT_STAR),
+            };
+            self.inputs[i].feed(run, column, vm, exec, &self.aggregations[i])?;
+        }
+        Ok(())
+    }
+
+    /// `feed` when no call runs a program: each call reads its column
+    #[inline(always)]
+    fn feed_columns(&self, runs: &mut [CompiledAggregate], row: &Row) {
+        for (run, column) in runs.iter_mut().zip(&self.columns) {
+            match column {
+                Some(idx) => {
+                    if let Some(value) = row.get(*idx) {
+                        run.accumulate(value);
+                    }
+                }
+                None => run.accumulate(&COUNT_STAR),
+            }
+        }
+    }
+
+    /// `run_one` when no program runs: the key is `columns` of the row
+    #[inline(always)]
+    fn run_columns(&self, groups: &mut GroupedAggregates, row: &Row, columns: &[usize]) {
+        let key = ColumnsKey {
+            values: row.as_slice(),
+            columns,
+        };
+        if let Some(group) = groups.group(&key) {
+            self.feed_columns(groups.aggregates(group), row);
+        }
+    }
+
+    /// Runs one row into its group
+    #[inline]
+    fn run_one(
+        &self,
+        groups: &mut GroupedAggregates,
+        row: &Row,
+        ctx: &ExecutionContext,
+        state: &mut FeedState,
+    ) -> Result<()> {
+        if let (false, Some(columns)) = (self.programs, &self.key_columns) {
+            self.run_columns(groups, row, columns);
+            return Ok(());
+        }
+        let exec = super::expression::ExecuteContext::new(row)
+            .with_params(ctx.params())
+            .with_named_params(ctx.named_params());
+        let group = match &self.key_columns {
+            Some(columns) => groups.group(&ColumnsKey {
+                values: row.as_slice(),
+                columns,
+            }),
+            None => {
+                self.read_key(row, &exec, state)?;
+                groups.group(state.key.as_slice())
+            }
+        };
+        match group {
+            Some(group) => self.feed(groups.aggregates(group), row, &exec, &mut state.vm),
+            None => Ok(()),
+        }
+    }
+
+    /// Runs every row into its group; a large input whose calls all merge
+    /// is split, and its parts merge in input order
+    fn run_rows(
+        &self,
+        groups: &mut GroupedAggregates,
+        rows: &[(i64, Row)],
+        ctx: &ExecutionContext,
+    ) -> Result<()> {
+        #[cfg(feature = "parallel")]
+        if rows.len() >= PARALLEL_ROWS && !self.programs && groups.can_merge() {
+            let chunk_size = (rows.len() / rayon::current_num_threads()).max(1000);
+            let parts: Vec<GroupedAggregates> = rows
+                .par_chunks(chunk_size)
+                .map(|chunk| {
+                    let mut part = groups.empty_like();
+                    let mut state = FeedState::default();
+                    for (_, row) in chunk {
+                        self.run_one(&mut part, row, ctx, &mut state)?;
+                    }
+                    Ok(part)
+                })
+                .collect::<Result<_>>()?;
+            for part in parts {
+                groups.merge(part);
+            }
+            return Ok(());
+        }
+        if let (false, Some(columns)) = (self.programs, &self.key_columns) {
+            if columns.is_empty() {
+                if let Some(group) = groups.group(&[] as &[Value]) {
+                    let runs = groups.aggregates(group);
+                    for (_, row) in rows {
+                        self.feed_columns(runs, row);
+                    }
+                }
+                return Ok(());
+            }
+            for (_, row) in rows {
+                self.run_columns(groups, row, columns);
+            }
+            return Ok(());
+        }
+        let mut state = FeedState::default();
+        for (_, row) in rows {
+            self.run_one(groups, row, ctx, &mut state)?;
+        }
+        Ok(())
+    }
+
+    /// Runs every row into its group in each grouping set, `picks` naming
+    /// the key items each set groups by
+    fn run_sets(
+        &self,
+        sets: &mut [GroupedAggregates],
+        picks: &[Vec<usize>],
+        rows: &[(i64, Row)],
+        ctx: &ExecutionContext,
+    ) -> Result<()> {
+        let mut state = FeedState::default();
+        for (_, row) in rows {
+            let exec = super::expression::ExecuteContext::new(row)
+                .with_params(ctx.params())
+                .with_named_params(ctx.named_params());
+            self.read_key(row, &exec, &mut state)?;
+            for (groups, picks) in sets.iter_mut().zip(picks) {
+                let key = Picked {
+                    key: &state.key,
+                    picks,
+                };
+                if let Some(group) = groups.group(&key) {
+                    self.feed(groups.aggregates(group), row, &exec, &mut state.vm)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Executor {
+    /// How every group runs each of the calls
+    fn call_templates(&self, aggregations: &[SqlAggregateFunction]) -> Result<Vec<CallTemplate>> {
+        aggregations
+            .iter()
+            .map(|agg| agg.template(&self.function_registry))
+            .collect()
+    }
+
     /// Execute SELECT with aggregation (GROUP BY support)
     pub(crate) fn execute_select_with_aggregation(
         &self,
@@ -807,20 +1071,18 @@ impl Executor {
         };
 
         // Build result
-        // having_applied_inline tracks if HAVING was already applied during fast aggregation
-        let (result_columns, result_rows, having_applied_inline) = if group_by_columns.is_empty() {
+        let (result_columns, result_rows) = if group_by_columns.is_empty() {
             // Global aggregation (no GROUP BY)
-            let (cols, rows) = self.execute_global_aggregation(
+            self.execute_global_aggregation(
                 &aggregations,
                 &base_rows,
                 base_columns,
                 &col_index_map,
                 ctx,
-            )?;
-            (cols, rows, false)
+            )?
         } else if stmt.group_by.modifier != GroupByModifier::None {
             // ROLLUP or CUBE aggregation
-            let (cols, rows) = self.execute_rollup_aggregation(
+            self.execute_rollup_aggregation(
                 &aggregations,
                 &group_by_columns,
                 &base_rows,
@@ -828,74 +1090,65 @@ impl Executor {
                 &col_index_map,
                 stmt,
                 ctx,
-            )?;
-            (cols, rows, false)
+            )?
         } else {
             // Regular grouped aggregation - pass limit for early termination
-            // May apply HAVING inline for simple cases (returns having_applied flag)
             self.execute_grouped_aggregation(
                 &aggregations,
                 &group_by_columns,
                 &base_rows,
                 base_columns,
                 &col_index_map,
-                stmt,
                 ctx,
                 aggregation_limit,
             )?
         };
 
         // Apply HAVING clause BEFORE projection (HAVING may reference aggregates not in SELECT)
-        // Skip if HAVING was already applied inline during fast aggregation
         let (having_columns, having_rows) = if let Some(ref having) = stmt.having {
-            if having_applied_inline {
-                // HAVING already applied inline, skip separate filtering
-                (result_columns, result_rows)
+            // Pre-process scalar subqueries in HAVING clause
+            // This executes subqueries like (SELECT AVG(a) FROM t) and replaces them with values.
+            // One that reads the group is left as written; apply_having
+            // runs it once per group with that group as the outer row
+            let has_correlated_having = Self::has_correlated_subqueries(having);
+            let processed_having = if has_correlated_having {
+                (**having).clone()
             } else {
-                // Pre-process scalar subqueries in HAVING clause
-                // This executes subqueries like (SELECT AVG(a) FROM t) and replaces them with values.
-                // One that reads the group is left as written; apply_having
-                // runs it once per group with that group as the outer row
-                let has_correlated_having = Self::has_correlated_subqueries(having);
-                let processed_having = if has_correlated_having {
-                    (**having).clone()
-                } else {
-                    self.process_where_subqueries(having, ctx)?
-                };
-                let outer_table: Option<String> =
-                    stmt.table_expr.as_ref().and_then(|te| match te.as_ref() {
-                        Expression::TableSource(source) => Some(
-                            source
-                                .alias
-                                .as_ref()
-                                .map(|a| a.value_lower.to_string())
-                                .unwrap_or_else(|| source.name.value_lower.to_string()),
-                        ),
-                        Expression::Aliased(aliased) => Some(aliased.alias.value_lower.to_string()),
-                        _ => None,
-                    });
+                self.process_where_subqueries(having, ctx)?
+            };
+            let outer_table: Option<String> =
+                stmt.table_expr.as_ref().and_then(|te| match te.as_ref() {
+                    Expression::TableSource(source) => Some(
+                        source
+                            .alias
+                            .as_ref()
+                            .map(|a| a.value_lower.to_string())
+                            .unwrap_or_else(|| source.name.value_lower.to_string()),
+                    ),
+                    Expression::Aliased(aliased) => Some(aliased.alias.value_lower.to_string()),
+                    _ => None,
+                });
 
-                // HAVING reads every group item and aggregate from its slot
-                let slots = aggregate_slot_keys(&group_by_columns, &aggregations, &stmt.columns);
-                let tmp_result = Box::new(ExecutorResult::new(result_columns.clone(), result_rows));
-                let mut having_result = self.apply_having(
-                    tmp_result,
-                    &processed_having,
-                    &result_columns,
-                    &slots,
-                    outer_table.as_deref(),
-                    ctx,
-                )?;
+            // HAVING reads every group item and aggregate from its slot
+            let slots = aggregate_slot_keys(&group_by_columns, &aggregations, &stmt.columns);
+            let tmp_result = Box::new(ExecutorResult::new(result_columns.clone(), result_rows));
+            let mut having_result = self.apply_having(
+                tmp_result,
+                &processed_having,
+                &result_columns,
+                &slots,
+                outer_table.as_deref(),
+                ctx,
+            )?;
 
-                // Collect rows after HAVING filter
-                let mut filtered_rows = RowVec::new();
-                let mut row_id = 0i64;
-                while having_result.next() {
-                    filtered_rows.push((row_id, having_result.take_row()));
-                    row_id += 1;
-                }
-                (result_columns, filtered_rows)
+            // Collect rows after HAVING filter
+            let mut filtered_rows = RowVec::new();
+            let mut row_id = 0i64;
+            while having_result.next() {
+                filtered_rows.push((row_id, having_result.take_row()));
+                row_id += 1;
             }
+            (result_columns, filtered_rows)
         } else {
             (result_columns, result_rows)
         };
@@ -1734,18 +1987,15 @@ impl Executor {
             )?
         } else {
             // Grouped aggregation - no limit since window functions need all groups
-            // Discard the having_applied flag - window functions apply HAVING separately
-            let (cols, rows, _having_applied) = self.execute_grouped_aggregation(
+            self.execute_grouped_aggregation(
                 &aggregations,
                 &group_by_columns,
                 base_rows,
                 base_columns,
                 &col_index_map,
-                stmt,
                 ctx,
                 None, // Window functions need all groups
-            )?;
-            (cols, rows)
+            )?
         };
 
         // Apply HAVING clause filter (in-place)
@@ -2233,12 +2483,8 @@ impl Executor {
         super::utils::expression_to_string(expr)
     }
 
-    /// Execute global aggregation (no GROUP BY)
-    ///
-    /// Optimized with parallel processing for large datasets:
-    /// - Partitions data into chunks
-    /// - Processes chunks in parallel
-    /// - Merges partial results
+    /// Execute global aggregation (no GROUP BY): the one group of the
+    /// grouped path, there with no rows
     fn execute_global_aggregation(
         &self,
         aggregations: &[SqlAggregateFunction],
@@ -2247,1233 +2493,18 @@ impl Executor {
         col_index_map: &StringMap<usize>,
         ctx: &ExecutionContext,
     ) -> Result<(Vec<String>, RowVec)> {
-        // FAST PATH: Single COUNT(*) - just return row count directly
-        if aggregations.len() == 1
-            && aggregations[0].name == "COUNT"
-            && aggregations[0].column == "*"
-            && aggregations[0].answered_with(Modifiers::NONE)
-        {
-            let result_columns: Vec<String> =
-                aggregations.iter().map(|a| a.get_column_name()).collect();
-            let mut result_rows = RowVec::with_capacity(1);
-            result_rows.push((0, Row::from_values(vec![Value::Integer(rows.len() as i64)])));
-            return Ok((result_columns, result_rows));
-        }
-
-        // Pre-compute column indices for faster access
-        // OPTIMIZATION: Use pre-computed column_lower instead of calling to_lowercase() each time
-        // Handle both qualified (e.g., "o.amount") and unqualified column names
-        let agg_col_indices: Vec<Option<usize>> = aggregations
-            .iter()
-            .map(|agg| {
-                if agg.column == "*" || agg.expression.is_some() {
-                    None // Don't use column index for expressions
-                } else {
-                    Self::lookup_column_index(&agg.column_lower, col_index_map)
-                }
-            })
-            .collect();
-
-        // FAST PATH: a single plain SUM or AVG over a column
-        if aggregations.len() == 1
-            && matches!(aggregations[0].name.as_str(), "SUM" | "AVG")
-            && aggregations[0].answered_with(Modifiers::NONE)
-        {
-            if let Some(col_idx) = agg_col_indices[0] {
-                let sum = Self::sum_column_rows(rows, col_idx);
-                let result = if aggregations[0].name == "SUM" {
-                    sum.sum()?
-                } else {
-                    sum.avg()
-                };
-                let result_columns: Vec<String> =
-                    aggregations.iter().map(|a| a.get_column_name()).collect();
-                let mut result_rows = RowVec::with_capacity(1);
-                result_rows.push((0, Row::from_values(vec![result])));
-                return Ok((result_columns, result_rows));
-            }
-        }
-
-        use super::expression::ExecuteContext;
-
-        // Compiled aggregates read a column and keep DISTINCT in their state
-        let can_use_compiled = aggregations
-            .iter()
-            .all(|agg| agg.answered_with(Modifiers::DISTINCT));
-
-        let result_values: Vec<Value> = if can_use_compiled {
-            // FAST PATH: Use CompiledAggregate for zero virtual dispatch
-            let compile_all = || -> Vec<CompiledAggregate> {
-                aggregations
-                    .iter()
-                    .map(|agg| {
-                        let is_count_star = agg.name == "COUNT" && agg.column == "*";
-                        CompiledAggregate::compile(
-                            &agg.name,
-                            is_count_star,
-                            agg.distinct,
-                            agg.state(&self.function_registry),
-                        )
-                        .unwrap_or_else(|| {
-                            // Fallback for unknown aggregates
-                            CompiledAggregate::dynamic(AggregateState::new(
-                                Box::new(crate::functions::aggregate::CountFunction::default()),
-                                agg.distinct,
-                                &[],
-                                Vec::new(),
-                            ))
-                        })
-                    })
-                    .collect()
-            };
-
-            // Hot loop with compiled aggregates - zero virtual dispatch
-            let accumulate_rows = |aggs: &mut [CompiledAggregate], rows: &[(i64, Row)]| {
-                // Pre-create static Value for COUNT(*)
-                let count_star_value = Value::Integer(1);
-                for (_, row) in rows {
-                    for (i, agg) in aggs.iter_mut().enumerate() {
-                        let value = if let Some(col_idx) = agg_col_indices[i] {
-                            row.get(col_idx)
-                        } else {
-                            Some(&count_star_value) // COUNT(*)
-                        };
-
-                        if let Some(v) = value {
-                            agg.accumulate(v);
-                        }
-                    }
-                }
-            };
-
-            let mut compiled_aggs = compile_all();
-            // Large inputs split into chunks when every aggregate merges
-            // its chunk runs into the whole
-            #[cfg(feature = "parallel")]
-            if rows.len() >= 100_000 && compiled_aggs.iter().all(CompiledAggregate::can_merge) {
-                let chunk_size = (rows.len() / rayon::current_num_threads()).max(1000);
-                let chunks: Vec<Vec<CompiledAggregate>> = rows
-                    .par_chunks(chunk_size)
-                    .map(|chunk| {
-                        let mut aggs = compile_all();
-                        accumulate_rows(&mut aggs, chunk);
-                        aggs
-                    })
-                    .collect();
-                for chunk in &chunks {
-                    for (agg, run) in compiled_aggs.iter_mut().zip(chunk) {
-                        agg.merge(run);
-                    }
-                }
-            } else {
-                accumulate_rows(&mut compiled_aggs, rows);
-            }
-            #[cfg(not(feature = "parallel"))]
-            accumulate_rows(&mut compiled_aggs, rows);
-
-            compiled_aggs
-                .iter()
-                .map(|agg| agg.result())
-                .collect::<Result<_>>()?
-        } else {
-            // SLOW PATH: Original algorithm with dynamic dispatch for complex aggregates
-            let mut agg_funcs: Vec<Option<AggregateState>> = aggregations
-                .iter()
-                .map(|agg| agg.state(&self.function_registry))
-                .collect();
-            let inputs = CallInputs::compile(aggregations, columns)?;
-            let mut expr_vm = None;
-
-            // Pre-create static Value for COUNT(*)
-            let count_star_value = Value::Integer(1);
-
-            for (_, row) in rows {
-                // Create execution context for this row
-                // CRITICAL: Include params for parameterized queries
-                let exec_ctx = ExecuteContext::new(row)
-                    .with_params(ctx.params())
-                    .with_named_params(ctx.named_params());
-
-                for (i, agg) in aggregations.iter().enumerate() {
-                    if let Some(ref mut func) = agg_funcs[i] {
-                        let column = match agg_col_indices[i] {
-                            Some(col_idx) => row.get(col_idx),
-                            None => Some(&count_star_value),
-                        };
-                        inputs[i].feed(func, column, &mut expr_vm, &exec_ctx, agg)?;
-                    }
-                }
-            }
-
-            aggregations
-                .iter()
-                .enumerate()
-                .map(|(i, agg)| {
-                    if let Some(ref func) = agg_funcs[i] {
-                        func.result()
-                    } else if agg.name == "COUNT" && agg.column == "*" {
-                        Ok(Value::Integer(rows.len() as i64))
-                    } else {
-                        Ok(Value::null_unknown())
-                    }
-                })
-                .collect::<Result<_>>()?
-        };
-
-        // Build result columns
-        let result_columns: Vec<String> =
-            aggregations.iter().map(|a| a.get_column_name()).collect();
-
-        let mut result_rows = RowVec::with_capacity(1);
-        result_rows.push((0, Row::from_values(result_values)));
-        Ok((result_columns, result_rows))
+        let mut groups = GroupedAggregates::global(self.call_templates(aggregations)?);
+        RowFeed::new(aggregations, &[], columns, col_index_map)?.run_rows(
+            &mut groups,
+            rows,
+            ctx,
+        )?;
+        let result_columns = aggregations.iter().map(|a| a.get_column_name()).collect();
+        Ok((result_columns, groups.into_rows()?))
     }
 
-    /// Try to use fast single-pass aggregation for simple cases
-    ///
-    /// Returns Some((columns, rows)) if fast path was used, None otherwise.
-    /// Fast path is used when:
-    /// - All GROUP BY items are simple column references
-    /// - All aggregates are COUNT, SUM, AVG, MIN, or MAX (no DISTINCT, FILTER, ORDER BY, or expression)
-    ///
-    /// When `limit` is provided and there's no ORDER BY, enables early termination:
-    /// once we have `limit` complete groups, we stop creating new groups.
-    ///
-    /// When `having_filter` is provided, applies HAVING inline during row generation,
-    /// avoiding a separate filtering pass.
-    #[allow(clippy::too_many_arguments)]
-    fn try_fast_aggregation(
-        &self,
-        aggregations: &[SqlAggregateFunction],
-        group_by_items: &[GroupByItem],
-        rows: &[(i64, Row)],
-        _columns: &[String],
-        col_index_map: &StringMap<usize>,
-        limit: Option<usize>,
-        having_filter: Option<&SimpleHavingFilter>,
-    ) -> Result<Option<(Vec<String>, RowVec)>> {
-        // Check if all GROUP BY items are simple column references
-        let group_by_indices: Vec<usize> = group_by_items
-            .iter()
-            .filter_map(|item| match item {
-                GroupByItem::Column(col_name) => {
-                    Self::lookup_column_index(&col_name.to_lowercase(), col_index_map)
-                }
-                _ => None,
-            })
-            .collect();
-
-        // All GROUP BY items must be resolved to column indices
-        if group_by_indices.len() != group_by_items.len() {
-            return Ok(None);
-        }
-
-        // Check if all aggregates are simple (COUNT/SUM/AVG/MIN/MAX without DISTINCT/FILTER/ORDER BY/expression)
-        let simple_aggs: Vec<Option<SimpleAgg>> = aggregations
-            .iter()
-            .map(|agg| {
-                if !agg.answered_with(Modifiers::NONE) {
-                    return None;
-                }
-
-                match agg.name.to_uppercase().as_str() {
-                    "COUNT" => {
-                        if agg.column == "*" {
-                            Some(SimpleAgg::Count)
-                        } else {
-                            Self::lookup_column_index(&agg.column_lower, col_index_map)
-                                .map(SimpleAgg::CountColumn)
-                        }
-                    }
-                    "SUM" => {
-                        if agg.column == "*" {
-                            None // SUM(*) is not valid
-                        } else {
-                            Self::lookup_column_index(&agg.column_lower, col_index_map)
-                                .map(SimpleAgg::Sum)
-                        }
-                    }
-                    "AVG" => {
-                        if agg.column == "*" {
-                            None // AVG(*) is not valid
-                        } else {
-                            Self::lookup_column_index(&agg.column_lower, col_index_map)
-                                .map(SimpleAgg::Avg)
-                        }
-                    }
-                    "MIN" => {
-                        if agg.column == "*" {
-                            None // MIN(*) is not valid
-                        } else {
-                            Self::lookup_column_index(&agg.column_lower, col_index_map)
-                                .map(SimpleAgg::Min)
-                        }
-                    }
-                    "MAX" => {
-                        if agg.column == "*" {
-                            None // MAX(*) is not valid
-                        } else {
-                            Self::lookup_column_index(&agg.column_lower, col_index_map)
-                                .map(SimpleAgg::Max)
-                        }
-                    }
-                    _ => None, // Other aggregates not supported in fast path
-                }
-            })
-            .collect();
-
-        // All aggregates must be resolved for fast path
-        if simple_aggs.iter().any(|a| a.is_none()) {
-            return Ok(None);
-        }
-
-        let simple_aggs: Vec<SimpleAgg> = simple_aggs.into_iter().map(|a| a.unwrap()).collect();
-
-        // OPTIMIZATION: Single-column GROUP BY uses direct Value storage (no Vec allocation per row)
-        if group_by_indices.len() == 1 {
-            return self.try_fast_aggregation_single_column(
-                &group_by_indices[0],
-                &simple_aggs,
-                aggregations,
-                group_by_items,
-                rows,
-                limit,
-                having_filter,
-            );
-        }
-
-        // Fast path: single-pass streaming aggregation for multi-column GROUP BY
-        // Store aggregate state directly in hash map instead of row indices
-        // SmallVec for inline storage when ≤4 aggregations (common case)
-        use smallvec::SmallVec;
-        type AggVec<T> = SmallVec<[T; 4]>;
-
-        struct FastGroupState {
-            sums: AggVec<SumAccumulator>,      // For SUM and AVG
-            counts: AggVec<i64>,               // For COUNT
-            min_values: AggVec<Option<Value>>, // For MIN
-            max_values: AggVec<Option<Value>>, // For MAX
-        }
-
-        // Pre-allocate hash map with estimated capacity to reduce resizing.
-        // Estimate: for high-cardinality groupings, assume ~1/3 of rows are unique groups.
-        // OPTIMIZATION: Use hashbrown::HashMap with Vec<Value> key directly - HashMap handles
-        // collisions efficiently with open addressing, avoiding our manual Vec-based collision chaining.
-        // Using raw_entry_mut API for O(1) lookup without cloning keys.
-        // NOTE: Uses FxHash here because raw_entry_mut().from_hash() requires compatible hasher.
-        // Value::hash() is simple (optimized for AHash), but FxHash still works correctly.
-        // Start small - HashMap grows efficiently, over-allocation wastes memory
-        let estimated_groups = (rows.len() / 32).clamp(16, 256);
-        type FxBuildHasher = BuildHasherDefault<FxHasher>;
-        let mut groups: hashbrown::HashMap<Vec<Value>, FastGroupState, FxBuildHasher> =
-            hashbrown::HashMap::with_capacity_and_hasher(
-                estimated_groups,
-                FxBuildHasher::default(),
-            );
-        let num_aggs = simple_aggs.len();
-
-        // Track for early termination optimization
-        let group_limit = limit.unwrap_or(usize::MAX);
-        let has_limit = limit.is_some();
-        let mut current_group_count: usize = 0;
-
-        for (_, row) in rows {
-            // OPTIMIZATION: Hash directly from row references (no clone for hashing)
-            // FxHasher has zero initialization cost unlike AHash.
-            // The manual hash MUST equal the map hasher's hash_one(&Vec<Value>),
-            // which length-prefixes the slice: on resize hashbrown rehashes
-            // every entry with the map's own hasher, and a mismatch scatters
-            // the table and splits groups
-            let mut hasher = FxHasher::default();
-            hasher.write_usize(group_by_indices.len());
-            for &idx in &group_by_indices {
-                if let Some(value) = row.get(idx) {
-                    value.hash(&mut hasher);
-                } else {
-                    Value::null_unknown().hash(&mut hasher);
-                }
-            }
-            let hash = hasher.finish();
-
-            // OPTIMIZATION: Use raw_entry_mut for O(1) lookup without cloning
-            // - Compute hash from row references (already done above)
-            // - Compare stored keys against row references (no clone for lookup)
-            // - Only clone when inserting a new group
-            // OPTIMIZATION: Unrolled comparison for common cases (2-3 columns)
-            // Avoids loop overhead and enables better branch prediction
-            let num_group_cols = group_by_indices.len();
-            let entry = groups.raw_entry_mut().from_hash(hash, |stored_key| {
-                if stored_key.len() != num_group_cols {
-                    return false;
-                }
-                // Inline helper for value comparison
-                #[inline(always)]
-                fn val_eq(stored: &Value, row_val: Option<&Value>) -> bool {
-                    match row_val {
-                        Some(rv) => stored == rv,
-                        None => matches!(stored, Value::Null(_)),
-                    }
-                }
-                match num_group_cols {
-                    2 => {
-                        // Unrolled 2-column comparison (most common multi-column case)
-                        val_eq(&stored_key[0], row.get(group_by_indices[0]))
-                            && val_eq(&stored_key[1], row.get(group_by_indices[1]))
-                    }
-                    3 => {
-                        // Unrolled 3-column comparison
-                        val_eq(&stored_key[0], row.get(group_by_indices[0]))
-                            && val_eq(&stored_key[1], row.get(group_by_indices[1]))
-                            && val_eq(&stored_key[2], row.get(group_by_indices[2]))
-                    }
-                    _ => {
-                        // Generic loop for 4+ columns
-                        for i in 0..num_group_cols {
-                            if !val_eq(&stored_key[i], row.get(group_by_indices[i])) {
-                                return false;
-                            }
-                        }
-                        true
-                    }
-                }
-            });
-
-            let state = match entry {
-                RawEntryMut::Occupied(occupied) => occupied.into_mut(),
-                RawEntryMut::Vacant(vacant) => {
-                    // New group - check limit before creating
-                    if has_limit && current_group_count >= group_limit {
-                        continue;
-                    }
-                    // Only clone values when creating a new group
-                    let key_values: Vec<Value> = group_by_indices
-                        .iter()
-                        .map(|&idx| row.get(idx).cloned().unwrap_or_else(Value::null_unknown))
-                        .collect();
-                    current_group_count += 1;
-                    let (_, state) = vacant.insert_hashed_nocheck(
-                        hash,
-                        key_values,
-                        FastGroupState {
-                            sums: smallvec::smallvec![SumAccumulator::default(); num_aggs],
-                            counts: smallvec::smallvec![0; num_aggs],
-                            min_values: smallvec::smallvec![None; num_aggs],
-                            max_values: smallvec::smallvec![None; num_aggs],
-                        },
-                    );
-                    state
-                }
-            };
-
-            // Accumulate aggregates
-            for (i, agg) in simple_aggs.iter().enumerate() {
-                match agg {
-                    SimpleAgg::Count => {
-                        state.counts[i] += 1;
-                    }
-                    SimpleAgg::CountColumn(col_idx) => {
-                        if let Some(value) = row.get(*col_idx) {
-                            if !value.is_null() {
-                                state.counts[i] += 1;
-                            }
-                        }
-                    }
-                    SimpleAgg::Sum(col_idx) | SimpleAgg::Avg(col_idx) => {
-                        if let Some(value) = row.get(*col_idx) {
-                            state.sums[i].add(value);
-                        }
-                    }
-                    SimpleAgg::Min(col_idx) => {
-                        if let Some(value) = row.get(*col_idx) {
-                            if !value.is_null() {
-                                match &state.min_values[i] {
-                                    None => state.min_values[i] = Some(value.clone()),
-                                    Some(current) if value.cmp(current).is_lt() => {
-                                        state.min_values[i] = Some(value.clone())
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                    SimpleAgg::Max(col_idx) => {
-                        if let Some(value) = row.get(*col_idx) {
-                            if !value.is_null() {
-                                match &state.max_values[i] {
-                                    None => state.max_values[i] = Some(value.clone()),
-                                    Some(current) if value.cmp(current).is_gt() => {
-                                        state.max_values[i] = Some(value.clone())
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Build result columns
-        let mut result_columns = Vec::with_capacity(group_by_items.len() + aggregations.len());
-
-        // Add GROUP BY column names (use column index to get actual name)
-        for (i, item) in group_by_items.iter().enumerate() {
-            let name = match item {
-                GroupByItem::Column(col_name) => col_name.clone(),
-                _ => format!("col{}", i),
-            };
-            result_columns.push(name);
-        }
-
-        // Add aggregate column names
-        for agg in aggregations {
-            let col_name = if let Some(ref alias) = agg.alias {
-                alias.clone()
-            } else {
-                agg.get_expression_name()
-            };
-            result_columns.push(col_name);
-        }
-
-        // Build result rows from HashMap entries
-        // OPTIMIZATION: Apply HAVING filter inline if provided, avoiding separate filtering pass
-        let mut result_rows = RowVec::new();
-        let mut row_id = 0i64;
-        for (key_values, mut state) in groups.into_iter() {
-            // Apply inline HAVING filter if provided (supports AND combinations)
-            if let Some(filter) = having_filter {
-                // All conditions must pass (AND semantics)
-                let mut passes = true;
-                for cond in &filter.conditions {
-                    let agg_value = match &simple_aggs[cond.agg_index] {
-                        SimpleAgg::Count | SimpleAgg::CountColumn(_) => {
-                            Some(Cow::Owned(Value::Integer(state.counts[cond.agg_index])))
-                        }
-                        SimpleAgg::Sum(_) => Some(state.sums[cond.agg_index].sum()?)
-                            .filter(|v| !v.is_null())
-                            .map(Cow::Owned),
-                        SimpleAgg::Avg(_) => Some(state.sums[cond.agg_index].avg())
-                            .filter(|v| !v.is_null())
-                            .map(Cow::Owned),
-                        SimpleAgg::Min(_) => {
-                            state.min_values[cond.agg_index].as_ref().map(Cow::Borrowed)
-                        }
-                        SimpleAgg::Max(_) => {
-                            state.max_values[cond.agg_index].as_ref().map(Cow::Borrowed)
-                        }
-                    };
-                    match agg_value {
-                        Some(val) => {
-                            if !cond.matches(&val) {
-                                passes = false;
-                                break;
-                            }
-                        }
-                        None => {
-                            passes = false;
-                            break;
-                        }
-                    }
-                }
-                if !passes {
-                    continue;
-                }
-            }
-
-            // Use CompactVec directly to avoid Vec→CompactVec conversion
-            let mut values: CompactVec<Value> =
-                CompactVec::with_capacity(key_values.len() + simple_aggs.len());
-            values.extend(key_values);
-
-            for (i, agg) in simple_aggs.iter().enumerate() {
-                let value = match agg {
-                    SimpleAgg::Count | SimpleAgg::CountColumn(_) => Value::Integer(state.counts[i]),
-                    SimpleAgg::Sum(_) => state.sums[i].sum()?,
-                    SimpleAgg::Avg(_) => state.sums[i].avg(),
-                    SimpleAgg::Min(_) => state.min_values[i]
-                        .take()
-                        .unwrap_or_else(Value::null_unknown),
-                    SimpleAgg::Max(_) => state.max_values[i]
-                        .take()
-                        .unwrap_or_else(Value::null_unknown),
-                };
-                values.push(value);
-            }
-
-            result_rows.push((row_id, Row::from_compact_vec(values)));
-            row_id += 1;
-        }
-
-        Ok(Some((result_columns, result_rows)))
-    }
-
-    /// Single-column GROUP BY fast aggregation - avoids Vec<Value> allocation per row
-    ///
-    /// For single-column GROUP BY (the most common case), we can store the group key
-    /// as a single Value instead of Vec<Value>, eliminating allocation overhead.
-    #[allow(clippy::too_many_arguments)]
-    fn try_fast_aggregation_single_column(
-        &self,
-        group_col_idx: &usize,
-        simple_aggs: &[SimpleAgg],
-        aggregations: &[SqlAggregateFunction],
-        group_by_items: &[GroupByItem],
-        rows: &[(i64, Row)],
-        limit: Option<usize>,
-        having_filter: Option<&SimpleHavingFilter>,
-    ) -> Result<Option<(Vec<String>, RowVec)>> {
-        // State for single-column GROUP BY - stores single Value instead of Vec<Value>
-        // SmallVec for inline storage when ≤4 aggregations (common case)
-        use smallvec::SmallVec;
-        type AggVec<T> = SmallVec<[T; 4]>;
-
-        struct SingleColGroupState {
-            key_value: Value,
-            sums: AggVec<SumAccumulator>,
-            counts: AggVec<i64>,
-            min_values: AggVec<Option<Value>>,
-            max_values: AggVec<Option<Value>>,
-        }
-
-        // Start small - HashMap grows efficiently, over-allocation wastes memory
-        let estimated_groups = (rows.len() / 32).clamp(16, 256);
-        let num_aggs = simple_aggs.len();
-        let col_idx = *group_col_idx;
-
-        // Track for early termination optimization
-        let group_limit = limit.unwrap_or(usize::MAX);
-        let has_limit = limit.is_some();
-
-        // OPTIMIZATION: Check if we can use Integer or String fast path
-        // Sample multiple rows to detect column type (first non-NULL value determines type)
-        // This handles cases where the first row might have NULL values.
-        let sampled_type = rows
-            .iter()
-            .take(16) // Sample up to 16 rows for efficiency
-            .filter_map(|(_, r)| r.get(col_idx))
-            .find(|v| !matches!(v, Value::Null(_)));
-
-        let use_integer_fast_path = sampled_type
-            .map(|v| matches!(v, Value::Integer(_)))
-            .unwrap_or(false);
-        let use_string_fast_path = sampled_type
-            .map(|v| matches!(v, Value::Text(_)))
-            .unwrap_or(false);
-
-        if use_integer_fast_path {
-            // Ultra-fast path for Integer GROUP BY: no Value cloning, no hashing overhead
-            // SmallVec for inline storage when ≤4 aggregations (common case)
-            // Avoids heap allocation on clone for new groups
-            use smallvec::SmallVec;
-            type AggVec<T> = SmallVec<[T; 4]>;
-
-            #[derive(Clone)]
-            struct IntGroupState {
-                sums: AggVec<SumAccumulator>,
-                counts: AggVec<i64>,
-                min_values: AggVec<Option<Value>>,
-                max_values: AggVec<Option<Value>>,
-            }
-
-            let mut groups: I64Map<IntGroupState> = I64Map::with_capacity(estimated_groups);
-            // Separate tracking for NULL group (SQL: all NULLs group together)
-            let mut null_group: Option<IntGroupState> = None;
-            let mut current_group_count: usize = 0;
-
-            // OPTIMIZATION: Pre-allocate template state - clone is faster than separate smallvec! calls
-            let state_template = IntGroupState {
-                sums: smallvec::smallvec![SumAccumulator::default(); num_aggs],
-                counts: smallvec::smallvec![0; num_aggs],
-                min_values: smallvec::smallvec![None; num_aggs],
-                max_values: smallvec::smallvec![None; num_aggs],
-            };
-
-            for (_, row) in rows {
-                // Extract integer key directly - no clone, no hash
-                // Handle NULL values separately (they form their own group)
-                let key_opt = match row.get(col_idx) {
-                    Some(Value::Integer(v)) => Some(*v),
-                    Some(Value::Null(_)) => None, // NULL goes to null_group (inline pattern)
-                    None => None,                 // Missing value treated as NULL
-                    _ => continue,                // Skip non-integer, non-NULL values
-                };
-
-                let state = if let Some(key) = key_opt {
-                    // OPTIMIZATION: Single hash lookup using entry API instead of
-                    // contains_key + entry (was doing 2 hash lookups)
-                    use crate::common::i64_map::Entry;
-                    match groups.entry(key) {
-                        Entry::Occupied(e) => e.into_mut(),
-                        Entry::Vacant(e) => {
-                            // Early termination check for new groups
-                            if has_limit && current_group_count >= group_limit {
-                                continue;
-                            }
-                            current_group_count += 1;
-                            e.insert(state_template.clone())
-                        }
-                    }
-                } else {
-                    // NULL group
-                    if null_group.is_none() {
-                        if has_limit && current_group_count >= group_limit {
-                            continue;
-                        }
-                        current_group_count += 1;
-                        null_group = Some(state_template.clone());
-                    }
-                    null_group.as_mut().unwrap()
-                };
-
-                // Accumulate aggregates
-                for (i, agg) in simple_aggs.iter().enumerate() {
-                    match agg {
-                        SimpleAgg::Count => {
-                            state.counts[i] += 1;
-                        }
-                        SimpleAgg::CountColumn(col_idx) => {
-                            if let Some(value) = row.get(*col_idx) {
-                                if !value.is_null() {
-                                    state.counts[i] += 1;
-                                }
-                            }
-                        }
-                        SimpleAgg::Sum(sum_col_idx) | SimpleAgg::Avg(sum_col_idx) => {
-                            if let Some(value) = row.get(*sum_col_idx) {
-                                state.sums[i].add(value);
-                            }
-                        }
-                        SimpleAgg::Min(min_col_idx) => {
-                            if let Some(value) = row.get(*min_col_idx) {
-                                if !value.is_null() {
-                                    match &state.min_values[i] {
-                                        None => state.min_values[i] = Some(value.clone()),
-                                        Some(current) if value.cmp(current).is_lt() => {
-                                            state.min_values[i] = Some(value.clone())
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
-                        SimpleAgg::Max(max_col_idx) => {
-                            if let Some(value) = row.get(*max_col_idx) {
-                                if !value.is_null() {
-                                    match &state.max_values[i] {
-                                        None => state.max_values[i] = Some(value.clone()),
-                                        Some(current) if value.cmp(current).is_gt() => {
-                                            state.max_values[i] = Some(value.clone())
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Build result columns
-            let mut result_columns = Vec::with_capacity(1 + aggregations.len());
-            let group_col_name = match &group_by_items[0] {
-                GroupByItem::Column(col_name) => col_name.clone(),
-                _ => "col0".to_string(),
-            };
-            result_columns.push(group_col_name);
-            for agg in aggregations {
-                let col_name = if let Some(ref alias) = agg.alias {
-                    alias.clone()
-                } else {
-                    agg.get_expression_name()
-                };
-                result_columns.push(col_name);
-            }
-
-            // Helper to check HAVING filter
-            let passes_having = |state: &IntGroupState| -> Result<bool> {
-                if let Some(filter) = having_filter {
-                    for cond in &filter.conditions {
-                        let agg_value = match &simple_aggs[cond.agg_index] {
-                            SimpleAgg::Count | SimpleAgg::CountColumn(_) => {
-                                Some(Cow::Owned(Value::Integer(state.counts[cond.agg_index])))
-                            }
-                            SimpleAgg::Sum(_) => Some(state.sums[cond.agg_index].sum()?)
-                                .filter(|v| !v.is_null())
-                                .map(Cow::Owned),
-                            SimpleAgg::Avg(_) => Some(state.sums[cond.agg_index].avg())
-                                .filter(|v| !v.is_null())
-                                .map(Cow::Owned),
-                            SimpleAgg::Min(_) => {
-                                state.min_values[cond.agg_index].as_ref().map(Cow::Borrowed)
-                            }
-                            SimpleAgg::Max(_) => {
-                                state.max_values[cond.agg_index].as_ref().map(Cow::Borrowed)
-                            }
-                        };
-                        match agg_value {
-                            Some(val) => {
-                                if !cond.matches(&val) {
-                                    return Ok(false);
-                                }
-                            }
-                            None => return Ok(false),
-                        }
-                    }
-                }
-                Ok(true)
-            };
-
-            // Helper to build row from state
-            // Use CompactVec directly to avoid Vec→CompactVec conversion
-            let build_row = |key_value: Value, mut state: IntGroupState| -> Result<Row> {
-                let mut values: CompactVec<Value> =
-                    CompactVec::with_capacity(1 + simple_aggs.len());
-                values.push(key_value);
-                for (i, agg) in simple_aggs.iter().enumerate() {
-                    let value = match agg {
-                        SimpleAgg::Count | SimpleAgg::CountColumn(_) => {
-                            Value::Integer(state.counts[i])
-                        }
-                        SimpleAgg::Sum(_) => state.sums[i].sum()?,
-                        SimpleAgg::Avg(_) => state.sums[i].avg(),
-                        SimpleAgg::Min(_) => state.min_values[i]
-                            .take()
-                            .unwrap_or_else(Value::null_unknown),
-                        SimpleAgg::Max(_) => state.max_values[i]
-                            .take()
-                            .unwrap_or_else(Value::null_unknown),
-                    };
-                    values.push(value);
-                }
-                Ok(Row::from_compact_vec(values))
-            };
-
-            // Build result rows with inline HAVING filter (supports AND combinations)
-            let mut result_rows = RowVec::new();
-            let mut row_id = 0i64;
-            for (key, state) in groups.into_iter() {
-                if passes_having(&state)? {
-                    result_rows.push((row_id, build_row(Value::Integer(key), state)?));
-                    row_id += 1;
-                }
-            }
-
-            // Add NULL group if it exists and passes HAVING
-            if let Some(ng) = null_group {
-                if passes_having(&ng)? {
-                    result_rows.push((row_id, build_row(Value::null_unknown(), ng)?));
-                }
-            }
-
-            return Ok(Some((result_columns, result_rows)));
-        }
-
-        // String fast path for Text GROUP BY: direct SmartString key, no Value::eq overhead
-        // SmallVec for inline storage when ≤4 aggregations (common case)
-        if use_string_fast_path {
-            use smallvec::SmallVec;
-            type AggVec<T> = SmallVec<[T; 4]>;
-
-            #[derive(Clone)]
-            struct StringGroupState {
-                sums: AggVec<SumAccumulator>,
-                counts: AggVec<i64>,
-                min_values: AggVec<Option<Value>>,
-                max_values: AggVec<Option<Value>>,
-            }
-
-            let mut groups: FxHashMap<crate::common::SmartString, StringGroupState> =
-                FxHashMap::with_capacity_and_hasher(estimated_groups, Default::default());
-            // Separate tracking for NULL group (SQL: all NULLs group together)
-            let mut null_group: Option<StringGroupState> = None;
-            let mut current_group_count: usize = 0;
-
-            // OPTIMIZATION: Pre-allocate template state - clone is faster than separate smallvec! calls
-            let state_template = StringGroupState {
-                sums: smallvec::smallvec![SumAccumulator::default(); num_aggs],
-                counts: smallvec::smallvec![0; num_aggs],
-                min_values: smallvec::smallvec![None; num_aggs],
-                max_values: smallvec::smallvec![None; num_aggs],
-            };
-
-            for (_, row) in rows {
-                // Extract string key directly - only clone when creating new group
-                // Handle NULL values separately (they form their own group)
-                let key_str_opt = match row.get(col_idx) {
-                    Some(Value::Text(s)) => Some(s),
-                    Some(Value::Null(_)) => None, // NULL goes to null_group (inline pattern)
-                    None => None,                 // Missing value treated as NULL
-                    _ => continue,                // Skip non-text, non-NULL values
-                };
-
-                let state = if let Some(key_str) = key_str_opt {
-                    // OPTIMIZATION: get_mut first (no clone for existing groups)
-                    // For aggregation with many rows but few groups, most rows hit existing groups
-                    // This avoids cloning the key on every row - major perf win
-                    match groups.get_mut(key_str) {
-                        Some(existing) => existing,
-                        None => {
-                            // Early termination check for new groups
-                            if has_limit && current_group_count >= group_limit {
-                                continue;
-                            }
-                            current_group_count += 1;
-                            // Clone key only when creating new group
-                            groups.insert(key_str.clone(), state_template.clone());
-                            // SAFETY: we just inserted, so key exists
-                            groups.get_mut(key_str).unwrap()
-                        }
-                    }
-                } else {
-                    // NULL group
-                    if null_group.is_none() {
-                        if has_limit && current_group_count >= group_limit {
-                            continue;
-                        }
-                        current_group_count += 1;
-                        null_group = Some(state_template.clone());
-                    }
-                    null_group.as_mut().unwrap()
-                };
-
-                // Accumulate aggregates
-                for (i, agg) in simple_aggs.iter().enumerate() {
-                    match agg {
-                        SimpleAgg::Count => {
-                            state.counts[i] += 1;
-                        }
-                        SimpleAgg::CountColumn(col_idx) => {
-                            if let Some(value) = row.get(*col_idx) {
-                                if !value.is_null() {
-                                    state.counts[i] += 1;
-                                }
-                            }
-                        }
-                        SimpleAgg::Sum(sum_col_idx) | SimpleAgg::Avg(sum_col_idx) => {
-                            if let Some(value) = row.get(*sum_col_idx) {
-                                state.sums[i].add(value);
-                            }
-                        }
-                        SimpleAgg::Min(min_col_idx) => {
-                            if let Some(value) = row.get(*min_col_idx) {
-                                if !value.is_null() {
-                                    match &state.min_values[i] {
-                                        None => state.min_values[i] = Some(value.clone()),
-                                        Some(current) if value.cmp(current).is_lt() => {
-                                            state.min_values[i] = Some(value.clone())
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
-                        SimpleAgg::Max(max_col_idx) => {
-                            if let Some(value) = row.get(*max_col_idx) {
-                                if !value.is_null() {
-                                    match &state.max_values[i] {
-                                        None => state.max_values[i] = Some(value.clone()),
-                                        Some(current) if value.cmp(current).is_gt() => {
-                                            state.max_values[i] = Some(value.clone())
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Build result columns
-            let mut result_columns = Vec::with_capacity(1 + aggregations.len());
-            let group_col_name = match &group_by_items[0] {
-                GroupByItem::Column(col_name) => col_name.clone(),
-                _ => "col0".to_string(),
-            };
-            result_columns.push(group_col_name);
-            for agg in aggregations {
-                let col_name = if let Some(ref alias) = agg.alias {
-                    alias.clone()
-                } else {
-                    agg.get_expression_name()
-                };
-                result_columns.push(col_name);
-            }
-
-            // Helper to check HAVING filter
-            let passes_having = |state: &StringGroupState| -> Result<bool> {
-                if let Some(filter) = having_filter {
-                    for cond in &filter.conditions {
-                        let agg_value = match &simple_aggs[cond.agg_index] {
-                            SimpleAgg::Count | SimpleAgg::CountColumn(_) => {
-                                Some(Cow::Owned(Value::Integer(state.counts[cond.agg_index])))
-                            }
-                            SimpleAgg::Sum(_) => Some(state.sums[cond.agg_index].sum()?)
-                                .filter(|v| !v.is_null())
-                                .map(Cow::Owned),
-                            SimpleAgg::Avg(_) => Some(state.sums[cond.agg_index].avg())
-                                .filter(|v| !v.is_null())
-                                .map(Cow::Owned),
-                            SimpleAgg::Min(_) => {
-                                state.min_values[cond.agg_index].as_ref().map(Cow::Borrowed)
-                            }
-                            SimpleAgg::Max(_) => {
-                                state.max_values[cond.agg_index].as_ref().map(Cow::Borrowed)
-                            }
-                        };
-                        match agg_value {
-                            Some(val) => {
-                                if !cond.matches(&val) {
-                                    return Ok(false);
-                                }
-                            }
-                            None => return Ok(false),
-                        }
-                    }
-                }
-                Ok(true)
-            };
-
-            // Helper to build row from state
-            // Use CompactVec directly to avoid Vec→CompactVec conversion
-            let build_row = |key_value: Value, mut state: StringGroupState| -> Result<Row> {
-                let mut values: CompactVec<Value> =
-                    CompactVec::with_capacity(1 + simple_aggs.len());
-                values.push(key_value);
-                for (i, agg) in simple_aggs.iter().enumerate() {
-                    let value = match agg {
-                        SimpleAgg::Count | SimpleAgg::CountColumn(_) => {
-                            Value::Integer(state.counts[i])
-                        }
-                        SimpleAgg::Sum(_) => state.sums[i].sum()?,
-                        SimpleAgg::Avg(_) => state.sums[i].avg(),
-                        SimpleAgg::Min(_) => state.min_values[i]
-                            .take()
-                            .unwrap_or_else(Value::null_unknown),
-                        SimpleAgg::Max(_) => state.max_values[i]
-                            .take()
-                            .unwrap_or_else(Value::null_unknown),
-                    };
-                    values.push(value);
-                }
-                Ok(Row::from_compact_vec(values))
-            };
-
-            // Build result rows with inline HAVING filter
-            let mut result_rows = RowVec::new();
-            let mut row_id = 0i64;
-            for (key, state) in groups.into_iter() {
-                if passes_having(&state)? {
-                    result_rows.push((row_id, build_row(Value::Text(key), state)?));
-                    row_id += 1;
-                }
-            }
-
-            // Add NULL group if it exists and passes HAVING
-            if let Some(ng) = null_group {
-                if passes_having(&ng)? {
-                    result_rows.push((row_id, build_row(Value::null_unknown(), ng)?));
-                }
-            }
-
-            return Ok(Some((result_columns, result_rows)));
-        }
-
-        // Fallback: general single-column path with Value storage
-        // Use hash -> Vec to handle collisions (different values with same hash)
-        let mut groups: FxHashMap<u64, Vec<SingleColGroupState>> =
-            FxHashMap::with_capacity_and_hasher(estimated_groups, Default::default());
-        let mut current_group_count: usize = 0;
-
-        for (_, row) in rows {
-            // OPTIMIZATION: Hash directly from row reference (no clone for hashing)
-            let row_value = row.get(col_idx);
-            let mut hasher = AHasher::default();
-            if let Some(value) = row_value {
-                hash_value_into(value, &mut hasher);
-            } else {
-                hash_value_into(&Value::null_unknown(), &mut hasher);
-            }
-            let hash = hasher.finish();
-
-            // Get or create bucket for this hash
-            let bucket = groups.entry(hash).or_default();
-
-            // OPTIMIZATION: Compare row value directly against stored keys (no clone for lookup)
-            // Inline is_null() check as pattern match to avoid function call overhead
-            let existing_idx = bucket.iter().position(|s| match row_value {
-                Some(rv) => &s.key_value == rv,
-                None => matches!(s.key_value, Value::Null(_)),
-            });
-
-            let state = if let Some(idx) = existing_idx {
-                // Existing group - no clone needed!
-                &mut bucket[idx]
-            } else {
-                // New group - check limit before creating
-                if has_limit && current_group_count >= group_limit {
-                    continue;
-                }
-                // Only clone when creating a new group
-                let key_value = row_value.cloned().unwrap_or_else(Value::null_unknown);
-                bucket.push(SingleColGroupState {
-                    key_value,
-                    sums: smallvec::smallvec![SumAccumulator::default(); num_aggs],
-                    counts: smallvec::smallvec![0; num_aggs],
-                    min_values: smallvec::smallvec![None; num_aggs],
-                    max_values: smallvec::smallvec![None; num_aggs],
-                });
-                current_group_count += 1;
-                bucket.last_mut().unwrap()
-            };
-
-            // Accumulate aggregates
-            for (i, agg) in simple_aggs.iter().enumerate() {
-                match agg {
-                    SimpleAgg::Count => {
-                        state.counts[i] += 1;
-                    }
-                    SimpleAgg::CountColumn(col_idx) => {
-                        if let Some(value) = row.get(*col_idx) {
-                            if !value.is_null() {
-                                state.counts[i] += 1;
-                            }
-                        }
-                    }
-                    SimpleAgg::Sum(sum_col_idx) | SimpleAgg::Avg(sum_col_idx) => {
-                        if let Some(value) = row.get(*sum_col_idx) {
-                            state.sums[i].add(value);
-                        }
-                    }
-                    SimpleAgg::Min(min_col_idx) => {
-                        if let Some(value) = row.get(*min_col_idx) {
-                            if !value.is_null() {
-                                match &state.min_values[i] {
-                                    None => state.min_values[i] = Some(value.clone()),
-                                    Some(current) if value.cmp(current).is_lt() => {
-                                        state.min_values[i] = Some(value.clone())
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                    SimpleAgg::Max(max_col_idx) => {
-                        if let Some(value) = row.get(*max_col_idx) {
-                            if !value.is_null() {
-                                match &state.max_values[i] {
-                                    None => state.max_values[i] = Some(value.clone()),
-                                    Some(current) if value.cmp(current).is_gt() => {
-                                        state.max_values[i] = Some(value.clone())
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Build result columns
-        let mut result_columns = Vec::with_capacity(1 + aggregations.len());
-
-        // Single GROUP BY column name
-        let group_col_name = match &group_by_items[0] {
-            GroupByItem::Column(col_name) => col_name.clone(),
-            _ => "col0".to_string(),
-        };
-        result_columns.push(group_col_name);
-
-        // Add aggregate column names
-        for agg in aggregations {
-            let col_name = if let Some(ref alias) = agg.alias {
-                alias.clone()
-            } else {
-                agg.get_expression_name()
-            };
-            result_columns.push(col_name);
-        }
-
-        // Build result rows with inline HAVING filter (supports AND combinations)
-        let mut result_rows = RowVec::new();
-        let mut row_id = 0i64;
-        for mut state in groups.into_values().flatten() {
-            // Apply inline HAVING filter
-            if let Some(filter) = having_filter {
-                let mut passes = true;
-                for cond in &filter.conditions {
-                    let agg_value = match &simple_aggs[cond.agg_index] {
-                        SimpleAgg::Count | SimpleAgg::CountColumn(_) => {
-                            Some(Cow::Owned(Value::Integer(state.counts[cond.agg_index])))
-                        }
-                        SimpleAgg::Sum(_) => Some(state.sums[cond.agg_index].sum()?)
-                            .filter(|v| !v.is_null())
-                            .map(Cow::Owned),
-                        SimpleAgg::Avg(_) => Some(state.sums[cond.agg_index].avg())
-                            .filter(|v| !v.is_null())
-                            .map(Cow::Owned),
-                        SimpleAgg::Min(_) => {
-                            state.min_values[cond.agg_index].as_ref().map(Cow::Borrowed)
-                        }
-                        SimpleAgg::Max(_) => {
-                            state.max_values[cond.agg_index].as_ref().map(Cow::Borrowed)
-                        }
-                    };
-                    match agg_value {
-                        Some(val) => {
-                            if !cond.matches(&val) {
-                                passes = false;
-                                break;
-                            }
-                        }
-                        None => {
-                            passes = false;
-                            break;
-                        }
-                    }
-                }
-                if !passes {
-                    continue;
-                }
-            }
-
-            // Use CompactVec directly to avoid Vec→CompactVec conversion
-            let mut values: CompactVec<Value> = CompactVec::with_capacity(1 + simple_aggs.len());
-            values.push(state.key_value);
-
-            for (i, agg) in simple_aggs.iter().enumerate() {
-                let value = match agg {
-                    SimpleAgg::Count | SimpleAgg::CountColumn(_) => Value::Integer(state.counts[i]),
-                    SimpleAgg::Sum(_) => state.sums[i].sum()?,
-                    SimpleAgg::Avg(_) => state.sums[i].avg(),
-                    SimpleAgg::Min(_) => state.min_values[i]
-                        .take()
-                        .unwrap_or_else(Value::null_unknown),
-                    SimpleAgg::Max(_) => state.max_values[i]
-                        .take()
-                        .unwrap_or_else(Value::null_unknown),
-                };
-                values.push(value);
-            }
-
-            result_rows.push((row_id, Row::from_compact_vec(values)));
-            row_id += 1;
-        }
-
-        Ok(Some((result_columns, result_rows)))
-    }
-
-    /// Execute grouped aggregation (with GROUP BY)
-    ///
-    /// Optimized version that:
-    /// 1. Uses hash-based grouping instead of Vec<Value> keys
-    /// 2. Pre-allocates aggregate functions once, resets per group
-    /// 3. Pre-computes column indices for aggregate columns
-    /// 4. Supports complex expressions in GROUP BY (e.g., function calls)
-    ///
-    /// When `limit` is provided (and there's no ORDER BY), enables early termination
-    /// for streaming aggregation - stops creating new groups after limit is reached.
+    /// Execute grouped aggregation (with GROUP BY). With `limit`, no group
+    /// past the first `limit` is made, and their rows are not aggregated
     #[allow(clippy::too_many_arguments)]
     fn execute_grouped_aggregation(
         &self,
@@ -3482,477 +2513,24 @@ impl Executor {
         rows: &[(i64, Row)],
         columns: &[String],
         col_index_map: &StringMap<usize>,
-        stmt: &SelectStatement,
         ctx: &ExecutionContext,
         limit: Option<usize>,
-    ) -> Result<(Vec<String>, RowVec, bool)> {
-        // Try to parse simple HAVING for inline filtering optimization
-        let inline_having = stmt
-            .having
-            .as_ref()
-            .and_then(|h| try_parse_simple_having(h, aggregations));
-
-        // FAST PATH: For simple aggregates (COUNT/SUM/AVG/MIN/MAX without DISTINCT/FILTER/ORDER BY/expression),
-        // use single-pass streaming aggregation that accumulates values directly
-        // When inline HAVING is available, it's applied during row generation
-        if let Some(result) = self.try_fast_aggregation(
-            aggregations,
-            group_by_items,
+    ) -> Result<(Vec<String>, RowVec)> {
+        let mut groups =
+            GroupedAggregates::new(self.call_templates(aggregations)?, group_by_items.len());
+        if let Some(limit) = limit {
+            groups = groups.with_group_cap(limit);
+        }
+        RowFeed::new(aggregations, group_by_items, columns, col_index_map)?.run_rows(
+            &mut groups,
             rows,
-            columns,
-            col_index_map,
-            limit,
-            inline_having.as_ref(),
-        )? {
-            // Return true for having_applied if we had an inline HAVING filter
-            return Ok((result.0, result.1, inline_having.is_some()));
-        }
+            ctx,
+        )?;
 
-        // Whether any call reads a program per row: an expression argument,
-        // a FILTER or an ORDER BY
-        let has_agg_expression = !aggregations
-            .iter()
-            .all(|a| a.answered_with(Modifiers::DISTINCT.and(Modifiers::EXTRA_ARGS)));
-
-        // Pre-compute aggregate column indices (once, not per row)
-        // OPTIMIZATION: Use pre-computed column_lower instead of calling to_lowercase() each time
-        // Handle both qualified (e.g., "o.amount") and unqualified column names
-        let agg_col_indices: Vec<Option<usize>> = aggregations
-            .iter()
-            .map(|agg| {
-                if agg.column == "*" || agg.expression.is_some() {
-                    None // COUNT(*) and expressions don't use column index
-                } else {
-                    Self::lookup_column_index(&agg.column_lower, col_index_map)
-                }
-            })
-            .collect();
-
-        // Use hash-based grouping with collision handling: u64 hash -> Vec<GroupEntry>
-        // Each hash bucket can contain multiple groups (handles hash collisions correctly)
-        // Uses u64 keys for performance (8 bytes vs hundreds of bytes for Vec<Value>)
-        // FxHashMap is optimized for trusted keys in embedded database context
-        let mut groups: FxHashMap<u64, Vec<GroupEntry>> = FxHashMap::default();
-
-        // Temporary buffer for computing group key hash (reused across rows)
-        let mut key_buffer: Vec<Value> = Vec::with_capacity(group_by_items.len());
-
-        // OPTIMIZATION: Pre-compute column indices for GROUP BY items to avoid to_lowercase() per row
-        enum PrecomputedGroupBy<'a> {
-            ColumnIndex(usize),
-            Position(usize),
-            Expression(&'a Expression),
-            NotFound,
-        }
-
-        let precomputed_group_by: Vec<PrecomputedGroupBy> = group_by_items
-            .iter()
-            .map(|item| match item {
-                GroupByItem::Column(col_name) => {
-                    // Use lookup_column_index to handle qualified names (e.g., "t.dept" -> "dept")
-                    if let Some(idx) =
-                        Self::lookup_column_index(&col_name.to_lowercase(), col_index_map)
-                    {
-                        PrecomputedGroupBy::ColumnIndex(idx)
-                    } else {
-                        PrecomputedGroupBy::NotFound
-                    }
-                }
-                GroupByItem::Position(pos) => PrecomputedGroupBy::Position(pos.saturating_sub(1)),
-                GroupByItem::Expression { expr, .. } => PrecomputedGroupBy::Expression(expr),
-            })
-            .collect();
-
-        // OPTIMIZATION: Check if we have any Expression GROUP BY items
-        // If so, pre-compile expressions and use VM for evaluation
-        let has_expr_group_by = precomputed_group_by
-            .iter()
-            .any(|item| matches!(item, PrecomputedGroupBy::Expression(_)));
-
-        // Pre-compile GROUP BY expressions for VM-based evaluation
-        // CRITICAL: Propagate errors instead of silently ignoring compilation failures
-        use super::expression::{compile_expression, ExecuteContext, ExprVM, SharedProgram};
-        let compiled_group_by_exprs: Vec<Option<SharedProgram>> = precomputed_group_by
-            .iter()
-            .map(|item| match item {
-                PrecomputedGroupBy::Expression(expr) => compile_expression(expr, columns).map(Some),
-                _ => Ok(None),
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let mut expr_vm = if has_expr_group_by || has_agg_expression {
-            Some(ExprVM::new())
-        } else {
-            None
-        };
-
-        // OPTIMIZATION: Check if all GROUP BY items are simple column indices
-        // In this case, we can hash directly from the row without cloning
-        let all_simple_columns = precomputed_group_by.iter().all(|item| {
-            matches!(
-                item,
-                PrecomputedGroupBy::ColumnIndex(_) | PrecomputedGroupBy::Position(_)
-            )
-        });
-
-        // Track for early termination optimization
-        let group_limit = limit.unwrap_or(usize::MAX);
-        let has_limit = limit.is_some();
-        let mut current_group_count: usize = 0; // Track actual group count for LIMIT optimization
-
-        if all_simple_columns && expr_vm.is_none() {
-            // Fast path: extract key values directly from row columns
-            let column_indices: Vec<usize> = precomputed_group_by
-                .iter()
-                .map(|item| match item {
-                    PrecomputedGroupBy::ColumnIndex(idx) => *idx,
-                    PrecomputedGroupBy::Position(idx) => *idx,
-                    _ => unreachable!(),
-                })
-                .collect();
-
-            // One raw-entry loop for any column count: hash and compare
-            // against borrowed row values, clone key Values only when a
-            // new group is actually inserted (same pattern as
-            // try_fast_aggregation above)
-            // The map hasher and the manual hash must agree exactly
-            // (hash_one(&Vec<Value>) length-prefixes the slice): hashbrown
-            // rehashes with the map's own hasher on resize
-            type FxBuild = BuildHasherDefault<FxHasher>;
-            let mut keyed_groups: hashbrown::HashMap<Vec<Value>, Vec<usize>, FxBuild> =
-                hashbrown::HashMap::with_capacity_and_hasher(64, FxBuild::default());
-            let num_cols = column_indices.len();
-            let mut group_count: usize = 0;
-
-            for (row_idx, (_, row)) in rows.iter().enumerate() {
-                let mut hasher = FxHasher::default();
-                hasher.write_usize(num_cols);
-                for &idx in &column_indices {
-                    match row.get(idx) {
-                        Some(value) => value.hash(&mut hasher),
-                        None => Value::null_unknown().hash(&mut hasher),
-                    }
-                }
-                let hash = hasher.finish();
-
-                let entry = keyed_groups.raw_entry_mut().from_hash(hash, |stored| {
-                    stored.len() == num_cols
-                        && stored.iter().zip(column_indices.iter()).all(|(s, &idx)| {
-                            match row.get(idx) {
-                                Some(rv) => s == rv,
-                                None => matches!(s, Value::Null(_)),
-                            }
-                        })
-                });
-                match entry {
-                    RawEntryMut::Occupied(mut occupied) => occupied.get_mut().push(row_idx),
-                    RawEntryMut::Vacant(vacant) => {
-                        // Early termination: skip rows that would create
-                        // new groups beyond the limit
-                        if has_limit && group_count >= group_limit {
-                            continue;
-                        }
-                        group_count += 1;
-                        let key: Vec<Value> = column_indices
-                            .iter()
-                            .map(|&idx| row.get(idx).cloned().unwrap_or_else(Value::null_unknown))
-                            .collect();
-                        vacant.insert_hashed_nocheck(hash, key, vec![row_idx]);
-                    }
-                }
-            }
-
-            // Convert to GroupEntry format for downstream processing
-            for (key_values, row_indices) in keyed_groups {
-                groups.entry(0).or_default().push(GroupEntry {
-                    key_values,
-                    row_indices,
-                });
-            }
-        } else {
-            // Slow path: need to evaluate expressions, use buffer. A key that
-            // fails is returned after the loop; an early return in it is slower
-            let mut key_error = None;
-            for (row_idx, (_, row)) in rows.iter().enumerate() {
-                key_buffer.clear();
-
-                // Create execution context for this row
-                // CRITICAL: Include params for parameterized queries
-                let exec_ctx = ExecuteContext::new(row)
-                    .with_params(ctx.params())
-                    .with_named_params(ctx.named_params());
-
-                for (i, item) in precomputed_group_by.iter().enumerate() {
-                    let value = match item {
-                        PrecomputedGroupBy::ColumnIndex(idx) => {
-                            row.get(*idx).cloned().unwrap_or_else(Value::null_unknown)
-                        }
-                        PrecomputedGroupBy::Position(idx) => {
-                            row.get(*idx).cloned().unwrap_or_else(Value::null_unknown)
-                        }
-                        PrecomputedGroupBy::Expression(_) => {
-                            // Use pre-compiled expression with VM
-                            if let (Some(ref mut vm), Some(ref program)) =
-                                (&mut expr_vm, &compiled_group_by_exprs[i])
-                            {
-                                match vm.execute_cow(program, &exec_ctx) {
-                                    Ok(value) => value,
-                                    Err(e) => keep_first_error(&mut key_error, e),
-                                }
-                            } else {
-                                Value::null_unknown()
-                            }
-                        }
-                        PrecomputedGroupBy::NotFound => Value::null_unknown(),
-                    };
-                    key_buffer.push(value);
-                }
-
-                // Compute hash of key (8-byte key for fast lookups)
-                let hash = hash_group_key(&key_buffer);
-
-                // OPTIMIZATION: Single scan to find existing group OR check limit
-                // Previously we scanned twice: once for key_exists check, once for find()
-                match groups.entry(hash) {
-                    std::collections::hash_map::Entry::Occupied(mut e) => {
-                        let bucket = e.get_mut();
-                        // Single scan: find position of matching group
-                        let existing_idx = bucket
-                            .iter()
-                            .position(|entry| entry.key_values == key_buffer);
-
-                        if let Some(idx) = existing_idx {
-                            // Existing group - just add this row to it
-                            bucket[idx].row_indices.push(row_idx);
-                        } else {
-                            // Hash collision: different key with same hash
-                            // Check limit before creating new group
-                            if has_limit && current_group_count >= group_limit {
-                                continue;
-                            }
-                            bucket.push(GroupEntry {
-                                key_values: key_buffer.clone(),
-                                row_indices: vec![row_idx],
-                            });
-                            current_group_count += 1;
-                        }
-                    }
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        // First entry for this hash - check limit before creating
-                        if has_limit && current_group_count >= group_limit {
-                            continue;
-                        }
-                        e.insert(vec![GroupEntry {
-                            key_values: key_buffer.clone(),
-                            row_indices: vec![row_idx],
-                        }]);
-                        current_group_count += 1;
-                    }
-                }
-            }
-            if let Some(e) = key_error {
-                return Err(e);
-            }
-        }
-
-        // Convert groups to Vec for parallel processing
-        // Flatten buckets: each bucket may contain multiple groups (hash collisions)
-        let groups_vec: Vec<GroupEntry> = groups.into_values().flatten().collect();
-
-        // Determine if parallel processing is beneficial
-        // Don't use parallel processing when expressions are involved (harder to handle)
-        // Key insight: parallel creates aggregate functions PER GROUP, so for many small groups
-        // (e.g., 10k groups with 3 rows each), the allocation overhead dominates.
-        // Only parallelize when groups are large enough to amortize the allocation cost.
-        #[cfg(feature = "parallel")]
-        let total_rows: usize = groups_vec.iter().map(|g| g.row_indices.len()).sum();
-        #[cfg(feature = "parallel")]
-        let avg_rows_per_group = total_rows / groups_vec.len().max(1);
-        #[cfg(feature = "parallel")]
-        let use_parallel = groups_vec.len() >= 4
-            && total_rows >= 10_000
-            && avg_rows_per_group >= 50
-            && !has_agg_expression;
-        #[cfg(not(feature = "parallel"))]
-        let use_parallel = false;
-
-        // Process groups (parallel or sequential based on data size)
-        let result_rows: RowVec = if use_parallel {
-            // PARALLEL: Process each group independently using Rayon
-            let function_registry = &self.function_registry;
-
-            #[cfg(feature = "parallel")]
-            let rows_vec: Vec<Row> = groups_vec
-                .into_par_iter()
-                .map(|group| {
-                    // Each thread creates its own aggregate functions
-                    let mut agg_funcs: Vec<Option<AggregateState>> = aggregations
-                        .iter()
-                        .map(|agg| agg.state(function_registry))
-                        .collect();
-
-                    // Accumulate values for this group
-                    // Pre-create static Value for COUNT(*)
-                    let count_star_value = Value::Integer(1);
-                    for &row_idx in &group.row_indices {
-                        let (_, row) = &rows[row_idx];
-                        for (i, func) in agg_funcs.iter_mut().enumerate() {
-                            if let Some(func) = func {
-                                // OPTIMIZATION: Avoid cloning by using reference directly
-                                let value_ref = if let Some(col_idx) = agg_col_indices[i] {
-                                    row.get(col_idx)
-                                } else {
-                                    Some(&count_star_value)
-                                };
-                                if let Some(v) = value_ref {
-                                    func.accumulate(v);
-                                }
-                            }
-                        }
-                    }
-
-                    // Build result row
-                    // Use CompactVec directly to avoid Vec→CompactVec conversion
-                    let mut row_values: CompactVec<Value> =
-                        CompactVec::with_capacity(group_by_items.len() + aggregations.len());
-                    row_values.extend(group.key_values);
-
-                    for (i, agg) in aggregations.iter().enumerate() {
-                        let value = if let Some(ref func) = agg_funcs[i] {
-                            func.result()?
-                        } else if agg.name == "COUNT" && agg.column == "*" {
-                            Value::Integer(group.row_indices.len() as i64)
-                        } else {
-                            Value::null_unknown()
-                        };
-                        row_values.push(value);
-                    }
-
-                    Ok(Row::from_compact_vec(row_values))
-                })
-                .collect::<Result<_>>()?;
-            #[cfg(not(feature = "parallel"))]
-            let rows_vec: Vec<Row> = groups_vec
-                .into_iter()
-                .map(|group| {
-                    // Each thread creates its own aggregate functions
-                    let mut agg_funcs: Vec<Option<AggregateState>> = aggregations
-                        .iter()
-                        .map(|agg| agg.state(function_registry))
-                        .collect();
-
-                    // Accumulate values for this group
-                    // Pre-create static Value for COUNT(*)
-                    let count_star_value = Value::Integer(1);
-                    for &row_idx in &group.row_indices {
-                        let (_, row) = &rows[row_idx];
-                        for (i, func) in agg_funcs.iter_mut().enumerate() {
-                            if let Some(func) = func {
-                                // OPTIMIZATION: Avoid cloning by using reference directly
-                                let value_ref = if let Some(col_idx) = agg_col_indices[i] {
-                                    row.get(col_idx)
-                                } else {
-                                    Some(&count_star_value)
-                                };
-                                if let Some(v) = value_ref {
-                                    func.accumulate(v);
-                                }
-                            }
-                        }
-                    }
-
-                    // Build result row
-                    // Use CompactVec directly to avoid Vec→CompactVec conversion
-                    let mut row_values: CompactVec<Value> =
-                        CompactVec::with_capacity(group_by_items.len() + aggregations.len());
-                    row_values.extend(group.key_values);
-
-                    for (i, agg) in aggregations.iter().enumerate() {
-                        let value = if let Some(ref func) = agg_funcs[i] {
-                            func.result()?
-                        } else if agg.name == "COUNT" && agg.column == "*" {
-                            Value::Integer(group.row_indices.len() as i64)
-                        } else {
-                            Value::null_unknown()
-                        };
-                        row_values.push(value);
-                    }
-
-                    Ok(Row::from_compact_vec(row_values))
-                })
-                .collect::<Result<_>>()?;
-            // Convert to RowVec with sequential IDs
-            rows_vec
-                .into_iter()
-                .enumerate()
-                .map(|(idx, row)| (idx as i64, row))
-                .collect()
-        } else {
-            // SEQUENTIAL: For small datasets, avoid parallel overhead, or when expressions are involved
-            let mut agg_funcs: Vec<Option<AggregateState>> = aggregations
-                .iter()
-                .map(|agg| agg.state(&self.function_registry))
-                .collect();
-            let inputs = CallInputs::compile(aggregations, columns)?;
-
-            let mut result_rows_seq = RowVec::with_capacity(groups_vec.len());
-            for (row_id, group) in groups_vec.into_iter().enumerate() {
-                // Reset aggregate functions for this group
-                for f in agg_funcs.iter_mut().flatten() {
-                    f.reset();
-                }
-
-                // Accumulate values for this group
-                // Pre-create static Value for COUNT(*)
-                let count_star_value = Value::Integer(1);
-                for &row_idx in &group.row_indices {
-                    let (_, row) = &rows[row_idx];
-
-                    // Create execution context for this row
-                    // CRITICAL: Include params for parameterized queries
-                    let exec_ctx = ExecuteContext::new(row)
-                        .with_params(ctx.params())
-                        .with_named_params(ctx.named_params());
-
-                    for (i, agg) in aggregations.iter().enumerate() {
-                        if let Some(ref mut func) = agg_funcs[i] {
-                            let column = match agg_col_indices[i] {
-                                Some(col_idx) => row.get(col_idx),
-                                None => Some(&count_star_value),
-                            };
-                            inputs[i].feed(func, column, &mut expr_vm, &exec_ctx, agg)?;
-                        }
-                    }
-                }
-
-                // Build result row
-                // Use CompactVec directly to avoid Vec→CompactVec conversion
-                let mut row_values: CompactVec<Value> =
-                    CompactVec::with_capacity(group_by_items.len() + aggregations.len());
-                row_values.extend(group.key_values);
-
-                for (i, agg) in aggregations.iter().enumerate() {
-                    let value = if let Some(ref func) = agg_funcs[i] {
-                        func.result()?
-                    } else if agg.name == "COUNT" && agg.column == "*" {
-                        Value::Integer(group.row_indices.len() as i64)
-                    } else {
-                        Value::null_unknown()
-                    };
-                    row_values.push(value);
-                }
-
-                result_rows_seq.push((row_id as i64, Row::from_compact_vec(row_values)));
-            }
-            result_rows_seq
-        };
-
-        // Build result columns
         let mut result_columns: Vec<String> =
             self.resolve_group_by_column_names_new(group_by_items, columns, col_index_map);
         result_columns.extend(aggregations.iter().map(|a| a.get_column_name()));
-
-        // Slow path doesn't apply HAVING inline, so return false
-        Ok((result_columns, result_rows, false))
+        Ok((result_columns, groups.into_rows()?))
     }
 
     /// Execute ROLLUP/CUBE aggregation
@@ -3991,272 +2569,52 @@ impl Executor {
             }
         };
 
-        // Pre-compute aggregate column indices
-        let agg_col_indices: Vec<Option<usize>> = aggregations
+        let feed = RowFeed::new(aggregations, group_by_items, columns, col_index_map)?;
+        let picks: Vec<Vec<usize>> = grouping_sets
             .iter()
-            .map(|agg| {
-                if agg.column == "*" || agg.expression.is_some() {
-                    None
-                } else {
-                    Self::lookup_column_index(&agg.column_lower, col_index_map)
-                }
+            .map(|set| {
+                set.active_columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &active)| active)
+                    .map(|(i, _)| i)
+                    .collect()
             })
             .collect();
-
-        // Pre-compute GROUP BY column indices
-        enum PrecomputedGroupBy<'a> {
-            ColumnIndex(usize),
-            Position(usize),
-            Expression(&'a Expression),
-            NotFound,
-        }
-
-        let precomputed_group_by: Vec<PrecomputedGroupBy> = group_by_items
+        let mut sets = picks
             .iter()
-            .map(|item| match item {
-                GroupByItem::Column(col_name) => {
-                    if let Some(idx) =
-                        Self::lookup_column_index(&col_name.to_lowercase(), col_index_map)
-                    {
-                        PrecomputedGroupBy::ColumnIndex(idx)
-                    } else {
-                        PrecomputedGroupBy::NotFound
-                    }
-                }
-                GroupByItem::Position(pos) => PrecomputedGroupBy::Position(pos.saturating_sub(1)),
-                GroupByItem::Expression { expr, .. } => PrecomputedGroupBy::Expression(expr),
-            })
-            .collect();
-
-        // Pre-compile GROUP BY and aggregate expressions for VM-based evaluation
-        let has_expr_group_by = precomputed_group_by
-            .iter()
-            .any(|item| matches!(item, PrecomputedGroupBy::Expression(_)));
-
-        // Pre-compile GROUP BY expressions
-        // CRITICAL: Propagate errors instead of silently ignoring compilation failures
-        use super::expression::{compile_expression, ExecuteContext, ExprVM, SharedProgram};
-        let compiled_group_by_exprs: Vec<Option<SharedProgram>> = precomputed_group_by
-            .iter()
-            .map(|item| match item {
-                PrecomputedGroupBy::Expression(expr) => compile_expression(expr, columns).map(Some),
-                _ => Ok(None),
+            .map(|picks| {
+                let calls = self.call_templates(aggregations)?;
+                Ok(match picks.len() {
+                    0 => GroupedAggregates::global(calls),
+                    width => GroupedAggregates::new(calls, width),
+                })
             })
             .collect::<Result<Vec<_>>>()?;
+        feed.run_sets(&mut sets, &picks, rows, ctx)?;
 
-        let inputs = CallInputs::compile(aggregations, columns)?;
-        let mut expr_vm = if has_expr_group_by {
-            Some(ExprVM::new())
-        } else {
-            None
-        };
-
-        // Collect all results from all grouping sets
+        // Each group's items where its set groups by them and NULL where the
+        // set rolls them up, then its aggregates, then the GROUPING flags
         let mut all_result_rows: RowVec = RowVec::new();
         let mut row_id = 0i64;
-
-        for grouping_set in &grouping_sets {
-            // Count active columns in this grouping set
-            let active_count = grouping_set.active_columns.iter().filter(|&&x| x).count();
-
-            if active_count == 0 {
-                // Grand total: aggregate all rows without grouping
-                let mut agg_funcs: Vec<Option<AggregateState>> = aggregations
-                    .iter()
-                    .map(|agg| agg.state(&self.function_registry))
-                    .collect();
-
-                let count_star_value = Value::Integer(1);
-
-                for (_, row) in rows {
-                    // Create execution context for this row
-                    // CRITICAL: Include params for parameterized queries
-                    let exec_ctx = ExecuteContext::new(row)
-                        .with_params(ctx.params())
-                        .with_named_params(ctx.named_params());
-
-                    for (i, agg) in aggregations.iter().enumerate() {
-                        if let Some(ref mut func) = agg_funcs[i] {
-                            let column = match agg_col_indices[i] {
-                                Some(col_idx) => row.get(col_idx),
-                                None => Some(&count_star_value),
-                            };
-                            inputs[i].feed(func, column, &mut expr_vm, &exec_ctx, agg)?;
-                        }
-                    }
-                }
-
-                // Build result row: all GROUP BY columns are NULL, then aggregates, then grouping flags
-                // Use CompactVec directly to avoid Vec→CompactVec conversion
+        for (grouping_set, groups) in grouping_sets.iter().zip(sets) {
+            for (_, row) in groups.into_rows()? {
+                let mut slots = row.into_values().into_iter();
                 let mut row_values: CompactVec<Value> = CompactVec::with_capacity(
                     group_by_items.len() + aggregations.len() + group_by_items.len(),
                 );
-                for _ in group_by_items {
-                    row_values.push(Value::null_unknown());
+                for &is_active in &grouping_set.active_columns {
+                    row_values.push(match is_active {
+                        true => slots.next().unwrap_or_else(Value::null_unknown),
+                        false => Value::null_unknown(),
+                    });
                 }
-                for (i, agg) in aggregations.iter().enumerate() {
-                    let value = if let Some(ref func) = agg_funcs[i] {
-                        func.result()?
-                    } else if agg.name == "COUNT" && agg.column == "*" {
-                        Value::Integer(rows.len() as i64)
-                    } else {
-                        Value::null_unknown()
-                    };
-                    row_values.push(value);
-                }
-                // Add GROUPING flags: all columns are rolled up in grand total (GROUPING = 1)
-                for _ in group_by_items {
-                    row_values.push(Value::Integer(1));
+                row_values.extend(slots);
+                for &is_active in &grouping_set.active_columns {
+                    row_values.push(Value::Integer(if is_active { 0 } else { 1 }));
                 }
                 all_result_rows.push((row_id, Row::from_compact_vec(row_values)));
                 row_id += 1;
-            } else {
-                // Partial grouping: group by active columns only
-                // Use hash-based grouping with collision handling: u64 hash -> Vec<GroupEntry>
-                // Each hash bucket can contain multiple groups (handles hash collisions correctly)
-                // FxHashMap is optimized for trusted keys in embedded database context
-                let mut groups: FxHashMap<u64, Vec<GroupEntry>> = FxHashMap::default();
-                let mut key_buffer: Vec<Value> = Vec::with_capacity(active_count);
-
-                for (row_idx, (_, row)) in rows.iter().enumerate() {
-                    key_buffer.clear();
-
-                    // Create execution context for this row
-                    // CRITICAL: Include params for parameterized queries
-                    let exec_ctx = ExecuteContext::new(row)
-                        .with_params(ctx.params())
-                        .with_named_params(ctx.named_params());
-
-                    // Only include active columns in the key
-                    for (col_idx, &is_active) in grouping_set.active_columns.iter().enumerate() {
-                        if is_active {
-                            let value = match &precomputed_group_by[col_idx] {
-                                PrecomputedGroupBy::ColumnIndex(idx) => {
-                                    row.get(*idx).cloned().unwrap_or_else(Value::null_unknown)
-                                }
-                                PrecomputedGroupBy::Position(idx) => {
-                                    row.get(*idx).cloned().unwrap_or_else(Value::null_unknown)
-                                }
-                                PrecomputedGroupBy::Expression(_) => {
-                                    // Use pre-compiled expression with VM
-                                    if let (Some(ref mut vm), Some(ref program)) =
-                                        (&mut expr_vm, &compiled_group_by_exprs[col_idx])
-                                    {
-                                        vm.execute_cow(program, &exec_ctx)?
-                                    } else {
-                                        Value::null_unknown()
-                                    }
-                                }
-                                PrecomputedGroupBy::NotFound => Value::null_unknown(),
-                            };
-                            key_buffer.push(value);
-                        }
-                    }
-
-                    // Compute hash and handle bucket with proper collision detection
-                    let hash = hash_group_key(&key_buffer);
-                    match groups.entry(hash) {
-                        std::collections::hash_map::Entry::Occupied(mut e) => {
-                            let bucket = e.get_mut();
-                            // Search bucket for matching group (handles hash collisions)
-                            if let Some(entry) = bucket
-                                .iter_mut()
-                                .find(|entry| entry.key_values == key_buffer)
-                            {
-                                entry.row_indices.push(row_idx);
-                            } else {
-                                // Hash collision: different key with same hash
-                                bucket.push(GroupEntry {
-                                    key_values: key_buffer.clone(),
-                                    row_indices: vec![row_idx],
-                                });
-                            }
-                        }
-                        std::collections::hash_map::Entry::Vacant(e) => {
-                            // First entry for this hash
-                            e.insert(vec![GroupEntry {
-                                key_values: key_buffer.clone(),
-                                row_indices: vec![row_idx],
-                            }]);
-                        }
-                    }
-                }
-
-                // Process each group
-                let mut agg_funcs: Vec<Option<AggregateState>> = aggregations
-                    .iter()
-                    .map(|agg| agg.state(&self.function_registry))
-                    .collect();
-
-                // Note: We don't sort groups here for performance.
-                // SQL does not guarantee result order without ORDER BY.
-                // Users who need ordered results should add ORDER BY to their query.
-                // Flatten buckets: each bucket may contain multiple groups (hash collisions)
-                for (_hash, bucket) in groups {
-                    for group in bucket {
-                        // Reset aggregate functions
-                        for f in agg_funcs.iter_mut().flatten() {
-                            f.reset();
-                        }
-
-                        let count_star_value = Value::Integer(1);
-                        for &row_idx in &group.row_indices {
-                            let (_, row) = &rows[row_idx];
-
-                            // Create execution context for this row
-                            // CRITICAL: Include params for parameterized queries
-                            let exec_ctx = ExecuteContext::new(row)
-                                .with_params(ctx.params())
-                                .with_named_params(ctx.named_params());
-
-                            for (i, agg) in aggregations.iter().enumerate() {
-                                if let Some(ref mut func) = agg_funcs[i] {
-                                    let column = match agg_col_indices[i] {
-                                        Some(col_idx) => row.get(col_idx),
-                                        None => Some(&count_star_value),
-                                    };
-                                    inputs[i].feed(func, column, &mut expr_vm, &exec_ctx, agg)?;
-                                }
-                            }
-                        }
-
-                        // Build result row
-                        // For GROUP BY columns: use key value if active, NULL if rolled up
-                        // Use CompactVec directly to avoid Vec→CompactVec conversion
-                        let mut row_values: CompactVec<Value> = CompactVec::with_capacity(
-                            group_by_items.len() + aggregations.len() + group_by_items.len(),
-                        );
-
-                        let mut key_idx = 0;
-                        for &is_active in &grouping_set.active_columns {
-                            if is_active {
-                                row_values.push(group.key_values[key_idx].clone());
-                                key_idx += 1;
-                            } else {
-                                row_values.push(Value::null_unknown());
-                            }
-                        }
-
-                        for (i, agg) in aggregations.iter().enumerate() {
-                            let value = if let Some(ref func) = agg_funcs[i] {
-                                func.result()?
-                            } else if agg.name == "COUNT" && agg.column == "*" {
-                                Value::Integer(group.row_indices.len() as i64)
-                            } else {
-                                Value::null_unknown()
-                            };
-                            row_values.push(value);
-                        }
-
-                        // Add GROUPING flags: 0 if column is active (grouped), 1 if rolled up
-                        for &is_active in &grouping_set.active_columns {
-                            row_values.push(Value::Integer(if is_active { 0 } else { 1 }));
-                        }
-
-                        all_result_rows.push((row_id, Row::from_compact_vec(row_values)));
-                        row_id += 1;
-                    } // end for group in bucket
-                } // end for bucket in groups
             }
         }
 
@@ -4492,32 +2850,6 @@ impl Executor {
             columns.to_vec(),
             filtered_rows,
         )))
-    }
-
-    /// The SUM of one column over materialized rows, for SUM and AVG to
-    /// read; large inputs sum their chunks in parallel and merge them
-    fn sum_column_rows(rows: &[(i64, Row)], col_idx: usize) -> SumAccumulator {
-        let sum_chunk = |chunk: &[(i64, Row)]| {
-            let mut sum = SumAccumulator::default();
-            for (_, row) in chunk {
-                if let Some(value) = row.get(col_idx) {
-                    sum.add(value);
-                }
-            }
-            sum
-        };
-        #[cfg(feature = "parallel")]
-        if rows.len() >= 10_000 {
-            let chunk_size = (rows.len() / rayon::current_num_threads()).max(1000);
-            return rows.par_chunks(chunk_size).map(sum_chunk).reduce(
-                SumAccumulator::default,
-                |mut total, part| {
-                    total.merge(&part);
-                    total
-                },
-            );
-        }
-        sum_chunk(rows)
     }
 
     /// Check if an expression is a PURE aggregate function call.
@@ -5106,122 +3438,24 @@ impl Executor {
             }
         }
 
-        // SLOW PATH: Fall back to scanner-based streaming
-        // Initialize aggregate states
-        struct AggState {
-            sum: SumAccumulator,
-            count: i64,
-            min: Option<Value>,
-            max: Option<Value>,
-            distinct_set: Option<crate::functions::aggregate::DistinctTracker>,
-        }
-
-        let mut states: Vec<AggState> = aggregations
-            .iter()
-            .map(|agg| AggState {
-                sum: SumAccumulator::default(),
-                count: 0,
-                min: None,
-                max: None,
-                distinct_set: agg.distinct.then(Default::default),
-            })
-            .collect();
-
-        // Get a scanner and stream through rows
+        // Otherwise the one group of the grouped path, fed by a scan
+        let mut groups = GroupedAggregates::global(self.call_templates(&aggregations)?);
+        let feed = RowFeed::new(&aggregations, &[], &schema_lower, &col_index_map)?;
+        let mut state = FeedState::default();
         let mut scanner = table.scan(&[], None)?;
-
         while scanner.next() {
-            let row = scanner.row();
-
-            for (i, agg) in aggregations.iter().enumerate() {
-                let state = &mut states[i];
-
-                if agg.column == "*" {
-                    // COUNT(*)
-                    state.count += 1;
-                    continue;
-                }
-
-                let col_idx = match agg_col_indices[i] {
-                    Some(idx) => idx,
-                    None => continue,
-                };
-
-                let value = match row.get(col_idx) {
-                    Some(v) if !v.is_null() => v,
-                    _ => continue, // Skip NULL values
-                };
-
-                // DISTINCT by the set every DISTINCT aggregate keeps
-                if let Some(ref mut distinct_set) = state.distinct_set {
-                    if !distinct_set.check_and_add(value) {
-                        continue; // Already seen this value
-                    }
-                }
-
-                match agg.name.as_str() {
-                    "COUNT" => {
-                        state.count += 1;
-                    }
-                    "SUM" | "AVG" => state.sum.add(value),
-                    "MIN" => {
-                        let is_smaller = match (&state.min, value) {
-                            (None, _) => true,
-                            (Some(current), new) => new.cmp(current).is_lt(),
-                        };
-                        if is_smaller {
-                            state.min = Some(value.clone());
-                        }
-                    }
-                    "MAX" => {
-                        let is_larger = match (&state.max, value) {
-                            (None, _) => true,
-                            (Some(current), new) => new.cmp(current).is_gt(),
-                        };
-                        if is_larger {
-                            state.max = Some(value.clone());
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            feed.run_one(&mut groups, scanner.row(), ctx, &mut state)?;
         }
-
         if let Some(e) = scanner.err() {
             return Err(crate::core::Error::internal(format!("scan error: {}", e)));
         }
         scanner.close()?;
 
-        // Build intermediate result columns (raw aggregate values)
-        // Use CompactVec directly to avoid Vec→CompactVec conversion
-        let mut agg_result_values: CompactVec<Value> =
-            CompactVec::with_capacity(aggregations.len());
-        let mut agg_result_columns: Vec<String> = Vec::with_capacity(aggregations.len());
-
-        for (i, agg) in aggregations.iter().enumerate() {
-            let state = &states[i];
-            agg_result_columns.push(agg.get_column_name());
-
-            let value = match agg.name.as_str() {
-                "COUNT" => Value::Integer(state.count),
-                "SUM" => state.sum.sum()?,
-                "AVG" => state.sum.avg(),
-                "MIN" => state
-                    .min
-                    .clone()
-                    .unwrap_or_else(|| Value::null(crate::core::DataType::Integer)),
-                "MAX" => state
-                    .max
-                    .clone()
-                    .unwrap_or_else(|| Value::null(crate::core::DataType::Integer)),
-                _ => Value::null(crate::core::DataType::Integer),
-            };
-            agg_result_values.push(value);
-        }
-
-        let agg_row = Row::from_compact_vec(agg_result_values);
-        let mut agg_rows = RowVec::with_capacity(1);
-        agg_rows.push((0, agg_row));
+        let agg_result_columns: Vec<String> = aggregations
+            .iter()
+            .map(|agg| agg.get_column_name())
+            .collect();
+        let agg_rows = groups.into_rows()?;
         let slots = AggregateSlots {
             stmt,
             written_stmt: stmt,
@@ -5258,9 +3492,6 @@ impl Executor {
         ctx: &ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
     ) -> Result<Option<Box<dyn QueryResult>>> {
-        use crate::common::SmartString;
-        use smallvec::SmallVec;
-
         if Self::aggregates_hold_subquery(stmt) {
             return Ok(None);
         }
@@ -5334,284 +3565,49 @@ impl Executor {
             return Ok(None);
         }
 
-        // Check all aggregations are simple enough for streaming
-        let simple_aggs: Vec<Option<SimpleAgg>> = aggregations
-            .iter()
-            .map(|agg| {
-                // Plain aggregates only: this path keeps no DISTINCT state
-                if !agg.answered_with(Modifiers::NONE) {
-                    return None;
+        // Plain COUNT, SUM, AVG, MIN and MAX over the derived table's columns
+        let plain = aggregations.iter().all(|agg| {
+            let column = || Self::lookup_column_index(&agg.column_lower, &col_index_map).is_some();
+            agg.answered_with(Modifiers::NONE)
+                && match agg.name.as_str() {
+                    "COUNT" => agg.column == "*" || column(),
+                    "SUM" | "AVG" | "MIN" | "MAX" => agg.column != "*" && column(),
+                    _ => false,
                 }
-
-                match agg.name.to_uppercase().as_str() {
-                    "COUNT" => {
-                        if agg.column == "*" {
-                            Some(SimpleAgg::Count)
-                        } else {
-                            Self::lookup_column_index(&agg.column_lower, &col_index_map)
-                                .map(SimpleAgg::CountColumn)
-                        }
-                    }
-                    "SUM" => {
-                        if agg.column == "*" {
-                            None
-                        } else {
-                            Self::lookup_column_index(&agg.column_lower, &col_index_map)
-                                .map(SimpleAgg::Sum)
-                        }
-                    }
-                    "AVG" => {
-                        if agg.column == "*" {
-                            None
-                        } else {
-                            Self::lookup_column_index(&agg.column_lower, &col_index_map)
-                                .map(SimpleAgg::Avg)
-                        }
-                    }
-                    "MIN" => {
-                        if agg.column == "*" {
-                            None
-                        } else {
-                            Self::lookup_column_index(&agg.column_lower, &col_index_map)
-                                .map(SimpleAgg::Min)
-                        }
-                    }
-                    "MAX" => {
-                        if agg.column == "*" {
-                            None
-                        } else {
-                            Self::lookup_column_index(&agg.column_lower, &col_index_map)
-                                .map(SimpleAgg::Max)
-                        }
-                    }
-                    _ => None,
-                }
-            })
-            .collect();
-
-        // All aggregates must be resolved for streaming path
-        if simple_aggs.iter().any(|a| a.is_none()) {
+        });
+        if !plain {
             return Ok(None);
         }
-
-        let simple_aggs: Vec<SimpleAgg> = simple_aggs.into_iter().map(|a| a.unwrap()).collect();
-        let num_aggs = simple_aggs.len();
-
-        // State for streaming aggregation
-        type AggVec<T> = SmallVec<[T; 4]>;
-
-        #[derive(Clone)]
-        struct StreamGroupState {
-            sums: AggVec<SumAccumulator>,
-            counts: AggVec<i64>,
-            min_values: AggVec<Option<Value>>,
-            max_values: AggVec<Option<Value>>,
-        }
-
-        // Template for new group state
-        let state_template = StreamGroupState {
-            sums: smallvec::smallvec![SumAccumulator::default(); num_aggs],
-            counts: smallvec::smallvec![0; num_aggs],
-            min_values: smallvec::smallvec![None; num_aggs],
-            max_values: smallvec::smallvec![None; num_aggs],
-        };
 
         let mut slot_columns = Vec::with_capacity(1 + aggregations.len());
         slot_columns.push(source_columns[group_col_idx].clone());
         slot_columns.extend(aggregations.iter().map(|agg| agg.get_column_name()));
 
-        // Sample first row to detect key type
-        if !result.next() {
-            if let Some(err) = result.last_error() {
-                return Err(err);
-            }
-            // No group: no row, under the columns the shared end names
-            let slots = AggregateSlots {
-                stmt,
-                written_stmt: stmt,
-                aggregations: &aggregations,
-                group_by_count: 1,
-            };
-            return self
-                .finish_aggregation(
-                    AggregatePath::StreamingDerivedTable,
-                    slots,
-                    ctx,
-                    slot_columns,
-                    RowVec::new(),
-                )
-                .map(Some);
+        let group_items = [GroupByItem::Column(group_col_name)];
+        let mut groups = GroupedAggregates::new(self.call_templates(&aggregations)?, 1);
+        let feed = RowFeed::new(&aggregations, &group_items, &source_columns, &col_index_map)?;
+        let mut state = FeedState::default();
+        while result.next() {
+            feed.run_one(&mut groups, result.row(), ctx, &mut state)?;
+        }
+        if let Some(err) = result.last_error() {
+            return Err(err);
         }
 
-        let first_row = result.row();
-        let first_value = first_row.get(group_col_idx);
-
-        // Use string fast path for Text values (common for derived tables with CASE expressions)
-        let use_string_path = first_value
-            .map(|v| matches!(v, Value::Text(_)))
-            .unwrap_or(false);
-
-        if use_string_path {
-            // String GROUP BY streaming path
-            // OPTIMIZATION: Use hashbrown::HashMap with raw_entry_mut to avoid SmartString allocation on lookup
-            type FxBuildHasher = std::hash::BuildHasherDefault<FxHasher>;
-            let mut groups: hashbrown::HashMap<SmartString, StreamGroupState, FxBuildHasher> =
-                hashbrown::HashMap::with_capacity_and_hasher(64, FxBuildHasher::default());
-            let mut null_group: Option<StreamGroupState> = None;
-
-            // Process first row
-            let process_row =
-                |row: &Row,
-                 groups: &mut hashbrown::HashMap<SmartString, StreamGroupState, FxBuildHasher>,
-                 null_group: &mut Option<StreamGroupState>,
-                 template: &StreamGroupState| {
-                    let key_opt = match row.get(group_col_idx) {
-                        Some(Value::Text(s)) => Some(s),
-                        Some(Value::Null(_)) | None => None,
-                        _ => return, // Skip non-text, non-NULL
-                    };
-
-                    let state = if let Some(key_str) = key_opt {
-                        // OPTIMIZATION: Use raw_entry_mut to avoid SmartString allocation on lookup
-                        // Only create SmartString when inserting a new group
-                        let mut hasher = FxHasher::default();
-                        std::hash::Hash::hash(key_str, &mut hasher);
-                        let hash = hasher.finish();
-
-                        let entry = groups
-                            .raw_entry_mut()
-                            .from_hash(hash, |k| k.as_str() == key_str);
-                        match entry {
-                            RawEntryMut::Occupied(o) => o.into_mut(),
-                            RawEntryMut::Vacant(v) => {
-                                v.insert_hashed_nocheck(
-                                    hash,
-                                    SmartString::new(key_str),
-                                    template.clone(),
-                                )
-                                .1
-                            }
-                        }
-                    } else {
-                        if null_group.is_none() {
-                            *null_group = Some(template.clone());
-                        }
-                        null_group.as_mut().unwrap()
-                    };
-
-                    // Accumulate aggregates
-                    for (i, agg) in simple_aggs.iter().enumerate() {
-                        match agg {
-                            SimpleAgg::Count => {
-                                state.counts[i] += 1;
-                            }
-                            SimpleAgg::CountColumn(col_idx) => {
-                                if let Some(value) = row.get(*col_idx) {
-                                    if !value.is_null() {
-                                        state.counts[i] += 1;
-                                    }
-                                }
-                            }
-                            SimpleAgg::Sum(col_idx) | SimpleAgg::Avg(col_idx) => {
-                                if let Some(value) = row.get(*col_idx) {
-                                    state.sums[i].add(value);
-                                }
-                            }
-                            SimpleAgg::Min(col_idx) => {
-                                if let Some(value) = row.get(*col_idx) {
-                                    if !value.is_null() {
-                                        match &state.min_values[i] {
-                                            None => state.min_values[i] = Some(value.clone()),
-                                            Some(current) if value.cmp(current).is_lt() => {
-                                                state.min_values[i] = Some(value.clone())
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                            }
-                            SimpleAgg::Max(col_idx) => {
-                                if let Some(value) = row.get(*col_idx) {
-                                    if !value.is_null() {
-                                        match &state.max_values[i] {
-                                            None => state.max_values[i] = Some(value.clone()),
-                                            Some(current) if value.cmp(current).is_gt() => {
-                                                state.max_values[i] = Some(value.clone())
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                };
-
-            // Process first row (already fetched)
-            process_row(first_row, &mut groups, &mut null_group, &state_template);
-
-            // Stream through remaining rows
-            while result.next() {
-                let row = result.row();
-                process_row(row, &mut groups, &mut null_group, &state_template);
-            }
-            if let Some(err) = result.last_error() {
-                return Err(err);
-            }
-
-            // Build result rows
-            let build_row = |key_value: Value, state: StreamGroupState| -> Result<Row> {
-                let mut values: crate::common::CompactVec<Value> =
-                    crate::common::CompactVec::with_capacity(1 + simple_aggs.len());
-                values.push(key_value);
-                for (i, agg) in simple_aggs.iter().enumerate() {
-                    let value = match agg {
-                        SimpleAgg::Count | SimpleAgg::CountColumn(_) => {
-                            Value::Integer(state.counts[i])
-                        }
-                        SimpleAgg::Sum(_) => state.sums[i].sum()?,
-                        SimpleAgg::Avg(_) => state.sums[i].avg(),
-                        SimpleAgg::Min(_) => state.min_values[i]
-                            .clone()
-                            .unwrap_or_else(|| Value::null(crate::core::DataType::Integer)),
-                        SimpleAgg::Max(_) => state.max_values[i]
-                            .clone()
-                            .unwrap_or_else(|| Value::null(crate::core::DataType::Integer)),
-                    };
-                    values.push(value);
-                }
-                Ok(Row::from_compact_vec(values))
-            };
-
-            let mut result_rows = RowVec::with_capacity(groups.len() + 1);
-            let mut row_id = 0i64;
-            for (key, state) in groups.into_iter() {
-                result_rows.push((row_id, build_row(Value::Text(key), state)?));
-                row_id += 1;
-            }
-            if let Some(ng) = null_group {
-                result_rows.push((row_id, build_row(Value::null_unknown(), ng)?));
-            }
-
-            let slots = AggregateSlots {
-                stmt,
-                written_stmt: stmt,
-                aggregations: &aggregations,
-                group_by_count: 1,
-            };
-            return self
-                .finish_aggregation(
-                    AggregatePath::StreamingDerivedTable,
-                    slots,
-                    ctx,
-                    slot_columns,
-                    result_rows,
-                )
-                .map(Some);
-        }
-
-        // Fallback: not eligible for streaming optimization
-        Ok(None)
+        let slots = AggregateSlots {
+            stmt,
+            written_stmt: stmt,
+            aggregations: &aggregations,
+            group_by_count: 1,
+        };
+        self.finish_aggregation(
+            AggregatePath::StreamingDerivedTable,
+            slots,
+            ctx,
+            slot_columns,
+            groups.into_rows()?,
+        )
+        .map(Some)
     }
 
     /// Try to use storage-level aggregation for GROUP BY queries.
@@ -5725,8 +3721,12 @@ impl Executor {
             });
         }
 
-        let results = match table.compute_grouped_aggregates(&group_by_indices, &aggregates) {
-            Ok(results) => results?,
+        let groups = match table.compute_grouped_aggregates(&group_by_indices, &aggregates) {
+            Ok(groups) => groups?,
+            Err(error) => return Some(Err(error)),
+        };
+        let rows = match groups.into_rows() {
+            Ok(rows) => rows,
             Err(error) => return Some(Err(error)),
         };
 
@@ -5735,15 +3735,6 @@ impl Executor {
             .map(|&i| all_columns[i].clone())
             .collect();
         slot_columns.extend(aggregations.iter().map(|agg| agg.get_column_name()));
-        let mut rows = RowVec::new();
-        for (row_id, r) in results.into_iter().enumerate() {
-            let mut values = r.group_values;
-            values.extend(r.aggregate_values);
-            rows.push((
-                row_id as i64,
-                Row::from_compact_vec(CompactVec::from_vec(values)),
-            ));
-        }
         let slots = AggregateSlots {
             stmt,
             written_stmt: stmt,

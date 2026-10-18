@@ -35,11 +35,14 @@ use crate::core::value::compare_floats;
 use crate::core::{
     DataType, IndexType, Result, Row, RowVec, Schema, SumAccumulator, Value, ValueMap, ValueSet,
 };
+use crate::functions::aggregate::{CompiledAggregate, GroupedAggregates};
 use crate::storage::expression::Expression;
 use crate::storage::index::id_list::GroupIds;
 use crate::storage::mvcc::registry::StatementView;
 use crate::storage::mvcc::txn_gate::{GateRef, TxnGate};
-use crate::storage::mvcc::version_store::{AggregateOp, GroupedAggregateResult, LayoutToken};
+use crate::storage::mvcc::version_store::{
+    aggregate_row, grouped_aggregates, AggregateOp, LayoutToken,
+};
 use crate::storage::traits::table::ScanPlan;
 use crate::storage::traits::{
     CapturedGroups, ColdChange, Index, PlannedUpdate, QueryResult, Scanner, Table,
@@ -8315,7 +8318,7 @@ impl Table for SegmentedTable {
         &self,
         group_by_indices: &[usize],
         aggregates: &[(AggregateOp, usize)],
-    ) -> Result<Option<Vec<GroupedAggregateResult>>> {
+    ) -> Result<Option<GroupedAggregates>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.compute_grouped_aggregates");
         // Multi-column GROUP BY: fall back to the full executor path.
@@ -8337,279 +8340,19 @@ impl Table for SegmentedTable {
 
             let gb_idx = group_by_indices[0];
 
-            // ---- Typed accumulator (no Value in inner loop) ----
-            #[derive(Clone)]
-            struct Accum {
-                count: i64,
-                int_sum: i128,
-                float_sum: f64,
-                min_i64: Option<i64>,
-                max_i64: Option<i64>,
-                min_f64: Option<f64>,
-                max_f64: Option<f64>,
-                is_int_agg: bool,
-            }
-
-            impl Default for Accum {
-                fn default() -> Self {
-                    Self {
-                        count: 0,
-                        int_sum: 0,
-                        float_sum: 0.0,
-                        min_i64: None,
-                        max_i64: None,
-                        min_f64: None,
-                        max_f64: None,
-                        is_int_agg: true,
-                    }
-                }
-            }
-
-            /// Merge `src` accumulator into `dst`.
-            #[inline(always)]
-            fn merge_accum(dst: &mut Accum, src: &Accum) {
-                dst.count += src.count;
-                dst.int_sum += src.int_sum;
-                dst.float_sum += src.float_sum;
-                if !src.is_int_agg {
-                    dst.is_int_agg = false;
-                }
-                if let Some(s) = src.min_i64 {
-                    dst.min_i64 = Some(match dst.min_i64 {
-                        Some(d) if d <= s => d,
-                        _ => s,
-                    });
-                }
-                if let Some(s) = src.max_i64 {
-                    dst.max_i64 = Some(match dst.max_i64 {
-                        Some(d) if d >= s => d,
-                        _ => s,
-                    });
-                }
-                if let Some(s) = src.min_f64 {
-                    dst.min_f64 = Some(match dst.min_f64 {
-                        Some(d) if compare_floats(d, s).is_le() => d,
-                        _ => s,
-                    });
-                }
-                if let Some(s) = src.max_f64 {
-                    dst.max_f64 = Some(match dst.max_f64 {
-                        Some(d) if compare_floats(d, s).is_ge() => d,
-                        _ => s,
-                    });
-                }
-            }
-
-            fn finalize_accums(
-                aggregates: &[(AggregateOp, usize)],
-                accums: &[Accum],
-                schema: &crate::core::Schema,
-            ) -> Result<Vec<Value>> {
-                let sum_of =
-                    |acc: &Accum| sum_parts(acc.int_sum, acc.float_sum, !acc.is_int_agg, acc.count);
-                aggregates
-                    .iter()
-                    .zip(accums.iter())
-                    .map(|((op, col_idx), acc)| -> Result<Value> {
-                        Ok(match op {
-                            AggregateOp::Count | AggregateOp::CountStar => {
-                                Value::Integer(acc.count)
-                            }
-                            AggregateOp::Sum => sum_of(acc).sum()?,
-                            AggregateOp::Avg => sum_of(acc).avg(),
-                            AggregateOp::Min => {
-                                let col_type = if *col_idx < schema.columns.len() {
-                                    schema.columns[*col_idx].data_type
-                                } else {
-                                    DataType::Null
-                                };
-                                match (acc.min_i64, acc.min_f64) {
-                                    (Some(i), None) => match col_type {
-                                        DataType::Timestamp => chrono::DateTime::from_timestamp(
-                                            i.div_euclid(1_000_000_000),
-                                            i.rem_euclid(1_000_000_000) as u32,
-                                        )
-                                        .map(Value::Timestamp)
-                                        .unwrap_or(Value::Null(DataType::Timestamp)),
-                                        _ => Value::Integer(i),
-                                    },
-                                    (None, Some(f)) => Value::Float(f),
-                                    (Some(i), Some(f)) => {
-                                        if Value::Integer(i)
-                                            .compare(&Value::Float(f))
-                                            .is_ok_and(|o| o.is_le())
-                                        {
-                                            Value::Integer(i)
-                                        } else {
-                                            Value::Float(f)
-                                        }
-                                    }
-                                    (None, None) => Value::Null(col_type),
-                                }
-                            }
-                            AggregateOp::Max => {
-                                let col_type = if *col_idx < schema.columns.len() {
-                                    schema.columns[*col_idx].data_type
-                                } else {
-                                    DataType::Null
-                                };
-                                match (acc.max_i64, acc.max_f64) {
-                                    (Some(i), None) => match col_type {
-                                        DataType::Timestamp => chrono::DateTime::from_timestamp(
-                                            i.div_euclid(1_000_000_000),
-                                            i.rem_euclid(1_000_000_000) as u32,
-                                        )
-                                        .map(Value::Timestamp)
-                                        .unwrap_or(Value::Null(DataType::Timestamp)),
-                                        _ => Value::Integer(i),
-                                    },
-                                    (None, Some(f)) => Value::Float(f),
-                                    (Some(i), Some(f)) => {
-                                        if Value::Integer(i)
-                                            .compare(&Value::Float(f))
-                                            .is_ok_and(|o| o.is_ge())
-                                        {
-                                            Value::Integer(i)
-                                        } else {
-                                            Value::Float(f)
-                                        }
-                                    }
-                                    (None, None) => Value::Null(col_type),
-                                }
-                            }
-                        })
-                    })
-                    .collect()
-            }
-
-            // Update accums from a hot-buffer Row (used for hot rows only).
-            #[inline(always)]
-            fn update_accums_row(
-                accums: &mut [Accum],
-                aggregates: &[(AggregateOp, usize)],
-                row: &Row,
-            ) {
-                for (agg_idx, (op, col_idx)) in aggregates.iter().enumerate() {
-                    let accum = &mut accums[agg_idx];
-                    match op {
-                        AggregateOp::CountStar => accum.count += 1,
-                        AggregateOp::Count => {
-                            if let Some(v) = row.get(*col_idx) {
-                                if !v.is_null() {
-                                    accum.count += 1;
-                                }
-                            }
-                        }
-                        AggregateOp::Sum | AggregateOp::Avg => {
-                            if let Some(v) = row.get(*col_idx) {
-                                match v {
-                                    Value::Integer(i) => {
-                                        accum.int_sum += *i as i128;
-                                        accum.count += 1;
-                                    }
-                                    Value::Float(f) => {
-                                        accum.float_sum += *f;
-                                        accum.count += 1;
-                                        accum.is_int_agg = false;
-                                    }
-                                    Value::Boolean(b) => {
-                                        accum.int_sum += *b as i128;
-                                        accum.count += 1;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        AggregateOp::Min => {
-                            if let Some(v) = row.get(*col_idx) {
-                                match v {
-                                    Value::Integer(i) => match accum.min_i64 {
-                                        None => accum.min_i64 = Some(*i),
-                                        Some(cur) if *i < cur => accum.min_i64 = Some(*i),
-                                        _ => {}
-                                    },
-                                    Value::Timestamp(t) => {
-                                        let nanos = t.timestamp_nanos_opt().unwrap_or_else(|| {
-                                            t.timestamp().saturating_mul(1_000_000_000)
-                                        });
-                                        match accum.min_i64 {
-                                            None => accum.min_i64 = Some(nanos),
-                                            Some(cur) if nanos < cur => accum.min_i64 = Some(nanos),
-                                            _ => {}
-                                        }
-                                    }
-                                    Value::Float(f) => {
-                                        accum.is_int_agg = false;
-                                        match accum.min_f64 {
-                                            None => accum.min_f64 = Some(*f),
-                                            Some(cur) if compare_floats(*f, cur).is_lt() => {
-                                                accum.min_f64 = Some(*f)
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        AggregateOp::Max => {
-                            if let Some(v) = row.get(*col_idx) {
-                                match v {
-                                    Value::Integer(i) => match accum.max_i64 {
-                                        None => accum.max_i64 = Some(*i),
-                                        Some(cur) if *i > cur => accum.max_i64 = Some(*i),
-                                        _ => {}
-                                    },
-                                    Value::Timestamp(t) => {
-                                        let nanos = t.timestamp_nanos_opt().unwrap_or_else(|| {
-                                            t.timestamp().saturating_mul(1_000_000_000)
-                                        });
-                                        match accum.max_i64 {
-                                            None => accum.max_i64 = Some(nanos),
-                                            Some(cur) if nanos > cur => accum.max_i64 = Some(nanos),
-                                            _ => {}
-                                        }
-                                    }
-                                    Value::Float(f) => {
-                                        accum.is_int_agg = false;
-                                        match accum.max_f64 {
-                                            None => accum.max_f64 = Some(*f),
-                                            Some(cur) if compare_floats(*f, cur).is_gt() => {
-                                                accum.max_f64 = Some(*f)
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
             let current_schema = self.hot.schema();
             if !typed_aggregates_answer(current_schema, aggregates) {
                 return Ok(None);
             }
 
-            // Build group map: group_key -> (group_key_values, accumulators)
-            let mut groups: ValueMap<(Vec<Value>, Vec<Accum>)> = ValueMap::default();
+            let mut groups = grouped_aggregates(group_by_indices, aggregates);
 
             // ---- Process hot rows (small, use Value-based path) ----
             let hot_rows = self.hot.collect_all_rows(None)?;
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::hot_and_cold_reads_split();
             for (_, row) in &hot_rows {
-                let key = row
-                    .get(gb_idx)
-                    .cloned()
-                    .unwrap_or(Value::Null(DataType::Null));
-                let group_key_values: Vec<Value> = vec![key.clone()];
-                let entry = groups.entry(key).or_insert_with(|| {
-                    (group_key_values, vec![Accum::default(); aggregates.len()])
-                });
-                update_accums_row(&mut entry.1, aggregates, row);
+                aggregate_row(&mut groups, group_by_indices, aggregates, row.as_slice());
             }
 
             // ---- Process cold volumes (columnar fast path) ----
@@ -8637,407 +8380,203 @@ impl Table for SegmentedTable {
                 return Ok(None);
             }
 
-            // Resolved physical aggregate column for a volume.
-            struct PhysAgg<'a> {
-                phys_col: Option<&'a super::column::ColumnData>, // None for CountStar or ColSource::Default
-                op: AggregateOp,
-                default_val: Option<Value>, // For ColSource::Default
+            // How each call reads a volume's rows: COUNT reads only whether
+            // the value is NULL, the others read the value
+            enum ColdInput<'a> {
+                Star,
+                Present(&'a super::column::ColumnData),
+                Integer(&'a [i64], &'a [bool]),
+                Float(&'a [f64], &'a [bool]),
+                Value(&'a super::column::ColumnData),
+                Default(Value),
             }
 
-            // Inline accumulation from raw columnar data for a single row.
+            /// What COUNT is fed for a row it counts
+            static COUNTED: Value = Value::Boolean(true);
+
             #[inline(always)]
-            fn accumulate_columnar(accums: &mut [Accum], phys_aggs: &[PhysAgg<'_>], i: usize) {
-                for (agg_idx, pa) in phys_aggs.iter().enumerate() {
-                    let acc = &mut accums[agg_idx];
-                    match pa.op {
-                        AggregateOp::CountStar => acc.count += 1,
-                        AggregateOp::Count => {
-                            if let Some(col) = pa.phys_col {
-                                if !col.is_null(i) {
-                                    acc.count += 1;
-                                }
-                            } else if let Some(ref def) = pa.default_val {
-                                if !def.is_null() {
-                                    acc.count += 1;
-                                }
+            fn accumulate_columnar(
+                runs: &mut [CompiledAggregate],
+                inputs: &[ColdInput<'_>],
+                i: usize,
+            ) {
+                for (run, input) in runs.iter_mut().zip(inputs) {
+                    match input {
+                        ColdInput::Star => run.accumulate(&COUNTED),
+                        ColdInput::Present(col) => {
+                            if !col.is_null(i) {
+                                run.accumulate(&COUNTED);
                             }
                         }
-                        AggregateOp::Sum | AggregateOp::Avg => {
-                            if let Some(col) = pa.phys_col {
-                                if !col.is_null(i) {
-                                    match col.data_type() {
-                                        DataType::Integer | DataType::Timestamp => {
-                                            acc.int_sum += col.get_i64(i) as i128;
-                                            acc.count += 1;
-                                        }
-                                        DataType::Float => {
-                                            acc.float_sum += col.get_f64(i);
-                                            acc.count += 1;
-                                            acc.is_int_agg = false;
-                                        }
-                                        DataType::Boolean => {
-                                            acc.int_sum += col.get_bool(i) as i128;
-                                            acc.count += 1;
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            } else if let Some(ref def) = pa.default_val {
-                                match def {
-                                    Value::Integer(v) => {
-                                        acc.int_sum += *v as i128;
-                                        acc.count += 1;
-                                    }
-                                    Value::Float(f) => {
-                                        acc.float_sum += *f;
-                                        acc.count += 1;
-                                        acc.is_int_agg = false;
-                                    }
-                                    Value::Boolean(b) => {
-                                        acc.int_sum += *b as i128;
-                                        acc.count += 1;
-                                    }
-                                    _ => {}
-                                }
+                        ColdInput::Integer(values, nulls) => {
+                            if !nulls[i] {
+                                run.accumulate(&Value::Integer(values[i]));
                             }
                         }
-                        AggregateOp::Min => {
-                            if let Some(col) = pa.phys_col {
-                                if !col.is_null(i) {
-                                    match col.data_type() {
-                                        DataType::Integer | DataType::Timestamp => {
-                                            let v = col.get_i64(i);
-                                            match acc.min_i64 {
-                                                None => acc.min_i64 = Some(v),
-                                                Some(cur) if v < cur => acc.min_i64 = Some(v),
-                                                _ => {}
-                                            }
-                                        }
-                                        DataType::Float => {
-                                            let f = col.get_f64(i);
-                                            acc.is_int_agg = false;
-                                            match acc.min_f64 {
-                                                None => acc.min_f64 = Some(f),
-                                                Some(cur) if compare_floats(f, cur).is_lt() => {
-                                                    acc.min_f64 = Some(f)
-                                                }
-                                                _ => {}
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            } else if let Some(ref def) = pa.default_val {
-                                match def {
-                                    Value::Integer(v) => match acc.min_i64 {
-                                        None => acc.min_i64 = Some(*v),
-                                        Some(cur) if *v < cur => acc.min_i64 = Some(*v),
-                                        _ => {}
-                                    },
-                                    Value::Timestamp(t) => {
-                                        let nanos = t.timestamp_nanos_opt().unwrap_or_else(|| {
-                                            t.timestamp().saturating_mul(1_000_000_000)
-                                        });
-                                        match acc.min_i64 {
-                                            None => acc.min_i64 = Some(nanos),
-                                            Some(cur) if nanos < cur => acc.min_i64 = Some(nanos),
-                                            _ => {}
-                                        }
-                                    }
-                                    Value::Float(f) => {
-                                        acc.is_int_agg = false;
-                                        match acc.min_f64 {
-                                            None => acc.min_f64 = Some(*f),
-                                            Some(cur) if compare_floats(*f, cur).is_lt() => {
-                                                acc.min_f64 = Some(*f)
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                    _ => {}
-                                }
+                        ColdInput::Float(values, nulls) => {
+                            if !nulls[i] {
+                                run.accumulate(&Value::Float(values[i]));
                             }
                         }
-                        AggregateOp::Max => {
-                            if let Some(col) = pa.phys_col {
-                                if !col.is_null(i) {
-                                    match col.data_type() {
-                                        DataType::Integer | DataType::Timestamp => {
-                                            let v = col.get_i64(i);
-                                            match acc.max_i64 {
-                                                None => acc.max_i64 = Some(v),
-                                                Some(cur) if v > cur => acc.max_i64 = Some(v),
-                                                _ => {}
-                                            }
-                                        }
-                                        DataType::Float => {
-                                            let f = col.get_f64(i);
-                                            acc.is_int_agg = false;
-                                            match acc.max_f64 {
-                                                None => acc.max_f64 = Some(f),
-                                                Some(cur) if compare_floats(f, cur).is_gt() => {
-                                                    acc.max_f64 = Some(f)
-                                                }
-                                                _ => {}
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            } else if let Some(ref def) = pa.default_val {
-                                match def {
-                                    Value::Integer(v) => match acc.max_i64 {
-                                        None => acc.max_i64 = Some(*v),
-                                        Some(cur) if *v > cur => acc.max_i64 = Some(*v),
-                                        _ => {}
-                                    },
-                                    Value::Timestamp(t) => {
-                                        let nanos = t.timestamp_nanos_opt().unwrap_or_else(|| {
-                                            t.timestamp().saturating_mul(1_000_000_000)
-                                        });
-                                        match acc.max_i64 {
-                                            None => acc.max_i64 = Some(nanos),
-                                            Some(cur) if nanos > cur => acc.max_i64 = Some(nanos),
-                                            _ => {}
-                                        }
-                                    }
-                                    Value::Float(f) => {
-                                        acc.is_int_agg = false;
-                                        match acc.max_f64 {
-                                            None => acc.max_f64 = Some(*f),
-                                            Some(cur) if compare_floats(*f, cur).is_gt() => {
-                                                acc.max_f64 = Some(*f)
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
+                        ColdInput::Value(col) => run.accumulate(&col.get_value(i)),
+                        ColdInput::Default(value) => run.accumulate(value),
                     }
                 }
             }
 
-            // Per-volume grouped aggregation closure.
-            // Returns Some(local_groups) or None to skip/bail.
-            let bail = std::sync::atomic::AtomicBool::new(false);
-            let agg_count = aggregates.len();
             let hot_skip_ref = &hot_skip;
             let tombstones_ref = &tombstones_arc;
 
-            type VolumeGroups = ValueMap<(Vec<Value>, Vec<Accum>)>;
-            let process_volume =
-            |(seg_id, cs): &(u64, super::manifest::ColdSegment)| -> Result<Option<VolumeGroups>> {
-                if bail.load(std::sync::atomic::Ordering::Relaxed) {
-                    return Ok(None);
-                }
+            // Runs one volume's visible rows into `groups`; false when the
+            // volume's layout cannot answer. A key's group is looked up once
+            // per volume, at the key's first row
+            let process_volume = |(seg_id, cs): &(u64, super::manifest::ColdSegment),
+                                  groups: &mut GroupedAggregates|
+             -> Result<bool> {
                 let vol = &cs.volume;
                 let mapping = self.segment_mgr.get_volume_mapping(*seg_id, current_schema);
-
                 if gb_idx >= mapping.sources.len() {
-                    bail.store(true, std::sync::atomic::Ordering::Relaxed);
-                    return Ok(None);
+                    return Ok(false);
                 }
 
                 let row_ids = vol.row_ids()?;
-                let Some(start) = (0..vol.meta.row_count).find(|&i| {
+                let visible = |i: usize| {
                     cs.is_visible(i)
                         && !self.is_row_tombstoned(tombstones_ref, row_ids[i])
                         && !hot_skip_ref.contains(&row_ids[i])
-                }) else {
-                    return Ok(None);
+                };
+                let Some(start) = (0..vol.meta.row_count).find(|&i| visible(i)) else {
+                    return Ok(true);
                 };
 
-                let mut phys_aggs: Vec<PhysAgg> = Vec::with_capacity(agg_count);
-                for (op, col_idx) in aggregates {
-                    if matches!(op, AggregateOp::CountStar) {
-                        phys_aggs.push(PhysAgg {
-                            phys_col: None,
-                            op: *op,
-                            default_val: None,
-                        });
+                let mut inputs: Vec<ColdInput> = Vec::with_capacity(aggregates.len());
+                for &(op, col_idx) in aggregates {
+                    if op == AggregateOp::CountStar {
+                        inputs.push(ColdInput::Star);
                         continue;
                     }
-                    if *col_idx >= mapping.sources.len() {
-                        bail.store(true, std::sync::atomic::Ordering::Relaxed);
-                        return Ok(None);
+                    if col_idx >= mapping.sources.len() {
+                        return Ok(false);
                     }
-                    match &mapping.sources[*col_idx] {
+                    inputs.push(match &mapping.sources[col_idx] {
                         super::writer::ColSource::Volume(phys_idx) => {
-                            phys_aggs.push(PhysAgg {
-                                phys_col: Some(vol.columns.get(*phys_idx)?),
-                                op: *op,
-                                default_val: None,
-                            });
+                            use super::column::ColumnData;
+                            let col = vol.columns.get(*phys_idx)?;
+                            match (op, col) {
+                                (AggregateOp::Count, _) => ColdInput::Present(col),
+                                (_, ColumnData::Int64 { values, nulls }) => {
+                                    ColdInput::Integer(values, nulls)
+                                }
+                                (_, ColumnData::Float64 { values, nulls }) => {
+                                    ColdInput::Float(values, nulls)
+                                }
+                                _ => ColdInput::Value(col),
+                            }
                         }
-                        super::writer::ColSource::Default(val) => {
-                            phys_aggs.push(PhysAgg {
-                                phys_col: None,
-                                op: *op,
-                                default_val: Some(val.clone()),
-                            });
-                        }
-                    }
+                        super::writer::ColSource::Default(val) => ColdInput::Default(val.clone()),
+                    });
                 }
-
-                let mut local_groups: ValueMap<(Vec<Value>, Vec<Accum>)> = ValueMap::default();
 
                 match &mapping.sources[gb_idx] {
                     super::writer::ColSource::Volume(gb_phys_idx) => {
-                        let gb_phys = *gb_phys_idx;
-                        let gb_col = vol.columns.get(gb_phys)?;
-
+                        let gb_col = vol.columns.get(*gb_phys_idx)?;
                         if gb_is_dict {
-                            if let super::column::ColumnData::Dictionary {
-                                ids: dict_ids,
+                            let super::column::ColumnData::Dictionary {
+                                ids,
                                 dictionary,
-                                nulls: gb_nulls,
+                                nulls,
                             } = gb_col
-                            {
-                                let dict_len = dictionary.len();
-                                let num_local = dict_len + 1;
-                                let mut la: Vec<Vec<Accum>> = (0..num_local)
-                                    .map(|_| vec![Accum::default(); agg_count])
-                                    .collect();
-                                let mut lc = vec![0u32; num_local];
-
-                                for i in start..vol.meta.row_count {
-                                    if !cs.is_visible(i) {
-                                        continue;
-                                    }
-                                    let rid = row_ids[i];
-                                    if self.is_row_tombstoned(tombstones_ref, rid)
-                                        || hot_skip_ref.contains(&rid)
-                                    {
-                                        continue;
-                                    }
-                                    let g = if gb_nulls[i] {
-                                        dict_len
-                                    } else {
-                                        dict_ids[i] as usize
-                                    };
-                                    lc[g] += 1;
-                                    accumulate_columnar(&mut la[g], &phys_aggs, i);
+                            else {
+                                return Ok(false);
+                            };
+                            // Each entry's group, NULL's last
+                            let mut known = vec![u32::MAX; dictionary.len() + 1];
+                            for i in start..vol.meta.row_count {
+                                if !visible(i) {
+                                    continue;
                                 }
-
-                                for gid in 0..num_local {
-                                    if lc[gid] == 0 {
-                                        continue;
-                                    }
-                                    let key = if gid == dict_len {
-                                        Value::Null(DataType::Text)
-                                    } else {
-                                        Value::Text(dictionary[gid].clone())
+                                let slot = if nulls[i] {
+                                    dictionary.len()
+                                } else {
+                                    ids[i] as usize
+                                };
+                                if known[slot] == u32::MAX {
+                                    let key = match dictionary.get(slot) {
+                                        Some(text) => Value::Text(text.clone()),
+                                        None => Value::Null(DataType::Text),
                                     };
-                                    let entry =
-                                        local_groups.entry(key.clone()).or_insert_with(|| {
-                                            (vec![key], vec![Accum::default(); agg_count])
-                                        });
-                                    for (ai, la_acc) in la[gid].iter().enumerate() {
-                                        merge_accum(&mut entry.1[ai], la_acc);
+                                    match groups.group(std::slice::from_ref(&key)) {
+                                        Some(group) => known[slot] = group as u32,
+                                        None => continue,
                                     }
                                 }
-                            } else {
-                                bail.store(true, std::sync::atomic::Ordering::Relaxed);
-                                return Ok(None);
+                                accumulate_columnar(
+                                    groups.aggregates(known[slot] as usize),
+                                    &inputs,
+                                    i,
+                                );
                             }
                         } else {
-                            let mut key_to_group: FxHashMap<i64, usize> = FxHashMap::default();
-                            let mut la: Vec<Vec<Accum>> = Vec::new();
-                            let mut null_acc: Vec<Accum> = vec![Accum::default(); agg_count];
-                            let mut null_cnt: u32 = 0;
-
-                            for (i, &rid) in row_ids.iter().enumerate().skip(start) {
-                                if !cs.is_visible(i) {
+                            let mut known: FxHashMap<i64, u32> = FxHashMap::default();
+                            let mut null_group: Option<u32> = None;
+                            for i in start..vol.meta.row_count {
+                                if !visible(i) {
                                     continue;
                                 }
-                                if self.is_row_tombstoned(tombstones_ref, rid)
-                                    || hot_skip_ref.contains(&rid)
-                                {
-                                    continue;
-                                }
-                                if gb_col.is_null(i) {
-                                    null_cnt += 1;
-                                    accumulate_columnar(&mut null_acc, &phys_aggs, i);
-                                } else {
-                                    let raw_key = gb_col.get_i64(i);
-                                    let next_id = la.len();
-                                    let gid = *key_to_group.entry(raw_key).or_insert_with(|| {
-                                        la.push(vec![Accum::default(); agg_count]);
-                                        next_id
-                                    });
-                                    accumulate_columnar(&mut la[gid], &phys_aggs, i);
-                                }
-                            }
-
-                            if null_cnt > 0 {
-                                let nk = Value::Null(gb_data_type);
-                                let entry = local_groups.entry(nk.clone()).or_insert_with(|| {
-                                    (vec![nk], vec![Accum::default(); agg_count])
-                                });
-                                for (ai, a) in null_acc.iter().enumerate() {
-                                    merge_accum(&mut entry.1[ai], a);
-                                }
-                            }
-                            for (raw_key, gid) in &key_to_group {
-                                let key = if gb_data_type == DataType::Timestamp {
-                                    let secs = raw_key.div_euclid(1_000_000_000);
-                                    let sub = raw_key.rem_euclid(1_000_000_000) as u32;
-                                    match chrono::TimeZone::timestamp_opt(&chrono::Utc, secs, sub) {
-                                        chrono::LocalResult::Single(dt) => Value::Timestamp(dt),
-                                        _ => Value::Null(DataType::Timestamp),
-                                    }
-                                } else {
-                                    Value::Integer(*raw_key)
+                                let is_null = gb_col.is_null(i);
+                                let found = match is_null {
+                                    true => null_group,
+                                    false => known.get(&gb_col.get_i64(i)).copied(),
                                 };
-                                let entry = local_groups.entry(key.clone()).or_insert_with(|| {
-                                    (vec![key], vec![Accum::default(); agg_count])
-                                });
-                                for (ai, a) in la[*gid].iter().enumerate() {
-                                    merge_accum(&mut entry.1[ai], a);
-                                }
+                                let group = match found {
+                                    Some(group) => group,
+                                    None => {
+                                        let key = gb_col.get_value(i);
+                                        let Some(group) = groups.group(std::slice::from_ref(&key))
+                                        else {
+                                            continue;
+                                        };
+                                        let group = group as u32;
+                                        match is_null {
+                                            true => null_group = Some(group),
+                                            false => {
+                                                known.insert(gb_col.get_i64(i), group);
+                                            }
+                                        }
+                                        group
+                                    }
+                                };
+                                accumulate_columnar(groups.aggregates(group as usize), &inputs, i);
                             }
                         }
                     }
                     super::writer::ColSource::Default(default_val) => {
-                        let mut la = vec![Accum::default(); agg_count];
-                        let mut visible = 0usize;
-                        for (i, &rid) in row_ids.iter().enumerate().skip(start) {
-                            if !cs.is_visible(i) {
+                        let mut group = None;
+                        for i in start..vol.meta.row_count {
+                            if !visible(i) {
                                 continue;
                             }
-                            if self.is_row_tombstoned(tombstones_ref, rid)
-                                || hot_skip_ref.contains(&rid)
-                            {
-                                continue;
+                            if group.is_none() {
+                                group = groups.group(std::slice::from_ref(default_val));
                             }
-                            visible += 1;
-                            accumulate_columnar(&mut la, &phys_aggs, i);
-                        }
-                        if visible > 0 {
-                            let key = default_val.clone();
-                            local_groups
-                                .entry(key.clone())
-                                .or_insert_with(|| (vec![key], vec![Accum::default(); agg_count]));
-                            if let Some(entry) = local_groups.get_mut(default_val) {
-                                for (ai, a) in la.iter().enumerate() {
-                                    merge_accum(&mut entry.1[ai], a);
-                                }
+                            if let Some(group) = group {
+                                accumulate_columnar(groups.aggregates(group), &inputs, i);
                             }
                         }
                     }
                 }
-
-                Ok(Some(local_groups))
+                Ok(true)
             };
 
-            // Sequential: merge each volume's groups immediately (O(1) extra maps).
-            // Parallel: collect per-volume maps then merge (O(volumes) extra maps).
-            let _total_cold_rows: usize =
-                volumes.iter().map(|(_, cs)| cs.volume.meta.row_count).sum();
+            // Large volume sets run each volume apart and merge the parts in
+            // volume order
             #[cfg(feature = "parallel")]
-            let use_parallel = volumes.len() >= 4 && _total_cold_rows >= 100_000;
+            let use_parallel = volumes.len() >= 4
+                && volumes
+                    .iter()
+                    .map(|(_, cs)| cs.volume.meta.row_count)
+                    .sum::<usize>()
+                    >= 100_000;
             #[cfg(not(feature = "parallel"))]
             let use_parallel = false;
 
@@ -9045,60 +8584,30 @@ impl Table for SegmentedTable {
                 #[cfg(feature = "parallel")]
                 {
                     use rayon::prelude::*;
-                    let vol_group_maps: Vec<Option<VolumeGroups>> = volumes
+                    let parts: Vec<Option<GroupedAggregates>> = volumes
                         .par_iter()
-                        .map(&process_volume)
+                        .map(|volume| {
+                            let mut part = groups.empty_like();
+                            Ok(process_volume(volume, &mut part)?.then_some(part))
+                        })
                         .collect::<Result<_>>()?;
-                    if bail.load(std::sync::atomic::Ordering::Relaxed) {
-                        return Ok(None);
-                    }
-                    for vol_map in vol_group_maps.into_iter().flatten() {
-                        for (key, (group_values, vol_accums)) in vol_map {
-                            let entry = groups.entry(key).or_insert_with(|| {
-                                (group_values, vec![Accum::default(); agg_count])
-                            });
-                            for (ai, a) in vol_accums.iter().enumerate() {
-                                merge_accum(&mut entry.1[ai], a);
-                            }
+                    for part in parts {
+                        match part {
+                            Some(part) => groups.merge(part),
+                            None => return Ok(None),
                         }
                     }
                 }
             } else {
-                for v in volumes.iter() {
-                    if bail.load(std::sync::atomic::Ordering::Relaxed) {
+                for volume in volumes.iter() {
+                    if !process_volume(volume, &mut groups)? {
                         return Ok(None);
-                    }
-                    if let Some(vol_map) = process_volume(v)? {
-                        for (key, (group_values, vol_accums)) in vol_map {
-                            let entry = groups.entry(key).or_insert_with(|| {
-                                (group_values, vec![Accum::default(); agg_count])
-                            });
-                            for (ai, a) in vol_accums.iter().enumerate() {
-                                merge_accum(&mut entry.1[ai], a);
-                            }
-                        }
                     }
                 }
             }
 
-            if bail.load(std::sync::atomic::Ordering::Relaxed) {
-                return Ok(None);
-            }
-
-            // Convert to results
-            let schema_ref = current_schema;
-            let results: Vec<GroupedAggregateResult> = groups
-                .into_values()
-                .map(|(group_values, accums)| {
-                    Ok(GroupedAggregateResult {
-                        group_values,
-                        aggregate_values: finalize_accums(aggregates, &accums, schema_ref)?,
-                    })
-                })
-                .collect::<Result<_>>()?;
-
             self.check_cold()?;
-            Ok(Some(results))
+            Ok(Some(groups))
         })
     }
 }

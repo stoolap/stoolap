@@ -5555,7 +5555,7 @@ impl Table for MVCCTable {
         &self,
         group_by_indices: &[usize],
         aggregates: &[(crate::storage::mvcc::version_store::AggregateOp, usize)],
-    ) -> Result<Option<Vec<crate::storage::mvcc::version_store::GroupedAggregateResult>>> {
+    ) -> Result<Option<crate::functions::aggregate::GroupedAggregates>> {
         // Only use storage-level aggregation if no uncommitted local changes
         let txn_versions = self.txn_versions.read().unwrap();
         if txn_versions.has_local_changes() {

@@ -35,6 +35,8 @@
 //!
 //! Expected speedup: 2-5x for aggregation-heavy queries.
 
+use std::cmp::Ordering;
+
 use crate::core::value::compare_floats;
 use crate::core::{Result, SumAccumulator, Value};
 
@@ -53,7 +55,9 @@ pub enum CompiledAggregate {
     Count { count: i64 },
 
     /// COUNT(DISTINCT column) - counts distinct non-NULL values
-    CountDistinct { distinct_tracker: DistinctTracker },
+    CountDistinct {
+        distinct_tracker: Box<DistinctTracker>,
+    },
 
     /// SUM(column) - sums numeric values
     Sum { state: SumAccumulator },
@@ -61,7 +65,7 @@ pub enum CompiledAggregate {
     /// SUM(DISTINCT column) - sums distinct numeric values
     SumDistinct {
         state: SumAccumulator,
-        distinct_tracker: DistinctTracker,
+        distinct_tracker: Box<DistinctTracker>,
     },
 
     /// AVG(column) - average of numeric values
@@ -70,7 +74,7 @@ pub enum CompiledAggregate {
     /// AVG(DISTINCT column) - average of distinct numeric values
     AvgDistinct {
         state: SumAccumulator,
-        distinct_tracker: DistinctTracker,
+        distinct_tracker: Box<DistinctTracker>,
     },
 
     /// MIN(column) - minimum value (type-generic using Value comparison)
@@ -158,6 +162,30 @@ impl std::fmt::Debug for CompiledAggregate {
     }
 }
 
+/// Puts `value` in place of a MIN or MAX run's `current` extreme when it
+/// orders `beyond` it. Two numbers of one type compare as `Value::cmp` has
+/// them and copy in place, without a call, a clone or a drop
+#[inline(always)]
+fn keep_extreme(current: &mut Value, value: &Value, beyond: Ordering) {
+    match (&mut *current, value) {
+        (Value::Integer(slot), Value::Integer(v)) => {
+            if v.cmp(slot) == beyond {
+                *slot = *v;
+            }
+        }
+        (Value::Float(slot), Value::Float(v)) => {
+            if compare_floats(*v, *slot) == beyond {
+                *slot = *v;
+            }
+        }
+        _ => {
+            if value.cmp(current) == beyond {
+                *current = value.clone();
+            }
+        }
+    }
+}
+
 impl CompiledAggregate {
     /// Create a compiled COUNT(*) aggregate
     pub fn count_star() -> Self {
@@ -168,7 +196,7 @@ impl CompiledAggregate {
     pub fn count(distinct: bool) -> Self {
         if distinct {
             CompiledAggregate::CountDistinct {
-                distinct_tracker: DistinctTracker::default(),
+                distinct_tracker: Box::default(),
             }
         } else {
             CompiledAggregate::Count { count: 0 }
@@ -180,7 +208,7 @@ impl CompiledAggregate {
         if distinct {
             CompiledAggregate::SumDistinct {
                 state: SumAccumulator::default(),
-                distinct_tracker: DistinctTracker::default(),
+                distinct_tracker: Box::default(),
             }
         } else {
             CompiledAggregate::Sum {
@@ -194,7 +222,7 @@ impl CompiledAggregate {
         if distinct {
             CompiledAggregate::AvgDistinct {
                 state: SumAccumulator::default(),
-                distinct_tracker: DistinctTracker::default(),
+                distinct_tracker: Box::default(),
             }
         } else {
             CompiledAggregate::Avg {
@@ -248,23 +276,59 @@ impl CompiledAggregate {
         distinct: bool,
         dynamic_fallback: Option<AggregateState>,
     ) -> Option<Self> {
-        if name.eq_ignore_ascii_case("COUNT") {
-            if is_count_star {
-                Some(CompiledAggregate::count_star())
-            } else {
-                Some(CompiledAggregate::count(distinct))
+        match Self::constructor(name, is_count_star, distinct) {
+            Some(make) => Some(make()),
+            None => dynamic_fallback.map(CompiledAggregate::Dynamic),
+        }
+    }
+
+    /// What makes an empty run of a call to `name`, when the call has a
+    /// compiled state
+    pub fn constructor(
+        name: &str,
+        is_count_star: bool,
+        distinct: bool,
+    ) -> Option<fn() -> CompiledAggregate> {
+        let make: fn() -> CompiledAggregate = if name.eq_ignore_ascii_case("COUNT") {
+            match (is_count_star, distinct) {
+                (true, _) => CompiledAggregate::count_star,
+                (false, true) => || CompiledAggregate::count(true),
+                (false, false) => || CompiledAggregate::count(false),
             }
         } else if name.eq_ignore_ascii_case("SUM") {
-            Some(CompiledAggregate::sum(distinct))
+            match distinct {
+                true => || CompiledAggregate::sum(true),
+                false => || CompiledAggregate::sum(false),
+            }
         } else if name.eq_ignore_ascii_case("AVG") {
-            Some(CompiledAggregate::avg(distinct))
+            match distinct {
+                true => || CompiledAggregate::avg(true),
+                false => || CompiledAggregate::avg(false),
+            }
         } else if name.eq_ignore_ascii_case("MIN") {
-            Some(CompiledAggregate::min())
+            CompiledAggregate::min
         } else if name.eq_ignore_ascii_case("MAX") {
-            Some(CompiledAggregate::max())
+            CompiledAggregate::max
         } else {
-            // Complex aggregates use dynamic fallback
-            dynamic_fallback.map(CompiledAggregate::Dynamic)
+            return None;
+        };
+        Some(make)
+    }
+
+    /// Whether the call orders its input by its own ORDER BY keys
+    pub fn supports_order_by(&self) -> bool {
+        match self {
+            CompiledAggregate::Dynamic(state) => state.supports_order_by(),
+            _ => false,
+        }
+    }
+
+    /// Accumulates a value with the call's ORDER BY keys for it
+    #[inline]
+    pub fn accumulate_with_sort_key(&mut self, value: &Value, sort_keys: Vec<Value>) {
+        match self {
+            CompiledAggregate::Dynamic(state) => state.accumulate_with_sort_key(value, sort_keys),
+            other => other.accumulate(value),
         }
     }
 
@@ -273,6 +337,14 @@ impl CompiledAggregate {
     /// This is the hot path - all code here should be as fast as possible.
     #[inline(always)]
     pub fn accumulate(&mut self, value: &Value) {
+        if let CompiledAggregate::CountStar { count } = self {
+            *count += 1;
+            return;
+        }
+        if let CompiledAggregate::Sum { state } | CompiledAggregate::Avg { state } = self {
+            state.add(value);
+            return;
+        }
         match self {
             // COUNT(*) - always increment
             CompiledAggregate::CountStar { count } => {
@@ -317,11 +389,7 @@ impl CompiledAggregate {
                 if !value.is_null() {
                     match min_value {
                         None => *min_value = Some(value.clone()),
-                        Some(current) => {
-                            if value.cmp(current).is_lt() {
-                                *min_value = Some(value.clone());
-                            }
-                        }
+                        Some(current) => keep_extreme(current, value, Ordering::Less),
                     }
                 }
             }
@@ -331,11 +399,7 @@ impl CompiledAggregate {
                 if !value.is_null() {
                     match max_value {
                         None => *max_value = Some(value.clone()),
-                        Some(current) => {
-                            if value.cmp(current).is_gt() {
-                                *max_value = Some(value.clone());
-                            }
-                        }
+                        Some(current) => keep_extreme(current, value, Ordering::Greater),
                     }
                 }
             }
@@ -531,6 +595,11 @@ impl CompiledAggregate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_run_takes_one_cache_line() {
+        assert_eq!(std::mem::size_of::<CompiledAggregate>(), 64);
+    }
 
     #[test]
     fn float_min_and_max_order_nan_last() {
