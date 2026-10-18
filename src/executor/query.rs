@@ -7381,18 +7381,14 @@ impl Executor {
         cross_filter: Option<&Expression>,
         plan: &SemijoinReduction,
     ) -> Result<Option<SelectOutput>> {
-        let filters_have_subquery = [
-            left_filter,
-            right_filter,
-            cross_filter,
-            join_source.condition.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .any(Self::filter_has_subquery);
+        let filters_have_subquery = [left_filter, right_filter, cross_filter]
+            .into_iter()
+            .flatten()
+            .any(Self::filter_has_subquery);
         let Some((aggregations, group_names)) = self.grouped_index_join_applies(
             stmt,
             join_type,
+            join_source.condition.as_deref(),
             right_filter.is_some(),
             filters_have_subquery,
         )?
@@ -11254,6 +11250,7 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         join_type: &str,
+        join_condition: Option<&Expression>,
         right_filter_present: bool,
         filters_have_subquery: bool,
     ) -> Result<
@@ -11270,8 +11267,10 @@ impl Executor {
         // A HAVING that reads the group it is asked about has to be run once
         // per group with that group as the outer row, which the general
         // aggregation does and this streaming path does not
+        // The ON clause compiles into the residual, where a subquery has no executor
         if stmt.group_by.modifier != crate::parser::ast::GroupByModifier::None
             || filters_have_subquery
+            || join_condition.is_some_and(Self::filter_has_subquery)
             || stmt
                 .having
                 .as_deref()
@@ -11358,6 +11357,7 @@ impl Executor {
         match self.grouped_index_join_applies(
             stmt,
             &join_type,
+            join.condition.as_deref(),
             right_filter_present,
             filters_have_subquery,
         ) {
@@ -11627,18 +11627,7 @@ impl Executor {
         }
 
         // Must have a table expression that is a simple TableSource
-        let table_expr = stmt.table_expr.as_ref()?;
-        match table_expr.as_ref() {
-            Expression::TableSource(ts) => Some(ts.name.value_lower.to_string()),
-            Expression::Aliased(aliased) => {
-                if let Expression::TableSource(ts) = aliased.expression.as_ref() {
-                    Some(ts.name.value_lower.to_string())
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
+        index_join_table_name(stmt.table_expr.as_ref()?)
     }
 
     /// Build an IN filter expression: column_name IN (v1, v2, ..., vN)

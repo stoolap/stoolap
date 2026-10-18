@@ -185,6 +185,13 @@ fn an_index_join_reads_the_table_as_of_the_time_asked() {
                 ),
                 vec![(1, Some(10))],
             ),
+            (
+                &format!(
+                    "SELECT r.id, x.y FROM r JOIN (SELECT * FROM t {as_of}) x ON r.id = x.id \
+                     WHERE r.id = 1"
+                ),
+                vec![(1, Some(10))],
+            ),
         ],
     );
 }
