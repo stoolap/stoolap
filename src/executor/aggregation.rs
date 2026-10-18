@@ -2968,91 +2968,15 @@ impl Executor {
             .map(|(i, c)| (c.clone(), i))
             .collect();
 
-        // Compute each aggregate
-        // Use CompactVec directly to avoid Vec→CompactVec conversion
-        let mut result_values: CompactVec<Value> = CompactVec::with_capacity(aggregations.len());
-        let mut result_columns: Vec<String> = Vec::with_capacity(aggregations.len());
-
-        for agg in &aggregations {
-            result_columns.push(agg.get_column_name());
-
-            match agg.name.as_str() {
-                "COUNT" => {
-                    if agg.distinct {
-                        // COUNT(DISTINCT col) - try to get count from index without cloning values
-                        if let Some(count) = table.get_partition_count(&agg.column_lower)? {
-                            // get_partition_count already excludes NULL values per SQL standard
-                            result_values.push(Value::Integer(count as i64));
-                        } else {
-                            // No index on this column, can't pushdown
-                            return Ok(None);
-                        }
-                    } else if agg.column == "*" {
-                        // COUNT(*) - use row_count
-                        let count = table.row_count()?;
-                        result_values.push(Value::Integer(count as i64));
-                    } else {
-                        // COUNT(col) - need to count non-null values, can't pushdown easily
-                        return Ok(None);
-                    }
-                }
-                "SUM" => {
-                    let col_idx = col_index_map.get(&agg.column_lower).copied();
-                    if let Some(idx) = col_idx {
-                        if let Some(sum) = table.sum_column(idx)? {
-                            result_values.push(sum.sum()?);
-                        } else {
-                            return Ok(None); // Pushdown not available
-                        }
-                    } else {
-                        return Ok(None); // Column not found
-                    }
-                }
-                "AVG" => {
-                    let col_idx = col_index_map.get(&agg.column_lower).copied();
-                    if let Some(idx) = col_idx {
-                        if let Some(sum) = table.avg_column(idx)? {
-                            result_values.push(sum.avg());
-                        } else {
-                            return Ok(None); // Pushdown not available
-                        }
-                    } else {
-                        return Ok(None); // Column not found
-                    }
-                }
-                "MIN" => {
-                    let col_idx = col_index_map.get(&agg.column_lower).copied();
-                    if let Some(idx) = col_idx {
-                        if let Some(min_val) = table.min_column(idx)? {
-                            result_values
-                                .push(min_val.unwrap_or_else(|| {
-                                    Value::null(crate::core::DataType::Integer)
-                                }));
-                        } else {
-                            return Ok(None); // Pushdown not available
-                        }
-                    } else {
-                        return Ok(None); // Column not found
-                    }
-                }
-                "MAX" => {
-                    let col_idx = col_index_map.get(&agg.column_lower).copied();
-                    if let Some(idx) = col_idx {
-                        if let Some(max_val) = table.max_column(idx)? {
-                            result_values
-                                .push(max_val.unwrap_or_else(|| {
-                                    Value::null(crate::core::DataType::Integer)
-                                }));
-                        } else {
-                            return Ok(None); // Pushdown not available
-                        }
-                    } else {
-                        return Ok(None); // Column not found
-                    }
-                }
-                _ => return Ok(None),
-            }
-        }
+        let Some(result_values) =
+            Self::global_values_from_table(table, &aggregations, &col_index_map)?
+        else {
+            return Ok(None);
+        };
+        let result_columns = aggregations
+            .iter()
+            .map(|agg| agg.get_column_name())
+            .collect();
 
         let row = Row::from_compact_vec(result_values);
         let mut rows = RowVec::with_capacity(1);
@@ -3065,6 +2989,42 @@ impl Executor {
         };
         self.finish_aggregation(AggregatePath::Pushdown, slots, ctx, result_columns, rows)
             .map(Some)
+    }
+
+    /// The value of every call answered from the table without reading its
+    /// rows: COUNT(*) from the row count, COUNT(DISTINCT) from an index,
+    /// SUM, AVG, MIN and MAX from the column; None when one call cannot be
+    fn global_values_from_table(
+        table: &dyn crate::storage::traits::Table,
+        aggregations: &[SqlAggregateFunction],
+        col_index_map: &StringMap<usize>,
+    ) -> Result<Option<CompactVec<Value>>> {
+        let mut values = CompactVec::with_capacity(aggregations.len());
+        for agg in aggregations {
+            let column = Self::lookup_column_index(&agg.column_lower, col_index_map);
+            let value = match (agg.name.as_str(), column) {
+                ("COUNT", _) if agg.distinct => table
+                    .get_partition_count(&agg.column_lower)?
+                    .map(|count| Value::Integer(count as i64)),
+                ("COUNT", _) if agg.column == "*" => {
+                    Some(Value::Integer(table.row_count()? as i64))
+                }
+                ("SUM", Some(idx)) => table.sum_column(idx)?.map(|sum| sum.sum()).transpose()?,
+                ("AVG", Some(idx)) => table.avg_column(idx)?.map(|sum| sum.avg()),
+                ("MIN", Some(idx)) => table
+                    .min_column(idx)?
+                    .map(|min| min.unwrap_or_else(|| Value::null(crate::core::DataType::Integer))),
+                ("MAX", Some(idx)) => table
+                    .max_column(idx)?
+                    .map(|max| max.unwrap_or_else(|| Value::null(crate::core::DataType::Integer))),
+                _ => None,
+            };
+            match value {
+                Some(value) => values.push(value),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(values))
     }
 
     /// Try to push filtered aggregation (WHERE + aggregates) directly to the storage layer.
@@ -3340,86 +3300,20 @@ impl Executor {
             .map(|(i, c)| (c.clone(), i))
             .collect();
 
-        // Pre-compute column indices for each aggregation
-        let agg_col_indices: Vec<Option<usize>> = aggregations
-            .iter()
-            .map(|agg| {
-                if agg.column == "*" || agg.expression.is_some() {
-                    None
-                } else {
-                    Self::lookup_column_index(&agg.column_lower, &col_index_map)
-                }
-            })
-            .collect();
-
-        // FAST PATH: Try deferred aggregation (no row materialization)
-        // This bypasses the lazy scanner entirely for simple aggregates
-        let can_use_deferred = aggregations
+        // FAST PATH: every call answered from the table without reading rows
+        let plain = aggregations
             .iter()
             .all(|agg| agg.answered_with(Modifiers::NONE));
-        if can_use_deferred {
-            let mut deferred_values: Vec<Option<Value>> = Vec::with_capacity(aggregations.len());
-            let mut all_succeeded = true;
-
-            for (i, agg) in aggregations.iter().enumerate() {
-                let col_idx = agg_col_indices[i];
-                let value = match agg.name.as_str() {
-                    "COUNT" => {
-                        if agg.column == "*" {
-                            // COUNT(*) - use row_count()
-                            Some(Value::Integer(table.row_count()? as i64))
-                        } else {
-                            // COUNT(col) - need scanner for NULL checking
-                            // Could optimize with a dedicated count_non_null method
-                            None
-                        }
-                    }
-                    "SUM" => match col_idx {
-                        Some(idx) => table.sum_column(idx)?.map(|sum| sum.sum()).transpose()?,
-                        None => None,
-                    },
-                    "AVG" => match col_idx {
-                        Some(idx) => table.avg_column(idx)?.map(|sum| sum.avg()),
-                        None => None,
-                    },
-                    "MIN" => match col_idx {
-                        Some(idx) => table.min_column(idx)?.map(|min_opt| {
-                            min_opt.unwrap_or_else(|| Value::null(crate::core::DataType::Integer))
-                        }),
-                        None => None,
-                    },
-                    "MAX" => match col_idx {
-                        Some(idx) => table.max_column(idx)?.map(|max_opt| {
-                            max_opt.unwrap_or_else(|| Value::null(crate::core::DataType::Integer))
-                        }),
-                        None => None,
-                    },
-                    _ => None,
-                };
-
-                if let Some(v) = value {
-                    deferred_values.push(Some(v));
-                } else {
-                    all_succeeded = false;
-                    break;
-                }
-            }
-
-            if all_succeeded && deferred_values.len() == aggregations.len() {
-                // Build result from deferred values
-                // Use CompactVec directly to avoid Vec→CompactVec conversion
-                let mut agg_result_values: CompactVec<Value> =
-                    CompactVec::with_capacity(aggregations.len());
-                let mut agg_result_columns: Vec<String> = Vec::with_capacity(aggregations.len());
-
-                for (i, agg) in aggregations.iter().enumerate() {
-                    agg_result_columns.push(agg.get_column_name());
-                    agg_result_values.push(deferred_values[i].take().unwrap());
-                }
-
-                let agg_row = Row::from_compact_vec(agg_result_values);
+        if plain {
+            if let Some(values) =
+                Self::global_values_from_table(table, &aggregations, &col_index_map)?
+            {
+                let agg_result_columns = aggregations
+                    .iter()
+                    .map(|agg| agg.get_column_name())
+                    .collect();
                 let mut agg_rows = RowVec::with_capacity(1);
-                agg_rows.push((0, agg_row));
+                agg_rows.push((0, Row::from_compact_vec(values)));
                 let slots = AggregateSlots {
                     stmt,
                     written_stmt: stmt,
