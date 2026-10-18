@@ -243,7 +243,7 @@ impl PartitionFrames {
                 .iter()
                 .map(|&idx| match order_by.get_first(idx) {
                     Some(Value::Integer(i)) => Some(sign * *i as f64),
-                    Some(Value::Float(f)) => Some(sign * *f),
+                    Some(Value::Float(f)) if !f.is_nan() => Some(sign * *f),
                     _ => None,
                 })
                 .collect()
@@ -285,7 +285,8 @@ impl PartitionFrames {
     }
 
     /// The first position whose key is at least the current key plus
-    /// `shift`; a row without a numeric key starts at its peers
+    /// `shift`; a row without a numeric key starts at its peers. An infinite
+    /// key shifted by an infinite distance has every numeric key within it.
     fn first_key_at_least(&self, i: usize, shift: f64) -> usize {
         let Some(current) = self.keys[i] else {
             return self.peers[i].0;
@@ -293,7 +294,7 @@ impl PartitionFrames {
         let bound = current + shift;
         self.keys
             .iter()
-            .position(|key| key.is_some_and(|k| k >= bound))
+            .position(|key| key.is_some_and(|k| k >= bound || bound.is_nan()))
             .unwrap_or(self.keys.len())
     }
 
@@ -306,7 +307,7 @@ impl PartitionFrames {
         let bound = current + shift;
         self.keys
             .iter()
-            .rposition(|key| key.is_some_and(|k| k <= bound))
+            .rposition(|key| key.is_some_and(|k| k <= bound || bound.is_nan()))
             .map_or(0, |j| j + 1)
     }
 }

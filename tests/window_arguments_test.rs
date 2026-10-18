@@ -291,3 +291,50 @@ fn test_a_frame_applies_without_an_order_by() {
         assert_eq!(by_id[&k], Value::Integer(k), "row {k}");
     }
 }
+
+#[test]
+fn test_a_range_key_that_is_not_a_number_frames_to_its_peers() {
+    let db = Database::open("memory://window_arguments_not_a_number").unwrap();
+    db.execute(
+        "CREATE TABLE n (id INTEGER PRIMARY KEY, g INTEGER, f FLOAT, x INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO n VALUES (1, 0, 1.0, 1), (2, 0, 2.0, 2), (3, 0, CAST('inf' AS FLOAT), 4), \
+         (4, 0, CAST('NaN' AS FLOAT), 10), (5, 0, CAST('NaN' AS FLOAT), 10), (6, 0, NULL, 100)",
+        (),
+    )
+    .unwrap();
+    // (frame, SUM(x), COUNT(*), FIRST_VALUE(x)) for ids 1 to 6
+    let cases = [
+        (
+            "RANGE BETWEEN 1 PRECEDING AND CURRENT ROW",
+            [1, 3, 4, 20, 20, 100],
+            [1, 2, 1, 2, 2, 1],
+            [1, 1, 4, 10, 10, 100],
+        ),
+        (
+            "RANGE BETWEEN CAST('inf' AS FLOAT) PRECEDING AND CURRENT ROW",
+            [1, 3, 7, 20, 20, 100],
+            [1, 2, 3, 2, 2, 1],
+            [1, 1, 1, 10, 10, 100],
+        ),
+    ];
+    for (frame, sum, count, first) in cases {
+        for (call, expected) in [
+            ("SUM(x)", sum),
+            ("COUNT(*)", count),
+            ("FIRST_VALUE(x)", first),
+        ] {
+            for partition in ["", "PARTITION BY g"] {
+                let sql = format!(
+                    "SELECT id, {call} OVER ({partition} ORDER BY f {frame}) FROM n ORDER BY id"
+                );
+                let rows = query(&db, &sql, ()).unwrap_or_else(|e| panic!("{sql}: {e}"));
+                let values: Vec<Value> = rows.into_iter().map(|(_, value)| value).collect();
+                assert_eq!(values, ints(&expected), "{sql}");
+            }
+        }
+    }
+}
