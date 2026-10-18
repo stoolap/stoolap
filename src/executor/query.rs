@@ -3083,6 +3083,10 @@ impl Executor {
                         };
 
                         if let Some((inner_rows, inner_key)) = inner {
+                            #[cfg(feature = "test-failpoints")]
+                            crate::test_failpoints::general_path_reached(
+                                crate::test_failpoints::GeneralPath::AntiJoin,
+                            );
                             // Materialize outer table rows
                             let mut outer_rows = table.collect_all_rows(storage_expr.as_deref())?;
 
@@ -9954,6 +9958,7 @@ impl Executor {
                 crate::executor::context::clear_scalar_subquery_cache();
                 crate::executor::context::clear_in_subquery_cache();
                 crate::executor::context::clear_semi_join_cache();
+                crate::executor::context::clear_exists_answer_cache();
 
                 let columns = vec!["result".to_string()];
                 let mut rows = RowVec::with_capacity(1);

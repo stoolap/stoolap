@@ -443,9 +443,24 @@ fn a_correlated_exists_probes_across_a_drop() {
     let _guard = fp::FailpointGuard::new();
     let dir = tempfile::tempdir().unwrap();
     let mut report = Vec::new();
-    for sql in [
-        "SELECT p.id FROM p WHERE EXISTS (SELECT 1 FROM c WHERE c.pid = p.v) ORDER BY p.id LIMIT 10",
-        "SELECT p.id, (SELECT COUNT(*) FROM c WHERE c.pid = p.v) FROM p ORDER BY p.id LIMIT 10",
+    // DISTINCT keeps the EXISTS out of the prepared family, on the general
+    // path's probe; the prepared family's own probe is the third shape
+    type Install = fn(Box<dyn FnOnce() + Send>);
+    let general: Install = |hook| fp::before_correlated_fetch(hook);
+    let prepared: Install = |hook| fp::before_prepared_exists(hook);
+    for (sql, install) in [
+        (
+            "SELECT DISTINCT p.id FROM p WHERE EXISTS (SELECT 1 FROM c WHERE c.pid = p.v) ORDER BY p.id LIMIT 10",
+            general,
+        ),
+        (
+            "SELECT p.id, (SELECT COUNT(*) FROM c WHERE c.pid = p.v) FROM p ORDER BY p.id LIMIT 10",
+            general,
+        ),
+        (
+            "SELECT p.id FROM p WHERE EXISTS (SELECT 1 FROM c WHERE c.pid = p.v) ORDER BY p.id LIMIT 10",
+            prepared,
+        ),
     ] {
     let expected = expected_probe(sql);
     for (engine, dsn) in engines(&dir, "exists") {
@@ -454,7 +469,7 @@ fn a_correlated_exists_probes_across_a_drop() {
         let other = db.clone();
         let reader = db.clone();
         let (got, fired, paths) = on_thread(
-            fp::before_correlated_fetch,
+            install,
             move || {
                 other.execute("ALTER TABLE c DROP COLUMN x", ()).unwrap();
             },

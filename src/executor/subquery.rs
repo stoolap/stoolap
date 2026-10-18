@@ -426,6 +426,10 @@ impl Executor {
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<bool> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::general_path_reached(
+            crate::test_failpoints::GeneralPath::ExistsSubquery,
+        );
         // Try index-nested-loop optimization for correlated EXISTS
         if let Some(exists) = self.try_execute_exists_with_index_probe(subquery, ctx)? {
             return Ok(exists);
@@ -2918,7 +2922,7 @@ impl Executor {
     /// stamp taken before its read: no explicit transaction and no statement
     /// snapshot that keeps the rows of its start. A statement view answers
     /// only through a stamp it sees whole
-    fn reads_cacheable_rows(ctx: &ExecutionContext) -> bool {
+    pub(crate) fn reads_cacheable_rows(ctx: &ExecutionContext) -> bool {
         ctx.transaction_id().is_none()
             && ctx.statement_snapshot().is_none_or(|snapshot| {
                 snapshot.reads_latest()
@@ -4174,8 +4178,6 @@ impl Executor {
         // 1. Small LIMIT (early termination benefit)
         // 2. NO additional predicates (pure correlation only)
         // 3. Index exists on correlation column
-        const SMALL_LIMIT_THRESHOLD: i64 = 500;
-
         // If there's a non-correlated predicate, always use semi-join
         // The semi-join can efficiently filter by predicate in bulk
         if info.non_correlated_where.is_some() {
@@ -4183,19 +4185,16 @@ impl Executor {
         }
 
         // For pure correlation (no additional predicate), check if index NL is worth it
-        let small_limit =
-            outer_limit.is_some_and(|limit| limit > 0 && limit <= SMALL_LIMIT_THRESHOLD);
-        if !small_limit && outer_rows.is_none() {
+        if !Self::small_probe_limit(outer_limit) && outer_rows.is_none() {
             return false;
         }
-        // A probe per outer row costs about what the semi-join pays for
-        // fourteen inner rows
         self.with_correlated_probe_table(ctx, &info.inner_table, |table| {
-            let few_outer =
-                outer_rows.is_some_and(|rows| rows.saturating_mul(16) <= table.row_count_hint());
-            Ok(Some(
-                (small_limit || few_outer) && Self::exists_probes(table, &info.inner_column),
-            ))
+            Ok(Some(Self::probe_cheaper(
+                table,
+                &info.inner_column,
+                outer_limit,
+                outer_rows,
+            )))
         })
         .ok()
         .flatten()
@@ -4203,6 +4202,26 @@ impl Executor {
     }
 
     /// Whether an EXISTS on `column` probes the table the statement sees
+    /// Whether a LIMIT is small enough that probing per outer row stops early
+    fn small_probe_limit(limit: Option<i64>) -> bool {
+        limit.is_some_and(|limit| (1..=500).contains(&limit))
+    }
+
+    /// Whether an EXISTS on `column` of `table` probes it per outer row more
+    /// cheaply than it builds a set: for a small LIMIT or few outer rows,
+    /// since a probe per outer row costs about what a set pays for sixteen
+    /// inner rows, and only when an index answers the probe
+    pub(crate) fn probe_cheaper(
+        table: &dyn Table,
+        column: &str,
+        outer_limit: Option<i64>,
+        outer_rows: Option<usize>,
+    ) -> bool {
+        let few_outer =
+            outer_rows.is_some_and(|rows| rows.saturating_mul(16) <= table.row_count_hint());
+        (Self::small_probe_limit(outer_limit) || few_outer) && Self::exists_probes(table, column)
+    }
+
     fn exists_probes(table: &dyn Table, column: &str) -> bool {
         // The table vouches for its indexes; one with local changes or an
         // older snapshot refuses every probe
@@ -4594,6 +4613,10 @@ impl Executor {
         hash_set: CompactArc<PredicateSet>,
         test: SetTest,
     ) -> Expression {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::general_path_reached(
+            crate::test_failpoints::GeneralPath::ExistsSemiJoin,
+        );
         // For empty hash set, return FALSE (no matches exist)
         // For NOT EXISTS with empty set, return TRUE (nothing exists to negate)
         if hash_set.is_empty() {

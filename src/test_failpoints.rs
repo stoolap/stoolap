@@ -1316,6 +1316,13 @@ pub(crate) fn alter_ddl_guard_next() {
 thread_local! {
     static PREPARED_SCALAR_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static PREPARED_PLAN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static PREPARED_EXISTS_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next prepared EXISTS block is about to
+/// read its table, by its probe or to build its keyed set
+pub fn before_prepared_exists(hook: impl FnOnce() + 'static) {
+    PREPARED_EXISTS_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
 /// Run once on this thread when its next prepared statement has taken its
@@ -1363,6 +1370,67 @@ pub fn before_prepared_scalar(hook: impl FnOnce() + 'static) {
 pub(crate) fn prepared_scalar_next() {
     PREPARED_SCALAR_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     run_hook(&PREPARED_SCALAR_HOOK);
+}
+
+/// Process-wide: prepared EXISTS blocks probed, keyed sets built, keyed
+/// set lookups, and statements whose rows a keyed set's keys named
+static PREPARED_EXISTS: [std::sync::atomic::AtomicUsize; 4] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 4];
+
+/// Prepared EXISTS probes, keyed sets built and keyed set lookups, so far
+pub fn prepared_exists_counts() -> (usize, usize, usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        PREPARED_EXISTS[0].load(Relaxed),
+        PREPARED_EXISTS[1].load(Relaxed),
+        PREPARED_EXISTS[2].load(Relaxed),
+    )
+}
+
+/// Prepared statements whose rows a keyed set's keys named, so far
+pub fn prepared_rows_narrowed() -> usize {
+    PREPARED_EXISTS[3].load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn prepared_rows_narrowed_by_keys() {
+    PREPARED_EXISTS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn prepared_exists_probed() {
+    PREPARED_EXISTS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    run_hook(&PREPARED_EXISTS_HOOK);
+}
+
+pub(crate) fn prepared_exists_set_built() {
+    PREPARED_EXISTS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    run_hook(&PREPARED_EXISTS_HOOK);
+}
+
+pub(crate) fn prepared_exists_looked_up() {
+    PREPARED_EXISTS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How a prepared EXISTS block that may take a keyed set is made to answer:
+/// 0 by the rule, 1 by its probe, 2 by its keyed set
+static FORCED_EXISTS_STRATEGY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Make every prepared EXISTS block that may take a keyed set take it
+/// (`Some(true)`) or its probe (`Some(false)`); None restores the rule
+pub fn force_exists_strategy(keyed: Option<bool>) {
+    let value = match keyed {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    FORCED_EXISTS_STRATEGY.store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn forced_exists_strategy() -> Option<bool> {
+    match FORCED_EXISTS_STRATEGY.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Some(false),
+        2 => Some(true),
+        _ => None,
+    }
 }
 
 /// Projections run by a prepared statement, so far
@@ -1419,11 +1487,17 @@ pub enum GeneralPath {
     ProjectionEvaluator,
     /// The sort's `CompiledEvaluator` for ORDER BY keys no column holds
     OrderByEvaluator,
+    /// The single-table scan's NOT EXISTS anti-join
+    AntiJoin,
+    /// An EXISTS or NOT EXISTS rewritten into a semi-join set
+    ExistsSemiJoin,
+    /// `execute_exists_subquery`
+    ExistsSubquery,
 }
 
 /// Process-wide: how often each general path mechanism ran
-static GENERAL_PATH_HITS: [std::sync::atomic::AtomicUsize; 7] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; 7];
+static GENERAL_PATH_HITS: [std::sync::atomic::AtomicUsize; 10] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 10];
 
 /// How often `path` ran, so far
 pub fn general_path_hits(path: GeneralPath) -> usize {

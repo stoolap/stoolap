@@ -743,12 +743,7 @@ impl ExprVM {
                 Op::AndFinalize => {
                     let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match (Self::to_tribool(&a), Self::to_tribool(&b)) {
-                        (Some(false), _) | (_, Some(false)) => Value::Boolean(false),
-                        (Some(true), Some(true)) => Value::Boolean(true),
-                        _ => Value::Null(DataType::Boolean),
-                    };
-                    self.stack.push(result);
+                    self.stack.push(Self::and(&a, &b));
                     pc += 1;
                 }
 
@@ -2230,12 +2225,7 @@ impl ExprVM {
                 Op::AndFinalize => {
                     let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
                     let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    let result = match (Self::to_tribool(&a), Self::to_tribool(&b)) {
-                        (Some(false), _) | (_, Some(false)) => Value::Boolean(false),
-                        (Some(true), Some(true)) => Value::Boolean(true),
-                        _ => Value::Null(DataType::Boolean),
-                    };
-                    stack.push(Cow::Owned(result));
+                    stack.push(Cow::Owned(Self::and(&a, &b)));
                     pc += 1;
                 }
 
@@ -2802,12 +2792,15 @@ impl ExprVM {
         }
 
         // General path: full VM execution
-        match self.execute_cow(program, ctx) {
-            Ok(Value::Boolean(b)) => Ok(b),
-            Ok(Value::Integer(i)) => Ok(i != 0),
-            Ok(Value::Null(_)) => Ok(false),
-            Ok(_) => Ok(false),
-            Err(e) => Err(e),
+        self.execute_cow(program, ctx).map(|v| Self::passes(&v))
+    }
+
+    /// Whether a filter's value keeps its row: TRUE or a non-zero integer
+    pub(crate) fn passes(v: &Value) -> bool {
+        match v {
+            Value::Boolean(b) => *b,
+            Value::Integer(i) => *i != 0,
+            _ => false,
         }
     }
 
@@ -3135,6 +3128,15 @@ impl ExprVM {
     }
 
     #[inline]
+    /// The right operand of an AND met with its left: FALSE wins over UNKNOWN
+    pub(crate) fn and(a: &Value, b: &Value) -> Value {
+        match (Self::to_tribool(a), Self::to_tribool(b)) {
+            (Some(false), _) | (_, Some(false)) => Value::Boolean(false),
+            (Some(true), Some(true)) => Value::Boolean(true),
+            _ => Value::Null(DataType::Boolean),
+        }
+    }
+
     fn to_tribool(v: &Value) -> Option<bool> {
         match v {
             Value::Boolean(b) => Some(*b),
