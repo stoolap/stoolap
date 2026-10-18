@@ -1151,7 +1151,7 @@ impl FromValue for i64 {
     fn from_value(value: &Value) -> Result<Self> {
         match value {
             Value::Integer(i) => Ok(*i),
-            Value::Float(f) => Ok(*f as i64),
+            Value::Float(f) => crate::core::integer::integer_from_float(*f),
             _ => Err(Error::TypeConversion {
                 from: format!("{:?}", value),
                 to: "Integer".to_string(),

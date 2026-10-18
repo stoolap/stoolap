@@ -54,10 +54,8 @@ impl ScalarFunction for AbsFunction {
         }
 
         // Try to preserve integer type if possible
-        if let Some(i) = value_to_i64(&args[0]) {
-            if matches!(args[0], Value::Integer(_)) {
-                return crate::core::integer::integer_abs(i).map(Value::Integer);
-            }
+        if let Value::Integer(i) = args[0] {
+            return crate::core::integer::integer_abs(i).map(Value::Integer);
         }
 
         let num = value_to_f64(&args[0])

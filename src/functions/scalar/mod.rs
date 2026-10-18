@@ -165,12 +165,15 @@ pub fn value_to_f64(value: &Value) -> Option<f64> {
     }
 }
 
-/// Try to convert a Value to i64
+/// Try to convert a Value to i64; None for a number outside the INTEGER range
 pub fn value_to_i64(value: &Value) -> Option<i64> {
     match value {
-        Value::Integer(i) => Some(*i),
-        Value::Float(f) => Some(*f as i64),
-        Value::Text(s) => s.parse().ok(),
+        Value::Integer(_) | Value::Float(_) | Value::Text(_) => {
+            match crate::core::integer::integer_reading(value) {
+                crate::core::integer::IntegerReading::Fits(i) => Some(i),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }

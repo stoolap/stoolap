@@ -14,8 +14,9 @@
 
 //! INTEGER arithmetic: exact, an error for a result outside the INTEGER
 //! range, NULL for a zero divisor, and a shift by 0 to 63 places only.
+//! Conversion into INTEGER: an error for a value outside the range.
 
-use super::{Error, Result};
+use super::{Error, Result, Value};
 
 /// An operator on two INTEGERs
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +69,91 @@ pub fn integer_abs(x: i64) -> Result<i64> {
         .ok_or_else(|| Error::Type(format!("Integer overflow in ABS: {x}")))
 }
 
+/// How a value reads as an INTEGER, decided without allocating
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegerReading {
+    Fits(i64),
+    OutOfRange,
+    NotAnInteger,
+}
+
+/// `value` as an INTEGER: a FLOAT truncates toward zero, TEXT is trimmed and
+/// parsed, a BOOLEAN is 1 or 0
+pub fn integer_reading(value: &Value) -> IntegerReading {
+    match value {
+        Value::Integer(i) => IntegerReading::Fits(*i),
+        Value::Float(f) => float_reading(*f),
+        Value::Text(s) => text_reading(s),
+        Value::Boolean(b) => IntegerReading::Fits(i64::from(*b)),
+        _ => IntegerReading::NotAnInteger,
+    }
+}
+
+/// `integer_reading`: None when the value has no INTEGER reading, an error
+/// when its number lies outside the INTEGER range
+pub fn integer_from(value: &Value) -> Result<Option<i64>> {
+    match value {
+        Value::Float(f) => integer_from_float(*f).map(Some),
+        Value::Text(s) => integer_from_text(s),
+        _ => match integer_reading(value) {
+            IntegerReading::Fits(i) => Ok(Some(i)),
+            _ => Ok(None),
+        },
+    }
+}
+
+/// FLOAT as an INTEGER, the `integer_from` reading of a float
+pub fn integer_from_float(f: f64) -> Result<i64> {
+    match float_reading(f) {
+        IntegerReading::Fits(i) => Ok(i),
+        _ => Err(out_of_range(&f)),
+    }
+}
+
+/// TEXT as an INTEGER, the `integer_from` reading of a string
+pub fn integer_from_text(s: &str) -> Result<Option<i64>> {
+    match text_reading(s) {
+        IntegerReading::Fits(i) => Ok(Some(i)),
+        IntegerReading::NotAnInteger => Ok(None),
+        IntegerReading::OutOfRange => Err(out_of_range(&s.trim())),
+    }
+}
+
+fn float_reading(f: f64) -> IntegerReading {
+    // -2^63 is exact as a float, 2^63 is the first value past the range
+    let past = -(i64::MIN as f64);
+    if (-past..past).contains(&f) {
+        IntegerReading::Fits(f as i64)
+    } else {
+        IntegerReading::OutOfRange
+    }
+}
+
+fn text_reading(s: &str) -> IntegerReading {
+    let s = s.trim();
+    match s.parse::<i64>() {
+        Ok(i) => IntegerReading::Fits(i),
+        // The parse reports an overflow before it reads the rest of the text
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow
+            ) && s
+                .strip_prefix(['+', '-'])
+                .unwrap_or(s)
+                .bytes()
+                .all(|b| b.is_ascii_digit()) =>
+        {
+            IntegerReading::OutOfRange
+        }
+        Err(_) => IntegerReading::NotAnInteger,
+    }
+}
+
+fn out_of_range(shown: &dyn std::fmt::Display) -> Error {
+    Error::Type(format!("Value {shown} is out of range for INTEGER"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +184,31 @@ mod tests {
         assert_eq!(integer_neg(i64::MAX).unwrap(), -i64::MAX);
         assert!(integer_abs(i64::MIN).is_err());
         assert_eq!(integer_abs(-5).unwrap(), 5);
+    }
+
+    #[test]
+    fn test_a_conversion_outside_the_range_is_an_error() {
+        let ok = |v: Value, want: Option<i64>| {
+            assert_eq!(integer_from(&v).unwrap(), want, "{v:?}");
+        };
+        let err = |v: Value| assert!(integer_from(&v).is_err(), "{v:?}");
+        ok(Value::float(3.7), Some(3));
+        ok(Value::float(-3.7), Some(-3));
+        ok(Value::float(i64::MIN as f64), Some(i64::MIN));
+        err(Value::float(-(i64::MIN as f64)));
+        err(Value::float(f64::INFINITY));
+        err(Value::float(f64::NAN));
+        ok(Value::text(" 42 "), Some(42));
+        ok(Value::text("3.7"), None);
+        ok(Value::text("x"), None);
+        ok(Value::text(""), None);
+        err(Value::text("9223372036854775808"));
+        err(Value::text("-9223372036854775809"));
+        err(Value::text("+99999999999999999999"));
+        ok(Value::text("999999999999999999999x"), None);
+        ok(Value::text("-999999999999999999999x"), None);
+        ok(Value::text("99999999999999999999 1"), None);
+        ok(Value::Boolean(true), Some(1));
+        ok(Value::Null(crate::core::DataType::Integer), None);
     }
 }

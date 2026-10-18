@@ -21,6 +21,7 @@ use chrono::{DateTime, TimeZone, Utc};
 
 use super::{find_column_index, resolve_alias, Expression};
 use crate::common::SmartString;
+use crate::core::integer::{integer_reading, IntegerReading};
 use crate::core::{DataType, Operator, Result, Row, Schema, Value};
 
 /// CAST expression (CAST(column AS type))
@@ -79,6 +80,15 @@ impl CastExpr {
             DataType::Null => Ok(Value::null(DataType::Null)),
         }
     }
+
+    /// Whether `perform_cast` succeeds, read for INTEGER without building
+    /// the error it would return
+    fn casts(&self, value: &Value) -> bool {
+        match self.target_type {
+            DataType::Integer => integer_reading(value) != IntegerReading::OutOfRange,
+            _ => self.perform_cast(value).is_ok(),
+        }
+    }
 }
 
 impl Expression for CastExpr {
@@ -100,10 +110,7 @@ impl Expression for CastExpr {
 
         // Perform the cast - if it succeeds, return true
         // (CAST by itself doesn't filter, parent expression handles comparison)
-        match self.perform_cast(col_value) {
-            Ok(_) => Ok(true),
-            Err(_) => Ok(false),
-        }
+        Ok(self.casts(col_value))
     }
 
     fn evaluate_fast(&self, row: &Row) -> bool {
@@ -118,7 +125,7 @@ impl Expression for CastExpr {
             return false;
         }
 
-        self.perform_cast(col_value).is_ok()
+        self.casts(col_value)
     }
 
     fn with_aliases(&self, aliases: &FxHashMap<String, String>) -> Box<dyn Expression> {
@@ -220,6 +227,10 @@ impl Expression for CompoundExpr {
 
         // Convert comparison value to target type if needed
         let comp_value = self.cast_expr.perform_cast(&self.value)?;
+        // A comparison with NULL is unknown, which filters the row out
+        if casted.is_null() || comp_value.is_null() {
+            return Ok(false);
+        }
 
         // Compare the values
         let cmp = compare_values(&casted, &comp_value);
@@ -252,32 +263,10 @@ impl Expression for CompoundExpr {
         // Fast path based on target type
         match self.cast_expr.target_type {
             DataType::Integer => {
-                let col_int = match col_value {
-                    Value::Integer(v) => *v,
-                    Value::Float(v) => *v as i64,
-                    Value::Boolean(b) => {
-                        if *b {
-                            1
-                        } else {
-                            0
-                        }
-                    }
-                    Value::Text(s) => {
-                        if let Ok(i) = s.parse::<i64>() {
-                            i
-                        } else if let Ok(f) = s.parse::<f64>() {
-                            f as i64
-                        } else {
-                            return false;
-                        }
-                    }
-                    _ => return false,
-                };
-
-                let comp_int = match &self.value {
-                    Value::Integer(v) => *v,
-                    Value::Float(v) => *v as i64,
-                    _ => return false,
+                let (IntegerReading::Fits(col_int), IntegerReading::Fits(comp_int)) =
+                    (integer_reading(col_value), integer_reading(&self.value))
+                else {
+                    return false;
                 };
 
                 match self.operator {
@@ -415,23 +404,7 @@ impl Expression for CompoundExpr {
 // Cast helper functions
 
 fn cast_to_integer(value: &Value) -> Result<Value> {
-    match value {
-        Value::Integer(v) => Ok(Value::Integer(*v)),
-        Value::Float(v) => Ok(Value::Integer(*v as i64)),
-        Value::Text(s) => {
-            if let Ok(i) = s.parse::<i64>() {
-                Ok(Value::Integer(i))
-            } else if let Ok(f) = s.parse::<f64>() {
-                Ok(Value::Integer(f as i64))
-            } else {
-                Ok(Value::Integer(0))
-            }
-        }
-        Value::Boolean(b) => Ok(Value::Integer(if *b { 1 } else { 0 })),
-        Value::Timestamp(t) => Ok(Value::Integer(t.timestamp())),
-        Value::Null(_) => Ok(Value::null(DataType::Integer)),
-        _ => Ok(Value::Integer(0)),
-    }
+    value.try_coerce_to_type(DataType::Integer)
 }
 
 fn cast_to_float(value: &Value) -> Result<Value> {
@@ -695,6 +668,23 @@ mod tests {
     }
 
     #[test]
+    fn test_compound_expr_with_a_cast_to_null_matches_nothing() {
+        let schema = test_schema();
+        let row = Row::from_values(vec![
+            Value::integer(1),
+            Value::text("3.7"),
+            Value::float(3.5),
+        ]);
+        for operator in [Operator::Lt, Operator::Ne, Operator::Gte] {
+            let cast = CastExpr::new("value", DataType::Integer);
+            let mut expr = CompoundExpr::new(cast, operator, Value::integer(-1));
+            expr.prepare_for_schema(&schema);
+            assert!(!expr.evaluate(&row).unwrap(), "{operator:?}");
+            assert!(!expr.evaluate_fast(&row), "{operator:?}");
+        }
+    }
+
+    #[test]
     fn test_compound_expr_float_comparison() {
         let schema = test_schema();
         let row = Row::from_values(vec![
@@ -789,12 +779,12 @@ mod tests {
     #[test]
     fn test_cast_invalid_string_to_integer() {
         let result = cast_to_integer(&Value::text("not_a_number")).unwrap();
-        assert_eq!(result, Value::integer(0)); // Invalid strings default to 0
+        assert_eq!(result, Value::null(DataType::Integer));
     }
 
     #[test]
     fn test_cast_float_string_to_integer() {
         let result = cast_to_integer(&Value::text("3.7")).unwrap();
-        assert_eq!(result, Value::integer(3)); // Truncates to integer
+        assert_eq!(result, Value::null(DataType::Integer));
     }
 }

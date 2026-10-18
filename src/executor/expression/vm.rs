@@ -1709,7 +1709,7 @@ impl ExprVM {
                 // =============================================================
                 Op::Cast(target_type) => {
                     let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = v.coerce_to_type(*target_type);
+                    let result = v.try_coerce_to_type(*target_type)?;
                     self.stack.push(result);
                     pc += 1;
                 }
