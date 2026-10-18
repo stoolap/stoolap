@@ -150,8 +150,7 @@ pub use operator::{
 };
 pub use operators::{
     BatchIndexNestedLoopJoinOperator, HashJoinOperator, IndexLookupStrategy,
-    IndexNestedLoopJoinOperator, JoinProjection, JoinSide, JoinType, MergeJoinOperator,
-    NestedLoopJoinOperator,
+    IndexNestedLoopJoinOperator, JoinProjection, JoinSide, JoinType, NestedLoopJoinOperator,
 };
 pub use utils::{compute_join_projection, extract_join_keys_and_residual, JoinProjectionIndices};
 

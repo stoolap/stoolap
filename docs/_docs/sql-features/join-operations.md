@@ -283,10 +283,9 @@ Stoolap automatically selects the optimal join algorithm based on data character
 | Algorithm | Used When | Complexity |
 |-----------|-----------|------------|
 | **Hash Join** | Equality conditions, larger tables | O(N+M) |
-| **Merge Join** | Pre-sorted inputs on join keys | O(N+M) |
 | **Index Nested Loop** | PK/index lookups, especially with LIMIT | O(N*log M) |
 | **Nested Loop** | Non-equality conditions, CROSS JOIN, small tables | O(N*M) |
 
-The query optimizer considers table sizes, available indexes, and sort order when choosing algorithms. Index Nested Loop is preferred when one side can use an index lookup, and a batch variant is used when no LIMIT is present.
+The query optimizer considers table sizes and available indexes when choosing algorithms. Index Nested Loop is preferred when one side can use an index lookup, and a batch variant is used when no LIMIT is present.
 
 On a persistent database, a join with a LIMIT also probes the index of a persistent table: the hot index for rows not sealed yet, and each volume's side file for sealed rows, under the same decision the scan makes per volume. Each probe takes at most 1024 row ids for one key, and the table refuses a probe when a volume has no side file for the column, a key has more ids than that or too large a share of a volume, the index cache refuses the read, or a seal, commit or TRUNCATE lands across the probe. A refused probe sends the whole join to the hash path once, so the result is the same either way. `PRAGMA INDEX_READ_STATS` counts the probes and the rows the side files served.

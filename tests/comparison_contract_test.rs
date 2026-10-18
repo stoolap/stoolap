@@ -465,7 +465,7 @@ fn test_a_composite_join_key_drops_only_the_mixed_pair() {
 }
 
 #[test]
-fn test_a_merge_join_is_chosen_again_without_the_mixed_pair() {
+fn test_a_join_with_a_mixed_key_pair_keeps_every_sorted_match() {
     let db = open("contract_join_merge");
     db.execute(
         "CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER)",
@@ -504,7 +504,7 @@ fn test_a_merge_join_is_chosen_again_without_the_mixed_pair() {
         .unwrap()
         .get(0)
         .unwrap();
-    assert_eq!(count, rows, "sorted on both keys, not on the one left");
+    assert_eq!(count, rows, "every a row matches one b row on both keys");
 }
 
 #[test]

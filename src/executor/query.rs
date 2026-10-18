@@ -5598,30 +5598,6 @@ impl Executor {
             None
         };
 
-        // Get join algorithm decision from QueryPlanner
-        // This uses cost-based optimization with edge-aware heuristics
-        let (left_key_indices, right_key_indices, _) = if let Some(cond) = effective_condition {
-            extract_join_keys_and_residual(cond, &left_columns, &right_columns)
-        } else {
-            (Vec::new(), Vec::new(), Vec::new())
-        };
-        let has_equality_keys = !left_key_indices.is_empty();
-
-        // Check if inputs are sorted on join keys
-        let left_sorted =
-            has_equality_keys && super::utils::is_sorted_on_keys(&left_rows, &left_key_indices);
-        let right_sorted =
-            has_equality_keys && super::utils::is_sorted_on_keys(&right_rows, &right_key_indices);
-
-        // Get algorithm decision from QueryPlanner
-        let algorithm_decision = self.get_query_planner().plan_runtime_join_with_sort_info(
-            left_rows.len(),
-            right_rows.len(),
-            has_equality_keys,
-            left_sorted,
-            right_sorted,
-        );
-
         // Execute join using JoinExecutor (takes ownership of rows)
         let join_executor = JoinExecutor::new();
         let join_request = super::join_executor::JoinRequest {
@@ -5633,7 +5609,6 @@ impl Executor {
             join_type: &join_type,
             limit: join_limit,
             ctx,
-            algorithm_hint: Some(&algorithm_decision),
             left_schema: self.base_table_side_schema(&join_source.left, ctx),
             right_schema: self.base_table_side_schema(&join_source.right, ctx),
         };

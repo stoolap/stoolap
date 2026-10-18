@@ -47,7 +47,7 @@ use super::operators::index_nested_loop::{IndexLookupStrategy, IndexNestedLoopJo
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::ExecutorResult;
 use super::row_count::{row_counts, rows_needed, static_row_counts};
-use super::utils::{build_column_index_map, extract_join_keys_and_residual, is_sorted_on_keys};
+use super::utils::build_column_index_map;
 use super::Executor;
 
 /// Type alias for CTE data: (columns, rows) with Arc for zero-copy sharing
@@ -794,33 +794,9 @@ impl Executor {
             None
         };
 
-        // Get join algorithm decision from QueryPlanner (same as query.rs)
-        let (left_key_indices, right_key_indices, _) =
-            if let Some(cond) = join_source.condition.as_ref() {
-                extract_join_keys_and_residual(cond, &left_qualified, &right_qualified)
-            } else {
-                (Vec::new(), Vec::new(), Vec::new())
-            };
-        let has_equality_keys = !left_key_indices.is_empty();
-
-        // Extract just the Row part for sort checking (JoinExecutor works with Row, not (i64, Row))
+        // JoinExecutor works with Row, not (i64, Row)
         let left_rows_only: Vec<Row> = left_rows.iter().map(|(_, row)| row.clone()).collect();
         let right_rows_only: Vec<Row> = right_rows.iter().map(|(_, row)| row.clone()).collect();
-
-        // Check if inputs are sorted on join keys
-        let left_sorted =
-            has_equality_keys && is_sorted_on_keys(&left_rows_only, &left_key_indices);
-        let right_sorted =
-            has_equality_keys && is_sorted_on_keys(&right_rows_only, &right_key_indices);
-
-        // Get algorithm decision from QueryPlanner
-        let algorithm_decision = self.get_query_planner().plan_runtime_join_with_sort_info(
-            left_rows_only.len(),
-            right_rows_only.len(),
-            has_equality_keys,
-            left_sorted,
-            right_sorted,
-        );
 
         // Use JoinExecutor for consistent join execution
         // Passes CompactArc<Vec<Row>> (without row IDs) to JoinExecutor
@@ -834,7 +810,6 @@ impl Executor {
             join_type: &join_type,
             limit: effective_limit,
             ctx,
-            algorithm_hint: Some(&algorithm_decision),
             left_schema: None,
             right_schema: None,
         })?;

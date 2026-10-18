@@ -23,7 +23,6 @@
 //! ## Join Operators
 //!
 //! - `HashJoinOperator` - Streaming hash join with O(N+M) complexity
-//! - `MergeJoinOperator` - Merge join for pre-sorted inputs with O(N+M) complexity
 //! - `NestedLoopJoinOperator` - Fallback for complex conditions with O(N*M) complexity
 //! - `IndexNestedLoopJoinOperator` - Index-based join with O(N*log M) complexity
 //! - `BatchIndexNestedLoopJoinOperator` - Batch variant for NO LIMIT queries
@@ -33,7 +32,6 @@
 //! | Condition | Recommended Operator |
 //! |-----------|---------------------|
 //! | Equality keys, large tables | `HashJoinOperator` |
-//! | Both inputs pre-sorted | `MergeJoinOperator` |
 //! | Inner table has index | `IndexNestedLoopJoinOperator` |
 //! | No LIMIT + index available | `BatchIndexNestedLoopJoinOperator` |
 //! | Non-equality conditions | `NestedLoopJoinOperator` |
@@ -51,7 +49,6 @@
 pub mod bloom_filter;
 pub mod hash_join;
 pub mod index_nested_loop;
-pub mod merge_join;
 pub mod nested_loop_join;
 
 // Re-export all operators and types
@@ -61,5 +58,4 @@ pub use index_nested_loop::{
     BatchIndexNestedLoopJoinOperator, IndexLookupStrategy, IndexNestedLoopJoinOperator,
     JoinProjection,
 };
-pub use merge_join::MergeJoinOperator;
 pub use nested_loop_join::NestedLoopJoinOperator;
