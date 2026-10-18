@@ -26,6 +26,7 @@
 
 pub mod error;
 pub mod integer;
+pub mod interval;
 pub mod predicate;
 pub mod row;
 pub mod row_vec;

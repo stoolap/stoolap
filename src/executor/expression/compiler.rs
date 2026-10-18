@@ -31,9 +31,10 @@ use crate::common::SmartString;
 use crate::common::StringMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::ops::{CompiledPattern, IntervalStep, IntervalUnit, Op, QuantifiedMembers};
+use super::ops::{CompiledPattern, IntervalStep, Op, QuantifiedMembers};
 use super::program::{Program, ProgramBuilder};
 use super::vm::{ExecuteContext, ExprVM};
+use crate::core::interval::IntervalUnit;
 use crate::core::predicate::PredicateSet;
 use crate::core::{DataType, Row, Value, ValueSet};
 use crate::executor::expr_key::ExprKey;

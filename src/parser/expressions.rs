@@ -1740,26 +1740,14 @@ impl Parser<'_> {
                 }
             };
 
-            // Expect a unit keyword (SECOND, MINUTE, HOUR, DAY, WEEK, MONTH, YEAR)
             self.next_token();
-            let unit_raw = self.cur_token.literal.to_uppercase();
-            let unit = match unit_raw.as_str() {
-                "SECOND" | "SECONDS" => "second",
-                "MINUTE" | "MINUTES" => "minute",
-                "HOUR" | "HOURS" => "hour",
-                "DAY" | "DAYS" => "day",
-                "WEEK" | "WEEKS" => "week",
-                "MONTH" | "MONTHS" => "month",
-                "YEAR" | "YEARS" => "year",
-                _ => {
-                    self.add_error(format!(
-                        "invalid interval unit: {} at {}. Expected SECOND, MINUTE, HOUR, DAY, WEEK, MONTH, or YEAR",
-                        self.cur_token.literal, self.cur_token.position
-                    ));
+            let unit = match self.interval_unit(&self.cur_token.literal) {
+                Ok(unit) => unit,
+                Err(message) => {
+                    self.add_error(message);
                     return None;
                 }
             };
-
             let value = SmartString::from_string(format!("{} {}", quantity, unit));
             Some(Expression::IntervalLiteral(IntervalLiteral {
                 token,
@@ -1804,17 +1792,35 @@ impl Parser<'_> {
                 }
             };
 
-            let unit = SmartString::from(parts[1].to_lowercase().trim_end_matches('s'));
-
+            let unit = match self.interval_unit(parts[1]) {
+                Ok(unit) => unit,
+                Err(message) => {
+                    self.add_error(message);
+                    return None;
+                }
+            };
             Some(Expression::IntervalLiteral(IntervalLiteral {
                 token,
                 value: SmartString::from(value_str),
                 quantity,
-                unit,
+                unit: SmartString::new(unit),
             }))
         } else {
             None
         }
+    }
+
+    /// The name of the INTERVAL unit `name` spells, or the parse error for
+    /// anything else
+    fn interval_unit(&self, name: &str) -> std::result::Result<&'static str, String> {
+        crate::core::interval::IntervalUnit::parse(name)
+            .map(|unit| unit.name())
+            .ok_or_else(|| {
+                format!(
+                    "invalid interval unit: {} at {}. Expected MICROSECOND, MILLISECOND, SECOND, MINUTE, HOUR, DAY, WEEK, MONTH, or YEAR",
+                    name, self.cur_token.position
+                )
+            })
     }
 
     /// Parse a typed literal (TIMESTAMP '...', DATE '...', TIME '...')
