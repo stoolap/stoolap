@@ -850,9 +850,9 @@ impl Executor {
             Expression::FloatLiteral(lit) => {
                 Some(UpdateValueSource::Literal(Value::Float(lit.value)))
             }
-            Expression::StringLiteral(lit) => {
-                Some(UpdateValueSource::Literal(Value::text(lit.value.as_str())))
-            }
+            Expression::StringLiteral(lit) => Some(UpdateValueSource::Literal(
+                super::utils::string_literal_value(lit),
+            )),
             Expression::BooleanLiteral(lit) => {
                 Some(UpdateValueSource::Literal(Value::Boolean(lit.value)))
             }

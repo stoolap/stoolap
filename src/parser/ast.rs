@@ -307,7 +307,17 @@ pub struct StringLiteral {
 
 impl fmt::Display for StringLiteral {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "'{}'", self.value)
+        // A typed literal is written back with its keyword, so it parses as one again
+        match self.type_hint.as_deref() {
+            Some(hint)
+                if ["TIMESTAMP", "DATE", "TIME"]
+                    .iter()
+                    .any(|keyword| hint.eq_ignore_ascii_case(keyword)) =>
+            {
+                write!(f, "{} '{}'", hint, self.value)
+            }
+            _ => write!(f, "'{}'", self.value),
+        }
     }
 }
 

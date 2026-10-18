@@ -8416,7 +8416,7 @@ impl Executor {
                         args.push(ArgSource::Const(Value::Float(lit.value)));
                     }
                     Expression::StringLiteral(lit) => {
-                        args.push(ArgSource::Const(Value::Text(lit.value.clone())));
+                        args.push(ArgSource::Const(string_literal_value(lit)));
                     }
                     Expression::BooleanLiteral(lit) => {
                         args.push(ArgSource::Const(Value::Boolean(lit.value)));
@@ -8468,9 +8468,7 @@ impl Executor {
                     Some(ArgSource::Const(Value::Integer(lit.value)))
                 }
                 Expression::FloatLiteral(lit) => Some(ArgSource::Const(Value::Float(lit.value))),
-                Expression::StringLiteral(lit) => {
-                    Some(ArgSource::Const(Value::Text(lit.value.clone())))
-                }
+                Expression::StringLiteral(lit) => Some(ArgSource::Const(string_literal_value(lit))),
                 Expression::BooleanLiteral(lit) => {
                     Some(ArgSource::Const(Value::Boolean(lit.value)))
                 }
