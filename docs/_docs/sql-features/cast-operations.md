@@ -116,11 +116,13 @@ SELECT CAST(NULL AS BOOLEAN);                  -- Returns NULL (typed as BOOLEAN
 
 ### To INTEGER
 
-- **From FLOAT**: Truncates decimal portion (123.45 → 123). Returns error for NaN, Infinity, or values outside i64 range
-- **From TEXT**: Parses numeric string ("123" → 123), non-numeric strings become 0
+- **From FLOAT**: Truncates toward zero (123.45 → 123, -3.7 → -3). A value outside the INTEGER range, NaN or infinity is an error
+- **From TEXT**: Parses an integer, ignoring the spaces around it (" 123 " → 123). A number outside the INTEGER range is an error; any other text, including "3.7" and "", becomes NULL
 - **From BOOLEAN**: TRUE → 1, FALSE → 0
-- **From TIMESTAMP**: Converts to Unix timestamp (seconds since epoch)
+- **From TIMESTAMP**: NULL
 - **From NULL**: Returns NULL (typed as INTEGER)
+
+The same conversion applies wherever a value becomes an INTEGER: a CAST, a value written into an INTEGER column by INSERT, UPDATE, upsert, a DEFAULT or COPY, and an INTEGER argument of a function such as LEFT or SUBSTRING. A FLOAT outside the range is never clamped to the largest INTEGER. `ALTER TABLE ... MODIFY COLUMN ... INTEGER` is the exception: a value it cannot convert becomes NULL, as described for that statement.
 
 ### To FLOAT
 

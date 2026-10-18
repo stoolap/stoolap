@@ -104,51 +104,7 @@ impl ScalarFunction for CastFunction {
 
 /// Cast a value to INTEGER
 fn cast_to_integer(value: &Value) -> Result<Value> {
-    match value {
-        Value::Integer(i) => Ok(Value::Integer(*i)),
-        Value::Float(f) => {
-            if !f.is_finite() {
-                return Err(Error::invalid_argument(format!(
-                    "Cannot cast {} to INTEGER",
-                    f
-                )));
-            }
-            if *f > i64::MAX as f64 || *f < i64::MIN as f64 {
-                return Err(Error::invalid_argument(format!(
-                    "Float value {} out of INTEGER range",
-                    f
-                )));
-            }
-            Ok(Value::Integer(*f as i64))
-        }
-        Value::Boolean(b) => Ok(Value::Integer(if *b { 1 } else { 0 })),
-        Value::Text(s) => {
-            if s.is_empty() {
-                return Ok(Value::Integer(0));
-            }
-            // Try to parse as integer first
-            if let Ok(i) = s.parse::<i64>() {
-                return Ok(Value::Integer(i));
-            }
-            // If that fails, try as float and truncate
-            if let Ok(f) = s.parse::<f64>() {
-                if !f.is_finite() || f > i64::MAX as f64 || f < i64::MIN as f64 {
-                    return Err(Error::invalid_argument(format!(
-                        "Cannot convert '{}' to INTEGER",
-                        s
-                    )));
-                }
-                return Ok(Value::Integer(f as i64));
-            }
-            Err(Error::invalid_argument(format!(
-                "Cannot convert '{}' to INTEGER",
-                s
-            )))
-        }
-        Value::Timestamp(t) => Ok(Value::Integer(t.timestamp())),
-        Value::Extension(_) => Ok(Value::Integer(0)),
-        Value::Null(dt) => Ok(Value::Null(*dt)),
-    }
+    value.try_coerce_to_type(DataType::Integer)
 }
 
 /// Cast a value to FLOAT
@@ -435,7 +391,7 @@ mod tests {
         assert_eq!(
             cast.evaluate(&[Value::text(""), Value::text("INTEGER")])
                 .unwrap(),
-            Value::Integer(0)
+            Value::Null(DataType::Integer)
         );
     }
 
@@ -443,26 +399,20 @@ mod tests {
     fn test_cast_text_to_integer_edge_cases() {
         let cast = CastFunction;
 
-        // "inf" → should error, not silently saturate to i64::MAX
+        for text in ["inf", "-inf", "NaN", "1e30", "3.14"] {
+            assert_eq!(
+                cast.evaluate(&[Value::text(text), Value::text("INTEGER")])
+                    .unwrap(),
+                Value::Null(DataType::Integer),
+                "{text}"
+            );
+        }
         assert!(cast
-            .evaluate(&[Value::text("inf"), Value::text("INTEGER")])
+            .evaluate(&[Value::text("9223372036854775808"), Value::text("INTEGER")])
             .is_err());
         assert!(cast
-            .evaluate(&[Value::text("-inf"), Value::text("INTEGER")])
+            .evaluate(&[Value::Float(1e30), Value::text("INTEGER")])
             .is_err());
-        assert!(cast
-            .evaluate(&[Value::text("NaN"), Value::text("INTEGER")])
-            .is_err());
-        // Out of i64 range
-        assert!(cast
-            .evaluate(&[Value::text("1e30"), Value::text("INTEGER")])
-            .is_err());
-        // Valid float string truncates to integer
-        assert_eq!(
-            cast.evaluate(&[Value::text("3.14"), Value::text("INTEGER")])
-                .unwrap(),
-            Value::Integer(3)
-        );
     }
 
     #[test]

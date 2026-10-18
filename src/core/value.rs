@@ -25,6 +25,7 @@ use std::sync::Arc;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 
 use super::error::{Error, Result};
+use super::integer::integer_from;
 use super::types::DataType;
 use crate::common::{CompactArc, SmartString};
 
@@ -592,20 +593,10 @@ impl Value {
         }
 
         match target_type {
-            DataType::Integer => {
-                // Convert to INTEGER
-                match self {
-                    Value::Integer(v) => Value::Integer(*v),
-                    Value::Float(v) => Value::Integer(*v as i64),
-                    Value::Text(s) => s
-                        .trim()
-                        .parse::<i64>()
-                        .map(Value::Integer)
-                        .unwrap_or(Value::Null(target_type)),
-                    Value::Boolean(b) => Value::Integer(if *b { 1 } else { 0 }),
-                    _ => Value::Null(target_type),
-                }
-            }
+            DataType::Integer => match integer_from(self) {
+                Ok(Some(v)) => Value::Integer(v),
+                _ => Value::Null(target_type),
+            },
             DataType::Float => {
                 // Convert to FLOAT
                 match self {
@@ -729,6 +720,28 @@ impl Value {
         }
     }
 
+    /// `coerce_to_type`, but an error for a number outside the INTEGER range,
+    /// as a CAST and a write into a column read it
+    pub fn try_coerce_to_type(&self, target_type: DataType) -> Result<Value> {
+        match target_type {
+            DataType::Integer if !self.is_null() => {
+                Ok(integer_from(self)?.map_or(Value::Null(target_type), Value::Integer))
+            }
+            _ => Ok(self.coerce_to_type(target_type)),
+        }
+    }
+
+    /// `try_coerce_to_type`, consuming self
+    #[inline]
+    pub fn try_into_coerce_to_type(self, target_type: DataType) -> Result<Value> {
+        match target_type {
+            DataType::Integer if !self.is_null() => {
+                Ok(integer_from(&self)?.map_or(Value::Null(target_type), Value::Integer))
+            }
+            _ => Ok(self.into_coerce_to_type(target_type)),
+        }
+    }
+
     /// Coerce value to target type, consuming self
     /// OPTIMIZATION: Avoids clone when types already match
     #[inline]
@@ -744,14 +757,8 @@ impl Value {
         }
 
         match target_type {
-            DataType::Integer => match &self {
-                Value::Integer(v) => Value::Integer(*v),
-                Value::Float(v) => Value::Integer(*v as i64),
-                Value::Text(s) => s
-                    .parse::<i64>()
-                    .map(Value::Integer)
-                    .unwrap_or(Value::Null(target_type)),
-                Value::Boolean(b) => Value::Integer(if *b { 1 } else { 0 }),
+            DataType::Integer => match integer_from(&self) {
+                Ok(Some(v)) => Value::Integer(v),
                 _ => Value::Null(target_type),
             },
             DataType::Float => match &self {

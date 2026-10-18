@@ -838,7 +838,7 @@ impl ScalarFunction for DateAddFunction {
 
         let interval = match &args[1] {
             Value::Integer(i) => *i,
-            Value::Float(f) => *f as i64,
+            Value::Float(f) => crate::core::integer::integer_from_float(*f)?,
             _ if args[1].is_null() => return Ok(Value::null_unknown()),
             _ => {
                 return Err(Error::invalid_argument(

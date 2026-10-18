@@ -138,7 +138,7 @@ impl GenerateSeriesFunction {
     fn to_i64(val: &Value) -> Result<i64> {
         match val {
             Value::Integer(i) => Ok(*i),
-            Value::Float(f) => Ok(*f as i64),
+            Value::Float(f) => crate::core::integer::integer_from_float(*f),
             Value::Null(_) => Err(Error::invalid_argument(
                 "GENERATE_SERIES arguments must not be NULL",
             )),

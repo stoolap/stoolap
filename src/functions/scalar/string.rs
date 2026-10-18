@@ -1363,7 +1363,7 @@ impl ScalarFunction for CharFunction {
 
         let code = match &args[0] {
             Value::Integer(n) => *n,
-            Value::Float(f) => *f as i64,
+            Value::Float(f) => crate::core::integer::integer_from_float(*f)?,
             _ => {
                 return Err(Error::invalid_argument("CHAR requires an integer argument"));
             }

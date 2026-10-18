@@ -14,8 +14,9 @@
 
 //! INTEGER arithmetic: exact, an error for a result outside the INTEGER
 //! range, NULL for a zero divisor, and a shift by 0 to 63 places only.
+//! Conversion into INTEGER: an error for a value outside the range.
 
-use super::{Error, Result};
+use super::{Error, Result, Value};
 
 /// An operator on two INTEGERs
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +69,51 @@ pub fn integer_abs(x: i64) -> Result<i64> {
         .ok_or_else(|| Error::Type(format!("Integer overflow in ABS: {x}")))
 }
 
+/// `value` as an INTEGER: a FLOAT truncates toward zero, TEXT is trimmed and
+/// parsed, a BOOLEAN is 1 or 0. None when the value has no INTEGER reading;
+/// an error when its number lies outside the INTEGER range.
+pub fn integer_from(value: &Value) -> Result<Option<i64>> {
+    match value {
+        Value::Integer(i) => Ok(Some(*i)),
+        Value::Float(f) => integer_from_float(*f).map(Some),
+        Value::Text(s) => integer_from_text(s),
+        Value::Boolean(b) => Ok(Some(i64::from(*b))),
+        _ => Ok(None),
+    }
+}
+
+/// FLOAT as an INTEGER, the `integer_from` reading of a float
+pub fn integer_from_float(f: f64) -> Result<i64> {
+    // -2^63 is exact as a float, 2^63 is the first value past the range
+    let past = -(i64::MIN as f64);
+    if (-past..past).contains(&f) {
+        Ok(f as i64)
+    } else {
+        Err(Error::Type(format!(
+            "Value {f} is out of range for INTEGER"
+        )))
+    }
+}
+
+/// TEXT as an INTEGER, the `integer_from` reading of a string
+pub fn integer_from_text(s: &str) -> Result<Option<i64>> {
+    let s = s.trim();
+    match s.parse::<i64>() {
+        Ok(i) => Ok(Some(i)),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow
+            ) =>
+        {
+            Err(Error::Type(format!(
+                "Value {s} is out of range for INTEGER"
+            )))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +144,27 @@ mod tests {
         assert_eq!(integer_neg(i64::MAX).unwrap(), -i64::MAX);
         assert!(integer_abs(i64::MIN).is_err());
         assert_eq!(integer_abs(-5).unwrap(), 5);
+    }
+
+    #[test]
+    fn test_a_conversion_outside_the_range_is_an_error() {
+        let ok = |v: Value, want: Option<i64>| {
+            assert_eq!(integer_from(&v).unwrap(), want, "{v:?}");
+        };
+        let err = |v: Value| assert!(integer_from(&v).is_err(), "{v:?}");
+        ok(Value::float(3.7), Some(3));
+        ok(Value::float(-3.7), Some(-3));
+        ok(Value::float(i64::MIN as f64), Some(i64::MIN));
+        err(Value::float(-(i64::MIN as f64)));
+        err(Value::float(f64::INFINITY));
+        err(Value::float(f64::NAN));
+        ok(Value::text(" 42 "), Some(42));
+        ok(Value::text("3.7"), None);
+        ok(Value::text("x"), None);
+        ok(Value::text(""), None);
+        err(Value::text("9223372036854775808"));
+        err(Value::text("-9223372036854775809"));
+        ok(Value::Boolean(true), Some(1));
+        ok(Value::Null(crate::core::DataType::Integer), None);
     }
 }

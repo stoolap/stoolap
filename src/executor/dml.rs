@@ -203,7 +203,7 @@ fn eval_default_slot(
     Ok(match program {
         Some((Ok(program), target)) => vm
             .execute_cow(program, exec_ctx)?
-            .into_coerce_to_type(*target),
+            .try_into_coerce_to_type(*target)?,
         Some((Err(e), _)) => return Err(e.clone()),
         None => template_val.clone(),
     })
@@ -241,8 +241,12 @@ fn build_default_slots(schema: &crate::core::Schema) -> (Vec<Value>, Vec<Default
             values.push(Value::null_unknown());
             continue;
         };
-        if let Some(lit) = try_extract_literal(expr) {
-            values.push(lit.into_coerce_to_type(target));
+        // A literal outside the column's range runs as a program, whose error
+        // a row that takes it raises
+        if let Some(Ok(value)) =
+            try_extract_literal(expr).map(|v| v.try_into_coerce_to_type(target))
+        {
+            values.push(value);
             continue;
         }
         values.push(Value::null_unknown());
@@ -3696,7 +3700,7 @@ impl Executor {
                 for (idx, col_type, vec_dims, program) in &effective.compiled_updates {
                     let coerced = vm
                         .execute_cow(program, &exec_ctx)?
-                        .into_coerce_to_type(*col_type);
+                        .try_into_coerce_to_type(*col_type)?;
                     // Validate vector dimensions
                     if *col_type == DataType::Vector && *vec_dims > 0 {
                         if let Value::Extension(data) = &coerced {
@@ -3894,7 +3898,7 @@ impl Executor {
             if let Some(expr) = select.columns.first() {
                 // Constant expression - no row context needed
                 let value = ExpressionEval::compile(expr, &[])?.eval_slice(&Row::new())?;
-                return Ok(value.into_coerce_to_type(target_type));
+                return value.try_into_coerce_to_type(target_type);
             }
         }
 

@@ -21,6 +21,7 @@ use chrono::{DateTime, TimeZone, Utc};
 
 use super::{find_column_index, resolve_alias, Expression};
 use crate::common::SmartString;
+use crate::core::integer::integer_from;
 use crate::core::{DataType, Operator, Result, Row, Schema, Value};
 
 /// CAST expression (CAST(column AS type))
@@ -252,32 +253,10 @@ impl Expression for CompoundExpr {
         // Fast path based on target type
         match self.cast_expr.target_type {
             DataType::Integer => {
-                let col_int = match col_value {
-                    Value::Integer(v) => *v,
-                    Value::Float(v) => *v as i64,
-                    Value::Boolean(b) => {
-                        if *b {
-                            1
-                        } else {
-                            0
-                        }
-                    }
-                    Value::Text(s) => {
-                        if let Ok(i) = s.parse::<i64>() {
-                            i
-                        } else if let Ok(f) = s.parse::<f64>() {
-                            f as i64
-                        } else {
-                            return false;
-                        }
-                    }
-                    _ => return false,
-                };
-
-                let comp_int = match &self.value {
-                    Value::Integer(v) => *v,
-                    Value::Float(v) => *v as i64,
-                    _ => return false,
+                let (Ok(Some(col_int)), Ok(Some(comp_int))) =
+                    (integer_from(col_value), integer_from(&self.value))
+                else {
+                    return false;
                 };
 
                 match self.operator {
@@ -415,23 +394,7 @@ impl Expression for CompoundExpr {
 // Cast helper functions
 
 fn cast_to_integer(value: &Value) -> Result<Value> {
-    match value {
-        Value::Integer(v) => Ok(Value::Integer(*v)),
-        Value::Float(v) => Ok(Value::Integer(*v as i64)),
-        Value::Text(s) => {
-            if let Ok(i) = s.parse::<i64>() {
-                Ok(Value::Integer(i))
-            } else if let Ok(f) = s.parse::<f64>() {
-                Ok(Value::Integer(f as i64))
-            } else {
-                Ok(Value::Integer(0))
-            }
-        }
-        Value::Boolean(b) => Ok(Value::Integer(if *b { 1 } else { 0 })),
-        Value::Timestamp(t) => Ok(Value::Integer(t.timestamp())),
-        Value::Null(_) => Ok(Value::null(DataType::Integer)),
-        _ => Ok(Value::Integer(0)),
-    }
+    value.try_coerce_to_type(DataType::Integer)
 }
 
 fn cast_to_float(value: &Value) -> Result<Value> {
@@ -789,12 +752,12 @@ mod tests {
     #[test]
     fn test_cast_invalid_string_to_integer() {
         let result = cast_to_integer(&Value::text("not_a_number")).unwrap();
-        assert_eq!(result, Value::integer(0)); // Invalid strings default to 0
+        assert_eq!(result, Value::null(DataType::Integer));
     }
 
     #[test]
     fn test_cast_float_string_to_integer() {
         let result = cast_to_integer(&Value::text("3.7")).unwrap();
-        assert_eq!(result, Value::integer(3)); // Truncates to integer
+        assert_eq!(result, Value::null(DataType::Integer));
     }
 }

@@ -1306,7 +1306,7 @@ impl Executor {
             if let Some(expr) = select.columns.first() {
                 let mut eval = ExpressionEval::compile(expr, &[])?;
                 let value = eval.eval_slice(&Row::new())?;
-                return Ok(value.into_coerce_to_type(target_type));
+                return value.try_into_coerce_to_type(target_type);
             }
         }
 

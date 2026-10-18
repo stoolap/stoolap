@@ -18,6 +18,7 @@
 //! for significantly faster loading compared to individual INSERT statements.
 
 use crate::common::{CompactArc, SmartString};
+use crate::core::integer::integer_from_text;
 use crate::core::{DataType, Error, Result, Row, Schema, Value};
 use crate::parser::ast::{CopyFormat, CopyStatement};
 use crate::storage::traits::transaction::StatementTable;
@@ -32,12 +33,14 @@ use super::Executor;
 #[inline]
 fn parse_field(field: &str, target_type: DataType, col_name: &str) -> Result<Value> {
     match target_type {
-        DataType::Integer => field.parse::<i64>().map(Value::Integer).map_err(|_| {
-            Error::Type(format!(
-                "cannot convert value '{}' to INTEGER for column '{}'",
-                field, col_name
-            ))
-        }),
+        DataType::Integer => integer_from_text(field)?
+            .map(Value::Integer)
+            .ok_or_else(|| {
+                Error::Type(format!(
+                    "cannot convert value '{}' to INTEGER for column '{}'",
+                    field, col_name
+                ))
+            }),
         DataType::Float => field.parse::<f64>().map(Value::Float).map_err(|_| {
             Error::Type(format!(
                 "cannot convert value '{}' to FLOAT for column '{}'",
