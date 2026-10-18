@@ -364,37 +364,12 @@ impl Executor {
         num_order_cols: usize,
     ) -> Ordering {
         for (i, ob) in order_by.iter().take(num_order_cols).enumerate() {
-            let ascending = ob.ascending;
-            let nulls_first = ob.nulls_first;
-            let a_val = a_keys.get(i);
-            let b_val = b_keys.get(i);
-
-            let a_is_null = a_val.is_none() || a_val.map(|v| v.is_null()).unwrap_or(true);
-            let b_is_null = b_val.is_none() || b_val.map(|v| v.is_null()).unwrap_or(true);
-
-            if a_is_null || b_is_null {
-                if a_is_null && b_is_null {
-                    continue;
-                }
-                let nulls_come_first = nulls_first.unwrap_or(!ascending);
-                return if a_is_null {
-                    if nulls_come_first {
-                        Ordering::Less
-                    } else {
-                        Ordering::Greater
-                    }
-                } else if nulls_come_first {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                };
-            }
-
-            let cmp = match (a_val, b_val) {
-                (Some(av), Some(bv)) => av.partial_cmp(bv).unwrap_or(Ordering::Equal),
-                _ => Ordering::Equal,
-            };
-            let cmp = if !ascending { cmp.reverse() } else { cmp };
+            let cmp = crate::core::value::compare_order_key(
+                a_keys.get(i),
+                b_keys.get(i),
+                ob.ascending,
+                ob.nulls_first,
+            );
             if cmp != Ordering::Equal {
                 return cmp;
             }
@@ -9726,46 +9701,12 @@ impl Executor {
     ) -> Ordering {
         for (col_idx, ascending, nulls_first) in order_specs {
             if let Some(idx) = col_idx {
-                let a_val = a.get(*idx);
-                let b_val = b.get(*idx);
-
-                // Check if either value is NULL
-                let a_is_null = a_val.is_none() || a_val.map(|v| v.is_null()).unwrap_or(true);
-                let b_is_null = b_val.is_none() || b_val.map(|v| v.is_null()).unwrap_or(true);
-
-                // Handle NULL comparison
-                if a_is_null || b_is_null {
-                    if a_is_null && b_is_null {
-                        continue; // Both NULL, move to next column
-                    }
-                    // Determine if NULLs should come first
-                    // Default: NULLS LAST for ASC, NULLS FIRST for DESC
-                    let nulls_come_first = nulls_first.unwrap_or(!*ascending);
-                    let cmp = if a_is_null {
-                        if nulls_come_first {
-                            Ordering::Less
-                        } else {
-                            Ordering::Greater
-                        }
-                    } else {
-                        // b_is_null
-                        if nulls_come_first {
-                            Ordering::Greater
-                        } else {
-                            Ordering::Less
-                        }
-                    };
-                    return cmp;
-                }
-
-                // Both non-NULL - normal comparison
-                let cmp = match (a_val, b_val) {
-                    (Some(av), Some(bv)) => av.partial_cmp(bv).unwrap_or(Ordering::Equal),
-                    _ => Ordering::Equal, // Already handled above
-                };
-
-                let cmp = if !*ascending { cmp.reverse() } else { cmp };
-
+                let cmp = crate::core::value::compare_order_key(
+                    a.get(*idx),
+                    b.get(*idx),
+                    *ascending,
+                    *nulls_first,
+                );
                 if cmp != Ordering::Equal {
                     return cmp;
                 }

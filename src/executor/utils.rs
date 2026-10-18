@@ -826,43 +826,9 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
     }
 }
 
-/// Compare two Values for ordering.
+/// Compare two Values for ordering, ascending with NULL last
 pub fn compare_values(a: &Value, b: &Value) -> Ordering {
-    match (a, b) {
-        (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
-        (Value::Float(x), Value::Float(y)) => crate::core::value::compare_floats(*x, *y),
-        (Value::Text(x), Value::Text(y)) => x.cmp(y),
-        (Value::Boolean(x), Value::Boolean(y)) => x.cmp(y),
-        (Value::Null(_), Value::Null(_)) => Ordering::Equal,
-        (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
-        (Value::Extension(x), Value::Extension(y)) => x.cmp(y),
-        // Cross-type comparisons - exact numeric ordering, consistent
-        // with Value::compare (merge join consumes ORDER BY output)
-        (Value::Integer(x), Value::Float(y)) => {
-            crate::core::value::cmp_i64_f64(*x, *y).unwrap_or(Ordering::Less)
-        }
-        (Value::Float(x), Value::Integer(y)) => crate::core::value::cmp_i64_f64(*y, *x)
-            .map(Ordering::reverse)
-            .unwrap_or(Ordering::Greater),
-        // NULL sorts last
-        (Value::Null(_), _) => Ordering::Greater,
-        (_, Value::Null(_)) => Ordering::Less,
-        // Different types - use a stable ordering based on type
-        _ => {
-            fn type_code(v: &Value) -> u8 {
-                match v {
-                    Value::Null(_) => 0,
-                    Value::Boolean(_) => 1,
-                    Value::Integer(_) => 2,
-                    Value::Float(_) => 3,
-                    Value::Text(_) => 4,
-                    Value::Timestamp(_) => 5,
-                    Value::Extension(_) => 6,
-                }
-            }
-            type_code(a).cmp(&type_code(b))
-        }
-    }
+    crate::core::value::compare_order_key(Some(a), Some(b), true, None)
 }
 
 /// Verify that all composite key columns match (handles hash collisions).

@@ -318,7 +318,7 @@ impl CompiledAggregate {
                     match min_value {
                         None => *min_value = Some(value.clone()),
                         Some(current) => {
-                            if Self::is_less_than(value, current) {
+                            if value.cmp(current).is_lt() {
                                 *min_value = Some(value.clone());
                             }
                         }
@@ -332,7 +332,7 @@ impl CompiledAggregate {
                     match max_value {
                         None => *max_value = Some(value.clone()),
                         Some(current) => {
-                            if Self::is_greater_than(value, current) {
+                            if value.cmp(current).is_gt() {
                                 *max_value = Some(value.clone());
                             }
                         }
@@ -524,42 +524,6 @@ impl CompiledAggregate {
             CompiledAggregate::MaxFloat { max_value } => *max_value = None,
 
             CompiledAggregate::Dynamic(state) => state.reset(),
-        }
-    }
-
-    /// Helper: compare values (a < b)
-    #[inline(always)]
-    fn is_less_than(a: &Value, b: &Value) -> bool {
-        match (a, b) {
-            (Value::Null(_), _) | (_, Value::Null(_)) => false,
-            (Value::Integer(a), Value::Integer(b)) => a < b,
-            // NaN orders after every number
-            (Value::Float(a), Value::Float(b)) => compare_floats(*a, *b).is_lt(),
-            (Value::Integer(_), Value::Float(_)) | (Value::Float(_), Value::Integer(_)) => {
-                a.compare(b).is_ok_and(|o| o.is_lt())
-            }
-            (Value::Text(a), Value::Text(b)) => a < b,
-            (Value::Boolean(a), Value::Boolean(b)) => !a && *b,
-            (Value::Timestamp(a), Value::Timestamp(b)) => a < b,
-            _ => false,
-        }
-    }
-
-    /// Helper: compare values (a > b)
-    #[inline(always)]
-    fn is_greater_than(a: &Value, b: &Value) -> bool {
-        match (a, b) {
-            (Value::Null(_), _) | (_, Value::Null(_)) => false,
-            (Value::Integer(a), Value::Integer(b)) => a > b,
-            // NaN orders after every number
-            (Value::Float(a), Value::Float(b)) => compare_floats(*a, *b).is_gt(),
-            (Value::Integer(_), Value::Float(_)) | (Value::Float(_), Value::Integer(_)) => {
-                a.compare(b).is_ok_and(|o| o.is_gt())
-            }
-            (Value::Text(a), Value::Text(b)) => a > b,
-            (Value::Boolean(a), Value::Boolean(b)) => *a && !b,
-            (Value::Timestamp(a), Value::Timestamp(b)) => a > b,
-            _ => false,
         }
     }
 }

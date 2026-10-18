@@ -14,7 +14,6 @@
 
 //! MIN aggregate function
 
-use crate::core::value::compare_floats;
 use crate::core::{Result, Value};
 use crate::functions::{
     AggregateFunction, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType,
@@ -61,7 +60,11 @@ impl AggregateFunction for MinFunction {
         }
 
         // Compare and update minimum
-        if is_less_than(value, self.min_value.as_ref().unwrap()) {
+        if self
+            .min_value
+            .as_ref()
+            .is_some_and(|min| value.cmp(min).is_lt())
+        {
             self.min_value = Some(value.clone());
         }
     }
@@ -76,23 +79,6 @@ impl AggregateFunction for MinFunction {
 
     fn clone_box(&self) -> Box<dyn AggregateFunction> {
         Box::new(MinFunction::default())
-    }
-}
-
-/// Compare two values, returns true if a < b
-fn is_less_than(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Null(_), _) | (_, Value::Null(_)) => false,
-        (Value::Integer(a), Value::Integer(b)) => a < b,
-        // NaN orders after every number
-        (Value::Float(a), Value::Float(b)) => compare_floats(*a, *b).is_lt(),
-        (Value::Integer(_), Value::Float(_)) | (Value::Float(_), Value::Integer(_)) => {
-            a.compare(b).is_ok_and(|o| o.is_lt())
-        }
-        (Value::Text(a), Value::Text(b)) => a < b,
-        (Value::Boolean(a), Value::Boolean(b)) => !a && *b, // false < true
-        (Value::Timestamp(a), Value::Timestamp(b)) => a < b,
-        _ => false, // Different types are not comparable
     }
 }
 

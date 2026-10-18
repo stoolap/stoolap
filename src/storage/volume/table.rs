@@ -508,6 +508,26 @@ impl SegmentedTable {
             .is_some_and(|index| index.index_type() == IndexType::BTree)
     }
 
+    /// Whether the volumes' bounds of a column (zone maps, statistics) order
+    /// its values by the sort order; a JSON or VECTOR column's bounds do not
+    fn bounds_order(&self, col_idx: Option<usize>) -> bool {
+        let schema = self.hot.schema();
+        col_idx
+            .and_then(|idx| schema.columns.get(idx))
+            .is_some_and(|c| c.data_type.is_orderable())
+    }
+
+    /// `bounds_order` for a column named as the index shortcuts name it
+    fn bounds_order_named(&self, column: &str) -> bool {
+        let idx = self
+            .hot
+            .schema()
+            .column_index_map()
+            .get(&column.to_lowercase())
+            .copied();
+        self.bounds_order(idx)
+    }
+
     /// Whether every row the volumes' zone maps count is a row they show:
     /// no tombstone, dead copy, overlap or copy a newer volume hides
     fn zone_maps_count_shown_rows(&self) -> bool {
@@ -4967,7 +4987,7 @@ impl Table for SegmentedTable {
                 return Ok(hot_result);
             }
 
-            if self.segment_mgr.seal_overlap() > 0 {
+            if self.segment_mgr.seal_overlap() > 0 || !self.bounds_order(Some(col_idx)) {
                 return Ok(None);
             }
 
@@ -5288,7 +5308,7 @@ impl Table for SegmentedTable {
                 return Ok(hot_result);
             }
 
-            if self.segment_mgr.seal_overlap() > 0 {
+            if self.segment_mgr.seal_overlap() > 0 || !self.bounds_order(Some(col_idx)) {
                 return Ok(None);
             }
 
@@ -7069,7 +7089,10 @@ impl Table for SegmentedTable {
                 return result;
             }
             // Only a B-tree gives the hot rows' bound
-            if !self.zone_maps_count_shown_rows() || !self.hot_btree_on(column_name) {
+            if !self.zone_maps_count_shown_rows()
+                || !self.hot_btree_on(column_name)
+                || !self.bounds_order_named(column_name)
+            {
                 return None;
             }
             let hot_min = self.hot.get_index_min_value(column_name);
@@ -7126,7 +7149,10 @@ impl Table for SegmentedTable {
                 return result;
             }
             // Only a B-tree gives the hot rows' bound
-            if !self.zone_maps_count_shown_rows() || !self.hot_btree_on(column_name) {
+            if !self.zone_maps_count_shown_rows()
+                || !self.hot_btree_on(column_name)
+                || !self.bounds_order_named(column_name)
+            {
                 return None;
             }
             let hot_max = self.hot.get_index_max_value(column_name);

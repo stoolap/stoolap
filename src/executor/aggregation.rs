@@ -2688,7 +2688,7 @@ impl Executor {
                             if !value.is_null() {
                                 match &state.min_values[i] {
                                     None => state.min_values[i] = Some(value.clone()),
-                                    Some(current) if value < current => {
+                                    Some(current) if value.cmp(current).is_lt() => {
                                         state.min_values[i] = Some(value.clone())
                                     }
                                     _ => {}
@@ -2701,7 +2701,7 @@ impl Executor {
                             if !value.is_null() {
                                 match &state.max_values[i] {
                                     None => state.max_values[i] = Some(value.clone()),
-                                    Some(current) if value > current => {
+                                    Some(current) if value.cmp(current).is_gt() => {
                                         state.max_values[i] = Some(value.clone())
                                     }
                                     _ => {}
@@ -2948,7 +2948,7 @@ impl Executor {
                                 if !value.is_null() {
                                     match &state.min_values[i] {
                                         None => state.min_values[i] = Some(value.clone()),
-                                        Some(current) if value < current => {
+                                        Some(current) if value.cmp(current).is_lt() => {
                                             state.min_values[i] = Some(value.clone())
                                         }
                                         _ => {}
@@ -2961,7 +2961,7 @@ impl Executor {
                                 if !value.is_null() {
                                     match &state.max_values[i] {
                                         None => state.max_values[i] = Some(value.clone()),
-                                        Some(current) if value > current => {
+                                        Some(current) if value.cmp(current).is_gt() => {
                                             state.max_values[i] = Some(value.clone())
                                         }
                                         _ => {}
@@ -3159,7 +3159,7 @@ impl Executor {
                                 if !value.is_null() {
                                     match &state.min_values[i] {
                                         None => state.min_values[i] = Some(value.clone()),
-                                        Some(current) if value < current => {
+                                        Some(current) if value.cmp(current).is_lt() => {
                                             state.min_values[i] = Some(value.clone())
                                         }
                                         _ => {}
@@ -3172,7 +3172,7 @@ impl Executor {
                                 if !value.is_null() {
                                     match &state.max_values[i] {
                                         None => state.max_values[i] = Some(value.clone()),
-                                        Some(current) if value > current => {
+                                        Some(current) if value.cmp(current).is_gt() => {
                                             state.max_values[i] = Some(value.clone())
                                         }
                                         _ => {}
@@ -3350,7 +3350,7 @@ impl Executor {
                             if !value.is_null() {
                                 match &state.min_values[i] {
                                     None => state.min_values[i] = Some(value.clone()),
-                                    Some(current) if value < current => {
+                                    Some(current) if value.cmp(current).is_lt() => {
                                         state.min_values[i] = Some(value.clone())
                                     }
                                     _ => {}
@@ -3363,7 +3363,7 @@ impl Executor {
                             if !value.is_null() {
                                 match &state.max_values[i] {
                                     None => state.max_values[i] = Some(value.clone()),
-                                    Some(current) if value > current => {
+                                    Some(current) if value.cmp(current).is_gt() => {
                                         state.max_values[i] = Some(value.clone())
                                     }
                                     _ => {}
@@ -5167,10 +5167,7 @@ impl Executor {
                     "MIN" => {
                         let is_smaller = match (&state.min, value) {
                             (None, _) => true,
-                            (Some(current), new) => {
-                                new.compare(current).unwrap_or(std::cmp::Ordering::Equal)
-                                    == std::cmp::Ordering::Less
-                            }
+                            (Some(current), new) => new.cmp(current).is_lt(),
                         };
                         if is_smaller {
                             state.min = Some(value.clone());
@@ -5179,10 +5176,7 @@ impl Executor {
                     "MAX" => {
                         let is_larger = match (&state.max, value) {
                             (None, _) => true,
-                            (Some(current), new) => {
-                                new.compare(current).unwrap_or(std::cmp::Ordering::Equal)
-                                    == std::cmp::Ordering::Greater
-                            }
+                            (Some(current), new) => new.cmp(current).is_gt(),
                         };
                         if is_larger {
                             state.max = Some(value.clone());
@@ -5528,7 +5522,7 @@ impl Executor {
                                     if !value.is_null() {
                                         match &state.min_values[i] {
                                             None => state.min_values[i] = Some(value.clone()),
-                                            Some(current) if value < current => {
+                                            Some(current) if value.cmp(current).is_lt() => {
                                                 state.min_values[i] = Some(value.clone())
                                             }
                                             _ => {}
@@ -5541,7 +5535,7 @@ impl Executor {
                                     if !value.is_null() {
                                         match &state.max_values[i] {
                                             None => state.max_values[i] = Some(value.clone()),
-                                            Some(current) if value > current => {
+                                            Some(current) if value.cmp(current).is_gt() => {
                                                 state.max_values[i] = Some(value.clone())
                                             }
                                             _ => {}

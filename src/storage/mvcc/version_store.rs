@@ -5017,7 +5017,7 @@ impl VersionStore {
                 match min_val {
                     None => *min_val = Some(val.clone()),
                     Some(ref current) => {
-                        if let Ok(std::cmp::Ordering::Less) = val.compare(current) {
+                        if val.cmp(current).is_lt() {
                             *min_val = Some(val.clone());
                         }
                     }
@@ -5128,7 +5128,7 @@ impl VersionStore {
                 match max_val {
                     None => *max_val = Some(val.clone()),
                     Some(ref current) => {
-                        if let Ok(std::cmp::Ordering::Greater) = val.compare(current) {
+                        if val.cmp(current).is_gt() {
                             *max_val = Some(val.clone());
                         }
                     }
@@ -7286,7 +7286,7 @@ impl VersionStore {
                                 match &accum.min {
                                     None => accum.min = Some(val.clone()),
                                     Some(current) => {
-                                        if val < current {
+                                        if val.cmp(current).is_lt() {
                                             accum.min = Some(val.clone());
                                         }
                                     }
@@ -7301,7 +7301,7 @@ impl VersionStore {
                                 match &accum.max {
                                     None => accum.max = Some(val.clone()),
                                     Some(current) => {
-                                        if val > current {
+                                        if val.cmp(current).is_gt() {
                                             accum.max = Some(val.clone());
                                         }
                                     }

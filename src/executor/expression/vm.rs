@@ -1636,7 +1636,7 @@ impl ExprVM {
                             match max_idx {
                                 None => max_idx = Some(start + i),
                                 Some(mi) => {
-                                    if v > &self.stack[mi] {
+                                    if v.cmp(&self.stack[mi]).is_gt() {
                                         max_idx = Some(start + i);
                                     }
                                 }
@@ -1670,7 +1670,7 @@ impl ExprVM {
                             match min_idx {
                                 None => min_idx = Some(start + i),
                                 Some(mi) => {
-                                    if v < &self.stack[mi] {
+                                    if v.cmp(&self.stack[mi]).is_lt() {
                                         min_idx = Some(start + i);
                                     }
                                 }
@@ -2371,9 +2371,7 @@ impl ExprVM {
                             match max_idx {
                                 None => max_idx = Some(start + i),
                                 Some(mi) => {
-                                    if let Some(std::cmp::Ordering::Greater) =
-                                        v.partial_cmp(&stack[mi])
-                                    {
+                                    if v.cmp(&stack[mi]).is_gt() {
                                         max_idx = Some(start + i);
                                     }
                                 }
@@ -2405,9 +2403,7 @@ impl ExprVM {
                             match min_idx {
                                 None => min_idx = Some(start + i),
                                 Some(mi) => {
-                                    if let Some(std::cmp::Ordering::Less) =
-                                        v.partial_cmp(&stack[mi])
-                                    {
+                                    if v.cmp(&stack[mi]).is_lt() {
                                         min_idx = Some(start + i);
                                     }
                                 }

@@ -231,7 +231,7 @@ impl ScalarFunction for GreatestFunction {
         // Find the greatest value
         let mut greatest = &args[0];
         for arg in args.iter().skip(1) {
-            if arg > greatest {
+            if arg.cmp(greatest).is_gt() {
                 greatest = arg;
             }
         }
@@ -281,7 +281,7 @@ impl ScalarFunction for LeastFunction {
         // Find the smallest value
         let mut least = &args[0];
         for arg in args.iter().skip(1) {
-            if arg < least {
+            if arg.cmp(least).is_lt() {
                 least = arg;
             }
         }
