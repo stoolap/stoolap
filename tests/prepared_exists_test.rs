@@ -177,8 +177,8 @@ fn test_exists_belongs_to_the_family_wherever_where_holds_it() {
         ),
         // The WHERE reads the alias, so the SELECT list's forms count
         (
-            "SELECT id FROM t WHERE EXISTS (SELECT u.k IN (SELECT k FROM w) AS x FROM u WHERE x)",
-            "IN (subquery)",
+            "SELECT id FROM t WHERE EXISTS (SELECT (u.k, u.id) IN (SELECT k, id FROM w) AS x FROM u WHERE x)",
+            "a tuple on the left of IN (subquery)",
         ),
     ] {
         assert_eq!(
@@ -319,15 +319,18 @@ fn test_the_rule_probes_for_few_outer_rows_or_a_small_limit_on_an_index() {
         .unwrap();
     let pure = "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM big WHERE big.k = t.k) ORDER BY id";
     let limited = "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k) LIMIT 2";
-    // Whether the run took the keyed set: it looked keys up and probed none
+    // Whether the run took the keyed set: it looked keys up or read the
+    // statement's rows by them, and probed none
     let keyed = |sql: &str, expected: Vec<i64>| {
         let (probes, _, lookups) = prepared_exists_counts();
+        let narrowed = prepared_rows_narrowed();
         assert_eq!(ids(&db, sql), expected, "{sql}");
         let (after_probes, _, after_lookups) = prepared_exists_counts();
-        match (after_probes > probes, after_lookups > lookups) {
+        let used = after_lookups > lookups || prepared_rows_narrowed() > narrowed;
+        match (after_probes > probes, used) {
             (false, true) => true,
             (true, false) => false,
-            other => panic!("{sql} probed and looked up: {other:?}"),
+            other => panic!("{sql} probed and used the set: {other:?}"),
         }
     };
     assert!(keyed(pure, vec![1, 2, 4, 5]), "{pure} without an index");

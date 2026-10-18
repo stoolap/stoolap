@@ -914,12 +914,11 @@ impl Executor {
         limit_here && row_counts(stmt, ctx).is_ok_and(|counts| counts.limit.is_some())
     }
 
-    /// The rows whose `column` is one of `members`, on a table
-    /// `in_members_eligible` admits and with no LIMIT applying here: the
-    /// B-tree's candidates under one capture, each row read and checked
-    /// against the members, else with `scan` a scan with the same check,
-    /// else None. The filter `remaining` gives is asked for only when the
-    /// rows are read here
+    /// The rows whose `column` is one of `members`, with no LIMIT applying
+    /// here: on a table `in_members_eligible` admits, the B-tree's
+    /// candidates under one capture, each row read and checked against the
+    /// members; else with `scan` a scan with the same check, else None. The
+    /// filter `remaining` gives is asked for only when the rows are read here
     fn in_member_rows(
         table: &dyn Table,
         column: &str,
@@ -932,15 +931,20 @@ impl Executor {
         let mut membership = InListExpr::new(column, members);
         membership.prepare_for_schema(table.schema());
         let mut ids = Vec::new();
-        #[cfg(any(test, feature = "test-failpoints"))]
-        crate::test_failpoints::in_members_probed();
-        let found = table.equality_candidates_in(
-            column,
-            membership.values(),
-            IN_CANDIDATE_CAP,
-            &mut ids,
-            &mut ProbeScratch::default(),
-        )?;
+        // A table `in_members_eligible` refuses is not asked, only scanned
+        let found = if Self::in_members_eligible(table, column) {
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::in_members_probed();
+            table.equality_candidates_in(
+                column,
+                membership.values(),
+                IN_CANDIDATE_CAP,
+                &mut ids,
+                &mut ProbeScratch::default(),
+            )?
+        } else {
+            None
+        };
         if found == Some(CappedEqual::Copied) {
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::in_members_read(false);
@@ -1022,6 +1026,38 @@ impl Executor {
         epoch.is_some() && table.index_view_epoch() == epoch
     }
 
+    /// A set's members as the comparison reads them against a column of
+    /// `column_type`, for a probe of the column to look up, and whether one
+    /// is UNKNOWN to every number. None where a probe's equality is not the
+    /// comparison's: a member outside the column's domain (a BOOLEAN against
+    /// a number, a number against TEXT), or a column of another type
+    pub(crate) fn members_for_column(
+        column_type: Option<DataType>,
+        set: &PredicateSet,
+    ) -> Option<(CompactArc<ValueSet>, bool)> {
+        // Read from the set's own summary: no member is visited here
+        let domain = match column_type {
+            // TEXT members a number column reads as numbers
+            Some(DataType::Integer | DataType::Float) => {
+                PredicateSet::INTEGER | PredicateSet::FLOAT | PredicateSet::TEXT
+            }
+            Some(DataType::Text) => PredicateSet::TEXT,
+            Some(DataType::Boolean) => PredicateSet::BOOLEAN,
+            Some(DataType::Timestamp) => PredicateSet::TIMESTAMP,
+            _ => 0,
+        };
+        if set.kinds() & !domain != 0 {
+            return None;
+        }
+        match column_type {
+            Some(DataType::Integer | DataType::Float) if set.has_text() => {
+                let (numbers, unknown) = numeric_members(set.members().iter());
+                Some((CompactArc::new(numbers.into_iter().collect()), unknown))
+            }
+            _ => Some((CompactArc::clone(set.members()), false)),
+        }
+    }
+
     /// Whether `column` is the table's one-column primary key
     fn is_primary_key(table: &dyn Table, column: &str) -> bool {
         let schema = table.schema();
@@ -1030,9 +1066,10 @@ impl Executor {
     }
 
     /// The rows whose `column` is one of `members`, each of the column's
-    /// type, read by the primary key, the column's index or the table's
-    /// candidates; None when none of them answers. Under a LIMIT the
-    /// candidates do not answer, and `target` rows, when given, are enough
+    /// type, read by the primary key, the column's index, or the table's
+    /// candidates and else a scan that keeps the members' rows; None when
+    /// none of them answers. Under a LIMIT the last two do not, and
+    /// `target` rows, when given, are enough
     pub(crate) fn rows_of_members<'v>(
         table: &dyn Table,
         column: &str,
@@ -1053,9 +1090,15 @@ impl Executor {
             if !Self::index_members(table, index.as_ref(), members, target, &mut ids) {
                 return Ok(None);
             }
-        } else if !limited && Self::in_members_eligible(table, column) {
-            let members = members.cloned().collect();
-            return Self::in_member_rows(table, column, members, || Ok(None), false);
+        } else if !limited {
+            // The scan's check reads a member as the column's type, so only
+            // members of that type keep the comparison's equality
+            let column_type = table.schema().get_column_type(column);
+            let members: Vec<Value> = members.cloned().collect();
+            if members.iter().any(|v| Some(v.data_type()) != column_type) {
+                return Ok(None);
+            }
+            return Self::in_member_rows(table, column, members, || Ok(None), true);
         } else {
             return Ok(None);
         }
@@ -1947,30 +1990,22 @@ impl Executor {
             return Ok(None);
         }
 
-        // The members as the comparison reads them against the column. A
-        // member UNKNOWN to every number leaves NOT IN true for no row and is
-        // no match to NOT EXISTS; a TEXT column is not probed for a non-TEXT
-        // member
-        let values: CompactArc<ValueSet> = match schema.get_column_type(&column_name) {
-            Some(DataType::Integer | DataType::Float) if values.has_text() => {
-                let (numbers, unknown) = numeric_members(values.members().iter());
-                if test == SetTest::NotIn && unknown {
-                    let output_columns = CompactArc::new(self.get_output_column_names(
-                        &stmt.columns,
-                        all_columns,
-                        table_alias,
-                    ));
-                    let result = ExecutorResult::with_arc_columns(
-                        CompactArc::clone(&output_columns),
-                        RowVec::new(),
-                    );
-                    return Ok(Some((Box::new(result), output_columns, true)));
-                }
-                CompactArc::new(numbers.into_iter().collect::<ValueSet>())
-            }
-            Some(DataType::Text) if values.has_non_text() => return Ok(None),
-            _ => CompactArc::clone(values.members()),
+        let Some((values, unknown)) =
+            Self::members_for_column(schema.get_column_type(&column_name), &values)
+        else {
+            return Ok(None);
         };
+        // A member UNKNOWN to every number leaves NOT IN true for no row
+        if test == SetTest::NotIn && unknown {
+            let output_columns = CompactArc::new(self.get_output_column_names(
+                &stmt.columns,
+                all_columns,
+                table_alias,
+            ));
+            let result =
+                ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), RowVec::new());
+            return Ok(Some((Box::new(result), output_columns, true)));
+        }
 
         // If not PK, check for index (only for non-negated IN); a table that
         // keeps rows outside its index reads the members by its candidates,

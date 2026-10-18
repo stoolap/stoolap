@@ -1020,16 +1020,8 @@ fn test_classifier_rules() {
     }
     let no = [
         (
-            "SELECT id FROM t WHERE id IN (SELECT id FROM u)".to_string(),
-            "IN (subquery)",
-        ),
-        (
-            "SELECT id FROM t WHERE a > ANY (SELECT v FROM u)".to_string(),
-            "ANY or ALL",
-        ),
-        (
-            "SELECT id FROM t WHERE a > ALL (SELECT v FROM u)".to_string(),
-            "ANY or ALL",
+            "SELECT id FROM t WHERE (id, a) IN (SELECT id, v FROM u)".to_string(),
+            "a tuple on the left of IN (subquery)",
         ),
         (
             format!("SELECT DISTINCT id FROM t WHERE a > {sq}"),

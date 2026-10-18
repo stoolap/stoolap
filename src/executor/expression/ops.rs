@@ -885,6 +885,18 @@ impl QuantifiedMembers {
         }
     }
 
+    /// `value op member` by the comparison contract; None is UNKNOWN
+    pub fn compares(op: CompareOp, value: &Value, member: &Value) -> Option<bool> {
+        match op {
+            CompareOp::Eq => sql_eq(value, member),
+            CompareOp::Ne => sql_eq(value, member).map(|eq| !eq),
+            CompareOp::Lt => sql_compare(value, member).map(|o| o.is_lt()),
+            CompareOp::Le => sql_compare(value, member).map(|o| o.is_le()),
+            CompareOp::Gt => sql_compare(value, member).map(|o| o.is_gt()),
+            CompareOp::Ge => sql_compare(value, member).map(|o| o.is_ge()),
+        }
+    }
+
     /// The operator a quantified comparison is written with
     pub fn operator(written: &str) -> Option<CompareOp> {
         Some(match written {
@@ -914,14 +926,7 @@ impl QuantifiedMembers {
             }
             _ => None,
         };
-        let by_contract = |member: &Value, value: &Value| match self.op {
-            CompareOp::Eq => sql_eq(value, member),
-            CompareOp::Ne => sql_eq(value, member).map(|eq| !eq),
-            CompareOp::Lt => sql_compare(value, member).map(|o| o.is_lt()),
-            CompareOp::Le => sql_compare(value, member).map(|o| o.is_le()),
-            CompareOp::Gt => sql_compare(value, member).map(|o| o.is_gt()),
-            CompareOp::Ge => sql_compare(value, member).map(|o| o.is_ge()),
-        };
+        let by_contract = |member: &Value, value: &Value| Self::compares(self.op, value, member);
         match self.bound.as_ref().zip(number) {
             Some((bound, number)) => match by_contract(bound, number) {
                 Some(result) if result == decides => return Some(decides),
