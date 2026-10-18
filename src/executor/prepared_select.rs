@@ -47,7 +47,7 @@ use super::result::ExecutorResult;
 use super::utils::{
     extract_literal_value, flip_operator, infix_to_operator, is_aggregate_function,
 };
-use super::volatility::expression_volatility;
+use super::volatility::{expression_volatility, statement_volatility_in};
 use super::Executor;
 
 /// Scopes one chain may hold: a block's own table and every enclosing one
@@ -909,6 +909,9 @@ struct PreparedSubquery {
     candidates: Option<SharedProgram>,
     /// The WHERE; for an EXISTS block, what of it the candidates leave
     filter: Option<SharedProgram>,
+    /// An EXISTS block's `filter` by conjunct, with the slots each reads:
+    /// asked in its place when a slot's value raised an error
+    rest: Vec<(SharedProgram, SmallVec<[usize; 2]>)>,
     answer: Answer,
     /// The subquery whose row this one runs for; None for the statement's row
     parent: Option<u16>,
@@ -930,6 +933,9 @@ struct Narrowing {
     /// NOT EXISTS: the rows its keys do not name
     negated: bool,
 }
+
+/// Slots whose value raised an error, each with its error
+type FailedSlots = SmallVec<[(usize, Error); 1]>;
 
 /// One slot's value over the row a subquery runs for
 #[derive(Debug)]
@@ -963,6 +969,9 @@ struct Existence {
     /// The block as written: what a result kept across statements is of
     identity: Arc<Expression>,
     identity_key: ExprKey,
+    /// The enclosing scopes' names, columns and types, which decide what
+    /// each name of the block binds to
+    scopes: Arc<str>,
     /// Every table the block and the blocks in it read
     tables: Vec<SmartString>,
     /// Its candidates grouped by key once per run, when that answers as the probe
@@ -1418,7 +1427,7 @@ impl Builder<'_> {
             })?),
             Some(exists) => {
                 let identity = Expression::Exists(exists.clone());
-                let keyed = self.keyed(&chain, &keys, &work, &identity).then(|| {
+                let keyed = self.keyed(&chain, &keys, &work, sq).then(|| {
                     let mut pushdown = Vec::new();
                     let mut pushed_whole = true;
                     let mut parts = Vec::new();
@@ -1441,15 +1450,34 @@ impl Builder<'_> {
                         pure: filter.is_none(),
                     }
                 });
+                let mut scopes = String::new();
+                for scope in outer {
+                    scopes.push_str(&scope.name);
+                    for (column, data_type) in scope.lower.iter().zip(&scope.types) {
+                        scopes.push_str(&format!("\u{0}{column}:{data_type:?}"));
+                    }
+                    scopes.push('\u{1}');
+                }
                 Answer::Exists(Existence {
                     identity_key: ExprKey::of(&identity),
                     identity: Arc::new(identity),
+                    scopes: Arc::from(scopes),
                     tables: vec![ts.name.value_lower.clone()],
                     keyed,
                 })
             }
         };
         let candidates = compile(&candidates)?;
+        let mut rest = Vec::new();
+        if let (Some(_), Some(filter)) = (exists, &filter) {
+            let mut parts = Vec::new();
+            conjuncts(filter, &mut parts);
+            for part in parts {
+                let mut slots = SmallVec::new();
+                slots_read(part, &mut slots);
+                rest.push((compile_with(&own, part)?, slots));
+            }
+        }
         let filter = compile(&filter)?;
         let holes = if work.holes.is_empty() {
             Vec::new()
@@ -1475,6 +1503,7 @@ impl Builder<'_> {
             pushed_whole,
             candidates,
             filter,
+            rest,
             answer,
             parent,
             holes,
@@ -1492,7 +1521,7 @@ impl Builder<'_> {
         chain: &Chain<'_>,
         keys: &[((usize, usize, usize), usize)],
         work: &Rewritten,
-        identity: &Expression,
+        block: &SelectStatement,
     ) -> bool {
         let key_slot = |slot: usize| keys.iter().any(|(_, key)| *key == slot);
         !keys.is_empty()
@@ -1513,7 +1542,9 @@ impl Builder<'_> {
                 .holes
                 .iter()
                 .all(|(slot, hole)| key_slot(*slot) || !reads_row_column(hole))
-            && !volatile(identity, &self.executor.function_registry)
+            // The block's own: around it an EXISTS counts once per statement
+            && statement_volatility_in(block, &self.executor.function_registry, &|_| false)
+                != Volatility::PerCall
     }
 }
 
@@ -1539,6 +1570,23 @@ fn correlation_key(
             _ => None,
         },
     )
+}
+
+/// Every positional parameter or slot `expr` reads, zero-based
+fn slots_read(expr: &Expression, out: &mut SmallVec<[usize; 2]>) {
+    match expr {
+        Expression::Parameter(p) if p.index > 0 && !p.name.starts_with(':') => {
+            if !out.contains(&(p.index - 1)) {
+                out.push(p.index - 1);
+            }
+        }
+        other => {
+            let _ = for_each_child(other, &mut |child| {
+                slots_read(child, out);
+                Ok(())
+            });
+        }
+    }
 }
 
 /// The slot a rewritten correlation equality compares its own column with
@@ -2248,6 +2296,9 @@ pub(crate) struct PreparedRunner<'a> {
     /// Each keyed EXISTS block's choice for this run, once made
     keyed_choice: Vec<std::cell::Cell<Option<bool>>>,
     keyed_sets: Vec<RefCell<Option<CompactArc<ExistsKeys>>>>,
+    /// Each subquery's slots whose value raised an error for this call,
+    /// its parent's included: an EXISTS block raises one only on a candidate
+    failed: Vec<RefCell<FailedSlots>>,
     /// The statement's parameters, then its run slots; the other slots NULL
     base: ParamVec,
     named: &'a FxHashMap<String, Value>,
@@ -2303,6 +2354,7 @@ impl<'a> PreparedRunner<'a> {
             statement_limit,
             keyed_choice: (0..count).map(|_| std::cell::Cell::new(None)).collect(),
             keyed_sets: (0..count).map(|_| RefCell::new(None)).collect(),
+            failed: (0..count).map(|_| RefCell::new(SmallVec::new())).collect(),
             buffers: (0..count).map(|_| RefCell::new(base.clone())).collect(),
             base,
             named: ctx.named_params(),
@@ -2399,6 +2451,8 @@ impl<'a> PreparedRunner<'a> {
         {
             let mut vm = self.vms[index].borrow_mut();
             let mut params = self.buffers[index].borrow_mut();
+            let mut failed = self.failed[index].borrow_mut();
+            failed.clear();
             let empty = Row::new();
             let exec = ExecuteContext::with_common_params(
                 &empty,
@@ -2408,7 +2462,13 @@ impl<'a> PreparedRunner<'a> {
             );
             for (slot, hole) in &sq.holes {
                 if !plan.keys.iter().any(|(_, key, _)| key == slot) {
-                    params[*slot] = hole.value(&mut vm, &empty, &exec)?;
+                    match hole.value(&mut vm, &empty, &exec) {
+                        Ok(value) => params[*slot] = value,
+                        Err(e) => {
+                            params[*slot] = Value::null_unknown();
+                            failed.push((*slot, e));
+                        }
+                    }
                 }
             }
         }
@@ -2437,8 +2497,11 @@ impl<'a> PreparedRunner<'a> {
     fn fill(&self, index: usize, vm: &mut ExprVM, row: &Row) -> Result<()> {
         let sq = &self.prepared.subqueries[index];
         let mut params = self.buffers[index].borrow_mut();
+        let mut failed = self.failed[index].borrow_mut();
+        failed.clear();
         if let Some(parent) = sq.parent {
             params.clone_from(&self.buffers[parent as usize].borrow());
+            failed.extend(self.failed[parent as usize].borrow().iter().cloned());
         }
         let hole_ctx = ExecuteContext::with_common_params(
             row,
@@ -2447,9 +2510,49 @@ impl<'a> PreparedRunner<'a> {
             self.transaction_id,
         );
         for (slot, hole) in &sq.holes {
-            params[*slot] = hole.value(vm, row, &hole_ctx)?;
+            match hole.value(vm, row, &hole_ctx) {
+                Ok(value) => params[*slot] = value,
+                Err(e) => {
+                    params[*slot] = Value::null_unknown();
+                    failed.push((*slot, e));
+                }
+            }
         }
-        Ok(())
+        match (&sq.answer, failed.first()) {
+            (Answer::Value(_), Some((_, e))) => Err(e.clone()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether a candidate passes what the correlation equalities leave of
+    /// the WHERE. With a slot failed, each conjunct is asked in turn as the
+    /// conjunction asks it, and one that reads the slot raises its error
+    fn passes_rest(
+        &self,
+        sq: &PreparedSubquery,
+        vm: &mut ExprVM,
+        exec: &ExecuteContext,
+        failed: &[(usize, Error)],
+    ) -> Result<bool> {
+        if failed.is_empty() {
+            return match &sq.filter {
+                Some(filter) => vm.execute_bool_checked(filter, exec),
+                None => Ok(true),
+            };
+        }
+        let mut unknown = false;
+        for (program, slots) in &sq.rest {
+            if let Some((_, e)) = failed.iter().find(|(slot, _)| slots.contains(slot)) {
+                return Err(e.clone());
+            }
+            match vm.execute(program, exec)? {
+                Value::Boolean(true) => {}
+                Value::Integer(i) if i != 0 => {}
+                Value::Null(_) => unknown = true,
+                _ => return Ok(false),
+            }
+        }
+        Ok(!unknown)
     }
 
     /// Whether an EXISTS block's candidate passes for the buffer filled:
@@ -2462,8 +2565,10 @@ impl<'a> PreparedRunner<'a> {
         let sq = &self.prepared.subqueries[index];
         let mut vm = self.vms[index].borrow_mut();
         let params = self.buffers[index].borrow();
+        let slots_failed = self.failed[index].borrow();
         let table = &*self.tables[index];
-        let pushed = self.bind_pushdown(index, &params);
+        // A failed slot holds NULL, which the scan must not compare with
+        let pushed = slots_failed.is_empty() && self.bind_pushdown(index, &params);
         let mut scanner = if pushed {
             let bound = self.bound[index].borrow();
             table.scan(&sq.column_indices, bound.as_ref().map(BoundPushdown::expr))?
@@ -2486,14 +2591,12 @@ impl<'a> PreparedRunner<'a> {
                         continue;
                     }
                 }
-                if let Some(filter) = &sq.filter {
-                    match vm.execute_bool_checked(filter, &exec) {
-                        Ok(true) => {}
-                        Ok(false) => continue,
-                        Err(e) => {
-                            failed.get_or_insert(e);
-                            continue;
-                        }
+                match self.passes_rest(sq, &mut vm, &exec, &slots_failed) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(e) => {
+                        failed.get_or_insert(e);
+                        continue;
                     }
                 }
             }
@@ -2608,19 +2711,22 @@ impl<'a> PreparedRunner<'a> {
         let sq = &self.prepared.subqueries[index];
         let mut vm = self.vms[index].borrow_mut();
         let params = self.buffers[index].borrow();
+        let slots_failed = self.failed[index].borrow();
         let values: Option<Vec<Value>> = plan
             .pushdown
             .iter()
             .map(|c| c.value(&params, self.named))
             .collect();
         let mut bound = None;
-        if let Some(values) = values.filter(|_| !plan.pushdown.is_empty()) {
+        if let Some(values) =
+            values.filter(|_| !plan.pushdown.is_empty() && slots_failed.is_empty())
+        {
             BoundPushdown::bind(&plan.pushdown, &mut bound, values);
         }
         let table = &*self.tables[index];
         let mut scanner =
             table.scan(&sq.column_indices, bound.as_ref().map(BoundPushdown::expr))?;
-        let decided = bound.is_some() && plan.pushed_whole;
+        let decided = sq.filter.is_none() || (bound.is_some() && plan.pushed_whole);
         let mut set = ExistsKeys::default();
         let mut scanned = 0u64;
         'rows: while scanner.next() {
@@ -2642,21 +2748,20 @@ impl<'a> PreparedRunner<'a> {
             ) {
                 continue;
             }
-            let outcome = match sq.filter.as_ref().filter(|_| !decided) {
-                None => ExistsOutcome::Passed,
-                Some(filter) => {
-                    let exec = ExecuteContext::with_common_params(
-                        row,
-                        &params,
-                        Some(self.named),
-                        self.transaction_id,
-                    )
-                    .with_subquery_executor(self);
-                    match vm.execute_bool_checked(filter, &exec) {
-                        Ok(true) => ExistsOutcome::Passed,
-                        Ok(false) => continue,
-                        Err(e) => ExistsOutcome::Failed(e),
-                    }
+            let outcome = if decided {
+                ExistsOutcome::Passed
+            } else {
+                let exec = ExecuteContext::with_common_params(
+                    row,
+                    &params,
+                    Some(self.named),
+                    self.transaction_id,
+                )
+                .with_subquery_executor(self);
+                match self.passes_rest(sq, &mut vm, &exec, &slots_failed) {
+                    Ok(true) => ExistsOutcome::Passed,
+                    Ok(false) => continue,
+                    Err(e) => ExistsOutcome::Failed(e),
                 }
             };
             match set.outcomes.entry(key) {
@@ -2700,6 +2805,7 @@ impl<'a> PreparedRunner<'a> {
         let origin = ExistsOrigin {
             block: &existence.identity,
             block_key: existence.identity_key,
+            scopes: &existence.scopes,
             params: statement.params(),
             named_params: statement.named_params(),
         };

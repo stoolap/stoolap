@@ -612,3 +612,84 @@ fn test_an_in_family_statement_never_reaches_the_general_path() {
     assert_eq!(ids(&db, old).len(), 2);
     assert!(general_path_hits(GeneralPath::AntiJoin) > before, "{old}");
 }
+
+#[test]
+fn test_a_kept_answer_is_of_the_scopes_its_names_bound_in() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_exists_binding").unwrap();
+    for sql in [
+        "CREATE TABLE t1 (id INTEGER PRIMARY KEY, k INTEGER, p TEXT)",
+        "CREATE TABLE t2 (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)",
+        "INSERT INTO t1 VALUES (1, 1, 'p')",
+        "INSERT INTO t2 VALUES (1, 1)",
+        "INSERT INTO u VALUES (1, 1, 'p')",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    force_exists_strategy(Some(true));
+    // "p" is t1's column, and a TEXT literal over t2
+    for table in ["t1", "t2", "t1"] {
+        let sql = format!(
+            "SELECT id FROM {table} t WHERE id = 0 OR EXISTS (SELECT 1 FROM u WHERE u.a = t.k AND u.b = \"p\")"
+        );
+        assert_eq!(ids(&db, &sql), vec![1], "{sql}");
+    }
+}
+
+#[test]
+fn test_a_volatile_block_takes_no_keyed_set() {
+    let _guard = serial();
+    let db = setup("volatile");
+    force_exists_strategy(Some(true));
+    let sql = "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k AND RANDOM() < 2) ORDER BY id";
+    let (probes, built, _) = prepared_exists_counts();
+    assert_eq!(ids(&db, sql), vec![1, 2, 4]);
+    let (after_probes, after_built, _) = prepared_exists_counts();
+    assert_eq!(after_built, built, "{sql} built a keyed set");
+    assert!(after_probes > probes, "{sql} probed");
+}
+
+#[test]
+fn test_a_value_the_where_computes_raises_only_on_a_candidate() {
+    let _guard = serial();
+    let db = setup("hoisted");
+    db.execute(
+        "CREATE TABLE e (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    let rows = |sql: &str, param: i64| {
+        db.query(sql, (param,))
+            .and_then(|rows| {
+                rows.map(|row| row.map(|row| row.get::<i64>(0).unwrap()))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(|e| e.to_string())
+    };
+    for strategy in STRATEGIES {
+        force_exists_strategy(strategy);
+        for sql in [
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM e WHERE e.v > $1 * 9223372036854775807)",
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM e WHERE e.k = t.k AND e.v > $1 * 9223372036854775807)",
+            "SELECT id FROM t WHERE 1 = (SELECT 1 FROM w WHERE w.id = t.id AND EXISTS (SELECT 1 FROM e WHERE e.k = w.k AND e.v > $1 * 9223372036854775807))",
+        ] {
+            assert_eq!(rows(sql, 2), Ok(vec![]), "{sql} under {strategy:?}");
+        }
+        // u holds candidates for keys 1, 2 and 4: each raises
+        let sql = "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k AND u.v > $1 * 9223372036854775807)";
+        assert!(rows(sql, 2).is_err(), "{sql} under {strategy:?}");
+        assert_eq!(rows(sql, 1), Ok(vec![]), "{sql} under {strategy:?}");
+        // The value reads the outer row: key 5 has no candidate, key 2 has one
+        let correlated = "SELECT id FROM t WHERE t.id = $1 AND EXISTS (SELECT 1 FROM u WHERE u.k = t.k AND u.v > t.k * 9223372036854775807)";
+        assert_eq!(
+            rows(correlated, 5),
+            Ok(vec![]),
+            "{correlated} under {strategy:?}"
+        );
+        assert!(
+            rows(correlated, 2).is_err(),
+            "{correlated} under {strategy:?}"
+        );
+    }
+}

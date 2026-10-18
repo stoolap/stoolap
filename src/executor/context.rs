@@ -601,11 +601,13 @@ pub enum ExistsAnswer {
     Keyed(CompactArc<ExistsKeys>),
 }
 
-/// What a prepared EXISTS answer is of: the block as written, its key,
-/// and every parameter value of the statement
+/// What a prepared EXISTS answer is of: the block as written, its key, the
+/// scopes around it its names bind in, and every parameter value of the
+/// statement
 pub(crate) struct ExistsOrigin<'a> {
     pub block: &'a Arc<crate::parser::ast::Expression>,
     pub block_key: super::expr_key::ExprKey,
+    pub scopes: &'a Arc<str>,
     pub params: &'a [Value],
     pub named_params: &'a FxHashMap<String, Value>,
 }
@@ -613,6 +615,7 @@ pub(crate) struct ExistsOrigin<'a> {
 /// An `ExistsOrigin` as its cache entry keeps it
 struct KeptExistsOrigin {
     block: Arc<crate::parser::ast::Expression>,
+    scopes: Arc<str>,
     params: Vec<Value>,
     named_params: FxHashMap<String, Value>,
 }
@@ -622,6 +625,7 @@ impl ExistsOrigin<'_> {
     pub fn key(&self) -> u64 {
         let mut hasher = rustc_hash::FxHasher::default();
         self.block_key.hash(&mut hasher);
+        self.scopes.hash(&mut hasher);
         self.params.len().hash(&mut hasher);
         for value in self.params {
             hash_parameter(value, &mut hasher);
@@ -638,6 +642,7 @@ impl ExistsOrigin<'_> {
 
     fn is(&self, kept: &KeptExistsOrigin) -> bool {
         (Arc::ptr_eq(self.block, &kept.block) || **self.block == *kept.block)
+            && (Arc::ptr_eq(self.scopes, &kept.scopes) || **self.scopes == *kept.scopes)
             && kept.params.len() == self.params.len()
             && kept
                 .params
@@ -697,6 +702,7 @@ pub(crate) fn cache_exists_answer(
 ) {
     let kept = KeptExistsOrigin {
         block: Arc::clone(origin.block),
+        scopes: Arc::clone(origin.scopes),
         params: origin.params.to_vec(),
         named_params: origin.named_params.clone(),
     };
