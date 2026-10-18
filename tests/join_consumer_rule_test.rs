@@ -106,9 +106,27 @@ fn an_index_join_keeps_projections_column_order_and_aliases() {
     db.execute("INSERT INTO b VALUES (1, 1, 5), (2, 2, 6)", ())
         .unwrap();
     let renamed = "FROM b JOIN (SELECT id, v AS k FROM a) x ON b.aid = x.id";
+    let fewer = "FROM b JOIN (SELECT id, k FROM a) x ON b.aid = x.id";
+    let reordered = "FROM b JOIN (SELECT k, id FROM a) x ON b.aid = x.id";
     let swapped = "FROM b JOIN (SELECT id, k FROM a WHERE k = 1) x ON b.id = x.id";
     let aliased = "FROM a JOIN b ON a.id = b.aid WHERE total > a.v + b.w - 1";
-    let cases: [(String, Vec<&str>, Vec<&str>); 6] = [
+    let cases: [(String, Vec<&str>, Vec<&str>); 8] = [
+        (
+            format!("SELECT *, COUNT(*) OVER () {fewer}"),
+            vec!["b.id", "b.aid", "b.w", "x.id", "x.k", "COUNT()"],
+            vec![
+                "[Integer(1), Integer(1), Integer(5), Integer(1), Integer(10), Integer(2)]",
+                "[Integer(2), Integer(2), Integer(6), Integer(2), Integer(1), Integer(2)]",
+            ],
+        ),
+        (
+            format!("SELECT * {reordered}"),
+            vec!["b.id", "b.aid", "b.w", "x.k", "x.id"],
+            vec![
+                "[Integer(1), Integer(1), Integer(5), Integer(10), Integer(1)]",
+                "[Integer(2), Integer(2), Integer(6), Integer(1), Integer(2)]",
+            ],
+        ),
         (
             format!("SELECT x.k {renamed}"),
             vec!["k"],
@@ -190,11 +208,15 @@ fn explain_reports_the_index_join_under_an_aggregate() {
     );
     // The left primary key is probed only by the swap execution makes: not
     // from a right table nothing filters
-    db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, aid INTEGER)", ())
-        .unwrap();
+    db.execute(
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, aid INTEGER, flag INTEGER)",
+        (),
+    )
+    .unwrap();
     for sql in [
         "EXPLAIN SELECT a.id FROM a JOIN p ON a.id = p.aid",
         "EXPLAIN SELECT COUNT(*) FROM a JOIN p ON a.id = p.aid",
+        "EXPLAIN SELECT COUNT(*) FROM a JOIN p ON a.id = p.aid WHERE 1 = 1 AND p.flag > 0",
     ] {
         let plan: Vec<String> = db
             .query(sql, ())

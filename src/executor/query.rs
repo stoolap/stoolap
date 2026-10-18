@@ -194,6 +194,55 @@ fn same_outer_source(
     })
 }
 
+/// A join's WHERE split as execution pushes it: a filter for each side it
+/// may narrow, never the side an outer join pads with NULLs, and the rest,
+/// asked of the joined rows
+pub(crate) fn split_join_where(
+    where_clause: &Expression,
+    left_alias: Option<&str>,
+    right_alias: Option<&str>,
+    join_type: &str,
+) -> (Option<Expression>, Option<Expression>, Option<Expression>) {
+    let (Some(left_a), Some(right_a)) = (left_alias, right_alias) else {
+        return (None, None, Some(where_clause.clone()));
+    };
+    let (l, r, c) = partition_where_for_join(where_clause, left_a, right_a);
+
+    // For OUTER JOINs, we can't push filters to the NULL-padded side
+    // because rows that don't match need to appear with NULLs
+    let can_push_left = !join_type.contains("RIGHT") && !join_type.contains("FULL");
+    let can_push_right = !join_type.contains("LEFT") && !join_type.contains("FULL");
+
+    let safe_left = if can_push_left {
+        l.as_ref().map(|f| strip_table_qualifier(f, left_a))
+    } else {
+        None
+    };
+
+    let safe_right = if can_push_right {
+        r.as_ref().map(|f| strip_table_qualifier(f, right_a))
+    } else {
+        None
+    };
+
+    // Any filters we couldn't push need to be applied post-join
+    // If we pushed a filter, don't include it in remaining; otherwise include it
+    let unpushed_left = if !can_push_left { l } else { None };
+    let unpushed_right = if !can_push_right { r } else { None };
+
+    let remaining = match (unpushed_left, unpushed_right, c) {
+        (Some(l), Some(r), Some(c)) => combine_predicates_with_and(vec![l, r, c]),
+        (Some(l), Some(r), None) => combine_predicates_with_and(vec![l, r]),
+        (Some(l), None, Some(c)) => combine_predicates_with_and(vec![l, c]),
+        (None, Some(r), Some(c)) => combine_predicates_with_and(vec![r, c]),
+        (Some(l), None, None) => Some(l),
+        (None, Some(r), None) => Some(r),
+        (None, None, c) => c,
+    };
+
+    (safe_left, safe_right, remaining)
+}
+
 /// The side an index join probes, given what the right table offers
 /// (`unswapped`): an INNER join probes its left table instead from a right
 /// side that is not a table, or for a primary key when only the right side
@@ -4127,50 +4176,15 @@ impl Executor {
             }
             (where_clause, _) => where_clause,
         };
-        let (left_filter, right_filter, cross_filter) =
-            if let Some(where_clause) = where_for_join.as_ref() {
-                if let (Some(left_a), Some(right_a)) = (&left_alias, &right_alias) {
-                    let (l, r, c) = partition_where_for_join(where_clause, left_a, right_a);
-
-                    // For OUTER JOINs, we can't push filters to the NULL-padded side
-                    // because rows that don't match need to appear with NULLs
-                    let can_push_left = !join_type.contains("RIGHT") && !join_type.contains("FULL");
-                    let can_push_right = !join_type.contains("LEFT") && !join_type.contains("FULL");
-
-                    let safe_left = if can_push_left {
-                        l.as_ref().map(|f| strip_table_qualifier(f, left_a))
-                    } else {
-                        None
-                    };
-
-                    let safe_right = if can_push_right {
-                        r.as_ref().map(|f| strip_table_qualifier(f, right_a))
-                    } else {
-                        None
-                    };
-
-                    // Any filters we couldn't push need to be applied post-join
-                    // If we pushed a filter, don't include it in remaining; otherwise include it
-                    let unpushed_left = if !can_push_left { l } else { None };
-                    let unpushed_right = if !can_push_right { r } else { None };
-
-                    let remaining = match (unpushed_left, unpushed_right, c) {
-                        (Some(l), Some(r), Some(c)) => combine_predicates_with_and(vec![l, r, c]),
-                        (Some(l), Some(r), None) => combine_predicates_with_and(vec![l, r]),
-                        (Some(l), None, Some(c)) => combine_predicates_with_and(vec![l, c]),
-                        (None, Some(r), Some(c)) => combine_predicates_with_and(vec![r, c]),
-                        (Some(l), None, None) => Some(l),
-                        (None, Some(r), None) => Some(r),
-                        (None, None, c) => c,
-                    };
-
-                    (safe_left, safe_right, remaining)
-                } else {
-                    (None, None, Some(where_clause.clone()))
-                }
-            } else {
-                (None, None, None)
-            };
+        let (left_filter, right_filter, cross_filter) = match where_for_join.as_ref() {
+            Some(where_clause) => split_join_where(
+                where_clause,
+                left_alias.as_deref(),
+                right_alias.as_deref(),
+                &join_type,
+            ),
+            None => (None, None, None),
+        };
 
         // Semi-join reduction optimization for LEFT JOIN + GROUP BY + LIMIT
         // Pattern: LEFT JOIN + GROUP BY on left columns only + LIMIT N + no ORDER BY
@@ -11353,12 +11367,11 @@ impl Executor {
         }
         let (right_filter_present, filters_have_subquery) = match &stmt.where_clause {
             Some(where_clause) => {
-                let (_, right, _) = super::explain::partition_where_for_explain(
+                let (_, right, _) = split_join_where(
                     where_clause,
-                    &join.left,
-                    &join.right,
-                    &join.join_type,
-                    self.engine.as_ref(),
+                    get_table_alias_from_expr(&join.left).as_deref(),
+                    get_table_alias_from_expr(&join.right).as_deref(),
+                    &join_type,
                 );
                 (right.is_some(), Self::filter_has_subquery(where_clause))
             }
@@ -11636,28 +11649,45 @@ impl Executor {
             return None;
         }
 
-        // Every output column must be a table column under its own name: the
-        // probe reads the table, not a column the subquery renamed or computed
-        let passthrough = |column: &Expression| match column {
-            Expression::Star(_)
-            | Expression::QualifiedStar(_)
-            | Expression::Identifier(_)
-            | Expression::QualifiedIdentifier(_) => true,
-            Expression::Aliased(aliased) => match aliased.expression.as_ref() {
-                Expression::Identifier(id) => id.value_lower == aliased.alias.value_lower,
-                Expression::QualifiedIdentifier(q) => {
-                    q.name.value_lower == aliased.alias.value_lower
-                }
-                _ => false,
-            },
-            _ => false,
-        };
-        if !stmt.columns.iter().all(passthrough) {
-            return None;
-        }
-
         // Must have a table expression that is a simple TableSource
-        index_join_table_name(stmt.table_expr.as_ref()?)
+        let table = index_join_table_name(stmt.table_expr.as_ref()?)?;
+
+        // The probe returns the table's columns in the table's order, so the
+        // subquery must select exactly those, each under its own name
+        if !matches!(
+            stmt.columns.as_slice(),
+            [Expression::Star(_)] | [Expression::QualifiedStar(_)]
+        ) {
+            let schema = self.engine.get_table_schema(&table).ok()?;
+            let own_name = |column: &Expression| match column {
+                Expression::Identifier(id) => Some(id.value_lower.to_string()),
+                Expression::QualifiedIdentifier(q) => Some(q.name.value_lower.to_string()),
+                Expression::Aliased(aliased) => match aliased.expression.as_ref() {
+                    Expression::Identifier(id) if id.value_lower == aliased.alias.value_lower => {
+                        Some(id.value_lower.to_string())
+                    }
+                    Expression::QualifiedIdentifier(q)
+                        if q.name.value_lower == aliased.alias.value_lower =>
+                    {
+                        Some(q.name.value_lower.to_string())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            let same = stmt.columns.len() == schema.columns.len()
+                && stmt
+                    .columns
+                    .iter()
+                    .zip(&schema.columns)
+                    .all(|(column, table_column)| {
+                        own_name(column).is_some_and(|name| name == table_column.name_lower)
+                    });
+            if !same {
+                return None;
+            }
+        }
+        Some(table)
     }
 
     /// Build an IN filter expression: column_name IN (v1, v2, ..., vN)

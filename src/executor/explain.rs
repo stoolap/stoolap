@@ -30,9 +30,12 @@ use super::operators::index_nested_loop::IndexLookupStrategy;
 use super::parallel;
 use super::planner::{QueryPlanner, RuntimeJoinAlgorithm};
 use super::pushdown;
-use super::query::{pick_index_join_side, JoinIndexUse};
+use super::query::{pick_index_join_side, split_join_where, JoinIndexUse};
 use super::result::ExecutorResult;
-use super::utils::{collect_table_qualifiers, combine_predicates_with_and, flatten_and_predicates};
+use super::utils::{
+    collect_table_qualifiers, combine_predicates_with_and, flatten_and_predicates,
+    get_table_alias_from_expr,
+};
 use super::Executor;
 
 impl Executor {
@@ -1010,12 +1013,11 @@ impl Executor {
             } else {
                 let (left_filtered, right_filtered) = match where_clause {
                     Some(where_clause) => {
-                        let (left, right, _) = partition_where_for_explain(
+                        let (left, right, _) = split_join_where(
                             where_clause,
-                            join_left,
-                            join_right,
-                            join_type,
-                            self.engine.as_ref(),
+                            get_table_alias_from_expr(join_left).as_deref(),
+                            get_table_alias_from_expr(join_right).as_deref(),
+                            &join_type_upper,
                         );
                         (left.is_some(), right.is_some())
                     }
