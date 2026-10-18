@@ -410,3 +410,92 @@ fn test_a_top_level_set_test_reads_only_the_rows_its_members_name() {
         "SELECT id FROM big WHERE k IN (SELECT v FROM u WHERE u.d * 9223372036854775807 > 0)";
     assert!(ids(&db, failing).is_err(), "{failing}");
 }
+
+#[test]
+fn test_a_probe_reads_only_members_its_equality_answers() {
+    let _guard = serial();
+    let db = setup("domains");
+    db.execute(
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, flag BOOLEAN, n FLOAT)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO b VALUES (1, TRUE, 1.5), (2, FALSE, 4.0)", ())
+        .unwrap();
+    db.execute("CREATE TABLE j (id INTEGER PRIMARY KEY, doc JSON)", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO j VALUES (1, '{\"a\":1}'), (2, '{\"a\":2}')",
+        (),
+    )
+    .unwrap();
+    for (sql, expected) in [
+        // A BOOLEAN is no number: TRUE equals no k
+        (
+            "SELECT id FROM t WHERE k IN (SELECT flag FROM b) ORDER BY id",
+            vec![],
+        ),
+        (
+            "SELECT id FROM t WHERE k NOT IN (SELECT flag FROM b) ORDER BY id",
+            vec![1, 2, 4, 5],
+        ),
+        (
+            "SELECT id FROM t WHERE id IN (SELECT flag FROM b) ORDER BY id",
+            vec![],
+        ),
+        // 1.5 equals no integer, 4.0 equals 4
+        (
+            "SELECT id FROM t WHERE k IN (SELECT n FROM b) ORDER BY id",
+            vec![4],
+        ),
+        (
+            "SELECT id FROM t WHERE id IN (SELECT n FROM b) ORDER BY id",
+            vec![4],
+        ),
+    ] {
+        assert_eq!(ids(&db, sql), Ok(expected), "{sql}");
+    }
+    let json = "SELECT id FROM j WHERE doc IN (SELECT doc FROM j WHERE id = 2) ORDER BY id";
+    let general =
+        "SELECT DISTINCT id FROM j WHERE doc IN (SELECT doc FROM j WHERE id = 2) ORDER BY id";
+    assert_eq!(ids(&db, json), ids(&db, general), "{json}");
+}
+
+#[test]
+fn test_a_long_probe_sees_its_statement_cancelled() {
+    use stoolap::test_failpoints::{before_prepared_exists, before_prepared_scalar};
+    let _guard = serial();
+    let db = setup("cancel");
+    db.execute(
+        "CREATE TABLE big (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO big SELECT value, 1, value FROM generate_series(1, 5000)",
+        (),
+    )
+    .unwrap();
+    let executor = stoolap::Executor::new(std::sync::Arc::clone(db.engine()));
+    force_exists_strategy(Some(false));
+    for (sql, scalar) in [
+        ("SELECT id FROM t WHERE t.id = 1 AND 10000 > ALL (SELECT v FROM big WHERE big.k = t.k)", false),
+        // `v * 1 < 0` is no comparison the scan takes, so every row reaches the probe
+        ("SELECT id FROM t WHERE t.id = 1 AND EXISTS (SELECT 1 FROM big WHERE big.k = t.k AND big.v * 1 < 0)", false),
+        ("SELECT id FROM t WHERE t.id = 1 AND 0 = (SELECT v FROM big WHERE big.k = t.k AND big.v * 1 < 0)", true),
+    ] {
+        let ctx = stoolap::ExecutionContext::new();
+        let handle = ctx.clone();
+        if scalar {
+            before_prepared_scalar(move || handle.cancel());
+        } else {
+            before_prepared_exists(move || handle.cancel());
+        }
+        let result = executor.execute_with_context(sql, &ctx);
+        assert!(
+            matches!(result, Err(stoolap::Error::QueryCancelled)),
+            "{sql}: {:?}",
+            result.map(|_| ())
+        );
+    }
+}

@@ -1028,20 +1028,33 @@ impl Executor {
 
     /// A set's members as the comparison reads them against a column of
     /// `column_type`, for a probe of the column to look up, and whether one
-    /// is UNKNOWN to every number; None for a TEXT column with a non-TEXT
-    /// member, which no probe answers
+    /// is UNKNOWN to every number. None where a probe's equality is not the
+    /// comparison's: a member outside the column's domain (a BOOLEAN against
+    /// a number, a number against TEXT), or a column of another type
     pub(crate) fn members_for_column(
         column_type: Option<DataType>,
         set: &PredicateSet,
     ) -> Option<(CompactArc<ValueSet>, bool)> {
-        match column_type {
+        let in_domain = |value: &Value| match column_type {
+            Some(DataType::Integer | DataType::Float) => {
+                matches!(value, Value::Integer(_) | Value::Float(_))
+            }
+            Some(DataType::Text) => matches!(value, Value::Text(_)),
+            Some(DataType::Boolean) => matches!(value, Value::Boolean(_)),
+            Some(DataType::Timestamp) => matches!(value, Value::Timestamp(_)),
+            _ => false,
+        };
+        let (members, unknown) = match column_type {
             Some(DataType::Integer | DataType::Float) if set.has_text() => {
                 let (numbers, unknown) = numeric_members(set.members().iter());
-                Some((CompactArc::new(numbers.into_iter().collect()), unknown))
+                (CompactArc::new(numbers.into_iter().collect()), unknown)
             }
-            Some(DataType::Text) if set.has_non_text() => None,
-            _ => Some((CompactArc::clone(set.members()), false)),
-        }
+            _ => (CompactArc::clone(set.members()), false),
+        };
+        members
+            .iter()
+            .all(|v| v.is_null() || in_domain(v))
+            .then_some((members, unknown))
     }
 
     /// Whether `column` is the table's one-column primary key
@@ -1077,7 +1090,13 @@ impl Executor {
                 return Ok(None);
             }
         } else if !limited {
-            let members = members.cloned().collect();
+            // The scan's check reads a member as the column's type, so only
+            // members of that type keep the comparison's equality
+            let column_type = table.schema().get_column_type(column);
+            let members: Vec<Value> = members.cloned().collect();
+            if members.iter().any(|v| Some(v.data_type()) != column_type) {
+                return Ok(None);
+            }
             return Self::in_member_rows(table, column, members, || Ok(None), true);
         } else {
             return Ok(None);

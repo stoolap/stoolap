@@ -2798,7 +2798,12 @@ impl<'a> PreparedRunner<'a> {
         };
         let decided = pushed && sq.pushed_whole;
         let mut failed = None;
+        let mut scanned = 0u64;
         while scanner.next() {
+            scanned += 1;
+            if scanned.is_multiple_of(100) {
+                self.ctx.check_cancelled()?;
+            }
             if !decided {
                 let exec = ExecuteContext::with_common_params(
                     scanner.row(),
@@ -3083,7 +3088,12 @@ impl SubqueryExecutor for PreparedRunner<'_> {
         };
         let filter = sq.filter.as_ref().filter(|_| !(pushed && sq.pushed_whole));
         let mut value = None;
+        let mut scanned = 0u64;
         while scanner.next() {
+            scanned += 1;
+            if scanned.is_multiple_of(100) {
+                self.ctx.check_cancelled()?;
+            }
             let exec = ExecuteContext::with_common_params(
                 scanner.row(),
                 &params,
@@ -3294,7 +3304,12 @@ impl PreparedRunner<'_> {
             MemberTest::Quantified(op, all) => (op, !all),
         };
         let (mut any, mut unknown, mut failed) = (false, false, None);
+        let mut scanned = 0u64;
         while scanner.next() {
+            scanned += 1;
+            if scanned.is_multiple_of(100) {
+                self.ctx.check_cancelled()?;
+            }
             let exec = ExecuteContext::with_common_params(
                 scanner.row(),
                 &params,
