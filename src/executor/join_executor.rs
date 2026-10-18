@@ -45,8 +45,8 @@
 //! This executor uses a **hybrid approach** that dynamically chooses between
 //! Volcano-style streaming and parallel bulk processing based on query characteristics:
 //!
-//! ### Streaming Volcano Path (default for small datasets or small LIMIT)
-//! - **When**: Build side < 10,000 rows OR LIMIT ≤ 1,000
+//! ### Streaming Volcano Path (default for small datasets or any LIMIT)
+//! - **When**: Build side < 10,000 rows OR a LIMIT
 //! - **Benefits**:
 //!   - O(1) memory for probe side (streaming, not materialized)
 //!   - Early termination: LIMIT 10 stops after 10 rows
@@ -54,7 +54,7 @@
 //!   - Composable operators (Filter → Join → Project → Limit)
 //!
 //! ### Parallel Hash Join Path (for large analytical queries)
-//! - **When**: Build side ≥ 10,000 rows AND (no LIMIT or LIMIT > 1,000)
+//! - **When**: Build side ≥ 10,000 rows AND no LIMIT
 //! - **Benefits**:
 //!   - Parallel hash build into partitioned maps, one thread per partition
 //!   - Parallel probe with Rayon work-stealing
@@ -64,7 +64,7 @@
 //! ### Why Not Always Parallel?
 //! Parallel execution has overhead (task scheduling, synchronization). For:
 //! - Small datasets: overhead exceeds benefit
-//! - Small LIMIT: streaming stops early; parallel computes full result then truncates
+//! - A LIMIT: streaming stops early; parallel would build every match first
 //!
 //! ## Bloom Filter Optimization (Not Yet Implemented)
 //!
@@ -93,17 +93,6 @@ use crate::executor::utils::{column_families, extract_join_keys_and_residual_kee
 use crate::functions::registry::global_registry;
 use crate::optimizer::bloom::RuntimeBloomFilter;
 use crate::parser::ast::Expression;
-
-/// LIMIT threshold below which streaming execution is preferred over parallel.
-///
-/// When LIMIT is small (≤ this value), streaming Volcano-style execution benefits from
-/// early termination - we can stop after producing just N rows without processing
-/// the entire join. Parallel execution would compute the full join result before
-/// truncating, wasting work.
-///
-/// When LIMIT is large (> this value), the early termination benefit is minimal,
-/// so parallel execution's throughput advantage dominates.
-const STREAMING_LIMIT_THRESHOLD: u64 = 1000;
 
 /// Result of a streaming join execution.
 #[derive(Debug)]
@@ -552,7 +541,7 @@ impl JoinExecutor {
         // Decide between parallel and streaming execution
         // Parallel is beneficial when:
         // 1. Build side row count exceeds threshold (parallel overhead worthwhile)
-        // 2. No small LIMIT (streaming benefits from early termination)
+        // 2. No LIMIT: the parallel join builds every match, streaming stops at the LIMIT
         let build_row_count = if build_left {
             left_rows.len()
         } else {
@@ -564,7 +553,7 @@ impl JoinExecutor {
             || analysis.join_type_str.contains("RIGHT")
             || analysis.join_type_str.contains("FULL");
         let use_parallel = build_row_count >= DEFAULT_PARALLEL_JOIN_THRESHOLD
-            && limit.is_none_or(|l| l > STREAMING_LIMIT_THRESHOLD)
+            && limit.is_none()
             && !(is_outer && !analysis.residual_conditions.is_empty());
 
         if use_parallel {
@@ -577,7 +566,6 @@ impl JoinExecutor {
                 right_col_count,
                 &all_columns,
                 build_left,
-                limit,
                 ctx,
             )
         } else {
@@ -599,7 +587,7 @@ impl JoinExecutor {
     /// Execute hash join using parallel execution (partitioned build + Rayon).
     ///
     /// Uses parallel hash build and probe phases for bulk analytics workloads.
-    /// Better for large datasets without small LIMIT constraints.
+    /// Taken only by a join without a LIMIT, since it builds every match.
     #[allow(clippy::too_many_arguments)]
     fn execute_hash_join_parallel(
         &self,
@@ -610,7 +598,6 @@ impl JoinExecutor {
         right_col_count: usize,
         all_columns: &[String],
         build_left: bool,
-        limit: Option<u64>,
         ctx: &ExecutionContext,
     ) -> Result<RowVec> {
         let config = ParallelConfig::default();
@@ -664,18 +651,11 @@ impl JoinExecutor {
             .map(|(i, row)| (i as i64, row))
             .collect();
 
-        // Apply residual conditions FIRST (before LIMIT)
-        // This ensures correct semantics: filter matching rows, then limit.
         // Only INNER joins reach this path: execute_hash_join() routes OUTER
         // joins carrying a residual to the streaming operator.
         for cond in &analysis.residual_conditions {
             let filter = RowFilter::new(cond, all_columns)?.with_context(ctx);
             filter.retain_checked(&mut rows)?;
-        }
-
-        // Apply LIMIT after filtering (correct order)
-        if let Some(max) = limit {
-            rows.truncate(max as usize);
         }
 
         Ok(rows)

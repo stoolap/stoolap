@@ -56,6 +56,8 @@ Hash joins are parallelized in two phases:
 - The probe side is processed in parallel
 - Each thread looks up matches in the shared hash table
 
+A join that carries a LIMIT runs on one thread instead, so it stops as soon as it has the rows the LIMIT needs.
+
 ### 3. Parallel Sort
 
 Large ORDER BY operations use parallel sorting:
