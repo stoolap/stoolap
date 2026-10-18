@@ -1035,26 +1035,27 @@ impl Executor {
         column_type: Option<DataType>,
         set: &PredicateSet,
     ) -> Option<(CompactArc<ValueSet>, bool)> {
-        let in_domain = |value: &Value| match column_type {
+        // Read from the set's own summary: no member is visited here
+        let domain = match column_type {
+            // TEXT members a number column reads as numbers
             Some(DataType::Integer | DataType::Float) => {
-                matches!(value, Value::Integer(_) | Value::Float(_))
+                PredicateSet::INTEGER | PredicateSet::FLOAT | PredicateSet::TEXT
             }
-            Some(DataType::Text) => matches!(value, Value::Text(_)),
-            Some(DataType::Boolean) => matches!(value, Value::Boolean(_)),
-            Some(DataType::Timestamp) => matches!(value, Value::Timestamp(_)),
-            _ => false,
+            Some(DataType::Text) => PredicateSet::TEXT,
+            Some(DataType::Boolean) => PredicateSet::BOOLEAN,
+            Some(DataType::Timestamp) => PredicateSet::TIMESTAMP,
+            _ => 0,
         };
-        let (members, unknown) = match column_type {
+        if set.kinds() & !domain != 0 {
+            return None;
+        }
+        match column_type {
             Some(DataType::Integer | DataType::Float) if set.has_text() => {
                 let (numbers, unknown) = numeric_members(set.members().iter());
-                (CompactArc::new(numbers.into_iter().collect()), unknown)
+                Some((CompactArc::new(numbers.into_iter().collect()), unknown))
             }
-            _ => (CompactArc::clone(set.members()), false),
-        };
-        members
-            .iter()
-            .all(|v| v.is_null() || in_domain(v))
-            .then_some((members, unknown))
+            _ => Some((CompactArc::clone(set.members()), false)),
+        }
     }
 
     /// Whether `column` is the table's one-column primary key

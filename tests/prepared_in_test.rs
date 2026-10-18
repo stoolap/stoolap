@@ -499,3 +499,42 @@ fn test_a_long_probe_sees_its_statement_cancelled() {
         );
     }
 }
+
+#[test]
+fn test_a_cancel_inside_a_block_is_raised_and_never_kept() {
+    use stoolap::test_failpoints::before_prepared_scalar;
+    let _guard = serial();
+    let db = Database::open("memory://prepared_in_cancel_kept").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY)",
+        "INSERT INTO t VALUES (1)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO u VALUES (1, 1)",
+        "CREATE TABLE big (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        "INSERT INTO big SELECT value, 1, value FROM generate_series(1, 5000)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let executor = stoolap::Executor::new(std::sync::Arc::clone(db.engine()));
+    let sql = "SELECT id FROM t WHERE id IN (SELECT (SELECT v FROM big WHERE big.k = u.k AND big.v * 1 < 0) FROM u)";
+    let ctx = stoolap::ExecutionContext::new();
+    let handle = ctx.clone();
+    before_prepared_scalar(move || handle.cancel());
+    let result = executor.execute_with_context(sql, &ctx);
+    assert!(
+        matches!(result, Err(stoolap::Error::QueryCancelled)),
+        "{sql}: {:?}",
+        result.map(|_| ())
+    );
+    // The scalar block gives NULL, so the IN is UNKNOWN for every row
+    let again = executor
+        .execute_with_context(sql, &stoolap::ExecutionContext::new())
+        .map(|mut rows| {
+            let mut count = 0;
+            while rows.next() {
+                count += 1;
+            }
+            count
+        });
+    assert_eq!(again.ok(), Some(0), "{sql} kept the cancel");
+}

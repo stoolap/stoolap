@@ -984,6 +984,16 @@ struct Narrowing {
 /// One key's members as read, and the first error one of its candidates raised
 type MemberGroup = (Vec<Value>, Option<Error>);
 
+/// An error a candidate raised, kept until no candidate settles the answer;
+/// a cancel ends the statement and is raised at once, so no answer kept
+/// across statements holds it
+fn deferred(e: Error) -> Result<Error> {
+    match e {
+        Error::QueryCancelled => Err(e),
+        other => Ok(other),
+    }
+}
+
 /// Slots whose value raised an error, each with its error
 type FailedSlots = SmallVec<[(usize, Error); 1]>;
 
@@ -2679,7 +2689,7 @@ impl<'a> PreparedRunner<'a> {
                         Ok(value) => params[*slot] = value,
                         Err(e) => {
                             params[*slot] = Value::null_unknown();
-                            failed.push((*slot, e));
+                            failed.push((*slot, deferred(e)?));
                         }
                     }
                 }
@@ -2727,7 +2737,7 @@ impl<'a> PreparedRunner<'a> {
                 Ok(value) => params[*slot] = value,
                 Err(e) => {
                     params[*slot] = Value::null_unknown();
-                    failed.push((*slot, e));
+                    failed.push((*slot, deferred(e)?));
                 }
             }
         }
@@ -2821,7 +2831,7 @@ impl<'a> PreparedRunner<'a> {
                     Ok(true) => {}
                     Ok(false) => continue,
                     Err(e) => {
-                        failed.get_or_insert(e);
+                        failed.get_or_insert(deferred(e)?);
                         continue;
                     }
                 }
@@ -2991,7 +3001,7 @@ impl<'a> PreparedRunner<'a> {
                 match self.passes_rest(sq, &mut vm, &exec, &slots_failed) {
                     Ok(true) => ExistsOutcome::Passed,
                     Ok(false) => continue,
-                    Err(e) => ExistsOutcome::Failed(e),
+                    Err(e) => ExistsOutcome::Failed(deferred(e)?),
                 }
             };
             match set.outcomes.entry(key) {
@@ -3327,7 +3337,7 @@ impl PreparedRunner<'_> {
                     Ok(true) => {}
                     Ok(false) => continue,
                     Err(e) => {
-                        failed.get_or_insert(e);
+                        failed.get_or_insert(deferred(e)?);
                         continue;
                     }
                 }
@@ -3335,7 +3345,7 @@ impl PreparedRunner<'_> {
             let member = match self.member(members, &mut vm, &exec) {
                 Ok(member) => member,
                 Err(e) => {
-                    failed.get_or_insert(e);
+                    failed.get_or_insert(deferred(e)?);
                     continue;
                 }
             };
@@ -3442,7 +3452,7 @@ impl PreparedRunner<'_> {
             match member {
                 Ok(member) => group.0.push(member),
                 Err(e) => {
-                    group.1.get_or_insert(e);
+                    group.1.get_or_insert(deferred(e)?);
                 }
             }
         }

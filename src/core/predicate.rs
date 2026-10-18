@@ -158,15 +158,35 @@ pub struct PredicateSet {
     has_non_text: bool,
     /// A TEXT member that is not a number: UNKNOWN against any number
     has_unreadable_text: bool,
+    /// The kinds of the members that are not NULL, as `PredicateSet::INTEGER` and the others
+    kinds: u8,
 }
 
 impl PredicateSet {
+    pub const INTEGER: u8 = 1;
+    pub const FLOAT: u8 = 2;
+    pub const TEXT: u8 = 4;
+    pub const BOOLEAN: u8 = 8;
+    pub const TIMESTAMP: u8 = 16;
+    /// Any other kind: JSON, VECTOR and the like
+    pub const OTHER: u8 = 32;
+
     pub fn new(members: CompactArc<ValueSet>, has_null: bool) -> Self {
         let mut numbers_in_text = ValueSet::default();
         let mut has_numbers = false;
         let mut has_non_text = false;
         let mut has_unreadable_text = false;
+        let mut kinds = 0;
         for member in members.iter() {
+            kinds |= match member {
+                Value::Null(_) => 0,
+                Value::Integer(_) => Self::INTEGER,
+                Value::Float(_) => Self::FLOAT,
+                Value::Text(_) => Self::TEXT,
+                Value::Boolean(_) => Self::BOOLEAN,
+                Value::Timestamp(_) => Self::TIMESTAMP,
+                _ => Self::OTHER,
+            };
             match member {
                 Value::Integer(_) | Value::Float(_) => has_numbers = true,
                 Value::Text(text) => match parse_sql_number(text) {
@@ -186,7 +206,13 @@ impl PredicateSet {
             has_numbers,
             has_non_text,
             has_unreadable_text,
+            kinds,
         }
+    }
+
+    /// The kinds of the members that are not NULL
+    pub fn kinds(&self) -> u8 {
+        self.kinds
     }
 
     pub fn len(&self) -> usize {
