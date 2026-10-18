@@ -173,6 +173,46 @@ fn cases() -> Vec<Case> {
             None,
         ),
         case("JSON", "'{\"a\":1}'", "'{\"a\":1}'", None, None, None),
+        case(
+            "TEXT",
+            "'yes'",
+            "TRUE",
+            Some(Value::Boolean(true)),
+            Some(true),
+            Some(Equal),
+        ),
+        case(
+            "TEXT",
+            "'junk'",
+            "TRUE",
+            Some(Value::Boolean(true)),
+            None,
+            None,
+        ),
+        case(
+            "TEXT",
+            "'2024-01-01'",
+            "CAST('2024-01-01 00:00:00' AS TIMESTAMP)",
+            None,
+            Some(true),
+            Some(Equal),
+        ),
+        case(
+            "TEXT",
+            "'2024-01-01'",
+            "TIMESTAMP '2024-01-01 00:00:00'",
+            None,
+            Some(true),
+            Some(Equal),
+        ),
+        case(
+            "TEXT",
+            "'{\"a\":1}'",
+            "CAST('{\"a\":1}' AS JSON)",
+            Some(Value::json("{\"a\":1}")),
+            None,
+            None,
+        ),
     ]
 }
 
@@ -206,6 +246,9 @@ const OPS: [&str; 10] = [
     "BETWEEN",
     "IN",
 ];
+
+/// A conjunct that holds for every row and puts the statement in the prepared family
+const PREPARED: &str = "EXISTS (SELECT 1 FROM c AS d WHERE d.id = c.id)";
 
 /// `v op c`, with `c` as both bounds of BETWEEN and the one member of IN
 fn predicate(v: &str, op: &str, c: &str) -> String {
@@ -258,7 +301,7 @@ fn wrong_answers(db: &Database, case: &Case, wrong: &mut Vec<String>) {
         );
         check(
             "prepared WHERE",
-            format!("SELECT id FROM c WHERE {p} AND (SELECT 1) = 1"),
+            format!("SELECT id FROM c WHERE {p} AND {PREPARED}"),
             vec![],
             kept(want),
         );
@@ -304,7 +347,7 @@ fn wrong_answers(db: &Database, case: &Case, wrong: &mut Vec<String>) {
             );
             check(
                 "parameter, prepared",
-                format!("SELECT id FROM c WHERE {p} AND (SELECT 1) = 1"),
+                format!("SELECT id FROM c WHERE {p} AND {PREPARED}"),
                 vec![param.clone()],
                 kept(want),
             );
@@ -362,6 +405,272 @@ fn test_one_comparison_rule_answers_sealed_rows() {
         |n| {
             format!(
                 "file://{}/rule_{n}?sync_mode=none&checkpoint_on_close=off&checkpoint_interval=0",
+                dir.path().display()
+            )
+        },
+        true,
+    );
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+/// A key column type with its three left keys and four right TEXT keys, the
+/// right ids 1 and 4 meeting left id 1 and right id 2 meeting left id 2, or
+/// none of them when every pair is UNKNOWN
+struct JoinKeys {
+    column: &'static str,
+    left: [&'static str; 3],
+    right: [&'static str; 4],
+    meets: bool,
+}
+
+const JOIN_KEYS: [JoinKeys; 4] = [
+    JoinKeys {
+        column: "INTEGER",
+        left: ["1", "2", "NULL"],
+        right: ["'1'", "'2.0'", "'junk'", "'01'"],
+        meets: true,
+    },
+    JoinKeys {
+        column: "BOOLEAN",
+        left: ["TRUE", "FALSE", "NULL"],
+        right: ["'yes'", "'f'", "'junk'", "'TRUE'"],
+        meets: true,
+    },
+    JoinKeys {
+        column: "TIMESTAMP",
+        left: ["'2024-01-01 00:00:00'", "'2024-01-02 00:00:00'", "NULL"],
+        right: [
+            "'2024-01-01'",
+            "'2024-01-02 00:00:00'",
+            "'junk'",
+            "'2024-01-01 00:00:00'",
+        ],
+        meets: true,
+    },
+    JoinKeys {
+        column: "JSON",
+        left: ["'{\"a\":1}'", "'{\"b\":2}'", "NULL"],
+        right: ["'{\"a\":1}'", "'{\"b\":2}'", "'junk'", "'{\"a\":1}'"],
+        meets: false,
+    },
+];
+
+fn join_rows(db: &Database, sql: &str) -> Result<Vec<Vec<Value>>, String> {
+    db.query(sql, ())
+        .and_then(|rows| {
+            rows.map(|row| {
+                row.map(|row| {
+                    (0..row.len())
+                        .map(|i| match row.get_value(i).cloned().unwrap() {
+                            Value::Null(_) => Value::Null(stoolap::DataType::Null),
+                            value => value,
+                        })
+                        .collect()
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// Every wrong answer of the joins and subqueries over `keys`
+fn join_wrong_answers(db: &Database, keys: &JoinKeys, wrong: &mut Vec<String>) {
+    let ids =
+        |ids: &[i64]| -> Vec<Vec<Value>> { ids.iter().map(|&i| vec![Value::Integer(i)]).collect() };
+    let pair = |l: i64, r: Option<i64>| {
+        vec![
+            Value::Integer(l),
+            r.map_or(Value::Null(stoolap::DataType::Null), Value::Integer),
+        ]
+    };
+    let meets = keys.meets;
+    let pairs = if meets {
+        vec![pair(1, Some(1)), pair(1, Some(4)), pair(2, Some(2))]
+    } else {
+        Vec::new()
+    };
+    let mut left = pairs.clone();
+    if !meets {
+        left.extend([pair(1, None), pair(2, None)]);
+    }
+    left.push(pair(3, None));
+    let pick = |met: &[i64], unmet: &[i64]| ids(if meets { met } else { unmet });
+    let queries: Vec<(&str, Vec<Vec<Value>>)> = vec![
+        (
+            "SELECT l.id, r.id FROM l JOIN r ON l.k = r.k ORDER BY 1, 2",
+            pairs.clone(),
+        ),
+        (
+            "SELECT l.id, r.id FROM r JOIN l ON r.k = l.k ORDER BY 1, 2",
+            pairs.clone(),
+        ),
+        (
+            "SELECT l.id, r.id FROM l LEFT JOIN r ON l.k = r.k ORDER BY 1, 2",
+            left.clone(),
+        ),
+        (
+            "SELECT l.id, r.id FROM l JOIN r ON l.k = r.k LIMIT 10",
+            pairs.clone(),
+        ),
+        (
+            "SELECT l.id, r.id FROM r JOIN l ON r.k = l.k LIMIT 10",
+            pairs,
+        ),
+        (
+            "SELECT l.id, r.id FROM l LEFT JOIN r ON l.k = r.k LIMIT 10",
+            left,
+        ),
+        (
+            "SELECT id FROM l WHERE k IN (SELECT k FROM r) ORDER BY id",
+            pick(&[1, 2], &[]),
+        ),
+        (
+            "SELECT id FROM r WHERE k IN (SELECT k FROM l) ORDER BY id",
+            pick(&[1, 2, 4], &[]),
+        ),
+        (
+            "SELECT id FROM l WHERE EXISTS (SELECT 1 FROM r WHERE r.k = l.k) ORDER BY id",
+            pick(&[1, 2], &[]),
+        ),
+        (
+            "SELECT id FROM r WHERE EXISTS (SELECT 1 FROM l WHERE l.k = r.k) ORDER BY id",
+            pick(&[1, 2, 4], &[]),
+        ),
+        (
+            "SELECT id FROM l WHERE NOT EXISTS (SELECT 1 FROM r WHERE r.k = l.k) ORDER BY id",
+            pick(&[3], &[1, 2, 3]),
+        ),
+        (
+            "SELECT id FROM r WHERE NOT EXISTS (SELECT 1 FROM l WHERE l.k = r.k) ORDER BY id",
+            pick(&[3], &[1, 2, 3, 4]),
+        ),
+        (
+            "SELECT id FROM l WHERE NOT EXISTS (SELECT 1 FROM r WHERE r.k = l.k)",
+            pick(&[3], &[1, 2, 3]),
+        ),
+        (
+            "SELECT id, EXISTS (SELECT 1 FROM r WHERE r.k = l.k) FROM l ORDER BY id",
+            [1, 2, 3]
+                .iter()
+                .map(|&id| vec![Value::Integer(id), Value::Boolean(meets && id < 3)])
+                .collect(),
+        ),
+        (
+            "SELECT id, (SELECT COUNT(*) FROM r WHERE r.k = l.k) FROM l ORDER BY id",
+            [(1, 2), (2, 1), (3, 0)]
+                .iter()
+                .map(|&(id, n)| {
+                    vec![
+                        Value::Integer(id),
+                        Value::Integer(if meets { n } else { 0 }),
+                    ]
+                })
+                .collect(),
+        ),
+        (
+            "SELECT id FROM r WHERE NOT EXISTS (SELECT 1 FROM l WHERE l.k = r.k)",
+            pick(&[3], &[1, 2, 3, 4]),
+        ),
+        (
+            "SELECT id FROM l WHERE k NOT IN (SELECT k FROM r WHERE id <> 3) ORDER BY id",
+            ids(&[]),
+        ),
+        (
+            "SELECT id FROM l WHERE k NOT IN (SELECT k FROM r WHERE id = 3) ORDER BY id",
+            ids(&[]),
+        ),
+        (
+            "SELECT id FROM r WHERE k NOT IN (SELECT k FROM l WHERE id <> 3) ORDER BY id",
+            ids(&[]),
+        ),
+    ];
+    for (sql, want) in queries {
+        let mut got = join_rows(db, sql);
+        if !sql.contains("ORDER BY") {
+            if let Ok(rows) = got.as_mut() {
+                rows.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            }
+        }
+        if got.as_ref() != Ok(&want) {
+            wrong.push(format!(
+                "{} keys: {sql} gave {got:?}, want {want:?}",
+                keys.column
+            ));
+        }
+    }
+}
+
+fn run_joins(dsn: impl Fn(usize) -> String, seal: bool) -> Vec<String> {
+    let mut wrong = Vec::new();
+    let mut n = 0;
+    for keys in &JOIN_KEYS {
+        let indexes: &[&[&str]] = if keys.column == "JSON" {
+            &[&[]]
+        } else {
+            &[
+                &[],
+                &["CREATE INDEX r_k ON r (k)"],
+                &["CREATE INDEX l_k ON l (k)"],
+                &["CREATE INDEX r_k ON r (k)", "CREATE INDEX l_k ON l (k)"],
+            ]
+        };
+        for index in indexes {
+            let db = Database::open(&dsn(n)).unwrap();
+            n += 1;
+            db.execute(
+                &format!("CREATE TABLE l (id INTEGER PRIMARY KEY, k {})", keys.column),
+                (),
+            )
+            .unwrap();
+            db.execute("CREATE TABLE r (id INTEGER PRIMARY KEY, k TEXT)", ())
+                .unwrap();
+            for (i, k) in keys.left.iter().enumerate() {
+                db.execute(&format!("INSERT INTO l VALUES ({}, {k})", i + 1), ())
+                    .unwrap();
+            }
+            for (i, k) in keys.right.iter().enumerate() {
+                db.execute(&format!("INSERT INTO r VALUES ({}, {k})", i + 1), ())
+                    .unwrap();
+            }
+            for sql in index.iter() {
+                db.execute(sql, ()).unwrap();
+            }
+            if seal {
+                db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+            }
+            let before = wrong.len();
+            join_wrong_answers(&db, keys, &mut wrong);
+            for answer in &mut wrong[before..] {
+                *answer = format!("{index:?} {answer}");
+            }
+        }
+    }
+    wrong
+}
+
+#[test]
+fn test_one_comparison_rule_answers_join_keys() {
+    let wrong = run_joins(|n| format!("memory://comparison_rule_join_{n}"), false);
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+#[test]
+fn test_one_comparison_rule_answers_join_keys_on_sealed_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let wrong = run_joins(
+        |n| {
+            format!(
+                "file://{}/join_{n}?sync_mode=none&checkpoint_on_close=off&checkpoint_interval=0",
                 dir.path().display()
             )
         },

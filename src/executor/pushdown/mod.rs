@@ -98,10 +98,10 @@ impl<'a> PushdownContext<'a> {
     /// lossless; otherwise it stays a Float and the storage comparison
     /// compares numerically.
     ///
-    /// A TEXT against a numeric column is read as a number by the predicate
-    /// comparison's own rule. None, so nothing is pushed, for unreadable TEXT
-    /// against a numeric column, for a number against a TEXT column and for
-    /// a column the scan does not compare.
+    /// A TEXT against a numeric, BOOLEAN or TIMESTAMP column is read as the
+    /// column's type by the predicate comparison's own rule. None, so nothing
+    /// is pushed, for a value the comparison does not read as the column's
+    /// type and for a column the scan does not compare.
     pub fn coerce_to_column_type(&self, column: &str, value: Value) -> Option<Value> {
         let column_type = self.column_type(column);
         if column_type.is_some_and(|t| !scan_compares(t)) {
@@ -121,38 +121,31 @@ pub(crate) fn scan_compares(data_type: crate::core::DataType) -> bool {
 }
 
 /// A value compared with a column of `column_type` as the scan reads it,
-/// for a program that compares it itself. What the scan takes no reading
-/// of stays as it is for the comparison's own rule: a TEXT that is no
-/// number against a numeric column, a number against a TEXT column, and a
-/// number, BOOLEAN or TIMESTAMP on the other side of the number domain
+/// for a program that compares it itself. A value the comparison does not
+/// read as the column's type stays as it is for the comparison's own rule
 pub(crate) fn read_as_column(column_type: crate::core::DataType, value: Value) -> Value {
-    let unread = match column_type {
-        crate::core::DataType::Text => matches!(value, Value::Integer(_) | Value::Float(_)),
-        t if t.is_numeric() => match &value {
-            Value::Text(s) => crate::core::predicate::parse_sql_number(s).is_none(),
-            other => other_domain(column_type, other),
-        },
-        _ => other_domain(column_type, &value),
-    };
-    if unread {
+    if !reads_as_column(column_type, &value) {
         return value;
     }
     coerce_constant(Some(column_type), value).unwrap_or_else(Value::null_unknown)
 }
 
-/// A number against a BOOLEAN or TIMESTAMP column, or a BOOLEAN or
-/// TIMESTAMP against a number column: other domains, which the scan reads
-/// no value across
-fn other_domain(column_type: crate::core::DataType, value: &Value) -> bool {
+/// Whether the comparison reads `value` as a value of `column_type`, so
+/// converting it keeps the answer: a NULL, a value of that type or of the
+/// same number domain, or a TEXT read as a number, BOOLEAN or TIMESTAMP
+fn reads_as_column(column_type: crate::core::DataType, value: &Value) -> bool {
     use crate::core::DataType;
-    match column_type {
-        DataType::Boolean | DataType::Timestamp => {
-            matches!(value, Value::Integer(_) | Value::Float(_))
-        }
-        DataType::Integer | DataType::Float => {
-            matches!(value, Value::Boolean(_) | Value::Timestamp(_))
-        }
-        _ => false,
+    match value {
+        Value::Null(_) => true,
+        Value::Integer(_) | Value::Float(_) => column_type.is_numeric(),
+        Value::Text(text) => match column_type {
+            DataType::Integer | DataType::Float => {
+                crate::core::predicate::parse_sql_number(text).is_some()
+            }
+            DataType::Text | DataType::Boolean | DataType::Timestamp => true,
+            _ => false,
+        },
+        other => other.data_type() == column_type,
     }
 }
 
@@ -163,14 +156,13 @@ pub(crate) fn coerce_constant(
     value: Value,
 ) -> Option<Value> {
     use crate::core::DataType;
-    if column_type.is_some_and(|t| other_domain(t, &value)) {
+    if column_type.is_some_and(|t| !reads_as_column(t, &value)) {
         return None;
     }
     let value = match (column_type, value) {
         (Some(DataType::Integer | DataType::Float), Value::Text(text)) => {
             crate::core::predicate::parse_sql_number(&text)?
         }
-        (Some(DataType::Text), Value::Integer(_) | Value::Float(_)) => return None,
         (_, value) => value,
     };
     Some(match (column_type, &value) {

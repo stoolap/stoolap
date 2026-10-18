@@ -137,11 +137,8 @@ fn read_text_across<'v>(
     b: &'v Value,
 ) -> Option<(std::borrow::Cow<'v, Value>, std::borrow::Cow<'v, Value>)> {
     use std::borrow::Cow;
-    let read = |text: &str, like: &Value| match like {
-        Value::Boolean(_) => Some(super::value::text_as_boolean(text).map(Value::Boolean)),
-        Value::Timestamp(_) => {
-            Some(super::value::parse_timestamp_for_compare(text).map(Value::Timestamp))
-        }
+    let read = |text: &str, like: &Value| match TextReading::of(like) {
+        Some(reading @ (TextReading::Boolean | TextReading::Timestamp)) => Some(reading.read(text)),
         _ => None,
     };
     match (a, b) {
@@ -186,33 +183,152 @@ pub fn sql_distinct(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// The kinds of the values a column or set holds, as one bit each
+pub mod kind {
+    use super::super::DataType;
+    use super::Value;
+
+    pub const INTEGER: u8 = 1;
+    pub const FLOAT: u8 = 2;
+    pub const TEXT: u8 = 4;
+    pub const BOOLEAN: u8 = 8;
+    pub const TIMESTAMP: u8 = 16;
+    pub const JSON: u8 = 32;
+    pub const VECTOR: u8 = 64;
+    /// Any other kind
+    pub const OTHER: u8 = 128;
+    /// The kinds a value of which is equal only to a value of its own kind
+    pub const EXTENSIONS: u8 = JSON | VECTOR | OTHER;
+    /// The kinds a TEXT is read as when compared with them
+    pub const READ_FROM_TEXT: u8 = INTEGER | FLOAT | BOOLEAN | TIMESTAMP;
+
+    /// The kind of a value; 0 for a NULL
+    pub fn of(value: &Value) -> u8 {
+        match value {
+            Value::Null(_) => 0,
+            Value::Integer(_) => INTEGER,
+            Value::Float(_) => FLOAT,
+            Value::Text(_) => TEXT,
+            Value::Boolean(_) => BOOLEAN,
+            Value::Timestamp(_) => TIMESTAMP,
+            other => of_type(other.data_type()),
+        }
+    }
+
+    /// The kind of the values of a column of `data_type`
+    pub fn of_type(data_type: DataType) -> u8 {
+        match data_type {
+            DataType::Null => 0,
+            DataType::Integer => INTEGER,
+            DataType::Float => FLOAT,
+            DataType::Text => TEXT,
+            DataType::Boolean => BOOLEAN,
+            DataType::Timestamp => TIMESTAMP,
+            DataType::Json => JSON,
+            DataType::Vector => VECTOR,
+        }
+    }
+
+    /// Whether a value of kinds `a` and one of kinds `b` can meet as a TEXT
+    /// the comparison reads as the other side's type, which no key equality follows
+    pub fn crosses(a: u8, b: u8) -> bool {
+        (a & TEXT != 0 && b & READ_FROM_TEXT != 0) || (b & TEXT != 0 && a & READ_FROM_TEXT != 0)
+    }
+}
+
+/// A type a comparison reads a TEXT as, the other side being of that type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextReading {
+    Number,
+    Boolean,
+    Timestamp,
+}
+
+impl TextReading {
+    /// The reading a TEXT gets against `value`; None for any other value
+    pub fn of(value: &Value) -> Option<Self> {
+        match value {
+            Value::Integer(_) | Value::Float(_) => Some(Self::Number),
+            Value::Boolean(_) => Some(Self::Boolean),
+            Value::Timestamp(_) => Some(Self::Timestamp),
+            _ => None,
+        }
+    }
+
+    /// `text` read as this type; None when it does not read
+    pub fn read(self, text: &str) -> Option<Value> {
+        match self {
+            Self::Number => parse_sql_number(text),
+            Self::Boolean => super::value::text_as_boolean(text).map(Value::Boolean),
+            Self::Timestamp => {
+                super::value::parse_timestamp_for_compare(text).map(Value::Timestamp)
+            }
+        }
+    }
+}
+
+/// The side of a cross a key column of one kind is on: TEXT, or a type a
+/// TEXT key is read as
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySide {
+    Text,
+    Read(TextReading),
+}
+
+impl KeySide {
+    /// The side of a column holding `kinds` when they are all on one side
+    pub fn of_kinds(kinds: u8) -> Option<Self> {
+        match kinds {
+            kind::TEXT => Some(Self::Text),
+            kind::BOOLEAN => Some(Self::Read(TextReading::Boolean)),
+            kind::TIMESTAMP => Some(Self::Read(TextReading::Timestamp)),
+            k if k != 0 && k & !(kind::INTEGER | kind::FLOAT) == 0 => {
+                Some(Self::Read(TextReading::Number))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `key` meets a column on this side as a TEXT read as the other
+    /// side's type
+    pub fn crosses(self, key: &Value) -> bool {
+        match self {
+            Self::Text => TextReading::of(key).is_some(),
+            Self::Read(_) => matches!(key, Value::Text(_)),
+        }
+    }
+}
+
+/// The values the TEXT members of a set read as, for one reading
+#[derive(Debug, Clone, Default)]
+struct TextReads {
+    values: ValueSet,
+    /// A TEXT member that does not read: UNKNOWN against any probe of that type
+    unreadable: bool,
+}
+
 /// The members of a constant `IN` list or set, kept for the predicate
-/// comparison: a number finds the TEXT members that read as it, a TEXT finds
-/// the numeric members it reads as, without a scan
+/// comparison: a number, BOOLEAN or TIMESTAMP finds the TEXT members that read
+/// as it, a TEXT finds the members it reads as, without a scan
 #[derive(Debug, Clone)]
 pub struct PredicateSet {
     members: CompactArc<ValueSet>,
     /// The numbers the TEXT members read as
     numbers_in_text: ValueSet,
+    /// The BOOLEAN and TIMESTAMP readings of the TEXT members, taken when a
+    /// probe of that type first meets them
+    text_reads: [std::sync::OnceLock<Box<TextReads>>; 2],
     has_null: bool,
     has_numbers: bool,
     /// A member that is neither TEXT nor NULL
     has_non_text: bool,
     /// A TEXT member that is not a number: UNKNOWN against any number
     has_unreadable_text: bool,
-    /// The kinds of the members that are not NULL, as `PredicateSet::INTEGER` and the others
+    /// The kinds of the members that are not NULL, as `kind::INTEGER` and the others
     kinds: u8,
 }
 
 impl PredicateSet {
-    pub const INTEGER: u8 = 1;
-    pub const FLOAT: u8 = 2;
-    pub const TEXT: u8 = 4;
-    pub const BOOLEAN: u8 = 8;
-    pub const TIMESTAMP: u8 = 16;
-    /// Any other kind: JSON, VECTOR and the like
-    pub const OTHER: u8 = 32;
-
     pub fn new(members: CompactArc<ValueSet>, has_null: bool) -> Self {
         let mut numbers_in_text = ValueSet::default();
         let mut has_numbers = false;
@@ -220,15 +336,7 @@ impl PredicateSet {
         let mut has_unreadable_text = false;
         let mut kinds = 0;
         for member in members.iter() {
-            kinds |= match member {
-                Value::Null(_) => 0,
-                Value::Integer(_) => Self::INTEGER,
-                Value::Float(_) => Self::FLOAT,
-                Value::Text(_) => Self::TEXT,
-                Value::Boolean(_) => Self::BOOLEAN,
-                Value::Timestamp(_) => Self::TIMESTAMP,
-                _ => Self::OTHER,
-            };
+            kinds |= kind::of(member);
             match member {
                 Value::Integer(_) | Value::Float(_) => has_numbers = true,
                 Value::Text(text) => match parse_sql_number(text) {
@@ -244,6 +352,7 @@ impl PredicateSet {
         Self {
             members,
             numbers_in_text,
+            text_reads: Default::default(),
             has_null,
             has_numbers,
             has_non_text,
@@ -299,13 +408,17 @@ impl PredicateSet {
         if probe.is_null() {
             return None;
         }
-        if self.reads_across(probe) {
-            return self.scan(probe);
-        }
         if self.members.contains(probe) {
             return Some(true);
         }
-        let mut unknown = self.has_null;
+        let probe_kind = kind::of(probe);
+        // A JSON or VECTOR equals only a member of its own kind, which the lookup finds
+        let others = if probe_kind & kind::EXTENSIONS != 0 {
+            !probe_kind
+        } else {
+            kind::EXTENSIONS
+        };
+        let mut unknown = self.has_null || self.kinds & others != 0;
         match probe {
             Value::Integer(_) | Value::Float(_) => {
                 if self.numbers_in_text.contains(probe) {
@@ -313,11 +426,34 @@ impl PredicateSet {
                 }
                 unknown |= self.has_unreadable_text;
             }
-            Value::Text(text) if self.has_numbers => match parse_sql_number(text) {
-                Some(number) if self.members.contains(&number) => return Some(true),
-                Some(_) => {}
-                None => unknown = true,
-            },
+            Value::Boolean(_) | Value::Timestamp(_) if self.kinds & kind::TEXT != 0 => {
+                let reads = self.text_reads(probe_kind);
+                if reads.values.contains(probe) {
+                    return Some(true);
+                }
+                unknown |= reads.unreadable;
+            }
+            Value::Text(text) => {
+                if self.has_numbers {
+                    match parse_sql_number(text) {
+                        Some(number) if self.members.contains(&number) => return Some(true),
+                        Some(_) => {}
+                        None => unknown = true,
+                    }
+                }
+                for (bit, reading) in [
+                    (kind::BOOLEAN, TextReading::Boolean),
+                    (kind::TIMESTAMP, TextReading::Timestamp),
+                ] {
+                    if self.kinds & bit != 0 {
+                        match reading.read(text) {
+                            Some(read) if self.members.contains(&read) => return Some(true),
+                            Some(_) => {}
+                            None => unknown = true,
+                        }
+                    }
+                }
+            }
             _ => {}
         }
         if unknown {
@@ -327,32 +463,27 @@ impl PredicateSet {
         }
     }
 
-    /// Whether `probe` meets a member that `=` reads as another type, a
-    /// BOOLEAN or TIMESTAMP against a TEXT, or a JSON or VECTOR on either side
-    fn reads_across(&self, probe: &Value) -> bool {
-        let text_reads = Self::BOOLEAN | Self::TIMESTAMP;
-        match probe {
-            Value::Integer(_) | Value::Float(_) => self.kinds & Self::OTHER != 0,
-            Value::Text(_) => self.kinds & (text_reads | Self::OTHER) != 0,
-            Value::Boolean(_) | Value::Timestamp(_) => self.kinds & (Self::TEXT | Self::OTHER) != 0,
-            _ => true,
-        }
-    }
-
-    /// `probe IN (members)` by `=` against each member
-    fn scan(&self, probe: &Value) -> Option<bool> {
-        let mut unknown = self.has_null;
-        for member in self.members.iter() {
-            match sql_eq(probe, member) {
-                Some(true) => return Some(true),
-                Some(false) => {}
-                None => unknown = true,
-            }
-        }
-        if unknown {
-            None
+    /// The readings of the TEXT members as the type of `probe_kind`, a
+    /// BOOLEAN or a TIMESTAMP, taken on the first call for that type
+    fn text_reads(&self, probe_kind: u8) -> &TextReads {
+        let (slot, reading) = if probe_kind == kind::BOOLEAN {
+            (&self.text_reads[0], TextReading::Boolean)
         } else {
-            Some(false)
-        }
+            (&self.text_reads[1], TextReading::Timestamp)
+        };
+        slot.get_or_init(|| {
+            let mut reads = TextReads::default();
+            for member in self.members.iter() {
+                if let Value::Text(text) = member {
+                    match reading.read(text) {
+                        Some(read) => {
+                            reads.values.insert(read);
+                        }
+                        None => reads.unreadable = true,
+                    }
+                }
+            }
+            Box::new(reads)
+        })
     }
 }

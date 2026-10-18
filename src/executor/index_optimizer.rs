@@ -24,7 +24,7 @@
 use std::sync::Arc;
 
 use crate::common::{CompactArc, I64Set};
-use crate::core::predicate::PredicateSet;
+use crate::core::predicate::{kind, PredicateSet};
 use crate::core::{DataType, Result, Row, RowVec, Value, ValueSet};
 use crate::parser::ast::*;
 use crate::storage::traits::{QueryResult, Table};
@@ -1038,12 +1038,10 @@ impl Executor {
         // Read from the set's own summary: no member is visited here
         let domain = match column_type {
             // TEXT members a number column reads as numbers
-            Some(DataType::Integer | DataType::Float) => {
-                PredicateSet::INTEGER | PredicateSet::FLOAT | PredicateSet::TEXT
-            }
-            Some(DataType::Text) => PredicateSet::TEXT,
-            Some(DataType::Boolean) => PredicateSet::BOOLEAN,
-            Some(DataType::Timestamp) => PredicateSet::TIMESTAMP,
+            Some(DataType::Integer | DataType::Float) => kind::INTEGER | kind::FLOAT | kind::TEXT,
+            Some(DataType::Text) => kind::TEXT,
+            Some(DataType::Boolean) => kind::BOOLEAN,
+            Some(DataType::Timestamp) => kind::TIMESTAMP,
             _ => 0,
         };
         if set.kinds() & !domain != 0 {
