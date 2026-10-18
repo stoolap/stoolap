@@ -2762,6 +2762,7 @@ impl MVCCEngine {
                     if expr_len > 0 && pos + expr_len <= data.len() {
                         let expr = String::from_utf8(data[pos..pos + expr_len].to_vec())
                             .map_err(|e| Error::internal(format!("invalid default expr: {}", e)))?;
+                        pos += expr_len;
                         Some(expr)
                     } else {
                         None
@@ -2770,13 +2771,21 @@ impl MVCCEngine {
                     None
                 };
 
+                // The default the existing rows took, in a record that carries it
+                let default_value = data
+                    .get(pos..pos + 2)
+                    .map(|len| u16::from_le_bytes([len[0], len[1]]) as usize)
+                    .filter(|&len| len > 0)
+                    .and_then(|len| data.get(pos + 2..pos + 2 + len))
+                    .and_then(|bytes| super::persistence::deserialize_value(bytes).ok());
+
                 // Apply the ADD COLUMN using engine method
                 self.create_column_with_default(
                     &table_name,
                     &column_name,
                     data_type,
                     nullable,
-                    default_expr,
+                    (default_expr, default_value),
                     vector_dimensions,
                 )?;
             }
@@ -3381,14 +3390,15 @@ impl MVCCEngine {
         self.check_column_change(table_name, &added, ColumnEvent::Added)
     }
 
-    /// Creates a column in a table with an optional default expression
+    /// Creates a column in a table with an optional default expression and
+    /// the value the existing rows take, read from the expression when absent
     pub fn create_column_with_default(
         &self,
         table_name: &str,
         column_name: &str,
         data_type: DataType,
         nullable: bool,
-        default_expr: Option<String>,
+        (default_expr, default_value): (Option<String>, Option<Value>),
         vector_dimensions: u16,
     ) -> Result<()> {
         if !self.is_open() {
@@ -3429,9 +3439,11 @@ impl MVCCEngine {
                     false,
                 );
                 // The rows the column is added to take its default now
-                col.default_value = default_expr
-                    .as_deref()
-                    .and_then(|expr| try_parse_default_literal(expr, data_type));
+                col.default_value = default_value.or_else(|| {
+                    default_expr
+                        .as_deref()
+                        .and_then(|expr| try_parse_default_literal(expr, data_type))
+                });
                 col.default_expr = default_expr;
                 col.vector_dimensions = vector_dimensions;
                 store.add_column(col)?;
@@ -8281,18 +8293,20 @@ impl Engine for MVCCEngine {
     fn record_alter_table_add_column(
         &self,
         table_name: &str,
-        column_name: &str,
-        data_type: crate::core::DataType,
-        nullable: bool,
-        default_expr: Option<&str>,
+        column: &crate::core::SchemaColumn,
         vector_dimensions: u16,
     ) -> Result<()> {
         if self.should_skip_wal() {
             return Ok(());
         }
+        let column_name = column.name.as_str();
+        let data_type = column.data_type;
+        let nullable = column.nullable;
+        let default_expr = column.default_expr.as_deref();
 
         // Serialize: operation_type(1) + table_name_len(2) + table_name + column_name_len(2) + column_name
         //          + data_type(1) + [IF Vector: vec_dims(2)] + nullable(1) + default_expr_len(2) + default_expr
+        //          + default_value_len(2) + default_value
         let mut data = Vec::new();
         data.push(1u8); // Operation type: AddColumn = 1
 
@@ -8319,6 +8333,20 @@ impl Engine for MVCCEngine {
             data.extend_from_slice(expr.as_bytes());
         } else {
             data.extend_from_slice(&0u16.to_le_bytes());
+        }
+
+        // The default the existing rows took, last so a record without it
+        // reads as before; replay reads its expression again only then
+        let default_value = column
+            .default_value
+            .as_ref()
+            .and_then(|value| super::persistence::serialize_value(value).ok());
+        match default_value {
+            Some(bytes) => {
+                data.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+                data.extend_from_slice(&bytes);
+            }
+            None => data.extend_from_slice(&0u16.to_le_bytes()),
         }
 
         // If this column was previously dropped, clear it from dropped_columns.
@@ -10332,6 +10360,63 @@ mod tests {
             builder.add_row(id, &Row::from_values(vec![Value::Integer(id)]));
         }
         Arc::new(builder.finish().unwrap())
+    }
+
+    /// An AddColumn record for a TIMESTAMP column `d` of table `t`, with the
+    /// default value field when `value` is given
+    fn add_column_record(expr: &str, value: Option<&Value>) -> Vec<u8> {
+        let mut data = vec![1u8];
+        for name in ["t", "d"] {
+            data.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            data.extend_from_slice(name.as_bytes());
+        }
+        data.push(DataType::Timestamp.as_u8());
+        data.push(1);
+        data.extend_from_slice(&(expr.len() as u16).to_le_bytes());
+        data.extend_from_slice(expr.as_bytes());
+        if let Some(value) = value {
+            let bytes = super::super::persistence::serialize_value(value).unwrap();
+            data.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+            data.extend_from_slice(&bytes);
+        }
+        data
+    }
+
+    #[test]
+    fn an_add_column_record_gives_the_default_it_carries_or_reads_its_expression() {
+        let at_alter = crate::core::value::parse_timestamp("2020-02-02 02:02:02.123456789")
+            .map(Value::Timestamp)
+            .unwrap();
+        let cases = [
+            ("'2024-01-01 12:00:00'", None, "2024-01-01 12:00:00"),
+            (
+                "TIMESTAMP '2024-01-01 12:00:00'",
+                None,
+                "2024-01-01 12:00:00",
+            ),
+            ("NOW()", Some(&at_alter), "2020-02-02 02:02:02.123456789"),
+        ];
+        for (expr, carried, want) in cases {
+            let engine = MVCCEngine::in_memory();
+            engine.open_engine().unwrap();
+            let schema = SchemaBuilder::new("t")
+                .column("id", DataType::Integer, false, true)
+                .build();
+            engine.create_table(schema).unwrap();
+            engine
+                .replay_alter_table(&add_column_record(expr, carried), 1)
+                .unwrap();
+            let schema = engine.get_table_schema("t").unwrap();
+            let want = crate::core::value::parse_timestamp(want)
+                .map(Value::Timestamp)
+                .unwrap();
+            assert_eq!(
+                schema.columns[1].default_value,
+                Some(want),
+                "default of {expr} carrying {carried:?}"
+            );
+            engine.close_engine().unwrap();
+        }
     }
 
     #[test]

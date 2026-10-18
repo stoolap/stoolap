@@ -373,3 +373,67 @@ fn test_an_inline_concat_answers_as_the_vm() {
         wrong.join("\n")
     );
 }
+
+#[test]
+fn test_a_default_computed_at_alter_survives_wal_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut wrong = Vec::new();
+    for (n, default) in ["NOW()", "TIMESTAMP '12:00:00'", "CURRENT_TIMESTAMP"]
+        .iter()
+        .enumerate()
+    {
+        let dsn = format!(
+            "file://{}/alter_{n}?checkpoint_on_close=off&checkpoint_interval=0",
+            dir.path().display()
+        );
+        let read = |db: &Database| -> Result<Vec<Vec<Value>>, String> {
+            db.query("SELECT id, d, s FROM t ORDER BY id", ())
+                .map_err(|e| e.to_string())
+                .and_then(|rows| {
+                    rows.map(|row| {
+                        row.map(|row| (0..3).map(|i| row.get_value(i).cloned().unwrap()).collect())
+                            .map_err(|e| e.to_string())
+                    })
+                    .collect()
+                })
+        };
+        let before = {
+            let db = Database::open(&dsn).unwrap();
+            db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+                .unwrap();
+            db.execute("INSERT INTO t VALUES (1), (2)", ()).unwrap();
+            db.execute(
+                &format!("ALTER TABLE t ADD COLUMN d TIMESTAMP DEFAULT {default}"),
+                (),
+            )
+            .unwrap();
+            db.execute(
+                &format!("ALTER TABLE t ADD COLUMN s TEXT DEFAULT {default}"),
+                (),
+            )
+            .unwrap();
+            let before = read(&db);
+            let _ = db.close();
+            before
+        };
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let db = Database::open(&dsn).unwrap();
+        let after = read(&db);
+        let filled = before.as_ref().is_ok_and(|rows| {
+            rows.iter()
+                .all(|row| !row[1].is_null() && !row[2].is_null())
+        });
+        if !filled || after != before {
+            wrong.push(format!(
+                "DEFAULT {default}: before {before:?}, after recovery {after:?}"
+            ));
+        }
+        let _ = db.close();
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
