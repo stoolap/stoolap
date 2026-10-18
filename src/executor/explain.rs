@@ -30,7 +30,7 @@ use super::operators::index_nested_loop::IndexLookupStrategy;
 use super::parallel;
 use super::planner::{QueryPlanner, RuntimeJoinAlgorithm};
 use super::pushdown;
-use super::query::{pick_index_join_side, split_join_where, JoinIndexUse};
+use super::query::{pick_index_join_side, split_join_where, CteNames, JoinIndexUse};
 use super::result::ExecutorResult;
 use super::utils::{
     collect_table_qualifiers, combine_predicates_with_and, flatten_and_predicates,
@@ -222,6 +222,7 @@ impl Executor {
                         indent + 1,
                         row_count,
                         self.join_index_use(select),
+                        &cte_names(select),
                     );
                 }
 
@@ -321,6 +322,7 @@ impl Executor {
     }
 
     /// Generate EXPLAIN output for a table expression with WHERE clause analysis and stats
+    #[allow(clippy::too_many_arguments)]
     fn explain_table_expr_with_where_and_stats(
         &self,
         expr: &Expression,
@@ -329,6 +331,7 @@ impl Executor {
         indent: usize,
         row_count: usize,
         index_use: JoinIndexUse,
+        ctes: &[String],
     ) {
         let prefix = "  ".repeat(indent);
 
@@ -445,6 +448,7 @@ impl Executor {
                     &join.using_columns,
                     where_clause,
                     index_use,
+                    ctes,
                 );
 
                 lines.push(format!(
@@ -480,6 +484,7 @@ impl Executor {
                     lines,
                     indent + 1,
                     index_use,
+                    ctes,
                 );
                 self.explain_table_expr_plan_only(
                     &join.right,
@@ -487,6 +492,7 @@ impl Executor {
                     lines,
                     indent + 1,
                     index_use,
+                    ctes,
                 );
             }
             Expression::CteReference(cte_ref) => {
@@ -653,6 +659,7 @@ impl Executor {
                 lines,
                 indent + 1,
                 self.join_index_use(select),
+                &cte_names(select),
             );
         }
 
@@ -701,8 +708,9 @@ impl Executor {
         lines: &mut Vec<String>,
         indent: usize,
         index_use: JoinIndexUse,
+        ctes: &[String],
     ) {
-        self.explain_table_expr_inner(expr, where_clause, lines, indent, false, index_use)
+        self.explain_table_expr_inner(expr, where_clause, lines, indent, false, index_use, ctes)
     }
 
     fn explain_table_expr_with_where(
@@ -712,10 +720,12 @@ impl Executor {
         lines: &mut Vec<String>,
         indent: usize,
         index_use: JoinIndexUse,
+        ctes: &[String],
     ) {
-        self.explain_table_expr_inner(expr, where_clause, lines, indent, true, index_use)
+        self.explain_table_expr_inner(expr, where_clause, lines, indent, true, index_use, ctes)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn explain_table_expr_inner(
         &self,
         expr: &Expression,
@@ -724,6 +734,7 @@ impl Executor {
         indent: usize,
         show_join_cost: bool,
         index_use: JoinIndexUse,
+        ctes: &[String],
     ) {
         let prefix = "  ".repeat(indent);
 
@@ -805,6 +816,7 @@ impl Executor {
                     &join.using_columns,
                     where_clause,
                     index_use,
+                    ctes,
                 );
 
                 if show_join_cost {
@@ -902,6 +914,7 @@ impl Executor {
                     indent + 1,
                     show_join_cost,
                     index_use,
+                    ctes,
                 );
                 self.explain_table_expr_inner(
                     &join.right,
@@ -910,6 +923,7 @@ impl Executor {
                     indent + 1,
                     show_join_cost,
                     index_use,
+                    ctes,
                 );
             }
             Expression::CteReference(cte_ref) => {
@@ -957,6 +971,7 @@ impl Executor {
         using_columns: &[Identifier],
         where_clause: Option<&Expression>,
         index_use: JoinIndexUse,
+        ctes: &[String],
     ) -> (String, Option<IndexLookupStrategy>) {
         // The index join is reported only where execution takes it: never
         // for a shape the reduction plan takes without the grouped operator,
@@ -979,7 +994,7 @@ impl Executor {
             let name = |strategy: &IndexLookupStrategy| match strategy {
                 IndexLookupStrategy::PrimaryKey => "Index Nested Loop (PK)".to_string(),
                 IndexLookupStrategy::TableEquality { .. } if small_outer => {
-                    "Standard Join (conditional: a small outer narrows the inner side by its index)"
+                    "Standard Join (conditional: a small outer narrows the inner side by its keys)"
                         .to_string()
                 }
                 IndexLookupStrategy::SecondaryIndex(_)
@@ -988,7 +1003,7 @@ impl Executor {
 
             // Check if INLJ is possible (right side has index/PK for join column)
             let inlj_info = self.check_index_nested_loop_opportunity(
-                None,
+                CteNames::Listed(ctes),
                 join_right,
                 Some(cond),
                 &join_type_upper,
@@ -1000,14 +1015,10 @@ impl Executor {
 
             // The side execution probes, by the rule it picks it with. The
             // executor swaps a small outer in only from a right side that is
-            // not a table
-            let right_is_table = match join_right {
-                Expression::TableSource(_) => true,
-                Expression::Aliased(aliased) => {
-                    matches!(aliased.expression.as_ref(), Expression::TableSource(_))
-                }
-                _ => false,
-            };
+            // not a base table
+            let right_is_table = self
+                .base_table_side_schema(join_right, CteNames::Listed(ctes))
+                .is_some();
             let picked = if index_use == JoinIndexUse::Grouped {
                 inlj_info.map(|info| (info, false))
             } else {
@@ -1025,13 +1036,13 @@ impl Executor {
                 };
                 pick_index_join_side(
                     &join_type_upper,
-                    join_right,
+                    right_is_table,
                     right_filtered,
                     left_filtered,
                     inlj_info,
                     || {
                         self.check_index_nested_loop_opportunity(
-                            None,
+                            CteNames::Listed(ctes),
                             join_left,
                             Some(cond),
                             &join_type_upper,
@@ -1262,6 +1273,16 @@ impl Executor {
 }
 
 /// Extract table alias from a table expression
+/// The names the WITH of `select` gives its CTEs, which hide tables of the
+/// same name in its FROM
+fn cte_names(select: &SelectStatement) -> Vec<String> {
+    select
+        .with
+        .iter()
+        .flat_map(|with| with.ctes.iter().map(|cte| cte.name.value_lower.to_string()))
+        .collect()
+}
+
 fn extract_table_alias(expr: &Expression) -> Option<String> {
     match expr {
         Expression::TableSource(simple) => simple
