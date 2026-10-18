@@ -194,6 +194,42 @@ fn same_outer_source(
     })
 }
 
+/// The side an index join probes, given what the right table offers
+/// (`unswapped`): an INNER join probes its left table instead from a right
+/// side that is not a table, or for a primary key when only the right side
+/// is filtered. Some((probe, true)) when the sides swap
+pub(crate) fn pick_index_join_side<T>(
+    join_type: &str,
+    right: &Expression,
+    right_filtered: bool,
+    left_filtered: bool,
+    unswapped: Option<T>,
+    probe_left: impl FnOnce() -> Option<T>,
+    is_primary_key: impl Fn(&T) -> bool,
+) -> Option<(T, bool)> {
+    // Only an INNER join reads the same with its sides exchanged; a LEFT
+    // join would go on preserving the side it was given
+    if join_type != "INNER" {
+        return unswapped.map(|probe| (probe, false));
+    }
+    let right_is_table = match right {
+        Expression::TableSource(_) => true,
+        Expression::Aliased(aliased) => {
+            matches!(aliased.expression.as_ref(), Expression::TableSource(_))
+        }
+        _ => false,
+    };
+    if unswapped.is_none() && !right_is_table {
+        return probe_left().map(|probe| (probe, true));
+    }
+    if right_filtered && !left_filtered {
+        if let Some(probe) = probe_left().filter(&is_primary_key) {
+            return Some((probe, true));
+        }
+    }
+    unswapped.map(|probe| (probe, false))
+}
+
 /// The table an index join can probe on a side that names one: never a table
 /// read AS OF, whose past rows no index holds
 pub(crate) fn index_join_table_name(side: &Expression) -> Option<String> {
@@ -4246,10 +4282,10 @@ impl Executor {
             // An INNER join without a limit narrows its inner side by a table's
             // candidates only for an outer side found small once it runs
             let small_outer = pushed_limit.is_none() && join_type == "INNER";
-            let index_nl_info = if correlated_where {
+            let picked = if correlated_where {
                 None
             } else {
-                self.check_index_nested_loop_opportunity(
+                let unswapped = self.check_index_nested_loop_opportunity(
                     Some(ctx),
                     &join_source.right,
                     on_condition,
@@ -4258,103 +4294,37 @@ impl Executor {
                     right_alias.as_deref(),
                     pushed_limit.is_some(),
                     small_outer,
+                );
+                pick_index_join_side(
+                    &join_type,
+                    &join_source.right,
+                    right_filter.is_some(),
+                    left_filter.is_some(),
+                    unswapped,
+                    || {
+                        self.check_index_nested_loop_opportunity(
+                            Some(ctx),
+                            &join_source.left,
+                            on_condition,
+                            &join_type,
+                            right_alias.as_deref(),
+                            left_alias.as_deref(),
+                            pushed_limit.is_some(),
+                            small_outer,
+                        )
+                    },
+                    |(_, strategy, _, _)| matches!(strategy, IndexLookupStrategy::PrimaryKey),
                 )
             };
-
-            // Subquery join optimization: When right side is a subquery (not a table)
-            // and left side is a table with PK/index, use swapped Index NL.
-            // This handles inlined CTEs: (table) JOIN (subquery) -> subquery outer, table inner
-            let (index_nl_info, force_swap) = if index_nl_info.is_none()
-                && !correlated_where
-                // Only an INNER join reads the same with its sides
-                // exchanged; a LEFT join would go on preserving the side it
-                // was given, which after the swap is the wrong one
-                && join_type == "INNER"
-                && !matches!(join_source.right.as_ref(), Expression::TableSource(_))
-                && !matches!(
-                    join_source.right.as_ref(),
-                    Expression::Aliased(a) if matches!(a.expression.as_ref(), Expression::TableSource(_))
-                ) {
-                // Right is subquery/CTE - check if left side has Index NL opportunity
-                let left_as_inner = self.check_index_nested_loop_opportunity(
-                    Some(ctx),
-                    &join_source.left,
-                    on_condition,
-                    &join_type,
-                    right_alias.as_deref(), // Swap aliases for the check
-                    left_alias.as_deref(),
-                    pushed_limit.is_some(),
-                    small_outer,
-                );
-                if left_as_inner.is_some() {
-                    (left_as_inner, true) // Force swap
-                } else {
-                    (None, false)
-                }
-            } else {
-                (index_nl_info, false)
-            };
-
-            // Join reordering optimization for INNER JOINs:
-            // When one side has a filter, prefer putting filtered side as outer (left)
-            // This reduces the number of probes into the inner table.
-            // Swap if: right has filter, left doesn't, and swapped order gives Index NL on PK
-            let (index_nl_info, nl_left_filter, nl_right_filter, swapped) = if force_swap {
-                // Subquery join optimization: swap is forced (right is subquery, left is table)
-                (
-                    index_nl_info,
-                    right_filter.clone(), // Subquery becomes outer, apply its filter
-                    left_filter.clone(),  // Table becomes inner
-                    true,
-                )
-            } else if !correlated_where
-                    && join_type == "INNER"
-                    && right_filter.is_some()  // Right side has a filter
-                    && left_filter.is_none()
-            // Left side doesn't have a filter
-            {
-                // Check if swapping gives Index NL opportunity with PK lookup
-                // (which is more efficient than secondary index lookup)
-                let swapped_info = self.check_index_nested_loop_opportunity(
-                    Some(ctx),
-                    &join_source.left, // Left becomes inner (right)
-                    on_condition,
-                    &join_type,
-                    right_alias.as_deref(), // Swap aliases
-                    left_alias.as_deref(),
-                    pushed_limit.is_some(),
-                    small_outer,
-                );
-
-                // Prefer swapped if it gives PK lookup (most efficient)
-                let prefer_swap = matches!(
-                    &swapped_info,
-                    Some((_, IndexLookupStrategy::PrimaryKey, _, _))
-                );
-
-                if prefer_swap {
-                    // Swap: right filter becomes outer filter
-                    (
-                        swapped_info,
-                        right_filter.clone(),
-                        left_filter.clone(),
-                        true,
-                    )
-                } else {
-                    (
-                        index_nl_info,
-                        left_filter.clone(),
-                        right_filter.clone(),
-                        false,
-                    )
-                }
-            } else {
-                (
-                    index_nl_info,
+            // A swapped join reads the right side as its outer, with its filter
+            let (index_nl_info, nl_left_filter, nl_right_filter, swapped) = match picked {
+                Some((info, true)) => (Some(info), right_filter.clone(), left_filter.clone(), true),
+                picked => (
+                    picked.map(|(info, _)| info),
                     left_filter.clone(),
                     right_filter.clone(),
                     false,
-                )
+                ),
             };
 
             // A join the inner table stops answering leaves through the label
@@ -4777,6 +4747,8 @@ impl Executor {
                     // applied per joined row rather than after collection
                     let cross_row_filter = match cross_filter {
                         Some(ref cross) => {
+                            let resolved = Self::with_select_aliases(stmt, cross, &all_columns);
+                            let cross = resolved.as_ref().unwrap_or(cross);
                             Some(RowFilter::new(cross, &all_columns)?.with_context(ctx))
                         }
                         None => None,
@@ -4941,8 +4913,27 @@ impl Executor {
                         )?;
                     }
 
-                    // No rotation needed - all_columns matches physical order
                     let mut final_rows = result_rows;
+                    // Columns are found by name, so rows keep the physical
+                    // outer-then-inner order, except where `*` lists the
+                    // columns in the order the statement wrote the sides
+                    let star = stmt
+                        .columns
+                        .iter()
+                        .any(|c| matches!(c, Expression::Star(_)));
+                    let all_columns = if swapped && star && projection_pushdown.is_none() {
+                        let outer_len = outer_cols.len();
+                        for (_, row) in final_rows.iter_mut() {
+                            let mut values = std::mem::take(row).into_values();
+                            values.rotate_left(outer_len);
+                            *row = Row::from_values(values);
+                        }
+                        let mut logical = inner_cols.clone();
+                        logical.extend(outer_cols.iter().cloned());
+                        logical
+                    } else {
+                        all_columns
+                    };
 
                     // Check for aggregation/window functions that need special handling
                     let has_agg = classification.has_aggregation;
@@ -5621,9 +5612,6 @@ impl Executor {
         let join_result = join_executor.execute(join_request)?;
         let result_rows = join_result.rows;
 
-        // Build alias map for alias substitution, excluding aliases that shadow real columns.
-        let alias_map = Self::build_alias_map_excluding(&stmt.columns, Some(&all_columns));
-
         // Apply remaining WHERE clause if present (after filter pushdown)
         // IMPORTANT: When predicates were pushed to left/right (left_filter or right_filter is Some),
         // we should ONLY apply cross_filter (predicates that reference both tables).
@@ -5638,13 +5626,11 @@ impl Executor {
             where_for_join.clone()
         };
 
-        let resolved_where_clause = if !alias_map.is_empty() {
-            effective_where
-                .as_ref()
-                .map(|where_expr| Box::new(Self::substitute_aliases(where_expr, &alias_map)))
-        } else {
-            effective_where.map(Box::new)
-        };
+        let resolved_where_clause = effective_where.map(|where_expr| {
+            Box::new(
+                Self::with_select_aliases(stmt, &where_expr, &all_columns).unwrap_or(where_expr),
+            )
+        });
 
         // Apply WHERE clause if present
         let filtered_rows = if let Some(ref where_clause) = resolved_where_clause {
@@ -7568,7 +7554,11 @@ impl Executor {
             None => None,
         };
         let cross = match cross_filter {
-            Some(cross) => Some(RowFilter::new(cross, &all_columns)?.with_context(ctx)),
+            Some(cross) => {
+                let resolved = Self::with_select_aliases(stmt, cross, &all_columns);
+                let cross = resolved.as_ref().unwrap_or(cross);
+                Some(RowFilter::new(cross, &all_columns)?.with_context(ctx))
+            }
             None => None,
         };
         // A right-side filter the storage layer takes whole runs inside the
@@ -10896,6 +10886,18 @@ impl Executor {
         alias_map
     }
 
+    /// A predicate over the join's `columns` with the SELECT aliases it names
+    /// spelled as their expressions, None when there is none to spell; an
+    /// alias a column of the join holds stays that column
+    fn with_select_aliases(
+        stmt: &SelectStatement,
+        predicate: &Expression,
+        columns: &[String],
+    ) -> Option<Expression> {
+        let alias_map = Self::build_alias_map_excluding(&stmt.columns, Some(columns));
+        (!alias_map.is_empty()).then(|| Self::substitute_aliases(predicate, &alias_map))
+    }
+
     /// Substitute column aliases in an expression with their underlying expressions
     pub(super) fn substitute_aliases(
         expr: &Expression,
@@ -11631,6 +11633,26 @@ impl Executor {
 
         // Must not have window definitions
         if !stmt.window_defs.is_empty() {
+            return None;
+        }
+
+        // Every output column must be a table column under its own name: the
+        // probe reads the table, not a column the subquery renamed or computed
+        let passthrough = |column: &Expression| match column {
+            Expression::Star(_)
+            | Expression::QualifiedStar(_)
+            | Expression::Identifier(_)
+            | Expression::QualifiedIdentifier(_) => true,
+            Expression::Aliased(aliased) => match aliased.expression.as_ref() {
+                Expression::Identifier(id) => id.value_lower == aliased.alias.value_lower,
+                Expression::QualifiedIdentifier(q) => {
+                    q.name.value_lower == aliased.alias.value_lower
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        if !stmt.columns.iter().all(passthrough) {
             return None;
         }
 

@@ -80,8 +80,82 @@ const SHAPES: &[&str] = &[
     "SELECT a.k, SUM(b.w), RANK() OVER (ORDER BY SUM(b.w)) FROM a JOIN {b} b \
      ON a.id = b.aid GROUP BY a.k",
     "SELECT SUM(b.w) FROM {b} b JOIN (SELECT id, k FROM a WHERE v > 1) x ON x.id = b.aid",
-    "SELECT *, COUNT(*) OVER () FROM {b} b JOIN (SELECT id, k FROM a) x ON x.id = b.aid",
+    "SELECT *, COUNT(*) OVER () FROM {b} b JOIN (SELECT id, k FROM a WHERE v > 1) x \
+     ON x.id = b.aid",
 ];
+
+/// The rows of the index join's own paths, asked with and without a reader
+/// above them: a renamed subquery column, `*` after the sides swap, and a
+/// SELECT alias in WHERE
+#[test]
+fn an_index_join_keeps_projections_column_order_and_aliases() {
+    let db = Database::open("memory://join_consumer_paths").unwrap();
+    db.execute(
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, aid INTEGER, w INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX b_aid ON b(aid)", ()).unwrap();
+    db.execute("INSERT INTO a VALUES (1, 10, 100), (2, 1, 200)", ())
+        .unwrap();
+    db.execute("INSERT INTO b VALUES (1, 1, 5), (2, 2, 6)", ())
+        .unwrap();
+    let renamed = "FROM b JOIN (SELECT id, v AS k FROM a) x ON b.aid = x.id";
+    let swapped = "FROM b JOIN (SELECT id, k FROM a WHERE k = 1) x ON b.id = x.id";
+    let aliased = "FROM a JOIN b ON a.id = b.aid WHERE total > a.v + b.w - 1";
+    let cases: [(String, Vec<&str>, Vec<&str>); 6] = [
+        (
+            format!("SELECT x.k {renamed}"),
+            vec!["k"],
+            vec!["[Integer(100)]", "[Integer(200)]"],
+        ),
+        (
+            format!("SELECT SUM(x.k) {renamed}"),
+            vec!["SUM(x.k)"],
+            vec!["[Integer(300)]"],
+        ),
+        (
+            format!("SELECT * {swapped}"),
+            vec!["b.id", "b.aid", "b.w", "x.id", "x.k"],
+            vec!["[Integer(2), Integer(2), Integer(6), Integer(2), Integer(1)]"],
+        ),
+        (
+            format!("SELECT *, COUNT(*) OVER () {swapped}"),
+            vec!["b.id", "b.aid", "b.w", "x.id", "x.k", "COUNT()"],
+            vec!["[Integer(2), Integer(2), Integer(6), Integer(2), Integer(1), Integer(1)]"],
+        ),
+        (
+            format!("SELECT a.v + b.w AS total {aliased}"),
+            vec!["total"],
+            vec!["[Integer(105)]", "[Integer(206)]"],
+        ),
+        (
+            format!("SELECT a.v + b.w AS total, COUNT(*) OVER () {aliased}"),
+            vec!["total", "COUNT()"],
+            vec!["[Integer(105), Integer(2)]", "[Integer(206), Integer(2)]"],
+        ),
+    ];
+    let wrong: Vec<String> = cases
+        .iter()
+        .filter_map(|(sql, columns, rows)| {
+            let got = match db.query(sql, ()) {
+                Ok(_) => answer(&db, sql),
+                Err(e) => return Some(format!("{sql}\n  error {e}")),
+            };
+            let want = (
+                columns.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
+                rows.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+            );
+            (got != want).then(|| format!("{sql}\n  got {got:?}\n  want {want:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
 
 #[test]
 fn an_aggregate_or_window_over_an_index_join_answers_as_over_a_hash_join() {
@@ -114,6 +188,25 @@ fn explain_reports_the_index_join_under_an_aggregate() {
         "{}",
         plan.join("\n")
     );
+    // The left primary key is probed only by the swap execution makes: not
+    // from a right table nothing filters
+    db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, aid INTEGER)", ())
+        .unwrap();
+    for sql in [
+        "EXPLAIN SELECT a.id FROM a JOIN p ON a.id = p.aid",
+        "EXPLAIN SELECT COUNT(*) FROM a JOIN p ON a.id = p.aid",
+    ] {
+        let plan: Vec<String> = db
+            .query(sql, ())
+            .unwrap()
+            .map(|row| row.unwrap().get::<String>(0).unwrap())
+            .collect();
+        assert!(
+            !plan.iter().any(|line| line.contains("Index Nested Loop")),
+            "{sql}\n{}",
+            plan.join("\n")
+        );
+    }
 }
 
 #[cfg(all(feature = "test-failpoints", not(feature = "test-filedb")))]
