@@ -30,9 +30,12 @@ use super::operators::index_nested_loop::IndexLookupStrategy;
 use super::parallel;
 use super::planner::{QueryPlanner, RuntimeJoinAlgorithm};
 use super::pushdown;
-use super::query::JoinIndexUse;
+use super::query::{pick_index_join_side, split_join_where, JoinIndexUse};
 use super::result::ExecutorResult;
-use super::utils::{collect_table_qualifiers, combine_predicates_with_and, flatten_and_predicates};
+use super::utils::{
+    collect_table_qualifiers, combine_predicates_with_and, flatten_and_predicates,
+    get_table_alias_from_expr,
+};
 use super::Executor;
 
 impl Executor {
@@ -440,6 +443,7 @@ impl Executor {
                     join.condition.as_deref(),
                     join.join_type.as_ref(),
                     &join.using_columns,
+                    where_clause,
                     index_use,
                 );
 
@@ -799,6 +803,7 @@ impl Executor {
                     join.condition.as_deref(),
                     join.join_type.as_ref(),
                     &join.using_columns,
+                    where_clause,
                     index_use,
                 );
 
@@ -942,6 +947,7 @@ impl Executor {
 
     /// Determine the join algorithm for EXPLAIN output
     /// This uses the same QueryPlanner logic as actual execution for consistency
+    #[allow(clippy::too_many_arguments)]
     fn determine_join_algorithm_for_explain(
         &self,
         join_left: &Expression,
@@ -949,11 +955,12 @@ impl Executor {
         join_condition: Option<&Expression>,
         join_type: &str,
         using_columns: &[Identifier],
+        where_clause: Option<&Expression>,
         index_use: JoinIndexUse,
     ) -> (String, Option<IndexLookupStrategy>) {
         // The index join is reported only where execution takes it: never
-        // under an aggregate or window the operators turn away, and for the
-        // grouped operator on the right side only
+        // for a shape the reduction plan takes without the grouped operator,
+        // and for the grouped operator on the right side only
         let bounded = match index_use {
             JoinIndexUse::None => None,
             JoinIndexUse::Streaming { bounded } => Some(bounded),
@@ -991,11 +998,7 @@ impl Executor {
                 small_outer,
             );
 
-            if let Some((_, strategy, _, _)) = inlj_info {
-                return (name(&strategy), Some(strategy));
-            }
-
-            // Check swapped direction for INLJ (left side has index/PK). The
+            // The side execution probes, by the rule it picks it with. The
             // executor swaps a small outer in only from a right side that is
             // not a table
             let right_is_table = match join_right {
@@ -1005,22 +1008,44 @@ impl Executor {
                 }
                 _ => false,
             };
-            let swapped_info = if index_use == JoinIndexUse::Grouped {
-                None
+            let picked = if index_use == JoinIndexUse::Grouped {
+                inlj_info.map(|info| (info, false))
             } else {
-                self.check_index_nested_loop_opportunity(
-                    None,
-                    join_left,
-                    Some(cond),
+                let (left_filtered, right_filtered) = match where_clause {
+                    Some(where_clause) => {
+                        let (left, right, _) = split_join_where(
+                            where_clause,
+                            get_table_alias_from_expr(join_left).as_deref(),
+                            get_table_alias_from_expr(join_right).as_deref(),
+                            &join_type_upper,
+                        );
+                        (left.is_some(), right.is_some())
+                    }
+                    None => (false, false),
+                };
+                pick_index_join_side(
                     &join_type_upper,
-                    right_alias.as_deref(),
-                    left_alias.as_deref(),
-                    bounded,
-                    small_outer && !right_is_table,
+                    join_right,
+                    right_filtered,
+                    left_filtered,
+                    inlj_info,
+                    || {
+                        self.check_index_nested_loop_opportunity(
+                            None,
+                            join_left,
+                            Some(cond),
+                            &join_type_upper,
+                            right_alias.as_deref(),
+                            left_alias.as_deref(),
+                            bounded,
+                            small_outer && !right_is_table,
+                        )
+                    },
+                    |(_, strategy, _, _)| matches!(strategy, IndexLookupStrategy::PrimaryKey),
                 )
             };
 
-            if let Some((_, strategy, _, _)) = swapped_info {
+            if let Some(((_, strategy, _, _), _)) = picked {
                 return (name(&strategy), Some(strategy));
             }
         }
