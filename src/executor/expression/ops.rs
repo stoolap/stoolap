@@ -966,30 +966,7 @@ pub enum CompareOp {
 
 impl CompareOp {
     pub fn compare(&self, a: &Value, b: &Value) -> Option<bool> {
-        match (a.partial_cmp(b), self) {
-            (Some(std::cmp::Ordering::Equal), CompareOp::Eq) => Some(true),
-            (Some(std::cmp::Ordering::Equal), CompareOp::Ne) => Some(false),
-            (Some(std::cmp::Ordering::Equal), CompareOp::Le) => Some(true),
-            (Some(std::cmp::Ordering::Equal), CompareOp::Ge) => Some(true),
-            (Some(std::cmp::Ordering::Equal), CompareOp::Lt) => Some(false),
-            (Some(std::cmp::Ordering::Equal), CompareOp::Gt) => Some(false),
-
-            (Some(std::cmp::Ordering::Less), CompareOp::Lt) => Some(true),
-            (Some(std::cmp::Ordering::Less), CompareOp::Le) => Some(true),
-            (Some(std::cmp::Ordering::Less), CompareOp::Ne) => Some(true),
-            (Some(std::cmp::Ordering::Less), CompareOp::Eq) => Some(false),
-            (Some(std::cmp::Ordering::Less), CompareOp::Gt) => Some(false),
-            (Some(std::cmp::Ordering::Less), CompareOp::Ge) => Some(false),
-
-            (Some(std::cmp::Ordering::Greater), CompareOp::Gt) => Some(true),
-            (Some(std::cmp::Ordering::Greater), CompareOp::Ge) => Some(true),
-            (Some(std::cmp::Ordering::Greater), CompareOp::Ne) => Some(true),
-            (Some(std::cmp::Ordering::Greater), CompareOp::Eq) => Some(false),
-            (Some(std::cmp::Ordering::Greater), CompareOp::Lt) => Some(false),
-            (Some(std::cmp::Ordering::Greater), CompareOp::Le) => Some(false),
-
-            (None, _) => None, // NULL comparison
-        }
+        QuantifiedMembers::compares(*self, a, b)
     }
 }
 
@@ -1603,6 +1580,22 @@ mod tests {
         assert_eq!(
             op.compare(&Value::Float(2.4), &Value::Float(2.5)),
             Some(false)
+        );
+    }
+
+    #[test]
+    fn test_compare_op_follows_the_predicate_comparison() {
+        assert_eq!(
+            CompareOp::Eq.compare(&Value::Integer(1), &Value::Text("1".into())),
+            Some(true)
+        );
+        assert_eq!(
+            CompareOp::Le.compare(&Value::Boolean(false), &Value::Text("yes".into())),
+            Some(true)
+        );
+        assert_eq!(
+            CompareOp::Lt.compare(&Value::Boolean(true), &Value::Integer(2)),
+            None
         );
     }
 

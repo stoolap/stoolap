@@ -192,25 +192,20 @@ impl JoinHashTable {
     }
 
     /// `build` over one key column, filling a bloom filter too when one is
-    /// given, and telling whether the column holds a number and whether
-    /// it holds a TEXT
+    /// given, and telling the kinds the column holds
     pub fn build_one_key(
         rows: &[Row],
         key_idx: usize,
         mut bloom_builder: Option<&mut crate::optimizer::bloom::BloomFilterBuilder>,
-    ) -> (Self, bool, bool) {
+    ) -> (Self, u8) {
         let mut table = Self::with_capacity(rows.len());
         let key_indices = [key_idx];
-        let (mut numbers, mut texts) = (false, false);
+        let mut kinds = 0;
         for (idx, row) in rows.iter().enumerate() {
-            // The key read once, for its family and for its hash
+            // The key read once, for its kind and for its hash
             let hash = match row.get(key_idx) {
                 Some(value) => {
-                    match value {
-                        Value::Integer(_) | Value::Float(_) => numbers = true,
-                        Value::Text(_) => texts = true,
-                        _ => {}
-                    }
+                    kinds |= crate::core::predicate::kind::of(value);
                     hash_key_value(value)
                 }
                 None => hash_row_keys(row, &key_indices),
@@ -220,7 +215,7 @@ impl JoinHashTable {
                 builder.insert_raw_hash(hash);
             }
         }
-        (table, numbers, texts)
+        (table, kinds)
     }
 
     /// Insert a row index with its pre-computed hash.

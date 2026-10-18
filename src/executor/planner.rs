@@ -899,7 +899,9 @@ impl QueryPlanner {
         match expr {
             Expression::IntegerLiteral(lit) => Some(Value::Integer(lit.value)),
             Expression::FloatLiteral(lit) => Some(Value::Float(lit.value)),
-            Expression::StringLiteral(lit) => Some(Value::Text(lit.value.to_string().into())),
+            Expression::StringLiteral(lit) => {
+                Some(crate::executor::utils::string_literal_value(lit))
+            }
             Expression::BooleanLiteral(lit) => Some(Value::Boolean(lit.value)),
             Expression::NullLiteral(_) => None, // NULL doesn't have a comparable value
             _ => None,

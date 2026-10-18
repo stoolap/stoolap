@@ -392,6 +392,19 @@ impl InListExpr {
             _ => false,
         }
     }
+
+    /// Whether a member equals the cell, which is not NULL
+    #[inline]
+    fn finds(&self, col_value: &Value) -> bool {
+        match col_value {
+            Value::Integer(val) => self.check_integer(*val),
+            Value::Float(val) => self.check_float(*val),
+            Value::Text(val) => self.check_string(val),
+            Value::Boolean(val) => self.check_boolean(*val),
+            Value::Timestamp(val) => self.check_timestamp(val),
+            _ => false,
+        }
+    }
 }
 
 impl Expression for InListExpr {
@@ -416,15 +429,7 @@ impl Expression for InListExpr {
             return Ok(false);
         }
 
-        // O(1) lookup using pre-computed hash sets!
-        let found = match col_value {
-            Value::Integer(val) => self.check_integer(*val),
-            Value::Float(val) => self.check_float(*val),
-            Value::Text(val) => self.check_string(val),
-            Value::Boolean(val) => self.check_boolean(*val),
-            Value::Timestamp(val) => self.check_timestamp(val),
-            _ => false,
-        };
+        let found = self.finds(col_value);
 
         if found {
             // Found a match
@@ -452,15 +457,7 @@ impl Expression for InListExpr {
             return false;
         }
 
-        // O(1) lookup using pre-computed hash sets!
-        let found = match col_value {
-            Value::Integer(val) => self.check_integer(*val),
-            Value::Float(val) => self.check_float(*val),
-            Value::Text(val) => self.check_string(val),
-            Value::Boolean(val) => self.check_boolean(*val),
-            Value::Timestamp(val) => self.check_timestamp(val),
-            _ => false,
-        };
+        let found = self.finds(col_value);
 
         if found {
             !self.not // IN returns true, NOT IN returns false
@@ -511,6 +508,14 @@ impl Expression for InListExpr {
 
     fn get_column_name(&self) -> Option<&str> {
         Some(&self.column)
+    }
+
+    /// A NULL cell, or no member found in a list that holds a NULL
+    fn is_unknown_due_to_null(&self, row: &Row) -> bool {
+        match self.col_index.and_then(|idx| row.get(idx)) {
+            Some(col_value) => col_value.is_null() || (self.has_null && !self.finds(col_value)),
+            None => false,
+        }
     }
 
     fn collect_comparisons(&self) -> Vec<(&str, crate::core::Operator, &Value)> {

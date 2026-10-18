@@ -32,6 +32,7 @@ use crate::storage::traits::transaction::StatementTable;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::common::{CompactArc, CompactVec, StringMap};
+use crate::core::predicate::{kind, sql_compare, sql_eq, KeySide};
 use crate::core::{DataType, Error, Result, Row, RowVec, Schema, Value, ValueSet};
 use crate::optimizer::ExpressionSimplifier;
 use crate::parser::ast::*;
@@ -112,11 +113,12 @@ use super::result::{
 use super::row_count::{row_counts, rows_needed, static_row_counts, RowCounts};
 use super::utils::compute_join_projection;
 use super::utils::{
-    add_table_qualifier, build_column_index_map, collect_table_qualifiers, column_families,
+    add_table_qualifier, build_column_index_map, collect_table_qualifiers, column_kinds,
     combine_predicates_with_and, dummy_token, expression_contains_aggregate,
     extract_and_conditions, extract_base_column_name, extract_join_keys_and_residual,
     filter_references_column, flatten_and_predicates, flip_operator, get_table_alias_from_expr,
-    index_join_residual, infix_to_operator, strip_table_qualifier, substitute_filter_column,
+    index_join_residual, infix_to_operator, string_literal_value, strip_table_qualifier,
+    substitute_filter_column,
 };
 use super::volatility::statement_constant;
 use super::window::{WindowPreGroupedState, WindowPreSortedState};
@@ -4396,14 +4398,9 @@ impl Executor {
                 // The join condition u.id = o.user_id means:
                 //   Filter "o.user_id IN (1,2,3)" is equivalent to "u.id IN (1,2,3)" for join results
                 // A small outer keeps the filter the standard join gives it
-                // The equivalence holds only for two keys of one family: a TEXT
-                // key's filter does not carry over to a numeric key or back
+                // The equivalence holds only for two keys of one type or both
+                // numbers: a comparison reads a constant against each by its own type
                 let same_family = || {
-                    let family = |data_type| match data_type {
-                        Some(DataType::Text) => Some(true),
-                        Some(DataType::Integer | DataType::Float) => Some(false),
-                        _ => None,
-                    };
                     let column_type = |expr: &Expression, column: &str| {
                         let name = column.rsplit('.').next().unwrap_or(column);
                         self.base_table_side_schema(expr, ctx)
@@ -4414,8 +4411,15 @@ impl Executor {
                     } else {
                         &join_source.right
                     };
-                    let inner = family(column_type(inner_expr, &inner_col));
-                    inner.is_none() || inner == family(column_type(outer_expr, &outer_col))
+                    match (
+                        column_type(inner_expr, &inner_col),
+                        column_type(outer_expr, &outer_col),
+                    ) {
+                        (Some(inner), Some(outer)) => {
+                            inner == outer || (inner.is_numeric() && outer.is_numeric())
+                        }
+                        _ => false,
+                    }
                 };
                 let nl_left_filter = if small_outer {
                     nl_left_filter
@@ -5275,12 +5279,12 @@ impl Executor {
                     let one_key_built = match build_key_indices.as_slice() {
                         &[build_idx] if !typed(build_idx) => {
                             let mut builder = wants_bloom.then(new_bloom);
-                            let (table, numbers, texts) = JoinHashTable::build_one_key(
+                            let (table, kinds) = JoinHashTable::build_one_key(
                                 &build_rows,
                                 build_idx,
                                 builder.as_mut(),
                             );
-                            Some((table, builder, numbers, texts))
+                            Some((table, builder, kinds))
                         }
                         _ => None,
                     };
@@ -5288,31 +5292,30 @@ impl Executor {
                     let mut unverified = false;
                     for (&build_idx, &probe_idx) in build_key_indices.iter().zip(&probe_key_indices)
                     {
-                        let (numbers, texts) = match &one_key_built {
-                            Some((_, _, numbers, texts)) => (*numbers, *texts),
-                            None => column_families(
+                        let build = match &one_key_built {
+                            Some((_, _, kinds)) => *kinds,
+                            None => column_kinds(
                                 &build_rows,
                                 &build_cols,
                                 build_schema.as_deref(),
                                 build_idx,
                             ),
                         };
-                        if !numbers && !texts {
+                        if build & (kind::TEXT | kind::READ_FROM_TEXT) == 0 {
                             continue;
                         }
                         let probe_column = &probe_cols[probe_idx];
                         let name = probe_column.rsplit('.').next().unwrap_or(probe_column);
-                        let crosses =
-                            match probe_schema.as_ref().and_then(|s| s.get_column_type(name)) {
-                                Some(DataType::Text) => numbers,
-                                Some(DataType::Integer | DataType::Float) => texts,
-                                Some(_) => false,
-                                None => true,
-                            };
-                        if crosses && build_key_indices.len() == 1 && numbers != texts {
-                            cross_key = Some(texts);
-                        } else if crosses {
-                            unverified = true;
+                        let crosses = probe_schema
+                            .as_ref()
+                            .and_then(|s| s.get_column_type(name))
+                            .is_none_or(|probe| kind::crosses(build, kind::of_type(probe)));
+                        match KeySide::of_kinds(build) {
+                            Some(side) if crosses && build_key_indices.len() == 1 => {
+                                cross_key = Some(side);
+                            }
+                            _ if crosses => unverified = true,
+                            _ => {}
                         }
                     }
                     if unverified {
@@ -5330,10 +5333,10 @@ impl Executor {
 
                     // Build hash table and bloom filter together in a single pass
                     // This avoids iterating build_rows twice (once for bloom, once for hash table)
-                    // A probe key the comparison reads as a number would miss a
-                    // bloom filter of the build keys as they are
+                    // A probe key the comparison reads as another type would miss
+                    // a bloom filter of the build keys as they are
                     let (bloom_filter, pre_built_hash_table) =
-                        if let Some((table, builder, _, _)) = one_key_built {
+                        if let Some((table, builder, _)) = one_key_built {
                             let bloom = builder
                                 .filter(|_| cross_key.is_none())
                                 .map(BloomFilterBuilder::build)
@@ -8475,7 +8478,7 @@ impl Executor {
             match expr {
                 Expression::IntegerLiteral(lit) => Some(Value::Integer(lit.value)),
                 Expression::FloatLiteral(lit) => Some(Value::Float(lit.value)),
-                Expression::StringLiteral(lit) => Some(Value::Text(lit.value.clone())),
+                Expression::StringLiteral(lit) => Some(string_literal_value(lit)),
                 Expression::BooleanLiteral(lit) => Some(Value::Boolean(lit.value)),
                 Expression::NullLiteral(_) => Some(Value::null_unknown()),
                 _ => None,
@@ -8868,17 +8871,23 @@ impl Executor {
                                     | CaseCondition::IsNull { col_idx } => row.get(*col_idx),
                                 };
                                 let cond_matches = match (&branch.condition, col_val) {
-                                    (CaseCondition::Equals { value, .. }, Some(v)) => v == value,
-                                    (CaseCondition::NotEquals { value, .. }, Some(v)) => v != value,
+                                    (CaseCondition::Equals { value, .. }, Some(v)) => {
+                                        sql_eq(v, value) == Some(true)
+                                    }
+                                    (CaseCondition::NotEquals { value, .. }, Some(v)) => {
+                                        sql_eq(v, value) == Some(false)
+                                    }
                                     (CaseCondition::GreaterThan { value, .. }, Some(v)) => {
-                                        v > value
+                                        sql_compare(v, value).is_some_and(|o| o.is_gt())
                                     }
                                     (CaseCondition::GreaterOrEqual { value, .. }, Some(v)) => {
-                                        v >= value
+                                        sql_compare(v, value).is_some_and(|o| o.is_ge())
                                     }
-                                    (CaseCondition::LessThan { value, .. }, Some(v)) => v < value,
+                                    (CaseCondition::LessThan { value, .. }, Some(v)) => {
+                                        sql_compare(v, value).is_some_and(|o| o.is_lt())
+                                    }
                                     (CaseCondition::LessOrEqual { value, .. }, Some(v)) => {
-                                        v <= value
+                                        sql_compare(v, value).is_some_and(|o| o.is_le())
                                     }
                                     (CaseCondition::IsNull { .. }, Some(v)) => v.is_null(),
                                     (_, None) => false,

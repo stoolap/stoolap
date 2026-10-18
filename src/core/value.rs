@@ -453,12 +453,10 @@ impl Value {
 
     /// Compare values of the same type
     fn compare_same_type(&self, other: &Value) -> Result<Ordering> {
+        if let Some(ordering) = self.plain_cmp(other) {
+            return Ok(ordering);
+        }
         match (self, other) {
-            (Value::Integer(a), Value::Integer(b)) => Ok(a.cmp(b)),
-            (Value::Float(a), Value::Float(b)) => Ok(compare_floats(*a, *b)),
-            (Value::Text(a), Value::Text(b)) => Ok(a.cmp(b)),
-            (Value::Boolean(a), Value::Boolean(b)) => Ok(a.cmp(b)),
-            (Value::Timestamp(a), Value::Timestamp(b)) => Ok(a.cmp(b)),
             (Value::Extension(a), Value::Extension(b)) => {
                 // Extension: tag byte is [0], so same-tag comparison is data equality
                 if a.first() != b.first() {
@@ -472,6 +470,34 @@ impl Value {
                 }
             }
             _ => Err(Error::IncomparableTypes),
+        }
+    }
+
+    /// How two values of one type that is neither NULL nor an extension
+    /// order; None for any other pair
+    #[inline]
+    pub(crate) fn plain_cmp(&self, other: &Value) -> Option<Ordering> {
+        match (self, other) {
+            (Value::Integer(a), Value::Integer(b)) => Some(a.cmp(b)),
+            (Value::Float(a), Value::Float(b)) => Some(compare_floats(*a, *b)),
+            (Value::Text(a), Value::Text(b)) => Some(a.cmp(b)),
+            (Value::Boolean(a), Value::Boolean(b)) => Some(a.cmp(b)),
+            (Value::Timestamp(a), Value::Timestamp(b)) => Some(a.cmp(b)),
+            _ => None,
+        }
+    }
+
+    /// Whether two values of one type that is neither NULL nor an extension
+    /// are equal, as `plain_cmp` orders them; None for any other pair
+    #[inline]
+    pub(crate) fn plain_eq(&self, other: &Value) -> Option<bool> {
+        match (self, other) {
+            (Value::Integer(a), Value::Integer(b)) => Some(a == b),
+            (Value::Float(a), Value::Float(b)) => Some(compare_floats(*a, *b).is_eq()),
+            (Value::Text(a), Value::Text(b)) => Some(a == b),
+            (Value::Boolean(a), Value::Boolean(b)) => Some(a == b),
+            (Value::Timestamp(a), Value::Timestamp(b)) => Some(a == b),
+            _ => None,
         }
     }
 
@@ -640,25 +666,7 @@ impl Value {
                     Value::Integer(v) => Value::Boolean(*v != 0),
                     Value::Float(v) => Value::Boolean(*v != 0.0),
                     Value::Text(s) => {
-                        // OPTIMIZATION: Use eq_ignore_ascii_case to avoid allocation
-                        let s_ref: &str = s.as_ref();
-                        if s_ref.eq_ignore_ascii_case("true")
-                            || s_ref.eq_ignore_ascii_case("t")
-                            || s_ref.eq_ignore_ascii_case("yes")
-                            || s_ref.eq_ignore_ascii_case("y")
-                            || s_ref == "1"
-                        {
-                            Value::Boolean(true)
-                        } else if s_ref.eq_ignore_ascii_case("false")
-                            || s_ref.eq_ignore_ascii_case("f")
-                            || s_ref.eq_ignore_ascii_case("no")
-                            || s_ref.eq_ignore_ascii_case("n")
-                            || s_ref == "0"
-                        {
-                            Value::Boolean(false)
-                        } else {
-                            Value::Null(target_type)
-                        }
+                        text_as_boolean(s).map_or(Value::Null(target_type), Value::Boolean)
                     }
                     _ => Value::Null(target_type),
                 }
@@ -794,25 +802,7 @@ impl Value {
                 Value::Integer(v) => Value::Boolean(*v != 0),
                 Value::Float(v) => Value::Boolean(*v != 0.0),
                 Value::Text(s) => {
-                    // OPTIMIZATION: Use eq_ignore_ascii_case to avoid allocation
-                    let s_ref: &str = s.as_ref();
-                    if s_ref.eq_ignore_ascii_case("true")
-                        || s_ref.eq_ignore_ascii_case("t")
-                        || s_ref.eq_ignore_ascii_case("yes")
-                        || s_ref.eq_ignore_ascii_case("y")
-                        || s_ref == "1"
-                    {
-                        Value::Boolean(true)
-                    } else if s_ref.eq_ignore_ascii_case("false")
-                        || s_ref.eq_ignore_ascii_case("f")
-                        || s_ref.eq_ignore_ascii_case("no")
-                        || s_ref.eq_ignore_ascii_case("n")
-                        || s_ref == "0"
-                    {
-                        Value::Boolean(false)
-                    } else {
-                        Value::Null(target_type)
-                    }
+                    text_as_boolean(s).map_or(Value::Null(target_type), Value::Boolean)
                 }
                 _ => Value::Null(target_type),
             },
@@ -1354,8 +1344,22 @@ thread_local! {
     static TS_FORMAT_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// A TEXT as `CAST(... AS BOOLEAN)` reads it: `true`, `t`, `yes`, `y` and
+/// `1` are TRUE, `false`, `f`, `no`, `n` and `0` FALSE, in any case
+pub fn text_as_boolean(s: &str) -> Option<bool> {
+    const TRUE: [&str; 4] = ["true", "t", "yes", "y"];
+    const FALSE: [&str; 4] = ["false", "f", "no", "n"];
+    if s == "1" || TRUE.iter().any(|t| s.eq_ignore_ascii_case(t)) {
+        Some(true)
+    } else if s == "0" || FALSE.iter().any(|f| s.eq_ignore_ascii_case(f)) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// `parse_timestamp` with a per-thread memo, for per-row comparison paths
-fn parse_timestamp_for_compare(s: &str) -> Option<DateTime<Utc>> {
+pub(crate) fn parse_timestamp_for_compare(s: &str) -> Option<DateTime<Utc>> {
     TS_COMPARE_PARSE_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         let (slots, next) = &mut *cache;

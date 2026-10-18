@@ -78,6 +78,7 @@
 //! checks are not yet integrated into the streaming operators.
 
 use crate::common::CompactArc;
+use crate::core::predicate::{kind, KeySide};
 use crate::core::{Result, Row, RowVec, Schema};
 use crate::executor::context::ExecutionContext;
 use crate::executor::expression::{JoinFilter, RowFilter};
@@ -89,7 +90,7 @@ use crate::executor::parallel::{
     parallel_hash_join, ParallelConfig, DEFAULT_PARALLEL_JOIN_THRESHOLD,
 };
 use crate::executor::planner::{QueryPlanner, RuntimeJoinAlgorithm, RuntimeJoinDecision};
-use crate::executor::utils::{column_families, extract_join_keys_and_residual_keeping};
+use crate::executor::utils::{column_kinds, extract_join_keys_and_residual_keeping};
 use crate::functions::registry::global_registry;
 use crate::optimizer::bloom::RuntimeBloomFilter;
 use crate::parser::ast::Expression;
@@ -198,9 +199,9 @@ pub struct StreamingJoinRequest<'a> {
     /// Pre-built hash table (if available). When provided, skips the hash table
     /// build phase in HashJoinOperator, avoiding double iteration of build_rows.
     pub pre_built_hash_table: Option<JoinHashTable>,
-    /// The one key's build family, TEXT (true) or numbers (false), when a
-    /// probe key of the other family may come and is answered as it streams
-    pub cross_key: Option<bool>,
+    /// The one key's build side, when a probe key that meets it across types
+    /// may come and is answered as it streams
+    pub cross_key: Option<KeySide>,
 }
 
 /// Modern streaming join executor.
@@ -238,29 +239,30 @@ impl JoinExecutor {
             &|_, _| true,
         );
 
-        // A key pair holding a number on one side and a TEXT on the other is
-        // compared in the residual instead, and the algorithm chosen again
+        // A key pair that can meet as a TEXT the comparison reads as the other
+        // side's type is compared in the residual instead, and the algorithm
+        // chosen again
         let cross_pairs: Vec<(usize, usize)> = analysis
             .left_key_indices
             .iter()
             .zip(&analysis.right_key_indices)
             .filter(|(l, r)| {
-                let (left_numbers, left_texts) = column_families(
+                let left = column_kinds(
                     &request.left_rows,
                     request.left_columns,
                     request.left_schema.as_deref(),
                     **l,
                 );
-                if !left_numbers && !left_texts {
+                if left & (kind::TEXT | kind::READ_FROM_TEXT) == 0 {
                     return false;
                 }
-                let (right_numbers, right_texts) = column_families(
+                let right = column_kinds(
                     &request.right_rows,
                     request.right_columns,
                     request.right_schema.as_deref(),
                     **r,
                 );
-                (left_numbers && right_texts) || (left_texts && right_numbers)
+                kind::crosses(left, right)
             })
             .map(|(l, r)| (*l, *r))
             .collect();
@@ -411,8 +413,8 @@ impl JoinExecutor {
                 build_side,
             )
         };
-        if let Some(build_is_text) = request.cross_key {
-            join_op = join_op.with_cross_key(build_is_text);
+        if let Some(build) = request.cross_key {
+            join_op = join_op.with_cross_key(build);
         }
 
         // Compile the non-equality part of the ON clause

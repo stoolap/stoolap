@@ -449,18 +449,11 @@ fn cast_to_boolean(value: &Value) -> Result<Value> {
     match value {
         Value::Integer(v) => Ok(Value::Boolean(*v != 0)),
         Value::Float(v) => Ok(Value::Boolean(*v != 0.0)),
-        Value::Text(s) => {
-            // Use case-insensitive comparison to avoid allocation
-            let b = s.eq_ignore_ascii_case("true")
-                || s == "1"
-                || s.eq_ignore_ascii_case("t")
-                || s.eq_ignore_ascii_case("yes")
-                || s.eq_ignore_ascii_case("y");
-            Ok(Value::Boolean(b))
-        }
+        Value::Text(s) => Ok(crate::core::value::text_as_boolean(s)
+            .map_or(Value::null(DataType::Boolean), Value::Boolean)),
         Value::Boolean(b) => Ok(Value::Boolean(*b)),
-        Value::Null(_) => Ok(Value::null(DataType::Boolean)),
-        _ => Ok(Value::Boolean(false)),
+        // As `Value::coerce_to_type` reads them: no BOOLEAN
+        _ => Ok(Value::null(DataType::Boolean)),
     }
 }
 
@@ -624,6 +617,18 @@ mod tests {
 
         let result = cast_to_boolean(&Value::integer(1)).unwrap();
         assert_eq!(result, Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_cast_to_boolean_reads_text_as_sql_cast() {
+        for text in [
+            "true", "T", "yes", "Y", "1", "false", "f", "NO", "n", "0", "junk", "", "2",
+        ] {
+            let want = crate::core::value::text_as_boolean(text)
+                .map_or(Value::null(DataType::Boolean), Value::Boolean);
+            let got = cast_to_boolean(&Value::text(text)).unwrap();
+            assert_eq!(got, want, "CAST('{text}' AS BOOLEAN)");
+        }
     }
 
     #[test]

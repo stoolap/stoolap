@@ -40,7 +40,7 @@ use super::context::{
     get_cached_exists_correlation, get_cached_exists_pred_key, get_cached_exists_predicate,
     get_cached_exists_schema, get_cached_in_subquery, get_cached_in_subquery_set,
     get_cached_scalar_subquery, get_cached_semi_join, get_exists_probe_fallback,
-    subquery_cache_tables, BatchAggregateLookupInfo, CacheTables, ExecutionContext,
+    subquery_cache_tables, BatchAggregate, BatchAggregateLookupInfo, CacheTables, ExecutionContext,
     ExistsCorrelationInfo, SemiJoinOrigin, SubqueryStamp,
 };
 use super::expression::compute_expression_hash;
@@ -49,11 +49,11 @@ use super::operator::{ColumnInfo, MaterializedOperator, Operator};
 use super::operators::hash_join::{HashJoinOperator, JoinSide, JoinType};
 use super::operators::index_nested_loop::{crosses_inner_key, EQUALITY_CANDIDATE_CAP};
 use super::query_cache::check_compiled_token;
-use super::utils::{dummy_token, dummy_token_clone, number_text_key_pair, value_to_expression};
+use super::utils::{crossing_key_pair, dummy_token, dummy_token_clone, value_to_expression};
 use super::volatility::{expression_volatility_in, statement_volatility_in};
 use super::Executor;
-use crate::core::predicate::PredicateSet;
-use crate::core::{DataType, NULL_VALUE};
+use crate::core::predicate::{kind, KeySide, PredicateSet};
+use crate::core::NULL_VALUE;
 use crate::functions::{global_registry, Volatility};
 
 // ============================================================================
@@ -1008,9 +1008,12 @@ impl Executor {
             None => return None, // Column not found, can't optimize
         };
 
-        // Look up in cache
+        // Look up in cache; a key the comparison reads across types is no group key
         let cache = get_cached_batch_aggregate(subquery_ptr)?;
-        let result = cache.get(&outer_value).cloned();
+        if kind::crosses(kind::of(&outer_value), cache.kinds) {
+            return None;
+        }
+        let result = cache.values.get(&outer_value).cloned();
 
         // Return 0 for COUNT if key not found (no matching rows)
         if result.is_none() && lookup_info.is_count {
@@ -1062,7 +1065,7 @@ impl Executor {
         &self,
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
-    ) -> Result<Option<CompactArc<ValueMap<Value>>>> {
+    ) -> Result<Option<CompactArc<BatchAggregate>>> {
         // Keyed by the subquery's address, read before any per-row work
         let subquery_ptr = subquery as *const SelectStatement as usize;
         if let Some(cached) = get_cached_batch_aggregate(subquery_ptr) {
@@ -1158,6 +1161,7 @@ impl Executor {
 
         // Build the result map - use take_row() to avoid cloning
         let mut result_map: ValueMap<Value> = ValueMap::default();
+        let mut kinds = 0;
         while result.next() {
             let row = result.take_row();
             if row.len() >= 2 {
@@ -1167,6 +1171,7 @@ impl Executor {
                     let value = values.pop().unwrap();
                     let key = values.swap_remove(0);
                     if !key.is_null() {
+                        kinds |= kind::of(&key);
                         result_map.insert(key, value);
                     }
                 }
@@ -1177,7 +1182,13 @@ impl Executor {
         }
 
         // Cache the results
-        cache_batch_aggregate(subquery_ptr, result_map);
+        cache_batch_aggregate(
+            subquery_ptr,
+            BatchAggregate {
+                values: result_map,
+                kinds,
+            },
+        );
 
         // Return the cached Arc
         Ok(get_cached_batch_aggregate(subquery_ptr))
@@ -1326,14 +1337,11 @@ impl Executor {
             else {
                 return Ok(None);
             };
-            // A key the comparison reads as a number against a TEXT column, or
-            // back, is no key the index holds
-            let inner_is_text = match table.schema().columns[key_idx].data_type {
-                DataType::Text => Some(true),
-                DataType::Integer | DataType::Float => Some(false),
-                _ => None,
-            };
-            if crosses_inner_key(inner_is_text, key) {
+            // A key the comparison reads against the column across types is
+            // no key the index holds
+            let inner_side =
+                KeySide::of_kinds(kind::of_type(table.schema().columns[key_idx].data_type));
+            if crosses_inner_key(inner_side, key) {
                 return Ok(None);
             }
             PROBE_BUFFERS.with(|cell| {
@@ -1905,9 +1913,6 @@ impl Executor {
             if let Some(batch_cache) = self.try_execute_and_cache_batch_aggregate(subquery, ctx)? {
                 if let Some(value) = Self::try_lookup_batch_aggregate(subquery, ctx) {
                     return Ok(value);
-                }
-                if Self::is_count_expression(&subquery.columns[0]) {
-                    return Ok(Value::Integer(0));
                 }
                 drop(batch_cache);
             }
@@ -4540,10 +4545,10 @@ impl Executor {
                 })?
         };
 
-        // A number against a TEXT is no hash key: each outer row is asked the
-        // predicate comparison against the inner keys, and kept when none is
-        // equal to it
-        if number_text_key_pair(&outer_rows, outer_key_idx, &inner_rows, 0) {
+        // A key pair that meets across types is no hash key: each outer row
+        // is asked the predicate comparison against the inner keys, and kept
+        // when none is equal to it
+        if crossing_key_pair(&outer_rows, outer_key_idx, &inner_rows, 0) {
             let keys = PredicateSet::new(CompactArc::new(seen), false);
             let mut result_rows = crate::core::RowVec::new();
             for row in outer_rows.iter() {

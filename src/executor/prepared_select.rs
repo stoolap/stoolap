@@ -42,7 +42,7 @@ use super::expression::{
     CompareOp, CompileContext, CompileError, ExecuteContext, ExprCompiler, ExprVM,
     QuantifiedMembers, SharedProgram, SubqueryExecutor,
 };
-use super::pushdown::{self, coerce_constant, read_as_column};
+use super::pushdown::{self, coerce_constant, read_as_column, scan_compares};
 use super::query_cache::CompiledExecution;
 use super::result::ExecutorResult;
 use super::utils::{
@@ -702,12 +702,6 @@ fn bind_aliases(
             });
         }
     }
-}
-
-/// Whether the scan compares values of `data_type` by the program's rule;
-/// a JSON or VECTOR comparison is left to the program
-fn scan_compares(data_type: DataType) -> bool {
-    !matches!(data_type, DataType::Json | DataType::Vector)
 }
 
 /// Whether every column `expr` reads is one the scan compares

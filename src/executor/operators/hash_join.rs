@@ -35,7 +35,7 @@
 use smallvec::SmallVec;
 
 use crate::common::CompactArc;
-use crate::core::predicate::{parse_sql_number, sql_eq};
+use crate::core::predicate::{sql_eq, KeySide, TextReading};
 use crate::core::value::NULL_VALUE;
 use crate::core::{Result, Row, Value, ValueMap};
 use crate::executor::expression::RowFilter;
@@ -43,7 +43,7 @@ use crate::executor::hash_table::{
     hash_key_value, hash_row_keys, verify_key_equality, JoinHashTable,
 };
 use crate::executor::operator::{ColumnInfo, Operator, RowRef};
-use crate::executor::operators::index_nested_loop::{crosses_inner_key, number_key};
+use crate::executor::operators::index_nested_loop::reading_key;
 
 /// Pre-computed column names to avoid format! allocations in hot paths.
 /// Covers most common cases (up to 32 columns).
@@ -258,19 +258,19 @@ pub struct HashJoinOperator {
     opened: bool,
     probe_exhausted: bool,
 
-    // The one key's build family, when a probe key of the other family is
-    // answered by the comparison rather than the hash table's equality
+    // The one key's build side, when a probe key that meets it across types
+    // is answered by the comparison rather than the hash table's equality
     cross: Option<CrossKey>,
     // The current probe key as that comparison reads it, for such a key
     current_cross_key: Option<Value>,
 }
 
-/// A build key column of one family that probe keys of the other meet:
-/// TEXT (true) or a number (false), and for a TEXT one, the build rows by
-/// the number each TEXT reads as, taken when a number first meets them
+/// A build key column on one side of a cross, and for a TEXT one, its rows
+/// by the value each TEXT reads as, per reading, taken when a key of that
+/// type first meets them
 struct CrossKey {
-    build_is_text: bool,
-    text_numbers: Option<ValueMap<SmallVec<[usize; 2]>>>,
+    build: KeySide,
+    text_reads: [Option<ValueMap<SmallVec<[usize; 2]>>>; 3],
 }
 
 impl HashJoinOperator {
@@ -510,49 +510,52 @@ impl HashJoinOperator {
         self
     }
 
-    /// For a join on one key whose build column holds one family, TEXT
-    /// (true) or numbers (false): a probe key of the other family is
-    /// answered by the comparison, while the probe streams
-    pub fn with_cross_key(mut self, build_is_text: bool) -> Self {
+    /// For a join on one key whose build column is on one side of a cross:
+    /// a probe key that meets it across types is answered by the
+    /// comparison, while the probe streams
+    pub fn with_cross_key(mut self, build: KeySide) -> Self {
         debug_assert_eq!(self.probe_key_indices().len(), 1);
         self.cross = Some(CrossKey {
-            build_is_text,
-            text_numbers: None,
+            build,
+            text_reads: Default::default(),
         });
         self
     }
 
-    /// The build rows a probe key of the other family meets: a TEXT key as
-    /// the number it reads as, a number by the TEXT build keys that read
-    /// as it. Leaves the key the matches are checked against
+    /// The build rows a probe key meets across types: a TEXT key as the
+    /// value it reads as, any other key by the TEXT build keys that read as
+    /// it. Leaves the key the matches are checked against
     fn probe_across(&mut self, key: &Value) {
         self.current_matches.clear();
-        if let Value::Text(text) = key {
-            self.current_cross_key = parse_sql_number(text);
-            if let (Some(number), Some(table)) = (&self.current_cross_key, &self.hash_table) {
-                self.current_matches
-                    .extend(table.probe(hash_key_value(number)));
-            }
-            return;
-        }
-        self.current_cross_key = Some(key.clone());
         let build_idx = self.build_key_indices()[0];
         let Some(cross) = self.cross.as_mut() else {
             return;
         };
+        if let (KeySide::Read(reading), Value::Text(text)) = (cross.build, key) {
+            self.current_cross_key = reading.read(text);
+            if let (Some(read), Some(table)) = (&self.current_cross_key, &self.hash_table) {
+                self.current_matches
+                    .extend(table.probe(hash_key_value(read)));
+            }
+            return;
+        }
+        self.current_cross_key = Some(key.clone());
+        let Some(reading) = TextReading::of(key) else {
+            return;
+        };
         let build_rows = &self.build_rows;
-        let numbers = cross.text_numbers.get_or_insert_with(|| {
-            let mut numbers: ValueMap<SmallVec<[usize; 2]>> = ValueMap::default();
+        let reads = cross.text_reads[reading as usize].get_or_insert_with(|| {
+            let mut reads: ValueMap<SmallVec<[usize; 2]>> = ValueMap::default();
             for (idx, row) in build_rows.iter().enumerate() {
                 if let Some(Value::Text(text)) = row.get(build_idx) {
-                    if let Some(number) = parse_sql_number(text).as_ref().and_then(number_key) {
-                        numbers.entry(number).or_default().push(idx);
+                    if let Some(read) = reading.read(text).as_ref().and_then(reading_key) {
+                        reads.entry(read).or_default().push(idx);
                     }
                 }
             }
-            numbers
+            reads
         });
-        if let Some(rows) = number_key(key).and_then(|number| numbers.get(&number)) {
+        if let Some(rows) = reading_key(key).and_then(|read| reads.get(&read)) {
             self.current_matches.extend_from_slice(rows);
         }
     }
@@ -864,7 +867,7 @@ impl Operator for HashJoinOperator {
                     let crosses = self.cross.as_ref().is_some_and(|cross| {
                         probe_row
                             .get(probe_key_indices[0])
-                            .is_some_and(|key| crosses_inner_key(Some(cross.build_is_text), key))
+                            .is_some_and(|key| cross.build.crosses(key))
                     });
                     if crosses {
                         let key_idx = self.probe_key_indices()[0];

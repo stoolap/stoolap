@@ -47,28 +47,13 @@ fn parse_field(field: &str, target_type: DataType, col_name: &str) -> Result<Val
                 field, col_name
             ))
         }),
-        DataType::Boolean => {
-            if field.eq_ignore_ascii_case("true")
-                || field.eq_ignore_ascii_case("t")
-                || field.eq_ignore_ascii_case("yes")
-                || field.eq_ignore_ascii_case("y")
-                || field == "1"
-            {
-                Ok(Value::Boolean(true))
-            } else if field.eq_ignore_ascii_case("false")
-                || field.eq_ignore_ascii_case("f")
-                || field.eq_ignore_ascii_case("no")
-                || field.eq_ignore_ascii_case("n")
-                || field == "0"
-            {
-                Ok(Value::Boolean(false))
-            } else {
-                Err(Error::Type(format!(
-                    "cannot convert value '{}' to BOOLEAN for column '{}'",
-                    field, col_name
-                )))
-            }
-        }
+        DataType::Boolean => match crate::core::value::text_as_boolean(field) {
+            Some(b) => Ok(Value::Boolean(b)),
+            None => Err(Error::Type(format!(
+                "cannot convert value '{}' to BOOLEAN for column '{}'",
+                field, col_name
+            ))),
+        },
         DataType::Timestamp => crate::core::parse_timestamp(field)
             .map(Value::Timestamp)
             .map_err(|_| {

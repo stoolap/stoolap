@@ -819,7 +819,14 @@ pub fn cache_exists_pred_key(subquery_ptr: usize, pred_key: String) {
 // Thread-local to avoid synchronization overhead.
 // The key is the subquery's address, as for the lookup info; the value maps a group key to its aggregate.
 thread_local! {
-    static BATCH_AGGREGATE_CACHE: RefCell<FxHashMap<usize, CompactArc<ValueMap<Value>>>> = RefCell::new(FxHashMap::default());
+    static BATCH_AGGREGATE_CACHE: RefCell<FxHashMap<usize, CompactArc<BatchAggregate>>> = RefCell::new(FxHashMap::default());
+}
+
+/// A batch aggregate's results by group key, with the kinds of the keys
+pub struct BatchAggregate {
+    pub values: ValueMap<Value>,
+    /// As `core::predicate::kind` names them
+    pub kinds: u8,
 }
 
 /// Clear the batch aggregate cache. Should be called at the start of each top-level query.
@@ -832,16 +839,16 @@ pub fn clear_batch_aggregate_cache() {
 }
 
 /// Get a cached batch aggregate result map by subquery address.
-pub fn get_cached_batch_aggregate(subquery_ptr: usize) -> Option<CompactArc<ValueMap<Value>>> {
+pub fn get_cached_batch_aggregate(subquery_ptr: usize) -> Option<CompactArc<BatchAggregate>> {
     BATCH_AGGREGATE_CACHE.with(|cache| cache.borrow().get(&subquery_ptr).cloned())
 }
 
 /// Cache a batch aggregate result map.
-pub fn cache_batch_aggregate(subquery_ptr: usize, values: ValueMap<Value>) {
+pub fn cache_batch_aggregate(subquery_ptr: usize, aggregate: BatchAggregate) {
     BATCH_AGGREGATE_CACHE.with(|cache| {
         cache
             .borrow_mut()
-            .insert(subquery_ptr, CompactArc::new(values));
+            .insert(subquery_ptr, CompactArc::new(aggregate));
     });
 }
 

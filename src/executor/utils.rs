@@ -31,6 +31,7 @@ use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 use crate::common::StringMap;
 
+use crate::core::predicate::kind;
 use crate::core::value::NULL_VALUE;
 use crate::core::{DataType, Operator, Row, Schema, Value};
 use crate::executor::operators::index_nested_loop::ColumnSource;
@@ -1013,11 +1014,27 @@ pub fn extract_literal_value(expr: &Expression) -> Option<Value> {
     match expr {
         Expression::IntegerLiteral(i) => Some(Value::Integer(i.value)),
         Expression::FloatLiteral(f) => Some(Value::Float(f.value)),
-        Expression::StringLiteral(s) => Some(Value::Text(s.value.clone())),
+        Expression::StringLiteral(s) => Some(string_literal_value(s)),
         Expression::BooleanLiteral(b) => Some(Value::Boolean(b.value)),
         Expression::NullLiteral(_) => Some(Value::Null(DataType::Text)),
         _ => None,
     }
+}
+
+/// The value a string literal stands for: a TIMESTAMP for `TIMESTAMP '...'`,
+/// `DATETIME '...'` and `DATE '...'` when the text parses, a TEXT otherwise
+pub fn string_literal_value(lit: &StringLiteral) -> Value {
+    let timestamp = lit.type_hint.as_deref().is_some_and(|hint| {
+        ["TIMESTAMP", "DATETIME", "DATE"]
+            .iter()
+            .any(|name| hint.eq_ignore_ascii_case(name))
+    });
+    if timestamp {
+        if let Ok(t) = crate::core::value::parse_timestamp(&lit.value) {
+            return Value::Timestamp(t);
+        }
+    }
+    Value::Text(lit.value.clone())
 }
 
 /// Flip a comparison operator for when column and value are swapped.
@@ -1984,34 +2001,23 @@ pub fn extract_join_keys_and_residual_keeping(
     (left_indices, right_indices, residual)
 }
 
-/// Whether a join key pair holds a number on one side and a TEXT on the other
-/// in any rows: the comparison reads such a TEXT as a number, which no key
-/// equality follows, so the pair cannot be a key.
-pub fn number_text_key_pair(
+/// Whether a join key pair can meet, in any rows, as a TEXT the comparison
+/// reads as the other side's type, which no key equality follows, so the
+/// pair cannot be a key.
+pub fn crossing_key_pair(
     left_rows: &[Row],
     left_idx: usize,
     right_rows: &[Row],
     right_idx: usize,
 ) -> bool {
-    let (numbers, texts) = key_families(left_rows, left_idx);
-    if !numbers && !texts {
-        return false;
-    }
-    right_rows.iter().any(|row| match row.get(right_idx) {
-        Some(Value::Integer(_) | Value::Float(_)) => texts,
-        Some(Value::Text(_)) => numbers,
-        _ => false,
-    })
+    let left = key_kinds(left_rows, left_idx);
+    left & (kind::TEXT | kind::READ_FROM_TEXT) != 0
+        && kind::crosses(left, key_kinds(right_rows, right_idx))
 }
 
-/// Whether a key column holds numbers and whether it holds TEXT: by the
-/// schema of a side that reads a base table, else by its rows
-pub fn column_families(
-    rows: &[Row],
-    columns: &[String],
-    schema: Option<&Schema>,
-    idx: usize,
-) -> (bool, bool) {
+/// The kinds a key column holds: by the schema of a side that reads a base
+/// table, else by its rows
+pub fn column_kinds(rows: &[Row], columns: &[String], schema: Option<&Schema>, idx: usize) -> u8 {
     let name = columns
         .get(idx)
         .map(|column| column.rsplit('.').next().unwrap_or(column));
@@ -2019,27 +2025,22 @@ pub fn column_families(
         .zip(name)
         .and_then(|(schema, name)| schema.get_column_type(name))
     {
-        Some(DataType::Integer | DataType::Float) => (true, false),
-        Some(DataType::Text) => (false, true),
-        Some(_) => (false, false),
-        None => key_families(rows, idx),
+        Some(data_type) => kind::of_type(data_type),
+        None => key_kinds(rows, idx),
     }
 }
 
-/// Whether a key column holds numbers and whether it holds TEXT, in any rows
-pub fn key_families(rows: &[Row], idx: usize) -> (bool, bool) {
-    let (mut numbers, mut texts) = (false, false);
+/// The kinds a key column holds in any rows, read until a TEXT and a kind a
+/// TEXT is read as are both found, which settles every crossing
+pub fn key_kinds(rows: &[Row], idx: usize) -> u8 {
+    let mut kinds = 0;
     for row in rows {
-        match row.get(idx) {
-            Some(Value::Integer(_) | Value::Float(_)) => numbers = true,
-            Some(Value::Text(_)) => texts = true,
-            _ => {}
-        }
-        if numbers && texts {
+        kinds |= row.get(idx).map_or(0, kind::of);
+        if kinds & kind::TEXT != 0 && kinds & kind::READ_FROM_TEXT != 0 {
             break;
         }
     }
-    (numbers, texts)
+    kinds
 }
 
 /// Recursively extract equality join keys from AND expressions.

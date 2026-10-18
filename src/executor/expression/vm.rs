@@ -31,7 +31,7 @@ use super::program::Program;
 use crate::common::{CompactArc, SmartString};
 use crate::core::integer::{integer_neg, integer_op, IntegerOp};
 use crate::core::interval::{self, Interval, IntervalUnit};
-use crate::core::predicate::{number_against_text, sql_compare, sql_distinct, sql_eq};
+use crate::core::predicate::{sql_compare, sql_distinct, sql_eq};
 use crate::core::value::{f64_eq, f64_ge, f64_gt, f64_le, f64_lt, f64_ne};
 use crate::core::{DataType, Result, Row, Value, NULL_VALUE};
 use crate::functions::scalar::extreme_position;
@@ -44,22 +44,6 @@ type StackValue<'a> = Cow<'a, Value>;
 #[inline]
 fn truth(result: Option<bool>) -> Value {
     result.map_or(Value::Null(DataType::Boolean), Value::Boolean)
-}
-
-/// A fused `=` against a non-numeric constant: a number against a TEXT by the
-/// predicate comparison, any other pair as `Value::compare` orders it
-#[inline]
-fn eq_const(col_val: &Value, val: &Value) -> Option<bool> {
-    if col_val.is_null() || val.is_null() {
-        return None;
-    }
-    if let Some(ordering) = number_against_text(col_val, val) {
-        return ordering.map(std::cmp::Ordering::is_eq);
-    }
-    Some(match col_val.compare(val) {
-        Ok(ordering) => ordering.is_eq(),
-        Err(_) => col_val == val,
-    })
 }
 
 /// `value BETWEEN low AND high`: `value >= low AND value <= high`, where a
@@ -552,7 +536,7 @@ impl ExprVM {
                     let result = match val {
                         Value::Integer(v) => Self::eq_int(col_val, *v),
                         Value::Float(v) => Self::eq_float(col_val, *v),
-                        _ => truth(eq_const(col_val, val)),
+                        _ => truth(sql_eq(col_val, val)),
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -567,7 +551,7 @@ impl ExprVM {
                     let result = match val {
                         Value::Integer(v) => Self::ne_int(col_val, *v),
                         Value::Float(v) => Self::ne_float(col_val, *v),
-                        _ => truth(eq_const(col_val, val).map(|eq| !eq)),
+                        _ => truth(sql_eq(col_val, val).map(|eq| !eq)),
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -1607,7 +1591,11 @@ impl ExprVM {
                 Op::NullIf => {
                     let b = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let a = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = if a == b { Value::null_unknown() } else { a };
+                    let result = if sql_eq(&a, &b) == Some(true) {
+                        Value::null_unknown()
+                    } else {
+                        a
+                    };
                     self.stack.push(result);
                     pc += 1;
                 }
@@ -1760,9 +1748,7 @@ impl ExprVM {
                     let when_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     // Use reference to avoid clone - case_val stays on stack for next comparison
                     let result = match self.stack.last() {
-                        Some(case_val) if !case_val.is_null() && !when_val.is_null() => {
-                            Value::Boolean(case_val == &when_val)
-                        }
+                        Some(case_val) => Value::Boolean(sql_eq(case_val, &when_val) == Some(true)),
                         _ => Value::Boolean(false),
                     };
                     self.stack.push(result);
@@ -2271,7 +2257,7 @@ impl ExprVM {
                     let result = match val {
                         Value::Integer(v) => Self::eq_int(col_val, *v),
                         Value::Float(v) => Self::eq_float(col_val, *v),
-                        _ => truth(eq_const(col_val, val)),
+                        _ => truth(sql_eq(col_val, val)),
                     };
                     stack.push(Cow::Owned(result));
                     pc += 1;
@@ -2306,7 +2292,7 @@ impl ExprVM {
                 Op::NullIf => {
                     let b = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
                     let a = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
-                    let result = if *a == *b {
+                    let result = if sql_eq(&a, &b) == Some(true) {
                         Cow::Borrowed(&NULL_VALUE)
                     } else {
                         a
@@ -2585,9 +2571,7 @@ impl ExprVM {
                     let when_val = stack.pop().unwrap_or(Cow::Borrowed(&NULL_VALUE));
                     // Use reference to avoid clone - case_val stays on stack for next comparison
                     let result = match stack.last() {
-                        Some(case_val) if !case_val.is_null() && !when_val.is_null() => {
-                            Value::Boolean(**case_val == *when_val)
-                        }
+                        Some(case_val) => Value::Boolean(sql_eq(case_val, &when_val) == Some(true)),
                         _ => Value::Boolean(false),
                     };
                     stack.push(Cow::Owned(result));
@@ -3023,27 +3007,11 @@ impl ExprVM {
             // Handle text comparisons (e.g., country = 'USA')
             Op::EqColumnConst(idx, Value::Text(val)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Text(v)) => Some(v == val),
-                Some(Value::Null(_)) | None => None,
-                Some(cell @ (Value::Integer(_) | Value::Float(_))) => {
-                    Self::fused_cell(op, Some(cell))
-                }
-                Some(col_val) => match col_val.compare(&Value::Text(val.clone())) {
-                    Ok(std::cmp::Ordering::Equal) => Some(true),
-                    Ok(_) => Some(false),
-                    Err(_) => Some(false),
-                },
+                cell => Self::fused_cell(op, cell),
             },
             Op::NeColumnConst(idx, Value::Text(val)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Text(v)) => Some(v != val),
-                Some(Value::Null(_)) | None => None,
-                Some(cell @ (Value::Integer(_) | Value::Float(_))) => {
-                    Self::fused_cell(op, Some(cell))
-                }
-                Some(col_val) => match col_val.compare(&Value::Text(val.clone())) {
-                    Ok(std::cmp::Ordering::Equal) => Some(false),
-                    Ok(_) => Some(true),
-                    Err(_) => Some(true),
-                },
+                cell => Self::fused_cell(op, cell),
             },
             // Handle LIKE pattern matching (e.g., fruit LIKE 'a%')
             Op::LikeColumn(idx, pattern, case_insensitive) => match ctx.row.get(*idx as usize) {
@@ -3137,27 +3105,16 @@ impl ExprVM {
             Op::LtColumnConst(_, v) => truth(sql_compare(cell, v).map(|o| o.is_lt())),
             Op::GeColumnConst(_, v) => truth(sql_compare(cell, v).map(|o| o.is_ge())),
             Op::LeColumnConst(_, v) => truth(sql_compare(cell, v).map(|o| o.is_le())),
-            Op::EqColumnConst(_, v) => return Self::eq_by_order(cell, v),
-            Op::NeColumnConst(_, v) => return Self::eq_by_order(cell, v).map(|eq| !eq),
+            Op::EqColumnConst(_, v) => return sql_eq(cell, v),
+            Op::NeColumnConst(_, v) => return sql_eq(cell, v).map(|eq| !eq),
             Op::BetweenColumnConst(_, low, high) => truth(between_cell(cell, low, high)),
             _ => return None,
         };
         Self::to_tribool(&value)
     }
 
-    /// A fast path `=`: a number against a TEXT by the predicate comparison,
-    /// any other pair equal when `Value::compare` orders it so
-    fn eq_by_order(cell: &Value, v: &Value) -> Option<bool> {
-        if cell.is_null() || v.is_null() {
-            return None;
-        }
-        match number_against_text(cell, v) {
-            Some(ordering) => ordering.map(std::cmp::Ordering::is_eq),
-            None => cell.compare(v).ok().map(std::cmp::Ordering::is_eq),
-        }
-    }
-
-    /// A TEXT cell against a numeric constant, by the predicate comparison
+    /// A cell that is not a number or NULL against a numeric constant, by the
+    /// predicate comparison
     #[inline]
     fn text_against(
         col_val: &Value,
@@ -3174,10 +3131,7 @@ impl ExprVM {
             Value::Integer(v) => Value::Boolean(*v > threshold),
             Value::Float(v) => Value::Boolean(crate::core::value::i64_lt_f64(threshold, *v)),
             Value::Null(_) => Value::Null(DataType::Boolean),
-            Value::Text(_) | Value::Boolean(_) | Value::Timestamp(_) => {
-                Self::text_against(col_val, Value::Integer(threshold), |o| o.is_gt())
-            }
-            _ => Value::Boolean(false),
+            _ => Self::text_against(col_val, Value::Integer(threshold), |o| o.is_gt()),
         }
     }
 
@@ -3188,10 +3142,7 @@ impl ExprVM {
             Value::Float(v) => Value::Boolean(f64_gt(*v, threshold)),
             Value::Integer(v) => Value::Boolean(crate::core::value::i64_gt_f64(*v, threshold)),
             Value::Null(_) => Value::Null(DataType::Boolean),
-            Value::Text(_) | Value::Boolean(_) | Value::Timestamp(_) => {
-                Self::text_against(col_val, Value::Float(threshold), |o| o.is_gt())
-            }
-            _ => Value::Boolean(false),
+            _ => Self::text_against(col_val, Value::Float(threshold), |o| o.is_gt()),
         }
     }
 
@@ -3202,10 +3153,7 @@ impl ExprVM {
             Value::Integer(v) => Value::Boolean(*v < threshold),
             Value::Float(v) => Value::Boolean(crate::core::value::i64_gt_f64(threshold, *v)),
             Value::Null(_) => Value::Null(DataType::Boolean),
-            Value::Text(_) | Value::Boolean(_) | Value::Timestamp(_) => {
-                Self::text_against(col_val, Value::Integer(threshold), |o| o.is_lt())
-            }
-            _ => Value::Boolean(false),
+            _ => Self::text_against(col_val, Value::Integer(threshold), |o| o.is_lt()),
         }
     }
 
@@ -3216,10 +3164,7 @@ impl ExprVM {
             Value::Float(v) => Value::Boolean(f64_lt(*v, threshold)),
             Value::Integer(v) => Value::Boolean(crate::core::value::i64_lt_f64(*v, threshold)),
             Value::Null(_) => Value::Null(DataType::Boolean),
-            Value::Text(_) | Value::Boolean(_) | Value::Timestamp(_) => {
-                Self::text_against(col_val, Value::Float(threshold), |o| o.is_lt())
-            }
-            _ => Value::Boolean(false),
+            _ => Self::text_against(col_val, Value::Float(threshold), |o| o.is_lt()),
         }
     }
 
@@ -3230,10 +3175,7 @@ impl ExprVM {
             Value::Integer(v) => Value::Boolean(*v >= threshold),
             Value::Float(v) => Value::Boolean(crate::core::value::i64_le_f64(threshold, *v)),
             Value::Null(_) => Value::Null(DataType::Boolean),
-            Value::Text(_) | Value::Boolean(_) | Value::Timestamp(_) => {
-                Self::text_against(col_val, Value::Integer(threshold), |o| o.is_ge())
-            }
-            _ => Value::Boolean(false),
+            _ => Self::text_against(col_val, Value::Integer(threshold), |o| o.is_ge()),
         }
     }
 
@@ -3244,10 +3186,7 @@ impl ExprVM {
             Value::Float(v) => Value::Boolean(f64_ge(*v, threshold)),
             Value::Integer(v) => Value::Boolean(crate::core::value::i64_ge_f64(*v, threshold)),
             Value::Null(_) => Value::Null(DataType::Boolean),
-            Value::Text(_) | Value::Boolean(_) | Value::Timestamp(_) => {
-                Self::text_against(col_val, Value::Float(threshold), |o| o.is_ge())
-            }
-            _ => Value::Boolean(false),
+            _ => Self::text_against(col_val, Value::Float(threshold), |o| o.is_ge()),
         }
     }
 
@@ -3258,10 +3197,7 @@ impl ExprVM {
             Value::Integer(v) => Value::Boolean(*v <= threshold),
             Value::Float(v) => Value::Boolean(crate::core::value::i64_ge_f64(threshold, *v)),
             Value::Null(_) => Value::Null(DataType::Boolean),
-            Value::Text(_) | Value::Boolean(_) | Value::Timestamp(_) => {
-                Self::text_against(col_val, Value::Integer(threshold), |o| o.is_le())
-            }
-            _ => Value::Boolean(false),
+            _ => Self::text_against(col_val, Value::Integer(threshold), |o| o.is_le()),
         }
     }
 
@@ -3272,10 +3208,7 @@ impl ExprVM {
             Value::Float(v) => Value::Boolean(f64_le(*v, threshold)),
             Value::Integer(v) => Value::Boolean(crate::core::value::i64_le_f64(*v, threshold)),
             Value::Null(_) => Value::Null(DataType::Boolean),
-            Value::Text(_) | Value::Boolean(_) | Value::Timestamp(_) => {
-                Self::text_against(col_val, Value::Float(threshold), |o| o.is_le())
-            }
-            _ => Value::Boolean(false),
+            _ => Self::text_against(col_val, Value::Float(threshold), |o| o.is_le()),
         }
     }
 
@@ -3286,8 +3219,7 @@ impl ExprVM {
             Value::Integer(v) => Value::Boolean(*v == val),
             Value::Float(v) => Value::Boolean(crate::core::value::i64_eq_f64(val, *v)),
             Value::Null(_) => Value::Null(DataType::Boolean),
-            Value::Text(_) => Self::text_against(col_val, Value::Integer(val), |o| o.is_eq()),
-            _ => Value::Boolean(false),
+            _ => truth(sql_eq(col_val, &Value::Integer(val))),
         }
     }
 
@@ -3298,8 +3230,7 @@ impl ExprVM {
             Value::Float(v) => Value::Boolean(f64_eq(*v, val)),
             Value::Integer(v) => Value::Boolean(crate::core::value::i64_eq_f64(*v, val)),
             Value::Null(_) => Value::Null(DataType::Boolean),
-            Value::Text(_) => Self::text_against(col_val, Value::Float(val), |o| o.is_eq()),
-            _ => Value::Boolean(false),
+            _ => truth(sql_eq(col_val, &Value::Float(val))),
         }
     }
 
@@ -3310,8 +3241,7 @@ impl ExprVM {
             Value::Integer(v) => Value::Boolean(*v != val),
             Value::Float(v) => Value::Boolean(crate::core::value::i64_ne_f64(val, *v)),
             Value::Null(_) => Value::Null(DataType::Boolean),
-            Value::Text(_) => Self::text_against(col_val, Value::Integer(val), |o| o.is_ne()),
-            _ => Value::Boolean(true),
+            _ => truth(sql_eq(col_val, &Value::Integer(val)).map(|eq| !eq)),
         }
     }
 
@@ -3322,8 +3252,7 @@ impl ExprVM {
             Value::Float(v) => Value::Boolean(f64_ne(*v, val)),
             Value::Integer(v) => Value::Boolean(crate::core::value::i64_ne_f64(*v, val)),
             Value::Null(_) => Value::Null(DataType::Boolean),
-            Value::Text(_) => Self::text_against(col_val, Value::Float(val), |o| o.is_ne()),
-            _ => Value::Boolean(true),
+            _ => truth(sql_eq(col_val, &Value::Float(val)).map(|eq| !eq)),
         }
     }
 
@@ -3337,12 +3266,11 @@ impl ExprVM {
                 Value::Boolean(crate::core::value::i64_le_f64(lo, *v) && f64_le(*v, hi))
             }
             Value::Null(_) => Value::Null(DataType::Boolean),
-            Value::Text(_) | Value::Boolean(_) | Value::Timestamp(_) => truth(between_cell(
+            _ => truth(between_cell(
                 col_val,
                 &Value::Integer(lo),
                 &Value::Float(hi),
             )),
-            _ => Value::Boolean(false),
         }
     }
 
@@ -3355,12 +3283,11 @@ impl ExprVM {
                 Value::Boolean(f64_ge(*v, lo) && crate::core::value::i64_ge_f64(hi, *v))
             }
             Value::Null(_) => Value::Null(DataType::Boolean),
-            Value::Text(_) | Value::Boolean(_) | Value::Timestamp(_) => truth(between_cell(
+            _ => truth(between_cell(
                 col_val,
                 &Value::Float(lo),
                 &Value::Integer(hi),
             )),
-            _ => Value::Boolean(false),
         }
     }
 
@@ -3373,12 +3300,11 @@ impl ExprVM {
                 crate::core::value::i64_le_f64(low, *v) && crate::core::value::i64_ge_f64(high, *v),
             ),
             Value::Null(_) => Value::Null(DataType::Boolean),
-            Value::Text(_) | Value::Boolean(_) | Value::Timestamp(_) => truth(between_cell(
+            _ => truth(between_cell(
                 col_val,
                 &Value::Integer(low),
                 &Value::Integer(high),
             )),
-            _ => Value::Boolean(false),
         }
     }
 
@@ -3391,12 +3317,11 @@ impl ExprVM {
                 crate::core::value::i64_ge_f64(*v, low) && crate::core::value::i64_le_f64(*v, high),
             ),
             Value::Null(_) => Value::Null(DataType::Boolean),
-            Value::Text(_) | Value::Boolean(_) | Value::Timestamp(_) => truth(between_cell(
+            _ => truth(between_cell(
                 col_val,
                 &Value::Float(low),
                 &Value::Float(high),
             )),
-            _ => Value::Boolean(false),
         }
     }
 
