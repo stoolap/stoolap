@@ -320,6 +320,16 @@ impl MVCCTable {
         self.version_store.check_layout(Some(self.layout))
     }
 
+    /// Whether the store's MIN and MAX order this column's values as the
+    /// sort order does; a JSON or VECTOR column is left to the general path
+    fn orders_column(&self, col_idx: usize) -> bool {
+        self.version_store
+            .schema()
+            .columns
+            .get(col_idx)
+            .is_some_and(|c| c.data_type.is_orderable())
+    }
+
     /// The schema as the store holds it now, and the layout that goes with
     /// it: what a handle takes after changing the columns itself
     fn take_schema(&mut self) {
@@ -5525,6 +5535,9 @@ impl Table for MVCCTable {
     }
 
     fn min_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
+        if !self.orders_column(col_idx) {
+            return Ok(None);
+        }
         // Only use deferred aggregation if no uncommitted local changes
         let txn_versions = self.txn_versions.read().unwrap();
         if txn_versions.has_local_changes() {
@@ -5538,6 +5551,9 @@ impl Table for MVCCTable {
     }
 
     fn max_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
+        if !self.orders_column(col_idx) {
+            return Ok(None);
+        }
         // Only use deferred aggregation if no uncommitted local changes
         let txn_versions = self.txn_versions.read().unwrap();
         if txn_versions.has_local_changes() {
