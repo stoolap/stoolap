@@ -134,3 +134,42 @@ fn copy_runs_a_volatile_default_for_each_row() {
         "each row runs RANDOM() as INSERT does"
     );
 }
+
+#[test]
+fn a_check_runs_on_a_null_value_and_only_a_null_result_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open("memory://write_path_check_null").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER CHECK (v IS NOT NULL), \
+         w INTEGER CHECK (w > 0))",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1, 1)", ()).unwrap();
+    let mut wrong = Vec::new();
+    for sql in [
+        "INSERT INTO t VALUES (2, NULL, 1)",
+        "INSERT INTO t (id, w) VALUES (3, 1)",
+        "UPDATE t SET v = NULL WHERE id = 1",
+        "INSERT INTO t VALUES (1, NULL, 1) ON DUPLICATE KEY UPDATE v = NULL",
+    ] {
+        if db.execute(sql, ()).is_ok() {
+            wrong.push(format!("{sql}: accepted a NULL v"));
+        }
+    }
+    let path = dir.path().join("null_v.csv");
+    std::fs::write(&path, "id,v,w\n4,,1\n").unwrap();
+    let copy = format!(
+        "COPY t FROM '{}' WITH (FORMAT CSV, HEADER TRUE)",
+        path.display()
+    );
+    if db.execute(&copy, ()).is_ok() {
+        wrong.push("COPY: accepted a NULL v".to_string());
+    }
+    // A NULL w makes w > 0 NULL, which passes
+    db.execute("INSERT INTO t VALUES (5, 5, NULL)", ()).unwrap();
+    db.execute("UPDATE t SET w = NULL WHERE id = 1", ())
+        .unwrap();
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM t WHERE v IS NULL"), 0);
+}

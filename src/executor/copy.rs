@@ -271,6 +271,7 @@ impl Executor {
         }
 
         let mut check_vm = super::expression::ExprVM::new();
+        let mut check_row = super::dml::check_scratch();
         for result in reader.records() {
             let record = result.map_err(|e| {
                 Error::InvalidArgument(format!(
@@ -313,6 +314,7 @@ impl Executor {
             for (col_idx, col_name, check_expr, program) in check_programs {
                 super::dml::run_check_program(
                     &mut check_vm,
+                    &mut check_row,
                     program,
                     col_name,
                     check_expr,
@@ -380,6 +382,11 @@ impl Executor {
         let stream = serde_json::Deserializer::from_reader(reader).into_iter::<serde_json::Value>();
 
         let mut rows_affected = 0i64;
+        let mut state = JsonRowState {
+            given: vec![false; all_column_types.len()],
+            vm: super::expression::ExprVM::new(),
+            check_row: super::dml::check_scratch(),
+        };
 
         for (idx, result) in stream.enumerate() {
             let item = result.map_err(|e| {
@@ -393,6 +400,7 @@ impl Executor {
                 obj,
                 table,
                 defaults,
+                &mut state,
                 &col_name_lower_map,
                 use_columns,
                 column_types,
@@ -415,6 +423,7 @@ impl Executor {
         obj: &serde_json::Map<String, serde_json::Value>,
         table: &mut Box<dyn Table>,
         defaults: &CopyDefaults,
+        state: &mut JsonRowState,
         col_name_lower_map: &[(String, usize)],
         use_columns: bool,
         column_types: &[DataType],
@@ -425,8 +434,12 @@ impl Executor {
         fk_schema: &Option<CompactArc<Schema>>,
     ) -> Result<()> {
         let mut row_values = defaults.template.clone();
-        // The columns the object gives; the others take their defaults
-        let mut given = vec![false; row_values.len()];
+        let JsonRowState {
+            given,
+            vm: check_vm,
+            check_row,
+        } = state;
+        given.fill(false);
 
         if use_columns {
             // Only import specified columns
@@ -463,11 +476,11 @@ impl Executor {
             }
         }
 
-        let mut check_vm = super::expression::ExprVM::new();
-        defaults.fill(&mut check_vm, &given, &mut row_values)?;
+        defaults.fill(check_vm, given, &mut row_values)?;
         for (col_idx, col_name, check_expr, program) in check_programs {
             super::dml::run_check_program(
-                &mut check_vm,
+                check_vm,
+                check_row,
                 program,
                 col_name,
                 check_expr,
@@ -484,6 +497,14 @@ impl Executor {
         table.insert_discard(row)?;
         Ok(())
     }
+}
+
+/// What a JSON COPY reuses from object to object: the columns an object
+/// gives, and the VM and row its defaults and CHECKs run with
+struct JsonRowState {
+    given: Vec<bool>,
+    vm: super::expression::ExprVM,
+    check_row: Row,
 }
 
 /// The defaults of a COPY's rows by the machinery INSERT runs: constants in

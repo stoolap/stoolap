@@ -416,19 +416,23 @@ fn compile_column_check(schema: &Schema, idx: usize) -> Result<Option<CompiledCh
     )))
 }
 
-/// Run one compiled CHECK against `value`. NULL passes, per the standard.
+/// The one-column row a statement's CHECKs run against, reused row to row
+pub(crate) fn check_scratch() -> Row {
+    Row::from_values(vec![Value::null_unknown()])
+}
+
+/// Run one compiled CHECK against `value`, held in `scratch`. The CHECK
+/// runs on a NULL value too; a NULL result passes, per the standard.
 pub(crate) fn run_check_program(
     vm: &mut super::expression::ExprVM,
+    scratch: &mut Row,
     program: &super::expression::SharedProgram,
     col_name: &str,
     check_expr: &str,
     value: &Value,
 ) -> Result<()> {
-    if value.is_null() {
-        return Ok(());
-    }
-    let check_row = Row::from_values(vec![value.clone()]);
-    let check_ctx = super::expression::ExecuteContext::new(&check_row);
+    scratch.set(0, value.clone())?;
+    let check_ctx = super::expression::ExecuteContext::new(scratch);
     let result = vm.execute_cow(program, &check_ctx)?;
     let is_truthy = match &result {
         Value::Boolean(b) => *b,
@@ -754,6 +758,7 @@ impl Executor {
         // Create VM for constant expression evaluation (reused for all INSERT values)
         use super::expression::{compile_expression, ExecuteContext, ExprVM};
         let mut vm = ExprVM::new();
+        let mut check_row = check_scratch();
         let params = ctx.params();
         let named_params = ctx.named_params();
         let empty_row = Row::new();
@@ -850,6 +855,7 @@ impl Executor {
                 for (col_idx, col_name, check_expr, program) in check_programs.iter() {
                     run_check_program(
                         &mut check_vm,
+                        &mut check_row,
                         program,
                         col_name,
                         check_expr,
@@ -1147,6 +1153,7 @@ impl Executor {
                 for (col_idx, col_name, check_expr, program) in check_programs.iter() {
                     run_check_program(
                         &mut check_vm,
+                        &mut check_row,
                         program,
                         col_name,
                         check_expr,
@@ -1359,6 +1366,7 @@ impl Executor {
                 for (col_idx, col_name, check_expr, program) in check_programs.iter() {
                     run_check_program(
                         &mut check_vm,
+                        &mut check_row,
                         program,
                         col_name,
                         check_expr,
@@ -1646,6 +1654,7 @@ impl Executor {
         // Create VM for constant expression evaluation (reused for all INSERT values)
         use super::expression::{compile_expression, ExecuteContext, ExprVM};
         let mut vm = ExprVM::new();
+        let mut check_row = check_scratch();
         let params = ctx.params();
         let named_params = ctx.named_params();
         let empty_row = Row::new();
@@ -1734,6 +1743,7 @@ impl Executor {
                 for (col_idx, col_name, check_expr, program) in compiled_checks.iter() {
                     run_check_program(
                         &mut vm,
+                        &mut check_row,
                         program,
                         col_name,
                         check_expr,
@@ -1828,6 +1838,7 @@ impl Executor {
                 for (col_idx, col_name, check_expr, program) in compiled_checks.iter() {
                     run_check_program(
                         &mut vm,
+                        &mut check_row,
                         program,
                         col_name,
                         check_expr,
@@ -2571,6 +2582,7 @@ impl Executor {
 
             // Create VM once and reuse for all rows
             let mut vm = ExprVM::new();
+            let mut check_row = check_scratch();
             // Extract params before the closure so they can be captured
             let params = ctx.params();
             let named_params = ctx.named_params();
@@ -2697,7 +2709,14 @@ impl Executor {
                 if changed {
                     for (col_idx, col_name, check_expr, program) in &compiled_check_exprs {
                         let value = row.get(*col_idx).unwrap_or(&crate::core::NULL_VALUE);
-                        run_check_program(&mut vm, program, col_name, check_expr, value)?;
+                        run_check_program(
+                            &mut vm,
+                            &mut check_row,
+                            program,
+                            col_name,
+                            check_expr,
+                            value,
+                        )?;
                     }
                 }
 
