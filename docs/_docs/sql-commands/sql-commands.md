@@ -41,6 +41,8 @@ FROM table_name
 - **LIMIT**: Maximum rows to return
 - **OFFSET**: Number of rows to skip
 
+Values sort in one total order, the same in ORDER BY, window ORDER BY, the ORDER BY of an aggregate such as `STRING_AGG`, and in `MIN`, `MAX`, `GREATEST` and `LEAST`. Numbers sort by their exact value, INTEGER and FLOAT together, with NaN after every number. Values of different types sort by type: BOOLEAN, then numbers, then TEXT, then TIMESTAMP. NULL goes where `NULLS FIRST` or `NULLS LAST` puts it (by default last for ASC and first for DESC), and `MIN` and `MAX` skip it. So a column mixing `TRUE`, `10`, `2.5` and `'a'` sorts as `TRUE, 2.5, 10, 'a'` whatever the order of the rows. This order is for sorting only: a comparison such as `10 < '5'` reads the TEXT as a number, as described in [CAST Operations]({% link _docs/sql-features/cast-operations.md %}).
+
 LIMIT and OFFSET each take an expression evaluated once for the statement, a literal, a parameter or arithmetic on them. The value must be a whole number of zero or more: an INTEGER, or a FLOAT with no fractional part (`LIMIT 2.0` is `LIMIT 2`). NULL, a negative value, a fractional value such as `LIMIT 2.5`, and any other type are an error.
 
 #### Examples

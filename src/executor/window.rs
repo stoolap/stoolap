@@ -3645,45 +3645,10 @@ impl Executor {
         Ordering::Equal
     }
 
-    /// Fast value comparison with type-specific paths
+    /// Value comparison for the window sort, ascending with NULL last
     #[inline]
     fn compare_values_fast(a: &Value, b: &Value) -> Ordering {
-        use crate::core::value::cmp_i64_f64;
-        match (a, b) {
-            (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
-            // Total order: all NaNs equal to each other and after every
-            // real (an Equal-vs-everything NaN makes the sort comparator
-            // inconsistent); mixed compares are exact above 2^53
-            (Value::Float(x), Value::Float(y)) => match (x.is_nan(), y.is_nan()) {
-                (true, true) => Ordering::Equal,
-                (true, false) => Ordering::Greater,
-                (false, true) => Ordering::Less,
-                (false, false) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
-            },
-            (Value::Integer(x), Value::Float(y)) => {
-                if y.is_nan() {
-                    Ordering::Less
-                } else {
-                    cmp_i64_f64(*x, *y).unwrap_or(Ordering::Equal)
-                }
-            }
-            (Value::Float(x), Value::Integer(y)) => {
-                if x.is_nan() {
-                    Ordering::Greater
-                } else {
-                    cmp_i64_f64(*y, *x)
-                        .map(Ordering::reverse)
-                        .unwrap_or(Ordering::Equal)
-                }
-            }
-            (Value::Null(_), Value::Null(_)) => Ordering::Equal,
-            (Value::Null(_), _) => Ordering::Greater, // NULLs last
-            (_, Value::Null(_)) => Ordering::Less,
-            // Heterogeneous pairs use Value's total order (type rank,
-            // then within-type): the old stringly fallback made the
-            // comparator cyclic (2 < 10, 10 < '15', '15' < 2)
-            _ => a.cmp(b),
-        }
+        crate::core::value::compare_order_key(Some(a), Some(b), true, None)
     }
 
     /// Ultra-fast sort for integer ORDER BY column (columnar layout)

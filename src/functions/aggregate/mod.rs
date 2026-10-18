@@ -78,42 +78,17 @@ pub(crate) fn compare_sort_keys(
     };
     for (i, (key_a, key_b)) in a.iter().zip(b.iter()).enumerate() {
         let key = keys.get(i).copied().unwrap_or(DEFAULT);
-        let (a_null, b_null) = (key_a.is_null(), key_b.is_null());
-        if a_null || b_null {
-            if a_null && b_null {
-                continue;
-            }
-            return if a_null == key.nulls_first() {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            };
-        }
-        let cmp = compare_values_for_sort(key_a, key_b);
+        let cmp = crate::core::value::compare_order_key(
+            Some(key_a),
+            Some(key_b),
+            key.ascending,
+            key.nulls_first,
+        );
         if cmp != Ordering::Equal {
-            return if key.ascending { cmp } else { cmp.reverse() };
+            return cmp;
         }
     }
     Ordering::Equal
-}
-
-/// Compare two Values for sorting. NULLs sort last.
-fn compare_values_for_sort(a: &Value, b: &Value) -> Ordering {
-    match (a, b) {
-        (Value::Null(_), Value::Null(_)) => Ordering::Equal,
-        (Value::Null(_), _) => Ordering::Greater,
-        (_, Value::Null(_)) => Ordering::Less,
-        (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
-        (Value::Float(a), Value::Float(b)) => crate::core::value::compare_floats(*a, *b),
-        (Value::Integer(a), Value::Float(b)) => crate::core::value::total_cmp_i64_f64(*a, *b),
-        (Value::Float(a), Value::Integer(b)) => {
-            crate::core::value::total_cmp_i64_f64(*b, *a).reverse()
-        }
-        (Value::Text(a), Value::Text(b)) => a.cmp(b),
-        (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
-        (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
-        _ => Ordering::Equal,
-    }
 }
 
 /// Helper struct for tracking distinct values

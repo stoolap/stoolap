@@ -1138,43 +1138,12 @@ pub fn parallel_order_by(
 ) {
     let compare = |(_, a): &(i64, Row), (_, b): &(i64, Row)| -> std::cmp::Ordering {
         for spec in sort_specs {
-            let a_val = a.get(spec.column_index);
-            let b_val = b.get(spec.column_index);
-
-            // Check for NULL values (either missing column or Value::Null)
-            let a_is_null = a_val.map(|v| v.is_null()).unwrap_or(true);
-            let b_is_null = b_val.map(|v| v.is_null()).unwrap_or(true);
-
-            let ordering = match (a_is_null, b_is_null) {
-                (true, true) => std::cmp::Ordering::Equal,
-                (true, false) => {
-                    if spec.nulls_first {
-                        std::cmp::Ordering::Less
-                    } else {
-                        std::cmp::Ordering::Greater
-                    }
-                }
-                (false, true) => {
-                    if spec.nulls_first {
-                        std::cmp::Ordering::Greater
-                    } else {
-                        std::cmp::Ordering::Less
-                    }
-                }
-                (false, false) => {
-                    // Both non-null, compare values
-                    let a_v = a_val.unwrap();
-                    let b_v = b_val.unwrap();
-                    a_v.partial_cmp(b_v).unwrap_or(std::cmp::Ordering::Equal)
-                }
-            };
-
-            let ordering = if spec.direction == SortDirection::Descending {
-                ordering.reverse()
-            } else {
-                ordering
-            };
-
+            let ordering = crate::core::value::compare_order_key(
+                a.get(spec.column_index),
+                b.get(spec.column_index),
+                spec.direction != SortDirection::Descending,
+                Some(spec.nulls_first),
+            );
             if ordering != std::cmp::Ordering::Equal {
                 return ordering;
             }

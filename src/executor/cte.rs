@@ -1655,44 +1655,12 @@ impl Executor {
         rows.sort_by(|(_, a), (_, b)| {
             for (col_idx, ascending, nulls_first) in &order_specs {
                 if let Some(idx) = col_idx {
-                    let a_val = a.get(*idx);
-                    let b_val = b.get(*idx);
-
-                    // Check if either value is NULL
-                    let a_is_null = a_val.is_none() || a_val.map(|v| v.is_null()).unwrap_or(true);
-                    let b_is_null = b_val.is_none() || b_val.map(|v| v.is_null()).unwrap_or(true);
-
-                    // Handle NULL comparison
-                    if a_is_null || b_is_null {
-                        if a_is_null && b_is_null {
-                            continue; // Both NULL, move to next column
-                        }
-                        // Default: NULLS LAST for ASC, NULLS FIRST for DESC
-                        let nulls_come_first = nulls_first.unwrap_or(!*ascending);
-                        let cmp = if a_is_null {
-                            if nulls_come_first {
-                                std::cmp::Ordering::Less
-                            } else {
-                                std::cmp::Ordering::Greater
-                            }
-                        } else if nulls_come_first {
-                            std::cmp::Ordering::Greater
-                        } else {
-                            std::cmp::Ordering::Less
-                        };
-                        return cmp;
-                    }
-
-                    // Both non-NULL - normal comparison
-                    let cmp = match (a_val, b_val) {
-                        (Some(av), Some(bv)) => {
-                            av.partial_cmp(bv).unwrap_or(std::cmp::Ordering::Equal)
-                        }
-                        _ => std::cmp::Ordering::Equal,
-                    };
-
-                    let cmp = if !*ascending { cmp.reverse() } else { cmp };
-
+                    let cmp = crate::core::value::compare_order_key(
+                        a.get(*idx),
+                        b.get(*idx),
+                        *ascending,
+                        *nulls_first,
+                    );
                     if cmp != std::cmp::Ordering::Equal {
                         return cmp;
                     }

@@ -218,14 +218,6 @@ pub struct AggregateOrder {
     pub nulls_first: Option<bool>,
 }
 
-impl AggregateOrder {
-    /// Where a NULL key goes, with the default the direction implies
-    #[inline]
-    pub fn nulls_first(&self) -> bool {
-        self.nulls_first.unwrap_or(!self.ascending)
-    }
-}
-
 pub trait AggregateFunction: Send + Sync {
     /// Get the function name
     fn name(&self) -> &str;

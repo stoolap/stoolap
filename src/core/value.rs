@@ -1191,74 +1191,37 @@ impl PartialOrd for Value {
 /// Violating this contract causes BTreeMap corruption.
 ///
 /// Note: This differs from SQL NULL semantics where NULL comparisons
-/// return UNKNOWN. This ordering is only for internal index structure.
+/// return UNKNOWN. Besides the indexes, every ORDER BY, MIN, MAX, GREATEST
+/// and LEAST orders values by it, through `compare_order_key`.
 impl Ord for Value {
+    #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
-        // Handle NULL comparisons - NULLs are ordered first
-        match (self.is_null(), other.is_null()) {
-            (true, true) => return Ordering::Equal,
-            (true, false) => return Ordering::Less,
-            (false, true) => return Ordering::Greater,
-            (false, false) => {} // Continue to value comparison
-        }
-
-        // Cross-type numeric comparison: Integer vs Float
-        // This MUST be consistent with PartialEq where Integer(5) == Float(5.0)
-        match (self, other) {
-            (Value::Integer(i), Value::Float(f)) => {
-                // Exact comparison: `i as f64` rounds above 2^53 and would
-                // make Ord call i64::MAX equal to Float(2^63), breaking the
-                // Eq/Ord consistency the BTree indexes rely on.
-                // NaN orders last (cmp_i64_f64 returns None only for NaN).
-                return crate::core::value::cmp_i64_f64(*i, *f).unwrap_or(Ordering::Less);
-            }
-            (Value::Float(f), Value::Integer(i)) => {
-                return crate::core::value::cmp_i64_f64(*i, *f)
-                    .map(Ordering::reverse)
-                    .unwrap_or(Ordering::Greater);
-            }
-            _ => {} // Continue to same-type comparison
-        }
-
-        // Helper function to get type discriminant for ordering
-        fn type_discriminant(v: &Value) -> u8 {
+        /// Rank of a type among the others; INTEGER and FLOAT share one so
+        /// they sort together by value, and NULL is first
+        fn type_rank(v: &Value) -> u8 {
             match v {
                 Value::Null(_) => 0,
                 Value::Boolean(_) => 1,
-                // Integer and Float share the same discriminant for ordering purposes
-                // This ensures they sort together by numeric value
                 Value::Integer(_) | Value::Float(_) => 2,
                 Value::Text(_) => 3,
                 Value::Timestamp(_) => 4,
                 Value::Extension(_) => 5,
             }
         }
-
-        let self_disc = type_discriminant(self);
-        let other_disc = type_discriminant(other);
-
-        // Different types: order by type discriminant
-        if self_disc != other_disc {
-            return self_disc.cmp(&other_disc);
-        }
-
-        // Same type comparison
         match (self, other) {
             (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
-            (Value::Float(a), Value::Float(b)) => {
-                // Handle NaN: NaN is ordered last
-                match (a.is_nan(), b.is_nan()) {
-                    (true, true) => Ordering::Equal,
-                    (true, false) => Ordering::Greater,
-                    (false, true) => Ordering::Less,
-                    (false, false) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-                }
-            }
+            (Value::Float(a), Value::Float(b)) => compare_floats(*a, *b),
             (Value::Text(a), Value::Text(b)) => a.cmp(b),
             (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
             (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
             (Value::Extension(a), Value::Extension(b)) => a.cmp(b),
-            _ => Ordering::Equal, // Should not reach here
+            // Exact, consistent with PartialEq where Integer(5) == Float(5.0)
+            // as the BTree indexes need; NaN orders after every number
+            (Value::Integer(i), Value::Float(f)) => cmp_i64_f64(*i, *f).unwrap_or(Ordering::Less),
+            (Value::Float(f), Value::Integer(i)) => cmp_i64_f64(*i, *f)
+                .map(Ordering::reverse)
+                .unwrap_or(Ordering::Greater),
+            _ => type_rank(self).cmp(&type_rank(other)),
         }
     }
 }
@@ -1578,6 +1541,38 @@ pub(crate) fn grouping_float(f: f64) -> f64 {
         0.0
     } else {
         f
+    }
+}
+
+/// One sort key: values in the total order of `Value::cmp`, a missing or
+/// NULL value placed by `nulls_first` (default: last ascending, first
+/// descending). Every ORDER BY, MIN and MAX orders values by this rule
+#[inline]
+pub fn compare_order_key(
+    a: Option<&Value>,
+    b: Option<&Value>,
+    ascending: bool,
+    nulls_first: Option<bool>,
+) -> Ordering {
+    let a = a.filter(|v| !v.is_null());
+    let b = b.filter(|v| !v.is_null());
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            let cmp = a.cmp(b);
+            if ascending {
+                cmp
+            } else {
+                cmp.reverse()
+            }
+        }
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) | (Some(_), None) => {
+            if a.is_none() == nulls_first.unwrap_or(!ascending) {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
     }
 }
 
