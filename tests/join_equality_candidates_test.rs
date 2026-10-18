@@ -291,6 +291,13 @@ fn explain_reports_the_grouped_index_join_only_for_the_shape_it_takes() {
         "an aggregate expression is not the grouped operator's: {}",
         plan(expression)
     );
+    let on_subquery = "SELECT u.id, SUM(o.amount) FROM users u INNER JOIN orders o \
+        ON u.id = o.user_id AND o.amount > (SELECT 0) GROUP BY u.id LIMIT 1";
+    assert!(
+        !plan(on_subquery).contains("Index Nested Loop"),
+        "a subquery in ON keeps the grouped index join out: {}",
+        plan(on_subquery)
+    );
     let window = "SELECT u.id, SUM(o.amount) OVER () FROM users u INNER JOIN orders o ON u.id = o.user_id LIMIT 1";
     assert!(
         !plan(window).contains("Index Nested Loop"),

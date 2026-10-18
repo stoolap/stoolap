@@ -1943,6 +1943,22 @@ pub fn extract_join_keys_and_residual(
     extract_join_keys_and_residual_keeping(condition, left_columns, right_columns, &|_, _| true)
 }
 
+/// What an index join asks of each pair besides its lookup key, the column
+/// pair (`outer_idx`, `inner_idx`): every other conjunct of the ON clause
+pub(crate) fn index_join_residual(
+    on: &Expression,
+    outer_columns: &[String],
+    inner_columns: &[String],
+    outer_idx: usize,
+    inner_idx: Option<usize>,
+) -> Option<Expression> {
+    let (_, _, residual) =
+        extract_join_keys_and_residual_keeping(on, outer_columns, inner_columns, &|o, i| {
+            o == outer_idx && Some(i) == inner_idx
+        });
+    combine_predicates_with_and(residual)
+}
+
 /// The same extraction, where a column pair that `keep` refuses stays in the
 /// residual as an ordinary equality.
 pub fn extract_join_keys_and_residual_keeping(
