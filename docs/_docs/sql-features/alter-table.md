@@ -18,7 +18,7 @@ ALTER TABLE users ADD COLUMN last_login TIMESTAMP;
 ALTER TABLE users ADD COLUMN score INTEGER;
 ```
 
-Existing rows receive the column's DEFAULT, or NULL without one, whether they are still in memory or already in a frozen volume. Subsequent inserts can provide values for the new column:
+Existing rows receive the column's DEFAULT, or NULL without one, whether they are still in memory or already in a frozen volume. The new column takes NOT NULL and DEFAULT; a CHECK, UNIQUE, PRIMARY KEY, AUTO_INCREMENT or REFERENCES constraint is refused with an error, and the table is left unchanged. Subsequent inserts can provide values for the new column:
 
 ```sql
 INSERT INTO users (id, name, score) VALUES (1, 'Alice', 100);
