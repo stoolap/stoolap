@@ -79,7 +79,7 @@ SELECT name, salary,
 FROM employees;
 ```
 
-Divides employees into 3 groups based on salary.
+Divides employees into 3 groups based on salary. `n` is an INTEGER of 1 or more; any other value, including NULL, is an error.
 
 #### PERCENT_RANK()
 Returns the relative rank of the current row as a percentage (0 to 1).
@@ -116,6 +116,8 @@ SELECT name, salary,
 FROM employees;
 ```
 
+The offset is 1 when omitted. It is an INTEGER of 0 or more, read as every INTEGER argument is; any other value, including NULL, is an error. The same holds for LEAD.
+
 #### LEAD(expression [, offset [, default]])
 Accesses a value from a following row within the partition.
 
@@ -150,7 +152,7 @@ FROM employees;
 ```
 
 #### NTH_VALUE(expression, n)
-Returns the nth value within the partition.
+Returns the nth value within the current window frame, or NULL when the frame holds fewer than n rows. `n` is an INTEGER of 1 or more; any other value, including NULL, is an error. It is evaluated only for a frame that holds rows.
 
 ```sql
 SELECT name, salary,
@@ -275,6 +277,15 @@ Window frames control exactly which rows within a partition are included in the 
 | `n FOLLOWING` | n rows/values after the current row |
 | `UNBOUNDED FOLLOWING` | End of the partition |
 
+### Frame Offsets
+
+The `n` of `n PRECEDING` and `n FOLLOWING` can be a literal, a parameter or a constant expression such as `1 + 1`. It is evaluated once for the statement and cannot reference a column.
+
+- For `ROWS`, `n` is a number of rows: an INTEGER of 0 or more, read as every INTEGER argument is (`2.0` is 2, `'2'` is 2).
+- For `RANGE`, `n` is a distance in the units of the ORDER BY: an INTEGER or FLOAT of 0 or more, so `0.5 PRECEDING` works. It is measured in the sort direction, so with `ORDER BY x DESC`, `1 PRECEDING` reaches the rows whose value is up to 1 above the current one. A row whose ORDER BY value is NULL or not a number frames to its peers.
+
+Any other value, including NULL and a negative number, is an error. A frame whose start lies after its end holds no rows.
+
 ### Default Frame
 
 When ORDER BY is specified without an explicit frame, the default is:
@@ -283,7 +294,7 @@ When ORDER BY is specified without an explicit frame, the default is:
 RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
 ```
 
-When ORDER BY is omitted, the entire partition is used.
+When ORDER BY is omitted, the entire partition is used. An explicit frame applies with or without ORDER BY.
 
 ### Examples
 
