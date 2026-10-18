@@ -159,7 +159,7 @@ fn try_extract_literal(expr: &Expression) -> Option<Value> {
     match expr {
         Expression::IntegerLiteral(lit) => Some(Value::Integer(lit.value)),
         Expression::FloatLiteral(lit) => Some(Value::Float(lit.value)),
-        Expression::StringLiteral(lit) => Some(Value::text(lit.value.as_str())),
+        Expression::StringLiteral(lit) => Some(super::utils::string_literal_value(lit)),
         Expression::BooleanLiteral(lit) => Some(Value::Boolean(lit.value)),
         Expression::NullLiteral(_) => Some(Value::null_unknown()),
         // Negative numbers: -5, -3.14

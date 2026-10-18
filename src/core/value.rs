@@ -1344,6 +1344,22 @@ thread_local! {
     static TS_FORMAT_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// The keywords a typed literal is written with: `TIMESTAMP '...'`,
+/// `DATE '...'`, `TIME '...'`
+pub const TYPED_LITERAL_KEYWORDS: [&str; 3] = ["TIMESTAMP", "DATE", "TIME"];
+
+/// The TIMESTAMP a typed literal stands for: a TIMESTAMP, DATETIME or DATE
+/// hint whose text parses. None otherwise, and the literal stays a TEXT
+pub fn typed_literal_timestamp(hint: &str, text: &str) -> Option<Value> {
+    let timestamp = ["TIMESTAMP", "DATETIME", "DATE"]
+        .iter()
+        .any(|name| hint.eq_ignore_ascii_case(name));
+    if !timestamp {
+        return None;
+    }
+    parse_timestamp(text).ok().map(Value::Timestamp)
+}
+
 /// A TEXT as `CAST(... AS BOOLEAN)` reads it: `true`, `t`, `yes`, `y` and
 /// `1` are TRUE, `false`, `f`, `no`, `n` and `0` FALSE, in any case
 pub fn text_as_boolean(s: &str) -> Option<bool> {

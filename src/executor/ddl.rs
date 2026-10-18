@@ -1051,7 +1051,7 @@ impl Executor {
                         &added,
                         crate::storage::mvcc::engine::ColumnEvent::Added,
                     )?;
-                    self.engine.add_column_schema(table_name, column)?;
+                    self.engine.add_column_schema(table_name, column.clone())?;
                     change.mark_changed();
 
                     // Refresh engine's schema cache from version store
@@ -1068,10 +1068,7 @@ impl Executor {
                     };
                     if let Err(error) = self.engine.record_alter_table_add_column(
                         table_name,
-                        &col_def.name.value,
-                        data_type,
-                        nullable,
-                        default_expr.as_deref(),
+                        &column,
                         vector_dimensions,
                     ) {
                         self.engine

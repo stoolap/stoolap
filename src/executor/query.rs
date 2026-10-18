@@ -8416,7 +8416,7 @@ impl Executor {
                         args.push(ArgSource::Const(Value::Float(lit.value)));
                     }
                     Expression::StringLiteral(lit) => {
-                        args.push(ArgSource::Const(Value::Text(lit.value.clone())));
+                        args.push(ArgSource::Const(string_literal_value(lit)));
                     }
                     Expression::BooleanLiteral(lit) => {
                         args.push(ArgSource::Const(Value::Boolean(lit.value)));
@@ -8468,9 +8468,7 @@ impl Executor {
                     Some(ArgSource::Const(Value::Integer(lit.value)))
                 }
                 Expression::FloatLiteral(lit) => Some(ArgSource::Const(Value::Float(lit.value))),
-                Expression::StringLiteral(lit) => {
-                    Some(ArgSource::Const(Value::Text(lit.value.clone())))
-                }
+                Expression::StringLiteral(lit) => Some(ArgSource::Const(string_literal_value(lit))),
                 Expression::BooleanLiteral(lit) => {
                     Some(ArgSource::Const(Value::Boolean(lit.value)))
                 }
@@ -8945,10 +8943,8 @@ impl Executor {
                                         any_null = true;
                                         break;
                                     }
-                                    Some(_) => {
-                                        all_text = false;
-                                        break;
-                                    }
+                                    // A later part may still be NULL
+                                    Some(_) => all_text = false,
                                 }
                             }
 
@@ -8969,7 +8965,8 @@ impl Executor {
                                 // len == capacity, so into_boxed_str is O(1)
                                 values.push(Value::Text(result.into()));
                             } else {
-                                // Slow path: mixed types, use Arc to avoid shrink_to_fit
+                                // Slow path: mixed types, written as Op::Concat writes
+                                // them; use Arc to avoid shrink_to_fit
                                 let mut result = String::with_capacity(64);
                                 for part in parts.iter() {
                                     let val: Option<&Value> = match part {
@@ -8978,18 +8975,10 @@ impl Executor {
                                     };
                                     match val {
                                         Some(Value::Text(s)) => result.push_str(s.as_str()),
-                                        Some(Value::Integer(i)) => {
+                                        Some(v) => {
                                             use std::fmt::Write;
-                                            let _ = write!(result, "{}", i);
+                                            let _ = write!(result, "{}", v);
                                         }
-                                        Some(Value::Float(f)) => {
-                                            use std::fmt::Write;
-                                            let _ = write!(result, "{}", f);
-                                        }
-                                        Some(Value::Boolean(b)) => {
-                                            result.push_str(if *b { "true" } else { "false" });
-                                        }
-                                        Some(v) => result.push_str(&v.to_string()),
                                         None => {}
                                     }
                                 }

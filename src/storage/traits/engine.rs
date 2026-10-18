@@ -185,25 +185,16 @@ pub trait Engine: Send + Sync {
         Ok(())
     }
 
-    /// Record ALTER TABLE ADD COLUMN operation to WAL for persistence
+    /// Record ALTER TABLE ADD COLUMN operation to WAL for persistence, with
+    /// the default the existing rows took
     fn record_alter_table_add_column(
         &self,
         table_name: &str,
-        column_name: &str,
-        data_type: crate::core::DataType,
-        nullable: bool,
-        default_expr: Option<&str>,
+        column: &crate::core::SchemaColumn,
         vector_dimensions: u16,
     ) -> Result<()> {
         // Default implementation does nothing (for in-memory engines)
-        let _ = (
-            table_name,
-            column_name,
-            data_type,
-            nullable,
-            default_expr,
-            vector_dimensions,
-        );
+        let _ = (table_name, column, vector_dimensions);
         Ok(())
     }
 
