@@ -80,6 +80,15 @@ impl CastExpr {
             DataType::Null => Ok(Value::null(DataType::Null)),
         }
     }
+
+    /// Whether `perform_cast` succeeds, read for INTEGER without building
+    /// the error it would return
+    fn casts(&self, value: &Value) -> bool {
+        match self.target_type {
+            DataType::Integer => integer_reading(value) != IntegerReading::OutOfRange,
+            _ => self.perform_cast(value).is_ok(),
+        }
+    }
 }
 
 impl Expression for CastExpr {
@@ -101,10 +110,7 @@ impl Expression for CastExpr {
 
         // Perform the cast - if it succeeds, return true
         // (CAST by itself doesn't filter, parent expression handles comparison)
-        match self.perform_cast(col_value) {
-            Ok(_) => Ok(true),
-            Err(_) => Ok(false),
-        }
+        Ok(self.casts(col_value))
     }
 
     fn evaluate_fast(&self, row: &Row) -> bool {
@@ -119,7 +125,7 @@ impl Expression for CastExpr {
             return false;
         }
 
-        self.perform_cast(col_value).is_ok()
+        self.casts(col_value)
     }
 
     fn with_aliases(&self, aliases: &FxHashMap<String, String>) -> Box<dyn Expression> {

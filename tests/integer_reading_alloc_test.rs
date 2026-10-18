@@ -111,4 +111,26 @@ fn test_a_conversion_to_null_outside_the_integer_range_allocates_nothing() {
     let allocated = bytes_for(|| matched = expr.evaluate_fast(&row));
     assert!(!matched, "a value outside the range matches nothing");
     assert_eq!(allocated, 0, "CompoundExpr::evaluate_fast");
+
+    let mut cast = CastExpr::new("s", DataType::Integer);
+    cast.prepare_for_schema(&schema);
+    let float_row = Row::from_values(vec![Value::Integer(1), float.clone()]);
+    let mut casts = Ok(true);
+    let allocated = bytes_for(|| casts = cast.evaluate(&float_row));
+    assert!(
+        matches!(casts, Ok(false)),
+        "CastExpr::evaluate gives {casts:?}"
+    );
+    assert_eq!(allocated, 0, "CastExpr::evaluate");
+    let mut casts = true;
+    let allocated = bytes_for(|| casts = cast.evaluate_fast(&float_row));
+    assert!(!casts, "CastExpr::evaluate_fast casts 1e30");
+    assert_eq!(allocated, 0, "CastExpr::evaluate_fast");
+
+    let text_row = Row::from_values(vec![Value::Integer(1), Value::text("x")]);
+    assert!(
+        cast.evaluate(&text_row).unwrap(),
+        "a text without a number casts to NULL"
+    );
+    assert!(cast.evaluate_fast(&text_row));
 }
