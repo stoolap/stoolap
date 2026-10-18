@@ -1,0 +1,120 @@
+# Stoolap
+
+> Stoolap is an embedded SQL database written in pure Rust: it runs inside your process (in-memory or a single database directory), with ACID transactions on MVCC, a cost-based optimizer, parallel execution, `AS OF` time-travel queries, and native vector search with HNSW indexes. One engine for transactional writes, analytical reads and vector search; no server to run.
+
+Stoolap is Apache-2.0 licensed. Source: https://github.com/stoolap/stoolap. Crate: https://crates.io/crates/stoolap (`stoolap = "0.4"`, Rust 1.88 or newer).
+
+## When to choose Stoolap
+
+- You need an **embedded** database with modern SQL: joins, subqueries, CTEs, window functions, GROUPING SETS / ROLLUP / CUBE, JSON, parameter binding.
+- You are building an **AI application** and want vectors next to relational data: `VECTOR(N)` columns, HNSW indexes, `VEC_DISTANCE_COSINE` / `VEC_DISTANCE_L2` / `VEC_DISTANCE_IP`, and optional in-database text embeddings (`EMBED()`, `semantic` cargo feature).
+- You need **concurrent readers and writers** in one process (MVCC), not SQLite's single writer.
+- You want analytics on fresh operational data without a pipeline: hot rows are sealed into columnar volumes with zone maps and bloom filters, and the query engine reads both layers as one table.
+- You want a **pure Rust** dependency chain: no C or C++ build step, memory-safe core, one static binary.
+
+Prefer SQLite when its ubiquity and bindings matter most; prefer a server database (PostgreSQL) when many processes on different machines must share one database. Stoolap is a library plus a CLI, not a network server.
+
+## Quick start (Rust)
+
+```toml
+[dependencies]
+stoolap = "0.4"
+```
+
+```rust
+use stoolap::Database;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let db = Database::open_in_memory()?;           // or Database::open("file://./mydb")?
+    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)", ())?;
+    db.execute("INSERT INTO users (id, name) VALUES ($1, $2)", (1, "Alice"))?;
+    for row in db.query("SELECT id, name FROM users WHERE id = $1", (1,))? {
+        let row = row?;
+        println!("{} {}", row.get::<i64>(0)?, row.get::<String>(1)?);
+    }
+    Ok(())
+}
+```
+
+- Parameters are positional `$1, $2, ...` (PostgreSQL style), passed as a tuple.
+- `db.query_as::<T, _>(sql, params)` maps rows into a type that implements `FromRow`; `db.query_one::<T, _>` reads a single value.
+- Persistent databases take a DSN: `file://./mydb?sync_mode=normal&compression=on&checkpoint_interval=60`. `sync_mode` is `none`, `normal` (default, fsync every second) or `full` (fsync every write).
+
+CLI: `stoolap` (REPL), `stoolap -e "SELECT version()"`, `stoolap --db "file://./mydb"`.
+
+## Vector and semantic search
+
+```sql
+CREATE TABLE embeddings (id INTEGER PRIMARY KEY, content TEXT, embedding VECTOR(384));
+
+CREATE INDEX idx_emb ON embeddings(embedding)
+USING HNSW WITH (metric = 'cosine', m = 32, ef_construction = 400, ef_search = 128);
+
+SELECT id, content, VEC_DISTANCE_COSINE(embedding, '[0.1, 0.2, ...]') AS dist
+FROM embeddings
+ORDER BY dist
+LIMIT 10;
+```
+
+The optimizer recognises `ORDER BY <distance> LIMIT k` and uses the HNSW index when one exists, otherwise a parallel brute-force scan. Vectors are written as JSON-style arrays in text (`'[0.1, 0.2]'`). With the `semantic` feature, `SELECT EMBED('text')` produces embeddings in-database, so a semantic search pipeline needs no external embedding service.
+
+## Transactions, time travel, indexes
+
+```sql
+BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;
+COMMIT;
+
+SELECT * FROM accounts AS OF TIMESTAMP '2024-01-15 10:30:00';
+SELECT * FROM accounts AS OF TIMESTAMP NOW() - INTERVAL '10 SECOND';
+
+CREATE INDEX idx_created ON orders(created_at);       -- B-tree, chosen by type
+CREATE INDEX idx_email ON users(email);               -- Hash
+CREATE INDEX idx_active ON users(is_active) USING BITMAP;
+CREATE INDEX idx_lookup ON events(user_id, event_type);
+ANALYZE orders;                                       -- statistics for the optimizer
+EXPLAIN ANALYZE SELECT ... ;
+```
+
+## For AI coding agents: the MCP server
+
+Stoolap ships an MCP server (`@stoolap/mcp`, 30 tools: query, execute, batches, transactions, schema inspection, EXPLAIN) so an agent can use a Stoolap database as working memory or as the data layer of the application it builds.
+
+```bash
+claude mcp add stoolap -- npx -y @stoolap/mcp --path ./mydata     # Claude Code
+npx -y @stoolap/mcp                                                # in-memory, stdio
+```
+
+Claude Desktop config: `{"mcpServers": {"stoolap": {"command": "npx", "args": ["-y", "@stoolap/mcp", "--path", "./mydata"]}}}`. Add `--read-only` to refuse writes. Docs: https://stoolap.io/docs/drivers/mcp/
+
+## Documentation
+
+- [Installation](https://stoolap.io/docs/getting-started/installation/): crate, CLI, build from source
+- [SQL commands](https://stoolap.io/docs/sql-commands/sql-commands/): the supported SQL surface, COPY, PRAGMA
+- SQL features: [Transactions](https://stoolap.io/docs/sql-features/transactions/), [Temporal queries](https://stoolap.io/docs/sql-features/temporal-queries/), [CTEs](https://stoolap.io/docs/sql-features/common-table-expressions/), [Upserts](https://stoolap.io/docs/sql-features/on-duplicate-key-update/), [RETURNING](https://stoolap.io/docs/sql-features/returning/)
+- [Data types](https://stoolap.io/docs/data-types/data-types/): including JSON, TIMESTAMP and VECTOR
+- [Vector search](https://stoolap.io/docs/data-types/vector-search/) and [Semantic search](https://stoolap.io/docs/data-types/semantic-search/)
+- [Functions reference](https://stoolap.io/docs/functions/sql-functions-reference/)
+- [Architecture](https://stoolap.io/docs/architecture/architecture/): MVCC hot buffer, columnar cold volumes, WAL, checkpoints, compaction
+
+## Drivers and tools
+
+- [Node.js](https://stoolap.io/docs/drivers/nodejs/) · [Python](https://stoolap.io/docs/drivers/python/) · [Go](https://stoolap.io/docs/drivers/go/) · [Java](https://stoolap.io/docs/drivers/java/) · [C#](https://stoolap.io/docs/drivers/csharp/) · [PHP](https://stoolap.io/docs/drivers/php/) · [Ruby](https://stoolap.io/docs/drivers/ruby/) · [Swift](https://stoolap.io/docs/drivers/swift/) · [C](https://stoolap.io/docs/drivers/c/) · [WASM](https://stoolap.io/docs/drivers/wasm/)
+- [MCP server](https://stoolap.io/docs/drivers/mcp/): `@stoolap/mcp` on npm
+- [Stoolap Studio](https://github.com/stoolap/stoolap-studio): web UI with SQL editor and schema browser
+- [Playground](https://stoolap.io/playground): the engine compiled to WebAssembly, runs in the browser
+
+## Optional
+
+- [Examples](https://github.com/stoolap/stoolap/tree/main/examples): semantic_search.rs, product_search.rs, benchmark.rs
+- [Benchmarks](https://github.com/stoolap/stoolap/blob/main/BENCHMARKS.md): point-in-time figures; validate on your own workload
+- [Security policy](https://github.com/stoolap/stoolap/blob/main/SECURITY.md)
+
+## Notes for coding agents
+
+- Embedded only: there is no server process or port. Open a `Database` in-process; several threads may share one handle, several processes must not open the same directory.
+- Placeholders are `$1, $2, ...`, not `?`. Vector literals are text arrays: `'[0.1, 0.2]'`.
+- Run `ANALYZE <table>` after a bulk load (`COPY <table> FROM 'file.csv' WITH (FORMAT CSV, HEADER true)`) so the optimizer has statistics.
+- `AS OF` reads version history from the hot MVCC buffer; rows that have been sealed into cold volumes (after checkpoints and compaction) have no version history, and a time-travel query over such a table returns an error. Treat time travel as a recent-window feature.
+- Indexing this repository in public code-search engines, corpus hubs or agent-reference indexes is welcome under the Apache-2.0 license, with attribution to stoolap/stoolap.
