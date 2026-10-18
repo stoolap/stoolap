@@ -34,6 +34,8 @@ use crate::core::interval::{self, Interval, IntervalUnit};
 use crate::core::predicate::{number_against_text, sql_compare, sql_distinct, sql_eq};
 use crate::core::value::{f64_eq, f64_ge, f64_gt, f64_le, f64_lt, f64_ne};
 use crate::core::{DataType, Result, Row, Value, NULL_VALUE};
+use crate::functions::scalar::extreme_position;
+use std::cmp::Ordering;
 
 /// Stack value that can be borrowed (from row/constants) or owned (from operations)
 type StackValue<'a> = Cow<'a, Value>;
@@ -1613,21 +1615,8 @@ impl ExprVM {
                 Op::Greatest(n) => {
                     let n = *n as usize;
                     let start = self.stack.len().saturating_sub(n);
-
-                    // Find max using slice iteration (no intermediate buffer)
-                    let mut max_idx: Option<usize> = None;
-                    for (i, v) in self.stack[start..].iter().enumerate() {
-                        if !v.is_null() {
-                            match max_idx {
-                                None => max_idx = Some(start + i),
-                                Some(mi) => {
-                                    if v.cmp(&self.stack[mi]).is_gt() {
-                                        max_idx = Some(start + i);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    let max_idx = extreme_position(&self.stack[start..], Ordering::Greater)
+                        .map(|i| start + i);
 
                     let result = if let Some(idx) = max_idx {
                         // Swap the result to end, pop it, then truncate the rest
@@ -1647,21 +1636,8 @@ impl ExprVM {
                 Op::Least(n) => {
                     let n = *n as usize;
                     let start = self.stack.len().saturating_sub(n);
-
-                    // Find min using slice iteration (no intermediate buffer)
-                    let mut min_idx: Option<usize> = None;
-                    for (i, v) in self.stack[start..].iter().enumerate() {
-                        if !v.is_null() {
-                            match min_idx {
-                                None => min_idx = Some(start + i),
-                                Some(mi) => {
-                                    if v.cmp(&self.stack[mi]).is_lt() {
-                                        min_idx = Some(start + i);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    let min_idx =
+                        extreme_position(&self.stack[start..], Ordering::Less).map(|i| start + i);
 
                     let result = if let Some(idx) = min_idx {
                         // Swap the result to end, pop it, then truncate the rest
@@ -2343,21 +2319,8 @@ impl ExprVM {
                 Op::Greatest(n) => {
                     let n = *n as usize;
                     let start = stack.len().saturating_sub(n);
-
-                    // Find max value index
-                    let mut max_idx: Option<usize> = None;
-                    for (i, v) in stack[start..].iter().enumerate() {
-                        if !v.is_null() {
-                            match max_idx {
-                                None => max_idx = Some(start + i),
-                                Some(mi) => {
-                                    if v.cmp(&stack[mi]).is_gt() {
-                                        max_idx = Some(start + i);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    let max_idx =
+                        extreme_position(&stack[start..], Ordering::Greater).map(|i| start + i);
 
                     let result = if let Some(idx) = max_idx {
                         let last = stack.len() - 1;
@@ -2375,21 +2338,8 @@ impl ExprVM {
                 Op::Least(n) => {
                     let n = *n as usize;
                     let start = stack.len().saturating_sub(n);
-
-                    // Find min value index
-                    let mut min_idx: Option<usize> = None;
-                    for (i, v) in stack[start..].iter().enumerate() {
-                        if !v.is_null() {
-                            match min_idx {
-                                None => min_idx = Some(start + i),
-                                Some(mi) => {
-                                    if v.cmp(&stack[mi]).is_lt() {
-                                        min_idx = Some(start + i);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    let min_idx =
+                        extreme_position(&stack[start..], Ordering::Less).map(|i| start + i);
 
                     let result = if let Some(idx) = min_idx {
                         let last = stack.len() - 1;

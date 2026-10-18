@@ -76,6 +76,7 @@ pub use string::{
     StartsWithFunction, StrposFunction, SubstrFunction, SubstringFunction, TrimFunction,
     UpperFunction,
 };
+pub(crate) use utility::extreme_position;
 pub use utility::{
     CoalesceFunction, GreatestFunction, IfNullFunction, IifFunction, JsonArrayFunction,
     JsonArrayLengthFunction, JsonExtractFunction, JsonKeysFunction, JsonObjectFunction,

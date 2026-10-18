@@ -771,13 +771,10 @@ fn test_greatest_function() {
 fn test_greatest_with_null() {
     let db = Database::open("memory://test_greatest_null").expect("Failed to create database");
 
-    // NULL propagation - if any arg is NULL, result is NULL
-    let result = db
-        .query("SELECT GREATEST(1, NULL, 3)", ())
+    let result: i64 = db
+        .query_one("SELECT GREATEST(1, NULL, 3)", ())
         .expect("Failed to query");
-    let rows: Vec<_> = result.into_iter().collect();
-    assert_eq!(rows.len(), 1);
-    // The result should be NULL
+    assert_eq!(result, 3, "a NULL argument is skipped");
 }
 
 #[test]
@@ -819,13 +816,10 @@ fn test_least_function() {
 fn test_least_with_null() {
     let db = Database::open("memory://test_least_null").expect("Failed to create database");
 
-    // NULL propagation - if any arg is NULL, result is NULL
-    let result = db
-        .query("SELECT LEAST(1, NULL, 3)", ())
+    let result: i64 = db
+        .query_one("SELECT LEAST(1, NULL, 3)", ())
         .expect("Failed to query");
-    let rows: Vec<_> = result.into_iter().collect();
-    assert_eq!(rows.len(), 1);
-    // The result should be NULL
+    assert_eq!(result, 1, "a NULL argument is skipped");
 }
 
 #[test]

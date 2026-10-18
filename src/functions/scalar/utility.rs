@@ -198,6 +198,27 @@ impl ScalarFunction for IfNullFunction {
 // GREATEST
 // ============================================================================
 
+/// The position of the value GREATEST (`beyond` Greater) or LEAST (Less)
+/// answers: the first non-NULL value that no other orders beyond, by
+/// `Value`'s order; None when every value is NULL
+pub(crate) fn extreme_position<V: std::borrow::Borrow<Value>>(
+    values: &[V],
+    beyond: std::cmp::Ordering,
+) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for (i, value) in values.iter().enumerate() {
+        let value = value.borrow();
+        if value.is_null() {
+            continue;
+        }
+        match best {
+            Some(b) if value.cmp(values[b].borrow()) != beyond => {}
+            _ => best = Some(i),
+        }
+    }
+    best
+}
+
 /// GREATEST function - returns the greatest value from a list of values
 #[derive(Default)]
 pub struct GreatestFunction;
@@ -223,20 +244,8 @@ impl ScalarFunction for GreatestFunction {
             ));
         }
 
-        // If any argument is NULL, return NULL (SQL standard behavior)
-        if args.iter().any(|v| v.is_null()) {
-            return Ok(Value::null_unknown());
-        }
-
-        // Find the greatest value
-        let mut greatest = &args[0];
-        for arg in args.iter().skip(1) {
-            if arg.cmp(greatest).is_gt() {
-                greatest = arg;
-            }
-        }
-
-        Ok(greatest.clone())
+        Ok(extreme_position(args, std::cmp::Ordering::Greater)
+            .map_or_else(Value::null_unknown, |i| args[i].clone()))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
@@ -273,20 +282,8 @@ impl ScalarFunction for LeastFunction {
             ));
         }
 
-        // If any argument is NULL, return NULL (SQL standard behavior)
-        if args.iter().any(|v| v.is_null()) {
-            return Ok(Value::null_unknown());
-        }
-
-        // Find the smallest value
-        let mut least = &args[0];
-        for arg in args.iter().skip(1) {
-            if arg.cmp(least).is_lt() {
-                least = arg;
-            }
-        }
-
-        Ok(least.clone())
+        Ok(extreme_position(args, std::cmp::Ordering::Less)
+            .map_or_else(Value::null_unknown, |i| args[i].clone()))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
@@ -1257,8 +1254,13 @@ mod tests {
     #[test]
     fn test_greatest_with_null() {
         let f = GreatestFunction;
+        assert_eq!(
+            f.evaluate(&[Value::Integer(1), Value::null_unknown(), Value::Integer(3)])
+                .unwrap(),
+            Value::Integer(3)
+        );
         assert!(f
-            .evaluate(&[Value::Integer(1), Value::null_unknown(), Value::Integer(3)])
+            .evaluate(&[Value::null_unknown(), Value::null_unknown()])
             .unwrap()
             .is_null());
     }
@@ -1319,8 +1321,13 @@ mod tests {
     #[test]
     fn test_least_with_null() {
         let f = LeastFunction;
+        assert_eq!(
+            f.evaluate(&[Value::Integer(1), Value::null_unknown(), Value::Integer(3)])
+                .unwrap(),
+            Value::Integer(1)
+        );
         assert!(f
-            .evaluate(&[Value::Integer(1), Value::null_unknown(), Value::Integer(3)])
+            .evaluate(&[Value::null_unknown(), Value::null_unknown()])
             .unwrap()
             .is_null());
     }
