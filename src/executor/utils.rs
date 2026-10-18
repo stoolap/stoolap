@@ -31,7 +31,7 @@ use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 use crate::common::StringMap;
 
-use crate::core::value::{grouping_float, NULL_VALUE};
+use crate::core::value::NULL_VALUE;
 use crate::core::{DataType, Operator, Row, Schema, Value};
 use crate::executor::operators::index_nested_loop::ColumnSource;
 use crate::parser::ast::{
@@ -752,8 +752,7 @@ pub fn hash_composite_key(row: &Row, key_indices: &[usize]) -> u64 {
         if let Some(value) = row.get(idx) {
             // Join keys hash via Value's Hash impl so cross-type numeric
             // keys (Integer 5, Float 5.0) share a bucket; values_equal
-            // decides the match exactly. hash_value_into is NOT used
-            // here: it keys GROUP BY, whose semantics stay unchanged
+            // decides the match exactly
             value.hash(&mut hasher);
         } else {
             // NULL marker
@@ -762,40 +761,6 @@ pub fn hash_composite_key(row: &Row, key_indices: &[usize]) -> u64 {
     }
 
     hasher.finish()
-}
-
-/// Hash a single value into an existing hasher.
-#[inline]
-pub fn hash_value_into<H: Hasher>(value: &Value, hasher: &mut H) {
-    match value {
-        Value::Integer(i) => {
-            1u8.hash(hasher);
-            i.hash(hasher);
-        }
-        Value::Float(f) => {
-            2u8.hash(hasher);
-            grouping_float(*f).to_bits().hash(hasher);
-        }
-        Value::Text(s) => {
-            3u8.hash(hasher);
-            s.hash(hasher);
-        }
-        Value::Boolean(b) => {
-            4u8.hash(hasher);
-            b.hash(hasher);
-        }
-        Value::Null(_) => {
-            5u8.hash(hasher);
-        }
-        Value::Timestamp(ts) => {
-            6u8.hash(hasher);
-            ts.timestamp_nanos_opt().hash(hasher);
-        }
-        Value::Extension(data) => {
-            10u8.hash(hasher);
-            data.hash(hasher);
-        }
-    }
 }
 
 // ============================================================================
@@ -3848,31 +3813,5 @@ mod tests {
         ));
         // The function is for filter expressions, not simple identifiers
         assert!(!filter_references_column(&expr, "target"));
-    }
-
-    // ============================================================================
-    // Hash Value Into Tests (detailed)
-    // ============================================================================
-
-    #[test]
-    fn test_hash_value_into_null() {
-        use crate::core::types::DataType;
-        use std::hash::DefaultHasher;
-        let mut hasher1 = DefaultHasher::new();
-        let mut hasher2 = DefaultHasher::new();
-        hash_value_into(&Value::Null(DataType::Integer), &mut hasher1);
-        hash_value_into(&Value::Null(DataType::Integer), &mut hasher2);
-        assert_eq!(hasher1.finish(), hasher2.finish());
-    }
-
-    #[test]
-    fn test_hash_value_into_different_types() {
-        use std::hash::DefaultHasher;
-        let mut hasher1 = DefaultHasher::new();
-        let mut hasher2 = DefaultHasher::new();
-        hash_value_into(&Value::Integer(42), &mut hasher1);
-        hash_value_into(&Value::Text("42".into()), &mut hasher2);
-        // Different types should produce different hashes
-        assert_ne!(hasher1.finish(), hasher2.finish());
     }
 }

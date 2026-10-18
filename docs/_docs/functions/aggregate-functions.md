@@ -238,6 +238,14 @@ Clothing    | 3     | 145.00  | 48.33   | 25.00   | 70.00
 
 A name in GROUP BY may be a SELECT alias: `SELECT a + 1 AS k, COUNT(*) FROM t GROUP BY k` groups by `a + 1`. An alias of an aggregate cannot be grouped by, so in `SELECT g AS n, COUNT(*) AS g FROM t GROUP BY g` the name `g` is the column of `t`.
 
+Two rows share a group exactly when their keys are equal the way DISTINCT and UNION compare them, and every row lands in a group:
+
+- all NULL keys form one group;
+- `1` and `1.0` share a group, as do `-0.0` and `0.0`, and every NaN shares one group;
+- a TEXT, BOOLEAN or TIMESTAMP key never shares a group with a number, so `'1'`, `TRUE` and `1` are three groups.
+
+A group's key is the value of the first row that reached it. ROLLUP, CUBE and GROUPING SETS group each of their sets by the same rule.
+
 ## Using HAVING
 
 The HAVING clause filters groups based on aggregate results:

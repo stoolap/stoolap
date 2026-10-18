@@ -1538,19 +1538,6 @@ pub fn parse_vector_str(s: &str) -> Option<Vec<f32>> {
     Some(result)
 }
 
-/// A float as a grouping key: 0.0 for either zero and one NaN for every NaN,
-/// as `Value`'s equality has them. Stored values keep their bits.
-#[inline]
-pub(crate) fn grouping_float(f: f64) -> f64 {
-    if f.is_nan() {
-        f64::NAN
-    } else if f == 0.0 {
-        0.0
-    } else {
-        f
-    }
-}
-
 /// One sort key: values in the total order of `Value::cmp`, a missing or
 /// NULL value placed by `nulls_first` (default: last ascending, first
 /// descending). Every ORDER BY, MIN and MAX orders values by this rule

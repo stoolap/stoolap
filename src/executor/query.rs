@@ -11844,16 +11844,9 @@ impl Executor {
             return Ok(None);
         }
 
-        // Check for simple aggregates (SUM, COUNT, AVG, MIN, MAX)
-        #[derive(Clone, Copy)]
-        enum StreamingAgg {
-            Count,
-            Sum(usize),    // SUM over this column index
-            Avg(usize),    // AVG over this column index
-            Column(usize), // MIN or MAX over this column index
-        }
-
-        let mut simple_aggs: Vec<StreamingAgg> = Vec::with_capacity(aggregations.len());
+        // COUNT(*), and SUM, AVG, MIN and MAX over a column: each call's
+        // column, None for COUNT(*)
+        let mut agg_columns: Vec<Option<usize>> = Vec::with_capacity(aggregations.len());
         for agg in &aggregations {
             // This walk keeps no distinct state and reads each column whole
             if !agg.answered_with(crate::executor::aggregation::Modifiers::NONE) {
@@ -11863,18 +11856,16 @@ impl Executor {
             match func_name.as_str() {
                 // Only COUNT(*) counts rows; COUNT(col) must skip NULLs,
                 // which this streaming path cannot do.
-                "COUNT" if col_name == "*" => simple_aggs.push(StreamingAgg::Count),
+                "COUNT" if col_name == "*" => agg_columns.push(None),
                 "COUNT" => return Ok(None),
                 "SUM" | "AVG" | "MIN" | "MAX" => {
                     // Find the column index for aggregate argument
-                    let col_idx = all_columns
+                    match all_columns
                         .iter()
-                        .position(|c| c.eq_ignore_ascii_case(col_name));
-                    match (col_idx, func_name.as_str()) {
-                        (Some(idx), "SUM") => simple_aggs.push(StreamingAgg::Sum(idx)),
-                        (Some(idx), "AVG") => simple_aggs.push(StreamingAgg::Avg(idx)),
-                        (Some(idx), _) => simple_aggs.push(StreamingAgg::Column(idx)),
-                        (None, _) => return Ok(None),
+                        .position(|c| c.eq_ignore_ascii_case(col_name))
+                    {
+                        Some(idx) => agg_columns.push(Some(idx)),
+                        None => return Ok(None),
                     }
                 }
                 _ => return Ok(None), // Unsupported aggregate (STDDEV, VARIANCE, etc.)
@@ -11884,9 +11875,7 @@ impl Executor {
         // OPTIMIZATION: Don't use streaming GROUP BY when row fetch is needed without LIMIT.
         // Streaming benefits from early termination (LIMIT), but without it, bulk fetch
         // of all rows is more efficient than per-group fetching, even with buffer reuse.
-        let needs_row_fetch = simple_aggs
-            .iter()
-            .any(|a| !matches!(a, StreamingAgg::Count));
+        let needs_row_fetch = agg_columns.iter().any(Option::is_some);
 
         // Only use streaming for COUNT-only queries or when LIMIT allows early termination
         if needs_row_fetch && stmt.limit.is_none() {
@@ -11916,7 +11905,6 @@ impl Executor {
         // Streaming aggregation: iterate through groups in sorted order
         let mut result_rows = RowVec::new();
         let mut result_row_id = 0i64;
-        let num_aggs = simple_aggs.len();
 
         // With streaming aggregation we can stop once LIMIT + OFFSET groups pass
         // HAVING; OFFSET is applied by the caller and must find its groups here
@@ -11935,33 +11923,18 @@ impl Executor {
         use crate::storage::expression::logical::ConstBoolExpr;
         let true_expr = ConstBoolExpr::true_expr();
 
-        // MIN and MAX by the aggregate functions every other path runs, so
-        // each type orders and answers as it does there; one per slot, reset
-        // for each group
-        let mut functions: Vec<Option<crate::functions::aggregate::AggregateState>> =
-            Vec::with_capacity(num_aggs);
-        for (agg, sql) in simple_aggs.iter().zip(&aggregations) {
-            functions.push(match agg {
-                StreamingAgg::Column(_) => match sql.state(&self.function_registry) {
-                    Some(function) => Some(function),
-                    None => return Ok(None),
-                },
-                _ => None,
-            });
-        }
-        // SUM and AVG by the one accumulator, reset for each group
-        let mut sums = vec![crate::core::SumAccumulator::default(); num_aggs];
+        // One run of each call by the implementation every aggregate path
+        // runs, reset for each group
+        let mut runs = aggregations
+            .iter()
+            .map(|agg| Ok(agg.template(&self.function_registry)?.instance()))
+            .collect::<Result<Vec<_>>>()?;
+        let count_star = Value::Integer(1);
 
         let mut aggregate = |group_value: &Value, row_ids: GroupIds<'_>| -> Result<bool> {
-            // COUNT(*) counts rows
-            let mut counts = vec![0i64; num_aggs];
-            sums.fill(crate::core::SumAccumulator::default());
-            for function in functions.iter_mut().flatten() {
-                function.reset();
+            for run in runs.iter_mut() {
+                run.reset();
             }
-
-            // Optimization: For COUNT-only aggregates, use row_ids.len() directly
-            let row_count = row_ids.len() as i64;
 
             if needs_row_fetch {
                 // A page of ids at a time through the one row buffer; the
@@ -11970,51 +11943,34 @@ impl Executor {
                     row_buffer.clear();
                     table.fetch_rows_by_ids_into(page, &true_expr, &mut row_buffer)?;
                     for (_row_id, row) in &row_buffer {
-                        for (i, agg) in simple_aggs.iter().enumerate() {
-                            match agg {
-                                StreamingAgg::Count => {
-                                    counts[i] += 1;
-                                }
-                                StreamingAgg::Sum(col_idx) | StreamingAgg::Avg(col_idx) => {
-                                    if let Some(value) = row.get(*col_idx) {
-                                        sums[i].add(value);
+                        for (run, column) in runs.iter_mut().zip(&agg_columns) {
+                            match column {
+                                Some(idx) => {
+                                    if let Some(value) = row.get(*idx) {
+                                        run.accumulate(value);
                                     }
                                 }
-                                StreamingAgg::Column(col_idx) => {
-                                    if let (Some(value), Some(function)) =
-                                        (row.get(*col_idx), functions[i].as_mut())
-                                    {
-                                        function.accumulate(value);
-                                    }
-                                }
+                                None => run.accumulate(&count_star),
                             }
                         }
                     }
                 }
             } else {
-                // Fast path: All aggregates are COUNT, no row fetch needed
-                for (i, agg) in simple_aggs.iter().enumerate() {
-                    if matches!(agg, StreamingAgg::Count) {
-                        counts[i] = row_count;
-                    }
+                // COUNT(*) alone: the group's row count, no row read
+                let rows = crate::functions::aggregate::CompiledAggregate::CountStar {
+                    count: row_ids.len() as i64,
+                };
+                for run in runs.iter_mut() {
+                    run.merge(&rows);
                 }
             }
 
             // One value per aggregate slot, then HAVING over them; only a
             // group that passes clones its group value
-            let mut values = Vec::with_capacity(1 + num_aggs);
+            let mut values = Vec::with_capacity(1 + runs.len());
             values.push(Value::null_unknown());
-            for (i, agg) in simple_aggs.iter().enumerate() {
-                let value = match agg {
-                    StreamingAgg::Count => Value::Integer(counts[i]),
-                    StreamingAgg::Sum(_) => sums[i].sum()?,
-                    StreamingAgg::Avg(_) => sums[i].avg(),
-                    StreamingAgg::Column(_) => match functions[i].as_ref() {
-                        Some(function) => function.result()?,
-                        None => Value::null_unknown(),
-                    },
-                };
-                values.push(value);
+            for run in &runs {
+                values.push(run.result()?);
             }
             if having_filter
                 .as_ref()

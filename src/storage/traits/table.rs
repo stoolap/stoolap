@@ -20,9 +20,10 @@ use std::fmt;
 
 use crate::common::CompactArc;
 use crate::core::{DataType, Error, IndexType, Result, Row, RowVec, Schema, Value};
+use crate::functions::aggregate::GroupedAggregates;
 use crate::storage::expression::Expression;
 use crate::storage::index::id_list::GroupIds;
-use crate::storage::mvcc::version_store::{AggregateOp, GroupedAggregateResult, LayoutToken};
+use crate::storage::mvcc::version_store::{AggregateOp, LayoutToken};
 use crate::storage::traits::{CappedEqual, Index, QueryResult, Scanner};
 
 /// Describes the access method that will be used for a table scan
@@ -1625,12 +1626,12 @@ pub trait Table: Send + Sync {
     /// * `aggregates` - List of (operation, column_index) pairs
     ///
     /// # Returns
-    /// Some(results) if optimization is available, None otherwise
+    /// Some(groups) if optimization is available, None otherwise
     fn compute_grouped_aggregates(
         &self,
         _group_by_indices: &[usize],
         _aggregates: &[(AggregateOp, usize)],
-    ) -> Result<Option<Vec<GroupedAggregateResult>>> {
+    ) -> Result<Option<GroupedAggregates>> {
         Ok(None) // Default: not supported
     }
 }
