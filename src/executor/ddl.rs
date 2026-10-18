@@ -23,9 +23,7 @@
 //! - CREATE VIEW
 //! - DROP VIEW
 
-use crate::core::{
-    DataType, Error, ForeignKeyAction, ForeignKeyConstraint, Result, Row, SchemaBuilder, Value,
-};
+use crate::core::{DataType, Error, ForeignKeyAction, ForeignKeyConstraint, Result, SchemaBuilder};
 use crate::parser::ast::*;
 use crate::storage::traits::transaction::StatementTable;
 use crate::storage::traits::{Engine, QueryResult};
@@ -135,7 +133,6 @@ fn validate_fk_reference(
 }
 
 use super::context::ExecutionContext;
-use super::expression::ExpressionEval;
 use super::result::ExecResult;
 use super::Executor;
 
@@ -987,6 +984,21 @@ impl Executor {
         match stmt.operation {
             AlterTableOperation::AddColumn => {
                 if let Some(ref col_def) = stmt.column_def {
+                    // A constraint the added column cannot keep is refused,
+                    // never accepted and ignored
+                    let unkept = col_def.constraints.iter().find_map(|c| match c {
+                        ColumnConstraint::NotNull | ColumnConstraint::Default(_) => None,
+                        ColumnConstraint::Check(_) => Some("CHECK"),
+                        ColumnConstraint::Unique => Some("UNIQUE"),
+                        ColumnConstraint::PrimaryKey => Some("PRIMARY KEY"),
+                        ColumnConstraint::AutoIncrement => Some("AUTO_INCREMENT"),
+                        ColumnConstraint::References { .. } => Some("REFERENCES"),
+                    });
+                    if let Some(constraint) = unkept {
+                        return Err(Error::InvalidArgument(format!(
+                            "ALTER TABLE ADD COLUMN does not take a {constraint} constraint"
+                        )));
+                    }
                     let data_type = self.parse_data_type(&col_def.data_type)?;
                     let nullable = !col_def
                         .constraints
@@ -1005,7 +1017,8 @@ impl Executor {
                     // Pre-compute the default value for schema evolution (backfilling existing rows)
                     // The default_expr string is also stored for new INSERTs
                     let default_value = if let Some(ref expr_str) = default_expr {
-                        let val = self.evaluate_default_expression(expr_str, data_type)?;
+                        let val =
+                            self.evaluate_default_expr(expr_str, &col_def.name.value, data_type)?;
                         if val.is_null() {
                             None
                         } else {
@@ -1281,36 +1294,6 @@ impl Executor {
             "VECTOR" => Ok(DataType::Vector),
             _ => Err(Error::Type(format!("Unknown data type: {}", type_str))),
         }
-    }
-
-    /// Evaluate a default expression string and return the resulting Value
-    fn evaluate_default_expression(
-        &self,
-        default_expr: &str,
-        target_type: DataType,
-    ) -> Result<Value> {
-        use crate::parser::parse_sql;
-
-        // Parse the default expression as a SELECT expression
-        let sql = format!("SELECT {}", default_expr);
-        let stmts = match parse_sql(&sql) {
-            Ok(s) => s,
-            Err(_) => return Ok(Value::null(target_type)),
-        };
-        if stmts.is_empty() {
-            return Ok(Value::null(target_type));
-        }
-
-        // Extract the expression from the SELECT statement
-        if let Statement::Select(select) = &stmts[0] {
-            if let Some(expr) = select.columns.first() {
-                let mut eval = ExpressionEval::compile(expr, &[])?;
-                let value = eval.eval_slice(&Row::new())?;
-                return value.try_into_coerce_to_type(target_type);
-            }
-        }
-
-        Ok(Value::null(target_type))
     }
 }
 

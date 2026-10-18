@@ -141,11 +141,7 @@ impl Executor {
         let all_column_types: Vec<DataType> = schema.columns.iter().map(|c| c.data_type).collect();
         let all_vector_dims: Vec<u16> =
             schema.columns.iter().map(|c| c.vector_dimensions).collect();
-        let default_exprs: Vec<Option<String>> = schema
-            .columns
-            .iter()
-            .map(|c| c.default_expr.clone())
-            .collect();
+        let defaults = CopyDefaults::of(schema);
         let check_programs = super::dml::compile_check_programs(schema)?;
 
         if stmt.columns.is_empty() {
@@ -189,10 +185,9 @@ impl Executor {
                 &column_names,
                 &all_column_types,
                 &all_vector_dims,
-                &default_exprs,
+                &defaults,
                 &check_programs,
                 &fk_schema,
-                schema_column_count,
             )?,
             CopyFormat::Json => self.copy_from_json(
                 stmt,
@@ -202,10 +197,9 @@ impl Executor {
                 &column_names,
                 &all_column_types,
                 &all_vector_dims,
-                &default_exprs,
+                &defaults,
                 &check_programs,
                 &fk_schema,
-                schema_column_count,
             )?,
         };
 
@@ -229,10 +223,9 @@ impl Executor {
         column_names: &[String],
         all_column_types: &[DataType],
         all_vector_dims: &[u16],
-        default_exprs: &[Option<String>],
+        defaults: &CopyDefaults,
         check_programs: &[super::dml::CompiledCheck],
         fk_schema: &Option<CompactArc<Schema>>,
-        schema_column_count: usize,
     ) -> Result<i64> {
         let file = std::fs::File::open(&stmt.file_path).map_err(|e| {
             Error::InvalidArgument(format!("cannot open file '{}': {}", stmt.file_path, e))
@@ -271,10 +264,14 @@ impl Executor {
         let null_str = stmt.null_string.as_deref().unwrap_or("");
         let mut rows_affected = 0i64;
 
-        let default_row =
-            build_default_row(self, default_exprs, all_column_types, schema_column_count);
+        // Every row gives the same columns: the others take their defaults
+        let mut given = vec![false; all_column_types.len()];
+        for &col_idx in field_to_col.as_deref().unwrap_or(column_indices) {
+            given[col_idx] = true;
+        }
 
         let mut check_vm = super::expression::ExprVM::new();
+        let mut check_row = None;
         for result in reader.records() {
             let record = result.map_err(|e| {
                 Error::InvalidArgument(format!(
@@ -295,8 +292,7 @@ impl Executor {
                 )));
             }
 
-            // Clone defaults template (cheap: Null/Integer/Bool are stack-only)
-            let mut row_values = default_row.clone();
+            let mut row_values = defaults.row(&mut check_vm, &given)?;
 
             // Parse CSV fields directly into target types (no intermediate Value::text allocation)
             for (i, field) in record.iter().enumerate() {
@@ -318,6 +314,7 @@ impl Executor {
             for (col_idx, col_name, check_expr, program) in check_programs {
                 super::dml::run_check_program(
                     &mut check_vm,
+                    &mut check_row,
                     program,
                     col_name,
                     check_expr,
@@ -350,17 +347,12 @@ impl Executor {
         column_names: &[String],
         all_column_types: &[DataType],
         all_vector_dims: &[u16],
-        default_exprs: &[Option<String>],
+        defaults: &CopyDefaults,
         check_programs: &[super::dml::CompiledCheck],
         fk_schema: &Option<CompactArc<Schema>>,
-        schema_column_count: usize,
     ) -> Result<i64> {
         let null_str = stmt.null_string.as_deref();
         let use_columns = !stmt.columns.is_empty();
-
-        // Pre-compute default row template once
-        let default_row =
-            build_default_row(self, default_exprs, all_column_types, schema_column_count);
 
         // Pre-build lowercase column name map for case-insensitive JSON key matching
         let col_name_lower_map: Vec<(String, usize)> = if use_columns {
@@ -390,6 +382,11 @@ impl Executor {
         let stream = serde_json::Deserializer::from_reader(reader).into_iter::<serde_json::Value>();
 
         let mut rows_affected = 0i64;
+        let mut state = JsonRowState {
+            given: vec![false; all_column_types.len()],
+            vm: super::expression::ExprVM::new(),
+            check_row: None,
+        };
 
         for (idx, result) in stream.enumerate() {
             let item = result.map_err(|e| {
@@ -402,7 +399,8 @@ impl Executor {
             self.insert_json_row(
                 obj,
                 table,
-                &default_row,
+                defaults,
+                &mut state,
                 &col_name_lower_map,
                 use_columns,
                 column_types,
@@ -424,7 +422,8 @@ impl Executor {
         &self,
         obj: &serde_json::Map<String, serde_json::Value>,
         table: &mut Box<dyn Table>,
-        default_row: &[Value],
+        defaults: &CopyDefaults,
+        state: &mut JsonRowState,
         col_name_lower_map: &[(String, usize)],
         use_columns: bool,
         column_types: &[DataType],
@@ -434,7 +433,13 @@ impl Executor {
         check_programs: &[super::dml::CompiledCheck],
         fk_schema: &Option<CompactArc<Schema>>,
     ) -> Result<()> {
-        let mut row_values = default_row.to_vec();
+        let mut row_values = defaults.template.clone();
+        let JsonRowState {
+            given,
+            vm: check_vm,
+            check_row,
+        } = state;
+        given.fill(false);
 
         if use_columns {
             // Only import specified columns
@@ -448,6 +453,7 @@ impl Executor {
                     let value = json_value_to_stoolap(v, target_type, lower_name, null_str)?;
                     validate_vector_dims(&value, target_type, all_vector_dims[*col_idx])?;
                     row_values[*col_idx] = value;
+                    given[*col_idx] = true;
                 }
                 // Missing key: keep default/null
             }
@@ -464,15 +470,17 @@ impl Executor {
                     let value = json_value_to_stoolap(json_val, target_type, &lower_key, null_str)?;
                     validate_vector_dims(&value, target_type, all_vector_dims[col_idx])?;
                     row_values[col_idx] = value;
+                    given[col_idx] = true;
                 }
                 // Unknown keys silently ignored
             }
         }
 
-        let mut check_vm = super::expression::ExprVM::new();
+        defaults.fill(check_vm, given, &mut row_values)?;
         for (col_idx, col_name, check_expr, program) in check_programs {
             super::dml::run_check_program(
-                &mut check_vm,
+                check_vm,
+                check_row,
                 program,
                 col_name,
                 check_expr,
@@ -491,26 +499,51 @@ impl Executor {
     }
 }
 
-/// Build the default row template from schema default expressions.
-fn build_default_row(
-    executor: &Executor,
-    default_exprs: &[Option<String>],
-    all_column_types: &[DataType],
-    schema_column_count: usize,
-) -> Vec<Value> {
-    let mut row = Vec::with_capacity(schema_column_count);
-    for i in 0..schema_column_count {
-        if let Some(ref default_expr) = default_exprs[i] {
-            let default_type = all_column_types[i];
-            match executor.evaluate_default_expr(default_expr, default_type) {
-                Ok(val) => row.push(val),
-                Err(_) => row.push(Value::null_unknown()),
-            }
-        } else {
-            row.push(Value::null_unknown());
-        }
+/// What a JSON COPY reuses from object to object: the columns an object
+/// gives, and the VM and row its defaults and CHECKs run with
+struct JsonRowState {
+    given: Vec<bool>,
+    vm: super::expression::ExprVM,
+    check_row: Option<Row>,
+}
+
+/// The defaults of a COPY's rows by the machinery INSERT runs: constants in
+/// a template, any other default run for each row that takes it, its error
+/// that row's
+struct CopyDefaults {
+    template: Vec<Value>,
+    programs: Vec<super::dml::DefaultSlot>,
+}
+
+impl CopyDefaults {
+    fn of(schema: &Schema) -> Self {
+        let (template, programs) = super::dml::build_default_slots(schema);
+        Self { template, programs }
     }
-    row
+
+    /// A row holding the default of every column `given` leaves out
+    fn row(&self, vm: &mut super::expression::ExprVM, given: &[bool]) -> Result<Vec<Value>> {
+        let mut row = self.template.clone();
+        self.fill(vm, given, &mut row)?;
+        Ok(row)
+    }
+
+    /// Runs the default of each column `given` leaves out of `row`
+    fn fill(
+        &self,
+        vm: &mut super::expression::ExprVM,
+        given: &[bool],
+        row: &mut [Value],
+    ) -> Result<()> {
+        let empty = Row::new();
+        let exec = super::expression::ExecuteContext::new(&empty);
+        for (i, slot) in self.programs.iter().enumerate() {
+            if slot.is_some() && !given[i] {
+                row[i] = super::dml::eval_default_slot(vm, &exec, slot, &self.template[i])?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Validate vector dimensions if the column is a VECTOR type.

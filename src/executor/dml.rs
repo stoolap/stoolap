@@ -194,7 +194,7 @@ fn try_extract_simple_value(expr: &Expression, ctx: &ExecutionContext) -> Option
 
 /// Evaluate one default slot for a row: run the per-row program when the
 /// default is non-literal, else clone the constant template value.
-fn eval_default_slot(
+pub(crate) fn eval_default_slot(
     vm: &mut super::expression::ExprVM,
     exec_ctx: &super::expression::ExecuteContext,
     program: &DefaultSlot,
@@ -213,11 +213,27 @@ fn eval_default_slot(
 /// with, raised only when a row takes the default
 pub(crate) type DefaultSlot = Option<(Result<super::expression::SharedProgram>, DataType)>;
 
+/// The expression a column's stored DEFAULT or CHECK text holds; a text
+/// that does not parse to one expression is an error, never a dropped one
+pub(crate) fn parse_stored_expression(text: &str, kind: &str, column: &str) -> Result<Expression> {
+    let not_one = || {
+        Error::parse(format!(
+            "the {kind} of {column} is not an expression: {text}"
+        ))
+    };
+    let statements = crate::parser::parse_sql(&format!("SELECT {}", text))
+        .map_err(|e| Error::parse(format!("the {kind} of {column} does not parse: {e}")))?;
+    match statements.into_iter().next() {
+        Some(Statement::Select(select)) => select.columns.into_iter().next().ok_or_else(not_one),
+        _ => Err(not_one()),
+    }
+}
+
 /// Per-statement default machinery: constant defaults land in the value
 /// template; non-literal defaults compile ONCE and execute PER ROW, so
-/// DEFAULT (RANDOM()) differs per row. A default that fails to compile is
-/// the error of a row that takes it, as in evaluate_default_expr.
-fn build_default_slots(schema: &crate::core::Schema) -> (Vec<Value>, Vec<DefaultSlot>) {
+/// DEFAULT (RANDOM()) differs per row. A default that fails to parse or
+/// compile is the error of a row that takes it, as in evaluate_default_expr.
+pub(crate) fn build_default_slots(schema: &crate::core::Schema) -> (Vec<Value>, Vec<DefaultSlot>) {
     use super::expression::compile_expression;
     let n = schema.columns.len();
     let mut values = Vec::with_capacity(n);
@@ -228,29 +244,23 @@ fn build_default_slots(schema: &crate::core::Schema) -> (Vec<Value>, Vec<Default
             continue;
         };
         let target = c.data_type;
-        let sql = format!("SELECT {}", expr_str);
-        let Ok(stmts) = crate::parser::parse_sql(&sql) else {
-            values.push(Value::null_unknown());
-            continue;
-        };
-        let Some(crate::parser::ast::Statement::Select(select)) = stmts.first() else {
-            values.push(Value::null_unknown());
-            continue;
-        };
-        let Some(expr) = select.columns.first() else {
-            values.push(Value::null_unknown());
-            continue;
+        values.push(Value::null_unknown());
+        let expr = match parse_stored_expression(expr_str, "default", &c.name) {
+            Ok(expr) => expr,
+            Err(e) => {
+                programs[i] = Some((Err(e), target));
+                continue;
+            }
         };
         // A literal outside the column's range runs as a program, whose error
         // a row that takes it raises
         if let Some(Ok(value)) =
-            try_extract_literal(expr).map(|v| v.try_into_coerce_to_type(target))
+            try_extract_literal(&expr).map(|v| v.try_into_coerce_to_type(target))
         {
-            values.push(value);
+            values[i] = value;
             continue;
         }
-        values.push(Value::null_unknown());
-        programs[i] = Some((compile_expression(expr, &[]), target));
+        programs[i] = Some((compile_expression(&expr, &[]), target));
     }
     (values, programs)
 }
@@ -384,24 +394,15 @@ pub(crate) fn compile_check_programs(schema: &Schema) -> Result<Vec<CompiledChec
     Ok(compiled)
 }
 
-/// Compile the CHECK constraint of column `idx`, if it has one that parses
+/// Compile the CHECK constraint of column `idx`, if it has one
 fn compile_column_check(schema: &Schema, idx: usize) -> Result<Option<CompiledCheck>> {
     let c = &schema.columns[idx];
     let Some(check_expr) = c.check_expr.as_ref() else {
         return Ok(None);
     };
-    let sql = format!("SELECT {}", check_expr);
-    let Ok(stmts) = crate::parser::parse_sql(&sql) else {
-        return Ok(None);
-    };
-    let Some(crate::parser::ast::Statement::Select(select)) = stmts.first() else {
-        return Ok(None);
-    };
-    let Some(expr) = select.columns.first() else {
-        return Ok(None);
-    };
+    let expr = parse_stored_expression(check_expr, "CHECK", &c.name)?;
     let columns = vec![c.name.to_string()];
-    let program = super::expression::compile_expression(expr, &columns).map_err(|e| {
+    let program = super::expression::compile_expression(&expr, &columns).map_err(|e| {
         Error::internal(format!(
             "CHECK constraint on column '{}' failed to compile: {}",
             c.name, e
@@ -415,19 +416,20 @@ fn compile_column_check(schema: &Schema, idx: usize) -> Result<Option<CompiledCh
     )))
 }
 
-/// Run one compiled CHECK against `value`. NULL passes, per the standard.
+/// Run one compiled CHECK against `value`, held in `scratch`, a one-column
+/// row built on the statement's first CHECK and reused row to row. The
+/// CHECK runs on a NULL value too; a NULL result passes, per the standard.
 pub(crate) fn run_check_program(
     vm: &mut super::expression::ExprVM,
+    scratch: &mut Option<Row>,
     program: &super::expression::SharedProgram,
     col_name: &str,
     check_expr: &str,
     value: &Value,
 ) -> Result<()> {
-    if value.is_null() {
-        return Ok(());
-    }
-    let check_row = Row::from_values(vec![value.clone()]);
-    let check_ctx = super::expression::ExecuteContext::new(&check_row);
+    let scratch = scratch.get_or_insert_with(|| Row::from_values(vec![Value::null_unknown()]));
+    scratch.set(0, value.clone())?;
+    let check_ctx = super::expression::ExecuteContext::new(scratch);
     let result = vm.execute_cow(program, &check_ctx)?;
     let is_truthy = match &result {
         Value::Boolean(b) => *b,
@@ -753,6 +755,7 @@ impl Executor {
         // Create VM for constant expression evaluation (reused for all INSERT values)
         use super::expression::{compile_expression, ExecuteContext, ExprVM};
         let mut vm = ExprVM::new();
+        let mut check_row = None;
         let params = ctx.params();
         let named_params = ctx.named_params();
         let empty_row = Row::new();
@@ -849,6 +852,7 @@ impl Executor {
                 for (col_idx, col_name, check_expr, program) in check_programs.iter() {
                     run_check_program(
                         &mut check_vm,
+                        &mut check_row,
                         program,
                         col_name,
                         check_expr,
@@ -1146,6 +1150,7 @@ impl Executor {
                 for (col_idx, col_name, check_expr, program) in check_programs.iter() {
                     run_check_program(
                         &mut check_vm,
+                        &mut check_row,
                         program,
                         col_name,
                         check_expr,
@@ -1358,6 +1363,7 @@ impl Executor {
                 for (col_idx, col_name, check_expr, program) in check_programs.iter() {
                     run_check_program(
                         &mut check_vm,
+                        &mut check_row,
                         program,
                         col_name,
                         check_expr,
@@ -1645,6 +1651,7 @@ impl Executor {
         // Create VM for constant expression evaluation (reused for all INSERT values)
         use super::expression::{compile_expression, ExecuteContext, ExprVM};
         let mut vm = ExprVM::new();
+        let mut check_row = None;
         let params = ctx.params();
         let named_params = ctx.named_params();
         let empty_row = Row::new();
@@ -1733,6 +1740,7 @@ impl Executor {
                 for (col_idx, col_name, check_expr, program) in compiled_checks.iter() {
                     run_check_program(
                         &mut vm,
+                        &mut check_row,
                         program,
                         col_name,
                         check_expr,
@@ -1827,6 +1835,7 @@ impl Executor {
                 for (col_idx, col_name, check_expr, program) in compiled_checks.iter() {
                     run_check_program(
                         &mut vm,
+                        &mut check_row,
                         program,
                         col_name,
                         check_expr,
@@ -1898,20 +1907,7 @@ impl Executor {
         // drawn again for every row
         match (&column.default_expr, &column.default_value) {
             (None, Some(value)) => Ok(super::utils::value_to_expression(value)),
-            (Some(text), _) => {
-                let statements = crate::parser::parse_sql(&format!("SELECT {}", text))
-                    .map_err(|e| Error::parse(e.to_string()))?;
-                match statements.into_iter().next() {
-                    Some(Statement::Select(select)) => select
-                        .columns
-                        .into_iter()
-                        .next()
-                        .ok_or_else(|| Error::parse(format!("the default of {name} is empty"))),
-                    _ => Err(Error::parse(format!(
-                        "the default of {name} is not an expression"
-                    ))),
-                }
-            }
+            (Some(text), _) => parse_stored_expression(text, "default", name),
             (None, None) => Ok(super::utils::value_to_expression(&Value::null_unknown())),
         }
     }
@@ -2573,34 +2569,17 @@ impl Executor {
                 .map(|(idx, _, _, _)| schema.columns[*idx].name.to_string())
                 .collect();
 
-            // Pre-compile CHECK constraints for columns being updated (once, not per row)
-            let compiled_check_exprs: Vec<(usize, String, String, SharedProgram)> =
-                compiled_updates
-                    .iter()
-                    .filter_map(|(idx, _dt, _, _)| {
-                        schema.columns[*idx].check_expr.as_ref().and_then(|expr| {
-                            let col_name = schema.columns[*idx].name.clone();
-                            let expr_text = expr.clone();
-                            let check = crate::parser::parse_sql(&format!("SELECT {}", expr))
-                                .ok()?
-                                .into_iter()
-                                .next()
-                                .and_then(|s| match s {
-                                    crate::parser::ast::Statement::Select(sel) => {
-                                        sel.columns.into_iter().next()
-                                    }
-                                    _ => None,
-                                })?;
-                            Some(
-                                compile_expression(&check, &column_names)
-                                    .map(|program| (*idx, col_name, expr_text, program)),
-                            )
-                        })
-                    })
-                    .collect::<Result<_>>()?;
+            // The CHECK constraints of the updated columns, compiled once
+            let mut compiled_check_exprs: Vec<CompiledCheck> = Vec::new();
+            for (idx, _, _, _) in &compiled_updates {
+                if let Some(check) = compile_column_check(schema, *idx)? {
+                    compiled_check_exprs.push(check);
+                }
+            }
 
             // Create VM once and reuse for all rows
             let mut vm = ExprVM::new();
+            let mut check_row = None;
             // Extract params before the closure so they can be captured
             let params = ctx.params();
             let named_params = ctx.named_params();
@@ -2723,38 +2702,18 @@ impl Executor {
                     let _ = row.set(idx, new_value);
                 }
 
-                // Validate CHECK constraints on updated columns (precompiled, no per-row parsing)
-                if changed && !compiled_check_exprs.is_empty() {
-                    let check_ctx = ExecuteContext::new(&row)
-                        .with_params(params)
-                        .with_named_params(named_params);
-                    for (_col_idx, col_name, expr_text, check_program) in &compiled_check_exprs {
-                        match vm.execute_cow(check_program, &check_ctx) {
-                            Ok(Value::Boolean(true)) => {}
-                            Ok(Value::Boolean(false)) => {
-                                return Err(Error::CheckConstraintViolation {
-                                    column: col_name.clone(),
-                                    expression: expr_text.clone(),
-                                });
-                            }
-                            Ok(Value::Null(_)) | Err(_) => {}
-                            Ok(ref v) => {
-                                // Non-boolean truthiness: zero/empty = false, all else = true.
-                                // Timestamp, Extension, etc. are truthy (non-null existence).
-                                let is_truthy = match v {
-                                    Value::Integer(i) => *i != 0,
-                                    Value::Float(f) => *f != 0.0,
-                                    Value::Text(s) => !s.is_empty(),
-                                    _ => true,
-                                };
-                                if !is_truthy {
-                                    return Err(Error::CheckConstraintViolation {
-                                        column: col_name.clone(),
-                                        expression: expr_text.clone(),
-                                    });
-                                }
-                            }
-                        }
+                // The CHECK of each updated column, by the one check every write runs
+                if changed {
+                    for (col_idx, col_name, check_expr, program) in &compiled_check_exprs {
+                        let value = row.get(*col_idx).unwrap_or(&crate::core::NULL_VALUE);
+                        run_check_program(
+                            &mut vm,
+                            &mut check_row,
+                            program,
+                            col_name,
+                            check_expr,
+                            value,
+                        )?;
                     }
                 }
 
@@ -3658,6 +3617,7 @@ impl Executor {
 
         // Create VM once and reuse for all rows
         let mut vm = ExprVM::new();
+        let mut check_row = None;
 
         // Extract params from execution context for use in the setter closure
         let params = ctx.params();
@@ -3726,24 +3686,15 @@ impl Executor {
             for (idx, new_value) in updates_to_apply {
                 // Validate CHECK constraint using pre-compiled program via existing VM
                 for (check_idx, col_name, check_expr, program) in &effective.compiled_checks {
-                    if *check_idx == idx && !new_value.is_null() {
-                        let check_row = Row::from_values(vec![new_value.clone()]);
-                        let check_ctx = ExecuteContext::new(&check_row);
-                        let result = vm.execute_cow(program, &check_ctx)?;
-                        let is_truthy = match &result {
-                            Value::Boolean(b) => *b,
-                            Value::Null(_) => true, // NULL passes CHECK (SQL standard)
-                            Value::Integer(i) => *i != 0,
-                            Value::Float(f) => *f != 0.0,
-                            Value::Text(s) => !s.is_empty(),
-                            _ => true, // Timestamp, Extension, etc. are truthy
-                        };
-                        if !is_truthy {
-                            return Err(Error::CheckConstraintViolation {
-                                column: col_name.to_string(),
-                                expression: check_expr.to_string(),
-                            });
-                        }
+                    if *check_idx == idx {
+                        run_check_program(
+                            &mut vm,
+                            &mut check_row,
+                            program,
+                            col_name,
+                            check_expr,
+                            &new_value,
+                        )?;
                     }
                 }
                 let _ = row.set(idx, new_value);
@@ -3874,35 +3825,18 @@ impl Executor {
         Ok(result)
     }
 
-    /// Evaluate a default expression string and return the resulting Value
+    /// The value of column `column`'s default text, evaluated once
     pub(crate) fn evaluate_default_expr(
         &self,
         default_expr: &str,
+        column: &str,
         target_type: crate::core::DataType,
     ) -> Result<Value> {
-        use super::expression::ExpressionEval;
-        use crate::parser::parse_sql;
-
-        // Parse the default expression as a SELECT expression
-        let sql = format!("SELECT {}", default_expr);
-        let stmts = match parse_sql(&sql) {
-            Ok(s) => s,
-            Err(_) => return Ok(Value::null_unknown()),
-        };
-        if stmts.is_empty() {
-            return Ok(Value::null_unknown());
-        }
-
-        // Extract the expression from the SELECT statement
-        if let crate::parser::ast::Statement::Select(select) = &stmts[0] {
-            if let Some(expr) = select.columns.first() {
-                // Constant expression - no row context needed
-                let value = ExpressionEval::compile(expr, &[])?.eval_slice(&Row::new())?;
-                return value.try_into_coerce_to_type(target_type);
-            }
-        }
-
-        Ok(Value::null_unknown())
+        let expr = parse_stored_expression(default_expr, "default", column)?;
+        // Constant expression - no row context needed
+        let value =
+            super::expression::ExpressionEval::compile(&expr, &[])?.eval_slice(&Row::new())?;
+        value.try_into_coerce_to_type(target_type)
     }
 
     #[inline(never)]
@@ -4032,6 +3966,32 @@ mod tests {
         let engine = MVCCEngine::in_memory();
         engine.open_engine().unwrap();
         Executor::new(Arc::new(engine))
+    }
+
+    #[test]
+    fn a_stored_text_that_does_not_parse_is_an_error() {
+        let schema = crate::core::SchemaBuilder::new("t")
+            .add_primary_key("id", DataType::Integer)
+            .add_with_constraints(
+                "v",
+                DataType::Integer,
+                true,
+                false,
+                false,
+                Some("(((".to_string()),
+                Some("v <".to_string()),
+            )
+            .build();
+        assert!(compile_check_programs(&schema).is_err(), "the CHECK");
+        let (_, programs) = build_default_slots(&schema);
+        assert!(
+            matches!(programs[1], Some((Err(_), _))),
+            "the DEFAULT, raised by a row that takes it"
+        );
+        let executor = create_test_executor();
+        assert!(executor
+            .evaluate_default_expr("(((", "v", DataType::Integer)
+            .is_err());
     }
 
     fn setup_test_table(executor: &Executor) {
