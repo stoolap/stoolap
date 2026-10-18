@@ -11659,17 +11659,19 @@ impl Executor {
             [Expression::Star(_)] | [Expression::QualifiedStar(_)]
         ) {
             let schema = self.engine.get_table_schema(&table).ok()?;
+            // The output name as written, since the probe names the column
+            // as the schema spells it
             let own_name = |column: &Expression| match column {
-                Expression::Identifier(id) => Some(id.value_lower.to_string()),
-                Expression::QualifiedIdentifier(q) => Some(q.name.value_lower.to_string()),
+                Expression::Identifier(id) => Some(id.value.to_string()),
+                Expression::QualifiedIdentifier(q) => Some(q.name.value.to_string()),
                 Expression::Aliased(aliased) => match aliased.expression.as_ref() {
                     Expression::Identifier(id) if id.value_lower == aliased.alias.value_lower => {
-                        Some(id.value_lower.to_string())
+                        Some(aliased.alias.value.to_string())
                     }
                     Expression::QualifiedIdentifier(q)
                         if q.name.value_lower == aliased.alias.value_lower =>
                     {
-                        Some(q.name.value_lower.to_string())
+                        Some(aliased.alias.value.to_string())
                     }
                     _ => None,
                 },
@@ -11681,7 +11683,7 @@ impl Executor {
                     .iter()
                     .zip(&schema.columns)
                     .all(|(column, table_column)| {
-                        own_name(column).is_some_and(|name| name == table_column.name_lower)
+                        own_name(column).is_some_and(|name| name == table_column.name)
                     });
             if !same {
                 return None;

@@ -108,9 +108,18 @@ fn an_index_join_keeps_projections_column_order_and_aliases() {
     let renamed = "FROM b JOIN (SELECT id, v AS k FROM a) x ON b.aid = x.id";
     let fewer = "FROM b JOIN (SELECT id, k FROM a) x ON b.aid = x.id";
     let reordered = "FROM b JOIN (SELECT k, id FROM a) x ON b.aid = x.id";
+    let respelled = "FROM b JOIN (SELECT id AS \"ID\", k, v FROM a) x ON b.aid = x.id";
     let swapped = "FROM b JOIN (SELECT id, k FROM a WHERE k = 1) x ON b.id = x.id";
     let aliased = "FROM a JOIN b ON a.id = b.aid WHERE total > a.v + b.w - 1";
-    let cases: [(String, Vec<&str>, Vec<&str>); 8] = [
+    let cases: [(String, Vec<&str>, Vec<&str>); 9] = [
+        (
+            format!("SELECT *, COUNT(*) OVER () {respelled}"),
+            vec!["b.id", "b.aid", "b.w", "x.ID", "x.k", "x.v", "COUNT()"],
+            vec![
+                "[Integer(1), Integer(1), Integer(5), Integer(1), Integer(10), Integer(100), Integer(2)]",
+                "[Integer(2), Integer(2), Integer(6), Integer(2), Integer(1), Integer(200), Integer(2)]",
+            ],
+        ),
         (
             format!("SELECT *, COUNT(*) OVER () {fewer}"),
             vec!["b.id", "b.aid", "b.w", "x.id", "x.k", "COUNT()"],
