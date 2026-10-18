@@ -979,7 +979,7 @@ impl Executor {
             let name = |strategy: &IndexLookupStrategy| match strategy {
                 IndexLookupStrategy::PrimaryKey => "Index Nested Loop (PK)".to_string(),
                 IndexLookupStrategy::TableEquality { .. } if small_outer => {
-                    "Standard Join (conditional: a small outer narrows the inner side by its index)"
+                    "Standard Join (conditional: a small outer narrows the inner side by its keys)"
                         .to_string()
                 }
                 IndexLookupStrategy::SecondaryIndex(_)
@@ -1000,14 +1000,8 @@ impl Executor {
 
             // The side execution probes, by the rule it picks it with. The
             // executor swaps a small outer in only from a right side that is
-            // not a table
-            let right_is_table = match join_right {
-                Expression::TableSource(_) => true,
-                Expression::Aliased(aliased) => {
-                    matches!(aliased.expression.as_ref(), Expression::TableSource(_))
-                }
-                _ => false,
-            };
+            // not a base table
+            let right_is_table = self.base_table_side_schema(join_right, None).is_some();
             let picked = if index_use == JoinIndexUse::Grouped {
                 inlj_info.map(|info| (info, false))
             } else {
@@ -1025,7 +1019,7 @@ impl Executor {
                 };
                 pick_index_join_side(
                     &join_type_upper,
-                    join_right,
+                    right_is_table,
                     right_filtered,
                     left_filtered,
                     inlj_info,

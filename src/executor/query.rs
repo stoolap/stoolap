@@ -245,11 +245,12 @@ pub(crate) fn split_join_where(
 
 /// The side an index join probes, given what the right table offers
 /// (`unswapped`): an INNER join probes its left table instead from a right
-/// side that is not a table, or for a primary key when only the right side
-/// is filtered. Some((probe, true)) when the sides swap
+/// side that is not a base table (a subquery, a CTE, a view), or for a
+/// primary key when only the right side is filtered. Some((probe, true))
+/// when the sides swap
 pub(crate) fn pick_index_join_side<T>(
     join_type: &str,
-    right: &Expression,
+    right_is_table: bool,
     right_filtered: bool,
     left_filtered: bool,
     unswapped: Option<T>,
@@ -261,13 +262,6 @@ pub(crate) fn pick_index_join_side<T>(
     if join_type != "INNER" {
         return unswapped.map(|probe| (probe, false));
     }
-    let right_is_table = match right {
-        Expression::TableSource(_) => true,
-        Expression::Aliased(aliased) => {
-            matches!(aliased.expression.as_ref(), Expression::TableSource(_))
-        }
-        _ => false,
-    };
     if unswapped.is_none() && !right_is_table {
         return probe_left().map(|probe| (probe, true));
     }
@@ -4311,7 +4305,8 @@ impl Executor {
                 );
                 pick_index_join_side(
                     &join_type,
-                    &join_source.right,
+                    self.base_table_side_schema(&join_source.right, Some(ctx))
+                        .is_some(),
                     right_filter.is_some(),
                     left_filter.is_some(),
                     unswapped,
@@ -4378,7 +4373,7 @@ impl Executor {
                 let same_family = || {
                     let column_type = |expr: &Expression, column: &str| {
                         let name = column.rsplit('.').next().unwrap_or(column);
-                        self.base_table_side_schema(expr, ctx)
+                        self.base_table_side_schema(expr, Some(ctx))
                             .and_then(|schema| schema.get_column_type(name))
                     };
                     let inner_expr = if swapped {
@@ -4474,7 +4469,7 @@ impl Executor {
                                         &join_source.right
                                     };
                                     let name = inner_col.rsplit('.').next().unwrap_or(&inner_col);
-                                    self.base_table_side_schema(inner_expr, ctx)
+                                    self.base_table_side_schema(inner_expr, Some(ctx))
                                         .and_then(|schema| schema.get_column_type(name))
                                 })
                             };
@@ -5247,8 +5242,8 @@ impl Executor {
                     } else {
                         (&join_source.right, &join_source.left)
                     };
-                    let build_schema = self.base_table_side_schema(build_expr, ctx);
-                    let probe_schema = self.base_table_side_schema(probe_expr, ctx);
+                    let build_schema = self.base_table_side_schema(build_expr, Some(ctx));
+                    let probe_schema = self.base_table_side_schema(probe_expr, Some(ctx));
 
                     // Skip bloom filter for small LIMIT queries - the overhead of building
                     // a bloom filter for thousands of rows isn't worth it when we only
@@ -5619,8 +5614,8 @@ impl Executor {
             join_type: &join_type,
             limit: join_limit,
             ctx,
-            left_schema: self.base_table_side_schema(&join_source.left, ctx),
-            right_schema: self.base_table_side_schema(&join_source.right, ctx),
+            left_schema: self.base_table_side_schema(&join_source.left, Some(ctx)),
+            right_schema: self.base_table_side_schema(&join_source.right, Some(ctx)),
         };
 
         let join_result = join_executor.execute(join_request)?;
@@ -11390,11 +11385,12 @@ impl Executor {
     }
 
     /// The schema of a join side that reads a base table directly; None for
-    /// a CTE, a view, a subquery or any other source
-    fn base_table_side_schema(
+    /// a CTE, a view, a subquery or any other source. Without a context, as
+    /// in EXPLAIN, a CTE is not known
+    pub(crate) fn base_table_side_schema(
         &self,
         expr: &Expression,
-        ctx: &ExecutionContext,
+        ctx: Option<&ExecutionContext>,
     ) -> Option<CompactArc<Schema>> {
         let ts = match expr {
             Expression::TableSource(ts) => ts,
@@ -11404,7 +11400,7 @@ impl Executor {
             },
             _ => return None,
         };
-        if ctx.get_cte_by_lower(&ts.name.value_lower).is_some() {
+        if ctx.is_some_and(|ctx| ctx.get_cte_by_lower(&ts.name.value_lower).is_some()) {
             return None;
         }
         self.engine.get_table_schema(&ts.name.value_lower).ok()
@@ -11573,11 +11569,13 @@ impl Executor {
                 .columns
                 .iter()
                 .any(|c| c.name_lower.eq_ignore_ascii_case(&outer_col));
-        let narrows = table.has_sealed_rows()
-            || table.row_count_hint() >= SMALL_OUTER_ROWS.saturating_mul(HOT_INNER_ROWS_PER_KEY);
-        if (bounded || (small_outer && outer_is_sure && narrows))
-            && crate::executor::utils::probes_by_equality(&*table, &inner_col_unqualified)
-        {
+        let large =
+            table.row_count_hint() >= SMALL_OUTER_ROWS.saturating_mul(HOT_INNER_ROWS_PER_KEY);
+        let probes = crate::executor::utils::probes_by_equality(&*table, &inner_col_unqualified);
+        // A bounded join probes the column. A small outer never probes: its
+        // keys narrow a large table's scan, or a sealed table's side file
+        let narrows = large || (probes && table.has_sealed_rows());
+        if (bounded && probes) || (small_outer && outer_is_sure && narrows) {
             return Some((
                 table_name,
                 IndexLookupStrategy::TableEquality {

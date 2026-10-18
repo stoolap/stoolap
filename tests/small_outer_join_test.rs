@@ -331,7 +331,7 @@ mod counted {
             .collect();
         assert!(
             plan.iter().any(|line| line.contains(
-                "Standard Join (conditional: a small outer narrows the inner side by its index)"
+                "Standard Join (conditional: a small outer narrows the inner side by its keys)"
             )),
             "{plan:#?}"
         );
