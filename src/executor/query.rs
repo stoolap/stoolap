@@ -194,6 +194,23 @@ fn same_outer_source(
     })
 }
 
+/// The CTE names that hide tables of the same name for a join's sides: the
+/// ones execution registered, or the ones EXPLAIN reads off the WITH
+#[derive(Clone, Copy)]
+pub(crate) enum CteNames<'a> {
+    Context(&'a ExecutionContext),
+    Listed(&'a [String]),
+}
+
+impl CteNames<'_> {
+    fn hides(self, name_lower: &str) -> bool {
+        match self {
+            CteNames::Context(ctx) => ctx.get_cte_by_lower(name_lower).is_some(),
+            CteNames::Listed(names) => names.iter().any(|name| name == name_lower),
+        }
+    }
+}
+
 /// A join's WHERE split as execution pushes it: a filter for each side it
 /// may narrow, never the side an outer join pads with NULLs, and the rest,
 /// asked of the joined rows
@@ -4294,7 +4311,7 @@ impl Executor {
                 None
             } else {
                 let unswapped = self.check_index_nested_loop_opportunity(
-                    Some(ctx),
+                    CteNames::Context(ctx),
                     &join_source.right,
                     on_condition,
                     &join_type,
@@ -4305,14 +4322,14 @@ impl Executor {
                 );
                 pick_index_join_side(
                     &join_type,
-                    self.base_table_side_schema(&join_source.right, Some(ctx))
+                    self.base_table_side_schema(&join_source.right, CteNames::Context(ctx))
                         .is_some(),
                     right_filter.is_some(),
                     left_filter.is_some(),
                     unswapped,
                     || {
                         self.check_index_nested_loop_opportunity(
-                            Some(ctx),
+                            CteNames::Context(ctx),
                             &join_source.left,
                             on_condition,
                             &join_type,
@@ -4373,7 +4390,7 @@ impl Executor {
                 let same_family = || {
                     let column_type = |expr: &Expression, column: &str| {
                         let name = column.rsplit('.').next().unwrap_or(column);
-                        self.base_table_side_schema(expr, Some(ctx))
+                        self.base_table_side_schema(expr, CteNames::Context(ctx))
                             .and_then(|schema| schema.get_column_type(name))
                     };
                     let inner_expr = if swapped {
@@ -4469,7 +4486,7 @@ impl Executor {
                                         &join_source.right
                                     };
                                     let name = inner_col.rsplit('.').next().unwrap_or(&inner_col);
-                                    self.base_table_side_schema(inner_expr, Some(ctx))
+                                    self.base_table_side_schema(inner_expr, CteNames::Context(ctx))
                                         .and_then(|schema| schema.get_column_type(name))
                                 })
                             };
@@ -5242,8 +5259,10 @@ impl Executor {
                     } else {
                         (&join_source.right, &join_source.left)
                     };
-                    let build_schema = self.base_table_side_schema(build_expr, Some(ctx));
-                    let probe_schema = self.base_table_side_schema(probe_expr, Some(ctx));
+                    let build_schema =
+                        self.base_table_side_schema(build_expr, CteNames::Context(ctx));
+                    let probe_schema =
+                        self.base_table_side_schema(probe_expr, CteNames::Context(ctx));
 
                     // Skip bloom filter for small LIMIT queries - the overhead of building
                     // a bloom filter for thousands of rows isn't worth it when we only
@@ -5614,8 +5633,8 @@ impl Executor {
             join_type: &join_type,
             limit: join_limit,
             ctx,
-            left_schema: self.base_table_side_schema(&join_source.left, Some(ctx)),
-            right_schema: self.base_table_side_schema(&join_source.right, Some(ctx)),
+            left_schema: self.base_table_side_schema(&join_source.left, CteNames::Context(ctx)),
+            right_schema: self.base_table_side_schema(&join_source.right, CteNames::Context(ctx)),
         };
 
         let join_result = join_executor.execute(join_request)?;
@@ -7397,7 +7416,7 @@ impl Executor {
         };
         let Some((table_name, lookup_strategy, inner_key_col, outer_key_col)) = self
             .check_index_nested_loop_opportunity(
-                Some(ctx),
+                CteNames::Context(ctx),
                 &join_source.right,
                 join_source.condition.as_deref(),
                 join_type,
@@ -11385,12 +11404,11 @@ impl Executor {
     }
 
     /// The schema of a join side that reads a base table directly; None for
-    /// a CTE, a view, a subquery or any other source. Without a context, as
-    /// in EXPLAIN, a CTE is not known
+    /// a CTE, a view, a subquery or any other source
     pub(crate) fn base_table_side_schema(
         &self,
         expr: &Expression,
-        ctx: Option<&ExecutionContext>,
+        ctes: CteNames<'_>,
     ) -> Option<CompactArc<Schema>> {
         let ts = match expr {
             Expression::TableSource(ts) => ts,
@@ -11400,7 +11418,7 @@ impl Executor {
             },
             _ => return None,
         };
-        if ctx.is_some_and(|ctx| ctx.get_cte_by_lower(&ts.name.value_lower).is_some()) {
+        if ctes.hides(&ts.name.value_lower) {
             return None;
         }
         self.engine.get_table_schema(&ts.name.value_lower).ok()
@@ -11409,7 +11427,7 @@ impl Executor {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn check_index_nested_loop_opportunity(
         &self,
-        ctx: Option<&ExecutionContext>,
+        ctes: CteNames<'_>,
         right_expr: &Expression,
         join_condition: Option<&Expression>,
         join_type: &str,
@@ -11458,7 +11476,7 @@ impl Executor {
         let table_name_ref = &table_name;
 
         // A CTE of the same name hides the table and has no index
-        if ctx.is_some_and(|ctx| ctx.get_cte_by_lower(table_name_ref).is_some()) {
+        if ctes.hides(table_name_ref) {
             return None;
         }
 

@@ -128,17 +128,25 @@ fn a_small_view_narrows_a_large_unindexed_table_as_its_control_answers() {
 #[test]
 fn explain_reports_the_probe_from_a_view_on_the_right() {
     let db = tables("materialized_side_explain");
-    let plan: Vec<String> = db
-        .query("EXPLAIN SELECT t.v FROM t JOIN c ON c.x = t.id", ())
-        .unwrap()
-        .map(|row| row.unwrap().get::<String>(0).unwrap())
-        .collect();
-    assert!(
-        plan.iter()
-            .any(|line| line.contains("Index Nested Loop (PK)")),
-        "{}",
-        plan.join("\n")
-    );
+    // A CTE hiding a table of its name is the CTE, as execution reads it
+    db.execute("CREATE TABLE w (x INTEGER)", ()).unwrap();
+    for sql in [
+        "EXPLAIN SELECT t.v FROM t JOIN c ON c.x = t.id",
+        "EXPLAIN WITH w(x) AS (SELECT x FROM r) SELECT t.v FROM t JOIN w ON w.x = t.id \
+         ORDER BY t.v",
+    ] {
+        let plan: Vec<String> = db
+            .query(sql, ())
+            .unwrap()
+            .map(|row| row.unwrap().get::<String>(0).unwrap())
+            .collect();
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("Index Nested Loop (PK)")),
+            "{sql}\n{}",
+            plan.join("\n")
+        );
+    }
 }
 
 #[cfg(all(feature = "test-failpoints", not(feature = "test-filedb")))]
