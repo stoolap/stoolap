@@ -151,7 +151,8 @@ fn a_check_runs_on_a_null_value_and_only_a_null_result_passes() {
         "INSERT INTO t VALUES (2, NULL, 1)",
         "INSERT INTO t (id, w) VALUES (3, 1)",
         "UPDATE t SET v = NULL WHERE id = 1",
-        "INSERT INTO t VALUES (1, NULL, 1) ON DUPLICATE KEY UPDATE v = NULL",
+        "INSERT INTO t VALUES (1, 1, 1) ON DUPLICATE KEY UPDATE v = NULL",
+        "INSERT INTO t VALUES (6, NULL, 1) ON DUPLICATE KEY UPDATE v = 1",
     ] {
         if db.execute(sql, ()).is_ok() {
             wrong.push(format!("{sql}: accepted a NULL v"));

@@ -271,7 +271,7 @@ impl Executor {
         }
 
         let mut check_vm = super::expression::ExprVM::new();
-        let mut check_row = super::dml::check_scratch();
+        let mut check_row = None;
         for result in reader.records() {
             let record = result.map_err(|e| {
                 Error::InvalidArgument(format!(
@@ -385,7 +385,7 @@ impl Executor {
         let mut state = JsonRowState {
             given: vec![false; all_column_types.len()],
             vm: super::expression::ExprVM::new(),
-            check_row: super::dml::check_scratch(),
+            check_row: None,
         };
 
         for (idx, result) in stream.enumerate() {
@@ -504,7 +504,7 @@ impl Executor {
 struct JsonRowState {
     given: Vec<bool>,
     vm: super::expression::ExprVM,
-    check_row: Row,
+    check_row: Option<Row>,
 }
 
 /// The defaults of a COPY's rows by the machinery INSERT runs: constants in

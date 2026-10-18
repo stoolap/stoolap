@@ -416,21 +416,18 @@ fn compile_column_check(schema: &Schema, idx: usize) -> Result<Option<CompiledCh
     )))
 }
 
-/// The one-column row a statement's CHECKs run against, reused row to row
-pub(crate) fn check_scratch() -> Row {
-    Row::from_values(vec![Value::null_unknown()])
-}
-
-/// Run one compiled CHECK against `value`, held in `scratch`. The CHECK
-/// runs on a NULL value too; a NULL result passes, per the standard.
+/// Run one compiled CHECK against `value`, held in `scratch`, a one-column
+/// row built on the statement's first CHECK and reused row to row. The
+/// CHECK runs on a NULL value too; a NULL result passes, per the standard.
 pub(crate) fn run_check_program(
     vm: &mut super::expression::ExprVM,
-    scratch: &mut Row,
+    scratch: &mut Option<Row>,
     program: &super::expression::SharedProgram,
     col_name: &str,
     check_expr: &str,
     value: &Value,
 ) -> Result<()> {
+    let scratch = scratch.get_or_insert_with(|| Row::from_values(vec![Value::null_unknown()]));
     scratch.set(0, value.clone())?;
     let check_ctx = super::expression::ExecuteContext::new(scratch);
     let result = vm.execute_cow(program, &check_ctx)?;
@@ -758,7 +755,7 @@ impl Executor {
         // Create VM for constant expression evaluation (reused for all INSERT values)
         use super::expression::{compile_expression, ExecuteContext, ExprVM};
         let mut vm = ExprVM::new();
-        let mut check_row = check_scratch();
+        let mut check_row = None;
         let params = ctx.params();
         let named_params = ctx.named_params();
         let empty_row = Row::new();
@@ -1654,7 +1651,7 @@ impl Executor {
         // Create VM for constant expression evaluation (reused for all INSERT values)
         use super::expression::{compile_expression, ExecuteContext, ExprVM};
         let mut vm = ExprVM::new();
-        let mut check_row = check_scratch();
+        let mut check_row = None;
         let params = ctx.params();
         let named_params = ctx.named_params();
         let empty_row = Row::new();
@@ -2582,7 +2579,7 @@ impl Executor {
 
             // Create VM once and reuse for all rows
             let mut vm = ExprVM::new();
-            let mut check_row = check_scratch();
+            let mut check_row = None;
             // Extract params before the closure so they can be captured
             let params = ctx.params();
             let named_params = ctx.named_params();
@@ -3620,6 +3617,7 @@ impl Executor {
 
         // Create VM once and reuse for all rows
         let mut vm = ExprVM::new();
+        let mut check_row = None;
 
         // Extract params from execution context for use in the setter closure
         let params = ctx.params();
@@ -3688,24 +3686,15 @@ impl Executor {
             for (idx, new_value) in updates_to_apply {
                 // Validate CHECK constraint using pre-compiled program via existing VM
                 for (check_idx, col_name, check_expr, program) in &effective.compiled_checks {
-                    if *check_idx == idx && !new_value.is_null() {
-                        let check_row = Row::from_values(vec![new_value.clone()]);
-                        let check_ctx = ExecuteContext::new(&check_row);
-                        let result = vm.execute_cow(program, &check_ctx)?;
-                        let is_truthy = match &result {
-                            Value::Boolean(b) => *b,
-                            Value::Null(_) => true, // NULL passes CHECK (SQL standard)
-                            Value::Integer(i) => *i != 0,
-                            Value::Float(f) => *f != 0.0,
-                            Value::Text(s) => !s.is_empty(),
-                            _ => true, // Timestamp, Extension, etc. are truthy
-                        };
-                        if !is_truthy {
-                            return Err(Error::CheckConstraintViolation {
-                                column: col_name.to_string(),
-                                expression: check_expr.to_string(),
-                            });
-                        }
+                    if *check_idx == idx {
+                        run_check_program(
+                            &mut vm,
+                            &mut check_row,
+                            program,
+                            col_name,
+                            check_expr,
+                            &new_value,
+                        )?;
                     }
                 }
                 let _ = row.set(idx, new_value);
