@@ -160,6 +160,16 @@ fn test_an_interval_reads_one_way() {
     // Text that is not an interval reads as NULL
     assert!(answer(&db, "SELECT ts + s FROM t WHERE id = 3").is_null());
     assert!(answer(&db, "SELECT ts + '1.5 days' FROM t WHERE id = 3").is_null());
+    for text in [
+        "banana days 99999999999999999999:00:00",
+        "99999999999999999999 days banana:00:00",
+    ] {
+        let rows = db
+            .query("SELECT ts + $1 FROM t WHERE id = 3", (Value::text(text),))
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+            .unwrap_or_else(|e| panic!("{text}: {e}"));
+        assert!(rows[0].get_value(0).unwrap().is_null(), "{text}");
+    }
 }
 
 #[test]

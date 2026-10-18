@@ -201,25 +201,26 @@ fn parse_formatted_duration(s: &str) -> Result<Option<Interval>> {
     else {
         return Ok(None);
     };
-    let days = match days {
-        Some(days) => integer_from_text(days)?,
-        None => Some(0),
+    let days = days.unwrap_or("0");
+    let digits = |f: &str| {
+        let f = f.strip_prefix('+').unwrap_or(f);
+        !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit())
     };
-    let (Some(days), Some(hours), Some(minutes), Some(seconds)) = (
-        days,
-        integer_from_text(h)?,
-        integer_from_text(m)?,
-        integer_from_text(sec)?,
-    ) else {
-        return Ok(None);
-    };
-    if days < 0 || hours < 0 || !(0..60).contains(&minutes) || !(0..60).contains(&seconds) {
+    if ![days, h, m, sec].into_iter().all(digits) {
         return Ok(None);
     }
+    let (Ok(minutes @ 0..60), Ok(seconds @ 0..60)) = (m.parse::<i64>(), sec.parse::<i64>()) else {
+        return Ok(None);
+    };
+    // The text is an interval now, so a field that does not parse overflowed
     let micros = days
-        .checked_mul(IntervalUnit::Day.micros())
-        .zip(hours.checked_mul(IntervalUnit::Hour.micros()))
-        .and_then(|(d, h)| d.checked_add(h))
+        .parse::<i64>()
+        .ok()
+        .zip(h.parse::<i64>().ok())
+        .and_then(|(d, h)| {
+            d.checked_mul(IntervalUnit::Day.micros())?
+                .checked_add(h.checked_mul(IntervalUnit::Hour.micros())?)
+        })
         .and_then(|total| total.checked_add(minutes * IntervalUnit::Minute.micros()))
         .and_then(|total| total.checked_add(seconds * IntervalUnit::Second.micros()))
         .ok_or_else(|| Error::Type(format!("INTERVAL '{s}' is out of range")))?;
@@ -290,6 +291,10 @@ mod tests {
             parse_interval("-1 days 02:00:00").unwrap(),
             Some(Interval::Duration(-TimeDelta::hours(26)))
         );
+        assert_eq!(
+            parse_interval("+1 days +02:00:00").unwrap(),
+            Some(Interval::Duration(TimeDelta::hours(26)))
+        );
         assert_eq!(parse_interval("banana").unwrap(), None);
         assert_eq!(parse_interval("1 banana").unwrap(), None);
         assert_eq!(parse_interval("1.5 days").unwrap(), None);
@@ -302,6 +307,16 @@ mod tests {
         assert!(parse_interval("99999999999999999999 days 00:00:00").is_err());
         assert!(parse_interval("99999999999999999999:00:00").is_err());
         assert_eq!(parse_interval("banana days 00:00:00").unwrap(), None);
+        for text in [
+            "banana days 99999999999999999999:00:00",
+            "99999999999999999999 days banana:00:00",
+            "99999999999999999999 days 00:60:00",
+            "99999999999999999999 days 00:00:99999999999999999999",
+            "99999999999999999999:00:00:00",
+            "-99999999999999999999 days -1:00:00",
+        ] {
+            assert_eq!(parse_interval(text).unwrap(), None, "{text}");
+        }
         assert_eq!(
             parse_interval("106751991 days 00:00:00")
                 .unwrap()
