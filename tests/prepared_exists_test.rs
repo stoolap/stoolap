@@ -549,7 +549,10 @@ fn test_a_top_level_exists_reads_only_the_rows_its_keys_name() {
         found.iter().all(|id| [1, 2, 4].contains(&(id % 30))),
         "{limited}: {found:?}"
     );
-    assert_eq!(prepared_rows_narrowed(), before + 1, "{limited}");
+    // A table that holds volumes reads the keys as candidates, which do not
+    // answer under a LIMIT, so it scans
+    let narrowed = if cfg!(feature = "test-filedb") { 0 } else { 1 };
+    assert_eq!(prepared_rows_narrowed(), before + narrowed, "{limited}");
     // NOT EXISTS reads by the primary key only, the keys that passed left out
     let not = "SELECT id FROM big WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.k = big.k)";
     let before = prepared_rows_narrowed();
