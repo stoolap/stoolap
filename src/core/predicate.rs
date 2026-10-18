@@ -104,15 +104,22 @@ pub fn number_against_text(a: &Value, b: &Value) -> Option<Option<Ordering>> {
 }
 
 /// How `a` orders against `b` in a predicate; None is UNKNOWN: a NULL, a
-/// TEXT that is not a number or a BOOLEAN or TIMESTAMP against a number, or
-/// a pair with no order
+/// TEXT that does not read as the other side's type, a BOOLEAN or TIMESTAMP
+/// against a number, a JSON or VECTOR, or two values of other domains
 pub fn sql_compare(a: &Value, b: &Value) -> Option<Ordering> {
     if a.is_null() || b.is_null() || non_number_against_number(a, b) {
         return None;
     }
-    match number_against_text(a, b) {
-        Some(ordering) => ordering,
-        None => a.partial_cmp(b),
+    if let Some(ordering) = number_against_text(a, b) {
+        return ordering;
+    }
+    let (a, b) = read_text_across(a, b)?;
+    match (a.as_ref(), b.as_ref()) {
+        (Value::Extension(_), _) | (_, Value::Extension(_)) => None,
+        (a, b) if a.data_type() == b.data_type() || (is_number(a) && is_number(b)) => {
+            a.partial_cmp(b)
+        }
+        _ => None,
     }
 }
 
@@ -122,8 +129,38 @@ fn non_number_against_number(a: &Value, b: &Value) -> bool {
     (is_number(a) && other(b)) || (other(a) && is_number(b))
 }
 
-/// `a = b` in a predicate; None is UNKNOWN. Pairs other than a number
-/// against a TEXT keep `Value`'s equality
+/// The pair with a TEXT read as the other side's type when that is a
+/// BOOLEAN, by the CAST rule, or a TIMESTAMP; None when the TEXT does not
+/// read. Any other pair as it is
+fn read_text_across<'v>(
+    a: &'v Value,
+    b: &'v Value,
+) -> Option<(std::borrow::Cow<'v, Value>, std::borrow::Cow<'v, Value>)> {
+    use std::borrow::Cow;
+    let read = |text: &str, like: &Value| match like {
+        Value::Boolean(_) => Some(super::value::text_as_boolean(text).map(Value::Boolean)),
+        Value::Timestamp(_) => {
+            Some(super::value::parse_timestamp_for_compare(text).map(Value::Timestamp))
+        }
+        _ => None,
+    };
+    match (a, b) {
+        (Value::Text(text), other) => match read(text, other) {
+            Some(read) => read.map(|a| (Cow::Owned(a), Cow::Borrowed(b))),
+            None => Some((Cow::Borrowed(a), Cow::Borrowed(b))),
+        },
+        (other, Value::Text(text)) => match read(text, other) {
+            Some(read) => read.map(|b| (Cow::Borrowed(a), Cow::Owned(b))),
+            None => Some((Cow::Borrowed(a), Cow::Borrowed(b))),
+        },
+        _ => Some((Cow::Borrowed(a), Cow::Borrowed(b))),
+    }
+}
+
+/// `a = b` in a predicate; None is UNKNOWN: a NULL, a TEXT that does not
+/// read as the other side's type, or a JSON or VECTOR against another type.
+/// Two values of other domains, a BOOLEAN or TIMESTAMP against a number
+/// among them, are not equal
 pub fn sql_eq(a: &Value, b: &Value) -> Option<bool> {
     if a.is_null() || b.is_null() {
         return None;
@@ -131,7 +168,12 @@ pub fn sql_eq(a: &Value, b: &Value) -> Option<bool> {
     if let Some(ordering) = number_against_text(a, b) {
         return ordering.map(|o| o == Ordering::Equal);
     }
-    Some(a == b)
+    let (a, b) = read_text_across(a, b)?;
+    match (a.as_ref(), b.as_ref()) {
+        (Value::Extension(x), Value::Extension(y)) if x.first() == y.first() => Some(x == y),
+        (Value::Extension(_), _) | (_, Value::Extension(_)) => None,
+        (a, b) => Some(a == b),
+    }
 }
 
 /// `a IS DISTINCT FROM b`: two NULLs are not distinct, a NULL and a value
@@ -257,6 +299,9 @@ impl PredicateSet {
         if probe.is_null() {
             return None;
         }
+        if self.reads_across(probe) {
+            return self.scan(probe);
+        }
         if self.members.contains(probe) {
             return Some(true);
         }
@@ -274,6 +319,35 @@ impl PredicateSet {
                 None => unknown = true,
             },
             _ => {}
+        }
+        if unknown {
+            None
+        } else {
+            Some(false)
+        }
+    }
+
+    /// Whether `probe` meets a member that `=` reads as another type, a
+    /// BOOLEAN or TIMESTAMP against a TEXT, or a JSON or VECTOR on either side
+    fn reads_across(&self, probe: &Value) -> bool {
+        let text_reads = Self::BOOLEAN | Self::TIMESTAMP;
+        match probe {
+            Value::Integer(_) | Value::Float(_) => self.kinds & Self::OTHER != 0,
+            Value::Text(_) => self.kinds & (text_reads | Self::OTHER) != 0,
+            Value::Boolean(_) | Value::Timestamp(_) => self.kinds & (Self::TEXT | Self::OTHER) != 0,
+            _ => true,
+        }
+    }
+
+    /// `probe IN (members)` by `=` against each member
+    fn scan(&self, probe: &Value) -> Option<bool> {
+        let mut unknown = self.has_null;
+        for member in self.members.iter() {
+            match sql_eq(probe, member) {
+                Some(true) => return Some(true),
+                Some(false) => {}
+                None => unknown = true,
+            }
         }
         if unknown {
             None

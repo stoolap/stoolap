@@ -32,6 +32,7 @@ use crate::storage::traits::transaction::StatementTable;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::common::{CompactArc, CompactVec, StringMap};
+use crate::core::predicate::{sql_compare, sql_eq};
 use crate::core::{DataType, Error, Result, Row, RowVec, Schema, Value, ValueSet};
 use crate::optimizer::ExpressionSimplifier;
 use crate::parser::ast::*;
@@ -8868,17 +8869,23 @@ impl Executor {
                                     | CaseCondition::IsNull { col_idx } => row.get(*col_idx),
                                 };
                                 let cond_matches = match (&branch.condition, col_val) {
-                                    (CaseCondition::Equals { value, .. }, Some(v)) => v == value,
-                                    (CaseCondition::NotEquals { value, .. }, Some(v)) => v != value,
+                                    (CaseCondition::Equals { value, .. }, Some(v)) => {
+                                        sql_eq(v, value) == Some(true)
+                                    }
+                                    (CaseCondition::NotEquals { value, .. }, Some(v)) => {
+                                        sql_eq(v, value) == Some(false)
+                                    }
                                     (CaseCondition::GreaterThan { value, .. }, Some(v)) => {
-                                        v > value
+                                        sql_compare(v, value).is_some_and(|o| o.is_gt())
                                     }
                                     (CaseCondition::GreaterOrEqual { value, .. }, Some(v)) => {
-                                        v >= value
+                                        sql_compare(v, value).is_some_and(|o| o.is_ge())
                                     }
-                                    (CaseCondition::LessThan { value, .. }, Some(v)) => v < value,
+                                    (CaseCondition::LessThan { value, .. }, Some(v)) => {
+                                        sql_compare(v, value).is_some_and(|o| o.is_lt())
+                                    }
                                     (CaseCondition::LessOrEqual { value, .. }, Some(v)) => {
-                                        v <= value
+                                        sql_compare(v, value).is_some_and(|o| o.is_le())
                                     }
                                     (CaseCondition::IsNull { .. }, Some(v)) => v.is_null(),
                                     (_, None) => false,

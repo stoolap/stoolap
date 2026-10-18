@@ -100,10 +100,24 @@ impl<'a> PushdownContext<'a> {
     ///
     /// A TEXT against a numeric column is read as a number by the predicate
     /// comparison's own rule. None, so nothing is pushed, for unreadable TEXT
-    /// against a numeric column and for a number against a TEXT column.
+    /// against a numeric column, for a number against a TEXT column and for
+    /// a column the scan does not compare.
     pub fn coerce_to_column_type(&self, column: &str, value: Value) -> Option<Value> {
-        coerce_constant(self.column_type(column), value)
+        let column_type = self.column_type(column);
+        if column_type.is_some_and(|t| !scan_compares(t)) {
+            return None;
+        }
+        coerce_constant(column_type, value)
     }
+}
+
+/// Whether the scan compares values of `data_type` by the predicate rule;
+/// a JSON or VECTOR comparison is left to the program
+pub(crate) fn scan_compares(data_type: crate::core::DataType) -> bool {
+    !matches!(
+        data_type,
+        crate::core::DataType::Json | crate::core::DataType::Vector
+    )
 }
 
 /// A value compared with a column of `column_type` as the scan reads it,

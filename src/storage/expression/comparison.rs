@@ -252,14 +252,10 @@ impl ComparisonExpr {
         }
     }
 
-    /// Compare two booleans with the configured operator
+    /// Compare two booleans with the configured operator, false before true
     #[inline]
     fn compare_booleans(&self, col_val: bool, cmp_val: bool) -> bool {
-        match self.operator {
-            Operator::Eq => col_val == cmp_val,
-            Operator::Ne => col_val != cmp_val,
-            _ => false, // Other operators don't make sense for booleans
-        }
+        self.check_ordering(col_val.cmp(&cmp_val))
     }
 
     /// Compare two timestamps with the configured operator

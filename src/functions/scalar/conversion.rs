@@ -157,14 +157,8 @@ fn cast_to_boolean(value: &Value) -> Result<Value> {
         Value::Boolean(b) => Ok(Value::Boolean(*b)),
         Value::Integer(i) => Ok(Value::Boolean(*i != 0)),
         Value::Float(f) => Ok(Value::Boolean(*f != 0.0)),
-        Value::Text(s) => {
-            let lower = s.to_lowercase();
-            let is_true = lower == "true"
-                || lower == "yes"
-                || lower == "1"
-                || (!lower.is_empty() && lower != "0" && lower != "false" && lower != "no");
-            Ok(Value::Boolean(is_true))
-        }
+        Value::Text(s) => Ok(crate::core::value::text_as_boolean(s)
+            .map_or(Value::Null(DataType::Boolean), Value::Boolean)),
         Value::Timestamp(_) => Err(Error::invalid_argument(
             "Cannot convert TIMESTAMP to BOOLEAN",
         )),
@@ -525,6 +519,21 @@ mod tests {
             .evaluate(&[Value::null_unknown(), Value::text("BOOLEAN")])
             .unwrap();
         assert!(result.is_null(), "CAST(NULL AS BOOLEAN) should return NULL");
+    }
+
+    #[test]
+    fn test_cast_to_boolean_reads_text_as_sql_cast() {
+        let cast = CastFunction;
+        for text in [
+            "true", "T", "yes", "Y", "1", "false", "f", "NO", "n", "0", "junk", "", "2",
+        ] {
+            let want = crate::core::value::text_as_boolean(text)
+                .map_or(Value::Null(DataType::Boolean), Value::Boolean);
+            let got = cast
+                .evaluate(&[Value::text(text), Value::text("BOOLEAN")])
+                .unwrap();
+            assert_eq!(got, want, "CAST('{text}' AS BOOLEAN)");
+        }
     }
 
     // COLLATE tests

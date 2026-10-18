@@ -640,25 +640,7 @@ impl Value {
                     Value::Integer(v) => Value::Boolean(*v != 0),
                     Value::Float(v) => Value::Boolean(*v != 0.0),
                     Value::Text(s) => {
-                        // OPTIMIZATION: Use eq_ignore_ascii_case to avoid allocation
-                        let s_ref: &str = s.as_ref();
-                        if s_ref.eq_ignore_ascii_case("true")
-                            || s_ref.eq_ignore_ascii_case("t")
-                            || s_ref.eq_ignore_ascii_case("yes")
-                            || s_ref.eq_ignore_ascii_case("y")
-                            || s_ref == "1"
-                        {
-                            Value::Boolean(true)
-                        } else if s_ref.eq_ignore_ascii_case("false")
-                            || s_ref.eq_ignore_ascii_case("f")
-                            || s_ref.eq_ignore_ascii_case("no")
-                            || s_ref.eq_ignore_ascii_case("n")
-                            || s_ref == "0"
-                        {
-                            Value::Boolean(false)
-                        } else {
-                            Value::Null(target_type)
-                        }
+                        text_as_boolean(s).map_or(Value::Null(target_type), Value::Boolean)
                     }
                     _ => Value::Null(target_type),
                 }
@@ -794,25 +776,7 @@ impl Value {
                 Value::Integer(v) => Value::Boolean(*v != 0),
                 Value::Float(v) => Value::Boolean(*v != 0.0),
                 Value::Text(s) => {
-                    // OPTIMIZATION: Use eq_ignore_ascii_case to avoid allocation
-                    let s_ref: &str = s.as_ref();
-                    if s_ref.eq_ignore_ascii_case("true")
-                        || s_ref.eq_ignore_ascii_case("t")
-                        || s_ref.eq_ignore_ascii_case("yes")
-                        || s_ref.eq_ignore_ascii_case("y")
-                        || s_ref == "1"
-                    {
-                        Value::Boolean(true)
-                    } else if s_ref.eq_ignore_ascii_case("false")
-                        || s_ref.eq_ignore_ascii_case("f")
-                        || s_ref.eq_ignore_ascii_case("no")
-                        || s_ref.eq_ignore_ascii_case("n")
-                        || s_ref == "0"
-                    {
-                        Value::Boolean(false)
-                    } else {
-                        Value::Null(target_type)
-                    }
+                    text_as_boolean(s).map_or(Value::Null(target_type), Value::Boolean)
                 }
                 _ => Value::Null(target_type),
             },
@@ -1354,8 +1318,22 @@ thread_local! {
     static TS_FORMAT_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// A TEXT as `CAST(... AS BOOLEAN)` reads it: `true`, `t`, `yes`, `y` and
+/// `1` are TRUE, `false`, `f`, `no`, `n` and `0` FALSE, in any case
+pub fn text_as_boolean(s: &str) -> Option<bool> {
+    const TRUE: [&str; 4] = ["true", "t", "yes", "y"];
+    const FALSE: [&str; 4] = ["false", "f", "no", "n"];
+    if s == "1" || TRUE.iter().any(|t| s.eq_ignore_ascii_case(t)) {
+        Some(true)
+    } else if s == "0" || FALSE.iter().any(|f| s.eq_ignore_ascii_case(f)) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// `parse_timestamp` with a per-thread memo, for per-row comparison paths
-fn parse_timestamp_for_compare(s: &str) -> Option<DateTime<Utc>> {
+pub(crate) fn parse_timestamp_for_compare(s: &str) -> Option<DateTime<Utc>> {
     TS_COMPARE_PARSE_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         let (slots, next) = &mut *cache;

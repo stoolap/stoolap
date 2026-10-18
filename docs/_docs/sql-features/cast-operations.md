@@ -145,7 +145,8 @@ The same conversion applies wherever a value becomes an INTEGER: a CAST, a value
 - **From INTEGER**: 0 → FALSE, non-zero → TRUE
 - **From FLOAT**: 0.0 → FALSE, non-zero → TRUE
 - **From TEXT**: "true", "t", "yes", "y", "1" → TRUE (case-insensitive)
-                "false", "f", "no", "n", "0", "" → FALSE (case-insensitive)
+                "false", "f", "no", "n", "0" → FALSE (case-insensitive)
+                any other text, including "", becomes NULL
 - **From NULL**: Returns NULL (typed as BOOLEAN)
 
 ### To TIMESTAMP
@@ -185,6 +186,18 @@ Stoolap performs implicit type conversion in these contexts:
    SELECT CAST('2025-01-01' AS TIMESTAMP) >= 0;        -- NULL
    SELECT TRUE = 1;                                    -- false
    SELECT * FROM t WHERE b = 0;                        -- no rows, for a BOOLEAN column b
+   ```
+
+   A TEXT compared with a BOOLEAN is read the way `CAST(... AS BOOLEAN)` reads it, and a TEXT compared with a TIMESTAMP is parsed as a timestamp. A TEXT that does not read makes the comparison unknown (NULL). BOOLEAN values order FALSE before TRUE. Two JSON values, or two VECTOR values, are equal or not by value; ordering them, and comparing either with any other type, is unknown. These rules hold for every operator and context listed above.
+   ```sql
+   SELECT TRUE = 'yes';                                -- true
+   SELECT FALSE < TRUE;                                -- true
+   SELECT TRUE = 'maybe';                              -- NULL
+   SELECT CAST('2024-01-01' AS TIMESTAMP) < '2024-01-02';  -- true
+   SELECT CAST('2024-01-01' AS TIMESTAMP) = 'junk';    -- NULL
+   SELECT CAST('{"a":1}' AS JSON) = CAST('{"a":1}' AS JSON);  -- true
+   SELECT CAST('{"a":1}' AS JSON) < CAST('{"a":2}' AS JSON);  -- NULL
+   SELECT * FROM t WHERE j = '{"a":1}';                -- no rows, for a JSON column j
    ```
 
 3. **Function arguments**: When a function expects specific types

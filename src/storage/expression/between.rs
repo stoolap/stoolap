@@ -254,6 +254,25 @@ impl BetweenExpr {
             val > lower && val < upper
         }
     }
+
+    /// Compare booleans with bounds, false before true
+    #[inline]
+    fn check_boolean(&self, val: bool, lower: bool, upper: bool) -> bool {
+        let (above, below) = (val.cmp(&lower), val.cmp(&upper));
+        if self.inclusive {
+            above.is_ge() && below.is_le()
+        } else {
+            above.is_gt() && below.is_lt()
+        }
+    }
+
+    /// Both bounds when they are BOOLEAN
+    fn boolean_bounds(&self) -> Option<(bool, bool)> {
+        match (&self.lower_bound, &self.upper_bound) {
+            (Value::Boolean(lower), Value::Boolean(upper)) => Some((*lower, *upper)),
+            _ => None,
+        }
+    }
 }
 
 impl Expression for BetweenExpr {
@@ -319,6 +338,13 @@ impl Expression for BetweenExpr {
                 self.check_timestamp(*val, lower, upper)
             }
 
+            Value::Boolean(val) => {
+                let (lower, upper) = self
+                    .boolean_bounds()
+                    .ok_or_else(|| crate::core::Error::type_conversion("bounds", "boolean"))?;
+                self.check_boolean(*val, lower, upper)
+            }
+
             _ => false,
         };
 
@@ -381,6 +407,11 @@ impl Expression for BetweenExpr {
                     return false;
                 }
             }
+
+            Value::Boolean(val) => match self.boolean_bounds() {
+                Some((lower, upper)) => self.check_boolean(*val, lower, upper),
+                None => return false,
+            },
 
             _ => return false,
         };

@@ -137,7 +137,7 @@ impl ScalarFunction for NullIfFunction {
         validate_arg_count!(args, "NULLIF", 2);
 
         // If both are equal, return NULL
-        if args[0] == args[1] {
+        if crate::core::predicate::sql_eq(&args[0], &args[1]) == Some(true) {
             return Ok(Value::null_unknown());
         }
 
@@ -1153,6 +1153,24 @@ mod tests {
             f.evaluate(&[Value::text("hello"), Value::text("world")])
                 .unwrap(),
             Value::text("hello")
+        );
+    }
+
+    #[test]
+    fn test_nullif_follows_the_predicate_comparison() {
+        let f = NullIfFunction;
+        assert!(f
+            .evaluate(&[Value::Integer(1), Value::text("1")])
+            .unwrap()
+            .is_null());
+        assert!(f
+            .evaluate(&[Value::Boolean(true), Value::text("yes")])
+            .unwrap()
+            .is_null());
+        assert_eq!(
+            f.evaluate(&[Value::Boolean(true), Value::Integer(1)])
+                .unwrap(),
+            Value::Boolean(true)
         );
     }
 
