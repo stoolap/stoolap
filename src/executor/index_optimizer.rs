@@ -985,6 +985,103 @@ impl Executor {
     /// grows from the rows still needed and is bounded whatever the list
     /// holds, so a run of members without a row never makes the fetch
     /// after it read every remaining row
+    /// The row ids `members` name on an INTEGER PRIMARY KEY: a member is
+    /// the row id, a float read as the comparison reads it
+    fn primary_key_members<'v, I: Iterator<Item = &'v Value> + 'v>(
+        members: I,
+    ) -> impl Iterator<Item = i64> + 'v {
+        members.filter_map(|value| match value {
+            Value::Integer(id) => Some(*id),
+            Value::Float(f) => Self::lossless_float_key(*f),
+            _ => None,
+        })
+    }
+
+    /// Each row id `index` holds for one of `members`, until `out` holds
+    /// `target`; false when the index does not answer for the view the
+    /// table reads: it holds neither the transaction's own writes nor, once
+    /// a commit the statement misses landed, its keys
+    fn index_members<'v>(
+        table: &dyn Table,
+        index: &dyn crate::storage::traits::Index,
+        members: impl Iterator<Item = &'v Value>,
+        target: Option<usize>,
+        out: &mut Vec<i64>,
+    ) -> bool {
+        let epoch = table.index_view_epoch();
+        for value in members {
+            if target.is_some_and(|target| out.len() >= target) {
+                break;
+            }
+            // A NULL member equals nothing, so it is not looked up
+            if value.is_null() {
+                continue;
+            }
+            index.get_row_ids_equal_into(std::slice::from_ref(value), out);
+        }
+        epoch.is_some() && table.index_view_epoch() == epoch
+    }
+
+    /// Whether `column` is the table's one-column primary key
+    fn is_primary_key(table: &dyn Table, column: &str) -> bool {
+        let schema = table.schema();
+        let pk = schema.primary_key_indices();
+        pk.len() == 1 && schema.columns[pk[0]].name_lower == column
+    }
+
+    /// The rows whose `column` is one of `members`, each of the column's
+    /// type, read by the primary key, the column's index or the table's
+    /// candidates; None when none of them answers. Under a LIMIT the
+    /// candidates do not answer, and `target` rows, when given, are enough
+    pub(crate) fn rows_of_members<'v>(
+        table: &dyn Table,
+        column: &str,
+        members: impl Iterator<Item = &'v Value> + 'v,
+        limited: bool,
+        target: Option<usize>,
+    ) -> Result<Option<RowVec>> {
+        use crate::storage::expression::logical::ConstBoolExpr;
+        let known = members.size_hint().0;
+        let mut ids = Vec::with_capacity(target.map_or(known, |target| target.min(known)));
+        if Self::is_primary_key(table, column) {
+            let mut keys = Self::primary_key_members(members);
+            if let Some(target) = target {
+                return Self::fetch_members_up_to(table, &mut keys, target, &mut ids).map(Some);
+            }
+            ids.extend(keys);
+        } else if let Some(index) = table.lookup_index_on_column(column) {
+            if !Self::index_members(table, index.as_ref(), members, target, &mut ids) {
+                return Ok(None);
+            }
+        } else if !limited && Self::in_members_eligible(table, column) {
+            let members = members.cloned().collect();
+            return Self::in_member_rows(table, column, members, || Ok(None), false);
+        } else {
+            return Ok(None);
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        let needed = target.unwrap_or(usize::MAX);
+        Self::fetch_rows_up_to(table, &ids, &ConstBoolExpr::true_expr(), needed).map(Some)
+    }
+
+    /// The rows whose `column`, the table's primary key, is none of
+    /// `members`, in key order and up to `target`; None for another column
+    pub(crate) fn rows_without_members<'v>(
+        table: &dyn Table,
+        column: &str,
+        members: impl Iterator<Item = &'v Value> + 'v,
+        target: Option<usize>,
+    ) -> Result<Option<RowVec>> {
+        use crate::storage::expression::logical::ConstBoolExpr;
+        if !Self::is_primary_key(table, column) {
+            return Ok(None);
+        }
+        let excluded: I64Set = Self::primary_key_members(members).collect();
+        let ids = table.visible_row_ids_excluding(&excluded, target.unwrap_or(usize::MAX))?;
+        Self::fetch_rows_up_to(table, &ids, &ConstBoolExpr::true_expr(), usize::MAX).map(Some)
+    }
+
     fn fetch_rows_up_to(
         table: &dyn Table,
         row_ids: &[i64],
@@ -1918,16 +2015,7 @@ impl Executor {
             if is_negated {
                 // NOT IN optimization for INTEGER PRIMARY KEY (from NOT EXISTS semi-join):
                 // Iterate through row_ids and exclude those in the hash set
-                // Only a losslessly integral float can name a key; one past
-                // i64 would saturate onto a key it does not equal
-                let exclusion_set: I64Set = values
-                    .iter()
-                    .filter_map(|v| match v {
-                        Value::Integer(id) => Some(*id),
-                        Value::Float(f) => Self::lossless_float_key(*f),
-                        _ => None,
-                    })
-                    .collect();
+                let exclusion_set: I64Set = Self::primary_key_members(values.iter()).collect();
 
                 let target = early_termination_target.unwrap_or(usize::MAX);
 
@@ -1936,14 +2024,8 @@ impl Executor {
                 // is not a row to keep
                 all_row_ids.extend(table.visible_row_ids_excluding(&exclusion_set, target)?);
             } else {
-                // IN: PRIMARY KEY - the value is the row id, a float read as
-                // the comparison reads it; a member with no row must not
-                // count toward the limit
-                let mut members = values.iter().filter_map(|value| match value {
-                    Value::Integer(id) => Some(*id),
-                    Value::Float(f) => Self::lossless_float_key(*f),
-                    _ => None,
-                });
+                // IN: a member with no row must not count toward the limit
+                let mut members = Self::primary_key_members(values.iter());
                 if let Some(target) = early_termination_target {
                     prefetched = Some(Self::fetch_members_up_to(
                         table,
@@ -1956,24 +2038,13 @@ impl Executor {
                 }
             }
         } else if let Some(ref idx) = index {
-            // The index holds neither the transaction's own writes nor, once
-            // a commit the statement misses landed, its keys
-            let epoch = table.index_view_epoch();
-            // Index probe for each value - use _into to avoid intermediate allocations
-            for value in values.iter() {
-                // Early termination check
-                if let Some(target) = early_termination_target {
-                    if all_row_ids.len() >= target {
-                        break;
-                    }
-                }
-                // A NULL member equals nothing, so it is not looked up
-                if value.is_null() {
-                    continue;
-                }
-                idx.get_row_ids_equal_into(std::slice::from_ref(value), &mut all_row_ids);
-            }
-            if epoch.is_none() || table.index_view_epoch() != epoch {
+            if !Self::index_members(
+                table,
+                idx.as_ref(),
+                values.iter(),
+                early_termination_target,
+                &mut all_row_ids,
+            ) {
                 return Ok(None);
             }
         }

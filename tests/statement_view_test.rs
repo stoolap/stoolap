@@ -309,9 +309,17 @@ fn a_dml_under_a_snapshot_view_selects_its_target_from_the_newest_state() {
 
 #[test]
 fn the_inner_reads_of_a_read_committed_snapshot_without_a_view_use_the_statements() {
-    let cases: [(&str, &str, &str, &'static str); 4] = [
+    // DISTINCT keeps the general path's probe; without it the prepared
+    // family probes
+    let cases: [(&str, &str, &str, &'static str); 5] = [
         (
             "probe",
+            "INSERT INTO w VALUES (1, 1)",
+            "SELECT DISTINCT id FROM s WHERE EXISTS (SELECT 1 FROM w WHERE w.x = s.id) ORDER BY id LIMIT 10",
+            "DELETE FROM w WHERE id = 1",
+        ),
+        (
+            "prepared probe",
             "INSERT INTO w VALUES (1, 1)",
             "SELECT id FROM s WHERE EXISTS (SELECT 1 FROM w WHERE w.x = s.id) ORDER BY id LIMIT 10",
             "DELETE FROM w WHERE id = 1",
@@ -352,6 +360,8 @@ fn the_inner_reads_of_a_read_committed_snapshot_without_a_view_use_the_statement
         // the outer scan has opened its table
         if name == "probe" {
             stoolap::test_failpoints::before_correlated_fetch(commit);
+        } else if name == "prepared probe" {
+            stoolap::test_failpoints::before_prepared_exists(commit);
         } else {
             stoolap::test_failpoints::after_select_table_opened(commit);
         }

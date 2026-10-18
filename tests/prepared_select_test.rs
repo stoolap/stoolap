@@ -1020,14 +1020,6 @@ fn test_classifier_rules() {
     }
     let no = [
         (
-            format!("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id) AND a > {sq}"),
-            "EXISTS",
-        ),
-        (
-            format!("SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.id = t.id) AND a > {sq}"),
-            "EXISTS",
-        ),
-        (
             "SELECT id FROM t WHERE id IN (SELECT id FROM u)".to_string(),
             "IN (subquery)",
         ),

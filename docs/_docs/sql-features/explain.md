@@ -224,7 +224,7 @@ If estimated rows differs significantly from actual rows:
 | Order By | Sort specification |
 | Limit | Row count limit |
 | Alias | Table alias in query |
-| Prepared | For a WHERE with a subquery: `yes` when the statement runs as a [prepared scalar subquery]({% link _docs/sql-features/subqueries.md %}#prepared-scalar-subqueries), otherwise `no` and the reason |
+| Prepared | For a WHERE with a subquery: `yes` when the statement runs as a [prepared subquery]({% link _docs/sql-features/subqueries.md %}#prepared-subqueries), otherwise `no` and the reason |
 
 ## Cost Information
 

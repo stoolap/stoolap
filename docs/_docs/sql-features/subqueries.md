@@ -49,6 +49,7 @@ WHERE NOT EXISTS (
 - EXISTS stops scanning as soon as it finds the first matching row
 - The SELECT list in the EXISTS subquery is ignored - you can use `SELECT 1` or `SELECT *`
 - EXISTS returns FALSE if the subquery returns no rows
+- A row whose WHERE fails with an error does not decide EXISTS when another row passes: in a [prepared subquery](#prepared-subqueries), EXISTS is TRUE when a row passes, else the first error a row raised is the statement's error, else FALSE. The equalities that correlate the subquery with the outer row (`u.k = t.k`) choose the rows its WHERE is asked of, so a row with another key, or a NULL one, raises no error for this outer row
 
 #### Common Use Cases
 
@@ -363,13 +364,13 @@ For correlated subqueries (those that reference the outer query):
 
 This means correlated subqueries may be executed multiple times (once per outer row), so they can be slower for large datasets. Consider using JOINs for better performance when possible.
 
-### Prepared Scalar Subqueries
+### Prepared Subqueries
 
 A SELECT of one shape is prepared once per cached plan instead of rebuilt for every outer row. The shape:
 
-- `FROM` one table (not a view, CTE, join or derived table, no `AS OF`), and a `WHERE` that holds at least one scalar subquery and no `EXISTS`, `IN (subquery)`, `ANY` or `ALL`
+- `FROM` one table (not a view, CTE, join or derived table, no `AS OF`), and a `WHERE` that holds at least one scalar subquery, `EXISTS` or `NOT EXISTS`, and no `IN (subquery)`, `ANY` or `ALL`
 - no `WITH`, `DISTINCT`, `GROUP BY`, `HAVING`, window functions or set operations; no subquery or aggregate in the SELECT list or `ORDER BY`; `LIMIT` and `OFFSET` as literals or parameters
-- each subquery reads one table and selects one expression, with an optional `WHERE`; it may hold further scalar subqueries, up to 32 scopes in one chain, and no aggregate, `ORDER BY`, `LIMIT` or `DISTINCT`
+- each subquery reads one table, with an optional `WHERE`; it may hold further scalar subqueries and `EXISTS`, up to 32 scopes in one chain, and no `ORDER BY`, `LIMIT` or `DISTINCT`. A scalar subquery selects one expression and no aggregate; an `EXISTS` subquery may select anything but an aggregate, and its SELECT list is never evaluated
 - the expressions are columns, literals, parameters, arithmetic, comparisons, `AND`, `OR`, `NOT`, `IS [NOT] NULL`, `IS [NOT] DISTINCT FROM`, `BETWEEN`, `IN (list)`, `LIKE`, `CASE`, `CAST` and scalar function calls
 
 `EXPLAIN` shows `Prepared: yes` for such a statement, or `Prepared: no (reason)` for a WHERE with a subquery that does not fit. For a prepared statement:
@@ -379,6 +380,9 @@ A SELECT of one shape is prepared once per cached plan instead of rebuilt for ev
 - a qualifier that names no scope is an error, as is a column its table does not have, and a named parameter the statement is given no value for
 - a value compared with a column, or tested against one with `IS [NOT] DISTINCT FROM`, is read as the column's type, the way an index or table scan reads it, whether or not the scan takes the comparison: `b = 'true'` matches a `TRUE` row of a `BOOLEAN` column and `s = TRUE` matches `'true'` in a `TEXT` one. A `TEXT` that is no number against a number column, and a number against a `TEXT` column, stay as they are and compare by the numeric rules above. A number against a `BOOLEAN` or `TIMESTAMP` column, and a `BOOLEAN` against a number column, stay as they are too: the two never compare equal, and their ordering is unknown. A `JSON` or `VECTOR` comparison is never handed to the scan
 - a subquery that reads no enclosing query runs at most once per execution, and only when a row needs it: a `CASE` arm or the right side of an `OR` that no row reaches does not run it. A subquery compared directly with a column in a top-level `AND` of the statement runs once before the scan, so the scan can use the column's index
+- an `EXISTS` that reads its enclosing query only through equalities `own column = enclosing column`, each pair of one type among `INTEGER`, `TEXT`, `BOOLEAN` and `TIMESTAMP`, and calls no volatile function, may read its table once per execution, grouped by those columns, and answer each outer row by one lookup. It does so unless an index on its column serves a probe per outer row more cheaply: for a `LIMIT` of at most 500 or for few outer rows, when its `WHERE` holds nothing besides the equalities. Both give the same answer
+- such an `EXISTS` with one equality in a top-level `AND` of the statement reads its table before the scan, and the statement reads only the rows whose column holds one of its keys, through the primary key, an index or the table's own candidates, when no `LIMIT` stops the scan early
+- the answer of an `EXISTS` read once per execution is kept for the next execution of the same statement with the same parameters, until a write to one of the tables it reads; not inside a transaction
 
 ## Examples
 

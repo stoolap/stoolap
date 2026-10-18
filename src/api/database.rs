@@ -1099,6 +1099,7 @@ impl Database {
         crate::executor::context::clear_scalar_subquery_cache();
         crate::executor::context::clear_in_subquery_cache();
         crate::executor::context::clear_semi_join_cache();
+        crate::executor::context::clear_exists_answer_cache();
         Ok(result)
     }
 

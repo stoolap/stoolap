@@ -32,7 +32,11 @@ use crate::parser::token::{Position, Token, TokenType};
 use crate::storage::expression::{AndExpr, ComparisonExpr, Expression as StorageExpr};
 use crate::storage::traits::{Engine, Table};
 
-use super::context::ExecutionContext;
+use super::context::{
+    cache_exists_answer, get_cached_exists_answer, ExecutionContext, ExistsAnswer, ExistsKeys,
+    ExistsOrigin, ExistsOutcome,
+};
+use super::expr_key::ExprKey;
 use super::expression::{
     CompileContext, CompileError, ExecuteContext, ExprCompiler, ExprVM, SharedProgram,
     SubqueryExecutor,
@@ -203,7 +207,13 @@ impl<'a> Family<'a> {
                 *found = true;
                 self.block(&sq.subquery, scopes + 1)
             }
-            Expression::Exists(_) => Err("EXISTS"),
+            Expression::Exists(exists) => {
+                if !subqueries {
+                    return Err("a subquery outside WHERE and the subquery blocks");
+                }
+                *found = true;
+                self.existence_block(&exists.subquery, scopes + 1)
+            }
             Expression::AllAny(_) => Err("ANY or ALL"),
             Expression::Window(_) => Err("a window function"),
             _ => Err("an expression form outside the family"),
@@ -233,6 +243,34 @@ impl<'a> Family<'a> {
         }
         let mut found = false;
         self.expression(column, scopes, true, &mut found)?;
+        match sq.where_clause.as_deref() {
+            Some(where_clause) => self.expression(where_clause, scopes, true, &mut found),
+            None => Ok(()),
+        }
+    }
+
+    /// The block of an EXISTS: its SELECT list is never evaluated, but its
+    /// WHERE may read an alias of it, and an aggregate in it decides the
+    /// row count, so the list holds the family's forms too
+    fn existence_block(
+        &self,
+        sq: &'a SelectStatement,
+        scopes: usize,
+    ) -> std::result::Result<(), OutOfFamily> {
+        if scopes > MAX_SCOPES {
+            return Err("more than 32 scopes in a chain");
+        }
+        if !plain_block(sq) || !sq.order_by.is_empty() || sq.limit.is_some() || sq.offset.is_some()
+        {
+            return Err("a subquery block with a clause outside the family");
+        }
+        self.from(sq.table_expr.as_deref())?;
+        let mut found = false;
+        for column in &sq.columns {
+            if !matches!(column, Expression::Star(_) | Expression::QualifiedStar(_)) {
+                self.expression(unaliased(column), scopes, true, &mut found)?;
+            }
+        }
         match sq.where_clause.as_deref() {
             Some(where_clause) => self.expression(where_clause, scopes, true, &mut found),
             None => Ok(()),
@@ -283,7 +321,7 @@ impl Executor {
             family.expression(where_clause, 1, true, &mut found)?;
         }
         if !found {
-            return Err("WHERE holds no scalar subquery");
+            return Err("WHERE holds no subquery");
         }
         for column in &stmt.columns {
             if !matches!(column, Expression::Star(_) | Expression::QualifiedStar(_)) {
@@ -311,6 +349,18 @@ struct ScopeTable {
     name: SmartString,
     columns: CompactArc<Vec<String>>,
     lower: CompactArc<Vec<String>>,
+    types: Vec<DataType>,
+}
+
+impl ScopeTable {
+    fn of(name: SmartString, schema: &Schema) -> Self {
+        Self {
+            name,
+            columns: schema.column_names_arc(),
+            lower: schema.column_names_lower_arc(),
+            types: schema.columns.iter().map(|c| c.data_type).collect(),
+        }
+    }
 }
 
 /// What an expression reads, one bit per scope of the chain: bit 0 the
@@ -413,7 +463,7 @@ impl Chain<'_> {
             Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => {
                 Ok(self.resolve(expr)?.map_or(0, |(depth, _)| 1 << depth))
             }
-            Expression::ScalarSubquery(_) => Ok(1),
+            Expression::ScalarSubquery(_) | Expression::Exists(_) => Ok(1),
             other => {
                 let mut reads = 0;
                 for_each_child(other, &mut |child| {
@@ -830,18 +880,21 @@ pub struct PreparedSelect {
     /// The conjuncts without a subquery, which the scan is narrowed by
     pushdown: Option<Expression>,
     /// Indexed by subquery id, nested ones included
-    subqueries: Vec<PreparedScalarSubquery>,
+    subqueries: Vec<PreparedSubquery>,
+    /// A top-level EXISTS or NOT EXISTS conjunct with one key, whose keyed
+    /// set's keys name the rows the WHERE may pass
+    narrowing: Option<Narrowing>,
     projection: PreparedProjection,
     output_columns: CompactArc<Vec<String>>,
     /// The output columns the statement shows; the sort's keys follow them
     visible: usize,
 }
 
-/// A scalar subquery over one table, prepared as its own scope: every
-/// value it reads from an enclosing scope becomes a parameter slot, filled
-/// per call by a hole program over the row it runs for
+/// A subquery over one table, prepared as its own scope: every value it
+/// reads from an enclosing scope becomes a parameter slot, filled per call
+/// by a hole program over the row it runs for
 #[derive(Debug)]
-struct PreparedScalarSubquery {
+struct PreparedSubquery {
     /// The inner table's name as the catalog knows it
     table: SmartString,
     column_indices: Vec<usize>,
@@ -852,15 +905,82 @@ struct PreparedScalarSubquery {
     /// Every conjunct is one the scan takes: a call that pushes them all
     /// has the scan's answer, as the general path does, and skips the filter
     pushed_whole: bool,
+    /// An EXISTS block's correlation equalities, which pick its candidate rows
+    candidates: Option<SharedProgram>,
+    /// The WHERE; for an EXISTS block, what of it the candidates leave
     filter: Option<SharedProgram>,
-    projection: SharedProgram,
+    answer: Answer,
     /// The subquery whose row this one runs for; None for the statement's row
     parent: Option<u16>,
-    /// Programs over that row, each filling one slot, including values a
-    /// deeper subquery reads from it
-    holes: Vec<(usize, SharedProgram)>,
+    /// What fills each slot from that row, including values a deeper
+    /// subquery reads from it
+    holes: Vec<(usize, Hole)>,
     /// Reads no enclosing scope: its value is computed once per run
     uncorrelated: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Narrowing {
+    /// The block's id
+    id: u16,
+    /// The statement column its key is
+    column: usize,
+    /// It is the whole WHERE
+    whole: bool,
+    /// NOT EXISTS: the rows its keys do not name
+    negated: bool,
+}
+
+/// One slot's value over the row a subquery runs for
+#[derive(Debug)]
+enum Hole {
+    /// A column of that row, copied without a program
+    Column(usize),
+    Program(SharedProgram),
+}
+
+impl Hole {
+    fn value(&self, vm: &mut ExprVM, row: &Row, ctx: &ExecuteContext) -> Result<Value> {
+        match self {
+            Hole::Column(index) => Ok(row.get(*index).cloned().unwrap_or_else(Value::null_unknown)),
+            Hole::Program(program) => vm.execute(program, ctx),
+        }
+    }
+}
+
+/// What a subquery block answers
+#[derive(Debug)]
+enum Answer {
+    /// Its one row's SELECT expression, NULL for no row
+    Value(SharedProgram),
+    /// Whether a candidate row passes its WHERE
+    Exists(Existence),
+}
+
+/// What an EXISTS block needs beyond its probe
+#[derive(Debug)]
+struct Existence {
+    /// The block as written: what a result kept across statements is of
+    identity: Arc<Expression>,
+    identity_key: ExprKey,
+    /// Every table the block and the blocks in it read
+    tables: Vec<SmartString>,
+    /// Its candidates grouped by key once per run, when that answers as the probe
+    keyed: Option<KeyedPlan>,
+}
+
+/// An EXISTS block that reads its parent only through `own column =
+/// parent column` equalities of one type a hash tells apart
+#[derive(Debug)]
+struct KeyedPlan {
+    /// Each key's own column, the slot its parent value fills, and the
+    /// parent's column that value is
+    keys: Vec<(usize, usize, usize)>,
+    /// The comparisons of what the keys leave of the WHERE that the scan takes
+    pushdown: Vec<PreparedComparison>,
+    pushed_whole: bool,
+    /// The WHERE is the keys alone, which is when a probe may be cheaper
+    pure: bool,
 }
 
 /// `column operator value` with the column resolved at preparation; only
@@ -998,6 +1118,8 @@ enum Output {
 #[derive(Debug)]
 struct PreparedProjection {
     outputs: Vec<Output>,
+    /// The outputs are the row's columns in order: each row is its own projection
+    whole_row: bool,
 }
 
 /// What preparing one statement builds up
@@ -1006,7 +1128,7 @@ struct Builder<'e> {
     /// The next free parameter slot
     next_slot: usize,
     /// Indexed by subquery id; None while that subquery is being prepared
-    subqueries: Vec<Option<PreparedScalarSubquery>>,
+    subqueries: Vec<Option<PreparedSubquery>>,
     named: Vec<SmartString>,
     /// The highest positional parameter the statement reads, one-based
     max_param: usize,
@@ -1082,45 +1204,63 @@ impl Builder<'_> {
                 }
             }
             Expression::ScalarSubquery(nested) => {
-                let (nested_id, delegated, reads_this_row) =
-                    self.subquery(&nested.subquery, chain.scopes, id)?;
-                work.reads_row |= reads_this_row;
-                for (slot, value, depth) in delegated {
-                    if depth == 2 {
-                        work.reads_parent = true;
-                        work.holes.push((slot, value));
-                    } else {
-                        work.delegated.push((slot, value, depth - 1));
-                    }
-                }
-                // Compiled by its id only: the node is a mark, not a copy of the block
-                let node = ScalarSubquery {
+                let mark = self.nested(chain, id, &nested.subquery, None, work)?;
+                Ok(Expression::ScalarSubquery(ScalarSubquery {
                     token: nested.token.clone(),
-                    subquery: Box::new(SelectStatement {
-                        token: nested.subquery.token.clone(),
-                        distinct: false,
-                        distinct_on: Vec::new(),
-                        columns: Vec::new(),
-                        with: None,
-                        table_expr: None,
-                        where_clause: None,
-                        group_by: GroupByClause::default(),
-                        having: None,
-                        window_defs: Vec::new(),
-                        order_by: Vec::new(),
-                        limit: None,
-                        offset: None,
-                        set_operations: Vec::new(),
-                    }),
-                };
-                work.ids.insert(
-                    &*node.subquery as *const SelectStatement as usize,
-                    nested_id,
-                );
-                Ok(Expression::ScalarSubquery(node))
+                    subquery: mark,
+                }))
+            }
+            Expression::Exists(nested) => {
+                let mark = self.nested(chain, id, &nested.subquery, Some(nested), work)?;
+                Ok(Expression::Exists(ExistsExpression {
+                    token: nested.token.clone(),
+                    subquery: mark,
+                }))
             }
             other => rebuild(other, &mut |child| self.rewrite(chain, id, child, work)),
         }
+    }
+
+    /// Prepare the block `sq` nested in the block whose chain is `chain`,
+    /// passing on what it reads beyond that block. Returns the mark the
+    /// program compiles by its id: a mark, not a copy of the block
+    fn nested(
+        &mut self,
+        chain: &Chain<'_>,
+        id: Option<u16>,
+        sq: &SelectStatement,
+        exists: Option<&ExistsExpression>,
+        work: &mut Rewritten,
+    ) -> Result<Box<SelectStatement>> {
+        let (nested_id, delegated, reads_this_row) = self.subquery(sq, chain.scopes, id, exists)?;
+        work.reads_row |= reads_this_row;
+        for (slot, value, depth) in delegated {
+            if depth == 2 {
+                work.reads_parent = true;
+                work.holes.push((slot, value));
+            } else {
+                work.delegated.push((slot, value, depth - 1));
+            }
+        }
+        let mark = Box::new(SelectStatement {
+            token: sq.token.clone(),
+            distinct: false,
+            distinct_on: Vec::new(),
+            columns: Vec::new(),
+            with: None,
+            table_expr: None,
+            where_clause: None,
+            group_by: GroupByClause::default(),
+            having: None,
+            window_defs: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            set_operations: Vec::new(),
+        });
+        work.ids
+            .insert(&*mark as *const SelectStatement as usize, nested_id);
+        Ok(mark)
     }
 
     /// A top-level conjunct of a subquery block's WHERE: the value an own
@@ -1184,14 +1324,15 @@ impl Builder<'_> {
         });
     }
 
-    /// Prepare `sq`, run once per row of the scope `outer[0]`. Returns its
-    /// id, the values it reads from scopes beyond its parent, and whether
-    /// it reads its parent's row at all
+    /// Prepare `sq`, run once per row of the scope `outer[0]`, as the block
+    /// of `exists` or as a scalar block. Returns its id, the values it reads
+    /// from scopes beyond its parent, and whether it reads its parent's row
     fn subquery(
         &mut self,
         sq: &SelectStatement,
         outer: &[&ScopeTable],
         parent: Option<u16>,
+        exists: Option<&ExistsExpression>,
     ) -> Result<(u16, Vec<Delegated>, bool)> {
         let executor = self.executor;
         let registry = &executor.function_registry;
@@ -1205,15 +1346,13 @@ impl Builder<'_> {
                 Error::TableNotFound(_) => Error::TableOrViewNotFound(ts.name.value.to_string()),
                 other => other,
             })?;
-        let scope = ScopeTable {
-            name: ts
-                .alias
+        let scope = ScopeTable::of(
+            ts.alias
                 .as_ref()
                 .map_or(&ts.name.value_lower, |alias| &alias.value_lower)
                 .clone(),
-            columns: schema.column_names_arc(),
-            lower: schema.column_names_lower_arc(),
-        };
+            &schema,
+        );
         let id = u16::try_from(self.subqueries.len())
             .map_err(|_| Error::internal("too many prepared subqueries"))?;
         self.subqueries.push(None);
@@ -1223,68 +1362,198 @@ impl Builder<'_> {
         scopes.extend_from_slice(outer);
         let chain = Chain { scopes: &scopes };
         let mut work = Rewritten::default();
-        let select = unaliased(&sq.columns[0]);
-        let projection = self.rewrite(&chain, Some(id), select, &mut work)?;
+        let projection = match exists {
+            Some(_) => None,
+            None => Some(self.rewrite(&chain, Some(id), unaliased(&sq.columns[0]), &mut work)?),
+        };
         let where_clause = sq
             .where_clause
             .as_deref()
             .map(|w| with_aliases(w, &sq.columns, &scope.columns));
         let mut pushdown = Vec::new();
         let mut pushed_whole = true;
-        let filter = match &where_clause {
-            Some(where_clause) => {
-                let mut parts = Vec::new();
-                conjuncts(where_clause, &mut parts);
-                let mut rewritten = Vec::with_capacity(parts.len());
-                for part in parts {
-                    let part = self.rewrite_conjunct(&chain, id, part, &mut work)?;
-                    match PreparedComparison::from_conjunct(&part, &schema) {
-                        Some(comparison) => pushdown.push(comparison),
-                        None => pushed_whole = false,
-                    }
-                    rewritten.push(part);
+        // An EXISTS block's correlation equalities apart from the rest
+        let mut keys = Vec::new();
+        let mut key_parts = Vec::new();
+        let mut rest = Vec::new();
+        if let Some(where_clause) = &where_clause {
+            let mut parts = Vec::new();
+            conjuncts(where_clause, &mut parts);
+            for part in parts {
+                let key = match exists {
+                    Some(_) => correlation_key(&chain, part)?,
+                    None => None,
+                };
+                let part = self.rewrite_conjunct(&chain, id, part, &mut work)?;
+                match PreparedComparison::from_conjunct(&part, &schema) {
+                    Some(comparison) => pushdown.push(comparison),
+                    None => pushed_whole = false,
                 }
-                conjunction(rewritten)
+                match key.and_then(|key| Some((key, slot_compared(&part)?))) {
+                    Some((key, slot)) => {
+                        keys.push((key, slot));
+                        key_parts.push(part);
+                    }
+                    None => rest.push(part),
+                }
             }
-            None => None,
-        };
+        }
+        let candidates = conjunction(key_parts);
+        let filter = conjunction(rest);
 
         let mut read_as = FxHashMap::default();
-        if let Some(filter) = &filter {
-            compare_as_scan(filter, &schema, &mut read_as);
+        for expr in candidates.iter().chain(&filter) {
+            compare_as_scan(expr, &schema, &mut read_as);
         }
         let own = CompileContext::new(&scope.columns, registry)
             .with_subquery_ids(&work.ids)
             .with_read_as(&read_as);
-        let projection = compile_with(&own, &projection)?;
-        let filter = match &filter {
-            Some(filter) => Some(compile_with(&own, filter)?),
-            None => None,
+        let compile = |expr: &Option<Expression>| match expr {
+            Some(expr) => compile_with(&own, expr).map(Some),
+            None => Ok(None),
         };
+        let answer = match exists {
+            None => Answer::Value(compile(&projection)?.ok_or_else(|| {
+                Error::internal("a prepared scalar subquery without a SELECT expression")
+            })?),
+            Some(exists) => {
+                let identity = Expression::Exists(exists.clone());
+                let keyed = self.keyed(&chain, &keys, &work, &identity).then(|| {
+                    let mut pushdown = Vec::new();
+                    let mut pushed_whole = true;
+                    let mut parts = Vec::new();
+                    if let Some(filter) = &filter {
+                        conjuncts(filter, &mut parts);
+                    }
+                    for part in &parts {
+                        match PreparedComparison::from_conjunct(part, &schema) {
+                            Some(comparison) => pushdown.push(comparison),
+                            None => pushed_whole = false,
+                        }
+                    }
+                    KeyedPlan {
+                        keys: keys
+                            .iter()
+                            .map(|((own, _, parent), slot)| (*own, *slot, *parent))
+                            .collect(),
+                        pushdown,
+                        pushed_whole,
+                        pure: filter.is_none(),
+                    }
+                });
+                Answer::Exists(Existence {
+                    identity_key: ExprKey::of(&identity),
+                    identity: Arc::new(identity),
+                    tables: vec![ts.name.value_lower.clone()],
+                    keyed,
+                })
+            }
+        };
+        let candidates = compile(&candidates)?;
+        let filter = compile(&filter)?;
         let holes = if work.holes.is_empty() {
             Vec::new()
         } else {
             let parent = CompileContext::new(&outer[0].columns, registry);
+            let column = |hole: &Expression| {
+                bound_column(hole).and_then(|name| outer[0].lower.iter().position(|c| c == name))
+            };
             work.holes
                 .iter()
-                .map(|(slot, hole)| compile_with(&parent, hole).map(|p| (*slot, p)))
+                .map(|(slot, hole)| match column(hole) {
+                    Some(index) => Ok((*slot, Hole::Column(index))),
+                    None => compile_with(&parent, hole).map(|p| (*slot, Hole::Program(p))),
+                })
                 .collect::<Result<Vec<_>>>()?
         };
         let correlated = work.reads_parent || !work.delegated.is_empty();
-        self.subqueries[id as usize] = Some(PreparedScalarSubquery {
+        self.subqueries[id as usize] = Some(PreparedSubquery {
             table: ts.name.value_lower.clone(),
             column_indices: (0..scope.columns.len()).collect(),
             schema: CompactArc::clone(&schema),
             pushdown,
             pushed_whole,
+            candidates,
             filter,
-            projection,
+            answer,
             parent,
             holes,
             uncorrelated: !correlated,
         });
         Ok((id, work.delegated, work.reads_parent))
     }
+
+    /// Whether an EXISTS block whose correlation equalities are `keys`
+    /// answers by a keyed set as its probe does: it reads its parent through
+    /// them alone, holds nothing volatile, and each key's two columns are of
+    /// one type whose equality is its hash's
+    fn keyed(
+        &self,
+        chain: &Chain<'_>,
+        keys: &[((usize, usize, usize), usize)],
+        work: &Rewritten,
+        identity: &Expression,
+    ) -> bool {
+        let key_slot = |slot: usize| keys.iter().any(|(_, key)| *key == slot);
+        !keys.is_empty()
+            && work.delegated.is_empty()
+            && keys.iter().all(|((own, depth, index), _)| {
+                let own = chain.scopes[0].types[*own];
+                *depth == 1
+                    && own == chain.scopes[1].types[*index]
+                    && matches!(
+                        own,
+                        DataType::Integer
+                            | DataType::Text
+                            | DataType::Boolean
+                            | DataType::Timestamp
+                    )
+            })
+            && work
+                .holes
+                .iter()
+                .all(|(slot, hole)| key_slot(*slot) || !reads_row_column(hole))
+            && !volatile(identity, &self.executor.function_registry)
+    }
+}
+
+/// `own column = enclosing column` as the own column, the enclosing
+/// scope's depth and that scope's column, when `conjunct` is one
+fn correlation_key(
+    chain: &Chain<'_>,
+    conjunct: &Expression,
+) -> Result<Option<(usize, usize, usize)>> {
+    let Expression::Infix(infix) = conjunct else {
+        return Ok(None);
+    };
+    if infix.op_type != InfixOperator::Equal {
+        return Ok(None);
+    }
+    Ok(
+        match (chain.resolve(&infix.left)?, chain.resolve(&infix.right)?) {
+            (Some((0, own)), Some((depth, index))) | (Some((depth, index)), Some((0, own)))
+                if depth > 0 =>
+            {
+                Some((own, depth, index))
+            }
+            _ => None,
+        },
+    )
+}
+
+/// The slot a rewritten correlation equality compares its own column with
+fn slot_compared(conjunct: &Expression) -> Option<usize> {
+    let Expression::Infix(infix) = conjunct else {
+        return None;
+    };
+    [&infix.left, &infix.right]
+        .into_iter()
+        .find_map(|side| match side.as_ref() {
+            Expression::Parameter(p) if p.index > 0 && !p.name.starts_with(':') => {
+                Some(p.index - 1)
+            }
+            _ => None,
+        })
 }
 
 /// Whether the pushdown would have to evaluate part of `expr` itself:
@@ -1301,7 +1570,7 @@ fn needs_folding(expr: &Expression) -> bool {
 fn mentions_column(expr: &Expression) -> bool {
     match expr {
         Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => true,
-        Expression::ScalarSubquery(_) => true,
+        Expression::ScalarSubquery(_) | Expression::Exists(_) => true,
         other => {
             let mut mentions = false;
             let _ = for_each_child(other, &mut |child| {
@@ -1423,12 +1692,23 @@ impl PreparedProjection {
             outputs.push(Output::AliasKey(compile_with(&alias_ctx, key)?));
             extra_names.push(name);
         }
-        Ok((Self { outputs }, extra_names))
+        let whole_row = outputs.len() == columns.len()
+            && outputs
+                .iter()
+                .enumerate()
+                .all(|(i, output)| matches!(output, Output::Column(c) if *c == i));
+        Ok((Self { outputs, whole_row }, extra_names))
     }
 
     fn project(&self, mut rows: RowVec, ctx: &ExecutionContext) -> Result<RowVec> {
-        let mut vm = ExprVM::new();
         let mut projected = RowVec::with_capacity(rows.len());
+        if self.whole_row {
+            for (row_id, row) in rows.drain_rows().enumerate() {
+                projected.push((row_id as i64, row));
+            }
+            return Ok(projected);
+        }
+        let mut vm = ExprVM::new();
         for (row_id, row) in rows.drain_rows().enumerate() {
             let mut values = Vec::with_capacity(self.outputs.len());
             let exec = ExecuteContext::with_common_params(
@@ -1477,11 +1757,7 @@ impl PreparedSelect {
         epoch: u64,
     ) -> Result<Self> {
         let registry = &executor.function_registry;
-        let scope = ScopeTable {
-            name: scope_name.clone(),
-            columns: schema.column_names_arc(),
-            lower: schema.column_names_lower_arc(),
-        };
+        let scope = ScopeTable::of(scope_name.clone(), schema);
         let scopes = [&scope];
         let chain = Chain { scopes: &scopes };
         let mut builder = Builder {
@@ -1503,13 +1779,32 @@ impl PreparedSelect {
         let mut rewritten = Vec::with_capacity(parts.len());
         let mut run_slots = Vec::new();
         let mut pushed = Vec::new();
+        let mut exists_conjuncts = Vec::new();
         for part in parts {
             let part = builder.statement_conjunct(&chain, part, &mut work, &mut run_slots)?;
             if !mentions_subquery(&part) && !needs_folding(&part) && scans_whole(&part, schema) {
                 pushed.push(part.clone());
             }
+            let exists = match &part {
+                Expression::Exists(mark) => Some((mark, false)),
+                Expression::Prefix(prefix) if prefix.op_type == PrefixOperator::Not => {
+                    match prefix.right.as_ref() {
+                        Expression::Exists(mark) => Some((mark, true)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some((mark, negated)) = exists {
+                exists_conjuncts.extend(
+                    work.ids
+                        .get(&(&*mark.subquery as *const SelectStatement as usize))
+                        .map(|&id| (id, negated)),
+                );
+            }
             rewritten.push(part);
         }
+        let rewritten_count = rewritten.len();
         let where_clause = conjunction(rewritten)
             .ok_or_else(|| Error::internal("a prepared statement without WHERE"))?;
         let mut read_as = FxHashMap::default();
@@ -1561,11 +1856,37 @@ impl PreparedSelect {
         };
         let visible = output_columns.len();
         output_columns.extend(extra_names);
-        let subqueries = builder
+        let mut subqueries = builder
             .subqueries
             .into_iter()
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| Error::internal("a prepared subquery left unfinished"))?;
+        let narrowing = exists_conjuncts.iter().find_map(|&(id, negated)| {
+            match &subqueries[id as usize].answer {
+                Answer::Exists(Existence {
+                    keyed: Some(plan), ..
+                }) if plan.keys.len() == 1 => Some(Narrowing {
+                    id,
+                    column: plan.keys[0].2,
+                    whole: rewritten_count == 1,
+                    negated,
+                }),
+                _ => None,
+            }
+        });
+        // A block's tables include those of every block nested in it
+        for nested in 0..subqueries.len() {
+            let mut ancestor = subqueries[nested].parent;
+            while let Some(at) = ancestor {
+                let table = subqueries[nested].table.clone();
+                if let Answer::Exists(existence) = &mut subqueries[at as usize].answer {
+                    if !existence.tables.contains(&table) {
+                        existence.tables.push(table);
+                    }
+                }
+                ancestor = subqueries[at as usize].parent;
+            }
+        }
         Ok(Self {
             cached_epoch: epoch,
             columns: scope.columns.clone(),
@@ -1576,6 +1897,7 @@ impl PreparedSelect {
             run_slots,
             pushdown: conjunction(pushed),
             subqueries,
+            narrowing,
             projection,
             output_columns: CompactArc::new(output_columns),
             visible,
@@ -1585,7 +1907,7 @@ impl PreparedSelect {
 
 fn mentions_subquery(expr: &Expression) -> bool {
     match expr {
-        Expression::ScalarSubquery(_) => true,
+        Expression::ScalarSubquery(_) | Expression::Exists(_) => true,
         other => {
             let mut found = false;
             let _ = for_each_child(other, &mut |child| {
@@ -1805,7 +2127,18 @@ impl Executor {
             }
         }
 
-        let mut runner = PreparedRunner::new(&prepared, ctx, inner_ctx, tables);
+        let statement_limit = limit
+            .filter(|_| stmt.order_by.is_empty())
+            .map(|limit| i64::try_from(limit).unwrap_or(i64::MAX));
+        let mut runner = PreparedRunner::new(
+            self,
+            &prepared,
+            ctx,
+            inner_ctx,
+            tables,
+            table.row_count_hint(),
+            statement_limit,
+        );
         if !prepared.run_slots.is_empty() {
             let values = runner.run_slot_values()?;
             for (slot, value) in values {
@@ -1840,25 +2173,48 @@ impl Executor {
         let target = limit
             .filter(|_| stmt.order_by.is_empty())
             .map(|limit| limit.saturating_add(offset));
-        let all: Vec<usize> = (0..prepared.columns.len()).collect();
-        let mut scanner = table.scan(&all, storage_expr.as_deref())?;
         let mut vm = ExprVM::new();
         let mut rows = RowVec::with_capacity(64);
         let mut scanned = 0u64;
-        while target.is_none_or(|target| rows.len() < target) && scanner.next() {
-            scanned += 1;
-            if scanned.is_multiple_of(100) {
-                ctx.check_cancelled()?;
+        if let Some((candidates, passed)) = runner.narrowed_rows(&*table, target)? {
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::prepared_rows_narrowed_by_keys();
+            for (_, row) in candidates {
+                if target.is_some_and(|target| rows.len() >= target) {
+                    break;
+                }
+                scanned += 1;
+                if scanned.is_multiple_of(100) {
+                    ctx.check_cancelled()?;
+                }
+                // The conjuncts the scan would have taken, before the WHERE
+                if storage_expr
+                    .as_ref()
+                    .is_some_and(|expr| !expr.evaluate_fast(&row))
+                {
+                    continue;
+                }
+                if passed || runner.matches(&mut vm, &row)? {
+                    rows.push((scanned as i64, row));
+                }
             }
-            let row = scanner.take_row();
-            if runner.matches(&mut vm, &row)? {
-                rows.push((scanned as i64, row));
+        } else {
+            let all: Vec<usize> = (0..prepared.columns.len()).collect();
+            let mut scanner = table.scan(&all, storage_expr.as_deref())?;
+            while target.is_none_or(|target| rows.len() < target) && scanner.next() {
+                scanned += 1;
+                if scanned.is_multiple_of(100) {
+                    ctx.check_cancelled()?;
+                }
+                let row = scanner.take_row();
+                if runner.matches(&mut vm, &row)? {
+                    rows.push((scanned as i64, row));
+                }
+            }
+            if let Some(err) = scanner.err() {
+                return Err(err.clone());
             }
         }
-        if let Some(err) = scanner.err() {
-            return Err(err.clone());
-        }
-        drop(scanner);
         let limit_applied = target.is_some();
         if limit_applied {
             let keep = limit.unwrap_or(usize::MAX);
@@ -1881,7 +2237,17 @@ impl Executor {
 /// parameter buffer: the statement's parameters, then every slot, its
 /// parent's values copied in before its own holes are filled
 pub(crate) struct PreparedRunner<'a> {
+    executor: &'a Executor,
     prepared: &'a PreparedSelect,
+    /// The statement's own context, whose view and parameters a kept answer is of
+    statement: &'a ExecutionContext,
+    /// The statement table's rows, by its hint
+    statement_rows: usize,
+    /// The rows the statement stops at, when no ORDER BY reads them all
+    statement_limit: Option<i64>,
+    /// Each keyed EXISTS block's choice for this run, once made
+    keyed_choice: Vec<std::cell::Cell<Option<bool>>>,
+    keyed_sets: Vec<RefCell<Option<CompactArc<ExistsKeys>>>>,
     /// The statement's parameters, then its run slots; the other slots NULL
     base: ParamVec,
     named: &'a FxHashMap<String, Value>,
@@ -1918,16 +2284,25 @@ impl<'a> PreparedRunner<'a> {
     }
 
     fn new(
+        executor: &'a Executor,
         prepared: &'a PreparedSelect,
         ctx: &'a ExecutionContext,
         inner_ctx: ExecutionContext,
         tables: Vec<Box<dyn Table>>,
+        statement_rows: usize,
+        statement_limit: Option<i64>,
     ) -> Self {
         let mut base: ParamVec = ctx.params().iter().cloned().collect();
         base.resize(prepared.slot_count, Value::null_unknown());
         let count = prepared.subqueries.len();
         Self {
+            executor,
             prepared,
+            statement: ctx,
+            statement_rows,
+            statement_limit,
+            keyed_choice: (0..count).map(|_| std::cell::Cell::new(None)).collect(),
+            keyed_sets: (0..count).map(|_| RefCell::new(None)).collect(),
             buffers: (0..count).map(|_| RefCell::new(base.clone())).collect(),
             base,
             named: ctx.named_params(),
@@ -1990,6 +2365,356 @@ impl<'a> PreparedRunner<'a> {
             None => false,
         }
     }
+
+    /// The statement's rows its narrowing EXISTS may pass, read by the keys
+    /// of the block's keyed set when the run takes it, and whether each
+    /// passes the WHERE without asking it: the EXISTS is the whole WHERE and
+    /// no key holds an error; None to scan
+    fn narrowed_rows(
+        &self,
+        table: &dyn Table,
+        target: Option<usize>,
+    ) -> Result<Option<(RowVec, bool)>> {
+        let Some(Narrowing {
+            id,
+            column,
+            whole,
+            negated,
+        }) = self.prepared.narrowing
+        else {
+            return Ok(None);
+        };
+        let index = id as usize;
+        let sq = &self.prepared.subqueries[index];
+        let Answer::Exists(existence) = &sq.answer else {
+            return Ok(None);
+        };
+        let Some(plan) = &existence.keyed else {
+            return Ok(None);
+        };
+        if !self.takes_keyed_set(index, plan) {
+            return Ok(None);
+        }
+        // Over no row: the holes besides the keys read none
+        {
+            let mut vm = self.vms[index].borrow_mut();
+            let mut params = self.buffers[index].borrow_mut();
+            let empty = Row::new();
+            let exec = ExecuteContext::with_common_params(
+                &empty,
+                &self.base,
+                Some(self.named),
+                self.transaction_id,
+            );
+            for (slot, hole) in &sq.holes {
+                if !plan.keys.iter().any(|(_, key, _)| key == slot) {
+                    params[*slot] = hole.value(&mut vm, &empty, &exec)?;
+                }
+            }
+        }
+        let set = self.keyed_set(index, existence, plan)?;
+        let passed = whole && !set.failed;
+        // Only rows that pass without the WHERE may stop at the LIMIT
+        let enough = target.filter(|_| passed);
+        let column = &table.schema().columns[column].name_lower;
+        let rows = if negated {
+            // A key holding an error is not left out: its rows raise it
+            let passing = set
+                .outcomes
+                .iter()
+                .filter(|(_, outcome)| matches!(outcome, ExistsOutcome::Passed))
+                .filter_map(|(key, _)| key.first());
+            Executor::rows_without_members(table, column, passing, enough)?
+        } else {
+            let members = set.outcomes.keys().filter_map(|key| key.first());
+            Executor::rows_of_members(table, column, members, target.is_some(), enough)?
+        };
+        Ok(rows.map(|rows| (rows, passed)))
+    }
+
+    /// The subquery's parameter buffer for a call for `row`: its parent's
+    /// values, then its own holes
+    fn fill(&self, index: usize, vm: &mut ExprVM, row: &Row) -> Result<()> {
+        let sq = &self.prepared.subqueries[index];
+        let mut params = self.buffers[index].borrow_mut();
+        if let Some(parent) = sq.parent {
+            params.clone_from(&self.buffers[parent as usize].borrow());
+        }
+        let hole_ctx = ExecuteContext::with_common_params(
+            row,
+            &self.base,
+            Some(self.named),
+            self.transaction_id,
+        );
+        for (slot, hole) in &sq.holes {
+            params[*slot] = hole.value(vm, row, &hole_ctx)?;
+        }
+        Ok(())
+    }
+
+    /// Whether an EXISTS block's candidate passes for the buffer filled:
+    /// TRUE at the first that does; else the first error a candidate
+    /// raised; else FALSE
+    fn probe(&self, index: usize) -> Result<bool> {
+        self.ctx.check_cancelled()?;
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::prepared_exists_probed();
+        let sq = &self.prepared.subqueries[index];
+        let mut vm = self.vms[index].borrow_mut();
+        let params = self.buffers[index].borrow();
+        let table = &*self.tables[index];
+        let pushed = self.bind_pushdown(index, &params);
+        let mut scanner = if pushed {
+            let bound = self.bound[index].borrow();
+            table.scan(&sq.column_indices, bound.as_ref().map(BoundPushdown::expr))?
+        } else {
+            table.scan(&sq.column_indices, None)?
+        };
+        let decided = pushed && sq.pushed_whole;
+        let mut failed = None;
+        while scanner.next() {
+            if !decided {
+                let exec = ExecuteContext::with_common_params(
+                    scanner.row(),
+                    &params,
+                    Some(self.named),
+                    self.transaction_id,
+                )
+                .with_subquery_executor(self);
+                if let Some(candidates) = &sq.candidates {
+                    if !vm.execute_bool_checked(candidates, &exec)? {
+                        continue;
+                    }
+                }
+                if let Some(filter) = &sq.filter {
+                    match vm.execute_bool_checked(filter, &exec) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(e) => {
+                            failed.get_or_insert(e);
+                            continue;
+                        }
+                    }
+                }
+            }
+            return Ok(true);
+        }
+        if let Some(err) = scanner.err() {
+            return Err(err.clone());
+        }
+        failed.map_or(Ok(false), Err)
+    }
+
+    /// Whether this run answers the block by its keyed set: decided on its
+    /// first call, by the rule the general path's index nested loop uses
+    fn takes_keyed_set(&self, index: usize, plan: &KeyedPlan) -> bool {
+        if let Some(keyed) = self.keyed_choice[index].get() {
+            return keyed;
+        }
+        #[cfg(feature = "test-failpoints")]
+        let forced = crate::test_failpoints::forced_exists_strategy();
+        #[cfg(not(feature = "test-failpoints"))]
+        let forced: Option<bool> = None;
+        let keyed = forced.unwrap_or_else(|| !(plan.pure && self.probe_cheaper(index, plan)));
+        self.keyed_choice[index].set(Some(keyed));
+        keyed
+    }
+
+    /// The general path's rule for its index nested loop, with the parent
+    /// block's rows as the outer rows; only the statement's LIMIT counts
+    fn probe_cheaper(&self, index: usize, plan: &KeyedPlan) -> bool {
+        let sq = &self.prepared.subqueries[index];
+        let parent_rows = match sq.parent {
+            Some(parent) => self.tables[parent as usize].row_count_hint(),
+            None => self.statement_rows,
+        };
+        Executor::probe_cheaper(
+            &*self.tables[index],
+            &sq.schema.columns[plan.keys[0].0].name,
+            self.statement_limit.filter(|_| sq.parent.is_none()),
+            Some(parent_rows),
+        )
+    }
+
+    /// The keyed set's answer for the buffer filled: FALSE for a NULL key
+    fn keyed_lookup(&self, index: usize, existence: &Existence, plan: &KeyedPlan) -> Result<bool> {
+        if self.keyed_sets[index].borrow().is_none() {
+            self.keyed_set(index, existence, plan)?;
+        }
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::prepared_exists_looked_up();
+        let sets = self.keyed_sets[index].borrow();
+        let set = sets
+            .as_ref()
+            .ok_or_else(|| Error::internal("a keyed set not built"))?;
+        let params = self.buffers[index].borrow();
+        let outcome = match plan.keys.as_slice() {
+            [(_, slot, _)] => {
+                let key = &params[*slot];
+                if key.is_null() {
+                    return Ok(false);
+                }
+                set.outcomes.get(std::slice::from_ref(key))
+            }
+            keys => {
+                let mut key: SmallVec<[Value; 4]> = SmallVec::with_capacity(keys.len());
+                for (_, slot, _) in keys {
+                    if params[*slot].is_null() {
+                        return Ok(false);
+                    }
+                    key.push(params[*slot].clone());
+                }
+                set.outcomes.get(key.as_slice())
+            }
+        };
+        match outcome {
+            Some(ExistsOutcome::Passed) => Ok(true),
+            Some(ExistsOutcome::Failed(e)) => Err(e.clone()),
+            None => Ok(false),
+        }
+    }
+
+    /// The block's keyed set, built on first need or taken from a run
+    /// before whose stamp still holds
+    fn keyed_set(
+        &self,
+        index: usize,
+        existence: &Existence,
+        plan: &KeyedPlan,
+    ) -> Result<CompactArc<ExistsKeys>> {
+        if let Some(set) = self.keyed_sets[index].borrow().as_ref() {
+            return Ok(CompactArc::clone(set));
+        }
+        let answer = self.kept(existence, || {
+            self.build_keyed_set(index, plan)
+                .map(|set| ExistsAnswer::Keyed(CompactArc::new(set)))
+        })?;
+        let ExistsAnswer::Keyed(set) = answer else {
+            return Err(Error::internal("a value kept for a keyed set"));
+        };
+        *self.keyed_sets[index].borrow_mut() = Some(CompactArc::clone(&set));
+        Ok(set)
+    }
+
+    /// Every candidate of the block grouped by its key: whether one passed
+    /// what the keys leave of the WHERE, or else the first error one raised.
+    /// A row with a NULL key is no key's candidate
+    fn build_keyed_set(&self, index: usize, plan: &KeyedPlan) -> Result<ExistsKeys> {
+        #[cfg(feature = "test-failpoints")]
+        {
+            crate::test_failpoints::prepared_exists_set_built();
+            crate::test_failpoints::inner_table_read_whole();
+        }
+        let sq = &self.prepared.subqueries[index];
+        let mut vm = self.vms[index].borrow_mut();
+        let params = self.buffers[index].borrow();
+        let values: Option<Vec<Value>> = plan
+            .pushdown
+            .iter()
+            .map(|c| c.value(&params, self.named))
+            .collect();
+        let mut bound = None;
+        if let Some(values) = values.filter(|_| !plan.pushdown.is_empty()) {
+            BoundPushdown::bind(&plan.pushdown, &mut bound, values);
+        }
+        let table = &*self.tables[index];
+        let mut scanner =
+            table.scan(&sq.column_indices, bound.as_ref().map(BoundPushdown::expr))?;
+        let decided = bound.is_some() && plan.pushed_whole;
+        let mut set = ExistsKeys::default();
+        let mut scanned = 0u64;
+        'rows: while scanner.next() {
+            scanned += 1;
+            if scanned.is_multiple_of(100) {
+                self.ctx.check_cancelled()?;
+            }
+            let row = scanner.row();
+            let mut key: SmallVec<[Value; 1]> = SmallVec::with_capacity(plan.keys.len());
+            for (column, _, _) in &plan.keys {
+                match row.get(*column) {
+                    Some(value) if !value.is_null() => key.push(value.clone()),
+                    _ => continue 'rows,
+                }
+            }
+            if matches!(
+                set.outcomes.get(key.as_slice()),
+                Some(ExistsOutcome::Passed)
+            ) {
+                continue;
+            }
+            let outcome = match sq.filter.as_ref().filter(|_| !decided) {
+                None => ExistsOutcome::Passed,
+                Some(filter) => {
+                    let exec = ExecuteContext::with_common_params(
+                        row,
+                        &params,
+                        Some(self.named),
+                        self.transaction_id,
+                    )
+                    .with_subquery_executor(self);
+                    match vm.execute_bool_checked(filter, &exec) {
+                        Ok(true) => ExistsOutcome::Passed,
+                        Ok(false) => continue,
+                        Err(e) => ExistsOutcome::Failed(e),
+                    }
+                }
+            };
+            match set.outcomes.entry(key) {
+                std::collections::hash_map::Entry::Occupied(mut kept) => {
+                    if matches!(outcome, ExistsOutcome::Passed) {
+                        kept.insert(outcome);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(free) => {
+                    free.insert(outcome);
+                }
+            }
+        }
+        if let Some(err) = scanner.err() {
+            return Err(err.clone());
+        }
+        set.failed = set
+            .outcomes
+            .values()
+            .any(|outcome| matches!(outcome, ExistsOutcome::Failed(_)));
+        Ok(set)
+    }
+
+    /// The block's answer for this run: kept from a run before when its
+    /// stamp still holds, else computed and kept under the stamp taken
+    /// before the read, where the run may keep one
+    fn kept(
+        &self,
+        existence: &Existence,
+        compute: impl FnOnce() -> Result<ExistsAnswer>,
+    ) -> Result<ExistsAnswer> {
+        let statement = self.statement;
+        let keeps = Executor::reads_cacheable_rows(statement)
+            && !Executor::expression_varies_by_statement(&existence.identity, statement);
+        let stamp = if keeps {
+            self.executor
+                .subquery_cache_stamp(&existence.tables, statement.statement_view())
+        } else {
+            None
+        };
+        let origin = ExistsOrigin {
+            block: &existence.identity,
+            block_key: existence.identity_key,
+            params: statement.params(),
+            named_params: statement.named_params(),
+        };
+        let key = origin.key();
+        if let Some(stamp) = &stamp {
+            if let Some(answer) = get_cached_exists_answer(&origin, key, stamp) {
+                return Ok(answer);
+            }
+        }
+        let answer = compute()?;
+        if let Some(stamp) = stamp {
+            cache_exists_answer(&origin, key, stamp, answer.clone());
+        }
+        Ok(answer)
+    }
 }
 
 impl SubqueryExecutor for PreparedRunner<'_> {
@@ -2008,22 +2733,11 @@ impl SubqueryExecutor for PreparedRunner<'_> {
         self.ctx.check_cancelled()?;
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::prepared_scalar_next();
+        let Answer::Value(projection) = &sq.answer else {
+            return Err(Error::internal("an EXISTS block run for a value"));
+        };
         let mut vm = self.vms[index].borrow_mut();
-        {
-            let mut params = self.buffers[index].borrow_mut();
-            if let Some(parent) = sq.parent {
-                params.clone_from(&self.buffers[parent as usize].borrow());
-            }
-            let hole_ctx = ExecuteContext::with_common_params(
-                row,
-                &self.base,
-                Some(self.named),
-                self.transaction_id,
-            );
-            for (slot, hole) in &sq.holes {
-                params[*slot] = vm.execute(hole, &hole_ctx)?;
-            }
-        }
+        self.fill(index, &mut vm, row)?;
         // Read-only from here on: a nested subquery copies these values
         let params = self.buffers[index].borrow();
         let table = &*self.tables[index];
@@ -2056,7 +2770,7 @@ impl SubqueryExecutor for PreparedRunner<'_> {
                     message: "scalar subquery returned more than one row".to_string(),
                 });
             }
-            value = Some(vm.execute(&sq.projection, &exec)?);
+            value = Some(vm.execute(projection, &exec)?);
         }
         if let Some(err) = scanner.err() {
             return Err(err.clone());
@@ -2068,8 +2782,41 @@ impl SubqueryExecutor for PreparedRunner<'_> {
         Ok(value)
     }
 
-    fn execute_exists(&self, _subquery_index: u16, _row: &Row) -> Result<bool> {
-        Err(Error::internal("EXISTS is not prepared"))
+    fn execute_exists(&self, subquery_index: u16, row: &Row) -> Result<bool> {
+        let index = subquery_index as usize;
+        let sq = self
+            .prepared
+            .subqueries
+            .get(index)
+            .ok_or_else(|| Error::internal("unknown prepared subquery"))?;
+        let Answer::Exists(existence) = &sq.answer else {
+            return Err(Error::internal("a scalar block run for EXISTS"));
+        };
+        if sq.uncorrelated {
+            if let Some(Value::Boolean(exists)) = self.values[index].borrow().as_ref() {
+                return Ok(*exists);
+            }
+        }
+        self.fill(index, &mut self.vms[index].borrow_mut(), row)?;
+        let exists = if sq.uncorrelated {
+            match self.kept(existence, || self.probe(index).map(ExistsAnswer::Once))? {
+                ExistsAnswer::Once(exists) => exists,
+                ExistsAnswer::Keyed(_) => {
+                    return Err(Error::internal("a keyed set kept for a value"))
+                }
+            }
+        } else {
+            match &existence.keyed {
+                Some(plan) if self.takes_keyed_set(index, plan) => {
+                    self.keyed_lookup(index, existence, plan)?
+                }
+                _ => self.probe(index)?,
+            }
+        };
+        if sq.uncorrelated {
+            *self.values[index].borrow_mut() = Some(Value::Boolean(exists));
+        }
+        Ok(exists)
     }
 
     fn execute_in(&self, _subquery_index: u16, _value: &Value, _row: &Row) -> Result<Option<bool>> {
