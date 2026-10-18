@@ -1982,6 +1982,10 @@ impl Executor {
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<Vec<crate::core::Value>> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::general_path_reached(
+            crate::test_failpoints::GeneralPath::InSubquery,
+        );
         // Check if this is a non-correlated subquery (no outer row context)
         // Non-correlated subqueries can be cached since they return the same result
         let is_non_correlated =

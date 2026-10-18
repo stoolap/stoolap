@@ -593,18 +593,39 @@ pub struct ExistsKeys {
     pub failed: bool,
 }
 
-/// A prepared EXISTS block's answer for a whole run
+/// A value block's members as one test asks them
+#[derive(Debug)]
+pub enum MemberSet {
+    In(PredicateSet),
+    Quantified(super::expression::QuantifiedMembers),
+}
+
+/// A value block's members for a whole run, and the first error one of
+/// its candidates raised
+#[derive(Debug)]
+pub struct KeptMembers {
+    pub set: MemberSet,
+    pub failed: Option<crate::core::Error>,
+}
+
+/// A correlated IN block's members grouped by key
+pub type MemberKeys = FxHashMap<SmallVec<[Value; 1]>, KeptMembers>;
+
+/// A prepared block's answer for a whole run
 #[derive(Debug, Clone)]
-pub enum ExistsAnswer {
-    /// An uncorrelated block's value
+pub enum BlockAnswer {
+    /// An uncorrelated EXISTS block's value
     Once(bool),
     Keyed(CompactArc<ExistsKeys>),
+    /// An uncorrelated value block's members
+    Members(CompactArc<KeptMembers>),
+    KeyedMembers(CompactArc<MemberKeys>),
 }
 
 /// What a prepared EXISTS answer is of: the block as written, its key, the
 /// scopes around it its names bind in, and every parameter value of the
 /// statement
-pub(crate) struct ExistsOrigin<'a> {
+pub(crate) struct BlockOrigin<'a> {
     pub block: &'a Arc<crate::parser::ast::Expression>,
     pub block_key: super::expr_key::ExprKey,
     pub scopes: &'a Arc<str>,
@@ -612,15 +633,15 @@ pub(crate) struct ExistsOrigin<'a> {
     pub named_params: &'a FxHashMap<String, Value>,
 }
 
-/// An `ExistsOrigin` as its cache entry keeps it
-struct KeptExistsOrigin {
+/// An `BlockOrigin` as its cache entry keeps it
+struct KeptBlockOrigin {
     block: Arc<crate::parser::ast::Expression>,
     scopes: Arc<str>,
     params: Vec<Value>,
     named_params: FxHashMap<String, Value>,
 }
 
-impl ExistsOrigin<'_> {
+impl BlockOrigin<'_> {
     /// The cache key, taken without allocation
     pub fn key(&self) -> u64 {
         let mut hasher = rustc_hash::FxHasher::default();
@@ -640,7 +661,7 @@ impl ExistsOrigin<'_> {
         hasher.finish()
     }
 
-    fn is(&self, kept: &KeptExistsOrigin) -> bool {
+    fn is(&self, kept: &KeptBlockOrigin) -> bool {
         (Arc::ptr_eq(self.block, &kept.block) || **self.block == *kept.block)
             && (Arc::ptr_eq(self.scopes, &kept.scopes) || **self.scopes == *kept.scopes)
             && kept.params.len() == self.params.len()
@@ -659,24 +680,24 @@ impl ExistsOrigin<'_> {
 }
 
 thread_local! {
-    static EXISTS_ANSWER_CACHE: RefCell<
-        LruCache<u64, (KeptExistsOrigin, SubqueryStamp, ExistsAnswer)>,
+    static BLOCK_ANSWER_CACHE: RefCell<
+        LruCache<u64, (KeptBlockOrigin, SubqueryStamp, BlockAnswer)>,
     > = RefCell::new(LruCache::new(NonZeroUsize::new(SEMI_JOIN_CACHE_SIZE).unwrap()));
 }
 
 /// Clear the prepared EXISTS answer cache completely
-pub fn clear_exists_answer_cache() {
-    EXISTS_ANSWER_CACHE.with(|cache| cache.borrow_mut().clear());
+pub fn clear_block_answer_cache() {
+    BLOCK_ANSWER_CACHE.with(|cache| cache.borrow_mut().clear());
 }
 
 /// The answer kept for `origin` under `stamp`; one read under another
 /// stamp is dropped
-pub(crate) fn get_cached_exists_answer(
-    origin: &ExistsOrigin<'_>,
+pub(crate) fn get_cached_block_answer(
+    origin: &BlockOrigin<'_>,
     key: u64,
     stamp: &SubqueryStamp,
-) -> Option<ExistsAnswer> {
-    EXISTS_ANSWER_CACHE.with(|cache| {
+) -> Option<BlockAnswer> {
+    BLOCK_ANSWER_CACHE.with(|cache| {
         let mut c = cache.borrow_mut();
         match c.get(&key) {
             Some((kept, kept_stamp, answer)) if origin.is(kept) => {
@@ -694,19 +715,19 @@ pub(crate) fn get_cached_exists_answer(
 }
 
 /// Keep an answer under the stamp taken before its read
-pub(crate) fn cache_exists_answer(
-    origin: &ExistsOrigin<'_>,
+pub(crate) fn cache_block_answer(
+    origin: &BlockOrigin<'_>,
     key: u64,
     stamp: SubqueryStamp,
-    answer: ExistsAnswer,
+    answer: BlockAnswer,
 ) {
-    let kept = KeptExistsOrigin {
+    let kept = KeptBlockOrigin {
         block: Arc::clone(origin.block),
         scopes: Arc::clone(origin.scopes),
         params: origin.params.to_vec(),
         named_params: origin.named_params.clone(),
     };
-    EXISTS_ANSWER_CACHE.with(|cache| cache.borrow_mut().put(key, (kept, stamp, answer)));
+    BLOCK_ANSWER_CACHE.with(|cache| cache.borrow_mut().put(key, (kept, stamp, answer)));
 }
 
 // Cache for EXISTS predicate filters to avoid re-compilation per row.

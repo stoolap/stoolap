@@ -399,7 +399,7 @@ pub enum CompiledFilter {
     IntegerLte { col_idx: usize, value: i64 },
     /// col BETWEEN min AND max (integers)
     IntegerBetween { col_idx: usize, min: i64, max: i64 },
-    /// col IN (v1, v2, ...) for integers
+    /// col IN (v1, v2, ...) for integers, the values sorted
     IntegerIn { col_idx: usize, values: Vec<i64> },
 
     // =========================================================================
@@ -453,7 +453,7 @@ pub enum CompiledFilter {
         col_idx: usize,
         value: CompactArc<str>,
     },
-    /// col IN (v1, v2, ...) for strings
+    /// col IN (v1, v2, ...) for strings, the values sorted
     StringIn {
         col_idx: usize,
         values: Vec<CompactArc<str>>,
@@ -936,7 +936,7 @@ impl CompiledFilter {
         let first = &values[0];
         let in_filter = match first {
             Value::Integer(_) => {
-                let int_values: Vec<i64> = values
+                let mut int_values: Vec<i64> = values
                     .iter()
                     .filter_map(|v| match v {
                         Value::Integer(i) => Some(*i),
@@ -944,6 +944,7 @@ impl CompiledFilter {
                     })
                     .collect();
                 if int_values.len() == values.len() {
+                    int_values.sort_unstable();
                     Some(CompiledFilter::IntegerIn {
                         col_idx,
                         values: int_values,
@@ -953,7 +954,7 @@ impl CompiledFilter {
                 }
             }
             Value::Text(_) => {
-                let str_values: Vec<CompactArc<str>> = values
+                let mut str_values: Vec<CompactArc<str>> = values
                     .iter()
                     .filter_map(|v| match v {
                         Value::Text(s) => Some(CompactArc::from(s.as_ref())),
@@ -961,6 +962,7 @@ impl CompiledFilter {
                     })
                     .collect();
                 if str_values.len() == values.len() {
+                    str_values.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
                     Some(CompiledFilter::StringIn {
                         col_idx,
                         values: str_values,
@@ -1192,7 +1194,7 @@ impl CompiledFilter {
             }
             CompiledFilter::IntegerIn { col_idx, values } => {
                 if let Some(Value::Integer(i)) = row.get(*col_idx) {
-                    values.contains(i)
+                    values.binary_search(i).is_ok()
                 } else {
                     false
                 }
@@ -1266,7 +1268,9 @@ impl CompiledFilter {
             }
             CompiledFilter::StringIn { col_idx, values } => {
                 if let Some(Value::Text(s)) = row.get(*col_idx) {
-                    values.iter().any(|v| s.as_str() == v.as_ref())
+                    values
+                        .binary_search_by(|v| v.as_ref().cmp(s.as_str()))
+                        .is_ok()
                 } else {
                     false
                 }
@@ -1533,7 +1537,7 @@ impl CompiledFilter {
                 values: set,
             } => {
                 if let Value::Integer(i) = get_val!(col_idx) {
-                    set.contains(i)
+                    set.binary_search(i).is_ok()
                 } else {
                     false
                 }
@@ -1610,7 +1614,7 @@ impl CompiledFilter {
                 values: set,
             } => {
                 if let Value::Text(s) = get_val!(col_idx) {
-                    set.iter().any(|v| s.as_str() == v.as_ref())
+                    set.binary_search_by(|v| v.as_ref().cmp(s.as_str())).is_ok()
                 } else {
                     false
                 }

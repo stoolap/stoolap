@@ -1392,11 +1392,17 @@ pub fn prepared_rows_narrowed() -> usize {
     PREPARED_EXISTS[3].load(std::sync::atomic::Ordering::Relaxed)
 }
 
-pub(crate) fn prepared_rows_narrowed_by_keys() {
+pub(crate) fn prepared_rows_narrowed_by_keys(left_out: bool) {
+    prepared_strategy_ran(if left_out {
+        PreparedStrategy::NarrowedOut
+    } else {
+        PreparedStrategy::NarrowedByKeys
+    });
     PREPARED_EXISTS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 pub(crate) fn prepared_exists_probed() {
+    prepared_strategy_ran(PreparedStrategy::Probe);
     PREPARED_EXISTS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     run_hook(&PREPARED_EXISTS_HOOK);
 }
@@ -1408,6 +1414,51 @@ pub(crate) fn prepared_exists_set_built() {
 
 pub(crate) fn prepared_exists_looked_up() {
     PREPARED_EXISTS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Every way a prepared EXISTS, IN, ANY or ALL block answers. The
+/// equivalence test fails for a variant no case of it reaches
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparedStrategy {
+    /// A scan of the block per call
+    Probe,
+    /// An uncorrelated EXISTS answered once per run
+    Once,
+    /// A correlated EXISTS's candidates grouped by key
+    KeyedSet,
+    /// An uncorrelated value block's members, read once per run
+    MemberSet,
+    /// A correlated IN block's members grouped by key
+    KeyedMembers,
+    /// The statement's rows read by an EXISTS or IN block's keys
+    NarrowedByKeys,
+    /// The statement's rows read by its primary keys a set leaves out
+    NarrowedOut,
+}
+
+impl PreparedStrategy {
+    pub const ALL: [PreparedStrategy; 7] = [
+        PreparedStrategy::Probe,
+        PreparedStrategy::Once,
+        PreparedStrategy::KeyedSet,
+        PreparedStrategy::MemberSet,
+        PreparedStrategy::KeyedMembers,
+        PreparedStrategy::NarrowedByKeys,
+        PreparedStrategy::NarrowedOut,
+    ];
+}
+
+/// Process-wide: how often each prepared strategy answered
+static PREPARED_STRATEGY_RUNS: [std::sync::atomic::AtomicUsize; 7] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 7];
+
+/// How often `strategy` answered, so far
+pub fn prepared_strategy_runs(strategy: PreparedStrategy) -> usize {
+    PREPARED_STRATEGY_RUNS[strategy as usize].load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn prepared_strategy_ran(strategy: PreparedStrategy) {
+    PREPARED_STRATEGY_RUNS[strategy as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// How a prepared EXISTS block that may take a keyed set is made to answer:
@@ -1493,11 +1544,13 @@ pub enum GeneralPath {
     ExistsSemiJoin,
     /// `execute_exists_subquery`
     ExistsSubquery,
+    /// `execute_in_subquery`, which reads an IN, ANY or ALL block's values
+    InSubquery,
 }
 
 /// Process-wide: how often each general path mechanism ran
-static GENERAL_PATH_HITS: [std::sync::atomic::AtomicUsize; 10] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; 10];
+static GENERAL_PATH_HITS: [std::sync::atomic::AtomicUsize; 11] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 11];
 
 /// How often `path` ran, so far
 pub fn general_path_hits(path: GeneralPath) -> usize {
