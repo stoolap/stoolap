@@ -1014,10 +1014,8 @@ pub enum StatsHealth {
 /// Runtime join algorithm selection
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeJoinAlgorithm {
-    /// Hash join: O(N + M) - best for large unsorted inputs with equality keys
+    /// Hash join: O(N + M) - best for large inputs with equality keys
     HashJoin,
-    /// Merge join: O(N + M) - best when inputs are already sorted on join keys
-    MergeJoin,
     /// Nested loop: O(N * M) - best for small tables or no equality keys
     NestedLoop,
 }
@@ -1038,11 +1036,6 @@ impl RuntimeJoinDecision {
     /// Check if hash join was selected
     pub fn use_hash_join(&self) -> bool {
         self.algorithm == RuntimeJoinAlgorithm::HashJoin
-    }
-
-    /// Check if merge join was selected
-    pub fn use_merge_join(&self) -> bool {
-        self.algorithm == RuntimeJoinAlgorithm::MergeJoin
     }
 
     /// Check if nested loop was selected
@@ -1066,47 +1059,15 @@ impl QueryPlanner {
     /// # Returns
     /// Decision on which algorithm to use and whether to swap sides
     pub fn plan_runtime_join(
-        &self,
         left_rows: usize,
         right_rows: usize,
         has_equality_keys: bool,
-    ) -> RuntimeJoinDecision {
-        self.plan_runtime_join_with_sort_info(
-            left_rows,
-            right_rows,
-            has_equality_keys,
-            false,
-            false,
-        )
-    }
-
-    /// Make a runtime join algorithm decision with sort information
-    ///
-    /// Extended version that also considers whether inputs are pre-sorted,
-    /// which enables merge join optimization.
-    ///
-    /// # Arguments
-    /// * `left_rows` - Actual row count from left side
-    /// * `right_rows` - Actual row count from right side
-    /// * `has_equality_keys` - Whether join has equality conditions (a.x = b.x)
-    /// * `left_sorted` - Whether left input is sorted on join keys
-    /// * `right_sorted` - Whether right input is sorted on join keys
-    pub fn plan_runtime_join_with_sort_info(
-        &self,
-        left_rows: usize,
-        right_rows: usize,
-        has_equality_keys: bool,
-        left_sorted: bool,
-        right_sorted: bool,
     ) -> RuntimeJoinDecision {
         // For small tables, nested loop is faster (no hash table overhead)
         // PostgreSQL uses similar thresholds
         const NESTED_LOOP_MAX: usize = 200;
         const HASH_JOIN_MIN_BENEFIT: usize = 50;
         const ESTIMATED_BYTES_PER_ROW: u64 = 100;
-        // Merge join is preferred over hash when both inputs are sorted
-        // and tables are large enough to benefit from avoiding hash overhead
-        const MERGE_JOIN_MIN_ROWS: usize = 500;
 
         let total_rows = left_rows + right_rows;
         let product = left_rows.saturating_mul(right_rows);
@@ -1155,8 +1116,7 @@ impl QueryPlanner {
             }
             EdgeJoinRecommendation::PreferHashJoin { .. } => {
                 // Edge mode prefers hash join - skip nested loop checks for medium tables
-                // But still consider merge join if both inputs are sorted
-                if total_rows > NESTED_LOOP_MAX && !(left_sorted && right_sorted) {
+                if total_rows > NESTED_LOOP_MAX {
                     let swap = right_rows < left_rows;
                     let (build, probe) = if swap {
                         (right_rows, left_rows)
@@ -1195,7 +1155,7 @@ impl QueryPlanner {
             };
         }
 
-        // Case 3: One side empty - no benefit from hash/merge join
+        // Case 3: One side empty - no benefit from a hash join
         if left_rows == 0 || right_rows == 0 {
             return RuntimeJoinDecision {
                 algorithm: RuntimeJoinAlgorithm::NestedLoop,
@@ -1204,21 +1164,7 @@ impl QueryPlanner {
             };
         }
 
-        // Case 4: Merge join when both inputs are already sorted
-        // Merge join is O(N + M) like hash join, but avoids hash table overhead
-        // It's optimal when both inputs are pre-sorted on join keys
-        if left_sorted && right_sorted && total_rows >= MERGE_JOIN_MIN_ROWS {
-            return RuntimeJoinDecision {
-                algorithm: RuntimeJoinAlgorithm::MergeJoin,
-                swap_sides: false,
-                explanation: format!(
-                    "Merge join: both inputs sorted ({} + {} rows)",
-                    left_rows, right_rows
-                ),
-            };
-        }
-
-        // Case 5: Hash join cost analysis
+        // Case 4: Hash join cost analysis
         // Hash join is O(N + M) vs nested loop O(N * M)
         // But hash join has setup cost, so only use when beneficial
         let hash_cost = total_rows as f64;
@@ -1236,7 +1182,7 @@ impl QueryPlanner {
             };
         }
 
-        // Case 6: Use hash join with smaller side as build side
+        // Case 5: Use hash join with smaller side as build side
         let swap = right_rows < left_rows;
         let (build_rows, probe_rows) = if swap {
             (right_rows, left_rows)
@@ -1361,43 +1307,26 @@ mod tests {
 
     #[test]
     fn test_runtime_join_decision_hash_join() {
-        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()));
-
         // For equality joins with reasonable sizes, hash join should be selected
-        let decision = planner.plan_runtime_join(1000, 1000, true);
+        let decision = QueryPlanner::plan_runtime_join(1000, 1000, true);
         assert!(decision.use_hash_join());
-        assert!(!decision.use_merge_join());
         assert!(!decision.use_nested_loop());
     }
 
     #[test]
     fn test_runtime_join_decision_nested_loop() {
-        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()));
-
         // Non-equality joins should use nested loop
-        let decision = planner.plan_runtime_join(100, 100, false);
+        let decision = QueryPlanner::plan_runtime_join(100, 100, false);
         assert!(decision.use_nested_loop());
         assert!(!decision.use_hash_join());
-        assert!(!decision.use_merge_join());
     }
 
     #[test]
     fn test_runtime_join_decision_small_tables() {
-        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()));
-
         // Very small tables might still use hash join for equality
-        let decision = planner.plan_runtime_join(10, 10, true);
+        let decision = QueryPlanner::plan_runtime_join(10, 10, true);
         // Small tables with equality should still use efficient algorithm
         assert!(decision.use_hash_join() || decision.use_nested_loop());
-    }
-
-    #[test]
-    fn test_runtime_join_decision_merge_join() {
-        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()));
-
-        // When both sides are sorted, merge join might be preferred
-        let decision = planner.plan_runtime_join_with_sort_info(10000, 10000, true, true, true);
-        assert!(decision.use_merge_join() || decision.use_hash_join());
     }
 
     #[test]
@@ -1473,9 +1402,7 @@ mod tests {
 
     #[test]
     fn test_runtime_join_decision_explanation() {
-        let planner = QueryPlanner::new(Arc::new(MVCCEngine::in_memory()));
-
-        let decision = planner.plan_runtime_join(1000, 1000, true);
+        let decision = QueryPlanner::plan_runtime_join(1000, 1000, true);
         // Explanation should not be empty
         assert!(!decision.explanation.is_empty());
     }

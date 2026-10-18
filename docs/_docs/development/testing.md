@@ -121,7 +121,7 @@ B-tree, Hash, Bitmap indexes, index selection, and multi-column indexes.
 
 Files: `join_simple_test.rs`, `join_comprehensive_test.rs`, `join_optimizer_test.rs`, `hash_join_test.rs`
 
-Hash Join, Merge Join, Nested Loop, Index Nested Loop, and join order optimization.
+Hash Join, Nested Loop, Index Nested Loop, and join order optimization.
 
 ### Subquery Tests (7 files)
 

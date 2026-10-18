@@ -212,7 +212,6 @@ If estimated rows differs significantly from actual rows:
 | Component | Description |
 |-----------|-------------|
 | Hash Join | Builds hash table, probes with other table |
-| Merge Join | Joins sorted inputs |
 | Nested Loop | Loops over each row combination |
 | Join Cond | Join condition |
 

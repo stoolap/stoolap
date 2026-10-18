@@ -202,7 +202,6 @@ SELECT name, price FROM products WHERE price > 100;
 Stoolap selects among several join algorithms:
 
 - **Hash Join** - For equality joins with large tables
-- **Merge Join** - For pre-sorted data
 - **Nested Loop Join** - For small tables or when using indexes
 
 ### Parallel Execution

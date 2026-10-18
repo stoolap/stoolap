@@ -16,7 +16,6 @@
 //!
 //! This module provides high-performance JOIN execution with:
 //! - **Hash Join**: Build smaller side, probe larger side with O(N+M) complexity
-//! - **Merge Join**: O(N+M) when inputs are pre-sorted on join keys
 //! - **Nested Loop**: O(N*M) fallback for non-equality joins or small tables
 //! - **Early Termination**: LIMIT stops execution immediately
 //! - **Residual Filters**: Non-equality conditions applied during streaming
@@ -46,8 +45,8 @@
 //! This executor uses a **hybrid approach** that dynamically chooses between
 //! Volcano-style streaming and parallel bulk processing based on query characteristics:
 //!
-//! ### Streaming Volcano Path (default for small datasets or small LIMIT)
-//! - **When**: Build side < 10,000 rows OR LIMIT ≤ 1,000
+//! ### Streaming Volcano Path (default for small datasets or any LIMIT)
+//! - **When**: Build side < 10,000 rows OR a LIMIT
 //! - **Benefits**:
 //!   - O(1) memory for probe side (streaming, not materialized)
 //!   - Early termination: LIMIT 10 stops after 10 rows
@@ -55,7 +54,7 @@
 //!   - Composable operators (Filter → Join → Project → Limit)
 //!
 //! ### Parallel Hash Join Path (for large analytical queries)
-//! - **When**: Build side ≥ 10,000 rows AND (no LIMIT or LIMIT > 1,000)
+//! - **When**: Build side ≥ 10,000 rows AND no LIMIT
 //! - **Benefits**:
 //!   - Parallel hash build into partitioned maps, one thread per partition
 //!   - Parallel probe with Rayon work-stealing
@@ -65,21 +64,7 @@
 //! ### Why Not Always Parallel?
 //! Parallel execution has overhead (task scheduling, synchronization). For:
 //! - Small datasets: overhead exceeds benefit
-//! - Small LIMIT: streaming stops early; parallel computes full result then truncates
-//!
-//! ## Merge Join Materialization
-//!
-//! The current MergeJoin implementation materializes both sides into
-//! `MaterializedOperator`. A true streaming merge join would require sorted
-//! iterators on both inputs. This is a future optimization opportunity:
-//!
-//! ```text
-//! Current:    left_rows → MaterializedOperator  ┐
-//!             right_rows → MaterializedOperator ┘→ MergeJoinOperator
-//!
-//! Optimal:    left_iter → SortedIterator  ┐
-//!             right_iter → SortedIterator ┘→ StreamingMergeJoin
-//! ```
+//! - A LIMIT: streaming stops early; parallel would build every match first
 //!
 //! ## Bloom Filter Optimization (Not Yet Implemented)
 //!
@@ -99,29 +84,15 @@ use crate::executor::expression::{JoinFilter, RowFilter};
 use crate::executor::hash_table::JoinHashTable;
 use crate::executor::operator::{ColumnInfo, MaterializedOperator, Operator};
 use crate::executor::operators::hash_join::{HashJoinOperator, JoinSide, JoinType};
-use crate::executor::operators::merge_join::MergeJoinOperator;
 use crate::executor::operators::nested_loop_join::NestedLoopJoinOperator;
 use crate::executor::parallel::{
     parallel_hash_join, ParallelConfig, DEFAULT_PARALLEL_JOIN_THRESHOLD,
 };
-use crate::executor::planner::{RuntimeJoinAlgorithm, RuntimeJoinDecision};
-use crate::executor::utils::{
-    column_families, extract_join_keys_and_residual_keeping, is_sorted_on_keys,
-};
+use crate::executor::planner::{QueryPlanner, RuntimeJoinAlgorithm, RuntimeJoinDecision};
+use crate::executor::utils::{column_families, extract_join_keys_and_residual_keeping};
 use crate::functions::registry::global_registry;
 use crate::optimizer::bloom::RuntimeBloomFilter;
 use crate::parser::ast::Expression;
-
-/// LIMIT threshold below which streaming execution is preferred over parallel.
-///
-/// When LIMIT is small (≤ this value), streaming Volcano-style execution benefits from
-/// early termination - we can stop after producing just N rows without processing
-/// the entire join. Parallel execution would compute the full join result before
-/// truncating, wasting work.
-///
-/// When LIMIT is large (> this value), the early termination benefit is minimal,
-/// so parallel execution's throughput advantage dominates.
-const STREAMING_LIMIT_THRESHOLD: u64 = 1000;
 
 /// Result of a streaming join execution.
 #[derive(Debug)]
@@ -141,10 +112,6 @@ pub struct JoinAnalysis {
     pub right_key_indices: Vec<usize>,
     /// Non-equality conditions to apply after hash matching.
     pub residual_conditions: Vec<Expression>,
-    /// Whether left input is sorted on join keys.
-    pub left_sorted: bool,
-    /// Whether right input is sorted on join keys.
-    pub right_sorted: bool,
     /// The parsed join type.
     pub join_type: JoinType,
     /// Join type as string (for compatibility).
@@ -183,9 +150,6 @@ pub struct JoinRequest<'a> {
     pub limit: Option<u64>,
     /// Execution context for expression evaluation.
     pub ctx: &'a ExecutionContext,
-    /// Optional algorithm decision from QueryPlanner.
-    /// When provided, the executor uses this instead of making its own decision.
-    pub algorithm_hint: Option<&'a RuntimeJoinDecision>,
     /// The schema of a side that reads a base table directly, which says
     /// what its key columns hold without reading the rows
     pub left_schema: Option<CompactArc<Schema>>,
@@ -257,7 +221,7 @@ impl JoinExecutor {
     ///
     /// This is the main entry point that:
     /// 1. Analyzes the join condition
-    /// 2. Uses provided algorithm hint or selects optimal algorithm
+    /// 2. Chooses the algorithm from the row counts and the keys
     /// 3. Executes with streaming
     /// 4. Applies early termination
     pub fn execute(&self, request: JoinRequest<'_>) -> Result<JoinResult> {
@@ -265,7 +229,7 @@ impl JoinExecutor {
         let mut all_columns = request.left_columns.to_vec();
         all_columns.extend(request.right_columns.iter().cloned());
 
-        // Analyze the join (key extraction only - sort check is deferred)
+        // Analyze the join (key extraction)
         let mut analysis = self.analyze(
             request.left_columns,
             request.right_columns,
@@ -310,34 +274,39 @@ impl JoinExecutor {
             );
         }
 
-        // Select algorithm: use provided hint from QueryPlanner if available,
-        // otherwise fall back to local heuristics
-        let config = match request.algorithm_hint {
-            Some(hint) if cross_pairs.is_empty() => self.convert_runtime_decision(hint, &analysis),
-            _ => self.select_algorithm(&analysis, &request.left_rows, &request.right_rows),
-        };
+        // The one place a join's algorithm is chosen, on the keys it runs with
+        let decision = QueryPlanner::plan_runtime_join(
+            request.left_rows.len(),
+            request.right_rows.len(),
+            !analysis.left_key_indices.is_empty(),
+        );
+        let config = self.convert_runtime_decision(&decision, &analysis);
+        let rows = self.run(&config, request, &analysis)?;
 
-        // Execute join based on algorithm (takes ownership of rows)
-        let rows = match config.algorithm {
+        Ok(JoinResult {
+            rows,
+            columns: all_columns,
+        })
+    }
+
+    /// Run the join with the algorithm `config` names (takes ownership of rows)
+    fn run(
+        &self,
+        config: &JoinConfig,
+        request: JoinRequest<'_>,
+        analysis: &JoinAnalysis,
+    ) -> Result<RowVec> {
+        match config.algorithm {
             RuntimeJoinAlgorithm::HashJoin => self.execute_hash_join(
                 request.left_rows,
                 request.right_rows,
-                &analysis,
+                analysis,
                 request.left_columns,
                 request.right_columns,
                 config.build_left,
                 request.limit,
                 request.ctx,
-            )?,
-            RuntimeJoinAlgorithm::MergeJoin => self.execute_merge_join(
-                request.left_rows,
-                request.right_rows,
-                request.left_columns,
-                request.right_columns,
-                &analysis,
-                request.limit,
-                request.ctx,
-            )?,
+            ),
             RuntimeJoinAlgorithm::NestedLoop => self.execute_nested_loop(
                 request.left_rows,
                 request.right_rows,
@@ -347,13 +316,8 @@ impl JoinExecutor {
                 &analysis.join_type_str,
                 request.limit,
                 request.ctx,
-            )?,
-        };
-
-        Ok(JoinResult {
-            rows,
-            columns: all_columns,
-        })
+            ),
+        }
     }
 
     /// Execute a streaming hash join where probe side streams from an operator.
@@ -483,10 +447,6 @@ impl JoinExecutor {
     }
 
     /// Analyze join for algorithm selection and key extraction.
-    ///
-    /// Note: Sortedness is NOT checked here. When an algorithm hint from QueryPlanner
-    /// is provided, the sort check is unnecessary overhead. Sortedness is only checked
-    /// lazily in select_algorithm() when fallback heuristics are used.
     fn analyze(
         &self,
         left_columns: &[String],
@@ -505,70 +465,12 @@ impl JoinExecutor {
                 (Vec::new(), Vec::new(), Vec::new())
             };
 
-        // Note: left_sorted/right_sorted are initialized to false.
-        // Actual sort check is deferred to select_algorithm() when needed.
         JoinAnalysis {
             left_key_indices,
             right_key_indices,
             residual_conditions,
-            left_sorted: false,
-            right_sorted: false,
             join_type,
             join_type_str: join_type_str.to_uppercase(),
-        }
-    }
-
-    /// Select optimal join algorithm based on analysis and cardinalities.
-    ///
-    /// This is the fallback algorithm selection when QueryPlanner doesn't provide
-    /// an algorithm hint. Sort check is performed here (lazily) only when needed.
-    fn select_algorithm(
-        &self,
-        analysis: &JoinAnalysis,
-        left_rows: &[Row],
-        right_rows: &[Row],
-    ) -> JoinConfig {
-        let has_equality_keys = !analysis.left_key_indices.is_empty();
-
-        // No equality keys -> must use nested loop
-        if !has_equality_keys {
-            return JoinConfig {
-                algorithm: RuntimeJoinAlgorithm::NestedLoop,
-                build_left: false,
-            };
-        }
-
-        // Check if both sides are sorted on join keys (lazy evaluation)
-        // Only perform this O(n) check when we might actually use merge join
-        let left_sorted = is_sorted_on_keys(left_rows, &analysis.left_key_indices);
-        let right_sorted =
-            left_sorted && is_sorted_on_keys(right_rows, &analysis.right_key_indices);
-
-        // Both sides sorted on join keys -> use merge join
-        if left_sorted && right_sorted {
-            return JoinConfig {
-                algorithm: RuntimeJoinAlgorithm::MergeJoin,
-                build_left: false,
-            };
-        }
-
-        // Use hash join with build on smaller side
-        // Exception: OUTER joins have restrictions on build side
-        let join_type = &analysis.join_type_str;
-        let build_left = if join_type.contains("LEFT") || join_type.contains("FULL") {
-            // LEFT/FULL OUTER: must build on right (left rows must be preserved)
-            false
-        } else if join_type.contains("RIGHT") {
-            // RIGHT OUTER: must build on left (right rows must be preserved)
-            true
-        } else {
-            // INNER/CROSS: build on smaller side
-            left_rows.len() <= right_rows.len()
-        };
-
-        JoinConfig {
-            algorithm: RuntimeJoinAlgorithm::HashJoin,
-            build_left,
         }
     }
 
@@ -639,7 +541,7 @@ impl JoinExecutor {
         // Decide between parallel and streaming execution
         // Parallel is beneficial when:
         // 1. Build side row count exceeds threshold (parallel overhead worthwhile)
-        // 2. No small LIMIT (streaming benefits from early termination)
+        // 2. No LIMIT: the parallel join builds every match, streaming stops at the LIMIT
         let build_row_count = if build_left {
             left_rows.len()
         } else {
@@ -651,7 +553,7 @@ impl JoinExecutor {
             || analysis.join_type_str.contains("RIGHT")
             || analysis.join_type_str.contains("FULL");
         let use_parallel = build_row_count >= DEFAULT_PARALLEL_JOIN_THRESHOLD
-            && limit.is_none_or(|l| l > STREAMING_LIMIT_THRESHOLD)
+            && limit.is_none()
             && !(is_outer && !analysis.residual_conditions.is_empty());
 
         if use_parallel {
@@ -664,7 +566,6 @@ impl JoinExecutor {
                 right_col_count,
                 &all_columns,
                 build_left,
-                limit,
                 ctx,
             )
         } else {
@@ -686,7 +587,7 @@ impl JoinExecutor {
     /// Execute hash join using parallel execution (partitioned build + Rayon).
     ///
     /// Uses parallel hash build and probe phases for bulk analytics workloads.
-    /// Better for large datasets without small LIMIT constraints.
+    /// Taken only by a join without a LIMIT, since it builds every match.
     #[allow(clippy::too_many_arguments)]
     fn execute_hash_join_parallel(
         &self,
@@ -697,7 +598,6 @@ impl JoinExecutor {
         right_col_count: usize,
         all_columns: &[String],
         build_left: bool,
-        limit: Option<u64>,
         ctx: &ExecutionContext,
     ) -> Result<RowVec> {
         let config = ParallelConfig::default();
@@ -751,18 +651,11 @@ impl JoinExecutor {
             .map(|(i, row)| (i as i64, row))
             .collect();
 
-        // Apply residual conditions FIRST (before LIMIT)
-        // This ensures correct semantics: filter matching rows, then limit.
         // Only INNER joins reach this path: execute_hash_join() routes OUTER
         // joins carrying a residual to the streaming operator.
         for cond in &analysis.residual_conditions {
             let filter = RowFilter::new(cond, all_columns)?.with_context(ctx);
             filter.retain_checked(&mut rows)?;
-        }
-
-        // Apply LIMIT after filtering (correct order)
-        if let Some(max) = limit {
-            rows.truncate(max as usize);
         }
 
         Ok(rows)
@@ -832,56 +725,6 @@ impl JoinExecutor {
 
         // Execute with Volcano model
         self.execute_operator_with_filter(&mut join_op, limit, inline_filters)
-    }
-
-    /// Execute merge join for pre-sorted inputs using MergeJoinOperator.
-    #[allow(clippy::too_many_arguments)]
-    fn execute_merge_join(
-        &self,
-        left_rows: CompactArc<Vec<Row>>,
-        right_rows: CompactArc<Vec<Row>>,
-        left_columns: &[String],
-        right_columns: &[String],
-        analysis: &JoinAnalysis,
-        limit: Option<u64>,
-        ctx: &ExecutionContext,
-    ) -> Result<RowVec> {
-        // Build schema for operators
-        let left_schema: Vec<ColumnInfo> = left_columns.iter().map(ColumnInfo::new).collect();
-        let right_schema: Vec<ColumnInfo> = right_columns.iter().map(ColumnInfo::new).collect();
-
-        // Unwrap CompactArc if sole owner, otherwise clone (MaterializedOperator needs Vec<Row>)
-        let left_vec = CompactArc::try_unwrap(left_rows).unwrap_or_else(|arc| (*arc).clone());
-        let right_vec = CompactArc::try_unwrap(right_rows).unwrap_or_else(|arc| (*arc).clone());
-
-        // Create input operators - takes ownership, no clone
-        let left_op = Box::new(MaterializedOperator::new(left_vec, left_schema));
-        let right_op = Box::new(MaterializedOperator::new(right_vec, right_schema));
-
-        // Create merge join operator
-        let mut merge_op = MergeJoinOperator::new(
-            left_op,
-            right_op,
-            analysis.join_type,
-            analysis.left_key_indices.clone(),
-            analysis.right_key_indices.clone(),
-        );
-
-        // The non-equality part of the ON clause decides whether a pair is a
-        // match, so the operator applies it while it walks the two runs.
-        if !analysis.residual_conditions.is_empty() {
-            let mut all_columns = left_columns.to_vec();
-            all_columns.extend(right_columns.iter().cloned());
-            let residual_filters: Vec<RowFilter> = analysis
-                .residual_conditions
-                .iter()
-                .map(|cond| RowFilter::new(cond, &all_columns).map(|f| f.with_context(ctx)))
-                .collect::<Result<Vec<_>>>()?;
-            merge_op = merge_op.with_residual(residual_filters);
-        }
-
-        // Execute with Volcano model
-        self.execute_operator_with_filter(&mut merge_op, limit, &[])
     }
 
     /// Execute nested loop join using NestedLoopJoinOperator.
@@ -1055,7 +898,6 @@ mod tests {
             join_type: "INNER",
             limit: None,
             ctx: &ctx,
-            algorithm_hint: None,
             left_schema: None,
             right_schema: None,
         };
@@ -1102,7 +944,6 @@ mod tests {
             join_type: "LEFT",
             limit: None,
             ctx: &ctx,
-            algorithm_hint: None,
             left_schema: None,
             right_schema: None,
         };
@@ -1149,7 +990,6 @@ mod tests {
             join_type: "INNER",
             limit: Some(1), // Only need 1 row
             ctx: &ctx,
-            algorithm_hint: None,
             left_schema: None,
             right_schema: None,
         };
@@ -1180,7 +1020,6 @@ mod tests {
             join_type: "CROSS",
             limit: None,
             ctx: &ctx,
-            algorithm_hint: None,
             left_schema: None,
             right_schema: None,
         };
@@ -1189,5 +1028,104 @@ mod tests {
 
         // 2 x 2 = 4 rows
         assert_eq!(result.rows.len(), 4);
+    }
+
+    fn on_clause(condition: &str) -> Expression {
+        let sql = format!("SELECT * FROM a JOIN b ON {condition}");
+        match &crate::parser::parse_sql(&sql).unwrap()[0] {
+            crate::parser::ast::Statement::Select(select) => match select.table_expr.as_deref() {
+                Some(Expression::JoinSource(join)) => join.condition.as_deref().unwrap().clone(),
+                other => panic!("not a join: {other:?}"),
+            },
+            other => panic!("not a SELECT: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_join_algorithm_returns_the_rows_of_the_nested_loop() {
+        use RuntimeJoinAlgorithm::{HashJoin, NestedLoop};
+        let all = [HashJoin, NestedLoop];
+        // A new algorithm fails to compile here until it joins `all`
+        match all[0] {
+            HashJoin | NestedLoop => {}
+        }
+        let left: Vec<Row> = [
+            (1, Value::integer(1)),
+            (2, Value::integer(1)),
+            (3, Value::float(2.0)),
+            (4, Value::null_unknown()),
+            (5, Value::integer(7)),
+            (6, Value::integer(3)),
+        ]
+        .into_iter()
+        .map(|(v, k)| Row::from_values(vec![k, Value::integer(v)]))
+        .collect();
+        let right: Vec<Row> = [
+            (Value::integer(2), 5),
+            (Value::integer(1), 1),
+            (Value::null_unknown(), 9),
+            (Value::integer(1), 9),
+            (Value::integer(3), 0),
+            (Value::integer(8), 2),
+        ]
+        .into_iter()
+        .map(|(k, w)| Row::from_values(vec![k, Value::integer(w)]))
+        .collect();
+        let left_cols = vec!["a.k".to_string(), "a.v".to_string()];
+        let right_cols = vec!["b.k".to_string(), "b.w".to_string()];
+        let ctx = ExecutionContext::new();
+        let executor = JoinExecutor::new();
+        let mut cases = 0;
+        for condition in ["a.k = b.k", "a.k = b.k AND a.v < b.w"] {
+            let condition = on_clause(condition);
+            for join_type in ["INNER", "LEFT", "RIGHT", "FULL"] {
+                let analysis = executor.analyze(
+                    &left_cols,
+                    &right_cols,
+                    Some(&condition),
+                    join_type,
+                    &|_, _| true,
+                );
+                let rows_of = |algorithm: RuntimeJoinAlgorithm, swap_sides: bool| {
+                    let decision = RuntimeJoinDecision {
+                        algorithm,
+                        swap_sides,
+                        explanation: String::new(),
+                    };
+                    let config = executor.convert_runtime_decision(&decision, &analysis);
+                    let request = JoinRequest {
+                        left_rows: CompactArc::new(left.clone()),
+                        right_rows: CompactArc::new(right.clone()),
+                        left_columns: &left_cols,
+                        right_columns: &right_cols,
+                        condition: Some(&condition),
+                        join_type,
+                        limit: None,
+                        ctx: &ctx,
+                        left_schema: None,
+                        right_schema: None,
+                    };
+                    let rows = executor.run(&config, request, &analysis).unwrap();
+                    let mut rows: Vec<String> = rows
+                        .iter()
+                        .map(|(_, row)| format!("{:?}", row.as_slice()))
+                        .collect();
+                    rows.sort();
+                    rows
+                };
+                let expected = rows_of(NestedLoop, false);
+                for algorithm in all {
+                    for swap_sides in [false, true] {
+                        assert_eq!(
+                            rows_of(algorithm, swap_sides),
+                            expected,
+                            "{algorithm:?} (swap {swap_sides}) on {join_type} JOIN ON {condition}"
+                        );
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 2 * 4 * all.len() * 2);
     }
 }

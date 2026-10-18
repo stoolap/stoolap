@@ -15,7 +15,7 @@ The query optimizer performs several tasks:
 - **Cost estimation**: Calculates the expected cost of different execution strategies
 - **Access method selection**: Chooses between table scans, index lookups, and primary key access
 - **Join ordering**: Determines the optimal order to join multiple tables
-- **Join algorithm selection**: Chooses Hash Join, Merge Join, or Nested Loop Join
+- **Join algorithm selection**: Chooses Hash Join or Nested Loop Join
 - **Predicate pushdown**: Moves filters close to data sources
 - **Expression simplification**: Optimizes boolean and arithmetic expressions
 
@@ -118,7 +118,6 @@ The optimizer selects the best join algorithm:
 | Algorithm | Best For | Requirements |
 |-----------|----------|--------------|
 | Hash Join | Large tables, equality joins | Memory for hash table |
-| Merge Join | Pre-sorted inputs | Sorted data |
 | Nested Loop | Small tables, any join condition | None |
 
 ### Semi-Join Optimization

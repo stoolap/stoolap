@@ -28,7 +28,7 @@ use crate::storage::traits::{Engine, QueryResult, ScanPlan};
 use super::context::ExecutionContext;
 use super::operators::index_nested_loop::IndexLookupStrategy;
 use super::parallel;
-use super::planner::RuntimeJoinAlgorithm;
+use super::planner::{QueryPlanner, RuntimeJoinAlgorithm};
 use super::pushdown;
 use super::query::JoinIndexUse;
 use super::result::ExecutorResult;
@@ -1048,13 +1048,7 @@ impl Executor {
         };
 
         // Get the runtime join decision from QueryPlanner
-        let decision = planner.plan_runtime_join_with_sort_info(
-            left_rows,
-            right_rows,
-            has_equality_keys,
-            false, // Can't determine sort status from AST alone
-            false,
-        );
+        let decision = QueryPlanner::plan_runtime_join(left_rows, right_rows, has_equality_keys);
 
         // Format the algorithm name with details
         let algo_name = match decision.algorithm {
@@ -1065,7 +1059,6 @@ impl Executor {
                     "Hash Join (build: left)".to_string()
                 }
             }
-            RuntimeJoinAlgorithm::MergeJoin => "Merge Join".to_string(),
             RuntimeJoinAlgorithm::NestedLoop => "Nested Loop".to_string(),
         };
 

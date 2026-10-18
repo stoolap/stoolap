@@ -51,7 +51,7 @@ fn setup(dsn: &str, n: i64, shuffled: bool) -> Database {
 
 #[test]
 fn int_float_equi_join_hash_path() {
-    // Shuffled keys defeat the sorted-input merge join
+    // Keys in shuffled order
     let db = setup("memory://xtype_hash", 100, true);
     let c: i64 = db
         .query_one("SELECT COUNT(*) FROM ta JOIN tb ON ta.k = tb.k", ())
@@ -61,9 +61,7 @@ fn int_float_equi_join_hash_path() {
 
 #[test]
 fn int_float_equi_join_sorted_path() {
-    // 400+400 sorted rows: past MERGE_JOIN_MIN_ROWS (500 total) and past
-    // the 200-row small-tables hash ceiling per side, so the planner
-    // reaches the sorted-input check and picks merge join
+    // 400+400 rows in key order, past the 200-row small-tables ceiling per side
     let db = setup("memory://xtype_sorted", 400, false);
     let c: i64 = db
         .query_one("SELECT COUNT(*) FROM ta JOIN tb ON ta.k = tb.k", ())
