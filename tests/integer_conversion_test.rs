@@ -56,6 +56,14 @@ fn test_cast_outside_the_range_is_an_error() {
     );
     assert_eq!(int(&db, "SELECT CAST(' 42 ' AS INTEGER)"), Some(42));
     assert_eq!(int(&db, "SELECT CAST('3.7' AS INTEGER)"), None);
+    assert_eq!(
+        int(&db, "SELECT CAST('999999999999999999999x' AS INTEGER)"),
+        None
+    );
+    assert_eq!(
+        int(&db, "SELECT CAST('-999999999999999999999x' AS INTEGER)"),
+        None
+    );
     for sql in [
         "SELECT CAST(9223372036854775807.0 AS INTEGER)",
         "SELECT CAST(1e30 AS INTEGER)",

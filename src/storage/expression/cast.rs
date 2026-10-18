@@ -221,6 +221,10 @@ impl Expression for CompoundExpr {
 
         // Convert comparison value to target type if needed
         let comp_value = self.cast_expr.perform_cast(&self.value)?;
+        // A comparison with NULL is unknown, which filters the row out
+        if casted.is_null() || comp_value.is_null() {
+            return Ok(false);
+        }
 
         // Compare the values
         let cmp = compare_values(&casted, &comp_value);
@@ -655,6 +659,23 @@ mod tests {
         expr.prepare_for_schema(&schema);
 
         assert!(!expr.evaluate(&row).unwrap());
+    }
+
+    #[test]
+    fn test_compound_expr_with_a_cast_to_null_matches_nothing() {
+        let schema = test_schema();
+        let row = Row::from_values(vec![
+            Value::integer(1),
+            Value::text("3.7"),
+            Value::float(3.5),
+        ]);
+        for operator in [Operator::Lt, Operator::Ne, Operator::Gte] {
+            let cast = CastExpr::new("value", DataType::Integer);
+            let mut expr = CompoundExpr::new(cast, operator, Value::integer(-1));
+            expr.prepare_for_schema(&schema);
+            assert!(!expr.evaluate(&row).unwrap(), "{operator:?}");
+            assert!(!expr.evaluate_fast(&row), "{operator:?}");
+        }
     }
 
     #[test]

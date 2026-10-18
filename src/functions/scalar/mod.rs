@@ -169,7 +169,10 @@ pub fn value_to_f64(value: &Value) -> Option<f64> {
 pub fn value_to_i64(value: &Value) -> Option<i64> {
     match value {
         Value::Integer(_) | Value::Float(_) | Value::Text(_) => {
-            crate::core::integer::integer_from(value).ok().flatten()
+            match crate::core::integer::integer_reading(value) {
+                crate::core::integer::IntegerReading::Fits(i) => Some(i),
+                _ => None,
+            }
         }
         _ => None,
     }

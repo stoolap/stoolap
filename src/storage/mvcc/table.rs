@@ -1683,7 +1683,8 @@ impl MVCCTable {
                     } else if actual_type == DataType::Float && col.data_type == DataType::Integer {
                         // Coerce Float to Integer (truncate)
                         if let Value::Float(f) = value {
-                            let _ = row.set(i, Value::Integer(*f as i64));
+                            let converted = crate::core::integer::integer_from_float(*f)?;
+                            let _ = row.set(i, Value::Integer(converted));
                         }
                     } else if actual_type == DataType::Integer && col.data_type == DataType::Boolean
                     {
@@ -5916,6 +5917,9 @@ mod tests {
         assert!(scanner.next());
         assert_eq!(scanner.row().get(1), Some(&Value::Integer(9)));
         scanner.close().unwrap();
+
+        let row = Row::from_values(vec![Value::Integer(2), Value::Float(1e30)]);
+        assert!(table.insert(row).is_err());
     }
 
     #[test]
