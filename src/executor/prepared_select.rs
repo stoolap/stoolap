@@ -47,7 +47,7 @@ use super::result::ExecutorResult;
 use super::utils::{
     extract_literal_value, flip_operator, infix_to_operator, is_aggregate_function,
 };
-use super::volatility::{expression_volatility, statement_volatility_in};
+use super::volatility::{expression_volatility, statement_draws_per_call};
 use super::Executor;
 
 /// Scopes one chain may hold: a block's own table and every enclosing one
@@ -912,6 +912,8 @@ struct PreparedSubquery {
     /// An EXISTS block's `filter` by conjunct, with the slots each reads:
     /// asked in its place when a slot's value raised an error
     rest: Vec<(SharedProgram, SmallVec<[usize; 2]>)>,
+    /// The slots its own programs read; a scalar block raises a failed one
+    reads: SmallVec<[usize; 2]>,
     answer: Answer,
     /// The subquery whose row this one runs for; None for the statement's row
     parent: Option<u16>,
@@ -1467,6 +1469,10 @@ impl Builder<'_> {
                 })
             }
         };
+        let mut reads = SmallVec::new();
+        for expr in projection.iter().chain(&candidates).chain(&filter) {
+            slots_read(expr, &mut reads);
+        }
         let candidates = compile(&candidates)?;
         let mut rest = Vec::new();
         if let (Some(_), Some(filter)) = (exists, &filter) {
@@ -1504,6 +1510,7 @@ impl Builder<'_> {
             candidates,
             filter,
             rest,
+            reads,
             answer,
             parent,
             holes,
@@ -1542,9 +1549,7 @@ impl Builder<'_> {
                 .holes
                 .iter()
                 .all(|(slot, hole)| key_slot(*slot) || !reads_row_column(hole))
-            // The block's own: around it an EXISTS counts once per statement
-            && statement_volatility_in(block, &self.executor.function_registry, &|_| false)
-                != Volatility::PerCall
+            && !statement_draws_per_call(block, &self.executor.function_registry)
     }
 }
 
@@ -2518,9 +2523,13 @@ impl<'a> PreparedRunner<'a> {
                 }
             }
         }
-        match (&sq.answer, failed.first()) {
-            (Answer::Value(_), Some((_, e))) => Err(e.clone()),
-            _ => Ok(()),
+        // A failed slot its nested blocks read is theirs to raise
+        match &sq.answer {
+            Answer::Value(_) => match failed.iter().find(|(slot, _)| sq.reads.contains(slot)) {
+                Some((_, e)) => Err(e.clone()),
+                None => Ok(()),
+            },
+            Answer::Exists(_) => Ok(()),
         }
     }
 
@@ -2540,19 +2549,23 @@ impl<'a> PreparedRunner<'a> {
                 None => Ok(true),
             };
         }
-        let mut unknown = false;
+        // The conjunction's own steps: only a FALSE skips what follows it,
+        // and each pair of operands meets as the VM's AND meets them
+        let mut acc: Option<Value> = None;
         for (program, slots) in &sq.rest {
+            if matches!(acc, Some(Value::Boolean(false))) {
+                break;
+            }
             if let Some((_, e)) = failed.iter().find(|(slot, _)| slots.contains(slot)) {
                 return Err(e.clone());
             }
-            match vm.execute(program, exec)? {
-                Value::Boolean(true) => {}
-                Value::Integer(i) if i != 0 => {}
-                Value::Null(_) => unknown = true,
-                _ => return Ok(false),
-            }
+            let value = vm.execute(program, exec)?;
+            acc = Some(match acc {
+                None => value,
+                Some(left) => ExprVM::and(&left, &value),
+            });
         }
-        Ok(!unknown)
+        Ok(acc.as_ref().is_none_or(ExprVM::passes))
     }
 
     /// Whether an EXISTS block's candidate passes for the buffer filled:

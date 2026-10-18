@@ -31,8 +31,26 @@ pub(crate) fn expression_volatility(expr: &Expression, registry: &FunctionRegist
         registry,
         statement_rows: &|_| false,
         constant: false,
+        whole_blocks: false,
     }
     .expression(expr)
+}
+
+/// Whether anything `stmt` evaluates, at any depth of the blocks nested in
+/// it, draws a new value each time it runs: a block run once for each row
+/// of `stmt` draws again for each
+pub(crate) fn statement_draws_per_call(
+    stmt: &SelectStatement,
+    registry: &FunctionRegistry,
+) -> bool {
+    Walk {
+        registry,
+        statement_rows: &|_| false,
+        constant: false,
+        whole_blocks: true,
+    }
+    .statement(stmt)
+        == Volatility::PerCall
 }
 
 /// Whether `expr` is one value for the whole statement, so it may be
@@ -44,6 +62,7 @@ pub(crate) fn statement_constant(expr: &Expression, registry: &FunctionRegistry)
         registry,
         statement_rows: &|_| false,
         constant: true,
+        whole_blocks: false,
     }
     .expression(expr)
         != Volatility::PerCall
@@ -62,6 +81,7 @@ pub(crate) fn statement_volatility_in(
         registry,
         statement_rows,
         constant: false,
+        whole_blocks: false,
     }
     .statement(stmt)
 }
@@ -76,6 +96,7 @@ pub(crate) fn expression_volatility_in(
         registry,
         statement_rows,
         constant: false,
+        whole_blocks: false,
     }
     .expression(expr)
 }
@@ -87,6 +108,9 @@ struct Walk<'a> {
     /// Asked by [`statement_constant`]: what is not one value for the
     /// statement answers PerCall
     constant: bool,
+    /// A nested block keeps its own volatility instead of counting once per
+    /// statement at most
+    whole_blocks: bool,
 }
 
 impl Walk<'_> {
@@ -224,6 +248,9 @@ impl Walk<'_> {
     fn block(&self, stmt: &SelectStatement) -> Volatility {
         if self.constant {
             return Volatility::PerCall;
+        }
+        if self.whole_blocks {
+            return self.statement(stmt);
         }
         self.statement(stmt).min(Volatility::PerStatement)
     }

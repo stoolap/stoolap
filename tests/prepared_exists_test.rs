@@ -693,3 +693,40 @@ fn test_a_value_the_where_computes_raises_only_on_a_candidate() {
         );
     }
 }
+
+#[test]
+fn test_a_block_drawing_per_call_at_any_depth_takes_no_keyed_set() {
+    let _guard = serial();
+    let db = setup("volatile_nested");
+    force_exists_strategy(Some(true));
+    let sql = "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k AND EXISTS (SELECT 1 FROM w WHERE w.k = u.k AND RANDOM() < 2)) ORDER BY id";
+    let (_, built, _) = prepared_exists_counts();
+    assert_eq!(ids(&db, sql), vec![1, 2, 4]);
+    assert_eq!(prepared_exists_counts().1, built, "{sql} built a keyed set");
+}
+
+#[test]
+fn test_a_failed_value_raises_only_where_it_is_read() {
+    let _guard = serial();
+    let db = setup("failed_reads");
+    let rows = |sql: &str| {
+        db.query(sql, (2,))
+            .and_then(|rows| {
+                rows.map(|row| row.map(|row| row.get::<i64>(0).unwrap()))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(|e| e.to_string())
+    };
+    for strategy in STRATEGIES {
+        force_exists_strategy(strategy);
+        // The scalar block reads no failed slot, and its FALSE ends the conjunction
+        let scalar = "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id AND 0 = (SELECT 1 FROM w WHERE w.id = u.id) AND u.v > $1 * 9223372036854775807)";
+        assert_eq!(rows(scalar), Ok(vec![]), "{scalar} under {strategy:?}");
+        // A FLOAT operand of AND is TRUE to the conjunction, which goes on to the failed slot
+        let float = "SELECT id FROM t WHERE t.id = 1 AND EXISTS (SELECT 1 FROM u WHERE u.k = t.k AND u.f AND u.v > $1 * 9223372036854775807)";
+        assert!(rows(float).is_err(), "{float} under {strategy:?}");
+        // A FALSE first ends it before the failed slot
+        let first = "SELECT id FROM t WHERE t.id = 1 AND EXISTS (SELECT 1 FROM u WHERE u.k = t.k AND u.v < 0 AND u.v > $1 * 9223372036854775807)";
+        assert_eq!(rows(first), Ok(vec![]), "{first} under {strategy:?}");
+    }
+}
