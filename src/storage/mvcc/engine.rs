@@ -264,6 +264,23 @@ fn try_parse_default_literal(expr: &str, data_type: DataType) -> Option<Value> {
         return Some(Value::Boolean(false));
     }
 
+    // A typed literal as a StringLiteral displays one, read as the executor reads it
+    if let Some((keyword, quoted)) = expr.split_once(char::is_whitespace) {
+        let quoted = quoted.trim_start();
+        let typed = crate::core::value::TYPED_LITERAL_KEYWORDS
+            .iter()
+            .any(|k| keyword.eq_ignore_ascii_case(k));
+        let text = quoted
+            .strip_prefix('\'')
+            .and_then(|rest| rest.strip_suffix('\''))
+            .filter(|text| !text.contains('\''));
+        if let (true, Some(text)) = (typed, text) {
+            let value = crate::core::value::typed_literal_timestamp(keyword, text)
+                .unwrap_or_else(|| Value::from(text));
+            return Some(value.coerce_to_type(data_type));
+        }
+    }
+
     // String literal (single-quoted) — coerce to target data type so that
     // e.g. TIMESTAMP DEFAULT '2024-01-01' is restored as a Timestamp, not Text.
     if expr.len() >= 2 && expr.starts_with('\'') && expr.ends_with('\'') {

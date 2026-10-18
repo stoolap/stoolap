@@ -250,3 +250,126 @@ fn test_a_stored_expression_keeps_the_literal_hint() {
         wrong.join("\n")
     );
 }
+
+#[test]
+fn test_a_typed_default_survives_wal_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut wrong = Vec::new();
+    for (n, (literal, stored)) in LITERALS.iter().enumerate() {
+        let dsn = format!(
+            "file://{}/wal_{n}?checkpoint_on_close=off&checkpoint_interval=0",
+            dir.path().display()
+        );
+        let want_ts = {
+            let db = Database::open(&dsn).unwrap();
+            db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+                .unwrap();
+            db.execute("INSERT INTO t VALUES (1), (2)", ()).unwrap();
+            db.execute(
+                &format!("ALTER TABLE t ADD COLUMN d TIMESTAMP DEFAULT {literal}"),
+                (),
+            )
+            .unwrap();
+            db.execute(
+                &format!("ALTER TABLE t ADD COLUMN s TEXT DEFAULT {literal}"),
+                (),
+            )
+            .unwrap();
+            let want: Value = db
+                .query(&format!("SELECT {literal}"), ())
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .get_value(0)
+                .cloned()
+                .unwrap();
+            let _ = db.close();
+            want
+        };
+        let db = Database::open(&dsn).unwrap();
+        let want = vec![
+            vec![Value::Integer(1), want_ts.clone(), Value::text(*stored)],
+            vec![Value::Integer(2), want_ts.clone(), Value::text(*stored)],
+        ];
+        let got: Result<Vec<Vec<Value>>, String> = db
+            .query("SELECT id, d, s FROM t ORDER BY id", ())
+            .map_err(|e| e.to_string())
+            .and_then(|rows| {
+                rows.map(|row| {
+                    row.map(|row| (0..3).map(|i| row.get_value(i).cloned().unwrap()).collect())
+                        .map_err(|e| e.to_string())
+                })
+                .collect()
+            });
+        if got.as_ref() != Ok(&want) {
+            wrong.push(format!(
+                "{literal} after recovery gave {got:?}, want {want:?}"
+            ));
+        }
+        let _ = db.close();
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+#[test]
+fn test_an_inline_concat_answers_as_the_vm() {
+    let db = Database::open("memory://literal_concat").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT, i INTEGER, f FLOAT, b BOOLEAN)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO t VALUES (1, 'a', 7, 1e20, TRUE), (2, NULL, 8, -0.5, FALSE), (3, 'c', NULL, 2.5, NULL)",
+        (),
+    )
+    .unwrap();
+    let mut wrong = Vec::new();
+    for expr in [
+        "TIMESTAMP '2024-01-01 12:00:00' || s",
+        "s || TIMESTAMP '2024-01-01 12:00:00'",
+        "i || s",
+        "s || i",
+        "f || s",
+        "s || f",
+        "i || '-' || s",
+        "b || s",
+        "s || '-' || b",
+    ] {
+        let inline: Vec<Value> = db
+            .query(&format!("SELECT {expr} FROM t ORDER BY id LIMIT 3"), ())
+            .unwrap()
+            .map(|row| row.unwrap().get_value(0).cloned().unwrap())
+            .collect();
+        for (k, got) in (1..=3).zip(&inline) {
+            let vm = db
+                .query(&format!("SELECT {expr} FROM t WHERE id = {k}"), ())
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .get_value(0)
+                .cloned()
+                .unwrap();
+            let same = match (got, &vm) {
+                (Value::Null(_), Value::Null(_)) => true,
+                (a, b) => a == b,
+            };
+            if !same {
+                wrong.push(format!("{expr} on row {k}: inline {got:?}, VM {vm:?}"));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}

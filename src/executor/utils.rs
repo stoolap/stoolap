@@ -1024,17 +1024,10 @@ pub fn extract_literal_value(expr: &Expression) -> Option<Value> {
 /// The value a string literal stands for: a TIMESTAMP for `TIMESTAMP '...'`,
 /// `DATETIME '...'` and `DATE '...'` when the text parses, a TEXT otherwise
 pub fn string_literal_value(lit: &StringLiteral) -> Value {
-    let timestamp = lit.type_hint.as_deref().is_some_and(|hint| {
-        ["TIMESTAMP", "DATETIME", "DATE"]
-            .iter()
-            .any(|name| hint.eq_ignore_ascii_case(name))
-    });
-    if timestamp {
-        if let Ok(t) = crate::core::value::parse_timestamp(&lit.value) {
-            return Value::Timestamp(t);
-        }
-    }
-    Value::Text(lit.value.clone())
+    lit.type_hint
+        .as_deref()
+        .and_then(|hint| crate::core::value::typed_literal_timestamp(hint, &lit.value))
+        .unwrap_or_else(|| Value::Text(lit.value.clone()))
 }
 
 /// Flip a comparison operator for when column and value are swapped.
