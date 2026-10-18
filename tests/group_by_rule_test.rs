@@ -245,3 +245,52 @@ fn group_by_groups_equal_keys_and_answers_every_aggregate() {
         wrong.join("\n")
     );
 }
+
+/// A LIMIT keeps some groups whole: over an input large enough to split,
+/// the kept group counts every one of its rows, wherever they fall
+#[test]
+fn a_limited_group_counts_all_its_rows() {
+    const ROWS: i64 = 200_000;
+    const SEEDS: i64 = 8;
+    let db = Database::open("memory://group_by_rule_limit").unwrap();
+    let columns: Vec<String> = (0..SEEDS).map(|s| format!("g{s} INTEGER")).collect();
+    db.execute(
+        &format!(
+            "CREATE TABLE p (id INTEGER PRIMARY KEY, v INTEGER, {})",
+            columns.join(", ")
+        ),
+        (),
+    )
+    .unwrap();
+    let keys: Vec<String> = (0..SEEDS)
+        .map(|s| format!("((value * 48271 + {}) % 65537) % 2", s * 7919))
+        .collect();
+    db.execute(
+        &format!(
+            "INSERT INTO p SELECT value, value % 10, {} FROM generate_series(1, {ROWS})",
+            keys.join(", ")
+        ),
+        (),
+    )
+    .unwrap();
+    let mut wrong = Vec::new();
+    for s in 0..SEEDS {
+        let sql =
+            format!("SELECT g{s}, COUNT(*), SUM(v) FROM p WHERE id > 0 GROUP BY g{s} LIMIT 1");
+        let got = rows(&db, &sql);
+        let key = got[0]
+            .split('|')
+            .next()
+            .unwrap()
+            .trim_start_matches("i:")
+            .to_string();
+        let whole = rows(
+            &db,
+            &format!("SELECT {key}, COUNT(*), SUM(v) FROM p WHERE g{s} = {key}"),
+        );
+        if got != whole {
+            wrong.push(format!("{sql}: got {got:?}, the group holds {whole:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

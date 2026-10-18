@@ -194,25 +194,26 @@ impl GroupedAggregates {
         self
     }
 
-    /// No groups, for the same calls and keys
+    /// No groups and no group cap, for the same calls and keys
     pub fn empty_like(&self) -> Self {
         Self::new(
             self.calls.iter().map(CallTemplate::duplicate).collect(),
             self.width,
         )
-        .with_group_cap(self.cap)
     }
 
     pub fn is_empty(&self) -> bool {
         self.groups == 0
     }
 
-    /// Whether runs over disjoint rows merge into the run over all of them
+    /// Whether runs over disjoint rows merge into the run over all of them;
+    /// under a group cap a part would drop rows of a group another part keeps
     pub fn can_merge(&self) -> bool {
-        self.calls.iter().all(|call| match call {
-            CallTemplate::Compiled(make) => make().can_merge(),
-            CallTemplate::Dynamic { .. } => false,
-        })
+        self.cap == usize::MAX
+            && self.calls.iter().all(|call| match call {
+                CallTemplate::Compiled(make) => make().can_merge(),
+                CallTemplate::Dynamic { .. } => false,
+            })
     }
 
     /// The group `key` belongs to, made at its first row; None for a new
@@ -286,6 +287,7 @@ impl GroupedAggregates {
 
     /// Folds the groups of a run over other rows into these, see `can_merge`
     pub fn merge(&mut self, other: GroupedAggregates) {
+        debug_assert!(self.can_merge(), "merge needs runs that merge");
         let calls = self.calls.len();
         for group in 0..other.groups {
             let key = &other.keys[group * other.width..][..other.width];
