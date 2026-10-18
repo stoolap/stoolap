@@ -1704,10 +1704,17 @@ fn test_json_comparisons_give_one_answer() {
     for (shape, found) in &answers {
         assert_eq!(
             found,
-            &vec![1],
-            "{shape}: a JSON column equal to the same text"
+            &Vec::<i64>::new(),
+            "{shape}: a JSON column against a TEXT is unknown"
         );
     }
+    let as_json = "SELECT t.id FROM t WHERE t.id = \
+                   (SELECT u.id FROM u WHERE u.j = CAST($1 AS JSON))";
+    assert_eq!(
+        ids(&db, as_json, (param,)).0,
+        vec![1],
+        "a JSON column equals the same JSON value"
+    );
 }
 
 #[test]
