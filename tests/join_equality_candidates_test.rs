@@ -300,8 +300,8 @@ fn explain_reports_the_grouped_index_join_only_for_the_shape_it_takes() {
     );
     let window = "SELECT u.id, SUM(o.amount) OVER () FROM users u INNER JOIN orders o ON u.id = o.user_id LIMIT 1";
     assert!(
-        !plan(window).contains("Index Nested Loop"),
-        "a window function is not the index join's: {}",
+        plan(window).contains("Index Nested Loop"),
+        "a window reads the index join's rows as a projection does: {}",
         plan(window)
     );
     db.execute("CREATE TABLE flags (uid INTEGER PRIMARY KEY)", ())

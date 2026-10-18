@@ -952,8 +952,8 @@ impl Executor {
         index_use: JoinIndexUse,
     ) -> (String, Option<IndexLookupStrategy>) {
         // The index join is reported only where execution takes it: never
-        // under an aggregate or window the operators turn away, and for the
-        // grouped operator on the right side only
+        // for a shape the reduction plan takes without the grouped operator,
+        // and for the grouped operator on the right side only
         let bounded = match index_use {
             JoinIndexUse::None => None,
             JoinIndexUse::Streaming { bounded } => Some(bounded),

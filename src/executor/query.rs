@@ -4238,20 +4238,15 @@ impl Executor {
             }));
             (left_rows, left_cols, right_rows, right_cols)
         } else {
-            // Skip Index Nested Loop if query has aggregation or window functions
-            // These require full result sets and can't use early termination
-            let has_agg = classification.has_aggregation;
-            let has_window = classification.has_window_functions;
-
             // Check if we can use Index Nested Loop Join
-            // This optimization avoids materializing the right side entirely
-            // NOTE: Don't use Index NL for aggregation/window queries - they need full results
-            // and the current implementation falls through to standard path, causing double execution
+            // This optimization avoids materializing the right side entirely.
+            // The join is chosen alike whatever reads its rows: an aggregate
+            // or a window takes the index join's rows as it takes the hash join's
             let pushed_limit = self.pushed_join_limit(stmt, Some(ctx), classification, &join_type);
             // An INNER join without a limit narrows its inner side by a table's
             // candidates only for an outer side found small once it runs
             let small_outer = pushed_limit.is_none() && join_type == "INNER";
-            let index_nl_info = if has_agg || has_window || correlated_where {
+            let index_nl_info = if correlated_where {
                 None
             } else {
                 self.check_index_nested_loop_opportunity(
@@ -4270,8 +4265,6 @@ impl Executor {
             // and left side is a table with PK/index, use swapped Index NL.
             // This handles inlined CTEs: (table) JOIN (subquery) -> subquery outer, table inner
             let (index_nl_info, force_swap) = if index_nl_info.is_none()
-                && !has_agg
-                && !has_window
                 && !correlated_where
                 // Only an INNER join reads the same with its sides
                 // exchanged; a LEFT join would go on preserving the side it
@@ -4314,9 +4307,7 @@ impl Executor {
                     left_filter.clone(),  // Table becomes inner
                     true,
                 )
-            } else if !has_agg
-                    && !has_window
-                    && !correlated_where
+            } else if !correlated_where
                     && join_type == "INNER"
                     && right_filter.is_some()  // Right side has a filter
                     && left_filter.is_none()
@@ -4958,8 +4949,8 @@ impl Executor {
                     let has_window = classification.has_window_functions;
 
                     // Apply ORDER BY if present. Aggregation/window queries
-                    // fall through to the standard path, which must see the
-                    // untruncated rows. An ORDER BY expression the join-local
+                    // order after aggregating, so they see the untruncated
+                    // rows. An ORDER BY expression the join-local
                     // evaluator cannot resolve (SELECT aliases, positions)
                     // also defers ordering to the standard path.
                     // A bare integer literal in ORDER BY is an output
@@ -5072,8 +5063,13 @@ impl Executor {
                     }
 
                     if has_agg || has_window {
-                        // Fall through to standard path for aggregation/window handling
-                        // Don't return early - let the standard path handle these
+                        return self.aggregate_joined_rows(
+                            stmt,
+                            ctx,
+                            classification,
+                            final_rows,
+                            &all_columns,
+                        );
                     } else if let Some(proj) = projection_pushdown {
                         // Projection was pushed down - rows are already projected
                         let output_columns = CompactArc::new(proj.output_columns);
@@ -5787,33 +5783,14 @@ impl Executor {
             (all_columns.clone(), filtered_rows)
         };
 
-        let has_agg = classification.has_aggregation;
-        let has_window = classification.has_window_functions;
-
-        // Check if we have both aggregation and window functions
-        if has_agg && has_window {
-            // 1. First apply GROUP BY aggregation
-            // 2. Then apply window functions on the aggregated result
-            let result =
-                self.execute_aggregation_then_windows(stmt, ctx, &final_rows, &final_columns)?;
-            let columns = CompactArc::new(result.columns().to_vec());
-            return Ok((result, columns, false, None));
-        }
-
-        // Check if we need window functions only (no aggregation)
-        if has_window {
-            let result =
-                self.execute_select_with_window_functions(stmt, ctx, &final_rows, &final_columns)?;
-            let columns = CompactArc::new(result.columns().to_vec());
-            return Ok((result, columns, false, None));
-        }
-
-        // Check if we need aggregation only
-        if has_agg {
-            let result =
-                self.execute_select_with_aggregation(stmt, ctx, final_rows, &final_columns)?;
-            let columns = CompactArc::new(result.columns().to_vec());
-            return Ok((result, columns, false, None));
+        if classification.has_aggregation || classification.has_window_functions {
+            return self.aggregate_joined_rows(
+                stmt,
+                ctx,
+                classification,
+                final_rows,
+                &final_columns,
+            );
         }
 
         // Check if ORDER BY or DISTINCT ON references columns not in SELECT
@@ -7285,6 +7262,31 @@ impl Executor {
             isolation,
             view.cloned(),
         ))
+    }
+
+    /// The aggregation and window functions of `stmt` over a join's rows, the
+    /// one tail every join operator hands its rows to
+    fn aggregate_joined_rows(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        classification: &QueryClassification,
+        rows: RowVec,
+        columns: &[String],
+    ) -> SelectResult {
+        let result = match (
+            classification.has_aggregation,
+            classification.has_window_functions,
+        ) {
+            // GROUP BY first, then the windows over the groups
+            (true, true) => self.execute_aggregation_then_windows(stmt, ctx, &rows, columns)?,
+            (false, true) => {
+                self.execute_select_with_window_functions(stmt, ctx, &rows, columns)?
+            }
+            _ => self.execute_select_with_aggregation(stmt, ctx, rows, columns)?,
+        };
+        let columns = CompactArc::new(result.columns().to_vec());
+        Ok((result, columns, false, None))
     }
 
     /// True when a filter carries a subquery anywhere inside it. The grouped
@@ -11312,11 +11314,11 @@ impl Executor {
     }
 
     /// Which index join operator, if any, a join in the FROM clause of
-    /// `stmt` runs on: the streaming or batch index join when nothing
-    /// aggregates or windows the rows, bounded when the executor pushes the
-    /// limit; the grouped index join when the reduction plan bounds it and
-    /// its shape is the grouped operator's. EXPLAIN asks this so it reports
-    /// the strategy execution would choose.
+    /// `stmt` runs on: the grouped index join when the reduction plan bounds
+    /// the join and its shape is the grouped operator's, no index join for
+    /// the other shapes of that plan, else the streaming or batch index join,
+    /// bounded when the executor pushes the limit. EXPLAIN asks this so it
+    /// reports the strategy execution would choose.
     pub(crate) fn join_index_use(&self, stmt: &SelectStatement) -> JoinIndexUse {
         let Some(Expression::JoinSource(join)) = stmt.table_expr.as_deref() else {
             return JoinIndexUse::None;
@@ -11326,12 +11328,6 @@ impl Executor {
         // A WHERE that reaches into the outer query keeps both operators out
         if classification.where_has_correlated_subqueries {
             return JoinIndexUse::None;
-        }
-        if !classification.has_aggregation && !classification.has_window_functions {
-            let bounded = self
-                .pushed_join_limit(stmt, None, &classification, &join_type)
-                .is_some();
-            return JoinIndexUse::Streaming { bounded };
         }
         let left_table = match join.left.as_ref() {
             Expression::TableSource(ts) => Some(ts.name.value.as_str()),
@@ -11348,7 +11344,10 @@ impl Executor {
             )
             .is_none()
         {
-            return JoinIndexUse::None;
+            let bounded = self
+                .pushed_join_limit(stmt, None, &classification, &join_type)
+                .is_some();
+            return JoinIndexUse::Streaming { bounded };
         }
         let (right_filter_present, filters_have_subquery) = match &stmt.where_clause {
             Some(where_clause) => {
