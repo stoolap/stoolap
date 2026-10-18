@@ -21,7 +21,7 @@ use chrono::{DateTime, TimeZone, Utc};
 
 use super::{find_column_index, resolve_alias, Expression};
 use crate::common::SmartString;
-use crate::core::integer::integer_from;
+use crate::core::integer::{integer_reading, IntegerReading};
 use crate::core::{DataType, Operator, Result, Row, Schema, Value};
 
 /// CAST expression (CAST(column AS type))
@@ -257,8 +257,8 @@ impl Expression for CompoundExpr {
         // Fast path based on target type
         match self.cast_expr.target_type {
             DataType::Integer => {
-                let (Ok(Some(col_int)), Ok(Some(comp_int))) =
-                    (integer_from(col_value), integer_from(&self.value))
+                let (IntegerReading::Fits(col_int), IntegerReading::Fits(comp_int)) =
+                    (integer_reading(col_value), integer_reading(&self.value))
                 else {
                     return false;
                 };

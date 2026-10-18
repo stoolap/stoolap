@@ -25,7 +25,7 @@ use std::sync::Arc;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 
 use super::error::{Error, Result};
-use super::integer::integer_from;
+use super::integer::{integer_from, integer_reading, IntegerReading};
 use super::types::DataType;
 use crate::common::{CompactArc, SmartString};
 
@@ -593,8 +593,8 @@ impl Value {
         }
 
         match target_type {
-            DataType::Integer => match integer_from(self) {
-                Ok(Some(v)) => Value::Integer(v),
+            DataType::Integer => match integer_reading(self) {
+                IntegerReading::Fits(v) => Value::Integer(v),
                 _ => Value::Null(target_type),
             },
             DataType::Float => {
@@ -757,8 +757,8 @@ impl Value {
         }
 
         match target_type {
-            DataType::Integer => match integer_from(&self) {
-                Ok(Some(v)) => Value::Integer(v),
+            DataType::Integer => match integer_reading(&self) {
+                IntegerReading::Fits(v) => Value::Integer(v),
                 _ => Value::Null(target_type),
             },
             DataType::Float => match &self {
