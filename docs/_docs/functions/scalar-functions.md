@@ -362,6 +362,8 @@ SELECT LEAST(1, 5, 3);                     -- Returns 1
 SELECT LEAST(price, max_price) FROM products;
 ```
 
+GREATEST and LEAST skip NULL arguments and return NULL only when every argument is NULL, wherever the call stands: `GREATEST(1, NULL, 3)` is 3, `LEAST(1, NULL, 3)` is 1, and `GREATEST(NULL, NULL)` is NULL. Among the other arguments they pick by the one sort order MIN, MAX and ORDER BY use.
+
 ## Date and Time Functions
 
 ### NOW / CURRENT_TIMESTAMP
