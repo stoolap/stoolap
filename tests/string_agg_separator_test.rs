@@ -220,3 +220,94 @@ fn test_a_window_separator_is_one_value_for_every_partition() {
         "{sql} used {separators:?}"
     );
 }
+
+#[test]
+fn test_a_window_separator_error_is_reported_by_a_row_that_reads_it() {
+    let db = Database::open("memory://string_agg_separator_empty").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, b TEXT)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX t_g ON t (g)", ()).unwrap();
+    let windows = [
+        "SELECT STRING_AGG(b, $1 + 1) OVER () FROM t",
+        "SELECT STRING_AGG(b, $1 + 1 ORDER BY id) OVER (PARTITION BY g) FROM t",
+        "SELECT g, STRING_AGG(b, $1 + 1) OVER (PARTITION BY g) FROM t LIMIT 4",
+    ];
+    let mut wrong = Vec::new();
+    let mut run = |sql: &str, want_error: bool| {
+        let got = db.query(sql, (i64::MAX,)).and_then(|rows| {
+            rows.collect::<stoolap::Result<Vec<_>>>()
+                .map(|rows| rows.len())
+        });
+        if got.is_err() != want_error {
+            wrong.push(format!("{sql} gave {got:?}, want an error: {want_error}"));
+        }
+    };
+    for sql in windows {
+        run(sql, false);
+    }
+    db.execute("INSERT INTO t VALUES (1, 1, 'x'), (2, 2, 'y')", ())
+        .unwrap();
+    for sql in windows {
+        run(sql, true);
+    }
+    drop(run);
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+#[test]
+fn test_a_separator_error_is_reported_by_a_group_that_reads_it() {
+    let db = Database::open("memory://string_agg_separator_groups").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, b TEXT)",
+        "CREATE TABLE p (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, pid INTEGER, b TEXT)",
+        "CREATE INDEX c_pid ON c (pid)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let grouped = [
+        "SELECT g, STRING_AGG(b, $1 + 1) FROM t GROUP BY g",
+        "SELECT g, STRING_AGG(b, $1 + 1 ORDER BY id) FROM t GROUP BY g",
+        "SELECT g, STRING_AGG(b, $1 + 1) FROM t GROUP BY g LIMIT 1",
+        "SELECT p.id, STRING_AGG(c.b, $1 + 1) FROM p JOIN c ON p.id = c.pid GROUP BY p.id LIMIT 1",
+    ];
+    let mut wrong = Vec::new();
+    let mut run = |sql: &str, want_error: bool| {
+        let got = db.query(sql, (i64::MAX,)).and_then(|rows| {
+            rows.collect::<stoolap::Result<Vec<_>>>()
+                .map(|rows| rows.len())
+        });
+        if got.is_err() != want_error {
+            wrong.push(format!("{sql} gave {got:?}, want an error: {want_error}"));
+        }
+    };
+    for sql in grouped {
+        run(sql, false);
+    }
+    run("SELECT STRING_AGG(b, $1 + 1) FROM t", true);
+    for sql in [
+        "INSERT INTO t VALUES (1, 1, 'x')",
+        "INSERT INTO p VALUES (1)",
+        "INSERT INTO c VALUES (1, 1, 'x')",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    for sql in grouped {
+        run(sql, true);
+    }
+    drop(run);
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}

@@ -7637,12 +7637,16 @@ impl Executor {
         let count_star = Value::Integer(1);
         let op_join_type = OperatorJoinType::parse(join_type);
         let want = plan.want;
+        let failed = crate::executor::aggregation::extra_args_failure(&aggregations);
 
         // Fold one finished group into an output row; true when HAVING kept it
         let finish = |first: &Row,
                       funcs: &mut [crate::functions::aggregate::AggregateState],
                       groups: &mut RowVec|
          -> Result<bool> {
+            if let Some(error) = failed {
+                return Err(error.clone());
+            }
             let mut values = Vec::with_capacity(result_columns.len());
             for &idx in &group_idx {
                 values.push(first.get(idx).cloned().unwrap_or_else(Value::null_unknown));

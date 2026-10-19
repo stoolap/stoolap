@@ -420,6 +420,9 @@ pub struct SqlAggregateFunction {
     pub distinct: bool,
     /// Extra arguments (e.g., separator for STRING_AGG)
     pub extra_args: Vec<Value>,
+    /// The error an extra argument gave when evaluated, the result of
+    /// every group that reads this call
+    pub(crate) extra_error: Option<crate::core::Error>,
     /// The expression to evaluate for each row (for SUM(val * 2), AVG(a + b), etc.)
     /// If None, use column directly; if Some, evaluate expression first
     pub expression: Option<Expression>,
@@ -488,6 +491,7 @@ impl SqlAggregateFunction {
             self.distinct,
             &self.extra_args,
             Executor::aggregate_order_keys(&self.order_by),
+            self.extra_error.clone(),
         ))
     }
 
@@ -591,38 +595,58 @@ impl Modifiers {
     }
 }
 
+/// An aggregate call's extra argument values and the error one of them gave
+pub(crate) type ExtraArgs = (Vec<Value>, Option<crate::core::Error>);
+
+/// The error an extra argument of one of `aggregations` gave, which a path
+/// that reads groups itself reports at its first group
+pub(crate) fn extra_args_failure(
+    aggregations: &[SqlAggregateFunction],
+) -> Option<&crate::core::Error> {
+    aggregations.iter().find_map(|agg| agg.extra_error.as_ref())
+}
+
 /// The extra arguments of an aggregate call (a STRING_AGG separator), each
-/// one value for the statement, read once with the parameters of `ctx`
+/// one value for the statement, read once with the parameters of `ctx`. An
+/// argument that fails to evaluate is NULL here and its error comes second,
+/// for the first group or frame that reads the call to report
 pub(crate) fn aggregate_extra_args(
     args: &[Expression],
     ctx: Option<&ExecutionContext>,
-) -> Result<Vec<Value>> {
-    args.iter()
-        .skip(1)
-        .map(|arg| match arg {
-            Expression::Identifier(id) if id.quoted => Ok(Value::text(id.value.as_str())),
-            arg => {
-                if let Some(value) = super::utils::extract_literal_value(arg) {
-                    return Ok(value);
+) -> Result<ExtraArgs> {
+    let mut values = Vec::with_capacity(args.len().saturating_sub(1));
+    let mut failed = None;
+    for arg in args.iter().skip(1) {
+        let value = match arg {
+            Expression::Identifier(id) if id.quoted => Value::text(id.value.as_str()),
+            arg => match super::utils::extract_literal_value(arg) {
+                Some(value) => value,
+                None => {
+                    if !super::volatility::statement_constant(
+                        arg,
+                        crate::functions::registry::global_registry(),
+                    ) {
+                        return Err(crate::core::Error::invalid_argument(format!(
+                            "an aggregate argument after the first must not read the row: {}",
+                            arg
+                        )));
+                    }
+                    let eval = super::expression::ExpressionEval::compile(arg, &[])?;
+                    let evaluated = match ctx {
+                        Some(ctx) => eval.with_context(ctx),
+                        None => eval,
+                    }
+                    .eval_slice(&Row::new());
+                    evaluated.unwrap_or_else(|error| {
+                        failed.get_or_insert(error);
+                        Value::null_unknown()
+                    })
                 }
-                if !super::volatility::statement_constant(
-                    arg,
-                    crate::functions::registry::global_registry(),
-                ) {
-                    return Err(crate::core::Error::invalid_argument(format!(
-                        "an aggregate argument after the first must not read the row: {}",
-                        arg
-                    )));
-                }
-                let eval = super::expression::ExpressionEval::compile(arg, &[])?;
-                match ctx {
-                    Some(ctx) => eval.with_context(ctx),
-                    None => eval,
-                }
-                .eval_slice(&Row::new())
-            }
-        })
-        .collect()
+            },
+        };
+        values.push(value);
+    }
+    Ok((values, failed))
 }
 
 /// What one aggregate call reads from each input row, compiled once: the
@@ -2152,7 +2176,7 @@ impl Executor {
                         }
                     }
 
-                    let (column, distinct, extra_args, expression) =
+                    let (column, distinct, (extra_args, extra_error), expression) =
                         self.extract_agg_column(&func.arguments, ctx)?;
                     let column_lower = column.to_lowercase();
                     aggregations.push(SqlAggregateFunction {
@@ -2162,6 +2186,7 @@ impl Executor {
                         alias: None,
                         distinct: distinct || func.is_distinct,
                         extra_args,
+                        extra_error,
                         expression,
                         order_by: func.order_by.clone(),
                         filter: func.filter.as_ref().map(|f| (**f).clone()),
@@ -2271,7 +2296,7 @@ impl Executor {
                         }
                     }
 
-                    let (column, distinct, extra_args, expression) =
+                    let (column, distinct, (extra_args, extra_error), expression) =
                         self.extract_agg_column(&func.arguments, ctx)?;
                     let column_lower = column.to_lowercase();
                     aggregations.push(SqlAggregateFunction {
@@ -2281,6 +2306,7 @@ impl Executor {
                         alias: Some(aliased.alias.value.to_string()),
                         distinct: distinct || func.is_distinct,
                         extra_args,
+                        extra_error,
                         expression,
                         order_by: func.order_by.clone(),
                         filter: func.filter.as_ref().map(|f| (**f).clone()),
@@ -2341,15 +2367,16 @@ impl Executor {
     /// Returns: (column_name, distinct, extra_args, expression)
     /// - column_name: The column or expression string the aggregate operates on (* for COUNT(*))
     /// - distinct: Whether DISTINCT was found in arguments
-    /// - extra_args: Additional arguments (e.g., separator for STRING_AGG)
+    /// - extra_args: Additional arguments (e.g., separator for STRING_AGG) and
+    ///   the error one gave, see [`aggregate_extra_args`]
     /// - expression: The expression to evaluate (Some for complex expressions like val * 2)
     fn extract_agg_column(
         &self,
         args: &[Expression],
         ctx: Option<&ExecutionContext>,
-    ) -> Result<(String, bool, Vec<Value>, Option<Expression>)> {
+    ) -> Result<(String, bool, ExtraArgs, Option<Expression>)> {
         if args.is_empty() {
-            return Ok(("*".to_string(), false, Vec::new(), None));
+            return Ok(("*".to_string(), false, (Vec::new(), None), None));
         }
 
         let (column, distinct, expression) = match &args[0] {

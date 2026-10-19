@@ -418,6 +418,8 @@ pub struct WindowFunctionInfo {
     pub call_order_by: Box<[OrderByExpression]>,
     /// An aggregate's arguments after the first, read once for the statement
     pub extra_args: Vec<Value>,
+    /// The error one of them gave, reported once there is a row to aggregate
+    pub extra_error: Option<Error>,
 }
 
 /// Information about a SELECT list item for window function processing
@@ -2170,6 +2172,11 @@ impl Executor {
 
         // Build column name
         let column_name = format!("{}()", func.function);
+        let (extra_args, extra_error) = if self.function_registry.is_aggregate(&func.function) {
+            super::aggregation::aggregate_extra_args(&func.arguments, Some(ctx))?
+        } else {
+            (Vec::new(), None)
+        };
 
         // OPTIMIZATION: func.function is already uppercase from parsing
         Ok(WindowFunctionInfo {
@@ -2183,11 +2190,8 @@ impl Executor {
             is_distinct: func.is_distinct,
             filter: func.filter.clone(),
             call_order_by: func.order_by.clone().into_boxed_slice(),
-            extra_args: if self.function_registry.is_aggregate(&func.function) {
-                super::aggregation::aggregate_extra_args(&func.arguments, Some(ctx))?
-            } else {
-                Vec::new()
-            },
+            extra_args,
+            extra_error,
         })
     }
 
@@ -3857,6 +3861,9 @@ impl Executor {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
+        if let Some(error) = &wf_info.extra_error {
+            return Err(error.clone());
+        }
         let frame = Frame::read(wf_info, &self.function_registry, ctx)?;
         let mut results: Vec<Option<Value>> = vec![None; rows.len()];
 
@@ -4096,6 +4103,7 @@ mod tests {
             filter: None,
             call_order_by: Box::new([]),
             extra_args: Vec::new(),
+            extra_error: None,
         };
 
         assert_eq!(info.name, "ROW_NUMBER");
