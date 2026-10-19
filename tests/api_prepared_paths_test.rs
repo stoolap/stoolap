@@ -259,3 +259,114 @@ fn named_parameters_on_a_prepared_statement_answer_as_the_sql_text_does() {
         .unwrap();
     assert_eq!(score, 5.0);
 }
+
+/// Two databases with the same DDL count, so their schema epochs match,
+/// and `t.v` of a different type in each
+fn twins(name: &str, here_v: &str, there_v: &str) -> (Database, Database) {
+    let open_one = |side: &str, v_type: &str| {
+        let db = Database::open(&format!("memory://{name}_{side}")).unwrap();
+        db.execute(
+            &format!("CREATE TABLE t (id INTEGER PRIMARY KEY, v {v_type})"),
+            (),
+        )
+        .unwrap();
+        db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.execute("INSERT INTO u VALUES (1)", ()).unwrap();
+        db
+    };
+    (open_one("here", here_v), open_one("there", there_v))
+}
+
+#[test]
+fn a_statement_from_another_database_is_planned_for_the_transaction_s_tables() {
+    let (here, there) = twins("api_paths_rebind_update", "INTEGER", "TEXT");
+    here.execute("INSERT INTO t VALUES (1, 5)", ()).unwrap();
+    there.execute("INSERT INTO t VALUES (1, 'x')", ()).unwrap();
+    let update = here.prepare("UPDATE t SET v = $1 WHERE id = $2").unwrap();
+    update.execute((6, 1)).unwrap();
+    let mut tx = there.begin().unwrap();
+    assert_eq!(update.execute_in(&mut tx, ("foo", 1)).unwrap(), 1);
+    tx.commit().unwrap();
+    let v: String = there.query_one("SELECT v FROM t WHERE id = 1", ()).unwrap();
+    assert_eq!(v, "foo");
+
+    let (here, there) = twins("api_paths_rebind_select", "BOOLEAN", "TEXT");
+    here.execute("INSERT INTO t VALUES (1, true)", ()).unwrap();
+    there
+        .execute("INSERT INTO t VALUES (1, 'foo')", ())
+        .unwrap();
+    let select = here
+        .prepare("SELECT v FROM t WHERE v = $1 AND EXISTS (SELECT 1 FROM u WHERE id = 1)")
+        .unwrap();
+    assert_eq!(collect(select.query(("true",))).unwrap().len(), 1);
+    let mut tx = there.begin().unwrap();
+    let rows = collect(select.query_in(&mut tx, ("foo",))).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(rows, vec![vec![Value::text("foo")]]);
+}
+
+#[test]
+fn current_transaction_id_reads_the_open_transaction_on_every_path() {
+    let db = Database::open("memory://api_paths_txn_id").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 0)", ()).unwrap();
+    let mut tx = db.begin().unwrap();
+    let id = tx.id();
+    tx.execute("UPDATE t SET v = CURRENT_TRANSACTION_ID() WHERE id = 1", ())
+        .unwrap();
+    tx.execute("INSERT INTO t SELECT 2, CURRENT_TRANSACTION_ID()", ())
+        .unwrap();
+    tx.execute("INSERT INTO t VALUES (3, CURRENT_TRANSACTION_ID())", ())
+        .unwrap();
+    let rows = collect(tx.query("SELECT id, v FROM t ORDER BY id", ())).unwrap();
+    tx.commit().unwrap();
+    let ids: Vec<Value> = rows.iter().map(|row| row[1].clone()).collect();
+    assert_eq!(ids, vec![Value::Integer(id); 3], "{rows:?}");
+}
+
+#[test]
+fn a_missing_named_update_parameter_writes_what_the_general_path_writes() {
+    // RETURNING keeps the statement off the compiled PK path
+    let general = "UPDATE t SET v = :v WHERE id = :id RETURNING id";
+    let compiled = "UPDATE t SET v = :v WHERE id = :id";
+    let outcome = |name: &str, sql: &str, in_tx: bool| {
+        let db = Database::open(&format!("memory://api_paths_missing_{name}")).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+            .unwrap();
+        let mut seen = Vec::new();
+        // The second run takes the plan compiled by the first
+        for _ in 0..2 {
+            db.execute("DELETE FROM t", ()).unwrap();
+            db.execute("INSERT INTO t VALUES (1, 9)", ()).unwrap();
+            let affected = if in_tx {
+                let mut tx = db.begin().unwrap();
+                let affected = tx.execute_named(sql, stoolap::named_params! { id: 1 });
+                tx.commit().unwrap();
+                affected
+            } else {
+                db.execute_named(sql, stoolap::named_params! { id: 1 })
+            };
+            let table = key(&collect(db.query("SELECT id, v FROM t", ())));
+            assert!(affected.is_ok(), "{name}: {affected:?}");
+            seen.push(table);
+        }
+        seen
+    };
+    let expected = outcome("general", general, false);
+    assert!(
+        expected[1].contains("Null"),
+        "the general path wrote {expected:?}"
+    );
+    assert_eq!(
+        outcome("autocommit", compiled, false),
+        expected,
+        "autocommit"
+    );
+    assert_eq!(
+        outcome("transaction", compiled, true),
+        expected,
+        "transaction"
+    );
+}

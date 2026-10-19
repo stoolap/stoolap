@@ -250,9 +250,16 @@ impl Statement {
         &self.sql
     }
 
-    /// The compiled plan; None for multi-statement SQL
-    pub(crate) fn plan(&self) -> Option<&CachedPlanRef> {
-        self.plan.as_ref()
+    /// The compiled plan when this statement was prepared on `engine`.
+    /// Compiled state is checked against its engine's schema epoch only,
+    /// so another engine plans the SQL afresh
+    pub(crate) fn plan_on(
+        &self,
+        engine: &Arc<crate::storage::mvcc::engine::MVCCEngine>,
+    ) -> Option<&CachedPlanRef> {
+        let plan = self.plan.as_ref()?;
+        let db = self.db_weak.upgrade()?;
+        Arc::ptr_eq(db.executor.engine(), engine).then_some(plan)
     }
 
     /// Execute the prepared statement inside `tx`

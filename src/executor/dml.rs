@@ -761,7 +761,8 @@ impl Executor {
         let empty_row = Row::new();
 
         // OPTIMIZATION: Pre-build ExecuteContext once (reused for all expressions)
-        let mut base_exec_ctx = ExecuteContext::new(&empty_row);
+        let mut base_exec_ctx =
+            ExecuteContext::new(&empty_row).with_transaction_id(ctx.transaction_id());
         if !params.is_empty() {
             base_exec_ctx = base_exec_ctx.with_params(params);
         }
@@ -1657,7 +1658,8 @@ impl Executor {
         let empty_row = Row::new();
 
         // OPTIMIZATION: Pre-build ExecuteContext once (reused for all expressions)
-        let mut base_exec_ctx = ExecuteContext::new(&empty_row);
+        let mut base_exec_ctx =
+            ExecuteContext::new(&empty_row).with_transaction_id(ctx.transaction_id());
         if !params.is_empty() {
             base_exec_ctx = base_exec_ctx.with_params(params);
         }

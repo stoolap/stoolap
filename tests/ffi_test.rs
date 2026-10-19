@@ -3854,3 +3854,41 @@ fn test_stmt_named_parameters_without_a_transaction() {
         stoolap_close(db);
     }
 }
+
+#[test]
+fn test_json_parameter_the_engine_cannot_read_is_refused() {
+    unsafe {
+        let db = packed_test_db(0);
+        let ddl = cstr("CREATE TABLE j (id INTEGER PRIMARY KEY, data JSON)");
+        assert_eq!(
+            stoolap_exec(db, ddl.as_ptr(), std::ptr::null_mut()),
+            STOOLAP_OK
+        );
+        let ins = cstr("INSERT INTO j VALUES ($1, $2)");
+        let payloads: [&'static [u8]; 2] = [br#"{"x":"\uD800"}"#, b"1e400"];
+        for (i, payload) in payloads.iter().enumerate() {
+            let params = [
+                int_param(i as i64),
+                StoolapValue {
+                    value_type: STOOLAP_TYPE_JSON,
+                    _padding: 0,
+                    v: StoolapValueData {
+                        text: StoolapTextData {
+                            ptr: payload.as_ptr() as *const c_char,
+                            len: payload.len() as i64,
+                        },
+                    },
+                },
+            ];
+            let rc =
+                stoolap_exec_params(db, ins.as_ptr(), params.as_ptr(), 2, std::ptr::null_mut());
+            assert_eq!(
+                rc,
+                STOOLAP_ERROR,
+                "{} was stored",
+                String::from_utf8_lossy(payload)
+            );
+        }
+        stoolap_close(db);
+    }
+}

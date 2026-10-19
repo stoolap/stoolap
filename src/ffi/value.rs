@@ -67,11 +67,10 @@ pub(crate) unsafe fn ffi_value_to_rust(v: &StoolapValue) -> Result<Value> {
                 Value::null_unknown()
             } else {
                 let slice = std::slice::from_raw_parts(text.ptr as *const u8, text.len as usize);
-                // Validates the whole document without building it
+                // The parser the JSON functions read with, so a value bound
+                // here is one they can read
                 match std::str::from_utf8(slice) {
-                    Ok(s) if serde_json::from_str::<serde::de::IgnoredAny>(s).is_ok() => {
-                        Value::json(s)
-                    }
+                    Ok(s) if serde_json::from_str::<serde_json::Value>(s).is_ok() => Value::json(s),
                     _ => return Err(Error::invalid_argument("JSON parameter is not valid JSON")),
                 }
             }

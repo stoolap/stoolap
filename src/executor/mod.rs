@@ -536,19 +536,11 @@ impl Executor {
             }
 
             let gate = self.enter(changes_session(&cached.statement));
+            let (active_txn_id, ctx) = self.gated_txn_ctx(&gate, ctx);
 
-            // INSERT handles the active transaction itself; dispatch before
-            // the txn-state capture so the hot prepared-INSERT path takes
-            // the transaction mutex only once.
             if let Statement::Insert(stmt) = cached.statement.as_ref() {
                 return self.execute_insert_with_compiled_cache(stmt, &ctx, &cached.compiled);
             }
-
-            // Capture transaction state once for the rest of the statement:
-            // the probe battery and the ctx txn-id injection both need it,
-            // and repeated mutex acquisitions dominate the fixed cost of
-            // cached statements.
-            let active_txn_id = self.gated_txn_id(&gate);
 
             if let Some(result) = self.compiled_fast_paths_until_held(
                 cached.statement.as_ref(),
@@ -586,12 +578,11 @@ impl Executor {
                 .put(sql, stmt_arc.clone(), has_params, param_count);
 
             let gate = self.enter(changes_session(&stmt_arc));
+            let (active_txn_id, ctx) = self.gated_txn_ctx(&gate, ctx);
 
             if let Statement::Insert(stmt) = stmt_arc.as_ref() {
                 return self.execute_insert_with_compiled_cache(stmt, &ctx, &cached_plan.compiled);
             }
-
-            let active_txn_id = self.gated_txn_id(&gate);
 
             if let Some(result) = self.compiled_fast_paths_until_held(
                 stmt_arc.as_ref(),
@@ -635,6 +626,24 @@ impl Executor {
         match gate {
             StatementGate::Shared { .. } => None,
             StatementGate::Exclusive { .. } => self.active_txn_id(),
+        }
+    }
+
+    /// The open transaction's id under `gate`, and `ctx` carrying it for
+    /// CURRENT_TRANSACTION_ID() on whichever path the statement takes
+    fn gated_txn_ctx<'c>(
+        &self,
+        gate: &StatementGate<'_>,
+        ctx: std::borrow::Cow<'c, ExecutionContext>,
+    ) -> (Option<i64>, std::borrow::Cow<'c, ExecutionContext>) {
+        let txn_id = self.gated_txn_id(gate);
+        match txn_id {
+            Some(id) => {
+                let mut ctx = ctx;
+                ctx.to_mut().set_transaction_id(id as u64);
+                (txn_id, ctx)
+            }
+            None => (None, ctx),
         }
     }
 
@@ -1236,14 +1245,11 @@ impl Executor {
         }
 
         let gate = self.enter(changes_session(&plan.statement));
+        let (active_txn_id, ctx) = self.gated_txn_ctx(&gate, ctx);
 
-        // INSERT handles the active transaction itself; dispatch before the
-        // txn-state capture so prepared INSERT takes the mutex only once.
         if let Statement::Insert(stmt) = plan.statement.as_ref() {
             return self.execute_insert_with_compiled_cache(stmt, &ctx, &plan.compiled);
         }
-
-        let active_txn_id = self.gated_txn_id(&gate);
         if let Some(result) = self.compiled_fast_paths_until_held(
             plan.statement.as_ref(),
             &ctx,

@@ -309,15 +309,15 @@ impl Transaction {
         self.executor.execute_with_cached_plan_owned(plan, ctx)
     }
 
-    /// Runs a prepared statement in this transaction: by its plan, or by
-    /// its SQL when it holds more than one statement
+    /// Runs a prepared statement in this transaction: by its plan when it
+    /// was prepared on this engine, by its SQL otherwise
     pub(crate) fn execute_prepared_statement(
         &mut self,
         statement: &super::Statement,
         ctx: ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
         self.check_active()?;
-        match statement.plan() {
+        match statement.plan_on(self.executor.engine()) {
             Some(plan) => self.execute_plan(plan, ctx),
             None => self.execute_sql_with_ctx(statement.sql(), ctx),
         }

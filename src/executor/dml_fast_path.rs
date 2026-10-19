@@ -461,6 +461,7 @@ impl Executor {
                 {
                     let mut exec_ctx = super::expression::ExecuteContext::new(&row);
                     if let Some(ctx) = ctx {
+                        exec_ctx = exec_ctx.with_transaction_id(ctx.transaction_id());
                         if !ctx.params().is_empty() {
                             exec_ctx = exec_ctx.with_params(ctx.params());
                         }
@@ -570,17 +571,16 @@ impl Executor {
         for u in &compiled.updates {
             let value = match &u.value_source {
                 UpdateValueSource::Literal(v) => v.clone(),
-                UpdateValueSource::Parameter(idx) => {
-                    let params = ctx.params();
-                    match params.get(*idx) {
-                        Some(v) => v.clone(),
-                        None => continue,
-                    }
-                }
-                UpdateValueSource::NamedParameter(name) => match ctx.get_named_param(name) {
-                    Some(v) => v.clone(),
-                    None => continue,
-                },
+                // A parameter the call did not give is NULL, as on the general path
+                UpdateValueSource::Parameter(idx) => ctx
+                    .params()
+                    .get(*idx)
+                    .cloned()
+                    .unwrap_or_else(Value::null_unknown),
+                UpdateValueSource::NamedParameter(name) => ctx
+                    .get_named_param(name)
+                    .cloned()
+                    .unwrap_or_else(Value::null_unknown),
                 UpdateValueSource::Expression(program) => {
                     expr_updates.push((
                         u.column_idx,
