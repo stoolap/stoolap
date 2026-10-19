@@ -307,18 +307,50 @@ pub struct StringLiteral {
 
 impl fmt::Display for StringLiteral {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // A typed literal is written back with its keyword, so it parses as one again
+        // A typed literal is written back with its keyword, so it parses as one
+        // again; the parser reads its text without backslash escapes
         match self.type_hint.as_deref() {
             Some(hint)
                 if crate::core::value::TYPED_LITERAL_KEYWORDS
                     .iter()
                     .any(|keyword| hint.eq_ignore_ascii_case(keyword)) =>
             {
-                write!(f, "{} '{}'", hint, self.value)
+                write!(f, "{} ", hint)?;
+                write_quoted(f, &self.value, false)
             }
-            _ => write!(f, "'{}'", self.value),
+            _ => write_quoted(f, &self.value, true),
         }
     }
+}
+
+/// `text` as a quoted string the parser reads back as `text`. A `decoded`
+/// text, a plain literal's, has a quote and a backslash doubled; a typed
+/// literal's keeps the lexer's escapes, a backslash with the character after
+/// it, so only a quote of its own is doubled
+fn write_quoted(f: &mut fmt::Formatter<'_>, text: &str, decoded: bool) -> fmt::Result {
+    use fmt::Write;
+    f.write_char('\'')?;
+    if !text.contains(['\'', '\\']) {
+        f.write_str(text)?;
+        return f.write_char('\'');
+    }
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if !decoded => {
+                f.write_char(c)?;
+                if let Some(escaped) = chars.next() {
+                    f.write_char(escaped)?;
+                }
+            }
+            '\'' | '\\' => {
+                f.write_char(c)?;
+                f.write_char(c)?;
+            }
+            c => f.write_char(c)?,
+        }
+    }
+    f.write_char('\'')
 }
 
 /// Boolean literal
@@ -823,7 +855,7 @@ impl fmt::Display for QuantifiedSetExpression {
                 f.write_str(", ")?;
             }
             match member {
-                Value::Text(s) => write!(f, "'{}'", s.replace('\'', "''"))?,
+                Value::Text(s) => write_quoted(f, s, true)?,
                 Value::Boolean(b) => f.write_str(if *b { "TRUE" } else { "FALSE" })?,
                 Value::Timestamp(_) => write!(f, "TIMESTAMP '{}'", member)?,
                 Value::Extension(_) => {
@@ -831,8 +863,9 @@ impl fmt::Display for QuantifiedSetExpression {
                         DataType::Vector => "VECTOR",
                         _ => "JSON",
                     };
-                    let text = member.to_string().replace('\'', "''");
-                    write!(f, "CAST('{}' AS {})", text, type_name)?
+                    f.write_str("CAST(")?;
+                    write_quoted(f, &member.to_string(), true)?;
+                    write!(f, " AS {})", type_name)?
                 }
                 _ => write!(f, "{}", member)?,
             }
