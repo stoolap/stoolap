@@ -535,3 +535,27 @@ fn test_a_cancel_inside_a_block_is_raised_and_never_kept() {
         });
     assert_eq!(again.ok(), Some(0), "{sql} kept the cancel");
 }
+
+#[test]
+fn test_a_conjunct_beside_a_narrowing_in_raises_its_error() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_in_narrowed_error").unwrap();
+    for sql in [
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER)",
+        "INSERT INTO a VALUES (1, -9223372036854775808)",
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO b VALUES (1, 1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    for sql in [
+        "SELECT id FROM a WHERE id IN (SELECT k FROM b) AND ABS(x) >= 0",
+        "SELECT id FROM a WHERE id IN (SELECT MAX(k) FROM b) AND ABS(x) >= 0",
+    ] {
+        let got = ids(&db, sql);
+        assert!(
+            got.is_err(),
+            "{sql} answered {got:?} for a row whose ABS overflows"
+        );
+    }
+}

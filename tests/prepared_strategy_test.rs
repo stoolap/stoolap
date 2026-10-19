@@ -21,6 +21,9 @@
 use stoolap::test_failpoints::{force_exists_strategy, prepared_strategy_runs, PreparedStrategy};
 use stoolap::Database;
 
+/// The forced strategy is process-wide: tests that force one take turns
+static FORCED: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn setup() -> Database {
     let db = Database::open("memory://prepared_strategy_corpus").unwrap();
     for sql in [
@@ -72,6 +75,7 @@ const CORPUS: &[(&str, &[i64])] = &[
 
 #[test]
 fn test_every_registered_strategy_answers_the_corpus_and_is_reached() {
+    let _turn = FORCED.lock().unwrap_or_else(|e| e.into_inner());
     let db = setup();
     let before: Vec<usize> = PreparedStrategy::ALL
         .iter()
@@ -90,4 +94,35 @@ fn test_every_registered_strategy_answers_the_corpus_and_is_reached() {
             "no case of the corpus reaches {strategy:?}"
         );
     }
+}
+
+#[test]
+fn test_a_group_error_belongs_to_its_key_under_every_strategy() {
+    let _turn = FORCED.lock().unwrap_or_else(|e| e.into_inner());
+    let db = Database::open("memory://prepared_strategy_group_error").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO t VALUES (1, 1)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        "INSERT INTO u VALUES (1, 1, 1), (2, 2, 9223372036854775807), (3, 2, 1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let sql = "SELECT id FROM t WHERE 2 = (SELECT SUM(v) + 1 FROM u WHERE u.k = t.k)";
+    for strategy in [Some(false), Some(true)] {
+        force_exists_strategy(strategy);
+        let got = db
+            .query(sql, ())
+            .map_err(|e| e.to_string())
+            .and_then(|rows| {
+                rows.map(|row| {
+                    row.map_err(|e| e.to_string())?
+                        .get::<i64>(0)
+                        .map_err(|e| e.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()
+            });
+        assert_eq!(got, Ok(vec![1]), "{sql} under {strategy:?}");
+    }
+    force_exists_strategy(None);
 }

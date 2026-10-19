@@ -125,6 +125,9 @@ pub(crate) struct AggregateSlots<'a> {
     pub written_stmt: &'a SelectStatement,
     pub aggregations: &'a [SqlAggregateFunction],
     pub group_by_count: usize,
+    /// The columns of the rows aggregated, which the statement may read
+    /// only through its groups
+    pub source_columns: &'a [String],
 }
 
 /// Single condition in a HAVING clause
@@ -349,6 +352,119 @@ fn group_by_item_key(item: &GroupByItem) -> ExprKey {
         GroupByItem::Column(name) => ExprKey::column(name),
         GroupByItem::Expression { expr, .. } => ExprKey::of(expr),
     }
+}
+
+/// The error of a column a query that aggregates reads outside its groups
+pub(crate) fn ungrouped_column(name: &str) -> crate::core::Error {
+    crate::core::Error::internal(format!(
+        "Compile error: {}",
+        super::expression::CompileError::ColumnNotFound(name.to_string())
+    ))
+}
+
+/// A column of `source` that `stmt` reads outside every GROUP BY item and
+/// aggregate call, in its SELECT list, HAVING or ORDER BY. A name HAVING
+/// or ORDER BY reads as a SELECT alias is no column; a subquery is its own scope
+fn ungrouped_read(
+    stmt: &SelectStatement,
+    items: &[GroupByItem],
+    source: &[String],
+) -> Option<String> {
+    fn last(name: &str) -> &str {
+        name.rsplit('.').next().unwrap_or(name)
+    }
+    let grouped_exprs: smallvec::SmallVec<[ExprKey; 4]> = items
+        .iter()
+        .filter_map(|item| match item {
+            GroupByItem::Expression { expr, .. } => Some(ExprKey::of(expr)),
+            GroupByItem::Column(_) => None,
+        })
+        .collect();
+    let read = |name: &str, by_alias: bool| {
+        let name = last(name);
+        let same = |other: &str| last(other).eq_ignore_ascii_case(name);
+        let column = source.iter().any(|c| same(c));
+        let grouped = items
+            .iter()
+            .any(|item| matches!(item, GroupByItem::Column(c) if same(c)));
+        let alias = by_alias
+            && stmt.columns.iter().any(
+                |c| matches!(c, Expression::Aliased(a) if a.alias.value.eq_ignore_ascii_case(name)),
+            );
+        column && !grouped && !alias
+    };
+    fn walk(
+        expr: &Expression,
+        by_alias: bool,
+        grouped: &[ExprKey],
+        read: &dyn Fn(&str, bool) -> bool,
+    ) -> Option<String> {
+        if !grouped.is_empty() && grouped.contains(&ExprKey::of(expr)) {
+            return None;
+        }
+        let each = |exprs: &mut dyn Iterator<Item = &Expression>| {
+            let mut found = None;
+            for e in exprs {
+                found = walk(e, by_alias, grouped, read);
+                if found.is_some() {
+                    break;
+                }
+            }
+            found
+        };
+        match expr {
+            Expression::Identifier(id) => read(&id.value, by_alias).then(|| id.value.to_string()),
+            Expression::QualifiedIdentifier(q) => read(&q.name.value, false).then(|| q.to_string()),
+            Expression::FunctionCall(call) if is_aggregate_function(&call.function) => None,
+            Expression::FunctionCall(call) => each(&mut call.arguments.iter()),
+            Expression::Aliased(a) => walk(&a.expression, by_alias, grouped, read),
+            Expression::Prefix(p) => walk(&p.right, by_alias, grouped, read),
+            Expression::Infix(i) => each(&mut [&*i.left, &*i.right].into_iter()),
+            Expression::Between(b) => each(&mut [&*b.expr, &*b.lower, &*b.upper].into_iter()),
+            Expression::Like(l) => each(&mut [&*l.left, &*l.pattern].into_iter()),
+            Expression::Cast(c) => walk(&c.expr, by_alias, grouped, read),
+            Expression::Distinct(d) => walk(&d.expr, by_alias, grouped, read),
+            Expression::QuantifiedSet(q) => walk(&q.left, by_alias, grouped, read),
+            Expression::List(l) => each(&mut l.elements.iter()),
+            Expression::ExpressionList(l) => each(&mut l.expressions.iter()),
+            Expression::In(i) => {
+                walk(&i.left, by_alias, grouped, read).or_else(|| match &*i.right {
+                    Expression::ScalarSubquery(_) => None,
+                    right => walk(right, by_alias, grouped, read),
+                })
+            }
+            Expression::Case(c) => c
+                .value
+                .as_deref()
+                .and_then(|v| walk(v, by_alias, grouped, read))
+                .or_else(|| {
+                    c.when_clauses.iter().find_map(|w| {
+                        walk(&w.condition, by_alias, grouped, read)
+                            .or_else(|| walk(&w.then_result, by_alias, grouped, read))
+                    })
+                })
+                .or_else(|| {
+                    c.else_value
+                        .as_deref()
+                        .and_then(|e| walk(e, by_alias, grouped, read))
+                }),
+            _ => None,
+        }
+    }
+    let read: &dyn Fn(&str, bool) -> bool = &read;
+    stmt.columns
+        .iter()
+        .find_map(|c| walk(c, false, &grouped_exprs, read))
+        .or_else(|| {
+            stmt.having
+                .as_deref()
+                .and_then(|h| walk(h, true, &grouped_exprs, read))
+        })
+        .or_else(|| {
+            stmt.order_by
+                .iter()
+                .find_map(|o| walk(&o.expression, true, &grouped_exprs, read))
+        })
 }
 
 /// The slot of each group item and aggregate in an aggregated row, which
@@ -1204,6 +1320,7 @@ impl Executor {
                 written_stmt,
                 aggregations: &aggregations,
                 group_by_count: group_by_columns.len(),
+                source_columns: base_columns,
             },
             ctx,
             having_columns,
@@ -1228,6 +1345,7 @@ impl Executor {
             written_stmt,
             aggregations,
             group_by_count,
+            source_columns,
         } = slots;
 
         // ORDER BY may name a grouped column the SELECT list drops. Capture
@@ -1251,6 +1369,7 @@ impl Executor {
             self.apply_post_aggregation_expressions(
                 stmt,
                 ctx,
+                source_columns,
                 aggregations,
                 having_columns,
                 having_rows,
@@ -1287,6 +1406,7 @@ impl Executor {
             let (mut cols, mut rows) = self.apply_post_aggregation_expressions(
                 stmt,
                 ctx,
+                source_columns,
                 aggregations,
                 having_columns,
                 having_rows,
@@ -1373,12 +1493,16 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
+        source_columns: &[String],
         aggregations: &[SqlAggregateFunction],
         agg_columns: Vec<String>,
         agg_rows: RowVec,
     ) -> Result<(Vec<String>, RowVec)> {
         // Parse GROUP BY items for GROUPING() function support
         let group_by_columns = self.parse_group_by(stmt, &agg_columns)?;
+        if let Some(name) = ungrouped_read(stmt, &group_by_columns, source_columns) {
+            return Err(ungrouped_column(&name));
+        }
 
         // Check which original columns have correlated subqueries
         // These need per-row evaluation with outer row context, not pre-processing
@@ -3016,6 +3140,7 @@ impl Executor {
             written_stmt: stmt,
             aggregations: &aggregations,
             group_by_count: 0,
+            source_columns: &table.schema().column_names_arc(),
         };
         self.finish_aggregation(AggregatePath::Pushdown, slots, ctx, result_columns, rows)
             .map(Some)
@@ -3244,6 +3369,7 @@ impl Executor {
             written_stmt: stmt,
             aggregations: &aggregations,
             group_by_count: 0,
+            source_columns: columns,
         };
         self.finish_aggregation(
             AggregatePath::FilteredPushdown,
@@ -3349,6 +3475,7 @@ impl Executor {
                     written_stmt: stmt,
                     aggregations: &aggregations,
                     group_by_count: 0,
+                    source_columns: &table.schema().column_names_arc(),
                 };
                 return self
                     .finish_aggregation(
@@ -3385,6 +3512,7 @@ impl Executor {
             written_stmt: stmt,
             aggregations: &aggregations,
             group_by_count: 0,
+            source_columns: &table.schema().column_names_arc(),
         };
         self.finish_aggregation(
             AggregatePath::StreamingGlobalScan,
@@ -3523,6 +3651,7 @@ impl Executor {
             written_stmt: stmt,
             aggregations: &aggregations,
             group_by_count: 1,
+            source_columns: &source_columns,
         };
         self.finish_aggregation(
             AggregatePath::StreamingDerivedTable,
@@ -3664,6 +3793,7 @@ impl Executor {
             written_stmt: stmt,
             aggregations: &aggregations,
             group_by_count: group_by_indices.len(),
+            source_columns: all_columns,
         };
         Some(self.finish_aggregation(
             AggregatePath::StorageGrouped,

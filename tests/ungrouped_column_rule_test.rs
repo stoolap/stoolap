@@ -52,6 +52,10 @@ fn answer(db: &Database, sql: &str) -> Result<Vec<String>, String> {
 const REFUSED: &[&str] = &[
     "SELECT v, COUNT(*) FROM u GROUP BY k",
     "SELECT u.v, COUNT(*) FROM u GROUP BY k",
+    "SELECT \"v\", COUNT(*) FROM u GROUP BY k",
+    "SELECT \"v\" || 'x', COUNT(*) FROM u GROUP BY k",
+    "SELECT k, COUNT(*) FROM u GROUP BY k HAVING \"v\" > 1",
+    "SELECT k, COUNT(*) FROM u GROUP BY k ORDER BY \"v\"",
     "SELECT v AS w, COUNT(*) FROM u GROUP BY k",
     "SELECT v + 1, COUNT(*) FROM u GROUP BY k",
     "SELECT CASE WHEN v > 1 THEN 1 END, COUNT(*) FROM u GROUP BY k",
@@ -91,6 +95,18 @@ const ANSWERED: &[(&str, &[&str])] = &[
         &["2|1", "4|1"],
     ),
     ("SELECT 7, COUNT(*) FROM u", &["7|5"]),
+    (
+        "SELECT \"w\", COUNT(*) FROM u WHERE k = 1 GROUP BY k",
+        &["w|2"],
+    ),
+    (
+        "SELECT id FROM t WHERE x + 1 = (SELECT u.k + t.k FROM u WHERE u.k = 1 GROUP BY 1)",
+        &["1", "2", "4"],
+    ),
+    (
+        "SELECT id FROM t WHERE 3 = (SELECT u.k + t.k AS s FROM u WHERE u.k = 1 GROUP BY s)",
+        &["2"],
+    ),
     (
         "SELECT id FROM t WHERE x < (SELECT MAX(v) + t.k FROM u WHERE u.k = t.k) ORDER BY id",
         &["1", "4"],

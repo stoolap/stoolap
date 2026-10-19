@@ -35,7 +35,7 @@ use crate::storage::expression::{AndExpr, ComparisonExpr, Expression as StorageE
 use crate::storage::traits::{Engine, Table};
 
 use super::aggregation::{
-    AggregatePath, CallInputs, GroupByItem, SqlAggregateFunction, COUNT_STAR,
+    ungrouped_column, AggregatePath, CallInputs, GroupByItem, SqlAggregateFunction, COUNT_STAR,
 };
 use super::context::{
     cache_block_answer, get_cached_block_answer, BlockAnswer, BlockOrigin, ExecutionContext,
@@ -1498,6 +1498,9 @@ struct Rewritten {
     reads_row: bool,
     /// Ids of the subquery nodes made while rewriting, by node address
     ids: FxHashMap<usize, u16>,
+    /// The slot of each enclosing column read, by scope depth and column:
+    /// one per column, so two reads of it are one expression
+    outer: FxHashMap<(usize, usize), usize>,
 }
 
 impl Builder<'_> {
@@ -1540,7 +1543,11 @@ impl Builder<'_> {
                         Ok(chain.column(0, index))
                     }
                     Some((depth, index)) => {
+                        if let Some(&slot) = work.outer.get(&(depth, index)) {
+                            return Ok(slot_parameter(slot));
+                        }
                         let slot = self.slot();
+                        work.outer.insert((depth, index), slot);
                         let value = chain.column(depth, index);
                         if depth == 1 {
                             work.reads_parent = true;
@@ -1837,8 +1844,16 @@ impl Builder<'_> {
                 test == MemberTest::In,
             ),
         };
-        let keyed = (keyed_test && grouped.is_none() && self.keyed(&chain, &keys, &work, sq))
-            .then(|| keyed_plan(&keys, filter.as_ref(), &schema));
+        let mut others = SmallVec::new();
+        for expr in projection.iter().chain(&filter) {
+            slots_read(expr, &mut others);
+        }
+        if let Some(grouped) = &grouped {
+            others.extend(grouped.reads.iter().copied());
+        }
+        let keyed =
+            (keyed_test && grouped.is_none() && self.keyed(&chain, &keys, &work, sq, &others))
+                .then(|| keyed_plan(&keys, filter.as_ref(), &schema));
         // What the block answers and how its members are read is part of what is kept
         let mut scopes = signature;
         for scope in outer {
@@ -1882,7 +1897,7 @@ impl Builder<'_> {
                         reads.push(slot);
                     }
                 }
-                if self.keyed(&chain, &keys, &work, sq) {
+                if self.keyed(&chain, &keys, &work, sq, &others) {
                     grouping.keyed = Some(keyed_plan(&keys, filter.as_ref(), &schema));
                 }
                 Some(Box::new(grouping))
@@ -1984,7 +1999,10 @@ impl Builder<'_> {
         };
 
         let item_keys: FxHashSet<ExprKey> = items.iter().map(ExprKey::of).collect();
-        let mut unread = Rewritten::default();
+        let mut unread = Rewritten {
+            outer: work.outer.clone(),
+            ..Rewritten::default()
+        };
         let mut listed = Vec::new();
         if exists {
             for column in &sq.columns {
@@ -1995,7 +2013,7 @@ impl Builder<'_> {
         }
         for expr in projection.into_iter().chain(&having).chain(&listed) {
             if let Some(name) = ungrouped(expr, &item_keys) {
-                return Err(compile_error(CompileError::ColumnNotFound(name)));
+                return Err(ungrouped_column(&name));
             }
         }
 
@@ -2092,16 +2110,19 @@ impl Builder<'_> {
     /// Whether an EXISTS block whose correlation equalities are `keys`
     /// answers by a keyed set as its probe does: it reads its parent through
     /// them alone, holds nothing volatile, and each key's two columns are of
-    /// one type whose equality is its hash's
+    /// one type whose equality is its hash's. No expression but the keys
+    /// reads a key's slot: `others` holds the slots the rest reads
     fn keyed(
         &self,
         chain: &Chain<'_>,
         keys: &[((usize, usize, usize), usize)],
         work: &Rewritten,
         block: &SelectStatement,
+        others: &[usize],
     ) -> bool {
         let key_slot = |slot: usize| keys.iter().any(|(_, key)| *key == slot);
         !keys.is_empty()
+            && keys.iter().all(|(_, slot)| !others.contains(slot))
             && work.delegated.is_empty()
             && keys.iter().all(|((own, depth, index), _)| {
                 let own = chain.scopes[0].types[*own];
@@ -2915,14 +2936,14 @@ impl Executor {
                 if scanned.is_multiple_of(100) {
                     ctx.check_cancelled()?;
                 }
-                // The conjuncts the scan would have taken, before the WHERE
-                if storage_expr
-                    .as_ref()
-                    .is_some_and(|expr| !expr.evaluate_fast(&row))
-                {
-                    continue;
-                }
-                if passed || runner.matches(&mut vm, &row)? {
+                // The conjuncts the scan would have taken, before the WHERE;
+                // one that fails to evaluate leaves the answer to the WHERE
+                let taken = match storage_expr.as_ref().map(|expr| expr.evaluate(&row)) {
+                    Some(Ok(false)) => continue,
+                    Some(Err(_)) => false,
+                    Some(Ok(true)) | None => true,
+                };
+                if (passed && taken) || runner.matches(&mut vm, &row)? {
                     rows.push((scanned as i64, row));
                 }
             }
@@ -4504,14 +4525,23 @@ impl PreparedRunner<'_> {
             return Err(err.clone());
         }
         let mut by_key: FxHashMap<SmallVec<[Value; 1]>, Result<Vec<Row>>> = FxHashMap::default();
-        for (_, row) in groups.into_rows()? {
-            let mut values = row.into_values();
-            let rest = values.split_off(prefix.len());
-            let rows = by_key
-                .entry(values.into_iter().collect())
-                .or_insert_with(|| Ok(Vec::new()));
-            if let Ok(rows) = rows {
-                rows.push(Row::from_values(rest));
+        // A group's error belongs to its key alone
+        for group in groups.into_group_results()? {
+            match group {
+                Ok(row) => {
+                    let mut values = row.into_values();
+                    let rest = values.split_off(prefix.len());
+                    let rows = by_key
+                        .entry(values.into_iter().collect())
+                        .or_insert_with(|| Ok(Vec::new()));
+                    if let Ok(rows) = rows {
+                        rows.push(Row::from_values(rest));
+                    }
+                }
+                Err((values, e)) => {
+                    let at = values.into_iter().take(prefix.len()).collect();
+                    failed.entry(at).or_insert(deferred(e)?);
+                }
             }
         }
         for (at, e) in failed {
