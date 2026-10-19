@@ -190,6 +190,16 @@ fn an_order_by_name_binds_the_output_column_and_a_qualified_one_the_input() {
             input.clone(),
         ),
         (
+            "WITH c(id) AS (SELECT id FROM t) SELECT -id AS x FROM c ORDER BY (SELECT 0) + id",
+            vec![],
+            input.clone(),
+        ),
+        (
+            "WITH c(id) AS (SELECT id FROM t) SELECT id AS x FROM c ORDER BY id, (SELECT -c.id)",
+            vec![],
+            vec![1, 2, 3],
+        ),
+        (
             "WITH g (id, n) AS (SELECT id, COUNT(*) FROM t GROUP BY id) SELECT -g.id AS id FROM g LEFT JOIN s ON s.id = g.id ORDER BY id LIMIT 2",
             vec![],
             vec![-3, -2],
@@ -377,6 +387,13 @@ fn the_rule_holds_for_every_source_and_pipeline() {
             false,
         ),
         (
+            "cte_columns",
+            "WITH c(id, k) AS (SELECT id, k FROM t) ",
+            "c AS src",
+            "",
+            false,
+        ),
+        (
             "cte_materialized",
             "WITH c AS (SELECT id, k FROM t) ",
             "c AS src",
@@ -410,6 +427,13 @@ fn the_rule_holds_for_every_source_and_pipeline() {
         ("*, -k AS k", "k + 0", &input, 1),
         ("src.*, -k AS k", "k", &output, 2),
         ("src.*, -k AS k", "src.k", &input, 2),
+        ("-k AS x", "(SELECT 0) + k", &input, 0),
+        ("-k AS k", "(SELECT 0) + k", &input, 0),
+        ("k AS x", "(SELECT 0) + k", &input, 0),
+        ("-k AS x", "(SELECT src.k)", &input, 0),
+        ("-k AS k", "(SELECT src.k)", &input, 0),
+        ("k AS x", "k, (SELECT -src.k)", &input, 0),
+        ("k AS x", "(SELECT -src.k) DESC", &input, 0),
     ];
     // (name, DISTINCT, extra item, GROUP BY, LIMIT/OFFSET, prepared)
     let pipelines = [
@@ -436,7 +460,9 @@ fn the_rule_holds_for_every_source_and_pipeline() {
                 // view or a materialized CTE is #509, and DISTINCT ordered by
                 // a column it does not select is not this rule's to settle
                 if grouped && (star > 0 || items == "-k AS k")
-                    || grouped && window && matches!(source, "view" | "cte_materialized")
+                    || grouped
+                        && window
+                        && matches!(source, "view" | "cte_columns" | "cte_materialized")
                     || distinct && items == "-k AS x" && order_by == "k"
                 {
                     continue;

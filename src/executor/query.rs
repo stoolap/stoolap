@@ -144,35 +144,44 @@ fn bind_order_key<'e>(expr: &'e Expression, stmt: &SelectStatement) -> OrderKey<
 
 /// Each input column `stmt`'s ORDER BY reads by its binding, with the
 /// reference that names it: a plain name bound to its input column, and
-/// every name inside an expression
+/// every name inside an expression; false when an expression reads more
+/// than its names say, as a subquery does
 fn visit_order_by_inputs<'e>(
     stmt: &'e SelectStatement,
     visit: &mut dyn FnMut(&'e Expression, OrderKey<'e>),
-) {
+) -> bool {
+    let mut read_all = true;
     for ob in &stmt.order_by {
         match bind_order_key(&ob.expression, stmt) {
             key @ OrderKey::Input(..) => visit(&ob.expression, key),
-            OrderKey::Expression => {
-                visit_column_refs(&ob.expression, &mut |column| match column {
-                    Expression::Identifier(id) => {
-                        visit(column, OrderKey::Input(None, &id.value_lower))
-                    }
-                    Expression::QualifiedIdentifier(qid) => visit(
-                        column,
-                        OrderKey::Input(Some(&qid.qualifier.value_lower), &qid.name.value_lower),
-                    ),
-                    _ => {}
-                });
-            }
+            OrderKey::Expression => read_all &= visit_expression_inputs(&ob.expression, visit),
             OrderKey::Ordinal(_) | OrderKey::Item(_) => {}
         }
     }
+    read_all
 }
 
-/// The input columns `stmt`'s ORDER BY reads, as indexes into `columns`
+/// Each name inside a sort expression, bound as an input column; false as
+/// `visit_column_refs` says
+fn visit_expression_inputs<'e>(
+    expr: &'e Expression,
+    visit: &mut dyn FnMut(&'e Expression, OrderKey<'e>),
+) -> bool {
+    visit_column_refs(expr, &mut |column| match column {
+        Expression::Identifier(id) => visit(column, OrderKey::Input(None, &id.value_lower)),
+        Expression::QualifiedIdentifier(qid) => visit(
+            column,
+            OrderKey::Input(Some(&qid.qualifier.value_lower), &qid.name.value_lower),
+        ),
+        _ => {}
+    })
+}
+
+/// The input columns `stmt`'s ORDER BY reads, as indexes into `columns`;
+/// every one of them when its names do not say all it reads
 pub(crate) fn order_by_inputs(stmt: &SelectStatement, columns: &[String]) -> Vec<usize> {
     let mut inputs = Vec::new();
-    visit_order_by_inputs(stmt, &mut |_, key| {
+    let read_all = visit_order_by_inputs(stmt, &mut |_, key| {
         if let OrderKey::Input(qualifier, name) = key {
             if let Some(input) = input_column_index(columns, qualifier, name) {
                 if !inputs.contains(&input) {
@@ -181,7 +190,11 @@ pub(crate) fn order_by_inputs(stmt: &SelectStatement, columns: &[String]) -> Vec
             }
         }
     });
-    inputs
+    if read_all {
+        inputs
+    } else {
+        (0..columns.len()).collect()
+    }
 }
 
 /// The input column a plain column reference reads, as the projection finds
@@ -1083,31 +1096,48 @@ impl Executor {
                         .iter()
                         .map(|c| CompactArc::from(c.to_lowercase().as_str()))
                         .collect();
-                    // Also pre-compute qualified names if alias is present
-                    let qualified_names: Option<Vec<CompactArc<str>>> =
-                        order_table_alias.as_ref().map(|alias| {
-                            columns_lower
-                                .iter()
-                                .map(|c| CompactArc::from(format!("{}.{}", alias, c).as_str()))
-                                .collect()
-                        });
+                    // Each name the outer row answers to, with its position:
+                    // the output names, then each input column's names at
+                    // the position the layout gives it, which win
+                    let mut outer_names: Vec<(CompactArc<str>, usize)> = Vec::new();
+                    let mut name_at = |name: &str, position: usize| {
+                        outer_names.push((CompactArc::from(name), position));
+                        if let Some(alias) = &order_table_alias {
+                            if !name.contains('.') {
+                                outer_names.push((
+                                    CompactArc::from(format!("{}.{}", alias, name).as_str()),
+                                    position,
+                                ));
+                            }
+                        }
+                    };
+                    for (position, name) in columns_lower.iter().enumerate() {
+                        name_at(name, position);
+                    }
+                    if let Some(layout) = layout {
+                        for (input, name) in layout.input_columns.iter().enumerate() {
+                            let Some(position) =
+                                layout.sources.iter().position(|s| s.input == Some(input))
+                            else {
+                                continue;
+                            };
+                            let name = name.to_lowercase();
+                            name_at(&name, position);
+                            if let Some((_, bare)) = name.rsplit_once('.') {
+                                name_at(bare, position);
+                            }
+                        }
+                    }
 
                     rows.iter()
                         .map(|(_, row)| {
                             // Build outer row context from current row
                             let mut outer_row_map: FxHashMap<CompactArc<str>, Value> =
                                 FxHashMap::default();
-                            for (idx, col_lower) in columns_lower.iter().enumerate() {
-                                let val = row.get(idx).cloned().unwrap_or(Value::null_unknown());
-                                // Use pre-computed lowercase and qualified names (Arc clone is cheap)
-                                if let Some(ref qualified) = qualified_names {
-                                    outer_row_map.insert(qualified[idx].clone(), val.clone());
-                                    outer_row_map.insert(col_lower.clone(), val);
-                                // move
-                                } else {
-                                    outer_row_map.insert(col_lower.clone(), val);
-                                    // move directly, no clone
-                                }
+                            for (name, position) in &outer_names {
+                                let val =
+                                    row.get(*position).cloned().unwrap_or(Value::null_unknown());
+                                outer_row_map.insert(name.clone(), val);
                             }
 
                             // Create context with outer row for correlated subquery evaluation
@@ -2101,6 +2131,19 @@ impl Executor {
                         _ => false,
                     });
                     if !aliased && !select_columns.contains(name.to_lowercase().as_str()) {
+                        return true;
+                    }
+                }
+                // One the sort evaluates reads its input columns from the row
+                other if Self::has_subqueries(other) => {
+                    let mut names_input = false;
+                    visit_expression_inputs(other, &mut |_, key| {
+                        if let OrderKey::Input(qualifier, name) = key {
+                            names_input |=
+                                input_column_index(all_columns, qualifier, name).is_some();
+                        }
+                    });
+                    if names_input {
                         return true;
                     }
                 }
@@ -9775,6 +9818,19 @@ impl Executor {
                     {
                         computed_order_by.push(other);
                     }
+                }
+                // An expression the sort evaluates carries the input columns
+                // it names, which the sort reads by the layout
+                other if Self::has_subqueries(other) => {
+                    visit_expression_inputs(other, &mut |_, key| {
+                        if let OrderKey::Input(qualifier, name) = key {
+                            if let Some(idx) = input_column_index(all_columns, qualifier, name) {
+                                if !extra_order_indices.contains(&idx) {
+                                    extra_order_indices.push(idx);
+                                }
+                            }
+                        }
+                    });
                 }
                 _ => {}
             }

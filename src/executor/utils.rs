@@ -880,13 +880,19 @@ pub(crate) fn collect_column_names(
 }
 
 /// Each column reference an expression reads, a bare or a qualified name,
-/// passed to `visit`; false as `collect_column_names` says
+/// passed to `visit`, the parts past one it cannot read included; false as
+/// `collect_column_names` says
 pub(crate) fn visit_column_refs<'e>(
     expr: &'e Expression,
     visit: &mut dyn FnMut(&'e Expression),
 ) -> bool {
-    fn all<'e>(exprs: &'e [Expression], visit: &mut dyn FnMut(&'e Expression)) -> bool {
-        exprs.iter().all(|e| visit_column_refs(e, visit))
+    fn all<'e>(
+        exprs: impl IntoIterator<Item = &'e Expression>,
+        visit: &mut dyn FnMut(&'e Expression),
+    ) -> bool {
+        exprs
+            .into_iter()
+            .fold(true, |read, e| visit_column_refs(e, visit) & read)
     }
     match expr {
         Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => {
@@ -901,53 +907,41 @@ pub(crate) fn visit_column_refs<'e>(
         | Expression::IntervalLiteral(_)
         | Expression::Parameter(_) => true,
         Expression::Prefix(p) => visit_column_refs(&p.right, visit),
-        Expression::Infix(i) => {
-            visit_column_refs(&i.left, visit) && visit_column_refs(&i.right, visit)
-        }
+        Expression::Infix(i) => all([&*i.left, &*i.right], visit),
         Expression::List(l) => all(&l.elements, visit),
         Expression::ExpressionList(l) => all(&l.expressions, visit),
         Expression::Distinct(d) => visit_column_refs(&d.expr, visit),
-        Expression::In(i) => {
-            visit_column_refs(&i.left, visit) && visit_column_refs(&i.right, visit)
-        }
+        Expression::In(i) => all([&*i.left, &*i.right], visit),
         Expression::InHashSet(h) => visit_column_refs(&h.column, visit),
         Expression::QuantifiedSet(q) => visit_column_refs(&q.left, visit),
-        Expression::Between(b) => {
-            visit_column_refs(&b.expr, visit)
-                && visit_column_refs(&b.lower, visit)
-                && visit_column_refs(&b.upper, visit)
-        }
-        Expression::Like(l) => {
-            visit_column_refs(&l.left, visit)
-                && visit_column_refs(&l.pattern, visit)
-                && l.escape
-                    .as_deref()
-                    .is_none_or(|e| visit_column_refs(e, visit))
-        }
-        Expression::Case(c) => {
+        Expression::Between(b) => all([&*b.expr, &*b.lower, &*b.upper], visit),
+        Expression::Like(l) => all(
+            [&*l.left, &*l.pattern]
+                .into_iter()
+                .chain(l.escape.as_deref()),
+            visit,
+        ),
+        Expression::Case(c) => all(
             c.value
                 .as_deref()
-                .is_none_or(|v| visit_column_refs(v, visit))
-                && c.when_clauses.iter().all(|w| {
-                    visit_column_refs(&w.condition, visit)
-                        && visit_column_refs(&w.then_result, visit)
-                })
-                && c.else_value
-                    .as_deref()
-                    .is_none_or(|e| visit_column_refs(e, visit))
-        }
+                .into_iter()
+                .chain(
+                    c.when_clauses
+                        .iter()
+                        .flat_map(|w| [&w.condition, &w.then_result]),
+                )
+                .chain(c.else_value.as_deref()),
+            visit,
+        ),
         Expression::Cast(c) => visit_column_refs(&c.expr, visit),
-        Expression::FunctionCall(f) => {
+        Expression::FunctionCall(f) => all(
             f.arguments
                 .iter()
-                .all(|a| matches!(a, Expression::Star(_)) || visit_column_refs(a, visit))
-                && f.filter
-                    .as_deref()
-                    .is_none_or(|e| visit_column_refs(e, visit))
-                && f.order_by
-                    .iter()
-                    .all(|o| visit_column_refs(&o.expression, visit))
-        }
+                .filter(|a| !matches!(a, Expression::Star(_)))
+                .chain(f.filter.as_deref())
+                .chain(f.order_by.iter().map(|o| &o.expression)),
+            visit,
+        ),
         Expression::Aliased(a) => visit_column_refs(&a.expression, visit),
         _ => false,
     }
