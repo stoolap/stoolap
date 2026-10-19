@@ -238,7 +238,9 @@ Electronics | 3     | 2150.00 | 716.67  | 150.00  | 1200.00
 Clothing    | 3     | 145.00  | 48.33   | 25.00   | 70.00
 ```
 
-A name in GROUP BY may be a SELECT alias: `SELECT a + 1 AS k, COUNT(*) FROM t GROUP BY k` groups by `a + 1`. An alias of an aggregate cannot be grouped by, so in `SELECT g AS n, COUNT(*) AS g FROM t GROUP BY g` the name `g` is the column of `t`.
+A name in GROUP BY may be a SELECT alias: `SELECT a + 1 AS k, COUNT(*) FROM t GROUP BY k` groups by `a + 1`. An alias of an aggregate cannot be grouped by, so in `SELECT g AS n, COUNT(*) AS g FROM t GROUP BY g` the name `g` is the column of `t`. A number in GROUP BY is a position in the SELECT list, from 1; a position the list does not have is an error.
+
+A query that aggregates, with GROUP BY or with an aggregate call alone, reads a column of its rows only through a GROUP BY item or inside an aggregate call. Reading one anywhere else is an error, in the SELECT list, HAVING and ORDER BY alike: `SELECT b, COUNT(*) FROM t GROUP BY a` and `SELECT b, COUNT(*) FROM t` both fail with `Column 'b' not found`. A subquery that aggregates follows the same rule, while a column of an enclosing query is one value for it and may be read anywhere.
 
 Two rows share a group exactly when their keys are equal the way DISTINCT and UNION compare them, and every row lands in a group:
 

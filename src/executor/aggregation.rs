@@ -343,7 +343,6 @@ struct GroupingSet {
 fn group_by_item_key(item: &GroupByItem) -> ExprKey {
     match item {
         GroupByItem::Column(name) => ExprKey::column(name),
-        GroupByItem::Position(pos) => ExprKey::position(*pos),
         GroupByItem::Expression { expr, .. } => ExprKey::of(expr),
     }
 }
@@ -381,8 +380,6 @@ pub(crate) fn aggregate_slot_keys(
 pub enum GroupByItem {
     /// Simple column reference by name
     Column(String),
-    /// Positional reference like GROUP BY 1
-    Position(usize),
     /// Complex expression that needs to be evaluated
     Expression {
         /// The expression to evaluate
@@ -827,7 +824,6 @@ impl<'a> RowFeed<'a> {
                             None => KeyItem::Null,
                         }
                     }
-                    GroupByItem::Position(pos) => KeyItem::Column(pos.saturating_sub(1)),
                     GroupByItem::Expression { expr, .. } => {
                         KeyItem::Program(super::expression::compile_expression(expr, columns)?)
                     }
@@ -1489,9 +1485,11 @@ impl Executor {
                         .filter(|_| !agg_col_index_map.contains_key(id.value_lower.as_str()))
                     {
                         Some(slot) => column_sources.push(ColumnSource::AggSlot(slot)),
-                        None => {
+                        None if agg_col_index_map.contains_key(id.value_lower.as_str()) => {
                             column_sources.push(ColumnSource::AggColumn(id.value_lower.to_string()))
                         }
+                        // Neither grouped nor aggregated: the slot compiler refuses it
+                        None => column_sources.push(make_source(col_expr, is_correlated)),
                     }
                 }
                 Expression::QualifiedIdentifier(qid) => {
@@ -1504,8 +1502,10 @@ impl Executor {
                     let unqualified_lower: String = qid.name.value_lower.to_string();
                     if agg_col_index_map.contains_key(&qualified_lower) {
                         column_sources.push(ColumnSource::AggColumn(qualified_lower));
-                    } else {
+                    } else if agg_col_index_map.contains_key(&unqualified_lower) {
                         column_sources.push(ColumnSource::AggColumn(unqualified_lower));
+                    } else {
+                        column_sources.push(make_source(col_expr, is_correlated));
                     }
                 }
                 Expression::FunctionCall(func) => {
@@ -1518,8 +1518,7 @@ impl Executor {
                     } else if func.function.eq_ignore_ascii_case("GROUPING") {
                         // GROUPING() function - map to the appropriate grouping flag column
                         final_columns.push(self.get_aggregate_column_name(func));
-                        if let Some(idx) =
-                            self.find_grouping_column_index(func, &group_by_columns, &agg_columns)
+                        if let Some(idx) = self.find_grouping_column_index(func, &group_by_columns)
                         {
                             column_sources.push(ColumnSource::GroupingFlag(idx));
                         } else {
@@ -1583,11 +1582,9 @@ impl Executor {
                                 if func.function.eq_ignore_ascii_case("GROUPING") =>
                             {
                                 // Aliased GROUPING() function
-                                if let Some(idx) = self.find_grouping_column_index(
-                                    func,
-                                    &group_by_columns,
-                                    &agg_columns,
-                                ) {
+                                if let Some(idx) =
+                                    self.find_grouping_column_index(func, &group_by_columns)
+                                {
                                     column_sources.push(ColumnSource::GroupingFlag(idx));
                                 } else {
                                     column_sources.push(ColumnSource::Expression(Box::new(
@@ -1823,7 +1820,6 @@ impl Executor {
         &self,
         func: &crate::parser::ast::FunctionCall,
         group_by_columns: &[GroupByItem],
-        columns: &[String],
     ) -> Option<usize> {
         // GROUPING() takes one argument - the column name
         if func.arguments.is_empty() {
@@ -1841,15 +1837,6 @@ impl Executor {
         for (idx, item) in group_by_columns.iter().enumerate() {
             let matches = match item {
                 GroupByItem::Column(col_name) => col_name.to_lowercase() == arg_name,
-                GroupByItem::Position(pos) => {
-                    // Position is 1-indexed, convert to 0-indexed
-                    let col_idx = pos.saturating_sub(1);
-                    if col_idx < columns.len() {
-                        columns[col_idx].to_lowercase() == arg_name
-                    } else {
-                        false
-                    }
-                }
                 GroupByItem::Expression { display_name, .. } => {
                     display_name.to_lowercase() == arg_name
                 }
@@ -2458,8 +2445,10 @@ impl Executor {
                             }
                         }
                     } else {
-                        // Invalid position, fall back to storing position
-                        group_items.push(GroupByItem::Position(pos));
+                        return Err(crate::core::Error::invalid_argument(format!(
+                            "GROUP BY position {} is not in the select list",
+                            lit.value
+                        )));
                     }
                 }
                 Expression::FunctionCall(_) => {
@@ -2765,15 +2754,6 @@ impl Executor {
                         }
                     } else {
                         names.push(col_name.clone());
-                    }
-                }
-                GroupByItem::Position(pos) => {
-                    // Position is 1-indexed
-                    let idx = pos.saturating_sub(1);
-                    if idx < columns.len() {
-                        names.push(columns[idx].clone());
-                    } else {
-                        names.push(format!("${}", pos));
                     }
                 }
                 GroupByItem::Expression { display_name, .. } => {

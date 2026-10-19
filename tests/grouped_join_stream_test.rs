@@ -276,11 +276,11 @@ fn test_grouped_join_right_filters() {
         ),
         (
             format!("{inner} WHERE o.status LIKE 'c%' AND u.id > 20"),
-            "GROUP BY u.id",
+            "GROUP BY u.id, u.name",
         ),
         (
             format!("{inner} WHERE o.status <> 'shipped' OR o.amount < 100"),
-            "GROUP BY u.id",
+            "GROUP BY u.id, u.name",
         ),
     ] {
         check(
