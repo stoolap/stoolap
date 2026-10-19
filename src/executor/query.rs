@@ -4788,7 +4788,12 @@ impl Executor {
                         None => None,
                     };
                     let mut result_rows = RowVec::new();
-                    if join_limit.is_some() {
+                    // A primary key join without a limit fetches its rows in one
+                    // batch; an index lookup streams, which costs less than the
+                    // batch's key maps for it
+                    let batch = join_limit.is_none()
+                        && matches!(lookup_strategy, IndexLookupStrategy::PrimaryKey);
+                    if !batch {
                         // Streaming INL for early termination with LIMIT. When the
                         // joined rows stop short of the limit and the outer chunk
                         // was full, the next pass continues with the outer rows
