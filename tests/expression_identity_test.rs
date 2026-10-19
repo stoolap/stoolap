@@ -296,13 +296,13 @@ fn test_a_sort_key_over_a_union_reads_each_branch() {
 }
 
 #[test]
-fn test_a_name_in_a_sort_expression_reads_the_output_column() {
+fn test_a_name_in_a_sort_expression_reads_the_table_column_first() {
     let db = setup("identity_sort_output_name");
     same(
         &db,
         "SELECT a AS x, b AS a FROM t ORDER BY x + a, x",
-        "SELECT 2, 1 UNION ALL SELECT 1, 5 UNION ALL SELECT 10, 0",
-        "a in the sort key is the output column b",
+        "SELECT 1, 5 UNION ALL SELECT 2, 1 UNION ALL SELECT 10, 0",
+        "a in the sort key is the table's a; x, which no table has, is the alias",
     );
 }
 
