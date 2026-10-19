@@ -97,40 +97,17 @@ impl AggregateFunction for StringAggFunction {
     }
 
     fn accumulate(&mut self, value: &Value) {
-        // Handle NULL values - STRING_AGG ignores NULLs
-        if value.is_null() {
+        // STRING_AGG ignores NULLs; a value is joined as its text form
+        let Some(s) = value.as_string() else {
             return;
-        }
-
-        // Convert value to string
-        let s = match value {
-            Value::Text(s) => s.to_string(),
-            Value::Integer(i) => i.to_string(),
-            Value::Float(f) => f.to_string(),
-            Value::Boolean(b) => b.to_string(),
-            Value::Timestamp(t) => t.to_string(),
-            Value::Extension(_) => value.to_string(),
-            Value::Null(_) => return,
         };
 
         self.values.push(s);
     }
 
     fn accumulate_with_sort_key(&mut self, value: &Value, sort_keys: Vec<Value>) {
-        // Handle NULL values
-        if value.is_null() {
+        let Some(s) = value.as_string() else {
             return;
-        }
-
-        // Convert value to string
-        let s = match value {
-            Value::Text(s) => s.to_string(),
-            Value::Integer(i) => i.to_string(),
-            Value::Float(f) => f.to_string(),
-            Value::Boolean(b) => b.to_string(),
-            Value::Timestamp(t) => t.to_string(),
-            Value::Extension(_) => value.to_string(),
-            Value::Null(_) => return,
         };
 
         self.ordered_entries.push(OrderedEntry {
