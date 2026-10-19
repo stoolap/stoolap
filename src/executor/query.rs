@@ -261,14 +261,20 @@ pub(crate) fn split_join_where(
     (safe_left, safe_right, remaining)
 }
 
-/// Whether `expr` is false for every row: a statement constant, so no column
-/// reads as the text of its name, that evaluates to false
-fn false_for_every_row(expr: &Expression, ctx: &ExecutionContext) -> bool {
+/// Whether a WHERE `expr` keeps no row: one of its AND terms is a statement
+/// constant, so no column reads as the text of its name, that evaluates to
+/// false or NULL
+fn true_for_no_row(expr: &Expression, ctx: &ExecutionContext) -> bool {
+    if let Expression::Infix(infix) = expr {
+        if infix.op_type == InfixOperator::And {
+            return true_for_no_row(&infix.left, ctx) || true_for_no_row(&infix.right, ctx);
+        }
+    }
     statement_constant(expr, global_registry())
         && ExpressionEval::compile(expr, &[]).is_ok_and(|eval| {
             matches!(
                 eval.with_context(ctx).eval_slice(&Row::new()),
-                Ok(Value::Boolean(false))
+                Ok(Value::Boolean(false) | Value::Null(_))
             )
         })
 }
@@ -1565,7 +1571,7 @@ impl Executor {
         // Short-circuit: if WHERE is a constant-false expression (e.g., 1=0),
         // skip TVF generation entirely and return empty result.
         if let Some(ref where_clause) = stmt.where_clause {
-            if false_for_every_row(where_clause, ctx) {
+            if true_for_no_row(where_clause, ctx) {
                 let columns = if !tvf_source.column_aliases.is_empty() {
                     tvf_source
                         .column_aliases
@@ -2341,6 +2347,42 @@ impl Executor {
         }
     }
 
+    /// A table scan's answer when no row can match: no rows, taking the
+    /// aggregate, window or projection path scanned rows would take
+    fn finish_without_rows(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        all_columns: &[String],
+        table_alias: Option<&str>,
+        classification: &QueryClassification,
+    ) -> SelectResult {
+        let result = match (
+            classification.has_aggregation,
+            classification.has_window_functions,
+        ) {
+            (true, true) => self.execute_aggregation_then_windows(stmt, ctx, &[], all_columns)?,
+            (false, true) => {
+                self.execute_select_with_window_functions(stmt, ctx, &[], all_columns)?
+            }
+            (true, false) => {
+                self.execute_select_with_aggregation(stmt, ctx, RowVec::new(), all_columns)?
+            }
+            (false, false) => {
+                let columns = CompactArc::new(self.get_output_column_names(
+                    &stmt.columns,
+                    all_columns,
+                    table_alias,
+                ));
+                let result =
+                    ExecutorResult::with_arc_columns(CompactArc::clone(&columns), RowVec::new());
+                return Ok((Box::new(result), columns, true, None));
+            }
+        };
+        let columns = CompactArc::new(result.columns().to_vec());
+        Ok((result, columns, false, None))
+    }
+
     /// Execute a simple table scan
     fn execute_simple_table_scan(
         &self,
@@ -2466,6 +2508,21 @@ impl Executor {
             .or_else(|| Some(table_name.to_string()));
 
         // classification is passed from caller to avoid redundant cache lookups
+
+        // A WHERE that keeps no row reads no row
+        if stmt
+            .where_clause
+            .as_deref()
+            .is_some_and(|w| true_for_no_row(w, ctx))
+        {
+            return self.finish_without_rows(
+                stmt,
+                ctx,
+                &all_columns,
+                table_alias.as_deref(),
+                classification,
+            );
+        }
 
         // AGGREGATION PUSHDOWN: Try to compute simple aggregates directly on storage
         // This avoids all row materialization for queries like:
@@ -2695,30 +2752,18 @@ impl Executor {
         // ZONE MAP PRUNING: Short-circuit if zone maps indicate no rows can match
         // This checks min/max statistics per segment to skip entire scan when
         // the WHERE clause predicates are outside all segment ranges
-        // IMPORTANT: Don't short-circuit if we have aggregation, window functions, or GROUP BY
-        // because aggregation on empty results needs to produce output (e.g., COUNT=0)
-        let has_aggregation_or_grouping = classification.has_aggregation
-            || classification.has_window_functions
-            || classification.has_group_by;
-
-        if !has_aggregation_or_grouping {
-            if let Some(ref expr) = storage_expr {
-                if self
-                    .get_query_planner()
-                    .can_prune_entire_scan(&*table, expr.as_ref())
-                {
-                    // Zone maps indicate no segments can match - return empty result
-                    let output_columns = CompactArc::new(self.get_output_column_names(
-                        &stmt.columns,
-                        &all_columns,
-                        table_alias.as_deref(),
-                    ));
-                    let result = ExecutorResult::with_arc_columns(
-                        CompactArc::clone(&output_columns),
-                        RowVec::new(),
-                    );
-                    return Ok((Box::new(result), output_columns, true, None));
-                }
+        if let Some(ref expr) = storage_expr {
+            if self
+                .get_query_planner()
+                .can_prune_entire_scan(&*table, expr.as_ref())
+            {
+                return self.finish_without_rows(
+                    stmt,
+                    ctx,
+                    &all_columns,
+                    table_alias.as_deref(),
+                    classification,
+                );
             }
         }
 
@@ -4192,12 +4237,12 @@ impl Executor {
             ),
             None => (None, None, None),
         };
-        // A WHERE false for every row joins no rows whatever the join type; the
+        // A WHERE that keeps no row joins no rows whatever the join type; the
         // sides run with no rows only to name their columns
         let never = where_for_join
             .as_ref()
             .filter(|_| !classification.where_has_subqueries)
-            .is_some_and(|w| false_for_every_row(w, ctx));
+            .is_some_and(|w| true_for_no_row(w, ctx));
 
         // Semi-join reduction optimization for LEFT JOIN + GROUP BY + LIMIT
         // Pattern: LEFT JOIN + GROUP BY on left columns only + LIMIT N + no ORDER BY
