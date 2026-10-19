@@ -23,325 +23,12 @@
 use std::sync::Arc;
 
 use crate::common::CompactArc;
-use memchr::memmem;
 
 use crate::core::interval::IntervalUnit;
+use crate::core::pattern::Pattern;
 use crate::core::predicate::{sql_compare, sql_eq, PredicateSet};
 use crate::core::{DataType, Value};
 use crate::functions::{NativeFn1, ScalarFunction};
-
-/// Compiled LIKE/ILIKE pattern for fast matching
-#[derive(Debug, Clone)]
-pub enum CompiledPattern {
-    /// Exact match (no wildcards)
-    Exact(String),
-    /// Prefix match: "abc%"
-    Prefix(String),
-    /// Suffix match: "%abc"
-    Suffix(String),
-    /// Contains match: "%abc%"
-    Contains(String),
-    /// Prefix + Suffix: "abc%xyz"
-    PrefixSuffix(String, String),
-    /// Complex pattern requiring regex
-    Regex(regex::Regex),
-    /// Match all: "%"
-    MatchAll,
-    /// Single char: "_"
-    SingleChar,
-}
-
-impl CompiledPattern {
-    /// Compile a LIKE pattern into optimized form
-    pub fn compile(pattern: &str, case_insensitive: bool) -> Self {
-        let pat = if case_insensitive {
-            pattern.to_lowercase()
-        } else {
-            pattern.to_string()
-        };
-
-        // Check for simple patterns that don't need regex
-        let has_percent = pat.contains('%');
-        let has_underscore = pat.contains('_');
-        let has_escape = pat.contains('\\');
-
-        if !has_percent && !has_underscore && !has_escape {
-            return CompiledPattern::Exact(pat);
-        }
-
-        // When backslash escapes are present (e.g. \% for literal %), skip all fast
-        // paths — they don't understand escape sequences. Fall through to regex which
-        // correctly handles them via like_to_regex().
-        if !has_escape {
-            if pat == "%" {
-                return CompiledPattern::MatchAll;
-            }
-
-            if pat == "_" {
-                return CompiledPattern::SingleChar;
-            }
-
-            // Check for prefix pattern: "abc%"
-            if pat.ends_with('%') && !pat[..pat.len() - 1].contains('%') && !has_underscore {
-                return CompiledPattern::Prefix(pat[..pat.len() - 1].to_string());
-            }
-
-            // Check for suffix pattern: "%abc"
-            if pat.starts_with('%') && !pat[1..].contains('%') && !has_underscore {
-                return CompiledPattern::Suffix(pat[1..].to_string());
-            }
-
-            // Check for contains pattern: "%abc%"
-            if pat.starts_with('%') && pat.ends_with('%') && pat.len() > 2 {
-                let middle = &pat[1..pat.len() - 1];
-                if !middle.contains('%') && !middle.contains('_') {
-                    return CompiledPattern::Contains(middle.to_string());
-                }
-            }
-
-            // Check for prefix+suffix: "abc%xyz"
-            if has_percent && !has_underscore {
-                let parts: Vec<&str> = pat.split('%').collect();
-                if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-                    return CompiledPattern::PrefixSuffix(
-                        parts[0].to_string(),
-                        parts[1].to_string(),
-                    );
-                }
-            }
-        }
-
-        // Fall back to regex for complex patterns
-        let regex_pattern = Self::like_to_regex(&pat);
-        let regex = if case_insensitive {
-            regex::Regex::new(&format!("(?i)^{}$", regex_pattern))
-        } else {
-            regex::Regex::new(&format!("^{}$", regex_pattern))
-        };
-
-        match regex {
-            Ok(re) => CompiledPattern::Regex(re),
-            Err(_) => CompiledPattern::Exact(pat), // Fallback
-        }
-    }
-
-    /// Compile a GLOB pattern into optimized form
-    /// GLOB uses * for any sequence and ? for single character (case-sensitive)
-    pub fn compile_glob(pattern: &str) -> Self {
-        let pat = pattern.to_string();
-
-        // Check for simple patterns that don't need regex
-        let has_star = pat.contains('*');
-        let has_question = pat.contains('?');
-
-        if !has_star && !has_question {
-            return CompiledPattern::Exact(pat);
-        }
-
-        if pat == "*" {
-            return CompiledPattern::MatchAll;
-        }
-
-        if pat == "?" {
-            return CompiledPattern::SingleChar;
-        }
-
-        // Check for prefix pattern: "abc*"
-        if pat.ends_with('*') && !pat[..pat.len() - 1].contains('*') && !has_question {
-            return CompiledPattern::Prefix(pat[..pat.len() - 1].to_string());
-        }
-
-        // Check for suffix pattern: "*abc"
-        if pat.starts_with('*') && !pat[1..].contains('*') && !has_question {
-            return CompiledPattern::Suffix(pat[1..].to_string());
-        }
-
-        // Check for contains pattern: "*abc*"
-        if pat.starts_with('*') && pat.ends_with('*') && pat.len() > 2 {
-            let middle = &pat[1..pat.len() - 1];
-            if !middle.contains('*') && !middle.contains('?') {
-                return CompiledPattern::Contains(middle.to_string());
-            }
-        }
-
-        // Check for prefix+suffix: "abc*xyz"
-        if has_star && !has_question {
-            let parts: Vec<&str> = pat.split('*').collect();
-            if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-                return CompiledPattern::PrefixSuffix(parts[0].to_string(), parts[1].to_string());
-            }
-        }
-
-        // Fall back to regex for complex patterns
-        let regex_pattern = Self::glob_to_regex(&pat);
-        let regex = regex::Regex::new(&format!("^{}$", regex_pattern));
-
-        match regex {
-            Ok(re) => CompiledPattern::Regex(re),
-            Err(_) => CompiledPattern::Exact(pat), // Fallback
-        }
-    }
-
-    /// Convert GLOB pattern to regex (* -> .*, ? -> .)
-    fn glob_to_regex(pattern: &str) -> String {
-        let mut result = String::with_capacity(pattern.len() * 2);
-        let mut chars = pattern.chars().peekable();
-
-        while let Some(c) = chars.next() {
-            match c {
-                '*' => result.push_str(".*"),
-                '?' => result.push('.'),
-                '\\' => {
-                    // Escape sequence
-                    if let Some(&next) = chars.peek() {
-                        if next == '*' || next == '?' || next == '\\' {
-                            result.push_str(&regex::escape(&next.to_string()));
-                            chars.next();
-                        } else {
-                            result.push_str(&regex::escape("\\"));
-                        }
-                    }
-                }
-                '[' => {
-                    // Character class in GLOB - pass through to regex
-                    result.push('[');
-                    for c in chars.by_ref() {
-                        if c == ']' {
-                            result.push(']');
-                            break;
-                        }
-                        result.push(c);
-                    }
-                }
-                _ => result.push_str(&regex::escape(&c.to_string())),
-            }
-        }
-
-        result
-    }
-
-    /// Convert LIKE pattern to regex
-    fn like_to_regex(pattern: &str) -> String {
-        let mut result = String::with_capacity(pattern.len() * 2);
-        let mut chars = pattern.chars().peekable();
-
-        while let Some(c) = chars.next() {
-            match c {
-                '%' => result.push_str(".*"),
-                '_' => result.push('.'),
-                '\\' => {
-                    // Escape sequence: \% → literal %, \_ → literal _, \\ → literal \
-                    if let Some(&next) = chars.peek() {
-                        if next == '%' || next == '_' || next == '\\' {
-                            chars.next();
-                            result.push_str(&regex::escape(&next.to_string()));
-                        } else {
-                            result.push_str(&regex::escape("\\"));
-                        }
-                    } else {
-                        // Trailing backslash: emit literal backslash
-                        result.push_str(&regex::escape("\\"));
-                    }
-                }
-                _ => result.push_str(&regex::escape(&c.to_string())),
-            }
-        }
-
-        result
-    }
-
-    /// Match a string against this pattern
-    #[inline]
-    pub fn matches(&self, text: &str, case_insensitive: bool) -> bool {
-        // Fast path: case-sensitive matching (no allocation)
-        if !case_insensitive {
-            return match self {
-                CompiledPattern::Exact(p) => text == p,
-                CompiledPattern::Prefix(p) => text.starts_with(p),
-                CompiledPattern::Suffix(p) => text.ends_with(p),
-                // Use memmem::find for SIMD-accelerated substring search
-                CompiledPattern::Contains(p) => {
-                    memmem::find(text.as_bytes(), p.as_bytes()).is_some()
-                }
-                CompiledPattern::PrefixSuffix(prefix, suffix) => {
-                    text.starts_with(prefix)
-                        && text.ends_with(suffix)
-                        && text.len() >= prefix.len() + suffix.len()
-                }
-                CompiledPattern::Regex(re) => re.is_match(text),
-                CompiledPattern::MatchAll => true,
-                CompiledPattern::SingleChar => text.chars().count() == 1,
-            };
-        }
-
-        // Case-insensitive: use ASCII fast path when possible, fall back to Unicode
-        // NOTE: Pattern is already lowercased at compile time (see compile() method),
-        // so we only need to lowercase the input text, not the pattern again.
-        match self {
-            CompiledPattern::Exact(p) => {
-                if text.is_ascii() && p.is_ascii() {
-                    text.eq_ignore_ascii_case(p)
-                } else {
-                    // Pattern already lowercased at compile time
-                    text.to_lowercase() == *p
-                }
-            }
-            CompiledPattern::Prefix(p) => {
-                if text.len() < p.len() {
-                    return false;
-                }
-                if text.is_ascii() && p.is_ascii() {
-                    text[..p.len()].eq_ignore_ascii_case(p)
-                } else {
-                    // Pattern already lowercased at compile time
-                    text.to_lowercase().starts_with(p)
-                }
-            }
-            CompiledPattern::Suffix(p) => {
-                if text.len() < p.len() {
-                    return false;
-                }
-                if text.is_ascii() && p.is_ascii() {
-                    text[text.len() - p.len()..].eq_ignore_ascii_case(p)
-                } else {
-                    // Pattern already lowercased at compile time
-                    text.to_lowercase().ends_with(p)
-                }
-            }
-            CompiledPattern::Contains(p) => {
-                if p.len() > text.len() {
-                    return false;
-                }
-                if text.is_ascii() && p.is_ascii() {
-                    // Fast path: ASCII-only, use byte-level comparison without allocation
-                    text.as_bytes()
-                        .windows(p.len())
-                        .any(|window| window.eq_ignore_ascii_case(p.as_bytes()))
-                } else {
-                    // Unicode path: lowercase text only (pattern already lowercased)
-                    text.to_lowercase().contains(p)
-                }
-            }
-            CompiledPattern::PrefixSuffix(prefix, suffix) => {
-                if text.len() < prefix.len() + suffix.len() {
-                    return false;
-                }
-                if text.is_ascii() && prefix.is_ascii() && suffix.is_ascii() {
-                    text[..prefix.len()].eq_ignore_ascii_case(prefix)
-                        && text[text.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
-                } else {
-                    // Patterns already lowercased at compile time
-                    let text_lower = text.to_lowercase();
-                    text_lower.starts_with(prefix) && text_lower.ends_with(suffix)
-                }
-            }
-            // Regex already has case-insensitivity compiled in
-            CompiledPattern::Regex(re) => re.is_match(text),
-            CompiledPattern::MatchAll => true,
-            CompiledPattern::SingleChar => text.chars().count() == 1,
-        }
-    }
-}
 
 /// An INTERVAL literal: `quantity` times one `unit`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -458,7 +145,7 @@ pub enum Op {
 
     /// Fused: column LIKE pattern
     /// Stack: [] -> [bool]
-    LikeColumn(u16, Arc<CompiledPattern>, bool), // col_idx, pattern, case_insensitive
+    LikeColumn(u16, Arc<Pattern>), // col_idx, pattern
 
     /// Fused: column IN (constant set with AHash)
     /// Stack: [] -> [bool]
@@ -534,11 +221,11 @@ pub enum Op {
 
     /// LIKE pattern match (pre-compiled pattern)
     /// Stack: [text] -> [bool]
-    Like(Arc<CompiledPattern>, bool), // pattern, case_insensitive
+    Like(Arc<Pattern>),
 
     /// GLOB pattern match
     /// Stack: [text] -> [bool]
-    Glob(Arc<CompiledPattern>),
+    Glob(Arc<Pattern>),
 
     /// REGEXP match (pre-compiled regex)
     /// Stack: [text] -> [bool]
@@ -546,7 +233,7 @@ pub enum Op {
 
     /// LIKE with ESCAPE character
     /// Stack: [text] -> [bool]
-    LikeEscape(Arc<CompiledPattern>, bool, char), // pattern, case_insensitive, escape_char
+    LikeEscape(Arc<Pattern>, char), // pattern, escape_char
 
     /// Dynamic LIKE: pattern is on the stack (e.g. from a parameter)
     /// Stack: [text, pattern_text] -> [bool]
@@ -999,7 +686,7 @@ impl std::fmt::Debug for Op {
             Op::GeColumnConst(col, val) => write!(f, "GeColumnConst({}, {:?})", col, val),
             Op::IsNullColumn(col) => write!(f, "IsNullColumn({})", col),
             Op::IsNotNullColumn(col) => write!(f, "IsNotNullColumn({})", col),
-            Op::LikeColumn(col, _, ci) => write!(f, "LikeColumn({}, case_insensitive={})", col, ci),
+            Op::LikeColumn(col, _) => write!(f, "LikeColumn({})", col),
             Op::InSetColumn(col, set) => {
                 write!(
                     f,
@@ -1031,12 +718,10 @@ impl std::fmt::Debug for Op {
             Op::Shl => write!(f, "Shl"),
             Op::Shr => write!(f, "Shr"),
             Op::Concat => write!(f, "Concat"),
-            Op::Like(_, ci) => write!(f, "Like(case_insensitive={})", ci),
+            Op::Like(_) => write!(f, "Like"),
             Op::Glob(_) => write!(f, "Glob"),
             Op::Regexp(_) => write!(f, "Regexp"),
-            Op::LikeEscape(_, ci, esc) => {
-                write!(f, "LikeEscape(case_insensitive={}, escape='{}')", ci, esc)
-            }
+            Op::LikeEscape(_, esc) => write!(f, "LikeEscape(escape='{}')", esc),
             Op::LikeDynamic(ci) => write!(f, "LikeDynamic(case_insensitive={})", ci),
             Op::LikeDynamicEscape(ci, esc) => {
                 write!(
@@ -1160,267 +845,6 @@ mod tests {
         // We want to keep Op small for cache efficiency
         // Ideally under 32 bytes, definitely under 64 bytes
         assert!(size <= 64, "Op enum is too large: {} bytes", size);
-    }
-
-    // =========================================================================
-    // CompiledPattern::compile() tests - LIKE patterns
-    // =========================================================================
-
-    #[test]
-    fn test_pattern_exact() {
-        let pattern = CompiledPattern::compile("hello", false);
-        assert!(matches!(pattern, CompiledPattern::Exact(ref s) if s == "hello"));
-        assert!(pattern.matches("hello", false));
-        assert!(!pattern.matches("Hello", false));
-        assert!(!pattern.matches("hello world", false));
-    }
-
-    #[test]
-    fn test_pattern_exact_case_insensitive() {
-        let pattern = CompiledPattern::compile("Hello", true);
-        assert!(matches!(pattern, CompiledPattern::Exact(ref s) if s == "hello"));
-        assert!(pattern.matches("hello", true));
-        assert!(pattern.matches("HELLO", true));
-        assert!(pattern.matches("HeLLo", true));
-    }
-
-    #[test]
-    fn test_pattern_match_all() {
-        let pattern = CompiledPattern::compile("%", false);
-        assert!(matches!(pattern, CompiledPattern::MatchAll));
-        assert!(pattern.matches("", false));
-        assert!(pattern.matches("anything", false));
-        assert!(pattern.matches("with spaces and 123", false));
-    }
-
-    #[test]
-    fn test_pattern_single_char() {
-        let pattern = CompiledPattern::compile("_", false);
-        assert!(matches!(pattern, CompiledPattern::SingleChar));
-        assert!(pattern.matches("a", false));
-        assert!(pattern.matches("Z", false));
-        assert!(!pattern.matches("", false));
-        assert!(!pattern.matches("ab", false));
-    }
-
-    #[test]
-    fn test_pattern_prefix() {
-        let pattern = CompiledPattern::compile("hello%", false);
-        assert!(matches!(pattern, CompiledPattern::Prefix(ref s) if s == "hello"));
-        assert!(pattern.matches("hello", false));
-        assert!(pattern.matches("hello world", false));
-        assert!(pattern.matches("hellooooo", false));
-        assert!(!pattern.matches("Hello", false));
-        assert!(!pattern.matches("say hello", false));
-    }
-
-    #[test]
-    fn test_pattern_prefix_case_insensitive() {
-        let pattern = CompiledPattern::compile("Hello%", true);
-        assert!(pattern.matches("hello world", true));
-        assert!(pattern.matches("HELLO WORLD", true));
-        assert!(!pattern.matches("say hello", true));
-    }
-
-    #[test]
-    fn test_pattern_suffix() {
-        let pattern = CompiledPattern::compile("%world", false);
-        assert!(matches!(pattern, CompiledPattern::Suffix(ref s) if s == "world"));
-        assert!(pattern.matches("world", false));
-        assert!(pattern.matches("hello world", false));
-        assert!(!pattern.matches("World", false));
-        assert!(!pattern.matches("world!", false));
-    }
-
-    #[test]
-    fn test_pattern_suffix_case_insensitive() {
-        let pattern = CompiledPattern::compile("%World", true);
-        assert!(pattern.matches("hello world", true));
-        assert!(pattern.matches("HELLO WORLD", true));
-        assert!(!pattern.matches("world!", true));
-    }
-
-    #[test]
-    fn test_pattern_contains() {
-        let pattern = CompiledPattern::compile("%ello%", false);
-        assert!(matches!(pattern, CompiledPattern::Contains(ref s) if s == "ello"));
-        assert!(pattern.matches("hello", false));
-        assert!(pattern.matches("yellow", false));
-        assert!(pattern.matches("hello world", false));
-        assert!(!pattern.matches("HELLO", false));
-    }
-
-    #[test]
-    fn test_pattern_contains_case_insensitive() {
-        let pattern = CompiledPattern::compile("%ELLO%", true);
-        assert!(pattern.matches("hello", true));
-        assert!(pattern.matches("YELLOW", true));
-        assert!(!pattern.matches("hi", true));
-    }
-
-    #[test]
-    fn test_pattern_prefix_suffix() {
-        let pattern = CompiledPattern::compile("hello%world", false);
-        assert!(
-            matches!(pattern, CompiledPattern::PrefixSuffix(ref p, ref s) if p == "hello" && s == "world")
-        );
-        assert!(pattern.matches("helloworld", false));
-        assert!(pattern.matches("hello world", false));
-        assert!(pattern.matches("hello beautiful world", false));
-        assert!(!pattern.matches("hello", false));
-        assert!(!pattern.matches("world", false));
-    }
-
-    #[test]
-    fn test_pattern_prefix_suffix_case_insensitive() {
-        let pattern = CompiledPattern::compile("Hello%World", true);
-        assert!(pattern.matches("helloworld", true));
-        assert!(pattern.matches("HELLO WORLD", true));
-        assert!(!pattern.matches("hello", true));
-    }
-
-    #[test]
-    fn test_pattern_prefix_suffix_too_short() {
-        let pattern = CompiledPattern::compile("abc%xyz", false);
-        // Text must be at least prefix.len() + suffix.len()
-        assert!(!pattern.matches("abcxy", false)); // too short
-        assert!(pattern.matches("abcxyz", false)); // exact length
-        assert!(pattern.matches("abc123xyz", false));
-    }
-
-    #[test]
-    fn test_pattern_complex_regex() {
-        // Pattern with multiple % or _ that requires regex
-        let pattern = CompiledPattern::compile("a%b%c", false);
-        assert!(matches!(pattern, CompiledPattern::Regex(_)));
-        assert!(pattern.matches("abc", false));
-        assert!(pattern.matches("aXbYc", false));
-        assert!(pattern.matches("aXXXbYYYc", false));
-        assert!(!pattern.matches("ac", false));
-    }
-
-    #[test]
-    fn test_pattern_underscore_regex() {
-        let pattern = CompiledPattern::compile("a_c", false);
-        assert!(matches!(pattern, CompiledPattern::Regex(_)));
-        assert!(pattern.matches("abc", false));
-        assert!(pattern.matches("aXc", false));
-        assert!(!pattern.matches("ac", false));
-        assert!(!pattern.matches("abbc", false));
-    }
-
-    #[test]
-    fn test_pattern_mixed_wildcards() {
-        let pattern = CompiledPattern::compile("a_%b", false);
-        assert!(matches!(pattern, CompiledPattern::Regex(_)));
-        assert!(pattern.matches("aXb", false));
-        assert!(pattern.matches("aXYZb", false));
-        assert!(!pattern.matches("ab", false));
-    }
-
-    // =========================================================================
-    // CompiledPattern::compile_glob() tests - GLOB patterns
-    // =========================================================================
-
-    #[test]
-    fn test_glob_exact() {
-        let pattern = CompiledPattern::compile_glob("hello");
-        assert!(matches!(pattern, CompiledPattern::Exact(ref s) if s == "hello"));
-        assert!(pattern.matches("hello", false));
-        assert!(!pattern.matches("Hello", false));
-    }
-
-    #[test]
-    fn test_glob_match_all() {
-        let pattern = CompiledPattern::compile_glob("*");
-        assert!(matches!(pattern, CompiledPattern::MatchAll));
-        assert!(pattern.matches("anything", false));
-    }
-
-    #[test]
-    fn test_glob_single_char() {
-        let pattern = CompiledPattern::compile_glob("?");
-        assert!(matches!(pattern, CompiledPattern::SingleChar));
-        assert!(pattern.matches("a", false));
-        assert!(!pattern.matches("ab", false));
-    }
-
-    #[test]
-    fn test_glob_prefix() {
-        let pattern = CompiledPattern::compile_glob("hello*");
-        assert!(matches!(pattern, CompiledPattern::Prefix(ref s) if s == "hello"));
-        assert!(pattern.matches("hello", false));
-        assert!(pattern.matches("hello world", false));
-    }
-
-    #[test]
-    fn test_glob_suffix() {
-        let pattern = CompiledPattern::compile_glob("*world");
-        assert!(matches!(pattern, CompiledPattern::Suffix(ref s) if s == "world"));
-        assert!(pattern.matches("world", false));
-        assert!(pattern.matches("hello world", false));
-    }
-
-    #[test]
-    fn test_glob_contains() {
-        let pattern = CompiledPattern::compile_glob("*ello*");
-        assert!(matches!(pattern, CompiledPattern::Contains(ref s) if s == "ello"));
-        assert!(pattern.matches("hello", false));
-        assert!(pattern.matches("yellow", false));
-    }
-
-    #[test]
-    fn test_glob_prefix_suffix() {
-        let pattern = CompiledPattern::compile_glob("hello*world");
-        assert!(
-            matches!(pattern, CompiledPattern::PrefixSuffix(ref p, ref s) if p == "hello" && s == "world")
-        );
-        assert!(pattern.matches("helloworld", false));
-        assert!(pattern.matches("hello beautiful world", false));
-    }
-
-    #[test]
-    fn test_glob_complex_regex() {
-        let pattern = CompiledPattern::compile_glob("a*b*c");
-        assert!(matches!(pattern, CompiledPattern::Regex(_)));
-        assert!(pattern.matches("abc", false));
-        assert!(pattern.matches("aXbYc", false));
-    }
-
-    #[test]
-    fn test_glob_question_mark() {
-        let pattern = CompiledPattern::compile_glob("a?c");
-        assert!(matches!(pattern, CompiledPattern::Regex(_)));
-        assert!(pattern.matches("abc", false));
-        assert!(!pattern.matches("ac", false));
-    }
-
-    #[test]
-    fn test_glob_character_class() {
-        // Character class alone without * or ? is treated as exact match
-        let pattern = CompiledPattern::compile_glob("a[bc]d");
-        assert!(matches!(pattern, CompiledPattern::Exact(_)));
-
-        // Pattern with * at end is treated as Prefix
-        let pattern2 = CompiledPattern::compile_glob("a[bc]*");
-        assert!(matches!(pattern2, CompiledPattern::Prefix(ref s) if s == "a[bc]"));
-
-        // *[bc]* is Contains since middle has no wildcards
-        let pattern3 = CompiledPattern::compile_glob("*[bc]*");
-        assert!(matches!(pattern3, CompiledPattern::Contains(ref s) if s == "[bc]"));
-    }
-
-    #[test]
-    fn test_glob_escape_edge_cases() {
-        // `a\\*b` splits on * giving ["a\\", "b"] - treated as PrefixSuffix
-        let pattern1 = CompiledPattern::compile_glob("a\\*b");
-        assert!(matches!(pattern1, CompiledPattern::PrefixSuffix(_, _)));
-
-        // Complex escapes with multiple wildcards go to regex
-        let pattern2 = CompiledPattern::compile_glob("*a*b*");
-        assert!(matches!(pattern2, CompiledPattern::Regex(_)));
-        assert!(pattern2.matches("XaYbZ", false));
-        assert!(pattern2.matches("ab", false));
     }
 
     // =========================================================================
@@ -1773,9 +1197,9 @@ mod tests {
 
     #[test]
     fn test_op_debug_like_glob() {
-        let pattern = Arc::new(CompiledPattern::compile("test%", false));
-        assert!(format!("{:?}", Op::Like(pattern.clone(), false)).contains("Like"));
+        let pattern = Arc::new(Pattern::like("test%", false));
+        assert!(format!("{:?}", Op::Like(pattern.clone())).contains("Like"));
         assert!(format!("{:?}", Op::Glob(pattern.clone())).contains("Glob"));
-        assert!(format!("{:?}", Op::LikeColumn(0, pattern, false)).contains("LikeColumn"));
+        assert!(format!("{:?}", Op::LikeColumn(0, pattern)).contains("LikeColumn"));
     }
 }

@@ -31,15 +31,16 @@ use crate::common::SmartString;
 use crate::common::StringMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::ops::{CompiledPattern, IntervalStep, Op, QuantifiedMembers};
+use super::ops::{IntervalStep, Op, QuantifiedMembers};
 use super::program::{Program, ProgramBuilder};
 use super::vm::{ExecuteContext, ExprVM};
 use crate::core::interval::IntervalUnit;
+use crate::core::pattern::Pattern;
 use crate::core::predicate::PredicateSet;
 use crate::core::{DataType, Row, Value, ValueSet};
 use crate::executor::expr_key::ExprKey;
 use crate::executor::utils::{
-    derived_aggregate_column_name, string_literal_value, string_to_datatype,
+    derived_aggregate_column_name, extract_literal_value, string_literal_value, string_to_datatype,
 };
 use crate::executor::volatility::expression_volatility;
 use crate::functions::{global_registry, FunctionRegistry, Volatility};
@@ -1057,8 +1058,7 @@ impl<'a> ExprCompiler<'a> {
                 self.compile_expr(&infix.left, builder)?;
                 let pattern_str = Self::extract_pattern_string(&infix.right);
                 if let Some(s) = pattern_str {
-                    let pattern = CompiledPattern::compile(&s, false);
-                    builder.emit(Op::Like(Arc::new(pattern), false));
+                    builder.emit(Op::Like(Arc::new(Pattern::like(&s, false))));
                 } else {
                     self.compile_expr(&infix.right, builder)?;
                     builder.emit(Op::LikeDynamic(false));
@@ -1069,8 +1069,7 @@ impl<'a> ExprCompiler<'a> {
                 self.compile_expr(&infix.left, builder)?;
                 let pattern_str = Self::extract_pattern_string(&infix.right);
                 if let Some(s) = pattern_str {
-                    let pattern = CompiledPattern::compile(&s, true);
-                    builder.emit(Op::Like(Arc::new(pattern), true));
+                    builder.emit(Op::Like(Arc::new(Pattern::like(&s, true))));
                 } else {
                     self.compile_expr(&infix.right, builder)?;
                     builder.emit(Op::LikeDynamic(true));
@@ -1081,8 +1080,7 @@ impl<'a> ExprCompiler<'a> {
                 self.compile_expr(&infix.left, builder)?;
                 let pattern_str = Self::extract_pattern_string(&infix.right);
                 if let Some(s) = pattern_str {
-                    let pattern = CompiledPattern::compile(&s, false);
-                    builder.emit(Op::Like(Arc::new(pattern), false));
+                    builder.emit(Op::Like(Arc::new(Pattern::like(&s, false))));
                     builder.emit(Op::Not);
                 } else {
                     self.compile_expr(&infix.right, builder)?;
@@ -1095,8 +1093,7 @@ impl<'a> ExprCompiler<'a> {
                 self.compile_expr(&infix.left, builder)?;
                 let pattern_str = Self::extract_pattern_string(&infix.right);
                 if let Some(s) = pattern_str {
-                    let pattern = CompiledPattern::compile(&s, true);
-                    builder.emit(Op::Like(Arc::new(pattern), true));
+                    builder.emit(Op::Like(Arc::new(Pattern::like(&s, true))));
                     builder.emit(Op::Not);
                 } else {
                     self.compile_expr(&infix.right, builder)?;
@@ -1109,8 +1106,7 @@ impl<'a> ExprCompiler<'a> {
                 self.compile_expr(&infix.left, builder)?;
                 let pattern_str = Self::extract_pattern_string(&infix.right);
                 if let Some(s) = pattern_str {
-                    let pattern = CompiledPattern::compile_glob(&s);
-                    builder.emit(Op::Glob(Arc::new(pattern)));
+                    builder.emit(Op::Glob(Arc::new(Pattern::glob(&s))));
                 } else {
                     self.compile_expr(&infix.right, builder)?;
                     builder.emit(Op::GlobDynamic);
@@ -1618,17 +1614,14 @@ impl<'a> ExprCompiler<'a> {
                 })?;
                 builder.emit(Op::Regexp(Arc::new(regex)));
             } else if is_glob {
-                // Use compile_glob for GLOB patterns (uses * and ? wildcards)
-                let pattern = CompiledPattern::compile_glob(&s);
-                builder.emit(Op::Glob(Arc::new(pattern)));
+                builder.emit(Op::Glob(Arc::new(Pattern::glob(&s))));
             } else if let Some(esc) = escape_char {
                 // LIKE with ESCAPE - pre-process pattern to handle escape character
                 let processed_pattern = self.process_like_escape(&s, esc);
-                let pattern = CompiledPattern::compile(&processed_pattern, case_insensitive);
-                builder.emit(Op::LikeEscape(Arc::new(pattern), case_insensitive, esc));
+                let pattern = Pattern::like(&processed_pattern, case_insensitive);
+                builder.emit(Op::LikeEscape(Arc::new(pattern), esc));
             } else {
-                let pattern = CompiledPattern::compile(&s, case_insensitive);
-                builder.emit(Op::Like(Arc::new(pattern), case_insensitive));
+                builder.emit(Op::Like(Arc::new(Pattern::like(&s, case_insensitive))));
             }
 
             if negated {
@@ -1655,13 +1648,15 @@ impl<'a> ExprCompiler<'a> {
         Ok(())
     }
 
-    /// Extract a static pattern string from a StringLiteral or a double-quoted Identifier.
-    /// Returns None for dynamic expressions (column references, function calls, etc.).
+    /// A pattern known when compiled: a literal read as its text form, a
+    /// typed literal by its value, or a double-quoted identifier's text. None
+    /// for a NULL and for an expression read per row
     fn extract_pattern_string(expr: &Expression) -> Option<SmartString> {
         match expr {
-            Expression::StringLiteral(lit) => Some(lit.value.clone()),
             Expression::Identifier(id) if id.quoted => Some(id.value.clone()),
-            _ => None,
+            expr => extract_literal_value(expr)?
+                .as_string()
+                .map(SmartString::from_string),
         }
     }
 

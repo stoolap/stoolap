@@ -76,6 +76,8 @@ SELECT CONCAT(first_name, ' ', last_name) AS full_name FROM users;
 
 ### Pattern Matching
 
+LIKE, ILIKE, GLOB and REGEXP read both the value and the pattern as text, as `CAST(... AS TEXT)` gives it, whatever their type. So `15 LIKE '1%'` is true, a TIMESTAMP is matched against its text `'2024-01-01T12:00:00+00:00'`, and `DATE '2024-01-01'` as a pattern is the text `'2024-01-01T00:00:00+00:00'`. A NULL on either side gives NULL, so `NOT (x LIKE p)` keeps no row where `x` is NULL. ILIKE folds case for any character, not only ASCII ones: `'Émile' ILIKE 'é%'` is true.
+
 #### LIKE (Case-Sensitive)
 
 ```sql

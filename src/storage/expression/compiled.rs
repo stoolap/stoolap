@@ -41,15 +41,10 @@
 //! }
 //! ```
 
-use std::cell::RefCell;
-use std::num::NonZeroUsize;
-
-use lru::LruCache;
-use memchr::memmem;
-
 use chrono::{DateTime, Utc};
 
 use crate::common::CompactArc;
+use crate::core::pattern::Pattern;
 use crate::core::value::{f64_eq, f64_ge, f64_gt, f64_le, f64_lt, f64_ne};
 use crate::core::{Operator, Row, Schema, Value};
 
@@ -62,318 +57,12 @@ use super::logical::{AndExpr, ConstBoolExpr, NotExpr, OrExpr};
 use super::null_check::NullCheckExpr;
 use super::Expression;
 
-/// Maximum number of cached regex patterns per thread
-const REGEX_CACHE_SIZE: usize = 128;
-
-// Thread-local LRU cache for compiled regex patterns to avoid recompilation
-thread_local! {
-    static REGEX_CACHE: RefCell<LruCache<String, regex::Regex>> =
-        RefCell::new(LruCache::new(NonZeroUsize::new(REGEX_CACHE_SIZE).unwrap()));
-}
-
-/// Clear the thread-local regex cache to release memory
-pub fn clear_regex_cache() {
-    REGEX_CACHE.with(|cache| {
-        cache.borrow_mut().clear();
-    });
-}
-
-/// Get or compile a regex pattern, using thread-local LRU cache
-fn get_or_compile_regex(pattern: &str) -> regex::Regex {
-    REGEX_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some(regex) = cache.get(pattern) {
-            return regex.clone();
-        }
-        let regex = regex::Regex::new(pattern).unwrap_or_else(|_| regex::Regex::new("^$").unwrap());
-        cache.put(pattern.to_string(), regex.clone());
-        regex
-    })
-}
-
-/// Compiled pattern for LIKE expressions
-#[derive(Debug, Clone)]
-pub enum CompiledPattern {
-    /// Exact match (no wildcards)
-    Exact(CompactArc<str>),
-    /// Prefix match (pattern%)
-    Prefix(CompactArc<str>),
-    /// Suffix match (%pattern)
-    Suffix(CompactArc<str>),
-    /// Contains match (%pattern%) - uses SIMD-accelerated substring search
-    Contains {
-        /// The substring to search for
-        substring: CompactArc<str>,
-        /// Pre-compiled SIMD finder for case-sensitive O(n) search (boxed to reduce enum size)
-        finder: Box<memmem::Finder<'static>>,
-    },
-    /// Prefix with pattern (literal_prefix + wildcard_pattern%)
-    /// First check starts_with(prefix), then regex for the rest
-    PrefixWithPattern {
-        prefix: CompactArc<str>,
-        prefix_len: usize,
-        rest_regex: regex::Regex,
-    },
-    /// Simple underscore pattern with trailing % (e.g., "User_1%")
-    /// Template contains literal chars (Some) or wildcards (None for _)
-    SimpleUnderscorePrefix {
-        /// Literal characters (None means wildcard _)
-        template: Vec<Option<char>>,
-        /// Has trailing %
-        has_trailing_percent: bool,
-    },
-    /// Full regex pattern (complex patterns)
-    Regex(regex::Regex),
-}
-
-impl CompiledPattern {
-    /// Compile a LIKE pattern into an optimized matcher
-    pub fn compile(pattern: &str, case_insensitive: bool) -> Self {
-        let pattern = if case_insensitive {
-            pattern.to_lowercase()
-        } else {
-            pattern.to_string()
-        };
-
-        // Check for simple patterns we can optimize
-        let has_leading_percent = pattern.starts_with('%');
-        let has_trailing_percent = pattern.ends_with('%');
-        let inner = pattern.trim_matches('%');
-
-        // If pattern contains backslash escape sequences, skip fast paths
-        // and use regex which handles \%, \_, \\ correctly via like_to_regex
-        let has_escape = pattern.contains('\\');
-
-        // Check if inner part has any wildcards
-        let has_inner_wildcards = inner.contains('%') || inner.contains('_');
-
-        if !has_inner_wildcards && !has_escape {
-            match (has_leading_percent, has_trailing_percent) {
-                (false, false) => CompiledPattern::Exact(CompactArc::from(inner)),
-                (false, true) => CompiledPattern::Prefix(CompactArc::from(inner)),
-                (true, false) => CompiledPattern::Suffix(CompactArc::from(inner)),
-                (true, true) => {
-                    // Pre-compile SIMD finder for O(n) substring search
-                    let substring: CompactArc<str> = CompactArc::from(inner);
-                    let finder = Box::new(memmem::Finder::new(substring.as_bytes()).into_owned());
-                    CompiledPattern::Contains { substring, finder }
-                }
-            }
-        } else {
-            // Check for simple underscore patterns without middle % (e.g., "User_1%", "User_1")
-            // These can use direct character comparison instead of regex
-            // Skip when escape sequences are present (backslash changes wildcard interpretation)
-            let has_middle_percent = inner.contains('%');
-            if !has_escape && !has_middle_percent && !case_insensitive {
-                // Pattern only has _ wildcards (and possibly trailing %)
-                // Build a template for direct character matching
-                let template: Vec<Option<char>> = inner
-                    .chars()
-                    .map(|c| if c == '_' { None } else { Some(c) })
-                    .collect();
-
-                return CompiledPattern::SimpleUnderscorePrefix {
-                    template,
-                    has_trailing_percent,
-                };
-            }
-
-            // Check for patterns with a literal prefix before wildcards (e.g., "User_1%")
-            // This allows fast rejection via starts_with before falling back to regex
-            // Skip when escape sequences are present (backslash changes prefix boundary)
-            if !has_escape && !has_leading_percent {
-                // Find the literal prefix (characters before first wildcard)
-                let prefix_end = pattern
-                    .chars()
-                    .position(|c| c == '%' || c == '_')
-                    .unwrap_or(pattern.len());
-
-                if prefix_end >= 2 {
-                    // We have a meaningful prefix (at least 2 chars)
-                    let prefix = &pattern[..prefix_end];
-                    let rest = &pattern[prefix_end..];
-
-                    // Build regex for the rest of the pattern
-                    let rest_regex_pattern = like_to_regex(rest);
-                    let flags = if case_insensitive { "(?i)" } else { "" };
-                    let full_rest_pattern = format!("^{}{}$", flags, rest_regex_pattern);
-
-                    // Use cached regex compilation
-                    let rest_regex = get_or_compile_regex(&full_rest_pattern);
-                    return CompiledPattern::PrefixWithPattern {
-                        prefix: CompactArc::from(prefix),
-                        prefix_len: prefix.len(),
-                        rest_regex,
-                    };
-                }
-            }
-
-            // Complex pattern - fall back to full regex (with caching)
-            let regex_pattern = like_to_regex(&pattern);
-            let flags = if case_insensitive { "(?i)" } else { "" };
-            let full_pattern = format!("^{}{}$", flags, regex_pattern);
-            CompiledPattern::Regex(get_or_compile_regex(&full_pattern))
-        }
-    }
-
-    /// Check if a string matches this pattern
-    #[inline(always)]
-    pub fn matches(&self, s: &str, case_insensitive: bool) -> bool {
-        // OPTIMIZATION: Avoid per-row allocation where possible
-        // - Regex patterns already use (?i) flag, no lowercasing needed
-        // - Simple patterns use allocation-free ASCII case-insensitive comparison
-        // - Fall back to to_lowercase() only for non-ASCII case-insensitive patterns
-        match self {
-            CompiledPattern::Exact(pattern) => {
-                if case_insensitive {
-                    s.eq_ignore_ascii_case(pattern.as_ref())
-                } else {
-                    s == pattern.as_ref()
-                }
-            }
-            CompiledPattern::Prefix(prefix) => {
-                let prefix_ref = prefix.as_ref();
-                if case_insensitive {
-                    s.len() >= prefix_ref.len()
-                        && s.as_bytes()[..prefix_ref.len()]
-                            .eq_ignore_ascii_case(prefix_ref.as_bytes())
-                } else {
-                    s.starts_with(prefix_ref)
-                }
-            }
-            CompiledPattern::Suffix(suffix) => {
-                let suffix_ref = suffix.as_ref();
-                if case_insensitive {
-                    s.len() >= suffix_ref.len()
-                        && s.as_bytes()[s.len() - suffix_ref.len()..]
-                            .eq_ignore_ascii_case(suffix_ref.as_bytes())
-                } else {
-                    s.ends_with(suffix_ref)
-                }
-            }
-            CompiledPattern::Contains { substring, finder } => {
-                let substr_ref = substring.as_ref();
-                if case_insensitive {
-                    // For case-insensitive contains, we need to scan through the string
-                    // Use allocation-free approach by checking each position
-                    if substr_ref.is_empty() {
-                        return true;
-                    }
-                    let substr_len = substr_ref.len();
-                    if s.len() < substr_len {
-                        return false;
-                    }
-                    // Check each starting position using byte slices to avoid
-                    // panics on multi-byte UTF-8 characters (str slicing requires
-                    // char boundary alignment, but byte slices don't)
-                    let s_bytes = s.as_bytes();
-                    let substr_bytes = substr_ref.as_bytes();
-                    for i in 0..=(s_bytes.len() - substr_len) {
-                        if s_bytes[i..i + substr_len].eq_ignore_ascii_case(substr_bytes) {
-                            return true;
-                        }
-                    }
-                    false
-                } else {
-                    // OPTIMIZATION: Use pre-compiled SIMD finder for O(n) search
-                    // This is ~3-10x faster than str::contains which recreates TwoWaySearcher each call
-                    finder.find(s.as_bytes()).is_some()
-                }
-            }
-            CompiledPattern::PrefixWithPattern {
-                prefix,
-                prefix_len,
-                rest_regex,
-            } => {
-                // Fast path: check prefix first (case-insensitive via ASCII)
-                let prefix_ref = prefix.as_ref();
-                if case_insensitive {
-                    if s.len() < *prefix_len || !s[..*prefix_len].eq_ignore_ascii_case(prefix_ref) {
-                        return false;
-                    }
-                } else if !s.starts_with(prefix_ref) {
-                    return false;
-                }
-                // Slow path: check the rest with regex (regex already has (?i) flag)
-                if s.len() < *prefix_len {
-                    return false;
-                }
-                rest_regex.is_match(&s[*prefix_len..])
-            }
-            CompiledPattern::SimpleUnderscorePrefix {
-                template,
-                has_trailing_percent,
-            } => {
-                // SimpleUnderscorePrefix is only used for case-sensitive patterns (see compile())
-                // Use character iteration for proper UTF-8 handling
-                let mut chars = s.chars();
-
-                // Check each character in template
-                for expected in template.iter() {
-                    match chars.next() {
-                        Some(actual_char) => {
-                            if let Some(expected_char) = expected {
-                                // Must match exact character
-                                if actual_char != *expected_char {
-                                    return false;
-                                }
-                            }
-                            // None means _ wildcard, matches any single character (skip check)
-                        }
-                        None => {
-                            // String is shorter than template
-                            return false;
-                        }
-                    }
-                }
-
-                // Check length constraints
-                if *has_trailing_percent {
-                    // With trailing %, any remaining chars are fine
-                    true
-                } else {
-                    // Without trailing %, string must be exactly min_len characters
-                    chars.next().is_none()
-                }
-            }
-            // Regex patterns already use (?i) flag for case-insensitivity
-            // No need to lowercase the input - just match directly
-            CompiledPattern::Regex(re) => re.is_match(s),
-        }
-    }
-}
-
-/// Convert LIKE pattern to regex pattern
-fn like_to_regex(pattern: &str) -> String {
-    let mut result = String::with_capacity(pattern.len() * 2);
-    let mut chars = pattern.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        match c {
-            '%' => result.push_str(".*"),
-            '_' => result.push('.'),
-            '\\' => {
-                // Escape sequence: \% = literal %, \_ = literal _, \\ = literal \
-                if let Some(&next) = chars.peek() {
-                    if next == '%' || next == '_' || next == '\\' {
-                        chars.next();
-                        // Must regex-escape the character (\ is a regex metachar)
-                        result.push_str(&regex::escape(&next.to_string()));
-                        continue;
-                    }
-                }
-                result.push_str("\\\\");
-            }
-            // Escape regex metacharacters
-            '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' => {
-                result.push('\\');
-                result.push(c);
-            }
-            _ => result.push(c),
-        }
-    }
-
-    result
+/// `value LIKE pattern`, negated when asked; false for a NULL
+#[inline(always)]
+fn string_like(pattern: &Pattern, negated: bool, value: &Value) -> bool {
+    pattern
+        .matches_value(value)
+        .is_some_and(|matched| matched != negated)
 }
 
 /// Compiled filter expression for high-performance row filtering
@@ -458,11 +147,12 @@ pub enum CompiledFilter {
         col_idx: usize,
         values: Vec<CompactArc<str>>,
     },
-    /// col LIKE pattern
+    /// col LIKE pattern, the value read as its text form
     StringLike {
         col_idx: usize,
-        pattern: CompiledPattern,
-        case_insensitive: bool,
+        /// Boxed, so the filter's tag stays a plain discriminant every
+        /// variant reads at no extra cost
+        pattern: Box<Pattern>,
         negated: bool,
     },
 
@@ -1071,17 +761,10 @@ impl CompiledFilter {
             None => return CompiledFilter::Dynamic(expr.clone_box()),
         };
 
-        let pattern_str = expr.get_pattern();
-        let case_insensitive = expr.is_case_insensitive();
-        let negated = expr.is_negated();
-
-        let pattern = CompiledPattern::compile(pattern_str, case_insensitive);
-
         CompiledFilter::StringLike {
             col_idx,
-            pattern,
-            case_insensitive,
-            negated,
+            pattern: Box::new(expr.compiled().clone()),
+            negated: expr.is_negated(),
         }
     }
 
@@ -1278,20 +961,10 @@ impl CompiledFilter {
             CompiledFilter::StringLike {
                 col_idx,
                 pattern,
-                case_insensitive,
                 negated,
-            } => {
-                if let Some(Value::Text(s)) = row.get(*col_idx) {
-                    let matches = pattern.matches(s.as_str(), *case_insensitive);
-                    if *negated {
-                        !matches
-                    } else {
-                        matches
-                    }
-                } else {
-                    false
-                }
-            }
+            } => row
+                .get(*col_idx)
+                .is_some_and(|value| string_like(pattern, *negated, value)),
 
             // Boolean comparisons
             CompiledFilter::BooleanEq { col_idx, value } => {
@@ -1622,20 +1295,8 @@ impl CompiledFilter {
             CompiledFilter::StringLike {
                 col_idx,
                 pattern,
-                case_insensitive,
                 negated,
-            } => {
-                if let Value::Text(s) = get_val!(col_idx) {
-                    let matches = pattern.matches(s.as_str(), *case_insensitive);
-                    if *negated {
-                        !matches
-                    } else {
-                        matches
-                    }
-                } else {
-                    false
-                }
-            }
+            } => string_like(pattern, *negated, get_val!(col_idx)),
 
             // Boolean comparisons
             CompiledFilter::BooleanEq { col_idx, value } => {
@@ -2288,11 +1949,10 @@ mod tests {
 
     #[test]
     fn test_like_prefix() {
-        let pattern = CompiledPattern::compile("Al%", false);
+        let pattern = Box::new(Pattern::like("Al%", false));
         let filter = CompiledFilter::StringLike {
             col_idx: 1,
             pattern,
-            case_insensitive: false,
             negated: false,
         };
 
@@ -2308,24 +1968,17 @@ mod tests {
     #[test]
     fn test_underscore_pattern_matching() {
         // This pattern has an underscore which is a LIKE wildcard
-        let pattern = CompiledPattern::compile("NAME_1%", false);
-        println!("Pattern type: {:?}", pattern);
+        let pattern = Pattern::like("NAME_1%", false);
 
         // Test direct pattern matching
+        assert!(pattern.matches("NAME_1"), "NAME_1 should match NAME_1%");
+        assert!(pattern.matches("NAME_10"), "NAME_10 should match NAME_1%");
         assert!(
-            pattern.matches("NAME_1", false),
-            "NAME_1 should match NAME_1%"
-        );
-        assert!(
-            pattern.matches("NAME_10", false),
-            "NAME_10 should match NAME_1%"
-        );
-        assert!(
-            !pattern.matches("NAME_0", false),
+            !pattern.matches("NAME_0"),
             "NAME_0 should NOT match NAME_1%"
         );
         assert!(
-            !pattern.matches("NAME_2", false),
+            !pattern.matches("NAME_2"),
             "NAME_2 should NOT match NAME_1%"
         );
     }
@@ -2333,30 +1986,20 @@ mod tests {
     #[test]
     fn test_underscore_pattern_no_trailing_percent() {
         // Pattern without trailing % - exact length match with wildcards
-        let pattern = CompiledPattern::compile("NAME__", false);
-        println!("Pattern type: {:?}", pattern);
+        let pattern = Pattern::like("NAME__", false);
 
         // Should match 6-character strings starting with NAME
-        assert!(
-            pattern.matches("NAME_1", false),
-            "NAME_1 should match NAME__"
-        );
-        assert!(
-            pattern.matches("NAME_0", false),
-            "NAME_0 should match NAME__"
-        );
-        assert!(
-            pattern.matches("NAMEZZ", false),
-            "NAMEZZ should match NAME__"
-        );
+        assert!(pattern.matches("NAME_1"), "NAME_1 should match NAME__");
+        assert!(pattern.matches("NAME_0"), "NAME_0 should match NAME__");
+        assert!(pattern.matches("NAMEZZ"), "NAMEZZ should match NAME__");
 
         // Should NOT match different lengths
         assert!(
-            !pattern.matches("NAME_10", false),
+            !pattern.matches("NAME_10"),
             "NAME_10 should NOT match NAME__ (too long)"
         );
         assert!(
-            !pattern.matches("NAME_", false),
+            !pattern.matches("NAME_"),
             "NAME_ should NOT match NAME__ (too short)"
         );
     }

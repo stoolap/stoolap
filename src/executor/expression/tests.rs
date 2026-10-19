@@ -22,9 +22,10 @@ use crate::common::SmartString;
 use crate::common::CompactArc;
 
 use super::compiler::{CompileContext, ExprCompiler};
-use super::ops::{CompiledPattern, Op};
+use super::ops::Op;
 use super::program::Program;
 use super::vm::{ExecuteContext, ExprVM};
+use crate::core::pattern::Pattern;
 use crate::core::{Value, ValueSet};
 use crate::parser::ast::Expression;
 use crate::Row;
@@ -237,10 +238,10 @@ fn test_like_pattern() {
     let mut vm = ExprVM::new();
 
     // col[0] LIKE 'test%'
-    let pattern = CompiledPattern::compile("test%", false);
+    let pattern = Pattern::like("test%", false);
     let program = Program::new(vec![
         Op::LoadColumn(0),
-        Op::Like(Arc::new(pattern), false),
+        Op::Like(Arc::new(pattern)),
         Op::Return,
     ]);
 
@@ -448,35 +449,35 @@ fn test_compiler_simple_expression() {
 
 #[test]
 fn test_compiled_pattern_prefix() {
-    let pattern = CompiledPattern::compile("test%", false);
-    assert!(pattern.matches("testing", false));
-    assert!(pattern.matches("test", false));
-    assert!(!pattern.matches("atest", false));
+    let pattern = Pattern::like("test%", false);
+    assert!(pattern.matches("testing"));
+    assert!(pattern.matches("test"));
+    assert!(!pattern.matches("atest"));
 }
 
 #[test]
 fn test_compiled_pattern_suffix() {
-    let pattern = CompiledPattern::compile("%test", false);
-    assert!(pattern.matches("mytest", false));
-    assert!(pattern.matches("test", false));
-    assert!(!pattern.matches("testa", false));
+    let pattern = Pattern::like("%test", false);
+    assert!(pattern.matches("mytest"));
+    assert!(pattern.matches("test"));
+    assert!(!pattern.matches("testa"));
 }
 
 #[test]
 fn test_compiled_pattern_contains() {
-    let pattern = CompiledPattern::compile("%test%", false);
-    assert!(pattern.matches("mytesting", false));
-    assert!(pattern.matches("test", false));
-    assert!(pattern.matches("atest", false));
-    assert!(!pattern.matches("other", false));
+    let pattern = Pattern::like("%test%", false);
+    assert!(pattern.matches("mytesting"));
+    assert!(pattern.matches("test"));
+    assert!(pattern.matches("atest"));
+    assert!(!pattern.matches("other"));
 }
 
 #[test]
 fn test_compiled_pattern_case_insensitive() {
-    let pattern = CompiledPattern::compile("TEST%", true);
-    assert!(pattern.matches("testing", true));
-    assert!(pattern.matches("TESTING", true));
-    assert!(pattern.matches("TeStInG", true));
+    let pattern = Pattern::like("TEST%", true);
+    assert!(pattern.matches("testing"));
+    assert!(pattern.matches("TESTING"));
+    assert!(pattern.matches("TeStInG"));
 }
 
 /// The WHERE of `SELECT * FROM t WHERE {predicate}`

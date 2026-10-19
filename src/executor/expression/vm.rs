@@ -26,11 +26,12 @@ use std::borrow::Cow;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
-use super::ops::{CompareOp, CompiledPattern, IntervalStep, Op};
+use super::ops::{CompareOp, IntervalStep, Op};
 use super::program::Program;
 use crate::common::{CompactArc, SmartString};
 use crate::core::integer::{integer_neg, integer_op, IntegerOp};
 use crate::core::interval::{self, Interval, IntervalUnit};
+use crate::core::pattern::Pattern;
 use crate::core::predicate::{sql_compare, sql_distinct, sql_eq};
 use crate::core::value::{f64_eq, f64_ge, f64_gt, f64_le, f64_lt, f64_ne};
 use crate::core::{DataType, Result, Row, Value, NULL_VALUE};
@@ -44,6 +45,19 @@ type StackValue<'a> = Cow<'a, Value>;
 #[inline]
 fn truth(result: Option<bool>) -> Value {
     result.map_or(Value::Null(DataType::Boolean), Value::Boolean)
+}
+
+/// `value LIKE pattern` or `GLOB`, the value read as its text form; NULL
+/// for a NULL
+#[inline]
+fn pattern_match(value: &Value, pattern: &Pattern) -> Value {
+    truth(pattern.matches_value(value))
+}
+
+/// `value REGEXP regex`, the value read as its text form; NULL for a NULL
+#[inline]
+fn regexp_match(value: &Value, regex: &regex::Regex) -> Value {
+    truth(value.text_form().map(|text| regex.is_match(&text)))
 }
 
 /// `value BETWEEN low AND high`: `value >= low AND value <= high`, where a
@@ -219,11 +233,11 @@ pub struct ExprVM {
 
     /// Cache for dynamic LIKE patterns (avoids recompilation per row)
     /// Stores (pattern_string, case_insensitive, escape_char, compiled_pattern)
-    cached_like: Option<(SmartString, bool, Option<char>, CompiledPattern)>,
+    cached_like: Option<(SmartString, bool, Option<char>, Pattern)>,
 
     /// Cache for dynamic GLOB patterns (separate from LIKE to avoid cross-contamination)
     /// Stores (pattern_string, compiled_pattern)
-    cached_glob: Option<(SmartString, CompiledPattern)>,
+    cached_glob: Option<(SmartString, Pattern)>,
 
     /// Cache for dynamic REGEXP patterns (avoids recompilation per row)
     /// Stores (pattern_string, compiled_regex)
@@ -270,31 +284,62 @@ impl ExprVM {
         ci: bool,
         esc: Option<char>,
     ) -> Value {
-        match (text_val, pattern_val) {
-            (Value::Text(text), Value::Text(pat)) => {
-                let need_compile = match &self.cached_like {
-                    Some((cached_pat, cached_ci, cached_esc, _)) => {
-                        cached_pat.as_str() != pat.as_str()
-                            || *cached_ci != ci
-                            || *cached_esc != esc
-                    }
-                    None => true,
-                };
-                if need_compile {
-                    // !% becomes \% so CompiledPattern treats the wildcard as literal
-                    let processed = match esc {
-                        Some(esc) => process_like_escape_runtime(pat, esc),
-                        None => pat.to_string(),
-                    };
-                    let compiled = CompiledPattern::compile(&processed, ci);
-                    self.cached_like = Some((pat.clone(), ci, esc, compiled));
-                }
-                let (_, _, _, ref compiled) = self.cached_like.as_ref().unwrap();
-                Value::Boolean(compiled.matches(text, ci))
+        // Both sides are read as their text form; a NULL on either is UNKNOWN
+        let (Some(text), Some(pat)) = (text_val.text_form(), pattern_val.text_form()) else {
+            return Value::Null(DataType::Boolean);
+        };
+        if let Some((cached_pat, cached_ci, cached_esc, compiled)) = &self.cached_like {
+            if cached_pat.as_str() == pat && *cached_ci == ci && *cached_esc == esc {
+                return Value::Boolean(compiled.matches(&text));
             }
-            (Value::Null(_), _) | (_, Value::Null(_)) => Value::Null(DataType::Boolean),
-            _ => Value::Boolean(false),
         }
+        // !% becomes \% so the pattern reads the wildcard as literal
+        let processed = match esc {
+            Some(esc) => process_like_escape_runtime(&pat, esc),
+            None => pat.to_string(),
+        };
+        let compiled = Pattern::like(&processed, ci);
+        let matched = compiled.matches(&text);
+        self.cached_like = Some((SmartString::new(&pat), ci, esc, compiled));
+        Value::Boolean(matched)
+    }
+
+    /// Match a runtime GLOB pattern, caching the compiled form per pattern
+    fn glob_dynamic(&mut self, text_val: &Value, pattern_val: &Value) -> Value {
+        let (Some(text), Some(pat)) = (text_val.text_form(), pattern_val.text_form()) else {
+            return Value::Null(DataType::Boolean);
+        };
+        if let Some((cached_pat, compiled)) = &self.cached_glob {
+            if cached_pat.as_str() == pat {
+                return Value::Boolean(compiled.matches(&text));
+            }
+        }
+        let compiled = Pattern::glob(&pat);
+        let matched = compiled.matches(&text);
+        self.cached_glob = Some((SmartString::new(&pat), compiled));
+        Value::Boolean(matched)
+    }
+
+    /// Match a runtime REGEXP pattern, caching the compiled regex per pattern;
+    /// an invalid one is an error, as a literal one is when compiled
+    fn regexp_dynamic(&mut self, text_val: &Value, pattern_val: &Value) -> Result<Value> {
+        let (Some(text), Some(pat)) = (text_val.text_form(), pattern_val.text_form()) else {
+            return Ok(Value::Null(DataType::Boolean));
+        };
+        if let Some((cached_pat, re)) = &self.cached_regexp {
+            if cached_pat.as_str() == pat {
+                return Ok(Value::Boolean(re.is_match(&text)));
+            }
+        }
+        let re = regex::Regex::new(&pat).map_err(|e| {
+            crate::core::Error::invalid_argument(format!(
+                "Invalid regular expression '{}': {}",
+                pat, e
+            ))
+        })?;
+        let matched = re.is_match(&text);
+        self.cached_regexp = Some((SmartString::new(&pat), re));
+        Ok(Value::Boolean(matched))
     }
 
     pub fn execute(&mut self, program: &Program, ctx: &ExecuteContext) -> Result<Value> {
@@ -637,17 +682,12 @@ impl ExprVM {
                     pc += 1;
                 }
 
-                Op::LikeColumn(idx, pattern, case_insensitive) => {
+                Op::LikeColumn(idx, pattern) => {
                     let col_val = ctx
                         .row
                         .get(*idx as usize)
                         .unwrap_or(&Value::Null(DataType::Null));
-                    let result = match col_val {
-                        Value::Text(s) => Value::Boolean(pattern.matches(s, *case_insensitive)),
-                        Value::Null(_) => Value::Null(DataType::Boolean),
-                        _ => Value::Boolean(false),
-                    };
-                    self.stack.push(result);
+                    self.stack.push(pattern_match(col_val, pattern));
                     pc += 1;
                 }
 
@@ -1046,77 +1086,26 @@ impl ExprVM {
                     pc += 1;
                 }
 
-                Op::Like(pattern, case_insensitive) => {
+                Op::Like(pattern) | Op::Glob(pattern) | Op::LikeEscape(pattern, _) => {
+                    // An ESCAPE is already part of the compiled pattern
                     let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match &v {
-                        Value::Text(s) => Value::Boolean(pattern.matches(s, *case_insensitive)),
-                        Value::Null(_) => Value::Null(DataType::Boolean),
-                        _ => Value::Boolean(false),
-                    };
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                Op::Glob(pattern) => {
-                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match &v {
-                        Value::Text(s) => Value::Boolean(pattern.matches(s, false)),
-                        Value::Null(_) => Value::Null(DataType::Boolean),
-                        _ => Value::Boolean(false),
-                    };
-                    self.stack.push(result);
+                    self.stack.push(pattern_match(&v, pattern));
                     pc += 1;
                 }
 
                 Op::Regexp(regex) => {
                     let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match &v {
-                        Value::Text(s) => Value::Boolean(regex.is_match(s)),
-                        Value::Null(_) => Value::Null(DataType::Boolean),
-                        _ => Value::Boolean(false),
-                    };
-                    self.stack.push(result);
-                    pc += 1;
-                }
-
-                Op::LikeEscape(pattern, case_insensitive, _escape) => {
-                    // ESCAPE is already incorporated into the compiled pattern
-                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match &v {
-                        Value::Text(s) => Value::Boolean(pattern.matches(s, *case_insensitive)),
-                        Value::Null(_) => Value::Null(DataType::Boolean),
-                        _ => Value::Boolean(false),
-                    };
-                    self.stack.push(result);
+                    self.stack.push(regexp_match(&v, regex));
                     pc += 1;
                 }
 
                 Op::LikeDynamic(case_insensitive) => {
+                    // Parameters are constant per query, so the compiled
+                    // pattern is cached rather than rebuilt per row
                     let pattern_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let text_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let ci = *case_insensitive;
-                    let result = match (&text_val, &pattern_val) {
-                        (Value::Text(text), Value::Text(pat)) => {
-                            // Cache compiled pattern: parameters are constant per query,
-                            // so recompiling every row is wasteful
-                            let need_compile = match &self.cached_like {
-                                Some((cached_pat, cached_ci, cached_esc, _)) => {
-                                    cached_pat.as_str() != pat.as_str()
-                                        || *cached_ci != ci
-                                        || cached_esc.is_some()
-                                }
-                                None => true,
-                            };
-                            if need_compile {
-                                let compiled = CompiledPattern::compile(pat, ci);
-                                self.cached_like = Some((pat.clone(), ci, None, compiled));
-                            }
-                            let (_, _, _, ref compiled) = self.cached_like.as_ref().unwrap();
-                            Value::Boolean(compiled.matches(text, ci))
-                        }
-                        (Value::Null(_), _) | (_, Value::Null(_)) => Value::Null(DataType::Boolean),
-                        _ => Value::Boolean(false),
-                    };
+                    let result =
+                        self.like_dynamic_escape(&text_val, &pattern_val, *case_insensitive, None);
                     self.stack.push(result);
                     pc += 1;
                 }
@@ -1160,22 +1149,7 @@ impl ExprVM {
                 Op::GlobDynamic => {
                     let pattern_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let text_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match (&text_val, &pattern_val) {
-                        (Value::Text(text), Value::Text(pat)) => {
-                            let need_compile = match &self.cached_glob {
-                                Some((cached_pat, _)) => cached_pat.as_str() != pat.as_str(),
-                                None => true,
-                            };
-                            if need_compile {
-                                let compiled = CompiledPattern::compile_glob(pat);
-                                self.cached_glob = Some((pat.clone(), compiled));
-                            }
-                            let (_, ref compiled) = self.cached_glob.as_ref().unwrap();
-                            Value::Boolean(compiled.matches(text, false))
-                        }
-                        (Value::Null(_), _) | (_, Value::Null(_)) => Value::Null(DataType::Boolean),
-                        _ => Value::Boolean(false),
-                    };
+                    let result = self.glob_dynamic(&text_val, &pattern_val);
                     self.stack.push(result);
                     pc += 1;
                 }
@@ -1183,34 +1157,7 @@ impl ExprVM {
                 Op::RegexpDynamic => {
                     let pattern_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let text_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match (&text_val, &pattern_val) {
-                        (Value::Text(text), Value::Text(pat)) => {
-                            let need_compile = match &self.cached_regexp {
-                                Some((cached_pat, _)) => cached_pat.as_str() != pat.as_str(),
-                                None => true,
-                            };
-                            if need_compile {
-                                match regex::Regex::new(pat) {
-                                    Ok(re) => {
-                                        self.cached_regexp = Some((pat.clone(), re));
-                                    }
-                                    Err(e) => {
-                                        self.cached_regexp = None;
-                                        // Return error for invalid regex, matching literal
-                                        // REGEXP behavior where bad patterns fail at compile time
-                                        return Err(crate::core::Error::invalid_argument(format!(
-                                            "Invalid regular expression '{}': {}",
-                                            pat, e
-                                        )));
-                                    }
-                                }
-                            }
-                            let (_, ref re) = self.cached_regexp.as_ref().unwrap();
-                            Value::Boolean(re.is_match(text))
-                        }
-                        (Value::Null(_), _) | (_, Value::Null(_)) => Value::Null(DataType::Boolean),
-                        _ => Value::Boolean(false),
-                    };
+                    let result = self.regexp_dynamic(&text_val, &pattern_val)?;
                     self.stack.push(result);
                     pc += 1;
                 }
@@ -2874,12 +2821,12 @@ impl ExprVM {
                 .get(*idx as usize)
                 .is_some_and(|v| set.contains(v) == Some(true)),
             // Handle LIKE pattern matching (e.g., fruit LIKE 'a%')
-            Op::LikeColumn(idx, pattern, case_insensitive) => {
-                match ctx.row.get(*idx as usize) {
-                    Some(Value::Text(s)) => pattern.matches(s, *case_insensitive),
-                    _ => false, // NULL or non-text -> false
-                }
-            }
+            // A NULL is UNKNOWN, which is not true
+            Op::LikeColumn(idx, pattern) => ctx
+                .row
+                .get(*idx as usize)
+                .and_then(|value| pattern.matches_value(value))
+                .unwrap_or(false),
             // For other ops, fall back to tribool and convert
             _ => Self::eval_single_op_tribool(op, ctx) == Some(true),
         }
@@ -3014,11 +2961,10 @@ impl ExprVM {
                 cell => Self::fused_cell(op, cell),
             },
             // Handle LIKE pattern matching (e.g., fruit LIKE 'a%')
-            Op::LikeColumn(idx, pattern, case_insensitive) => match ctx.row.get(*idx as usize) {
-                Some(Value::Text(s)) => Some(pattern.matches(s, *case_insensitive)),
-                Some(Value::Null(_)) | None => None,
-                _ => Some(false),
-            },
+            Op::LikeColumn(idx, pattern) => ctx
+                .row
+                .get(*idx as usize)
+                .and_then(|value| pattern.matches_value(value)),
             // Any other fused comparison, by the predicate comparison
             Op::LtColumnConst(idx, _)
             | Op::LeColumnConst(idx, _)
@@ -3605,7 +3551,7 @@ impl Default for ExprVM {
 /// Process a LIKE pattern with a custom escape character at runtime.
 ///
 /// Converts escaped wildcards (e.g. `!%` with escape `!`) into the
-/// default `\%` escape form that `CompiledPattern::compile` understands.
+/// default `\%` escape form that `Pattern::like` understands.
 fn process_like_escape_runtime(pattern: &str, escape: char) -> String {
     let mut result = String::with_capacity(pattern.len());
     let mut chars = pattern.chars().peekable();
@@ -4477,13 +4423,11 @@ mod tests {
 
     #[test]
     fn test_like_pattern() {
-        use super::super::ops::CompiledPattern;
-
         let mut vm = ExprVM::new();
-        let pattern = CompiledPattern::compile("%world%", false);
+        let pattern = Pattern::like("%world%", false);
         let program = Program::new(vec![
             Op::LoadColumn(0),
-            Op::Like(Arc::new(pattern), false),
+            Op::Like(Arc::new(pattern)),
             Op::Return,
         ]);
 
@@ -4498,10 +4442,8 @@ mod tests {
 
     #[test]
     fn test_glob_pattern() {
-        use super::super::ops::CompiledPattern;
-
         let mut vm = ExprVM::new();
-        let pattern = CompiledPattern::compile_glob("*.txt");
+        let pattern = Pattern::glob("*.txt");
         let program = Program::new(vec![
             Op::LoadColumn(0),
             Op::Glob(Arc::new(pattern)),
@@ -5146,14 +5088,9 @@ mod tests {
 
     #[test]
     fn test_like_column() {
-        use super::super::ops::CompiledPattern;
-
         let mut vm = ExprVM::new();
-        let pattern = CompiledPattern::compile("test%", false);
-        let program = Program::new(vec![
-            Op::LikeColumn(0, Arc::new(pattern), false),
-            Op::Return,
-        ]);
+        let pattern = Pattern::like("test%", false);
+        let program = Program::new(vec![Op::LikeColumn(0, Arc::new(pattern)), Op::Return]);
 
         let row = Row::from_values(vec![Value::Text("testing".into())]);
         let ctx = ExecuteContext::new(&row);
