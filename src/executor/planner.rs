@@ -574,6 +574,8 @@ impl QueryPlanner {
         }
 
         // All comparisons indicate no segments match - can skip entire scan
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::zone_map_pruned();
         true
     }
 

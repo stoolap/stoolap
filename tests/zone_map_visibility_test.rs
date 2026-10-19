@@ -173,3 +173,31 @@ fn a_commit_between_analyzes_read_and_its_maps_leaves_them_unused() {
         wrong.join("\n")
     );
 }
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn maintenance_that_changes_no_row_keeps_the_zone_maps_in_use() {
+    use stoolap::test_failpoints::zone_map_prunes;
+    let db = Database::open("memory://zone_map_empty_gc").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO t SELECT value, 1 FROM generate_series(1, 1000)",
+        (),
+    )
+    .unwrap();
+    db.execute("ANALYZE t", ()).unwrap();
+    let pruned = |db: &Database| {
+        let before = zone_map_prunes();
+        assert_eq!(
+            ids(db.query("SELECT id FROM t WHERE k = 9", ())),
+            Ok(vec![])
+        );
+        zone_map_prunes() - before
+    };
+    assert_eq!(pruned(&db), 1, "pruned after ANALYZE");
+    db.execute("VACUUM t", ()).unwrap();
+    assert_eq!(pruned(&db), 1, "pruned after a VACUUM that removed no row");
+    db.execute("INSERT INTO t VALUES (1001, 1)", ()).unwrap();
+    assert_eq!(pruned(&db), 0, "not pruned after a commit");
+}
