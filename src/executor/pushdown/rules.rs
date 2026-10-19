@@ -535,12 +535,7 @@ impl LikeRule {
             return PushdownResult::CannotPush;
         }
 
-        // Check for UPPER(col) or LOWER(col) LIKE pattern -> case-insensitive LIKE
-        let (column, force_ilike) = if let Some(col) = extract_column_name(&like.left) {
-            (col, false)
-        } else if let Some(col) = self.extract_upper_lower_column(&like.left) {
-            (col, true) // UPPER/LOWER(col) LIKE -> ILIKE
-        } else {
+        let Some(column) = extract_column_name(&like.left) else {
             return PushdownResult::CannotPush;
         };
 
@@ -549,13 +544,12 @@ impl LikeRule {
             return PushdownResult::CannotPush;
         }
 
-        let pattern = match &*like.pattern {
-            ast::Expression::StringLiteral(s) => s.value.clone(),
-            _ => return PushdownResult::CannotPush,
+        let Some(pattern) = extract_pattern(&like.pattern) else {
+            return PushdownResult::CannotPush;
         };
 
         let is_not = op_upper.contains("NOT");
-        let is_ilike = force_ilike || op_upper.contains("ILIKE");
+        let is_ilike = op_upper.contains("ILIKE");
 
         let mut expr = match (is_not, is_ilike) {
             (true, true) => LikeExpr::not_ilike(column, pattern),
@@ -565,17 +559,6 @@ impl LikeRule {
         };
         expr.prepare_for_schema(ctx.schema);
         PushdownResult::Converted(Box::new(expr))
-    }
-
-    /// Extract column name from UPPER(col) or LOWER(col) function call
-    fn extract_upper_lower_column(&self, expr: &ast::Expression) -> Option<String> {
-        if let ast::Expression::FunctionCall(fc) = expr {
-            let func_name = fc.function.to_uppercase();
-            if (func_name == "UPPER" || func_name == "LOWER") && fc.arguments.len() == 1 {
-                return extract_column_name(&fc.arguments[0]);
-            }
-        }
-        None
     }
 
     fn convert_infix_like(
@@ -597,12 +580,7 @@ impl LikeRule {
             return PushdownResult::NotApplicable;
         }
 
-        // Extract column, checking for UPPER/LOWER wrapper
-        let (column, force_ilike) = if let Some(col) = extract_column_name(&infix.left) {
-            (col, false)
-        } else if let Some(col) = self.extract_upper_lower_column(&infix.left) {
-            (col, true) // UPPER/LOWER(col) -> force case-insensitive
-        } else {
+        let Some(column) = extract_column_name(&infix.left) else {
             return PushdownResult::CannotPush;
         };
 
@@ -617,9 +595,9 @@ impl LikeRule {
         };
 
         let (is_ilike, is_not) = match infix.op_type {
-            InfixOperator::Like => (force_ilike, false),
+            InfixOperator::Like => (false, false),
             InfixOperator::ILike => (true, false),
-            InfixOperator::NotLike => (force_ilike, true),
+            InfixOperator::NotLike => (false, true),
             InfixOperator::NotILike => (true, true),
             _ => return PushdownResult::NotApplicable, // Should never reach here due to check above
         };
@@ -639,11 +617,10 @@ impl LikeRule {
     }
 }
 
+/// A literal pattern read as its text form, a typed literal by its value;
+/// None for a NULL or a pattern read per row, which stays in memory
 fn extract_pattern(expr: &ast::Expression) -> Option<String> {
-    match expr {
-        ast::Expression::StringLiteral(s) => Some(s.value.to_string()),
-        _ => None,
-    }
+    crate::executor::utils::extract_literal_value(expr)?.as_string()
 }
 
 // =============================================================================

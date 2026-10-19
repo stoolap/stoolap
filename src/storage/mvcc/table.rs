@@ -685,6 +685,21 @@ impl MVCCTable {
         Some(row_ids)
     }
 
+    /// The index and the `[start, end)` text range a `LIKE 'prefix%'` reads:
+    /// only a TEXT column's index orders its keys as LIKE reads them
+    fn like_prefix_range(&self, expr: &dyn Expression) -> Option<(Arc<dyn Index>, Value, Value)> {
+        let (col_name, prefix, negated) = expr.get_like_prefix_info()?;
+        if negated {
+            return None;
+        }
+        let index = self.version_store.get_index_by_column(col_name)?;
+        if index.data_types() != [DataType::Text] {
+            return None;
+        }
+        let end = crate::core::pattern::Pattern::prefix_range_end(&prefix)?;
+        Some((index, Value::text(&prefix), Value::text(&end)))
+    }
+
     fn index_lookup(
         &self,
         expr: &dyn Expression,
@@ -985,21 +1000,12 @@ impl MVCCTable {
         }
 
         // OPTIMIZATION: Handle LIKE prefix patterns with index range scan
-        // For 'name LIKE 'John%'', use index range scan from 'John' to 'John\xff'
-        if let Some((col_name, prefix, negated)) = expr.get_like_prefix_info() {
-            // Don't optimize NOT LIKE (would need complement of range)
-            if negated {
-                return None;
-            }
-
-            if let Some(index) = self.version_store.get_index_by_column(col_name) {
-                // Create range from prefix to prefix + '\xff' (highest byte)
-                // This captures all strings starting with the prefix
-                let min_value = Value::text(&prefix);
-                let mut max_prefix = prefix.clone();
-                max_prefix.push('\u{FFFF}'); // Highest unicode char
-                let max_value = Value::text(&max_prefix);
-
+        // For 'name LIKE 'John%'', use index range scan from 'John' to 'Joho'
+        if expr.get_like_prefix_info().is_some() {
+            // NOT LIKE, a column that is not TEXT, or a prefix with no
+            // range end reads no index
+            let (index, min_value, max_value) = self.like_prefix_range(expr)?;
+            {
                 // Use index range query
                 if let Ok(entries) = index.find_range(
                     std::slice::from_ref(&min_value),
@@ -5213,19 +5219,17 @@ impl Table for MVCCTable {
             }
         }
 
-        // Check for LIKE prefix pattern
-        if let Some((col_name, prefix, negated)) = expr.get_like_prefix_info() {
-            if !negated {
-                if let Some(index) = self.version_store.get_index_by_column(col_name) {
-                    return ScanPlan::IndexScan {
-                        table: table_name,
-                        index_name: index.name().to_string(),
-                        column: col_name.to_string(),
-                        condition: format!("LIKE '{}%'", prefix),
-                        filter: None,
-                    };
-                }
-            }
+        // Check for LIKE prefix pattern, as index_lookup reads it
+        if let (Some((col_name, prefix, _)), Some((index, _, _))) =
+            (expr.get_like_prefix_info(), self.like_prefix_range(expr))
+        {
+            return ScanPlan::IndexScan {
+                table: table_name,
+                index_name: index.name().to_string(),
+                column: col_name.to_string(),
+                condition: format!("LIKE '{}%'", prefix),
+                filter: None,
+            };
         }
 
         // Check for OR expressions (union of indexes)

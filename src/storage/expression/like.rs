@@ -19,49 +19,13 @@
 //! - `_` matches any single character
 
 use std::any::Any;
-use std::cell::RefCell;
 use std::fmt;
-use std::num::NonZeroUsize;
 
-use lru::LruCache;
-use regex::Regex;
 use rustc_hash::FxHashMap;
 
 use super::{find_column_index, resolve_alias, Expression};
-use crate::core::{Result, Row, Schema};
-
-/// Maximum number of cached LIKE regex patterns per thread
-const LIKE_REGEX_CACHE_SIZE: usize = 128;
-
-// Thread-local LRU cache for compiled regex patterns
-thread_local! {
-    static LIKE_REGEX_CACHE: RefCell<LruCache<String, Regex>> =
-        RefCell::new(LruCache::new(NonZeroUsize::new(LIKE_REGEX_CACHE_SIZE).unwrap()));
-}
-
-/// Clear the thread-local LIKE regex cache to release memory
-pub fn clear_like_regex_cache() {
-    LIKE_REGEX_CACHE.with(|cache| {
-        cache.borrow_mut().clear();
-    });
-}
-
-/// Get or compile a regex pattern, using thread-local LRU cache
-fn get_or_compile_like_regex(pattern: &str) -> Option<Regex> {
-    LIKE_REGEX_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some(regex) = cache.get(pattern) {
-            return Some(regex.clone());
-        }
-        match Regex::new(pattern) {
-            Ok(regex) => {
-                cache.put(pattern.to_string(), regex.clone());
-                Some(regex)
-            }
-            Err(_) => None,
-        }
-    })
-}
+use crate::core::pattern::Pattern;
+use crate::core::{Result, Row, Schema, Value};
 
 /// LIKE expression for SQL pattern matching
 ///
@@ -89,8 +53,8 @@ pub struct LikeExpr {
     negated: bool,
     /// Pre-computed column index for fast evaluation
     col_index: Option<usize>,
-    /// Compiled regex pattern
-    regex: Option<Regex>,
+    /// The pattern as the shared matcher compiled it
+    compiled: Pattern,
     /// Whether preparation has been attempted
     prepared: bool,
 }
@@ -98,30 +62,23 @@ pub struct LikeExpr {
 impl LikeExpr {
     /// Create a new LIKE expression
     pub fn new(column: impl Into<String>, pattern: impl Into<String>) -> Self {
-        let pattern_str = pattern.into();
-        let regex = Self::compile_pattern(&pattern_str, false);
-        Self {
-            column: column.into(),
-            pattern: pattern_str,
-            case_insensitive: false,
-            negated: false,
-            col_index: None,
-            regex,
-            prepared: false,
-        }
+        Self::with_case(column.into(), pattern.into(), false)
     }
 
     /// Create a new ILIKE expression (case-insensitive)
     pub fn new_ilike(column: impl Into<String>, pattern: impl Into<String>) -> Self {
-        let pattern_str = pattern.into();
-        let regex = Self::compile_pattern(&pattern_str, true);
+        Self::with_case(column.into(), pattern.into(), true)
+    }
+
+    fn with_case(column: String, pattern: String, case_insensitive: bool) -> Self {
+        let compiled = Pattern::like(&pattern, case_insensitive);
         Self {
-            column: column.into(),
-            pattern: pattern_str,
-            case_insensitive: true,
+            column,
+            pattern,
+            case_insensitive,
             negated: false,
             col_index: None,
-            regex,
+            compiled,
             prepared: false,
         }
     }
@@ -140,68 +97,16 @@ impl LikeExpr {
         expr
     }
 
-    /// Compile SQL LIKE pattern to regex (with caching)
-    ///
-    /// Handles `\` as the SQL LIKE escape character:
-    /// - `\%` matches a literal `%`
-    /// - `\_` matches a literal `_`
-    /// - `\\` matches a literal `\`
-    pub fn compile_pattern(pattern: &str, case_insensitive: bool) -> Option<Regex> {
-        // Build regex pattern character by character
-        // We need to handle % and _ specially while escaping everything else
-        let mut regex_pattern = String::with_capacity(pattern.len() * 2);
-        regex_pattern.push('^'); // Anchor start
-
-        let mut chars = pattern.chars().peekable();
-        while let Some(c) = chars.next() {
-            match c {
-                '%' => regex_pattern.push_str(".*"),
-                '_' => regex_pattern.push('.'),
-                '\\' => {
-                    // Backslash escapes the next character in LIKE
-                    if let Some(&next) = chars.peek() {
-                        if next == '%' || next == '_' || next == '\\' {
-                            // Escaped LIKE special char or literal backslash
-                            regex_pattern.push_str(&regex::escape(&next.to_string()));
-                            chars.next();
-                        } else {
-                            // Backslash followed by non-special char: literal backslash
-                            regex_pattern.push_str("\\\\");
-                        }
-                    } else {
-                        // Trailing backslash: literal
-                        regex_pattern.push_str("\\\\");
-                    }
-                }
-                // Escape regex special characters
-                '.' | '+' | '*' | '?' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' => {
-                    regex_pattern.push('\\');
-                    regex_pattern.push(c);
-                }
-                _ => regex_pattern.push(c),
-            }
-        }
-
-        regex_pattern.push('$'); // Anchor end
-
-        // Build regex with case insensitivity if needed
-        let regex_str = if case_insensitive {
-            format!("(?i){}", regex_pattern)
-        } else {
-            regex_pattern
-        };
-
-        // Use cached compilation to avoid recompiling same patterns
-        get_or_compile_like_regex(&regex_str)
+    /// Whether the row's value, read as its text form, matches, the negation
+    /// applied; None when the value is NULL or missing, which is UNKNOWN
+    fn holds(&self, row: &Row) -> Option<bool> {
+        let matched = self.compiled.matches_value(row.get(self.col_index?)?)?;
+        Some(matched != self.negated)
     }
 
-    /// Check if a string matches the pattern
-    fn matches(&self, value: &str) -> bool {
-        if let Some(ref regex) = self.regex {
-            regex.is_match(value)
-        } else {
-            false
-        }
+    /// The compiled pattern, for a filter built from this expression
+    pub(crate) fn compiled(&self) -> &Pattern {
+        &self.compiled
     }
 
     /// Get the pattern (for expression compilation)
@@ -238,75 +143,30 @@ impl fmt::Debug for LikeExpr {
 
 impl Expression for LikeExpr {
     fn evaluate(&self, row: &Row) -> Result<bool> {
-        // Get column value
-        let value = if let Some(idx) = self.col_index {
-            row.get(idx)
-        } else {
-            None
-        };
-
-        let value = match value {
-            Some(v) => v,
-            None => return Ok(false),
-        };
-
-        // NULL handling: LIKE with NULL returns false
-        if value.is_null() {
-            return Ok(false);
-        }
-
-        // OPTIMIZATION: Use Cow to avoid allocation for Text values
-        let str_value: std::borrow::Cow<'_, str> = match value.as_str() {
-            Some(s) => std::borrow::Cow::Borrowed(s),
-            None => std::borrow::Cow::Owned(value.to_string()),
-        };
-
-        let matched = self.matches(&str_value);
-        Ok(if self.negated { !matched } else { matched })
+        Ok(self.holds(row).unwrap_or(false))
     }
 
     fn evaluate_fast(&self, row: &Row) -> bool {
-        let idx = match self.col_index {
-            Some(i) => i,
-            None => return false,
-        };
+        self.holds(row).unwrap_or(false)
+    }
 
-        let value = match row.get(idx) {
-            Some(v) => v,
-            None => return false,
-        };
-
-        if value.is_null() {
-            return false;
-        }
-
-        // OPTIMIZATION: Use Cow to avoid allocation for Text values
-        let str_value: std::borrow::Cow<'_, str> = match value.as_str() {
-            Some(s) => std::borrow::Cow::Borrowed(s),
-            None => std::borrow::Cow::Owned(value.to_string()),
-        };
-
-        let matched = self.matches(&str_value);
-        if self.negated {
-            !matched
-        } else {
-            matched
-        }
+    fn is_unknown_due_to_null(&self, row: &Row) -> bool {
+        self.col_index
+            .and_then(|idx| row.get(idx))
+            .is_some_and(Value::is_null)
     }
 
     fn with_aliases(&self, aliases: &FxHashMap<String, String>) -> Box<dyn Expression> {
         let resolved = resolve_alias(&self.column, aliases);
-        let mut expr = LikeExpr {
+        Box::new(LikeExpr {
             column: resolved.to_string(),
             pattern: self.pattern.clone(),
             case_insensitive: self.case_insensitive,
             negated: self.negated,
             col_index: None,
-            regex: self.regex.clone(),
+            compiled: self.compiled.clone(),
             prepared: false,
-        };
-        expr.regex = Self::compile_pattern(&self.pattern, self.case_insensitive);
-        Box::new(expr)
+        })
     }
 
     fn prepare_for_schema(&mut self, schema: &Schema) {
@@ -342,12 +202,8 @@ impl Expression for LikeExpr {
             return None;
         }
 
-        // Extract prefix before first wildcard (% or _)
-        let prefix: String = self
-            .pattern
-            .chars()
-            .take_while(|&c| c != '%' && c != '_')
-            .collect();
+        // The literal text before the first wildcard or escape
+        let prefix = Pattern::literal_prefix(&self.pattern).to_string();
 
         // Need at least one character of prefix to be useful
         if prefix.is_empty() {
@@ -364,7 +220,7 @@ impl Expression for LikeExpr {
             case_insensitive: self.case_insensitive,
             negated: self.negated,
             col_index: self.col_index,
-            regex: self.regex.clone(),
+            compiled: self.compiled.clone(),
             prepared: self.prepared,
         })
     }

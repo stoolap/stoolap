@@ -284,6 +284,7 @@ impl Value {
     /// The value read as TEXT: the one form CAST AS TEXT, the text
     /// functions, STRING_AGG and LIKE give it. None for NULL and for an
     /// extension that has no text form
+    #[inline(always)]
     pub fn text_form(&self) -> Option<std::borrow::Cow<'_, str>> {
         use std::borrow::Cow;
         if let Some(text) = self.stored_text() {
@@ -311,6 +312,8 @@ impl Value {
     }
 
     /// The text form of a FLOAT, TIMESTAMP or VECTOR, which is formatted
+    #[cold]
+    #[inline(never)]
     fn formatted_text(&self) -> Option<String> {
         match self {
             Value::Float(v) => Some(format_float(*v)),
@@ -323,6 +326,7 @@ impl Value {
     }
 
     /// The text form of a value that holds it as it is: TEXT, BOOLEAN, JSON
+    #[inline(always)]
     fn stored_text(&self) -> Option<&str> {
         match self {
             Value::Text(s) => Some(s.as_str()),

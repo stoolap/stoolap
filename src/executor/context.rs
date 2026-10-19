@@ -1020,8 +1020,7 @@ pub fn clear_all_thread_local_caches() {
     });
 
     // Clear storage expression caches (regex patterns)
-    crate::storage::expression::clear_regex_cache();
-    crate::storage::expression::clear_like_regex_cache();
+    crate::core::pattern::clear_regex_cache();
 
     // Clear RowVec and RowIdVec thread-local pools
     crate::core::row_vec::clear_row_vec_pool();

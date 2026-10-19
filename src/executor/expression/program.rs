@@ -235,7 +235,7 @@ impl Program {
                 // More fused ops: push 1
                 | Op::IsNullColumn(_)
                 | Op::IsNotNullColumn(_)
-                | Op::LikeColumn(_, _, _)
+                | Op::LikeColumn(_, _)
                 | Op::InSetColumn(_, _)
                 | Op::BetweenColumnConst(_, _, _)
                 // A subquery's value or existence: push 1
@@ -303,8 +303,8 @@ impl Program {
                 | Op::Not
                 | Op::Neg
                 | Op::BitNot
-                | Op::Like(_, _)
-                | Op::LikeEscape(_, _, _)
+                | Op::Like(_)
+                | Op::LikeEscape(_, _)
                 | Op::Glob(_)
                 | Op::Regexp(_)
                 | Op::InSet(_)
@@ -555,9 +555,7 @@ impl Program {
                         let fused = match &ops[i + 1] {
                             Op::IsNull => Some(Op::IsNullColumn(*col_idx)),
                             Op::IsNotNull => Some(Op::IsNotNullColumn(*col_idx)),
-                            Op::Like(pattern, case_insensitive) => {
-                                Some(Op::LikeColumn(*col_idx, pattern.clone(), *case_insensitive))
-                            }
+                            Op::Like(pattern) => Some(Op::LikeColumn(*col_idx, pattern.clone())),
                             Op::InSet(set) => Some(Op::InSetColumn(*col_idx, set.clone())),
                             _ => None,
                         };
