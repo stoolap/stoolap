@@ -2923,50 +2923,69 @@ impl Executor {
         let mut vm = ExprVM::new();
         let mut rows = RowVec::with_capacity(64);
         let mut scanned = 0u64;
-        if let Some((candidates, passed)) = runner.narrowed_rows(&*table, target)? {
-            #[cfg(feature = "test-failpoints")]
-            crate::test_failpoints::prepared_rows_narrowed_by_keys(
-                prepared.narrowing.is_some_and(|n| n.negated),
-            );
-            for (_, row) in candidates {
-                if target.is_some_and(|target| rows.len() >= target) {
-                    break;
+        // The rows the statement reads: the ones its narrowing names, which
+        // the conjuncts the scan would take still judge; the scan's answers
+        // up to the LIMIT when it takes the whole WHERE; or the scan
+        let (mut listed, mut scanner, judged, passed) =
+            match runner.narrowed_rows(&*table, target)? {
+                Some((candidates, passed)) => {
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::prepared_rows_narrowed_by_keys(
+                        prepared.narrowing.is_some_and(|n| n.negated),
+                    );
+                    (Some(candidates.into_iter()), None, true, passed)
                 }
-                scanned += 1;
-                if scanned.is_multiple_of(100) {
-                    ctx.check_cancelled()?;
-                }
-                // The conjuncts the scan would have taken, before the WHERE;
-                // one that fails to evaluate leaves the answer to the WHERE
-                let taken = match storage_expr.as_ref().map(|expr| expr.evaluate(&row)) {
-                    Some(Ok(false)) => continue,
-                    Some(Err(_)) => false,
-                    Some(Ok(true)) | None => true,
-                };
-                if (passed && taken) || runner.matches(&mut vm, &row)? {
-                    rows.push((scanned as i64, row));
-                }
+                None => match target.filter(|_| scanned_whole) {
+                    Some(target) => {
+                        let answers = table.collect_rows_with_limit_unordered(
+                            storage_expr.as_deref(),
+                            target,
+                            0,
+                        )?;
+                        (Some(answers.into_iter()), None, false, true)
+                    }
+                    None => {
+                        let all: Vec<usize> = (0..prepared.columns.len()).collect();
+                        let scan = table.scan(&all, storage_expr.as_deref())?;
+                        (None, Some(scan), false, scanned_whole)
+                    }
+                },
+            };
+        while target.is_none_or(|target| rows.len() < target) {
+            let row = match (&mut listed, &mut scanner) {
+                (Some(listed), _) => match listed.next() {
+                    Some((_, row)) => row,
+                    None => break,
+                },
+                (None, Some(scanner)) => match scanner.next() {
+                    true => scanner.take_row(),
+                    false => break,
+                },
+                (None, None) => break,
+            };
+            scanned += 1;
+            if scanned.is_multiple_of(100) {
+                ctx.check_cancelled()?;
             }
-        } else if let (true, Some(target)) = (scanned_whole, target) {
-            // Every row the scan passes is an answer, so it stops at the LIMIT
-            rows = table.collect_rows_with_limit_unordered(storage_expr.as_deref(), target, 0)?;
-        } else {
-            let all: Vec<usize> = (0..prepared.columns.len()).collect();
-            let mut scanner = table.scan(&all, storage_expr.as_deref())?;
-            while target.is_none_or(|target| rows.len() < target) && scanner.next() {
-                scanned += 1;
-                if scanned.is_multiple_of(100) {
-                    ctx.check_cancelled()?;
-                }
-                let row = scanner.take_row();
-                if scanned_whole || runner.matches(&mut vm, &row)? {
-                    rows.push((scanned as i64, row));
-                }
-            }
-            if let Some(err) = scanner.err() {
-                return Err(err.clone());
+            // One that fails to evaluate leaves the answer to the WHERE
+            let taken = match storage_expr
+                .as_ref()
+                .filter(|_| judged)
+                .map(|e| e.evaluate(&row))
+            {
+                Some(Ok(false)) => continue,
+                Some(Err(_)) => false,
+                Some(Ok(true)) | None => true,
+            };
+            if (passed && taken) || runner.matches(&mut vm, &row)? {
+                rows.push((scanned as i64, row));
             }
         }
+        if let Some(err) = scanner.as_ref().and_then(|scanner| scanner.err()) {
+            return Err(err.clone());
+        }
+        // A read that checks for no cancel is the statement's all the same
+        ctx.check_cancelled()?;
         let limit_applied = target.is_some();
         if limit_applied {
             let keep = limit.unwrap_or(usize::MAX);

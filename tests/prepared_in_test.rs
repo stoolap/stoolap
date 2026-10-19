@@ -559,3 +559,29 @@ fn test_a_conjunct_beside_a_narrowing_in_raises_its_error() {
         );
     }
 }
+
+#[test]
+fn test_a_cancel_before_the_scan_stops_at_its_limit_is_raised() {
+    use stoolap::test_failpoints::before_prepared_scalar;
+    let _guard = serial();
+    let db = Database::open("memory://prepared_in_cancel_limit").unwrap();
+    for sql in [
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO u VALUES (1, 1)",
+        "CREATE TABLE big (id INTEGER PRIMARY KEY, v INTEGER)",
+        "INSERT INTO big SELECT value, value FROM generate_series(1, 5000)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let executor = stoolap::Executor::new(std::sync::Arc::clone(db.engine()));
+    let sql = "SELECT id FROM big WHERE id >= (SELECT k FROM u WHERE u.id = 1) LIMIT 1000000";
+    let ctx = stoolap::ExecutionContext::new();
+    let handle = ctx.clone();
+    before_prepared_scalar(move || handle.cancel());
+    let result = executor.execute_with_context(sql, &ctx);
+    assert!(
+        matches!(result, Err(stoolap::Error::QueryCancelled)),
+        "{sql}: {:?}",
+        result.map(|_| ())
+    );
+}
