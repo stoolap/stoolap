@@ -1368,6 +1368,9 @@ fn collect_table_qualifiers_impl(expr: &Expression, qualifiers: &mut FxHashSet<S
         Expression::Like(like) => {
             collect_table_qualifiers_impl(&like.left, qualifiers);
             collect_table_qualifiers_impl(&like.pattern, qualifiers);
+            if let Some(escape) = &like.escape {
+                collect_table_qualifiers_impl(escape, qualifiers);
+            }
         }
         Expression::FunctionCall(func) => {
             for arg in &func.arguments {
@@ -1390,6 +1393,83 @@ fn collect_table_qualifiers_impl(expr: &Expression, qualifiers: &mut FxHashSet<S
             }
             if let Some(ref else_val) = case.else_value {
                 collect_table_qualifiers_impl(else_val, qualifiers);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect the unqualified (bare) column names of an expression, lowercase,
+/// through the same expressions `collect_table_qualifiers` reads
+pub fn collect_unqualified_columns(expr: &Expression, columns: &mut FxHashSet<String>) {
+    match expr {
+        Expression::Identifier(id) => {
+            columns.insert(id.value_lower.to_string());
+        }
+        Expression::Infix(infix) => {
+            collect_unqualified_columns(&infix.left, columns);
+            collect_unqualified_columns(&infix.right, columns);
+        }
+        Expression::Prefix(prefix) => {
+            collect_unqualified_columns(&prefix.right, columns);
+        }
+        Expression::In(in_expr) => {
+            collect_unqualified_columns(&in_expr.left, columns);
+            match in_expr.right.as_ref() {
+                Expression::ExpressionList(el) => {
+                    for elem in &el.expressions {
+                        collect_unqualified_columns(elem, columns);
+                    }
+                }
+                Expression::List(list) => {
+                    for elem in &list.elements {
+                        collect_unqualified_columns(elem, columns);
+                    }
+                }
+                other => {
+                    collect_unqualified_columns(other, columns);
+                }
+            }
+        }
+        Expression::InHashSet(in_set) => {
+            collect_unqualified_columns(&in_set.column, columns);
+        }
+        Expression::QuantifiedSet(quantified) => {
+            collect_unqualified_columns(&quantified.left, columns);
+        }
+        Expression::Between(between) => {
+            collect_unqualified_columns(&between.expr, columns);
+            collect_unqualified_columns(&between.lower, columns);
+            collect_unqualified_columns(&between.upper, columns);
+        }
+        Expression::Like(like) => {
+            collect_unqualified_columns(&like.left, columns);
+            collect_unqualified_columns(&like.pattern, columns);
+            if let Some(escape) = &like.escape {
+                collect_unqualified_columns(escape, columns);
+            }
+        }
+        Expression::FunctionCall(func) => {
+            for arg in &func.arguments {
+                collect_unqualified_columns(arg, columns);
+            }
+        }
+        Expression::Aliased(aliased) => {
+            collect_unqualified_columns(&aliased.expression, columns);
+        }
+        Expression::Cast(cast) => {
+            collect_unqualified_columns(&cast.expr, columns);
+        }
+        Expression::Case(case) => {
+            if let Some(ref val) = case.value {
+                collect_unqualified_columns(val, columns);
+            }
+            for when in &case.when_clauses {
+                collect_unqualified_columns(&when.condition, columns);
+                collect_unqualified_columns(&when.then_result, columns);
+            }
+            if let Some(ref else_val) = case.else_value {
+                collect_unqualified_columns(else_val, columns);
             }
         }
         _ => {}

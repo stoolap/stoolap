@@ -92,7 +92,7 @@ SELECT * FROM above_average_depts;
 
 ## CTEs with Joins
 
-CTEs work seamlessly with JOIN operations:
+CTEs work seamlessly with JOIN operations. A CTE on a join side is joined as a derived table would be: `USING` and `NATURAL` join on the shared columns, `*` lists the sides in the order the query names them, and a table on the other side is probed by its primary key or index:
 
 ```sql
 WITH 

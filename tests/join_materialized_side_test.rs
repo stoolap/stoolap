@@ -50,6 +50,14 @@ fn tables(name: &str) -> Database {
     .unwrap();
     db.execute("CREATE VIEW sv AS SELECT n, txt FROM small", ())
         .unwrap();
+    // A table below the size that pays for narrowing from a base table
+    db.execute("CREATE TABLE m (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO m SELECT g.value, g.value % 1000 FROM generate_series(1, 30000) g",
+        (),
+    )
+    .unwrap();
     db
 }
 
@@ -111,6 +119,8 @@ fn a_small_view_narrows_a_large_unindexed_table_as_its_control_answers() {
         ("SELECT COUNT(*) FROM t JOIN sv ON t.k = sv.n", 140),
         ("SELECT COUNT(*) FROM sv JOIN t ON t.s = sv.n", 140),
         ("SELECT COUNT(*) FROM sv JOIN t ON t.k = sv.txt", 70),
+        ("SELECT COUNT(*) FROM sv JOIN m ON m.k = sv.n", 60),
+        ("SELECT COUNT(*) FROM m JOIN sv ON m.k = sv.txt", 30),
         (
             "SELECT COUNT(*) FROM sv JOIN t ON t.k = sv.n AND t.v > 35000",
             70,
@@ -165,16 +175,21 @@ fn the_index_join_and_the_narrowing_run_for_materialized_sides() {
         answer(&db, sql);
         assert!(opened.get(), "the left table was probed: {sql}");
     }
-    for sql in [
-        "SELECT COUNT(*) FROM sv JOIN t ON t.k = sv.n",
-        "SELECT COUNT(*) FROM t JOIN sv ON t.k = sv.n",
+    for (sql, narrowed) in [
+        ("SELECT COUNT(*) FROM sv JOIN t ON t.k = sv.n", 1),
+        ("SELECT COUNT(*) FROM t JOIN sv ON t.k = sv.n", 1),
+        // A materialized side narrows a table of any size
+        ("SELECT COUNT(*) FROM sv JOIN m ON m.k = sv.n", 1),
+        ("SELECT COUNT(*) FROM m JOIN sv ON m.k = sv.n", 1),
+        // A base table outer narrows only a large table, as before
+        ("SELECT COUNT(*) FROM small JOIN m ON m.k = small.n", 0),
     ] {
         let before = stoolap::test_failpoints::small_outer_joins();
         count(&db, sql);
         assert_eq!(
             stoolap::test_failpoints::small_outer_joins() - before,
-            1,
-            "the small view narrowed t: {sql}"
+            narrowed,
+            "narrowings: {sql}"
         );
     }
 }

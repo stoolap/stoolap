@@ -113,17 +113,17 @@ use super::result::{
 use super::row_count::{row_counts, rows_needed, static_row_counts, RowCounts};
 use super::utils::compute_join_projection;
 use super::utils::{
-    add_table_qualifier, build_column_index_map, collect_table_qualifiers, column_kinds,
-    combine_predicates_with_and, dummy_token, expression_contains_aggregate,
-    extract_and_conditions, extract_base_column_name, extract_join_keys_and_residual,
-    filter_references_column, flatten_and_predicates, flip_operator, get_table_alias_from_expr,
-    index_join_residual, infix_to_operator, string_literal_value, strip_table_qualifier,
-    substitute_filter_column,
+    add_table_qualifier, build_column_index_map, collect_table_qualifiers,
+    collect_unqualified_columns, column_kinds, combine_predicates_with_and, dummy_token,
+    expression_contains_aggregate, extract_and_conditions, extract_base_column_name,
+    extract_join_keys_and_residual, filter_references_column, flatten_and_predicates,
+    flip_operator, get_table_alias_from_expr, index_join_residual, infix_to_operator,
+    string_literal_value, strip_table_qualifier, substitute_filter_column,
 };
-use super::volatility::statement_constant;
+use super::volatility::{expression_volatility, statement_constant};
 use super::window::{WindowPreGroupedState, WindowPreSortedState};
 use super::Executor;
-use crate::functions::global_registry;
+use crate::functions::{global_registry, Volatility};
 use crate::optimizer::bloom::BloomFilterBuilder;
 use crate::storage::volume::side_index::{resolve_known, Domain, Resolved};
 
@@ -213,17 +213,18 @@ impl CteNames<'_> {
 
 /// A join's WHERE split as execution pushes it: a filter for each side it
 /// may narrow, never the side an outer join pads with NULLs, and the rest,
-/// asked of the joined rows
+/// asked of the joined rows. The schemas are the sides that are base tables
 pub(crate) fn split_join_where(
     where_clause: &Expression,
     left_alias: Option<&str>,
     right_alias: Option<&str>,
+    schemas: (Option<&Schema>, Option<&Schema>),
     join_type: &str,
 ) -> (Option<Expression>, Option<Expression>, Option<Expression>) {
     let (Some(left_a), Some(right_a)) = (left_alias, right_alias) else {
         return (None, None, Some(where_clause.clone()));
     };
-    let (l, r, c) = partition_where_for_join(where_clause, left_a, right_a);
+    let (l, r, c) = partition_where_for_join(where_clause, left_a, right_a, schemas);
 
     // For OUTER JOINs, we can't push filters to the NULL-padded side
     // because rows that don't match need to appear with NULLs
@@ -258,6 +259,18 @@ pub(crate) fn split_join_where(
     };
 
     (safe_left, safe_right, remaining)
+}
+
+/// Whether `expr` is false for every row: a statement constant, so no column
+/// reads as the text of its name, that evaluates to false
+fn false_for_every_row(expr: &Expression, ctx: &ExecutionContext) -> bool {
+    statement_constant(expr, global_registry())
+        && ExpressionEval::compile(expr, &[]).is_ok_and(|eval| {
+            matches!(
+                eval.with_context(ctx).eval_slice(&Row::new()),
+                Ok(Value::Boolean(false))
+            )
+        })
 }
 
 /// The side an index join probes, given what the right table offers
@@ -312,10 +325,14 @@ pub(crate) fn index_join_table_name(side: &Expression) -> Option<String> {
 /// - left_filter: predicates referencing only left table
 /// - right_filter: predicates referencing only right table
 /// - cross_table_filter: predicates referencing both tables (must be applied post-join)
+///
+/// An unqualified column belongs to a side only when both sides are base
+/// tables and only that one has it; otherwise its predicate stays post-join
 fn partition_where_for_join(
     where_clause: &Expression,
     left_alias: &str,
     right_alias: &str,
+    (left_schema, right_schema): (Option<&Schema>, Option<&Schema>),
 ) -> (Option<Expression>, Option<Expression>, Option<Expression>) {
     let left_alias_lower = left_alias.to_lowercase();
     let right_alias_lower = right_alias.to_lowercase();
@@ -329,13 +346,31 @@ fn partition_where_for_join(
 
     for pred in predicates {
         let qualifiers = collect_table_qualifiers(&pred);
+        let mut unqualified = FxHashSet::default();
+        collect_unqualified_columns(&pred, &mut unqualified);
 
-        let refs_left = qualifiers.contains(&left_alias_lower);
-        let refs_right = qualifiers.contains(&right_alias_lower);
+        let mut refs_left = qualifiers.contains(&left_alias_lower);
+        let mut refs_right = qualifiers.contains(&right_alias_lower);
+        let mut unowned = false;
+        for column in &unqualified {
+            match (
+                left_schema.map(|s| s.has_column(column)),
+                right_schema.map(|s| s.has_column(column)),
+            ) {
+                (Some(true), Some(false)) => refs_left = true,
+                (Some(false), Some(true)) => refs_right = true,
+                _ => unowned = true,
+            }
+        }
 
         // The qualifiers inside a subquery are not collected, so a correlated
-        // one may read either side and is evaluated on the joined row
-        if (refs_left && refs_right) || Executor::has_correlated_subqueries(&pred) {
+        // one may read either side and is evaluated on the joined row, as is
+        // a predicate that draws a new value for every row it is asked of
+        if (refs_left && refs_right)
+            || unowned
+            || Executor::has_correlated_subqueries(&pred)
+            || expression_volatility(&pred, global_registry()) == Volatility::PerCall
+        {
             // References both tables - must be applied post-join
             cross_preds.push(pred);
         } else if refs_left {
@@ -1530,26 +1565,17 @@ impl Executor {
         // Short-circuit: if WHERE is a constant-false expression (e.g., 1=0),
         // skip TVF generation entirely and return empty result.
         if let Some(ref where_clause) = stmt.where_clause {
-            if let Ok(eval) = ExpressionEval::compile(where_clause, &[]) {
-                if let Ok(val) = eval.with_context(ctx).eval_slice(&Row::new()) {
-                    if val == Value::Boolean(false) {
-                        let columns = if !tvf_source.column_aliases.is_empty() {
-                            tvf_source
-                                .column_aliases
-                                .iter()
-                                .map(|id| id.value.to_string())
-                                .collect()
-                        } else {
-                            vec!["value".to_string()]
-                        };
-                        return self.execute_query_on_memory_result(
-                            stmt,
-                            ctx,
-                            columns,
-                            RowVec::new(),
-                        );
-                    }
-                }
+            if false_for_every_row(where_clause, ctx) {
+                let columns = if !tvf_source.column_aliases.is_empty() {
+                    tvf_source
+                        .column_aliases
+                        .iter()
+                        .map(|id| id.value.to_string())
+                        .collect()
+                } else {
+                    vec!["value".to_string()]
+                };
+                return self.execute_query_on_memory_result(stmt, ctx, columns, RowVec::new());
             }
         }
 
@@ -4080,39 +4106,6 @@ impl Executor {
     ) -> SelectResult {
         // classification is passed from caller to avoid redundant cache lookups
 
-        // Short-circuit: if WHERE is constant-false (e.g., 1=0), skip all join
-        // materialization and return an empty result immediately. A subquery
-        // has no value in this evaluator, so a WHERE holding one is not judged
-        if let Some(where_clause) = stmt
-            .where_clause
-            .as_ref()
-            .filter(|_| !classification.where_has_subqueries)
-        {
-            if let Ok(eval) = ExpressionEval::compile(where_clause, &[]) {
-                if let Ok(Value::Boolean(false)) = eval.with_context(ctx).eval_slice(&Row::new()) {
-                    // Derive output column names from SELECT clause
-                    let col_names: Vec<String> = stmt
-                        .columns
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, expr)| match expr {
-                            Expression::Aliased(a) => Some(a.alias.value.to_string()),
-                            Expression::Identifier(id) => Some(id.value.to_string()),
-                            Expression::QualifiedIdentifier(qi) => Some(qi.name.value.to_string()),
-                            Expression::Star(_) | Expression::QualifiedStar(_) => None,
-                            _ => Some(format!("column{}", i + 1)),
-                        })
-                        .collect();
-                    let columns = CompactArc::new(col_names);
-                    let result = ExecutorResult::with_arc_columns(
-                        CompactArc::clone(&columns),
-                        RowVec::new(),
-                    );
-                    return Ok((Box::new(result), columns, false, None));
-                }
-            }
-        }
-
         // Get table aliases for filter pushdown
         let left_alias = get_table_alias_from_expr(&join_source.left);
         let right_alias = get_table_alias_from_expr(&join_source.right);
@@ -4187,15 +4180,24 @@ impl Executor {
             }
             (where_clause, _) => where_clause,
         };
+        let left_schema = self.base_table_side_schema(&join_source.left, CteNames::Context(ctx));
+        let right_schema = self.base_table_side_schema(&join_source.right, CteNames::Context(ctx));
         let (left_filter, right_filter, cross_filter) = match where_for_join.as_ref() {
             Some(where_clause) => split_join_where(
                 where_clause,
                 left_alias.as_deref(),
                 right_alias.as_deref(),
+                (left_schema.as_deref(), right_schema.as_deref()),
                 &join_type,
             ),
             None => (None, None, None),
         };
+        // A WHERE false for every row joins no rows whatever the join type; the
+        // sides run with no rows only to name their columns
+        let never = where_for_join
+            .as_ref()
+            .filter(|_| !classification.where_has_subqueries)
+            .is_some_and(|w| false_for_every_row(w, ctx));
 
         // Semi-join reduction optimization for LEFT JOIN + GROUP BY + LIMIT
         // Pattern: LEFT JOIN + GROUP BY on left columns only + LIMIT N + no ORDER BY
@@ -4218,9 +4220,30 @@ impl Executor {
             )
         };
 
-        let (left_rows, left_columns, right_rows, right_columns) = if let Some(plan) =
-            semijoin_limit
-        {
+        let (left_rows, left_columns, right_rows, right_columns) = if never {
+            // Not every side honours the filter or the limit, so its rows are
+            // dropped and only its columns kept
+            let (_, left_cols, _, _) = self.execute_table_expression_with_filter_limit(
+                &join_source.left,
+                ctx,
+                where_for_join.as_ref(),
+                Some(0),
+                0,
+            )?;
+            let (_, right_cols, _, _) = self.execute_table_expression_with_filter_limit(
+                &join_source.right,
+                ctx,
+                where_for_join.as_ref(),
+                Some(0),
+                0,
+            )?;
+            (
+                CompactArc::new(Vec::new()),
+                left_cols,
+                CompactArc::new(Vec::new()),
+                right_cols,
+            )
+        } else if let Some(plan) = semijoin_limit {
             if let Some(result) = self.try_grouped_index_join(
                 stmt,
                 ctx,
@@ -4310,8 +4333,11 @@ impl Executor {
             let picked = if correlated_where {
                 None
             } else {
+                let ctes = CteNames::Context(ctx);
+                let left_is_table = left_schema.is_some();
+                let right_is_table = right_schema.is_some();
                 let unswapped = self.check_index_nested_loop_opportunity(
-                    CteNames::Context(ctx),
+                    ctes,
                     &join_source.right,
                     on_condition,
                     &join_type,
@@ -4319,17 +4345,17 @@ impl Executor {
                     right_alias.as_deref(),
                     pushed_limit.is_some(),
                     small_outer,
+                    !left_is_table,
                 );
                 pick_index_join_side(
                     &join_type,
-                    self.base_table_side_schema(&join_source.right, CteNames::Context(ctx))
-                        .is_some(),
+                    right_is_table,
                     right_filter.is_some(),
                     left_filter.is_some(),
                     unswapped,
                     || {
                         self.check_index_nested_loop_opportunity(
-                            CteNames::Context(ctx),
+                            ctes,
                             &join_source.left,
                             on_condition,
                             &join_type,
@@ -4337,6 +4363,7 @@ impl Executor {
                             left_alias.as_deref(),
                             pushed_limit.is_some(),
                             small_outer,
+                            !right_is_table,
                         )
                     },
                     |(_, strategy, _, _)| matches!(strategy, IndexLookupStrategy::PrimaryKey),
@@ -4780,7 +4807,12 @@ impl Executor {
                         None => None,
                     };
                     let mut result_rows = RowVec::new();
-                    if join_limit.is_some() {
+                    // A primary key join without a limit fetches its rows in one
+                    // batch; an index lookup streams, which costs less than the
+                    // batch's key maps for it
+                    let batch = join_limit.is_none()
+                        && matches!(lookup_strategy, IndexLookupStrategy::PrimaryKey);
+                    if !batch {
                         // Streaming INL for early termination with LIMIT. When the
                         // joined rows stop short of the limit and the outer chunk
                         // was full, the next pass continues with the outer rows
@@ -6793,16 +6825,6 @@ impl Executor {
         Ok((Box::new(final_result), projected_columns_arc, false, None))
     }
 
-    /// Execute a table expression (for JOIN left/right sides)
-    /// Returns columns prefixed with table alias for proper qualified name resolution
-    pub(crate) fn execute_table_expression(
-        &self,
-        expr: &Expression,
-        ctx: &ExecutionContext,
-    ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
-        self.execute_table_expression_with_filter(expr, ctx, None)
-    }
-
     /// Execute a table expression with optional filter pushdown
     /// This is used by JOIN to push WHERE predicates to individual table scans
     pub(crate) fn execute_table_expression_with_filter(
@@ -7423,6 +7445,7 @@ impl Executor {
                 left_alias,
                 right_alias,
                 true,
+                false,
                 false,
             )
         else {
@@ -11370,10 +11393,14 @@ impl Executor {
         }
         let (right_filter_present, filters_have_subquery) = match &stmt.where_clause {
             Some(where_clause) => {
+                let ctes = super::explain::cte_names(stmt);
+                let schema = |side| self.base_table_side_schema(side, CteNames::Listed(&ctes));
+                let (left_schema, right_schema) = (schema(&join.left), schema(&join.right));
                 let (_, right, _) = split_join_where(
                     where_clause,
                     get_table_alias_from_expr(&join.left).as_deref(),
                     get_table_alias_from_expr(&join.right).as_deref(),
+                    (left_schema.as_deref(), right_schema.as_deref()),
                     &join_type,
                 );
                 (right.is_some(), Self::filter_has_subquery(where_clause))
@@ -11424,6 +11451,7 @@ impl Executor {
         right_alias: Option<&str>,
         bounded: bool,
         small_outer: bool,
+        outer_materialized: bool,
     ) -> Option<(
         String,              // table_name
         IndexLookupStrategy, // lookup strategy (index or PK)
@@ -11580,8 +11608,11 @@ impl Executor {
             table.row_count_hint() >= SMALL_OUTER_ROWS.saturating_mul(HOT_INNER_ROWS_PER_KEY);
         let probes = crate::executor::utils::probes_by_equality(&*table, &inner_col_unqualified);
         // A bounded join probes the column. A small outer never probes: its
-        // keys narrow a large table's scan, or a sealed table's side file
-        let narrows = large || (probes && table.has_sealed_rows());
+        // keys narrow a large table, a sealed table through its side file,
+        // or the scan of a column no probe reads, from a side whose size only
+        // running it tells
+        let narrows =
+            large || (probes && table.has_sealed_rows()) || (outer_materialized && !probes);
         if (bounded && probes) || (small_outer && outer_is_sure && narrows) {
             return Some((
                 table_name,
