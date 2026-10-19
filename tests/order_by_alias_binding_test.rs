@@ -349,3 +349,146 @@ fn an_alias_over_its_own_column_reads_as_the_column_does() {
         wrong.join("\n")
     );
 }
+
+#[test]
+fn the_rule_holds_for_every_source_and_pipeline() {
+    let db = Database::open("memory://order_by_alias_matrix").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE INDEX t_k ON t (k)",
+        "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, z INTEGER)",
+        "INSERT INTO s VALUES (1, 0), (2, 0), (3, 0)",
+        "CREATE VIEW v AS SELECT id, k FROM t",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    // (name, WITH, FROM, WHERE, whether a qualified star expands there)
+    let sources = [
+        ("table", "", "t AS src", "", true),
+        ("join", "", "t AS src JOIN s ON s.id = src.id", "", true),
+        ("view", "", "v AS src", "", false),
+        ("derived", "", "(SELECT id, k FROM t) AS src", "", false),
+        (
+            "cte",
+            "WITH c AS (SELECT id, k FROM t) ",
+            "c AS src",
+            "",
+            false,
+        ),
+        (
+            "cte_materialized",
+            "WITH c AS (SELECT id, k FROM t) ",
+            "c AS src",
+            "src.id IN (SELECT id FROM c)",
+            false,
+        ),
+        (
+            "values",
+            "",
+            "(SELECT column1 AS id, column2 AS k FROM (VALUES (1, 10), (2, 20), (3, 30))) AS src",
+            "",
+            false,
+        ),
+    ];
+    let output = vec![3, 2, 1];
+    let input = vec![1, 2, 3];
+    // (SELECT items after src.id, ORDER BY, ids in order, whether a star is used)
+    let shapes = [
+        ("-k AS k", "k", &output, 0),
+        ("-k AS k", "src.k", &input, 0),
+        ("-k AS k", "k + 0", &input, 0),
+        ("-k AS k", "2", &output, 0),
+        ("-k AS k", "k DESC, src.id", &input, 0),
+        ("k AS x", "k", &input, 0),
+        ("k AS x", "k, k * 2", &input, 0),
+        ("k AS x", "x DESC", &output, 0),
+        ("-k AS x", "x * 1", &output, 0),
+        ("-k AS x", "k", &input, 0),
+        ("*, -k AS k", "k", &output, 1),
+        ("*, -k AS k", "src.k", &input, 1),
+        ("*, -k AS k", "k + 0", &input, 1),
+        ("src.*, -k AS k", "k", &output, 2),
+        ("src.*, -k AS k", "src.k", &input, 2),
+    ];
+    // (name, DISTINCT, extra item, GROUP BY, LIMIT/OFFSET, prepared)
+    let pipelines = [
+        ("plain", false, false, false, "", false),
+        ("limit", false, false, false, " LIMIT 3", false),
+        ("offset", false, false, false, " LIMIT 3 OFFSET 0", false),
+        ("distinct", true, false, false, "", false),
+        ("window", false, true, false, "", false),
+        ("window_limit", false, true, false, " LIMIT 3", false),
+        ("grouped", false, false, true, "", false),
+        ("grouped_window", false, true, true, "", false),
+        ("prepared", false, false, false, " LIMIT 3", true),
+    ];
+    let mut wrong = Vec::new();
+    let mut ran = 0;
+    for (source, with, from, filter, qualified_star) in sources {
+        for (items, order_by, want, star) in shapes {
+            if star == 2 && !qualified_star {
+                continue;
+            }
+            for (pipeline, distinct, window, grouped, rows, prepared) in pipelines {
+                // Out of this rule: a star under GROUP BY is refused, an alias
+                // named as a grouping column is #508, a grouped window over a
+                // view or a materialized CTE is #509, and DISTINCT ordered by
+                // a column it does not select is not this rule's to settle
+                if grouped && (star > 0 || items == "-k AS k")
+                    || grouped && window && matches!(source, "view" | "cte_materialized")
+                    || distinct && items == "-k AS x" && order_by == "k"
+                {
+                    continue;
+                }
+                let mut conditions: Vec<&str> = Vec::new();
+                if !filter.is_empty() {
+                    conditions.push(filter);
+                }
+                if prepared {
+                    conditions.push("src.id > $1");
+                }
+                let sql =
+                    format!(
+                    "{with}SELECT {}src.id, {items}{} FROM {from}{}{} ORDER BY {order_by}{rows}",
+                    if distinct { "DISTINCT " } else { "" },
+                    if window {
+                        ", ROW_NUMBER() OVER (ORDER BY src.id) AS rn"
+                    } else {
+                        ""
+                    },
+                    if conditions.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" WHERE {}", conditions.join(" AND "))
+                    },
+                    if grouped { " GROUP BY src.id, src.k" } else { "" },
+                );
+                let got = if prepared {
+                    db.prepare(&sql)
+                        .and_then(|statement| {
+                            statement.query((0,)).and_then(|rows| {
+                                rows.map(|row| row.and_then(|row| row.get::<i64>(0)))
+                                    .collect::<stoolap::Result<Vec<_>>>()
+                            })
+                        })
+                        .map_err(|e| e.to_string())
+                } else {
+                    first_column(&db, &sql, &[])
+                };
+                ran += 1;
+                if got.as_ref() != Ok(want) {
+                    wrong.push(format!(
+                        "[{source}/{pipeline}] {sql}\n  got  {got:?}\n  want {want:?}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} of {ran} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}

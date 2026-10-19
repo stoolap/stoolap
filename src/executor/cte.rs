@@ -40,7 +40,7 @@ use crate::storage::traits::QueryResult;
 
 use super::context::ExecutionContext;
 use super::expression::ExpressionEval;
-use super::query::OutputLayout;
+use super::query::{order_by_inputs, ColumnSource, OutputLayout};
 use super::query_classification::get_classification;
 use super::result::ExecutorResult;
 use super::row_count::{row_counts, static_row_counts};
@@ -697,88 +697,56 @@ impl Executor {
         let needs_projection = self.needs_projection_for_columns(columns_to_use);
 
         if skip_order_limit {
-            // Caller will handle ORDER BY + LIMIT/OFFSET via expression-based sort.
-            // If ORDER BY references source columns not in the projected output,
-            // return unprojected rows so the caller can evaluate ORDER BY expressions.
-            // The caller's truncation logic (expected_columns) will trim afterwards.
-            let needs_source_for_order = classification.has_order_by
-                && self.order_by_needs_source_columns(
-                    &stmt.order_by,
-                    &output_columns,
-                    &cte_columns,
-                );
-
-            if needs_source_for_order {
-                // Return source columns + projected columns so caller can sort on source columns
-                // then trim to projected columns via expected_columns mechanism
-                let mut combined_columns = output_columns.clone();
-                for src_col in &cte_columns {
-                    if !combined_columns
-                        .iter()
-                        .any(|c| c.eq_ignore_ascii_case(src_col))
-                    {
-                        combined_columns.push(src_col.clone());
-                    }
-                }
-
-                // Build rows with projected columns first, then extra source columns
-                let result_rows = if needs_projection {
-                    let projected = self.project_cte_rows_from_columns(
-                        columns_to_use,
-                        &filtered_rows,
-                        &cte_columns,
-                        cte_alias.as_deref(),
-                        ctx,
-                    )?;
-                    // Append source columns that aren't in output
-                    let extra_src_indices: Vec<usize> = cte_columns
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, c)| {
-                            !output_columns.iter().any(|oc| oc.eq_ignore_ascii_case(c))
-                        })
-                        .map(|(i, _)| i)
-                        .collect();
-
-                    projected
-                        .into_iter()
-                        .zip(filtered_rows.iter())
-                        .map(|((id, proj_row), (_, src_row))| {
-                            let mut vals = proj_row.into_values();
-                            for &idx in &extra_src_indices {
-                                vals.push(
-                                    src_row.get(idx).cloned().unwrap_or(Value::null_unknown()),
-                                );
-                            }
-                            (id, Row::from_values(vals))
-                        })
-                        .collect()
-                } else {
-                    filtered_rows
-                };
-                let layout = Self::result_layout(
-                    stmt,
-                    &cte_columns,
-                    cte_alias.as_deref(),
-                    &combined_columns,
-                );
-                return Ok((combined_columns, result_rows, false, layout));
-            }
-
+            // The caller sorts by the layout and trims after: every input
+            // column ORDER BY reads that no output column copies rides along
+            let mut layout = Self::output_layout(stmt, &cte_columns, cte_alias.as_deref());
+            let extra: Vec<usize> = match &layout {
+                Some(layout) if needs_projection => order_by_inputs(stmt, &cte_columns)
+                    .into_iter()
+                    .filter(|&idx| !layout.sources.iter().any(|s| s.input == Some(idx)))
+                    .collect(),
+                _ => Vec::new(),
+            };
             let result_rows = if needs_projection {
-                self.project_cte_rows_from_columns(
+                let projected = self.project_cte_rows_from_columns(
                     columns_to_use,
                     &filtered_rows,
                     &cte_columns,
                     cte_alias.as_deref(),
                     ctx,
-                )?
+                )?;
+                if extra.is_empty() {
+                    projected
+                } else {
+                    projected
+                        .into_iter()
+                        .zip(filtered_rows.iter())
+                        .map(|((id, proj_row), (_, src_row))| {
+                            let mut vals = proj_row.into_values();
+                            vals.extend(extra.iter().map(|&idx| {
+                                src_row
+                                    .get(idx)
+                                    .cloned()
+                                    .unwrap_or_else(Value::null_unknown)
+                            }));
+                            (id, Row::from_values(vals))
+                        })
+                        .collect()
+                }
             } else {
                 filtered_rows
             };
-            let layout =
-                Self::result_layout(stmt, &cte_columns, cte_alias.as_deref(), &output_columns);
-            return Ok((output_columns, result_rows, false, layout));
+            let mut columns = output_columns;
+            if let Some(layout) = layout.as_mut() {
+                for &idx in &extra {
+                    columns.push(cte_columns[idx].clone());
+                    layout.sources.push(ColumnSource {
+                        item: None,
+                        input: Some(idx),
+                    });
+                }
+            }
+            return Ok((columns, result_rows, false, layout));
         }
 
         let mut result_rows = if needs_projection {
@@ -957,88 +925,6 @@ impl Executor {
     /// standard sort binds by the output's layout, to execute_select
     fn cte_result_path_finishes(stmt: &SelectStatement) -> bool {
         stmt.set_operations.is_empty() && !stmt.distinct && stmt.order_by.is_empty()
-    }
-
-    /// Check if ORDER BY references source columns not present in the projected output.
-    /// Returns true if sorting must happen before projection.
-    /// Recursively inspects expressions (e.g., -value, value*2) for column references.
-    fn order_by_needs_source_columns(
-        &self,
-        order_by: &[OrderByExpression],
-        output_columns: &[String],
-        source_columns: &[String],
-    ) -> bool {
-        let output_lower: AHashSet<String> =
-            output_columns.iter().map(|c| c.to_lowercase()).collect();
-
-        for ob in order_by {
-            if self.expr_references_source_not_output(&ob.expression, &output_lower, source_columns)
-            {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Recursively check if an expression references source columns not in the output.
-    /// Conservative: returns true for any unknown composite expression to avoid
-    /// silently dropping columns that ORDER BY needs.
-    fn expr_references_source_not_output(
-        &self,
-        expr: &Expression,
-        output_lower: &AHashSet<String>,
-        source_columns: &[String],
-    ) -> bool {
-        let check = |e: &Expression| {
-            self.expr_references_source_not_output(e, output_lower, source_columns)
-        };
-        let is_source_not_output = |name: &str| {
-            !output_lower.contains(name)
-                && source_columns.iter().any(|c| c.eq_ignore_ascii_case(name))
-        };
-
-        match expr {
-            // Leaf column references — the core check
-            Expression::Identifier(id) => is_source_not_output(id.value_lower.as_str()),
-            Expression::QualifiedIdentifier(qi) => {
-                is_source_not_output(qi.name.value_lower.as_str())
-            }
-
-            // Literals and constants — never reference columns
-            Expression::IntegerLiteral(_)
-            | Expression::FloatLiteral(_)
-            | Expression::StringLiteral(_)
-            | Expression::BooleanLiteral(_)
-            | Expression::NullLiteral(_)
-            | Expression::IntervalLiteral(_)
-            | Expression::Parameter(_)
-            | Expression::Star(_)
-            | Expression::QualifiedStar(_)
-            | Expression::Default(_) => false,
-
-            // Composite expressions — recurse into children
-            Expression::Prefix(p) => check(&p.right),
-            Expression::Infix(inf) => check(&inf.left) || check(&inf.right),
-            Expression::FunctionCall(fc) => fc.arguments.iter().any(&check),
-            Expression::Cast(c) => check(&c.expr),
-            Expression::Aliased(a) => check(&a.expression),
-            Expression::Case(case) => {
-                case.value.as_ref().is_some_and(|v| check(v))
-                    || case
-                        .when_clauses
-                        .iter()
-                        .any(|w| check(&w.condition) || check(&w.then_result))
-                    || case.else_value.as_ref().is_some_and(|e| check(e))
-            }
-            Expression::Between(b) => check(&b.expr) || check(&b.lower) || check(&b.upper),
-            Expression::In(i) => check(&i.left),
-            Expression::Like(l) => check(&l.left) || check(&l.pattern),
-            Expression::Distinct(d) => check(&d.expr),
-            Expression::Window(w) => w.function.arguments.iter().any(check),
-
-            // Unknown composite — conservatively assume it may reference source columns
-            _ => true,
-        }
     }
 
     // =========================================================================

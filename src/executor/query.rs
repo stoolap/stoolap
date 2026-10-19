@@ -142,6 +142,48 @@ fn bind_order_key<'e>(expr: &'e Expression, stmt: &SelectStatement) -> OrderKey<
     }
 }
 
+/// Each input column `stmt`'s ORDER BY reads by its binding, with the
+/// reference that names it: a plain name bound to its input column, and
+/// every name inside an expression
+fn visit_order_by_inputs<'e>(
+    stmt: &'e SelectStatement,
+    visit: &mut dyn FnMut(&'e Expression, OrderKey<'e>),
+) {
+    for ob in &stmt.order_by {
+        match bind_order_key(&ob.expression, stmt) {
+            key @ OrderKey::Input(..) => visit(&ob.expression, key),
+            OrderKey::Expression => {
+                visit_column_refs(&ob.expression, &mut |column| match column {
+                    Expression::Identifier(id) => {
+                        visit(column, OrderKey::Input(None, &id.value_lower))
+                    }
+                    Expression::QualifiedIdentifier(qid) => visit(
+                        column,
+                        OrderKey::Input(Some(&qid.qualifier.value_lower), &qid.name.value_lower),
+                    ),
+                    _ => {}
+                });
+            }
+            OrderKey::Ordinal(_) | OrderKey::Item(_) => {}
+        }
+    }
+}
+
+/// The input columns `stmt`'s ORDER BY reads, as indexes into `columns`
+pub(crate) fn order_by_inputs(stmt: &SelectStatement, columns: &[String]) -> Vec<usize> {
+    let mut inputs = Vec::new();
+    visit_order_by_inputs(stmt, &mut |_, key| {
+        if let OrderKey::Input(qualifier, name) = key {
+            if let Some(input) = input_column_index(columns, qualifier, name) {
+                if !inputs.contains(&input) {
+                    inputs.push(input);
+                }
+            }
+        }
+    });
+    inputs
+}
+
 /// The input column a plain column reference reads, as the projection finds
 /// it: the qualified name, then the bare name, then a qualified column whose
 /// last part is the bare name
@@ -238,6 +280,7 @@ use super::utils::{
     extract_join_keys_and_residual, filter_references_column, flatten_and_predicates,
     flip_operator, get_table_alias_from_expr, index_join_residual, infix_to_operator,
     order_by_names_an_alias, string_literal_value, strip_table_qualifier, substitute_filter_column,
+    visit_column_refs,
 };
 use super::volatility::{expression_volatility, statement_constant};
 use super::window::{WindowPreGroupedState, WindowPreSortedState};
@@ -977,6 +1020,17 @@ impl Executor {
                 evaluator.init_columns(&columns);
                 // An aggregate inside a sort key reads the column computing it
                 evaluator.add_aggregate_aliases(&aggregate_slots);
+                // A name inside a sort expression reads the input column, at
+                // the position the layout gives it
+                if let Some(layout) = layout {
+                    let mut input_slots: FxHashMap<ExprKey, usize> = FxHashMap::default();
+                    visit_order_by_inputs(stmt, &mut |column, key| {
+                        if let Some(position) = layout.position(&key) {
+                            input_slots.entry(ExprKey::of(column)).or_insert(position);
+                        }
+                    });
+                    evaluator.add_aggregate_aliases(&input_slots);
+                }
 
                 // Check if any ORDER BY expression contains a correlated subquery
                 // Use cached classification to avoid expensive AST traversal

@@ -872,16 +872,25 @@ pub(crate) fn collect_column_names(
     expr: &Expression,
     out: &mut Vec<crate::common::SmartString>,
 ) -> bool {
-    fn all(exprs: &[Expression], out: &mut Vec<crate::common::SmartString>) -> bool {
-        exprs.iter().all(|e| collect_column_names(e, out))
+    visit_column_refs(expr, &mut |column| match column {
+        Expression::Identifier(id) => out.push(id.value_lower.clone()),
+        Expression::QualifiedIdentifier(q) => out.push(q.name.value_lower.clone()),
+        _ => {}
+    })
+}
+
+/// Each column reference an expression reads, a bare or a qualified name,
+/// passed to `visit`; false as `collect_column_names` says
+pub(crate) fn visit_column_refs<'e>(
+    expr: &'e Expression,
+    visit: &mut dyn FnMut(&'e Expression),
+) -> bool {
+    fn all<'e>(exprs: &'e [Expression], visit: &mut dyn FnMut(&'e Expression)) -> bool {
+        exprs.iter().all(|e| visit_column_refs(e, visit))
     }
     match expr {
-        Expression::Identifier(id) => {
-            out.push(id.value_lower.clone());
-            true
-        }
-        Expression::QualifiedIdentifier(q) => {
-            out.push(q.name.value_lower.clone());
+        Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => {
+            visit(expr);
             true
         }
         Expression::IntegerLiteral(_)
@@ -891,55 +900,55 @@ pub(crate) fn collect_column_names(
         | Expression::NullLiteral(_)
         | Expression::IntervalLiteral(_)
         | Expression::Parameter(_) => true,
-        Expression::Prefix(p) => collect_column_names(&p.right, out),
+        Expression::Prefix(p) => visit_column_refs(&p.right, visit),
         Expression::Infix(i) => {
-            collect_column_names(&i.left, out) && collect_column_names(&i.right, out)
+            visit_column_refs(&i.left, visit) && visit_column_refs(&i.right, visit)
         }
-        Expression::List(l) => all(&l.elements, out),
-        Expression::ExpressionList(l) => all(&l.expressions, out),
-        Expression::Distinct(d) => collect_column_names(&d.expr, out),
+        Expression::List(l) => all(&l.elements, visit),
+        Expression::ExpressionList(l) => all(&l.expressions, visit),
+        Expression::Distinct(d) => visit_column_refs(&d.expr, visit),
         Expression::In(i) => {
-            collect_column_names(&i.left, out) && collect_column_names(&i.right, out)
+            visit_column_refs(&i.left, visit) && visit_column_refs(&i.right, visit)
         }
-        Expression::InHashSet(h) => collect_column_names(&h.column, out),
-        Expression::QuantifiedSet(q) => collect_column_names(&q.left, out),
+        Expression::InHashSet(h) => visit_column_refs(&h.column, visit),
+        Expression::QuantifiedSet(q) => visit_column_refs(&q.left, visit),
         Expression::Between(b) => {
-            collect_column_names(&b.expr, out)
-                && collect_column_names(&b.lower, out)
-                && collect_column_names(&b.upper, out)
+            visit_column_refs(&b.expr, visit)
+                && visit_column_refs(&b.lower, visit)
+                && visit_column_refs(&b.upper, visit)
         }
         Expression::Like(l) => {
-            collect_column_names(&l.left, out)
-                && collect_column_names(&l.pattern, out)
+            visit_column_refs(&l.left, visit)
+                && visit_column_refs(&l.pattern, visit)
                 && l.escape
                     .as_deref()
-                    .is_none_or(|e| collect_column_names(e, out))
+                    .is_none_or(|e| visit_column_refs(e, visit))
         }
         Expression::Case(c) => {
             c.value
                 .as_deref()
-                .is_none_or(|v| collect_column_names(v, out))
+                .is_none_or(|v| visit_column_refs(v, visit))
                 && c.when_clauses.iter().all(|w| {
-                    collect_column_names(&w.condition, out)
-                        && collect_column_names(&w.then_result, out)
+                    visit_column_refs(&w.condition, visit)
+                        && visit_column_refs(&w.then_result, visit)
                 })
                 && c.else_value
                     .as_deref()
-                    .is_none_or(|e| collect_column_names(e, out))
+                    .is_none_or(|e| visit_column_refs(e, visit))
         }
-        Expression::Cast(c) => collect_column_names(&c.expr, out),
+        Expression::Cast(c) => visit_column_refs(&c.expr, visit),
         Expression::FunctionCall(f) => {
             f.arguments
                 .iter()
-                .all(|a| matches!(a, Expression::Star(_)) || collect_column_names(a, out))
+                .all(|a| matches!(a, Expression::Star(_)) || visit_column_refs(a, visit))
                 && f.filter
                     .as_deref()
-                    .is_none_or(|e| collect_column_names(e, out))
+                    .is_none_or(|e| visit_column_refs(e, visit))
                 && f.order_by
                     .iter()
-                    .all(|o| collect_column_names(&o.expression, out))
+                    .all(|o| visit_column_refs(&o.expression, visit))
         }
-        Expression::Aliased(a) => collect_column_names(&a.expression, out),
+        Expression::Aliased(a) => visit_column_refs(&a.expression, visit),
         _ => false,
     }
 }

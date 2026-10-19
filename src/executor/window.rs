@@ -346,7 +346,7 @@ use crate::storage::traits::{QueryResult, Table};
 use super::context::ExecutionContext;
 use super::expr_key::ExprKey;
 use super::expression::{compute_expression_hash, ExpressionEval, MultiExpressionEval};
-use super::query::{ColumnSource, OutputLayout};
+use super::query::{order_by_inputs, ColumnSource, OutputLayout};
 use super::result::{ColumnarResult, ExecutorResult};
 use super::utils::{build_column_index_map, derived_aggregate_column_name};
 use super::volatility::expression_volatility;
@@ -1056,10 +1056,8 @@ impl Executor {
             }
         }
 
-        // ORDER BY may name a base column the projection drops (a grouped
-        // column when this runs over aggregated rows). Carry those columns
-        // so the sort in execute_select can see them; the expected-column
-        // trim removes them again afterwards.
+        // Every input column ORDER BY reads that no output column copies is
+        // carried for the sort, which the expected-column trim then drops
         let (mut result_columns, mut column_data) = (result_columns, column_data);
         let mut sources: Vec<ColumnSource> = select_items
             .iter()
@@ -1072,14 +1070,17 @@ impl Executor {
                 },
             })
             .collect();
-        for (name, idx, values) in
-            Self::collect_hidden_order_by_columns_from_slice(stmt, base_columns, base_rows)
-        {
+        for idx in order_by_inputs(stmt, base_columns) {
             if sources.iter().any(|source| source.input == Some(idx)) {
                 continue;
             }
-            result_columns.push(name);
-            column_data.push(values);
+            result_columns.push(base_columns[idx].clone());
+            column_data.push(
+                base_rows
+                    .iter()
+                    .map(|(_, row)| row.get(idx).cloned().unwrap_or_else(Value::null_unknown))
+                    .collect(),
+            );
             sources.push(ColumnSource {
                 item: None,
                 input: Some(idx),
@@ -1095,27 +1096,6 @@ impl Executor {
             Box::new(ColumnarResult::new(result_columns, column_data)),
             layout,
         ))
-    }
-
-    /// Same contract as the aggregate path's collector, over a row slice,
-    /// with the source column each hidden column copies
-    fn collect_hidden_order_by_columns_from_slice(
-        stmt: &SelectStatement,
-        source_columns: &[String],
-        source_rows: &[(i64, Row)],
-    ) -> Vec<(String, usize, Vec<Value>)> {
-        stmt.order_by
-            .iter()
-            .filter_map(|ob| {
-                // One shared name-resolution rule with the aggregate path
-                let (publish_as, idx) = Self::resolve_hidden_order_by_column(ob, source_columns)?;
-                let values = source_rows
-                    .iter()
-                    .map(|(_, row)| row.get(idx).cloned().unwrap_or_else(Value::null_unknown))
-                    .collect();
-                Some((publish_as, idx, values))
-            })
-            .collect()
     }
 
     /// Streaming execution for window functions with LIMIT pushdown
