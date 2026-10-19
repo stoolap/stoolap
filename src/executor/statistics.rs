@@ -158,6 +158,12 @@ impl Executor {
         // Get row count
         let row_count = table.row_count()?;
 
+        // The committed state the zone maps describe: one publish epoch, read
+        // as the newest with no writes of this transaction mixed in
+        let epoch = table
+            .publish_epoch_if_quiet()
+            .filter(|_| table.sees_newest() && !table.has_local_changes());
+
         // Collect all rows for zone map building (zone maps need complete data)
         let mut all_rows = table.collect_all_rows(None)?;
 
@@ -166,8 +172,10 @@ impl Executor {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::analyze_rows_collected();
 
-        // Build zone maps from all rows
-        let zone_maps = self.build_zone_maps(&rows_vec, &schema);
+        // Build zone maps from all rows; a commit published across the read
+        // leaves them describing no one state
+        let mut zone_maps = self.build_zone_maps(&rows_vec, &schema);
+        zone_maps.epoch = epoch.filter(|&epoch| table.publish_epoch_if_quiet() == Some(epoch));
 
         // Store zone maps in the table
         table.set_zone_maps(zone_maps);

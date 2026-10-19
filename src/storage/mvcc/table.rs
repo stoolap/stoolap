@@ -1960,22 +1960,8 @@ impl MVCCTable {
     /// Index updates are handled by TransactionVersionStore::commit() using batch
     /// operations to reduce lock acquisitions from O(rows × indexes) to O(indexes).
     pub(crate) fn commit_published(&mut self) -> Result<()> {
-        // Check if there are local changes before committing
-        let has_changes = {
-            let txn_versions = self.txn_versions.read().unwrap();
-            txn_versions.has_local_changes()
-        };
-
         // Commit versions to the version store (this also updates indexes)
-        self.txn_versions.write_store().commit()?;
-
-        // Mark zone maps as stale if we had any data changes
-        // This ensures the optimizer won't use outdated pruning info
-        if has_changes {
-            self.version_store.mark_zone_maps_stale();
-        }
-
-        Ok(())
+        self.txn_versions.write_store().commit()
     }
 
     /// Rolls back the transaction's local changes

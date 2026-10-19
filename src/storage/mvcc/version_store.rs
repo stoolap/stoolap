@@ -760,14 +760,17 @@ impl Drop for ColumnClosure {
 }
 
 /// A GC pass, counted as `PublishGuard` counts a commit; see
-/// VersionStore::admit_gc
+/// VersionStore::admit_gc. A pass that removed no row publishes nothing
 pub struct GcAdmission<'a> {
     store: &'a VersionStore,
+    removed: bool,
 }
 
 impl Drop for GcAdmission<'_> {
     fn drop(&mut self) {
-        self.store.publish_epoch.fetch_add(1, Ordering::SeqCst);
+        if self.removed {
+            self.store.publish_epoch.fetch_add(1, Ordering::SeqCst);
+        }
         self.store.publishing.fetch_sub(1, Ordering::SeqCst);
     }
 }
@@ -3371,7 +3374,10 @@ impl VersionStore {
             self.publishing.fetch_sub(1, Ordering::SeqCst);
             return None;
         }
-        Some(GcAdmission { store: self })
+        Some(GcAdmission {
+            store: self,
+            removed: false,
+        })
     }
 
     /// Closes the table for a change of a column's definition: GC passes are
@@ -5490,14 +5496,6 @@ impl VersionStore {
             .and_then(|zm| zm.get_prune_stats(column, operator, value))
     }
 
-    /// Marks zone maps as stale (needing rebuild after data changes)
-    pub fn mark_zone_maps_stale(&self) {
-        let guard = self.zone_maps.read();
-        if let Some(ref zm) = *guard {
-            zm.mark_stale();
-        }
-    }
-
     /// Close the version store
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
@@ -6293,7 +6291,7 @@ impl VersionStore {
             return 0;
         }
         // Held through the index and arena cleanup after the versions lock
-        let Some(_admitted) = self.admit_gc() else {
+        let Some(mut admitted) = self.admit_gc() else {
             return 0;
         };
 
@@ -6353,6 +6351,7 @@ impl VersionStore {
         if actually_deleted.is_empty() {
             return 0;
         }
+        admitted.removed = true;
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::gc_rows_removed();
 

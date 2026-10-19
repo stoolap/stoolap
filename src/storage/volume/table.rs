@@ -6451,6 +6451,10 @@ impl Table for SegmentedTable {
         self.hot.publish_epoch_if_quiet()
     }
 
+    fn sees_newest(&self) -> bool {
+        self.snapshot_seq.is_none() && self.hot.sees_newest()
+    }
+
     fn count_equal_candidates(
         &self,
         row_ids: &[i64],

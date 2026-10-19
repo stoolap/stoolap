@@ -1506,6 +1506,20 @@ pub(crate) fn random_drawn() {
 }
 
 thread_local! {
+    /// Scans zone maps pruned on this thread
+    static ZONE_MAP_PRUNES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Scans zone maps pruned on this thread, so far
+pub fn zone_map_prunes() -> usize {
+    ZONE_MAP_PRUNES.with(|prunes| prunes.get())
+}
+
+pub(crate) fn zone_map_pruned() {
+    ZONE_MAP_PRUNES.with(|prunes| prunes.set(prunes.get() + 1));
+}
+
+thread_local! {
     /// Rows table-valued functions generated on this thread: a statement
     /// generates on the thread that runs it, so tests in parallel never meet
     static TVF_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
