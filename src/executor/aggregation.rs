@@ -39,10 +39,12 @@ use crate::storage::traits::{Engine, QueryResult};
 use super::context::ExecutionContext;
 use super::expr_key::ExprKey;
 use super::expression::{ExprVM, Op};
+use super::query::order_by_inputs;
 use super::query_cache::{CompiledCountDistinct, CompiledExecution};
 use super::query_classification::QueryClassification;
 use super::result::ExecutorResult;
 use super::utils::build_column_index_map;
+use super::window::WindowOutput;
 use super::Executor;
 
 // Re-export for backward compatibility
@@ -1320,76 +1322,27 @@ impl Executor {
         Ok(result)
     }
 
-    /// Append grouped columns that ORDER BY needs but SELECT does not project.
-    /// Values come from the pre-projection aggregate rows, matched by position.
-    /// Grouped columns that ORDER BY names but the SELECT list does not
-    /// project, paired with their per-group values. A grouped column may be
-    /// stored qualified ("t.v") or bare, and ORDER BY resolves the qualified
-    /// form first, so both spellings are tried in that order.
-    /// Resolve one ORDER BY item against the pre-projection columns.
-    /// Returns the name to publish the carried column under (the spelling
-    /// the sorter will look for) and its index in `source_columns`.
-    ///
-    /// The two spellings do not have to agree: a query may group by `t.v`
-    /// and order by `v`, or the reverse, so a bare name also matches a
-    /// unique `<qualifier>.<name>` column and a qualified name falls back
-    /// to its bare form.
-    pub(crate) fn resolve_hidden_order_by_column(
-        ob: &crate::parser::ast::OrderByExpression,
-        source_columns: &[String],
-    ) -> Option<(String, usize)> {
-        let (publish_as, candidates) = match &ob.expression {
-            Expression::Identifier(id) => (id.value.to_string(), vec![id.value.to_string()]),
-            Expression::QualifiedIdentifier(qid) => {
-                let full = format!("{}.{}", qid.qualifier.value, qid.name.value);
-                (full.clone(), vec![full, qid.name.value.to_string()])
-            }
-            _ => return None,
-        };
-
-        for cand in &candidates {
-            if let Some(idx) = source_columns
-                .iter()
-                .position(|c| c.eq_ignore_ascii_case(cand))
-            {
-                return Some((publish_as, idx));
-            }
-        }
-
-        // Bare name against a qualified column: only when unambiguous
-        let bare = match &ob.expression {
-            Expression::Identifier(id) => id.value.to_string(),
-            Expression::QualifiedIdentifier(qid) => qid.name.value.to_string(),
-            _ => return None,
-        };
-        let suffix = format!(".{}", bare);
-        let mut matches = source_columns
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| c.to_lowercase().ends_with(&suffix.to_lowercase()));
-        let (idx, _) = matches.next()?;
-        if matches.next().is_some() {
-            return None; // ambiguous across qualifiers
-        }
-        Some((publish_as, idx))
-    }
-
-    /// Grouped columns that ORDER BY names but the SELECT list does not
-    /// project, paired with their per-group values.
+    /// The grouped columns ORDER BY reads that no SELECT item copies, paired
+    /// with their per-group values
     pub(crate) fn collect_hidden_order_by_columns(
         stmt: &SelectStatement,
         source_columns: &[String],
         source_rows: &RowVec,
     ) -> Vec<(String, Vec<Value>)> {
-        stmt.order_by
-            .iter()
-            .filter_map(|ob| {
-                let (publish_as, idx) = Self::resolve_hidden_order_by_column(ob, source_columns)?;
+        let inputs = order_by_inputs(stmt, source_columns);
+        if inputs.is_empty() {
+            return Vec::new();
+        }
+        let copied = Self::select_layout(&stmt.columns, source_columns, None).sources;
+        inputs
+            .into_iter()
+            .filter(|&idx| !copied.iter().any(|source| source.input == Some(idx)))
+            .map(|idx| {
                 let values = source_rows
                     .iter()
                     .map(|(_, row)| row.get(idx).cloned().unwrap_or_else(Value::null_unknown))
                     .collect();
-                Some((publish_as, values))
+                (source_columns[idx].clone(), values)
             })
             .collect()
     }
@@ -1400,9 +1353,6 @@ impl Executor {
         hidden: Vec<(String, Vec<Value>)>,
     ) -> (Vec<String>, RowVec) {
         for (name, values) in hidden {
-            if columns.iter().any(|c| c.eq_ignore_ascii_case(&name)) {
-                continue; // already projected, nothing to carry
-            }
             columns.push(name);
             for (row_idx, (_, row)) in rows.iter_mut().enumerate() {
                 row.push(
@@ -1955,7 +1905,7 @@ impl Executor {
         ctx: &ExecutionContext,
         base_rows: &[(i64, Row)],
         base_columns: &[String],
-    ) -> Result<Box<dyn QueryResult>> {
+    ) -> Result<WindowOutput> {
         let lifted_stmt;
         let lifted_rows;
         let lifted_columns;

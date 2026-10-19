@@ -35,7 +35,9 @@ use super::expression::{ExpressionEval, RowFilter};
 use super::query_classification::QueryClassification;
 use super::result::ExecutorResult;
 use super::row_count::{row_counts, RowCounts};
-use super::utils::{extract_and_conditions, flip_operator, infix_to_operator};
+use super::utils::{
+    extract_and_conditions, flip_operator, infix_to_operator, order_by_names_an_alias,
+};
 use super::volatility::statement_constant;
 use super::Executor;
 use crate::storage::volume::side_index::{resolve_all, Domain, Resolved};
@@ -207,6 +209,9 @@ impl Executor {
             Expression::QualifiedIdentifier(qid) => qid.name.value.clone(),
             _ => return Ok(None), // Can't optimize complex ORDER BY expressions
         };
+        if order_by_names_an_alias(&order_by.expression, stmt) {
+            return Ok(None);
+        }
 
         // Determine sort order
         let ascending = order_by.ascending;
@@ -267,23 +272,8 @@ impl Executor {
             Expression::QualifiedIdentifier(qid) => qid.name.value.clone(),
             _ => return Ok(None),
         };
-        // The name may be a select-list alias for another expression; only a
-        // bare column under that alias still orders by the table column
-        for item in &stmt.columns {
-            if let Expression::Aliased(aliased) = item {
-                if aliased.alias.value.eq_ignore_ascii_case(&column_name) {
-                    let same_column = match &*aliased.expression {
-                        Expression::Identifier(id) => id.value.eq_ignore_ascii_case(&column_name),
-                        Expression::QualifiedIdentifier(qid) => {
-                            qid.name.value.eq_ignore_ascii_case(&column_name)
-                        }
-                        _ => false,
-                    };
-                    if !same_column {
-                        return Ok(None);
-                    }
-                }
-            }
+        if order_by_names_an_alias(&order_by.expression, stmt) {
+            return Ok(None);
         }
         let ascending = order_by.ascending;
 
@@ -336,6 +326,9 @@ impl Executor {
             Expression::QualifiedIdentifier(qid) => qid.name.value.clone(),
             _ => return Ok(None),
         };
+        if order_by_names_an_alias(&order_by.expression, stmt) {
+            return Ok(None);
+        }
 
         // Must be ascending order (most common case for keyset pagination)
         let ascending = order_by.ascending;

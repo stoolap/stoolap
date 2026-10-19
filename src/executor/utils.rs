@@ -872,16 +872,31 @@ pub(crate) fn collect_column_names(
     expr: &Expression,
     out: &mut Vec<crate::common::SmartString>,
 ) -> bool {
-    fn all(exprs: &[Expression], out: &mut Vec<crate::common::SmartString>) -> bool {
-        exprs.iter().all(|e| collect_column_names(e, out))
+    visit_column_refs(expr, &mut |column| match column {
+        Expression::Identifier(id) => out.push(id.value_lower.clone()),
+        Expression::QualifiedIdentifier(q) => out.push(q.name.value_lower.clone()),
+        _ => {}
+    })
+}
+
+/// Each column reference an expression reads, a bare or a qualified name,
+/// passed to `visit`, the parts past one it cannot read included; false as
+/// `collect_column_names` says
+pub(crate) fn visit_column_refs<'e>(
+    expr: &'e Expression,
+    visit: &mut dyn FnMut(&'e Expression),
+) -> bool {
+    fn all<'e>(
+        exprs: impl IntoIterator<Item = &'e Expression>,
+        visit: &mut dyn FnMut(&'e Expression),
+    ) -> bool {
+        exprs
+            .into_iter()
+            .fold(true, |read, e| visit_column_refs(e, visit) & read)
     }
     match expr {
-        Expression::Identifier(id) => {
-            out.push(id.value_lower.clone());
-            true
-        }
-        Expression::QualifiedIdentifier(q) => {
-            out.push(q.name.value_lower.clone());
+        Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => {
+            visit(expr);
             true
         }
         Expression::IntegerLiteral(_)
@@ -891,55 +906,43 @@ pub(crate) fn collect_column_names(
         | Expression::NullLiteral(_)
         | Expression::IntervalLiteral(_)
         | Expression::Parameter(_) => true,
-        Expression::Prefix(p) => collect_column_names(&p.right, out),
-        Expression::Infix(i) => {
-            collect_column_names(&i.left, out) && collect_column_names(&i.right, out)
-        }
-        Expression::List(l) => all(&l.elements, out),
-        Expression::ExpressionList(l) => all(&l.expressions, out),
-        Expression::Distinct(d) => collect_column_names(&d.expr, out),
-        Expression::In(i) => {
-            collect_column_names(&i.left, out) && collect_column_names(&i.right, out)
-        }
-        Expression::InHashSet(h) => collect_column_names(&h.column, out),
-        Expression::QuantifiedSet(q) => collect_column_names(&q.left, out),
-        Expression::Between(b) => {
-            collect_column_names(&b.expr, out)
-                && collect_column_names(&b.lower, out)
-                && collect_column_names(&b.upper, out)
-        }
-        Expression::Like(l) => {
-            collect_column_names(&l.left, out)
-                && collect_column_names(&l.pattern, out)
-                && l.escape
-                    .as_deref()
-                    .is_none_or(|e| collect_column_names(e, out))
-        }
-        Expression::Case(c) => {
+        Expression::Prefix(p) => visit_column_refs(&p.right, visit),
+        Expression::Infix(i) => all([&*i.left, &*i.right], visit),
+        Expression::List(l) => all(&l.elements, visit),
+        Expression::ExpressionList(l) => all(&l.expressions, visit),
+        Expression::Distinct(d) => visit_column_refs(&d.expr, visit),
+        Expression::In(i) => all([&*i.left, &*i.right], visit),
+        Expression::InHashSet(h) => visit_column_refs(&h.column, visit),
+        Expression::QuantifiedSet(q) => visit_column_refs(&q.left, visit),
+        Expression::Between(b) => all([&*b.expr, &*b.lower, &*b.upper], visit),
+        Expression::Like(l) => all(
+            [&*l.left, &*l.pattern]
+                .into_iter()
+                .chain(l.escape.as_deref()),
+            visit,
+        ),
+        Expression::Case(c) => all(
             c.value
                 .as_deref()
-                .is_none_or(|v| collect_column_names(v, out))
-                && c.when_clauses.iter().all(|w| {
-                    collect_column_names(&w.condition, out)
-                        && collect_column_names(&w.then_result, out)
-                })
-                && c.else_value
-                    .as_deref()
-                    .is_none_or(|e| collect_column_names(e, out))
-        }
-        Expression::Cast(c) => collect_column_names(&c.expr, out),
-        Expression::FunctionCall(f) => {
+                .into_iter()
+                .chain(
+                    c.when_clauses
+                        .iter()
+                        .flat_map(|w| [&w.condition, &w.then_result]),
+                )
+                .chain(c.else_value.as_deref()),
+            visit,
+        ),
+        Expression::Cast(c) => visit_column_refs(&c.expr, visit),
+        Expression::FunctionCall(f) => all(
             f.arguments
                 .iter()
-                .all(|a| matches!(a, Expression::Star(_)) || collect_column_names(a, out))
-                && f.filter
-                    .as_deref()
-                    .is_none_or(|e| collect_column_names(e, out))
-                && f.order_by
-                    .iter()
-                    .all(|o| collect_column_names(&o.expression, out))
-        }
-        Expression::Aliased(a) => collect_column_names(&a.expression, out),
+                .filter(|a| !matches!(a, Expression::Star(_)))
+                .chain(f.filter.as_deref())
+                .chain(f.order_by.iter().map(|o| &o.expression)),
+            visit,
+        ),
+        Expression::Aliased(a) => visit_column_refs(&a.expression, visit),
         _ => false,
     }
 }
@@ -1403,6 +1406,31 @@ fn collect_table_qualifiers_impl(expr: &Expression, qualifiers: &mut FxHashSet<S
         }
         _ => {}
     }
+}
+
+/// Whether an ORDER BY `expr` of `stmt` sorts by a SELECT alias rather than
+/// the input column of its name: a bare name the list gives to anything but
+/// that column, which only the same bare name proves, or over a single
+/// table also that name qualified. A qualified name or an expression always
+/// reads the input, so a path that orders input rows can answer every item
+/// this is false for
+pub fn order_by_names_an_alias(expr: &Expression, stmt: &SelectStatement) -> bool {
+    let Expression::Identifier(id) = expr else {
+        return false;
+    };
+    let one_table = matches!(stmt.table_expr.as_deref(), Some(Expression::TableSource(_)));
+    stmt.columns.iter().any(|item| match item {
+        Expression::Aliased(aliased) if aliased.alias.value_lower == id.value_lower => {
+            match &*aliased.expression {
+                Expression::Identifier(column) => column.value_lower != id.value_lower,
+                Expression::QualifiedIdentifier(column) => {
+                    !one_table || column.name.value_lower != id.value_lower
+                }
+                _ => true,
+            }
+        }
+        _ => false,
+    })
 }
 
 /// Collect the unqualified (bare) column names of an expression, lowercase,

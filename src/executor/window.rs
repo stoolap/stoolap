@@ -346,6 +346,7 @@ use crate::storage::traits::{QueryResult, Table};
 use super::context::ExecutionContext;
 use super::expr_key::ExprKey;
 use super::expression::{compute_expression_hash, ExpressionEval, MultiExpressionEval};
+use super::query::{order_by_inputs, ColumnSource, OutputLayout};
 use super::result::{ColumnarResult, ExecutorResult};
 use super::utils::{build_column_index_map, derived_aggregate_column_name};
 use super::volatility::expression_volatility;
@@ -421,6 +422,9 @@ pub struct WindowFunctionInfo {
     /// The error one of them gave, reported once there is a row to aggregate
     pub extra_error: Option<Error>,
 }
+
+/// A window result, with the layout its ORDER BY reads when it has one
+pub(crate) type WindowOutput = (Box<dyn QueryResult>, Option<OutputLayout>);
 
 /// Information about a SELECT list item for window function processing
 pub struct SelectItem {
@@ -594,7 +598,7 @@ impl Executor {
         ctx: &ExecutionContext,
         base_rows: &[(i64, Row)],
         base_columns: &[String],
-    ) -> Result<Box<dyn QueryResult>> {
+    ) -> Result<WindowOutput> {
         self.execute_select_with_window_functions_internal(
             stmt,
             ctx,
@@ -615,7 +619,7 @@ impl Executor {
         base_rows: &[(i64, Row)],
         base_columns: &[String],
         group_slots: &FxHashMap<ExprKey, usize>,
-    ) -> Result<Box<dyn QueryResult>> {
+    ) -> Result<WindowOutput> {
         self.execute_select_with_window_functions_internal(
             stmt,
             ctx,
@@ -637,7 +641,7 @@ impl Executor {
         base_rows: &[(i64, Row)],
         base_columns: &[String],
         pre_sorted: Option<WindowPreSortedState>,
-    ) -> Result<Box<dyn QueryResult>> {
+    ) -> Result<WindowOutput> {
         self.execute_select_with_window_functions_internal(
             stmt,
             ctx,
@@ -659,7 +663,7 @@ impl Executor {
         base_rows: &[(i64, Row)],
         base_columns: &[String],
         pre_grouped: WindowPreGroupedState,
-    ) -> Result<Box<dyn QueryResult>> {
+    ) -> Result<WindowOutput> {
         self.execute_select_with_window_functions_internal(
             stmt,
             ctx,
@@ -682,11 +686,12 @@ impl Executor {
         group_slots: &FxHashMap<ExprKey, usize>,
         pre_sorted: Option<WindowPreSortedState>,
         pre_grouped: Option<WindowPreGroupedState>,
-    ) -> Result<Box<dyn QueryResult>> {
+    ) -> Result<WindowOutput> {
         // A window function in ORDER BY that the select list does not carry
         // is computed into a column of its own, named after it, which the
         // sort reads and the projection then drops. It goes in before the
         // subqueries are lifted, so one inside it is lifted with the rest
+        let written_items = stmt.columns.len();
         let extended_stmt;
         let stmt = {
             let hidden = Self::hidden_order_by_windows(stmt);
@@ -745,7 +750,11 @@ impl Executor {
             for (id, row) in base_rows.iter() {
                 rows.push((*id, row.clone()));
             }
-            return Ok(Box::new(ExecutorResult::new(base_columns.to_vec(), rows)));
+            let layout = (!stmt.order_by.is_empty()).then(|| OutputLayout::of_input(base_columns));
+            return Ok((
+                Box::new(ExecutorResult::new(base_columns.to_vec(), rows)),
+                layout,
+            ));
         }
 
         // OPTIMIZATION: LIMIT pushdown for PARTITION BY queries
@@ -770,7 +779,8 @@ impl Executor {
             if has_partition_by && Self::all_partitions_match(&window_functions) {
                 if let Some(limit_val) = super::row_count::rows_needed(stmt, ctx) {
                     if limit_val > 0 {
-                        return self.execute_select_with_window_functions_streaming(
+                        // Streaming runs without an ORDER BY, which reads no layout
+                        let result = self.execute_select_with_window_functions_streaming(
                             stmt,
                             ctx,
                             base_rows,
@@ -779,7 +789,8 @@ impl Executor {
                             visible_columns,
                             &window_functions,
                             limit_val,
-                        );
+                        )?;
+                        return Ok((result, None));
                     }
                 }
             }
@@ -843,12 +854,15 @@ impl Executor {
         let mut result_columns = Vec::new();
 
         // Parse the SELECT list to determine output column order
+        let laid_out = !stmt.order_by.is_empty();
+        let mut item_of = Vec::new();
         let select_items = self.parse_select_list_for_window(
             stmt,
             base_columns,
             visible_columns,
             &window_functions,
             group_slots,
+            laid_out.then_some(&mut item_of),
         );
 
         for item in &select_items {
@@ -1042,43 +1056,46 @@ impl Executor {
             }
         }
 
-        // ORDER BY may name a base column the projection drops (a grouped
-        // column when this runs over aggregated rows). Carry those columns
-        // so the sort in execute_select can see them; the expected-column
-        // trim removes them again afterwards.
+        // Every input column ORDER BY reads that no output column copies is
+        // carried for the sort, which the expected-column trim then drops
         let (mut result_columns, mut column_data) = (result_columns, column_data);
-        for (name, values) in
-            Self::collect_hidden_order_by_columns_from_slice(stmt, base_columns, base_rows)
-        {
-            if result_columns.iter().any(|c| c.eq_ignore_ascii_case(&name)) {
+        let mut sources: Vec<ColumnSource> = select_items
+            .iter()
+            .zip(&item_of)
+            .map(|(select_item, &item)| ColumnSource {
+                item: (item < written_items).then_some(item),
+                input: match select_item.source {
+                    SelectItemSource::BaseColumn(idx) => Some(idx),
+                    _ => None,
+                },
+            })
+            .collect();
+        for idx in order_by_inputs(stmt, base_columns) {
+            if sources.iter().any(|source| source.input == Some(idx)) {
                 continue;
             }
-            result_columns.push(name);
-            column_data.push(values);
-        }
-
-        // Return ColumnarResult which materializes rows lazily with zero per-row allocation
-        Ok(Box::new(ColumnarResult::new(result_columns, column_data)))
-    }
-
-    /// Same contract as the aggregate path's collector, over a row slice
-    fn collect_hidden_order_by_columns_from_slice(
-        stmt: &SelectStatement,
-        source_columns: &[String],
-        source_rows: &[(i64, Row)],
-    ) -> Vec<(String, Vec<Value>)> {
-        stmt.order_by
-            .iter()
-            .filter_map(|ob| {
-                // One shared name-resolution rule with the aggregate path
-                let (publish_as, idx) = Self::resolve_hidden_order_by_column(ob, source_columns)?;
-                let values = source_rows
+            result_columns.push(base_columns[idx].clone());
+            column_data.push(
+                base_rows
                     .iter()
                     .map(|(_, row)| row.get(idx).cloned().unwrap_or_else(Value::null_unknown))
-                    .collect();
-                Some((publish_as, values))
-            })
-            .collect()
+                    .collect(),
+            );
+            sources.push(ColumnSource {
+                item: None,
+                input: Some(idx),
+            });
+        }
+        let layout = laid_out.then(|| OutputLayout {
+            input_columns: base_columns.to_vec(),
+            sources,
+        });
+
+        // Return ColumnarResult which materializes rows lazily with zero per-row allocation
+        Ok((
+            Box::new(ColumnarResult::new(result_columns, column_data)),
+            layout,
+        ))
     }
 
     /// Streaming execution for window functions with LIMIT pushdown
@@ -1121,6 +1138,7 @@ impl Executor {
             visible_columns,
             window_functions,
             group_slots,
+            None,
         );
         let result_columns: Vec<String> =
             select_items.iter().map(|i| i.output_name.clone()).collect();
@@ -1372,6 +1390,7 @@ impl Executor {
             base_columns.len(),
             &window_functions,
             &group_slots,
+            None,
         );
         let result_columns: Vec<String> =
             select_items.iter().map(|i| i.output_name.clone()).collect();
@@ -1561,7 +1580,8 @@ impl Executor {
         ))))
     }
 
-    /// Parse SELECT list to determine output order and sources
+    /// Parse SELECT list to determine output order and sources, and into
+    /// `item_of` the SELECT item each output column comes from
     fn parse_select_list_for_window(
         &self,
         stmt: &SelectStatement,
@@ -1569,13 +1589,14 @@ impl Executor {
         visible_columns: usize,
         window_functions: &[WindowFunctionInfo],
         group_slots: &FxHashMap<ExprKey, usize>,
+        mut item_of: Option<&mut Vec<usize>>,
     ) -> Vec<SelectItem> {
         let col_index_map = build_column_index_map(base_columns);
 
         let mut items = Vec::new();
         let mut wf_idx = 0;
 
-        for col_expr in &stmt.columns {
+        for (item, col_expr) in stmt.columns.iter().enumerate() {
             match col_expr {
                 Expression::Window(_) => {
                     // Window function - use pre-computed values, named as written
@@ -1807,6 +1828,9 @@ impl Executor {
                         });
                     }
                 }
+            }
+            if let Some(item_of) = item_of.as_deref_mut() {
+                item_of.resize(items.len(), item);
             }
         }
 
