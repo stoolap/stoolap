@@ -6806,16 +6806,6 @@ impl Executor {
         Ok((Box::new(final_result), projected_columns_arc, false, None))
     }
 
-    /// Execute a table expression (for JOIN left/right sides)
-    /// Returns columns prefixed with table alias for proper qualified name resolution
-    pub(crate) fn execute_table_expression(
-        &self,
-        expr: &Expression,
-        ctx: &ExecutionContext,
-    ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
-        self.execute_table_expression_with_filter(expr, ctx, None)
-    }
-
     /// Execute a table expression with optional filter pushdown
     /// This is used by JOIN to push WHERE predicates to individual table scans
     pub(crate) fn execute_table_expression_with_filter(
