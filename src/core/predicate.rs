@@ -111,6 +111,11 @@ pub fn sql_compare(a: &Value, b: &Value) -> Option<Ordering> {
     if let Some(ordering) = a.plain_cmp(b) {
         return Some(ordering);
     }
+    // An INTEGER against a FLOAT orders by exact value, as `compare_across`
+    // would answer it, without the checks for the other pairs
+    if let (Value::Integer(_), Value::Float(_)) | (Value::Float(_), Value::Integer(_)) = (a, b) {
+        return compare_numbers(a, b);
+    }
     compare_across(a, b)
 }
 
@@ -173,6 +178,11 @@ fn read_text_across<'v>(
 pub fn sql_eq(a: &Value, b: &Value) -> Option<bool> {
     if let Some(eq) = a.plain_eq(b) {
         return Some(eq);
+    }
+    // An INTEGER and a FLOAT are equal by exact value, as `eq_across` would
+    // answer them
+    if let (Value::Integer(_), Value::Float(_)) | (Value::Float(_), Value::Integer(_)) = (a, b) {
+        return compare_numbers(a, b).map(Ordering::is_eq);
     }
     eq_across(a, b)
 }

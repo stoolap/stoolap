@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cmp::Ordering;
+
 use stoolap::{Database, Value};
 
 const T: Option<bool> = Some(true);
@@ -1107,4 +1109,111 @@ fn test_a_distinct_on_join_orders_by_a_column_it_does_not_select() {
             assert_eq!(sorted_pairs(&db, &sql), expected, "{sql}");
         }
     }
+}
+
+#[test]
+fn test_an_integer_against_a_float_compares_exactly_in_every_context() {
+    let db = open("contract_integer_float");
+    let pairs: [(i64, f64, Ordering); 7] = [
+        (5, 5.0, Ordering::Equal),
+        (5, 5.5, Ordering::Less),
+        (9007199254740993, 9007199254740992.0, Ordering::Greater),
+        (i64::MAX, 9223372036854775808.0, Ordering::Less),
+        (i64::MIN, -9223372036854775808.0, Ordering::Equal),
+        (0, -0.0, Ordering::Equal),
+        (1, f64::NAN, Ordering::Less),
+    ];
+    // One table a pair, so each query scans and projects its one row
+    for (id, (i, f, _)) in pairs.iter().enumerate() {
+        db.execute(
+            &format!("CREATE TABLE n{id} (id INTEGER PRIMARY KEY, i INTEGER, f FLOAT)"),
+            (),
+        )
+        .unwrap();
+        db.execute(
+            &format!("INSERT INTO n{id} VALUES (1, $1, $2)"),
+            vec![Value::Integer(*i), Value::Float(*f)],
+        )
+        .unwrap();
+    }
+    let mut wrong = Vec::new();
+    for (id, (i, f, ordering)) in pairs.iter().enumerate() {
+        for op in ["=", "<>", "<", "<=", ">", ">="] {
+            let holds = |ordering: Ordering| match op {
+                "=" => ordering.is_eq(),
+                "<>" => ordering.is_ne(),
+                "<" => ordering.is_lt(),
+                "<=" => ordering.is_le(),
+                ">" => ordering.is_gt(),
+                _ => ordering.is_ge(),
+            };
+            let params = || vec![Value::Integer(*i), Value::Float(*f)];
+            let row = format!("FROM n{id}");
+            let case =
+                |test: String| format!("SELECT CASE WHEN {test} THEN TRUE ELSE FALSE END {row}");
+            // (query, parameters, whether the FLOAT is on the left)
+            let mut shapes = vec![
+                (format!("SELECT i {op} f {row}"), vec![], false),
+                (format!("SELECT f {op} i {row}"), vec![], true),
+                (format!("SELECT $1 {op} $2"), params(), false),
+                (case(format!("i {op} f")), vec![], false),
+                (
+                    format!("SELECT CASE WHEN $1 {op} $2 THEN TRUE ELSE FALSE END"),
+                    params(),
+                    false,
+                ),
+                (
+                    format!("SELECT COUNT(*) > 0 {row} WHERE i {op} f"),
+                    vec![],
+                    false,
+                ),
+                (
+                    format!("SELECT f {op} $1 {row}"),
+                    vec![Value::Integer(*i)],
+                    true,
+                ),
+                (
+                    format!("SELECT i {op} $1 {row}"),
+                    vec![Value::Float(*f)],
+                    false,
+                ),
+            ];
+            // A NaN and i64::MIN have no literal, the others are written as one
+            if !f.is_nan() && *i != i64::MIN {
+                let (il, fl) = (i.to_string(), format!("{f:?}"));
+                shapes.extend([
+                    (format!("SELECT f {op} {il} {row}"), vec![], true),
+                    (format!("SELECT i {op} {fl} {row}"), vec![], false),
+                    (case(format!("f {op} {il}")), vec![], true),
+                    (case(format!("i {op} {fl}")), vec![], false),
+                ]);
+            }
+            // A scan under LIMIT projects through the inline CASE and compare loops
+            let limited: Vec<_> = shapes
+                .iter()
+                .filter(|(sql, _, _)| sql.ends_with(&row))
+                .map(|(sql, params, float_left)| {
+                    (format!("{sql} LIMIT 10"), params.clone(), *float_left)
+                })
+                .collect();
+            shapes.extend(limited);
+            for (sql, params, float_left) in shapes {
+                let want = holds(if float_left {
+                    ordering.reverse()
+                } else {
+                    *ordering
+                });
+                let got = truth(&db, &sql, params.clone());
+                if got != Some(want) {
+                    wrong.push(format!("{sql} with {params:?} gave {got:?}, want {want}"));
+                }
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
 }
