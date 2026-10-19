@@ -437,3 +437,46 @@ fn test_a_default_computed_at_alter_survives_wal_recovery() {
         wrong.join("\n")
     );
 }
+
+#[test]
+fn test_a_foreign_key_checks_the_value_a_hinted_literal_writes() {
+    let mut wrong = Vec::new();
+    for (n, (literal, stored)) in LITERALS.iter().enumerate() {
+        let written = literal.split('\'').nth(1).unwrap();
+        for (parent, held) in [("stored", stored), ("written", &written)] {
+            let db = Database::open(&format!("memory://literal_fk_{parent}_{n}")).unwrap();
+            for sql in [
+                "CREATE TABLE p (id INTEGER PRIMARY KEY, s TEXT UNIQUE)".to_string(),
+                "CREATE TABLE c (id INTEGER PRIMARY KEY, s TEXT REFERENCES p(s))".to_string(),
+                format!("INSERT INTO p VALUES (1, '{held}')"),
+                "INSERT INTO c VALUES (1, NULL)".to_string(),
+                "BEGIN".to_string(),
+            ] {
+                db.execute(&sql, ()).unwrap();
+            }
+            let update = db.execute(&format!("UPDATE c SET s = {literal} WHERE id = 1"), ());
+            match (parent, update) {
+                ("stored", Err(e)) => {
+                    wrong.push(format!("{literal} with p holding '{held}' refused: {e}"))
+                }
+                ("written", Ok(_)) => wrong.push(format!(
+                    "{literal} with p holding only '{held}' wrote {:?}",
+                    db.query("SELECT s FROM c", ())
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .get_value(0)
+                        .cloned()
+                )),
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}

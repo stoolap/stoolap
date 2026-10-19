@@ -2078,7 +2078,11 @@ impl Executor {
                         .iter()
                         .find(|f| f.column_index == col_idx)
                     {
-                        if let Some(value) = Self::try_extract_constant_fk_value(expr, ctx) {
+                        // The value as the column stores it; one that does not
+                        // convert is left to the update, which reports it
+                        if let Some(Ok(value)) = try_extract_simple_value(expr, ctx)
+                            .map(|v| v.try_into_coerce_to_type(schema.columns[col_idx].data_type))
+                        {
                             if !value.is_null() {
                                 super::foreign_key::validate_fk_value(
                                     &self.engine,
@@ -2828,34 +2832,6 @@ impl Executor {
         statement_rollback.finish(Ok(Box::new(ExecResult::with_rows_affected(
             rows_affected as i64,
         ))))
-    }
-
-    /// Try to extract a constant value from a SET expression for FK pre-validation.
-    /// Returns Some(value) for literals, parameters, and negated literals.
-    /// Returns None for column references, functions, subqueries, etc.
-    fn try_extract_constant_fk_value(expr: &Expression, ctx: &ExecutionContext) -> Option<Value> {
-        match expr {
-            Expression::IntegerLiteral(lit) => Some(Value::Integer(lit.value)),
-            Expression::FloatLiteral(lit) => Some(Value::Float(lit.value)),
-            Expression::StringLiteral(lit) => Some(Value::text(lit.value.as_str())),
-            Expression::BooleanLiteral(lit) => Some(Value::Boolean(lit.value)),
-            Expression::NullLiteral(_) => Some(Value::null_unknown()),
-            Expression::Prefix(prefix) if prefix.operator == "-" => match prefix.right.as_ref() {
-                Expression::IntegerLiteral(lit) => integer_neg(lit.value).ok().map(Value::Integer),
-                Expression::FloatLiteral(lit) => Some(Value::Float(-lit.value)),
-                _ => None,
-            },
-            Expression::Parameter(param) => {
-                if param.name.starts_with(':') {
-                    ctx.get_named_param(&param.name[1..]).cloned()
-                } else if param.index > 0 {
-                    ctx.params().get(param.index - 1).cloned()
-                } else {
-                    None
-                }
-            }
-            _ => None, // Column reference, function, subquery, etc. — can't pre-validate
-        }
     }
 
     /// Execute a DELETE statement
