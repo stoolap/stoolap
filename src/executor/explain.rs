@@ -1001,6 +1001,12 @@ impl Executor {
                 | IndexLookupStrategy::TableEquality { .. } => "Index Nested Loop".to_string(),
             };
 
+            let left_is_table = self
+                .base_table_side_schema(join_left, CteNames::Listed(ctes))
+                .is_some();
+            let right_is_table = self
+                .base_table_side_schema(join_right, CteNames::Listed(ctes))
+                .is_some();
             // Check if INLJ is possible (right side has index/PK for join column)
             let inlj_info = self.check_index_nested_loop_opportunity(
                 CteNames::Listed(ctes),
@@ -1011,14 +1017,12 @@ impl Executor {
                 right_alias.as_deref(),
                 bounded,
                 small_outer,
+                !left_is_table,
             );
 
             // The side execution probes, by the rule it picks it with. The
             // executor swaps a small outer in only from a right side that is
             // not a base table
-            let right_is_table = self
-                .base_table_side_schema(join_right, CteNames::Listed(ctes))
-                .is_some();
             let picked = if index_use == JoinIndexUse::Grouped {
                 inlj_info.map(|info| (info, false))
             } else {
@@ -1050,6 +1054,7 @@ impl Executor {
                             left_alias.as_deref(),
                             bounded,
                             small_outer && !right_is_table,
+                            !right_is_table,
                         )
                     },
                     |(_, strategy, _, _)| matches!(strategy, IndexLookupStrategy::PrimaryKey),

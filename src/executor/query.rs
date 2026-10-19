@@ -4310,8 +4310,15 @@ impl Executor {
             let picked = if correlated_where {
                 None
             } else {
+                let ctes = CteNames::Context(ctx);
+                let left_is_table = self
+                    .base_table_side_schema(&join_source.left, ctes)
+                    .is_some();
+                let right_is_table = self
+                    .base_table_side_schema(&join_source.right, ctes)
+                    .is_some();
                 let unswapped = self.check_index_nested_loop_opportunity(
-                    CteNames::Context(ctx),
+                    ctes,
                     &join_source.right,
                     on_condition,
                     &join_type,
@@ -4319,17 +4326,17 @@ impl Executor {
                     right_alias.as_deref(),
                     pushed_limit.is_some(),
                     small_outer,
+                    !left_is_table,
                 );
                 pick_index_join_side(
                     &join_type,
-                    self.base_table_side_schema(&join_source.right, CteNames::Context(ctx))
-                        .is_some(),
+                    right_is_table,
                     right_filter.is_some(),
                     left_filter.is_some(),
                     unswapped,
                     || {
                         self.check_index_nested_loop_opportunity(
-                            CteNames::Context(ctx),
+                            ctes,
                             &join_source.left,
                             on_condition,
                             &join_type,
@@ -4337,6 +4344,7 @@ impl Executor {
                             left_alias.as_deref(),
                             pushed_limit.is_some(),
                             small_outer,
+                            !right_is_table,
                         )
                     },
                     |(_, strategy, _, _)| matches!(strategy, IndexLookupStrategy::PrimaryKey),
@@ -7423,6 +7431,7 @@ impl Executor {
                 left_alias,
                 right_alias,
                 true,
+                false,
                 false,
             )
         else {
@@ -11424,6 +11433,7 @@ impl Executor {
         right_alias: Option<&str>,
         bounded: bool,
         small_outer: bool,
+        outer_materialized: bool,
     ) -> Option<(
         String,              // table_name
         IndexLookupStrategy, // lookup strategy (index or PK)
@@ -11580,8 +11590,11 @@ impl Executor {
             table.row_count_hint() >= SMALL_OUTER_ROWS.saturating_mul(HOT_INNER_ROWS_PER_KEY);
         let probes = crate::executor::utils::probes_by_equality(&*table, &inner_col_unqualified);
         // A bounded join probes the column. A small outer never probes: its
-        // keys narrow a large table's scan, or a sealed table's side file
-        let narrows = large || (probes && table.has_sealed_rows());
+        // keys narrow a large table, a sealed table through its side file,
+        // or the scan of a column no probe reads, from a side whose size only
+        // running it tells
+        let narrows =
+            large || (probes && table.has_sealed_rows()) || (outer_materialized && !probes);
         if (bounded && probes) || (small_outer && outer_is_sure && narrows) {
             return Some((
                 table_name,
