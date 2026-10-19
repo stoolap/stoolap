@@ -50,10 +50,9 @@ fn after(db: &Database, write: &str, read: &str) -> Result<Value, String> {
     one(db, read)
 }
 
-fn wrong_answers(n: usize, value: &str, wrong: &mut Vec<String>) {
-    let lit = literal(value);
-    let want = Value::text(value);
-    let db = Database::open(&format!("memory://stored_text_{n}")).unwrap();
+/// Every wrong answer for the literal written `lit`, whose value is `want`
+fn wrong_answers(name: &str, lit: &str, want: Value, wrong: &mut Vec<String>) {
+    let db = Database::open(&format!("memory://stored_text_{name}")).unwrap();
     db.execute(
         &format!(
             "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT DEFAULT {lit}, c TEXT CHECK (c <> {lit}))"
@@ -73,10 +72,10 @@ fn wrong_answers(n: usize, value: &str, wrong: &mut Vec<String>) {
         .execute(&format!("INSERT INTO t (id, c) VALUES (2, {lit})"), ())
         .is_ok()
     {
-        wrong.push(format!("{value:?} CHECK let its own value in"));
+        wrong.push(format!("{lit} CHECK let its own value in"));
     }
     if let Err(e) = db.execute("INSERT INTO t (id, c) VALUES (3, 'other')", ()) {
-        wrong.push(format!("{value:?} CHECK refused another value: {e}"));
+        wrong.push(format!("{lit} CHECK refused another value: {e}"));
     }
     answers.push((
         "view",
@@ -109,7 +108,7 @@ fn wrong_answers(n: usize, value: &str, wrong: &mut Vec<String>) {
             let row = rows.next().ok_or("no row")?.map_err(|e| e.to_string())?;
             row.get::<String>(1).map_err(|e| e.to_string())
         });
-    let copy = Database::open(&format!("memory://stored_text_copy_{n}")).unwrap();
+    let copy = Database::open(&format!("memory://stored_text_copy_{name}")).unwrap();
     answers.push((
         "SHOW CREATE TABLE run again",
         shown.and_then(|ddl| {
@@ -123,7 +122,7 @@ fn wrong_answers(n: usize, value: &str, wrong: &mut Vec<String>) {
     ));
     for (context, got) in answers {
         if got.as_ref() != Ok(&want) {
-            wrong.push(format!("{value:?} {context}: gave {got:?}"));
+            wrong.push(format!("{lit} {context}: gave {got:?}, want {want:?}"));
         }
     }
 }
@@ -132,7 +131,42 @@ fn wrong_answers(n: usize, value: &str, wrong: &mut Vec<String>) {
 fn test_a_stored_expression_reads_back_as_written() {
     let mut wrong = Vec::new();
     for (n, value) in VALUES.iter().enumerate() {
-        wrong_answers(n, value, &mut wrong);
+        wrong_answers(
+            &n.to_string(),
+            &literal(value),
+            Value::text(*value),
+            &mut wrong,
+        );
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+#[test]
+fn test_a_stored_typed_literal_reads_back_as_written() {
+    let mut wrong = Vec::new();
+    for (n, lit) in [
+        "TIME 'a\\'b'",
+        "TIME 'a''b'",
+        "TIME 'a\\\\b'",
+        "TIME 'x\\n'",
+        "TIME 'a\\\\'",
+        "TIMESTAMP '2024-01-01 12:00:00'",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let db = Database::open(&format!("memory://typed_value_{n}")).unwrap();
+        let want = one(&db, &format!("SELECT {lit}")).unwrap();
+        let want = match want {
+            Value::Timestamp(_) => one(&db, &format!("SELECT CAST({lit} AS TEXT)")).unwrap(),
+            text => text,
+        };
+        wrong_answers(&format!("typed_{n}"), lit, want, &mut wrong);
     }
     assert!(
         wrong.is_empty(),

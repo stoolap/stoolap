@@ -323,18 +323,33 @@ impl fmt::Display for StringLiteral {
     }
 }
 
-/// `text` as a quoted string the parser reads back as `text`: a quote
-/// doubled, and a backslash doubled where the parser reads backslash escapes
-fn write_quoted(f: &mut fmt::Formatter<'_>, text: &str, backslashes: bool) -> fmt::Result {
+/// `text` as a quoted string the parser reads back as `text`. A `decoded`
+/// text, a plain literal's, has a quote and a backslash doubled; a typed
+/// literal's keeps the lexer's escapes, a backslash with the character after
+/// it, so only a quote of its own is doubled
+fn write_quoted(f: &mut fmt::Formatter<'_>, text: &str, decoded: bool) -> fmt::Result {
     use fmt::Write;
     f.write_char('\'')?;
-    let mut rest = text;
-    while let Some(at) = rest.find(|c| c == '\'' || (backslashes && c == '\\')) {
-        f.write_str(&rest[..=at])?;
-        f.write_char(rest.as_bytes()[at] as char)?;
-        rest = &rest[at + 1..];
+    if !text.contains(['\'', '\\']) {
+        f.write_str(text)?;
+        return f.write_char('\'');
     }
-    f.write_str(rest)?;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if !decoded => {
+                f.write_char(c)?;
+                if let Some(escaped) = chars.next() {
+                    f.write_char(escaped)?;
+                }
+            }
+            '\'' | '\\' => {
+                f.write_char(c)?;
+                f.write_char(c)?;
+            }
+            c => f.write_char(c)?,
+        }
+    }
     f.write_char('\'')
 }
 
