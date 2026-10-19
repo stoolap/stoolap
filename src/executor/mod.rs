@@ -345,8 +345,16 @@ impl Executor {
     }
 
     /// Set this session's isolation level: the level of every transaction
-    /// it begins without naming one, autocommit statements included
+    /// it begins without naming one, autocommit statements included. Waits
+    /// for the session's running statements, which read the level more than once
     pub fn set_default_isolation_level(&self, level: crate::core::IsolationLevel) {
+        let _gate = self.enter(true);
+        self.store_isolation_level(level);
+    }
+
+    /// Writes the session's isolation level; the caller holds the gate
+    /// exclusively
+    fn store_isolation_level(&self, level: crate::core::IsolationLevel) {
         self.default_isolation_level
             .store(level as u8, Ordering::Relaxed);
     }
@@ -465,7 +473,7 @@ impl Executor {
         }
 
         // Try compiled fast paths based on statement type
-        match plan.statement.as_ref() {
+        self.fast_path_until_held(&plan.statement, None, || match plan.statement.as_ref() {
             Statement::Select(stmt) => {
                 self.try_fast_pk_lookup_with_params(stmt, params, &plan.compiled)
             }
@@ -476,7 +484,7 @@ impl Executor {
                 self.try_fast_pk_delete_with_params(stmt, params, &plan.compiled)
             }
             _ => None,
-        }
+        })
     }
 
     /// Execute a SQL query with named parameters
@@ -536,11 +544,11 @@ impl Executor {
             }
 
             let gate = self.enter(changes_session(&cached.statement));
-            let (active_txn_id, ctx) = self.gated_txn_ctx(&gate, ctx);
-
+            // INSERT takes the transaction and its id in one lock section
             if let Statement::Insert(stmt) = cached.statement.as_ref() {
                 return self.execute_insert_with_compiled_cache(stmt, &ctx, &cached.compiled);
             }
+            let (active_txn_id, ctx) = self.gated_txn_ctx(&gate, ctx);
 
             if let Some(result) = self.compiled_fast_paths_until_held(
                 cached.statement.as_ref(),
@@ -578,11 +586,10 @@ impl Executor {
                 .put(sql, stmt_arc.clone(), has_params, param_count);
 
             let gate = self.enter(changes_session(&stmt_arc));
-            let (active_txn_id, ctx) = self.gated_txn_ctx(&gate, ctx);
-
             if let Statement::Insert(stmt) = stmt_arc.as_ref() {
                 return self.execute_insert_with_compiled_cache(stmt, &ctx, &cached_plan.compiled);
             }
+            let (active_txn_id, ctx) = self.gated_txn_ctx(&gate, ctx);
 
             if let Some(result) = self.compiled_fast_paths_until_held(
                 stmt_arc.as_ref(),
@@ -630,7 +637,8 @@ impl Executor {
     }
 
     /// The open transaction's id under `gate`, and `ctx` carrying it for
-    /// CURRENT_TRANSACTION_ID() on whichever path the statement takes
+    /// CURRENT_TRANSACTION_ID() on the compiled and general paths; INSERT
+    /// reads the id in the lock section that takes its table
     fn gated_txn_ctx<'c>(
         &self,
         gate: &StatementGate<'_>,
@@ -665,18 +673,36 @@ impl Executor {
         compiled: &Arc<std::sync::RwLock<query_cache::CompiledExecution>>,
         in_txn: bool,
     ) -> Option<Result<Box<dyn QueryResult>>> {
+        self.fast_path_until_held(statement, Some(ctx), || {
+            self.try_compiled_fast_paths(statement, ctx, compiled, in_txn)
+        })
+    }
+
+    /// Runs a fast path `attempt` for `statement` again, under the bound
+    /// the regular path has, while a truncate or drop overtakes the view of
+    /// a SELECT that took its own; `ctx` is None for borrowed parameters
+    fn fast_path_until_held(
+        &self,
+        statement: &Statement,
+        ctx: Option<&ExecutionContext>,
+        mut attempt: impl FnMut() -> Option<Result<Box<dyn QueryResult>>>,
+    ) -> Option<Result<Box<dyn QueryResult>>> {
         let mut runs = 1;
         loop {
-            let result = self.try_compiled_fast_paths(statement, ctx, compiled, in_txn);
+            let result = attempt();
             let again = matches!(result, Some(Err(Error::ViewOvertaken)))
                 && runs < STATEMENT_RUNS
                 && matches!(statement, Statement::Select(_))
-                && ctx.statement_view().is_none()
+                && ctx.is_none_or(|ctx| ctx.statement_view().is_none())
                 && !self.function_registry.has_registered_functions();
             if !again {
                 return result;
             }
-            if let Err(e) = self.wait_out_destruction(ctx) {
+            let waited = match ctx {
+                Some(ctx) => self.wait_out_destruction(ctx),
+                None => self.wait_out_destruction(&ExecutionContext::new()),
+            };
+            if let Err(e) = waited {
                 return Some(Err(e));
             }
             runs += 1;
@@ -1245,11 +1271,10 @@ impl Executor {
         }
 
         let gate = self.enter(changes_session(&plan.statement));
-        let (active_txn_id, ctx) = self.gated_txn_ctx(&gate, ctx);
-
         if let Statement::Insert(stmt) = plan.statement.as_ref() {
             return self.execute_insert_with_compiled_cache(stmt, &ctx, &plan.compiled);
         }
+        let (active_txn_id, ctx) = self.gated_txn_ctx(&gate, ctx);
         if let Some(result) = self.compiled_fast_paths_until_held(
             plan.statement.as_ref(),
             &ctx,

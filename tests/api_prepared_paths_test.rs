@@ -370,3 +370,44 @@ fn a_missing_named_update_parameter_writes_what_the_general_path_writes() {
         "transaction"
     );
 }
+
+#[test]
+fn an_update_value_that_does_not_convert_fails_only_for_a_row_it_finds() {
+    // RETURNING keeps the statement off the compiled PK path
+    let general = "UPDATE t SET a = $1 WHERE id = $2 RETURNING id";
+    let compiled = "UPDATE t SET a = $1 WHERE id = $2";
+    let run = |name: &str, sql: &str, in_tx: bool, id: i64| {
+        let db = Database::open(&format!("memory://api_paths_bad_{name}_{id}")).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)", ())
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 5)", ()).unwrap();
+        // The first call compiles the plan the second takes
+        let mut outcome = Vec::new();
+        for _ in 0..2 {
+            let result = if in_tx {
+                let mut tx = db.begin().unwrap();
+                let result = tx.query(sql, ("bad", id)).map(|rows| rows.count());
+                tx.rollback().unwrap();
+                result
+            } else {
+                db.query(sql, ("bad", id)).map(|rows| rows.count())
+            };
+            outcome.push(result.is_ok());
+        }
+        outcome
+    };
+    for id in [999, 1] {
+        let expected = run("general", general, false, id);
+        assert_eq!(expected[0], id == 999, "the general path for id {id}");
+        assert_eq!(
+            run("auto", compiled, false, id),
+            expected,
+            "autocommit, id {id}"
+        );
+        assert_eq!(
+            run("tx", compiled, true, id),
+            expected,
+            "transaction, id {id}"
+        );
+    }
+}

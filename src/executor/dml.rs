@@ -1631,6 +1631,16 @@ impl Executor {
             )
         };
 
+        // INSERT is dispatched before the dispatcher puts the transaction
+        // id in the context, so the expressions are given it here
+        let ctx_with_txn;
+        let ctx = match active_txn_id {
+            Some(txn_id) => {
+                ctx_with_txn = ctx.with_transaction_id(txn_id as u64);
+                &ctx_with_txn
+            }
+            None => ctx,
+        };
         // Its query and subqueries read through one view, taken before them;
         // the target keeps the newest
         let ctx_with_view;

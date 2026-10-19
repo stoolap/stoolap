@@ -79,9 +79,7 @@ impl Executor {
                             self.extract_pk_value_from_source(&update.pk_value_source, ctx)?;
                         #[cfg(feature = "test-failpoints")]
                         crate::test_failpoints::compiled_epoch_checked();
-                        return or_normal_path(
-                            self.execute_compiled_pk_update(update, pk_value, ctx, in_txn),
-                        );
+                        return self.execute_compiled_pk_update(update, pk_value, ctx, in_txn);
                     }
                     // Epoch changed - fall through to recompile
                 }
@@ -551,14 +549,16 @@ impl Executor {
     // EXECUTION METHODS
     // ============================================================================
 
-    /// Execute a compiled PK update (extracts values from ctx then delegates to core impl)
+    /// Execute a compiled PK update (extracts values from ctx then delegates
+    /// to core impl). None when a value does not convert to its column: the
+    /// normal path reports that only for a row the WHERE finds
     fn execute_compiled_pk_update(
         &self,
         compiled: &CompiledPkUpdate,
         pk_value: i64,
         ctx: &ExecutionContext,
         in_txn: bool,
-    ) -> Result<Box<dyn QueryResult>> {
+    ) -> Option<Result<Box<dyn QueryResult>>> {
         // Extract constant values; row expressions run per update inside
         // the setter (they read the current row, e.g. SET n = n + 1)
         let mut updates = Vec::with_capacity(compiled.updates.len());
@@ -598,11 +598,12 @@ impl Executor {
                 &compiled.schema.columns[u.column_idx].name,
                 u.column_type,
                 u.column_vector_dims,
-            )?;
+            )
+            .ok()?;
             updates.push((u.column_idx, coerced));
         }
 
-        self.execute_pk_update_minimal(
+        or_normal_path(self.execute_pk_update_minimal(
             &compiled.table_name,
             &compiled.pk_column_name,
             &compiled.schema,
@@ -612,7 +613,7 @@ impl Executor {
             &expr_updates,
             Some(ctx),
             in_txn,
-        )
+        ))
     }
 
     /// Execute a compiled PK delete (delegates to core impl)
@@ -659,9 +660,7 @@ impl Executor {
                 if self.engine.schema_epoch() == update.cached_epoch =>
             {
                 let pk_value = self.extract_pk_value_from_source(&update.pk_value_source, ctx)?;
-                return or_normal_path(
-                    self.execute_compiled_pk_update(update, pk_value, ctx, in_txn),
-                );
+                return self.execute_compiled_pk_update(update, pk_value, ctx, in_txn);
             }
             CompiledExecution::PkUpdate(_)
             | CompiledExecution::NotOptimizable(_)
@@ -791,7 +790,7 @@ impl Executor {
         drop(compiled_guard);
 
         // Execute
-        or_normal_path(self.execute_compiled_pk_update(&compiled_update, pk_value, ctx, in_txn))
+        self.execute_compiled_pk_update(&compiled_update, pk_value, ctx, in_txn)
     }
 
     /// Compile and execute a PK delete, caching the compiled state

@@ -9981,7 +9981,7 @@ impl Executor {
                 if let Some(ref mut tx_state) = *active_tx {
                     tx_state.transaction.set_isolation_level(isolation)?;
                 } else {
-                    self.set_default_isolation_level(isolation);
+                    self.store_isolation_level(isolation);
                 }
 
                 Ok(Box::new(ExecResult::empty()))

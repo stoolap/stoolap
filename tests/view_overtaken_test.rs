@@ -308,3 +308,87 @@ fn a_view_the_caller_gave_is_not_taken_again() {
         Err(Error::ViewOvertaken)
     ));
 }
+
+#[test]
+fn a_compiled_pk_lookup_with_borrowed_parameters_runs_again() {
+    let db = memory("borrowed_pk");
+    let sql = "SELECT v FROM t WHERE id = $1";
+    let prepared = db.prepare(sql).unwrap();
+    let plan = db.cached_plan(sql).unwrap();
+    for _ in 0..2 {
+        // The first runs compile the lookup the last ones take
+        values(db.query(sql, (1,))).unwrap();
+        values(prepared.query((1,))).unwrap();
+    }
+    let entries: [(&str, &dyn Fn() -> stoolap::Result<stoolap::Rows>); 3] = [
+        ("db.query", &|| db.query(sql, (3,))),
+        ("Statement::query", &|| prepared.query((3,))),
+        ("query_plan", &|| db.query_plan(&plan, (3,))),
+    ];
+    for (n, (name, run)) in entries.into_iter().enumerate() {
+        db.execute("DELETE FROM t WHERE id = 3", ()).unwrap();
+        // A commit held while it publishes into t sends the lookup of a
+        // row not hot to a view of its own
+        let (publishing_tx, publishing) = std::sync::mpsc::channel();
+        let (go_tx, go) = std::sync::mpsc::channel::<()>();
+        let writer = db.clone();
+        let id = 100 + n as i64;
+        let commit = std::thread::spawn(move || {
+            fp::after_commit_counted(move || {
+                publishing_tx.send(()).unwrap();
+                go.recv().unwrap();
+            });
+            writer
+                .execute(&format!("INSERT INTO t VALUES ({id}, 0)"), ())
+                .unwrap();
+        });
+        publishing
+            .recv_timeout(Duration::from_secs(15))
+            .expect("the commit is publishing");
+        let ran = Rc::new(Cell::new(false));
+        let (other, flag) = (db.clone(), Rc::clone(&ran));
+        fp::after_statement_view_taken(move || {
+            go_tx.send(()).unwrap();
+            for sql in TRUNCATE_AND_ADD {
+                other.execute(sql, ()).unwrap();
+            }
+            flag.set(true);
+        });
+        let seen = values(run());
+        commit.join().unwrap();
+        assert!(
+            ran.get(),
+            "{name}: the truncate did not land after the view"
+        );
+        assert_eq!(
+            seen.unwrap(),
+            [30],
+            "{name}: row 3 once the truncate is done"
+        );
+        db.execute("INSERT INTO t VALUES (1, 10), (2, 20)", ())
+            .unwrap();
+    }
+}
+
+#[test]
+fn the_isolation_level_holds_still_while_a_statement_of_the_handle_runs() {
+    let db = Arc::new(memory("level_still"));
+    let setter = Rc::new(std::cell::RefCell::new(None));
+    let (handle, slot) = (Arc::clone(&db), Rc::clone(&setter));
+    fp::after_statement_view_taken(move || {
+        let set = std::thread::spawn(move || {
+            handle
+                .set_default_isolation_level(stoolap::IsolationLevel::SnapshotIsolation)
+                .unwrap()
+        });
+        // Long enough for a setter that does not wait to land mid-statement
+        std::thread::sleep(Duration::from_millis(100));
+        *slot.borrow_mut() = Some(set);
+    });
+    let seen = values(db.query("SELECT v FROM t WHERE v > 0 ORDER BY v", ()));
+    let set = setter.borrow_mut().take().expect("the view was taken");
+    set.join().unwrap();
+    assert_eq!(seen.unwrap(), [10, 20], "the statement kept its level");
+    db.set_default_isolation_level(stoolap::IsolationLevel::ReadCommitted)
+        .unwrap();
+}

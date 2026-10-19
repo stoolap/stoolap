@@ -189,8 +189,6 @@ let rows = stmt.query_in(&mut tx, (1,))?;
 tx.commit()?;
 ```
 
-A named parameter that the call does not give binds as NULL.
-
 ## Benefits of Parameters
 
 1. **SQL Injection Prevention**: Parameters are never interpolated into SQL strings
