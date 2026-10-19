@@ -261,6 +261,18 @@ pub(crate) fn split_join_where(
     (safe_left, safe_right, remaining)
 }
 
+/// Whether `expr` is false for every row: a statement constant, so no column
+/// reads as the text of its name, that evaluates to false
+fn false_for_every_row(expr: &Expression, ctx: &ExecutionContext) -> bool {
+    statement_constant(expr, global_registry())
+        && ExpressionEval::compile(expr, &[]).is_ok_and(|eval| {
+            matches!(
+                eval.with_context(ctx).eval_slice(&Row::new()),
+                Ok(Value::Boolean(false))
+            )
+        })
+}
+
 /// The side an index join probes, given what the right table offers
 /// (`unswapped`): an INNER join probes its left table instead from a right
 /// side that is not a base table (a subquery, a CTE, a view), or for a
@@ -1548,26 +1560,17 @@ impl Executor {
         // Short-circuit: if WHERE is a constant-false expression (e.g., 1=0),
         // skip TVF generation entirely and return empty result.
         if let Some(ref where_clause) = stmt.where_clause {
-            if let Ok(eval) = ExpressionEval::compile(where_clause, &[]) {
-                if let Ok(val) = eval.with_context(ctx).eval_slice(&Row::new()) {
-                    if val == Value::Boolean(false) {
-                        let columns = if !tvf_source.column_aliases.is_empty() {
-                            tvf_source
-                                .column_aliases
-                                .iter()
-                                .map(|id| id.value.to_string())
-                                .collect()
-                        } else {
-                            vec!["value".to_string()]
-                        };
-                        return self.execute_query_on_memory_result(
-                            stmt,
-                            ctx,
-                            columns,
-                            RowVec::new(),
-                        );
-                    }
-                }
+            if false_for_every_row(where_clause, ctx) {
+                let columns = if !tvf_source.column_aliases.is_empty() {
+                    tvf_source
+                        .column_aliases
+                        .iter()
+                        .map(|id| id.value.to_string())
+                        .collect()
+                } else {
+                    vec!["value".to_string()]
+                };
+                return self.execute_query_on_memory_result(stmt, ctx, columns, RowVec::new());
             }
         }
 
@@ -4189,13 +4192,7 @@ impl Executor {
         let never = where_for_join
             .as_ref()
             .filter(|_| !classification.where_has_subqueries)
-            .and_then(|w| ExpressionEval::compile(w, &[]).ok())
-            .is_some_and(|eval| {
-                matches!(
-                    eval.with_context(ctx).eval_slice(&Row::new()),
-                    Ok(Value::Boolean(false))
-                )
-            });
+            .is_some_and(|w| false_for_every_row(w, ctx));
 
         // Semi-join reduction optimization for LEFT JOIN + GROUP BY + LIMIT
         // Pattern: LEFT JOIN + GROUP BY on left columns only + LIMIT N + no ORDER BY
@@ -4219,25 +4216,26 @@ impl Executor {
         };
 
         let (left_rows, left_columns, right_rows, right_columns) = if never {
-            let (left_result, left_cols, _, _) = self.execute_table_expression_with_filter_limit(
+            // Not every side honours the filter or the limit, so its rows are
+            // dropped and only its columns kept
+            let (_, left_cols, _, _) = self.execute_table_expression_with_filter_limit(
                 &join_source.left,
                 ctx,
                 where_for_join.as_ref(),
                 Some(0),
                 0,
             )?;
-            let (right_result, right_cols, _, _) = self
-                .execute_table_expression_with_filter_limit(
-                    &join_source.right,
-                    ctx,
-                    where_for_join.as_ref(),
-                    Some(0),
-                    0,
-                )?;
+            let (_, right_cols, _, _) = self.execute_table_expression_with_filter_limit(
+                &join_source.right,
+                ctx,
+                where_for_join.as_ref(),
+                Some(0),
+                0,
+            )?;
             (
-                Self::materialize_result_arc(left_result)?,
+                CompactArc::new(Vec::new()),
                 left_cols,
-                Self::materialize_result_arc(right_result)?,
+                CompactArc::new(Vec::new()),
                 right_cols,
             )
         } else if let Some(plan) = semijoin_limit {

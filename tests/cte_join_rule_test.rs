@@ -150,6 +150,20 @@ fn a_join_where_reads_columns_and_aggregates_as_written() {
             vec!["[Integer(1)]"],
         ),
         (
+            "SELECT x FROM (VALUES (1)) AS a(x) CROSS JOIN (VALUES (2)) AS b(y) WHERE 1 = 0",
+            vec![],
+        ),
+        (
+            "WITH c(x) AS (SELECT 'yes'), d(k) AS (SELECT 1) \
+             SELECT COUNT(*) FROM c CROSS JOIN d WHERE \"x\" = 'yes'",
+            vec!["[Integer(1)]"],
+        ),
+        (
+            "SELECT COUNT(*) FROM generate_series(1, 3) \
+             WHERE CAST(\"value\" AS TEXT) <> 'value'",
+            vec!["[Integer(3)]"],
+        ),
+        (
             "WITH c(id) AS (SELECT 1), d(k) AS (SELECT 1) \
              SELECT COUNT(*) FROM c JOIN d ON c.id = d.k WHERE 1 = 0",
             vec!["[Integer(0)]"],
