@@ -24,6 +24,10 @@ fn open(db: Database, seal: bool) -> Database {
         "INSERT INTO u VALUES (1, 1, 1), (2, 1, 10), (3, 2, NULL), (4, NULL, 4), (5, 4, 4)",
         "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, x INTEGER)",
         "INSERT INTO t VALUES (1, 1, 1), (2, 2, 2), (4, 4, 4)",
+        "CREATE TABLE e (id INTEGER PRIMARY KEY, s TEXT, w TEXT)",
+        "INSERT INTO e VALUES (1, 'a', '!'), (2, 'b', '!')",
+        "CREATE TABLE q (id INTEGER PRIMARY KEY, \"a.b\" INTEGER)",
+        "INSERT INTO q VALUES (1, 5), (2, 6)",
     ] {
         db.execute(sql, ()).unwrap();
     }
@@ -54,6 +58,8 @@ const REFUSED: &[&str] = &[
     "SELECT u.v, COUNT(*) FROM u GROUP BY k",
     "SELECT \"v\", COUNT(*) FROM u GROUP BY k",
     "SELECT \"v\" || 'x', COUNT(*) FROM u GROUP BY k",
+    "SELECT s LIKE 'a' ESCAPE \"w\", COUNT(*) FROM e GROUP BY s",
+    "SELECT \"b\", COUNT(*) FROM q",
     "SELECT k, COUNT(*) FROM u GROUP BY k HAVING \"v\" > 1",
     "SELECT k, COUNT(*) FROM u GROUP BY k ORDER BY \"v\"",
     "SELECT v AS w, COUNT(*) FROM u GROUP BY k",
@@ -98,6 +104,14 @@ const ANSWERED: &[(&str, &[&str])] = &[
     (
         "SELECT \"w\", COUNT(*) FROM u WHERE k = 1 GROUP BY k",
         &["w|2"],
+    ),
+    (
+        "SELECT \"b\", COUNT(*) FROM q GROUP BY \"a.b\"",
+        &["5|1", "6|1"],
+    ),
+    (
+        "SELECT id, 11 IN (SELECT MAX(v) + t.k FROM u) FROM t",
+        &["1|true", "2|false", "4|false"],
     ),
     (
         "SELECT id FROM t WHERE x + 1 = (SELECT u.k + t.k FROM u WHERE u.k = 1 GROUP BY 1)",

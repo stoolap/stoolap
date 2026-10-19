@@ -363,16 +363,16 @@ pub(crate) fn ungrouped_column(name: &str) -> crate::core::Error {
 }
 
 /// A column of `source` that `stmt` reads outside every GROUP BY item and
-/// aggregate call, in its SELECT list, HAVING or ORDER BY. A name HAVING
-/// or ORDER BY reads as a SELECT alias is no column; a subquery is its own scope
+/// aggregate call, in its SELECT list, HAVING or ORDER BY. Each name binds
+/// as the compiler binds it, the outer row of `ctx` included; a HAVING name
+/// or a bare ORDER BY name a SELECT alias carries is the alias's
 fn ungrouped_read(
     stmt: &SelectStatement,
     items: &[GroupByItem],
     source: &[String],
+    ctx: &ExecutionContext,
 ) -> Option<String> {
-    fn last(name: &str) -> &str {
-        name.rsplit('.').next().unwrap_or(name)
-    }
+    use std::cell::OnceCell;
     let grouped_exprs: smallvec::SmallVec<[ExprKey; 4]> = items
         .iter()
         .filter_map(|item| match item {
@@ -380,91 +380,98 @@ fn ungrouped_read(
             GroupByItem::Column(_) => None,
         })
         .collect();
-    let read = |name: &str, by_alias: bool| {
-        let name = last(name);
-        let same = |other: &str| last(other).eq_ignore_ascii_case(name);
-        let column = source.iter().any(|c| same(c));
-        let grouped = items
-            .iter()
-            .any(|item| matches!(item, GroupByItem::Column(c) if same(c)));
-        let alias = by_alias
-            && stmt.columns.iter().any(
-                |c| matches!(c, Expression::Aliased(a) if a.alias.value.eq_ignore_ascii_case(name)),
-            );
-        column && !grouped && !alias
+    let skip = |expr: &Expression| match expr {
+        Expression::FunctionCall(call) if is_aggregate_function(&call.function) => true,
+        _ => !grouped_exprs.is_empty() && grouped_exprs.contains(&ExprKey::of(expr)),
     };
-    fn walk(
-        expr: &Expression,
-        by_alias: bool,
-        grouped: &[ExprKey],
-        read: &dyn Fn(&str, bool) -> bool,
-    ) -> Option<String> {
-        if !grouped.is_empty() && grouped.contains(&ExprKey::of(expr)) {
-            return None;
-        }
-        let each = |exprs: &mut dyn Iterator<Item = &Expression>| {
-            let mut found = None;
-            for e in exprs {
-                found = walk(e, by_alias, grouped, read);
-                if found.is_some() {
-                    break;
-                }
+    // A reference spelled as a group column binds as that column does
+    let spelled_grouped = |reference: &Expression| {
+        items.iter().any(|item| match (item, reference) {
+            (GroupByItem::Column(c), Expression::Identifier(id)) => {
+                c.eq_ignore_ascii_case(&id.value)
             }
-            found
+            (GroupByItem::Column(c), Expression::QualifiedIdentifier(q)) => {
+                c.split_once('.').is_some_and(|(table, name)| {
+                    table.eq_ignore_ascii_case(&q.qualifier.value)
+                        && name.eq_ignore_ascii_case(&q.name.value)
+                })
+            }
+            _ => false,
+        })
+    };
+    let outer: OnceCell<Option<Vec<String>>> = OnceCell::new();
+    let compile: OnceCell<super::expression::CompileContext<'_>> = OnceCell::new();
+    let column_of = |reference: &Expression| {
+        let compile = compile.get_or_init(|| {
+            let outer = outer.get_or_init(|| {
+                ctx.outer_row()
+                    .map(|row| row.keys().map(|k| k.to_string()).collect())
+            });
+            let compile = super::expression::CompileContext::new(
+                source,
+                crate::functions::registry::global_registry(),
+            );
+            match outer {
+                Some(outer) => compile.with_outer_columns(outer),
+                None => compile,
+            }
+        });
+        compile.reference(reference).and_then(|r| r.row_column())
+    };
+    let grouped_columns: OnceCell<smallvec::SmallVec<[Option<u16>; 4]>> = OnceCell::new();
+    let is_alias = |reference: &Expression| match reference {
+        Expression::Identifier(id) => stmt
+            .columns
+            .iter()
+            .any(|c| matches!(c, Expression::Aliased(a) if a.alias.value_lower == id.value_lower)),
+        _ => false,
+    };
+    let mut found = None;
+    let mut check = |reference: &Expression, aliases: bool| {
+        if found.is_some() || spelled_grouped(reference) || (aliases && is_alias(reference)) {
+            return;
+        }
+        let Some(column) = column_of(reference) else {
+            return;
         };
-        match expr {
-            Expression::Identifier(id) => read(&id.value, by_alias).then(|| id.value.to_string()),
-            Expression::QualifiedIdentifier(q) => read(&q.name.value, false).then(|| q.to_string()),
-            Expression::FunctionCall(call) if is_aggregate_function(&call.function) => None,
-            Expression::FunctionCall(call) => each(&mut call.arguments.iter()),
-            Expression::Aliased(a) => walk(&a.expression, by_alias, grouped, read),
-            Expression::Prefix(p) => walk(&p.right, by_alias, grouped, read),
-            Expression::Infix(i) => each(&mut [&*i.left, &*i.right].into_iter()),
-            Expression::Between(b) => each(&mut [&*b.expr, &*b.lower, &*b.upper].into_iter()),
-            Expression::Like(l) => each(&mut [&*l.left, &*l.pattern].into_iter()),
-            Expression::Cast(c) => walk(&c.expr, by_alias, grouped, read),
-            Expression::Distinct(d) => walk(&d.expr, by_alias, grouped, read),
-            Expression::QuantifiedSet(q) => walk(&q.left, by_alias, grouped, read),
-            Expression::List(l) => each(&mut l.elements.iter()),
-            Expression::ExpressionList(l) => each(&mut l.expressions.iter()),
-            Expression::In(i) => {
-                walk(&i.left, by_alias, grouped, read).or_else(|| match &*i.right {
-                    Expression::ScalarSubquery(_) => None,
-                    right => walk(right, by_alias, grouped, read),
-                })
-            }
-            Expression::Case(c) => c
-                .value
-                .as_deref()
-                .and_then(|v| walk(v, by_alias, grouped, read))
-                .or_else(|| {
-                    c.when_clauses.iter().find_map(|w| {
-                        walk(&w.condition, by_alias, grouped, read)
-                            .or_else(|| walk(&w.then_result, by_alias, grouped, read))
-                    })
-                })
-                .or_else(|| {
-                    c.else_value
-                        .as_deref()
-                        .and_then(|e| walk(e, by_alias, grouped, read))
-                }),
-            _ => None,
-        }
-    }
-    let read: &dyn Fn(&str, bool) -> bool = &read;
-    stmt.columns
-        .iter()
-        .find_map(|c| walk(c, false, &grouped_exprs, read))
-        .or_else(|| {
-            stmt.having
-                .as_deref()
-                .and_then(|h| walk(h, true, &grouped_exprs, read))
-        })
-        .or_else(|| {
-            stmt.order_by
+        let grouped = grouped_columns.get_or_init(|| {
+            items
                 .iter()
-                .find_map(|o| walk(&o.expression, true, &grouped_exprs, read))
-        })
+                .filter_map(|item| match item {
+                    GroupByItem::Column(name) => Some(column_of(&Expression::Identifier(
+                        crate::parser::ast::Identifier::new(
+                            crate::parser::token::Token::new(
+                                crate::parser::token::TokenType::Identifier,
+                                name,
+                                crate::parser::token::Position::default(),
+                            ),
+                            name.as_str(),
+                        ),
+                    ))),
+                    GroupByItem::Expression { .. } => None,
+                })
+                .collect()
+        });
+        if !grouped.contains(&Some(column)) {
+            found = Some(match reference {
+                Expression::Identifier(id) => id.value.to_string(),
+                other => other.to_string(),
+            });
+        }
+    };
+    for column in &stmt.columns {
+        super::utils::visit_column_refs_outside(column, &skip, &mut |r| check(r, false));
+    }
+    if let Some(having) = stmt.having.as_deref() {
+        super::utils::visit_column_refs_outside(having, &skip, &mut |r| check(r, true));
+    }
+    for ob in &stmt.order_by {
+        if super::utils::order_by_names_an_alias(&ob.expression, stmt) {
+            continue;
+        }
+        super::utils::visit_column_refs_outside(&ob.expression, &skip, &mut |r| check(r, false));
+    }
+    found
 }
 
 /// The slot of each group item and aggregate in an aggregated row, which
@@ -1500,7 +1507,7 @@ impl Executor {
     ) -> Result<(Vec<String>, RowVec)> {
         // Parse GROUP BY items for GROUPING() function support
         let group_by_columns = self.parse_group_by(stmt, &agg_columns)?;
-        if let Some(name) = ungrouped_read(stmt, &group_by_columns, source_columns) {
+        if let Some(name) = ungrouped_read(stmt, &group_by_columns, source_columns, ctx) {
             return Err(ungrouped_column(&name));
         }
 

@@ -886,14 +886,30 @@ pub(crate) fn visit_column_refs<'e>(
     expr: &'e Expression,
     visit: &mut dyn FnMut(&'e Expression),
 ) -> bool {
+    visit_column_refs_outside(expr, &|_| false, visit)
+}
+
+/// `visit_column_refs` past every part `skip` takes, whose references are not visited
+pub(crate) fn visit_column_refs_outside<'e>(
+    expr: &'e Expression,
+    skip: &dyn Fn(&Expression) -> bool,
+    visit: &mut dyn FnMut(&'e Expression),
+) -> bool {
     fn all<'e>(
         exprs: impl IntoIterator<Item = &'e Expression>,
+        skip: &dyn Fn(&Expression) -> bool,
         visit: &mut dyn FnMut(&'e Expression),
     ) -> bool {
-        exprs
-            .into_iter()
-            .fold(true, |read, e| visit_column_refs(e, visit) & read)
+        exprs.into_iter().fold(true, |read, e| {
+            visit_column_refs_outside(e, skip, visit) & read
+        })
     }
+    if skip(expr) {
+        return true;
+    }
+    let one = |e: &'e Expression, visit: &mut dyn FnMut(&'e Expression)| {
+        visit_column_refs_outside(e, skip, visit)
+    };
     match expr {
         Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => {
             visit(expr);
@@ -906,19 +922,20 @@ pub(crate) fn visit_column_refs<'e>(
         | Expression::NullLiteral(_)
         | Expression::IntervalLiteral(_)
         | Expression::Parameter(_) => true,
-        Expression::Prefix(p) => visit_column_refs(&p.right, visit),
-        Expression::Infix(i) => all([&*i.left, &*i.right], visit),
-        Expression::List(l) => all(&l.elements, visit),
-        Expression::ExpressionList(l) => all(&l.expressions, visit),
-        Expression::Distinct(d) => visit_column_refs(&d.expr, visit),
-        Expression::In(i) => all([&*i.left, &*i.right], visit),
-        Expression::InHashSet(h) => visit_column_refs(&h.column, visit),
-        Expression::QuantifiedSet(q) => visit_column_refs(&q.left, visit),
-        Expression::Between(b) => all([&*b.expr, &*b.lower, &*b.upper], visit),
+        Expression::Prefix(p) => one(&p.right, visit),
+        Expression::Infix(i) => all([&*i.left, &*i.right], skip, visit),
+        Expression::List(l) => all(&l.elements, skip, visit),
+        Expression::ExpressionList(l) => all(&l.expressions, skip, visit),
+        Expression::Distinct(d) => one(&d.expr, visit),
+        Expression::In(i) => all([&*i.left, &*i.right], skip, visit),
+        Expression::InHashSet(h) => one(&h.column, visit),
+        Expression::QuantifiedSet(q) => one(&q.left, visit),
+        Expression::Between(b) => all([&*b.expr, &*b.lower, &*b.upper], skip, visit),
         Expression::Like(l) => all(
             [&*l.left, &*l.pattern]
                 .into_iter()
                 .chain(l.escape.as_deref()),
+            skip,
             visit,
         ),
         Expression::Case(c) => all(
@@ -931,18 +948,20 @@ pub(crate) fn visit_column_refs<'e>(
                         .flat_map(|w| [&w.condition, &w.then_result]),
                 )
                 .chain(c.else_value.as_deref()),
+            skip,
             visit,
         ),
-        Expression::Cast(c) => visit_column_refs(&c.expr, visit),
+        Expression::Cast(c) => one(&c.expr, visit),
         Expression::FunctionCall(f) => all(
             f.arguments
                 .iter()
                 .filter(|a| !matches!(a, Expression::Star(_)))
                 .chain(f.filter.as_deref())
                 .chain(f.order_by.iter().map(|o| &o.expression)),
+            skip,
             visit,
         ),
-        Expression::Aliased(a) => visit_column_refs(&a.expression, visit),
+        Expression::Aliased(a) => one(&a.expression, visit),
         _ => false,
     }
 }
