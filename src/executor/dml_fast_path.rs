@@ -670,7 +670,7 @@ impl Executor {
 
         // Validate pattern
         let where_clause = stmt.where_clause.as_ref()?;
-        if !stmt.returning.is_empty() {
+        if !stmt.returning.is_empty() || stmt.with.is_some() {
             *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
             return None;
         }
@@ -826,7 +826,7 @@ impl Executor {
 
         // Validate pattern
         let where_clause = stmt.where_clause.as_ref()?;
-        if !stmt.returning.is_empty() {
+        if !stmt.returning.is_empty() || stmt.with.is_some() {
             *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
             return None;
         }

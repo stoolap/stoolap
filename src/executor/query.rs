@@ -4580,10 +4580,9 @@ impl Executor {
                 // continuation finds that a commit moved rows under it
                 let mut snapshot = match ctx.statement_snapshot() {
                     Some(snapshot) => snapshot.clone(),
-                    None => self.new_statement_snapshot(
-                        crate::core::IsolationLevel::ReadCommitted,
-                        ctx.statement_view(),
-                    )?,
+                    None => {
+                        self.new_statement_snapshot(self.isolation_level(), ctx.statement_view())?
+                    }
                 };
                 let mut ctx_join = ctx.with_statement_snapshot(snapshot.clone());
                 if small_outer {
@@ -7558,10 +7557,7 @@ impl Executor {
         // explicit transaction the outer side is read whole
         let mut snapshot = match ctx.statement_snapshot() {
             Some(snapshot) => snapshot.clone(),
-            None => self.new_statement_snapshot(
-                crate::core::IsolationLevel::ReadCommitted,
-                ctx.statement_view(),
-            )?,
+            None => self.new_statement_snapshot(self.isolation_level(), ctx.statement_view())?,
         };
         let mut ctx_join = ctx.with_statement_snapshot(snapshot.clone());
         let in_explicit_transaction = self.active_transaction.lock().unwrap().is_some();

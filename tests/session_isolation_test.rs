@@ -140,3 +140,42 @@ fn prepared_statements_read_at_the_transaction_s_level() {
     assert_eq!(value(&mut tx), before, "snapshot read through query_in");
     tx.commit().unwrap();
 }
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn an_index_join_reads_one_snapshot_at_the_handle_s_snapshot_level() {
+    let db = Database::open("memory://session_iso_join").unwrap();
+    for table in ["a", "b"] {
+        db.execute(
+            &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, v INTEGER)"),
+            (),
+        )
+        .unwrap();
+        db.execute(&format!("INSERT INTO {table} VALUES (1, 0)"), ())
+            .unwrap();
+    }
+    db.execute("SET isolation_level = 'SNAPSHOT'", ()).unwrap();
+    let writer = db.clone();
+    let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+    let hook_ran = ran.clone();
+    stoolap::test_failpoints::after_join_inner_opened(move || {
+        hook_ran.set(true);
+        writer.execute("BEGIN", ()).unwrap();
+        writer
+            .execute("UPDATE a SET v = 1 WHERE id = 1", ())
+            .unwrap();
+        writer
+            .execute("UPDATE b SET v = 1 WHERE id = 1", ())
+            .unwrap();
+        writer.execute("COMMIT", ()).unwrap();
+    });
+    let row = db
+        .query("SELECT a.v, b.v FROM a JOIN b ON a.id = b.id LIMIT 1", ())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    assert!(ran.get(), "the commit landed inside the index join");
+    let pair: (i64, i64) = (row.get(0).unwrap(), row.get(1).unwrap());
+    assert_eq!(pair.0, pair.1, "both sides from one snapshot, got {pair:?}");
+}

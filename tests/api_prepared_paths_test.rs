@@ -411,3 +411,22 @@ fn an_update_value_that_does_not_convert_fails_only_for_a_row_it_finds() {
         );
     }
 }
+
+#[test]
+fn a_point_write_with_a_cte_resolves_the_cte_on_every_path() {
+    let db = open("api_paths_with_cte");
+    for sql in [
+        "WITH x AS (SELECT * FROM missing_table) UPDATE t SET name = 'z' WHERE id = 1",
+        "WITH x AS (SELECT * FROM missing_table) DELETE FROM t WHERE id = 1",
+    ] {
+        // The first call compiles the plan the second takes
+        for attempt in 0..2 {
+            assert!(db.execute(sql, ()).is_err(), "autocommit {attempt}: {sql}");
+            let mut tx = db.begin().unwrap();
+            assert!(tx.execute(sql, ()).is_err(), "transaction {attempt}: {sql}");
+            tx.rollback().unwrap();
+        }
+    }
+    let name: String = db.query_one("SELECT name FROM t WHERE id = 1", ()).unwrap();
+    assert_eq!(name, "a", "no write went through");
+}
