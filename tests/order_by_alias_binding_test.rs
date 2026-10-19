@@ -200,6 +200,11 @@ fn an_order_by_name_binds_the_output_column_and_a_qualified_one_the_input() {
             vec![1, 2, 3],
         ),
         (
+            "WITH c(id) AS (SELECT id FROM t) SELECT id AS x, id * 2 AS id FROM c ORDER BY (SELECT -3 * c.id) + id * 2",
+            vec![],
+            vec![3, 2, 1],
+        ),
+        (
             "WITH g (id, n) AS (SELECT id, COUNT(*) FROM t GROUP BY id) SELECT -g.id AS id FROM g LEFT JOIN s ON s.id = g.id ORDER BY id LIMIT 2",
             vec![],
             vec![-3, -2],
@@ -434,6 +439,13 @@ fn the_rule_holds_for_every_source_and_pipeline() {
         ("-k AS k", "(SELECT src.k)", &input, 0),
         ("k AS x", "k, (SELECT -src.k)", &input, 0),
         ("k AS x", "(SELECT -src.k) DESC", &input, 0),
+        ("-k AS k", "(SELECT 0 * src.k) + k", &input, 0),
+        (
+            "k AS x, k * 2 AS k",
+            "(SELECT -3 * src.k) + k * 2",
+            &output,
+            0,
+        ),
     ];
     // (name, DISTINCT, extra item, GROUP BY, LIMIT/OFFSET, prepared)
     let pipelines = [

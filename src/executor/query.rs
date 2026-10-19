@@ -1028,22 +1028,21 @@ impl Executor {
                 crate::test_failpoints::general_path_reached(
                     crate::test_failpoints::GeneralPath::OrderByEvaluator,
                 );
+                // What a sort expression reads from the row, for every
+                // evaluator below: an aggregate the column computing it, a
+                // name the input column at the position the layout gives it
+                let mut sort_slots = aggregate_slots;
+                if let Some(layout) = layout {
+                    visit_order_by_inputs(stmt, &mut |column, key| {
+                        if let Some(position) = layout.position(&key) {
+                            sort_slots.entry(ExprKey::of(column)).or_insert(position);
+                        }
+                    });
+                }
                 let mut evaluator = CompiledEvaluator::new(&self.function_registry);
                 evaluator = evaluator.with_context(ctx);
                 evaluator.init_columns(&columns);
-                // An aggregate inside a sort key reads the column computing it
-                evaluator.add_aggregate_aliases(&aggregate_slots);
-                // A name inside a sort expression reads the input column, at
-                // the position the layout gives it
-                if let Some(layout) = layout {
-                    let mut input_slots: FxHashMap<ExprKey, usize> = FxHashMap::default();
-                    visit_order_by_inputs(stmt, &mut |column, key| {
-                        if let Some(position) = layout.position(&key) {
-                            input_slots.entry(ExprKey::of(column)).or_insert(position);
-                        }
-                    });
-                    evaluator.add_aggregate_aliases(&input_slots);
-                }
+                evaluator.add_aggregate_aliases(&sort_slots);
 
                 // Check if any ORDER BY expression contains a correlated subquery
                 // Use cached classification to avoid expensive AST traversal
@@ -1167,6 +1166,7 @@ impl Executor {
                                         let mut corr_eval =
                                             CompiledEvaluator::new(&self.function_registry);
                                         corr_eval.init_columns(&columns);
+                                        corr_eval.add_aggregate_aliases(&sort_slots);
                                         corr_eval.set_row_array(row);
                                         corr_eval = corr_eval.with_context(&correlated_ctx);
                                         corr_eval.evaluate(&processed_expr)
