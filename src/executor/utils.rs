@@ -2008,8 +2008,53 @@ pub fn expression_to_string(expr: &Expression) -> String {
                 cast.type_name
             )
         }
+        // The call as an aggregate names it, then OVER as the query wrote it
+        Expression::Window(window) => {
+            let mut parts: Vec<String> = Vec::new();
+            if !window.partition_by.is_empty() {
+                let keys: Vec<String> = window
+                    .partition_by
+                    .iter()
+                    .map(expression_to_string)
+                    .collect();
+                parts.push(format!("PARTITION BY {}", keys.join(", ")));
+            }
+            if !window.order_by.is_empty() {
+                let keys: Vec<String> = window.order_by.iter().map(order_key_to_string).collect();
+                parts.push(format!("ORDER BY {}", keys.join(", ")));
+            }
+            if let Some(frame) = &window.frame {
+                parts.push(frame.to_string());
+            }
+            let over = match (&window.window_ref, parts.is_empty()) {
+                (Some(name), true) => name.to_string(),
+                (name, _) => {
+                    let name = name.iter().map(|n| n.to_string());
+                    format!("({})", name.chain(parts).collect::<Vec<_>>().join(" "))
+                }
+            };
+            format!(
+                "{} OVER {}",
+                function_call_to_string(&window.function),
+                over
+            )
+        }
         _ => format!("{}", expr),
     }
+}
+
+/// An ORDER BY key as written: ASC is the default and is left out
+fn order_key_to_string(key: &crate::parser::ast::OrderByExpression) -> String {
+    let mut text = expression_to_string(&key.expression);
+    if !key.ascending {
+        text.push_str(" DESC");
+    }
+    match key.nulls_first {
+        Some(true) => text.push_str(" NULLS FIRST"),
+        Some(false) => text.push_str(" NULLS LAST"),
+        None => {}
+    }
+    text
 }
 
 /// How tightly an infix operator binds, higher first

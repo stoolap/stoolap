@@ -1573,9 +1573,9 @@ impl Executor {
 
         for col_expr in &stmt.columns {
             match col_expr {
-                Expression::Window(window_expr) => {
-                    // Window function - use pre-computed values
-                    let output_name = format!("{}()", window_expr.function.function);
+                Expression::Window(_) => {
+                    // Window function - use pre-computed values, named as written
+                    let output_name = super::utils::expression_to_string(col_expr);
                     let key = if wf_idx < window_functions.len() {
                         window_functions[wf_idx].column_name.to_lowercase()
                     } else {
