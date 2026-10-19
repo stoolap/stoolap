@@ -1377,7 +1377,9 @@ impl Executor {
                         }
                     }
                     _ => {
-                        // The SELECT column computing the same expression, else the column named after it
+                        // The SELECT column computing the same expression, else the
+                        // hidden column carried for it, as ORDER BY reads them, else
+                        // the column named after it
                         let key = ExprKey::of(expr);
                         select_exprs
                             .filter(|sel| {
@@ -1386,6 +1388,11 @@ impl Executor {
                                 })
                             })
                             .and_then(|sel| sel.iter().position(|s| ExprKey::of(s) == key))
+                            .or_else(|| {
+                                result_columns
+                                    .iter()
+                                    .position(|c| ExprKey::from_hidden_column_name(c) == Some(key))
+                            })
                             .or_else(|| {
                                 let expr_str = expr.to_string();
                                 result_columns.iter().position(|c| *c == expr_str)

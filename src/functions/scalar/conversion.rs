@@ -254,19 +254,8 @@ impl ScalarFunction for CollateFunction {
             return Ok(Value::null_unknown());
         }
 
-        // Convert first argument to string
-        let s = match &args[0] {
-            Value::Text(s) => s.to_string(),
-            Value::Integer(i) => i.to_string(),
-            Value::Float(f) => f.to_string(),
-            Value::Boolean(b) => b.to_string(),
-            Value::Timestamp(t) => t.to_rfc3339(),
-            Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
-                std::str::from_utf8(&data[1..]).unwrap_or("").to_string()
-            }
-            Value::Extension(_) => String::new(),
-            Value::Null(_) => return Ok(Value::null_unknown()),
-        };
+        // The first argument as text
+        let s = args[0].as_string().unwrap_or_default();
 
         // Get collation name
         let collation = match &args[1] {

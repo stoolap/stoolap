@@ -23,6 +23,8 @@ function_name([expression]) OVER (
 - **ORDER BY**: Defines the order of rows within each partition
 - **frame_clause**: Defines which rows within the partition to include (see [Window Frames](#window-frames))
 
+A window function column without an alias is named as the query wrote it, its OVER clause included: `SELECT SUM(price) OVER (PARTITION BY category)` gives a column named `SUM(price) OVER (PARTITION BY category)`. The call is written as an aggregate column is named, so a FILTER or the call's own ORDER BY is not part of the name.
+
 ## Available Window Functions
 
 ### Ranking Functions

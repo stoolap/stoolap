@@ -140,7 +140,7 @@ The same conversion applies wherever a value becomes an INTEGER: a CAST, a value
 - **From TIMESTAMP**: RFC 3339 in UTC ("2023-05-15T14:30:00+00:00"), with the fractional seconds the value holds, up to nanoseconds ("2023-05-15T14:30:00.123456789+00:00")
 - **From NULL**: Returns NULL (typed as TEXT)
 
-The same conversion applies wherever a value becomes a TEXT: a CAST, and a value written into a TEXT column by INSERT, UPDATE, upsert or a DEFAULT. A typed literal such as `TIMESTAMP '2023-05-15 14:30:00'` or `DATE '2023-05-15'` is a TIMESTAMP, so written into a TEXT column it is stored as `'2023-05-15T14:30:00+00:00'`, not as the text between its quotes. A plain string literal is stored as written.
+The same conversion applies wherever a value becomes a TEXT: a CAST, a value written into a TEXT column by INSERT, UPDATE, upsert or a DEFAULT, `||`, and every function that reads its argument as text, such as `CONCAT`, `CONCAT_WS`, `UPPER`, `LENGTH`, `SUBSTRING`, `REPLACE`, `LPAD` and `STRING_AGG`. So `CONCAT_WS('', 1e20)` is `'1e20'`, as `CAST(1e20 AS TEXT)` is. A typed literal such as `TIMESTAMP '2023-05-15 14:30:00'` or `DATE '2023-05-15'` is a TIMESTAMP, so written into a TEXT column it is stored as `'2023-05-15T14:30:00+00:00'`, not as the text between its quotes. A plain string literal is stored as written.
 
 ### To BOOLEAN
 

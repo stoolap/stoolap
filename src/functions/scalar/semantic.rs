@@ -246,8 +246,9 @@ impl ScalarFunction for EmbedFunction {
         let text = match &args[0] {
             Value::Null(_) => return Ok(Value::null_unknown()),
             Value::Text(s) => s.as_ref(),
-            Value::Integer(i) => return embed_and_wrap(&i.to_string()),
-            Value::Float(f) => return embed_and_wrap(&f.to_string()),
+            Value::Integer(_) | Value::Float(_) => {
+                return embed_and_wrap(&args[0].as_string().unwrap_or_default())
+            }
             other => {
                 return Err(Error::invalid_argument(format!(
                     "EMBED requires TEXT argument, got {:?}",

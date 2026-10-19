@@ -114,7 +114,7 @@ fn an_index_join_keeps_projections_column_order_and_aliases() {
     let cases: [(String, Vec<&str>, Vec<&str>); 9] = [
         (
             format!("SELECT *, COUNT(*) OVER () {respelled}"),
-            vec!["b.id", "b.aid", "b.w", "x.ID", "x.k", "x.v", "COUNT()"],
+            vec!["b.id", "b.aid", "b.w", "x.ID", "x.k", "x.v", "COUNT(*) OVER ()"],
             vec![
                 "[Integer(1), Integer(1), Integer(5), Integer(1), Integer(10), Integer(100), Integer(2)]",
                 "[Integer(2), Integer(2), Integer(6), Integer(2), Integer(1), Integer(200), Integer(2)]",
@@ -122,7 +122,7 @@ fn an_index_join_keeps_projections_column_order_and_aliases() {
         ),
         (
             format!("SELECT *, COUNT(*) OVER () {fewer}"),
-            vec!["b.id", "b.aid", "b.w", "x.id", "x.k", "COUNT()"],
+            vec!["b.id", "b.aid", "b.w", "x.id", "x.k", "COUNT(*) OVER ()"],
             vec![
                 "[Integer(1), Integer(1), Integer(5), Integer(1), Integer(10), Integer(2)]",
                 "[Integer(2), Integer(2), Integer(6), Integer(2), Integer(1), Integer(2)]",
@@ -153,7 +153,7 @@ fn an_index_join_keeps_projections_column_order_and_aliases() {
         ),
         (
             format!("SELECT *, COUNT(*) OVER () {swapped}"),
-            vec!["b.id", "b.aid", "b.w", "x.id", "x.k", "COUNT()"],
+            vec!["b.id", "b.aid", "b.w", "x.id", "x.k", "COUNT(*) OVER ()"],
             vec!["[Integer(2), Integer(2), Integer(6), Integer(2), Integer(1), Integer(1)]"],
         ),
         (
@@ -163,7 +163,7 @@ fn an_index_join_keeps_projections_column_order_and_aliases() {
         ),
         (
             format!("SELECT a.v + b.w AS total, COUNT(*) OVER () {aliased}"),
-            vec!["total", "COUNT()"],
+            vec!["total", "COUNT(*) OVER ()"],
             vec!["[Integer(105), Integer(2)]", "[Integer(206), Integer(2)]"],
         ),
     ];

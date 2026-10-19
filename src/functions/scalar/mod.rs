@@ -84,7 +84,7 @@ pub use utility::{
     NullIfFunction, SleepFunction, TypeOfFunction,
 };
 
-use crate::core::{DataType, Value};
+use crate::core::Value;
 
 /// Macro to validate argument count for scalar functions.
 ///
@@ -134,26 +134,9 @@ pub fn value_as_str(value: &Value) -> Option<&str> {
     }
 }
 
-/// Convert a Value to a string representation
+/// A Value as text, the form [`Value::text_form`] gives; empty for NULL
 pub fn value_to_string(value: &Value) -> String {
-    if value.is_null() {
-        return String::new();
-    }
-    match value {
-        Value::Null(_) => String::new(),
-        Value::Integer(i) => i.to_string(),
-        Value::Float(f) => f.to_string(),
-        Value::Text(s) => s.to_string(),
-        Value::Boolean(b) => b.to_string(),
-        Value::Timestamp(t) => t.to_rfc3339(),
-        Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
-            std::str::from_utf8(&data[1..]).unwrap_or("").to_string()
-        }
-        Value::Extension(data) if data.first() == Some(&(DataType::Vector as u8)) => {
-            crate::core::value::format_vector_bytes(&data[1..])
-        }
-        Value::Extension(_) => String::new(),
-    }
+    value.as_string().unwrap_or_default()
 }
 
 /// Try to convert a Value to f64

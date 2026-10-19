@@ -281,31 +281,62 @@ impl Value {
         }
     }
 
-    /// Extract as String, with type coercion
-    pub fn as_string(&self) -> Option<String> {
+    /// The value read as TEXT: the one form CAST AS TEXT, the text
+    /// functions, STRING_AGG and LIKE give it. None for NULL and for an
+    /// extension that has no text form
+    pub fn text_form(&self) -> Option<std::borrow::Cow<'_, str>> {
+        use std::borrow::Cow;
+        if let Some(text) = self.stored_text() {
+            return Some(Cow::Borrowed(text));
+        }
         match self {
-            Value::Null(_) => None,
-            Value::Integer(v) => Some(v.to_string()),
+            Value::Integer(v) => Some(Cow::Owned(v.to_string())),
+            other => other.formatted_text().map(Cow::Owned),
+        }
+    }
+
+    /// Writes the value's [`Value::text_form`] to `out`, without a buffer of
+    /// its own for an INTEGER; false, writing nothing, when it has none
+    pub fn write_text<W: fmt::Write>(&self, out: &mut W) -> std::result::Result<bool, fmt::Error> {
+        if let Some(text) = self.stored_text() {
+            out.write_str(text)?;
+        } else if let Value::Integer(v) = self {
+            write!(out, "{}", v)?;
+        } else if let Some(text) = self.formatted_text() {
+            out.write_str(&text)?;
+        } else {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// The text form of a FLOAT, TIMESTAMP or VECTOR, which is formatted
+    fn formatted_text(&self) -> Option<String> {
+        match self {
             Value::Float(v) => Some(format_float(*v)),
-            Value::Text(s) => Some(s.to_string()),
-            Value::Boolean(b) => Some(if *b { "true" } else { "false" }.to_string()),
             Value::Timestamp(t) => Some(t.to_rfc3339()),
-            Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
-                // SAFETY: Json data is always stored as valid UTF-8
-                Some(std::str::from_utf8(&data[1..]).unwrap_or("").to_string())
-            }
             Value::Extension(data) if data.first() == Some(&(DataType::Vector as u8)) => {
                 Some(format_vector_bytes(&data[1..]))
             }
-            Value::Extension(data) => {
-                // Generic fallback: try payload as UTF-8
-                if data.len() > 1 {
-                    std::str::from_utf8(&data[1..]).ok().map(|s| s.to_string())
-                } else {
-                    None
-                }
-            }
+            _ => None,
         }
+    }
+
+    /// The text form of a value that holds it as it is: TEXT, BOOLEAN, JSON
+    fn stored_text(&self) -> Option<&str> {
+        match self {
+            Value::Text(s) => Some(s.as_str()),
+            Value::Boolean(b) => Some(if *b { "true" } else { "false" }),
+            Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
+                Some(std::str::from_utf8(&data[1..]).unwrap_or(""))
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract as String, with type coercion, see [`Value::text_form`]
+    pub fn as_string(&self) -> Option<String> {
+        self.text_form().map(std::borrow::Cow::into_owned)
     }
 
     /// Extract as string reference (avoids clone for Text/Json)
@@ -779,23 +810,10 @@ impl Value {
                 Value::Boolean(b) => Value::Float(if *b { 1.0 } else { 0.0 }),
                 _ => Value::Null(target_type),
             },
-            DataType::Text => match self {
-                Value::Text(s) => Value::Text(s),
-                Value::Integer(v) => Value::Text(SmartString::from_string(v.to_string())),
-                Value::Float(v) => Value::Text(SmartString::from_string(format_float(v))),
-                Value::Boolean(b) => {
-                    Value::Text(SmartString::new(if b { "true" } else { "false" }))
-                }
-                Value::Timestamp(t) => Value::Text(SmartString::from_string(t.to_rfc3339())),
-                Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
-                    Value::Text(SmartString::new(
-                        std::str::from_utf8(&data[1..]).unwrap_or(""),
-                    ))
-                }
-                Value::Extension(data) if data.first() == Some(&(DataType::Vector as u8)) => {
-                    Value::Text(SmartString::from_string(format_vector_bytes(&data[1..])))
-                }
-                Value::Extension(_) | Value::Null(_) => Value::Null(target_type),
+            DataType::Text => match self.text_form() {
+                Some(std::borrow::Cow::Owned(text)) => Value::Text(SmartString::from_string(text)),
+                Some(std::borrow::Cow::Borrowed(text)) => Value::Text(SmartString::new(text)),
+                None => Value::Null(target_type),
             },
             DataType::Boolean => match &self {
                 Value::Boolean(b) => Value::Boolean(*b),
@@ -862,23 +880,14 @@ impl Default for Value {
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.write_text(f)? {
+            return Ok(());
+        }
         match self {
-            Value::Null(_) => write!(f, "NULL"),
-            Value::Integer(v) => write!(f, "{}", v),
-            Value::Float(v) => write!(f, "{}", format_float(*v)),
-            Value::Text(s) => write!(f, "{}", s),
-            Value::Boolean(b) => write!(f, "{}", if *b { "true" } else { "false" }),
-            Value::Timestamp(t) => write!(f, "{}", t.to_rfc3339()),
             Value::Extension(data) => {
-                let tag = data.first().copied().unwrap_or(0);
-                if tag == DataType::Json as u8 {
-                    write!(f, "{}", std::str::from_utf8(&data[1..]).unwrap_or(""))
-                } else if tag == DataType::Vector as u8 {
-                    write!(f, "{}", format_vector_bytes(&data[1..]))
-                } else {
-                    write!(f, "<extension:{}>", tag)
-                }
+                write!(f, "<extension:{}>", data.first().copied().unwrap_or(0))
             }
+            _ => f.write_str("NULL"),
         }
     }
 }
