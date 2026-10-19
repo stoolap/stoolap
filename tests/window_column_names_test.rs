@@ -139,3 +139,40 @@ fn test_a_sort_window_is_not_taken_for_a_visible_one_named_alike() {
         wrong.join("\n")
     );
 }
+
+#[test]
+fn test_distinct_on_reads_a_sort_window_by_identity() {
+    let db = Database::open("memory://window_distinct_on_identity").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 5), (2, 5), (3, 6)", ())
+        .unwrap();
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        (
+            "SELECT DISTINCT ON (ROW_NUMBER() OVER (ORDER BY id)) id FROM t \
+             ORDER BY ROW_NUMBER() OVER (ORDER BY id)",
+            vec![1, 2, 3],
+        ),
+        (
+            "SELECT DISTINCT ON (DENSE_RANK() OVER (ORDER BY v)) id FROM t \
+             ORDER BY DENSE_RANK() OVER (ORDER BY v), id",
+            vec![1, 3],
+        ),
+    ] {
+        let got: Result<Vec<i64>, String> =
+            db.query(sql, ()).map_err(|e| e.to_string()).map(|rows| {
+                rows.map(|row| row.unwrap().get::<i64>(0).unwrap())
+                    .collect()
+            });
+        if got.as_ref() != Ok(&want) {
+            wrong.push(format!("{sql} gave {got:?}, want {want:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}

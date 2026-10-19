@@ -285,11 +285,14 @@ impl Value {
     /// functions, STRING_AGG and LIKE give it. None for NULL and for an
     /// extension that has no text form
     pub fn text_form(&self) -> Option<std::borrow::Cow<'_, str>> {
+        use std::borrow::Cow;
         if let Some(text) = self.stored_text() {
-            return Some(std::borrow::Cow::Borrowed(text));
+            return Some(Cow::Borrowed(text));
         }
-        let mut text = String::new();
-        matches!(self.write_text(&mut text), Ok(true)).then_some(std::borrow::Cow::Owned(text))
+        match self {
+            Value::Integer(v) => Some(Cow::Owned(v.to_string())),
+            other => other.formatted_text().map(Cow::Owned),
+        }
     }
 
     /// Writes the value's [`Value::text_form`] to `out`, without a buffer of
@@ -297,18 +300,26 @@ impl Value {
     pub fn write_text<W: fmt::Write>(&self, out: &mut W) -> std::result::Result<bool, fmt::Error> {
         if let Some(text) = self.stored_text() {
             out.write_str(text)?;
-            return Ok(true);
-        }
-        match self {
-            Value::Integer(v) => write!(out, "{}", v)?,
-            Value::Float(v) => out.write_str(&format_float(*v))?,
-            Value::Timestamp(t) => out.write_str(&t.to_rfc3339())?,
-            Value::Extension(data) if data.first() == Some(&(DataType::Vector as u8)) => {
-                out.write_str(&format_vector_bytes(&data[1..]))?
-            }
-            _ => return Ok(false),
+        } else if let Value::Integer(v) = self {
+            write!(out, "{}", v)?;
+        } else if let Some(text) = self.formatted_text() {
+            out.write_str(&text)?;
+        } else {
+            return Ok(false);
         }
         Ok(true)
+    }
+
+    /// The text form of a FLOAT, TIMESTAMP or VECTOR, which is formatted
+    fn formatted_text(&self) -> Option<String> {
+        match self {
+            Value::Float(v) => Some(format_float(*v)),
+            Value::Timestamp(t) => Some(t.to_rfc3339()),
+            Value::Extension(data) if data.first() == Some(&(DataType::Vector as u8)) => {
+                Some(format_vector_bytes(&data[1..]))
+            }
+            _ => None,
+        }
     }
 
     /// The text form of a value that holds it as it is: TEXT, BOOLEAN, JSON

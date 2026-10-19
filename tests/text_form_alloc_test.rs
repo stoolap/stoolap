@@ -69,3 +69,25 @@ fn test_a_value_written_as_text_allocates_nothing_of_its_own() {
         );
     }
 }
+
+#[test]
+fn test_owning_a_formatted_text_costs_no_more_than_writing_it() {
+    let timestamp = Value::text("2024-01-01 12:00:00.123456789")
+        .into_coerce_to_type(stoolap::core::DataType::Timestamp);
+    let values = [Value::Float(1e20), Value::Float(1.5), timestamp];
+    let mut out = String::with_capacity(256);
+    for value in &values {
+        out.clear();
+        let before = ALLOCATIONS.with(Cell::get);
+        write!(out, "{}", value).unwrap();
+        let written = ALLOCATIONS.with(Cell::get) - before;
+        let before = ALLOCATIONS.with(Cell::get);
+        let owned = value.as_string();
+        let allocated = ALLOCATIONS.with(Cell::get) - before;
+        assert_eq!(owned.as_deref(), Some(out.as_str()));
+        assert!(
+            allocated <= written,
+            "owning {value:?} allocated {allocated} times, writing it {written}"
+        );
+    }
+}
