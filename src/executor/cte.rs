@@ -40,6 +40,7 @@ use crate::storage::traits::QueryResult;
 
 use super::context::ExecutionContext;
 use super::expression::ExpressionEval;
+use super::query::OutputLayout;
 use super::query_classification::get_classification;
 use super::result::ExecutorResult;
 use super::row_count::{row_counts, static_row_counts};
@@ -567,13 +568,14 @@ impl Executor {
         cte_columns: Vec<String>,
         cte_rows: RowVec,
     ) -> Result<(Vec<String>, RowVec)> {
-        let (cols, rows, _applied) =
+        let (cols, rows, _applied, _layout) =
             self.execute_query_on_cte_result_inner(stmt, ctx, cte_columns, cte_rows, false)?;
         Ok((cols, rows))
     }
 
     /// Inner implementation that optionally skips ORDER BY/LIMIT processing.
-    /// Returns (columns, rows, order_limit_applied).
+    /// Returns (columns, rows, order_limit_applied, layout of the columns
+    /// for the ORDER BY the caller applies).
     /// When `skip_order_limit` is true, ORDER BY and LIMIT/OFFSET are NOT applied,
     /// allowing the caller to delegate to a more capable ORDER BY handler.
     pub(crate) fn execute_query_on_cte_result_inner(
@@ -583,7 +585,7 @@ impl Executor {
         cte_columns: Vec<String>,
         cte_rows: RowVec,
         skip_order_limit: bool,
-    ) -> Result<(Vec<String>, RowVec, bool)> {
+    ) -> Result<(Vec<String>, RowVec, bool, Option<OutputLayout>)> {
         debug_assert!(skip_order_limit || stmt.order_by.is_empty());
         // OPTIMIZATION: Get cached query classification to avoid repeated AST traversals
         let classification = get_classification(stmt);
@@ -657,17 +659,18 @@ impl Executor {
             let result =
                 self.execute_select_with_aggregation(stmt, ctx, filtered_rows, &cte_columns)?;
             let columns = result.columns().to_vec();
+            let layout = Self::result_layout(stmt, &cte_columns, cte_alias.as_deref(), &columns);
             let mut rows = Self::materialize_result(result)?;
 
             if !skip_order_limit {
                 row_counts(stmt, ctx)?.apply(&mut rows);
             }
-            return Ok((columns, rows, !skip_order_limit));
+            return Ok((columns, rows, !skip_order_limit, layout));
         }
 
         // Check for window functions
         if classification.has_window_functions {
-            let result =
+            let (result, layout) =
                 self.execute_select_with_window_functions(stmt, ctx, &filtered_rows, &cte_columns)?;
             let columns = result.columns().to_vec();
             let mut rows = Self::materialize_result(result)?;
@@ -675,7 +678,7 @@ impl Executor {
             if !skip_order_limit {
                 row_counts(stmt, ctx)?.apply(&mut rows);
             }
-            return Ok((columns, rows, !skip_order_limit));
+            return Ok((columns, rows, !skip_order_limit, layout));
         }
 
         // Process scalar subqueries in SELECT columns before projection; a
@@ -753,7 +756,13 @@ impl Executor {
                 } else {
                     filtered_rows
                 };
-                return Ok((combined_columns, result_rows, false));
+                let layout = Self::result_layout(
+                    stmt,
+                    &cte_columns,
+                    cte_alias.as_deref(),
+                    &combined_columns,
+                );
+                return Ok((combined_columns, result_rows, false, layout));
             }
 
             let result_rows = if needs_projection {
@@ -767,7 +776,9 @@ impl Executor {
             } else {
                 filtered_rows
             };
-            return Ok((output_columns, result_rows, false));
+            let layout =
+                Self::result_layout(stmt, &cte_columns, cte_alias.as_deref(), &output_columns);
+            return Ok((output_columns, result_rows, false, layout));
         }
 
         let mut result_rows = if needs_projection {
@@ -784,7 +795,7 @@ impl Executor {
 
         row_counts(stmt, ctx)?.apply(&mut result_rows);
 
-        Ok((output_columns, result_rows, true))
+        Ok((output_columns, result_rows, true, None))
     }
 
     /// Extract the base CTE/table name for registry lookup (ignores aliases)

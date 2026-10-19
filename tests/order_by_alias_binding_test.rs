@@ -37,6 +37,7 @@ fn tables(name: &str) -> Database {
         "INSERT INTO sa VALUES (1, 1, 30), (2, 2, 20), (3, 3, 10)",
         "CREATE TABLE sb (id INTEGER PRIMARY KEY, k INTEGER)",
         "INSERT INTO sb VALUES (10, 0), (20, 0), (30, 0)",
+        "CREATE VIEW v AS SELECT id FROM t",
     ] {
         db.execute(sql, ()).unwrap();
     }
@@ -163,6 +164,31 @@ fn an_order_by_name_binds_the_output_column_and_a_qualified_one_the_input() {
         ("SELECT -id AS n FROM t ORDER BY id", vec![], input.clone()),
         ("SELECT -id AS n FROM t ORDER BY n", vec![], output.clone()),
         ("WITH c AS (SELECT id FROM t) SELECT -c.id AS id FROM c ORDER BY c.id", vec![], input.clone()),
+        (
+            "WITH c AS (SELECT id, k FROM t) SELECT -id AS id, k FROM c ORDER BY c.id",
+            vec![],
+            input.clone(),
+        ),
+        (
+            "SELECT v.*, -id AS x, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM v ORDER BY x",
+            vec![],
+            vec![3, 2, 1],
+        ),
+        (
+            "SELECT t.*, -t.id AS x, ROW_NUMBER() OVER (ORDER BY t.id) AS rn FROM t JOIN s ON s.id = t.id ORDER BY x",
+            vec![],
+            vec![3, 2, 1],
+        ),
+        (
+            "WITH c AS (SELECT id FROM t) SELECT c.*, -id AS x, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM c ORDER BY x",
+            vec![],
+            vec![3, 2, 1],
+        ),
+        (
+            "SELECT -id AS id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM t ORDER BY t.id",
+            vec![],
+            input.clone(),
+        ),
         (
             "WITH g (id, n) AS (SELECT id, COUNT(*) FROM t GROUP BY id) SELECT -g.id AS id FROM g LEFT JOIN s ON s.id = g.id ORDER BY id LIMIT 2",
             vec![],

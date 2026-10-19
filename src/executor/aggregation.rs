@@ -43,6 +43,7 @@ use super::query_cache::{CompiledCountDistinct, CompiledExecution};
 use super::query_classification::QueryClassification;
 use super::result::ExecutorResult;
 use super::utils::build_column_index_map;
+use super::window::WindowOutput;
 use super::Executor;
 
 // Re-export for backward compatibility
@@ -1955,7 +1956,7 @@ impl Executor {
         ctx: &ExecutionContext,
         base_rows: &[(i64, Row)],
         base_columns: &[String],
-    ) -> Result<Box<dyn QueryResult>> {
+    ) -> Result<WindowOutput> {
         let lifted_stmt;
         let lifted_rows;
         let lifted_columns;

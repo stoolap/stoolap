@@ -78,7 +78,7 @@ pub(crate) struct OutputLayout {
 impl OutputLayout {
     /// The layout of rows that are the input `columns` themselves, as a
     /// projection deferred past the sort leaves them
-    fn of_input(columns: &[String]) -> Self {
+    pub(crate) fn of_input(columns: &[String]) -> Self {
         Self {
             input_columns: columns.to_vec(),
             sources: (0..columns.len())
@@ -1916,22 +1916,9 @@ impl Executor {
         // LIMIT after it; DISTINCT reads every row before a LIMIT counts them
         let skip_order_limit = !stmt.order_by.is_empty() || stmt.distinct;
 
-        // The input columns, kept for the layout the caller's ORDER BY binds by
-        let input_columns = (!stmt.order_by.is_empty()).then(|| columns.clone());
-        let (result_cols, result_rows, order_limit_applied) =
+        let (result_cols, result_rows, order_limit_applied, layout) =
             self.execute_query_on_cte_result_inner(stmt, ctx, columns, rows, skip_order_limit)?;
-        let shape = input_columns.and_then(|input_columns| {
-            let alias = stmt
-                .table_expr
-                .as_deref()
-                .and_then(get_table_alias_from_expr);
-            SelectShape::laid_out(Self::result_layout(
-                stmt,
-                &input_columns,
-                alias.as_deref(),
-                &result_cols,
-            ))
-        });
+        let shape = SelectShape::laid_out(layout);
         let result_cols = CompactArc::new(result_cols);
         Ok((
             Box::new(ExecutorResult::with_arc_columns(
@@ -2488,7 +2475,7 @@ impl Executor {
         table_alias: Option<&str>,
         classification: &QueryClassification,
     ) -> SelectResult {
-        let result = match (
+        let (result, layout) = match (
             classification.has_aggregation,
             classification.has_window_functions,
         ) {
@@ -2497,7 +2484,10 @@ impl Executor {
                 self.execute_select_with_window_functions(stmt, ctx, &[], all_columns)?
             }
             (true, false) => {
-                self.execute_select_with_aggregation(stmt, ctx, RowVec::new(), all_columns)?
+                let result =
+                    self.execute_select_with_aggregation(stmt, ctx, RowVec::new(), all_columns)?;
+                let layout = Self::result_layout(stmt, all_columns, table_alias, result.columns());
+                (result, layout)
             }
             (false, false) => {
                 let (rows, columns, layout) = self.project_scanned_rows(
@@ -2520,7 +2510,6 @@ impl Executor {
             }
         };
         let columns = CompactArc::new(result.columns().to_vec());
-        let layout = Self::result_layout(stmt, all_columns, table_alias, &columns);
         Ok((result, columns, false, SelectShape::laid_out(layout)))
     }
 
@@ -3999,8 +3988,7 @@ impl Executor {
                                     )?;
                                 if let Some(query_result) = result {
                                     let columns = CompactArc::new(query_result.columns().to_vec());
-                                    let shape = shape_of(&columns);
-                                    return Ok((query_result, columns, false, shape));
+                                    return Ok((query_result, columns, false, None));
                                 }
                                 // Fall through when the optimization is unavailable.
                             }
@@ -4148,16 +4136,16 @@ impl Executor {
             // Both aggregation and window functions:
             // 1. First apply GROUP BY aggregation
             // 2. Then apply window functions on the aggregated result
-            let result = self.execute_aggregation_then_windows(stmt, ctx, &rows, &all_columns)?;
+            let (result, layout) =
+                self.execute_aggregation_then_windows(stmt, ctx, &rows, &all_columns)?;
             let columns = CompactArc::new(result.columns().to_vec());
-            let shape = shape_of(&columns);
-            return Ok((result, columns, false, shape));
+            return Ok((result, columns, false, SelectShape::laid_out(layout)));
         }
 
         // Check if we need window functions only (no aggregation)
         if has_window {
             // Use optimized paths if rows were pre-fetched with index optimization
-            let result = if let Some(pregrouped) = window_pregrouped_state {
+            let (result, layout) = if let Some(pregrouped) = window_pregrouped_state {
                 // PARTITION BY optimization: rows are already grouped by partition
                 self.execute_select_with_window_functions_pregrouped(
                     stmt,
@@ -4180,8 +4168,7 @@ impl Executor {
                 self.execute_select_with_window_functions(stmt, ctx, &rows, &all_columns)?
             };
             let columns = CompactArc::new(result.columns().to_vec());
-            let shape = shape_of(&columns);
-            return Ok((result, columns, false, shape));
+            return Ok((result, columns, false, SelectShape::laid_out(layout)));
         }
 
         // Check if we need aggregation only (no window functions)
@@ -6306,10 +6293,9 @@ impl Executor {
 
         // Check if we need window functions
         if classification.has_window_functions {
-            let result =
+            let (result, layout) =
                 self.execute_select_with_window_functions(stmt, ctx, &filtered_rows, &columns)?;
             let out_columns = CompactArc::new(result.columns().to_vec());
-            let layout = Self::result_layout(stmt, &columns, subquery_alias, &out_columns);
             return Ok((result, out_columns, false, SelectShape::laid_out(layout)));
         }
 
@@ -6565,17 +6551,15 @@ impl Executor {
 
             if classification.has_aggregation {
                 // Aggregation + window functions: aggregate first, then apply window functions
-                let result =
+                let (result, layout) =
                     self.execute_aggregation_then_windows(stmt, ctx, &rows, &view_columns)?;
                 let columns = CompactArc::new(result.columns().to_vec());
-                let layout = Self::result_layout(stmt, &view_columns, None, &columns);
                 return Ok((result, columns, false, SelectShape::laid_out(layout)));
             }
 
-            let result =
+            let (result, layout) =
                 self.execute_select_with_window_functions(stmt, ctx, &rows, &view_columns)?;
             let columns = CompactArc::new(result.columns().to_vec());
-            let layout = Self::result_layout(stmt, &view_columns, None, &columns);
             return Ok((result, columns, false, SelectShape::laid_out(layout)));
         }
 
@@ -6902,10 +6886,9 @@ impl Executor {
 
         // Check if we need window functions
         if classification.has_window_functions {
-            let result =
+            let (result, layout) =
                 self.execute_select_with_window_functions(stmt, ctx, &result_rows, &column_names)?;
             let columns = CompactArc::new(result.columns().to_vec());
-            let layout = Self::result_layout(stmt, &column_names, values_alias, &columns);
             return Ok((result, columns, false, SelectShape::laid_out(layout)));
         }
 
@@ -7631,7 +7614,7 @@ impl Executor {
         rows: RowVec,
         columns: &[String],
     ) -> SelectResult {
-        let result = match (
+        let (result, layout) = match (
             classification.has_aggregation,
             classification.has_window_functions,
         ) {
@@ -7640,11 +7623,13 @@ impl Executor {
             (false, true) => {
                 self.execute_select_with_window_functions(stmt, ctx, &rows, columns)?
             }
-            _ => self.execute_select_with_aggregation(stmt, ctx, rows, columns)?,
+            _ => {
+                let result = self.execute_select_with_aggregation(stmt, ctx, rows, columns)?;
+                let layout = Self::result_layout(stmt, columns, None, result.columns());
+                (result, layout)
+            }
         };
-        let input_columns = columns;
         let columns = CompactArc::new(result.columns().to_vec());
-        let layout = Self::result_layout(stmt, input_columns, None, &columns);
         Ok((result, columns, false, SelectShape::laid_out(layout)))
     }
 
@@ -9982,6 +9967,7 @@ impl Executor {
         mut sources: Option<&mut Vec<ColumnSource>>,
     ) -> Vec<String> {
         let mut names = Vec::with_capacity(select_exprs.len());
+        let laid_out = sources.is_some();
         let mut source = |item: usize, input: Option<usize>| {
             if let Some(sources) = sources.as_deref_mut() {
                 sources.push(ColumnSource {
@@ -10046,22 +10032,24 @@ impl Executor {
                 _ => {}
             }
             // A plain column, aliased or not, is a copy of its input column
-            let copied = match expr {
-                Expression::Aliased(aliased) => aliased.expression.as_ref(),
-                other => other,
-            };
-            let input = match copied {
-                Expression::Identifier(id) => {
-                    input_column_index(all_columns, None, &id.value_lower)
-                }
-                Expression::QualifiedIdentifier(qid) => input_column_index(
-                    all_columns,
-                    Some(&qid.qualifier.value_lower),
-                    &qid.name.value_lower,
-                ),
-                _ => None,
-            };
-            source(i, input);
+            if laid_out {
+                let copied = match expr {
+                    Expression::Aliased(aliased) => aliased.expression.as_ref(),
+                    other => other,
+                };
+                let input = match copied {
+                    Expression::Identifier(id) => {
+                        input_column_index(all_columns, None, &id.value_lower)
+                    }
+                    Expression::QualifiedIdentifier(qid) => input_column_index(
+                        all_columns,
+                        Some(&qid.qualifier.value_lower),
+                        &qid.name.value_lower,
+                    ),
+                    _ => None,
+                };
+                source(i, input);
+            }
             let name = match expr {
                 Expression::Identifier(id) => id.value.to_string(),
                 Expression::QualifiedIdentifier(qid) => {
@@ -11160,11 +11148,10 @@ impl Executor {
 
         // Check for window functions
         if classification.has_window_functions {
-            let result =
+            let (result, layout) =
                 self.execute_select_with_window_functions(stmt, ctx, &rows, &all_columns)?;
             let columns = CompactArc::new(result.columns().to_vec());
-            let shape = shape_of(&columns);
-            return Ok((result, columns, false, shape));
+            return Ok((result, columns, false, SelectShape::laid_out(layout)));
         }
 
         // Check for aggregation
