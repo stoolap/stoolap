@@ -108,3 +108,66 @@ fn a_cte_join_returns_the_stated_rows() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+#[test]
+fn a_join_where_reads_columns_and_aggregates_as_written() {
+    let db = tables("cte_join_rule_where");
+    db.execute("CREATE TABLE b (k INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO b VALUES (1, 2)", ()).unwrap();
+    let mut wrong = Vec::new();
+    for (sql, rows) in [
+        (
+            "WITH c(id) AS (SELECT 1), d(k, v) AS (SELECT 1, 2) \
+             SELECT c.id FROM c JOIN d ON c.id = d.k WHERE v > 0",
+            vec!["[Integer(1)]"],
+        ),
+        (
+            "SELECT c.id FROM (SELECT 1 AS id) c JOIN (SELECT 1 AS k, 2 AS v) d \
+             ON c.id = d.k WHERE v > 0",
+            vec!["[Integer(1)]"],
+        ),
+        (
+            "SELECT r.id FROM r JOIN b ON r.id = b.k WHERE v > 0",
+            vec!["[Integer(1)]"],
+        ),
+        (
+            "SELECT b.k FROM b JOIN r ON r.id = b.k WHERE v > 0",
+            vec!["[Integer(1)]"],
+        ),
+        (
+            "SELECT r.id FROM r JOIN b ON r.id = b.k WHERE b.v > id",
+            vec!["[Integer(1)]"],
+        ),
+        (
+            "WITH c(id) AS (SELECT 1), d(k) AS (SELECT 1) \
+             SELECT COUNT(*) FROM c JOIN d ON c.id = d.k WHERE 1 = 0",
+            vec!["[Integer(0)]"],
+        ),
+        (
+            "WITH c(id) AS (SELECT 1), d(k) AS (SELECT 1) \
+             SELECT SUM(c.id) FROM c JOIN d ON c.id = d.k WHERE 1 = 0",
+            vec!["[Null(Null)]"],
+        ),
+        (
+            "SELECT SUM(r.id) FROM r JOIN b ON r.id = b.k WHERE 1 = 0",
+            vec!["[Null(Null)]"],
+        ),
+        (
+            "SELECT COUNT(*) FROM r JOIN b ON r.id = b.k WHERE 1 = 0",
+            vec!["[Integer(0)]"],
+        ),
+        (
+            "SELECT COUNT(*) FROM (SELECT 1 AS id) c JOIN (SELECT 1 AS k) d \
+             ON c.id = d.k WHERE 1 = 0",
+            vec!["[Integer(0)]"],
+        ),
+    ] {
+        let got = answer(&db, sql).map(|(_, rows)| rows);
+        let want: Result<Vec<String>, String> = Ok(rows.iter().map(|r| r.to_string()).collect());
+        if got != want {
+            wrong.push(format!("{sql}\n  got  {got:?}\n  want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

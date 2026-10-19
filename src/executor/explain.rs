@@ -33,8 +33,8 @@ use super::pushdown;
 use super::query::{pick_index_join_side, split_join_where, CteNames, JoinIndexUse};
 use super::result::ExecutorResult;
 use super::utils::{
-    collect_table_qualifiers, combine_predicates_with_and, flatten_and_predicates,
-    get_table_alias_from_expr,
+    collect_table_qualifiers, collect_unqualified_columns, combine_predicates_with_and,
+    flatten_and_predicates, get_table_alias_from_expr,
 };
 use super::Executor;
 
@@ -1001,12 +1001,10 @@ impl Executor {
                 | IndexLookupStrategy::TableEquality { .. } => "Index Nested Loop".to_string(),
             };
 
-            let left_is_table = self
-                .base_table_side_schema(join_left, CteNames::Listed(ctes))
-                .is_some();
-            let right_is_table = self
-                .base_table_side_schema(join_right, CteNames::Listed(ctes))
-                .is_some();
+            let left_schema = self.base_table_side_schema(join_left, CteNames::Listed(ctes));
+            let right_schema = self.base_table_side_schema(join_right, CteNames::Listed(ctes));
+            let left_is_table = left_schema.is_some();
+            let right_is_table = right_schema.is_some();
             // Check if INLJ is possible (right side has index/PK for join column)
             let inlj_info = self.check_index_nested_loop_opportunity(
                 CteNames::Listed(ctes),
@@ -1032,6 +1030,7 @@ impl Executor {
                             where_clause,
                             get_table_alias_from_expr(join_left).as_deref(),
                             get_table_alias_from_expr(join_right).as_deref(),
+                            (left_schema.as_deref(), right_schema.as_deref()),
                             &join_type_upper,
                         );
                         (left.is_some(), right.is_some())
@@ -1280,7 +1279,7 @@ impl Executor {
 /// Extract table alias from a table expression
 /// The names the WITH of `select` gives its CTEs, which hide tables of the
 /// same name in its FROM
-fn cte_names(select: &SelectStatement) -> Vec<String> {
+pub(crate) fn cte_names(select: &SelectStatement) -> Vec<String> {
     select
         .with
         .iter()
@@ -1445,74 +1444,6 @@ fn extract_select_column_names(
             // Star or complex expressions — can't determine column names
             _ => {}
         }
-    }
-}
-
-/// Collect unqualified (bare) column names from a predicate expression.
-fn collect_unqualified_columns(expr: &Expression, columns: &mut rustc_hash::FxHashSet<String>) {
-    match expr {
-        Expression::Identifier(id) => {
-            columns.insert(id.value_lower.to_string());
-        }
-        Expression::Infix(infix) => {
-            collect_unqualified_columns(&infix.left, columns);
-            collect_unqualified_columns(&infix.right, columns);
-        }
-        Expression::Prefix(prefix) => {
-            collect_unqualified_columns(&prefix.right, columns);
-        }
-        Expression::In(in_expr) => {
-            collect_unqualified_columns(&in_expr.left, columns);
-            // Recurse into the right side (ExpressionList, List, or subquery)
-            match in_expr.right.as_ref() {
-                Expression::ExpressionList(el) => {
-                    for elem in &el.expressions {
-                        collect_unqualified_columns(elem, columns);
-                    }
-                }
-                Expression::List(list) => {
-                    for elem in &list.elements {
-                        collect_unqualified_columns(elem, columns);
-                    }
-                }
-                other => {
-                    collect_unqualified_columns(other, columns);
-                }
-            }
-        }
-        Expression::Between(between) => {
-            collect_unqualified_columns(&between.expr, columns);
-            collect_unqualified_columns(&between.lower, columns);
-            collect_unqualified_columns(&between.upper, columns);
-        }
-        Expression::Like(like) => {
-            collect_unqualified_columns(&like.left, columns);
-            collect_unqualified_columns(&like.pattern, columns);
-        }
-        Expression::FunctionCall(func) => {
-            for arg in &func.arguments {
-                collect_unqualified_columns(arg, columns);
-            }
-        }
-        Expression::Cast(cast) => {
-            collect_unqualified_columns(&cast.expr, columns);
-        }
-        Expression::Case(case) => {
-            if let Some(ref val) = case.value {
-                collect_unqualified_columns(val, columns);
-            }
-            for when in &case.when_clauses {
-                collect_unqualified_columns(&when.condition, columns);
-                collect_unqualified_columns(&when.then_result, columns);
-            }
-            if let Some(ref else_val) = case.else_value {
-                collect_unqualified_columns(else_val, columns);
-            }
-        }
-        Expression::Aliased(aliased) => {
-            collect_unqualified_columns(&aliased.expression, columns);
-        }
-        _ => {}
     }
 }
 

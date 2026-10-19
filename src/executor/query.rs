@@ -113,12 +113,12 @@ use super::result::{
 use super::row_count::{row_counts, rows_needed, static_row_counts, RowCounts};
 use super::utils::compute_join_projection;
 use super::utils::{
-    add_table_qualifier, build_column_index_map, collect_table_qualifiers, column_kinds,
-    combine_predicates_with_and, dummy_token, expression_contains_aggregate,
-    extract_and_conditions, extract_base_column_name, extract_join_keys_and_residual,
-    filter_references_column, flatten_and_predicates, flip_operator, get_table_alias_from_expr,
-    index_join_residual, infix_to_operator, string_literal_value, strip_table_qualifier,
-    substitute_filter_column,
+    add_table_qualifier, build_column_index_map, collect_table_qualifiers,
+    collect_unqualified_columns, column_kinds, combine_predicates_with_and, dummy_token,
+    expression_contains_aggregate, extract_and_conditions, extract_base_column_name,
+    extract_join_keys_and_residual, filter_references_column, flatten_and_predicates,
+    flip_operator, get_table_alias_from_expr, index_join_residual, infix_to_operator,
+    string_literal_value, strip_table_qualifier, substitute_filter_column,
 };
 use super::volatility::statement_constant;
 use super::window::{WindowPreGroupedState, WindowPreSortedState};
@@ -213,17 +213,18 @@ impl CteNames<'_> {
 
 /// A join's WHERE split as execution pushes it: a filter for each side it
 /// may narrow, never the side an outer join pads with NULLs, and the rest,
-/// asked of the joined rows
+/// asked of the joined rows. The schemas are the sides that are base tables
 pub(crate) fn split_join_where(
     where_clause: &Expression,
     left_alias: Option<&str>,
     right_alias: Option<&str>,
+    schemas: (Option<&Schema>, Option<&Schema>),
     join_type: &str,
 ) -> (Option<Expression>, Option<Expression>, Option<Expression>) {
     let (Some(left_a), Some(right_a)) = (left_alias, right_alias) else {
         return (None, None, Some(where_clause.clone()));
     };
-    let (l, r, c) = partition_where_for_join(where_clause, left_a, right_a);
+    let (l, r, c) = partition_where_for_join(where_clause, left_a, right_a, schemas);
 
     // For OUTER JOINs, we can't push filters to the NULL-padded side
     // because rows that don't match need to appear with NULLs
@@ -312,10 +313,14 @@ pub(crate) fn index_join_table_name(side: &Expression) -> Option<String> {
 /// - left_filter: predicates referencing only left table
 /// - right_filter: predicates referencing only right table
 /// - cross_table_filter: predicates referencing both tables (must be applied post-join)
+///
+/// An unqualified column belongs to a side only when both sides are base
+/// tables and only that one has it; otherwise its predicate stays post-join
 fn partition_where_for_join(
     where_clause: &Expression,
     left_alias: &str,
     right_alias: &str,
+    (left_schema, right_schema): (Option<&Schema>, Option<&Schema>),
 ) -> (Option<Expression>, Option<Expression>, Option<Expression>) {
     let left_alias_lower = left_alias.to_lowercase();
     let right_alias_lower = right_alias.to_lowercase();
@@ -329,13 +334,26 @@ fn partition_where_for_join(
 
     for pred in predicates {
         let qualifiers = collect_table_qualifiers(&pred);
+        let mut unqualified = FxHashSet::default();
+        collect_unqualified_columns(&pred, &mut unqualified);
 
-        let refs_left = qualifiers.contains(&left_alias_lower);
-        let refs_right = qualifiers.contains(&right_alias_lower);
+        let mut refs_left = qualifiers.contains(&left_alias_lower);
+        let mut refs_right = qualifiers.contains(&right_alias_lower);
+        let mut unowned = false;
+        for column in &unqualified {
+            match (
+                left_schema.map(|s| s.has_column(column)),
+                right_schema.map(|s| s.has_column(column)),
+            ) {
+                (Some(true), Some(false)) => refs_left = true,
+                (Some(false), Some(true)) => refs_right = true,
+                _ => unowned = true,
+            }
+        }
 
         // The qualifiers inside a subquery are not collected, so a correlated
         // one may read either side and is evaluated on the joined row
-        if (refs_left && refs_right) || Executor::has_correlated_subqueries(&pred) {
+        if (refs_left && refs_right) || unowned || Executor::has_correlated_subqueries(&pred) {
             // References both tables - must be applied post-join
             cross_preds.push(pred);
         } else if refs_left {
@@ -4082,11 +4100,12 @@ impl Executor {
 
         // Short-circuit: if WHERE is constant-false (e.g., 1=0), skip all join
         // materialization and return an empty result immediately. A subquery
-        // has no value in this evaluator, so a WHERE holding one is not judged
+        // has no value in this evaluator, so a WHERE holding one is not judged,
+        // and an aggregate still answers its empty input
         if let Some(where_clause) = stmt
             .where_clause
             .as_ref()
-            .filter(|_| !classification.where_has_subqueries)
+            .filter(|_| !classification.where_has_subqueries && !classification.has_aggregation)
         {
             if let Ok(eval) = ExpressionEval::compile(where_clause, &[]) {
                 if let Ok(Value::Boolean(false)) = eval.with_context(ctx).eval_slice(&Row::new()) {
@@ -4187,11 +4206,14 @@ impl Executor {
             }
             (where_clause, _) => where_clause,
         };
+        let left_schema = self.base_table_side_schema(&join_source.left, CteNames::Context(ctx));
+        let right_schema = self.base_table_side_schema(&join_source.right, CteNames::Context(ctx));
         let (left_filter, right_filter, cross_filter) = match where_for_join.as_ref() {
             Some(where_clause) => split_join_where(
                 where_clause,
                 left_alias.as_deref(),
                 right_alias.as_deref(),
+                (left_schema.as_deref(), right_schema.as_deref()),
                 &join_type,
             ),
             None => (None, None, None),
@@ -4311,12 +4333,8 @@ impl Executor {
                 None
             } else {
                 let ctes = CteNames::Context(ctx);
-                let left_is_table = self
-                    .base_table_side_schema(&join_source.left, ctes)
-                    .is_some();
-                let right_is_table = self
-                    .base_table_side_schema(&join_source.right, ctes)
-                    .is_some();
+                let left_is_table = left_schema.is_some();
+                let right_is_table = right_schema.is_some();
                 let unswapped = self.check_index_nested_loop_opportunity(
                     ctes,
                     &join_source.right,
@@ -11374,10 +11392,14 @@ impl Executor {
         }
         let (right_filter_present, filters_have_subquery) = match &stmt.where_clause {
             Some(where_clause) => {
+                let ctes = super::explain::cte_names(stmt);
+                let schema = |side| self.base_table_side_schema(side, CteNames::Listed(&ctes));
+                let (left_schema, right_schema) = (schema(&join.left), schema(&join.right));
                 let (_, right, _) = split_join_where(
                     where_clause,
                     get_table_alias_from_expr(&join.left).as_deref(),
                     get_table_alias_from_expr(&join.right).as_deref(),
+                    (left_schema.as_deref(), right_schema.as_deref()),
                     &join_type,
                 );
                 (right.is_some(), Self::filter_has_subquery(where_clause))
