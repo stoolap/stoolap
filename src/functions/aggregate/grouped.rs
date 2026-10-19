@@ -40,26 +40,36 @@ pub enum CallTemplate {
         distinct: bool,
         extra_args: Vec<Value>,
         order_by: Vec<AggregateOrder>,
+        /// The error an extra argument gave, the result of the call once
+        /// there is a group to read
+        failed: Option<crate::core::Error>,
     },
 }
 
 impl CallTemplate {
     /// The template of a call to `function`, compiled when its name has a
-    /// compiled state
+    /// compiled state. A call whose extra argument gave `failed` keeps it
+    /// for `into_rows` to report, and no result of it is read
     pub fn new(
         function: Box<dyn AggregateFunction>,
         is_count_star: bool,
         distinct: bool,
         extra_args: &[Value],
         order_by: Vec<AggregateOrder>,
+        failed: Option<crate::core::Error>,
     ) -> Self {
-        match CompiledAggregate::constructor(function.name(), is_count_star, distinct) {
+        let compiled = failed
+            .is_none()
+            .then(|| CompiledAggregate::constructor(function.name(), is_count_star, distinct))
+            .flatten();
+        match compiled {
             Some(make) => CallTemplate::Compiled(make),
             None => CallTemplate::Dynamic {
                 function,
                 distinct,
                 extra_args: extra_args.to_vec(),
                 order_by,
+                failed,
             },
         }
     }
@@ -74,12 +84,21 @@ impl CallTemplate {
                 distinct,
                 extra_args,
                 order_by,
+                ..
             } => CompiledAggregate::Dynamic(AggregateState::new(
                 function.clone_box(),
                 *distinct,
                 extra_args,
                 order_by.clone(),
             )),
+        }
+    }
+
+    /// The error the call's extra argument gave, if it gave one
+    fn failure(&self) -> Option<&crate::core::Error> {
+        match self {
+            CallTemplate::Dynamic { failed, .. } => failed.as_ref(),
+            CallTemplate::Compiled(_) => None,
         }
     }
 
@@ -91,11 +110,13 @@ impl CallTemplate {
                 distinct,
                 extra_args,
                 order_by,
+                failed,
             } => CallTemplate::Dynamic {
                 function: function.clone_box(),
                 distinct: *distinct,
                 extra_args: extra_args.clone(),
                 order_by: order_by.clone(),
+                failed: failed.clone(),
             },
         }
     }
@@ -302,6 +323,11 @@ impl GroupedAggregates {
 
     /// One row per group: its key values, then the result of every call
     pub fn into_rows(self) -> Result<RowVec> {
+        if self.groups > 0 {
+            if let Some(error) = self.calls.iter().find_map(CallTemplate::failure) {
+                return Err(error.clone());
+            }
+        }
         let calls = self.calls.len();
         let mut rows = RowVec::with_capacity(self.groups);
         let mut keys = self.keys.into_iter();
@@ -329,6 +355,7 @@ mod tests {
             false,
             &[],
             Vec::new(),
+            None,
         )]
     }
 

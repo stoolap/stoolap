@@ -416,6 +416,10 @@ pub struct WindowFunctionInfo {
     pub filter: Option<Box<Expression>>,
     /// The aggregate's own ORDER BY, for an aggregate that orders its input
     pub call_order_by: Box<[OrderByExpression]>,
+    /// An aggregate's arguments after the first, read once for the statement
+    pub extra_args: Vec<Value>,
+    /// The error one of them gave, reported once there is a row to aggregate
+    pub extra_error: Option<Error>,
 }
 
 /// Information about a SELECT list item for window function processing
@@ -728,7 +732,7 @@ impl Executor {
         };
 
         // Parse window functions from the SELECT list
-        let mut window_functions = self.parse_window_functions(stmt, base_columns)?;
+        let mut window_functions = self.parse_window_functions(stmt, base_columns, ctx)?;
         self.fold_window_control_arguments(&mut window_functions, ctx)?;
 
         if window_functions.is_empty() {
@@ -1332,7 +1336,7 @@ impl Executor {
         limit: usize,
     ) -> Result<Option<Box<dyn QueryResult>>> {
         // Parse window functions from SELECT list
-        let mut window_functions = self.parse_window_functions(stmt, base_columns)?;
+        let mut window_functions = self.parse_window_functions(stmt, base_columns, ctx)?;
         self.fold_window_control_arguments(&mut window_functions, ctx)?;
         if window_functions.is_empty() {
             return Ok(None);
@@ -1811,6 +1815,7 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         _base_columns: &[String],
+        ctx: &ExecutionContext,
     ) -> Result<Vec<WindowFunctionInfo>> {
         let mut window_functions = Vec::new();
         let mut col_idx = 0;
@@ -1819,7 +1824,7 @@ impl Executor {
             match col_expr {
                 Expression::Window(window_expr) => {
                     let mut wf_info =
-                        self.extract_window_function_info(window_expr, &stmt.window_defs)?;
+                        self.extract_window_function_info(window_expr, &stmt.window_defs, ctx)?;
                     // Two unaliased windows of the same function would share a
                     // name; the internal one is unique, the output keeps the
                     // function's own
@@ -1830,7 +1835,7 @@ impl Executor {
                 Expression::Aliased(aliased) => {
                     if let Expression::Window(window_expr) = aliased.expression.as_ref() {
                         let mut wf_info =
-                            self.extract_window_function_info(window_expr, &stmt.window_defs)?;
+                            self.extract_window_function_info(window_expr, &stmt.window_defs, ctx)?;
                         // The alias is only the output name; the internal name
                         // cannot collide with an alias or another window
                         wf_info.column_name = format!("__wf_{}_0", col_idx);
@@ -1843,8 +1848,11 @@ impl Executor {
                             &mut windows,
                         );
                         for (i, window_expr) in windows.into_iter().enumerate() {
-                            let mut wf_info =
-                                self.extract_window_function_info(window_expr, &stmt.window_defs)?;
+                            let mut wf_info = self.extract_window_function_info(
+                                window_expr,
+                                &stmt.window_defs,
+                                ctx,
+                            )?;
                             wf_info.column_name = format!("__wf_{}_{}", col_idx, i);
                             window_functions.push(wf_info);
                         }
@@ -1856,7 +1864,7 @@ impl Executor {
                     Self::collect_all_windows_in_expression(col_expr, &mut windows);
                     for (i, window_expr) in windows.into_iter().enumerate() {
                         let mut wf_info =
-                            self.extract_window_function_info(window_expr, &stmt.window_defs)?;
+                            self.extract_window_function_info(window_expr, &stmt.window_defs, ctx)?;
                         wf_info.column_name = format!("__wf_{}_{}", col_idx, i);
                         window_functions.push(wf_info);
                     }
@@ -2116,6 +2124,7 @@ impl Executor {
         &self,
         window_expr: &WindowExpression,
         window_defs: &[WindowDefinition],
+        ctx: &ExecutionContext,
     ) -> Result<WindowFunctionInfo> {
         let func = &window_expr.function;
 
@@ -2163,6 +2172,11 @@ impl Executor {
 
         // Build column name
         let column_name = format!("{}()", func.function);
+        let (extra_args, extra_error) = if self.function_registry.is_aggregate(&func.function) {
+            super::aggregation::aggregate_extra_args(&func.arguments, Some(ctx))?
+        } else {
+            (Vec::new(), None)
+        };
 
         // OPTIMIZATION: func.function is already uppercase from parsing
         Ok(WindowFunctionInfo {
@@ -2176,6 +2190,8 @@ impl Executor {
             is_distinct: func.is_distinct,
             filter: func.filter.clone(),
             call_order_by: func.order_by.clone().into_boxed_slice(),
+            extra_args,
+            extra_error,
         })
     }
 
@@ -3690,7 +3706,7 @@ impl Executor {
             &self.function_registry,
             &wf_info.name,
             wf_info.is_distinct,
-            &super::aggregation::aggregate_extra_args(&wf_info.arguments),
+            &wf_info.extra_args,
             order_by,
         )
         .ok_or_else(|| Error::NotSupported(format!("Unknown aggregate function: {}", wf_info.name)))
@@ -3844,6 +3860,9 @@ impl Executor {
         // No row, no frame offset evaluates
         if rows.is_empty() {
             return Ok(Vec::new());
+        }
+        if let Some(error) = &wf_info.extra_error {
+            return Err(error.clone());
         }
         let frame = Frame::read(wf_info, &self.function_registry, ctx)?;
         let mut results: Vec<Option<Value>> = vec![None; rows.len()];
@@ -4083,6 +4102,8 @@ mod tests {
             is_distinct: false,
             filter: None,
             call_order_by: Box::new([]),
+            extra_args: Vec::new(),
+            extra_error: None,
         };
 
         assert_eq!(info.name, "ROW_NUMBER");

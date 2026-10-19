@@ -7432,6 +7432,7 @@ impl Executor {
             join_source.condition.as_deref(),
             right_filter.is_some(),
             filters_have_subquery,
+            Some(ctx),
         )?
         else {
             return Ok(None);
@@ -7659,12 +7660,16 @@ impl Executor {
         let count_star = Value::Integer(1);
         let op_join_type = OperatorJoinType::parse(join_type);
         let want = plan.want;
+        let failed = crate::executor::aggregation::extra_args_failure(&aggregations);
 
         // Fold one finished group into an output row; true when HAVING kept it
         let finish = |first: &Row,
                       funcs: &mut [crate::functions::aggregate::AggregateState],
                       groups: &mut RowVec|
          -> Result<bool> {
+            if let Some(error) = failed {
+                return Err(error.clone());
+            }
             let mut values = Vec::with_capacity(result_columns.len());
             for &idx in &group_idx {
                 values.push(first.get(idx).cloned().unwrap_or_else(Value::null_unknown));
@@ -11298,7 +11303,8 @@ impl Executor {
     /// join, or one whose right side carries no filter; plain aggregates the
     /// registry knows, without expressions, FILTER, ORDER BY or hidden
     /// ones; a plain GROUP BY over columns; no subquery in the filters.
-    /// The executor and EXPLAIN ask the same question.
+    /// The executor and EXPLAIN ask the same question; the executor passes
+    /// `ctx`, whose parameters the calls it runs read
     fn grouped_index_join_applies(
         &self,
         stmt: &SelectStatement,
@@ -11306,6 +11312,7 @@ impl Executor {
         join_condition: Option<&Expression>,
         right_filter_present: bool,
         filters_have_subquery: bool,
+        ctx: Option<&ExecutionContext>,
     ) -> Result<
         Option<(
             Vec<crate::executor::aggregation::SqlAggregateFunction>,
@@ -11331,7 +11338,7 @@ impl Executor {
         {
             return Ok(None);
         }
-        let (aggregations, _) = self.parse_aggregations(stmt)?;
+        let (aggregations, _) = self.parse_aggregations(stmt, ctx)?;
         // The operator reads columns and keeps each call's DISTINCT and
         // extra arguments in its state
         let supported = crate::executor::aggregation::Modifiers::DISTINCT
@@ -11413,6 +11420,7 @@ impl Executor {
             join.condition.as_deref(),
             right_filter_present,
             filters_have_subquery,
+            None,
         ) {
             Ok(Some(_)) => JoinIndexUse::Grouped,
             _ => JoinIndexUse::None,
@@ -11896,7 +11904,7 @@ impl Executor {
 
         // The aggregate slots, as every aggregate path reads them; the select
         // list may read the group column and aggregate calls only
-        let (aggregations, non_agg_columns) = self.parse_aggregations(stmt)?;
+        let (aggregations, non_agg_columns) = self.parse_aggregations(stmt, Some(ctx))?;
         if aggregations.is_empty() {
             return Ok(None);
         }

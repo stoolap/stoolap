@@ -420,6 +420,9 @@ pub struct SqlAggregateFunction {
     pub distinct: bool,
     /// Extra arguments (e.g., separator for STRING_AGG)
     pub extra_args: Vec<Value>,
+    /// The error an extra argument gave when evaluated, the result of
+    /// every group that reads this call
+    pub(crate) extra_error: Option<crate::core::Error>,
     /// The expression to evaluate for each row (for SUM(val * 2), AVG(a + b), etc.)
     /// If None, use column directly; if Some, evaluate expression first
     pub expression: Option<Expression>,
@@ -488,6 +491,7 @@ impl SqlAggregateFunction {
             self.distinct,
             &self.extra_args,
             Executor::aggregate_order_keys(&self.order_by),
+            self.extra_error.clone(),
         ))
     }
 
@@ -591,21 +595,58 @@ impl Modifiers {
     }
 }
 
-/// The extra arguments of an aggregate call (a STRING_AGG separator), the
-/// literals after its first argument
-pub(crate) fn aggregate_extra_args(args: &[Expression]) -> Vec<Value> {
-    args.iter()
-        .skip(1)
-        .filter_map(|arg| match arg {
-            Expression::StringLiteral(lit) => Some(Value::text(lit.value.as_str())),
-            Expression::IntegerLiteral(lit) => Some(Value::Integer(lit.value)),
-            Expression::FloatLiteral(lit) => Some(Value::Float(lit.value)),
-            Expression::BooleanLiteral(b) => Some(Value::Boolean(b.value)),
-            Expression::NullLiteral(_) => Some(Value::null_unknown()),
-            Expression::Identifier(id) if id.quoted => Some(Value::text(id.value.as_str())),
-            _ => None,
-        })
-        .collect()
+/// An aggregate call's extra argument values and the error one of them gave
+pub(crate) type ExtraArgs = (Vec<Value>, Option<crate::core::Error>);
+
+/// The error an extra argument of one of `aggregations` gave, which a path
+/// that reads groups itself reports at its first group
+pub(crate) fn extra_args_failure(
+    aggregations: &[SqlAggregateFunction],
+) -> Option<&crate::core::Error> {
+    aggregations.iter().find_map(|agg| agg.extra_error.as_ref())
+}
+
+/// The extra arguments of an aggregate call (a STRING_AGG separator), each
+/// one value for the statement, read once with the parameters of `ctx`. An
+/// argument that fails to evaluate is NULL here and its error comes second,
+/// for the first group or frame that reads the call to report
+pub(crate) fn aggregate_extra_args(
+    args: &[Expression],
+    ctx: Option<&ExecutionContext>,
+) -> Result<ExtraArgs> {
+    let mut values = Vec::with_capacity(args.len().saturating_sub(1));
+    let mut failed = None;
+    for arg in args.iter().skip(1) {
+        let value = match arg {
+            Expression::Identifier(id) if id.quoted => Value::text(id.value.as_str()),
+            arg => match super::utils::extract_literal_value(arg) {
+                Some(value) => value,
+                None => {
+                    if !super::volatility::statement_constant(
+                        arg,
+                        crate::functions::registry::global_registry(),
+                    ) {
+                        return Err(crate::core::Error::invalid_argument(format!(
+                            "an aggregate argument after the first must not read the row: {}",
+                            arg
+                        )));
+                    }
+                    let eval = super::expression::ExpressionEval::compile(arg, &[])?;
+                    let evaluated = match ctx {
+                        Some(ctx) => eval.with_context(ctx),
+                        None => eval,
+                    }
+                    .eval_slice(&Row::new());
+                    evaluated.unwrap_or_else(|error| {
+                        failed.get_or_insert(error);
+                        Value::null_unknown()
+                    })
+                }
+            },
+        };
+        values.push(value);
+    }
+    Ok((values, failed))
 }
 
 /// What one aggregate call reads from each input row, compiled once: the
@@ -1046,7 +1087,7 @@ impl Executor {
         };
 
         // Parse aggregations and group by columns
-        let (aggregations, _non_agg_columns) = self.parse_aggregations(stmt)?;
+        let (aggregations, _non_agg_columns) = self.parse_aggregations(stmt, Some(ctx))?;
         let group_by_columns = self.parse_group_by(stmt, base_columns)?;
 
         // Create column index map for fast lookup (FxHashMap for speed)
@@ -1219,7 +1260,7 @@ impl Executor {
             let written_keys: Option<Vec<ExprKey>> = if std::ptr::eq(stmt, written_stmt) {
                 None
             } else {
-                let (written, _) = self.parse_aggregations(written_stmt)?;
+                let (written, _) = self.parse_aggregations(written_stmt, Some(ctx))?;
                 (written.len() == aggregations.len())
                     .then(|| written.iter().map(|agg| agg.key).collect())
             };
@@ -1968,7 +2009,7 @@ impl Executor {
         base_columns: &[String],
     ) -> Result<(Vec<String>, RowVec, FxHashMap<ExprKey, usize>)> {
         // Parse aggregations and group by columns
-        let (aggregations, _non_agg_columns) = self.parse_aggregations(stmt)?;
+        let (aggregations, _non_agg_columns) = self.parse_aggregations(stmt, Some(ctx))?;
         let group_by_columns = self.parse_group_by(stmt, base_columns)?;
 
         // Create column index map for fast lookup
@@ -2024,24 +2065,36 @@ impl Executor {
         Ok((result_columns, result_rows_with_ids, slots))
     }
 
-    /// Parse aggregate functions from SELECT list
+    /// Parse aggregate functions from SELECT list; `ctx` binds the parameters
+    /// an extra argument reads, None where only the shape is asked
     /// Returns: (aggregations, non_agg_columns, post_agg_expressions)
     pub(crate) fn parse_aggregations(
         &self,
         stmt: &SelectStatement,
+        ctx: Option<&ExecutionContext>,
     ) -> Result<(Vec<SqlAggregateFunction>, Vec<String>)> {
         let mut aggregations = Vec::new();
         let mut non_agg_columns = Vec::new();
 
         for col_expr in &stmt.columns {
-            self.extract_aggregates_from_expr(col_expr, &mut aggregations, &mut non_agg_columns)?;
+            self.extract_aggregates_from_expr(
+                col_expr,
+                &mut aggregations,
+                &mut non_agg_columns,
+                ctx,
+            )?;
         }
         let select_count = aggregations.len();
 
         // Also extract aggregates from HAVING clause
         // These need to be computed even if they're not in SELECT
         if let Some(ref having) = stmt.having {
-            self.extract_aggregates_from_expr(having, &mut aggregations, &mut non_agg_columns)?;
+            self.extract_aggregates_from_expr(
+                having,
+                &mut aggregations,
+                &mut non_agg_columns,
+                ctx,
+            )?;
         }
 
         // Also extract aggregates from ORDER BY clause
@@ -2053,6 +2106,7 @@ impl Executor {
                 &order_expr.expression,
                 &mut aggregations,
                 &mut non_agg_columns,
+                ctx,
             )?;
         }
         // A named window a function refers to with OVER w may partition or
@@ -2063,7 +2117,12 @@ impl Executor {
                 .iter()
                 .chain(window.order_by.iter().map(|o| &o.expression))
             {
-                self.extract_aggregates_from_expr(expr, &mut aggregations, &mut non_agg_columns)?;
+                self.extract_aggregates_from_expr(
+                    expr,
+                    &mut aggregations,
+                    &mut non_agg_columns,
+                    ctx,
+                )?;
             }
         }
         // An ORDER BY aggregate the SELECT list does not compute is hidden
@@ -2101,6 +2160,7 @@ impl Executor {
         expr: &Expression,
         aggregations: &mut Vec<SqlAggregateFunction>,
         non_agg_columns: &mut Vec<String>,
+        ctx: Option<&ExecutionContext>,
     ) -> Result<()> {
         match expr {
             Expression::FunctionCall(func) => {
@@ -2116,8 +2176,8 @@ impl Executor {
                         }
                     }
 
-                    let (column, distinct, extra_args, expression) =
-                        self.extract_agg_column(&func.arguments)?;
+                    let (column, distinct, (extra_args, extra_error), expression) =
+                        self.extract_agg_column(&func.arguments, ctx)?;
                     let column_lower = column.to_lowercase();
                     aggregations.push(SqlAggregateFunction {
                         name: func.function.to_string(),
@@ -2126,6 +2186,7 @@ impl Executor {
                         alias: None,
                         distinct: distinct || func.is_distinct,
                         extra_args,
+                        extra_error,
                         expression,
                         order_by: func.order_by.clone(),
                         filter: func.filter.as_ref().map(|f| (**f).clone()),
@@ -2136,13 +2197,13 @@ impl Executor {
                     // Non-aggregate function: recursively check arguments for nested aggregates
                     // e.g., COALESCE(SUM(val), 0), ABS(SUM(val)), etc.
                     for arg in &func.arguments {
-                        self.extract_aggregates_from_expr(arg, aggregations, non_agg_columns)?;
+                        self.extract_aggregates_from_expr(arg, aggregations, non_agg_columns, ctx)?;
                     }
                 }
             }
             Expression::Aliased(aliased) => {
                 // For aliased expressions, extract aggregates from the inner expression
-                self.extract_aggregates_from_aliased(aliased, aggregations, non_agg_columns)?;
+                self.extract_aggregates_from_aliased(aliased, aggregations, non_agg_columns, ctx)?;
             }
             Expression::Identifier(id) => {
                 non_agg_columns.push(id.value.to_string());
@@ -2154,29 +2215,46 @@ impl Executor {
                         &when_clause.condition,
                         aggregations,
                         non_agg_columns,
+                        ctx,
                     )?;
                     self.extract_aggregates_from_expr(
                         &when_clause.then_result,
                         aggregations,
                         non_agg_columns,
+                        ctx,
                     )?;
                 }
                 if let Some(ref else_val) = case.else_value {
-                    self.extract_aggregates_from_expr(else_val, aggregations, non_agg_columns)?;
+                    self.extract_aggregates_from_expr(
+                        else_val,
+                        aggregations,
+                        non_agg_columns,
+                        ctx,
+                    )?;
                 }
             }
             Expression::Infix(infix) => {
-                self.extract_aggregates_from_expr(&infix.left, aggregations, non_agg_columns)?;
-                self.extract_aggregates_from_expr(&infix.right, aggregations, non_agg_columns)?;
+                self.extract_aggregates_from_expr(&infix.left, aggregations, non_agg_columns, ctx)?;
+                self.extract_aggregates_from_expr(
+                    &infix.right,
+                    aggregations,
+                    non_agg_columns,
+                    ctx,
+                )?;
             }
             Expression::Prefix(prefix) => {
-                self.extract_aggregates_from_expr(&prefix.right, aggregations, non_agg_columns)?;
+                self.extract_aggregates_from_expr(
+                    &prefix.right,
+                    aggregations,
+                    non_agg_columns,
+                    ctx,
+                )?;
             }
             Expression::Cast(cast) => {
-                self.extract_aggregates_from_expr(&cast.expr, aggregations, non_agg_columns)?;
+                self.extract_aggregates_from_expr(&cast.expr, aggregations, non_agg_columns, ctx)?;
             }
             Expression::QuantifiedSet(set) => {
-                self.extract_aggregates_from_expr(&set.left, aggregations, non_agg_columns)?;
+                self.extract_aggregates_from_expr(&set.left, aggregations, non_agg_columns, ctx)?;
             }
             // An aggregate a window function takes as its argument, or
             // partitions or orders by, is computed like any other
@@ -2188,7 +2266,7 @@ impl Executor {
                     .chain(window.partition_by.iter())
                     .chain(window.order_by.iter().map(|o| &o.expression))
                 {
-                    self.extract_aggregates_from_expr(expr, aggregations, non_agg_columns)?;
+                    self.extract_aggregates_from_expr(expr, aggregations, non_agg_columns, ctx)?;
                 }
             }
             _ => {}
@@ -2202,6 +2280,7 @@ impl Executor {
         aliased: &crate::parser::ast::AliasedExpression,
         aggregations: &mut Vec<SqlAggregateFunction>,
         non_agg_columns: &mut Vec<String>,
+        ctx: Option<&ExecutionContext>,
     ) -> Result<()> {
         match aliased.expression.as_ref() {
             Expression::FunctionCall(func) => {
@@ -2217,8 +2296,8 @@ impl Executor {
                         }
                     }
 
-                    let (column, distinct, extra_args, expression) =
-                        self.extract_agg_column(&func.arguments)?;
+                    let (column, distinct, (extra_args, extra_error), expression) =
+                        self.extract_agg_column(&func.arguments, ctx)?;
                     let column_lower = column.to_lowercase();
                     aggregations.push(SqlAggregateFunction {
                         name: func.function.to_string(),
@@ -2227,6 +2306,7 @@ impl Executor {
                         alias: Some(aliased.alias.value.to_string()),
                         distinct: distinct || func.is_distinct,
                         extra_args,
+                        extra_error,
                         expression,
                         order_by: func.order_by.clone(),
                         filter: func.filter.as_ref().map(|f| (**f).clone()),
@@ -2237,7 +2317,7 @@ impl Executor {
                     // Non-aggregate function: recursively check arguments for nested aggregates
                     // e.g., COALESCE(SUM(val), 0) AS total, ABS(SUM(val)) AS abs_sum
                     for arg in &func.arguments {
-                        self.extract_aggregates_from_expr(arg, aggregations, non_agg_columns)?;
+                        self.extract_aggregates_from_expr(arg, aggregations, non_agg_columns, ctx)?;
                     }
                 }
             }
@@ -2248,26 +2328,34 @@ impl Executor {
                         &when_clause.condition,
                         aggregations,
                         non_agg_columns,
+                        ctx,
                     )?;
                     self.extract_aggregates_from_expr(
                         &when_clause.then_result,
                         aggregations,
                         non_agg_columns,
+                        ctx,
                     )?;
                 }
                 if let Some(ref else_val) = case.else_value {
-                    self.extract_aggregates_from_expr(else_val, aggregations, non_agg_columns)?;
+                    self.extract_aggregates_from_expr(
+                        else_val,
+                        aggregations,
+                        non_agg_columns,
+                        ctx,
+                    )?;
                 }
             }
             Expression::Cast(cast) => {
                 // Extract aggregates from CAST expression (e.g., CAST(SUM(val) AS TEXT) AS sum_text)
-                self.extract_aggregates_from_expr(&cast.expr, aggregations, non_agg_columns)?;
+                self.extract_aggregates_from_expr(&cast.expr, aggregations, non_agg_columns, ctx)?;
             }
             _ => {
                 self.extract_aggregates_from_expr(
                     &aliased.expression,
                     aggregations,
                     non_agg_columns,
+                    ctx,
                 )?;
             }
         }
@@ -2279,14 +2367,16 @@ impl Executor {
     /// Returns: (column_name, distinct, extra_args, expression)
     /// - column_name: The column or expression string the aggregate operates on (* for COUNT(*))
     /// - distinct: Whether DISTINCT was found in arguments
-    /// - extra_args: Additional arguments (e.g., separator for STRING_AGG)
+    /// - extra_args: Additional arguments (e.g., separator for STRING_AGG) and
+    ///   the error one gave, see [`aggregate_extra_args`]
     /// - expression: The expression to evaluate (Some for complex expressions like val * 2)
     fn extract_agg_column(
         &self,
         args: &[Expression],
-    ) -> Result<(String, bool, Vec<Value>, Option<Expression>)> {
+        ctx: Option<&ExecutionContext>,
+    ) -> Result<(String, bool, ExtraArgs, Option<Expression>)> {
         if args.is_empty() {
-            return Ok(("*".to_string(), false, Vec::new(), None));
+            return Ok(("*".to_string(), false, (Vec::new(), None), None));
         }
 
         let (column, distinct, expression) = match &args[0] {
@@ -2305,7 +2395,12 @@ impl Executor {
             }
         };
 
-        Ok((column, distinct, aggregate_extra_args(args), expression))
+        Ok((
+            column,
+            distinct,
+            aggregate_extra_args(args, ctx)?,
+            expression,
+        ))
     }
 
     /// Parse GROUP BY clause
@@ -2933,7 +3028,7 @@ impl Executor {
         }
 
         // Parse aggregations
-        let (aggregations, non_agg_columns) = self.parse_aggregations(stmt)?;
+        let (aggregations, non_agg_columns) = self.parse_aggregations(stmt, Some(ctx))?;
 
         // Must have only aggregations, no regular columns
         if !non_agg_columns.is_empty() {
@@ -3096,7 +3191,7 @@ impl Executor {
         }
 
         // Parse aggregations to validate and extract details
-        let (aggregations, non_agg_columns) = self.parse_aggregations(stmt)?;
+        let (aggregations, non_agg_columns) = self.parse_aggregations(stmt, Some(ctx))?;
 
         // Must have only aggregations, no regular columns
         if !non_agg_columns.is_empty() || aggregations.is_empty() {
@@ -3265,7 +3360,7 @@ impl Executor {
         }
 
         // Parse aggregations - allow non-pure expressions (like AVG(col) * 100)
-        let (aggregations, non_agg_columns) = self.parse_aggregations(stmt)?;
+        let (aggregations, non_agg_columns) = self.parse_aggregations(stmt, Some(ctx))?;
 
         // Must have only aggregations, no regular columns
         if !non_agg_columns.is_empty() {
@@ -3430,7 +3525,7 @@ impl Executor {
         };
 
         // Parse aggregations
-        let (aggregations, non_agg_columns) = self.parse_aggregations(stmt)?;
+        let (aggregations, non_agg_columns) = self.parse_aggregations(stmt, Some(ctx))?;
 
         // The select list reads the group column, bare or qualified, and
         // aggregate calls; the shared end projects the slots onto it
@@ -3591,7 +3686,7 @@ impl Executor {
         }
 
         // One storage aggregate per slot, ORDER BY's own included
-        let (aggregations, _) = match self.parse_aggregations(stmt) {
+        let (aggregations, _) = match self.parse_aggregations(stmt, Some(ctx)) {
             Ok(parsed) => parsed,
             Err(error) => return Some(Err(error)),
         };

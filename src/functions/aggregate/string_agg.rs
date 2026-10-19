@@ -15,6 +15,7 @@
 //! STRING_AGG aggregate function
 
 use crate::core::{Result, Value};
+use crate::functions::scalar::value_to_string;
 use crate::functions::{
     AggregateFunction, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType,
 };
@@ -43,8 +44,9 @@ pub struct StringAggFunction {
     order_keys: Vec<crate::functions::AggregateOrder>,
     /// Whether ORDER BY is active
     has_order_by: bool,
-    /// Separator between values (default: ",")
-    separator: String,
+    /// Separator between values (default: ","); None for a NULL one, which
+    /// makes the result NULL as CONCAT_WS does
+    separator: Option<String>,
 }
 
 impl Default for StringAggFunction {
@@ -54,7 +56,7 @@ impl Default for StringAggFunction {
             ordered_entries: Vec::new(),
             order_keys: Vec::new(),
             has_order_by: false,
-            separator: ",".to_string(),
+            separator: Some(",".to_string()),
         }
     }
 }
@@ -79,9 +81,9 @@ impl AggregateFunction for StringAggFunction {
     }
 
     fn configure(&mut self, options: &[Value]) {
-        // First option is the separator
-        if let Some(Value::Text(sep)) = options.first() {
-            self.separator = sep.to_string();
+        // First option is the separator, read as CONCAT_WS reads its own
+        if let Some(sep) = options.first() {
+            self.separator = (!sep.is_null()).then(|| value_to_string(sep));
         }
     }
 
@@ -159,10 +161,11 @@ impl AggregateFunction for StringAggFunction {
             return Ok(Value::null_unknown());
         };
 
-        if values_to_output.is_empty() {
-            Ok(Value::null_unknown())
-        } else {
-            Ok(Value::text(values_to_output.join(&self.separator)))
+        match &self.separator {
+            Some(separator) if !values_to_output.is_empty() => {
+                Ok(Value::text(values_to_output.join(separator)))
+            }
+            _ => Ok(Value::null_unknown()),
         }
     }
 
