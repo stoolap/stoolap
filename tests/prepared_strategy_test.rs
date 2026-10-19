@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Every registered prepared strategy answers a corpus of EXISTS, IN, ANY
-//! and ALL statements as its written answer says, and the corpus reaches
-//! every one of them: a strategy added without a case fails here.
+//! Every registered prepared strategy answers a corpus of EXISTS, IN, ANY,
+//! ALL and aggregating scalar statements as its written answer says, and the
+//! corpus reaches every one of them: a strategy added without a case fails here.
 
 #![cfg(feature = "test-failpoints")]
 
@@ -60,6 +60,14 @@ const CORPUS: &[(&str, &[i64])] = &[
     ("SELECT id FROM t WHERE x NOT IN (SELECT v FROM u WHERE u.k = t.k) ORDER BY id", &[3, 5]),
     ("SELECT id FROM t WHERE x < ANY (SELECT v FROM u WHERE u.k = t.k) ORDER BY id", &[1]),
     ("SELECT id FROM t WHERE x >= ALL (SELECT v FROM u WHERE v IS NOT NULL) ORDER BY id", &[]),
+    ("SELECT id FROM t WHERE x < (SELECT MAX(v) FROM u WHERE u.k = t.k) ORDER BY id", &[1]),
+    ("SELECT id FROM t WHERE (SELECT COUNT(*) FROM u WHERE u.k = t.k) = 0 ORDER BY id", &[3, 5]),
+    ("SELECT id FROM t WHERE EXISTS (SELECT u.k FROM u WHERE u.k = t.k GROUP BY u.k HAVING COUNT(*) > 1) ORDER BY id", &[1]),
+    ("SELECT id FROM t WHERE x IN (SELECT MAX(v) FROM u WHERE u.k = t.k) ORDER BY id", &[4]),
+    ("SELECT id FROM t WHERE x IN (SELECT MIN(v) FROM u GROUP BY k) ORDER BY id", &[1, 4]),
+    ("SELECT id FROM t WHERE x <= ALL (SELECT COUNT(*) FROM u WHERE u.k = t.k GROUP BY u.d) ORDER BY id", &[1, 3, 5]),
+    ("SELECT id FROM t WHERE x = (SELECT MIN(v) FROM u WHERE u.k = t.k HAVING MIN(v) < t.x + 1) ORDER BY id", &[1, 4]),
+    ("SELECT id FROM t WHERE x > (SELECT AVG(v) FROM u) ORDER BY id", &[5]),
 ];
 
 #[test]

@@ -68,6 +68,7 @@ const REFUSED: &[&str] = &[
     "SELECT id FROM t WHERE x = (SELECT v FROM u WHERE u.k = t.k GROUP BY k)",
     "SELECT id FROM t WHERE x = (SELECT v FROM u WHERE u.k = t.k HAVING COUNT(*) > 0)",
     "SELECT id FROM t WHERE x IN (SELECT v FROM u GROUP BY k)",
+    "SELECT id FROM t WHERE EXISTS (SELECT v FROM u WHERE u.k = t.k GROUP BY k)",
     "SELECT id FROM t WHERE x = (SELECT MAX(v) FROM u WHERE u.k = t.k HAVING v > 0)",
     "SELECT id, (SELECT v FROM u WHERE u.k = t.k GROUP BY k) FROM t",
     "SELECT id, EXISTS (SELECT v FROM u WHERE u.k = t.k GROUP BY k) FROM t",

@@ -68,6 +68,8 @@ pub(crate) enum AggregatePath {
     CompiledCountStar,
     /// COUNT(DISTINCT col) answered by a cached plan from the column's index
     CompiledCountDistinct,
+    /// A prepared subquery block that aggregates, per call or by key
+    PreparedBlock,
 }
 
 impl AggregatePath {
@@ -82,7 +84,7 @@ impl AggregatePath {
 
 #[cfg(any(test, feature = "test-failpoints"))]
 impl AggregatePath {
-    pub(crate) const ALL: [AggregatePath; 11] = [
+    pub(crate) const ALL: [AggregatePath; 12] = [
         AggregatePath::General,
         AggregatePath::Pushdown,
         AggregatePath::FilteredPushdown,
@@ -94,6 +96,7 @@ impl AggregatePath {
         AggregatePath::IndexMinMax,
         AggregatePath::CompiledCountStar,
         AggregatePath::CompiledCountDistinct,
+        AggregatePath::PreparedBlock,
     ];
 
     pub(crate) const fn name(self) -> &'static str {
@@ -109,6 +112,7 @@ impl AggregatePath {
             AggregatePath::IndexMinMax => "index_min_max",
             AggregatePath::CompiledCountStar => "compiled_count_star",
             AggregatePath::CompiledCountDistinct => "compiled_count_distinct",
+            AggregatePath::PreparedBlock => "prepared_block",
         }
     }
 }
@@ -663,25 +667,26 @@ impl CallInputs {
         aggregations: &[SqlAggregateFunction],
         columns: &[String],
     ) -> Result<Vec<CallInputs>> {
-        use super::expression::compile_expression;
+        Self::compile_with(aggregations, |expr| {
+            super::expression::compile_expression(expr, columns)
+        })
+    }
+
+    /// The inputs of every call, each program made by `compile`
+    pub(crate) fn compile_with(
+        aggregations: &[SqlAggregateFunction],
+        compile: impl Fn(&Expression) -> Result<super::expression::SharedProgram>,
+    ) -> Result<Vec<CallInputs>> {
         aggregations
             .iter()
             .map(|agg| {
                 Ok(CallInputs {
-                    filter: agg
-                        .filter
-                        .as_ref()
-                        .map(|f| compile_expression(f, columns))
-                        .transpose()?,
-                    argument: agg
-                        .expression
-                        .as_ref()
-                        .map(|e| compile_expression(e, columns))
-                        .transpose()?,
+                    filter: agg.filter.as_ref().map(&compile).transpose()?,
+                    argument: agg.expression.as_ref().map(&compile).transpose()?,
                     order: agg
                         .order_by
                         .iter()
-                        .map(|o| compile_expression(&o.expression, columns))
+                        .map(|o| compile(&o.expression))
                         .collect::<Result<_>>()?,
                 })
             })
@@ -756,7 +761,7 @@ impl CallInputs {
 }
 
 /// The value COUNT(*) is fed for each row
-static COUNT_STAR: Value = Value::Integer(1);
+pub(crate) static COUNT_STAR: Value = Value::Integer(1);
 
 /// Rows at which an aggregation whose calls all merge splits its input
 #[cfg(feature = "parallel")]

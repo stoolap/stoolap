@@ -614,6 +614,8 @@ pub type MemberKeys = FxHashMap<SmallVec<[Value; 1]>, KeptMembers>;
 /// A prepared block's answer for a whole run
 #[derive(Debug, Clone)]
 pub enum BlockAnswer {
+    /// An uncorrelated scalar block's value
+    Value(Value),
     /// An uncorrelated EXISTS block's value
     Once(bool),
     Keyed(CompactArc<ExistsKeys>),

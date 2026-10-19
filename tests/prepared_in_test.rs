@@ -223,6 +223,7 @@ fn test_a_set_test_belongs_to_the_family_wherever_where_holds_it() {
         "SELECT id FROM t WHERE CASE WHEN x > 1 THEN x = ANY (SELECT v FROM u) ELSE FALSE END",
         "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.v IN (SELECT x FROM w WHERE w.k = u.k))",
         "SELECT id FROM t WHERE x >= ALL (SELECT v + 1 FROM u WHERE u.k = t.k) LIMIT 2",
+        "SELECT id FROM t WHERE x IN (SELECT MAX(v) FROM u)",
     ] {
         assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
     }
@@ -234,10 +235,6 @@ fn test_a_set_test_belongs_to_the_family_wherever_where_holds_it() {
         (
             "SELECT id FROM t WHERE x IN (SELECT v, k FROM u)",
             "a subquery block without exactly one SELECT expression",
-        ),
-        (
-            "SELECT id FROM t WHERE x IN (SELECT MAX(v) FROM u)",
-            "an aggregate",
         ),
         (
             "SELECT id, x IN (SELECT v FROM u) FROM t WHERE x IN (SELECT v FROM u)",

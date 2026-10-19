@@ -102,7 +102,7 @@ impl CallTemplate {
         }
     }
 
-    fn duplicate(&self) -> CallTemplate {
+    pub(crate) fn duplicate(&self) -> CallTemplate {
         match self {
             CallTemplate::Compiled(make) => CallTemplate::Compiled(*make),
             CallTemplate::Dynamic {
