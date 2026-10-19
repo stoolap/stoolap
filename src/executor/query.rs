@@ -2555,12 +2555,14 @@ impl Executor {
 
         // classification is passed from caller to avoid redundant cache lookups
 
-        // A WHERE that keeps no row reads no row
-        if stmt
-            .where_clause
-            .as_deref()
-            .is_some_and(|w| true_for_no_row(w, ctx))
-        {
+        // A WHERE that keeps no row reads no row; one with a subquery or a
+        // parent row to bind is left to the scan, which prepares both
+        if let Some(where_clause) = stmt.where_clause.as_deref().filter(|w| {
+            !classification.where_has_subqueries
+                && ctx.outer_row().is_none()
+                && true_for_no_row(w, ctx)
+        }) {
+            Self::bind_empty_where(stmt, where_clause, &all_columns)?;
             return self.finish_without_rows(
                 stmt,
                 ctx,
@@ -4324,6 +4326,10 @@ impl Executor {
                 Some(0),
                 0,
             )?;
+            if let Some(where_clause) = &where_for_join {
+                let joined: Vec<String> = left_cols.iter().chain(&right_cols).cloned().collect();
+                Self::bind_empty_where(stmt, where_clause, &joined)?;
+            }
             (
                 CompactArc::new(Vec::new()),
                 left_cols,
@@ -11028,6 +11034,18 @@ impl Executor {
     ) -> Option<Expression> {
         let alias_map = Self::build_alias_map_excluding(&stmt.columns, Some(columns));
         (!alias_map.is_empty()).then(|| Self::substitute_aliases(predicate, &alias_map))
+    }
+
+    /// Binds a WHERE that keeps no row over the `columns` it would filter,
+    /// as the filter of their rows would, without reading one: a column it
+    /// cannot find is the error the filter gives
+    fn bind_empty_where(
+        stmt: &SelectStatement,
+        where_clause: &Expression,
+        columns: &[String],
+    ) -> Result<()> {
+        let resolved = Self::with_select_aliases(stmt, where_clause, columns);
+        RowFilter::new(resolved.as_ref().unwrap_or(where_clause), columns).map(|_| ())
     }
 
     /// Substitute column aliases in an expression with their underlying expressions

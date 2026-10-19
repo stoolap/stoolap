@@ -74,6 +74,11 @@ fn a_constant_false_where_answers_as_an_empty_filter() {
         "SELECT missing, COUNT(*) FROM t GROUP BY missing",
         "SELECT id, SUM(missing) OVER () FROM t",
         "SELECT x.id FROM t y",
+        "SELECT id FROM t WHERE missing = 1 AND {never}",
+        "SELECT id AS x FROM t WHERE x = 1 AND {never}",
+        "SELECT id FROM t WHERE t.id = 1 AND {never}",
+        "SELECT id FROM t WHERE y.id = 1 AND {never}",
+        "SELECT g, COUNT(*) FROM t WHERE missing > 0 AND {never} GROUP BY g",
     ] {
         let at = |never: &str| {
             if select.contains("{never}") {
@@ -240,4 +245,46 @@ fn a_join_whose_where_keeps_no_row_reads_each_side_alone() {
 
 fn sql_with(sql: &str) -> String {
     sql.replace("$1", "1")
+}
+
+#[test]
+fn a_join_whose_where_keeps_no_row_binds_the_where() {
+    let db = Database::open("memory://constant_false_join_binds").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 2)", ()).unwrap();
+    let mut wrong = Vec::new();
+    for select in [
+        "WITH c(x) AS (SELECT 1), d(y) AS (SELECT 2) \
+         SELECT COUNT(*) FROM c CROSS JOIN d WHERE c.missing = 1 AND {never}",
+        "WITH c(x) AS (SELECT 1), d(y) AS (SELECT 2) \
+         SELECT COUNT(*) FROM c CROSS JOIN d WHERE missing = 1 AND {never}",
+        "WITH c(x) AS (SELECT 1) SELECT c.x AS n FROM c JOIN t ON t.id = c.x WHERE n = 1 AND {never}",
+        "SELECT a.id FROM t a JOIN t b ON a.id = b.id WHERE b.missing = 2 AND {never}",
+        "SELECT a.id FROM t a JOIN t b ON a.id = b.id WHERE b.v = 2 AND {never}",
+    ] {
+        for never in ["1 = 0", "NULL"] {
+            let sql = select.replace("{never}", never);
+            let empty = if select.contains("FROM c") {
+                "ABS(c.x) < 0"
+            } else {
+                "ABS(a.id) < 0"
+            };
+            let want = answer(&db, &select.replace("{never}", empty));
+            let got = answer(&db, &sql);
+            // A side's filter and the joined filter name an unknown column apiece
+            if got.is_err() && want.is_err() {
+                continue;
+            }
+            if got != want {
+                wrong.push(format!("{sql}\n  got  {got:?}\n  want {want:?}"));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
 }
