@@ -261,14 +261,20 @@ pub(crate) fn split_join_where(
     (safe_left, safe_right, remaining)
 }
 
-/// Whether `expr` is false for every row: a statement constant, so no column
-/// reads as the text of its name, that evaluates to false
-fn false_for_every_row(expr: &Expression, ctx: &ExecutionContext) -> bool {
+/// Whether a WHERE `expr` keeps no row: one of its AND terms is a statement
+/// constant, so no column reads as the text of its name, that evaluates to
+/// false or NULL
+fn true_for_no_row(expr: &Expression, ctx: &ExecutionContext) -> bool {
+    if let Expression::Infix(infix) = expr {
+        if infix.op_type == InfixOperator::And {
+            return true_for_no_row(&infix.left, ctx) || true_for_no_row(&infix.right, ctx);
+        }
+    }
     statement_constant(expr, global_registry())
         && ExpressionEval::compile(expr, &[]).is_ok_and(|eval| {
             matches!(
                 eval.with_context(ctx).eval_slice(&Row::new()),
-                Ok(Value::Boolean(false))
+                Ok(Value::Boolean(false) | Value::Null(_))
             )
         })
 }
@@ -1572,7 +1578,7 @@ impl Executor {
         // Short-circuit: if WHERE is a constant-false expression (e.g., 1=0),
         // skip TVF generation entirely and return empty result.
         if let Some(ref where_clause) = stmt.where_clause {
-            if false_for_every_row(where_clause, ctx) {
+            if true_for_no_row(where_clause, ctx) {
                 let columns = if !tvf_source.column_aliases.is_empty() {
                     tvf_source
                         .column_aliases
@@ -2348,6 +2354,88 @@ impl Executor {
         }
     }
 
+    /// A table scan's rows projected by the SELECT list and the names of the
+    /// output columns; with `order_by_extra`, the ORDER BY columns the list
+    /// lacks follow, for execute_select to sort by and drop
+    #[allow(clippy::too_many_arguments)]
+    fn project_scanned_rows(
+        &self,
+        stmt: &SelectStatement,
+        rows: RowVec,
+        all_columns: &[String],
+        all_columns_lower: &[String],
+        table_alias: Option<&str>,
+        order_by_extra: bool,
+        ctx: &ExecutionContext,
+    ) -> Result<(RowVec, Vec<String>)> {
+        let mut output_columns =
+            self.get_output_column_names(&stmt.columns, all_columns, table_alias);
+        if order_by_extra {
+            let (projected_rows, extra_names) = self.project_rows_with_order_by(
+                &stmt.columns,
+                &stmt.order_by,
+                &stmt.distinct_on,
+                rows,
+                all_columns,
+                table_alias,
+                ctx,
+            )?;
+            output_columns.extend(extra_names);
+            return Ok((projected_rows, output_columns));
+        }
+        let projected_rows = self.project_rows_with_alias(
+            &stmt.columns,
+            rows,
+            all_columns,
+            Some(all_columns_lower),
+            ctx,
+            table_alias,
+        )?;
+        Ok((projected_rows, output_columns))
+    }
+
+    /// A table scan's answer when no row can match: no rows, taking the
+    /// aggregate, window or projection path scanned rows would take
+    #[allow(clippy::too_many_arguments)]
+    fn finish_without_rows(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        all_columns: &[String],
+        all_columns_lower: &[String],
+        table_alias: Option<&str>,
+        classification: &QueryClassification,
+    ) -> SelectResult {
+        let result = match (
+            classification.has_aggregation,
+            classification.has_window_functions,
+        ) {
+            (true, true) => self.execute_aggregation_then_windows(stmt, ctx, &[], all_columns)?,
+            (false, true) => {
+                self.execute_select_with_window_functions(stmt, ctx, &[], all_columns)?
+            }
+            (true, false) => {
+                self.execute_select_with_aggregation(stmt, ctx, RowVec::new(), all_columns)?
+            }
+            (false, false) => {
+                let (rows, columns) = self.project_scanned_rows(
+                    stmt,
+                    RowVec::new(),
+                    all_columns,
+                    all_columns_lower,
+                    table_alias,
+                    self.order_by_needs_extra_columns(stmt, all_columns),
+                    ctx,
+                )?;
+                let columns = CompactArc::new(columns);
+                let result = ExecutorResult::with_arc_columns(CompactArc::clone(&columns), rows);
+                return Ok((Box::new(result), columns, false, None));
+            }
+        };
+        let columns = CompactArc::new(result.columns().to_vec());
+        Ok((result, columns, false, None))
+    }
+
     /// Execute a simple table scan
     fn execute_simple_table_scan(
         &self,
@@ -2473,6 +2561,24 @@ impl Executor {
             .or_else(|| Some(table_name.to_string()));
 
         // classification is passed from caller to avoid redundant cache lookups
+
+        // A WHERE that keeps no row reads no row; one with a subquery or a
+        // parent row to bind is left to the scan, which prepares both
+        if let Some(where_clause) = stmt.where_clause.as_deref().filter(|w| {
+            !classification.where_has_subqueries
+                && ctx.outer_row().is_none()
+                && true_for_no_row(w, ctx)
+        }) {
+            Self::bind_empty_where(stmt, where_clause, &all_columns)?;
+            return self.finish_without_rows(
+                stmt,
+                ctx,
+                &all_columns,
+                &all_columns_lower,
+                table_alias.as_deref(),
+                classification,
+            );
+        }
 
         // AGGREGATION PUSHDOWN: Try to compute simple aggregates directly on storage
         // This avoids all row materialization for queries like:
@@ -2714,17 +2820,14 @@ impl Executor {
                     .get_query_planner()
                     .can_prune_entire_scan(&*table, expr.as_ref())
                 {
-                    // Zone maps indicate no segments can match - return empty result
-                    let output_columns = CompactArc::new(self.get_output_column_names(
-                        &stmt.columns,
+                    return self.finish_without_rows(
+                        stmt,
+                        ctx,
                         &all_columns,
+                        &all_columns_lower,
                         table_alias.as_deref(),
-                    ));
-                    let result = ExecutorResult::with_arc_columns(
-                        CompactArc::clone(&output_columns),
-                        RowVec::new(),
+                        classification,
                     );
-                    return Ok((Box::new(result), output_columns, true, None));
                 }
             }
         }
@@ -3983,47 +4086,28 @@ impl Executor {
             classification,
         );
 
-        let (projected_rows, output_columns, deferred_proj) = if order_by_needs_extra_columns {
-            // When ORDER BY references columns not in SELECT, we need to:
-            // 1. Include those columns in the output (appended at end)
-            // 2. Sort will happen in execute_select
-            // 3. Extra columns will be projected out after sorting
-            let (projected_rows, extra_names) = self.project_rows_with_order_by(
-                &stmt.columns,
-                &stmt.order_by,
-                &stmt.distinct_on,
-                rows,
-                &all_columns,
-                table_alias.as_deref(),
-                ctx,
-            )?;
-            // Get base column names, then the ones the projection appended,
-            // which it names in the order it appends them
-            let mut output_columns =
-                self.get_output_column_names(&stmt.columns, &all_columns, table_alias.as_deref());
-            output_columns.extend(extra_names);
-            (projected_rows, output_columns, None)
-        } else if let Some((col_indices, output_names)) = deferred_projection_info {
-            // DEFERRED PROJECTION: Skip projection now, do it after ORDER BY + LIMIT
-            // Return all source columns; projection will be applied after TopNResult
-            (
-                rows,
-                all_columns.to_vec(),
-                Some((col_indices, output_names)),
-            )
-        } else {
-            // Standard projection
-            let projected_rows = self.project_rows_with_alias(
-                &stmt.columns,
-                rows,
-                &all_columns,
-                Some(&all_columns_lower),
-                ctx,
-                table_alias.as_deref(),
-            )?;
-            let output_columns =
-                self.get_output_column_names(&stmt.columns, &all_columns, table_alias.as_deref());
-            (projected_rows, output_columns, None)
+        let (projected_rows, output_columns, deferred_proj) = match deferred_projection_info {
+            Some((col_indices, output_names)) if !order_by_needs_extra_columns => {
+                // DEFERRED PROJECTION: Skip projection now, do it after ORDER BY + LIMIT
+                // Return all source columns; projection will be applied after TopNResult
+                (
+                    rows,
+                    all_columns.to_vec(),
+                    Some((col_indices, output_names)),
+                )
+            }
+            _ => {
+                let (projected_rows, output_columns) = self.project_scanned_rows(
+                    stmt,
+                    rows,
+                    &all_columns,
+                    &all_columns_lower,
+                    table_alias.as_deref(),
+                    order_by_needs_extra_columns,
+                    ctx,
+                )?;
+                (projected_rows, output_columns, None)
+            }
         };
 
         // SEMANTIC CACHE: Insert result for eligible queries
@@ -4199,12 +4283,12 @@ impl Executor {
             ),
             None => (None, None, None),
         };
-        // A WHERE false for every row joins no rows whatever the join type; the
+        // A WHERE that keeps no row joins no rows whatever the join type; the
         // sides run with no rows only to name their columns
         let never = where_for_join
             .as_ref()
             .filter(|_| !classification.where_has_subqueries)
-            .is_some_and(|w| false_for_every_row(w, ctx));
+            .is_some_and(|w| true_for_no_row(w, ctx));
 
         // Semi-join reduction optimization for LEFT JOIN + GROUP BY + LIMIT
         // Pattern: LEFT JOIN + GROUP BY on left columns only + LIMIT N + no ORDER BY
@@ -4229,21 +4313,30 @@ impl Executor {
 
         let (left_rows, left_columns, right_rows, right_columns) = if never {
             // Not every side honours the filter or the limit, so its rows are
-            // dropped and only its columns kept
+            // dropped and only its columns kept. The filter reads no column,
+            // as a side knows only its own
+            let none = Expression::BooleanLiteral(BooleanLiteral {
+                token: dummy_token("FALSE", TokenType::Keyword),
+                value: false,
+            });
             let (_, left_cols, _, _) = self.execute_table_expression_with_filter_limit(
                 &join_source.left,
                 ctx,
-                where_for_join.as_ref(),
+                Some(&none),
                 Some(0),
                 0,
             )?;
             let (_, right_cols, _, _) = self.execute_table_expression_with_filter_limit(
                 &join_source.right,
                 ctx,
-                where_for_join.as_ref(),
+                Some(&none),
                 Some(0),
                 0,
             )?;
+            if let Some(where_clause) = &where_for_join {
+                let joined: Vec<String> = left_cols.iter().chain(&right_cols).cloned().collect();
+                Self::bind_empty_where(stmt, where_clause, &joined)?;
+            }
             (
                 CompactArc::new(Vec::new()),
                 left_cols,
@@ -10948,6 +11041,18 @@ impl Executor {
     ) -> Option<Expression> {
         let alias_map = Self::build_alias_map_excluding(&stmt.columns, Some(columns));
         (!alias_map.is_empty()).then(|| Self::substitute_aliases(predicate, &alias_map))
+    }
+
+    /// Binds a WHERE that keeps no row over the `columns` it would filter,
+    /// as the filter of their rows would, without reading one: a column it
+    /// cannot find is the error the filter gives
+    fn bind_empty_where(
+        stmt: &SelectStatement,
+        where_clause: &Expression,
+        columns: &[String],
+    ) -> Result<()> {
+        let resolved = Self::with_select_aliases(stmt, where_clause, columns);
+        RowFilter::new(resolved.as_ref().unwrap_or(where_clause), columns).map(|_| ())
     }
 
     /// Substitute column aliases in an expression with their underlying expressions

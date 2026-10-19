@@ -186,6 +186,8 @@ The optimizer simplifies expressions when possible:
 -- After:  SELECT * FROM t WHERE x > 5
 ```
 
+A WHERE that keeps no row, because one of its `AND` terms is a constant that is false or NULL (`1 = 0`, `NULL`, `$1 = 0` with a parameter that makes it false), reads no row of the table at all. The same holds when zone maps show that no row can match. Aggregates and window functions still answer their empty input, so `SELECT COUNT(*) FROM t WHERE 1 = 0` returns `0`.
+
 ### Predicate Merging
 
 ```sql
