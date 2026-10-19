@@ -12,11 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A subquery in any clause gives the answer its value gives written as a
-//! literal, or an error until the clause runs on a prepared plan: never a
-//! NULL it did not compute, a dropped predicate or a skipped check.
+//! The ledger of subquery evaluation sites. Each site states what it does
+//! today: `Right`, the answer its value gives written as a literal, or
+//! `Fails`, an error that changes nothing until the named step prepares it.
+//! A site that answers otherwise fails here, a wrong answer and a site a
+//! step fixed without updating the ledger alike.
 
 use stoolap::Database;
+
+/// What a site does today
+#[derive(Clone, Copy, Debug)]
+enum State {
+    /// The literal's answer
+    Right,
+    /// An error that changes nothing, until the plan step named prepares it
+    Fails(&'static str),
+}
+
+use State::{Fails, Right};
 
 /// t: id 1..6, a = id % 3, b = id * 10. u: id 1..3, x = id
 fn setup(name: &str) -> Database {
@@ -60,53 +73,68 @@ fn table(db: &Database) -> Vec<Vec<String>> {
     rows(db, "SELECT * FROM t ORDER BY id").unwrap()
 }
 
-/// The literal's answer, or an error until `owner` prepares the clause
-fn never_wrong(name: &str, owner: &str, with_subquery: &str, with_literal: &str) {
-    let db = setup(name);
-    let expected = rows(&db, with_literal).unwrap();
-    if let Ok(got) = rows(&db, with_subquery) {
-        assert_eq!(got, expected, "{with_subquery} (prepared by {owner})");
+/// That `got`, the outcome of `what`, is what `state` says, against `want`
+fn holds<T: PartialEq + std::fmt::Debug>(
+    state: State,
+    got: Result<T, String>,
+    want: &T,
+    what: &str,
+) {
+    match (state, got) {
+        (Right, Ok(got)) => assert_eq!(&got, want, "{what}"),
+        (Right, Err(e)) => panic!("{what} should answer as its literal: {e}"),
+        (Fails(_), Err(_)) => {}
+        (Fails(owner), Ok(got)) if &got == want => {
+            panic!("{what} now answers right: mark it Right, {owner} prepared it")
+        }
+        (Fails(owner), Ok(got)) => {
+            panic!("{what} gave {got:?}, want {want:?}, or an error until {owner}")
+        }
     }
 }
 
-/// The literal's answer, now
-fn same(name: &str, with_subquery: &str, with_literal: &str) {
+/// A query site
+fn site(name: &str, state: State, with_subquery: &str, with_literal: &str) {
     let db = setup(name);
-    let expected = rows(&db, with_literal).unwrap();
-    assert_eq!(rows(&db, with_subquery), Ok(expected), "{with_subquery}");
+    let want = rows(&db, with_literal).unwrap();
+    holds(state, rows(&db, with_subquery), &want, with_subquery);
 }
 
-/// The literal's effect, or an error that leaves the table as it was
-fn never_wrong_effect(name: &str, owner: &str, with_subquery: &str, with_literal: &str) {
+/// A write site: the literal's effect, or an error that leaves the table
+fn write_site(name: &str, state: State, with_subquery: &str, with_literal: &str) {
     let left = setup(&format!("{name}_subquery"));
     let right = setup(&format!("{name}_literal"));
     let before = table(&left);
     right.execute(with_literal, ()).unwrap();
-    let expected = match left.execute(with_subquery, ()) {
-        Ok(_) => table(&right),
-        Err(_) => before,
-    };
-    assert_eq!(
-        table(&left),
-        expected,
-        "{with_subquery} (prepared by {owner})"
+    let got = left.execute(with_subquery, ()).map_err(|e| e.to_string());
+    if got.is_err() {
+        assert_eq!(table(&left), before, "{with_subquery} failed but wrote");
+    }
+    holds(
+        state,
+        got.map(|_| table(&left)),
+        &table(&right),
+        with_subquery,
     );
 }
 
 #[test]
 fn test_select_list_exists_and_quantified() {
-    same(
+    site(
         "site_select_exists",
+        Right,
         "SELECT id, EXISTS (SELECT 1 FROM u) FROM t ORDER BY id",
         "SELECT id, TRUE FROM t ORDER BY id",
     );
-    same(
+    site(
         "site_select_all",
+        Right,
         "SELECT id, a < ALL (SELECT x FROM u) FROM t ORDER BY id",
         "SELECT id, a < 1 FROM t ORDER BY id",
     );
-    same(
+    site(
         "site_select_correlated_exists",
+        Right,
         "SELECT id, EXISTS (SELECT 1 FROM u WHERE u.id = t.a) FROM t ORDER BY id",
         "SELECT id, a BETWEEN 1 AND 3 FROM t ORDER BY id",
     );
@@ -114,8 +142,9 @@ fn test_select_list_exists_and_quantified() {
 
 #[test]
 fn test_constant_arithmetic_on_a_subquery() {
-    same(
+    site(
         "site_constant_fold",
+        Right,
         "SELECT id FROM t WHERE b = (SELECT 1) + 9 ORDER BY id",
         "SELECT id FROM t WHERE b = 10 ORDER BY id",
     );
@@ -123,15 +152,15 @@ fn test_constant_arithmetic_on_a_subquery() {
 
 #[test]
 fn test_limit_and_offset() {
-    never_wrong(
+    site(
         "site_offset",
-        "step 1",
+        Fails("step 1"),
         "SELECT id FROM t ORDER BY id OFFSET (SELECT 2)",
         "SELECT id FROM t ORDER BY id OFFSET 2",
     );
-    never_wrong(
+    site(
         "site_limit",
-        "step 1",
+        Fails("step 1"),
         "SELECT id FROM t ORDER BY id LIMIT (SELECT 2)",
         "SELECT id FROM t ORDER BY id LIMIT 2",
     );
@@ -139,9 +168,9 @@ fn test_limit_and_offset() {
 
 #[test]
 fn test_as_of_where() {
-    never_wrong(
+    site(
         "site_as_of",
-        "step 1",
+        Fails("step 1"),
         "SELECT id FROM t AS OF TIMESTAMP '2999-01-01 00:00:00' WHERE a IN (SELECT x FROM u) ORDER BY id",
         "SELECT id FROM t AS OF TIMESTAMP '2999-01-01 00:00:00' WHERE a IN (1, 2, 3) ORDER BY id",
     );
@@ -156,20 +185,26 @@ fn test_vector_search_select_list() {
         db.execute("INSERT INTO d VALUES ($1, $2)", (id, e))
             .unwrap();
     }
-    let with_literal = "SELECT id, 4 FROM d ORDER BY VEC_DISTANCE_L2(e, '[1,2]') LIMIT 3";
     let with_subquery =
         "SELECT id, (SELECT COUNT(*) FROM d) FROM d ORDER BY VEC_DISTANCE_L2(e, '[1,2]') LIMIT 3";
-    let expected = rows(&db, with_literal).unwrap();
-    if let Ok(got) = rows(&db, with_subquery) {
-        assert_eq!(got, expected, "{with_subquery} (prepared by step 1)");
-    }
+    let want = rows(
+        &db,
+        "SELECT id, 4 FROM d ORDER BY VEC_DISTANCE_L2(e, '[1,2]') LIMIT 3",
+    )
+    .unwrap();
+    holds(
+        Fails("step 1"),
+        rows(&db, with_subquery),
+        &want,
+        with_subquery,
+    );
 }
 
 #[test]
 fn test_correlated_conjunct_beside_an_indexed_in() {
-    never_wrong(
+    site(
         "site_index_correlated_conjunct",
-        "step 2",
+        Right,
         "SELECT id FROM t WHERE id IN (SELECT x FROM u) AND EXISTS (SELECT 1 FROM u w WHERE w.id = t.a) ORDER BY id",
         "SELECT id FROM t WHERE id IN (1, 2, 3) AND a BETWEEN 1 AND 3 ORDER BY id",
     );
@@ -177,9 +212,9 @@ fn test_correlated_conjunct_beside_an_indexed_in() {
 
 #[test]
 fn test_correlated_join_on() {
-    never_wrong(
+    site(
         "site_correlated_on",
-        "step 3",
+        Fails("step 3"),
         "SELECT t.id, u.id FROM t JOIN u ON u.id = (SELECT MIN(w.id) FROM u w WHERE w.x = t.a) ORDER BY t.id",
         "SELECT t.id, u.id FROM t JOIN u ON u.id = t.a ORDER BY t.id",
     );
@@ -187,9 +222,9 @@ fn test_correlated_join_on() {
 
 #[test]
 fn test_group_by_expression() {
-    never_wrong(
+    site(
         "site_group_by",
-        "step 4",
+        Fails("step 4"),
         "SELECT COUNT(*) FROM t GROUP BY id > (SELECT MAX(x) FROM u) ORDER BY 1",
         "SELECT COUNT(*) FROM t GROUP BY id > 3 ORDER BY 1",
     );
@@ -197,9 +232,9 @@ fn test_group_by_expression() {
 
 #[test]
 fn test_having_beside_a_window() {
-    never_wrong(
+    site(
         "site_having_window",
-        "step 4",
+        Fails("step 4"),
         "SELECT a, SUM(b), RANK() OVER (ORDER BY a) FROM t GROUP BY a HAVING SUM(b) > (SELECT 70) ORDER BY a",
         "SELECT a, SUM(b), RANK() OVER (ORDER BY a) FROM t GROUP BY a HAVING SUM(b) > 70 ORDER BY a",
     );
@@ -207,9 +242,9 @@ fn test_having_beside_a_window() {
 
 #[test]
 fn test_grouped_items_mixing_correlated_and_uncorrelated() {
-    never_wrong(
+    site(
         "site_grouped_mixed",
-        "step 4",
+        Fails("step 4"),
         "SELECT a, (SELECT MAX(x) FROM u), (SELECT COUNT(*) FROM u WHERE u.id = t.a) FROM t GROUP BY a ORDER BY a",
         "SELECT a, 3, CASE WHEN a BETWEEN 1 AND 3 THEN 1 ELSE 0 END FROM t GROUP BY a ORDER BY a",
     );
@@ -217,9 +252,9 @@ fn test_grouped_items_mixing_correlated_and_uncorrelated() {
 
 #[test]
 fn test_distinct_on_expression() {
-    never_wrong(
+    site(
         "site_distinct_on",
-        "step 4",
+        Fails("step 4"),
         "SELECT DISTINCT ON (a + (SELECT COUNT(*) FROM u)) a FROM t ORDER BY a + (SELECT COUNT(*) FROM u), id",
         "SELECT DISTINCT ON (a + 3) a FROM t ORDER BY a + 3, id",
     );
@@ -227,19 +262,21 @@ fn test_distinct_on_expression() {
 
 #[test]
 fn test_window_control_argument_reading_the_row() {
+    // What a control argument that reads the row means is open (plan 5.8)
     let db = setup("site_window_control");
-    let got = rows(
-        &db,
-        "SELECT id, NTILE((SELECT MAX(x) FROM u WHERE u.x = t.a)) OVER (ORDER BY id) FROM t ORDER BY id",
+    let sql = "SELECT id, NTILE((SELECT MAX(x) FROM u WHERE u.x = t.a)) OVER (ORDER BY id) FROM t ORDER BY id";
+    let got = rows(&db, sql);
+    assert!(
+        got.is_err(),
+        "{sql} answered {got:?} before its rule is set"
     );
-    assert!(got.is_err(), "a control argument reading the row: {got:?}");
 }
 
 #[test]
 fn test_insert_values() {
-    never_wrong_effect(
+    write_site(
         "site_insert_values",
-        "step 5",
+        Fails("step 5"),
         "INSERT INTO t VALUES (7, (SELECT MAX(x) FROM u), 0)",
         "INSERT INTO t VALUES (7, 3, 0)",
     );
@@ -247,9 +284,9 @@ fn test_insert_values() {
 
 #[test]
 fn test_on_conflict_set() {
-    never_wrong_effect(
+    write_site(
         "site_on_conflict",
-        "step 5",
+        Fails("step 5"),
         "INSERT INTO t VALUES (1, 0, 0) ON CONFLICT (id) DO UPDATE SET b = (SELECT MAX(x) FROM u)",
         "INSERT INTO t VALUES (1, 0, 0) ON CONFLICT (id) DO UPDATE SET b = 3",
     );
@@ -257,9 +294,9 @@ fn test_on_conflict_set() {
 
 #[test]
 fn test_update_set_mixing_correlated_and_uncorrelated() {
-    never_wrong_effect(
+    write_site(
         "site_update_mixed",
-        "step 5",
+        Fails("step 5"),
         "UPDATE t SET b = (SELECT MAX(x) FROM u), a = (SELECT COUNT(*) FROM u WHERE u.id = t.id)",
         "UPDATE t SET b = 3, a = CASE WHEN id <= 3 THEN 1 ELSE 0 END",
     );
@@ -268,64 +305,77 @@ fn test_update_set_mixing_correlated_and_uncorrelated() {
 #[test]
 fn test_returning() {
     let db = setup("site_returning");
-    let with_subquery = "DELETE FROM t WHERE id = 1 RETURNING id, (SELECT MAX(x) FROM u)";
-    if let Ok(got) = rows(&db, with_subquery) {
-        assert_eq!(
-            got,
-            vec![vec!["1".to_string(), "3".to_string()]],
-            "{with_subquery} (prepared by step 5)"
-        );
+    let before = table(&db);
+    let sql = "DELETE FROM t WHERE id = 1 RETURNING id, (SELECT MAX(x) FROM u)";
+    let got = rows(&db, sql);
+    if got.is_err() {
+        assert_eq!(table(&db), before, "{sql} failed but deleted");
     }
+    let want = vec![vec!["1".to_string(), "3".to_string()]];
+    holds(Fails("step 5"), got, &want, sql);
 }
 
 #[test]
 fn test_column_default() {
+    // Whether a DEFAULT may hold a subquery is open (plan 5.9)
     let db = setup("site_default");
-    if db
-        .execute(
-            "CREATE TABLE d (id INTEGER PRIMARY KEY, v INTEGER DEFAULT (SELECT MAX(x) FROM u))",
-            (),
-        )
-        .is_err()
-    {
-        return;
-    }
+    db.execute(
+        "CREATE TABLE d (id INTEGER PRIMARY KEY, v INTEGER DEFAULT (SELECT MAX(x) FROM u))",
+        (),
+    )
+    .unwrap();
     db.execute("INSERT INTO d VALUES (1, 7)", ())
         .expect("a row that names the column takes no default");
-    if db.execute("INSERT INTO d (id) VALUES (2)", ()).is_ok() {
+    let sql = "INSERT INTO d (id) VALUES (2)";
+    let got = db
+        .execute(sql, ())
+        .map_err(|e| e.to_string())
+        .and_then(|_| rows(&db, "SELECT v FROM d WHERE id = 2"));
+    if got.is_err() {
         assert_eq!(
-            rows(&db, "SELECT v FROM d WHERE id = 2"),
-            Ok(vec![vec!["3".to_string()]]),
-            "DEFAULT (SELECT MAX(x) FROM u) (prepared by step 5)"
+            rows(&db, "SELECT COUNT(*) FROM d"),
+            Ok(vec![vec!["1".to_string()]]),
+            "{sql} failed but stored a row"
         );
     }
+    holds(
+        Fails("step 5, rule open (5.9)"),
+        got,
+        &vec![vec!["3".to_string()]],
+        "DEFAULT (SELECT MAX(x) FROM u)",
+    );
 }
 
 #[test]
 fn test_check() {
+    // Whether a CHECK may hold a subquery is open (plan 5.9)
     let db = setup("site_check");
-    if db
-        .execute(
-            "CREATE TABLE c (id INTEGER PRIMARY KEY, w INTEGER CHECK (w < (SELECT MAX(x) FROM u)))",
-            (),
-        )
-        .is_err()
-    {
-        return;
-    }
-    let _ = db.execute("INSERT INTO c VALUES (1, 10)", ());
-    assert_eq!(
-        rows(&db, "SELECT COUNT(*) FROM c"),
-        Ok(vec![vec!["0".to_string()]]),
-        "a row breaking CHECK (w < (SELECT MAX(x) FROM u)) was stored (prepared by step 5)"
+    db.execute(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, w INTEGER CHECK (w < (SELECT MAX(x) FROM u)))",
+        (),
+    )
+    .unwrap();
+    assert!(
+        db.execute("INSERT INTO c VALUES (1, 10)", ()).is_err(),
+        "a row breaking CHECK (w < (SELECT MAX(x) FROM u)) was stored"
+    );
+    let got = db
+        .execute("INSERT INTO c VALUES (2, 1)", ())
+        .map_err(|e| e.to_string())
+        .and_then(|_| rows(&db, "SELECT id FROM c ORDER BY id"));
+    holds(
+        Fails("step 5, rule open (5.9)"),
+        got,
+        &vec![vec!["2".to_string()]],
+        "a row keeping CHECK (w < (SELECT MAX(x) FROM u))",
     );
 }
 
 #[test]
 fn test_derived_table_where() {
-    never_wrong(
+    site(
         "site_derived_where",
-        "step 6",
+        Fails("step 6"),
         "SELECT id FROM (SELECT id, a FROM t) s WHERE id > (SELECT MAX(x) FROM u) ORDER BY id",
         "SELECT id FROM (SELECT id, a FROM t) s WHERE id > 3 ORDER BY id",
     );
@@ -333,9 +383,9 @@ fn test_derived_table_where() {
 
 #[test]
 fn test_values_source_where() {
-    never_wrong(
+    site(
         "site_values_where",
-        "step 6",
+        Fails("step 6"),
         "SELECT n FROM (VALUES (1), (5)) AS w(n) WHERE n > (SELECT MAX(x) FROM u)",
         "SELECT n FROM (VALUES (1), (5)) AS w(n) WHERE n > 3",
     );
@@ -356,18 +406,21 @@ fn test_view_where_and_select_list() {
             "SELECT id, 3 FROM v ORDER BY id",
         ),
     ] {
-        let expected = rows(&db, with_literal).unwrap();
-        if let Ok(got) = rows(&db, with_subquery) {
-            assert_eq!(got, expected, "{with_subquery} (prepared by step 6)");
-        }
+        let want = rows(&db, with_literal).unwrap();
+        holds(
+            Fails("step 6"),
+            rows(&db, with_subquery),
+            &want,
+            with_subquery,
+        );
     }
 }
 
 #[test]
 fn test_cte_block_reading_the_grandparent_row() {
-    never_wrong(
+    site(
         "site_cte_grandparent",
-        "step 6",
+        Fails("step 6"),
         "WITH c AS (SELECT 1 AS x) SELECT id FROM t WHERE EXISTS (SELECT 1 FROM c WHERE c.x IN (SELECT u.x FROM u WHERE u.id = t.a)) ORDER BY id",
         "SELECT id FROM t WHERE a = 1 ORDER BY id",
     );
@@ -375,9 +428,10 @@ fn test_cte_block_reading_the_grandparent_row() {
 
 #[test]
 fn test_table_function_argument() {
-    never_wrong(
+    // The grammar does not take a subquery argument yet
+    site(
         "site_tvf_argument",
-        "step 6",
+        Fails("step 6, grammar first"),
         "SELECT * FROM generate_series(1, (SELECT 3))",
         "SELECT * FROM generate_series(1, 3)",
     );
