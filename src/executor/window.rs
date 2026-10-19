@@ -545,10 +545,10 @@ impl Executor {
     /// Execute SELECT with window functions
     /// Accepts &[(i64, Row)] to allow RowVec to be passed directly via deref
     /// The window functions ORDER BY reads that no select column is named
-    /// for, each as a column aliased to its own text, so the sort finds it
-    /// by name and the projection drops it afterwards
+    /// for, each as a column named by its identity, so the sort finds it by
+    /// that and the projection drops it afterwards
     pub(crate) fn hidden_order_by_windows(stmt: &SelectStatement) -> Vec<Expression> {
-        let mut names: Vec<String> = Vec::new();
+        let mut keys: Vec<ExprKey> = Vec::new();
         stmt.order_by
             .iter()
             .map(|ob| &ob.expression)
@@ -558,18 +558,22 @@ impl Executor {
                 )
             })
             .filter_map(|expr| {
-                let name = expr.to_string();
-                let carried = names.contains(&name)
+                // Named by its identity, which the sort reads, so a visible
+                // column that only writes alike is never taken for it
+                let key = ExprKey::of(expr);
+                let written = expr.to_string();
+                let carried = keys.contains(&key)
                     || stmt.columns.iter().any(|c| match c {
                         Expression::Aliased(a) => {
-                            a.alias.value.as_str() == name || a.expression.to_string() == name
+                            a.alias.value.as_str() == written || ExprKey::of(&a.expression) == key
                         }
                         _ => false,
                     });
                 if carried {
                     return None;
                 }
-                names.push(name.clone());
+                keys.push(key);
+                let name = key.hidden_column_name();
                 let token = crate::parser::token::Token::new(
                     crate::parser::token::TokenType::Identifier,
                     name.clone(),

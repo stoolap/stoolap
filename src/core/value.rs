@@ -285,21 +285,41 @@ impl Value {
     /// functions, STRING_AGG and LIKE give it. None for NULL and for an
     /// extension that has no text form
     pub fn text_form(&self) -> Option<std::borrow::Cow<'_, str>> {
-        use std::borrow::Cow;
+        if let Some(text) = self.stored_text() {
+            return Some(std::borrow::Cow::Borrowed(text));
+        }
+        let mut text = String::new();
+        matches!(self.write_text(&mut text), Ok(true)).then_some(std::borrow::Cow::Owned(text))
+    }
+
+    /// Writes the value's [`Value::text_form`] to `out`, without a buffer of
+    /// its own for an INTEGER; false, writing nothing, when it has none
+    pub fn write_text<W: fmt::Write>(&self, out: &mut W) -> std::result::Result<bool, fmt::Error> {
+        if let Some(text) = self.stored_text() {
+            out.write_str(text)?;
+            return Ok(true);
+        }
         match self {
-            Value::Null(_) => None,
-            Value::Integer(v) => Some(Cow::Owned(v.to_string())),
-            Value::Float(v) => Some(Cow::Owned(format_float(*v))),
-            Value::Text(s) => Some(Cow::Borrowed(s.as_str())),
-            Value::Boolean(b) => Some(Cow::Borrowed(if *b { "true" } else { "false" })),
-            Value::Timestamp(t) => Some(Cow::Owned(t.to_rfc3339())),
-            Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
-                Some(Cow::Borrowed(std::str::from_utf8(&data[1..]).unwrap_or("")))
-            }
+            Value::Integer(v) => write!(out, "{}", v)?,
+            Value::Float(v) => out.write_str(&format_float(*v))?,
+            Value::Timestamp(t) => out.write_str(&t.to_rfc3339())?,
             Value::Extension(data) if data.first() == Some(&(DataType::Vector as u8)) => {
-                Some(Cow::Owned(format_vector_bytes(&data[1..])))
+                out.write_str(&format_vector_bytes(&data[1..]))?
             }
-            Value::Extension(_) => None,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// The text form of a value that holds it as it is: TEXT, BOOLEAN, JSON
+    fn stored_text(&self) -> Option<&str> {
+        match self {
+            Value::Text(s) => Some(s.as_str()),
+            Value::Boolean(b) => Some(if *b { "true" } else { "false" }),
+            Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
+                Some(std::str::from_utf8(&data[1..]).unwrap_or(""))
+            }
+            _ => None,
         }
     }
 
@@ -849,13 +869,14 @@ impl Default for Value {
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match (self, self.text_form()) {
-            (_, Some(text)) => f.write_str(&text),
-            (Value::Null(_), None) => f.write_str("NULL"),
-            (Value::Extension(data), None) => {
+        if self.write_text(f)? {
+            return Ok(());
+        }
+        match self {
+            Value::Extension(data) => {
                 write!(f, "<extension:{}>", data.first().copied().unwrap_or(0))
             }
-            (_, None) => Ok(()),
+            _ => f.write_str("NULL"),
         }
     }
 }

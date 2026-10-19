@@ -91,3 +91,51 @@ fn test_an_unaliased_window_column_is_named_as_written() {
         wrong.join("\n")
     );
 }
+
+#[test]
+fn test_a_sort_window_is_not_taken_for_a_visible_one_named_alike() {
+    let db = Database::open("memory://window_sort_identity").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO t VALUES (1, 1, 10), (2, 1, -100), (3, 2, 1)",
+        (),
+    )
+    .unwrap();
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        (
+            "SELECT g, SUM(v) FILTER (WHERE v > 0) OVER (PARTITION BY g) FROM t \
+             ORDER BY SUM(v) OVER (PARTITION BY g), id",
+            vec![1, 1, 2],
+        ),
+        (
+            "SELECT g, SUM(v) FILTER (WHERE v > 0) OVER (PARTITION BY g) FROM t \
+             ORDER BY SUM(v) OVER (PARTITION BY g) DESC, id",
+            vec![2, 1, 1],
+        ),
+    ] {
+        let got: Result<(usize, Vec<i64>), String> =
+            db.query(sql, ()).map_err(|e| e.to_string()).map(|rows| {
+                let width = rows.columns().len();
+                let groups = rows
+                    .map(|row| row.unwrap().get::<i64>(0).unwrap())
+                    .collect();
+                (width, groups)
+            });
+        if got != Ok((2, want.clone())) {
+            wrong.push(format!(
+                "{sql} gave {got:?}, want 2 columns and groups {want:?}"
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}

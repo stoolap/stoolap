@@ -54,8 +54,8 @@ fn first_row(db: &Database, sql: &str, params: Vec<Value>) -> Result<Vec<Value>,
         .collect())
 }
 
-fn open() -> Database {
-    let db = Database::open("memory://text_form_rule").unwrap();
+fn open(name: &str) -> Database {
+    let db = Database::open(&format!("memory://text_form_rule_{name}")).unwrap();
     db.execute(
         "CREATE TABLE t (id INTEGER PRIMARY KEY, f FLOAT, ts TIMESTAMP, b BOOLEAN, n INTEGER, j JSON)",
         (),
@@ -75,7 +75,7 @@ fn open() -> Database {
 
 #[test]
 fn test_every_reading_of_a_value_as_text_is_its_cast() {
-    let db = open();
+    let db = open("columns");
     let mut wrong = Vec::new();
     for id in 1..=4 {
         for column in COLUMNS {
@@ -109,7 +109,7 @@ fn test_every_reading_of_a_value_as_text_is_its_cast() {
 
 #[test]
 fn test_a_parameter_read_as_text_is_its_cast() {
-    let db = open();
+    let db = open("parameters");
     let mut wrong = Vec::new();
     for value in [
         Value::Float(1e20),
