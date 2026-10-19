@@ -22,7 +22,7 @@ use crate::core::integer::integer_from_text;
 use crate::core::{DataType, Error, Result, Row, Schema, Value};
 use crate::parser::ast::{CopyFormat, CopyStatement};
 use crate::storage::traits::transaction::StatementTable;
-use crate::storage::traits::{Engine, QueryResult, Table};
+use crate::storage::traits::{QueryResult, Table};
 
 use super::context::ExecutionContext;
 use super::result::ExecResult;
@@ -113,7 +113,7 @@ impl Executor {
         }
 
         // Create a standalone auto-commit transaction
-        let mut tx = self.engine.begin_transaction()?;
+        let mut tx = self.begin_transaction()?;
         let mut table = tx.get_statement_table(table_name)?;
 
         // Pre-compute schema information

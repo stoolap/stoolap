@@ -245,7 +245,8 @@ if db.table_exists("users")? {
 // Get the DSN this database was opened with
 let dsn = db.dsn();  // "memory://" or "file:///path"
 
-// Set default isolation level for new transactions
+// Set this handle's isolation level (same as SET isolation_level):
+// begin(), BEGIN and autocommit statements on this handle use it
 use stoolap::IsolationLevel;
 db.set_default_isolation_level(IsolationLevel::SnapshotIsolation)?;
 
@@ -298,7 +299,7 @@ Statement holds a weak reference to the Database. It becomes invalid after the D
 ### Programmatic API
 
 ```rust
-// Begin with default isolation (ReadCommitted)
+// Begin at this handle's isolation level (ReadCommitted unless set)
 let mut tx = db.begin()?;
 
 // Begin with specific isolation level
@@ -432,9 +433,11 @@ let mut tx = db.begin_with_isolation(IsolationLevel::SnapshotIsolation)?;
 // SQL-based
 db.execute("BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT", ())?;
 
-// Set default for all new transactions
+// Set the default for this handle's new transactions and autocommit statements
 db.set_default_isolation_level(IsolationLevel::SnapshotIsolation)?;
 ```
+
+The default belongs to the handle: a clone, or the same DSN opened again, keeps its own.
 
 The Rust API has two enum variants: `ReadCommitted` (default) and `SnapshotIsolation`. At the SQL level, `SNAPSHOT`, `SERIALIZABLE`, `REPEATABLE READ` all map to `SnapshotIsolation`, and `READ UNCOMMITTED` maps to `ReadCommitted`.
 
@@ -682,12 +685,12 @@ fn main() -> Result<()> {
 | `execute_named_plan(plan, params)` | `Result<i64>` | Execute cached plan with named params |
 | `query_named_plan(plan, params)` | `Result<Rows>` | Query cached plan with named params |
 | `prepare(sql)` | `Result<Statement>` | Create a prepared statement |
-| `begin()` | `Result<Transaction>` | Begin transaction (ReadCommitted) |
+| `begin()` | `Result<Transaction>` | Begin transaction at this handle's isolation level |
 | `begin_with_isolation(level)` | `Result<Transaction>` | Begin with isolation level |
 | `close()` | `Result<()>` | Close database, release file lock |
 | `table_exists(name)` | `Result<bool>` | Check if table exists |
 | `dsn()` | `&str` | Get the DSN |
-| `set_default_isolation_level(level)` | `Result<()>` | Set default isolation |
+| `set_default_isolation_level(level)` | `Result<()>` | Set this handle's isolation level (same as `SET isolation_level`) |
 | `create_snapshot()` | `Result<()>` | Create point-in-time snapshot |
 | `semantic_cache_stats()` | `Result<Stats>` | Get cache statistics |
 | `clear_semantic_cache()` | `Result<()>` | Clear query cache |
@@ -700,6 +703,8 @@ fn main() -> Result<()> {
 | `query(params)` | `Result<Rows>` | Query rows |
 | `query_one(params)` | `Result<T>` | Single value |
 | `query_opt(params)` | `Result<Option<T>>` | Optional value |
+| `execute_named(params)` | `Result<i64>` | Execute with named params |
+| `query_named(params)` | `Result<Rows>` | Query with named params |
 | `execute_in(tx, params)` | `Result<i64>` | Execute DML inside a transaction |
 | `query_in(tx, params)` | `Result<Rows>` | Query rows inside a transaction |
 | `execute_named_in(tx, params)` | `Result<i64>` | Execute inside a transaction with named params |

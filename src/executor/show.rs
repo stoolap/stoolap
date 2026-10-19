@@ -42,7 +42,7 @@ impl Executor {
         _stmt: &ShowTablesStatement,
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        let tx = self.engine.begin_transaction()?;
+        let tx = self.begin_transaction()?;
         let tables = tx.list_tables()?;
 
         let columns = vec!["table_name".to_string()];
@@ -84,7 +84,7 @@ impl Executor {
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
         let table_name = &stmt.table_name.value;
-        let tx = self.engine.begin_transaction()?;
+        let tx = self.begin_transaction()?;
         let table = tx.get_statement_table(table_name)?;
         let schema = table.schema();
 
@@ -216,7 +216,7 @@ impl Executor {
         let table_name = &stmt.table_name.value;
 
         // Get a table reference to access indexes
-        let tx = self.engine.begin_transaction()?;
+        let tx = self.begin_transaction()?;
         let table = tx.get_statement_table(table_name)?;
 
         // Get index info from version store through the table
@@ -293,7 +293,7 @@ impl Executor {
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
         let table_name = &stmt.table_name.value;
-        let tx = self.engine.begin_transaction()?;
+        let tx = self.begin_transaction()?;
         let table = tx.get_statement_table(table_name)?;
         let schema = table.schema();
 

@@ -96,3 +96,27 @@ fn test_transaction_api_cached_lookup_rereads_a_dropped_column_layout() {
     assert!(fired.get(), "the column dropped after the epoch check");
     tx.commit().unwrap();
 }
+
+#[test]
+fn test_transaction_update_takes_the_compiled_path_and_rereads_a_dropped_column() {
+    let db = table("tx_pk_layout_update");
+    let update = db.prepare("UPDATE t SET v = $1 WHERE id = $2").unwrap();
+    update.execute((11, 1)).unwrap();
+    let mut tx = db.begin().unwrap();
+    let other = db.clone();
+    let fired = Rc::new(Cell::new(false));
+    let hook_fired = Rc::clone(&fired);
+    stoolap::test_failpoints::after_compiled_epoch_checked(move || {
+        other.execute("ALTER TABLE t DROP COLUMN a", ()).unwrap();
+        hook_fired.set(true);
+    });
+    let result = update.execute_in(&mut tx, (12, 1));
+    assert!(
+        fired.get(),
+        "the UPDATE in the transaction took the compiled path"
+    );
+    tx.commit().unwrap();
+    let v: i64 = db.query_one(SELECT, (1,)).unwrap();
+    let expected = if result.is_ok() { 12 } else { 11 };
+    assert_eq!(v, expected, "{result:?}");
+}

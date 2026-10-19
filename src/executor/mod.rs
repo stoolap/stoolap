@@ -231,7 +231,8 @@ pub struct Executor {
     engine: Arc<MVCCEngine>,
     /// Function registry for scalar, aggregate, and window functions
     function_registry: Arc<FunctionRegistry>,
-    /// Default isolation level for transactions, as its `u8` value
+    /// This session's isolation level as its `u8` value, `LEVEL_UNSET`
+    /// until the session sets one
     default_isolation_level: AtomicU8,
     /// Query cache for parsed statements, shared with the executors of
     /// this session's transactions
@@ -255,6 +256,9 @@ pub struct Executor {
 /// The view memories an executor keeps for its next statements
 const VIEW_SPARES: usize = 4;
 
+/// A session that has not set an isolation level runs at the engine's
+const LEVEL_UNSET: u8 = u8::MAX;
+
 /// The runs a SELECT gets, the first included, when a truncate or drop
 /// overtakes its view
 const STATEMENT_RUNS: usize = 3;
@@ -265,9 +269,7 @@ impl Executor {
         Self {
             engine,
             function_registry: default_function_registry(),
-            default_isolation_level: AtomicU8::new(
-                crate::core::IsolationLevel::ReadCommitted as u8,
-            ),
+            default_isolation_level: AtomicU8::new(LEVEL_UNSET),
             query_cache: Arc::new(QueryCache::default()),
             semantic_cache: Arc::new(SemanticCache::default()),
             statement_gate: RwLock::new(()),
@@ -285,9 +287,7 @@ impl Executor {
         Self {
             engine,
             function_registry,
-            default_isolation_level: AtomicU8::new(
-                crate::core::IsolationLevel::ReadCommitted as u8,
-            ),
+            default_isolation_level: AtomicU8::new(LEVEL_UNSET),
             query_cache: Arc::new(QueryCache::default()),
             semantic_cache: Arc::new(SemanticCache::default()),
             statement_gate: RwLock::new(()),
@@ -302,9 +302,7 @@ impl Executor {
         Self {
             engine,
             function_registry: default_function_registry(),
-            default_isolation_level: AtomicU8::new(
-                crate::core::IsolationLevel::ReadCommitted as u8,
-            ),
+            default_isolation_level: AtomicU8::new(LEVEL_UNSET),
             query_cache: Arc::new(QueryCache::new(cache_size)),
             semantic_cache: Arc::new(SemanticCache::default()),
             statement_gate: RwLock::new(()),
@@ -346,10 +344,18 @@ impl Executor {
             .get_or_init(|| QueryPlanner::new(Arc::clone(&self.engine)))
     }
 
-    /// Set the default isolation level for new transactions
+    /// Set this session's isolation level: the level of every transaction
+    /// it begins without naming one, autocommit statements included
     pub fn set_default_isolation_level(&self, level: crate::core::IsolationLevel) {
         self.default_isolation_level
             .store(level as u8, Ordering::Relaxed);
+    }
+
+    /// This session's isolation level; the engine's until the session sets one
+    pub fn isolation_level(&self) -> crate::core::IsolationLevel {
+        let level = self.default_isolation_level.load(Ordering::Relaxed);
+        crate::core::IsolationLevel::from_u8(level)
+            .unwrap_or_else(|| self.engine.get_isolation_level())
     }
 
     /// The gate for one entry: shared while this session has no explicit
@@ -636,9 +642,9 @@ impl Executor {
     /// Callers dispatch INSERT before calling this (its compiled path
     /// handles the active transaction itself).
     ///
-    /// Inside an explicit transaction (`in_txn`) only the PK lookup runs, read
-    /// through the transaction; the COUNT and UPDATE/DELETE probes read
-    /// committed state only and must not fire.
+    /// Inside an explicit transaction (`in_txn`) the PK lookup, UPDATE and
+    /// DELETE run through the transaction; the COUNT probes read committed
+    /// state only and must not fire.
     ///
     /// A SELECT whose own view a truncate or drop overtook runs again, under
     /// the same bound as the regular path
@@ -710,11 +716,11 @@ impl Executor {
                 }
                 self.try_fast_count_star_compiled(stmt, compiled)
             }
-            Statement::Update(stmt) if !in_txn => {
-                self.try_fast_pk_update_compiled(stmt, ctx, compiled)
+            Statement::Update(stmt) => {
+                self.try_fast_pk_update_compiled(stmt, ctx, compiled, in_txn)
             }
-            Statement::Delete(stmt) if !in_txn => {
-                self.try_fast_pk_delete_compiled(stmt, ctx, compiled)
+            Statement::Delete(stmt) => {
+                self.try_fast_pk_delete_compiled(stmt, ctx, compiled, in_txn)
             }
             _ => None,
         }
@@ -1079,7 +1085,7 @@ impl Executor {
         }
         let level = match active_txn_id {
             Some(txn_id) => self.engine.registry_ref().get_isolation_level(txn_id),
-            None => self.engine.get_isolation_level(),
+            None => self.isolation_level(),
         };
         (level == crate::core::IsolationLevel::ReadCommitted).then(|| self.capture_view())
     }
@@ -1109,7 +1115,7 @@ impl Executor {
     /// A view of the commits complete now, for an autocommit read under read
     /// committed; None under snapshot isolation, which reads at its own point
     pub(crate) fn autocommit_view(&self) -> Option<crate::storage::mvcc::registry::StatementView> {
-        (self.engine.get_isolation_level() == crate::core::IsolationLevel::ReadCommitted)
+        (self.isolation_level() == crate::core::IsolationLevel::ReadCommitted)
             .then(|| self.capture_view())
     }
 
@@ -1137,9 +1143,10 @@ impl Executor {
         active_tx.take().map(|at| at.transaction)
     }
 
-    /// Begin a new transaction
+    /// Begin a new transaction at this session's isolation level
     pub fn begin_transaction(&self) -> Result<Box<dyn Transaction>> {
-        self.engine.begin_transaction()
+        self.engine
+            .begin_transaction_with_level(self.isolation_level())
     }
 
     /// Begin a new transaction with a specific isolation level

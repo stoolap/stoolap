@@ -349,7 +349,7 @@ impl Executor {
             if taken.is_none() {
                 // Under read committed a committed, live head is this row's
                 // latest committed state whatever else publishes to the table
-                let latest = if read_committed(self.engine.get_isolation_level()) {
+                let latest = if read_committed(self.isolation_level()) {
                     self.engine.fetch_latest_row(table_name, pk_value, token)?
                 } else {
                     self.engine
@@ -371,7 +371,7 @@ impl Executor {
                     return Ok(rows);
                 }
             }
-            let tx = self.engine.begin_transaction()?;
+            let tx = self.begin_transaction()?;
             let table = tx.get_statement_table_at(table_name, view.as_ref())?;
             check_compiled_token(&*table, token)?;
             let rows = table.fetch_rows_by_ids(&[pk_value], &ConstBoolExpr::true_expr())?;

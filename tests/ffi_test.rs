@@ -3764,3 +3764,93 @@ fn test_exec_batch_refuses_impossible_parameter_layouts() {
         stoolap_close(db);
     }
 }
+
+#[test]
+fn test_stmt_named_parameters_without_a_transaction() {
+    unsafe {
+        let db = packed_test_db(3);
+        let upd = cstr("UPDATE t SET score = :score WHERE id = :id");
+        let mut update: *mut StoolapStmt = std::ptr::null_mut();
+        assert_eq!(stoolap_prepare(db, upd.as_ptr(), &mut update), STOOLAP_OK);
+        let float_param = |f: f64| StoolapValue {
+            value_type: STOOLAP_TYPE_FLOAT,
+            _padding: 0,
+            v: StoolapValueData { float64: f },
+        };
+        let set = [
+            named_param("score", float_param(9.0)),
+            named_param("id", int_param(2)),
+        ];
+        let mut affected = 0i64;
+        assert_eq!(
+            stoolap_stmt_exec_named(update, set.as_ptr(), 2, &mut affected),
+            STOOLAP_OK
+        );
+        assert_eq!(affected, 1);
+
+        let sel = cstr("SELECT id, score FROM t WHERE id = :id");
+        let mut select: *mut StoolapStmt = std::ptr::null_mut();
+        assert_eq!(stoolap_prepare(db, sel.as_ptr(), &mut select), STOOLAP_OK);
+        let id = [named_param("id", int_param(2))];
+        let mut rows: *mut StoolapRows = std::ptr::null_mut();
+        assert_eq!(
+            stoolap_stmt_query_named(select, id.as_ptr(), 1, &mut rows),
+            STOOLAP_OK
+        );
+        assert_eq!(stoolap_rows_next(rows), STOOLAP_ROW);
+        assert_eq!(stoolap_rows_column_double(rows, 1), 9.0);
+        assert_eq!(stoolap_rows_next(rows), STOOLAP_DONE);
+        stoolap_rows_close(rows);
+
+        let mut buf: *const u8 = std::ptr::null();
+        let mut len = 0i64;
+        let rc = stoolap_stmt_query_named_all(
+            select,
+            std::ptr::null_mut(),
+            id.as_ptr(),
+            1,
+            &mut buf,
+            &mut len,
+        );
+        assert_eq!(rc, STOOLAP_OK);
+        assert_eq!(decode_packed(buf, len).1, vec![vec!["2", "9"]]);
+
+        let mut tx: *mut StoolapTx = std::ptr::null_mut();
+        assert_eq!(stoolap_begin(db, &mut tx), STOOLAP_OK);
+        let ins = cstr("INSERT INTO t (id, score) VALUES (7, 7.5)");
+        assert_eq!(
+            stoolap_tx_exec(tx, ins.as_ptr(), std::ptr::null_mut()),
+            STOOLAP_OK
+        );
+        let seven = [named_param("id", int_param(7))];
+        let rc = stoolap_stmt_query_named_all(select, tx, seven.as_ptr(), 1, &mut buf, &mut len);
+        assert_eq!(rc, STOOLAP_OK);
+        assert_eq!(
+            decode_packed(buf, len).1,
+            vec![vec!["7", "7.5"]],
+            "inside the transaction"
+        );
+        assert_eq!(stoolap_tx_rollback(tx), STOOLAP_OK);
+        let rc = stoolap_stmt_query_named_all(
+            select,
+            std::ptr::null_mut(),
+            seven.as_ptr(),
+            1,
+            &mut buf,
+            &mut len,
+        );
+        assert_eq!(rc, STOOLAP_OK);
+        assert!(decode_packed(buf, len).1.is_empty(), "rolled back");
+
+        let bad = [named_param("id", bad_text_param(b"\xff"))];
+        assert_eq!(
+            stoolap_stmt_query_named(select, bad.as_ptr(), 1, &mut rows),
+            STOOLAP_ERROR
+        );
+        assert!(!read_cstr(stoolap_stmt_errmsg(select)).is_empty());
+
+        stoolap_stmt_finalize(update);
+        stoolap_stmt_finalize(select);
+        stoolap_close(db);
+    }
+}

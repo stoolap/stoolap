@@ -160,3 +160,102 @@ fn get_by_name_matches_names_without_regard_to_case() {
         assert!(row.get_by_name::<String>("missing").is_err());
     }
 }
+
+#[test]
+fn point_writes_inside_a_transaction_see_and_undo_its_own_rows() {
+    let db = open("api_paths_tx_writes");
+    let update = db.prepare("UPDATE t SET score = $1 WHERE id = $2").unwrap();
+    let delete = db.prepare("DELETE FROM t WHERE id = $1").unwrap();
+    let table = |db: &Database| {
+        key(&collect(
+            db.query("SELECT id, name, score FROM t ORDER BY id", ()),
+        ))
+    };
+    let committed = table(&db);
+
+    let mut tx = db.begin().unwrap();
+    tx.execute("INSERT INTO t VALUES (4, 'd', 4.0)", ())
+        .unwrap();
+    assert_eq!(
+        update.execute_in(&mut tx, (40.0, 4)).unwrap(),
+        1,
+        "own insert"
+    );
+    assert_eq!(update.execute_in(&mut tx, (10.0, 1)).unwrap(), 1);
+    assert_eq!(delete.execute_in(&mut tx, (2,)).unwrap(), 1);
+    assert_eq!(
+        delete.execute_in(&mut tx, (2,)).unwrap(),
+        0,
+        "deleted twice"
+    );
+    let inside = collect(tx.query("SELECT id, score FROM t ORDER BY id", ())).unwrap();
+    assert_eq!(
+        inside,
+        vec![
+            vec![Value::Integer(1), Value::Float(10.0)],
+            vec![Value::Integer(3), Value::Float(3.5)],
+            vec![Value::Integer(4), Value::Float(40.0)],
+        ]
+    );
+    assert_eq!(table(&db), committed, "uncommitted writes leaked");
+    tx.rollback().unwrap();
+    assert_eq!(table(&db), committed, "rollback kept a write");
+
+    db.execute("BEGIN", ()).unwrap();
+    db.execute("UPDATE t SET score = 9.0 WHERE id = 1", ())
+        .unwrap();
+    db.execute("SAVEPOINT s", ()).unwrap();
+    db.execute("DELETE FROM t WHERE id = 1", ()).unwrap();
+    db.execute("ROLLBACK TO SAVEPOINT s", ()).unwrap();
+    db.execute("COMMIT", ()).unwrap();
+    let score: f64 = db
+        .query_one("SELECT score FROM t WHERE id = 1", ())
+        .unwrap();
+    assert_eq!(score, 9.0);
+}
+
+#[test]
+fn two_snapshot_transactions_writing_one_row_conflict() {
+    let db = open("api_paths_tx_conflict");
+    let other = db.clone();
+    let update = db.prepare("UPDATE t SET score = $1 WHERE id = $2").unwrap();
+    let mut first = db
+        .begin_with_isolation(stoolap::IsolationLevel::SnapshotIsolation)
+        .unwrap();
+    let mut second = other
+        .begin_with_isolation(stoolap::IsolationLevel::SnapshotIsolation)
+        .unwrap();
+    assert_eq!(update.execute_in(&mut first, (1.0, 1)).unwrap(), 1);
+    let clash = update
+        .execute_in(&mut second, (2.0, 1))
+        .and_then(|_| second.commit());
+    first.commit().unwrap();
+    assert!(clash.is_err(), "both writes of one row committed");
+    let score: f64 = db
+        .query_one("SELECT score FROM t WHERE id = 1", ())
+        .unwrap();
+    assert_eq!(score, 1.0);
+}
+
+#[test]
+fn named_parameters_on_a_prepared_statement_answer_as_the_sql_text_does() {
+    let db = open("api_paths_named");
+    let sql = "SELECT id, name FROM t WHERE id = :id";
+    let stmt = db.prepare(sql).unwrap();
+    for id in [1i64, 3, 9] {
+        let adhoc = collect(db.query_named(sql, stoolap::named_params! { id: id }));
+        let prepared = collect(stmt.query_named(stoolap::named_params! { id: id }));
+        assert_eq!(key(&prepared), key(&adhoc), "id {id}");
+    }
+    let update = db
+        .prepare("UPDATE t SET score = :s WHERE id = :id")
+        .unwrap();
+    let affected = update
+        .execute_named(stoolap::named_params! { s: 5.0, id: 2 })
+        .unwrap();
+    assert_eq!(affected, 1);
+    let score: f64 = db
+        .query_one("SELECT score FROM t WHERE id = 2", ())
+        .unwrap();
+    assert_eq!(score, 5.0);
+}

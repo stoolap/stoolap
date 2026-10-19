@@ -950,7 +950,7 @@ impl Database {
     /// tx.commit()?;
     /// ```
     pub fn begin(&self) -> Result<Transaction> {
-        self.begin_with_isolation(IsolationLevel::ReadCommitted)
+        self.begin_with_isolation(self.inner.executor.isolation_level())
     }
 
     /// Begin a new transaction with a specific isolation level

@@ -41,13 +41,13 @@ use super::utils::dummy_token_clone;
 use super::Executor;
 use std::sync::RwLock;
 
-struct StatementRollback<'a> {
+pub(super) struct StatementRollback<'a> {
     engine: &'a crate::storage::mvcc::MVCCEngine,
     checkpoint: Option<(i64, i64)>,
 }
 
 impl<'a> StatementRollback<'a> {
-    fn new(
+    pub(super) fn new(
         engine: &'a crate::storage::mvcc::MVCCEngine,
         active: Option<&super::ActiveTransaction>,
     ) -> Self {
@@ -58,7 +58,7 @@ impl<'a> StatementRollback<'a> {
         }
     }
 
-    fn finish<T>(mut self, result: Result<T>) -> Result<T> {
+    pub(super) fn finish<T>(mut self, result: Result<T>) -> Result<T> {
         if result.is_ok() {
             self.checkpoint = None;
         }
@@ -638,7 +638,7 @@ impl Executor {
                 (table, false, None)
             } else {
                 // No active transaction - create a standalone transaction with auto-commit
-                let tx = self.engine.begin_transaction()?;
+                let tx = self.begin_transaction()?;
                 let table = tx.get_statement_table(table_name)?;
                 (table, true, Some(tx))
             };
@@ -1487,7 +1487,7 @@ impl Executor {
                 (table, false, None)
             } else {
                 // No active transaction - create a standalone transaction with auto-commit
-                let tx = self.engine.begin_transaction()?;
+                let tx = self.begin_transaction()?;
                 let table = tx.get_statement_table(table_name)?;
                 (table, true, Some(tx))
             };
@@ -1951,7 +1951,7 @@ impl Executor {
                 (table, false, None)
             } else {
                 // No active transaction - create a standalone transaction with auto-commit
-                let tx = self.engine.begin_transaction()?;
+                let tx = self.begin_transaction()?;
                 let table = tx.get_statement_table(table_name)?;
                 (table, true, Some(tx))
             };
@@ -2880,7 +2880,7 @@ impl Executor {
                 (table, false, None)
             } else {
                 // No active transaction - create a standalone transaction with auto-commit
-                let tx = self.engine.begin_transaction()?;
+                let tx = self.begin_transaction()?;
                 let table = tx.get_statement_table(table_name)?;
                 (table, true, Some(tx))
             };
@@ -3385,7 +3385,7 @@ impl Executor {
                 (table, false, None)
             } else {
                 // No active transaction - create a standalone transaction with auto-commit
-                let tx = self.engine.begin_transaction()?;
+                let tx = self.begin_transaction()?;
                 let table = tx.get_statement_table(table_name)?;
                 (table, true, Some(tx))
             };

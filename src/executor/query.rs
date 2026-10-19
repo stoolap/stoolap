@@ -593,8 +593,8 @@ impl Executor {
             && ctx.statement_snapshot().is_none()
             && self.active_transaction.lock().unwrap().is_none()
         {
-            let snapshot = self
-                .new_statement_snapshot(self.engine.get_isolation_level(), ctx.statement_view())?;
+            let snapshot =
+                self.new_statement_snapshot(self.isolation_level(), ctx.statement_view())?;
             snapshot_ctx = ctx.with_statement_snapshot(snapshot);
             &snapshot_ctx
         } else {
@@ -2263,7 +2263,7 @@ impl Executor {
             || ctx.timeout_ms() > 0
             || ctx.query_depth > 0
             || expression_contains_aggregate(where_expr)
-            || self.engine.get_isolation_level() != crate::core::IsolationLevel::ReadCommitted
+            || self.isolation_level() != crate::core::IsolationLevel::ReadCommitted
         {
             return Ok(EarlySemantic::NotTried);
         }
@@ -2494,7 +2494,7 @@ impl Executor {
                              // otherwise a standalone transaction
             if let Some(snapshot) = ctx.statement_snapshot() {
                 if let Some(ref as_of) = table_source.as_of {
-                    let tx = self.engine.begin_transaction()?;
+                    let tx = self.begin_transaction()?;
                     return self.execute_temporal_query(
                         table_name,
                         as_of,
@@ -2515,7 +2515,7 @@ impl Executor {
                     })?;
                 (table, None)
             } else {
-                let tx = self.engine.begin_transaction()?;
+                let tx = self.begin_transaction()?;
 
                 // Check for AS OF (temporal query)
                 if let Some(ref as_of) = table_source.as_of {
@@ -9879,7 +9879,7 @@ impl Executor {
             let isolation = Self::parse_isolation_level(level)?;
             self.engine.begin_transaction_with_level(isolation)?
         } else {
-            self.engine.begin_transaction()?
+            self.begin_transaction()?
         };
 
         *active_tx = Some(ActiveTransaction {
@@ -9981,8 +9981,7 @@ impl Executor {
                 if let Some(ref mut tx_state) = *active_tx {
                     tx_state.transaction.set_isolation_level(isolation)?;
                 } else {
-                    // No active transaction: set the engine's default isolation level
-                    self.engine.registry().set_global_isolation_level(isolation);
+                    self.set_default_isolation_level(isolation);
                 }
 
                 Ok(Box::new(ExecResult::empty()))
@@ -11688,7 +11687,7 @@ impl Executor {
         };
 
         // Try to get the table and check for index or PK
-        let txn = self.engine.begin_transaction().ok()?;
+        let txn = self.begin_transaction().ok()?;
         let table = txn.get_statement_table(table_name_ref).ok()?;
         let schema = table.schema();
 

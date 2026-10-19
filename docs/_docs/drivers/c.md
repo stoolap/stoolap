@@ -319,6 +319,8 @@ The `total_affected` pointer may be NULL if you do not need the count. When `row
 | `stoolap_stmt_exec(stmt, params, len, &affected)` | `int32_t` | Execute with parameters |
 | `stoolap_stmt_exec_batch(db, stmt, params, params_per_row, row_count, &total)` | `int32_t` | Execute batch in a single transaction |
 | `stoolap_stmt_query(stmt, params, len, &rows)` | `int32_t` | Query with parameters |
+| `stoolap_stmt_exec_named(stmt, params, len, &affected)` | `int32_t` | Execute with named parameters |
+| `stoolap_stmt_query_named(stmt, params, len, &rows)` | `int32_t` | Query with named parameters |
 | `stoolap_stmt_sql(stmt)` | `const char*` | Get the SQL text |
 | `stoolap_stmt_finalize(stmt)` | `void` | Destroy the statement (NULL-safe) |
 | `stoolap_stmt_errmsg(stmt)` | `const char*` | Last error message |
@@ -556,13 +558,27 @@ for (int i = 0; i < 100; i++) {
 }
 stoolap_tx_commit(tx2);
 stoolap_stmt_finalize(stmt);
+
+/* Prepared statement + named params outside a transaction */
+StoolapStmt* lookup = NULL;
+stoolap_prepare(db, "SELECT name FROM t WHERE id = :id", &lookup);
+StoolapRows* found = NULL;
+stoolap_stmt_query_named(lookup, qp, 1, &found);
+/* ... iterate found ... */
+stoolap_rows_close(found);
+
+/* Or all rows in one call, inside tx when it is not NULL */
+const uint8_t* buf = NULL;
+int64_t buf_len = 0;
+stoolap_stmt_query_named_all(lookup, NULL, qp, 1, &buf, &buf_len);
+stoolap_stmt_finalize(lookup);
 ```
 
 The parameter name must be valid UTF-8 and match the `:name` placeholder in the SQL (without the `:` prefix). Names with invalid UTF-8 or zero length are silently skipped.
 
 Text and JSON parameters do not need to be null-terminated. The `len` field specifies the byte length. Both must be valid UTF-8.
 
-JSON parameters are validated with a full parse. Malformed JSON (including empty strings) is rejected and treated as NULL.
+JSON parameters are validated with a full parse. Malformed JSON (including empty strings) fails the call, as text that is not valid UTF-8 does.
 
 BLOB parameters must be packed little-endian f32 data. The byte length must be a multiple of 4. Non-conforming payloads are treated as NULL.
 
@@ -800,6 +816,8 @@ stoolap_tx_commit(tx);
 | `stoolap_stmt_exec(stmt, params, len, &affected)` | `int32_t` | Execute prepared statement |
 | `stoolap_stmt_exec_batch(db, stmt, params, params_per_row, row_count, &total)` | `int32_t` | Execute batch in a single transaction |
 | `stoolap_stmt_query(stmt, params, len, &rows)` | `int32_t` | Query with prepared statement |
+| `stoolap_stmt_exec_named(stmt, params, len, &affected)` | `int32_t` | Execute prepared statement with named parameters |
+| `stoolap_stmt_query_named(stmt, params, len, &rows)` | `int32_t` | Query with prepared statement and named parameters |
 | `stoolap_stmt_sql(stmt)` | `const char*` | Get SQL text (valid until finalize) |
 | `stoolap_stmt_finalize(stmt)` | `void` | Destroy statement (NULL-safe) |
 | `stoolap_stmt_errmsg(stmt)` | `const char*` | Last error message |
@@ -851,6 +869,7 @@ stoolap_tx_commit(tx);
 | `stoolap_buffer_free(buf, len)` | `void` | Free a buffer from `stoolap_rows_fetch_all` (NULL-safe) |
 | `stoolap_rows_fetch_chunk(rows, max, &buf, &len, &n)` | `int32_t` | Fetch up to `max` rows into a buffer owned by the rows handle; `n == 0` at the end |
 | `stoolap_stmt_query_all(stmt, tx, params, len, &buf, &buf_len)` | `int32_t` | Run a prepared statement and pack all rows into a buffer owned by the statement |
+| `stoolap_stmt_query_named_all(stmt, tx, params, len, &buf, &buf_len)` | `int32_t` | `stoolap_stmt_query_all` with named parameters |
 | `stoolap_query_params_all(db, tx, sql, params, len, &buf, &buf_len)` | `int32_t` | Run SQL and pack all rows into a buffer owned by the database handle |
 
 ### Memory

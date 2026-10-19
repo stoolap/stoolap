@@ -452,23 +452,12 @@ pub unsafe extern "C" fn stoolap_query_params_all(
             }
         };
 
-        let param_vec = match value::params_to_vec(params, params_len) {
-            Ok(p) => p,
-            Err(e) => {
-                handle.set_error(&e.to_string());
-                return STOOLAP_ERROR;
+        let rows = value::params_to_vec(params, params_len).and_then(|p| {
+            match super::statement::open_transaction(tx)? {
+                None => handle.db.query(sql_str, p),
+                Some(inner_tx) => inner_tx.query(sql_str, p),
             }
-        };
-        let rows = match tx.as_mut() {
-            None => handle.db.query(sql_str, param_vec),
-            Some(tx_handle) => match &mut tx_handle.tx {
-                Some(inner_tx) => inner_tx.query(sql_str, param_vec),
-                None => {
-                    handle.set_error("transaction already ended");
-                    return STOOLAP_ERROR;
-                }
-            },
-        };
+        });
         match rows.and_then(|mut rows| pack_all(&mut rows, &mut handle.packed)) {
             Ok(_) => {
                 *out_buf = handle.packed.as_ptr();

@@ -339,6 +339,27 @@ int32_t stoolap_stmt_query(
 );
 
 /**
+ * Execute a prepared statement with named parameters (:name).
+ */
+int32_t stoolap_stmt_exec_named(
+    StoolapStmt* stmt,
+    const StoolapNamedParam* params,
+    int32_t params_len,
+    int64_t* rows_affected
+);
+
+/**
+ * Query using a prepared statement with named parameters (:name).
+ * On success, *out_rows must be closed with stoolap_rows_close().
+ */
+int32_t stoolap_stmt_query_named(
+    StoolapStmt* stmt,
+    const StoolapNamedParam* params,
+    int32_t params_len,
+    StoolapRows** out_rows
+);
+
+/**
  * Get the SQL text of a prepared statement.
  * Returns a pointer valid for the lifetime of the statement. Must NOT be freed.
  */
@@ -651,6 +672,18 @@ int32_t stoolap_stmt_query_all(
     StoolapStmt* stmt,
     StoolapTx* tx,
     const StoolapValue* params,
+    int32_t params_len,
+    const uint8_t** out_buf,
+    int64_t* out_len
+);
+
+/**
+ * stoolap_stmt_query_all() with named parameters (:name).
+ */
+int32_t stoolap_stmt_query_named_all(
+    StoolapStmt* stmt,
+    StoolapTx* tx,
+    const StoolapNamedParam* params,
     int32_t params_len,
     const uint8_t** out_buf,
     int64_t* out_len

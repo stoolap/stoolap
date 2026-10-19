@@ -30,9 +30,10 @@ use crate::parser::ast::{DeleteStatement, Expression, UpdateStatement};
 use crate::storage::expression::{ComparisonExpr, Expression as StorageExpression};
 use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::traits::transaction::StatementTable;
-use crate::storage::traits::{Engine, QueryResult};
+use crate::storage::traits::{Engine, QueryResult, Table, Transaction};
 
 use super::context::ExecutionContext;
+use super::dml::StatementRollback;
 use super::query_cache::{
     check_compiled_token, or_normal_path, CompiledExecution, CompiledPkDelete, CompiledPkUpdate,
     CompiledUpdateColumn, PkValueSource, UpdateValueSource,
@@ -40,17 +41,24 @@ use super::query_cache::{
 use super::result::ExecResult;
 use super::Executor;
 
+/// The table a compiled PK write goes through, the autocommit transaction
+/// to commit after it if any, and the rollback of the statement on failure
+type PkWriteTable<'a> = (
+    Box<dyn Table>,
+    Option<Box<dyn Transaction>>,
+    StatementRollback<'a>,
+);
+
 impl Executor {
-    /// Try to execute an UPDATE using pre-compiled state
+    /// Try to execute an UPDATE using pre-compiled state, inside the open
+    /// transaction when `in_txn`
     pub(crate) fn try_fast_pk_update_compiled(
         &self,
         stmt: &UpdateStatement,
         ctx: &ExecutionContext,
         compiled: &RwLock<CompiledExecution>,
+        in_txn: bool,
     ) -> Option<Result<Box<dyn QueryResult>>> {
-        // Caller (try_compiled_fast_paths) guarantees no explicit transaction
-        // is active; this path reads and writes committed state only.
-
         // Try read lock first - check if already compiled
         {
             let compiled_guard = match compiled.read() {
@@ -72,7 +80,7 @@ impl Executor {
                         #[cfg(feature = "test-failpoints")]
                         crate::test_failpoints::compiled_epoch_checked();
                         return or_normal_path(
-                            self.execute_compiled_pk_update(update, pk_value, ctx),
+                            self.execute_compiled_pk_update(update, pk_value, ctx, in_txn),
                         );
                     }
                     // Epoch changed - fall through to recompile
@@ -83,19 +91,18 @@ impl Executor {
         }
 
         // First execution or schema changed - compile and cache
-        self.compile_and_execute_pk_update(stmt, ctx, compiled)
+        self.compile_and_execute_pk_update(stmt, ctx, compiled, in_txn)
     }
 
-    /// Try to execute a DELETE using pre-compiled state
+    /// Try to execute a DELETE using pre-compiled state, inside the open
+    /// transaction when `in_txn`
     pub(crate) fn try_fast_pk_delete_compiled(
         &self,
         stmt: &DeleteStatement,
         ctx: &ExecutionContext,
         compiled: &RwLock<CompiledExecution>,
+        in_txn: bool,
     ) -> Option<Result<Box<dyn QueryResult>>> {
-        // Caller (try_compiled_fast_paths) guarantees no explicit transaction
-        // is active; this path reads and writes committed state only.
-
         // Try read lock first - check if already compiled
         {
             let compiled_guard = match compiled.read() {
@@ -116,7 +123,9 @@ impl Executor {
                             self.extract_pk_value_from_source(&delete.pk_value_source, ctx)?;
                         #[cfg(feature = "test-failpoints")]
                         crate::test_failpoints::compiled_epoch_checked();
-                        return or_normal_path(self.execute_compiled_pk_delete(delete, pk_value));
+                        return or_normal_path(
+                            self.execute_compiled_pk_delete(delete, pk_value, in_txn),
+                        );
                     }
                     // Epoch changed - fall through to recompile
                 }
@@ -126,7 +135,7 @@ impl Executor {
         }
 
         // First execution or schema changed - compile and cache
-        self.compile_and_execute_pk_delete(stmt, ctx, compiled)
+        self.compile_and_execute_pk_delete(stmt, ctx, compiled, in_txn)
     }
 
     // ============================================================================
@@ -335,7 +344,8 @@ impl Executor {
                         pk_value,
                         updates,
                         &[],
-                        &ExecutionContext::new(),
+                        None,
+                        false,
                     ));
                 }
                 None // Epoch changed, use normal path
@@ -375,6 +385,7 @@ impl Executor {
                         &schema,
                         token,
                         pk_value,
+                        false,
                     ));
                 }
                 None // Epoch changed, use normal path
@@ -384,7 +395,34 @@ impl Executor {
         }
     }
 
-    /// Execute PK update with minimal data (avoids cloning CompiledPkUpdate)
+    /// The table a compiled PK write goes through: the open transaction's,
+    /// kept for its commit or rollback, when `in_txn`; otherwise a new
+    /// autocommit transaction's, handed back to commit after the write
+    fn pk_write_table(&self, table_name: &str, in_txn: bool) -> Result<PkWriteTable<'_>> {
+        if in_txn {
+            let mut active_tx = self
+                .active_transaction
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let rollback = StatementRollback::new(&self.engine, active_tx.as_ref());
+            if let Some(tx_state) = active_tx.as_mut() {
+                let table = tx_state.transaction.get_statement_table(table_name)?;
+                if !tx_state.tables.contains_key(table_name) {
+                    tx_state.tables.insert(
+                        table_name.to_string(),
+                        tx_state.transaction.get_statement_table(table_name)?,
+                    );
+                }
+                return Ok((table, None, rollback));
+            }
+        }
+        let tx = self.begin_transaction()?;
+        let table = tx.get_statement_table(table_name)?;
+        Ok((table, Some(tx), StatementRollback::new(&self.engine, None)))
+    }
+
+    /// Execute PK update with minimal data (avoids cloning CompiledPkUpdate).
+    /// `ctx` carries the parameters row expressions read; None without any
     #[allow(clippy::too_many_arguments)]
     fn execute_pk_update_minimal(
         &self,
@@ -400,11 +438,10 @@ impl Executor {
             crate::core::DataType,
             u16,
         )],
-        ctx: &ExecutionContext,
+        ctx: Option<&ExecutionContext>,
+        in_txn: bool,
     ) -> Result<Box<dyn QueryResult>> {
-        // Create auto-commit transaction
-        let tx = self.engine.begin_transaction()?;
-        let mut table = tx.get_statement_table(table_name)?;
+        let (mut table, autocommit, rollback) = self.pk_write_table(table_name, in_txn)?;
         check_compiled_token(table.as_ref(), token)?;
 
         // Build WHERE expression for PK lookup
@@ -418,18 +455,18 @@ impl Executor {
         // Execute update with simple setter. Row expressions all read the
         // ORIGINAL row (SET a = b, b = a swaps), then everything applies.
         let mut vm = super::expression::ExprVM::new();
-        let params = ctx.params();
-        let named_params = ctx.named_params();
         let mut setter = |mut row: Row| -> Result<(Row, bool)> {
             if !expr_updates.is_empty() {
                 let mut computed = Vec::with_capacity(expr_updates.len());
                 {
                     let mut exec_ctx = super::expression::ExecuteContext::new(&row);
-                    if !params.is_empty() {
-                        exec_ctx = exec_ctx.with_params(params);
-                    }
-                    if !named_params.is_empty() {
-                        exec_ctx = exec_ctx.with_named_params(named_params);
+                    if let Some(ctx) = ctx {
+                        if !ctx.params().is_empty() {
+                            exec_ctx = exec_ctx.with_params(ctx.params());
+                        }
+                        if !ctx.named_params().is_empty() {
+                            exec_ctx = exec_ctx.with_named_params(ctx.named_params());
+                        }
                     }
                     for (idx, program, col_type, vector_dims) in expr_updates {
                         let value = vm.execute_cow(program, &exec_ctx)?;
@@ -454,17 +491,17 @@ impl Executor {
             Ok((row, true))
         };
 
-        let rows_affected = table.update(Some(&pk_expr), &mut setter)?;
+        let rows_affected = rollback.finish(table.update(Some(&pk_expr), &mut setter))?;
 
         // Invalidate caches
         if rows_affected > 0 {
             self.semantic_cache.invalidate_table(table_name);
         }
 
-        // Commit
         drop(table);
-        let mut tx = tx;
-        tx.commit()?;
+        if let Some(mut tx) = autocommit {
+            tx.commit()?;
+        }
 
         Ok(Box::new(ExecResult::with_rows_affected(
             rows_affected as i64,
@@ -479,10 +516,9 @@ impl Executor {
         schema: &CompactArc<Schema>,
         token: LayoutToken,
         pk_value: i64,
+        in_txn: bool,
     ) -> Result<Box<dyn QueryResult>> {
-        // Create auto-commit transaction
-        let tx = self.engine.begin_transaction()?;
-        let mut table = tx.get_statement_table(table_name)?;
+        let (mut table, autocommit, rollback) = self.pk_write_table(table_name, in_txn)?;
         check_compiled_token(table.as_ref(), token)?;
 
         // Build WHERE expression for PK lookup
@@ -493,18 +529,17 @@ impl Executor {
         );
         pk_expr.prepare_for_schema(schema);
 
-        // Execute delete
-        let rows_affected = table.delete(Some(&pk_expr))?;
+        let rows_affected = rollback.finish(table.delete(Some(&pk_expr)))?;
 
         // Invalidate caches
         if rows_affected > 0 {
             self.semantic_cache.invalidate_table(table_name);
         }
 
-        // Commit
         drop(table);
-        let mut tx = tx;
-        tx.commit()?;
+        if let Some(mut tx) = autocommit {
+            tx.commit()?;
+        }
 
         Ok(Box::new(ExecResult::with_rows_affected(
             rows_affected as i64,
@@ -521,6 +556,7 @@ impl Executor {
         compiled: &CompiledPkUpdate,
         pk_value: i64,
         ctx: &ExecutionContext,
+        in_txn: bool,
     ) -> Result<Box<dyn QueryResult>> {
         // Extract constant values; row expressions run per update inside
         // the setter (they read the current row, e.g. SET n = n + 1)
@@ -574,7 +610,8 @@ impl Executor {
             pk_value,
             updates,
             &expr_updates,
-            ctx,
+            Some(ctx),
+            in_txn,
         )
     }
 
@@ -583,6 +620,7 @@ impl Executor {
         &self,
         compiled: &CompiledPkDelete,
         pk_value: i64,
+        in_txn: bool,
     ) -> Result<Box<dyn QueryResult>> {
         self.execute_pk_delete_minimal(
             &compiled.table_name,
@@ -590,6 +628,7 @@ impl Executor {
             &compiled.schema,
             compiled.token,
             pk_value,
+            in_txn,
         )
     }
 
@@ -603,6 +642,7 @@ impl Executor {
         stmt: &UpdateStatement,
         ctx: &ExecutionContext,
         compiled: &RwLock<CompiledExecution>,
+        in_txn: bool,
     ) -> Option<Result<Box<dyn QueryResult>>> {
         // Acquire write lock
         let mut compiled_guard = match compiled.write() {
@@ -619,7 +659,9 @@ impl Executor {
                 if self.engine.schema_epoch() == update.cached_epoch =>
             {
                 let pk_value = self.extract_pk_value_from_source(&update.pk_value_source, ctx)?;
-                return or_normal_path(self.execute_compiled_pk_update(update, pk_value, ctx));
+                return or_normal_path(
+                    self.execute_compiled_pk_update(update, pk_value, ctx, in_txn),
+                );
             }
             CompiledExecution::PkUpdate(_)
             | CompiledExecution::NotOptimizable(_)
@@ -749,7 +791,7 @@ impl Executor {
         drop(compiled_guard);
 
         // Execute
-        or_normal_path(self.execute_compiled_pk_update(&compiled_update, pk_value, ctx))
+        or_normal_path(self.execute_compiled_pk_update(&compiled_update, pk_value, ctx, in_txn))
     }
 
     /// Compile and execute a PK delete, caching the compiled state
@@ -758,6 +800,7 @@ impl Executor {
         stmt: &DeleteStatement,
         ctx: &ExecutionContext,
         compiled: &RwLock<CompiledExecution>,
+        in_txn: bool,
     ) -> Option<Result<Box<dyn QueryResult>>> {
         // Acquire write lock
         let mut compiled_guard = match compiled.write() {
@@ -774,7 +817,7 @@ impl Executor {
                 if self.engine.schema_epoch() == delete.cached_epoch =>
             {
                 let pk_value = self.extract_pk_value_from_source(&delete.pk_value_source, ctx)?;
-                return or_normal_path(self.execute_compiled_pk_delete(delete, pk_value));
+                return or_normal_path(self.execute_compiled_pk_delete(delete, pk_value, in_txn));
             }
             CompiledExecution::PkDelete(_)
             | CompiledExecution::NotOptimizable(_)
@@ -838,7 +881,7 @@ impl Executor {
         drop(compiled_guard);
 
         // Execute
-        or_normal_path(self.execute_compiled_pk_delete(&compiled_delete, pk_value))
+        or_normal_path(self.execute_compiled_pk_delete(&compiled_delete, pk_value, in_txn))
     }
 
     /// Extract value source (literal or parameter) from expression

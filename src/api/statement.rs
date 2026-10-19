@@ -190,6 +190,32 @@ impl Statement {
         }
     }
 
+    /// Execute the prepared statement with named parameters (`:name`)
+    pub fn execute_named(&self, params: NamedParams) -> Result<i64> {
+        let db = self.get_db()?;
+        match &self.plan {
+            Some(plan) => {
+                let ctx = ExecutionContext::with_named_params(params.into_inner());
+                let result = db.executor().execute_with_cached_plan_owned(plan, ctx)?;
+                Ok(result.rows_affected())
+            }
+            None => db.execute_named(&self.sql, params),
+        }
+    }
+
+    /// Query using the prepared statement with named parameters (`:name`)
+    pub fn query_named(&self, params: NamedParams) -> Result<Rows> {
+        let db = self.get_db()?;
+        match &self.plan {
+            Some(plan) => {
+                let ctx = ExecutionContext::with_named_params(params.into_inner());
+                let result = db.executor().execute_with_cached_plan_owned(plan, ctx)?;
+                Ok(Rows::new(result))
+            }
+            None => db.query_named(&self.sql, params),
+        }
+    }
+
     /// Query and return a single value
     ///
     /// # Examples
