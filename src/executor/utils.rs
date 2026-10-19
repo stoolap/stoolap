@@ -1142,7 +1142,13 @@ pub fn expressions_equivalent(a: &Expression, b: &Expression) -> bool {
         (Expression::FloatLiteral(la), Expression::FloatLiteral(lb)) => {
             crate::core::value::f64_eq(la.value, lb.value)
         }
-        (Expression::StringLiteral(la), Expression::StringLiteral(lb)) => la.value == lb.value,
+        (Expression::StringLiteral(la), Expression::StringLiteral(lb)) => {
+            la.value == lb.value
+                && match (&la.type_hint, &lb.type_hint) {
+                    (Some(ha), Some(hb)) => ha.eq_ignore_ascii_case(hb),
+                    (ha, hb) => ha.is_none() && hb.is_none(),
+                }
+        }
         (Expression::BooleanLiteral(la), Expression::BooleanLiteral(lb)) => la.value == lb.value,
         (Expression::NullLiteral(_), Expression::NullLiteral(_)) => true,
         (Expression::Infix(ia), Expression::Infix(ib)) => {
@@ -1861,7 +1867,7 @@ pub fn expression_to_string(expr: &Expression) -> String {
         }
         Expression::IntegerLiteral(lit) => lit.value.to_string(),
         Expression::FloatLiteral(lit) => lit.value.to_string(),
-        Expression::StringLiteral(lit) => format!("'{}'", lit.value),
+        Expression::StringLiteral(lit) => lit.to_string(),
         Expression::BooleanLiteral(lit) => lit.value.to_string(),
         Expression::FunctionCall(func) => function_call_to_string(func),
         // An operand bound less tightly than its operator keeps its

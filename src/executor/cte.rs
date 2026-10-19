@@ -90,7 +90,7 @@ fn expr_to_normalized_string(expr: &Expression) -> String {
         }
         Expression::IntegerLiteral(lit) => lit.value.to_string(),
         Expression::FloatLiteral(lit) => lit.value.to_string(),
-        Expression::StringLiteral(lit) => format!("'{}'", lit.value),
+        Expression::StringLiteral(lit) => lit.to_string(),
         Expression::Infix(infix) => {
             // Handle expressions like col + 1, a * b
             format!(

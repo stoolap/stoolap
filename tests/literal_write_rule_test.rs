@@ -480,3 +480,88 @@ fn test_a_foreign_key_checks_the_value_a_hinted_literal_writes() {
         wrong.join("\n")
     );
 }
+
+#[test]
+fn test_a_cached_result_is_not_taken_for_a_hinted_literal() {
+    let mut wrong = Vec::new();
+    for (n, (literal, stored)) in LITERALS.iter().enumerate() {
+        let written = literal.split('\'').nth(1).unwrap();
+        let plain = format!("'{written}'");
+        for (first, second) in [(literal, &plain.as_str()), (&plain.as_str(), literal)] {
+            for shape in ["s = {}", "s IN ({}, 'b')"] {
+                let ids = |db: &Database, lit: &str| -> Vec<i64> {
+                    let sql = format!("SELECT * FROM t WHERE {}", shape.replace("{}", lit));
+                    db.query(&sql, ())
+                        .unwrap()
+                        .map(|row| row.unwrap().get::<i64>(0).unwrap())
+                        .collect()
+                };
+                let open = |name: &str| {
+                    let db = Database::open(&format!(
+                        "memory://literal_cache_{name}_{n}_{}",
+                        first.len()
+                    ))
+                    .unwrap();
+                    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)", ())
+                        .unwrap();
+                    db.execute(
+                        &format!(
+                            "INSERT INTO t VALUES (1, '{stored}'), (2, '{written}'), (3, 'c')"
+                        ),
+                        (),
+                    )
+                    .unwrap();
+                    db
+                };
+                let fresh = ids(&open(&format!("fresh_{}", shape.len())), second);
+                let db = open(&format!("cached_{}", shape.len()));
+                ids(&db, first);
+                let after = ids(&db, second);
+                if after != fresh {
+                    wrong.push(format!(
+                        "{} after {}: gave {after:?}, want {fresh:?}",
+                        shape.replace("{}", second),
+                        shape.replace("{}", first)
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+#[test]
+fn test_an_unaliased_column_names_a_literal_as_written() {
+    let db = Database::open("memory://literal_names").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'a')", ()).unwrap();
+    let mut wrong = Vec::new();
+    for literal in LITERALS
+        .iter()
+        .map(|(literal, _)| *literal)
+        .chain(["'it''s'", "'a\\\\b'"])
+    {
+        for call in [
+            format!("MAX(s || {literal})"),
+            format!("SUM(LENGTH(s || {literal}))"),
+        ] {
+            let sql = format!("SELECT {call} FROM t");
+            let columns = db.query(&sql, ()).unwrap().columns().to_vec();
+            if columns != [call.as_str()] {
+                wrong.push(format!("{sql} named {columns:?}"));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
