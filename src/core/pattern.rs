@@ -166,7 +166,9 @@ impl Pattern {
     }
 
     fn regex(body: &str, case_insensitive: bool, pat: &str) -> Shape {
-        let flags = if case_insensitive { "(?i)" } else { "" };
+        // A wildcard matches any character, a line break included, as the
+        // shapes without a regex do
+        let flags = if case_insensitive { "(?is)" } else { "(?s)" };
         let source = format!("{flags}^{body}$");
         let cached = REGEX_CACHE.with(|cache| cache.borrow_mut().get(&source).cloned());
         if let Some(re) = cached {
@@ -224,7 +226,7 @@ impl Pattern {
                 }
                 Shape::Regex(re) => re.is_match(text),
                 Shape::Any => true,
-                Shape::OneChar => text.chars().count() == 1,
+                Shape::OneChar => one_char(text),
             };
         }
         self.matches_folded(text)
@@ -271,7 +273,7 @@ impl Pattern {
             Shape::Template { .. } => false,
             Shape::Regex(re) => re.is_match(text),
             Shape::Any => true,
-            Shape::OneChar => text.chars().count() == 1,
+            Shape::OneChar => one_char(text),
         }
     }
 
@@ -292,6 +294,13 @@ impl Pattern {
         end.push(next);
         Some(end)
     }
+}
+
+/// Whether `text` is one character, reading no more than two of it
+#[inline]
+fn one_char(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars.next().is_some() && chars.next().is_none()
 }
 
 /// A LIKE pattern as a regex body
@@ -328,8 +337,7 @@ fn glob_to_regex(pattern: &str) -> String {
                     chars.next();
                     result.push_str(&regex::escape(&next.to_string()));
                 }
-                Some(_) => result.push_str(&regex::escape("\\")),
-                None => {}
+                _ => result.push_str(&regex::escape("\\")),
             },
             '[' => {
                 result.push('[');
@@ -368,6 +376,13 @@ mod tests {
             ("a\\%b", "a%b", true),
             ("a\\%b", "axb", false),
             ("%", "", true),
+            ("%%", "a\nb", true),
+            ("a%b%", "a\nb\nc", true),
+            ("a_b", "a\nb", true),
+            ("_", "\n", true),
+            ("_", "a long text", false),
+            ("abc\\", "abc\\", true),
+            ("abc\\", "abc", false),
             ("_", "é", true),
             ("a%b%c", "aXbYc", true),
             ("hello", "Hello", false),
@@ -407,6 +422,9 @@ mod tests {
     fn test_ilike_folds_case_beyond_ascii() {
         for (pattern, text, want) in [
             ("JOHN", "john", true),
+            ("A%B%", "a\nb\nc", true),
+            ("_", "É", true),
+            ("_", "ÉÉ", false),
             ("é%", "Émile", true),
             ("%MILE", "Émile", true),
             ("user_1%", "USER_12", true),
@@ -454,6 +472,11 @@ mod tests {
             ("*[bc]*", "xcx", true),
             ("a\\*b", "a*b", true),
             ("a\\*b", "axb", false),
+            ("abc\\", "abc\\", true),
+            ("abc\\", "abc", false),
+            ("a\\?\\", "a?\\", true),
+            ("**", "a\nb", true),
+            ("a?b", "a\nb", true),
             ("*a*b*", "XaYbZ", true),
             ("*a*b*", "ab", true),
         ] {

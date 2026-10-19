@@ -290,3 +290,89 @@ fn test_an_index_range_reads_every_row_a_prefix_pattern_matches() {
         wrong.join("\n")
     );
 }
+
+#[test]
+fn test_a_wildcard_and_a_trailing_escape_read_alike_on_every_path() {
+    let long = "x".repeat(10_000);
+    let mut wrong = Vec::new();
+    for sealed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = if sealed {
+            Database::open(&format!(
+                "file://{}?checkpoint_interval=0",
+                dir.path().display()
+            ))
+            .unwrap()
+        } else {
+            Database::open("memory://pattern_rule_wildcards").unwrap()
+        };
+        db.execute("CREATE TABLE w (id INTEGER PRIMARY KEY, s TEXT)", ())
+            .unwrap();
+        for (id, s) in [
+            (1, "a\nb"),
+            (2, "abc\\"),
+            (3, "abc"),
+            (4, "x"),
+            (5, long.as_str()),
+            (6, "\n"),
+        ] {
+            db.execute(
+                "INSERT INTO w VALUES ($1, $2)",
+                vec![Value::Integer(id), Value::text(s)],
+            )
+            .unwrap();
+        }
+        if sealed {
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        let backslash = Value::text("abc\\");
+        for (sql, params, want) in [
+            (
+                "SELECT id FROM w WHERE s LIKE '%%'",
+                vec![],
+                vec![1, 2, 3, 4, 5, 6],
+            ),
+            (
+                "SELECT id FROM w WHERE s LIKE 'a%b%'",
+                vec![],
+                vec![1, 2, 3],
+            ),
+            ("SELECT id FROM w WHERE s LIKE 'a_b'", vec![], vec![1]),
+            ("SELECT id FROM w WHERE s LIKE '_'", vec![], vec![4, 6]),
+            (
+                "SELECT id FROM w WHERE s ILIKE 'A%B%'",
+                vec![],
+                vec![1, 2, 3],
+            ),
+            (
+                "SELECT id FROM w WHERE s GLOB '**'",
+                vec![],
+                vec![1, 2, 3, 4, 5, 6],
+            ),
+            ("SELECT id FROM w WHERE s GLOB 'a?b'", vec![], vec![1]),
+            (
+                "SELECT id FROM w WHERE s GLOB $1",
+                vec![backslash.clone()],
+                vec![2],
+            ),
+            (
+                "SELECT id FROM (SELECT id, s GLOB $1 AS m FROM w) x WHERE m",
+                vec![backslash.clone()],
+                vec![2],
+            ),
+        ] {
+            let got = ids(&db, sql, params.clone());
+            if got != Ok(want.clone()) {
+                wrong.push(format!(
+                    "sealed {sealed}: {sql} {params:?} gave {got:?}, want {want:?}"
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
