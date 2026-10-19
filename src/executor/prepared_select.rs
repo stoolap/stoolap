@@ -1029,6 +1029,9 @@ pub struct PreparedSelect {
     run_slots: Vec<(usize, SharedProgram)>,
     /// The conjuncts without a subquery, which the scan is narrowed by
     pushdown: Option<Expression>,
+    /// Every conjunct is in `pushdown`: a scan that takes it whole passes
+    /// only rows the WHERE passes
+    pushed_whole: bool,
     /// Indexed by subquery id, nested ones included
     subqueries: Vec<PreparedSubquery>,
     /// A top-level EXISTS or NOT EXISTS conjunct with one key, whose keyed
@@ -2608,6 +2611,7 @@ impl PreparedSelect {
             named: builder.named,
             where_program,
             run_slots,
+            pushed_whole: pushed.len() == rewritten_count,
             pushdown: conjunction(pushed),
             subqueries,
             narrowing,
@@ -2859,17 +2863,19 @@ impl Executor {
                 runner.base[slot] = value;
             }
         }
-        let storage_expr = match &prepared.pushdown {
+        let (storage_expr, residual) = match &prepared.pushdown {
             Some(pushdown) if prepared.run_slots.is_empty() => {
-                pushdown::try_pushdown(pushdown, table.schema(), Some(ctx)).0
+                pushdown::try_pushdown(pushdown, table.schema(), Some(ctx))
             }
             Some(pushdown) => {
                 let mut run_ctx = ctx.clone();
                 run_ctx.set_params(runner.base.clone());
-                pushdown::try_pushdown(pushdown, table.schema(), Some(&run_ctx)).0
+                pushdown::try_pushdown(pushdown, table.schema(), Some(&run_ctx))
             }
-            None => None,
+            None => (None, true),
         };
+        // The scan took the whole WHERE: its rows need no second look
+        let scanned_whole = prepared.pushed_whole && storage_expr.is_some() && !residual;
         let output_columns = CompactArc::clone(&prepared.output_columns);
         if let Some(expr) = &storage_expr {
             if self
@@ -2929,7 +2935,7 @@ impl Executor {
                     ctx.check_cancelled()?;
                 }
                 let row = scanner.take_row();
-                if runner.matches(&mut vm, &row)? {
+                if scanned_whole || runner.matches(&mut vm, &row)? {
                     rows.push((scanned as i64, row));
                 }
             }
