@@ -2947,6 +2947,9 @@ impl Executor {
                     rows.push((scanned as i64, row));
                 }
             }
+        } else if let (true, Some(target)) = (scanned_whole, target) {
+            // Every row the scan passes is an answer, so it stops at the LIMIT
+            rows = table.collect_rows_with_limit_unordered(storage_expr.as_deref(), target, 0)?;
         } else {
             let all: Vec<usize> = (0..prepared.columns.len()).collect();
             let mut scanner = table.scan(&all, storage_expr.as_deref())?;
