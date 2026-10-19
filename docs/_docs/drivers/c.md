@@ -657,6 +657,7 @@ The C API is designed so that callers never need to free individual strings. All
 **Summary of rules:**
 
 - Never free pointers returned by `stoolap_errmsg()`, `stoolap_rows_column_text()`, `stoolap_rows_column_name()`, `stoolap_stmt_sql()`, or `stoolap_version()`.
+- Never free buffers from `stoolap_rows_fetch_chunk()`, `stoolap_stmt_query_all()` or `stoolap_query_params_all()`: their handle owns and reuses them. Only `stoolap_rows_fetch_all()` buffers are freed, with `stoolap_buffer_free()`.
 - Always call `stoolap_rows_close()` on every `StoolapRows` handle, even after `STOOLAP_DONE`.
 - Always call `stoolap_stmt_finalize()` on every `StoolapStmt` handle.
 - Always call `stoolap_close()` on every `StoolapDB` handle.
@@ -703,6 +704,57 @@ The buffer layout is:
 ```
 
 The caller must free the buffer with `stoolap_buffer_free(buf, buf_len)`. The rows handle must still be closed with `stoolap_rows_close()` after the fetch.
+
+If the query fails while its rows are being produced (for example a parameterized `REGEXP` with an invalid pattern), `stoolap_rows_fetch_all()` returns `STOOLAP_ERROR`, sets no buffer, and the message is available from `stoolap_rows_errmsg()`. A result is never returned cut short.
+
+### Chunked Fetch
+
+`stoolap_rows_fetch_chunk()` packs at most `max_rows` of the remaining rows in the same format and advances the cursor. A binding can serve its own row iterator from the chunk and cross the FFI boundary once per chunk instead of once per row and column. Every chunk carries the column header; `out_rows` is 0 once the result is exhausted.
+
+The chunk buffer belongs to the rows handle and is reused for the next chunk, so there is nothing to free and no allocation per chunk once the buffer has grown. Read or copy a chunk before the next call on the same handle.
+
+```c
+StoolapRows* rows = NULL;
+stoolap_query(db, "SELECT id, name FROM users", &rows);
+
+const uint8_t* buf = NULL;
+int64_t buf_len = 0;
+int32_t n = 0;
+while (stoolap_rows_fetch_chunk(rows, 256, &buf, &buf_len, &n) == STOOLAP_OK && n > 0) {
+    /* Parse n rows from buf (format above) before the next call */
+}
+stoolap_rows_close(rows);
+```
+
+`stoolap_rows_fetch_chunk()` and `stoolap_rows_next()` advance the same cursor and can be mixed.
+
+### Query and Fetch in One Call
+
+`stoolap_stmt_query_all()` and `stoolap_query_params_all()` run a query and return all of its rows in the packed format in a single call. No rows handle is created, so a point lookup is one FFI call instead of four (query, fetch, free, close). Pass a transaction handle as `tx` to run inside it, or NULL to run outside a transaction.
+
+The buffer belongs to the statement (`stoolap_stmt_query_all`) or the database handle (`stoolap_query_params_all`) and is reused by the next call on that handle, so it must not be freed and must be read before that call. A buffer that grew beyond 1 MiB for a large result is released at the next call. Errors are read with `stoolap_stmt_errmsg(stmt)` or `stoolap_errmsg(db)`, including when the call ran inside `tx`.
+
+```c
+StoolapStmt* stmt = NULL;
+stoolap_prepare(db, "SELECT name FROM users WHERE id = $1", &stmt);
+
+StoolapValue id = { .value_type = STOOLAP_TYPE_INTEGER, .v.integer = 42 };
+const uint8_t* buf = NULL;
+int64_t buf_len = 0;
+if (stoolap_stmt_query_all(stmt, NULL, &id, 1, &buf, &buf_len) == STOOLAP_OK) {
+    /* Parse buf before the next call on stmt */
+} else {
+    fprintf(stderr, "%s\n", stoolap_stmt_errmsg(stmt));
+}
+
+/* Ad-hoc SQL inside a transaction */
+StoolapTx* tx = NULL;
+stoolap_begin(db, &tx);
+if (stoolap_query_params_all(db, tx, "SELECT COUNT(*) FROM users", NULL, 0, &buf, &buf_len) != STOOLAP_OK) {
+    fprintf(stderr, "%s\n", stoolap_errmsg(db));
+}
+stoolap_tx_commit(tx);
+```
 
 ## API Reference
 
@@ -795,6 +847,9 @@ The caller must free the buffer with `stoolap_buffer_free(buf, buf_len)`. The ro
 |----------|---------|-------------|
 | `stoolap_rows_fetch_all(rows, &buf, &len)` | `int32_t` | Fetch all remaining rows into a packed binary buffer |
 | `stoolap_buffer_free(buf, len)` | `void` | Free a buffer from `stoolap_rows_fetch_all` (NULL-safe) |
+| `stoolap_rows_fetch_chunk(rows, max, &buf, &len, &n)` | `int32_t` | Fetch up to `max` rows into a buffer owned by the rows handle; `n == 0` at the end |
+| `stoolap_stmt_query_all(stmt, tx, params, len, &buf, &buf_len)` | `int32_t` | Run a prepared statement and pack all rows into a buffer owned by the statement |
+| `stoolap_query_params_all(db, tx, sql, params, len, &buf, &buf_len)` | `int32_t` | Run SQL and pack all rows into a buffer owned by the database handle |
 
 ### Memory
 

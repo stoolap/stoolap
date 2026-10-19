@@ -607,6 +607,8 @@ const char* stoolap_rows_errmsg(const StoolapRows* rows);
  * On success, *out_buf receives a heap-allocated buffer and *out_len its
  * byte length.  Caller MUST free with stoolap_buffer_free().
  * The rows handle's data is consumed; call stoolap_rows_close() afterward.
+ * A runtime error that ends the result early returns STOOLAP_ERROR and no
+ * buffer; read it with stoolap_rows_errmsg().
  */
 int32_t stoolap_rows_fetch_all(
     StoolapRows* rows,
@@ -619,6 +621,58 @@ int32_t stoolap_rows_fetch_all(
  * Safe to call with NULL (no-op).
  */
 void stoolap_buffer_free(uint8_t* buf, int64_t len);
+
+/**
+ * Fetch up to max_rows of the remaining rows, in the stoolap_rows_fetch_all()
+ * format, and advance the cursor.
+ *
+ * *out_rows receives the number of rows packed; 0 means the result is
+ * exhausted. The buffer belongs to the rows handle: it stays valid until the
+ * next call on the handle or stoolap_rows_close(), and must NOT be freed.
+ */
+int32_t stoolap_rows_fetch_chunk(
+    StoolapRows* rows,
+    int32_t max_rows,
+    const uint8_t** out_buf,
+    int64_t* out_len,
+    int32_t* out_rows
+);
+
+/**
+ * Run a prepared statement and pack every row, in the
+ * stoolap_rows_fetch_all() format, in one call and without a rows handle.
+ *
+ * Runs inside tx when tx is not NULL. The buffer belongs to the statement:
+ * it stays valid until the next call on the statement or
+ * stoolap_stmt_finalize(), and must NOT be freed. On error, read
+ * stoolap_stmt_errmsg(stmt).
+ */
+int32_t stoolap_stmt_query_all(
+    StoolapStmt* stmt,
+    StoolapTx* tx,
+    const StoolapValue* params,
+    int32_t params_len,
+    const uint8_t** out_buf,
+    int64_t* out_len
+);
+
+/**
+ * Run a query with positional parameters and pack every row, in the
+ * stoolap_rows_fetch_all() format, in one call and without a rows handle.
+ *
+ * Runs inside tx when tx is not NULL. The buffer belongs to db: it stays
+ * valid until the next call on db or stoolap_close(), and must NOT be freed.
+ * On error, read stoolap_errmsg(db).
+ */
+int32_t stoolap_query_params_all(
+    StoolapDB* db,
+    StoolapTx* tx,
+    const char* sql,
+    const StoolapValue* params,
+    int32_t params_len,
+    const uint8_t** out_buf,
+    int64_t* out_len
+);
 
 /* =========================================================================
  * Memory management

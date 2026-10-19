@@ -74,6 +74,8 @@ pub struct StoolapNamedParam {
 pub struct StoolapDB {
     pub(crate) db: Database,
     pub(crate) last_error: Option<CString>,
+    /// Buffer behind `stoolap_query_params_all()`, reused across calls
+    pub(crate) packed: Vec<u8>,
 }
 
 /// Opaque handle wrapping a [`Statement`].
@@ -84,6 +86,8 @@ pub struct StoolapStmt {
     pub(crate) sql_cstr: CString,
     /// Cached column name CStrings (computed on first query, reused thereafter).
     pub(crate) cached_columns: Option<Arc<Vec<CString>>>,
+    /// Buffer behind `stoolap_stmt_query_all()`, reused across calls
+    pub(crate) packed: Vec<u8>,
     /// Keeps the originating `DatabaseInner` alive so the `Statement`'s `Weak`
     /// reference can be upgraded, and with it the engine.
     pub(crate) _db_keepalive: Arc<DatabaseInner>,
@@ -116,6 +120,8 @@ pub struct StoolapRows {
     pub(crate) text_cache_dirty: bool,
     /// Number of rows affected (for DML results).
     pub(crate) rows_affected: i64,
+    /// Buffer behind `stoolap_rows_fetch_chunk()`, reused across chunks
+    pub(crate) packed: Vec<u8>,
 }
 
 impl StoolapDB {

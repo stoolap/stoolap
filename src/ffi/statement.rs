@@ -19,7 +19,12 @@ use std::os::raw::c_char;
 use std::panic;
 use std::sync::Arc;
 
-use super::types::{StoolapDB, StoolapRows, StoolapStmt, StoolapValue};
+use crate::api::transaction::Transaction;
+use crate::api::{ParamVec, Rows};
+use crate::core::Result;
+
+use super::rows::pack_all;
+use super::types::{StoolapDB, StoolapRows, StoolapStmt, StoolapTx, StoolapValue};
 use super::value;
 use super::{STOOLAP_ERROR, STOOLAP_OK};
 
@@ -70,6 +75,7 @@ pub unsafe extern "C" fn stoolap_prepare(
                     last_error: None,
                     sql_cstr,
                     cached_columns: None,
+                    packed: Vec::new(),
                     _db_keepalive: db_keepalive,
                 });
                 *out_stmt = Box::into_raw(stmt_handle);
@@ -296,6 +302,7 @@ pub unsafe extern "C" fn stoolap_stmt_query(
                     text_cache: Vec::new(),
                     text_cache_dirty: false,
                     rows_affected: affected,
+                    packed: Vec::new(),
                 });
                 *out_rows = Box::into_raw(rows_handle);
                 STOOLAP_OK
@@ -309,6 +316,82 @@ pub unsafe extern "C" fn stoolap_stmt_query(
 
     result.unwrap_or_else(|_| {
         handle.set_error("panic during stoolap_stmt_query");
+        STOOLAP_ERROR
+    })
+}
+
+impl StoolapStmt {
+    /// Runs the statement inside `tx`, by its plan when it has one
+    pub(crate) fn query_in(&self, tx: &mut Transaction, params: ParamVec) -> Result<Rows> {
+        match self.stmt.ast_statement() {
+            Some(ast) => tx.query_prepared(ast, params),
+            None => tx.query(self.sql_cstr.to_str().unwrap_or(""), params),
+        }
+    }
+}
+
+/// Query a prepared statement and pack every row into one buffer, in the
+/// format of `stoolap_rows_fetch_all()`, without a rows handle.
+///
+/// Runs inside `tx` when it is not NULL. The buffer belongs to the
+/// statement and stays valid until the next call on it or
+/// `stoolap_stmt_finalize()`. Must NOT be freed. Errors are read with
+/// `stoolap_stmt_errmsg()`.
+///
+/// # Safety
+///
+/// - `stmt` must be a valid `StoolapStmt` pointer.
+/// - `tx` must be a valid `StoolapTx` pointer or NULL.
+/// - `params` must point to `params_len` valid `StoolapValue` structs (or be NULL).
+/// - `out_buf` and `out_len` must not be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_stmt_query_all(
+    stmt: *mut StoolapStmt,
+    tx: *mut StoolapTx,
+    params: *const StoolapValue,
+    params_len: i32,
+    out_buf: *mut *const u8,
+    out_len: *mut i64,
+) -> i32 {
+    if out_buf.is_null() || out_len.is_null() {
+        return STOOLAP_ERROR;
+    }
+    *out_buf = std::ptr::null();
+    *out_len = 0;
+
+    let handle = match stmt.as_mut() {
+        Some(h) => h,
+        None => return STOOLAP_ERROR,
+    };
+    handle.last_error = None;
+
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let param_vec = value::params_to_vec(params, params_len);
+        let rows = match tx.as_mut() {
+            None => handle.stmt.query(param_vec),
+            Some(tx_handle) => match &mut tx_handle.tx {
+                Some(inner_tx) => handle.query_in(inner_tx, param_vec),
+                None => {
+                    handle.set_error("transaction already ended");
+                    return STOOLAP_ERROR;
+                }
+            },
+        };
+        match rows.and_then(|mut rows| pack_all(&mut rows, &mut handle.packed)) {
+            Ok(_) => {
+                *out_buf = handle.packed.as_ptr();
+                *out_len = handle.packed.len() as i64;
+                STOOLAP_OK
+            }
+            Err(e) => {
+                handle.set_error(&e.to_string());
+                STOOLAP_ERROR
+            }
+        }
+    }));
+
+    result.unwrap_or_else(|_| {
+        handle.set_error("panic during stoolap_stmt_query_all");
         STOOLAP_ERROR
     })
 }

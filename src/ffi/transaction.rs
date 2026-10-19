@@ -301,6 +301,7 @@ pub unsafe extern "C" fn stoolap_tx_query_params(
                     text_cache: Vec::new(),
                     text_cache_dirty: false,
                     rows_affected: affected,
+                    packed: Vec::new(),
                 });
                 *out_rows = Box::into_raw(rows_handle);
                 STOOLAP_OK
@@ -523,43 +524,8 @@ pub unsafe extern "C" fn stoolap_tx_stmt_query(
             }
         };
 
-        let ast_stmt = match stmt_handle.stmt.ast_statement() {
-            Some(s) => s,
-            None => {
-                // Multi-statement SQL: fall back to SQL-based execution
-                let sql_str = stmt_handle.sql_cstr.to_str().unwrap_or("");
-                let param_vec = value::params_to_vec(params, params_len);
-                match inner_tx.query(sql_str, param_vec) {
-                    Ok(rows) => {
-                        let column_names: Vec<CString> = rows
-                            .columns()
-                            .iter()
-                            .map(|name| CString::new(name.as_str()).unwrap_or_default())
-                            .collect();
-                        let affected = rows.rows_affected();
-
-                        let rows_handle = Box::new(StoolapRows {
-                            rows: Some(rows),
-                            has_row: false,
-                            last_error: None,
-                            column_names: Arc::new(column_names),
-                            text_cache: Vec::new(),
-                            text_cache_dirty: false,
-                            rows_affected: affected,
-                        });
-                        *out_rows = Box::into_raw(rows_handle);
-                        return STOOLAP_OK;
-                    }
-                    Err(e) => {
-                        handle.set_error(&e.to_string());
-                        return STOOLAP_ERROR;
-                    }
-                }
-            }
-        };
-
         let param_vec = value::params_to_vec(params, params_len);
-        match inner_tx.query_prepared(ast_stmt, param_vec) {
+        match stmt_handle.query_in(inner_tx, param_vec) {
             Ok(rows) => {
                 let column_names: Vec<CString> = rows
                     .columns()
@@ -576,6 +542,7 @@ pub unsafe extern "C" fn stoolap_tx_stmt_query(
                     text_cache: Vec::new(),
                     text_cache_dirty: false,
                     rows_affected: affected,
+                    packed: Vec::new(),
                 });
                 *out_rows = Box::into_raw(rows_handle);
                 STOOLAP_OK
@@ -727,6 +694,7 @@ pub unsafe extern "C" fn stoolap_tx_query_named(
                     text_cache: Vec::new(),
                     text_cache_dirty: false,
                     rows_affected: affected,
+                    packed: Vec::new(),
                 });
                 *out_rows = Box::into_raw(rows_handle);
                 STOOLAP_OK
@@ -893,6 +861,7 @@ pub unsafe extern "C" fn stoolap_tx_stmt_query_named(
                             text_cache: Vec::new(),
                             text_cache_dirty: false,
                             rows_affected: affected,
+                            packed: Vec::new(),
                         });
                         *out_rows = Box::into_raw(rows_handle);
                         return STOOLAP_OK;
@@ -922,6 +891,7 @@ pub unsafe extern "C" fn stoolap_tx_stmt_query_named(
                     text_cache: Vec::new(),
                     text_cache_dirty: false,
                     rows_affected: affected,
+                    packed: Vec::new(),
                 });
                 *out_rows = Box::into_raw(rows_handle);
                 STOOLAP_OK
