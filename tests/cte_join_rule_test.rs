@@ -140,6 +140,16 @@ fn a_join_where_reads_columns_and_aggregates_as_written() {
             vec!["[Integer(1)]"],
         ),
         (
+            "WITH c(id, s) AS (SELECT 1, 'a_b'), d(k, e) AS (SELECT 1, '!') \
+             SELECT c.id FROM c JOIN d ON c.id = d.k WHERE c.s LIKE 'a!_b' ESCAPE e",
+            vec!["[Integer(1)]"],
+        ),
+        (
+            "WITH c(id, s) AS (SELECT 1, 'a_b'), d(k, e) AS (SELECT 1, '!') \
+             SELECT c.id FROM c JOIN d ON c.id = d.k WHERE c.s LIKE 'a!_b' ESCAPE d.e",
+            vec!["[Integer(1)]"],
+        ),
+        (
             "WITH c(id) AS (SELECT 1), d(k) AS (SELECT 1) \
              SELECT COUNT(*) FROM c JOIN d ON c.id = d.k WHERE 1 = 0",
             vec!["[Integer(0)]"],
@@ -167,6 +177,29 @@ fn a_join_where_reads_columns_and_aggregates_as_written() {
         let want: Result<Vec<String>, String> = Ok(rows.iter().map(|r| r.to_string()).collect());
         if got != want {
             wrong.push(format!("{sql}\n  got  {got:?}\n  want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn an_empty_join_names_its_columns_as_a_filtered_one() {
+    let db = tables("cte_join_rule_empty");
+    let mut wrong = Vec::new();
+    for (from, never) in [
+        (
+            "WITH c(id) AS (SELECT 1), d(k) AS (SELECT 1) SELECT {cols} FROM c JOIN d ON c.id = d.k",
+            "c.id < 0",
+        ),
+        ("SELECT {cols} FROM r c JOIN t d ON c.id = d.id", "c.id < 0"),
+    ] {
+        for cols in ["*", "c.*", "c.id + 1", "c.id AS x, d.*", "UPPER('a')"] {
+            let base = from.replace("{cols}", cols);
+            let got = answer(&db, &format!("{base} WHERE 1 = 0"));
+            let want = answer(&db, &format!("{base} WHERE {never}"));
+            if got != want {
+                wrong.push(format!("{base}\n  got  {got:?}\n  want {want:?}"));
+            }
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));

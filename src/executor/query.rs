@@ -4098,40 +4098,6 @@ impl Executor {
     ) -> SelectResult {
         // classification is passed from caller to avoid redundant cache lookups
 
-        // Short-circuit: if WHERE is constant-false (e.g., 1=0), skip all join
-        // materialization and return an empty result immediately. A subquery
-        // has no value in this evaluator, so a WHERE holding one is not judged,
-        // and an aggregate still answers its empty input
-        if let Some(where_clause) = stmt
-            .where_clause
-            .as_ref()
-            .filter(|_| !classification.where_has_subqueries && !classification.has_aggregation)
-        {
-            if let Ok(eval) = ExpressionEval::compile(where_clause, &[]) {
-                if let Ok(Value::Boolean(false)) = eval.with_context(ctx).eval_slice(&Row::new()) {
-                    // Derive output column names from SELECT clause
-                    let col_names: Vec<String> = stmt
-                        .columns
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, expr)| match expr {
-                            Expression::Aliased(a) => Some(a.alias.value.to_string()),
-                            Expression::Identifier(id) => Some(id.value.to_string()),
-                            Expression::QualifiedIdentifier(qi) => Some(qi.name.value.to_string()),
-                            Expression::Star(_) | Expression::QualifiedStar(_) => None,
-                            _ => Some(format!("column{}", i + 1)),
-                        })
-                        .collect();
-                    let columns = CompactArc::new(col_names);
-                    let result = ExecutorResult::with_arc_columns(
-                        CompactArc::clone(&columns),
-                        RowVec::new(),
-                    );
-                    return Ok((Box::new(result), columns, false, None));
-                }
-            }
-        }
-
         // Get table aliases for filter pushdown
         let left_alias = get_table_alias_from_expr(&join_source.left);
         let right_alias = get_table_alias_from_expr(&join_source.right);
@@ -4218,6 +4184,18 @@ impl Executor {
             ),
             None => (None, None, None),
         };
+        // A WHERE false for every row joins no rows whatever the join type; the
+        // sides run with no rows only to name their columns
+        let never = where_for_join
+            .as_ref()
+            .filter(|_| !classification.where_has_subqueries)
+            .and_then(|w| ExpressionEval::compile(w, &[]).ok())
+            .is_some_and(|eval| {
+                matches!(
+                    eval.with_context(ctx).eval_slice(&Row::new()),
+                    Ok(Value::Boolean(false))
+                )
+            });
 
         // Semi-join reduction optimization for LEFT JOIN + GROUP BY + LIMIT
         // Pattern: LEFT JOIN + GROUP BY on left columns only + LIMIT N + no ORDER BY
@@ -4240,9 +4218,29 @@ impl Executor {
             )
         };
 
-        let (left_rows, left_columns, right_rows, right_columns) = if let Some(plan) =
-            semijoin_limit
-        {
+        let (left_rows, left_columns, right_rows, right_columns) = if never {
+            let (left_result, left_cols, _, _) = self.execute_table_expression_with_filter_limit(
+                &join_source.left,
+                ctx,
+                where_for_join.as_ref(),
+                Some(0),
+                0,
+            )?;
+            let (right_result, right_cols, _, _) = self
+                .execute_table_expression_with_filter_limit(
+                    &join_source.right,
+                    ctx,
+                    where_for_join.as_ref(),
+                    Some(0),
+                    0,
+                )?;
+            (
+                Self::materialize_result_arc(left_result)?,
+                left_cols,
+                Self::materialize_result_arc(right_result)?,
+                right_cols,
+            )
+        } else if let Some(plan) = semijoin_limit {
             if let Some(result) = self.try_grouped_index_join(
                 stmt,
                 ctx,

@@ -1368,6 +1368,9 @@ fn collect_table_qualifiers_impl(expr: &Expression, qualifiers: &mut FxHashSet<S
         Expression::Like(like) => {
             collect_table_qualifiers_impl(&like.left, qualifiers);
             collect_table_qualifiers_impl(&like.pattern, qualifiers);
+            if let Some(escape) = &like.escape {
+                collect_table_qualifiers_impl(escape, qualifiers);
+            }
         }
         Expression::FunctionCall(func) => {
             for arg in &func.arguments {
@@ -1442,6 +1445,9 @@ pub fn collect_unqualified_columns(expr: &Expression, columns: &mut FxHashSet<St
         Expression::Like(like) => {
             collect_unqualified_columns(&like.left, columns);
             collect_unqualified_columns(&like.pattern, columns);
+            if let Some(escape) = &like.escape {
+                collect_unqualified_columns(escape, columns);
+            }
         }
         Expression::FunctionCall(func) => {
             for arg in &func.arguments {
