@@ -41,8 +41,6 @@
 //! └──────────┴─────────────┴─────────────┘
 //! ```
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use rustc_hash::FxHashMap;
 
 use crate::core::{Operator, Value};
@@ -229,7 +227,7 @@ impl ColumnZoneMap {
 }
 
 /// Zone map for an entire table
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TableZoneMap {
     /// Zone maps per column
     pub columns: FxHashMap<String, ColumnZoneMap>,
@@ -237,19 +235,9 @@ pub struct TableZoneMap {
     pub segment_size: usize,
     /// Total number of segments
     pub segment_count: u32,
-    /// Whether zone maps need rebuilding (after inserts/updates)
-    pub stale: AtomicBool,
-}
-
-impl Clone for TableZoneMap {
-    fn clone(&self) -> Self {
-        Self {
-            columns: self.columns.clone(),
-            segment_size: self.segment_size,
-            segment_count: self.segment_count,
-            stale: AtomicBool::new(self.stale.load(Ordering::SeqCst)),
-        }
-    }
+    /// The publish epoch of the committed state the maps were built from;
+    /// None when the build did not read exactly one such state
+    pub epoch: Option<u64>,
 }
 
 impl TableZoneMap {
@@ -259,7 +247,7 @@ impl TableZoneMap {
             columns: FxHashMap::default(),
             segment_size,
             segment_count: 0,
-            stale: AtomicBool::new(false),
+            epoch: None,
         }
     }
 
@@ -282,21 +270,6 @@ impl TableZoneMap {
                 .or_insert_with(|| ColumnZoneMap::new(col_name.clone()));
             col_map.update_segment(segment_id, value);
         }
-    }
-
-    /// Mark zone maps as stale (needing rebuild)
-    pub fn mark_stale(&self) {
-        self.stale.store(true, Ordering::SeqCst);
-    }
-
-    /// Check if zone maps need rebuilding
-    pub fn is_stale(&self) -> bool {
-        self.stale.load(Ordering::SeqCst)
-    }
-
-    /// Clear stale flag after rebuild
-    pub fn clear_stale(&self) {
-        self.stale.store(false, Ordering::SeqCst);
     }
 
     /// Get pruned segment count for a single-column predicate

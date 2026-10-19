@@ -543,9 +543,16 @@ impl QueryPlanner {
             None => return false, // No zone maps, cannot prune
         };
 
-        // Check if zone maps are stale
-        if zone_maps.is_stale() {
-            return false; // Stale zone maps, don't trust them
+        // The maps describe the committed state of one publish epoch, so they
+        // answer only for a statement reading exactly that state: no commit
+        // since, no older snapshot and no writes of its own
+        let reads_their_state = zone_maps
+            .epoch
+            .is_some_and(|epoch| table.publish_epoch_if_quiet() == Some(epoch))
+            && table.sees_newest()
+            && !table.has_local_changes();
+        if !reads_their_state {
+            return false;
         }
 
         // Extract all comparisons from the expression

@@ -186,7 +186,9 @@ The optimizer simplifies expressions when possible:
 -- After:  SELECT * FROM t WHERE x > 5
 ```
 
-A WHERE that keeps no row, because one of its `AND` terms is a constant that is false or NULL (`1 = 0`, `NULL`, `$1 = 0` with a parameter that makes it false), reads no row of the table at all. The same holds when zone maps show that no row can match. Aggregates and window functions still answer their empty input, so `SELECT COUNT(*) FROM t WHERE 1 = 0` returns `0`.
+A WHERE that keeps no row, because one of its `AND` terms is a constant that is false or NULL (`1 = 0`, `NULL`, `$1 = 0` with a parameter that makes it false), reads no row of the table at all. Aggregates and window functions still answer their empty input, so `SELECT COUNT(*) FROM t WHERE 1 = 0` returns `0`.
+
+`ANALYZE` also builds zone maps, the smallest and largest value of each column, which let a query without aggregates, window functions or `GROUP BY` skip the scan when no row can match its WHERE. They describe the committed rows `ANALYZE` read, so a query uses them only while no commit has landed on the table since, and never inside a transaction that has written to the table or reads an older snapshot. Run `ANALYZE` again after changes to use them again.
 
 ### Predicate Merging
 

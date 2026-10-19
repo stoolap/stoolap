@@ -5490,14 +5490,6 @@ impl VersionStore {
             .and_then(|zm| zm.get_prune_stats(column, operator, value))
     }
 
-    /// Marks zone maps as stale (needing rebuild after data changes)
-    pub fn mark_zone_maps_stale(&self) {
-        let guard = self.zone_maps.read();
-        if let Some(ref zm) = *guard {
-            zm.mark_stale();
-        }
-    }
-
     /// Close the version store
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
