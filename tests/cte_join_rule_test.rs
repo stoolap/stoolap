@@ -218,3 +218,29 @@ fn an_empty_join_names_its_columns_as_a_filtered_one() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+#[test]
+fn a_join_draws_a_volatile_where_for_every_joined_row() {
+    let db = tables("cte_join_rule_volatile");
+    let mut wrong = Vec::new();
+    let ctes = "WITH c(x) AS (SELECT 1), d(y) AS (SELECT value FROM generate_series(1, 20000)) ";
+    for shape in [
+        "SELECT COUNT(*) FROM c CROSS JOIN d WHERE RANDOM() < 0.5",
+        "SELECT COUNT(*) FROM d CROSS JOIN c WHERE RANDOM() < 0.5",
+        "SELECT COUNT(*) FROM c CROSS JOIN d WHERE c.x + RANDOM() < 1.5",
+        "SELECT COUNT(*) FROM c JOIN d ON d.y > 0 WHERE RANDOM() < 0.5",
+        "SELECT COUNT(*) FROM c JOIN d ON d.y > 0 AND RANDOM() < 0.5",
+        "SELECT COUNT(*) FROM c JOIN d ON c.x + RANDOM() < 1.5",
+        "SELECT COUNT(*) FROM c JOIN r ON r.id = c.x CROSS JOIN d WHERE RANDOM() < 0.5",
+    ] {
+        let sql = format!("{ctes}{shape}");
+        let count = db.query(&sql, ()).and_then(|rows| {
+            rows.map(|row| row.and_then(|row| row.get::<i64>(0)))
+                .collect::<stoolap::Result<Vec<_>>>()
+        });
+        if !matches!(count.as_deref(), Ok([n]) if *n > 0 && *n < 20000) {
+            wrong.push(format!("{sql}\n  got {count:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

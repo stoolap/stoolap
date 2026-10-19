@@ -353,6 +353,23 @@ fn test_explain_cross_table_predicate_equality() {
     );
 }
 
+#[test]
+fn test_explain_volatile_predicate_runs_on_joined_rows() {
+    let db = setup_db();
+    let lines = get_explain_lines(
+        &db,
+        "EXPLAIN SELECT * FROM orders o JOIN users u ON o.user_id = u.id WHERE u.id + RANDOM() < 5",
+    );
+    let plan = lines.join("\n");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("Join Filter:") && l.contains("RANDOM")),
+        "A predicate drawing per row should appear as 'Join Filter'.\nFull plan:\n{}",
+        plan
+    );
+}
+
 // ============================================================================
 // FunctionTableSource filter rendering
 // ============================================================================

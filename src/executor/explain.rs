@@ -1511,6 +1511,11 @@ pub(crate) fn partition_where_for_explain(
                 unqual_in_right && !unqual_in_left,
             )
         };
+        // A predicate drawing a new value per row runs on the joined rows
+        let draws =
+            super::volatility::expression_volatility(&pred, crate::functions::global_registry())
+                == crate::functions::Volatility::PerCall;
+        let (targets_left, targets_right) = (targets_left && !draws, targets_right && !draws);
 
         if targets_left && !targets_right {
             if left_nullable {

@@ -120,10 +120,10 @@ use super::utils::{
     flip_operator, get_table_alias_from_expr, index_join_residual, infix_to_operator,
     string_literal_value, strip_table_qualifier, substitute_filter_column,
 };
-use super::volatility::statement_constant;
+use super::volatility::{expression_volatility, statement_constant};
 use super::window::{WindowPreGroupedState, WindowPreSortedState};
 use super::Executor;
-use crate::functions::global_registry;
+use crate::functions::{global_registry, Volatility};
 use crate::optimizer::bloom::BloomFilterBuilder;
 use crate::storage::volume::side_index::{resolve_known, Domain, Resolved};
 
@@ -364,8 +364,13 @@ fn partition_where_for_join(
         }
 
         // The qualifiers inside a subquery are not collected, so a correlated
-        // one may read either side and is evaluated on the joined row
-        if (refs_left && refs_right) || unowned || Executor::has_correlated_subqueries(&pred) {
+        // one may read either side and is evaluated on the joined row, as is
+        // a predicate that draws a new value for every row it is asked of
+        if (refs_left && refs_right)
+            || unowned
+            || Executor::has_correlated_subqueries(&pred)
+            || expression_volatility(&pred, global_registry()) == Volatility::PerCall
+        {
             // References both tables - must be applied post-join
             cross_preds.push(pred);
         } else if refs_left {
