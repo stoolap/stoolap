@@ -145,3 +145,78 @@ fn test_a_separator_names_its_column_as_written() {
         wrong.join("\n")
     );
 }
+
+#[test]
+fn test_a_grouped_index_join_reads_the_separator_parameter() {
+    let db = Database::open("memory://string_agg_separator_join").unwrap();
+    for sql in [
+        "CREATE TABLE p (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, pid INTEGER, b TEXT)",
+        "CREATE INDEX c_pid ON c (pid)",
+        "INSERT INTO p VALUES (1), (2)",
+        "INSERT INTO c VALUES (1, 1, 'x'), (2, 1, 'x'), (3, 2, 'x'), (4, 2, 'x')",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let sql =
+        "SELECT p.id, STRING_AGG(c.b, $1) FROM p JOIN c ON p.id = c.pid GROUP BY p.id LIMIT 1";
+    let mut wrong = Vec::new();
+    let got = last_of_first_row(db.query(sql, ("|",)));
+    if got != Ok(Value::text("x|x")) {
+        wrong.push(format!("{sql} gave {got:?}"));
+    }
+    let prepared = db.prepare(sql).unwrap();
+    for sep in ["+", "-"] {
+        let got = last_of_first_row(prepared.query((sep,)));
+        if got != Ok(Value::text(format!("x{sep}x"))) {
+            wrong.push(format!("prepared {sql} with {sep} gave {got:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+#[test]
+fn test_a_separator_reads_the_transaction() {
+    let db = Database::open("memory://string_agg_separator_txn").unwrap();
+    create(&db);
+    db.execute("BEGIN", ()).unwrap();
+    let want =
+        last_of_first_row(db.query("SELECT CONCAT_WS(CURRENT_TRANSACTION_ID(), 'x', 'y')", ()));
+    let got = last_of_first_row(db.query(
+        "SELECT STRING_AGG(b, CURRENT_TRANSACTION_ID() ORDER BY id) FROM t",
+        (),
+    ));
+    db.execute("COMMIT", ()).unwrap();
+    assert!(want.is_ok() && got == want, "gave {got:?}, want {want:?}");
+}
+
+#[test]
+fn test_a_window_separator_is_one_value_for_every_partition() {
+    let db = Database::open("memory://string_agg_separator_partitions").unwrap();
+    create(&db);
+    db.execute(
+        "INSERT INTO t VALUES (3, 2, 'x', '-'), (4, 2, 'y', '-')",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX t_g ON t (g)", ()).unwrap();
+    let sql = "SELECT g, STRING_AGG(b, NOW() ORDER BY id) OVER (PARTITION BY g) FROM t LIMIT 4";
+    let separators: Vec<String> = db
+        .query(sql, ())
+        .unwrap()
+        .map(|row| {
+            let joined: String = row.unwrap().get(1).unwrap();
+            joined[1..joined.len() - 1].to_string()
+        })
+        .collect();
+    assert_eq!(separators.len(), 4, "{sql}");
+    assert!(
+        separators.iter().all(|sep| sep == &separators[0]),
+        "{sql} used {separators:?}"
+    );
+}

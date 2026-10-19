@@ -614,12 +614,12 @@ pub(crate) fn aggregate_extra_args(
                         arg
                     )));
                 }
-                super::expression::try_eval_constant_expr_with_context(arg, ctx).ok_or_else(|| {
-                    crate::core::Error::invalid_argument(format!(
-                        "the aggregate argument {} could not be evaluated",
-                        arg
-                    ))
-                })
+                let eval = super::expression::ExpressionEval::compile(arg, &[])?;
+                match ctx {
+                    Some(ctx) => eval.with_context(ctx),
+                    None => eval,
+                }
+                .eval_slice(&Row::new())
             }
         })
         .collect()

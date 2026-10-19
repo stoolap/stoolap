@@ -416,6 +416,8 @@ pub struct WindowFunctionInfo {
     pub filter: Option<Box<Expression>>,
     /// The aggregate's own ORDER BY, for an aggregate that orders its input
     pub call_order_by: Box<[OrderByExpression]>,
+    /// An aggregate's arguments after the first, read once for the statement
+    pub extra_args: Vec<Value>,
 }
 
 /// Information about a SELECT list item for window function processing
@@ -728,7 +730,7 @@ impl Executor {
         };
 
         // Parse window functions from the SELECT list
-        let mut window_functions = self.parse_window_functions(stmt, base_columns)?;
+        let mut window_functions = self.parse_window_functions(stmt, base_columns, ctx)?;
         self.fold_window_control_arguments(&mut window_functions, ctx)?;
 
         if window_functions.is_empty() {
@@ -1332,7 +1334,7 @@ impl Executor {
         limit: usize,
     ) -> Result<Option<Box<dyn QueryResult>>> {
         // Parse window functions from SELECT list
-        let mut window_functions = self.parse_window_functions(stmt, base_columns)?;
+        let mut window_functions = self.parse_window_functions(stmt, base_columns, ctx)?;
         self.fold_window_control_arguments(&mut window_functions, ctx)?;
         if window_functions.is_empty() {
             return Ok(None);
@@ -1811,6 +1813,7 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         _base_columns: &[String],
+        ctx: &ExecutionContext,
     ) -> Result<Vec<WindowFunctionInfo>> {
         let mut window_functions = Vec::new();
         let mut col_idx = 0;
@@ -1819,7 +1822,7 @@ impl Executor {
             match col_expr {
                 Expression::Window(window_expr) => {
                     let mut wf_info =
-                        self.extract_window_function_info(window_expr, &stmt.window_defs)?;
+                        self.extract_window_function_info(window_expr, &stmt.window_defs, ctx)?;
                     // Two unaliased windows of the same function would share a
                     // name; the internal one is unique, the output keeps the
                     // function's own
@@ -1830,7 +1833,7 @@ impl Executor {
                 Expression::Aliased(aliased) => {
                     if let Expression::Window(window_expr) = aliased.expression.as_ref() {
                         let mut wf_info =
-                            self.extract_window_function_info(window_expr, &stmt.window_defs)?;
+                            self.extract_window_function_info(window_expr, &stmt.window_defs, ctx)?;
                         // The alias is only the output name; the internal name
                         // cannot collide with an alias or another window
                         wf_info.column_name = format!("__wf_{}_0", col_idx);
@@ -1843,8 +1846,11 @@ impl Executor {
                             &mut windows,
                         );
                         for (i, window_expr) in windows.into_iter().enumerate() {
-                            let mut wf_info =
-                                self.extract_window_function_info(window_expr, &stmt.window_defs)?;
+                            let mut wf_info = self.extract_window_function_info(
+                                window_expr,
+                                &stmt.window_defs,
+                                ctx,
+                            )?;
                             wf_info.column_name = format!("__wf_{}_{}", col_idx, i);
                             window_functions.push(wf_info);
                         }
@@ -1856,7 +1862,7 @@ impl Executor {
                     Self::collect_all_windows_in_expression(col_expr, &mut windows);
                     for (i, window_expr) in windows.into_iter().enumerate() {
                         let mut wf_info =
-                            self.extract_window_function_info(window_expr, &stmt.window_defs)?;
+                            self.extract_window_function_info(window_expr, &stmt.window_defs, ctx)?;
                         wf_info.column_name = format!("__wf_{}_{}", col_idx, i);
                         window_functions.push(wf_info);
                     }
@@ -2116,6 +2122,7 @@ impl Executor {
         &self,
         window_expr: &WindowExpression,
         window_defs: &[WindowDefinition],
+        ctx: &ExecutionContext,
     ) -> Result<WindowFunctionInfo> {
         let func = &window_expr.function;
 
@@ -2176,6 +2183,11 @@ impl Executor {
             is_distinct: func.is_distinct,
             filter: func.filter.clone(),
             call_order_by: func.order_by.clone().into_boxed_slice(),
+            extra_args: if self.function_registry.is_aggregate(&func.function) {
+                super::aggregation::aggregate_extra_args(&func.arguments, Some(ctx))?
+            } else {
+                Vec::new()
+            },
         })
     }
 
@@ -3684,14 +3696,13 @@ impl Executor {
         &self,
         wf_info: &WindowFunctionInfo,
         ordered: bool,
-        extra_args: &[Value],
     ) -> Result<crate::functions::aggregate::AggregateState> {
         let order_by: &[OrderByExpression] = if ordered { &wf_info.call_order_by } else { &[] };
         Self::aggregate_state(
             &self.function_registry,
             &wf_info.name,
             wf_info.is_distinct,
-            extra_args,
+            &wf_info.extra_args,
             order_by,
         )
         .ok_or_else(|| Error::NotSupported(format!("Unknown aggregate function: {}", wf_info.name)))
@@ -3847,7 +3858,6 @@ impl Executor {
             return Ok(Vec::new());
         }
         let frame = Frame::read(wf_info, &self.function_registry, ctx)?;
-        let extra_args = super::aggregation::aggregate_extra_args(&wf_info.arguments, Some(ctx))?;
         let mut results: Vec<Option<Value>> = vec![None; rows.len()];
 
         for row_indices in partitions.iter() {
@@ -3857,8 +3867,7 @@ impl Executor {
                 let frames = PartitionFrames::new(&frame, row_indices, order_by_values);
 
                 // Get aggregate function ONCE, reuse with reset() for each row
-                let mut agg_func =
-                    self.window_aggregate_state(wf_info, keys.is_some(), &extra_args)?;
+                let mut agg_func = self.window_aggregate_state(wf_info, keys.is_some())?;
 
                 // O(n) incremental accumulation instead of O(n²) reset when
                 // the frame only grows; DISTINCT needs the full set
@@ -3927,8 +3936,7 @@ impl Executor {
                 } // end of else (non-incremental path)
             } else {
                 // Without ORDER BY or a frame, compute aggregate over entire partition
-                let mut agg_func =
-                    self.window_aggregate_state(wf_info, keys.is_some(), &extra_args)?;
+                let mut agg_func = self.window_aggregate_state(wf_info, keys.is_some())?;
 
                 // Accumulate all values in the partition
                 if keys.is_none() {
@@ -4087,6 +4095,7 @@ mod tests {
             is_distinct: false,
             filter: None,
             call_order_by: Box::new([]),
+            extra_args: Vec::new(),
         };
 
         assert_eq!(info.name, "ROW_NUMBER");
