@@ -59,6 +59,21 @@ pub trait TableValuedFunction: Send + Sync {
 pub struct GenerateSeriesFunction;
 
 impl GenerateSeriesFunction {
+    /// Whether a series with another value in range stops before it at
+    /// `len` rows: at the caller's limit it does; at MAX_TVF_ROWS it is an
+    /// error, as a shorter series would be a wrong answer
+    fn stops_at(len: usize, limit: Option<usize>) -> Result<bool> {
+        if limit.is_some_and(|limit| len >= limit) {
+            return Ok(true);
+        }
+        if len >= MAX_TVF_ROWS {
+            return Err(Error::invalid_argument(format!(
+                "GENERATE_SERIES would generate more than {MAX_TVF_ROWS} rows"
+            )));
+        }
+        Ok(false)
+    }
+
     fn to_i64(val: &Value) -> Result<i64> {
         match val {
             Value::Integer(i) => Ok(*i),
@@ -109,43 +124,26 @@ impl GenerateSeriesFunction {
             return Ok(RowVec::new());
         }
 
-        let max_rows = limit.unwrap_or(MAX_TVF_ROWS).min(MAX_TVF_ROWS);
-
-        let capacity = if let Some(lim) = limit {
-            lim.min(MAX_TVF_ROWS)
-        } else {
-            let raw_count =
-                ((stop as i128 - start as i128) / step as i128).unsigned_abs() as usize + 1;
-            raw_count.min(MAX_TVF_ROWS)
-        };
+        // The length is known, so a series past the cap fails before it is built
+        let count = ((stop as i128 - start as i128) / step as i128).unsigned_abs() + 1;
+        if count > MAX_TVF_ROWS as u128 {
+            Self::stops_at(MAX_TVF_ROWS, limit)?;
+        }
+        let capacity = (count.min(MAX_TVF_ROWS as u128) as usize).min(limit.unwrap_or(usize::MAX));
         let mut rows = RowVec::with_capacity(capacity);
         let mut current = start;
         let mut row_id = 0i64;
 
-        if step > 0 {
-            while current <= stop {
-                rows.push((row_id, Row::from_values(vec![Value::Integer(current)])));
-                row_id += 1;
-                if rows.len() >= max_rows {
-                    break;
-                }
-                current = match current.checked_add(step) {
-                    Some(v) => v,
-                    None => break,
-                };
+        while (step > 0 && current <= stop) || (step < 0 && current >= stop) {
+            if Self::stops_at(rows.len(), limit)? {
+                break;
             }
-        } else {
-            while current >= stop {
-                rows.push((row_id, Row::from_values(vec![Value::Integer(current)])));
-                row_id += 1;
-                if rows.len() >= max_rows {
-                    break;
-                }
-                current = match current.checked_add(step) {
-                    Some(v) => v,
-                    None => break,
-                };
-            }
+            rows.push((row_id, Row::from_values(vec![Value::Integer(current)])));
+            row_id += 1;
+            current = match current.checked_add(step) {
+                Some(v) => v,
+                None => break,
+            };
         }
 
         Ok(rows)
@@ -232,10 +230,10 @@ impl GenerateSeriesFunction {
             if (direction > 0 && current > stop) || (direction < 0 && current < stop) {
                 break;
             }
-            rows.push((k, Row::from_values(vec![Value::Timestamp(current)])));
-            if rows.len() >= max_rows {
+            if Self::stops_at(rows.len(), limit)? {
                 break;
             }
+            rows.push((k, Row::from_values(vec![Value::Timestamp(current)])));
         }
 
         Ok(rows)
@@ -293,14 +291,13 @@ impl GenerateSeriesFunction {
             } else if current < stop - step.abs() * 1e-10 {
                 break;
             }
+            if Self::stops_at(rows.len(), limit)? {
+                break;
+            }
 
             rows.push((row_id, Row::from_values(vec![Value::Float(current)])));
             row_id += 1;
             i += 1;
-
-            if i >= max_rows {
-                break;
-            }
         }
 
         Ok(rows)
@@ -423,6 +420,19 @@ impl ScalarFunction for GenerateSeriesScalarFunction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_a_series_stops_at_its_limit_and_fails_at_the_cap() {
+        assert!(!GenerateSeriesFunction::stops_at(0, None).unwrap());
+        assert!(GenerateSeriesFunction::stops_at(5, Some(5)).unwrap());
+        assert!(GenerateSeriesFunction::stops_at(MAX_TVF_ROWS, Some(MAX_TVF_ROWS)).unwrap());
+        assert!(GenerateSeriesFunction::stops_at(MAX_TVF_ROWS, None).is_err());
+        assert!(GenerateSeriesFunction::stops_at(MAX_TVF_ROWS, Some(MAX_TVF_ROWS + 1)).is_err());
+        let f = GenerateSeriesFunction;
+        let over = [Value::Integer(1), Value::Integer(MAX_TVF_ROWS as i64 + 1)];
+        assert!(f.generate(&over, None).is_err());
+        assert_eq!(f.generate(&over, Some(4)).unwrap().len(), 4);
+    }
 
     #[test]
     fn test_generate_series_basic() {
