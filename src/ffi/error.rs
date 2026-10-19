@@ -28,7 +28,7 @@ thread_local! {
 
 pub(crate) fn set_global_error(msg: &str) {
     THREAD_ERROR.with(|cell| {
-        *cell.borrow_mut() = CString::new(msg).ok();
+        *cell.borrow_mut() = CString::new(msg.replace('\0', "\\0")).ok();
     });
 }
 

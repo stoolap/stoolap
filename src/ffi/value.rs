@@ -16,7 +16,7 @@
 
 use crate::api::params::NamedParams;
 use crate::api::ParamVec;
-use crate::core::Value;
+use crate::core::{Error, Result, Value};
 
 use super::types::{StoolapNamedParam, StoolapValue};
 use super::{
@@ -24,13 +24,14 @@ use super::{
     STOOLAP_TYPE_JSON, STOOLAP_TYPE_NULL, STOOLAP_TYPE_TEXT, STOOLAP_TYPE_TIMESTAMP,
 };
 
-/// Convert a C `StoolapValue` to a Rust `Value`.
+/// Convert a C `StoolapValue` to a Rust `Value`. Text that is not UTF-8
+/// and JSON that does not parse are refused, not read as NULL.
 ///
 /// # Safety
 ///
 /// The caller must ensure text/blob pointers are valid for the specified length.
-pub(crate) unsafe fn ffi_value_to_rust(v: &StoolapValue) -> Value {
-    match v.value_type {
+pub(crate) unsafe fn ffi_value_to_rust(v: &StoolapValue) -> Result<Value> {
+    Ok(match v.value_type {
         STOOLAP_TYPE_NULL => Value::null_unknown(),
         STOOLAP_TYPE_INTEGER => Value::Integer(v.v.integer),
         STOOLAP_TYPE_FLOAT => Value::Float(v.v.float64),
@@ -44,7 +45,9 @@ pub(crate) unsafe fn ffi_value_to_rust(v: &StoolapValue) -> Value {
                 let slice = std::slice::from_raw_parts(text.ptr as *const u8, text.len as usize);
                 match std::str::from_utf8(slice) {
                     Ok(s) => Value::text(s),
-                    Err(_) => Value::null_unknown(),
+                    Err(_) => {
+                        return Err(Error::invalid_argument("text parameter is not valid UTF-8"))
+                    }
                 }
             }
         }
@@ -62,21 +65,14 @@ pub(crate) unsafe fn ffi_value_to_rust(v: &StoolapValue) -> Value {
             let text = &v.v.text;
             if text.ptr.is_null() || text.len < 0 {
                 Value::null_unknown()
-            } else if text.len == 0 {
-                // Empty string is not valid JSON
-                Value::null_unknown()
             } else {
                 let slice = std::slice::from_raw_parts(text.ptr as *const u8, text.len as usize);
+                // Validates the whole document without building it
                 match std::str::from_utf8(slice) {
-                    Ok(s) => {
-                        // Validate JSON before tagging
-                        if serde_json::from_str::<serde_json::Value>(s).is_ok() {
-                            Value::json(s)
-                        } else {
-                            Value::null_unknown()
-                        }
+                    Ok(s) if serde_json::from_str::<serde::de::IgnoredAny>(s).is_ok() => {
+                        Value::json(s)
                     }
-                    Err(_) => Value::null_unknown(),
+                    _ => return Err(Error::invalid_argument("JSON parameter is not valid JSON")),
                 }
             }
         }
@@ -99,7 +95,7 @@ pub(crate) unsafe fn ffi_value_to_rust(v: &StoolapValue) -> Value {
             }
         }
         _ => Value::null_unknown(),
-    }
+    })
 }
 
 /// Convert an FFI parameter array to a Rust `ParamVec`.
@@ -107,9 +103,9 @@ pub(crate) unsafe fn ffi_value_to_rust(v: &StoolapValue) -> Value {
 /// # Safety
 ///
 /// `params` must point to `len` valid `StoolapValue` structs (or be null if `len <= 0`).
-pub(crate) unsafe fn params_to_vec(params: *const StoolapValue, len: i32) -> ParamVec {
+pub(crate) unsafe fn params_to_vec(params: *const StoolapValue, len: i32) -> Result<ParamVec> {
     if params.is_null() || len <= 0 {
-        return ParamVec::new();
+        return Ok(ParamVec::new());
     }
     let slice = std::slice::from_raw_parts(params, len as usize);
     slice.iter().map(|v| ffi_value_to_rust(v)).collect()
@@ -124,9 +120,9 @@ pub(crate) unsafe fn params_to_vec(params: *const StoolapValue, len: i32) -> Par
 pub(crate) unsafe fn named_params_from_ffi(
     params: *const StoolapNamedParam,
     len: i32,
-) -> NamedParams {
+) -> Result<NamedParams> {
     if params.is_null() || len <= 0 {
-        return NamedParams::new();
+        return Ok(NamedParams::new());
     }
     let slice = std::slice::from_raw_parts(params, len as usize);
     let mut named = NamedParams::with_capacity(slice.len());
@@ -136,8 +132,8 @@ pub(crate) unsafe fn named_params_from_ffi(
         }
         let name_bytes = std::slice::from_raw_parts(p.name as *const u8, p.name_len as usize);
         if let Ok(name) = std::str::from_utf8(name_bytes) {
-            named.insert(name, ffi_value_to_rust(&p.value));
+            named.insert(name, ffi_value_to_rust(&p.value)?);
         }
     }
-    named
+    Ok(named)
 }

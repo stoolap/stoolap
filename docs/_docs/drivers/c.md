@@ -497,6 +497,8 @@ float vec[] = { 1.0f, 2.0f, 3.0f };
 StoolapValue v_blob = { .value_type = STOOLAP_TYPE_BLOB, 0, { .blob = { (const uint8_t*)vec, sizeof(vec) } } };
 ```
 
+A `STOOLAP_TYPE_TEXT` value that is not valid UTF-8, and a `STOOLAP_TYPE_JSON` value that is not valid JSON (including an empty string), make the call fail with `STOOLAP_ERROR` and an error message on the handle. Nothing is executed. A NULL `ptr` passes SQL NULL.
+
 ### Named Parameters (StoolapNamedParam)
 
 Named parameters use `:name` syntax in SQL. Pass an array of `StoolapNamedParam` structs instead of positional `StoolapValue` arrays:

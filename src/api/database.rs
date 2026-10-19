@@ -51,10 +51,10 @@ use crate::executor::context::ExecutionContextBuilder;
 use crate::executor::{CachedPlanRef, ExecutionContext, Executor};
 use crate::storage::mvcc::engine::MVCCEngine;
 use crate::storage::traits::transaction::StatementTable;
-use crate::storage::traits::Engine;
+use crate::storage::traits::{Engine, QueryResult};
 use crate::storage::{Config, SyncMode};
 
-use super::params::{NamedParams, Params};
+use super::params::{NamedParams, ParamVec, Params};
 use super::rows::{FromRow, Rows};
 use super::statement::Statement;
 use super::transaction::Transaction;
@@ -93,7 +93,7 @@ impl Drop for SharedEngine {
 
 /// One session on an engine: its own executor and transaction state
 pub(crate) struct DatabaseInner {
-    executor: Executor,
+    pub(super) executor: Executor,
     shared: Arc<SharedEngine>,
 }
 
@@ -969,8 +969,7 @@ impl Database {
         let executor = &self.inner.executor;
 
         let tx = executor.begin_transaction_with_isolation(isolation)?;
-        let engine = executor.engine().clone();
-        Ok(Transaction::new(tx, engine))
+        Ok(Transaction::new(executor.for_transaction(tx)))
     }
 
     /// Get the underlying storage engine
@@ -1012,28 +1011,29 @@ impl Database {
 
     /// Execute a pre-cached plan with positional parameters (no parsing, no cache lookup).
     pub fn execute_plan<P: Params>(&self, plan: &CachedPlanRef, params: P) -> Result<i64> {
-        let executor = &self.inner.executor;
-        let param_values = params.into_params();
-        let ctx = if param_values.is_empty() {
-            ExecutionContext::new()
-        } else {
-            ExecutionContext::with_params(param_values)
-        };
-        let result = executor.execute_with_cached_plan_owned(plan, ctx)?;
-        Ok(result.rows_affected())
+        Ok(self.run_plan(plan, params.into_params())?.rows_affected())
     }
 
     /// Query using a pre-cached plan with positional parameters (no parsing, no cache lookup).
     pub fn query_plan<P: Params>(&self, plan: &CachedPlanRef, params: P) -> Result<Rows> {
+        Ok(Rows::new(self.run_plan(plan, params.into_params())?))
+    }
+
+    /// Runs `plan` with `params`: by a compiled path taking them borrowed
+    /// when one applies, through an execution context otherwise
+    pub(crate) fn run_plan(
+        &self,
+        plan: &CachedPlanRef,
+        params: ParamVec,
+    ) -> Result<Box<dyn QueryResult>> {
         let executor = &self.inner.executor;
-        let param_values = params.into_params();
-        let ctx = if param_values.is_empty() {
-            ExecutionContext::new()
-        } else {
-            ExecutionContext::with_params(param_values)
-        };
-        let result = executor.execute_with_cached_plan_owned(plan, ctx)?;
-        Ok(Rows::new(result))
+        if params.is_empty() {
+            return executor.execute_with_cached_plan_owned(plan, ExecutionContext::new());
+        }
+        if let Some(result) = executor.try_plan_fast_path(plan, &params) {
+            return result;
+        }
+        executor.execute_with_cached_plan_owned(plan, ExecutionContext::with_params(params))
     }
 
     /// Execute a pre-cached plan with named parameters (no parsing, no cache lookup).

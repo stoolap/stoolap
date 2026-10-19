@@ -56,6 +56,11 @@ fn test_cached_lookup_in_begin_rereads_a_dropped_column_layout() {
 #[test]
 fn test_transaction_api_lookup_rereads_a_dropped_column_layout() {
     let db = table("tx_pk_layout_api");
+    let ast = stoolap::parser::Parser::new(SELECT)
+        .parse_program()
+        .unwrap()
+        .statements
+        .remove(0);
     let mut tx = db.begin().unwrap();
     let other = db.clone();
     let fired = Rc::new(Cell::new(false));
@@ -64,10 +69,30 @@ fn test_transaction_api_lookup_rereads_a_dropped_column_layout() {
         other.execute("ALTER TABLE t DROP COLUMN a", ()).unwrap();
         hook_fired.set(true);
     });
-    assert_eq!(tx.query_one::<i64, _>(SELECT, (1,)).unwrap(), 10);
+    let mut rows = tx.query_prepared(&ast, (1,)).unwrap();
+    assert!(rows.advance());
+    assert_eq!(rows.current_row().as_slice(), [stoolap::Value::Integer(10)]);
+    drop(rows);
     assert!(
         fired.get(),
         "the column dropped after the positions resolved"
     );
+    tx.commit().unwrap();
+}
+
+#[test]
+fn test_transaction_api_cached_lookup_rereads_a_dropped_column_layout() {
+    let db = table("tx_pk_layout_api_cached");
+    assert_eq!(db.query_one::<i64, _>(SELECT, (1,)).unwrap(), 10);
+    let mut tx = db.begin().unwrap();
+    let other = db.clone();
+    let fired = Rc::new(Cell::new(false));
+    let hook_fired = Rc::clone(&fired);
+    stoolap::test_failpoints::after_compiled_epoch_checked(move || {
+        other.execute("ALTER TABLE t DROP COLUMN a", ()).unwrap();
+        hook_fired.set(true);
+    });
+    assert_eq!(tx.query_one::<i64, _>(SELECT, (1,)).unwrap(), 10);
+    assert!(fired.get(), "the column dropped after the epoch check");
     tx.commit().unwrap();
 }

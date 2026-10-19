@@ -576,6 +576,8 @@ impl Executor {
                     // Fast path: extract value from slice directly
                     let pk_value =
                         Self::extract_pk_value_from_slice(&lookup.pk_value_source, params)?;
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::compiled_epoch_checked();
                     or_normal_path(self.execute_compiled_pk_lookup(lookup, pk_value, false, None))
                 } else {
                     // Epoch changed - need recompile, use normal path

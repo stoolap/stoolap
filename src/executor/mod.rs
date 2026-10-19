@@ -233,10 +233,11 @@ pub struct Executor {
     function_registry: Arc<FunctionRegistry>,
     /// Default isolation level for transactions, as its `u8` value
     default_isolation_level: AtomicU8,
-    /// Query cache for parsed statements
-    query_cache: QueryCache,
+    /// Query cache for parsed statements, shared with the executors of
+    /// this session's transactions
+    query_cache: Arc<QueryCache>,
     /// Semantic cache for query results with subsumption detection
-    semantic_cache: SemanticCache,
+    semantic_cache: Arc<SemanticCache>,
     /// Taken before `active_transaction`: shared by statements that run
     /// outside an explicit transaction, exclusive for the rest
     statement_gate: RwLock<()>,
@@ -267,8 +268,8 @@ impl Executor {
             default_isolation_level: AtomicU8::new(
                 crate::core::IsolationLevel::ReadCommitted as u8,
             ),
-            query_cache: QueryCache::default(),
-            semantic_cache: SemanticCache::default(),
+            query_cache: Arc::new(QueryCache::default()),
+            semantic_cache: Arc::new(SemanticCache::default()),
             statement_gate: RwLock::new(()),
             active_transaction: Mutex::new(None),
             query_planner: std::sync::OnceLock::new(),
@@ -287,8 +288,8 @@ impl Executor {
             default_isolation_level: AtomicU8::new(
                 crate::core::IsolationLevel::ReadCommitted as u8,
             ),
-            query_cache: QueryCache::default(),
-            semantic_cache: SemanticCache::default(),
+            query_cache: Arc::new(QueryCache::default()),
+            semantic_cache: Arc::new(SemanticCache::default()),
             statement_gate: RwLock::new(()),
             active_transaction: Mutex::new(None),
             query_planner: std::sync::OnceLock::new(),
@@ -304,10 +305,31 @@ impl Executor {
             default_isolation_level: AtomicU8::new(
                 crate::core::IsolationLevel::ReadCommitted as u8,
             ),
-            query_cache: QueryCache::new(cache_size),
-            semantic_cache: SemanticCache::default(),
+            query_cache: Arc::new(QueryCache::new(cache_size)),
+            semantic_cache: Arc::new(SemanticCache::default()),
             statement_gate: RwLock::new(()),
             active_transaction: Mutex::new(None),
+            query_planner: std::sync::OnceLock::new(),
+            view_spares: parking_lot::Mutex::new(smallvec::SmallVec::new()),
+        }
+    }
+
+    /// An executor that runs `tx` as its open transaction, sharing this
+    /// one's plans, compiled paths and result cache
+    pub(crate) fn for_transaction(&self, tx: Box<dyn Transaction>) -> Self {
+        Self {
+            engine: Arc::clone(&self.engine),
+            function_registry: Arc::clone(&self.function_registry),
+            default_isolation_level: AtomicU8::new(
+                self.default_isolation_level.load(Ordering::Relaxed),
+            ),
+            query_cache: Arc::clone(&self.query_cache),
+            semantic_cache: Arc::clone(&self.semantic_cache),
+            statement_gate: RwLock::new(()),
+            active_transaction: Mutex::new(Some(ActiveTransaction {
+                transaction: tx,
+                tables: FxHashMap::default(),
+            })),
             query_planner: std::sync::OnceLock::new(),
             view_spares: parking_lot::Mutex::new(smallvec::SmallVec::new()),
         }
@@ -411,22 +433,41 @@ impl Executor {
 
         // Try to get from cache
         let cached = self.query_cache.get(sql)?;
+        self.param_fast_paths(&cached, params)
+    }
 
+    /// [`Self::try_fast_path_with_params`] for a plan the caller holds
+    pub(crate) fn try_plan_fast_path(
+        &self,
+        plan: &CachedPlanRef,
+        params: &[Value],
+    ) -> Option<Result<Box<dyn QueryResult>>> {
+        let _gate = self.enter_shared()?;
+        self.param_fast_paths(plan, params)
+    }
+
+    /// The compiled PK paths that take borrowed params, under a shared gate
+    /// the caller holds; None when none applies
+    fn param_fast_paths(
+        &self,
+        plan: &CachedPlanRef,
+        params: &[Value],
+    ) -> Option<Result<Box<dyn QueryResult>>> {
         // Validate parameter count
-        if cached.has_params && params.len() < cached.param_count {
+        if plan.has_params && params.len() < plan.param_count {
             return None; // Let normal path handle error
         }
 
         // Try compiled fast paths based on statement type
-        match cached.statement.as_ref() {
+        match plan.statement.as_ref() {
             Statement::Select(stmt) => {
-                self.try_fast_pk_lookup_with_params(stmt, params, &cached.compiled)
+                self.try_fast_pk_lookup_with_params(stmt, params, &plan.compiled)
             }
             Statement::Update(stmt) => {
-                self.try_fast_pk_update_with_params(stmt, params, &cached.compiled)
+                self.try_fast_pk_update_with_params(stmt, params, &plan.compiled)
             }
             Statement::Delete(stmt) => {
-                self.try_fast_pk_delete_with_params(stmt, params, &cached.compiled)
+                self.try_fast_pk_delete_with_params(stmt, params, &plan.compiled)
             }
             _ => None,
         }
@@ -573,7 +614,7 @@ impl Executor {
 
     /// Current explicit-transaction id, if one is active.
     #[inline]
-    fn active_txn_id(&self) -> Option<i64> {
+    pub(crate) fn active_txn_id(&self) -> Option<i64> {
         self.active_transaction
             .lock()
             .unwrap()
@@ -1115,23 +1156,36 @@ impl Executor {
     /// Returns a lightweight CachedPlanRef that can be stored and reused
     /// for repeated execution without re-parsing or cache lookup overhead.
     pub fn get_or_create_plan(&self, sql: &str) -> Result<CachedPlanRef> {
+        self.plan_or_program(sql)?
+            .map_err(|_| Error::parse("Prepared statements must contain exactly one statement"))
+    }
+
+    /// The cached plan of single-statement `sql`, made and cached on first
+    /// use, or the parsed program when `sql` holds any other count
+    pub(crate) fn plan_or_program(
+        &self,
+        sql: &str,
+    ) -> Result<std::result::Result<CachedPlanRef, Program>> {
         if let Some(plan) = self.query_cache.get(sql) {
-            return Ok(plan);
+            return Ok(Ok(plan));
         }
         let mut parser = Parser::new(sql);
         let mut program = parser
             .parse_program()
             .map_err(|e| Error::parse(e.to_string()))?;
         if program.statements.len() != 1 {
-            return Err(Error::parse(
-                "Prepared statements must contain exactly one statement",
-            ));
+            return Ok(Err(program));
         }
-        let stmt = program.statements.pop().unwrap();
+        let Some(stmt) = program.statements.pop() else {
+            return Ok(Err(program));
+        };
         let (has_params, param_count) = count_parameters(&stmt);
-        Ok(self
-            .query_cache
-            .put(sql, Arc::new(stmt), has_params, param_count))
+        Ok(Ok(self.query_cache.put(
+            sql,
+            Arc::new(stmt),
+            has_params,
+            param_count,
+        )))
     }
 
     /// Execute a pre-cached plan directly, skipping cache lookup.

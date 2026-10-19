@@ -14,6 +14,7 @@
 
 //! FFI type definitions: opaque wrapper structs and `#[repr(C)]` value type.
 
+use std::cell::OnceCell;
 use std::ffi::CString;
 use std::os::raw::c_char;
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use std::sync::Arc;
 use crate::api::database::DatabaseInner;
 use crate::api::transaction::Transaction;
 use crate::api::{Database, Rows, Statement};
+use crate::common::CompactArc;
 
 /// FFI-safe tagged union for passing parameter values across the C boundary.
 #[repr(C)]
@@ -107,17 +109,17 @@ pub struct StoolapRows {
     pub(crate) rows: Option<Rows>,
     pub(crate) has_row: bool,
     pub(crate) last_error: Option<CString>,
-    /// Column names as CStrings (shared via Arc for prepared statement reuse).
-    pub(crate) column_names: Arc<Vec<CString>>,
-    /// Lazy text cache for the current row. Starts empty; grown on demand by
-    /// `stoolap_rows_column_text()`. Cleared only when at least one entry was
-    /// populated (`text_cache_dirty`), so numeric-only scans pay zero overhead.
-    /// Each populated entry is `[text_bytes..., 0]` — the original text (may
-    /// contain interior NULs) with a trailing NUL terminator for C compat.
-    pub(crate) text_cache: Vec<Option<Vec<u8>>>,
-    /// True when at least one entry in `text_cache` was populated for the
-    /// current row. Avoids clearing the entire Vec when no text was accessed.
-    pub(crate) text_cache_dirty: bool,
+    /// Column names of the result, kept after the rows are consumed
+    pub(crate) columns: CompactArc<Vec<String>>,
+    /// Column names as CStrings, built on the first `stoolap_rows_column_name()`
+    /// unless a prepared statement handed over its cached ones
+    pub(crate) column_names: OnceCell<Arc<Vec<CString>>>,
+    /// Per column, the row it was read for and its text with a trailing NUL.
+    /// Buffers are reused from row to row; an entry is current when its row
+    /// matches `row_gen`
+    pub(crate) text_cache: Vec<(u64, Vec<u8>)>,
+    /// Counts the rows `stoolap_rows_next()` advanced to
+    pub(crate) row_gen: u64,
     /// Number of rows affected (for DML results).
     pub(crate) rows_affected: i64,
     /// Buffer behind `stoolap_rows_fetch_chunk()`, reused across chunks
@@ -167,6 +169,36 @@ impl StoolapTx {
 }
 
 impl StoolapRows {
+    /// A handle on `rows`, with a prepared statement's cached column names
+    /// when it has them
+    pub(crate) fn boxed(rows: Rows, column_names: Option<Arc<Vec<CString>>>) -> *mut Self {
+        let rows_affected = rows.rows_affected();
+        let handle = Box::new(StoolapRows {
+            columns: rows.columns_arc().clone(),
+            column_names: column_names.map(OnceCell::from).unwrap_or_default(),
+            rows: Some(rows),
+            has_row: false,
+            last_error: None,
+            text_cache: Vec::new(),
+            row_gen: 0,
+            rows_affected,
+            packed: Vec::new(),
+        });
+        Box::into_raw(handle)
+    }
+
+    /// The column names as CStrings, built on first use
+    pub(crate) fn column_cstrs(&self) -> &Arc<Vec<CString>> {
+        self.column_names.get_or_init(|| {
+            Arc::new(
+                self.columns
+                    .iter()
+                    .map(|name| CString::new(name.as_str()).unwrap_or_default())
+                    .collect(),
+            )
+        })
+    }
+
     pub(crate) fn set_error(&mut self, msg: &str) {
         let sanitized = msg.replace('\0', "\\0");
         self.last_error = CString::new(sanitized).ok();

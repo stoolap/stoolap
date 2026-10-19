@@ -9930,20 +9930,27 @@ impl Executor {
                 ))
             }
         } else {
-            // Full ROLLBACK - ends the transaction
-            if let Some(mut tx_state) = active_tx.take() {
-                // Rollback all tables first
-                for (_name, mut table) in tx_state.tables.drain() {
-                    table.rollback();
-                }
-                // Then rollback the transaction
-                tx_state.transaction.rollback()?;
-                Ok(Box::new(ExecResult::empty()))
-            } else {
-                // No active transaction - this is a no-op
-                Ok(Box::new(ExecResult::empty()))
-            }
+            drop(active_tx);
+            self.rollback_active()?;
+            Ok(Box::new(ExecResult::empty()))
         }
+    }
+
+    /// Rolls back and ends the open transaction, its tables first; a no-op
+    /// when none is open
+    pub(crate) fn rollback_active(&self) -> Result<()> {
+        let taken = self
+            .active_transaction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(mut tx_state) = taken {
+            for (_name, mut table) in tx_state.tables.drain() {
+                table.rollback();
+            }
+            tx_state.transaction.rollback()?;
+        }
+        Ok(())
     }
 
     /// Execute SET statement

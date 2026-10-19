@@ -28,19 +28,6 @@ use super::{
     STOOLAP_TYPE_TEXT, STOOLAP_TYPE_TIMESTAMP,
 };
 
-/// Build a NUL-terminated byte buffer from a string.
-///
-/// Unlike `CString`, this preserves interior NUL bytes so that callers
-/// using the `out_len` parameter can access the full data.  Callers
-/// treating the pointer as a C string will naturally see a truncated
-/// view at the first embedded NUL — this matches C convention.
-fn make_text_buf(s: &str) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(s.len() + 1);
-    buf.extend_from_slice(s.as_bytes());
-    buf.push(0); // trailing NUL for C compatibility
-    buf
-}
-
 /// Advance to the next row.
 ///
 /// Returns `STOOLAP_ROW` if a row is available, `STOOLAP_DONE` when exhausted,
@@ -62,12 +49,7 @@ pub unsafe extern "C" fn stoolap_rows_next(rows: *mut StoolapRows) -> i32 {
             None => return STOOLAP_DONE,
         };
 
-        // Clear text cache from previous row (only if anything was cached)
-        if handle.text_cache_dirty {
-            handle.text_cache.fill(None);
-            handle.text_cache_dirty = false;
-        }
-
+        handle.row_gen += 1;
         if rows_inner.advance() {
             handle.has_row = true;
             STOOLAP_ROW
@@ -96,7 +78,7 @@ pub unsafe extern "C" fn stoolap_rows_next(rows: *mut StoolapRows) -> i32 {
 #[no_mangle]
 pub unsafe extern "C" fn stoolap_rows_column_count(rows: *const StoolapRows) -> i32 {
     match rows.as_ref() {
-        Some(handle) => handle.column_names.len() as i32,
+        Some(handle) => handle.columns.len() as i32,
         None => 0,
     }
 }
@@ -123,7 +105,7 @@ pub unsafe extern "C" fn stoolap_rows_column_name(
         return std::ptr::null();
     }
 
-    match handle.column_names.get(index as usize) {
+    match handle.column_cstrs().get(index as usize) {
         Some(cs) => cs.as_ptr(),
         None => std::ptr::null(),
     }
@@ -234,57 +216,49 @@ pub unsafe extern "C" fn stoolap_rows_column_text(
     }
 
     let idx = index as usize;
-
-    // Check text cache first
-    if let Some(Some(ref cached)) = handle.text_cache.get(idx) {
-        if !out_len.is_null() {
-            // Length excludes the trailing NUL terminator
-            *out_len = (cached.len() - 1) as i64;
-        }
-        return cached.as_ptr() as *const c_char;
-    }
-
-    // Get the value and build a NUL-terminated byte buffer.
-    // Fast path: for Text/Json values, use as_str() to avoid an intermediate String allocation.
-    // Slow path: for other types (Integer, Float, etc.), fall back to as_string().
-    //
-    // Interior NUL bytes are preserved in the buffer; callers using out_len
-    // can access the full data.  Callers treating the pointer as a C string
-    // will see a truncated view at the first embedded NUL.
-    let buf = {
-        let rows_inner = match &handle.rows {
-            Some(r) => r,
-            None => return std::ptr::null(),
-        };
-        let row = rows_inner.current_row();
-        match row.get(idx) {
-            Some(val) => {
-                if let Some(s) = val.as_str() {
-                    Some(make_text_buf(s))
-                } else {
-                    val.as_string().map(|s| make_text_buf(&s))
-                }
-            }
-            None => None,
-        }
+    let row_gen = handle.row_gen;
+    let fresh = match handle.text_cache.get(idx) {
+        Some((read_at, _)) => *read_at != row_gen,
+        None => true,
     };
-
-    match buf {
-        Some(b) => {
-            // Grow the cache lazily to fit this column index
-            if handle.text_cache.len() <= idx {
-                handle.text_cache.resize_with(idx + 1, || None);
-            }
-            handle.text_cache[idx] = Some(b);
-            handle.text_cache_dirty = true;
-            let cached = handle.text_cache[idx].as_ref().unwrap();
-            if !out_len.is_null() {
-                *out_len = (cached.len() - 1) as i64;
-            }
-            cached.as_ptr() as *const c_char
+    if fresh {
+        let Some(rows_inner) = &handle.rows else {
+            return std::ptr::null();
+        };
+        let Some(val) = rows_inner.current_row().get(idx) else {
+            return std::ptr::null();
+        };
+        if handle.text_cache.len() <= idx {
+            let len = handle.columns.len().max(idx + 1);
+            handle
+                .text_cache
+                .resize_with(len, || (u64::MAX, Vec::new()));
         }
-        None => std::ptr::null(),
+        let (read_at, buf) = &mut handle.text_cache[idx];
+        // Interior NULs are kept: out_len gives the full text, a C string
+        // reader stops at the first one
+        let mut fill = |s: &str| {
+            buf.clear();
+            buf.reserve(s.len() + 1);
+            buf.extend_from_slice(s.as_bytes());
+            buf.push(0);
+        };
+        if let Some(s) = val.as_str() {
+            fill(s);
+        } else if let Some(s) = val.as_string() {
+            fill(&s);
+        } else {
+            return std::ptr::null();
+        }
+        *read_at = row_gen;
     }
+
+    let (_, cached) = &handle.text_cache[idx];
+    if !out_len.is_null() {
+        // Length excludes the trailing NUL terminator
+        *out_len = (cached.len() - 1) as i64;
+    }
+    cached.as_ptr() as *const c_char
 }
 
 /// Get a boolean value from the current row. Returns 0 (false) if NULL or not convertible.
@@ -589,8 +563,8 @@ pub unsafe extern "C" fn stoolap_rows_fetch_all(
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         let mut buf = Vec::with_capacity(4096);
-        let count_at = write_header(handle.column_names.iter().map(|n| n.to_bytes()), &mut buf);
-        let col_count = handle.column_names.len();
+        let count_at = write_header(handle.columns.iter().map(|n| n.as_bytes()), &mut buf);
+        let col_count = handle.columns.len();
         let packed = match &mut handle.rows {
             Some(r) => write_rows(r, col_count, usize::MAX, count_at, &mut buf),
             None => Ok(0),
@@ -661,9 +635,9 @@ pub unsafe extern "C" fn stoolap_rows_fetch_chunk(
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         handle.has_row = false;
         reset_packed(&mut handle.packed);
-        let names = handle.column_names.iter().map(|n| n.to_bytes());
+        let names = handle.columns.iter().map(|n| n.as_bytes());
         let count_at = write_header(names, &mut handle.packed);
-        let col_count = handle.column_names.len();
+        let col_count = handle.columns.len();
         let max = max_rows as usize;
         let packed = match &mut handle.rows {
             Some(r) => write_rows(r, col_count, max, count_at, &mut handle.packed),

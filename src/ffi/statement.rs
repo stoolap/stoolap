@@ -19,9 +19,7 @@ use std::os::raw::c_char;
 use std::panic;
 use std::sync::Arc;
 
-use crate::api::transaction::Transaction;
-use crate::api::{ParamVec, Rows};
-use crate::core::Result;
+use crate::api::ParamVec;
 
 use super::rows::pack_all;
 use super::types::{StoolapDB, StoolapRows, StoolapStmt, StoolapTx, StoolapValue};
@@ -115,9 +113,7 @@ pub unsafe extern "C" fn stoolap_stmt_exec(
     handle.last_error = None;
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let param_vec = value::params_to_vec(params, params_len);
-
-        match handle.stmt.execute(param_vec) {
+        match value::params_to_vec(params, params_len).and_then(|p| handle.stmt.execute(p)) {
             Ok(affected) => {
                 if !rows_affected.is_null() {
                     *rows_affected = affected;
@@ -185,6 +181,10 @@ pub unsafe extern "C" fn stoolap_stmt_exec_batch(
         }
         return STOOLAP_OK;
     }
+    if params_per_row < 0 || (params_per_row > 0 && params.is_null()) {
+        db_handle.set_error("params must hold row_count * params_per_row values");
+        return STOOLAP_ERROR;
+    }
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         let mut tx = match db_handle.db.begin() {
@@ -195,22 +195,17 @@ pub unsafe extern "C" fn stoolap_stmt_exec_batch(
             }
         };
 
-        let ast_stmt = stmt_handle.stmt.ast_statement();
         let ppr = params_per_row as usize;
         let mut total: i64 = 0;
 
         for r in 0..(row_count as usize) {
-            let row_params = params.add(r * ppr);
-            let param_vec = value::params_to_vec(row_params, params_per_row);
-
-            let exec_result = if let Some(ast) = ast_stmt {
-                tx.execute_prepared(ast, param_vec)
+            let param_vec = if ppr == 0 {
+                Ok(ParamVec::new())
             } else {
-                let sql_str = stmt_handle.sql_cstr.to_str().unwrap_or("");
-                tx.execute(sql_str, param_vec)
+                value::params_to_vec(params.add(r * ppr), params_per_row)
             };
 
-            match exec_result {
+            match param_vec.and_then(|p| stmt_handle.stmt.execute_in(&mut tx, p)) {
                 Ok(affected) => total += affected,
                 Err(e) => {
                     let _ = tx.rollback();
@@ -266,45 +261,33 @@ pub unsafe extern "C" fn stoolap_stmt_query(
     handle.last_error = None;
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let param_vec = value::params_to_vec(params, params_len);
-
-        match handle.stmt.query(param_vec) {
+        match value::params_to_vec(params, params_len).and_then(|p| handle.stmt.query(p)) {
             Ok(rows) => {
                 let actual_columns = rows.columns();
                 let actual_count = actual_columns.len();
 
                 // Validate cache: rebuild if column count or names changed (DDL)
-                let cache_valid = handle.cached_columns.as_ref().is_some_and(|cached| {
-                    cached.len() == actual_count
-                        && cached
+                let column_names = match &handle.cached_columns {
+                    Some(cached)
+                        if cached.len() == actual_count
+                            && cached
+                                .iter()
+                                .zip(actual_columns.iter())
+                                .all(|(c, a)| c.as_bytes() == a.as_str().as_bytes()) =>
+                    {
+                        Arc::clone(cached)
+                    }
+                    _ => {
+                        let names: Vec<CString> = actual_columns
                             .iter()
-                            .zip(actual_columns.iter())
-                            .all(|(c, a)| c.as_bytes() == a.as_str().as_bytes())
-                });
-                let column_names = if cache_valid {
-                    Arc::clone(handle.cached_columns.as_ref().unwrap())
-                } else {
-                    let names: Vec<CString> = actual_columns
-                        .iter()
-                        .map(|name| CString::new(name.as_str()).unwrap_or_default())
-                        .collect();
-                    let arc = Arc::new(names);
-                    handle.cached_columns = Some(Arc::clone(&arc));
-                    arc
+                            .map(|name| CString::new(name.as_str()).unwrap_or_default())
+                            .collect();
+                        let arc = Arc::new(names);
+                        handle.cached_columns = Some(Arc::clone(&arc));
+                        arc
+                    }
                 };
-                let affected = rows.rows_affected();
-
-                let rows_handle = Box::new(StoolapRows {
-                    rows: Some(rows),
-                    has_row: false,
-                    last_error: None,
-                    column_names,
-                    text_cache: Vec::new(),
-                    text_cache_dirty: false,
-                    rows_affected: affected,
-                    packed: Vec::new(),
-                });
-                *out_rows = Box::into_raw(rows_handle);
+                *out_rows = StoolapRows::boxed(rows, Some(column_names));
                 STOOLAP_OK
             }
             Err(e) => {
@@ -318,16 +301,6 @@ pub unsafe extern "C" fn stoolap_stmt_query(
         handle.set_error("panic during stoolap_stmt_query");
         STOOLAP_ERROR
     })
-}
-
-impl StoolapStmt {
-    /// Runs the statement inside `tx`, by its plan when it has one
-    pub(crate) fn query_in(&self, tx: &mut Transaction, params: ParamVec) -> Result<Rows> {
-        match self.stmt.ast_statement() {
-            Some(ast) => tx.query_prepared(ast, params),
-            None => tx.query(self.sql_cstr.to_str().unwrap_or(""), params),
-        }
-    }
 }
 
 /// Query a prepared statement and pack every row into one buffer, in the
@@ -366,11 +339,17 @@ pub unsafe extern "C" fn stoolap_stmt_query_all(
     handle.last_error = None;
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let param_vec = value::params_to_vec(params, params_len);
+        let param_vec = match value::params_to_vec(params, params_len) {
+            Ok(p) => p,
+            Err(e) => {
+                handle.set_error(&e.to_string());
+                return STOOLAP_ERROR;
+            }
+        };
         let rows = match tx.as_mut() {
             None => handle.stmt.query(param_vec),
             Some(tx_handle) => match &mut tx_handle.tx {
-                Some(inner_tx) => handle.query_in(inner_tx, param_vec),
+                Some(inner_tx) => handle.stmt.query_in(inner_tx, param_vec),
                 None => {
                     handle.set_error("transaction already ended");
                     return STOOLAP_ERROR;

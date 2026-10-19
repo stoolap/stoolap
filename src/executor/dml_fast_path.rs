@@ -323,6 +323,8 @@ impl Executor {
                     let schema = update.schema.clone();
                     let token = update.token;
                     drop(compiled_guard);
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::compiled_epoch_checked();
                     // Expression sources bail above, so no row programs
                     // and no parameters are needed here
                     return or_normal_path(self.execute_pk_update_minimal(
@@ -365,6 +367,8 @@ impl Executor {
                     let schema = delete.schema.clone();
                     let token = delete.token;
                     drop(compiled_guard);
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::compiled_epoch_checked();
                     return or_normal_path(self.execute_pk_delete_minimal(
                         &table_name,
                         &pk_column_name,

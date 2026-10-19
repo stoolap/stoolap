@@ -342,9 +342,9 @@ tx.commit()?;
 
 Transactions auto-rollback on drop if not committed.
 
-### Pre-parsed Statements in Transactions
+### Prepared Statements in Transactions
 
-For batch operations, parse SQL once and execute many times within a transaction.
+A statement prepared on the database runs inside a transaction with `execute_in` and `query_in`. It keeps its parsed plan and the compiled fast paths (primary key lookups, INSERT) that it has outside a transaction.
 
 ```rust
 // Prepare once (via Database)
@@ -352,7 +352,7 @@ let insert = db.prepare("INSERT INTO users VALUES ($1, $2, $3)")?;
 
 let mut tx = db.begin()?;
 for (id, name, age) in data {
-    tx.execute_prepared(&insert, (id, name, age))?;
+    insert.execute_in(&mut tx, (id, name, age))?;
 }
 tx.commit()?;
 ```
@@ -364,26 +364,30 @@ let lookup = db.prepare("SELECT * FROM users WHERE id = $1")?;
 
 let mut tx = db.begin()?;
 // Reads within the transaction see uncommitted changes
-let rows = tx.query_prepared(&lookup, (42,))?;
+let rows = lookup.query_in(&mut tx, (42,))?;
 tx.commit()?;
 ```
 
-Pre-parsed statements also work with named parameters, combining parse-once performance with `:name`-style bindings:
+Named parameters use `execute_named_in` and `query_named_in`:
 
 ```rust
 let insert = db.prepare("INSERT INTO users VALUES (:id, :name, :age)")?;
 
 let mut tx = db.begin()?;
-tx.execute_prepared_named(&insert, named_params!{ id: 1, name: "Alice", age: 30 })?;
-tx.execute_prepared_named(&insert, named_params!{ id: 2, name: "Bob", age: 25 })?;
+insert.execute_named_in(&mut tx, named_params!{ id: 1, name: "Alice", age: 30 })?;
+insert.execute_named_in(&mut tx, named_params!{ id: 2, name: "Bob", age: 25 })?;
 tx.commit()?;
 
 // Query variant
 let lookup = db.prepare("SELECT * FROM users WHERE id = :id")?;
 let mut tx = db.begin()?;
-let rows = tx.query_prepared_named(&lookup, named_params!{ id: 1 })?;
+let rows = lookup.query_named_in(&mut tx, named_params!{ id: 1 })?;
 tx.commit()?;
 ```
+
+SQL text passed to `tx.execute` and `tx.query` is parsed once and kept in the same plan cache as the database's own statements, so repeating it inside a transaction does not parse it again. A transaction runs `SELECT`, `INSERT`, `UPDATE`, `DELETE` and savepoint statements; other statements return `Error::NotSupported`.
+
+`tx.execute_prepared` and `tx.query_prepared` (and their `_named` forms) take a parsed `parser::ast::Statement` rather than a prepared `Statement`, and run without a cached plan.
 
 ### SQL-based Transactions
 
@@ -696,6 +700,10 @@ fn main() -> Result<()> {
 | `query(params)` | `Result<Rows>` | Query rows |
 | `query_one(params)` | `Result<T>` | Single value |
 | `query_opt(params)` | `Result<Option<T>>` | Optional value |
+| `execute_in(tx, params)` | `Result<i64>` | Execute DML inside a transaction |
+| `query_in(tx, params)` | `Result<Rows>` | Query rows inside a transaction |
+| `execute_named_in(tx, params)` | `Result<i64>` | Execute inside a transaction with named params |
+| `query_named_in(tx, params)` | `Result<Rows>` | Query inside a transaction with named params |
 | `sql()` | `&str` | Get the SQL text |
 
 ### Transaction
@@ -708,10 +716,10 @@ fn main() -> Result<()> {
 | `query_opt(sql, params)` | `Result<Option<T>>` | Optional value |
 | `execute_named(sql, params)` | `Result<i64>` | Execute with named params |
 | `query_named(sql, params)` | `Result<Rows>` | Query with named params |
-| `execute_prepared(stmt, params)` | `Result<i64>` | Execute pre-parsed statement |
-| `query_prepared(stmt, params)` | `Result<Rows>` | Query with pre-parsed statement |
-| `execute_prepared_named(stmt, params)` | `Result<i64>` | Execute pre-parsed statement with named params |
-| `query_prepared_named(stmt, params)` | `Result<Rows>` | Query pre-parsed statement with named params |
+| `execute_prepared(ast, params)` | `Result<i64>` | Execute a parsed AST statement |
+| `query_prepared(ast, params)` | `Result<Rows>` | Query with a parsed AST statement |
+| `execute_prepared_named(ast, params)` | `Result<i64>` | Execute a parsed AST statement with named params |
+| `query_prepared_named(ast, params)` | `Result<Rows>` | Query a parsed AST statement with named params |
 | `commit()` | `Result<()>` | Commit |
 | `rollback()` | `Result<()>` | Rollback |
 | `id()` | `i64` | Transaction ID |
