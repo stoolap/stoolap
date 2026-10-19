@@ -1495,11 +1495,12 @@ impl Executor {
         // Only push limit to TVF generation when no filter will discard rows afterwards.
         // With a filter, we must generate all rows first, then filter, then let
         // downstream processing handle the limit. The flag says whether the
-        // limit and offset were applied here.
-        let tvf_limit = if filter.is_some() {
-            None
-        } else {
-            limit.map(|l| l.saturating_add(offset))
+        // limit and offset were applied here. A filter that keeps no row
+        // generates none.
+        let tvf_limit = match filter {
+            Some(filter) if true_for_no_row(filter, ctx) => Some(0),
+            Some(_) => None,
+            None => limit.map(|l| l.saturating_add(offset)),
         };
 
         // Extract range bounds from the filter to narrow TVF generation range.

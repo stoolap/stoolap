@@ -1137,14 +1137,37 @@ fn test_generate_series_large_where_false_returns_empty() {
     assert!(rows.is_empty());
 }
 
-/// The 10M cap now silently truncates rather than erroring.
-/// Verify that generate_series(1, 20000000) without LIMIT produces rows up to the cap.
 #[test]
-fn test_generate_series_cap_truncates_not_errors() {
-    let db = create_test_db("cap_truncates");
-    let values = collect_i64(
-        &db,
-        "SELECT COUNT(*) FROM generate_series(1, 20000000) AS g(value)",
+fn a_series_past_the_row_cap_is_refused_not_cut_short() {
+    let db = create_test_db("gs_row_cap");
+    for sql in [
+        "SELECT COUNT(*) FROM generate_series(1, 10000001)",
+        "SELECT COUNT(*) FROM generate_series(20000000, 1)",
+        "SELECT value FROM generate_series(1, 20000000) ORDER BY value DESC LIMIT 1",
+    ] {
+        let got = db
+            .query(sql, ())
+            .and_then(|rows| rows.collect::<stoolap::Result<Vec<_>>>());
+        match got {
+            Err(e) => assert!(
+                e.to_string().contains("more than 10000000 rows"),
+                "{sql}: {e}"
+            ),
+            Ok(rows) => panic!("{sql} answered {} rows instead of refusing", rows.len()),
+        }
+    }
+    assert_eq!(
+        collect_i64(
+            &db,
+            "SELECT value FROM generate_series(1, 20000000) LIMIT 3"
+        ),
+        vec![1, 2, 3]
     );
-    assert_eq!(values, vec![10_000_000]);
+    assert_eq!(
+        collect_i64(
+            &db,
+            "SELECT COUNT(*) FROM generate_series(1, 20000000) WHERE value < 10"
+        ),
+        vec![9]
+    );
 }

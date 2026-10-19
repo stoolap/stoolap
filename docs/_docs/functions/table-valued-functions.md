@@ -307,6 +307,6 @@ ORDER BY x, y;
 - **Auto-detect direction**: When `step` is omitted, the function automatically determines the direction. For integers and floats, it uses `+1` or `-1`. For timestamps, it uses `+1 day` or `-1 day`.
 - **Direction mismatch**: If the step goes in the opposite direction from start to stop (e.g., `generate_series(1, 5, -1)`), an empty result is returned. This follows PostgreSQL behavior.
 - **Zero step**: A step of zero is an error.
-- **Safety limit**: A maximum of 10,000,000 rows can be generated per call to prevent out-of-memory conditions.
+- **Safety limit**: A call generates at most 10,000,000 rows, to prevent out-of-memory conditions. A series longer than that is an error, never a shorter answer, unless the query needs fewer rows: a `LIMIT` the query can hand to the series, a `WHERE` range on its value, or a `WHERE` that keeps no row.
 - **Case insensitive**: `GENERATE_SERIES`, `generate_series`, and `Generate_Series` all work.
 - **Calendar months**: A `month` or `year` step moves the calendar. Each value is the start moved by a whole number of steps, so a day clamped in a short month does not carry over to the next value.
