@@ -145,6 +145,8 @@ SET isolation_level = 'READ COMMITTED';
 
 Both `isolation_level` and `transaction_isolation` are accepted as variable names. If called within an active transaction, the isolation level is changed for that transaction only.
 
+The session is one database handle. Its level applies to `BEGIN` without a level, to statements run outside a transaction, and to `begin()` in the Rust API (`set_default_isolation_level` sets the same value). Another handle on the same database, including a clone or the same DSN opened again, keeps its own level.
+
 ## Transaction Behavior Summary
 
 | Statement | Behavior |

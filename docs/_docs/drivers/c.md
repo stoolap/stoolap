@@ -89,7 +89,7 @@ The API uses four opaque handle types. Each handle is created by a specific func
 | `StoolapDB` | `stoolap_open`, `stoolap_open_in_memory`, `stoolap_clone` | `stoolap_close` | NULL-safe close (no-op) |
 | `StoolapStmt` | `stoolap_prepare` | `stoolap_stmt_finalize` | NULL-safe finalize (no-op). Keeps the database engine alive. |
 | `StoolapTx` | `stoolap_begin`, `stoolap_begin_with_isolation` | `stoolap_tx_commit` or `stoolap_tx_rollback` | Handle consumed on commit/rollback regardless of success or failure. Keeps the database engine alive. |
-| `StoolapRows` | `stoolap_query*`, `stoolap_stmt_query`, `stoolap_tx_query*`, `stoolap_tx_stmt_query*` | `stoolap_rows_close` | Must be closed even after `STOOLAP_DONE`. NULL-safe close (no-op) |
+| `StoolapRows` | `stoolap_query`, `stoolap_query_params`, `stoolap_query_named`, `stoolap_stmt_query`, `stoolap_stmt_query_named`, `stoolap_tx_query*`, `stoolap_tx_stmt_query*` | `stoolap_rows_close` | Must be closed even after `STOOLAP_DONE`. NULL-safe close (no-op). The `*_all` functions create no rows handle. |
 
 **Important**: `stoolap_tx_commit()` and `stoolap_tx_rollback()` free the transaction handle whether they succeed or fail. After calling either function, the `StoolapTx` pointer is invalid.
 
@@ -309,7 +309,7 @@ stoolap_stmt_finalize(stmt);
 
 On success, all rows are committed atomically. On any error, the entire batch is rolled back and the error is available via `stoolap_errmsg(db)`.
 
-The `total_affected` pointer may be NULL if you do not need the count. When `row_count` is 0, the function returns `STOOLAP_OK` immediately without opening a transaction.
+The `total_affected` pointer may be NULL if you do not need the count. When `row_count` is 0, the function returns `STOOLAP_OK` immediately without opening a transaction. A negative `params_per_row`, or a NULL `params` with a positive `params_per_row`, returns `STOOLAP_ERROR` before anything runs.
 
 ### Statement Functions
 
@@ -610,11 +610,11 @@ if (stoolap_open("bad://dsn", &db) != STOOLAP_OK) {
 
 | Function | Use when |
 |----------|----------|
-| `stoolap_errmsg(db)` | After `stoolap_exec*`, `stoolap_query*`, `stoolap_prepare` fail |
+| `stoolap_errmsg(db)` | After `stoolap_exec*`, `stoolap_query*` (including `stoolap_query_params_all`), `stoolap_prepare`, `stoolap_stmt_exec_batch` fail |
 | `stoolap_errmsg(NULL)` | After `stoolap_open*` fails, or after `stoolap_tx_commit`/`stoolap_tx_rollback` fails |
-| `stoolap_stmt_errmsg(stmt)` | After `stoolap_stmt_exec`, `stoolap_stmt_query` fail |
-| `stoolap_tx_errmsg(tx)` | After `stoolap_tx_exec*`, `stoolap_tx_query*`, `stoolap_tx_stmt_*_named` fail |
-| `stoolap_rows_errmsg(rows)` | After `stoolap_rows_next` returns `STOOLAP_ERROR` |
+| `stoolap_stmt_errmsg(stmt)` | After `stoolap_stmt_exec*`, `stoolap_stmt_query*` (including the `_all` forms, even when run inside a transaction) fail |
+| `stoolap_tx_errmsg(tx)` | After `stoolap_tx_exec*`, `stoolap_tx_query*`, `stoolap_tx_stmt_*` fail |
+| `stoolap_rows_errmsg(rows)` | After `stoolap_rows_next`, `stoolap_rows_fetch_all` or `stoolap_rows_fetch_chunk` returns `STOOLAP_ERROR` |
 
 If no error has occurred, all `*_errmsg()` functions return an empty string (`""`), never NULL.
 
