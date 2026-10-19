@@ -1405,6 +1405,31 @@ fn collect_table_qualifiers_impl(expr: &Expression, qualifiers: &mut FxHashSet<S
     }
 }
 
+/// Whether an ORDER BY `expr` of `stmt` sorts by a SELECT alias rather than
+/// the input column of its name: a bare name the list gives to anything but
+/// that column, which only the same bare name proves, or over a single
+/// table also that name qualified. A qualified name or an expression always
+/// reads the input, so a path that orders input rows can answer every item
+/// this is false for
+pub fn order_by_names_an_alias(expr: &Expression, stmt: &SelectStatement) -> bool {
+    let Expression::Identifier(id) = expr else {
+        return false;
+    };
+    let one_table = matches!(stmt.table_expr.as_deref(), Some(Expression::TableSource(_)));
+    stmt.columns.iter().any(|item| match item {
+        Expression::Aliased(aliased) if aliased.alias.value_lower == id.value_lower => {
+            match &*aliased.expression {
+                Expression::Identifier(column) => column.value_lower != id.value_lower,
+                Expression::QualifiedIdentifier(column) => {
+                    !one_table || column.name.value_lower != id.value_lower
+                }
+                _ => true,
+            }
+        }
+        _ => false,
+    })
+}
+
 /// Collect the unqualified (bare) column names of an expression, lowercase,
 /// through the same expressions `collect_table_qualifiers` reads
 pub fn collect_unqualified_columns(expr: &Expression, columns: &mut FxHashSet<String>) {

@@ -57,14 +57,133 @@ const ANTI_JOIN_LIMIT_THRESHOLD: i64 = 10000;
 /// Used when projection can be deferred until after ORDER BY + LIMIT
 type DeferredProjection = (Vec<usize>, Vec<String>);
 
-/// Type alias for select execution results: (result, column_names, limit_offset_applied, deferred_projection)
+/// What one output column of a SELECT holds
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ColumnSource {
+    /// The SELECT item that gives it; None for an input column appended
+    /// after the list for ORDER BY or DISTINCT ON to read
+    pub(crate) item: Option<usize>,
+    /// The input column it is a copy of, when it is one
+    pub(crate) input: Option<usize>,
+}
+
+/// Where each output column of a SELECT comes from, over the input columns
+/// it was projected from: the one record an ORDER BY name is bound by
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OutputLayout {
+    pub(crate) input_columns: Vec<String>,
+    pub(crate) sources: Vec<ColumnSource>,
+}
+
+impl OutputLayout {
+    /// The layout of rows that are the input `columns` themselves, as a
+    /// projection deferred past the sort leaves them
+    fn of_input(columns: &[String]) -> Self {
+        Self {
+            input_columns: columns.to_vec(),
+            sources: (0..columns.len())
+                .map(|idx| ColumnSource {
+                    item: None,
+                    input: Some(idx),
+                })
+                .collect(),
+        }
+    }
+
+    /// The output column of SELECT item `item`, its first under a star
+    fn item_position(&self, item: usize) -> Option<usize> {
+        self.sources.iter().position(|s| s.item == Some(item))
+    }
+
+    /// The output position of what `key` reads: the column its SELECT item
+    /// gives, or a column holding its input column unchanged
+    fn position(&self, key: &OrderKey) -> Option<usize> {
+        match *key {
+            OrderKey::Item(item) => self.item_position(item),
+            OrderKey::Input(qualifier, name) => {
+                let input = input_column_index(&self.input_columns, qualifier, name)?;
+                self.sources.iter().position(|s| s.input == Some(input))
+            }
+            OrderKey::Ordinal(_) | OrderKey::Expression => None,
+        }
+    }
+}
+
+/// What one ORDER BY item sorts by, bound once by one rule: a bare name a
+/// SELECT alias over anything but that column carries sorts by the alias's
+/// column, any other plain name by its input column, an ordinal by the
+/// output column at that position
+enum OrderKey<'e> {
+    Ordinal(usize),
+    Item(usize),
+    Input(Option<&'e str>, &'e str),
+    /// Anything else: read from a column that computes it, or evaluated
+    Expression,
+}
+
+/// The binding of ORDER BY `expr` of `stmt`
+fn bind_order_key<'e>(expr: &'e Expression, stmt: &SelectStatement) -> OrderKey<'e> {
+    match expr {
+        Expression::IntegerLiteral(lit) => {
+            OrderKey::Ordinal((lit.value as usize).saturating_sub(1))
+        }
+        Expression::Identifier(id) if order_by_names_an_alias(expr, stmt) => stmt
+            .columns
+            .iter()
+            .position(|item| {
+                matches!(item, Expression::Aliased(aliased) if aliased.alias.value_lower == id.value_lower)
+            })
+            .map_or(OrderKey::Expression, OrderKey::Item),
+        Expression::Identifier(id) => OrderKey::Input(None, &id.value_lower),
+        Expression::QualifiedIdentifier(qid) => {
+            OrderKey::Input(Some(&qid.qualifier.value_lower), &qid.name.value_lower)
+        }
+        _ => OrderKey::Expression,
+    }
+}
+
+/// The input column a plain column reference reads, as the projection finds
+/// it: the qualified name, then the bare name, then a qualified column whose
+/// last part is the bare name
+fn input_column_index(columns: &[String], qualifier: Option<&str>, name: &str) -> Option<usize> {
+    let exact = |want: &str| columns.iter().position(|c| c.eq_ignore_ascii_case(want));
+    qualifier
+        .and_then(|qualifier| exact(&format!("{qualifier}.{name}")))
+        .or_else(|| exact(name))
+        .or_else(|| {
+            columns.iter().position(|c| {
+                c.rsplit_once('.')
+                    .is_some_and(|(_, last)| last.eq_ignore_ascii_case(name))
+            })
+        })
+}
+
+/// What a SELECT's rows carry to its ORDER BY: the projection deferred past
+/// ORDER BY and LIMIT, when it is, and the layout of the columns
+#[derive(Default)]
+pub(crate) struct SelectShape {
+    deferred: Option<DeferredProjection>,
+    layout: Option<CompactArc<OutputLayout>>,
+}
+
+impl SelectShape {
+    /// The shape of columns laid out as `layout`, with no deferred
+    /// projection; none without a layout, as a statement with no ORDER BY
+    fn laid_out(layout: Option<OutputLayout>) -> Option<Self> {
+        layout.map(|layout| Self {
+            deferred: None,
+            layout: Some(CompactArc::new(layout)),
+        })
+    }
+}
+
+/// Type alias for select execution results: (result, column_names, limit_offset_applied, shape)
 /// Using CompactArc<Vec<String>> for column names enables zero-copy sharing across query execution.
-/// The deferred_projection field is Some when projection should be applied after ORDER BY + LIMIT.
 type SelectOutput = (
     Box<dyn QueryResult>,
     CompactArc<Vec<String>>,
     bool,
-    Option<DeferredProjection>,
+    Option<SelectShape>,
 );
 type SelectResult = Result<SelectOutput>;
 
@@ -118,7 +237,7 @@ use super::utils::{
     expression_contains_aggregate, extract_and_conditions, extract_base_column_name,
     extract_join_keys_and_residual, filter_references_column, flatten_and_predicates,
     flip_operator, get_table_alias_from_expr, index_join_residual, infix_to_operator,
-    string_literal_value, strip_table_qualifier, substitute_filter_column,
+    order_by_names_an_alias, string_literal_value, strip_table_qualifier, substitute_filter_column,
 };
 use super::volatility::{expression_volatility, statement_constant};
 use super::window::{WindowPreGroupedState, WindowPreSortedState};
@@ -136,6 +255,8 @@ pub(super) struct OrderByProjection<'e> {
     pub(super) computed_order_by: Vec<&'e Expression>,
     pub(super) computed_distinct_on: Vec<&'e Expression>,
     pub(super) extra_names: Vec<String>,
+    /// The source of each appended column, in the order of `extra_names`
+    pub(super) extra_sources: Vec<ColumnSource>,
 }
 
 /// Pre-computed column name mappings for correlated subqueries.
@@ -673,14 +794,22 @@ impl Executor {
         };
         // A prepared statement knows how many columns it shows, a star included
         let mut prepared_visible = None;
-        let (mut result, columns, limit_offset_applied, deferred_projection) = if in_family {
-            let (result, columns, applied, visible) =
+        let (mut result, columns, limit_offset_applied, shape) = if in_family {
+            let (result, columns, applied, visible, layout) =
                 self.execute_prepared_select(stmt, ctx, compiled, limit, offset)?;
             prepared_visible = Some(visible);
-            (result, columns, applied, None)
+            let shape = SelectShape {
+                deferred: None,
+                layout,
+            };
+            (result, columns, applied, Some(shape))
         } else {
             self.execute_select_internal(branch, ctx, &classification, compiled)?
         };
+        let SelectShape {
+            deferred: deferred_projection,
+            layout,
+        } = shape.unwrap_or_default();
 
         // Apply set operations (UNION, INTERSECT, EXCEPT)
         // Pass limit+offset to enable early termination for UNION ALL
@@ -741,29 +870,38 @@ impl Executor {
             // column stands for a sort key only when aliased or an aggregate,
             // as on main, and aggregates are not read inside keys
             let set_operation = !stmt.set_operations.is_empty();
-            if !stmt
+            // The rows' layout names each column's source; a set operation's
+            // rows are the branches' too, so there only output names stand
+            let layout = layout.as_ref().filter(|_| !set_operation);
+            let star = stmt
                 .columns
                 .iter()
-                .any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)))
-            {
-                for (i, col) in stmt.columns.iter().enumerate() {
-                    if set_operation
-                        && !matches!(col, Expression::Aliased(_))
-                        && !matches!(col, Expression::FunctionCall(f) if self.function_registry.is_aggregate(&f.function))
-                    {
-                        continue;
-                    }
-                    let key = ExprKey::of(col);
-                    column_slots.entry(key).or_insert(i);
-                    let inner = match col {
-                        Expression::Aliased(aliased) => aliased.expression.as_ref(),
-                        other => other,
-                    };
-                    if !set_operation
-                        && matches!(inner, Expression::FunctionCall(f) if self.function_registry.is_aggregate(&f.function))
-                    {
-                        aggregate_slots.entry(key).or_insert(i);
-                    }
+                .any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)));
+            for (i, col) in stmt.columns.iter().enumerate() {
+                if set_operation
+                    && !matches!(col, Expression::Aliased(_))
+                    && !matches!(col, Expression::FunctionCall(f) if self.function_registry.is_aggregate(&f.function))
+                {
+                    continue;
+                }
+                // An item's column by the layout; without one, by its index
+                // while no star moves the positions
+                let Some(position) = (match layout {
+                    Some(layout) => layout.item_position(i),
+                    None => (!star).then_some(i),
+                }) else {
+                    continue;
+                };
+                let key = ExprKey::of(col);
+                column_slots.entry(key).or_insert(position);
+                let inner = match col {
+                    Expression::Aliased(aliased) => aliased.expression.as_ref(),
+                    other => other,
+                };
+                if !set_operation
+                    && matches!(inner, Expression::FunctionCall(f) if self.function_registry.is_aggregate(&f.function))
+                {
+                    aggregate_slots.entry(key).or_insert(position);
                 }
             }
             for (i, name) in columns.iter().enumerate() {
@@ -782,96 +920,31 @@ impl Executor {
                 })
             };
 
-            // Check if ORDER BY expression can be mapped to existing column (handles aggregates)
+            // Each ORDER BY item by its binding: an ordinal by position, a
+            // plain name by the column the layout says holds what it reads,
+            // a name the input lacks or anything else by a column computing it
             let try_map_to_column = |ob: &crate::parser::ast::OrderByExpression| -> Option<usize> {
-                match &ob.expression {
-                    Expression::Identifier(id) => {
-                        // First, try matching against output column names
-                        if let Some(pos) = columns
-                            .iter()
-                            .position(|c| c.eq_ignore_ascii_case(&id.value_lower))
-                        {
-                            return Some(pos);
-                        }
-                        // Also check if this identifier matches the original expression of an aliased column
-                        // e.g., SELECT val AS amount ... ORDER BY val should use the amount column
-                        for (i, select_expr) in stmt.columns.iter().enumerate() {
-                            if let Expression::Aliased(aliased) = select_expr {
-                                // Check if the aliased expression is an identifier matching our ORDER BY
-                                if let Expression::Identifier(aliased_id) = &*aliased.expression {
-                                    if aliased_id.value_lower == id.value_lower {
-                                        return Some(i);
-                                    }
-                                }
-                                // Also check qualified identifier (table.column)
-                                if let Expression::QualifiedIdentifier(qid) = &*aliased.expression {
-                                    if qid.name.value_lower == id.value_lower {
-                                        return Some(i);
-                                    }
-                                }
-                            }
-                        }
-                        None
+                let key = bind_order_key(&ob.expression, stmt);
+                match (&key, layout) {
+                    (OrderKey::Ordinal(position), _) => Some(*position),
+                    (OrderKey::Expression, _) => find_column_for(&ob.expression),
+                    (_, Some(layout)) => layout
+                        .position(&key)
+                        .or_else(|| find_column_for(&ob.expression)),
+                    // A set operation's rows carry only output names
+                    (OrderKey::Item(_) | OrderKey::Input(..), None) => {
+                        debug_assert!(
+                            set_operation,
+                            "rows reached ORDER BY {} without a layout",
+                            ob.expression
+                        );
+                        let name = match &ob.expression {
+                            Expression::QualifiedIdentifier(qid) => &qid.name.value_lower,
+                            Expression::Identifier(id) => &id.value_lower,
+                            _ => return None,
+                        };
+                        columns.iter().position(|c| c.eq_ignore_ascii_case(name))
                     }
-                    Expression::QualifiedIdentifier(qid) => {
-                        // Handle qualified column names like "c.name" for ORDER BY
-                        // First, try matching against SELECT expressions directly
-                        for (i, select_expr) in stmt.columns.iter().enumerate() {
-                            match select_expr {
-                                Expression::QualifiedIdentifier(sel_qid)
-                                    // Direct match: ORDER BY c.name matches SELECT c.name
-                                    if sel_qid.qualifier.value_lower == qid.qualifier.value_lower
-                                        && sel_qid.name.value_lower == qid.name.value_lower =>
-                                {
-                                    return Some(i);
-                                }
-                                Expression::Aliased(aliased) => {
-                                    // Check if the aliased expression matches
-                                    if let Expression::QualifiedIdentifier(sel_qid) =
-                                        aliased.expression.as_ref()
-                                    {
-                                        if sel_qid.qualifier.value_lower
-                                            == qid.qualifier.value_lower
-                                            && sel_qid.name.value_lower == qid.name.value_lower
-                                        {
-                                            return Some(i);
-                                        }
-                                    }
-                                    // An alias whose name happens to equal the
-                                    // column part only matches when no column
-                                    // carries the qualified name (an alias is
-                                    // never itself qualified), so it is tried
-                                    // after the full-name lookup below
-                                    let full_name = format!(
-                                        "{}.{}",
-                                        qid.qualifier.value_lower, qid.name.value_lower
-                                    );
-                                    if aliased.alias.value_lower == qid.name.value_lower
-                                        && !columns
-                                            .iter()
-                                            .any(|c| c.eq_ignore_ascii_case(&full_name))
-                                    {
-                                        return Some(i);
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        // Fallback: try full qualified name first, then unqualified
-                        let full_name =
-                            format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
-                        if let Some(pos) = columns
-                            .iter()
-                            .position(|c| c.eq_ignore_ascii_case(&full_name))
-                        {
-                            return Some(pos);
-                        }
-                        columns
-                            .iter()
-                            .position(|c| c.eq_ignore_ascii_case(&qid.name.value_lower))
-                    }
-                    Expression::IntegerLiteral(lit) => Some((lit.value as usize).saturating_sub(1)),
-                    _ => find_column_for(&ob.expression),
                 }
             };
             // Mapped once: the correlated path below asks for every row
@@ -1776,7 +1849,8 @@ impl Executor {
                 let columns = CompactArc::new(columns);
                 let result =
                     ExecutorResult::with_arc_columns(CompactArc::clone(&columns), RowVec::new());
-                return Ok((Box::new(result), columns, false, None));
+                let shape = SelectShape::laid_out(Self::result_layout(stmt, &[], None, &columns));
+                return Ok((Box::new(result), columns, false, shape));
             }
         }
 
@@ -1790,7 +1864,8 @@ impl Executor {
             let result =
                 self.execute_select_with_aggregation(stmt, ctx, dummy_rows, &empty_columns)?;
             let columns = CompactArc::new(result.columns().to_vec());
-            return Ok((result, columns, false, None));
+            let shape = SelectShape::laid_out(Self::result_layout(stmt, &[], None, &columns));
+            return Ok((result, columns, false, shape));
         }
 
         // Process scalar subqueries in SELECT columns first (single-pass)
@@ -1825,7 +1900,8 @@ impl Executor {
         rows.push((0, row));
         let result = ExecutorResult::with_arc_columns(CompactArc::clone(&columns), rows);
 
-        Ok((Box::new(result), columns, false, None))
+        let shape = SelectShape::laid_out(Self::result_layout(stmt, &[], None, &columns));
+        Ok((Box::new(result), columns, false, shape))
     }
 
     /// Execute a query against in-memory data (for CTEs referenced from context)
@@ -1836,25 +1912,26 @@ impl Executor {
         columns: Vec<String>,
         rows: RowVec,
     ) -> SelectResult {
-        // Check if ORDER BY has complex expressions (e.g., -value, SUM(x), val*2)
-        // that the CTE path's simple column-name-based sort can't handle.
-        // If so, skip ORDER BY/LIMIT in the CTE path and let outer execute_select handle it.
-        let has_complex_order_by = stmt.order_by.iter().any(|ob| {
-            !matches!(
-                &ob.expression,
-                Expression::Identifier(_)
-                    | Expression::QualifiedIdentifier(_)
-                    | Expression::IntegerLiteral(_)
-            )
-        });
+        // ORDER BY is the caller's, which binds it by the layout, and so is
+        // LIMIT after it; DISTINCT reads every row before a LIMIT counts them
+        let skip_order_limit = !stmt.order_by.is_empty() || stmt.distinct;
 
-        // Also skip when DISTINCT is present: the outer execute_select applies
-        // DISTINCT after projection but before LIMIT. If we apply LIMIT here first,
-        // DISTINCT sees too few rows and produces wrong results.
-        let skip_order_limit = has_complex_order_by || stmt.distinct;
-
+        // The input columns, kept for the layout the caller's ORDER BY binds by
+        let input_columns = (!stmt.order_by.is_empty()).then(|| columns.clone());
         let (result_cols, result_rows, order_limit_applied) =
             self.execute_query_on_cte_result_inner(stmt, ctx, columns, rows, skip_order_limit)?;
+        let shape = input_columns.and_then(|input_columns| {
+            let alias = stmt
+                .table_expr
+                .as_deref()
+                .and_then(get_table_alias_from_expr);
+            SelectShape::laid_out(Self::result_layout(
+                stmt,
+                &input_columns,
+                alias.as_deref(),
+                &result_cols,
+            ))
+        });
         let result_cols = CompactArc::new(result_cols);
         Ok((
             Box::new(ExecutorResult::with_arc_columns(
@@ -1863,7 +1940,7 @@ impl Executor {
             )),
             result_cols,
             order_limit_applied,
-            None,
+            shape,
         ))
     }
 
@@ -2070,6 +2147,9 @@ impl Executor {
 
         // ORDER BY columns must exist in source columns (so sorting can happen before projection)
         for ob in &stmt.order_by {
+            if order_by_names_an_alias(&ob.expression, stmt) {
+                return None;
+            }
             let col_exists = match &ob.expression {
                 Expression::Identifier(id) => source_columns_lower
                     .iter()
@@ -2355,9 +2435,9 @@ impl Executor {
         }
     }
 
-    /// A table scan's rows projected by the SELECT list and the names of the
-    /// output columns; with `order_by_extra`, the ORDER BY columns the list
-    /// lacks follow, for execute_select to sort by and drop
+    /// A table scan's rows projected by the SELECT list, the names of the
+    /// output columns and, for an ORDER BY, their layout; with `order_by_extra`, the ORDER BY
+    /// columns the list lacks follow, for execute_select to sort by and drop
     #[allow(clippy::too_many_arguments)]
     fn project_scanned_rows(
         &self,
@@ -2368,11 +2448,11 @@ impl Executor {
         table_alias: Option<&str>,
         order_by_extra: bool,
         ctx: &ExecutionContext,
-    ) -> Result<(RowVec, Vec<String>)> {
+    ) -> Result<(RowVec, Vec<String>, Option<OutputLayout>)> {
         let mut output_columns =
             self.get_output_column_names(&stmt.columns, all_columns, table_alias);
         if order_by_extra {
-            let (projected_rows, extra_names) = self.project_rows_with_order_by(
+            let (projected_rows, extra_names, layout) = self.project_rows_with_order_by(
                 &stmt.columns,
                 &stmt.order_by,
                 &stmt.distinct_on,
@@ -2382,7 +2462,7 @@ impl Executor {
                 ctx,
             )?;
             output_columns.extend(extra_names);
-            return Ok((projected_rows, output_columns));
+            return Ok((projected_rows, output_columns, Some(layout)));
         }
         let projected_rows = self.project_rows_with_alias(
             &stmt.columns,
@@ -2392,7 +2472,8 @@ impl Executor {
             ctx,
             table_alias,
         )?;
-        Ok((projected_rows, output_columns))
+        let layout = Self::output_layout(stmt, all_columns, table_alias);
+        Ok((projected_rows, output_columns, layout))
     }
 
     /// A table scan's answer when no row can match: no rows, taking the
@@ -2419,7 +2500,7 @@ impl Executor {
                 self.execute_select_with_aggregation(stmt, ctx, RowVec::new(), all_columns)?
             }
             (false, false) => {
-                let (rows, columns) = self.project_scanned_rows(
+                let (rows, columns, layout) = self.project_scanned_rows(
                     stmt,
                     RowVec::new(),
                     all_columns,
@@ -2430,11 +2511,17 @@ impl Executor {
                 )?;
                 let columns = CompactArc::new(columns);
                 let result = ExecutorResult::with_arc_columns(CompactArc::clone(&columns), rows);
-                return Ok((Box::new(result), columns, false, None));
+                return Ok((
+                    Box::new(result),
+                    columns,
+                    false,
+                    SelectShape::laid_out(layout),
+                ));
             }
         };
         let columns = CompactArc::new(result.columns().to_vec());
-        Ok((result, columns, false, None))
+        let layout = Self::result_layout(stmt, all_columns, table_alias, &columns);
+        Ok((result, columns, false, SelectShape::laid_out(layout)))
     }
 
     /// Execute a simple table scan
@@ -2560,6 +2647,15 @@ impl Executor {
             .as_ref()
             .map(|a| a.value_lower.to_string())
             .or_else(|| Some(table_name.to_string()));
+        // The shape of a result this scan answers whole, for its ORDER BY
+        let shape_of = |columns: &[String]| {
+            SelectShape::laid_out(Self::result_layout(
+                stmt,
+                &all_columns,
+                table_alias.as_deref(),
+                columns,
+            ))
+        };
 
         // classification is passed from caller to avoid redundant cache lookups
 
@@ -2593,7 +2689,8 @@ impl Executor {
                 if let Some((result, columns)) =
                     self.try_min_max_index_optimization(stmt, &*table, &all_columns)?
                 {
-                    return Ok((result, columns, false, None));
+                    let shape = shape_of(&columns);
+                    return Ok((result, columns, false, shape));
                 }
             }
 
@@ -2602,7 +2699,8 @@ impl Executor {
                 self.try_aggregation_pushdown(table.as_ref(), stmt, ctx, classification)?
             {
                 let columns = CompactArc::new(result.columns().to_vec());
-                return Ok((result, columns, false, None));
+                let shape = shape_of(&columns);
+                return Ok((result, columns, false, shape));
             }
 
             // Try filtered aggregation pushdown (WHERE + aggregates, no GROUP BY)
@@ -2616,7 +2714,8 @@ impl Executor {
                     &all_columns,
                 )? {
                     let columns = CompactArc::new(result.columns().to_vec());
-                    return Ok((result, columns, false, None));
+                    let shape = shape_of(&columns);
+                    return Ok((result, columns, false, shape));
                 }
             }
 
@@ -2632,7 +2731,8 @@ impl Executor {
                 ) {
                     let result = result?;
                     let columns = CompactArc::new(result.columns().to_vec());
-                    return Ok((result, columns, false, None));
+                    let shape = shape_of(&columns);
+                    return Ok((result, columns, false, shape));
                 }
             }
 
@@ -2642,7 +2742,8 @@ impl Executor {
                 self.try_streaming_global_aggregation(table.as_ref(), stmt, ctx, classification)?
             {
                 let columns = CompactArc::new(result.columns().to_vec());
-                return Ok((result, columns, false, None));
+                let shape = shape_of(&columns);
+                return Ok((result, columns, false, shape));
             }
         }
 
@@ -2655,7 +2756,8 @@ impl Executor {
                 self.try_distinct_pushdown(table.as_ref(), stmt, &all_columns, classification)?
             {
                 let columns = CompactArc::new(result.columns().to_vec());
-                return Ok((result, columns, false, None));
+                let shape = shape_of(&columns);
+                return Ok((result, columns, false, shape));
             }
         }
 
@@ -2751,7 +2853,8 @@ impl Executor {
                     where_expr,
                     stamp,
                 )? {
-                    return Ok((result, output_columns, false, None));
+                    let shape = shape_of(&output_columns);
+                    return Ok((result, output_columns, false, shape));
                 }
             }
         }
@@ -2848,7 +2951,8 @@ impl Executor {
             if let Some((result, columns)) =
                 self.try_streaming_group_by(stmt, &*table, &all_columns, ctx)?
             {
-                return Ok((result, columns, false, None));
+                let shape = shape_of(&columns);
+                return Ok((result, columns, false, shape));
             }
         }
 
@@ -2967,7 +3071,8 @@ impl Executor {
                         classification,
                     )?
                 {
-                    return Ok((result, columns, limit_applied, None));
+                    let shape = shape_of(&columns);
+                    return Ok((result, columns, limit_applied, shape));
                 }
             }
         }
@@ -3001,7 +3106,8 @@ impl Executor {
                         needs_memory_filter,
                     )?
                 {
-                    return Ok((result, columns, limit_applied, None));
+                    let shape = shape_of(&columns);
+                    return Ok((result, columns, limit_applied, shape));
                 }
             }
         }
@@ -3159,11 +3265,13 @@ impl Executor {
                         (*output_columns).clone(),
                     ));
                     // LIMIT/OFFSET NOT applied yet - streaming path
-                    return Ok((result, output_columns, false, None));
+                    let shape = shape_of(&output_columns);
+                    return Ok((result, output_columns, false, shape));
                 } else {
                     // SELECT * - no projection needed
                     // LIMIT/OFFSET NOT applied yet - streaming path
-                    return Ok((result, CompactArc::new(output_columns), false, None));
+                    let shape = shape_of(&output_columns);
+                    return Ok((result, CompactArc::new(output_columns), false, shape));
                 }
             } else if !classification.select_has_scalar_subqueries {
                 // STREAMING WITH EXPRESSIONS: Use ExprMappedResult for complex projections
@@ -3215,7 +3323,8 @@ impl Executor {
                         .with_context(ctx),
                 );
 
-                return Ok((result, output_columns, false, None));
+                let shape = shape_of(&output_columns);
+                return Ok((result, output_columns, false, shape));
             }
         }
 
@@ -3358,7 +3467,8 @@ impl Executor {
                                 CompactArc::clone(&output_columns),
                                 projected_rows,
                             );
-                            return Ok((Box::new(result), output_columns, false, None));
+                            let shape = shape_of(&output_columns);
+                            return Ok((Box::new(result), output_columns, false, shape));
                         }
                     }
 
@@ -3444,7 +3554,8 @@ impl Executor {
                             ctx,
                         )?
                     {
-                        return Ok((result, columns, limit_applied, None));
+                        let shape = shape_of(&columns);
+                        return Ok((result, columns, limit_applied, shape));
                     }
                 }
             }
@@ -3888,7 +3999,8 @@ impl Executor {
                                     )?;
                                 if let Some(query_result) = result {
                                     let columns = CompactArc::new(query_result.columns().to_vec());
-                                    return Ok((query_result, columns, false, None));
+                                    let shape = shape_of(&columns);
+                                    return Ok((query_result, columns, false, shape));
                                 }
                                 // Fall through when the optimization is unavailable.
                             }
@@ -4038,7 +4150,8 @@ impl Executor {
             // 2. Then apply window functions on the aggregated result
             let result = self.execute_aggregation_then_windows(stmt, ctx, &rows, &all_columns)?;
             let columns = CompactArc::new(result.columns().to_vec());
-            return Ok((result, columns, false, None));
+            let shape = shape_of(&columns);
+            return Ok((result, columns, false, shape));
         }
 
         // Check if we need window functions only (no aggregation)
@@ -4067,14 +4180,16 @@ impl Executor {
                 self.execute_select_with_window_functions(stmt, ctx, &rows, &all_columns)?
             };
             let columns = CompactArc::new(result.columns().to_vec());
-            return Ok((result, columns, false, None));
+            let shape = shape_of(&columns);
+            return Ok((result, columns, false, shape));
         }
 
         // Check if we need aggregation only (no window functions)
         if has_agg {
             let result = self.execute_select_with_aggregation(stmt, ctx, rows, &all_columns)?;
             let columns = CompactArc::new(result.columns().to_vec());
-            return Ok((result, columns, false, None));
+            let shape = shape_of(&columns);
+            return Ok((result, columns, false, shape));
         }
 
         // Project rows according to SELECT expressions
@@ -4087,18 +4202,21 @@ impl Executor {
             classification,
         );
 
-        let (projected_rows, output_columns, deferred_proj) = match deferred_projection_info {
+        let (projected_rows, output_columns, shape) = match deferred_projection_info {
             Some((col_indices, output_names)) if !order_by_needs_extra_columns => {
                 // DEFERRED PROJECTION: Skip projection now, do it after ORDER BY + LIMIT
                 // Return all source columns; projection will be applied after TopNResult
                 (
                     rows,
                     all_columns.to_vec(),
-                    Some((col_indices, output_names)),
+                    SelectShape {
+                        deferred: Some((col_indices, output_names)),
+                        layout: Some(CompactArc::new(OutputLayout::of_input(&all_columns))),
+                    },
                 )
             }
             _ => {
-                let (projected_rows, output_columns) = self.project_scanned_rows(
+                let (projected_rows, output_columns, layout) = self.project_scanned_rows(
                     stmt,
                     rows,
                     &all_columns,
@@ -4107,7 +4225,11 @@ impl Executor {
                     order_by_needs_extra_columns,
                     ctx,
                 )?;
-                (projected_rows, output_columns, None)
+                (
+                    projected_rows,
+                    output_columns,
+                    SelectShape::laid_out(layout).unwrap_or_default(),
+                )
             }
         };
 
@@ -4117,7 +4239,7 @@ impl Executor {
         // Note: The cache stores Vec<Row>, so we extract rows from RowVec for caching.
         // The result keeps the original RowVec.
         // Skip caching when deferred projection is used (rows are not projected yet)
-        if let Some(stamp) = cache_stamp.filter(|_| cache_eligible && deferred_proj.is_none()) {
+        if let Some(stamp) = cache_stamp.filter(|_| cache_eligible && shape.deferred.is_none()) {
             if let Some(where_expr) = where_to_use {
                 // Clone rows for cache (cache needs Vec<Row>)
                 let rows_for_cache: Vec<Row> = projected_rows.rows().cloned().collect();
@@ -4134,7 +4256,7 @@ impl Executor {
         let output_columns = CompactArc::new(output_columns);
         let result =
             ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), projected_rows);
-        Ok((Box::new(result), output_columns, false, deferred_proj))
+        Ok((Box::new(result), output_columns, false, Some(shape)))
     }
 
     /// Execute a JOIN source. A GROUP BY + LIMIT join fetches its left side in
@@ -5103,19 +5225,21 @@ impl Executor {
                     // rows. An ORDER BY expression the join-local
                     // evaluator cannot resolve (SELECT aliases, positions)
                     // also defers ordering to the standard path.
-                    // A bare integer literal in ORDER BY is an output
-                    // ordinal, which only the standard path resolves
-                    let has_positional = stmt
-                        .order_by
-                        .iter()
-                        .any(|ob| matches!(ob.expression, Expression::IntegerLiteral(_)));
+                    // An ordinal, or a name bound to an alias's column, reads
+                    // the output, which only the standard path holds
+                    let reads_output = stmt.order_by.iter().any(|ob| {
+                        matches!(
+                            bind_order_key(&ob.expression, stmt),
+                            OrderKey::Ordinal(_) | OrderKey::Item(_)
+                        )
+                    });
                     let mut order_limit_applied = false;
                     // DISTINCT merges rows before the LIMIT counts them, so
                     // its ordering and LIMIT are left to the standard path
                     let distinct = stmt.distinct || !stmt.distinct_on.is_empty();
                     if !has_agg
                         && !has_window
-                        && !has_positional
+                        && !reads_output
                         && !distinct
                         && !stmt.order_by.is_empty()
                     {
@@ -5233,15 +5357,16 @@ impl Executor {
                     {
                         // Ordering left to the standard path keeps the ORDER BY
                         // and DISTINCT ON columns the SELECT does not hold
-                        let (projected_rows, extra_names) = self.project_rows_with_order_by(
-                            &stmt.columns,
-                            &stmt.order_by,
-                            &stmt.distinct_on,
-                            final_rows,
-                            &all_columns,
-                            None,
-                            ctx,
-                        )?;
+                        let (projected_rows, extra_names, layout) = self
+                            .project_rows_with_order_by(
+                                &stmt.columns,
+                                &stmt.order_by,
+                                &stmt.distinct_on,
+                                final_rows,
+                                &all_columns,
+                                None,
+                                ctx,
+                            )?;
                         let mut output_columns =
                             self.get_output_column_names(&stmt.columns, &all_columns, None);
                         output_columns.extend(extra_names);
@@ -5250,7 +5375,12 @@ impl Executor {
                             CompactArc::clone(&output_columns),
                             projected_rows,
                         );
-                        return Ok((Box::new(result), output_columns, false, None));
+                        return Ok((
+                            Box::new(result),
+                            output_columns,
+                            false,
+                            SelectShape::laid_out(Some(layout)),
+                        ));
                     } else {
                         // Project rows according to SELECT expressions
                         let projected_rows = self.project_rows_with_alias(
@@ -5272,7 +5402,13 @@ impl Executor {
                             CompactArc::clone(&output_columns),
                             projected_rows,
                         );
-                        return Ok((Box::new(result), output_columns, order_limit_applied, None));
+                        let layout = Self::output_layout(stmt, &all_columns, None);
+                        return Ok((
+                            Box::new(result),
+                            output_columns,
+                            order_limit_applied,
+                            SelectShape::laid_out(layout),
+                        ));
                     }
                 }
             }
@@ -5944,9 +6080,9 @@ impl Executor {
         let join_needs_extra_columns = self.order_by_needs_extra_columns(stmt, &final_columns);
 
         // Project rows according to SELECT expressions
-        let (projected_rows, output_columns) = if join_needs_extra_columns {
+        let (projected_rows, output_columns, layout) = if join_needs_extra_columns {
             // Use projection that preserves extra ORDER BY / DISTINCT ON columns
-            let (projected_rows, extra_names) = self.project_rows_with_order_by(
+            let (projected_rows, extra_names, layout) = self.project_rows_with_order_by(
                 &stmt.columns,
                 &stmt.order_by,
                 &stmt.distinct_on,
@@ -5958,7 +6094,11 @@ impl Executor {
             let mut output_columns =
                 self.get_output_column_names(&stmt.columns, &final_columns, None);
             output_columns.extend(extra_names);
-            (projected_rows, CompactArc::new(output_columns))
+            (
+                projected_rows,
+                CompactArc::new(output_columns),
+                Some(layout),
+            )
         } else {
             let projected_rows = self.project_rows_with_alias(
                 &stmt.columns,
@@ -5973,12 +6113,18 @@ impl Executor {
             // so we pass None for table_alias - the prefix matching will work
             let output_columns =
                 CompactArc::new(self.get_output_column_names(&stmt.columns, &final_columns, None));
-            (projected_rows, output_columns)
+            let layout = Self::output_layout(stmt, &final_columns, None);
+            (projected_rows, output_columns, layout)
         };
 
         let result =
             ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), projected_rows);
-        Ok((Box::new(result), output_columns, false, None))
+        Ok((
+            Box::new(result),
+            output_columns,
+            false,
+            SelectShape::laid_out(layout),
+        ))
     }
 
     /// Keep the rows of an in-memory source that pass a WHERE holding a
@@ -6052,7 +6198,17 @@ impl Executor {
                 self.try_streaming_derived_table_aggregation(result, stmt, ctx, classification)?
             {
                 let out_columns = CompactArc::new(agg_result.columns().to_vec());
-                return Ok((agg_result, out_columns, false, None));
+                let alias = subquery_source
+                    .alias
+                    .as_ref()
+                    .map(|a| a.value_lower.as_str());
+                let layout = Self::result_layout(stmt, &columns, alias, &out_columns);
+                return Ok((
+                    agg_result,
+                    out_columns,
+                    false,
+                    SelectShape::laid_out(layout),
+                ));
             }
             // Streaming not applicable - need to re-execute the subquery
             // (the streaming function consumed the result iterator)
@@ -6072,7 +6228,17 @@ impl Executor {
 
             let agg_result = self.execute_select_with_aggregation(stmt, ctx, rows, &columns)?;
             let out_columns = CompactArc::new(agg_result.columns().to_vec());
-            return Ok((agg_result, out_columns, false, None));
+            let alias = subquery_source
+                .alias
+                .as_ref()
+                .map(|a| a.value_lower.as_str());
+            let layout = Self::result_layout(stmt, &columns, alias, &out_columns);
+            return Ok((
+                agg_result,
+                out_columns,
+                false,
+                SelectShape::laid_out(layout),
+            ));
         }
 
         // Materialize the subquery result directly with synthetic row IDs
@@ -6133,12 +6299,18 @@ impl Executor {
             rows
         };
 
+        let subquery_alias = subquery_source
+            .alias
+            .as_ref()
+            .map(|a| a.value_lower.as_str());
+
         // Check if we need window functions
         if classification.has_window_functions {
             let result =
                 self.execute_select_with_window_functions(stmt, ctx, &filtered_rows, &columns)?;
             let out_columns = CompactArc::new(result.columns().to_vec());
-            return Ok((result, out_columns, false, None));
+            let layout = Self::result_layout(stmt, &columns, subquery_alias, &out_columns);
+            return Ok((result, out_columns, false, SelectShape::laid_out(layout)));
         }
 
         // Check if we need aggregation
@@ -6146,51 +6318,57 @@ impl Executor {
             let result =
                 self.execute_select_with_aggregation(stmt, ctx, filtered_rows, &columns)?;
             let out_columns = CompactArc::new(result.columns().to_vec());
-            return Ok((result, out_columns, false, None));
+            let layout = Self::result_layout(stmt, &columns, subquery_alias, &out_columns);
+            return Ok((result, out_columns, false, SelectShape::laid_out(layout)));
         }
-
-        let subquery_alias = subquery_source
-            .alias
-            .as_ref()
-            .map(|a| a.value_lower.as_str());
 
         // Project rows according to SELECT expressions; a column ORDER BY
         // or DISTINCT ON reads that the select list leaves out rides along
-        let (projected_rows, output_columns) = if self.order_by_needs_extra_columns(stmt, &columns)
-        {
-            let (projected_rows, extra_names) = self.project_rows_with_order_by(
-                &stmt.columns,
-                &stmt.order_by,
-                &stmt.distinct_on,
-                filtered_rows,
-                &columns,
-                subquery_alias,
-                ctx,
-            )?;
-            let mut output_columns =
-                self.get_output_column_names(&stmt.columns, &columns, subquery_alias);
-            output_columns.extend(extra_names);
-            (projected_rows, CompactArc::new(output_columns))
-        } else {
-            let projected_rows = self.project_rows_with_alias(
-                &stmt.columns,
-                filtered_rows,
-                &columns,
-                None,
-                ctx,
-                None,
-            )?;
-            let output_columns = CompactArc::new(self.get_output_column_names(
-                &stmt.columns,
-                &columns,
-                subquery_alias,
-            ));
-            (projected_rows, output_columns)
-        };
+        let (projected_rows, output_columns, layout) =
+            if self.order_by_needs_extra_columns(stmt, &columns) {
+                let (projected_rows, extra_names, layout) = self.project_rows_with_order_by(
+                    &stmt.columns,
+                    &stmt.order_by,
+                    &stmt.distinct_on,
+                    filtered_rows,
+                    &columns,
+                    subquery_alias,
+                    ctx,
+                )?;
+                let mut output_columns =
+                    self.get_output_column_names(&stmt.columns, &columns, subquery_alias);
+                output_columns.extend(extra_names);
+                (
+                    projected_rows,
+                    CompactArc::new(output_columns),
+                    Some(layout),
+                )
+            } else {
+                let projected_rows = self.project_rows_with_alias(
+                    &stmt.columns,
+                    filtered_rows,
+                    &columns,
+                    None,
+                    ctx,
+                    None,
+                )?;
+                let output_columns = CompactArc::new(self.get_output_column_names(
+                    &stmt.columns,
+                    &columns,
+                    subquery_alias,
+                ));
+                let layout = Self::output_layout(stmt, &columns, subquery_alias);
+                (projected_rows, output_columns, layout)
+            };
 
         let result =
             ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), projected_rows);
-        Ok((Box::new(result), output_columns, false, None))
+        Ok((
+            Box::new(result),
+            output_columns,
+            false,
+            SelectShape::laid_out(layout),
+        ))
     }
 
     /// Parse a view's SQL query and return the cached Statement.
@@ -6343,7 +6521,13 @@ impl Executor {
                 CompactArc::clone(&output_columns),
                 projected_rows,
             );
-            return Ok((Box::new(result), output_columns, false, None));
+            let layout = Self::output_layout(stmt, &view_columns, None);
+            return Ok((
+                Box::new(result),
+                output_columns,
+                false,
+                SelectShape::laid_out(layout),
+            ));
         }
 
         // Handle aggregation: if outer query has aggregates, materialize view result and aggregate
@@ -6363,7 +6547,8 @@ impl Executor {
             let agg_result =
                 self.execute_select_with_aggregation(stmt, ctx, rows, &view_columns)?;
             let columns = CompactArc::new(agg_result.columns().to_vec());
-            return Ok((agg_result, columns, false, None));
+            let layout = Self::result_layout(stmt, &view_columns, None, &columns);
+            return Ok((agg_result, columns, false, SelectShape::laid_out(layout)));
         }
 
         // Handle window functions: materialize view result and delegate
@@ -6383,13 +6568,15 @@ impl Executor {
                 let result =
                     self.execute_aggregation_then_windows(stmt, ctx, &rows, &view_columns)?;
                 let columns = CompactArc::new(result.columns().to_vec());
-                return Ok((result, columns, false, None));
+                let layout = Self::result_layout(stmt, &view_columns, None, &columns);
+                return Ok((result, columns, false, SelectShape::laid_out(layout)));
             }
 
             let result =
                 self.execute_select_with_window_functions(stmt, ctx, &rows, &view_columns)?;
             let columns = CompactArc::new(result.columns().to_vec());
-            return Ok((result, columns, false, None));
+            let layout = Self::result_layout(stmt, &view_columns, None, &columns);
+            return Ok((result, columns, false, SelectShape::laid_out(layout)));
         }
 
         // Handle projection: apply outer query's column selection
@@ -6403,7 +6590,13 @@ impl Executor {
         if is_select_star {
             // For SELECT *, just return the view result with WHERE applied
             // DISTINCT, ORDER BY, LIMIT/OFFSET are handled by execute_select
-            return Ok((result, CompactArc::new(view_columns), false, None));
+            let layout = Self::output_layout(stmt, &view_columns, view_alias.as_deref());
+            return Ok((
+                result,
+                CompactArc::new(view_columns),
+                false,
+                SelectShape::laid_out(layout),
+            ));
         }
 
         // A column ORDER BY or DISTINCT ON reads that the select list leaves
@@ -6419,7 +6612,7 @@ impl Executor {
             if let Some(err) = result.last_error() {
                 return Err(err);
             }
-            let (projected_rows, extra_names) = self.project_rows_with_order_by(
+            let (projected_rows, extra_names, layout) = self.project_rows_with_order_by(
                 &stmt.columns,
                 &stmt.order_by,
                 &stmt.distinct_on,
@@ -6436,7 +6629,12 @@ impl Executor {
                 CompactArc::clone(&output_columns),
                 projected_rows,
             );
-            return Ok((Box::new(result), output_columns, false, None));
+            return Ok((
+                Box::new(result),
+                output_columns,
+                false,
+                SelectShape::laid_out(Some(layout)),
+            ));
         }
 
         // Determine if we have any complex expressions (not just column references)
@@ -6595,7 +6793,13 @@ impl Executor {
             output_columns
         };
 
-        Ok((result, CompactArc::new(final_columns), false, None))
+        let layout = Self::output_layout(stmt, &view_columns, view_alias.as_deref());
+        Ok((
+            result,
+            CompactArc::new(final_columns),
+            false,
+            SelectShape::laid_out(layout),
+        ))
     }
 
     /// Execute a VALUES source (e.g., (VALUES (1, 'a'), (2, 'b')) AS t(col1, col2))
@@ -6694,12 +6898,15 @@ impl Executor {
             }
         }
 
+        let values_alias = values_source.alias.as_ref().map(|a| a.value_lower.as_str());
+
         // Check if we need window functions
         if classification.has_window_functions {
             let result =
                 self.execute_select_with_window_functions(stmt, ctx, &result_rows, &column_names)?;
             let columns = CompactArc::new(result.columns().to_vec());
-            return Ok((result, columns, false, None));
+            let layout = Self::result_layout(stmt, &column_names, values_alias, &columns);
+            return Ok((result, columns, false, SelectShape::laid_out(layout)));
         }
 
         // Check if we need aggregation
@@ -6707,8 +6914,11 @@ impl Executor {
             let result =
                 self.execute_select_with_aggregation(stmt, ctx, result_rows, &column_names)?;
             let columns = CompactArc::new(result.columns().to_vec());
-            return Ok((result, columns, false, None));
+            let layout = Self::result_layout(stmt, &column_names, values_alias, &columns);
+            return Ok((result, columns, false, SelectShape::laid_out(layout)));
         }
+
+        let layout = Self::output_layout(stmt, &column_names, values_alias);
 
         // Create the result - use CompactArc for column names
         let column_names_arc = CompactArc::new(column_names);
@@ -6723,7 +6933,12 @@ impl Executor {
             )
         {
             // SELECT * or t.* - return all columns
-            return Ok((Box::new(values_result), column_names_arc, false, None));
+            return Ok((
+                Box::new(values_result),
+                column_names_arc,
+                false,
+                SelectShape::laid_out(layout),
+            ));
         }
 
         // Apply column projection
@@ -6923,7 +7138,12 @@ impl Executor {
             CompactArc::clone(&projected_columns_arc),
             projected_rows,
         );
-        Ok((Box::new(final_result), projected_columns_arc, false, None))
+        Ok((
+            Box::new(final_result),
+            projected_columns_arc,
+            false,
+            SelectShape::laid_out(layout),
+        ))
     }
 
     /// Execute a table expression with optional filter pushdown
@@ -7422,8 +7642,10 @@ impl Executor {
             }
             _ => self.execute_select_with_aggregation(stmt, ctx, rows, columns)?,
         };
+        let input_columns = columns;
         let columns = CompactArc::new(result.columns().to_vec());
-        Ok((result, columns, false, None))
+        let layout = Self::result_layout(stmt, input_columns, None, &columns);
+        Ok((result, columns, false, SelectShape::laid_out(layout)))
     }
 
     /// True when a filter carries a subquery anywhere inside it. The grouped
@@ -9282,7 +9504,7 @@ impl Executor {
         all_columns: &[String],
         table_alias: Option<&str>,
         ctx: &ExecutionContext,
-    ) -> Result<(RowVec, Vec<String>)> {
+    ) -> Result<(RowVec, Vec<String>, OutputLayout)> {
         // A correlated select expression is evaluated per row first, and
         // read below as the column it was bound to
         let mut bound_exprs = None;
@@ -9316,7 +9538,10 @@ impl Executor {
             computed_order_by,
             computed_distinct_on,
             extra_names,
+            extra_sources,
         } = self.order_by_projection(&select_exprs, order_by, distinct_on, all_columns);
+        let mut layout = Self::select_layout(&select_exprs, all_columns, table_alias);
+        layout.sources.extend(extra_sources);
 
         // Check if we can use fast path (all simple column refs, no computed DISTINCT ON)
         let all_simple = select_column_indices.iter().all(|idx| idx.is_some())
@@ -9347,7 +9572,7 @@ impl Executor {
             }
 
             // Output column names will be computed in caller
-            Ok((projected, extra_names))
+            Ok((projected, extra_names, layout))
         } else {
             // Slow path: Use Evaluator for complex expressions
             #[cfg(feature = "test-failpoints")]
@@ -9399,7 +9624,7 @@ impl Executor {
                 projected.push((row_id as i64, Row::from_values(values)));
             }
 
-            Ok((projected, extra_names))
+            Ok((projected, extra_names, layout))
         }
     }
 
@@ -9616,6 +9841,13 @@ impl Executor {
             .collect();
         extra_names.extend(computed_order_by.iter().map(|expr| expr.to_string()));
         extra_names.extend(computed_distinct_on.iter().map(|expr| expr.to_string()));
+        let computed = computed_order_by.len() + computed_distinct_on.len();
+        let extra_sources = extra_order_indices
+            .iter()
+            .map(|&idx| Some(idx))
+            .chain(std::iter::repeat_n(None, computed))
+            .map(|input| ColumnSource { item: None, input })
+            .collect();
 
         OrderByProjection {
             col_index_map_lower,
@@ -9624,6 +9856,7 @@ impl Executor {
             computed_order_by,
             computed_distinct_on,
             extra_names,
+            extra_sources,
         }
     }
 
@@ -9681,7 +9914,82 @@ impl Executor {
         all_columns: &[String],
         table_alias: Option<&str>,
     ) -> Vec<String> {
+        Self::output_columns(select_exprs, all_columns, table_alias, None)
+    }
+
+    /// The layout of the output columns `select_exprs` give over the input
+    /// `all_columns`, from the expansion that names them
+    pub(crate) fn select_layout(
+        select_exprs: &[Expression],
+        all_columns: &[String],
+        table_alias: Option<&str>,
+    ) -> OutputLayout {
+        let mut sources = Vec::with_capacity(select_exprs.len());
+        Self::output_columns(select_exprs, all_columns, table_alias, Some(&mut sources));
+        OutputLayout {
+            input_columns: all_columns.to_vec(),
+            sources,
+        }
+    }
+
+    /// The layout of `stmt`'s output columns over the input `all_columns`,
+    /// for its ORDER BY to read; None without one, which reads nothing
+    pub(crate) fn output_layout(
+        stmt: &SelectStatement,
+        all_columns: &[String],
+        table_alias: Option<&str>,
+    ) -> Option<OutputLayout> {
+        (!stmt.order_by.is_empty())
+            .then(|| Self::select_layout(&stmt.columns, all_columns, table_alias))
+    }
+
+    /// The layout of a grouped or windowed result of `stmt`: its first
+    /// columns those of the SELECT list over `all_columns`, the rest appended
+    /// for ORDER BY, a hidden key computing an expression and any other
+    /// column carrying the input column it is named after. None without an
+    /// ORDER BY
+    pub(crate) fn result_layout(
+        stmt: &SelectStatement,
+        all_columns: &[String],
+        table_alias: Option<&str>,
+        result_columns: &[String],
+    ) -> Option<OutputLayout> {
+        let mut layout = Self::output_layout(stmt, all_columns, table_alias)?;
+        let appended = result_columns
+            .get(layout.sources.len()..)
+            .unwrap_or_default();
+        for name in appended {
+            let input = match ExprKey::from_hidden_column_name(name) {
+                Some(_) => None,
+                None => match name.rsplit_once('.') {
+                    Some((qualifier, bare)) => {
+                        input_column_index(all_columns, Some(qualifier), bare)
+                    }
+                    None => input_column_index(all_columns, None, name),
+                },
+            };
+            layout.sources.push(ColumnSource { item: None, input });
+        }
+        Some(layout)
+    }
+
+    /// The names of the output columns `select_exprs` give over the input
+    /// `all_columns`, a star expanded, and into `sources` the source of each
+    fn output_columns(
+        select_exprs: &[Expression],
+        all_columns: &[String],
+        table_alias: Option<&str>,
+        mut sources: Option<&mut Vec<ColumnSource>>,
+    ) -> Vec<String> {
         let mut names = Vec::with_capacity(select_exprs.len());
+        let mut source = |item: usize, input: Option<usize>| {
+            if let Some(sources) = sources.as_deref_mut() {
+                sources.push(ColumnSource {
+                    item: Some(item),
+                    input,
+                });
+            }
+        };
 
         // OPTIMIZATION: Pre-compute lowercase column names once to avoid per-column to_lowercase()
         // Only compute if we have QualifiedStar expressions
@@ -9699,6 +10007,7 @@ impl Executor {
                 Expression::Star(_) => {
                     // SELECT * - add all column names
                     names.extend(all_columns.iter().cloned());
+                    (0..all_columns.len()).for_each(|idx| source(i, Some(idx)));
                     continue;
                 }
                 Expression::QualifiedStar(qs) => {
@@ -9717,6 +10026,7 @@ impl Executor {
                                 // Strip "qualifier." from the column name for the output
                                 // e.g., "e.name" becomes "name"
                                 names.push(all_columns[idx][qualifier_len + 1..].to_string());
+                                source(i, Some(idx));
                                 found_any = true;
                             }
                         }
@@ -9727,6 +10037,7 @@ impl Executor {
                         if let Some(alias) = table_alias {
                             if alias.eq_ignore_ascii_case(&qualifier_lower) {
                                 names.extend(all_columns.iter().cloned());
+                                (0..all_columns.len()).for_each(|idx| source(i, Some(idx)));
                             }
                         }
                     }
@@ -9734,6 +10045,23 @@ impl Executor {
                 }
                 _ => {}
             }
+            // A plain column, aliased or not, is a copy of its input column
+            let copied = match expr {
+                Expression::Aliased(aliased) => aliased.expression.as_ref(),
+                other => other,
+            };
+            let input = match copied {
+                Expression::Identifier(id) => {
+                    input_column_index(all_columns, None, &id.value_lower)
+                }
+                Expression::QualifiedIdentifier(qid) => input_column_index(
+                    all_columns,
+                    Some(&qid.qualifier.value_lower),
+                    &qid.name.value_lower,
+                ),
+                _ => None,
+            };
+            source(i, input);
             let name = match expr {
                 Expression::Identifier(id) => id.value.to_string(),
                 Expression::QualifiedIdentifier(qid) => {
@@ -10820,25 +11148,38 @@ impl Executor {
             }
         }
 
+        // The shape of what this read answers, for its ORDER BY
+        let shape_of = |columns: &[String]| {
+            SelectShape::laid_out(Self::result_layout(
+                stmt,
+                &all_columns,
+                Some(table_name),
+                columns,
+            ))
+        };
+
         // Check for window functions
         if classification.has_window_functions {
             let result =
                 self.execute_select_with_window_functions(stmt, ctx, &rows, &all_columns)?;
             let columns = CompactArc::new(result.columns().to_vec());
-            return Ok((result, columns, false, None));
+            let shape = shape_of(&columns);
+            return Ok((result, columns, false, shape));
         }
 
         // Check for aggregation
         if classification.has_aggregation {
             let result = self.execute_select_with_aggregation(stmt, ctx, rows, &all_columns)?;
             let columns = CompactArc::new(result.columns().to_vec());
-            return Ok((result, columns, false, None));
+            let shape = shape_of(&columns);
+            return Ok((result, columns, false, shape));
         }
 
         // Project rows
         let (projected_rows, final_columns) =
             self.project_rows_for_select(stmt, rows, &all_columns, ctx)?;
 
+        let shape = shape_of(&final_columns);
         let final_columns_arc = CompactArc::new(final_columns);
         Ok((
             Box::new(ExecutorResult::with_arc_columns(
@@ -10847,7 +11188,7 @@ impl Executor {
             )),
             final_columns_arc,
             false,
-            None,
+            shape,
         ))
     }
 

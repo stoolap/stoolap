@@ -43,6 +43,8 @@ FROM table_name
 
 Values sort in one total order, the same in ORDER BY, window ORDER BY, the ORDER BY of an aggregate such as `STRING_AGG`, and in `MIN`, `MAX`, `GREATEST` and `LEAST`. Numbers sort by their exact value, INTEGER and FLOAT together, with NaN after every number. Values of different types sort by type: BOOLEAN, then numbers, then TEXT, then TIMESTAMP. NULL goes where `NULLS FIRST` or `NULLS LAST` puts it (by default last for ASC and first for DESC), and `MIN` and `MAX` skip it. So a column mixing `TRUE`, `10`, `2.5` and `'a'` sorts as `TRUE, 2.5, 10, 'a'` whatever the order of the rows. This order is for sorting only: a comparison such as `10 < '5'` reads the TEXT as a number, as described in [CAST Operations]({% link _docs/sql-features/cast-operations.md %}).
 
+A bare name in ORDER BY that is both a SELECT alias and a column of the tables in FROM sorts by the output column the alias names: `SELECT -id AS id FROM t ORDER BY id` sorts by `-id`. A qualified name such as `t.id`, or an expression such as `id + 0`, sorts by the table's column. This holds with or without LIMIT and OFFSET, over joins, CTEs, derived tables and prepared statements.
+
 LIMIT and OFFSET each take an expression evaluated once for the statement, a literal, a parameter or arithmetic on them. The value must be a whole number of zero or more: an INTEGER, or a FLOAT with no fractional part (`LIMIT 2.0` is `LIMIT 2`). NULL, a negative value, a fractional value such as `LIMIT 2.5`, and any other type are an error.
 
 #### Examples

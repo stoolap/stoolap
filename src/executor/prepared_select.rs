@@ -43,6 +43,7 @@ use super::expression::{
     QuantifiedMembers, SharedProgram, SubqueryExecutor,
 };
 use super::pushdown::{self, coerce_constant, read_as_column, scan_compares};
+use super::query::{ColumnSource, OutputLayout};
 use super::query_cache::CompiledExecution;
 use super::result::ExecutorResult;
 use super::utils::{
@@ -61,13 +62,14 @@ const RESOLVED: &str = "\u{0}";
 /// Why a statement runs on the general path instead of the prepared one
 pub(crate) type OutOfFamily = &'static str;
 
-/// The rows, their columns, whether LIMIT and OFFSET were applied, and how
-/// many of the columns the statement shows
+/// The rows, their columns, whether LIMIT and OFFSET were applied, how many
+/// of the columns the statement shows, and their layout for an ORDER BY
 type PreparedOutput = (
     Box<dyn crate::storage::traits::QueryResult>,
     CompactArc<Vec<String>>,
     bool,
     usize,
+    Option<CompactArc<OutputLayout>>,
 );
 
 /// The classifier's walk over one statement
@@ -925,6 +927,8 @@ pub struct PreparedSelect {
     output_columns: CompactArc<Vec<String>>,
     /// The output columns the statement shows; the sort's keys follow them
     visible: usize,
+    /// Where each output column comes from, for an ORDER BY to bind by
+    layout: Option<CompactArc<OutputLayout>>,
 }
 
 /// A subquery over one table, prepared as its own scope: every value it
@@ -1816,12 +1820,12 @@ fn check_names(chain: &Chain<'_>, expr: &Expression, aliases: &[&str]) -> Result
 
 impl PreparedProjection {
     /// The SELECT list over `chain`'s one table and what ORDER BY appends,
-    /// with the names of the appended columns
+    /// with the names and the sources of the appended columns
     fn prepare(
         executor: &Executor,
         stmt: &SelectStatement,
         chain: &Chain<'_>,
-    ) -> Result<(Self, Vec<String>)> {
+    ) -> Result<(Self, Vec<String>, Vec<ColumnSource>)> {
         let scope = chain.scopes[0];
         let columns: &[String] = &scope.columns;
         let aliases: Vec<&str> = stmt
@@ -1879,6 +1883,7 @@ impl PreparedProjection {
         // A key reading a SELECT alias reads the value the projection gave
         // it, under the key's own text, which is how the sort finds it
         let mut extra_names = plan.extra_names;
+        let mut extra_sources = plan.extra_sources;
         let alias_map = Executor::build_alias_map_excluding(&stmt.columns, Some(columns));
         // Each alias reference is bound to its position by node, not by name,
         // so no column name can meet it; a repeated alias is its last use,
@@ -1911,13 +1916,17 @@ impl PreparedProjection {
             }
             outputs.push(Output::AliasKey(compile_with(&alias_ctx, key)?));
             extra_names.push(name);
+            extra_sources.push(ColumnSource {
+                item: None,
+                input: None,
+            });
         }
         let whole_row = outputs.len() == columns.len()
             && outputs
                 .iter()
                 .enumerate()
                 .all(|(i, output)| matches!(output, Output::Column(c) if *c == i));
-        Ok((Self { outputs, whole_row }, extra_names))
+        Ok((Self { outputs, whole_row }, extra_names, extra_sources))
     }
 
     fn project(&self, mut rows: RowVec, ctx: &ExecutionContext) -> Result<RowVec> {
@@ -2046,7 +2055,8 @@ impl PreparedSelect {
             .iter()
             .map(|(slot, value)| compile(value).map(|p| (*slot, p)))
             .collect::<Result<Vec<_>>>()?;
-        let (projection, extra_names) = PreparedProjection::prepare(executor, stmt, &chain)?;
+        let (projection, extra_names, extra_sources) =
+            PreparedProjection::prepare(executor, stmt, &chain)?;
         for column in stmt
             .columns
             .iter()
@@ -2063,13 +2073,12 @@ impl PreparedSelect {
         }
         // Over one table `t.*` is `*`, the projection's expansion; the
         // names' prefix rule for a joined `t.*` would drop columns
-        let mut output_columns = if stmt
+        let select: std::borrow::Cow<[Expression]> = if stmt
             .columns
             .iter()
             .any(|c| matches!(c, Expression::QualifiedStar(_)))
         {
-            let unqualified: Vec<Expression> = stmt
-                .columns
+            stmt.columns
                 .iter()
                 .map(|c| match c {
                     Expression::QualifiedStar(star) => Expression::Star(StarExpression {
@@ -2077,13 +2086,20 @@ impl PreparedSelect {
                     }),
                     other => other.clone(),
                 })
-                .collect();
-            executor.get_output_column_names(&unqualified, &scope.columns, Some(scope_name))
+                .collect()
         } else {
-            executor.get_output_column_names(&stmt.columns, &scope.columns, Some(scope_name))
+            std::borrow::Cow::Borrowed(&stmt.columns)
         };
+        let mut output_columns =
+            executor.get_output_column_names(&select, &scope.columns, Some(scope_name));
         let visible = output_columns.len();
         output_columns.extend(extra_names);
+        // The layout an ORDER BY binds its names by, built with the plan
+        let layout = (!stmt.order_by.is_empty()).then(|| {
+            let mut layout = Executor::select_layout(&select, &scope.columns, Some(scope_name));
+            layout.sources.extend(extra_sources);
+            CompactArc::new(layout)
+        });
         let mut subqueries = builder
             .subqueries
             .into_iter()
@@ -2142,6 +2158,7 @@ impl PreparedSelect {
             projection,
             output_columns: CompactArc::new(output_columns),
             visible,
+            layout,
         })
     }
 }
@@ -2407,7 +2424,13 @@ impl Executor {
                     CompactArc::clone(&output_columns),
                     RowVec::new(),
                 );
-                return Ok((Box::new(result), output_columns, true, prepared.visible));
+                return Ok((
+                    Box::new(result),
+                    output_columns,
+                    true,
+                    prepared.visible,
+                    None,
+                ));
             }
         }
 
@@ -2472,6 +2495,7 @@ impl Executor {
             output_columns,
             limit_applied,
             prepared.visible,
+            prepared.layout.clone(),
         ))
     }
 }
