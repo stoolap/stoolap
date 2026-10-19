@@ -2921,19 +2921,20 @@ impl Executor {
             .filter(|_| stmt.order_by.is_empty())
             .map(|limit| limit.saturating_add(offset));
         let mut vm = ExprVM::new();
-        let mut rows = RowVec::with_capacity(64);
         let mut scanned = 0u64;
         // The rows the statement reads: the ones its narrowing names, which
         // the conjuncts the scan would take still judge; the scan's answers
-        // up to the LIMIT when it takes the whole WHERE; or the scan
-        let (mut listed, mut scanner, judged, passed) =
+        // up to the LIMIT when it takes the whole WHERE, which are the rows;
+        // or the scan
+        let (mut rows, mut listed, mut scanner, judged, passed) =
             match runner.narrowed_rows(&*table, target)? {
                 Some((candidates, passed)) => {
                     #[cfg(feature = "test-failpoints")]
                     crate::test_failpoints::prepared_rows_narrowed_by_keys(
                         prepared.narrowing.is_some_and(|n| n.negated),
                     );
-                    (Some(candidates.into_iter()), None, true, passed)
+                    let rows = RowVec::with_capacity(64);
+                    (rows, Some(candidates.into_iter()), None, true, passed)
                 }
                 None => match target.filter(|_| scanned_whole) {
                     Some(target) => {
@@ -2942,12 +2943,13 @@ impl Executor {
                             target,
                             0,
                         )?;
-                        (Some(answers.into_iter()), None, false, true)
+                        (answers, None, None, false, true)
                     }
                     None => {
                         let all: Vec<usize> = (0..prepared.columns.len()).collect();
                         let scan = table.scan(&all, storage_expr.as_deref())?;
-                        (None, Some(scan), false, scanned_whole)
+                        let rows = RowVec::with_capacity(64);
+                        (rows, None, Some(scan), false, scanned_whole)
                     }
                 },
             };
