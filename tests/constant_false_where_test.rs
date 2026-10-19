@@ -67,6 +67,13 @@ fn a_constant_false_where_answers_as_an_empty_filter() {
         "SELECT id FROM t WHERE id = 7 AND {never}",
         "SELECT id FROM t WHERE id IN (1, 2) AND {never}",
         "SELECT MIN(id) FROM t WHERE {never}",
+        "SELECT missing FROM t",
+        "SELECT id, missing + 1 FROM t",
+        "SELECT id FROM t ORDER BY missing",
+        "SELECT COUNT(missing) FROM t",
+        "SELECT missing, COUNT(*) FROM t GROUP BY missing",
+        "SELECT id, SUM(missing) OVER () FROM t",
+        "SELECT x.id FROM t y",
     ] {
         let at = |never: &str| {
             if select.contains("{never}") {
@@ -168,4 +175,69 @@ fn a_where_that_keeps_no_row_reads_no_row() {
         wrong.len(),
         wrong.join("\n")
     );
+}
+
+#[test]
+fn a_zone_map_prune_leaves_the_transactions_own_rows() {
+    let db = Database::open("memory://constant_false_own_rows").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO t VALUES (1, 1)",
+        "ANALYZE t",
+        "BEGIN",
+        "INSERT INTO t VALUES (2, 9)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let mut wrong = Vec::new();
+    for (sql, rows) in [
+        (
+            "SELECT k, COUNT(*) FROM t WHERE k = 9 GROUP BY k",
+            vec!["[Integer(9), Integer(1)]"],
+        ),
+        ("SELECT COUNT(*) FROM t WHERE k = 9", vec!["[Integer(1)]"]),
+    ] {
+        let got = answer(&db, sql).map(|(_, rows)| rows);
+        let want: Result<Vec<String>, String> = Ok(rows.iter().map(|r| r.to_string()).collect());
+        if got != want {
+            wrong.push(format!("{sql}\n  got  {got:?}\n  want {want:?}"));
+        }
+    }
+    db.execute("ROLLBACK", ()).unwrap();
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+#[test]
+fn a_join_whose_where_keeps_no_row_reads_each_side_alone() {
+    let db = Database::open("memory://constant_false_join_sides").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 2)", ()).unwrap();
+    let mut wrong = Vec::new();
+    for sql in [
+        "WITH c(x) AS (SELECT 1), d(y) AS (SELECT 2) \
+         SELECT COUNT(*) FROM c CROSS JOIN d WHERE $1 = 0 AND d.y = 2",
+        "WITH c(x) AS (SELECT 1) SELECT COUNT(*) FROM c JOIN t ON t.id = c.x WHERE t.v = 2 AND $1 = 0",
+        "SELECT COUNT(*) FROM t a JOIN t b ON a.id = b.id WHERE a.v = 2 AND NULL",
+    ] {
+        let got = answer(&db, sql_with(sql).as_str());
+        if got != Ok((vec!["COUNT(*)".to_string()], vec!["[Integer(0)]".to_string()])) {
+            wrong.push(format!("{sql}\n  got  {got:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+fn sql_with(sql: &str) -> String {
+    sql.replace("$1", "1")
 }

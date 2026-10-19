@@ -2347,13 +2347,55 @@ impl Executor {
         }
     }
 
+    /// A table scan's rows projected by the SELECT list and the names of the
+    /// output columns; with `order_by_extra`, the ORDER BY columns the list
+    /// lacks follow, for execute_select to sort by and drop
+    #[allow(clippy::too_many_arguments)]
+    fn project_scanned_rows(
+        &self,
+        stmt: &SelectStatement,
+        rows: RowVec,
+        all_columns: &[String],
+        all_columns_lower: &[String],
+        table_alias: Option<&str>,
+        order_by_extra: bool,
+        ctx: &ExecutionContext,
+    ) -> Result<(RowVec, Vec<String>)> {
+        let mut output_columns =
+            self.get_output_column_names(&stmt.columns, all_columns, table_alias);
+        if order_by_extra {
+            let (projected_rows, extra_names) = self.project_rows_with_order_by(
+                &stmt.columns,
+                &stmt.order_by,
+                &stmt.distinct_on,
+                rows,
+                all_columns,
+                table_alias,
+                ctx,
+            )?;
+            output_columns.extend(extra_names);
+            return Ok((projected_rows, output_columns));
+        }
+        let projected_rows = self.project_rows_with_alias(
+            &stmt.columns,
+            rows,
+            all_columns,
+            Some(all_columns_lower),
+            ctx,
+            table_alias,
+        )?;
+        Ok((projected_rows, output_columns))
+    }
+
     /// A table scan's answer when no row can match: no rows, taking the
     /// aggregate, window or projection path scanned rows would take
+    #[allow(clippy::too_many_arguments)]
     fn finish_without_rows(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         all_columns: &[String],
+        all_columns_lower: &[String],
         table_alias: Option<&str>,
         classification: &QueryClassification,
     ) -> SelectResult {
@@ -2369,14 +2411,18 @@ impl Executor {
                 self.execute_select_with_aggregation(stmt, ctx, RowVec::new(), all_columns)?
             }
             (false, false) => {
-                let columns = CompactArc::new(self.get_output_column_names(
-                    &stmt.columns,
+                let (rows, columns) = self.project_scanned_rows(
+                    stmt,
+                    RowVec::new(),
                     all_columns,
+                    all_columns_lower,
                     table_alias,
-                ));
-                let result =
-                    ExecutorResult::with_arc_columns(CompactArc::clone(&columns), RowVec::new());
-                return Ok((Box::new(result), columns, true, None));
+                    self.order_by_needs_extra_columns(stmt, all_columns),
+                    ctx,
+                )?;
+                let columns = CompactArc::new(columns);
+                let result = ExecutorResult::with_arc_columns(CompactArc::clone(&columns), rows);
+                return Ok((Box::new(result), columns, false, None));
             }
         };
         let columns = CompactArc::new(result.columns().to_vec());
@@ -2519,6 +2565,7 @@ impl Executor {
                 stmt,
                 ctx,
                 &all_columns,
+                &all_columns_lower,
                 table_alias.as_deref(),
                 classification,
             );
@@ -2752,18 +2799,27 @@ impl Executor {
         // ZONE MAP PRUNING: Short-circuit if zone maps indicate no rows can match
         // This checks min/max statistics per segment to skip entire scan when
         // the WHERE clause predicates are outside all segment ranges
-        if let Some(ref expr) = storage_expr {
-            if self
-                .get_query_planner()
-                .can_prune_entire_scan(&*table, expr.as_ref())
-            {
-                return self.finish_without_rows(
-                    stmt,
-                    ctx,
-                    &all_columns,
-                    table_alias.as_deref(),
-                    classification,
-                );
+        // IMPORTANT: Don't short-circuit if we have aggregation, window functions, or GROUP BY
+        // because aggregation on empty results needs to produce output (e.g., COUNT=0)
+        let has_aggregation_or_grouping = classification.has_aggregation
+            || classification.has_window_functions
+            || classification.has_group_by;
+
+        if !has_aggregation_or_grouping {
+            if let Some(ref expr) = storage_expr {
+                if self
+                    .get_query_planner()
+                    .can_prune_entire_scan(&*table, expr.as_ref())
+                {
+                    return self.finish_without_rows(
+                        stmt,
+                        ctx,
+                        &all_columns,
+                        &all_columns_lower,
+                        table_alias.as_deref(),
+                        classification,
+                    );
+                }
             }
         }
 
@@ -4021,47 +4077,28 @@ impl Executor {
             classification,
         );
 
-        let (projected_rows, output_columns, deferred_proj) = if order_by_needs_extra_columns {
-            // When ORDER BY references columns not in SELECT, we need to:
-            // 1. Include those columns in the output (appended at end)
-            // 2. Sort will happen in execute_select
-            // 3. Extra columns will be projected out after sorting
-            let (projected_rows, extra_names) = self.project_rows_with_order_by(
-                &stmt.columns,
-                &stmt.order_by,
-                &stmt.distinct_on,
-                rows,
-                &all_columns,
-                table_alias.as_deref(),
-                ctx,
-            )?;
-            // Get base column names, then the ones the projection appended,
-            // which it names in the order it appends them
-            let mut output_columns =
-                self.get_output_column_names(&stmt.columns, &all_columns, table_alias.as_deref());
-            output_columns.extend(extra_names);
-            (projected_rows, output_columns, None)
-        } else if let Some((col_indices, output_names)) = deferred_projection_info {
-            // DEFERRED PROJECTION: Skip projection now, do it after ORDER BY + LIMIT
-            // Return all source columns; projection will be applied after TopNResult
-            (
-                rows,
-                all_columns.to_vec(),
-                Some((col_indices, output_names)),
-            )
-        } else {
-            // Standard projection
-            let projected_rows = self.project_rows_with_alias(
-                &stmt.columns,
-                rows,
-                &all_columns,
-                Some(&all_columns_lower),
-                ctx,
-                table_alias.as_deref(),
-            )?;
-            let output_columns =
-                self.get_output_column_names(&stmt.columns, &all_columns, table_alias.as_deref());
-            (projected_rows, output_columns, None)
+        let (projected_rows, output_columns, deferred_proj) = match deferred_projection_info {
+            Some((col_indices, output_names)) if !order_by_needs_extra_columns => {
+                // DEFERRED PROJECTION: Skip projection now, do it after ORDER BY + LIMIT
+                // Return all source columns; projection will be applied after TopNResult
+                (
+                    rows,
+                    all_columns.to_vec(),
+                    Some((col_indices, output_names)),
+                )
+            }
+            _ => {
+                let (projected_rows, output_columns) = self.project_scanned_rows(
+                    stmt,
+                    rows,
+                    &all_columns,
+                    &all_columns_lower,
+                    table_alias.as_deref(),
+                    order_by_needs_extra_columns,
+                    ctx,
+                )?;
+                (projected_rows, output_columns, None)
+            }
         };
 
         // SEMANTIC CACHE: Insert result for eligible queries
@@ -4267,18 +4304,23 @@ impl Executor {
 
         let (left_rows, left_columns, right_rows, right_columns) = if never {
             // Not every side honours the filter or the limit, so its rows are
-            // dropped and only its columns kept
+            // dropped and only its columns kept. The filter reads no column,
+            // as a side knows only its own
+            let none = Expression::BooleanLiteral(BooleanLiteral {
+                token: dummy_token("FALSE", TokenType::Keyword),
+                value: false,
+            });
             let (_, left_cols, _, _) = self.execute_table_expression_with_filter_limit(
                 &join_source.left,
                 ctx,
-                where_for_join.as_ref(),
+                Some(&none),
                 Some(0),
                 0,
             )?;
             let (_, right_cols, _, _) = self.execute_table_expression_with_filter_limit(
                 &join_source.right,
                 ctx,
-                where_for_join.as_ref(),
+                Some(&none),
                 Some(0),
                 0,
             )?;
