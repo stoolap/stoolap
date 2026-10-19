@@ -156,6 +156,8 @@ FROM employees
 GROUP BY department;
 ```
 
+The separator is one value for the whole statement: a literal, a parameter or an expression that reads no column. It is turned into text as `CONCAT_WS` turns its separator, so `STRING_AGG(n, 0)` joins with `0` and `STRING_AGG(n, DATE '2024-01-01')` with `2024-01-01T00:00:00+00:00`. A NULL separator gives NULL. A separator that reads a column is an error. Without a separator the values are joined with `,`.
+
 ### GROUP_CONCAT
 
 Alias for STRING_AGG. Concatenates values with a separator:

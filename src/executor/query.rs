@@ -11308,7 +11308,7 @@ impl Executor {
         {
             return Ok(None);
         }
-        let (aggregations, _) = self.parse_aggregations(stmt)?;
+        let (aggregations, _) = self.parse_aggregations(stmt, None)?;
         // The operator reads columns and keeps each call's DISTINCT and
         // extra arguments in its state
         let supported = crate::executor::aggregation::Modifiers::DISTINCT
@@ -11865,7 +11865,7 @@ impl Executor {
 
         // The aggregate slots, as every aggregate path reads them; the select
         // list may read the group column and aggregate calls only
-        let (aggregations, non_agg_columns) = self.parse_aggregations(stmt)?;
+        let (aggregations, non_agg_columns) = self.parse_aggregations(stmt, Some(ctx))?;
         if aggregations.is_empty() {
             return Ok(None);
         }

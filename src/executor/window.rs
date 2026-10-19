@@ -3684,13 +3684,14 @@ impl Executor {
         &self,
         wf_info: &WindowFunctionInfo,
         ordered: bool,
+        extra_args: &[Value],
     ) -> Result<crate::functions::aggregate::AggregateState> {
         let order_by: &[OrderByExpression] = if ordered { &wf_info.call_order_by } else { &[] };
         Self::aggregate_state(
             &self.function_registry,
             &wf_info.name,
             wf_info.is_distinct,
-            &super::aggregation::aggregate_extra_args(&wf_info.arguments),
+            extra_args,
             order_by,
         )
         .ok_or_else(|| Error::NotSupported(format!("Unknown aggregate function: {}", wf_info.name)))
@@ -3846,6 +3847,7 @@ impl Executor {
             return Ok(Vec::new());
         }
         let frame = Frame::read(wf_info, &self.function_registry, ctx)?;
+        let extra_args = super::aggregation::aggregate_extra_args(&wf_info.arguments, Some(ctx))?;
         let mut results: Vec<Option<Value>> = vec![None; rows.len()];
 
         for row_indices in partitions.iter() {
@@ -3855,7 +3857,8 @@ impl Executor {
                 let frames = PartitionFrames::new(&frame, row_indices, order_by_values);
 
                 // Get aggregate function ONCE, reuse with reset() for each row
-                let mut agg_func = self.window_aggregate_state(wf_info, keys.is_some())?;
+                let mut agg_func =
+                    self.window_aggregate_state(wf_info, keys.is_some(), &extra_args)?;
 
                 // O(n) incremental accumulation instead of O(n²) reset when
                 // the frame only grows; DISTINCT needs the full set
@@ -3924,7 +3927,8 @@ impl Executor {
                 } // end of else (non-incremental path)
             } else {
                 // Without ORDER BY or a frame, compute aggregate over entire partition
-                let mut agg_func = self.window_aggregate_state(wf_info, keys.is_some())?;
+                let mut agg_func =
+                    self.window_aggregate_state(wf_info, keys.is_some(), &extra_args)?;
 
                 // Accumulate all values in the partition
                 if keys.is_none() {
