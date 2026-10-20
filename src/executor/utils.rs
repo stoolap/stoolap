@@ -2661,15 +2661,26 @@ pub fn compute_join_projection(
     })
 }
 
+/// `f` over the characters of `s` lowercased as `str::to_lowercase` gives
+/// them; a copy is made only for a name holding `Σ`, the one letter it
+/// lowercases by its context
+pub(crate) fn with_lowercase<R>(s: &str, f: impl FnOnce(&mut dyn Iterator<Item = char>) -> R) -> R {
+    if s.contains('Σ') {
+        f(&mut s.to_lowercase().chars())
+    } else {
+        f(&mut s.chars().flat_map(char::to_lowercase))
+    }
+}
+
 /// Case-insensitive comparison of a column name against an already
 /// lowercased name, lowercasing the column as `str::to_lowercase` does,
-/// final sigma included; only a non-ASCII column is lowercased into a copy.
+/// final sigma included
 #[inline]
 pub(crate) fn eq_folded(column: &str, lower: &str) -> bool {
     if column.is_ascii() {
         lower.is_ascii() && column.eq_ignore_ascii_case(lower)
     } else {
-        column.to_lowercase() == lower
+        with_lowercase(column, |column| column.eq(lower.chars()))
     }
 }
 
@@ -2690,7 +2701,7 @@ pub(crate) fn eq_folded_qualified(column: &str, qualifier: &str, name: &str) -> 
             .chars()
             .chain(std::iter::once('.'))
             .chain(name.chars());
-        column.to_lowercase().chars().eq(expected)
+        with_lowercase(column, |column| column.eq(expected))
     }
 }
 
