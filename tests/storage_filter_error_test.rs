@@ -259,3 +259,27 @@ fn a_filter_error_is_the_statements_as_of_a_transaction() {
         );
     }
 }
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_row_a_cold_round_judged_is_not_asked_again_after_it_moves_hot() {
+    use stoolap::test_failpoints::{after_cold_round_prepared, FailpointGuard};
+    let _guard = FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?checkpoint_interval=3600",
+        dir.path().display()
+    ))
+    .unwrap();
+    db.execute("CREATE TABLE p (x INTEGER)", ()).unwrap();
+    db.execute("INSERT INTO p VALUES (1)", ()).unwrap();
+    db.engine().seal_for_test().unwrap();
+    let other = db.clone();
+    after_cold_round_prepared(move || {
+        let moved =
+            std::thread::spawn(move || other.execute("UPDATE p SET x = -9223372036854775808", ()));
+        assert_eq!(moved.join().unwrap().ok(), Some(1), "the other update");
+    });
+    let updated = db.execute("UPDATE p SET x = 2 WHERE ABS(x) >= 0 AND x + x < 0", ());
+    assert_eq!(updated.ok(), Some(0));
+}

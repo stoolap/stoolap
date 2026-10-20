@@ -4041,7 +4041,7 @@ impl VersionStore {
     ///
     /// Returns (row_id, Row, RowVersion) tuples - the RowVersion is needed for
     /// MVCC conflict detection during the update. A row `hidden` names is
-    /// left out before the filter is asked of it.
+    /// left out, before a filter that can fail is asked of it.
     pub fn get_all_visible_rows_for_update_filtered(
         &self,
         txn_id: i64,
@@ -4077,7 +4077,8 @@ impl VersionStore {
         let mut result: Vec<(i64, Row, RowVersion)> = Vec::with_capacity(versions.len() / 4);
 
         for (&row_id, chain) in versions.iter() {
-            if hidden(row_id) {
+            // Before a filter that can fail, after one that cannot
+            if fallible && hidden(row_id) {
                 continue;
             }
             // FAST PATH: Check HEAD version first - O(1) for common case
@@ -4088,6 +4089,7 @@ impl VersionStore {
                 // HEAD is visible - check if deleted
                 if (head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id))
                     && matches_row(&chain.version.data)?
+                    && (fallible || !hidden(row_id))
                 {
                     let mut version_copy = chain.version.clone();
                     version_copy.create_time = current_seq;
@@ -4105,6 +4107,7 @@ impl VersionStore {
                 if checker.is_visible(version_txn_id, txn_id) {
                     if (deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id))
                         && matches_row(&e.version.data)?
+                        && (fallible || !hidden(row_id))
                     {
                         let mut version_copy = e.version.clone();
                         version_copy.create_time = current_seq;
@@ -4759,11 +4762,13 @@ impl VersionStore {
     ///
     /// Calls `callback(row_id, row_data)` for each matching row. The callback
     /// returns `true` to continue or `false` to stop iteration.
-    /// This avoids materializing all matching rows into a Vec.
+    /// This avoids materializing all matching rows into a Vec. A row `hidden`
+    /// names is left out, before a filter that can fail is asked of it.
     pub fn for_each_visible_filtered<F>(
         &self,
         reader: Reader<'_>,
         filter: &dyn crate::storage::expression::Expression,
+        hidden: impl Fn(i64) -> bool,
         mut callback: F,
     ) -> crate::core::Result<()>
     where
@@ -4792,6 +4797,10 @@ impl VersionStore {
         let versions = self.snapshot_versions();
 
         for (&row_id, chain) in versions.iter() {
+            // Before a filter that can fail, after one that cannot
+            if fallible && hidden(row_id) {
+                continue;
+            }
             let mut current: Option<&VersionChainEntry> = Some(chain);
 
             while let Some(e) = current {
@@ -4803,7 +4812,10 @@ impl VersionStore {
                         break;
                     }
 
-                    if matches_row(&e.version.data)? && !callback(row_id, e.version.data.clone()) {
+                    if matches_row(&e.version.data)?
+                        && (fallible || !hidden(row_id))
+                        && !callback(row_id, e.version.data.clone())
+                    {
                         return Ok(());
                     }
                     break;

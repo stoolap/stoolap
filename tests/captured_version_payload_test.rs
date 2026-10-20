@@ -149,10 +149,15 @@ captured_rows_test!(captured_filtered_rows, |store, id| store
 captured_rows_test!(captured_filtered_callback, |store, id| {
     let mut rows = RowVec::new();
     store
-        .for_each_visible_filtered(id.into(), &balance_filter(), |row_id, row| {
-            rows.push((row_id, row));
-            true
-        })
+        .for_each_visible_filtered(
+            id.into(),
+            &balance_filter(),
+            |_| false,
+            |row_id, row| {
+                rows.push((row_id, row));
+                true
+            },
+        )
         .unwrap();
     rows
 });
