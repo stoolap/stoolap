@@ -283,3 +283,74 @@ fn a_row_a_cold_round_judged_is_not_asked_again_after_it_moves_hot() {
     let updated = db.execute("UPDATE p SET x = 2 WHERE ABS(x) >= 0 AND x + x < 0", ());
     assert_eq!(updated.ok(), Some(0));
 }
+
+mod written_by_the_filter {
+    use std::cell::RefCell;
+    use std::sync::Arc;
+
+    use stoolap::core::{Operator, Result, Row, Value};
+    use stoolap::functions::scalar::SleepFunction;
+    use stoolap::functions::{FunctionInfo, ScalarFunction};
+    use stoolap::storage::expression::{Expression, FunctionArg, FunctionExpr};
+    use stoolap::storage::traits::{Engine, Table};
+    use stoolap::Database;
+
+    thread_local! {
+        static OTHER: RefCell<Option<Box<dyn Table>>> = const { RefCell::new(None) };
+    }
+
+    /// Inserts one row through another handle of the same transaction the
+    /// first time it is asked, then answers 1
+    struct InsertsOnce;
+
+    impl ScalarFunction for InsertsOnce {
+        fn name(&self) -> &str {
+            "INSERTS_ONCE"
+        }
+
+        fn info(&self) -> FunctionInfo {
+            SleepFunction.info()
+        }
+
+        fn evaluate(&self, _args: &[Value]) -> Result<Value> {
+            OTHER.with(|other| {
+                if let Some(mut table) = other.borrow_mut().take() {
+                    table.insert(Row::from_values(vec![Value::Integer(9), Value::Integer(1)]))?;
+                }
+                Ok(Value::Integer(1))
+            })
+        }
+
+        fn clone_box(&self) -> Box<dyn ScalarFunction> {
+            Box::new(Self)
+        }
+    }
+
+    #[test]
+    fn a_filter_may_write_through_another_handle_of_its_transaction() {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let db = Database::open("memory://storage_filter_writes_through").unwrap();
+            db.execute("CREATE TABLE w (id INTEGER PRIMARY KEY, v INTEGER)", ())
+                .unwrap();
+            db.execute("INSERT INTO w VALUES (1, 1), (2, 1)", ())
+                .unwrap();
+            let tx = db.engine().begin_transaction().unwrap();
+            let mut first = tx.get_table("w").unwrap();
+            OTHER.with(|other| *other.borrow_mut() = Some(tx.get_table("w").unwrap()));
+            let mut filter = FunctionExpr::new(
+                Arc::new(InsertsOnce),
+                vec![FunctionArg::Column("v".to_string())],
+                Operator::Eq,
+                Value::Integer(1),
+            );
+            filter.prepare_for_schema(first.schema());
+            let updated = first.update(Some(&filter), &mut |row| Ok((row, true)));
+            let _ = done.send(updated.map_err(|e| e.to_string()));
+        });
+        let updated = finished.recv_timeout(std::time::Duration::from_secs(10));
+        assert!(updated.is_ok(), "the UPDATE did not finish");
+        let updated = updated.unwrap();
+        assert!(updated.is_ok(), "the UPDATE failed: {updated:?}");
+    }
+}
