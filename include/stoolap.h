@@ -707,6 +707,19 @@ int32_t stoolap_query_params_all(
     int64_t* out_len
 );
 
+/**
+ * stoolap_query_params_all() with named parameters (:name).
+ */
+int32_t stoolap_query_named_all(
+    StoolapDB* db,
+    StoolapTx* tx,
+    const char* sql,
+    const StoolapNamedParam* params,
+    int32_t params_len,
+    const uint8_t** out_buf,
+    int64_t* out_len
+);
+
 /* =========================================================================
  * Memory management
  * ========================================================================= */

@@ -596,6 +596,76 @@ pub unsafe extern "C" fn stoolap_query_named(
     })
 }
 
+/// `stoolap_query_params_all()` with named parameters (`:name`).
+///
+/// # Safety
+///
+/// - `db` must be a valid `StoolapDB` pointer.
+/// - `tx` must be a valid `StoolapTx` pointer or NULL.
+/// - `sql` must be a valid null-terminated UTF-8 string.
+/// - `params` must point to `params_len` valid `StoolapNamedParam` structs (or be NULL).
+/// - `out_buf` and `out_len` must not be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_query_named_all(
+    db: *mut StoolapDB,
+    tx: *mut StoolapTx,
+    sql: *const c_char,
+    params: *const StoolapNamedParam,
+    params_len: i32,
+    out_buf: *mut *const u8,
+    out_len: *mut i64,
+) -> i32 {
+    if out_buf.is_null() || out_len.is_null() {
+        return STOOLAP_ERROR;
+    }
+    *out_buf = std::ptr::null();
+    *out_len = 0;
+
+    let handle = match db.as_mut() {
+        Some(h) => h,
+        None => return STOOLAP_ERROR,
+    };
+    handle.last_error = None;
+
+    if sql.is_null() {
+        handle.set_error("SQL string is NULL");
+        return STOOLAP_ERROR;
+    }
+
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let sql_str = match CStr::from_ptr(sql).to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                handle.set_error(&format!("invalid UTF-8 in SQL: {}", e));
+                return STOOLAP_ERROR;
+            }
+        };
+
+        let rows = value::named_params_from_ffi(params, params_len).and_then(|named| {
+            match super::statement::open_transaction(tx)? {
+                None => handle.db.query_named(sql_str, named),
+                Some(inner_tx) => inner_tx.query_named(sql_str, named),
+            }
+        });
+        match rows.and_then(|mut rows| pack_all(&mut rows, &mut handle.packed)) {
+            Ok(_) => {
+                *out_buf = handle.packed.as_ptr();
+                *out_len = handle.packed.len() as i64;
+                STOOLAP_OK
+            }
+            Err(e) => {
+                handle.set_error(&e.to_string());
+                STOOLAP_ERROR
+            }
+        }
+    }));
+
+    result.unwrap_or_else(|_| {
+        handle.set_error("panic during stoolap_query_named_all");
+        STOOLAP_ERROR
+    })
+}
+
 /// Free a string allocated by the library.
 ///
 /// Safe to call with NULL (no-op).
