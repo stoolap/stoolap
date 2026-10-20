@@ -56,8 +56,8 @@ pub struct Transaction {
     committed: bool,
     rolled_back: bool,
     /// Keeps the session, and with it the engine, open until the transaction
-    /// is gone; last, so it drops after the transaction it keeps
-    _session: Arc<DatabaseInner>,
+    /// commits or rolls back; last, so a drop releases it after the rollback
+    _session: Option<Arc<DatabaseInner>>,
 }
 
 /// Whether `statement` may run inside a transaction: DML and savepoints
@@ -86,14 +86,14 @@ impl Transaction {
             executor,
             committed: false,
             rolled_back: false,
-            _session: session,
+            _session: Some(session),
         }
     }
 
-    /// The session this transaction began on
+    /// The session this transaction began on, until it ends
     #[cfg(feature = "ffi")]
-    pub(crate) fn session(&self) -> &DatabaseInner {
-        &self._session
+    pub(crate) fn session(&self) -> Option<&DatabaseInner> {
+        self._session.as_deref()
     }
 
     /// Check if the transaction is still active
@@ -359,6 +359,7 @@ impl Transaction {
             }
         }
         self.committed = true;
+        self._session = None;
         Ok(())
     }
 
@@ -375,7 +376,9 @@ impl Transaction {
         }
 
         self.rolled_back = true;
-        self.executor.rollback_active()
+        let result = self.executor.rollback_active();
+        self._session = None;
+        result
     }
 }
 

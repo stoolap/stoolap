@@ -438,10 +438,11 @@ pub(super) unsafe fn open_transaction_on<'a>(
     tx: *mut StoolapTx,
 ) -> Result<Option<&'a mut Transaction>> {
     let inner = open_transaction(tx)?;
-    if inner
-        .as_ref()
-        .is_some_and(|inner_tx| !db.shares_engine_with(inner_tx.session()))
-    {
+    if inner.as_ref().is_some_and(|inner_tx| {
+        inner_tx
+            .session()
+            .is_some_and(|session| !db.shares_engine_with(session))
+    }) {
         return Err(Error::invalid_argument(
             "transaction belongs to another database",
         ));

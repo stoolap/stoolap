@@ -61,6 +61,36 @@ fn a_transaction_outlives_the_last_file_handle() {
     assert_eq!(count(&db, "t"), 1, "the committed row was lost");
 }
 
+/// Under `test-filedb` a memory DSN opens a file database, which keeps its rows
+#[cfg(not(feature = "test-filedb"))]
+#[test]
+fn a_finished_transaction_releases_the_database() {
+    for (dsn, commit) in [
+        ("memory://tx_finished_releases_commit", true),
+        ("memory://tx_finished_releases_rollback", false),
+    ] {
+        let db = Database::open(dsn).expect("open");
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+            .expect("create");
+        let mut tx = db.begin().expect("begin");
+        tx.execute("INSERT INTO t VALUES (1, 1)", ())
+            .expect("insert");
+        drop(db);
+        if commit {
+            tx.commit().expect("commit");
+        } else {
+            tx.rollback().expect("rollback");
+        }
+
+        let fresh = Database::open(dsn).expect("reopen");
+        assert!(
+            fresh.query("SELECT COUNT(*) FROM t", ()).is_err(),
+            "{dsn}: the engine stayed open after the transaction ended"
+        );
+        drop(tx);
+    }
+}
+
 #[test]
 fn a_commit_after_an_explicit_close_is_refused() {
     let db = Database::open("memory://tx_commit_after_close").expect("open");
