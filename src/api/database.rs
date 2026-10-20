@@ -158,6 +158,11 @@ impl Database {
     pub(crate) fn keepalive(&self) -> Arc<DatabaseInner> {
         Arc::clone(&self.inner)
     }
+
+    /// Whether `session` runs on this handle's engine
+    pub(crate) fn shares_engine_with(&self, session: &DatabaseInner) -> bool {
+        Arc::ptr_eq(&self.inner.shared, &session.shared)
+    }
 }
 
 impl Clone for Database {

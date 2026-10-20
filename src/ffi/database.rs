@@ -405,9 +405,11 @@ pub unsafe extern "C" fn stoolap_query_params(
 /// buffer, in the format of `stoolap_rows_fetch_all()`, without a rows
 /// handle.
 ///
-/// Runs inside `tx` when it is not NULL. The buffer belongs to `db` and
-/// stays valid until the next call on it or `stoolap_close()`. Must NOT be
-/// freed. Errors are read with `stoolap_errmsg(db)`.
+/// Runs inside `tx` when it is not NULL; a `tx` begun on another database
+/// than `db` (a `stoolap_clone()` of it is the same one) is an error. The
+/// buffer belongs to `db` and stays valid until the next call on it or
+/// `stoolap_close()`. Must NOT be freed. Errors are read with
+/// `stoolap_errmsg(db)`.
 ///
 /// # Safety
 ///
@@ -453,7 +455,7 @@ pub unsafe extern "C" fn stoolap_query_params_all(
         };
 
         let rows = value::params_to_vec(params, params_len).and_then(|p| {
-            match super::statement::open_transaction(tx)? {
+            match super::statement::open_transaction_on(&handle.db, tx)? {
                 None => handle.db.query(sql_str, p),
                 Some(inner_tx) => inner_tx.query(sql_str, p),
             }
@@ -642,7 +644,7 @@ pub unsafe extern "C" fn stoolap_query_named_all(
         };
 
         let rows = value::named_params_from_ffi(params, params_len).and_then(|named| {
-            match super::statement::open_transaction(tx)? {
+            match super::statement::open_transaction_on(&handle.db, tx)? {
                 None => handle.db.query_named(sql_str, named),
                 Some(inner_tx) => inner_tx.query_named(sql_str, named),
             }

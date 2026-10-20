@@ -20,7 +20,7 @@ use std::panic;
 use std::sync::Arc;
 
 use crate::api::transaction::Transaction;
-use crate::api::{ParamVec, Rows};
+use crate::api::{Database, ParamVec, Rows};
 use crate::core::{Error, Result};
 
 use super::rows::pack_all;
@@ -430,6 +430,21 @@ pub(super) unsafe fn open_transaction<'a>(
             None => Err(Error::TransactionEnded),
         },
     }
+}
+
+/// `open_transaction`, refusing a `tx` begun on another engine than `db`
+pub(super) unsafe fn open_transaction_on<'a>(
+    db: &Database,
+    tx: *mut StoolapTx,
+) -> Result<Option<&'a mut Transaction>> {
+    if let Some(tx_handle) = tx.as_ref() {
+        if !db.shares_engine_with(&tx_handle._db_keepalive) {
+            return Err(Error::invalid_argument(
+                "transaction belongs to another database",
+            ));
+        }
+    }
+    open_transaction(tx)
 }
 
 /// Query a prepared statement and pack every row into one buffer, in the
