@@ -4041,12 +4041,14 @@ impl VersionStore {
     ///
     /// Returns (row_id, Row, RowVersion) tuples - the RowVersion is needed for
     /// MVCC conflict detection during the update. A row `hidden` names is
-    /// left out, before a filter that can fail is asked of it.
+    /// left out, before a filter that can fail is asked of it; an error on a
+    /// row `forgives` names, asked only then, leaves that row out instead.
     pub fn get_all_visible_rows_for_update_filtered(
         &self,
         txn_id: i64,
         filter: &dyn crate::storage::expression::Expression,
         hidden: impl Fn(i64) -> bool,
+        forgives: impl Fn(i64) -> bool,
     ) -> crate::core::Result<Vec<(i64, Row, RowVersion)>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.get_all_visible_rows_for_update_filtered");
@@ -4088,7 +4090,13 @@ impl VersionStore {
             if checker.is_visible(head_txn_id, txn_id) {
                 // HEAD is visible - check if deleted
                 if (head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id))
-                    && matches_row(&chain.version.data)?
+                    && matches_row(&chain.version.data).or_else(|error| {
+                        if forgives(row_id) {
+                            Ok(false)
+                        } else {
+                            Err(error)
+                        }
+                    })?
                     && (fallible || !hidden(row_id))
                 {
                     let mut version_copy = chain.version.clone();
@@ -4106,7 +4114,13 @@ impl VersionStore {
 
                 if checker.is_visible(version_txn_id, txn_id) {
                     if (deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id))
-                        && matches_row(&e.version.data)?
+                        && matches_row(&e.version.data).or_else(|error| {
+                            if forgives(row_id) {
+                                Ok(false)
+                            } else {
+                                Err(error)
+                            }
+                        })?
                         && (fallible || !hidden(row_id))
                     {
                         let mut version_copy = e.version.clone();

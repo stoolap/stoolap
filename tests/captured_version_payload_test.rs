@@ -120,7 +120,7 @@ captured_rows_test!(captured_update_rows, |store, id| update_rows(
 ));
 captured_rows_test!(captured_filtered_update, |store, id| update_rows(
     store
-        .get_all_visible_rows_for_update_filtered(id, &balance_filter(), |_| false)
+        .get_all_visible_rows_for_update_filtered(id, &balance_filter(), |_| false, |_| false)
         .unwrap()
 ));
 captured_rows_test!(captured_limited_rows, |store, id| store

@@ -2584,11 +2584,12 @@ impl MVCCTable {
             }
         }
 
-        // Full scan: the filter is applied before rows are cloned. One that
-        // can fail is not asked of a row already planned or of one the
-        // transaction wrote, which its own version alone answers. No guard
-        // is held while a filter runs, since a function may write
-        let wrote = self.txn_versions.read().unwrap().has_local_changes();
+        // Full scan: the filter is applied before rows are cloned, with no
+        // guard held, since a function in it may write through another
+        // handle. A committed row the transaction wrote, before or during the
+        // scan, leaves afterwards for its own version; an error on one is not
+        // the statement's, and one that can fail is not asked of a row
+        // already planned
         let written = |row_id: i64| {
             self.txn_versions
                 .read()
@@ -2599,12 +2600,15 @@ impl MVCCTable {
         let committed = match where_expr {
             Some(expr) if fallible => self
                 .version_store
-                .get_all_visible_rows_for_update_filtered(self.txn_id, expr, |row_id| {
-                    skipped(row_id) || (wrote && written(row_id))
-                })?,
+                .get_all_visible_rows_for_update_filtered(self.txn_id, expr, skipped, written)?,
             Some(expr) => self
                 .version_store
-                .get_all_visible_rows_for_update_filtered(self.txn_id, expr, |_| false)?,
+                .get_all_visible_rows_for_update_filtered(
+                    self.txn_id,
+                    expr,
+                    |_| false,
+                    |_| false,
+                )?,
             None => self
                 .version_store
                 .get_all_visible_rows_for_update(self.txn_id),
@@ -2629,7 +2633,7 @@ impl MVCCTable {
         // row only it inserted joins. With a WHERE, a committed row it wrote
         // leaves too, and its own version is judged with the rows below
         let txn_versions = self.txn_versions.read().unwrap();
-        if wrote && !fallible {
+        if txn_versions.has_local_changes() {
             let mut kept = start;
             for i in start..plan.hot.len() {
                 let row_id = plan.hot[i].0;
@@ -2645,29 +2649,53 @@ impl MVCCTable {
             }
             plan.hot.truncate(kept);
         }
-        let laid = plan.hot.len();
-        for (row_id, version) in txn_versions.iter_local() {
-            if skipped(row_id)
-                || version.is_deleted()
-                || (where_expr.is_none() && self.version_store.quick_check_row_existence(row_id))
-            {
-                continue;
-            }
-            let row = self.normalize_row_to_schema(version.data.clone(), schema);
-            plan.hot.push((row_id, row, self.local_read(version)));
-        }
-        drop(txn_versions);
-        // The filter judges the rows it wrote once the guard is gone
-        if let Some(expr) = where_expr {
-            let mut kept = laid;
-            for i in laid..plan.hot.len() {
-                if !passes(expr, fallible, &plan.hot[i].1)? {
+        let Some(expr) = where_expr.filter(|_| fallible) else {
+            for (row_id, version) in txn_versions.iter_local() {
+                if skipped(row_id)
+                    || version.is_deleted()
+                    || (where_expr.is_none()
+                        && self.version_store.quick_check_row_existence(row_id))
+                {
                     continue;
                 }
-                plan.hot.swap(kept, i);
-                kept += 1;
+                let row = self.normalize_row_to_schema(version.data.clone(), schema);
+                if let Some(expr) = where_expr {
+                    if !passes(expr, fallible, &row)? {
+                        continue;
+                    }
+                }
+                plan.hot.push((row_id, row, self.local_read(version)));
             }
-            plan.hot.truncate(kept);
+            drop(txn_versions);
+            return Self::set_planned(plan, start, setter);
+        };
+        // The rows it wrote are read one at a time, each as it stands when
+        // the filter is asked of it
+        let written: Vec<i64> = txn_versions
+            .iter_local()
+            .map(|(row_id, _)| row_id)
+            .collect();
+        drop(txn_versions);
+        for row_id in written {
+            if skipped(row_id) {
+                continue;
+            }
+            let read = self
+                .txn_versions
+                .read()
+                .unwrap()
+                .get_latest_local(row_id)
+                .filter(|version| !version.is_deleted())
+                .map(|version| {
+                    let row = self.normalize_row_to_schema(version.data.clone(), schema);
+                    (row, self.local_read(version))
+                });
+            let Some((row, read)) = read else {
+                continue;
+            };
+            if passes(expr, fallible, &row)? {
+                plan.hot.push((row_id, row, read));
+            }
         }
         Self::set_planned(plan, start, setter)
     }

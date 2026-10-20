@@ -289,9 +289,9 @@ mod written_by_the_filter {
     use std::sync::Arc;
 
     use stoolap::core::{Operator, Result, Row, Value};
-    use stoolap::functions::scalar::SleepFunction;
+    use stoolap::functions::scalar::{AbsFunction, SleepFunction};
     use stoolap::functions::{FunctionInfo, ScalarFunction};
-    use stoolap::storage::expression::{Expression, FunctionArg, FunctionExpr};
+    use stoolap::storage::expression::{AndExpr, Expression, FunctionArg, FunctionExpr};
     use stoolap::storage::traits::{Engine, Table};
     use stoolap::Database;
 
@@ -299,13 +299,19 @@ mod written_by_the_filter {
         static OTHER: RefCell<Option<Box<dyn Table>>> = const { RefCell::new(None) };
     }
 
-    /// Inserts one row through another handle of the same transaction the
-    /// first time it is asked, then answers 1
-    struct InsertsOnce;
+    type Write = Box<dyn FnOnce(&mut dyn Table) -> Result<()> + Send>;
 
-    impl ScalarFunction for InsertsOnce {
+    thread_local! {
+        static WRITE: RefCell<Option<Write>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `WRITE` on another handle of the same transaction the first time
+    /// it is asked, then answers 1
+    struct WritesOnce;
+
+    impl ScalarFunction for WritesOnce {
         fn name(&self) -> &str {
-            "INSERTS_ONCE"
+            "WRITES_ONCE"
         }
 
         fn info(&self) -> FunctionInfo {
@@ -313,12 +319,12 @@ mod written_by_the_filter {
         }
 
         fn evaluate(&self, _args: &[Value]) -> Result<Value> {
-            OTHER.with(|other| {
-                if let Some(mut table) = other.borrow_mut().take() {
-                    table.insert(Row::from_values(vec![Value::Integer(9), Value::Integer(1)]))?;
-                }
-                Ok(Value::Integer(1))
-            })
+            let table = OTHER.with(|other| other.borrow_mut().take());
+            let write = WRITE.with(|write| write.borrow_mut().take());
+            if let (Some(mut table), Some(write)) = (table, write) {
+                write(table.as_mut())?;
+            }
+            Ok(Value::Integer(1))
         }
 
         fn clone_box(&self) -> Box<dyn ScalarFunction> {
@@ -326,31 +332,90 @@ mod written_by_the_filter {
         }
     }
 
-    #[test]
-    fn a_filter_may_write_through_another_handle_of_its_transaction() {
+    /// Runs `UPDATE w SET v = v` on `w (id, v, x)` holding `rows`, under
+    /// `filter`, with `write` armed on a second handle of its transaction
+    fn update_writing(
+        dsn: &'static str,
+        rows: &'static str,
+        filter: fn() -> Box<dyn Expression>,
+        write: Write,
+    ) -> Option<std::result::Result<i32, String>> {
         let (done, finished) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let db = Database::open("memory://storage_filter_writes_through").unwrap();
-            db.execute("CREATE TABLE w (id INTEGER PRIMARY KEY, v INTEGER)", ())
-                .unwrap();
-            db.execute("INSERT INTO w VALUES (1, 1), (2, 1)", ())
+            let db = Database::open(dsn).unwrap();
+            db.execute(
+                "CREATE TABLE w (id INTEGER PRIMARY KEY, v INTEGER, x INTEGER)",
+                (),
+            )
+            .unwrap();
+            db.execute(&format!("INSERT INTO w VALUES {rows}"), ())
                 .unwrap();
             let tx = db.engine().begin_transaction().unwrap();
             let mut first = tx.get_table("w").unwrap();
             OTHER.with(|other| *other.borrow_mut() = Some(tx.get_table("w").unwrap()));
-            let mut filter = FunctionExpr::new(
-                Arc::new(InsertsOnce),
-                vec![FunctionArg::Column("v".to_string())],
-                Operator::Eq,
-                Value::Integer(1),
-            );
+            WRITE.with(|slot| *slot.borrow_mut() = Some(write));
+            let mut filter = filter();
             filter.prepare_for_schema(first.schema());
-            let updated = first.update(Some(&filter), &mut |row| Ok((row, true)));
+            let updated = first.update(Some(filter.as_ref()), &mut |row| Ok((row, true)));
             let _ = done.send(updated.map_err(|e| e.to_string()));
         });
-        let updated = finished.recv_timeout(std::time::Duration::from_secs(10));
-        assert!(updated.is_ok(), "the UPDATE did not finish");
-        let updated = updated.unwrap();
-        assert!(updated.is_ok(), "the UPDATE failed: {updated:?}");
+        finished
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .ok()
+    }
+
+    fn writes_once_on_v() -> FunctionExpr {
+        FunctionExpr::new(
+            Arc::new(WritesOnce),
+            vec![FunctionArg::Column("v".to_string())],
+            Operator::Eq,
+            Value::Integer(1),
+        )
+    }
+
+    #[test]
+    fn a_filter_may_write_through_another_handle_of_its_transaction() {
+        let updated = update_writing(
+            "memory://storage_filter_writes_through",
+            "(1, 1, 0), (2, 1, 0)",
+            || Box::new(writes_once_on_v()),
+            Box::new(|table| {
+                table.insert(Row::from_values(vec![
+                    Value::Integer(9),
+                    Value::Integer(1),
+                    Value::Integer(0),
+                ]))?;
+                Ok(())
+            }),
+        );
+        assert!(updated.is_some(), "the UPDATE did not finish");
+        assert!(
+            matches!(updated, Some(Ok(_))),
+            "the UPDATE failed: {updated:?}"
+        );
+    }
+
+    #[test]
+    fn a_row_the_filter_deletes_is_not_asked_again() {
+        let updated = update_writing(
+            "memory://storage_filter_deletes_through",
+            "(1, 1, 0), (2, 1, -9223372036854775808)",
+            || {
+                Box::new(AndExpr::new(vec![
+                    Box::new(writes_once_on_v()),
+                    Box::new(FunctionExpr::new(
+                        Arc::new(AbsFunction),
+                        vec![FunctionArg::Column("x".to_string())],
+                        Operator::Gte,
+                        Value::Integer(0),
+                    )),
+                ]))
+            },
+            Box::new(|table| {
+                table.delete_by_row_ids(&[2])?;
+                Ok(())
+            }),
+        );
+        assert_eq!(updated, Some(Ok(1)));
     }
 }
