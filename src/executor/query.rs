@@ -71,16 +71,25 @@ pub(crate) struct ColumnSource {
 /// it was projected from: the one record an ORDER BY name is bound by
 #[derive(Clone, Debug, Default)]
 pub(crate) struct OutputLayout {
-    pub(crate) input_columns: Vec<String>,
-    pub(crate) sources: Vec<ColumnSource>,
+    /// Shared with the source that names them, where it holds them shared
+    pub(crate) input_columns: CompactArc<Vec<String>>,
+    /// Held inline up to eight columns, so a short layout costs no allocation
+    pub(crate) sources: LayoutSources,
 }
+
+pub(crate) type LayoutSources = smallvec::SmallVec<[ColumnSource; 8]>;
 
 impl OutputLayout {
     /// The layout of rows that are the input `columns` themselves, as a
     /// projection deferred past the sort leaves them
     pub(crate) fn of_input(columns: &[String]) -> Self {
+        Self::of_shared_input(&CompactArc::new(columns.to_vec()))
+    }
+
+    /// `of_input` over input columns a source already holds shared
+    pub(crate) fn of_shared_input(columns: &CompactArc<Vec<String>>) -> Self {
         Self {
-            input_columns: columns.to_vec(),
+            input_columns: CompactArc::clone(columns),
             sources: (0..columns.len())
                 .map(|idx| ColumnSource {
                     item: None,
@@ -218,7 +227,27 @@ fn input_column_index(columns: &[String], qualifier: Option<&str>, name: &str) -
 #[derive(Default)]
 pub(crate) struct SelectShape {
     deferred: Option<DeferredProjection>,
-    layout: Option<CompactArc<OutputLayout>>,
+    layout: Option<LaidOut>,
+}
+
+/// A layout the rows carry: built for this execution, or the one a
+/// prepared plan holds for all of them. Boxing the built one would be the
+/// allocation this type exists to avoid
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum LaidOut {
+    Built(OutputLayout),
+    Shared(CompactArc<OutputLayout>),
+}
+
+impl std::ops::Deref for LaidOut {
+    type Target = OutputLayout;
+
+    fn deref(&self) -> &OutputLayout {
+        match self {
+            LaidOut::Built(layout) => layout,
+            LaidOut::Shared(layout) => layout,
+        }
+    }
 }
 
 impl SelectShape {
@@ -227,7 +256,7 @@ impl SelectShape {
     fn laid_out(layout: Option<OutputLayout>) -> Option<Self> {
         layout.map(|layout| Self {
             deferred: None,
-            layout: Some(CompactArc::new(layout)),
+            layout: Some(LaidOut::Built(layout)),
         })
     }
 }
@@ -856,7 +885,7 @@ impl Executor {
             prepared_visible = Some(visible);
             let shape = SelectShape {
                 deferred: None,
-                layout,
+                layout: layout.map(LaidOut::Shared),
             };
             (result, columns, applied, Some(shape))
         } else {
@@ -934,6 +963,10 @@ impl Executor {
                 .iter()
                 .any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)));
             for (i, col) in stmt.columns.iter().enumerate() {
+                // No sort key names a star
+                if matches!(col, Expression::Star(_) | Expression::QualifiedStar(_)) {
+                    continue;
+                }
                 if set_operation
                     && !matches!(col, Expression::Aliased(_))
                     && !matches!(col, Expression::FunctionCall(f) if self.function_registry.is_aggregate(&f.function))
@@ -2527,7 +2560,7 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         rows: RowVec,
-        all_columns: &[String],
+        all_columns: &CompactArc<Vec<String>>,
         all_columns_lower: &[String],
         table_alias: Option<&str>,
         order_by_extra: bool,
@@ -2556,7 +2589,7 @@ impl Executor {
             ctx,
             table_alias,
         )?;
-        let layout = Self::output_layout(stmt, all_columns, table_alias);
+        let layout = Self::shared_output_layout(stmt, all_columns, table_alias);
         Ok((projected_rows, output_columns, layout))
     }
 
@@ -2567,7 +2600,7 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
-        all_columns: &[String],
+        all_columns: &CompactArc<Vec<String>>,
         all_columns_lower: &[String],
         table_alias: Option<&str>,
         classification: &QueryClassification,
@@ -2583,7 +2616,8 @@ impl Executor {
             (true, false) => {
                 let result =
                     self.execute_select_with_aggregation(stmt, ctx, RowVec::new(), all_columns)?;
-                let layout = Self::result_layout(stmt, all_columns, table_alias, result.columns());
+                let layout =
+                    Self::shared_result_layout(stmt, all_columns, table_alias, result.columns());
                 (result, layout)
             }
             (false, false) => {
@@ -2735,7 +2769,7 @@ impl Executor {
             .or_else(|| Some(table_name.to_string()));
         // The shape of a result this scan answers whole, for its ORDER BY
         let shape_of = |columns: &[String]| {
-            SelectShape::laid_out(Self::result_layout(
+            SelectShape::laid_out(Self::shared_result_layout(
                 stmt,
                 &all_columns,
                 table_alias.as_deref(),
@@ -4295,7 +4329,7 @@ impl Executor {
                     all_columns.to_vec(),
                     SelectShape {
                         deferred: Some((col_indices, output_names)),
-                        layout: Some(CompactArc::new(OutputLayout::of_input(&all_columns))),
+                        layout: Some(LaidOut::Built(OutputLayout::of_shared_input(&all_columns))),
                     },
                 )
             }
@@ -10016,10 +10050,23 @@ impl Executor {
         all_columns: &[String],
         table_alias: Option<&str>,
     ) -> OutputLayout {
-        let mut sources = Vec::with_capacity(select_exprs.len());
-        Self::output_columns(select_exprs, all_columns, table_alias, Some(&mut sources));
+        Self::shared_select_layout(
+            select_exprs,
+            CompactArc::new(all_columns.to_vec()),
+            table_alias,
+        )
+    }
+
+    /// `select_layout` over input columns a source already holds shared
+    pub(crate) fn shared_select_layout(
+        select_exprs: &[Expression],
+        all_columns: CompactArc<Vec<String>>,
+        table_alias: Option<&str>,
+    ) -> OutputLayout {
+        let mut sources = LayoutSources::new();
+        Self::output_columns(select_exprs, &all_columns, table_alias, Some(&mut sources));
         OutputLayout {
-            input_columns: all_columns.to_vec(),
+            input_columns: all_columns,
             sources,
         }
     }
@@ -10035,6 +10082,17 @@ impl Executor {
             .then(|| Self::select_layout(&stmt.columns, all_columns, table_alias))
     }
 
+    /// `output_layout` over input columns a source already holds shared
+    pub(crate) fn shared_output_layout(
+        stmt: &SelectStatement,
+        all_columns: &CompactArc<Vec<String>>,
+        table_alias: Option<&str>,
+    ) -> Option<OutputLayout> {
+        (!stmt.order_by.is_empty()).then(|| {
+            Self::shared_select_layout(&stmt.columns, CompactArc::clone(all_columns), table_alias)
+        })
+    }
+
     /// The layout of a grouped or windowed result of `stmt`: its first
     /// columns those of the SELECT list over `all_columns`, the rest appended
     /// for ORDER BY, a hidden key computing an expression and any other
@@ -10046,7 +10104,27 @@ impl Executor {
         table_alias: Option<&str>,
         result_columns: &[String],
     ) -> Option<OutputLayout> {
-        let mut layout = Self::output_layout(stmt, all_columns, table_alias)?;
+        let layout = Self::output_layout(stmt, all_columns, table_alias)?;
+        Some(Self::appended_layout(layout, all_columns, result_columns))
+    }
+
+    /// `result_layout` over input columns a source already holds shared
+    pub(crate) fn shared_result_layout(
+        stmt: &SelectStatement,
+        all_columns: &CompactArc<Vec<String>>,
+        table_alias: Option<&str>,
+        result_columns: &[String],
+    ) -> Option<OutputLayout> {
+        let layout = Self::shared_output_layout(stmt, all_columns, table_alias)?;
+        Some(Self::appended_layout(layout, all_columns, result_columns))
+    }
+
+    /// `layout` with a source for each of `result_columns` past its own
+    fn appended_layout(
+        mut layout: OutputLayout,
+        all_columns: &[String],
+        result_columns: &[String],
+    ) -> OutputLayout {
         let appended = result_columns
             .get(layout.sources.len()..)
             .unwrap_or_default();
@@ -10062,7 +10140,7 @@ impl Executor {
             };
             layout.sources.push(ColumnSource { item: None, input });
         }
-        Some(layout)
+        layout
     }
 
     /// The names of the output columns `select_exprs` give over the input
@@ -10071,10 +10149,11 @@ impl Executor {
         select_exprs: &[Expression],
         all_columns: &[String],
         table_alias: Option<&str>,
-        mut sources: Option<&mut Vec<ColumnSource>>,
+        mut sources: Option<&mut LayoutSources>,
     ) -> Vec<String> {
-        let mut names = Vec::with_capacity(select_exprs.len());
+        // A layout reads the sources alone: no name is built for it
         let laid_out = sources.is_some();
+        let mut names = Vec::with_capacity(if laid_out { 0 } else { select_exprs.len() });
         let mut source = |item: usize, input: Option<usize>| {
             if let Some(sources) = sources.as_deref_mut() {
                 sources.push(ColumnSource {
@@ -10099,7 +10178,9 @@ impl Executor {
             match expr {
                 Expression::Star(_) => {
                     // SELECT * - add all column names
-                    names.extend(all_columns.iter().cloned());
+                    if !laid_out {
+                        names.extend(all_columns.iter().cloned());
+                    }
                     (0..all_columns.len()).for_each(|idx| source(i, Some(idx)));
                     continue;
                 }
@@ -10118,7 +10199,9 @@ impl Executor {
                             {
                                 // Strip "qualifier." from the column name for the output
                                 // e.g., "e.name" becomes "name"
-                                names.push(all_columns[idx][qualifier_len + 1..].to_string());
+                                if !laid_out {
+                                    names.push(all_columns[idx][qualifier_len + 1..].to_string());
+                                }
                                 source(i, Some(idx));
                                 found_any = true;
                             }
@@ -10129,7 +10212,9 @@ impl Executor {
                     if !found_any {
                         if let Some(alias) = table_alias {
                             if alias.eq_ignore_ascii_case(&qualifier_lower) {
-                                names.extend(all_columns.iter().cloned());
+                                if !laid_out {
+                                    names.extend(all_columns.iter().cloned());
+                                }
                                 (0..all_columns.len()).for_each(|idx| source(i, Some(idx)));
                             }
                         }
@@ -10156,6 +10241,7 @@ impl Executor {
                     _ => None,
                 };
                 source(i, input);
+                continue;
             }
             let name = match expr {
                 Expression::Identifier(id) => id.value.to_string(),
