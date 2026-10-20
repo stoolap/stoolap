@@ -3856,6 +3856,102 @@ fn test_stmt_named_parameters_without_a_transaction() {
 }
 
 #[test]
+fn test_query_named_all_ad_hoc() {
+    unsafe {
+        let db = packed_test_db(3);
+        let sel = cstr("SELECT id, name FROM t WHERE id >= :lo ORDER BY id");
+        let lo = [named_param("lo", int_param(2))];
+        let mut buf: *const u8 = std::ptr::null();
+        let mut len = 0i64;
+        let rc = stoolap_query_named_all(
+            db,
+            std::ptr::null_mut(),
+            sel.as_ptr(),
+            lo.as_ptr(),
+            1,
+            &mut buf,
+            &mut len,
+        );
+        assert_eq!(rc, STOOLAP_OK);
+        assert_eq!(
+            decode_packed(buf, len),
+            fetch_all_of(db, "SELECT id, name FROM t WHERE id >= 2 ORDER BY id")
+        );
+
+        let mut tx: *mut StoolapTx = std::ptr::null_mut();
+        assert_eq!(stoolap_begin(db, &mut tx), STOOLAP_OK);
+        let ins = cstr("INSERT INTO t (id, name) VALUES (9, 'n9')");
+        assert_eq!(
+            stoolap_tx_exec(tx, ins.as_ptr(), std::ptr::null_mut()),
+            STOOLAP_OK
+        );
+        let nine = [named_param("lo", int_param(9))];
+        let rc =
+            stoolap_query_named_all(db, tx, sel.as_ptr(), nine.as_ptr(), 1, &mut buf, &mut len);
+        assert_eq!(rc, STOOLAP_OK);
+        assert_eq!(
+            decode_packed(buf, len).1,
+            vec![vec!["9", "3:n9"]],
+            "inside the transaction"
+        );
+        let rc = stoolap_query_named_all(
+            db,
+            std::ptr::null_mut(),
+            sel.as_ptr(),
+            nine.as_ptr(),
+            1,
+            &mut buf,
+            &mut len,
+        );
+        assert_eq!(rc, STOOLAP_OK);
+        assert!(
+            decode_packed(buf, len).1.is_empty(),
+            "outside the transaction"
+        );
+        assert_eq!(stoolap_tx_rollback(tx), STOOLAP_OK);
+
+        let bad = [named_param("lo", bad_text_param(b"\xff"))];
+        let rc = stoolap_query_named_all(
+            db,
+            std::ptr::null_mut(),
+            sel.as_ptr(),
+            bad.as_ptr(),
+            1,
+            &mut buf,
+            &mut len,
+        );
+        assert_eq!(rc, STOOLAP_ERROR, "invalid UTF-8 parameter");
+        assert!(buf.is_null());
+        assert!(read_cstr(stoolap_errmsg(db)).contains("UTF-8"));
+
+        let missing = cstr("SELECT * FROM missing WHERE id = :lo");
+        let rc = stoolap_query_named_all(
+            db,
+            std::ptr::null_mut(),
+            missing.as_ptr(),
+            lo.as_ptr(),
+            1,
+            &mut buf,
+            &mut len,
+        );
+        assert_eq!(rc, STOOLAP_ERROR, "unknown table");
+        assert!(!read_cstr(stoolap_errmsg(db)).is_empty());
+
+        let rc = stoolap_query_named_all(
+            db,
+            std::ptr::null_mut(),
+            sel.as_ptr(),
+            lo.as_ptr(),
+            1,
+            std::ptr::null_mut(),
+            &mut len,
+        );
+        assert_eq!(rc, STOOLAP_ERROR, "NULL out_buf");
+        stoolap_close(db);
+    }
+}
+
+#[test]
 fn test_json_parameter_the_engine_cannot_read_is_refused() {
     unsafe {
         let db = packed_test_db(0);

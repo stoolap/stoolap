@@ -610,7 +610,7 @@ if (stoolap_open("bad://dsn", &db) != STOOLAP_OK) {
 
 | Function | Use when |
 |----------|----------|
-| `stoolap_errmsg(db)` | After `stoolap_exec*`, `stoolap_query*` (including `stoolap_query_params_all`), `stoolap_prepare`, `stoolap_stmt_exec_batch` fail |
+| `stoolap_errmsg(db)` | After `stoolap_exec*`, `stoolap_query*` (including `stoolap_query_params_all` and `stoolap_query_named_all`), `stoolap_prepare`, `stoolap_stmt_exec_batch` fail |
 | `stoolap_errmsg(NULL)` | After `stoolap_open*` fails, or after `stoolap_tx_commit`/`stoolap_tx_rollback` fails |
 | `stoolap_stmt_errmsg(stmt)` | After `stoolap_stmt_exec*`, `stoolap_stmt_query*` (including the `_all` forms, even when run inside a transaction) fail |
 | `stoolap_tx_errmsg(tx)` | After `stoolap_tx_exec*`, `stoolap_tx_query*`, `stoolap_tx_stmt_*` fail |
@@ -675,7 +675,7 @@ The C API is designed so that callers never need to free individual strings. All
 **Summary of rules:**
 
 - Never free pointers returned by `stoolap_errmsg()`, `stoolap_rows_column_text()`, `stoolap_rows_column_name()`, `stoolap_stmt_sql()`, or `stoolap_version()`.
-- Never free buffers from `stoolap_rows_fetch_chunk()`, `stoolap_stmt_query_all()` or `stoolap_query_params_all()`: their handle owns and reuses them. Only `stoolap_rows_fetch_all()` buffers are freed, with `stoolap_buffer_free()`.
+- Never free buffers from `stoolap_rows_fetch_chunk()` or the `*_query*_all()` functions: their handle owns and reuses them. Only `stoolap_rows_fetch_all()` buffers are freed, with `stoolap_buffer_free()`.
 - Always call `stoolap_rows_close()` on every `StoolapRows` handle, even after `STOOLAP_DONE`.
 - Always call `stoolap_stmt_finalize()` on every `StoolapStmt` handle.
 - Always call `stoolap_close()` on every `StoolapDB` handle.
@@ -748,9 +748,9 @@ stoolap_rows_close(rows);
 
 ### Query and Fetch in One Call
 
-`stoolap_stmt_query_all()` and `stoolap_query_params_all()` run a query and return all of its rows in the packed format in a single call. No rows handle is created, so a point lookup is one FFI call instead of four (query, fetch, free, close). Pass a transaction handle as `tx` to run inside it, or NULL to run outside a transaction.
+`stoolap_stmt_query_all()` and `stoolap_query_params_all()` run a query and return all of its rows in the packed format in a single call. No rows handle is created, so a point lookup is one FFI call instead of four (query, fetch, free, close). Pass a transaction handle as `tx` to run inside it, or NULL to run outside a transaction. `stoolap_stmt_query_named_all()` and `stoolap_query_named_all()` are the same calls with named parameters.
 
-The buffer belongs to the statement (`stoolap_stmt_query_all`) or the database handle (`stoolap_query_params_all`) and is reused by the next call on that handle, so it must not be freed and must be read before that call. A buffer that grew beyond 1 MiB for a large result is released at the next call. Errors are read with `stoolap_stmt_errmsg(stmt)` or `stoolap_errmsg(db)`, including when the call ran inside `tx`.
+The buffer belongs to the statement (`stoolap_stmt_query_all`, `stoolap_stmt_query_named_all`) or the database handle (`stoolap_query_params_all`, `stoolap_query_named_all`) and is reused by the next call on that handle, so it must not be freed and must be read before that call. A buffer that grew beyond 1 MiB for a large result is released at the next call. Errors are read with `stoolap_stmt_errmsg(stmt)` or `stoolap_errmsg(db)`, including when the call ran inside `tx`.
 
 ```c
 StoolapStmt* stmt = NULL;
@@ -871,6 +871,7 @@ stoolap_tx_commit(tx);
 | `stoolap_stmt_query_all(stmt, tx, params, len, &buf, &buf_len)` | `int32_t` | Run a prepared statement and pack all rows into a buffer owned by the statement |
 | `stoolap_stmt_query_named_all(stmt, tx, params, len, &buf, &buf_len)` | `int32_t` | `stoolap_stmt_query_all` with named parameters |
 | `stoolap_query_params_all(db, tx, sql, params, len, &buf, &buf_len)` | `int32_t` | Run SQL and pack all rows into a buffer owned by the database handle |
+| `stoolap_query_named_all(db, tx, sql, params, len, &buf, &buf_len)` | `int32_t` | `stoolap_query_params_all` with named parameters |
 
 ### Memory
 
