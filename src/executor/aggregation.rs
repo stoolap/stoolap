@@ -43,7 +43,7 @@ use super::query::order_by_inputs;
 use super::query_cache::{CompiledCountDistinct, CompiledExecution};
 use super::query_classification::QueryClassification;
 use super::result::ExecutorResult;
-use super::utils::build_column_index_map;
+use super::utils::{build_column_index_map, eq_folded};
 use super::window::WindowOutput;
 use super::Executor;
 
@@ -476,7 +476,8 @@ fn ungrouped_read(
 
 /// The slot of each group item and aggregate in an aggregated row, which
 /// holds the group items first and the aggregates after them; a SELECT
-/// alias names its expression's slot, unless a group column has that name
+/// alias names its expression's slot, unless a group column, qualified or
+/// not, has that name
 pub(crate) fn aggregate_slot_keys(
     group_items: &[GroupByItem],
     aggregations: &[SqlAggregateFunction],
@@ -489,8 +490,22 @@ pub(crate) fn aggregate_slot_keys(
     for (i, agg) in aggregations.iter().enumerate() {
         slots.entry(agg.key).or_insert(group_items.len() + i);
     }
+    // The alias comes lowercased; the column keeps its written spelling
+    let names_a_group_column = |alias_lower: &str| {
+        group_items.iter().any(|item| match item {
+            GroupByItem::Column(name) => eq_folded(
+                name.rsplit_once('.')
+                    .map_or(name.as_str(), |(_, bare)| bare),
+                alias_lower,
+            ),
+            GroupByItem::Expression { .. } => false,
+        })
+    };
     for col in select {
         if let Expression::Aliased(aliased) = col {
+            if names_a_group_column(&aliased.alias.value_lower) {
+                continue;
+            }
             if let Some(&slot) = slots.get(&ExprKey::of(&aliased.expression)) {
                 slots
                     .entry(ExprKey::column(&aliased.alias.value))
@@ -1578,7 +1593,10 @@ impl Executor {
                         name.to_lowercase()
                             == format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower)
                     }
-                    Expression::Aliased(a) => name.to_lowercase() == a.alias.value_lower.as_str(),
+                    Expression::Aliased(a) => {
+                        slot_of(&a.expression) == Some(i)
+                            && name.to_lowercase() == a.alias.value_lower.as_str()
+                    }
                     Expression::FunctionCall(func) if is_aggregate_function(&func.function) => {
                         slot_of(col_expr) == Some(i)
                             && self.get_aggregate_column_name(func) == *name
@@ -1682,15 +1700,12 @@ impl Executor {
                 }
                 Expression::Aliased(aliased) => {
                     final_columns.push(aliased.alias.value.to_string());
-                    let alias_lower: String = aliased.alias.value_lower.to_string();
 
-                    // The item's own identity first: an alias may repeat the
-                    // name another slot carries, as in `g AS n, COUNT(*) AS n`
+                    // The item by its own identity, never by its alias: an
+                    // alias may repeat the name another slot carries
                     let slot = slot_of(&aliased.expression).filter(|_| !is_correlated);
                     if let Some(slot) = slot {
                         column_sources.push(ColumnSource::AggSlot(slot));
-                    } else if agg_col_index_map.contains_key(&alias_lower) && !is_correlated {
-                        column_sources.push(ColumnSource::AggColumn(alias_lower));
                     } else if is_correlated {
                         // For correlated subqueries, use the original expression for per-row eval
                         column_sources.push(ColumnSource::CorrelatedExpression(Box::new(
@@ -1704,9 +1719,6 @@ impl Executor {
                                 // Read by identity, not alias: a deduplicated aggregate keeps one name
                                 if let Some(slot) = slot_of(&aliased.expression) {
                                     column_sources.push(ColumnSource::AggSlot(slot));
-                                } else if agg_col_index_map.contains_key(&alias_lower) {
-                                    // Fall back to alias if expression name not found
-                                    column_sources.push(ColumnSource::AggColumn(alias_lower));
                                 } else {
                                     // Last resort: evaluate the expression
                                     column_sources.push(ColumnSource::Expression(Box::new(

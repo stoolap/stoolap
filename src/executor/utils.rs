@@ -2705,15 +2705,76 @@ pub(crate) fn eq_folded_qualified(column: &str, qualifier: &str, name: &str) -> 
     }
 }
 
-/// Whether a qualified star over `qualifier_lower` takes the column whose
-/// whole name lowercased is `column_lower`: the rule the row projection
-/// and the output layout both expand a star by
-#[inline]
-pub(crate) fn star_takes_lowered(column_lower: &str, qualifier_lower: &str) -> bool {
-    let q = qualifier_lower.len();
-    column_lower.len() > q
-        && column_lower.as_bytes()[q] == b'.'
-        && column_lower.starts_with(qualifier_lower)
+/// Each column a qualified star over `qualifier` takes from `columns`, as
+/// its index and where its bare name starts: the columns named
+/// `qualifier.name`, the part before the dot lowercased on its own, or,
+/// when none is and `table_alias` is the qualifier, every column. The one
+/// rule every projection expands `qualifier.*` by
+pub(crate) fn for_each_qualified_star_column(
+    columns: &[String],
+    qualifier: &str,
+    table_alias: Option<&str>,
+    mut take: impl FnMut(usize, usize),
+) {
+    let mut found = false;
+    for (idx, column) in columns.iter().enumerate() {
+        if let Some(start) = qualified_name_start(column, qualifier) {
+            take(idx, start);
+            found = true;
+        }
+    }
+    if !found && table_alias.is_some_and(|alias| eq_names(alias, qualifier)) {
+        (0..columns.len()).for_each(|idx| take(idx, 0));
+    }
+}
+
+/// Whether `expr` is a star that takes every column of `columns` in order,
+/// so a projection of it alone hands the rows on as they are
+pub(crate) fn star_takes_every_column(
+    expr: &Expression,
+    columns: &[String],
+    table_alias: Option<&str>,
+) -> bool {
+    match expr {
+        Expression::Star(_) => true,
+        Expression::QualifiedStar(qs) => {
+            let mut next = 0;
+            let mut in_order = true;
+            for_each_qualified_star_column(columns, &qs.qualifier, table_alias, |idx, _| {
+                in_order &= idx == next;
+                next += 1;
+            });
+            in_order && next == columns.len()
+        }
+        _ => false,
+    }
+}
+
+/// Where the bare name of `column` starts when the part before one of its
+/// dots names `qualifier`
+fn qualified_name_start(column: &str, qualifier: &str) -> Option<usize> {
+    if column.is_ascii() && qualifier.is_ascii() {
+        let q = qualifier.len();
+        return (column.len() > q
+            && column.as_bytes()[q] == b'.'
+            && column[..q].eq_ignore_ascii_case(qualifier))
+        .then_some(q + 1);
+    }
+    column
+        .match_indices('.')
+        .map(|(dot, _)| dot)
+        .find(|&dot| eq_names(&column[..dot], qualifier))
+        .map(|dot| dot + 1)
+}
+
+/// Whether two names are one ignoring case, each lowercased on its own as
+/// `str::to_lowercase` does
+fn eq_names(a: &str, b: &str) -> bool {
+    if a.is_ascii() && b.is_ascii() {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        with_lowercase(a, |a| with_lowercase(b, |b| a.eq(b)))
+    }
 }
 
 #[cfg(test)]
