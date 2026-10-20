@@ -347,6 +347,43 @@ fn test_the_rule_probes_for_few_outer_rows_or_a_small_limit_on_an_index() {
 }
 
 #[test]
+fn test_a_keyed_outcome_uses_at_most_one_word() {
+    let bytes = std::mem::size_of::<stoolap::executor::context::ExistsOutcome>();
+    assert!(
+        bytes <= std::mem::size_of::<usize>(),
+        "a successful EXISTS key reserves {bytes} bytes for its outcome"
+    );
+}
+
+#[test]
+fn test_dropping_a_session_releases_prepared_block_answers() {
+    let _guard = serial();
+    let db = setup("drop_cached_answers");
+    force_exists_strategy(Some(true));
+    let sql =
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k AND u.v > 8) ORDER BY id";
+    let (_, before, _) = prepared_exists_counts();
+    assert_eq!(ids(&db, sql), vec![1]);
+    let (_, built, _) = prepared_exists_counts();
+    assert_eq!(built, before + 1);
+    let hits = subquery_cache_hits();
+    assert_eq!(ids(&db, sql), vec![1]);
+    assert_eq!(prepared_exists_counts().1, built);
+    assert_eq!(subquery_cache_hits(), hits + 1);
+
+    drop(db.clone());
+
+    let hits = subquery_cache_hits();
+    assert_eq!(ids(&db, sql), vec![1]);
+    assert_eq!(
+        prepared_exists_counts().1,
+        built + 1,
+        "dropping a database session must release its thread's block answers"
+    );
+    assert_eq!(subquery_cache_hits(), hits);
+}
+
+#[test]
 fn test_an_answer_is_computed_once_per_run_and_kept_while_its_stamp_holds() {
     let _guard = serial();
     let db = setup("kept");

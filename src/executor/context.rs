@@ -582,7 +582,7 @@ pub fn cache_semi_join_arc(
 #[derive(Debug, Clone)]
 pub enum ExistsOutcome {
     Passed,
-    Failed(crate::core::Error),
+    Failed(Box<crate::core::Error>),
 }
 
 /// A prepared EXISTS block's candidates, grouped by key, and whether a
@@ -984,6 +984,7 @@ pub fn clear_all_thread_local_caches() {
     SEMI_JOIN_CACHE.with(|cache| {
         cache.borrow_mut().clear();
     });
+    clear_block_answer_cache();
     // Clear and shrink unbounded caches
     EXISTS_PREDICATE_CACHE.with(|cache| {
         let mut c = cache.borrow_mut();

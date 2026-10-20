@@ -3464,7 +3464,7 @@ impl<'a> PreparedRunner<'a> {
         };
         match outcome {
             Some(ExistsOutcome::Passed) => Ok(true),
-            Some(ExistsOutcome::Failed(e)) => Err(e.clone()),
+            Some(ExistsOutcome::Failed(e)) => Err((**e).clone()),
             None => Ok(false),
         }
     }
@@ -3553,7 +3553,7 @@ impl<'a> PreparedRunner<'a> {
                 match self.passes_rest(sq, &mut vm, &exec, &slots_failed) {
                     Ok(true) => ExistsOutcome::Passed,
                     Ok(false) => continue,
-                    Err(e) => ExistsOutcome::Failed(deferred(e)?),
+                    Err(e) => ExistsOutcome::Failed(Box::new(deferred(e)?)),
                 }
             };
             match set.outcomes.entry(key) {
