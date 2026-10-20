@@ -2121,15 +2121,6 @@ impl Executor {
                 .dml_family(stmt.where_clause.as_deref(), stmt.updates.values(), ctx)
                 .is_ok();
         let where_prepared = in_family && where_has_subqueries;
-        let snapshot_ctx;
-        let ctx = if in_family && should_auto_commit && ctx.statement_snapshot().is_none() {
-            let snapshot =
-                self.new_statement_snapshot(self.isolation_level(), ctx.statement_view())?;
-            snapshot_ctx = ctx.with_statement_snapshot(snapshot);
-            &snapshot_ctx
-        } else {
-            ctx
-        };
         let held_dml;
         let dml_run = if in_family {
             let col_map = schema.column_index_map();
@@ -2148,6 +2139,7 @@ impl Executor {
                 table_name,
                 stmt.where_clause.as_deref(),
                 &sets,
+                standalone_tx.as_deref(),
                 ctx,
             )?;
             held_dml = prepared;
@@ -2233,13 +2225,14 @@ impl Executor {
             Option<Box<dyn StorageExpr>>,
             bool,
             Option<Expression>,
-        ) = if let Some(ref where_clause) = stmt.where_clause {
+        ) = if where_prepared {
+            // The runner reads the rows a prepared WHERE passes
+            (None, true, None)
+        } else if let Some(ref where_clause) = stmt.where_clause {
             let has_correlated_where =
                 Self::has_subqueries(where_clause) && Self::has_correlated_subqueries(where_clause);
 
-            let processed_where = if where_prepared {
-                (**where_clause).clone()
-            } else if has_correlated_where {
+            let processed_where = if has_correlated_where {
                 // Try semi-join optimization for correlated EXISTS/IN
                 // Avoid cloning upfront - only clone if no optimization succeeds
                 let outer_tables = vec![table_name.to_string()];
@@ -2278,7 +2271,7 @@ impl Executor {
                 (**where_clause).clone()
             };
 
-            if where_is_correlated || where_prepared {
+            if where_is_correlated {
                 (None, true, Some(processed_where))
             } else {
                 // Try to push down predicate to storage layer
@@ -2327,6 +2320,9 @@ impl Executor {
             Vec::new()
         };
 
+        // The row ids a prepared WHERE passes, when the precheck read them
+        let mut prepared_ids: Option<Vec<i64>> = None;
+
         // Pre-partition FKs by referenced column index for post-update dispatch.
         // This avoids re-borrowing schema after table.update().
         let fks_by_ref_col: FxHashMap<usize, Vec<(String, crate::core::ForeignKeyConstraint)>> =
@@ -2352,7 +2348,19 @@ impl Executor {
                 .values()
                 .any(|fks| super::foreign_key::fk_tree_needs_precheck(&self.engine, fks));
             if any_needs_precheck {
-                let parent_rows = table.collect_all_rows(where_expr.as_deref())?;
+                let parent_rows = match dml_run.as_ref().filter(|_| where_prepared) {
+                    Some(run) => {
+                        let mut rows = RowVec::new();
+                        let mut ids = Vec::new();
+                        run.passing_rows(&*table, ctx, &mut |id, row| {
+                            ids.push(id);
+                            rows.push((id, row));
+                        })?;
+                        prepared_ids = Some(ids);
+                        rows
+                    }
+                    None => table.collect_all_rows(where_expr.as_deref())?,
+                };
                 // A WHERE the semi-join rewrite refused is bound to each
                 // row here as it is in the update itself, or the check
                 // would look at rows the update does not touch
@@ -2369,13 +2377,9 @@ impl Executor {
                 } else {
                     Vec::new()
                 };
-                let mut check_vm = super::expression::ExprVM::new();
                 for (_rid, row) in parent_rows.iter() {
-                    if let Some(run) = dml_run.as_ref().filter(|_| where_prepared) {
-                        if !run.matches(&mut check_vm, &run.context(row))? {
-                            continue;
-                        }
-                    } else if needs_memory_filter {
+                    // The prepared WHERE chose these rows already
+                    if !where_prepared && needs_memory_filter {
                         if let Some(ref mem_where) = memory_where_clause {
                             evaluator.set_row_array(row);
                             let held = if where_is_correlated {
@@ -2848,7 +2852,19 @@ impl Executor {
 
             // OPTIMIZATION: Use SELECT executor to find matching row_ids, then batch update.
             // This reuses ALL SELECT optimizations: indexes, semi-joins, parallel execution, etc.
-            let rows = if let Some(ref where_clause) = memory_where_clause {
+            let rows = if let Some(run) = dml_run.as_ref().filter(|_| where_prepared) {
+                // One runner chooses the rows and asks each again as it is written
+                let mut row_ids = match prepared_ids.take() {
+                    Some(ids) => ids,
+                    None => {
+                        let mut ids = Vec::new();
+                        run.passing_rows(&*table, ctx, &mut |id, _| ids.push(id))?;
+                        ids
+                    }
+                };
+                row_ids.sort_unstable();
+                table.update_by_row_ids(&row_ids, &mut setter)?
+            } else if let Some(ref where_clause) = memory_where_clause {
                 if let Some(row_ids) = self.select_row_ids_for_dml(
                     table_name,
                     where_clause,
@@ -3005,15 +3021,6 @@ impl Executor {
             && self
                 .dml_family(stmt.where_clause.as_deref(), [], ctx)
                 .is_ok();
-        let snapshot_ctx;
-        let ctx = if where_prepared && should_auto_commit && ctx.statement_snapshot().is_none() {
-            let snapshot =
-                self.new_statement_snapshot(self.isolation_level(), ctx.statement_view())?;
-            snapshot_ctx = ctx.with_statement_snapshot(snapshot);
-            &snapshot_ctx
-        } else {
-            ctx
-        };
         let held_dml;
         let dml_run = if where_prepared {
             let (prepared, tables) = self.open_prepared_dml(
@@ -3022,6 +3029,7 @@ impl Executor {
                 &SmartString::from(effective_name),
                 stmt.where_clause.as_deref(),
                 &[],
+                standalone_tx.as_deref(),
                 ctx,
             )?;
             held_dml = prepared;
@@ -3054,7 +3062,8 @@ impl Executor {
             Option<Expression>,
         ) = if let Some(ref where_clause) = stmt.where_clause {
             if where_prepared {
-                (None, true, Some((**where_clause).clone()))
+                // The runner reads the rows a prepared WHERE passes
+                (None, true, None)
             } else if has_correlated {
                 // Try semi-join optimization for correlated EXISTS/IN
                 // Avoid cloning upfront - only clone if no optimization succeeds
@@ -3178,11 +3187,43 @@ impl Executor {
                 });
             let transaction_id = ctx.transaction_id();
 
-            // Scan all rows and collect IDs of rows to delete
-            let column_indices: Vec<usize> = (0..column_count).collect();
-            let mut scanner = table.scan(&column_indices, where_expr.as_deref())?;
             let mut rows_to_delete: Vec<(Value, Option<Row>)> = Vec::new();
             let mut rows_to_delete_by_row_id: Vec<(i64, Option<Row>)> = Vec::new();
+            // A row to delete, by its primary key or, without one, its row id
+            let mut collect = |row_id: i64, row: &Row| {
+                // Without a primary key the row itself is what the
+                // foreign keys are read from, so it is kept for them too
+                let row_data = if has_returning || (has_referencing_fks && pk_col_idx.is_none()) {
+                    Some(row.clone())
+                } else {
+                    None
+                };
+                match pk_col_idx {
+                    Some(pk_idx) => {
+                        if let Some(pk_value) = row.get(pk_idx) {
+                            rows_to_delete.push((pk_value.clone(), row_data));
+                        }
+                    }
+                    None => rows_to_delete_by_row_id.push((row_id, row_data)),
+                }
+            };
+            // A prepared WHERE's rows are read as a prepared SELECT reads them
+            if let Some(run) = &dml_run {
+                run.passing_rows(&*table, ctx, &mut |row_id, row| {
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::prepared_dml_site_ran(
+                        crate::test_failpoints::PreparedDmlSite::DeleteWhere,
+                    );
+                    collect(row_id, &row);
+                })?;
+            }
+
+            // Scan all rows and collect IDs of rows to delete
+            let column_indices: Vec<usize> = (0..column_count).collect();
+            let mut scanner = match dml_run {
+                Some(_) => None,
+                None => Some(table.scan(&column_indices, where_expr.as_deref())?),
+            };
 
             // Pre-compute column name mappings for correlated subqueries
             let column_names_arc = if has_correlated {
@@ -3226,17 +3267,14 @@ impl Executor {
             let mut outer_row_map: FxHashMap<CompactArc<str>, Value> =
                 FxHashMap::with_capacity_and_hasher(estimated_entries, Default::default());
 
-            while scanner.next() {
+            while let Some(scanner) = scanner.as_mut() {
+                if !scanner.next() {
+                    break;
+                }
                 let row = scanner.row();
 
                 // Check memory filter if needed
-                let matches = if let Some(run) = &dml_run {
-                    #[cfg(feature = "test-failpoints")]
-                    crate::test_failpoints::prepared_dml_site_ran(
-                        crate::test_failpoints::PreparedDmlSite::DeleteWhere,
-                    );
-                    run.matches(&mut delete_vm, &run.context(row))?
-                } else if needs_memory_filter {
+                let matches = if needs_memory_filter {
                     evaluator.set_row_array(row);
                     if let Some(ref where_expr) = memory_where_clause {
                         if has_correlated {
@@ -3293,27 +3331,10 @@ impl Executor {
                 };
 
                 if matches {
-                    // Without a primary key the row itself is what the
-                    // foreign keys are read from, so it is kept for them too
-                    let row_data = if has_returning || (has_referencing_fks && pk_col_idx.is_none())
-                    {
-                        Some(row.clone())
-                    } else {
-                        None
-                    };
-                    // Row matches - get primary key value for deletion.
-                    // A table without one is named by its row id instead
-                    match pk_col_idx {
-                        Some(pk_idx) => {
-                            if let Some(pk_value) = row.get(pk_idx) {
-                                rows_to_delete.push((pk_value.clone(), row_data));
-                            }
-                        }
-                        None => rows_to_delete_by_row_id.push((scanner.current_row_id(), row_data)),
-                    }
+                    collect(scanner.current_row_id(), row);
                 }
             }
-            if let Some(error) = scanner.err() {
+            if let Some(error) = scanner.as_ref().and_then(|scanner| scanner.err()) {
                 return Err(error.clone());
             }
             // Drop scanner to release borrow

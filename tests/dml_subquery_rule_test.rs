@@ -159,3 +159,67 @@ fn a_cached_dml_statement_follows_a_schema_change() {
     db.execute(sql, ()).unwrap();
     assert_eq!(rows(&db).join(" "), "1:1 2:2 3:3 4:9");
 }
+
+static TICKS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// 1 on its first call, then 2, 3 and on; registered as answering anew per call
+#[derive(Default)]
+struct Tick;
+
+impl stoolap::functions::ScalarFunction for Tick {
+    fn name(&self) -> &str {
+        "TICK"
+    }
+    fn info(&self) -> stoolap::functions::FunctionInfo {
+        use stoolap::functions::{FunctionDataType, FunctionInfo, FunctionSignature, FunctionType};
+        FunctionInfo::new(
+            "TICK",
+            FunctionType::Scalar,
+            "test counter",
+            FunctionSignature::new(FunctionDataType::Integer, vec![], 0, 0),
+        )
+        .non_deterministic()
+    }
+    fn evaluate(
+        &self,
+        _args: &[stoolap::core::Value],
+    ) -> stoolap::core::Result<stoolap::core::Value> {
+        let tick = TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        Ok(stoolap::core::Value::Integer(tick))
+    }
+    fn clone_box(&self) -> Box<dyn stoolap::functions::ScalarFunction> {
+        Box::new(Tick)
+    }
+}
+
+#[test]
+fn an_uncorrelated_subquery_answers_once_for_the_rows_it_chooses_and_writes() {
+    use std::sync::Arc;
+    let registry = stoolap::functions::registry::FunctionRegistry::new();
+    registry.register_scalar::<Tick>();
+    let mut engine = stoolap::storage::mvcc::engine::MVCCEngine::in_memory();
+    stoolap::storage::traits::Engine::open(&mut engine).unwrap();
+    let executor =
+        stoolap::executor::Executor::with_function_registry(Arc::new(engine), Arc::new(registry));
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, b INTEGER)",
+        "INSERT INTO t VALUES (1, 0), (2, 0), (3, 0)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY)",
+        "INSERT INTO u VALUES (1)",
+    ] {
+        executor.execute(sql).unwrap();
+    }
+    TICKS.store(0, std::sync::atomic::Ordering::Relaxed);
+    executor
+        .execute("UPDATE t SET b = 9 WHERE (SELECT TICK() FROM u) = 1")
+        .unwrap();
+    let mut rows = executor
+        .execute("SELECT COUNT(*) FROM t WHERE b = 9")
+        .unwrap();
+    assert!(rows.next());
+    assert_eq!(
+        rows.row().get(0).cloned(),
+        Some(stoolap::core::Value::Integer(3)),
+        "the rows the subquery chose are the rows it let the update write"
+    );
+}
