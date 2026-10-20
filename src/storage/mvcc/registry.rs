@@ -1521,10 +1521,12 @@ impl TransactionRegistry {
                 return 0;
             }
 
+            // Single-threaded: no other transaction can end while this one waits
+            if cfg!(target_arch = "wasm32") {
+                break;
+            }
             #[cfg(not(target_arch = "wasm32"))]
             std::thread::sleep(std::time::Duration::from_millis(10));
-            #[cfg(target_arch = "wasm32")]
-            break;
         }
 
         self.active_count() as i32

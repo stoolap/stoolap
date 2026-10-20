@@ -3397,11 +3397,15 @@ impl VersionStore {
 
     /// Waits until no publication counted before the close is running;
     /// false when one still is at `deadline`
-    pub fn wait_until_quiet(&self, deadline: std::time::Instant) -> bool {
+    pub fn wait_until_quiet(&self, deadline: crate::common::time_compat::Instant) -> bool {
         while self.publishing.load(Ordering::SeqCst) != 0 {
-            if std::time::Instant::now() >= deadline {
+            // Single-threaded: a publication still running never finishes
+            if cfg!(target_arch = "wasm32")
+                || crate::common::time_compat::Instant::now() >= deadline
+            {
                 return false;
             }
+            #[cfg(not(target_arch = "wasm32"))]
             std::thread::sleep(std::time::Duration::from_micros(200));
         }
         true

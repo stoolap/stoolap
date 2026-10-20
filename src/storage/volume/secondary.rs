@@ -226,8 +226,8 @@ static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
 // fetch_update is deprecated in 1.99; try_update is stable only from 1.95, above the 1.88 MSRV
 #[allow(deprecated)]
 pub fn next_generation() -> u64 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let now = crate::common::time_compat::SystemTime::now()
+        .duration_since(crate::common::time_compat::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(1);
     NEXT_GENERATION
@@ -3250,7 +3250,7 @@ fn build_side_file_staged(
     let _admitted = INDEX_BUILDS
         .try_charge(workspace_bytes)
         .ok_or_else(|| refused("a build workspace"))?;
-    let started = std::time::Instant::now();
+    let started = crate::common::time_compat::Instant::now();
     let budget = Budget::new(workspace_bytes);
     let mut report = BuildReport::default();
     // The output buffer and the writer's page buffers live for the build,

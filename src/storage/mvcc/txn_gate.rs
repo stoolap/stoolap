@@ -20,7 +20,6 @@ use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
 
 use crate::core::{Error, Result};
 
@@ -326,7 +325,12 @@ impl Backoff {
         match self.0 {
             0..=64 => std::hint::spin_loop(),
             65..=128 => std::thread::yield_now(),
-            n => std::thread::sleep(Duration::from_micros(u64::from((n - 128).min(1000)))),
+            #[cfg(target_arch = "wasm32")]
+            _ => std::hint::spin_loop(),
+            #[cfg(not(target_arch = "wasm32"))]
+            n => std::thread::sleep(std::time::Duration::from_micros(u64::from(
+                (n - 128).min(1000),
+            ))),
         }
     }
 }

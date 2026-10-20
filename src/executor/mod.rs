@@ -939,7 +939,8 @@ impl Executor {
         // owns takes both in place, a borrowed one is copied once
         let select = matches!(statement, Statement::Select(_));
         // A timed SELECT's deadline counts from before its first view
-        let started = (select && ctx.timeout_ms() > 0).then(std::time::Instant::now);
+        let started =
+            (select && ctx.timeout_ms() > 0).then(crate::common::time_compat::Instant::now);
         // A whole answer the semantic cache holds needs no view
         let mut semantic_miss = None;
         if let (Statement::Select(stmt), None, Some(slot)) =
@@ -995,7 +996,7 @@ impl Executor {
         statement: &Statement,
         mut ctx: std::borrow::Cow<'_, ExecutionContext>,
         took_view: bool,
-        started: Option<std::time::Instant>,
+        started: Option<crate::common::time_compat::Instant>,
         plan_classification: Option<
             &std::sync::OnceLock<Arc<query_classification::QueryClassification>>,
         >,

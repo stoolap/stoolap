@@ -1755,8 +1755,8 @@ impl WALManager {
                 // (power failure is the exception). Checkpoint (every 60s) moves
                 // data to fsynced volume files for full durability.
                 // Max data loss on power failure: ~1 second of commits.
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_nanos() as i64)
                     .unwrap_or(0);
                 let last = self.last_sync_time.load(Ordering::Relaxed);

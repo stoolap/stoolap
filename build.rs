@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Runs on the build host, never on wasm32
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use std::process::Command;
 use std::time::SystemTime;
 

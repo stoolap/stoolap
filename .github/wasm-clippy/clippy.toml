@@ -1,0 +1,13 @@
+# Read only by the CI wasm job (CLIPPY_CONF_DIR) on wasm32-unknown-unknown; native clippy ignores it
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "panics on wasm32-unknown-unknown; use crate::common::time_compat::Instant" },
+    { path = "std::time::SystemTime::now", reason = "panics on wasm32-unknown-unknown; use crate::common::time_compat::SystemTime" },
+    { path = "std::thread::spawn", reason = "wasm32 cannot spawn threads; gate the caller on cfg(not(target_arch = \"wasm32\"))" },
+    { path = "std::thread::Builder::spawn", reason = "wasm32 cannot spawn threads; gate the caller on cfg(not(target_arch = \"wasm32\"))" },
+    { path = "std::thread::sleep", reason = "panics on wasm32-unknown-unknown; gate the caller on cfg(not(target_arch = \"wasm32\"))" },
+    { path = "std::sync::Condvar::wait_timeout", reason = "panics on wasm32-unknown-unknown" },
+]
+disallowed-types = [
+    { path = "std::time::Instant", reason = "panics on wasm32-unknown-unknown; use crate::common::time_compat::Instant" },
+    { path = "std::time::SystemTime", reason = "panics on wasm32-unknown-unknown; use crate::common::time_compat::SystemTime" },
+]

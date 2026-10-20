@@ -199,6 +199,8 @@ db.Exec(ctx, "ANALYZE my_table")
 
 **Important**: `PRAGMA checkpoint` is the most critical command for file-based WASM databases. Without it, data stays in the hot buffer (high memory) and the WAL grows indefinitely. Call it periodically (e.g., every 60 seconds or after bulk writes).
 
+`hot_max_bytes` does not hold commits back on WASM. Natively a commit over the limit waits for the background seal, which WASM does not have, so the hot buffer only shrinks when `PRAGMA checkpoint` runs.
+
 For production file-based workloads with automatic background maintenance, use the [CGO driver]({{ '/docs/drivers/go/' | relative_url }}).
 
 ## FetchAll (Bulk Read)

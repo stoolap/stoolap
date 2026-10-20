@@ -2514,6 +2514,8 @@ impl MVCCEngine {
                             break;
                         }
                         if attempt < 4 {
+                            #[allow(clippy::disallowed_methods)]
+                            // persistence only: never in a browser
                             std::thread::sleep(std::time::Duration::from_millis(10));
                         }
                     }
@@ -2528,12 +2530,16 @@ impl MVCCEngine {
         // resources. Without this, a detached compaction thread could still
         // be rewriting manifests and deleting volume files after close returns.
         while self.compaction_running.load(Ordering::Acquire) {
+            #[allow(clippy::disallowed_methods)]
+            // only a background thread holds it; wasm32 has none
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         // No backfill starts from here, and one running stops at its next
         // volume; its files are this engine's until it has
         self.closing.store(true, Ordering::Release);
         while self.backfill_running.load(Ordering::Acquire) {
+            #[allow(clippy::disallowed_methods)]
+            // only a background thread holds it; wasm32 has none
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
@@ -4752,6 +4758,8 @@ impl MVCCEngine {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
+            #[allow(clippy::disallowed_methods)]
+            // only a background thread holds it; wasm32 has none
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let _compaction_guard = AtomicBoolGuard(&self.compaction_running);
@@ -4784,6 +4792,7 @@ impl MVCCEngine {
                         "PRAGMA SNAPSHOT timed out waiting for in-flight commits to complete",
                     ));
                 }
+                #[allow(clippy::disallowed_methods)] // persistence only: never in a browser
                 std::thread::sleep(std::time::Duration::from_micros(100));
             }
         }
@@ -5432,6 +5441,8 @@ impl MVCCEngine {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
+            #[allow(clippy::disallowed_methods)]
+            // only a background thread holds it; wasm32 has none
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         // Drop guard: release the compaction slot on any early return.
@@ -6463,6 +6474,8 @@ impl MVCCEngine {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
+            #[allow(clippy::disallowed_methods)]
+            // only a background thread holds it; wasm32 has none
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         self.run_compaction_guarded()
@@ -8820,7 +8833,7 @@ fn close_and_settle(
     let closure = super::version_store::ColumnClosure::close(store);
     #[cfg(feature = "test-failpoints")]
     crate::test_failpoints::column_change_waiting();
-    let deadline = std::time::Instant::now() + SETTLE_WAIT;
+    let deadline = Instant::now() + SETTLE_WAIT;
     let refused = || Error::TableHasOpenTransactionRows {
         table: name.to_string(),
     };
@@ -8829,9 +8842,11 @@ fn close_and_settle(
     }
     let open = |txn_id: i64| txn_id > 0 && registry.is_open(txn_id);
     while closure.store().holds_versions_of(&open) {
-        if std::time::Instant::now() >= deadline {
+        // Single-threaded: no other transaction can finish while this one waits
+        if cfg!(target_arch = "wasm32") || Instant::now() >= deadline {
             return Err(refused());
         }
+        #[cfg(not(target_arch = "wasm32"))]
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     Ok(closure)
@@ -10010,19 +10025,23 @@ impl TransactionEngineOperations for EngineOperations {
         }
         limits.admission_waits.fetch_add(1, Ordering::Relaxed);
         limits.seal_requested.store(true, Ordering::Release);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut guard = limits.admission.0.lock().unwrap();
-        while over() {
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                break;
+        // wasm32 runs no seal thread, so nothing could end the wait
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let deadline = Instant::now() + std::time::Duration::from_secs(10);
+            let mut guard = limits.admission.0.lock().unwrap();
+            while over() {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                guard = limits
+                    .admission
+                    .1
+                    .wait_timeout(guard, deadline - now)
+                    .unwrap()
+                    .0;
             }
-            guard = limits
-                .admission
-                .1
-                .wait_timeout(guard, deadline - now)
-                .unwrap()
-                .0;
         }
     }
 }
