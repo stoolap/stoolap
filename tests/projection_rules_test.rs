@@ -109,6 +109,12 @@ fn every_source_projects_by_one_rule() {
             "(VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30)) AS src(id, g, k)",
             "",
         ),
+        (
+            "temporal",
+            "",
+            "t AS OF TIMESTAMP '2050-01-01 00:00:00' AS src",
+            "",
+        ),
     ];
     let star = ["id", "g", "k"];
     let shapes: Vec<Shape> = vec![
@@ -287,6 +293,12 @@ fn every_source_projects_by_one_rule() {
 #[test]
 fn a_source_without_a_table_projects_by_the_same_rule() {
     let db = open("projection_rules_no_table");
+    for sql in [
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, a INTEGER, \"Κ\" INTEGER)",
+        "INSERT INTO u VALUES (1, 1, 10)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
     let mut wrong = Vec::new();
     for (sql, columns, want) in [
         (
@@ -308,6 +320,11 @@ fn a_source_without_a_table_projects_by_the_same_rule() {
         (
             "SELECT COUNT(*) AS n, ROW_NUMBER() OVER () AS rn",
             vec!["n", "rn"],
+            rows(&[&[1, 1]]),
+        ),
+        (
+            "SELECT u.a AS \"Κ\", COUNT(*) AS n FROM u GROUP BY u.a, u.\"Κ\" HAVING \"Κ\" > 5",
+            vec!["Κ", "n"],
             rows(&[&[1, 1]]),
         ),
         (

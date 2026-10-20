@@ -43,7 +43,7 @@ use super::query::order_by_inputs;
 use super::query_cache::{CompiledCountDistinct, CompiledExecution};
 use super::query_classification::QueryClassification;
 use super::result::ExecutorResult;
-use super::utils::build_column_index_map;
+use super::utils::{build_column_index_map, eq_folded};
 use super::window::WindowOutput;
 use super::Executor;
 
@@ -490,12 +490,14 @@ pub(crate) fn aggregate_slot_keys(
     for (i, agg) in aggregations.iter().enumerate() {
         slots.entry(agg.key).or_insert(group_items.len() + i);
     }
-    let names_a_group_column = |alias: &str| {
+    // The alias comes lowercased; the column keeps its written spelling
+    let names_a_group_column = |alias_lower: &str| {
         group_items.iter().any(|item| match item {
-            GroupByItem::Column(name) => name
-                .rsplit_once('.')
-                .map_or(name.as_str(), |(_, bare)| bare)
-                .eq_ignore_ascii_case(alias),
+            GroupByItem::Column(name) => eq_folded(
+                name.rsplit_once('.')
+                    .map_or(name.as_str(), |(_, bare)| bare),
+                alias_lower,
+            ),
             GroupByItem::Expression { .. } => false,
         })
     };

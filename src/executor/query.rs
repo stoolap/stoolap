@@ -11176,6 +11176,12 @@ impl Executor {
         let table = tx.get_statement_table(table_name)?;
         let schema = table.schema().clone();
         let all_columns: Vec<String> = schema.column_names_owned().to_vec();
+        // The name the statement gives the source: its alias, or the table's
+        let source_alias = stmt
+            .table_expr
+            .as_deref()
+            .and_then(get_table_alias_from_expr);
+        let source_alias = source_alias.as_deref().unwrap_or(table_name);
 
         // Parse temporal value
         let temporal_value = self.parse_temporal_value(as_of, ctx)?;
@@ -11228,7 +11234,7 @@ impl Executor {
             SelectShape::laid_out(Self::result_layout(
                 stmt,
                 &all_columns,
-                Some(table_name),
+                Some(source_alias),
                 columns,
             ))
         };
@@ -11240,13 +11246,13 @@ impl Executor {
                 classification,
                 rows,
                 &all_columns,
-                Some(table_name),
+                Some(source_alias),
             );
         }
 
         // Project rows
         let (projected_rows, final_columns) =
-            self.project_rows_for_select(stmt, rows, &all_columns, Some(table_name), ctx)?;
+            self.project_rows_for_select(stmt, rows, &all_columns, Some(source_alias), ctx)?;
 
         let shape = shape_of(&final_columns);
         let final_columns_arc = CompactArc::new(final_columns);
