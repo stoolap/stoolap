@@ -495,12 +495,10 @@ fn true_for_no_row(expr: &Expression, ctx: &ExecutionContext) -> bool {
         }
     }
     statement_constant(expr, global_registry())
-        && ExpressionEval::compile(expr, &[]).is_ok_and(|eval| {
-            matches!(
-                eval.with_context(ctx).eval_slice(&Row::new()),
-                Ok(Value::Boolean(false) | Value::Null(_))
-            )
-        })
+        && matches!(
+            super::expression::evaluate_once(expr, Some(ctx)),
+            Ok(Value::Boolean(false) | Value::Null(_))
+        )
 }
 
 /// The side an index join probes, given what the right table offers
@@ -1843,11 +1841,7 @@ impl Executor {
             if !statement_constant(expr, global_registry()) {
                 return None;
             }
-            ExpressionEval::compile(expr, &[])
-                .ok()?
-                .with_context(ctx)
-                .eval_slice(&Row::new())
-                .ok()
+            super::expression::evaluate_once(expr, Some(ctx)).ok()
         };
         let mut comparisons = Vec::new();
         for conjunct in extract_and_conditions(filter) {
@@ -1909,10 +1903,7 @@ impl Executor {
         // Evaluate arguments to Values
         let mut arg_values = Vec::with_capacity(tvf_source.arguments.len());
         for arg in &tvf_source.arguments {
-            let value = ExpressionEval::compile(arg, &[])?
-                .with_context(ctx)
-                .eval_slice(&Row::new())?;
-            arg_values.push(value);
+            arg_values.push(super::expression::evaluate_once(arg, Some(ctx))?);
         }
 
         if let Some(range) = range_hint {
@@ -1961,9 +1952,7 @@ impl Executor {
                 Some(outer) => super::utils::substitute_outer_references(&processed_where, outer),
                 None => processed_where,
             };
-            let where_result = ExpressionEval::compile(&processed_where, &[])?
-                .with_context(ctx)
-                .eval_slice(&Row::new())?;
+            let where_result = super::expression::evaluate_once(&processed_where, Some(ctx))?;
             let passes = match where_result {
                 Value::Boolean(b) => b,
                 Value::Null(_) => false, // NULL in WHERE is treated as false
@@ -2016,9 +2005,8 @@ impl Executor {
             let bound = ctx
                 .outer_row()
                 .map(|outer| super::utils::substitute_outer_references(col_expr, outer));
-            let value = ExpressionEval::compile(bound.as_ref().unwrap_or(col_expr), &[])?
-                .with_context(ctx)
-                .eval_slice(&Row::new())?;
+            let value =
+                super::expression::evaluate_once(bound.as_ref().unwrap_or(col_expr), Some(ctx))?;
             values.push(value);
         }
 
@@ -11152,9 +11140,7 @@ impl Executor {
         stmt: &ExpressionStatement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        let value = ExpressionEval::compile(&stmt.expression, &[])?
-            .with_context(ctx)
-            .eval_slice(&Row::new())?;
+        let value = super::expression::evaluate_once(&stmt.expression, Some(ctx))?;
         let columns = vec!["result".to_string()];
         let mut rows = RowVec::with_capacity(1);
         rows.push((0, Row::from_values(vec![value])));
@@ -11273,9 +11259,7 @@ impl Executor {
 
     /// Parse temporal value from AS OF clause
     fn parse_temporal_value(&self, as_of: &AsOfClause, ctx: &ExecutionContext) -> Result<i64> {
-        let value = ExpressionEval::compile(&as_of.value, &[])?
-            .with_context(ctx)
-            .eval_slice(&Row::new())?;
+        let value = super::expression::evaluate_once(&as_of.value, Some(ctx))?;
 
         match as_of.as_of_type.to_uppercase().as_str() {
             "TRANSACTION" => {

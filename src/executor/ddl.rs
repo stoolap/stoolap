@@ -157,8 +157,13 @@ fn constraint_expression(
         )));
     }
     if let Some(columns) = columns {
-        super::expression::compile_expression(expr, columns)
-            .map_err(|e| Error::invalid_argument(format!("the {kind} of {owner}: {e}")))?;
+        super::expression::ExprCompiler::new(
+            &super::expression::CompileContext::with_global_registry(columns),
+        )
+        .compile(expr)
+        .map_err(|e| {
+            Error::invalid_argument(format!("the {kind} of {owner}: Compile error: {e}"))
+        })?;
     }
     Ok(())
 }

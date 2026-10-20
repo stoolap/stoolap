@@ -38,16 +38,19 @@
 
 mod compiler;
 mod evaluator_bridge;
+mod once;
 mod ops;
 mod program;
 mod vm;
 
 pub use compiler::{CompileContext, CompileError, ExprCompiler};
-pub(crate) use evaluator_bridge::try_eval_constant_expr_with_context;
 pub use evaluator_bridge::{
     clear_program_cache, compile_expression, compile_expression_with_context,
     compute_expression_hash, CompiledEvaluator, ExpressionEval, JoinFilter, MultiExpressionEval,
     RowFilter, SharedProgram,
+};
+pub(crate) use once::{
+    compile_once, evaluate_once, execute_once, try_eval_constant_expr_with_context,
 };
 pub use ops::{CompareOp, Op, QuantifiedMembers};
 pub use program::Program;

@@ -71,6 +71,16 @@ pub fn clear_program_cache() {
     *guard = None;
 }
 
+/// Whether the process-wide cache holds a program for `expr` over `columns`
+#[cfg(test)]
+pub(crate) fn program_cached(expr: &Expression, columns: &[String]) -> bool {
+    let key = compute_cache_key(expr, columns);
+    PROGRAM_CACHE
+        .lock()
+        .as_ref()
+        .is_some_and(|cache| cache.contains(&key))
+}
+
 /// Compute cache key from expression and columns using efficient recursive hashing.
 /// This avoids the overhead of Debug formatting by directly hashing expression structure.
 ///
@@ -425,126 +435,6 @@ fn compile_expression_cached(expr: &Expression, columns: &[String]) -> Result<Sh
 /// * `CompactArc<Program>` that can be executed with `RowFilter` or `ExprVM`
 pub fn compile_expression(expr: &Expression, columns: &[String]) -> Result<SharedProgram> {
     compile_expression_cached(expr, columns)
-}
-
-/// Evaluate a column-free AST expression to a concrete Value at query time.
-///
-/// Returns `Some(value)` if the expression is entirely self-contained (no column
-/// references) and can be evaluated. Returns `None` if the expression references
-/// columns, contains context-dependent functions, or evaluation fails.
-///
-/// This is used by pushdown rules to resolve compound constant expressions like
-/// `NOW() - INTERVAL '24 hours'` into concrete Values for index/storage filtering.
-///
-/// Non-deterministic functions like NOW() and RANDOM() ARE allowed here — they
-/// produce valid values with a blank context (they read system clock / RNG).
-/// Only context-dependent functions (CURRENT_TRANSACTION_ID) are rejected because
-/// they require ExecuteContext fields that are unavailable here.
-///
-/// Note: this is distinct from compile-time constant folding (which rejects ALL
-/// non-deterministic functions to avoid caching stale values in the program LRU).
-pub(crate) fn try_eval_constant_expr_with_context(
-    expr: &Expression,
-    context: Option<&ExecutionContext>,
-) -> Option<Value> {
-    use std::cell::RefCell;
-
-    // Reject expressions that require execution context (e.g. transaction_id).
-    // CURRENT_TRANSACTION_ID is the only such function; it emits Op::LoadTransactionId
-    // which returns NULL with a blank context.
-    if contains_context_dependent_function(expr) {
-        return None;
-    }
-
-    thread_local! {
-        static EVAL_VM: RefCell<ExprVM> = RefCell::new(ExprVM::new());
-        static EVAL_ROW: Row = Row::new();
-    }
-
-    let empty_cols: &[String] = &[];
-    let ctx = CompileContext::with_global_registry(empty_cols);
-    let compiler = ExprCompiler::new(&ctx);
-    let program = compiler.compile(expr).ok()?;
-
-    EVAL_ROW.with(|empty_row| {
-        let mut exec_ctx = ExecuteContext::new(empty_row);
-        if let Some(context) = context {
-            exec_ctx = exec_ctx
-                .with_params(context.params())
-                .with_named_params(context.named_params());
-        }
-        EVAL_VM.with(|vm_cell| {
-            let mut vm = vm_cell.borrow_mut();
-            vm.execute(&program, &exec_ctx).ok()
-        })
-    })
-}
-
-/// Check if an expression contains functions that depend on ExecuteContext
-/// (transaction state, session variables, etc.) and cannot be evaluated
-/// with a blank context. Currently only CURRENT_TRANSACTION_ID.
-fn contains_context_dependent_function(expr: &Expression) -> bool {
-    match expr {
-        Expression::FunctionCall(func) => {
-            func.function.eq_ignore_ascii_case("CURRENT_TRANSACTION_ID")
-                || func
-                    .arguments
-                    .iter()
-                    .any(contains_context_dependent_function)
-        }
-        Expression::Infix(infix) => {
-            contains_context_dependent_function(&infix.left)
-                || contains_context_dependent_function(&infix.right)
-        }
-        Expression::Prefix(prefix) => contains_context_dependent_function(&prefix.right),
-        Expression::Cast(cast) => contains_context_dependent_function(&cast.expr),
-        Expression::Case(case) => {
-            case.value
-                .as_ref()
-                .is_some_and(|v| contains_context_dependent_function(v))
-                || case.when_clauses.iter().any(|w| {
-                    contains_context_dependent_function(&w.condition)
-                        || contains_context_dependent_function(&w.then_result)
-                })
-                || case
-                    .else_value
-                    .as_ref()
-                    .is_some_and(|v| contains_context_dependent_function(v))
-        }
-        Expression::Between(between) => {
-            contains_context_dependent_function(&between.expr)
-                || contains_context_dependent_function(&between.lower)
-                || contains_context_dependent_function(&between.upper)
-        }
-        Expression::In(in_expr) => {
-            contains_context_dependent_function(&in_expr.left)
-                || contains_context_dependent_function(&in_expr.right)
-        }
-        Expression::Like(like) => {
-            contains_context_dependent_function(&like.left)
-                || contains_context_dependent_function(&like.pattern)
-                || like
-                    .escape
-                    .as_ref()
-                    .is_some_and(|e| contains_context_dependent_function(e))
-        }
-        Expression::List(list) => list
-            .elements
-            .iter()
-            .any(contains_context_dependent_function),
-        Expression::ExpressionList(list) => list
-            .expressions
-            .iter()
-            .any(contains_context_dependent_function),
-        Expression::Aliased(aliased) => contains_context_dependent_function(&aliased.expression),
-        Expression::Distinct(distinct) => contains_context_dependent_function(&distinct.expr),
-        Expression::AllAny(all_any) => contains_context_dependent_function(&all_any.left),
-        Expression::InHashSet(in_hash) => contains_context_dependent_function(&in_hash.column),
-        Expression::QuantifiedSet(quantified) => {
-            contains_context_dependent_function(&quantified.left)
-        }
-        _ => false,
-    }
 }
 
 /// Compile an expression with full context (parameters, outer columns, etc.)

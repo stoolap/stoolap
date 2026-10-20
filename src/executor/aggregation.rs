@@ -610,13 +610,8 @@ pub(crate) fn aggregate_extra_args(
                             arg
                         )));
                     }
-                    let eval = super::expression::ExpressionEval::compile(arg, &[])?;
-                    let evaluated = match ctx {
-                        Some(ctx) => eval.with_context(ctx),
-                        None => eval,
-                    }
-                    .eval_slice(&Row::new());
-                    evaluated.unwrap_or_else(|error| {
+                    let program = super::expression::compile_once(arg)?;
+                    super::expression::execute_once(&program, ctx).unwrap_or_else(|error| {
                         failed.get_or_insert(error);
                         Value::null_unknown()
                     })
