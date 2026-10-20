@@ -12520,10 +12520,11 @@ impl Executor {
                     Some(&slots),
                     None,
                 )?;
+                use crate::executor::expression::Op;
                 if filter
                     .ops()
                     .iter()
-                    .any(|op| matches!(op, crate::executor::expression::Op::CallScalar { .. }))
+                    .any(|op| matches!(op, Op::CallScalar { .. } | Op::NativeFn1(_)))
                 {
                     return Ok(None);
                 }
