@@ -226,8 +226,8 @@ fn input_column_index(columns: &[String], qualifier: Option<&str>, name: &str) -
 }
 
 /// Where the bare name starts in `column` when a qualified star over
-/// `qualifier` takes it, by `star_takes_lowered`; only a non-ASCII name is
-/// lowercased into a copy
+/// `qualifier` takes it, by `star_takes_lowered`'s rule evaluated on the
+/// lowercased characters, which copies only a name holding `Σ`
 fn qualified_star_name_start(column: &str, qualifier: &str) -> Option<usize> {
     if column.is_ascii() && qualifier.is_ascii() {
         let q = qualifier.len();
@@ -236,12 +236,25 @@ fn qualified_star_name_start(column: &str, qualifier: &str) -> Option<usize> {
             && column[..q].eq_ignore_ascii_case(qualifier))
         .then_some(q + 1);
     }
-    let qualifier = qualifier.to_lowercase();
-    star_takes_lowered(&column.to_lowercase(), &qualifier).then(|| {
+    let takes = with_lowercase(column, |column| {
+        with_lowercase(qualifier, |qualifier| {
+            for q in qualifier {
+                if column.next() != Some(q) {
+                    return false;
+                }
+            }
+            true
+        }) && column.next() == Some('.')
+    });
+    takes.then(|| {
         column
             .match_indices('.')
             .map(|(dot, _)| dot + 1)
-            .find(|&start| column[..start - 1].to_lowercase() == qualifier)
+            .find(|&start| {
+                with_lowercase(&column[..start - 1], |prefix| {
+                    with_lowercase(qualifier, |qualifier| prefix.eq(qualifier))
+                })
+            })
             .unwrap_or(0)
     })
 }
@@ -359,8 +372,8 @@ use super::utils::{
     eq_folded_qualified, expression_contains_aggregate, extract_and_conditions,
     extract_base_column_name, extract_join_keys_and_residual, filter_references_column,
     flatten_and_predicates, flip_operator, get_table_alias_from_expr, index_join_residual,
-    infix_to_operator, order_by_names_an_alias, star_takes_lowered, string_literal_value,
-    strip_table_qualifier, substitute_filter_column, visit_column_refs,
+    infix_to_operator, order_by_names_an_alias, string_literal_value, strip_table_qualifier,
+    substitute_filter_column, visit_column_refs, with_lowercase,
 };
 use super::volatility::{expression_volatility, statement_constant};
 use super::window::{WindowPreGroupedState, WindowPreSortedState};
