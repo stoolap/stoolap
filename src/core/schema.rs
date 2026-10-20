@@ -770,26 +770,39 @@ impl Schema {
             .get_column_index(old_name)
             .ok_or_else(|| Error::ColumnNotFound(old_name.to_string()))?;
 
-        // Every CHECK reads the row by name, so each follows the column
-        let old_lower = old_name.to_lowercase();
+        // Every CHECK reads the row by name: each name bound to the column
+        // follows it, and every name must bind as before once renamed
+        use crate::executor::expression::CompileContext;
+        let before: Vec<String> = self.columns.iter().map(|c| c.name.clone()).collect();
+        let mut after = before.clone();
+        after[idx] = new_name.clone();
+        let (old_binding, new_binding) = (
+            CompileContext::with_global_registry(&before),
+            CompileContext::with_global_registry(&after),
+        );
+        let bound = |binding: &CompileContext, expr: &crate::parser::ast::Expression| {
+            let mut columns = Vec::new();
+            crate::executor::utils::visit_column_refs(expr, &mut |e| {
+                columns.push(binding.reference(e).and_then(|r| r.row_column()));
+            });
+            columns
+        };
         let renamed = |text: &String| -> Result<Option<String>> {
             let parse = crate::parser::parse_stored_expression;
             let mut expr = parse(text, "CHECK", &self.table_name)?;
-            let before = expr.to_string();
-            expr.rename_column(&old_lower, &new_name);
-            let after = expr.to_string();
-            if after == before {
-                return Ok(None);
+            let reads = bound(&old_binding, &expr);
+            let binds = |e: &crate::parser::ast::Expression| {
+                old_binding.reference(e).and_then(|r| r.row_column()) == Some(idx as u16)
+            };
+            expr.rename_references(&binds, &new_name);
+            let rewritten = expr.to_string();
+            let reread = parse(&rewritten, "CHECK", &self.table_name).ok();
+            if reread.map(|e| bound(&new_binding, &e)) != Some(reads) {
+                return Err(Error::invalid_argument(format!(
+                    "cannot rename {old_name} to {new_name}: the CHECK {text} would read another column"
+                )));
             }
-            // The stored text is read back by name: the new one must read as itself
-            match parse(&new_name, "CHECK", &self.table_name) {
-                Ok(crate::parser::ast::Expression::Identifier(id)) if id.value == new_name => {
-                    Ok(Some(after))
-                }
-                _ => Err(Error::invalid_argument(format!(
-                    "a CHECK reads {old_name}, and {new_name} does not read back as a column name"
-                ))),
-            }
+            Ok((rewritten != *text).then_some(rewritten))
         };
         let columns = self
             .columns

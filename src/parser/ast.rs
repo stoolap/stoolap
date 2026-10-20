@@ -164,68 +164,71 @@ impl fmt::Display for Expression {
 }
 
 impl Expression {
-    /// Renames each reference to the column `old` (lowercase), bare or
-    /// qualified, as `new`. A subquery is a scope of its own and keeps its
-    /// names; every variant is matched, so a new one has to say what it reads
-    pub fn rename_column(&mut self, old: &str, new: &str) {
-        fn rename(id: &mut Identifier, old: &str, new: &str) {
-            if id.value_lower == old {
-                id.value = SmartString::from(new);
-                id.value_lower = SmartString::from(new.to_lowercase());
-            }
-        }
+    /// Replaces each name, bare or qualified, that `binds` says reads the
+    /// renamed column with the bare name `new`. A subquery is a scope of its
+    /// own and keeps its names; every variant is matched, so a new one has
+    /// to say what it reads
+    pub fn rename_references(&mut self, binds: &dyn Fn(&Expression) -> bool, new: &str) {
         let each = |exprs: &mut [&mut Expression]| {
             for expr in exprs {
-                expr.rename_column(old, new);
+                expr.rename_references(binds, new);
             }
         };
         match self {
-            Expression::Identifier(id) => rename(id, old, new),
-            Expression::QualifiedIdentifier(q) => rename(&mut q.name, old, new),
-            Expression::Prefix(e) => e.right.rename_column(old, new),
+            Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => {
+                if binds(self) {
+                    *self = Expression::Identifier(Identifier {
+                        value: SmartString::from(new),
+                        value_lower: SmartString::from(new.to_lowercase()),
+                        position: self.position(),
+                        quoted: false,
+                    });
+                }
+            }
+            Expression::Prefix(e) => e.right.rename_references(binds, new),
             Expression::Infix(e) => each(&mut [&mut *e.left, &mut *e.right]),
             Expression::List(e) => e
                 .elements
                 .iter_mut()
-                .for_each(|e| e.rename_column(old, new)),
+                .for_each(|e| e.rename_references(binds, new)),
             Expression::ExpressionList(e) => e
                 .expressions
                 .iter_mut()
-                .for_each(|e| e.rename_column(old, new)),
-            Expression::Distinct(e) => e.expr.rename_column(old, new),
-            Expression::AllAny(e) => e.left.rename_column(old, new),
+                .for_each(|e| e.rename_references(binds, new)),
+            Expression::Distinct(e) => e.expr.rename_references(binds, new),
+            Expression::AllAny(e) => e.left.rename_references(binds, new),
             Expression::In(e) => each(&mut [&mut *e.left, &mut *e.right]),
-            Expression::InHashSet(e) => e.column.rename_column(old, new),
-            Expression::QuantifiedSet(e) => e.left.rename_column(old, new),
+            Expression::InHashSet(e) => e.column.rename_references(binds, new),
+            Expression::QuantifiedSet(e) => e.left.rename_references(binds, new),
             Expression::Between(e) => each(&mut [&mut *e.expr, &mut *e.lower, &mut *e.upper]),
             Expression::Like(e) => {
                 each(&mut [&mut *e.left, &mut *e.pattern]);
                 if let Some(escape) = e.escape.as_deref_mut() {
-                    escape.rename_column(old, new);
+                    escape.rename_references(binds, new);
                 }
             }
             Expression::Case(e) => {
                 if let Some(value) = e.value.as_deref_mut() {
-                    value.rename_column(old, new);
+                    value.rename_references(binds, new);
                 }
                 for when in &mut e.when_clauses {
                     each(&mut [&mut when.condition, &mut when.then_result]);
                 }
                 if let Some(other) = e.else_value.as_deref_mut() {
-                    other.rename_column(old, new);
+                    other.rename_references(binds, new);
                 }
             }
-            Expression::Cast(e) => e.expr.rename_column(old, new),
-            Expression::FunctionCall(call) => call.rename_column(old, new),
-            Expression::Aliased(e) => e.expression.rename_column(old, new),
+            Expression::Cast(e) => e.expr.rename_references(binds, new),
+            Expression::FunctionCall(call) => call.rename_references(binds, new),
+            Expression::Aliased(e) => e.expression.rename_references(binds, new),
             Expression::Window(e) => {
-                e.function.rename_column(old, new);
+                e.function.rename_references(binds, new);
                 e.partition_by
                     .iter_mut()
-                    .for_each(|e| e.rename_column(old, new));
+                    .for_each(|e| e.rename_references(binds, new));
                 e.order_by
                     .iter_mut()
-                    .for_each(|o| o.expression.rename_column(old, new));
+                    .for_each(|o| o.expression.rename_references(binds, new));
             }
             Expression::IntegerLiteral(_)
             | Expression::FloatLiteral(_)
@@ -1102,17 +1105,17 @@ pub struct FunctionCall {
 }
 
 impl FunctionCall {
-    /// `Expression::rename_column` over the call's arguments, FILTER and ORDER BY
-    pub fn rename_column(&mut self, old: &str, new: &str) {
+    /// `Expression::rename_references` over the call's arguments, FILTER and ORDER BY
+    pub fn rename_references(&mut self, binds: &dyn Fn(&Expression) -> bool, new: &str) {
         self.arguments
             .iter_mut()
-            .for_each(|e| e.rename_column(old, new));
+            .for_each(|e| e.rename_references(binds, new));
         if let Some(filter) = self.filter.as_deref_mut() {
-            filter.rename_column(old, new);
+            filter.rename_references(binds, new);
         }
         self.order_by
             .iter_mut()
-            .for_each(|o| o.expression.rename_column(old, new));
+            .for_each(|o| o.expression.rename_references(binds, new));
     }
 }
 

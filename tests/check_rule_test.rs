@@ -163,6 +163,46 @@ fn a_check_reads_a_column_whose_name_holds_a_dot() {
 }
 
 #[test]
+fn rename_follows_the_column_a_check_binds_to() {
+    for (sql, name) in [
+        ("ALTER TABLE c RENAME COLUMN b TO z", "rename_last_part"),
+        ("ALTER TABLE c RENAME COLUMN \"a.b\" TO x", "rename_dotted"),
+    ] {
+        let db = Database::open(&format!("memory://check_{name}")).unwrap();
+        db.execute(
+            "CREATE TABLE c (id INTEGER PRIMARY KEY, \"a.b\" INTEGER CHECK (\"a.b\" > 0), b INTEGER, CHECK (b < 10))",
+            (),
+        )
+        .unwrap();
+        db.execute(sql, ()).unwrap();
+        db.execute("INSERT INTO c VALUES (1, 1, 1)", ()).unwrap();
+        for row in ["(2, -1, 1)", "(2, 1, 20)"] {
+            assert!(
+                db.execute(&format!("INSERT INTO c VALUES {row}"), ())
+                    .is_err(),
+                "after {sql}, {row} was stored"
+            );
+        }
+    }
+}
+
+#[test]
+fn rename_refuses_a_name_that_would_rebind_a_check() {
+    let db = Database::open("memory://check_rename_rebind").unwrap();
+    db.execute(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, b INTEGER, z INTEGER, CHECK (c.b > 0))",
+        (),
+    )
+    .unwrap();
+    let sql = "ALTER TABLE c RENAME COLUMN z TO \"c.b\"";
+    assert!(
+        db.execute(sql, ()).is_err(),
+        "{sql} moved CHECK (c.b > 0) onto z"
+    );
+    refused(&db, &["INSERT INTO c VALUES (1, -1, 1)"]);
+}
+
+#[test]
 fn an_update_runs_a_volatile_check_whatever_it_sets() {
     let db = Database::open("memory://check_volatile").unwrap();
     db.execute(
