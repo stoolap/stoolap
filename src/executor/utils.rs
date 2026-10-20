@@ -2664,7 +2664,7 @@ pub fn compute_join_projection(
 /// Case-insensitive comparison of a column name against an already
 /// lowercased name, folding the Unicode way without allocating.
 #[inline]
-fn eq_folded(column: &str, lower: &str) -> bool {
+pub(crate) fn eq_folded(column: &str, lower: &str) -> bool {
     if column.is_ascii() && lower.is_ascii() {
         column.eq_ignore_ascii_case(lower)
     } else {
@@ -2678,7 +2678,7 @@ fn eq_folded(column: &str, lower: &str) -> bool {
 /// The same for `qualifier.name`, compared as one string so that a dot
 /// inside a quoted qualifier or name is not taken for the separator.
 #[inline]
-fn eq_folded_qualified(column: &str, qualifier: &str, name: &str) -> bool {
+pub(crate) fn eq_folded_qualified(column: &str, qualifier: &str, name: &str) -> bool {
     if column.is_ascii() && qualifier.is_ascii() && name.is_ascii() {
         let q = qualifier.len();
         column.len() == q + 1 + name.len()

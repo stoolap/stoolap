@@ -208,18 +208,41 @@ pub(crate) fn order_by_inputs(stmt: &SelectStatement, columns: &[String]) -> Vec
 
 /// The input column a plain column reference reads, as the projection finds
 /// it: the qualified name, then the bare name, then a qualified column whose
-/// last part is the bare name
+/// last part is the bare name. The names come lowercased
 fn input_column_index(columns: &[String], qualifier: Option<&str>, name: &str) -> Option<usize> {
-    let exact = |want: &str| columns.iter().position(|c| c.eq_ignore_ascii_case(want));
     qualifier
-        .and_then(|qualifier| exact(&format!("{qualifier}.{name}")))
-        .or_else(|| exact(name))
+        .and_then(|qualifier| {
+            columns
+                .iter()
+                .position(|c| eq_folded_qualified(c, qualifier, name))
+        })
+        .or_else(|| columns.iter().position(|c| eq_folded(c, name)))
         .or_else(|| {
             columns.iter().position(|c| {
                 c.rsplit_once('.')
-                    .is_some_and(|(_, last)| last.eq_ignore_ascii_case(name))
+                    .is_some_and(|(_, last)| eq_folded(last, name))
             })
         })
+}
+
+/// The length of `qualifier.` when `column` starts with it, the qualifier
+/// lowercased, so the bare name is what follows
+fn qualified_prefix_len(column: &str, qualifier: &str) -> Option<usize> {
+    column
+        .match_indices('.')
+        .map(|(dot, _)| dot)
+        .find(|&dot| eq_folded(&column[..dot], qualifier))
+        .map(|dot| dot + 1)
+}
+
+/// `name` as `eq_folded` takes it: borrowed when ASCII, which it compares
+/// ignoring case, or already lowercase
+fn folded(name: &str) -> std::borrow::Cow<'_, str> {
+    if !name.is_ascii() && name.chars().any(char::is_uppercase) {
+        std::borrow::Cow::Owned(name.to_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(name)
+    }
 }
 
 /// What a SELECT's rows carry to its ORDER BY: the projection deferred past
@@ -317,12 +340,12 @@ use super::row_count::{row_counts, rows_needed, static_row_counts, RowCounts};
 use super::utils::compute_join_projection;
 use super::utils::{
     add_table_qualifier, build_column_index_map, collect_table_qualifiers,
-    collect_unqualified_columns, column_kinds, combine_predicates_with_and, dummy_token,
-    expression_contains_aggregate, extract_and_conditions, extract_base_column_name,
-    extract_join_keys_and_residual, filter_references_column, flatten_and_predicates,
-    flip_operator, get_table_alias_from_expr, index_join_residual, infix_to_operator,
-    order_by_names_an_alias, string_literal_value, strip_table_qualifier, substitute_filter_column,
-    visit_column_refs,
+    collect_unqualified_columns, column_kinds, combine_predicates_with_and, dummy_token, eq_folded,
+    eq_folded_qualified, expression_contains_aggregate, extract_and_conditions,
+    extract_base_column_name, extract_join_keys_and_residual, filter_references_column,
+    flatten_and_predicates, flip_operator, get_table_alias_from_expr, index_join_residual,
+    infix_to_operator, order_by_names_an_alias, string_literal_value, strip_table_qualifier,
+    substitute_filter_column, visit_column_refs,
 };
 use super::volatility::{expression_volatility, statement_constant};
 use super::window::{WindowPreGroupedState, WindowPreSortedState};
@@ -10131,7 +10154,7 @@ impl Executor {
         for name in appended {
             let input = match ExprKey::from_hidden_column_name(name) {
                 Some(_) => None,
-                None => match name.rsplit_once('.') {
+                None => match folded(name).rsplit_once('.') {
                     Some((qualifier, bare)) => {
                         input_column_index(all_columns, Some(qualifier), bare)
                     }
@@ -10163,17 +10186,6 @@ impl Executor {
             }
         };
 
-        // OPTIMIZATION: Pre-compute lowercase column names once to avoid per-column to_lowercase()
-        // Only compute if we have QualifiedStar expressions
-        let all_columns_lower: Option<Vec<String>> = if select_exprs
-            .iter()
-            .any(|e| matches!(e, Expression::QualifiedStar(_)))
-        {
-            Some(all_columns.iter().map(|c| c.to_lowercase()).collect())
-        } else {
-            None
-        };
-
         for (i, expr) in select_exprs.iter().enumerate() {
             match expr {
                 Expression::Star(_) => {
@@ -10186,32 +10198,24 @@ impl Executor {
                 }
                 Expression::QualifiedStar(qs) => {
                     // SELECT t.* - add columns matching the qualifier
-                    let qualifier_lower = qs.qualifier.to_lowercase();
-                    let qualifier_len = qualifier_lower.len();
+                    let qualifier = folded(&qs.qualifier);
                     let mut found_any = false;
-                    // Use pre-computed lowercase columns
-                    if let Some(ref cols_lower) = all_columns_lower {
-                        for (idx, col_lower) in cols_lower.iter().enumerate() {
-                            // Inline prefix check: "qualifier." without format! allocation
-                            if col_lower.len() > qualifier_len
-                                && col_lower.starts_with(qualifier_lower.as_str())
-                                && col_lower.as_bytes()[qualifier_len] == b'.'
-                            {
-                                // Strip "qualifier." from the column name for the output
-                                // e.g., "e.name" becomes "name"
-                                if !laid_out {
-                                    names.push(all_columns[idx][qualifier_len + 1..].to_string());
-                                }
-                                source(i, Some(idx));
-                                found_any = true;
+                    for (idx, column) in all_columns.iter().enumerate() {
+                        if let Some(len) = qualified_prefix_len(column, &qualifier) {
+                            // Strip "qualifier." from the column name for the output
+                            // e.g., "e.name" becomes "name"
+                            if !laid_out {
+                                names.push(column[len..].to_string());
                             }
+                            source(i, Some(idx));
+                            found_any = true;
                         }
                     }
                     // If no columns matched the prefix (single-table query), check if
                     // the qualifier matches the table alias - if so, include all columns
                     if !found_any {
                         if let Some(alias) = table_alias {
-                            if alias.eq_ignore_ascii_case(&qualifier_lower) {
+                            if eq_folded(alias, &qualifier) {
                                 if !laid_out {
                                     names.extend(all_columns.iter().cloned());
                                 }
