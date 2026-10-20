@@ -32,22 +32,12 @@
 //! tx.commit()?;
 //! ```
 
-use std::hash::Hasher;
-use std::sync::Arc;
-
-use rustc_hash::{FxHashMap, FxHasher};
-
 use crate::api::params::{NamedParams, ParamVec};
-use crate::core::{Error, Result, Row, Schema, Value};
+use crate::core::{Error, Result};
 use crate::executor::context::ExecutionContext;
-use crate::executor::expression::ExpressionEval;
-use crate::executor::Executor;
-use crate::parser::ast::{Expression, RollbackStatement, Statement};
-use crate::parser::Parser;
-use crate::storage::expression::Expression as StorageExprTrait;
-use crate::storage::mvcc::engine::MVCCEngine;
-use crate::storage::traits::transaction::StatementTable;
-use crate::storage::traits::{QueryResult, Transaction as StorageTransaction};
+use crate::executor::{CachedPlanRef, Executor};
+use crate::parser::ast::{RollbackStatement, Statement};
+use crate::storage::traits::QueryResult;
 
 use super::database::FromValue;
 use super::params::Params;
@@ -58,69 +48,53 @@ use super::rows::Rows;
 /// Provides ACID guarantees for a series of database operations.
 /// Must be explicitly committed or rolled back.
 pub struct Transaction {
-    tx: Option<Box<dyn StorageTransaction>>,
-    engine: Arc<MVCCEngine>,
+    /// Holds the open transaction and runs its statements on the plans and
+    /// compiled paths of the session that began it
+    executor: Executor,
     committed: bool,
     rolled_back: bool,
-    /// Statements parsed from single-statement SQL, keyed by the SQL without
-    /// surrounding whitespace; dropped when the transaction ends
-    plans: Option<FxHashMap<Box<str>, Arc<Statement>>>,
-    /// Hashes of the latest SQL parsed once; SQL is kept parsed on its
-    /// second run, and the hash only admits it, never selects a statement
-    seen: [u64; SEEN_RING],
-    seen_next: usize,
 }
 
-/// Distinct SQL texts a transaction keeps parsed; SQL past them is parsed each time
-const TX_PLAN_CACHE_SIZE: usize = 64;
-
-/// SQL runs a transaction remembers when deciding what to keep parsed
-const SEEN_RING: usize = 16;
+/// Whether `statement` may run inside a transaction: DML and savepoints
+fn runs_in_transaction(statement: &Statement) -> Result<()> {
+    match statement {
+        Statement::Select(_)
+        | Statement::Insert(_)
+        | Statement::Update(_)
+        | Statement::Delete(_)
+        | Statement::Savepoint(_)
+        | Statement::ReleaseSavepoint(_)
+        | Statement::Rollback(RollbackStatement {
+            savepoint_name: Some(_),
+            ..
+        }) => Ok(()),
+        _ => Err(Error::NotSupported(
+            "Only DML statements are supported in transactions".to_string(),
+        )),
+    }
+}
 
 impl Transaction {
-    /// Create a new transaction wrapper
-    pub(crate) fn new(tx: Box<dyn StorageTransaction>, engine: Arc<MVCCEngine>) -> Self {
+    /// Create a new transaction wrapper around an executor holding it open
+    pub(crate) fn new(executor: Executor) -> Self {
         Self {
-            tx: Some(tx),
-            engine,
+            executor,
             committed: false,
             rolled_back: false,
-            plans: None,
-            seen: [0; SEEN_RING],
-            seen_next: 0,
         }
-    }
-
-    /// Whether SQL with this key ran before in the transaction; records it when not
-    fn seen_before(&mut self, key: &str) -> bool {
-        let mut hasher = FxHasher::default();
-        hasher.write(key.as_bytes());
-        let hash = hasher.finish();
-        if self.seen.contains(&hash) {
-            return true;
-        }
-        self.seen[self.seen_next] = hash;
-        self.seen_next = (self.seen_next + 1) % SEEN_RING;
-        false
     }
 
     /// Check if the transaction is still active
     fn check_active(&self) -> Result<()> {
-        if self.committed {
+        if self.committed || self.rolled_back {
             return Err(Error::TransactionEnded);
-        }
-        if self.rolled_back {
-            return Err(Error::TransactionEnded);
-        }
-        if self.tx.is_none() {
-            return Err(Error::TransactionNotStarted);
         }
         Ok(())
     }
 
     /// Get the transaction ID
     pub fn id(&self) -> i64 {
-        self.tx.as_ref().map(|tx| tx.id()).unwrap_or(-1)
+        self.executor.active_txn_id().unwrap_or(-1)
     }
 
     /// Execute a SQL statement within the transaction
@@ -314,35 +288,39 @@ impl Transaction {
         sql: &str,
         ctx: ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        let key = sql.trim_matches(|c: char| c.is_ascii_whitespace());
-        if let Some(statement) = self.plans.as_ref().and_then(|plans| plans.get(key)) {
-            let statement = Arc::clone(statement);
-            return self.execute_statement(&statement, &ctx);
-        }
-        let mut parser = Parser::new(sql);
-        let mut program = parser
-            .parse_program()
-            .map_err(|e| Error::parse(e.to_string()))?;
-
-        if program.statements.len() == 1
-            && self
-                .plans
-                .as_ref()
-                .is_none_or(|plans| plans.len() < TX_PLAN_CACHE_SIZE)
-            && self.seen_before(key)
-        {
-            let statement = Arc::new(program.statements.remove(0));
-            self.plans
-                .get_or_insert_with(FxHashMap::default)
-                .insert(Box::from(key), Arc::clone(&statement));
-            return self.execute_statement(&statement, &ctx);
-        }
-
+        let program = match self.executor.plan_or_program(sql)? {
+            Ok(plan) => return self.execute_plan(&plan, ctx),
+            Err(program) => program,
+        };
         let mut last_result: Option<Box<dyn QueryResult>> = None;
         for statement in &program.statements {
             last_result = Some(self.execute_statement(statement, &ctx)?);
         }
         last_result.ok_or(Error::NoStatementsToExecute)
+    }
+
+    /// Runs a cached plan, with its compiled paths, in this transaction
+    fn execute_plan(
+        &mut self,
+        plan: &CachedPlanRef,
+        ctx: ExecutionContext,
+    ) -> Result<Box<dyn QueryResult>> {
+        runs_in_transaction(&plan.statement)?;
+        self.executor.execute_with_cached_plan_owned(plan, ctx)
+    }
+
+    /// Runs a prepared statement in this transaction: by its plan when it
+    /// was prepared on this engine, by its SQL otherwise
+    pub(crate) fn execute_prepared_statement(
+        &mut self,
+        statement: &super::Statement,
+        ctx: ExecutionContext,
+    ) -> Result<Box<dyn QueryResult>> {
+        self.check_active()?;
+        match statement.plan_on(self.executor.engine()) {
+            Some(plan) => self.execute_plan(plan, ctx),
+            None => self.execute_sql_with_ctx(statement.sql(), ctx),
+        }
     }
 
     /// Execute a single statement
@@ -351,235 +329,8 @@ impl Transaction {
         statement: &Statement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        use crate::executor::result::ExecResult;
-
-        // For SELECT and INSERT, delegate to the full executor pipeline.
-        // INSERT delegation is required for correct handling of partial column lists,
-        // default values, type coercion, RETURNING, ON DUPLICATE KEY, and FK validation.
-        // Must handle before borrowing self.tx since we need to take ownership.
-        if matches!(
-            statement,
-            Statement::Select(_)
-                | Statement::Insert(_)
-                | Statement::Update(_)
-                | Statement::Delete(_)
-        ) {
-            let tx = self.tx.take().ok_or(Error::TransactionNotStarted)?;
-            let executor = Executor::new(self.engine.clone());
-            executor.install_transaction(tx);
-            let result = executor.execute_statement(statement, ctx);
-            // Reclaim the transaction regardless of success/failure
-            self.tx = executor.take_transaction();
-            return result;
-        }
-
-        let tx = self.tx.as_mut().ok_or(Error::TransactionNotStarted)?;
-
-        match statement {
-            Statement::Update(stmt) => {
-                use crate::executor::expression::{
-                    compile_expression, ExecuteContext, ExprVM, RowFilter, SharedProgram,
-                };
-
-                let table_name = &stmt.table_name.value;
-                let mut table = tx.get_statement_table(table_name)?;
-                // Get schema and column names owned to avoid borrow conflict with table.update()
-                let schema = table.schema().clone();
-                let columns: Vec<String> = schema.column_names_owned().to_vec();
-
-                // Build the setter function that applies updates
-                let updates = stmt.updates.clone();
-
-                // OPTIMIZATION: Pre-compile WHERE clause (if present) using RowFilter
-                // CRITICAL: Must include context for parameter support
-                let where_filter: Option<RowFilter> = stmt
-                    .where_clause
-                    .as_ref()
-                    .map(|expr| RowFilter::new(expr, &columns).map(|f| f.with_context(ctx)))
-                    .transpose()?;
-
-                // OPTIMIZATION: Pre-compile update expressions and compute column indices
-                // CRITICAL: Return errors instead of silently skipping failed compilations
-                let compiled_updates: Vec<(usize, SharedProgram)> = updates
-                    .iter()
-                    .map(|(col_name, expr)| {
-                        let idx = columns
-                            .iter()
-                            .position(|c| c.eq_ignore_ascii_case(col_name))
-                            .ok_or_else(|| Error::ColumnNotFound(col_name.to_string()))?;
-                        let program = compile_expression(expr, &columns)?;
-                        Ok((idx, program))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-
-                // Create VM for expression execution (reused for all rows)
-                let mut vm = ExprVM::new();
-
-                // Arc-clone params for the setter closure (O(1) refcount bump, no deep copy)
-                let positional_params = ctx.params_arc().clone();
-                let named_params = ctx.named_params_arc().clone();
-
-                let mut setter = |row: Row| -> Result<(Row, bool)> {
-                    // Check WHERE clause if present (uses thread-local VM internally)
-                    if let Some(ref filter) = where_filter {
-                        if !filter.matches_checked(&row)? {
-                            return Ok((row, false));
-                        }
-                    }
-
-                    // Evaluate all expressions first (while we can still borrow row)
-                    // CRITICAL: Include positional and named params for parameter resolution
-                    let mut exec_ctx = ExecuteContext::new(&row);
-                    if !positional_params.is_empty() {
-                        exec_ctx = exec_ctx.with_params(&positional_params);
-                    }
-                    if !named_params.is_empty() {
-                        exec_ctx = exec_ctx.with_named_params(&named_params);
-                    }
-
-                    // CRITICAL: Collect evaluated values, propagating any errors
-                    let mut updates_to_apply: Vec<(usize, Value)> =
-                        Vec::with_capacity(compiled_updates.len());
-                    for (idx, program) in compiled_updates.iter() {
-                        let v = vm.execute(program, &exec_ctx)?;
-                        updates_to_apply.push((*idx, v));
-                    }
-
-                    // Now apply updates - take ownership of row
-                    let mut new_values = row.into_values();
-                    for (idx, value) in updates_to_apply {
-                        new_values[idx] = value;
-                    }
-
-                    Ok((Row::from_values(new_values), true))
-                };
-
-                // Try to convert WHERE clause to storage expression for index optimization
-                // (PK lookup, secondary index, etc.). If conversion fails for complex
-                // expressions, fall back to None and let the setter handle filtering.
-                let storage_where_expr = stmt
-                    .where_clause
-                    .as_ref()
-                    .and_then(|expr| self.convert_to_storage_expression(expr, ctx, &schema).ok());
-
-                let updated_count = table.update(storage_where_expr.as_deref(), &mut setter)?;
-
-                Ok(Box::new(ExecResult::with_rows_affected(
-                    updated_count as i64,
-                )))
-            }
-            Statement::Delete(stmt) => {
-                let table_name = &stmt.table_name.value;
-                let mut table = tx.get_statement_table(table_name)?;
-                let schema = table.schema().clone();
-
-                // Convert WHERE clause to Expression if present
-                let where_expr = stmt
-                    .where_clause
-                    .as_ref()
-                    .map(|expr| self.convert_to_storage_expression(expr, ctx, &schema))
-                    .transpose()?;
-
-                let deleted_count = table.delete(where_expr.as_deref())?;
-
-                Ok(Box::new(ExecResult::with_rows_affected(
-                    deleted_count as i64,
-                )))
-            }
-            Statement::Savepoint(stmt) => {
-                tx.create_savepoint(&stmt.savepoint_name.value)?;
-                Ok(Box::new(ExecResult::empty()))
-            }
-            Statement::ReleaseSavepoint(stmt) => {
-                tx.release_savepoint(&stmt.savepoint_name.value)?;
-                Ok(Box::new(ExecResult::empty()))
-            }
-            Statement::Rollback(RollbackStatement {
-                savepoint_name: Some(name),
-                ..
-            }) => {
-                tx.rollback_to_savepoint(&name.value)?;
-                Ok(Box::new(ExecResult::empty()))
-            }
-            Statement::Select(_) | Statement::Insert(_) => {
-                unreachable!("SELECT and INSERT handled above via executor delegation")
-            }
-            _ => Err(Error::NotSupported(
-                "Only DML statements are supported in transactions".to_string(),
-            )),
-        }
-    }
-
-    /// Convert AST expression to storage expression
-    fn convert_to_storage_expression(
-        &self,
-        expr: &Expression,
-        ctx: &ExecutionContext,
-        schema: &Schema,
-    ) -> Result<Box<dyn crate::storage::expression::Expression>> {
-        use crate::core::Operator;
-        use crate::storage::expression::{AndExpr, ComparisonExpr, OrExpr};
-
-        match expr {
-            Expression::Infix(infix) => {
-                let op_str = infix.operator.as_str();
-                match op_str {
-                    "AND" => {
-                        let left = self.convert_to_storage_expression(&infix.left, ctx, schema)?;
-                        let right =
-                            self.convert_to_storage_expression(&infix.right, ctx, schema)?;
-                        return Ok(Box::new(AndExpr::and(left, right)));
-                    }
-                    "OR" => {
-                        let left = self.convert_to_storage_expression(&infix.left, ctx, schema)?;
-                        let right =
-                            self.convert_to_storage_expression(&infix.right, ctx, schema)?;
-                        return Ok(Box::new(OrExpr::or(left, right)));
-                    }
-                    _ => {}
-                }
-
-                let op = match op_str {
-                    "=" | "==" => Operator::Eq,
-                    "!=" | "<>" => Operator::Ne,
-                    "<" => Operator::Lt,
-                    "<=" => Operator::Lte,
-                    ">" => Operator::Gt,
-                    ">=" => Operator::Gte,
-                    _ => {
-                        return Err(Error::NotSupported(format!(
-                            "Operator {} not supported in transaction WHERE clause",
-                            infix.operator
-                        )));
-                    }
-                };
-
-                // Get column name from left side
-                let column = match infix.left.as_ref() {
-                    Expression::Identifier(id) => id.value.clone(),
-                    _ => {
-                        return Err(Error::NotSupported(
-                            "Only column references supported on left side of comparison"
-                                .to_string(),
-                        ));
-                    }
-                };
-
-                // Get value from right side (constant expression, no row context needed)
-                let value = ExpressionEval::compile(&infix.right, &[])?
-                    .with_context(ctx)
-                    .eval_slice(&Row::new())?;
-
-                // Create expression and prepare it for the schema
-                let mut storage_expr = ComparisonExpr::new(column, op, value);
-                storage_expr.prepare_for_schema(schema);
-                Ok(Box::new(storage_expr))
-            }
-            _ => Err(Error::NotSupported(format!(
-                "Expression type {:?} not supported in transaction WHERE clause",
-                expr
-            ))),
-        }
+        runs_in_transaction(statement)?;
+        self.executor.execute_statement(statement, ctx)
     }
 
     /// Commit the transaction
@@ -588,20 +339,14 @@ impl Transaction {
     pub fn commit(&mut self) -> Result<()> {
         self.check_active()?;
 
-        if let Some(mut tx) = self.tx.take() {
-            match tx.commit() {
-                Ok(()) => {
-                    self.committed = true;
-                    self.plans = None;
-                }
-                Err(e) => {
-                    // Restore the transaction so rollback is still possible
-                    self.tx = Some(tx);
-                    return Err(e);
-                }
+        if let Some(mut tx) = self.executor.take_transaction() {
+            if let Err(e) = tx.commit() {
+                // Restore the transaction so rollback is still possible
+                self.executor.install_transaction(tx);
+                return Err(e);
             }
         }
-
+        self.committed = true;
         Ok(())
     }
 
@@ -617,13 +362,8 @@ impl Transaction {
             return Ok(()); // Already rolled back
         }
 
-        if let Some(mut tx) = self.tx.take() {
-            tx.rollback()?;
-            self.rolled_back = true;
-            self.plans = None;
-        }
-
-        Ok(())
+        self.rolled_back = true;
+        self.executor.rollback_active()
     }
 }
 
@@ -946,85 +686,40 @@ mod tests {
         assert_eq!(final_count, 3);
     }
 
-    fn cached(tx: &super::Transaction, sql: &str) -> std::sync::Arc<super::Statement> {
-        tx.plans
-            .as_ref()
-            .and_then(|plans| plans.get(sql))
-            .cloned()
-            .expect("statement cached")
-    }
-
     #[test]
-    fn repeated_sql_reuses_the_statement_parsed_on_its_second_run() {
+    fn transaction_sql_runs_on_the_session_plan() {
         let db = Database::open_in_memory().unwrap();
         db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
             .unwrap();
+        let sql = "SELECT v FROM t WHERE id = $1";
         let mut tx = db.begin().unwrap();
-        let sql = "SELECT COUNT(*) FROM t WHERE id > $1";
-        let _: i64 = tx.query_one(sql, (0,)).unwrap();
-        assert!(tx.plans.is_none(), "SQL run once was kept");
-        let _: i64 = tx.query_one(&format!("  {sql}\n"), (1,)).unwrap();
-        let second = cached(&tx, sql);
-        let _: i64 = tx.query_one(sql, (2,)).unwrap();
-        assert!(
-            std::sync::Arc::ptr_eq(&second, &cached(&tx, sql)),
-            "the third call parsed the SQL again"
-        );
-        let both = "UPDATE t SET v = 1 WHERE id = 1; UPDATE t SET v = 2 WHERE id = 2";
-        tx.execute(both, ()).unwrap();
-        tx.execute(both, ()).unwrap();
-        assert_eq!(tx.plans.as_ref().map(|p| p.len()), Some(1));
-        tx.commit().unwrap();
-    }
-
-    #[test]
-    fn the_parsed_statements_are_bounded_and_go_with_the_transaction() {
-        let db = Database::open_in_memory().unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
-            .unwrap();
-        let mut tx = db.begin().unwrap();
-        for n in 0..(super::TX_PLAN_CACHE_SIZE * 2) {
-            let sql = format!("SELECT COUNT(*) FROM t WHERE id > {n}");
-            for _ in 0..2 {
-                let count: i64 = tx.query_one(&sql, ()).unwrap();
-                assert_eq!(count, 0);
-            }
-        }
-        let kept = tx.plans.as_ref().map_or(0, |p| p.len());
-        assert_eq!(kept, super::TX_PLAN_CACHE_SIZE);
-        tx.commit().unwrap();
-        assert!(tx.plans.is_none(), "commit kept the parsed statements");
-
-        let mut tx = db.begin().unwrap();
-        let _: i64 = tx.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
-        let _: i64 = tx.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
+        tx.execute("INSERT INTO t VALUES (1, 10)", ()).unwrap();
+        assert_eq!(tx.query_one::<i64, _>(sql, (1,)).unwrap(), 10);
+        let plan = db
+            .executor()
+            .query_cache()
+            .get(sql)
+            .expect("the transaction did not plan through its session");
+        assert_eq!(tx.query_one::<i64, _>(sql, (1,)).unwrap(), 10);
+        let again = db.executor().query_cache().get(sql).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&plan.statement, &again.statement));
         tx.rollback().unwrap();
-        assert!(tx.plans.is_none(), "rollback kept the parsed statements");
+        assert!(db.query_one::<i64, _>(sql, (1,)).is_err());
     }
 
     #[test]
-    fn an_admission_hash_collision_keeps_each_sql_to_its_own_statement() {
-        use std::hash::Hasher;
+    fn transaction_refuses_statements_other_than_dml() {
         let db = Database::open_in_memory().unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
-            .unwrap();
-        db.execute("INSERT INTO t VALUES (1, 10), (2, 20)", ())
-            .unwrap();
         let mut tx = db.begin().unwrap();
-        let a = "SELECT v FROM t WHERE id = 1";
-        let b = "SELECT v FROM t WHERE id = 2";
-        let _: i64 = tx.query_one(b, ()).unwrap();
-        // Another SQL recorded under a's hash, as if it collided with a
-        let mut hasher = rustc_hash::FxHasher::default();
-        hasher.write(a.as_bytes());
-        tx.seen[tx.seen_next] = hasher.finish();
-        assert_eq!(tx.query_one::<i64, _>(a, ()).unwrap(), 10);
-        assert!(tx.plans.as_ref().is_some_and(|p| p.contains_key(a)));
-        for _ in 0..2 {
-            assert_eq!(tx.query_one::<i64, _>(b, ()).unwrap(), 20);
-            assert_eq!(tx.query_one::<i64, _>(a, ()).unwrap(), 10);
+        for sql in ["CREATE TABLE t (id INTEGER PRIMARY KEY)", "COMMIT", "BEGIN"] {
+            assert!(
+                matches!(
+                    tx.execute(sql, ()),
+                    Err(crate::core::Error::NotSupported(_))
+                ),
+                "{sql} ran inside the transaction"
+            );
         }
-        assert!(!std::sync::Arc::ptr_eq(&cached(&tx, a), &cached(&tx, b)));
         tx.commit().unwrap();
     }
 }

@@ -105,11 +105,17 @@ Files: `snapshot_system_test.rs`, `snapshot_recovery_test.rs`, `wal_visibility_t
 
 Snapshot creation, loading, recovery after crashes.
 
-### MVCC and Transactions (5 files)
+### MVCC and Transactions (6 files)
 
-Files: `transaction_test.rs`, `mvcc_isolation_sql_test.rs`, `dirty_read_test.rs`, `isolation_level_test.rs`, `concurrency_history_test.rs`
+Files: `transaction_test.rs`, `mvcc_isolation_sql_test.rs`, `dirty_read_test.rs`, `isolation_level_test.rs`, `session_isolation_test.rs`, `concurrency_history_test.rs`
 
-Snapshot isolation, transaction visibility, and consistency.
+Snapshot isolation, transaction visibility, consistency, and the isolation level each session keeps.
+
+### API Paths (2 files)
+
+Files: `api_prepared_paths_test.rs`, `ffi_test.rs`
+
+The same statement through SQL text, a prepared statement, a transaction and the C API answers alike; the C API's packed results, parameter checks and handle lifetimes.
 
 ### Index Tests (8 files)
 
@@ -186,6 +192,8 @@ SQLLogicTest files provide a database-agnostic specification format, making it p
 | Job | Description |
 |-----|-------------|
 | **Lint** | `cargo fmt --check` + `cargo clippy -D warnings` |
+| **MSRV** | `cargo check --all-features` on Rust 1.88 |
+| **WASI build** | `cargo check` of the C API (`--features ffi`) for `wasm32-wasip1` |
 | **Test** | Full test suite on Linux, macOS, Windows |
 | **Feature-Gated** | Heap profile (heap-profile), failpoint I/O tests |
 | **Coverage** | `cargo llvm-cov` uploaded to Codecov |

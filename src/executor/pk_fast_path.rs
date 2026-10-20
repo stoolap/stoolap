@@ -349,7 +349,7 @@ impl Executor {
             if taken.is_none() {
                 // Under read committed a committed, live head is this row's
                 // latest committed state whatever else publishes to the table
-                let latest = if read_committed(self.engine.get_isolation_level()) {
+                let latest = if read_committed(self.isolation_level()) {
                     self.engine.fetch_latest_row(table_name, pk_value, token)?
                 } else {
                     self.engine
@@ -371,7 +371,7 @@ impl Executor {
                     return Ok(rows);
                 }
             }
-            let tx = self.engine.begin_transaction()?;
+            let tx = self.begin_transaction()?;
             let table = tx.get_statement_table_at(table_name, view.as_ref())?;
             check_compiled_token(&*table, token)?;
             let rows = table.fetch_rows_by_ids(&[pk_value], &ConstBoolExpr::true_expr())?;
@@ -576,6 +576,8 @@ impl Executor {
                     // Fast path: extract value from slice directly
                     let pk_value =
                         Self::extract_pk_value_from_slice(&lookup.pk_value_source, params)?;
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::compiled_epoch_checked();
                     or_normal_path(self.execute_compiled_pk_lookup(lookup, pk_value, false, None))
                 } else {
                     // Epoch changed - need recompile, use normal path

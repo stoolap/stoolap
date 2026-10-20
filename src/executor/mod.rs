@@ -231,12 +231,14 @@ pub struct Executor {
     engine: Arc<MVCCEngine>,
     /// Function registry for scalar, aggregate, and window functions
     function_registry: Arc<FunctionRegistry>,
-    /// Default isolation level for transactions, as its `u8` value
+    /// This session's isolation level as its `u8` value, `LEVEL_UNSET`
+    /// until the session sets one
     default_isolation_level: AtomicU8,
-    /// Query cache for parsed statements
-    query_cache: QueryCache,
+    /// Query cache for parsed statements, shared with the executors of
+    /// this session's transactions
+    query_cache: Arc<QueryCache>,
     /// Semantic cache for query results with subsumption detection
-    semantic_cache: SemanticCache,
+    semantic_cache: Arc<SemanticCache>,
     /// Taken before `active_transaction`: shared by statements that run
     /// outside an explicit transaction, exclusive for the rest
     statement_gate: RwLock<()>,
@@ -254,6 +256,9 @@ pub struct Executor {
 /// The view memories an executor keeps for its next statements
 const VIEW_SPARES: usize = 4;
 
+/// A session that has not set an isolation level runs at the engine's
+const LEVEL_UNSET: u8 = u8::MAX;
+
 /// The runs a SELECT gets, the first included, when a truncate or drop
 /// overtakes its view
 const STATEMENT_RUNS: usize = 3;
@@ -264,11 +269,9 @@ impl Executor {
         Self {
             engine,
             function_registry: default_function_registry(),
-            default_isolation_level: AtomicU8::new(
-                crate::core::IsolationLevel::ReadCommitted as u8,
-            ),
-            query_cache: QueryCache::default(),
-            semantic_cache: SemanticCache::default(),
+            default_isolation_level: AtomicU8::new(LEVEL_UNSET),
+            query_cache: Arc::new(QueryCache::default()),
+            semantic_cache: Arc::new(SemanticCache::default()),
             statement_gate: RwLock::new(()),
             active_transaction: Mutex::new(None),
             query_planner: std::sync::OnceLock::new(),
@@ -284,11 +287,9 @@ impl Executor {
         Self {
             engine,
             function_registry,
-            default_isolation_level: AtomicU8::new(
-                crate::core::IsolationLevel::ReadCommitted as u8,
-            ),
-            query_cache: QueryCache::default(),
-            semantic_cache: SemanticCache::default(),
+            default_isolation_level: AtomicU8::new(LEVEL_UNSET),
+            query_cache: Arc::new(QueryCache::default()),
+            semantic_cache: Arc::new(SemanticCache::default()),
             statement_gate: RwLock::new(()),
             active_transaction: Mutex::new(None),
             query_planner: std::sync::OnceLock::new(),
@@ -301,13 +302,32 @@ impl Executor {
         Self {
             engine,
             function_registry: default_function_registry(),
-            default_isolation_level: AtomicU8::new(
-                crate::core::IsolationLevel::ReadCommitted as u8,
-            ),
-            query_cache: QueryCache::new(cache_size),
-            semantic_cache: SemanticCache::default(),
+            default_isolation_level: AtomicU8::new(LEVEL_UNSET),
+            query_cache: Arc::new(QueryCache::new(cache_size)),
+            semantic_cache: Arc::new(SemanticCache::default()),
             statement_gate: RwLock::new(()),
             active_transaction: Mutex::new(None),
+            query_planner: std::sync::OnceLock::new(),
+            view_spares: parking_lot::Mutex::new(smallvec::SmallVec::new()),
+        }
+    }
+
+    /// An executor that runs `tx` as its open transaction, sharing this
+    /// one's plans, compiled paths and result cache
+    pub(crate) fn for_transaction(&self, tx: Box<dyn Transaction>) -> Self {
+        Self {
+            engine: Arc::clone(&self.engine),
+            function_registry: Arc::clone(&self.function_registry),
+            default_isolation_level: AtomicU8::new(
+                self.default_isolation_level.load(Ordering::Relaxed),
+            ),
+            query_cache: Arc::clone(&self.query_cache),
+            semantic_cache: Arc::clone(&self.semantic_cache),
+            statement_gate: RwLock::new(()),
+            active_transaction: Mutex::new(Some(ActiveTransaction {
+                transaction: tx,
+                tables: FxHashMap::default(),
+            })),
             query_planner: std::sync::OnceLock::new(),
             view_spares: parking_lot::Mutex::new(smallvec::SmallVec::new()),
         }
@@ -324,10 +344,26 @@ impl Executor {
             .get_or_init(|| QueryPlanner::new(Arc::clone(&self.engine)))
     }
 
-    /// Set the default isolation level for new transactions
+    /// Set this session's isolation level: the level of every transaction
+    /// it begins without naming one, autocommit statements included. Waits
+    /// for the session's running statements, which read the level more than once
     pub fn set_default_isolation_level(&self, level: crate::core::IsolationLevel) {
+        let _gate = self.enter(true);
+        self.store_isolation_level(level);
+    }
+
+    /// Writes the session's isolation level; the caller holds the gate
+    /// exclusively
+    fn store_isolation_level(&self, level: crate::core::IsolationLevel) {
         self.default_isolation_level
             .store(level as u8, Ordering::Relaxed);
+    }
+
+    /// This session's isolation level; the engine's until the session sets one
+    pub fn isolation_level(&self) -> crate::core::IsolationLevel {
+        let level = self.default_isolation_level.load(Ordering::Relaxed);
+        crate::core::IsolationLevel::from_u8(level)
+            .unwrap_or_else(|| self.engine.get_isolation_level())
     }
 
     /// The gate for one entry: shared while this session has no explicit
@@ -411,25 +447,44 @@ impl Executor {
 
         // Try to get from cache
         let cached = self.query_cache.get(sql)?;
+        self.param_fast_paths(&cached, params)
+    }
 
+    /// [`Self::try_fast_path_with_params`] for a plan the caller holds
+    pub(crate) fn try_plan_fast_path(
+        &self,
+        plan: &CachedPlanRef,
+        params: &[Value],
+    ) -> Option<Result<Box<dyn QueryResult>>> {
+        let _gate = self.enter_shared()?;
+        self.param_fast_paths(plan, params)
+    }
+
+    /// The compiled PK paths that take borrowed params, under a shared gate
+    /// the caller holds; None when none applies
+    fn param_fast_paths(
+        &self,
+        plan: &CachedPlanRef,
+        params: &[Value],
+    ) -> Option<Result<Box<dyn QueryResult>>> {
         // Validate parameter count
-        if cached.has_params && params.len() < cached.param_count {
+        if plan.has_params && params.len() < plan.param_count {
             return None; // Let normal path handle error
         }
 
         // Try compiled fast paths based on statement type
-        match cached.statement.as_ref() {
+        self.fast_path_until_held(&plan.statement, None, || match plan.statement.as_ref() {
             Statement::Select(stmt) => {
-                self.try_fast_pk_lookup_with_params(stmt, params, &cached.compiled)
+                self.try_fast_pk_lookup_with_params(stmt, params, &plan.compiled)
             }
             Statement::Update(stmt) => {
-                self.try_fast_pk_update_with_params(stmt, params, &cached.compiled)
+                self.try_fast_pk_update_with_params(stmt, params, &plan.compiled)
             }
             Statement::Delete(stmt) => {
-                self.try_fast_pk_delete_with_params(stmt, params, &cached.compiled)
+                self.try_fast_pk_delete_with_params(stmt, params, &plan.compiled)
             }
             _ => None,
-        }
+        })
     }
 
     /// Execute a SQL query with named parameters
@@ -489,19 +544,11 @@ impl Executor {
             }
 
             let gate = self.enter(changes_session(&cached.statement));
-
-            // INSERT handles the active transaction itself; dispatch before
-            // the txn-state capture so the hot prepared-INSERT path takes
-            // the transaction mutex only once.
+            // INSERT takes the transaction and its id in one lock section
             if let Statement::Insert(stmt) = cached.statement.as_ref() {
                 return self.execute_insert_with_compiled_cache(stmt, &ctx, &cached.compiled);
             }
-
-            // Capture transaction state once for the rest of the statement:
-            // the probe battery and the ctx txn-id injection both need it,
-            // and repeated mutex acquisitions dominate the fixed cost of
-            // cached statements.
-            let active_txn_id = self.gated_txn_id(&gate);
+            let (active_txn_id, ctx) = self.gated_txn_ctx(&gate, ctx);
 
             if let Some(result) = self.compiled_fast_paths_until_held(
                 cached.statement.as_ref(),
@@ -539,12 +586,10 @@ impl Executor {
                 .put(sql, stmt_arc.clone(), has_params, param_count);
 
             let gate = self.enter(changes_session(&stmt_arc));
-
             if let Statement::Insert(stmt) = stmt_arc.as_ref() {
                 return self.execute_insert_with_compiled_cache(stmt, &ctx, &cached_plan.compiled);
             }
-
-            let active_txn_id = self.gated_txn_id(&gate);
+            let (active_txn_id, ctx) = self.gated_txn_ctx(&gate, ctx);
 
             if let Some(result) = self.compiled_fast_paths_until_held(
                 stmt_arc.as_ref(),
@@ -573,7 +618,7 @@ impl Executor {
 
     /// Current explicit-transaction id, if one is active.
     #[inline]
-    fn active_txn_id(&self) -> Option<i64> {
+    pub(crate) fn active_txn_id(&self) -> Option<i64> {
         self.active_transaction
             .lock()
             .unwrap()
@@ -591,13 +636,32 @@ impl Executor {
         }
     }
 
+    /// The open transaction's id under `gate`, and `ctx` carrying it for
+    /// CURRENT_TRANSACTION_ID() on the compiled and general paths; INSERT
+    /// reads the id in the lock section that takes its table
+    fn gated_txn_ctx<'c>(
+        &self,
+        gate: &StatementGate<'_>,
+        ctx: std::borrow::Cow<'c, ExecutionContext>,
+    ) -> (Option<i64>, std::borrow::Cow<'c, ExecutionContext>) {
+        let txn_id = self.gated_txn_id(gate);
+        match txn_id {
+            Some(id) => {
+                let mut ctx = ctx;
+                ctx.to_mut().set_transaction_id(id as u64);
+                (txn_id, ctx)
+            }
+            None => (None, ctx),
+        }
+    }
+
     /// Run the compiled fast-path battery for a single cached statement.
     /// Callers dispatch INSERT before calling this (its compiled path
     /// handles the active transaction itself).
     ///
-    /// Inside an explicit transaction (`in_txn`) only the PK lookup runs, read
-    /// through the transaction; the COUNT and UPDATE/DELETE probes read
-    /// committed state only and must not fire.
+    /// Inside an explicit transaction (`in_txn`) the PK lookup, UPDATE and
+    /// DELETE run through the transaction; the COUNT probes read committed
+    /// state only and must not fire.
     ///
     /// A SELECT whose own view a truncate or drop overtook runs again, under
     /// the same bound as the regular path
@@ -609,18 +673,36 @@ impl Executor {
         compiled: &Arc<std::sync::RwLock<query_cache::CompiledExecution>>,
         in_txn: bool,
     ) -> Option<Result<Box<dyn QueryResult>>> {
+        self.fast_path_until_held(statement, Some(ctx), || {
+            self.try_compiled_fast_paths(statement, ctx, compiled, in_txn)
+        })
+    }
+
+    /// Runs a fast path `attempt` for `statement` again, under the bound
+    /// the regular path has, while a truncate or drop overtakes the view of
+    /// a SELECT that took its own; `ctx` is None for borrowed parameters
+    fn fast_path_until_held(
+        &self,
+        statement: &Statement,
+        ctx: Option<&ExecutionContext>,
+        mut attempt: impl FnMut() -> Option<Result<Box<dyn QueryResult>>>,
+    ) -> Option<Result<Box<dyn QueryResult>>> {
         let mut runs = 1;
         loop {
-            let result = self.try_compiled_fast_paths(statement, ctx, compiled, in_txn);
+            let result = attempt();
             let again = matches!(result, Some(Err(Error::ViewOvertaken)))
                 && runs < STATEMENT_RUNS
                 && matches!(statement, Statement::Select(_))
-                && ctx.statement_view().is_none()
+                && ctx.is_none_or(|ctx| ctx.statement_view().is_none())
                 && !self.function_registry.has_registered_functions();
             if !again {
                 return result;
             }
-            if let Err(e) = self.wait_out_destruction(ctx) {
+            let waited = match ctx {
+                Some(ctx) => self.wait_out_destruction(ctx),
+                None => self.wait_out_destruction(&ExecutionContext::new()),
+            };
+            if let Err(e) = waited {
                 return Some(Err(e));
             }
             runs += 1;
@@ -669,11 +751,11 @@ impl Executor {
                 }
                 self.try_fast_count_star_compiled(stmt, compiled)
             }
-            Statement::Update(stmt) if !in_txn => {
-                self.try_fast_pk_update_compiled(stmt, ctx, compiled)
+            Statement::Update(stmt) => {
+                self.try_fast_pk_update_compiled(stmt, ctx, compiled, in_txn)
             }
-            Statement::Delete(stmt) if !in_txn => {
-                self.try_fast_pk_delete_compiled(stmt, ctx, compiled)
+            Statement::Delete(stmt) => {
+                self.try_fast_pk_delete_compiled(stmt, ctx, compiled, in_txn)
             }
             _ => None,
         }
@@ -1038,7 +1120,7 @@ impl Executor {
         }
         let level = match active_txn_id {
             Some(txn_id) => self.engine.registry_ref().get_isolation_level(txn_id),
-            None => self.engine.get_isolation_level(),
+            None => self.isolation_level(),
         };
         (level == crate::core::IsolationLevel::ReadCommitted).then(|| self.capture_view())
     }
@@ -1068,7 +1150,7 @@ impl Executor {
     /// A view of the commits complete now, for an autocommit read under read
     /// committed; None under snapshot isolation, which reads at its own point
     pub(crate) fn autocommit_view(&self) -> Option<crate::storage::mvcc::registry::StatementView> {
-        (self.engine.get_isolation_level() == crate::core::IsolationLevel::ReadCommitted)
+        (self.isolation_level() == crate::core::IsolationLevel::ReadCommitted)
             .then(|| self.capture_view())
     }
 
@@ -1096,9 +1178,10 @@ impl Executor {
         active_tx.take().map(|at| at.transaction)
     }
 
-    /// Begin a new transaction
+    /// Begin a new transaction at this session's isolation level
     pub fn begin_transaction(&self) -> Result<Box<dyn Transaction>> {
-        self.engine.begin_transaction()
+        self.engine
+            .begin_transaction_with_level(self.isolation_level())
     }
 
     /// Begin a new transaction with a specific isolation level
@@ -1115,23 +1198,36 @@ impl Executor {
     /// Returns a lightweight CachedPlanRef that can be stored and reused
     /// for repeated execution without re-parsing or cache lookup overhead.
     pub fn get_or_create_plan(&self, sql: &str) -> Result<CachedPlanRef> {
+        self.plan_or_program(sql)?
+            .map_err(|_| Error::parse("Prepared statements must contain exactly one statement"))
+    }
+
+    /// The cached plan of single-statement `sql`, made and cached on first
+    /// use, or the parsed program when `sql` holds any other count
+    pub(crate) fn plan_or_program(
+        &self,
+        sql: &str,
+    ) -> Result<std::result::Result<CachedPlanRef, Program>> {
         if let Some(plan) = self.query_cache.get(sql) {
-            return Ok(plan);
+            return Ok(Ok(plan));
         }
         let mut parser = Parser::new(sql);
         let mut program = parser
             .parse_program()
             .map_err(|e| Error::parse(e.to_string()))?;
         if program.statements.len() != 1 {
-            return Err(Error::parse(
-                "Prepared statements must contain exactly one statement",
-            ));
+            return Ok(Err(program));
         }
-        let stmt = program.statements.pop().unwrap();
+        let Some(stmt) = program.statements.pop() else {
+            return Ok(Err(program));
+        };
         let (has_params, param_count) = count_parameters(&stmt);
-        Ok(self
-            .query_cache
-            .put(sql, Arc::new(stmt), has_params, param_count))
+        Ok(Ok(self.query_cache.put(
+            sql,
+            Arc::new(stmt),
+            has_params,
+            param_count,
+        )))
     }
 
     /// Execute a pre-cached plan directly, skipping cache lookup.
@@ -1175,14 +1271,10 @@ impl Executor {
         }
 
         let gate = self.enter(changes_session(&plan.statement));
-
-        // INSERT handles the active transaction itself; dispatch before the
-        // txn-state capture so prepared INSERT takes the mutex only once.
         if let Statement::Insert(stmt) = plan.statement.as_ref() {
             return self.execute_insert_with_compiled_cache(stmt, &ctx, &plan.compiled);
         }
-
-        let active_txn_id = self.gated_txn_id(&gate);
+        let (active_txn_id, ctx) = self.gated_txn_ctx(&gate, ctx);
         if let Some(result) = self.compiled_fast_paths_until_held(
             plan.statement.as_ref(),
             &ctx,

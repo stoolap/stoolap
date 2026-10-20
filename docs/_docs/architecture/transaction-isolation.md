@@ -48,6 +48,11 @@ Both `isolation_level` and `transaction_isolation` are accepted as variable name
 This setting affects:
 - **Auto-commit transactions** - Queries executed without an explicit transaction
 - **Transactions started with BEGIN** - When no isolation level is specified
+- **Transactions started with `db.begin()`** in the Rust API
+
+The setting belongs to the connection (one `Database` handle). Another handle on the same database, including one from `db.clone()` or from opening the same DSN again, keeps its own level. `db.set_default_isolation_level(...)` sets the same value as `SET isolation_level`. A connection that never sets a level runs at READ COMMITTED.
+
+Inside an open transaction, `SET isolation_level` changes that transaction's level instead.
 
 ### Transaction-specific Isolation Level
 

@@ -1414,10 +1414,6 @@ fn test_blob_rejects_non_multiple_of_4() {
 
 #[test]
 fn test_json_parameter_rejects_invalid() {
-    // Regression: STOOLAP_TYPE_JSON accepted any UTF-8 string without
-    // validation. Malformed payloads like "not json" were tagged as JSON
-    // and JSON_VALID() would return 1. Now the FFI input path validates
-    // with serde_json and rejects invalid payloads as NULL.
     unsafe {
         let mut db: *mut StoolapDB = std::ptr::null_mut();
         stoolap_open_in_memory(&mut db);
@@ -1446,15 +1442,9 @@ fn test_json_parameter_rejects_invalid() {
         ];
 
         let sql = cstr("INSERT INTO t VALUES ($1, $2)");
-        stoolap_exec_params(db, sql.as_ptr(), params.as_ptr(), 2, std::ptr::null_mut());
-
-        // The inserted value should be NULL (rejected invalid JSON)
-        let sql = cstr("SELECT data FROM t WHERE id = 1");
-        let mut rows: *mut StoolapRows = std::ptr::null_mut();
-        stoolap_query(db, sql.as_ptr(), &mut rows);
-        stoolap_rows_next(rows);
-        assert_eq!(stoolap_rows_column_is_null(rows, 0), 1);
-        stoolap_rows_close(rows);
+        let rc = stoolap_exec_params(db, sql.as_ptr(), params.as_ptr(), 2, std::ptr::null_mut());
+        assert_eq!(rc, STOOLAP_ERROR, "invalid JSON was stored");
+        assert!(read_cstr(stoolap_errmsg(db)).contains("JSON"));
 
         // Also test empty string — not valid JSON
         let empty = b"";
@@ -1477,15 +1467,10 @@ fn test_json_parameter_rejects_invalid() {
         ];
 
         let sql = cstr("INSERT INTO t VALUES ($1, $2)");
-        stoolap_exec_params(db, sql.as_ptr(), params2.as_ptr(), 2, std::ptr::null_mut());
+        let rc = stoolap_exec_params(db, sql.as_ptr(), params2.as_ptr(), 2, std::ptr::null_mut());
+        assert_eq!(rc, STOOLAP_ERROR, "an empty JSON parameter was stored");
 
-        let sql = cstr("SELECT data FROM t WHERE id = 2");
-        let mut rows2: *mut StoolapRows = std::ptr::null_mut();
-        stoolap_query(db, sql.as_ptr(), &mut rows2);
-        stoolap_rows_next(rows2);
-        assert_eq!(stoolap_rows_column_is_null(rows2, 0), 1);
-        stoolap_rows_close(rows2);
-
+        assert_eq!(query_single_int(db, "SELECT COUNT(*) FROM t"), 0);
         stoolap_close(db);
     }
 }
@@ -3259,6 +3244,651 @@ fn test_tx_stmt_exec_named_rollback() {
         assert_eq!(count, 1);
 
         stoolap_stmt_finalize(stmt);
+        stoolap_close(db);
+    }
+}
+
+// =========================================================================
+// Packed results: fetch_all, fetch_chunk, query_all
+// =========================================================================
+
+/// Decodes a packed buffer into its column names and rows, each cell as text
+unsafe fn decode_packed(buf: *const u8, len: i64) -> (Vec<String>, Vec<Vec<String>>) {
+    let b = std::slice::from_raw_parts(buf, len as usize);
+    let mut at = 0;
+    let mut take = |n: usize| {
+        let s = &b[at..at + n];
+        at += n;
+        s
+    };
+    let cols = u32::from_le_bytes(take(4).try_into().unwrap()) as usize;
+    let mut names = Vec::new();
+    for _ in 0..cols {
+        let n = u16::from_le_bytes(take(2).try_into().unwrap()) as usize;
+        names.push(String::from_utf8(take(n).to_vec()).unwrap());
+    }
+    let count = u32::from_le_bytes(take(4).try_into().unwrap()) as usize;
+    let mut rows = Vec::new();
+    for _ in 0..count {
+        let mut row = Vec::new();
+        for _ in 0..cols {
+            let cell = match take(1)[0] {
+                0 => "NULL".to_string(),
+                1 => i64::from_le_bytes(take(8).try_into().unwrap()).to_string(),
+                2 => f64::from_le_bytes(take(8).try_into().unwrap()).to_string(),
+                4 => (take(1)[0] != 0).to_string(),
+                5 => format!("ts:{}", i64::from_le_bytes(take(8).try_into().unwrap())),
+                tag => {
+                    let n = u32::from_le_bytes(take(4).try_into().unwrap()) as usize;
+                    format!("{}:{}", tag, String::from_utf8_lossy(take(n)))
+                }
+            };
+            row.push(cell);
+        }
+        rows.push(row);
+    }
+    assert_eq!(at, b.len(), "packed buffer has trailing bytes");
+    (names, rows)
+}
+
+unsafe fn packed_test_db(rows: i64) -> *mut StoolapDB {
+    let mut db: *mut StoolapDB = std::ptr::null_mut();
+    assert_eq!(stoolap_open_in_memory(&mut db), STOOLAP_OK);
+    let ddl = cstr("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score FLOAT, ok BOOLEAN)");
+    assert_eq!(
+        stoolap_exec(db, ddl.as_ptr(), std::ptr::null_mut()),
+        STOOLAP_OK
+    );
+    for i in 1..=rows {
+        let name = if i % 4 == 0 {
+            "NULL".to_string()
+        } else {
+            format!("'n{}'", i)
+        };
+        let sql = cstr(&format!(
+            "INSERT INTO t VALUES ({}, {}, {}.5, {})",
+            i,
+            name,
+            i,
+            i % 2 == 0
+        ));
+        assert_eq!(
+            stoolap_exec(db, sql.as_ptr(), std::ptr::null_mut()),
+            STOOLAP_OK
+        );
+    }
+    db
+}
+
+/// Runs `sql` through `stoolap_query` and `stoolap_rows_fetch_all`
+unsafe fn fetch_all_of(db: *mut StoolapDB, sql: &str) -> (Vec<String>, Vec<Vec<String>>) {
+    let sql = cstr(sql);
+    let mut rows: *mut StoolapRows = std::ptr::null_mut();
+    assert_eq!(stoolap_query(db, sql.as_ptr(), &mut rows), STOOLAP_OK);
+    let mut buf: *mut u8 = std::ptr::null_mut();
+    let mut len: i64 = 0;
+    assert_eq!(stoolap_rows_fetch_all(rows, &mut buf, &mut len), STOOLAP_OK);
+    let decoded = decode_packed(buf, len);
+    stoolap_buffer_free(buf, len);
+    stoolap_rows_close(rows);
+    decoded
+}
+
+fn int_param(v: i64) -> StoolapValue {
+    StoolapValue {
+        value_type: STOOLAP_TYPE_INTEGER,
+        _padding: 0,
+        v: StoolapValueData { integer: v },
+    }
+}
+
+#[test]
+fn test_fetch_all_reports_runtime_error() {
+    unsafe {
+        let db = packed_test_db(5);
+        let sql = cstr("SELECT id, 'x' REGEXP CASE WHEN id = 3 THEN '[' ELSE 'x' END FROM t");
+        let mut rows: *mut StoolapRows = std::ptr::null_mut();
+        assert_eq!(stoolap_query(db, sql.as_ptr(), &mut rows), STOOLAP_OK);
+        let mut buf: *mut u8 = std::ptr::null_mut();
+        let mut len: i64 = 0;
+        let rc = stoolap_rows_fetch_all(rows, &mut buf, &mut len);
+        assert_eq!(
+            rc, STOOLAP_ERROR,
+            "a result cut short by an error was returned as complete"
+        );
+        assert!(buf.is_null());
+        assert!(!read_cstr(stoolap_rows_errmsg(rows)).is_empty());
+        stoolap_rows_close(rows);
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_fetch_chunk_matches_fetch_all() {
+    unsafe {
+        let db = packed_test_db(10);
+        let sql = "SELECT id, name, score, ok FROM t ORDER BY id";
+        let (all_names, all_rows) = fetch_all_of(db, sql);
+        assert_eq!(all_rows.len(), 10);
+
+        for chunk in [1, 3, 5, 10, 64] {
+            let q = cstr(sql);
+            let mut rows: *mut StoolapRows = std::ptr::null_mut();
+            assert_eq!(stoolap_query(db, q.as_ptr(), &mut rows), STOOLAP_OK);
+            let mut got = Vec::new();
+            let mut sizes = Vec::new();
+            loop {
+                let mut buf: *const u8 = std::ptr::null();
+                let mut len: i64 = 0;
+                let mut n: i32 = -1;
+                assert_eq!(
+                    stoolap_rows_fetch_chunk(rows, chunk, &mut buf, &mut len, &mut n),
+                    STOOLAP_OK
+                );
+                let (names, part) = decode_packed(buf, len);
+                assert_eq!(names, all_names);
+                assert_eq!(part.len(), n as usize);
+                sizes.push(n);
+                if n == 0 {
+                    break;
+                }
+                got.extend(part);
+            }
+            assert_eq!(got, all_rows, "chunk size {}", chunk);
+            assert!(sizes[..sizes.len() - 1]
+                .iter()
+                .all(|&n| n > 0 && n <= chunk));
+            stoolap_rows_close(rows);
+        }
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_fetch_chunk_after_next_continues() {
+    unsafe {
+        let db = packed_test_db(4);
+        let q = cstr("SELECT id FROM t ORDER BY id");
+        let mut rows: *mut StoolapRows = std::ptr::null_mut();
+        assert_eq!(stoolap_query(db, q.as_ptr(), &mut rows), STOOLAP_OK);
+        assert_eq!(stoolap_rows_next(rows), STOOLAP_ROW);
+        assert_eq!(stoolap_rows_column_int64(rows, 0), 1);
+
+        let mut buf: *const u8 = std::ptr::null();
+        let mut len: i64 = 0;
+        let mut n: i32 = 0;
+        assert_eq!(
+            stoolap_rows_fetch_chunk(rows, 10, &mut buf, &mut len, &mut n),
+            STOOLAP_OK
+        );
+        let (_, part) = decode_packed(buf, len);
+        assert_eq!(part, vec![vec!["2"], vec!["3"], vec!["4"]]);
+        assert_eq!(stoolap_rows_next(rows), STOOLAP_DONE);
+        stoolap_rows_close(rows);
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_fetch_chunk_rejects_bad_max_and_reports_error() {
+    unsafe {
+        let db = packed_test_db(5);
+        let q = cstr("SELECT id, 'x' REGEXP CASE WHEN id = 3 THEN '[' ELSE 'x' END FROM t");
+        let mut rows: *mut StoolapRows = std::ptr::null_mut();
+        assert_eq!(stoolap_query(db, q.as_ptr(), &mut rows), STOOLAP_OK);
+        let mut buf: *const u8 = std::ptr::null();
+        let mut len: i64 = 0;
+        let mut n: i32 = 0;
+        assert_eq!(
+            stoolap_rows_fetch_chunk(rows, 0, &mut buf, &mut len, &mut n),
+            STOOLAP_ERROR
+        );
+        assert_eq!(
+            stoolap_rows_fetch_chunk(rows, 10, &mut buf, &mut len, &mut n),
+            STOOLAP_ERROR
+        );
+        assert!(buf.is_null());
+        assert!(!read_cstr(stoolap_rows_errmsg(rows)).is_empty());
+        stoolap_rows_close(rows);
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_stmt_query_all_matches_fetch_all() {
+    unsafe {
+        let db = packed_test_db(10);
+        let expected = fetch_all_of(
+            db,
+            "SELECT id, name, score, ok FROM t WHERE id > 3 ORDER BY id",
+        );
+
+        let sql = cstr("SELECT id, name, score, ok FROM t WHERE id > $1 ORDER BY id");
+        let mut stmt: *mut StoolapStmt = std::ptr::null_mut();
+        assert_eq!(stoolap_prepare(db, sql.as_ptr(), &mut stmt), STOOLAP_OK);
+        let params = [int_param(3)];
+        for _ in 0..3 {
+            let mut buf: *const u8 = std::ptr::null();
+            let mut len: i64 = 0;
+            let rc = stoolap_stmt_query_all(
+                stmt,
+                std::ptr::null_mut(),
+                params.as_ptr(),
+                1,
+                &mut buf,
+                &mut len,
+            );
+            assert_eq!(rc, STOOLAP_OK);
+            assert_eq!(decode_packed(buf, len), expected);
+        }
+        stoolap_stmt_finalize(stmt);
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_query_all_in_transaction_sees_own_writes() {
+    unsafe {
+        let db = packed_test_db(2);
+        let mut tx: *mut StoolapTx = std::ptr::null_mut();
+        assert_eq!(stoolap_begin(db, &mut tx), STOOLAP_OK);
+        let ins = cstr("INSERT INTO t VALUES (3, 'n3', 3.5, false)");
+        assert_eq!(
+            stoolap_tx_exec(tx, ins.as_ptr(), std::ptr::null_mut()),
+            STOOLAP_OK
+        );
+
+        let sql = cstr("SELECT id FROM t WHERE id >= $1 ORDER BY id");
+        let params = [int_param(2)];
+        let mut buf: *const u8 = std::ptr::null();
+        let mut len: i64 = 0;
+        let rc =
+            stoolap_query_params_all(db, tx, sql.as_ptr(), params.as_ptr(), 1, &mut buf, &mut len);
+        assert_eq!(rc, STOOLAP_OK);
+        assert_eq!(decode_packed(buf, len).1, vec![vec!["2"], vec!["3"]]);
+
+        let mut stmt: *mut StoolapStmt = std::ptr::null_mut();
+        assert_eq!(stoolap_prepare(db, sql.as_ptr(), &mut stmt), STOOLAP_OK);
+        let rc = stoolap_stmt_query_all(stmt, tx, params.as_ptr(), 1, &mut buf, &mut len);
+        assert_eq!(rc, STOOLAP_OK);
+        assert_eq!(decode_packed(buf, len).1, vec![vec!["2"], vec!["3"]]);
+
+        let rc = stoolap_stmt_query_all(
+            stmt,
+            std::ptr::null_mut(),
+            params.as_ptr(),
+            1,
+            &mut buf,
+            &mut len,
+        );
+        assert_eq!(rc, STOOLAP_OK);
+        assert_eq!(
+            decode_packed(buf, len).1,
+            vec![vec!["2"]],
+            "outside the transaction"
+        );
+
+        assert_eq!(stoolap_tx_rollback(tx), STOOLAP_OK);
+        stoolap_stmt_finalize(stmt);
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_query_params_all_errors_and_large_results() {
+    unsafe {
+        let db = packed_test_db(5);
+        let bad = cstr("SELECT * FROM missing");
+        let mut buf: *const u8 = std::ptr::null();
+        let mut len: i64 = 0;
+        let rc = stoolap_query_params_all(
+            db,
+            std::ptr::null_mut(),
+            bad.as_ptr(),
+            std::ptr::null(),
+            0,
+            &mut buf,
+            &mut len,
+        );
+        assert_eq!(rc, STOOLAP_ERROR);
+        assert!(buf.is_null());
+        assert!(!read_cstr(stoolap_errmsg(db)).is_empty());
+
+        let late = cstr("SELECT id, 'x' REGEXP CASE WHEN id = 3 THEN '[' ELSE 'x' END FROM t");
+        let rc = stoolap_query_params_all(
+            db,
+            std::ptr::null_mut(),
+            late.as_ptr(),
+            std::ptr::null(),
+            0,
+            &mut buf,
+            &mut len,
+        );
+        assert_eq!(
+            rc, STOOLAP_ERROR,
+            "a result cut short by an error was returned as complete"
+        );
+
+        // Larger than the buffer a handle keeps, then a small result on the same handle
+        let big = cstr("SELECT id, REPEAT('x', 300000) FROM t");
+        let rc = stoolap_query_params_all(
+            db,
+            std::ptr::null_mut(),
+            big.as_ptr(),
+            std::ptr::null(),
+            0,
+            &mut buf,
+            &mut len,
+        );
+        assert_eq!(rc, STOOLAP_OK);
+        assert!(len > 1 << 20);
+        assert_eq!(decode_packed(buf, len).1.len(), 5);
+
+        let small = cstr("SELECT id FROM t ORDER BY id LIMIT 2");
+        let rc = stoolap_query_params_all(
+            db,
+            std::ptr::null_mut(),
+            small.as_ptr(),
+            std::ptr::null(),
+            0,
+            &mut buf,
+            &mut len,
+        );
+        assert_eq!(rc, STOOLAP_OK);
+        assert_eq!(decode_packed(buf, len).1, vec![vec!["1"], vec!["2"]]);
+        stoolap_close(db);
+    }
+}
+
+// =========================================================================
+// Parameter refusal, text reads, column names, batch arguments
+// =========================================================================
+
+fn bad_text_param(bytes: &'static [u8]) -> StoolapValue {
+    StoolapValue {
+        value_type: STOOLAP_TYPE_TEXT,
+        _padding: 0,
+        v: StoolapValueData {
+            text: StoolapTextData {
+                ptr: bytes.as_ptr() as *const c_char,
+                len: bytes.len() as i64,
+            },
+        },
+    }
+}
+
+#[test]
+fn test_invalid_utf8_text_parameter_is_refused_on_every_path() {
+    const BAD: &[u8] = b"ab\xff\xfe";
+    unsafe {
+        let db = packed_test_db(1);
+        let ins = cstr("INSERT INTO t (id, name) VALUES ($1, $2)");
+        let params = [int_param(10), bad_text_param(BAD)];
+
+        let rc = stoolap_exec_params(db, ins.as_ptr(), params.as_ptr(), 2, std::ptr::null_mut());
+        assert_eq!(rc, STOOLAP_ERROR, "exec_params");
+        assert!(read_cstr(stoolap_errmsg(db)).contains("UTF-8"));
+
+        let mut stmt: *mut StoolapStmt = std::ptr::null_mut();
+        assert_eq!(stoolap_prepare(db, ins.as_ptr(), &mut stmt), STOOLAP_OK);
+        let rc = stoolap_stmt_exec(stmt, params.as_ptr(), 2, std::ptr::null_mut());
+        assert_eq!(rc, STOOLAP_ERROR, "stmt_exec");
+
+        let mut tx: *mut StoolapTx = std::ptr::null_mut();
+        assert_eq!(stoolap_begin(db, &mut tx), STOOLAP_OK);
+        let rc = stoolap_tx_stmt_exec(tx, stmt, params.as_ptr(), 2, std::ptr::null_mut());
+        assert_eq!(rc, STOOLAP_ERROR, "tx_stmt_exec");
+        let named = [
+            named_param("id", int_param(11)),
+            named_param("name", bad_text_param(BAD)),
+        ];
+        let ins_named = cstr("INSERT INTO t (id, name) VALUES (:id, :name)");
+        let rc = stoolap_tx_exec_named(
+            tx,
+            ins_named.as_ptr(),
+            named.as_ptr(),
+            2,
+            std::ptr::null_mut(),
+        );
+        assert_eq!(rc, STOOLAP_ERROR, "tx_exec_named");
+        assert_eq!(stoolap_tx_commit(tx), STOOLAP_OK);
+
+        let sel = cstr("SELECT id FROM t WHERE name = $1");
+        let mut buf: *const u8 = std::ptr::null();
+        let mut len = 0i64;
+        let rc = stoolap_stmt_query_all(
+            stmt,
+            std::ptr::null_mut(),
+            params[1..].as_ptr(),
+            1,
+            &mut buf,
+            &mut len,
+        );
+        assert_eq!(rc, STOOLAP_ERROR, "stmt_query_all");
+        let rc = stoolap_query_params_all(
+            db,
+            std::ptr::null_mut(),
+            sel.as_ptr(),
+            params[1..].as_ptr(),
+            1,
+            &mut buf,
+            &mut len,
+        );
+        assert_eq!(rc, STOOLAP_ERROR, "query_params_all");
+
+        assert_eq!(query_single_int(db, "SELECT COUNT(*) FROM t"), 1);
+        stoolap_stmt_finalize(stmt);
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_column_text_pointers_hold_for_the_row_across_columns() {
+    unsafe {
+        let db = packed_test_db(6);
+        let q = cstr("SELECT name, id, score FROM t ORDER BY id");
+        let mut rows: *mut StoolapRows = std::ptr::null_mut();
+        assert_eq!(stoolap_query(db, q.as_ptr(), &mut rows), STOOLAP_OK);
+        let mut id = 0;
+        while stoolap_rows_next(rows) == STOOLAP_ROW {
+            id += 1;
+            let mut len = 0i64;
+            let name = stoolap_rows_column_text(rows, 0, &mut len);
+            let id_text = stoolap_rows_column_text(rows, 1, std::ptr::null_mut());
+            let score = stoolap_rows_column_text(rows, 2, std::ptr::null_mut());
+            let again = stoolap_rows_column_text(rows, 0, std::ptr::null_mut());
+            if id % 4 == 0 {
+                assert!(name.is_null(), "row {id}: NULL read as text");
+            } else {
+                assert_eq!(read_cstr(name), format!("n{id}"));
+                assert_eq!(len, format!("n{id}").len() as i64);
+                assert_eq!(name, again, "the same cell was copied twice");
+            }
+            assert_eq!(read_cstr(id_text), id.to_string());
+            assert_eq!(read_cstr(score), format!("{id}.5"));
+        }
+        assert_eq!(id, 6);
+        stoolap_rows_close(rows);
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_column_names_survive_consuming_the_rows() {
+    unsafe {
+        let db = packed_test_db(2);
+        let q = cstr("SELECT id AS a, name AS b FROM t");
+        let mut rows: *mut StoolapRows = std::ptr::null_mut();
+        assert_eq!(stoolap_query(db, q.as_ptr(), &mut rows), STOOLAP_OK);
+        let mut buf: *mut u8 = std::ptr::null_mut();
+        let mut len = 0i64;
+        assert_eq!(stoolap_rows_fetch_all(rows, &mut buf, &mut len), STOOLAP_OK);
+        stoolap_buffer_free(buf, len);
+        assert_eq!(stoolap_rows_column_count(rows), 2);
+        assert_eq!(read_cstr(stoolap_rows_column_name(rows, 0)), "a");
+        assert_eq!(read_cstr(stoolap_rows_column_name(rows, 1)), "b");
+        assert!(stoolap_rows_column_name(rows, 2).is_null());
+        stoolap_rows_close(rows);
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_exec_batch_refuses_impossible_parameter_layouts() {
+    unsafe {
+        let db = packed_test_db(0);
+        let ins = cstr("INSERT INTO t (id) VALUES ($1)");
+        let mut stmt: *mut StoolapStmt = std::ptr::null_mut();
+        assert_eq!(stoolap_prepare(db, ins.as_ptr(), &mut stmt), STOOLAP_OK);
+        let params = [int_param(1), int_param(2)];
+        // A statement taking no parameters runs whatever the layout says,
+        // so only the layout check can refuse these
+        let upd = cstr("UPDATE t SET score = 0");
+        let mut no_params: *mut StoolapStmt = std::ptr::null_mut();
+        assert_eq!(
+            stoolap_prepare(db, upd.as_ptr(), &mut no_params),
+            STOOLAP_OK
+        );
+        let rc =
+            stoolap_stmt_exec_batch(db, no_params, params.as_ptr(), -1, 2, std::ptr::null_mut());
+        assert_eq!(rc, STOOLAP_ERROR, "negative params_per_row");
+        let rc =
+            stoolap_stmt_exec_batch(db, no_params, std::ptr::null(), 1, 2, std::ptr::null_mut());
+        assert_eq!(rc, STOOLAP_ERROR, "NULL params");
+        stoolap_stmt_finalize(no_params);
+        let mut total = 0i64;
+        let rc = stoolap_stmt_exec_batch(db, stmt, params.as_ptr(), 1, 2, &mut total);
+        assert_eq!(rc, STOOLAP_OK);
+        assert_eq!(total, 2);
+        stoolap_stmt_finalize(stmt);
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_stmt_named_parameters_without_a_transaction() {
+    unsafe {
+        let db = packed_test_db(3);
+        let upd = cstr("UPDATE t SET score = :score WHERE id = :id");
+        let mut update: *mut StoolapStmt = std::ptr::null_mut();
+        assert_eq!(stoolap_prepare(db, upd.as_ptr(), &mut update), STOOLAP_OK);
+        let float_param = |f: f64| StoolapValue {
+            value_type: STOOLAP_TYPE_FLOAT,
+            _padding: 0,
+            v: StoolapValueData { float64: f },
+        };
+        let set = [
+            named_param("score", float_param(9.0)),
+            named_param("id", int_param(2)),
+        ];
+        let mut affected = 0i64;
+        assert_eq!(
+            stoolap_stmt_exec_named(update, set.as_ptr(), 2, &mut affected),
+            STOOLAP_OK
+        );
+        assert_eq!(affected, 1);
+
+        let sel = cstr("SELECT id, score FROM t WHERE id = :id");
+        let mut select: *mut StoolapStmt = std::ptr::null_mut();
+        assert_eq!(stoolap_prepare(db, sel.as_ptr(), &mut select), STOOLAP_OK);
+        let id = [named_param("id", int_param(2))];
+        let mut rows: *mut StoolapRows = std::ptr::null_mut();
+        assert_eq!(
+            stoolap_stmt_query_named(select, id.as_ptr(), 1, &mut rows),
+            STOOLAP_OK
+        );
+        assert_eq!(stoolap_rows_next(rows), STOOLAP_ROW);
+        assert_eq!(stoolap_rows_column_double(rows, 1), 9.0);
+        assert_eq!(stoolap_rows_next(rows), STOOLAP_DONE);
+        stoolap_rows_close(rows);
+
+        let mut buf: *const u8 = std::ptr::null();
+        let mut len = 0i64;
+        let rc = stoolap_stmt_query_named_all(
+            select,
+            std::ptr::null_mut(),
+            id.as_ptr(),
+            1,
+            &mut buf,
+            &mut len,
+        );
+        assert_eq!(rc, STOOLAP_OK);
+        assert_eq!(decode_packed(buf, len).1, vec![vec!["2", "9"]]);
+
+        let mut tx: *mut StoolapTx = std::ptr::null_mut();
+        assert_eq!(stoolap_begin(db, &mut tx), STOOLAP_OK);
+        let ins = cstr("INSERT INTO t (id, score) VALUES (7, 7.5)");
+        assert_eq!(
+            stoolap_tx_exec(tx, ins.as_ptr(), std::ptr::null_mut()),
+            STOOLAP_OK
+        );
+        let seven = [named_param("id", int_param(7))];
+        let rc = stoolap_stmt_query_named_all(select, tx, seven.as_ptr(), 1, &mut buf, &mut len);
+        assert_eq!(rc, STOOLAP_OK);
+        assert_eq!(
+            decode_packed(buf, len).1,
+            vec![vec!["7", "7.5"]],
+            "inside the transaction"
+        );
+        assert_eq!(stoolap_tx_rollback(tx), STOOLAP_OK);
+        let rc = stoolap_stmt_query_named_all(
+            select,
+            std::ptr::null_mut(),
+            seven.as_ptr(),
+            1,
+            &mut buf,
+            &mut len,
+        );
+        assert_eq!(rc, STOOLAP_OK);
+        assert!(decode_packed(buf, len).1.is_empty(), "rolled back");
+
+        let bad = [named_param("id", bad_text_param(b"\xff"))];
+        assert_eq!(
+            stoolap_stmt_query_named(select, bad.as_ptr(), 1, &mut rows),
+            STOOLAP_ERROR
+        );
+        assert!(!read_cstr(stoolap_stmt_errmsg(select)).is_empty());
+
+        stoolap_stmt_finalize(update);
+        stoolap_stmt_finalize(select);
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_json_parameter_the_engine_cannot_read_is_refused() {
+    unsafe {
+        let db = packed_test_db(0);
+        let ddl = cstr("CREATE TABLE j (id INTEGER PRIMARY KEY, data JSON)");
+        assert_eq!(
+            stoolap_exec(db, ddl.as_ptr(), std::ptr::null_mut()),
+            STOOLAP_OK
+        );
+        let ins = cstr("INSERT INTO j VALUES ($1, $2)");
+        let payloads: [&'static [u8]; 2] = [br#"{"x":"\uD800"}"#, b"1e400"];
+        for (i, payload) in payloads.iter().enumerate() {
+            let params = [
+                int_param(i as i64),
+                StoolapValue {
+                    value_type: STOOLAP_TYPE_JSON,
+                    _padding: 0,
+                    v: StoolapValueData {
+                        text: StoolapTextData {
+                            ptr: payload.as_ptr() as *const c_char,
+                            len: payload.len() as i64,
+                        },
+                    },
+                },
+            ];
+            let rc =
+                stoolap_exec_params(db, ins.as_ptr(), params.as_ptr(), 2, std::ptr::null_mut());
+            assert_eq!(
+                rc,
+                STOOLAP_ERROR,
+                "{} was stored",
+                String::from_utf8_lossy(payload)
+            );
+        }
         stoolap_close(db);
     }
 }

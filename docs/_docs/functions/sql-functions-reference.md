@@ -7,7 +7,7 @@ order: 1
 
 # SQL Functions Reference
 
-Quick reference for all built-in SQL functions in Stoolap (127 in the default build, 128 with the `semantic` feature), organized by category. For detailed documentation with examples, see [Scalar Functions]({% link _docs/functions/scalar-functions.md %}), [Aggregate Functions]({% link _docs/functions/aggregate-functions.md %}), [Window Functions]({% link _docs/functions/window-functions.md %}), and [Table-Valued Functions]({% link _docs/functions/table-valued-functions.md %}).
+Quick reference for all built-in SQL functions in Stoolap (128 in the default build, 129 with the `semantic` feature), organized by category. For detailed documentation with examples, see [Scalar Functions]({% link _docs/functions/scalar-functions.md %}), [Aggregate Functions]({% link _docs/functions/aggregate-functions.md %}), [Window Functions]({% link _docs/functions/window-functions.md %}), and [Table-Valued Functions]({% link _docs/functions/table-valued-functions.md %}).
 
 ## Aggregate Functions (17)
 
@@ -183,12 +183,13 @@ JSON shorthand operators are also supported:
 
 See [Vector Search]({% link _docs/data-types/vector-search.md %}) for usage examples and HNSW index documentation.
 
-### System Functions (2)
+### System Functions (3)
 
 | Function | Syntax | Description |
 |----------|--------|-------------|
 | `VERSION` | `VERSION()` | Database version string |
 | `SLEEP` | `SLEEP(seconds)` | Pause execution (for testing) |
+| `CURRENT_TRANSACTION_ID` | `CURRENT_TRANSACTION_ID()` | Id of the open transaction, NULL outside one |
 
 ## Window Functions (11)
 

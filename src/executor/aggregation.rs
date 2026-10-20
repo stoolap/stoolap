@@ -3750,17 +3750,16 @@ impl Executor {
         // committed one: it answers only when no commit published across its
         // reads. Else the count is read through a view
         let quiet_count = || -> Result<Option<usize>> {
-            let tx = self.engine.begin_transaction()?;
+            let tx = self.begin_transaction()?;
             let table = tx.get_statement_table_at(&cd.table_name, None)?;
             table.get_partition_count(&cd.column_name)
         };
-        let read_committed =
-            self.engine.get_isolation_level() == crate::core::IsolationLevel::ReadCommitted;
+        let read_committed = self.isolation_level() == crate::core::IsolationLevel::ReadCommitted;
         let count = match read_committed.then(quiet_count).transpose()?.flatten() {
             Some(count) => count,
             None => {
                 let view = self.autocommit_view();
-                let tx = self.engine.begin_transaction()?;
+                let tx = self.begin_transaction()?;
                 let table = tx.get_statement_table_at(&cd.table_name, view.as_ref())?;
                 let Some(count) = table.get_partition_count(&cd.column_name)? else {
                     return Ok(None);
@@ -3934,7 +3933,7 @@ impl Executor {
         };
 
         // Try to get table and verify index exists
-        let tx = match self.engine.begin_transaction() {
+        let tx = match self.begin_transaction() {
             Ok(tx) => tx,
             Err(_) => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
@@ -4046,17 +4045,16 @@ impl Executor {
         // one: it answers only when no commit published across its reads.
         // Else the count is read through a view
         let quiet_count = || -> Result<Option<usize>> {
-            let tx = self.engine.begin_transaction()?;
+            let tx = self.begin_transaction()?;
             let table = tx.get_statement_table_at(&cs.table_name, None)?;
             table.fast_row_count()
         };
-        let read_committed =
-            self.engine.get_isolation_level() == crate::core::IsolationLevel::ReadCommitted;
+        let read_committed = self.isolation_level() == crate::core::IsolationLevel::ReadCommitted;
         let count = match read_committed.then(quiet_count).transpose()?.flatten() {
             Some(count) => count,
             None => {
                 let view = self.autocommit_view();
-                let tx = self.engine.begin_transaction()?;
+                let tx = self.begin_transaction()?;
                 let table = tx.get_statement_table_at(&cs.table_name, view.as_ref())?;
                 let count = table.row_count()?;
                 view.as_ref()
@@ -4265,7 +4263,7 @@ impl Executor {
         };
 
         // Try to get table and get count
-        let tx = match self.engine.begin_transaction() {
+        let tx = match self.begin_transaction() {
             Ok(tx) => tx,
             Err(_) => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());

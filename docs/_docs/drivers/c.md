@@ -89,7 +89,7 @@ The API uses four opaque handle types. Each handle is created by a specific func
 | `StoolapDB` | `stoolap_open`, `stoolap_open_in_memory`, `stoolap_clone` | `stoolap_close` | NULL-safe close (no-op) |
 | `StoolapStmt` | `stoolap_prepare` | `stoolap_stmt_finalize` | NULL-safe finalize (no-op). Keeps the database engine alive. |
 | `StoolapTx` | `stoolap_begin`, `stoolap_begin_with_isolation` | `stoolap_tx_commit` or `stoolap_tx_rollback` | Handle consumed on commit/rollback regardless of success or failure. Keeps the database engine alive. |
-| `StoolapRows` | `stoolap_query*`, `stoolap_stmt_query`, `stoolap_tx_query*`, `stoolap_tx_stmt_query*` | `stoolap_rows_close` | Must be closed even after `STOOLAP_DONE`. NULL-safe close (no-op) |
+| `StoolapRows` | `stoolap_query`, `stoolap_query_params`, `stoolap_query_named`, `stoolap_stmt_query`, `stoolap_stmt_query_named`, `stoolap_tx_query*`, `stoolap_tx_stmt_query*` | `stoolap_rows_close` | Must be closed even after `STOOLAP_DONE`. NULL-safe close (no-op). The `*_all` functions create no rows handle. |
 
 **Important**: `stoolap_tx_commit()` and `stoolap_tx_rollback()` free the transaction handle whether they succeed or fail. After calling either function, the `StoolapTx` pointer is invalid.
 
@@ -309,7 +309,7 @@ stoolap_stmt_finalize(stmt);
 
 On success, all rows are committed atomically. On any error, the entire batch is rolled back and the error is available via `stoolap_errmsg(db)`.
 
-The `total_affected` pointer may be NULL if you do not need the count. When `row_count` is 0, the function returns `STOOLAP_OK` immediately without opening a transaction.
+The `total_affected` pointer may be NULL if you do not need the count. When `row_count` is 0, the function returns `STOOLAP_OK` immediately without opening a transaction. A negative `params_per_row`, or a NULL `params` with a positive `params_per_row`, returns `STOOLAP_ERROR` before anything runs.
 
 ### Statement Functions
 
@@ -319,6 +319,8 @@ The `total_affected` pointer may be NULL if you do not need the count. When `row
 | `stoolap_stmt_exec(stmt, params, len, &affected)` | `int32_t` | Execute with parameters |
 | `stoolap_stmt_exec_batch(db, stmt, params, params_per_row, row_count, &total)` | `int32_t` | Execute batch in a single transaction |
 | `stoolap_stmt_query(stmt, params, len, &rows)` | `int32_t` | Query with parameters |
+| `stoolap_stmt_exec_named(stmt, params, len, &affected)` | `int32_t` | Execute with named parameters |
+| `stoolap_stmt_query_named(stmt, params, len, &rows)` | `int32_t` | Query with named parameters |
 | `stoolap_stmt_sql(stmt)` | `const char*` | Get the SQL text |
 | `stoolap_stmt_finalize(stmt)` | `void` | Destroy the statement (NULL-safe) |
 | `stoolap_stmt_errmsg(stmt)` | `const char*` | Last error message |
@@ -497,6 +499,8 @@ float vec[] = { 1.0f, 2.0f, 3.0f };
 StoolapValue v_blob = { .value_type = STOOLAP_TYPE_BLOB, 0, { .blob = { (const uint8_t*)vec, sizeof(vec) } } };
 ```
 
+A `STOOLAP_TYPE_TEXT` value that is not valid UTF-8, and a `STOOLAP_TYPE_JSON` value that is not valid JSON (including an empty string), make the call fail with `STOOLAP_ERROR` and an error message on the handle. Nothing is executed. A NULL `ptr` passes SQL NULL.
+
 ### Named Parameters (StoolapNamedParam)
 
 Named parameters use `:name` syntax in SQL. Pass an array of `StoolapNamedParam` structs instead of positional `StoolapValue` arrays:
@@ -554,13 +558,27 @@ for (int i = 0; i < 100; i++) {
 }
 stoolap_tx_commit(tx2);
 stoolap_stmt_finalize(stmt);
+
+/* Prepared statement + named params outside a transaction */
+StoolapStmt* lookup = NULL;
+stoolap_prepare(db, "SELECT name FROM t WHERE id = :id", &lookup);
+StoolapRows* found = NULL;
+stoolap_stmt_query_named(lookup, qp, 1, &found);
+/* ... iterate found ... */
+stoolap_rows_close(found);
+
+/* Or all rows in one call, inside tx when it is not NULL */
+const uint8_t* buf = NULL;
+int64_t buf_len = 0;
+stoolap_stmt_query_named_all(lookup, NULL, qp, 1, &buf, &buf_len);
+stoolap_stmt_finalize(lookup);
 ```
 
 The parameter name must be valid UTF-8 and match the `:name` placeholder in the SQL (without the `:` prefix). Names with invalid UTF-8 or zero length are silently skipped.
 
 Text and JSON parameters do not need to be null-terminated. The `len` field specifies the byte length. Both must be valid UTF-8.
 
-JSON parameters are validated with a full parse. Malformed JSON (including empty strings) is rejected and treated as NULL.
+JSON parameters are validated with a full parse. Malformed JSON (including empty strings) fails the call, as text that is not valid UTF-8 does.
 
 BLOB parameters must be packed little-endian f32 data. The byte length must be a multiple of 4. Non-conforming payloads are treated as NULL.
 
@@ -592,11 +610,11 @@ if (stoolap_open("bad://dsn", &db) != STOOLAP_OK) {
 
 | Function | Use when |
 |----------|----------|
-| `stoolap_errmsg(db)` | After `stoolap_exec*`, `stoolap_query*`, `stoolap_prepare` fail |
+| `stoolap_errmsg(db)` | After `stoolap_exec*`, `stoolap_query*` (including `stoolap_query_params_all`), `stoolap_prepare`, `stoolap_stmt_exec_batch` fail |
 | `stoolap_errmsg(NULL)` | After `stoolap_open*` fails, or after `stoolap_tx_commit`/`stoolap_tx_rollback` fails |
-| `stoolap_stmt_errmsg(stmt)` | After `stoolap_stmt_exec`, `stoolap_stmt_query` fail |
-| `stoolap_tx_errmsg(tx)` | After `stoolap_tx_exec*`, `stoolap_tx_query*`, `stoolap_tx_stmt_*_named` fail |
-| `stoolap_rows_errmsg(rows)` | After `stoolap_rows_next` returns `STOOLAP_ERROR` |
+| `stoolap_stmt_errmsg(stmt)` | After `stoolap_stmt_exec*`, `stoolap_stmt_query*` (including the `_all` forms, even when run inside a transaction) fail |
+| `stoolap_tx_errmsg(tx)` | After `stoolap_tx_exec*`, `stoolap_tx_query*`, `stoolap_tx_stmt_*` fail |
+| `stoolap_rows_errmsg(rows)` | After `stoolap_rows_next`, `stoolap_rows_fetch_all` or `stoolap_rows_fetch_chunk` returns `STOOLAP_ERROR` |
 
 If no error has occurred, all `*_errmsg()` functions return an empty string (`""`), never NULL.
 
@@ -657,6 +675,7 @@ The C API is designed so that callers never need to free individual strings. All
 **Summary of rules:**
 
 - Never free pointers returned by `stoolap_errmsg()`, `stoolap_rows_column_text()`, `stoolap_rows_column_name()`, `stoolap_stmt_sql()`, or `stoolap_version()`.
+- Never free buffers from `stoolap_rows_fetch_chunk()`, `stoolap_stmt_query_all()` or `stoolap_query_params_all()`: their handle owns and reuses them. Only `stoolap_rows_fetch_all()` buffers are freed, with `stoolap_buffer_free()`.
 - Always call `stoolap_rows_close()` on every `StoolapRows` handle, even after `STOOLAP_DONE`.
 - Always call `stoolap_stmt_finalize()` on every `StoolapStmt` handle.
 - Always call `stoolap_close()` on every `StoolapDB` handle.
@@ -704,6 +723,57 @@ The buffer layout is:
 
 The caller must free the buffer with `stoolap_buffer_free(buf, buf_len)`. The rows handle must still be closed with `stoolap_rows_close()` after the fetch.
 
+If the query fails while its rows are being produced (for example a parameterized `REGEXP` with an invalid pattern), `stoolap_rows_fetch_all()` returns `STOOLAP_ERROR`, sets no buffer, and the message is available from `stoolap_rows_errmsg()`. A result is never returned cut short.
+
+### Chunked Fetch
+
+`stoolap_rows_fetch_chunk()` packs at most `max_rows` of the remaining rows in the same format and advances the cursor. A binding can serve its own row iterator from the chunk and cross the FFI boundary once per chunk instead of once per row and column. Every chunk carries the column header; `out_rows` is 0 once the result is exhausted.
+
+The chunk buffer belongs to the rows handle and is reused for the next chunk, so there is nothing to free and no allocation per chunk once the buffer has grown. Read or copy a chunk before the next call on the same handle.
+
+```c
+StoolapRows* rows = NULL;
+stoolap_query(db, "SELECT id, name FROM users", &rows);
+
+const uint8_t* buf = NULL;
+int64_t buf_len = 0;
+int32_t n = 0;
+while (stoolap_rows_fetch_chunk(rows, 256, &buf, &buf_len, &n) == STOOLAP_OK && n > 0) {
+    /* Parse n rows from buf (format above) before the next call */
+}
+stoolap_rows_close(rows);
+```
+
+`stoolap_rows_fetch_chunk()` and `stoolap_rows_next()` advance the same cursor and can be mixed.
+
+### Query and Fetch in One Call
+
+`stoolap_stmt_query_all()` and `stoolap_query_params_all()` run a query and return all of its rows in the packed format in a single call. No rows handle is created, so a point lookup is one FFI call instead of four (query, fetch, free, close). Pass a transaction handle as `tx` to run inside it, or NULL to run outside a transaction.
+
+The buffer belongs to the statement (`stoolap_stmt_query_all`) or the database handle (`stoolap_query_params_all`) and is reused by the next call on that handle, so it must not be freed and must be read before that call. A buffer that grew beyond 1 MiB for a large result is released at the next call. Errors are read with `stoolap_stmt_errmsg(stmt)` or `stoolap_errmsg(db)`, including when the call ran inside `tx`.
+
+```c
+StoolapStmt* stmt = NULL;
+stoolap_prepare(db, "SELECT name FROM users WHERE id = $1", &stmt);
+
+StoolapValue id = { .value_type = STOOLAP_TYPE_INTEGER, .v.integer = 42 };
+const uint8_t* buf = NULL;
+int64_t buf_len = 0;
+if (stoolap_stmt_query_all(stmt, NULL, &id, 1, &buf, &buf_len) == STOOLAP_OK) {
+    /* Parse buf before the next call on stmt */
+} else {
+    fprintf(stderr, "%s\n", stoolap_stmt_errmsg(stmt));
+}
+
+/* Ad-hoc SQL inside a transaction */
+StoolapTx* tx = NULL;
+stoolap_begin(db, &tx);
+if (stoolap_query_params_all(db, tx, "SELECT COUNT(*) FROM users", NULL, 0, &buf, &buf_len) != STOOLAP_OK) {
+    fprintf(stderr, "%s\n", stoolap_errmsg(db));
+}
+stoolap_tx_commit(tx);
+```
+
 ## API Reference
 
 ### Library
@@ -746,6 +816,8 @@ The caller must free the buffer with `stoolap_buffer_free(buf, buf_len)`. The ro
 | `stoolap_stmt_exec(stmt, params, len, &affected)` | `int32_t` | Execute prepared statement |
 | `stoolap_stmt_exec_batch(db, stmt, params, params_per_row, row_count, &total)` | `int32_t` | Execute batch in a single transaction |
 | `stoolap_stmt_query(stmt, params, len, &rows)` | `int32_t` | Query with prepared statement |
+| `stoolap_stmt_exec_named(stmt, params, len, &affected)` | `int32_t` | Execute prepared statement with named parameters |
+| `stoolap_stmt_query_named(stmt, params, len, &rows)` | `int32_t` | Query with prepared statement and named parameters |
 | `stoolap_stmt_sql(stmt)` | `const char*` | Get SQL text (valid until finalize) |
 | `stoolap_stmt_finalize(stmt)` | `void` | Destroy statement (NULL-safe) |
 | `stoolap_stmt_errmsg(stmt)` | `const char*` | Last error message |
@@ -795,6 +867,10 @@ The caller must free the buffer with `stoolap_buffer_free(buf, buf_len)`. The ro
 |----------|---------|-------------|
 | `stoolap_rows_fetch_all(rows, &buf, &len)` | `int32_t` | Fetch all remaining rows into a packed binary buffer |
 | `stoolap_buffer_free(buf, len)` | `void` | Free a buffer from `stoolap_rows_fetch_all` (NULL-safe) |
+| `stoolap_rows_fetch_chunk(rows, max, &buf, &len, &n)` | `int32_t` | Fetch up to `max` rows into a buffer owned by the rows handle; `n == 0` at the end |
+| `stoolap_stmt_query_all(stmt, tx, params, len, &buf, &buf_len)` | `int32_t` | Run a prepared statement and pack all rows into a buffer owned by the statement |
+| `stoolap_stmt_query_named_all(stmt, tx, params, len, &buf, &buf_len)` | `int32_t` | `stoolap_stmt_query_all` with named parameters |
+| `stoolap_query_params_all(db, tx, sql, params, len, &buf, &buf_len)` | `int32_t` | Run SQL and pack all rows into a buffer owned by the database handle |
 
 ### Memory
 

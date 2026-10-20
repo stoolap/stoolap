@@ -177,6 +177,18 @@ for id in 1..=100 {
 }
 ```
 
+Prepared statements take named parameters too, and run inside a transaction with the `_in` methods:
+
+```rust
+let update = db.prepare("UPDATE users SET age = :age WHERE id = :id")?;
+update.execute_named(named_params!{ age: 31, id: 1 })?;
+
+let mut tx = db.begin()?;
+update.execute_named_in(&mut tx, named_params!{ age: 32, id: 1 })?;
+let rows = stmt.query_in(&mut tx, (1,))?;
+tx.commit()?;
+```
+
 ## Benefits of Parameters
 
 1. **SQL Injection Prevention**: Parameters are never interpolated into SQL strings

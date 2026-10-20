@@ -768,6 +768,20 @@ SELECT SLEEP(1);                           -- Pauses for 1 second, returns 0
 SELECT SLEEP(0.5);                         -- Pauses for 500ms
 ```
 
+### CURRENT_TRANSACTION_ID
+Returns the id of the open explicit transaction as an INTEGER, and NULL for a statement run outside one (autocommit). It is evaluated once per statement, so every row a statement writes gets the same id.
+
+```sql
+BEGIN;
+INSERT INTO audit (id, txn) VALUES (1, CURRENT_TRANSACTION_ID());
+UPDATE t SET last_txn = CURRENT_TRANSACTION_ID() WHERE id = 7;
+COMMIT;
+
+SELECT CURRENT_TRANSACTION_ID();           -- NULL outside a transaction
+```
+
+Inside a transaction from the Rust API (`db.begin()`) it returns the same id as `tx.id()`. It also works in statements run through a C API transaction (`stoolap_begin`).
+
 ## Example Queries
 
 ### Data Cleaning

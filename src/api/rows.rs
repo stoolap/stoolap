@@ -183,11 +183,17 @@ impl ResultRow {
 
     /// Get the index of a column by name (case-insensitive)
     fn column_index(&self, name: &str) -> Result<usize> {
-        let name_lower = name.to_lowercase();
-        self.columns
-            .iter()
-            .position(|c| c.to_lowercase() == name_lower)
-            .ok_or_else(|| Error::ColumnNotFound(name.to_string()))
+        let position = if name.is_ascii() && self.columns.iter().all(|c| c.is_ascii()) {
+            self.columns
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(name))
+        } else {
+            let name_lower = name.to_lowercase();
+            self.columns
+                .iter()
+                .position(|c| c.to_lowercase() == name_lower)
+        };
+        position.ok_or_else(|| Error::ColumnNotFound(name.to_string()))
     }
 }
 
@@ -247,6 +253,12 @@ impl Rows {
 
     /// Get the column names
     pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+
+    /// The column names, shared
+    #[cfg(feature = "ffi")]
+    pub(crate) fn columns_arc(&self) -> &CompactArc<Vec<String>> {
         &self.columns
     }
 

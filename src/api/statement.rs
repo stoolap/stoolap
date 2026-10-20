@@ -47,8 +47,9 @@ use crate::executor::query_cache::CachedPlanRef;
 use crate::parser::Parser;
 
 use super::database::{Database, DatabaseInnerHandle, FromValue};
-use super::params::Params;
+use super::params::{NamedParams, Params};
 use super::rows::Rows;
+use super::transaction::Transaction;
 
 /// A prepared SQL statement
 ///
@@ -160,9 +161,7 @@ impl Statement {
     pub fn execute<P: Params>(&self, params: P) -> Result<i64> {
         let db = self.get_db()?;
         if let Some(plan) = &self.plan {
-            let ctx = ExecutionContext::with_params(params.into_params());
-            let result = db.executor().execute_with_cached_plan_owned(plan, ctx)?;
-            Ok(result.rows_affected())
+            Ok(db.run_plan(plan, params.into_params())?.rows_affected())
         } else {
             db.execute(&self.sql, params)
         }
@@ -185,11 +184,35 @@ impl Statement {
     pub fn query<P: Params>(&self, params: P) -> Result<Rows> {
         let db = self.get_db()?;
         if let Some(plan) = &self.plan {
-            let ctx = ExecutionContext::with_params(params.into_params());
-            let result = db.executor().execute_with_cached_plan_owned(plan, ctx)?;
-            Ok(Rows::new(result))
+            Ok(Rows::new(db.run_plan(plan, params.into_params())?))
         } else {
             db.query(&self.sql, params)
+        }
+    }
+
+    /// Execute the prepared statement with named parameters (`:name`)
+    pub fn execute_named(&self, params: NamedParams) -> Result<i64> {
+        let db = self.get_db()?;
+        match &self.plan {
+            Some(plan) => {
+                let ctx = ExecutionContext::with_named_params(params.into_inner());
+                let result = db.executor().execute_with_cached_plan_owned(plan, ctx)?;
+                Ok(result.rows_affected())
+            }
+            None => db.execute_named(&self.sql, params),
+        }
+    }
+
+    /// Query using the prepared statement with named parameters (`:name`)
+    pub fn query_named(&self, params: NamedParams) -> Result<Rows> {
+        let db = self.get_db()?;
+        match &self.plan {
+            Some(plan) => {
+                let ctx = ExecutionContext::with_named_params(params.into_inner());
+                let result = db.executor().execute_with_cached_plan_owned(plan, ctx)?;
+                Ok(Rows::new(result))
+            }
+            None => db.query_named(&self.sql, params),
         }
     }
 
@@ -227,12 +250,40 @@ impl Statement {
         &self.sql
     }
 
-    /// Get the AST statement from the cached plan (if available).
-    ///
-    /// Returns `None` for multi-statement SQL which doesn't cache a plan.
-    #[cfg(feature = "ffi")]
-    pub(crate) fn ast_statement(&self) -> Option<&Arc<crate::parser::ast::Statement>> {
-        self.plan.as_ref().map(|p| &p.statement)
+    /// The compiled plan when this statement was prepared on `engine`.
+    /// Compiled state is checked against its engine's schema epoch only,
+    /// so another engine plans the SQL afresh
+    pub(crate) fn plan_on(
+        &self,
+        engine: &Arc<crate::storage::mvcc::engine::MVCCEngine>,
+    ) -> Option<&CachedPlanRef> {
+        let plan = self.plan.as_ref()?;
+        let db = self.db_weak.upgrade()?;
+        Arc::ptr_eq(db.executor.engine(), engine).then_some(plan)
+    }
+
+    /// Execute the prepared statement inside `tx`
+    pub fn execute_in<P: Params>(&self, tx: &mut Transaction, params: P) -> Result<i64> {
+        let ctx = ExecutionContext::with_params(params.into_params());
+        Ok(tx.execute_prepared_statement(self, ctx)?.rows_affected())
+    }
+
+    /// Query using the prepared statement inside `tx`
+    pub fn query_in<P: Params>(&self, tx: &mut Transaction, params: P) -> Result<Rows> {
+        let ctx = ExecutionContext::with_params(params.into_params());
+        Ok(Rows::new(tx.execute_prepared_statement(self, ctx)?))
+    }
+
+    /// Execute the prepared statement inside `tx` with named parameters
+    pub fn execute_named_in(&self, tx: &mut Transaction, params: NamedParams) -> Result<i64> {
+        let ctx = ExecutionContext::with_named_params(params.into_inner());
+        Ok(tx.execute_prepared_statement(self, ctx)?.rows_affected())
+    }
+
+    /// Query using the prepared statement inside `tx` with named parameters
+    pub fn query_named_in(&self, tx: &mut Transaction, params: NamedParams) -> Result<Rows> {
+        let ctx = ExecutionContext::with_named_params(params.into_inner());
+        Ok(Rows::new(tx.execute_prepared_statement(self, ctx)?))
     }
 }
 

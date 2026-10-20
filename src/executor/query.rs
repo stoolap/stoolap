@@ -770,8 +770,8 @@ impl Executor {
             && ctx.statement_snapshot().is_none()
             && self.active_transaction.lock().unwrap().is_none()
         {
-            let snapshot = self
-                .new_statement_snapshot(self.engine.get_isolation_level(), ctx.statement_view())?;
+            let snapshot =
+                self.new_statement_snapshot(self.isolation_level(), ctx.statement_view())?;
             snapshot_ctx = ctx.with_statement_snapshot(snapshot);
             &snapshot_ctx
         } else {
@@ -2427,7 +2427,7 @@ impl Executor {
             || ctx.timeout_ms() > 0
             || ctx.query_depth > 0
             || expression_contains_aggregate(where_expr)
-            || self.engine.get_isolation_level() != crate::core::IsolationLevel::ReadCommitted
+            || self.isolation_level() != crate::core::IsolationLevel::ReadCommitted
         {
             return Ok(EarlySemantic::NotTried);
         }
@@ -2667,7 +2667,7 @@ impl Executor {
                              // otherwise a standalone transaction
             if let Some(snapshot) = ctx.statement_snapshot() {
                 if let Some(ref as_of) = table_source.as_of {
-                    let tx = self.engine.begin_transaction()?;
+                    let tx = self.begin_transaction()?;
                     return self.execute_temporal_query(
                         table_name,
                         as_of,
@@ -2688,7 +2688,7 @@ impl Executor {
                     })?;
                 (table, None)
             } else {
-                let tx = self.engine.begin_transaction()?;
+                let tx = self.begin_transaction()?;
 
                 // Check for AS OF (temporal query)
                 if let Some(ref as_of) = table_source.as_of {
@@ -4786,10 +4786,9 @@ impl Executor {
                 // continuation finds that a commit moved rows under it
                 let mut snapshot = match ctx.statement_snapshot() {
                     Some(snapshot) => snapshot.clone(),
-                    None => self.new_statement_snapshot(
-                        crate::core::IsolationLevel::ReadCommitted,
-                        ctx.statement_view(),
-                    )?,
+                    None => {
+                        self.new_statement_snapshot(self.isolation_level(), ctx.statement_view())?
+                    }
                 };
                 let mut ctx_join = ctx.with_statement_snapshot(snapshot.clone());
                 if small_outer {
@@ -7862,10 +7861,7 @@ impl Executor {
         // explicit transaction the outer side is read whole
         let mut snapshot = match ctx.statement_snapshot() {
             Some(snapshot) => snapshot.clone(),
-            None => self.new_statement_snapshot(
-                crate::core::IsolationLevel::ReadCommitted,
-                ctx.statement_view(),
-            )?,
+            None => self.new_statement_snapshot(self.isolation_level(), ctx.statement_view())?,
         };
         let mut ctx_join = ctx.with_statement_snapshot(snapshot.clone());
         let in_explicit_transaction = self.active_transaction.lock().unwrap().is_some();
@@ -10305,7 +10301,7 @@ impl Executor {
             let isolation = Self::parse_isolation_level(level)?;
             self.engine.begin_transaction_with_level(isolation)?
         } else {
-            self.engine.begin_transaction()?
+            self.begin_transaction()?
         };
 
         *active_tx = Some(ActiveTransaction {
@@ -10356,20 +10352,27 @@ impl Executor {
                 ))
             }
         } else {
-            // Full ROLLBACK - ends the transaction
-            if let Some(mut tx_state) = active_tx.take() {
-                // Rollback all tables first
-                for (_name, mut table) in tx_state.tables.drain() {
-                    table.rollback();
-                }
-                // Then rollback the transaction
-                tx_state.transaction.rollback()?;
-                Ok(Box::new(ExecResult::empty()))
-            } else {
-                // No active transaction - this is a no-op
-                Ok(Box::new(ExecResult::empty()))
-            }
+            drop(active_tx);
+            self.rollback_active()?;
+            Ok(Box::new(ExecResult::empty()))
         }
+    }
+
+    /// Rolls back and ends the open transaction, its tables first; a no-op
+    /// when none is open
+    pub(crate) fn rollback_active(&self) -> Result<()> {
+        let taken = self
+            .active_transaction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(mut tx_state) = taken {
+            for (_name, mut table) in tx_state.tables.drain() {
+                table.rollback();
+            }
+            tx_state.transaction.rollback()?;
+        }
+        Ok(())
     }
 
     /// Execute SET statement
@@ -10400,8 +10403,7 @@ impl Executor {
                 if let Some(ref mut tx_state) = *active_tx {
                     tx_state.transaction.set_isolation_level(isolation)?;
                 } else {
-                    // No active transaction: set the engine's default isolation level
-                    self.engine.registry().set_global_isolation_level(isolation);
+                    self.store_isolation_level(isolation);
                 }
 
                 Ok(Box::new(ExecResult::empty()))
@@ -12119,7 +12121,7 @@ impl Executor {
         };
 
         // Try to get the table and check for index or PK
-        let txn = self.engine.begin_transaction().ok()?;
+        let txn = self.begin_transaction().ok()?;
         let table = txn.get_statement_table(table_name_ref).ok()?;
         let schema = table.schema();
 

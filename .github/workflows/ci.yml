@@ -54,6 +54,23 @@ jobs:
     - name: Check all features on MSRV
       run: cargo check --all-features
 
+  wasm:
+    name: WASI build (C API)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: wasm32-wasip1
+
+    - name: Cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Check the C API for wasm32-wasip1
+      run: cargo check --lib --target wasm32-wasip1 --no-default-features --features ffi
+
   test:
     name: Test
     runs-on: ${{ matrix.os }}

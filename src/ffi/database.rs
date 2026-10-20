@@ -17,13 +17,13 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::panic;
-use std::sync::Arc;
 
 use crate::api::Database;
 use crate::common::version::VERSION;
 
 use super::error;
-use super::types::{StoolapDB, StoolapNamedParam, StoolapRows, StoolapValue};
+use super::rows::pack_all;
+use super::types::{StoolapDB, StoolapNamedParam, StoolapRows, StoolapTx, StoolapValue};
 use super::value;
 use super::{STOOLAP_ERROR, STOOLAP_OK};
 
@@ -72,6 +72,7 @@ pub unsafe extern "C" fn stoolap_open(dsn: *const c_char, out_db: *mut *mut Stoo
                 let handle = Box::new(StoolapDB {
                     db,
                     last_error: None,
+                    packed: Vec::new(),
                 });
                 *out_db = Box::into_raw(handle);
                 STOOLAP_OK
@@ -107,6 +108,7 @@ pub unsafe extern "C" fn stoolap_open_in_memory(out_db: *mut *mut StoolapDB) -> 
                 let handle = Box::new(StoolapDB {
                     db,
                     last_error: None,
+                    packed: Vec::new(),
                 });
                 *out_db = Box::into_raw(handle);
                 STOOLAP_OK
@@ -185,6 +187,7 @@ pub unsafe extern "C" fn stoolap_clone(db: *const StoolapDB, out_db: *mut *mut S
         let new_handle = Box::new(StoolapDB {
             db: cloned,
             last_error: None,
+            packed: Vec::new(),
         });
         *out_db = Box::into_raw(new_handle);
         STOOLAP_OK
@@ -303,9 +306,7 @@ pub unsafe extern "C" fn stoolap_exec_params(
             }
         };
 
-        let param_vec = value::params_to_vec(params, params_len);
-
-        match handle.db.execute(sql_str, param_vec) {
+        match value::params_to_vec(params, params_len).and_then(|p| handle.db.execute(sql_str, p)) {
             Ok(affected) => {
                 if !rows_affected.is_null() {
                     *rows_affected = affected;
@@ -382,27 +383,9 @@ pub unsafe extern "C" fn stoolap_query_params(
             }
         };
 
-        let param_vec = value::params_to_vec(params, params_len);
-
-        match handle.db.query(sql_str, param_vec) {
+        match value::params_to_vec(params, params_len).and_then(|p| handle.db.query(sql_str, p)) {
             Ok(rows) => {
-                let column_names: Vec<CString> = rows
-                    .columns()
-                    .iter()
-                    .map(|name| CString::new(name.as_str()).unwrap_or_default())
-                    .collect();
-                let affected = rows.rows_affected();
-
-                let rows_handle = Box::new(StoolapRows {
-                    rows: Some(rows),
-                    has_row: false,
-                    last_error: None,
-                    column_names: Arc::new(column_names),
-                    text_cache: Vec::new(),
-                    text_cache_dirty: false,
-                    rows_affected: affected,
-                });
-                *out_rows = Box::into_raw(rows_handle);
+                *out_rows = StoolapRows::boxed(rows, None);
                 STOOLAP_OK
             }
             Err(e) => {
@@ -414,6 +397,82 @@ pub unsafe extern "C" fn stoolap_query_params(
 
     result.unwrap_or_else(|_| {
         handle.set_error("panic during stoolap_query_params");
+        STOOLAP_ERROR
+    })
+}
+
+/// Run a query with positional parameters and pack every row into one
+/// buffer, in the format of `stoolap_rows_fetch_all()`, without a rows
+/// handle.
+///
+/// Runs inside `tx` when it is not NULL. The buffer belongs to `db` and
+/// stays valid until the next call on it or `stoolap_close()`. Must NOT be
+/// freed. Errors are read with `stoolap_errmsg(db)`.
+///
+/// # Safety
+///
+/// - `db` must be a valid `StoolapDB` pointer.
+/// - `tx` must be a valid `StoolapTx` pointer or NULL.
+/// - `sql` must be a valid null-terminated UTF-8 string.
+/// - `params` must point to `params_len` valid `StoolapValue` structs (or be NULL).
+/// - `out_buf` and `out_len` must not be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_query_params_all(
+    db: *mut StoolapDB,
+    tx: *mut StoolapTx,
+    sql: *const c_char,
+    params: *const StoolapValue,
+    params_len: i32,
+    out_buf: *mut *const u8,
+    out_len: *mut i64,
+) -> i32 {
+    if out_buf.is_null() || out_len.is_null() {
+        return STOOLAP_ERROR;
+    }
+    *out_buf = std::ptr::null();
+    *out_len = 0;
+
+    let handle = match db.as_mut() {
+        Some(h) => h,
+        None => return STOOLAP_ERROR,
+    };
+    handle.last_error = None;
+
+    if sql.is_null() {
+        handle.set_error("SQL string is NULL");
+        return STOOLAP_ERROR;
+    }
+
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let sql_str = match CStr::from_ptr(sql).to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                handle.set_error(&format!("invalid UTF-8 in SQL: {}", e));
+                return STOOLAP_ERROR;
+            }
+        };
+
+        let rows = value::params_to_vec(params, params_len).and_then(|p| {
+            match super::statement::open_transaction(tx)? {
+                None => handle.db.query(sql_str, p),
+                Some(inner_tx) => inner_tx.query(sql_str, p),
+            }
+        });
+        match rows.and_then(|mut rows| pack_all(&mut rows, &mut handle.packed)) {
+            Ok(_) => {
+                *out_buf = handle.packed.as_ptr();
+                *out_len = handle.packed.len() as i64;
+                STOOLAP_OK
+            }
+            Err(e) => {
+                handle.set_error(&e.to_string());
+                STOOLAP_ERROR
+            }
+        }
+    }));
+
+    result.unwrap_or_else(|_| {
+        handle.set_error("panic during stoolap_query_params_all");
         STOOLAP_ERROR
     })
 }
@@ -456,7 +515,7 @@ pub unsafe extern "C" fn stoolap_exec_named(
 
         let named = value::named_params_from_ffi(params, params_len);
 
-        match handle.db.execute_named(sql_str, named) {
+        match named.and_then(|named| handle.db.execute_named(sql_str, named)) {
             Ok(affected) => {
                 if !rows_affected.is_null() {
                     *rows_affected = affected;
@@ -519,25 +578,9 @@ pub unsafe extern "C" fn stoolap_query_named(
 
         let named = value::named_params_from_ffi(params, params_len);
 
-        match handle.db.query_named(sql_str, named) {
+        match named.and_then(|named| handle.db.query_named(sql_str, named)) {
             Ok(rows) => {
-                let column_names: Vec<CString> = rows
-                    .columns()
-                    .iter()
-                    .map(|name| CString::new(name.as_str()).unwrap_or_default())
-                    .collect();
-                let affected = rows.rows_affected();
-
-                let rows_handle = Box::new(StoolapRows {
-                    rows: Some(rows),
-                    has_row: false,
-                    last_error: None,
-                    column_names: Arc::new(column_names),
-                    text_cache: Vec::new(),
-                    text_cache_dirty: false,
-                    rows_affected: affected,
-                });
-                *out_rows = Box::into_raw(rows_handle);
+                *out_rows = StoolapRows::boxed(rows, None);
                 STOOLAP_OK
             }
             Err(e) => {

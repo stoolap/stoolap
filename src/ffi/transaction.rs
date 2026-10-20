@@ -14,10 +14,9 @@
 
 //! Transaction FFI functions.
 
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::panic;
-use std::sync::Arc;
 
 use crate::core::types::IsolationLevel;
 
@@ -195,9 +194,7 @@ pub unsafe extern "C" fn stoolap_tx_exec_params(
             }
         };
 
-        let param_vec = value::params_to_vec(params, params_len);
-
-        match inner_tx.execute(sql_str, param_vec) {
+        match value::params_to_vec(params, params_len).and_then(|p| inner_tx.execute(sql_str, p)) {
             Ok(affected) => {
                 if !rows_affected.is_null() {
                     *rows_affected = affected;
@@ -282,27 +279,9 @@ pub unsafe extern "C" fn stoolap_tx_query_params(
             }
         };
 
-        let param_vec = value::params_to_vec(params, params_len);
-
-        match inner_tx.query(sql_str, param_vec) {
+        match value::params_to_vec(params, params_len).and_then(|p| inner_tx.query(sql_str, p)) {
             Ok(rows) => {
-                let column_names: Vec<CString> = rows
-                    .columns()
-                    .iter()
-                    .map(|name| CString::new(name.as_str()).unwrap_or_default())
-                    .collect();
-                let affected = rows.rows_affected();
-
-                let rows_handle = Box::new(StoolapRows {
-                    rows: Some(rows),
-                    has_row: false,
-                    last_error: None,
-                    column_names: Arc::new(column_names),
-                    text_cache: Vec::new(),
-                    text_cache_dirty: false,
-                    rows_affected: affected,
-                });
-                *out_rows = Box::into_raw(rows_handle);
+                *out_rows = StoolapRows::boxed(rows, None);
                 STOOLAP_OK
             }
             Err(e) => {
@@ -435,29 +414,8 @@ pub unsafe extern "C" fn stoolap_tx_stmt_exec(
             }
         };
 
-        let ast_stmt = match stmt_handle.stmt.ast_statement() {
-            Some(s) => s,
-            None => {
-                // Multi-statement SQL: fall back to SQL-based execution
-                let sql_str = stmt_handle.sql_cstr.to_str().unwrap_or("");
-                let param_vec = value::params_to_vec(params, params_len);
-                match inner_tx.execute(sql_str, param_vec) {
-                    Ok(affected) => {
-                        if !rows_affected.is_null() {
-                            *rows_affected = affected;
-                        }
-                        return STOOLAP_OK;
-                    }
-                    Err(e) => {
-                        handle.set_error(&e.to_string());
-                        return STOOLAP_ERROR;
-                    }
-                }
-            }
-        };
-
         let param_vec = value::params_to_vec(params, params_len);
-        match inner_tx.execute_prepared(ast_stmt, param_vec) {
+        match param_vec.and_then(|p| stmt_handle.stmt.execute_in(inner_tx, p)) {
             Ok(affected) => {
                 if !rows_affected.is_null() {
                     *rows_affected = affected;
@@ -523,61 +481,10 @@ pub unsafe extern "C" fn stoolap_tx_stmt_query(
             }
         };
 
-        let ast_stmt = match stmt_handle.stmt.ast_statement() {
-            Some(s) => s,
-            None => {
-                // Multi-statement SQL: fall back to SQL-based execution
-                let sql_str = stmt_handle.sql_cstr.to_str().unwrap_or("");
-                let param_vec = value::params_to_vec(params, params_len);
-                match inner_tx.query(sql_str, param_vec) {
-                    Ok(rows) => {
-                        let column_names: Vec<CString> = rows
-                            .columns()
-                            .iter()
-                            .map(|name| CString::new(name.as_str()).unwrap_or_default())
-                            .collect();
-                        let affected = rows.rows_affected();
-
-                        let rows_handle = Box::new(StoolapRows {
-                            rows: Some(rows),
-                            has_row: false,
-                            last_error: None,
-                            column_names: Arc::new(column_names),
-                            text_cache: Vec::new(),
-                            text_cache_dirty: false,
-                            rows_affected: affected,
-                        });
-                        *out_rows = Box::into_raw(rows_handle);
-                        return STOOLAP_OK;
-                    }
-                    Err(e) => {
-                        handle.set_error(&e.to_string());
-                        return STOOLAP_ERROR;
-                    }
-                }
-            }
-        };
-
         let param_vec = value::params_to_vec(params, params_len);
-        match inner_tx.query_prepared(ast_stmt, param_vec) {
+        match param_vec.and_then(|p| stmt_handle.stmt.query_in(inner_tx, p)) {
             Ok(rows) => {
-                let column_names: Vec<CString> = rows
-                    .columns()
-                    .iter()
-                    .map(|name| CString::new(name.as_str()).unwrap_or_default())
-                    .collect();
-                let affected = rows.rows_affected();
-
-                let rows_handle = Box::new(StoolapRows {
-                    rows: Some(rows),
-                    has_row: false,
-                    last_error: None,
-                    column_names: Arc::new(column_names),
-                    text_cache: Vec::new(),
-                    text_cache_dirty: false,
-                    rows_affected: affected,
-                });
-                *out_rows = Box::into_raw(rows_handle);
+                *out_rows = StoolapRows::boxed(rows, None);
                 STOOLAP_OK
             }
             Err(e) => {
@@ -639,7 +546,7 @@ pub unsafe extern "C" fn stoolap_tx_exec_named(
 
         let named = value::named_params_from_ffi(params, params_len);
 
-        match inner_tx.execute_named(sql_str, named) {
+        match named.and_then(|named| inner_tx.execute_named(sql_str, named)) {
             Ok(affected) => {
                 if !rows_affected.is_null() {
                     *rows_affected = affected;
@@ -710,25 +617,9 @@ pub unsafe extern "C" fn stoolap_tx_query_named(
 
         let named = value::named_params_from_ffi(params, params_len);
 
-        match inner_tx.query_named(sql_str, named) {
+        match named.and_then(|named| inner_tx.query_named(sql_str, named)) {
             Ok(rows) => {
-                let column_names: Vec<CString> = rows
-                    .columns()
-                    .iter()
-                    .map(|name| CString::new(name.as_str()).unwrap_or_default())
-                    .collect();
-                let affected = rows.rows_affected();
-
-                let rows_handle = Box::new(StoolapRows {
-                    rows: Some(rows),
-                    has_row: false,
-                    last_error: None,
-                    column_names: Arc::new(column_names),
-                    text_cache: Vec::new(),
-                    text_cache_dirty: false,
-                    rows_affected: affected,
-                });
-                *out_rows = Box::into_raw(rows_handle);
+                *out_rows = StoolapRows::boxed(rows, None);
                 STOOLAP_OK
             }
             Err(e) => {
@@ -785,27 +676,7 @@ pub unsafe extern "C" fn stoolap_tx_stmt_exec_named(
 
         let named = value::named_params_from_ffi(params, params_len);
 
-        let ast_stmt = match stmt_handle.stmt.ast_statement() {
-            Some(s) => s,
-            None => {
-                // Multi-statement SQL: fall back to SQL-based execution
-                let sql_str = stmt_handle.sql_cstr.to_str().unwrap_or("");
-                match inner_tx.execute_named(sql_str, named) {
-                    Ok(affected) => {
-                        if !rows_affected.is_null() {
-                            *rows_affected = affected;
-                        }
-                        return STOOLAP_OK;
-                    }
-                    Err(e) => {
-                        handle.set_error(&e.to_string());
-                        return STOOLAP_ERROR;
-                    }
-                }
-            }
-        };
-
-        match inner_tx.execute_prepared_named(ast_stmt, named) {
+        match named.and_then(|named| stmt_handle.stmt.execute_named_in(inner_tx, named)) {
             Ok(affected) => {
                 if !rows_affected.is_null() {
                     *rows_affected = affected;
@@ -871,59 +742,9 @@ pub unsafe extern "C" fn stoolap_tx_stmt_query_named(
 
         let named = value::named_params_from_ffi(params, params_len);
 
-        let ast_stmt = match stmt_handle.stmt.ast_statement() {
-            Some(s) => s,
-            None => {
-                // Multi-statement SQL: fall back to SQL-based execution
-                let sql_str = stmt_handle.sql_cstr.to_str().unwrap_or("");
-                match inner_tx.query_named(sql_str, named) {
-                    Ok(rows) => {
-                        let column_names: Vec<CString> = rows
-                            .columns()
-                            .iter()
-                            .map(|name| CString::new(name.as_str()).unwrap_or_default())
-                            .collect();
-                        let affected = rows.rows_affected();
-
-                        let rows_handle = Box::new(StoolapRows {
-                            rows: Some(rows),
-                            has_row: false,
-                            last_error: None,
-                            column_names: Arc::new(column_names),
-                            text_cache: Vec::new(),
-                            text_cache_dirty: false,
-                            rows_affected: affected,
-                        });
-                        *out_rows = Box::into_raw(rows_handle);
-                        return STOOLAP_OK;
-                    }
-                    Err(e) => {
-                        handle.set_error(&e.to_string());
-                        return STOOLAP_ERROR;
-                    }
-                }
-            }
-        };
-
-        match inner_tx.query_prepared_named(ast_stmt, named) {
+        match named.and_then(|named| stmt_handle.stmt.query_named_in(inner_tx, named)) {
             Ok(rows) => {
-                let column_names: Vec<CString> = rows
-                    .columns()
-                    .iter()
-                    .map(|name| CString::new(name.as_str()).unwrap_or_default())
-                    .collect();
-                let affected = rows.rows_affected();
-
-                let rows_handle = Box::new(StoolapRows {
-                    rows: Some(rows),
-                    has_row: false,
-                    last_error: None,
-                    column_names: Arc::new(column_names),
-                    text_cache: Vec::new(),
-                    text_cache_dirty: false,
-                    rows_affected: affected,
-                });
-                *out_rows = Box::into_raw(rows_handle);
+                *out_rows = StoolapRows::boxed(rows, None);
                 STOOLAP_OK
             }
             Err(e) => {

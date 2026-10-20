@@ -41,13 +41,13 @@ use super::utils::dummy_token_clone;
 use super::Executor;
 use std::sync::RwLock;
 
-struct StatementRollback<'a> {
+pub(super) struct StatementRollback<'a> {
     engine: &'a crate::storage::mvcc::MVCCEngine,
     checkpoint: Option<(i64, i64)>,
 }
 
 impl<'a> StatementRollback<'a> {
-    fn new(
+    pub(super) fn new(
         engine: &'a crate::storage::mvcc::MVCCEngine,
         active: Option<&super::ActiveTransaction>,
     ) -> Self {
@@ -58,7 +58,7 @@ impl<'a> StatementRollback<'a> {
         }
     }
 
-    fn finish<T>(mut self, result: Result<T>) -> Result<T> {
+    pub(super) fn finish<T>(mut self, result: Result<T>) -> Result<T> {
         if result.is_ok() {
             self.checkpoint = None;
         }
@@ -638,7 +638,7 @@ impl Executor {
                 (table, false, None)
             } else {
                 // No active transaction - create a standalone transaction with auto-commit
-                let tx = self.engine.begin_transaction()?;
+                let tx = self.begin_transaction()?;
                 let table = tx.get_statement_table(table_name)?;
                 (table, true, Some(tx))
             };
@@ -761,7 +761,8 @@ impl Executor {
         let empty_row = Row::new();
 
         // OPTIMIZATION: Pre-build ExecuteContext once (reused for all expressions)
-        let mut base_exec_ctx = ExecuteContext::new(&empty_row);
+        let mut base_exec_ctx =
+            ExecuteContext::new(&empty_row).with_transaction_id(ctx.transaction_id());
         if !params.is_empty() {
             base_exec_ctx = base_exec_ctx.with_params(params);
         }
@@ -1487,7 +1488,7 @@ impl Executor {
                 (table, false, None)
             } else {
                 // No active transaction - create a standalone transaction with auto-commit
-                let tx = self.engine.begin_transaction()?;
+                let tx = self.begin_transaction()?;
                 let table = tx.get_statement_table(table_name)?;
                 (table, true, Some(tx))
             };
@@ -1630,6 +1631,16 @@ impl Executor {
             )
         };
 
+        // INSERT is dispatched before the dispatcher puts the transaction
+        // id in the context, so the expressions are given it here
+        let ctx_with_txn;
+        let ctx = match active_txn_id {
+            Some(txn_id) => {
+                ctx_with_txn = ctx.with_transaction_id(txn_id as u64);
+                &ctx_with_txn
+            }
+            None => ctx,
+        };
         // Its query and subqueries read through one view, taken before them;
         // the target keeps the newest
         let ctx_with_view;
@@ -1657,7 +1668,8 @@ impl Executor {
         let empty_row = Row::new();
 
         // OPTIMIZATION: Pre-build ExecuteContext once (reused for all expressions)
-        let mut base_exec_ctx = ExecuteContext::new(&empty_row);
+        let mut base_exec_ctx =
+            ExecuteContext::new(&empty_row).with_transaction_id(ctx.transaction_id());
         if !params.is_empty() {
             base_exec_ctx = base_exec_ctx.with_params(params);
         }
@@ -1951,7 +1963,7 @@ impl Executor {
                 (table, false, None)
             } else {
                 // No active transaction - create a standalone transaction with auto-commit
-                let tx = self.engine.begin_transaction()?;
+                let tx = self.begin_transaction()?;
                 let table = tx.get_statement_table(table_name)?;
                 (table, true, Some(tx))
             };
@@ -2880,7 +2892,7 @@ impl Executor {
                 (table, false, None)
             } else {
                 // No active transaction - create a standalone transaction with auto-commit
-                let tx = self.engine.begin_transaction()?;
+                let tx = self.begin_transaction()?;
                 let table = tx.get_statement_table(table_name)?;
                 (table, true, Some(tx))
             };
@@ -3385,7 +3397,7 @@ impl Executor {
                 (table, false, None)
             } else {
                 // No active transaction - create a standalone transaction with auto-commit
-                let tx = self.engine.begin_transaction()?;
+                let tx = self.begin_transaction()?;
                 let table = tx.get_statement_table(table_name)?;
                 (table, true, Some(tx))
             };

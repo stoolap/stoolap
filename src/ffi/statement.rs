@@ -19,7 +19,14 @@ use std::os::raw::c_char;
 use std::panic;
 use std::sync::Arc;
 
-use super::types::{StoolapDB, StoolapRows, StoolapStmt, StoolapValue};
+use crate::api::transaction::Transaction;
+use crate::api::{ParamVec, Rows};
+use crate::core::{Error, Result};
+
+use super::rows::pack_all;
+use super::types::{
+    StoolapDB, StoolapNamedParam, StoolapRows, StoolapStmt, StoolapTx, StoolapValue,
+};
 use super::value;
 use super::{STOOLAP_ERROR, STOOLAP_OK};
 
@@ -70,6 +77,7 @@ pub unsafe extern "C" fn stoolap_prepare(
                     last_error: None,
                     sql_cstr,
                     cached_columns: None,
+                    packed: Vec::new(),
                     _db_keepalive: db_keepalive,
                 });
                 *out_stmt = Box::into_raw(stmt_handle);
@@ -109,9 +117,7 @@ pub unsafe extern "C" fn stoolap_stmt_exec(
     handle.last_error = None;
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let param_vec = value::params_to_vec(params, params_len);
-
-        match handle.stmt.execute(param_vec) {
+        match value::params_to_vec(params, params_len).and_then(|p| handle.stmt.execute(p)) {
             Ok(affected) => {
                 if !rows_affected.is_null() {
                     *rows_affected = affected;
@@ -179,6 +185,10 @@ pub unsafe extern "C" fn stoolap_stmt_exec_batch(
         }
         return STOOLAP_OK;
     }
+    if params_per_row < 0 || (params_per_row > 0 && params.is_null()) {
+        db_handle.set_error("params must hold row_count * params_per_row values");
+        return STOOLAP_ERROR;
+    }
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         let mut tx = match db_handle.db.begin() {
@@ -189,22 +199,17 @@ pub unsafe extern "C" fn stoolap_stmt_exec_batch(
             }
         };
 
-        let ast_stmt = stmt_handle.stmt.ast_statement();
         let ppr = params_per_row as usize;
         let mut total: i64 = 0;
 
         for r in 0..(row_count as usize) {
-            let row_params = params.add(r * ppr);
-            let param_vec = value::params_to_vec(row_params, params_per_row);
-
-            let exec_result = if let Some(ast) = ast_stmt {
-                tx.execute_prepared(ast, param_vec)
+            let param_vec = if ppr == 0 {
+                Ok(ParamVec::new())
             } else {
-                let sql_str = stmt_handle.sql_cstr.to_str().unwrap_or("");
-                tx.execute(sql_str, param_vec)
+                value::params_to_vec(params.add(r * ppr), params_per_row)
             };
 
-            match exec_result {
+            match param_vec.and_then(|p| stmt_handle.stmt.execute_in(&mut tx, p)) {
                 Ok(affected) => total += affected,
                 Err(e) => {
                     let _ = tx.rollback();
@@ -260,44 +265,9 @@ pub unsafe extern "C" fn stoolap_stmt_query(
     handle.last_error = None;
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let param_vec = value::params_to_vec(params, params_len);
-
-        match handle.stmt.query(param_vec) {
+        match value::params_to_vec(params, params_len).and_then(|p| handle.stmt.query(p)) {
             Ok(rows) => {
-                let actual_columns = rows.columns();
-                let actual_count = actual_columns.len();
-
-                // Validate cache: rebuild if column count or names changed (DDL)
-                let cache_valid = handle.cached_columns.as_ref().is_some_and(|cached| {
-                    cached.len() == actual_count
-                        && cached
-                            .iter()
-                            .zip(actual_columns.iter())
-                            .all(|(c, a)| c.as_bytes() == a.as_str().as_bytes())
-                });
-                let column_names = if cache_valid {
-                    Arc::clone(handle.cached_columns.as_ref().unwrap())
-                } else {
-                    let names: Vec<CString> = actual_columns
-                        .iter()
-                        .map(|name| CString::new(name.as_str()).unwrap_or_default())
-                        .collect();
-                    let arc = Arc::new(names);
-                    handle.cached_columns = Some(Arc::clone(&arc));
-                    arc
-                };
-                let affected = rows.rows_affected();
-
-                let rows_handle = Box::new(StoolapRows {
-                    rows: Some(rows),
-                    has_row: false,
-                    last_error: None,
-                    column_names,
-                    text_cache: Vec::new(),
-                    text_cache_dirty: false,
-                    rows_affected: affected,
-                });
-                *out_rows = Box::into_raw(rows_handle);
+                *out_rows = handle.rows_handle(rows);
                 STOOLAP_OK
             }
             Err(e) => {
@@ -309,6 +279,250 @@ pub unsafe extern "C" fn stoolap_stmt_query(
 
     result.unwrap_or_else(|_| {
         handle.set_error("panic during stoolap_stmt_query");
+        STOOLAP_ERROR
+    })
+}
+
+/// Query using a prepared statement with named parameters (`:name`).
+///
+/// # Safety
+///
+/// - `stmt` must be a valid `StoolapStmt` pointer.
+/// - `params` must point to `params_len` valid `StoolapNamedParam` structs (or be NULL).
+/// - `out_rows` must be a valid pointer to a `*mut StoolapRows`.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_stmt_query_named(
+    stmt: *mut StoolapStmt,
+    params: *const StoolapNamedParam,
+    params_len: i32,
+    out_rows: *mut *mut StoolapRows,
+) -> i32 {
+    if out_rows.is_null() {
+        return STOOLAP_ERROR;
+    }
+    *out_rows = std::ptr::null_mut();
+
+    let handle = match stmt.as_mut() {
+        Some(h) => h,
+        None => return STOOLAP_ERROR,
+    };
+    handle.last_error = None;
+
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let named = value::named_params_from_ffi(params, params_len);
+        match named.and_then(|named| handle.stmt.query_named(named)) {
+            Ok(rows) => {
+                *out_rows = handle.rows_handle(rows);
+                STOOLAP_OK
+            }
+            Err(e) => {
+                handle.set_error(&e.to_string());
+                STOOLAP_ERROR
+            }
+        }
+    }));
+
+    result.unwrap_or_else(|_| {
+        handle.set_error("panic during stoolap_stmt_query_named");
+        STOOLAP_ERROR
+    })
+}
+
+/// Execute a prepared statement with named parameters (`:name`).
+///
+/// # Safety
+///
+/// - `stmt` must be a valid `StoolapStmt` pointer.
+/// - `params` must point to `params_len` valid `StoolapNamedParam` structs (or be NULL).
+/// - `rows_affected` may be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_stmt_exec_named(
+    stmt: *mut StoolapStmt,
+    params: *const StoolapNamedParam,
+    params_len: i32,
+    rows_affected: *mut i64,
+) -> i32 {
+    let handle = match stmt.as_mut() {
+        Some(h) => h,
+        None => return STOOLAP_ERROR,
+    };
+    handle.last_error = None;
+
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let named = value::named_params_from_ffi(params, params_len);
+        match named.and_then(|named| handle.stmt.execute_named(named)) {
+            Ok(affected) => {
+                if !rows_affected.is_null() {
+                    *rows_affected = affected;
+                }
+                STOOLAP_OK
+            }
+            Err(e) => {
+                handle.set_error(&e.to_string());
+                STOOLAP_ERROR
+            }
+        }
+    }));
+
+    result.unwrap_or_else(|_| {
+        handle.set_error("panic during stoolap_stmt_exec_named");
+        STOOLAP_ERROR
+    })
+}
+
+impl StoolapStmt {
+    /// A rows handle on `rows`, with the column names this statement keeps
+    /// until a DDL changes them
+    fn rows_handle(&mut self, rows: Rows) -> *mut StoolapRows {
+        let actual_columns = rows.columns();
+        let column_names = match &self.cached_columns {
+            Some(cached)
+                if cached.len() == actual_columns.len()
+                    && cached
+                        .iter()
+                        .zip(actual_columns.iter())
+                        .all(|(c, a)| c.as_bytes() == a.as_str().as_bytes()) =>
+            {
+                Arc::clone(cached)
+            }
+            _ => {
+                let names: Vec<CString> = actual_columns
+                    .iter()
+                    .map(|name| CString::new(name.as_str()).unwrap_or_default())
+                    .collect();
+                let arc = Arc::new(names);
+                self.cached_columns = Some(Arc::clone(&arc));
+                arc
+            }
+        };
+        StoolapRows::boxed(rows, Some(column_names))
+    }
+
+    /// Packs `rows` into this statement's buffer for a `*_query_all` call
+    unsafe fn pack_into(
+        &mut self,
+        rows: Result<Rows>,
+        out_buf: *mut *const u8,
+        out_len: *mut i64,
+    ) -> i32 {
+        match rows.and_then(|mut rows| pack_all(&mut rows, &mut self.packed)) {
+            Ok(_) => {
+                *out_buf = self.packed.as_ptr();
+                *out_len = self.packed.len() as i64;
+                STOOLAP_OK
+            }
+            Err(e) => {
+                self.set_error(&e.to_string());
+                STOOLAP_ERROR
+            }
+        }
+    }
+}
+
+/// The open transaction behind `tx`: None for NULL, an error once it ended
+pub(super) unsafe fn open_transaction<'a>(
+    tx: *mut StoolapTx,
+) -> Result<Option<&'a mut Transaction>> {
+    match tx.as_mut() {
+        None => Ok(None),
+        Some(tx_handle) => match &mut tx_handle.tx {
+            Some(inner_tx) => Ok(Some(inner_tx)),
+            None => Err(Error::TransactionEnded),
+        },
+    }
+}
+
+/// Query a prepared statement and pack every row into one buffer, in the
+/// format of `stoolap_rows_fetch_all()`, without a rows handle.
+///
+/// Runs inside `tx` when it is not NULL. The buffer belongs to the
+/// statement and stays valid until the next call on it or
+/// `stoolap_stmt_finalize()`. Must NOT be freed. Errors are read with
+/// `stoolap_stmt_errmsg()`.
+///
+/// # Safety
+///
+/// - `stmt` must be a valid `StoolapStmt` pointer.
+/// - `tx` must be a valid `StoolapTx` pointer or NULL.
+/// - `params` must point to `params_len` valid `StoolapValue` structs (or be NULL).
+/// - `out_buf` and `out_len` must not be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_stmt_query_all(
+    stmt: *mut StoolapStmt,
+    tx: *mut StoolapTx,
+    params: *const StoolapValue,
+    params_len: i32,
+    out_buf: *mut *const u8,
+    out_len: *mut i64,
+) -> i32 {
+    if out_buf.is_null() || out_len.is_null() {
+        return STOOLAP_ERROR;
+    }
+    *out_buf = std::ptr::null();
+    *out_len = 0;
+
+    let handle = match stmt.as_mut() {
+        Some(h) => h,
+        None => return STOOLAP_ERROR,
+    };
+    handle.last_error = None;
+
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let rows =
+            value::params_to_vec(params, params_len).and_then(|p| match open_transaction(tx)? {
+                None => handle.stmt.query(p),
+                Some(inner_tx) => handle.stmt.query_in(inner_tx, p),
+            });
+        handle.pack_into(rows, out_buf, out_len)
+    }));
+
+    result.unwrap_or_else(|_| {
+        handle.set_error("panic during stoolap_stmt_query_all");
+        STOOLAP_ERROR
+    })
+}
+
+/// `stoolap_stmt_query_all()` with named parameters (`:name`).
+///
+/// # Safety
+///
+/// - `stmt` must be a valid `StoolapStmt` pointer.
+/// - `tx` must be a valid `StoolapTx` pointer or NULL.
+/// - `params` must point to `params_len` valid `StoolapNamedParam` structs (or be NULL).
+/// - `out_buf` and `out_len` must not be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_stmt_query_named_all(
+    stmt: *mut StoolapStmt,
+    tx: *mut StoolapTx,
+    params: *const StoolapNamedParam,
+    params_len: i32,
+    out_buf: *mut *const u8,
+    out_len: *mut i64,
+) -> i32 {
+    if out_buf.is_null() || out_len.is_null() {
+        return STOOLAP_ERROR;
+    }
+    *out_buf = std::ptr::null();
+    *out_len = 0;
+
+    let handle = match stmt.as_mut() {
+        Some(h) => h,
+        None => return STOOLAP_ERROR,
+    };
+    handle.last_error = None;
+
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let rows = value::named_params_from_ffi(params, params_len).and_then(|named| {
+            match open_transaction(tx)? {
+                None => handle.stmt.query_named(named),
+                Some(inner_tx) => handle.stmt.query_named_in(inner_tx, named),
+            }
+        });
+        handle.pack_into(rows, out_buf, out_len)
+    }));
+
+    result.unwrap_or_else(|_| {
+        handle.set_error("panic during stoolap_stmt_query_named_all");
         STOOLAP_ERROR
     })
 }

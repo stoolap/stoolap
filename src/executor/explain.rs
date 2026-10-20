@@ -100,7 +100,7 @@ impl Executor {
                             let predicate_hash = fingerprint_predicate(&table_name, where_clause);
 
                             // Get estimated row count from planner
-                            let tx = self.engine.begin_transaction().ok();
+                            let tx = self.begin_transaction().ok();
                             let estimated_rows = tx
                                 .as_ref()
                                 .and_then(|tx| tx.get_statement_table(&table_name).ok())
@@ -338,7 +338,7 @@ impl Executor {
         match expr {
             Expression::TableSource(simple) => {
                 // Try to get the table and analyze access plan
-                if let Ok(tx) = self.engine.begin_transaction() {
+                if let Ok(tx) = self.begin_transaction() {
                     if let Ok(table) = tx.get_statement_table(&simple.name.value) {
                         // Build storage expression from WHERE clause for analysis
                         let storage_expr = if let Some(where_expr) = where_clause {
@@ -741,7 +741,7 @@ impl Executor {
         match expr {
             Expression::TableSource(simple) => {
                 // Try to get the table and analyze access plan
-                if let Ok(tx) = self.engine.begin_transaction() {
+                if let Ok(tx) = self.begin_transaction() {
                     if let Ok(table) = tx.get_statement_table(&simple.name.value) {
                         // Build storage expression from WHERE clause for analysis
                         let storage_expr = if let Some(where_expr) = where_clause {
@@ -1184,7 +1184,7 @@ impl Executor {
         // Check for WHERE clause filter text
         let filter = select.where_clause.as_ref().map(|w| format!("{}", w));
 
-        if let Ok(tx) = self.engine.begin_transaction() {
+        if let Ok(tx) = self.begin_transaction() {
             if let Ok(table) = tx.get_statement_table(table_name) {
                 let hnsw_index = table.get_index_on_column(&vec_col_name).filter(|idx| {
                     idx.index_type() == crate::core::IndexType::Hnsw
