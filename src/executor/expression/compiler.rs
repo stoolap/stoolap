@@ -560,20 +560,13 @@ impl<'a> ExprCompiler<'a> {
 
         match expr {
             // === LITERALS ===
-            Expression::IntegerLiteral(lit) => {
-                builder.emit(Op::LoadConst(Value::Integer(lit.value)));
-            }
-
-            Expression::FloatLiteral(lit) => {
-                builder.emit(Op::LoadConst(Value::Float(lit.value)));
-            }
-
-            Expression::StringLiteral(lit) => {
-                builder.emit(Op::LoadConst(string_literal_value(lit)));
-            }
-
-            Expression::BooleanLiteral(lit) => {
-                builder.emit(Op::LoadConst(Value::Boolean(lit.value)));
+            Expression::IntegerLiteral(_)
+            | Expression::FloatLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::BooleanLiteral(_) => {
+                if let Some(value) = literal_value(expr) {
+                    builder.emit(Op::LoadConst(value));
+                }
             }
 
             Expression::NullLiteral(_) => {
@@ -613,18 +606,12 @@ impl<'a> ExprCompiler<'a> {
             }
 
             // === PARAMETERS ===
-            Expression::Parameter(param) => {
-                if param.name.starts_with(':') {
-                    let name = &param.name[1..];
-                    builder.emit(Op::LoadNamedParam(CompactArc::from(name)));
-                } else if param.index > 0 {
-                    builder.emit(Op::LoadParam((param.index - 1) as u16));
-                } else {
-                    return Err(CompileError::InvalidExpression(
-                        "Invalid parameter".to_string(),
-                    ));
+            Expression::Parameter(param) => match parameter_slot(param)? {
+                ParameterSlot::Named(name) => {
+                    builder.emit(Op::LoadNamedParam(CompactArc::from(name)))
                 }
-            }
+                ParameterSlot::Positional(index) => builder.emit(Op::LoadParam(index)),
+            },
 
             // === INFIX EXPRESSIONS ===
             Expression::Infix(infix) => {
@@ -1959,6 +1946,39 @@ fn is_column_free(expr: &Expression) -> bool {
 
         // Anything else: conservatively assume it references columns
         _ => false,
+    }
+}
+
+/// Which value a parameter reads
+pub(crate) enum ParameterSlot<'p> {
+    /// `:name`, by its name without the colon
+    Named(&'p str),
+    /// `$n` or `?`, zero-based
+    Positional(u16),
+}
+
+/// The slot `param` reads
+pub(crate) fn parameter_slot(param: &Parameter) -> Result<ParameterSlot<'_>, CompileError> {
+    if let Some(name) = param.name.strip_prefix(':') {
+        Ok(ParameterSlot::Named(name))
+    } else if param.index > 0 {
+        Ok(ParameterSlot::Positional((param.index - 1) as u16))
+    } else {
+        Err(CompileError::InvalidExpression(
+            "Invalid parameter".to_string(),
+        ))
+    }
+}
+
+/// The value a program loads for a literal; None for any other expression
+pub(crate) fn literal_value(expr: &Expression) -> Option<Value> {
+    match expr {
+        Expression::IntegerLiteral(lit) => Some(Value::Integer(lit.value)),
+        Expression::FloatLiteral(lit) => Some(Value::Float(lit.value)),
+        Expression::StringLiteral(lit) => Some(string_literal_value(lit)),
+        Expression::BooleanLiteral(lit) => Some(Value::Boolean(lit.value)),
+        Expression::NullLiteral(_) => Some(Value::Null(DataType::Null)),
+        _ => None,
     }
 }
 

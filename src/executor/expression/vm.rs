@@ -185,6 +185,20 @@ impl<'a> ExecuteContext<'a> {
         self.subquery_executor = Some(executor);
         self
     }
+
+    /// Positional parameter `index`, zero-based; NULL when it was not given
+    #[inline]
+    pub fn param_ref(&self, index: usize) -> &'a Value {
+        self.params.get(index).unwrap_or(&NULL_VALUE)
+    }
+
+    /// Named parameter `name`; NULL when it was not given
+    #[inline]
+    pub fn named_param_ref(&self, name: &str) -> &'a Value {
+        self.named_params
+            .and_then(|params| params.get(name))
+            .unwrap_or(&NULL_VALUE)
+    }
 }
 
 /// Runs a prepared plan's subquery blocks for the row being evaluated; a
@@ -390,22 +404,12 @@ impl ExprVM {
                 }
 
                 Op::LoadParam(idx) => {
-                    let idx = *idx as usize;
-                    let value = ctx
-                        .params
-                        .get(idx)
-                        .cloned()
-                        .unwrap_or_else(Value::null_unknown);
-                    self.stack.push(value);
+                    self.stack.push(ctx.param_ref(*idx as usize).clone());
                     pc += 1;
                 }
 
                 Op::LoadNamedParam(name) => {
-                    let value = ctx
-                        .named_params
-                        .and_then(|p| p.get(name.as_ref()).cloned())
-                        .unwrap_or_else(Value::null_unknown);
-                    self.stack.push(value);
+                    self.stack.push(ctx.named_param_ref(name).clone());
                     pc += 1;
                 }
 
@@ -1974,13 +1978,7 @@ impl ExprVM {
                 }
 
                 Op::LoadParam(idx) => {
-                    let idx = *idx as usize;
-                    let value = ctx
-                        .params
-                        .get(idx)
-                        .map(Cow::Borrowed)
-                        .unwrap_or_else(|| Cow::Borrowed(&NULL_VALUE));
-                    stack.push(value);
+                    stack.push(Cow::Borrowed(ctx.param_ref(*idx as usize)));
                     pc += 1;
                 }
 

@@ -3804,8 +3804,7 @@ impl Executor {
     ) -> Result<Value> {
         let expr = parse_stored_expression(default_expr, "default", column)?;
         // Constant expression - no row context needed
-        let value =
-            super::expression::ExpressionEval::compile(&expr, &[])?.eval_slice(&Row::new())?;
+        let value = super::expression::evaluate_once(&expr, None)?;
         value.try_into_coerce_to_type(target_type)
     }
 

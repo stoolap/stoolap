@@ -15,11 +15,11 @@
 //! The row counts a LIMIT and an OFFSET ask for: every path that applies
 //! them, or decides a shortcut by them, reads them here.
 
-use crate::core::{Error, Result, Row, RowVec, Value};
+use crate::core::{Error, Result, RowVec, Value};
 use crate::parser::ast::{Expression, SelectStatement};
 
 use super::context::ExecutionContext;
-use super::expression::ExpressionEval;
+use super::expression::evaluate_once;
 
 /// The LIMIT and OFFSET of one statement, read
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,9 +88,7 @@ pub(crate) fn row_count(
 ) -> Result<usize> {
     let value = match expr {
         Expression::IntegerLiteral(lit) => Value::Integer(lit.value),
-        _ => ExpressionEval::compile(expr, &[])?
-            .with_context(ctx)
-            .eval_slice(&Row::new())?,
+        _ => evaluate_once(expr, Some(ctx))?,
     };
     // 2^63, the first FLOAT above every INTEGER
     const ABOVE_INTEGERS: f64 = 9_223_372_036_854_775_808.0;

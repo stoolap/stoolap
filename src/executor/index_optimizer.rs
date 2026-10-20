@@ -425,11 +425,7 @@ impl Executor {
             if !statement_constant(value, &self.function_registry) {
                 return None;
             }
-            let value = ExpressionEval::compile(value, &[])
-                .ok()?
-                .with_context(ctx)
-                .eval_slice(&Row::new())
-                .ok()?;
+            let value = super::expression::evaluate_once(value, Some(ctx)).ok()?;
             comparisons.push((op, value));
         }
         Some(resolve_all(
@@ -1888,14 +1884,8 @@ impl Executor {
     ) -> Option<Vec<Value>> {
         let mut values = Vec::with_capacity(exprs.len());
         for expr in exprs {
-            // Try to evaluate as a constant expression
-            match ExpressionEval::compile(expr, &[]) {
-                Ok(compiled) => match compiled.with_context(ctx).eval_slice(&Row::new()) {
-                    Ok(val) => values.push(val),
-                    Err(_) => return None, // Can't evaluate as constant
-                },
-                Err(_) => return None, // Can't compile (e.g., column reference)
-            }
+            // A column reference does not compile over no columns
+            values.push(super::expression::evaluate_once(expr, Some(ctx)).ok()?);
         }
         Some(values)
     }
@@ -2399,10 +2389,7 @@ impl Executor {
             }
             Expression::Parameter(_) => {
                 // Evaluate parameter
-                match ExpressionEval::compile(&func_call.arguments[1], &[])
-                    .ok()
-                    .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                {
+                match super::expression::evaluate_once(&func_call.arguments[1], Some(ctx)).ok() {
                     Some(v @ Value::Extension(_)) => v,
                     Some(Value::Text(s)) => {
                         match crate::core::value::parse_vector_str(s.as_ref()) {
