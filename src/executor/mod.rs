@@ -103,7 +103,7 @@ use crate::parser::Parser;
 use crate::storage::mvcc::engine::MVCCEngine;
 use crate::storage::traits::{Engine, QueryResult, Table, Transaction};
 
-pub(crate) use aggregation::{try_parse_simple_having, AggregatePath, AggregateSlots};
+pub(crate) use aggregation::{AggregatePath, AggregateSlots};
 pub use context::{clear_all_thread_local_caches, ExecutionContext, TimeoutGuard};
 pub use expression::{
     CompileContext, CompileError, CompiledEvaluator, ExecuteContext, ExprCompiler, ExprVM,

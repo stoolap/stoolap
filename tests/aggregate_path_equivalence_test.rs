@@ -107,6 +107,13 @@ const CASES: &[(&str, &str, &str, &str)] = &[
     (
         "memory",
         "streaming_group_by",
+        "SELECT g, COUNT(*) FROM t GROUP BY g HAVING g > 1 OR COUNT(*) + 0 >= 2 * MIN(s) LIMIT 10",
+        "SELECT g, COUNT(*) FROM t WHERE id + 0 = id GROUP BY g \
+         HAVING g > 1 OR COUNT(*) + 0 >= 2 * MIN(s) LIMIT 10",
+    ),
+    (
+        "memory",
+        "streaming_group_by",
         "SELECT g, MAX(s), MIN(a) FROM t GROUP BY g HAVING COUNT(*) > 0 LIMIT 10",
         "SELECT g, MAX(s), MIN(a) FROM t WHERE id + 0 = id GROUP BY g HAVING COUNT(*) > 0 \
          LIMIT 10",
