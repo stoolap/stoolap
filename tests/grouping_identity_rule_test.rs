@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Values that `=` calls equal are one key wherever rows are grouped or
-//! deduplicated: INTEGER 1 and FLOAT 1.0 are one group, 0, 0.0 and -0.0 are
-//! one, every NULL is one, and 9007199254740993 and 9007199254740992.0 stay
-//! two. A group shows one of its values
+//! Rows are grouped and deduplicated by one key equality: numbers by exact
+//! value, INTEGER and FLOAT together, any other values by type and value, a
+//! TEXT never read as another type. So 1 and 1.0 are one group, 0, 0.0 and
+//! -0.0 one, every NULL one; 9007199254740993 and 9007199254740992.0 are two,
+//! and so are 1 and '1' and TRUE and 'true', though `=` holds between them
 
 use stoolap::core::Value;
 use stoolap::Database;
@@ -23,16 +24,22 @@ use stoolap::Database;
 /// An INTEGER for even ids, a FLOAT for odd ones
 const M: &str = "CASE WHEN id % 2 = 0 THEN a ELSE f END";
 
-/// A number by its value, whatever its type; other values as written
+/// A number by its value, whatever its type; other values with their type
 fn render(value: &Value) -> String {
     match value {
         Value::Integer(n) => format!("n:{n}"),
         Value::Float(f) if f.fract() == 0.0 && f.abs() < 1e18 => format!("n:{}", *f as i64),
         Value::Float(f) => format!("n:{f}"),
+        Value::Text(s) => format!("t:{s}"),
+        Value::Boolean(b) => format!("b:{b}"),
         v if v.is_null() => "null".to_string(),
         other => format!("{other}"),
     }
 }
+
+/// A TEXT, an INTEGER or a BOOLEAN that `=` calls equal to one another in
+/// pairs, by id: 1 and 2 give '1' and 1, 3 and 4 give 'true' and TRUE
+const T: &str = "CASE id WHEN 1 THEN '1' WHEN 2 THEN 1 WHEN 3 THEN 'true' ELSE TRUE END";
 
 fn rows(db: &Database, sql: &str) -> Vec<String> {
     let result = match db.query(sql, ()) {
@@ -167,6 +174,26 @@ fn check(db: &Database, ctx: &str, wrong: &mut Vec<String>) {
             ),
             sorted(&["n:0", "n:1"]),
         ),
+        (
+            "SELECT 1 = '1', TRUE = 'true'".to_string(),
+            vec!["b:true|b:true".to_string()],
+        ),
+        (
+            format!("SELECT {T}, COUNT(*) FROM t WHERE id <= 4 GROUP BY {T}"),
+            sorted(&["t:1|n:1", "n:1|n:1", "t:true|n:1", "b:true|n:1"]),
+        ),
+        (
+            format!("SELECT DISTINCT {T} FROM t WHERE id <= 4"),
+            sorted(&["t:1", "n:1", "t:true", "b:true"]),
+        ),
+        (
+            format!("SELECT COUNT(DISTINCT {T}) FROM t WHERE id <= 4"),
+            vec!["n:4".to_string()],
+        ),
+        (
+            format!("SELECT {T} FROM t WHERE id <= 2 UNION SELECT {T} FROM t WHERE id <= 2"),
+            sorted(&["t:1", "n:1"]),
+        ),
     ];
     for (sql, want) in cases {
         let got = rows(db, &sql);
@@ -177,7 +204,7 @@ fn check(db: &Database, ctx: &str, wrong: &mut Vec<String>) {
 }
 
 #[test]
-fn values_equal_by_eq_are_one_key_everywhere() {
+fn rows_group_by_one_key_equality_everywhere() {
     let mut wrong = Vec::new();
     check(
         &open(
