@@ -107,6 +107,9 @@ pub(crate) fn inside_own_statement() -> Error {
 /// This trait allows the transaction to call back into the engine
 /// without creating circular dependencies.
 pub trait TransactionEngineOperations: Send + Sync {
+    /// Whether the engine is still open; a closed one drops what it is handed
+    fn is_open(&self) -> bool;
+
     /// Get a table by name, initializing transaction-local version store;
     /// a handle given a `gate` admits its statements through it, and one
     /// given a `view` reads through it
@@ -574,6 +577,13 @@ impl Transaction for MvccTransaction {
 
     fn commit(&mut self) -> Result<()> {
         self.check_active()?;
+        if self
+            .engine_operations
+            .as_ref()
+            .is_some_and(|ops| !ops.is_open())
+        {
+            return Err(Error::EngineNotOpen);
+        }
         // Before anything reads the local changes or takes the seal fence,
         // which a statement in flight holds
         self.close_writes()?;

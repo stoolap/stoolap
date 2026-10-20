@@ -56,7 +56,6 @@ pub unsafe extern "C" fn stoolap_begin(db: *mut StoolapDB, out_tx: *mut *mut Sto
             let tx_handle = Box::new(StoolapTx {
                 tx: Some(tx),
                 last_error: None,
-                _db_keepalive: handle.db.keepalive(),
             });
             *out_tx = Box::into_raw(tx_handle);
             STOOLAP_OK
@@ -116,7 +115,6 @@ pub unsafe extern "C" fn stoolap_begin_with_isolation(
                 let tx_handle = Box::new(StoolapTx {
                     tx: Some(tx),
                     last_error: None,
-                    _db_keepalive: handle.db.keepalive(),
                 });
                 *out_tx = Box::into_raw(tx_handle);
                 STOOLAP_OK

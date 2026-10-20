@@ -437,14 +437,16 @@ pub(super) unsafe fn open_transaction_on<'a>(
     db: &Database,
     tx: *mut StoolapTx,
 ) -> Result<Option<&'a mut Transaction>> {
-    if let Some(tx_handle) = tx.as_ref() {
-        if !db.shares_engine_with(&tx_handle._db_keepalive) {
-            return Err(Error::invalid_argument(
-                "transaction belongs to another database",
-            ));
-        }
+    let inner = open_transaction(tx)?;
+    if inner
+        .as_ref()
+        .is_some_and(|inner_tx| !db.shares_engine_with(inner_tx.session()))
+    {
+        return Err(Error::invalid_argument(
+            "transaction belongs to another database",
+        ));
     }
-    open_transaction(tx)
+    Ok(inner)
 }
 
 /// Query a prepared statement and pack every row into one buffer, in the

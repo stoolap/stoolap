@@ -32,6 +32,8 @@
 //! tx.commit()?;
 //! ```
 
+use std::sync::Arc;
+
 use crate::api::params::{NamedParams, ParamVec};
 use crate::core::{Error, Result};
 use crate::executor::context::ExecutionContext;
@@ -39,7 +41,7 @@ use crate::executor::{CachedPlanRef, Executor};
 use crate::parser::ast::{RollbackStatement, Statement};
 use crate::storage::traits::QueryResult;
 
-use super::database::FromValue;
+use super::database::{DatabaseInner, FromValue};
 use super::params::Params;
 use super::rows::Rows;
 
@@ -53,6 +55,9 @@ pub struct Transaction {
     executor: Executor,
     committed: bool,
     rolled_back: bool,
+    /// Keeps the session, and with it the engine, open until the transaction
+    /// is gone; last, so it drops after the transaction it keeps
+    _session: Arc<DatabaseInner>,
 }
 
 /// Whether `statement` may run inside a transaction: DML and savepoints
@@ -76,12 +81,19 @@ fn runs_in_transaction(statement: &Statement) -> Result<()> {
 
 impl Transaction {
     /// Create a new transaction wrapper around an executor holding it open
-    pub(crate) fn new(executor: Executor) -> Self {
+    pub(crate) fn new(executor: Executor, session: Arc<DatabaseInner>) -> Self {
         Self {
             executor,
             committed: false,
             rolled_back: false,
+            _session: session,
         }
+    }
+
+    /// The session this transaction began on
+    #[cfg(feature = "ffi")]
+    pub(crate) fn session(&self) -> &DatabaseInner {
+        &self._session
     }
 
     /// Check if the transaction is still active

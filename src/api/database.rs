@@ -974,7 +974,10 @@ impl Database {
         let executor = &self.inner.executor;
 
         let tx = executor.begin_transaction_with_isolation(isolation)?;
-        Ok(Transaction::new(executor.for_transaction(tx)))
+        Ok(Transaction::new(
+            executor.for_transaction(tx),
+            Arc::clone(&self.inner),
+        ))
     }
 
     /// Get the underlying storage engine
