@@ -257,6 +257,25 @@ fn updates_that_grow_past_the_byte_limit_request_a_seal() {
 }
 
 #[test]
+fn a_second_cleanup_start_keeps_commits_waiting_for_the_seal() {
+    let dir = tempdir().expect("tempdir");
+    let db = Database::open(&format!(
+        "file://{}?checkpoint_interval=3600&hot_max_rows=0&hot_max_bytes=200000",
+        dir.path().display()
+    ))
+    .expect("open");
+    db.engine().start_cleanup();
+    db.execute("CREATE TABLE r (id INTEGER PRIMARY KEY, t TEXT)", ())
+        .expect("create");
+    for batch in 0..30 {
+        insert_batch(&db, "r", batch * 1000 + 1, 1000);
+    }
+    let (_, _, _, waits) = memory_stats(&db, "r");
+    assert!(waits > 0, "no commit waited for the running cleanup thread");
+    assert_eq!(int(&db, "SELECT COUNT(*) FROM r"), 30_000);
+}
+
+#[test]
 fn a_database_without_the_cleanup_thread_ignores_the_byte_limit() {
     let dir = tempdir().expect("tempdir");
     let db = Database::open(&format!(

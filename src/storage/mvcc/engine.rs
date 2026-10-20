@@ -1092,6 +1092,11 @@ impl MVCCEngine {
     /// - Old previous versions no longer needed
     /// - Old transaction metadata (in Snapshot Isolation mode only)
     pub fn start_cleanup(self: &Arc<Self>) {
+        // A second start would stop the running thread, which clears seal_worker
+        let mut cleanup_handle = self.cleanup_handle.lock().unwrap();
+        if cleanup_handle.is_some() {
+            return;
+        }
         let config = self.config.read().unwrap();
         if !config.cleanup.enabled {
             return;
@@ -1106,8 +1111,6 @@ impl MVCCEngine {
 
         let handle =
             self.start_periodic_cleanup_internal(interval, deleted_row_retention, txn_retention);
-
-        let mut cleanup_handle = self.cleanup_handle.lock().unwrap();
         *cleanup_handle = Some(handle);
     }
 
