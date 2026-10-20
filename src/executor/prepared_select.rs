@@ -2759,6 +2759,16 @@ pub(crate) struct DmlTables {
     inner_ctx: ExecutionContext,
 }
 
+/// The rows an UPDATE may write, each asked its WHERE as it is written
+pub(crate) enum Candidates {
+    /// The scan proves that no row passes
+    Pruned,
+    /// The rows a set test's keys name, by row id
+    Keyed(Vec<i64>),
+    /// A scan narrowed by the conjuncts without a subquery
+    Scan(Option<Box<dyn StorageExpr>>),
+}
+
 /// One execution of a prepared UPDATE or DELETE over its target's rows
 pub(crate) struct DmlRunner<'a> {
     runner: PreparedRunner<'a>,
@@ -2809,6 +2819,27 @@ impl<'a> DmlRunner<'a> {
             Some(where_) => vm.execute_bool_checked(&where_.program, exec),
             None => Ok(true),
         }
+    }
+
+    /// The rows of `table` the WHERE may pass, read as a prepared SELECT
+    /// reads them but not yet asked the WHERE
+    pub(crate) fn candidates(
+        &self,
+        table: &dyn Table,
+        ctx: &ExecutionContext,
+    ) -> Result<Candidates> {
+        let Some(where_) = &self.prepared.where_ else {
+            return Ok(Candidates::Scan(None));
+        };
+        let Some((storage_expr, _)) = self.runner.where_scan(where_, table, ctx) else {
+            return Ok(Candidates::Pruned);
+        };
+        Ok(
+            match self.runner.narrowed_rows(where_.narrowing, table, None)? {
+                Some((rows, _)) => Candidates::Keyed(rows.into_iter().map(|(id, _)| id).collect()),
+                None => Candidates::Scan(storage_expr),
+            },
+        )
     }
 
     /// Hand `keep` the row id and row of each row of `table` the WHERE
@@ -2974,38 +3005,22 @@ impl Executor {
     /// `name` as this statement reads it: through the explicit transaction,
     /// or through the statement's snapshot, each at the statement's view
     fn prepared_table(&self, name: &str, ctx: &ExecutionContext) -> Result<Box<dyn Table>> {
-        self.prepared_table_in(None, name, ctx)
-    }
-
-    /// `prepared_table`, read through `writer` when given: the transaction
-    /// a statement that writes before it reads nothing writes in
-    fn prepared_table_in(
-        &self,
-        writer: Option<&dyn crate::storage::traits::Transaction>,
-        name: &str,
-        ctx: &ExecutionContext,
-    ) -> Result<Box<dyn Table>> {
         use crate::storage::traits::transaction::StatementTable;
-        let table = match writer {
-            Some(writer) => writer.get_statement_table_at(name, ctx.scan_view(name)),
+        let active = self
+            .active_transaction
+            .lock()
+            .map_err(|_| Error::internal("active transaction lock poisoned"))?;
+        let table = match active.as_ref() {
+            Some(tx) => tx
+                .transaction
+                .get_statement_table_at(name, ctx.scan_view(name)),
             None => {
-                let active = self
-                    .active_transaction
-                    .lock()
-                    .map_err(|_| Error::internal("active transaction lock poisoned"))?;
-                match active.as_ref() {
-                    Some(tx) => tx
-                        .transaction
-                        .get_statement_table_at(name, ctx.scan_view(name)),
-                    None => {
-                        drop(active);
-                        ctx.statement_snapshot()
-                            .ok_or_else(|| {
-                                Error::internal("a prepared statement reads without a snapshot")
-                            })?
-                            .statement_table_at(name, ctx.scan_view(name))
-                    }
-                }
+                drop(active);
+                ctx.statement_snapshot()
+                    .ok_or_else(|| {
+                        Error::internal("a prepared statement reads without a snapshot")
+                    })?
+                    .statement_table_at(name, ctx.scan_view(name))
             }
         };
         let table = table.map_err(|e| match e {
@@ -3115,10 +3130,9 @@ impl Executor {
     }
 
     /// The plan's prepared UPDATE or DELETE over a target of `schema`,
-    /// named `scope_name`, with its blocks' tables open, through `writer`
-    /// when given; prepared now when the plan holds none for this schema,
-    /// these columns and this parameter count
-    #[allow(clippy::too_many_arguments)]
+    /// named `scope_name`, with its blocks' tables open; prepared now when
+    /// the plan holds none for this schema, these columns and this
+    /// parameter count
     pub(crate) fn open_prepared_dml(
         &self,
         compiled: Option<&RwLock<CompiledExecution>>,
@@ -3126,7 +3140,6 @@ impl Executor {
         scope_name: &SmartString,
         where_clause: Option<&Expression>,
         sets: &[(usize, &Expression)],
-        writer: Option<&dyn crate::storage::traits::Transaction>,
         ctx: &ExecutionContext,
     ) -> Result<(Arc<PreparedDml>, DmlTables)> {
         let epoch = self.engine.schema_epoch();
@@ -3175,9 +3188,7 @@ impl Executor {
                     prepared
                 }
             };
-            if let Some(tables) =
-                PreparedRunner::open_tables(self, &prepared.blocks, writer, &inner_ctx)?
-            {
+            if let Some(tables) = PreparedRunner::open_tables(self, &prepared.blocks, &inner_ctx)? {
                 for name in &prepared.blocks.named {
                     if !ctx.named_params().contains_key(name.as_str()) {
                         return Err(Error::invalid_argument(format!(
@@ -3225,9 +3236,7 @@ impl Executor {
             let prepared = self.prepared_for(compiled, stmt, &*table, scope_name, ctx, fresh)?;
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::prepared_plan_taken();
-            if let Some(tables) =
-                PreparedRunner::open_tables(self, &prepared.blocks, None, &inner_ctx)?
-            {
+            if let Some(tables) = PreparedRunner::open_tables(self, &prepared.blocks, &inner_ctx)? {
                 break (prepared, tables);
             }
             if fresh {
@@ -3360,18 +3369,16 @@ struct BlockState {
 }
 
 impl<'a> PreparedRunner<'a> {
-    /// Every subquery's table as `inner_ctx` reads it, through `writer`
-    /// when given, or None when one no longer holds the columns its
-    /// programs were prepared for
+    /// Every subquery's table as `inner_ctx` reads it, or None when one no
+    /// longer holds the columns its programs were prepared for
     fn open_tables(
         executor: &Executor,
         prepared: &PreparedBlocks,
-        writer: Option<&dyn crate::storage::traits::Transaction>,
         inner_ctx: &ExecutionContext,
     ) -> Result<Option<Vec<Box<dyn Table>>>> {
         let mut tables = Vec::with_capacity(prepared.subqueries.len());
         for sq in &prepared.subqueries {
-            let table = executor.prepared_table_in(writer, &sq.table, inner_ctx)?;
+            let table = executor.prepared_table(&sq.table, inner_ctx)?;
             if table.schema().columns != sq.schema.columns {
                 return Ok(None);
             }
@@ -3475,6 +3482,39 @@ impl<'a> PreparedRunner<'a> {
         }
     }
 
+    /// The scan `where_`'s conjuncts without a subquery narrow, with
+    /// whether it takes the whole WHERE; None when it proves no row passes
+    fn where_scan(
+        &self,
+        where_: &PreparedWhere,
+        table: &dyn Table,
+        ctx: &ExecutionContext,
+    ) -> Option<(Option<Box<dyn StorageExpr>>, bool)> {
+        let (storage_expr, residual) = match &where_.pushdown {
+            Some(pushdown) if self.prepared.run_slots.is_empty() => {
+                pushdown::try_pushdown(pushdown, table.schema(), Some(ctx))
+            }
+            Some(pushdown) => {
+                let mut run_ctx = ctx.clone();
+                run_ctx.set_params(self.base.clone());
+                pushdown::try_pushdown(pushdown, table.schema(), Some(&run_ctx))
+            }
+            None => (None, true),
+        };
+        if let Some(expr) = &storage_expr {
+            if self
+                .executor
+                .get_query_planner()
+                .can_prune_entire_scan(table, expr.as_ref())
+            {
+                return None;
+            }
+        }
+        // The scan took the whole WHERE: its rows need no second look
+        let scanned_whole = where_.pushed_whole && storage_expr.is_some() && !residual;
+        Some((storage_expr, scanned_whole))
+    }
+
     /// Hand `keep` each row of `table` that passes `where_`, with its row
     /// id and the count of rows read so far, until `keep` says stop: the
     /// rows its narrowing names, or a scan the conjuncts without a subquery
@@ -3488,28 +3528,9 @@ impl<'a> PreparedRunner<'a> {
         target: Option<usize>,
         mut keep: impl FnMut(i64, u64, Row) -> bool,
     ) -> Result<Passing> {
-        let (storage_expr, residual) = match &where_.pushdown {
-            Some(pushdown) if self.prepared.run_slots.is_empty() => {
-                pushdown::try_pushdown(pushdown, table.schema(), Some(ctx))
-            }
-            Some(pushdown) => {
-                let mut run_ctx = ctx.clone();
-                run_ctx.set_params(self.base.clone());
-                pushdown::try_pushdown(pushdown, table.schema(), Some(&run_ctx))
-            }
-            None => (None, true),
+        let Some((storage_expr, scanned_whole)) = self.where_scan(where_, table, ctx) else {
+            return Ok(Passing::Pruned);
         };
-        // The scan took the whole WHERE: its rows need no second look
-        let scanned_whole = where_.pushed_whole && storage_expr.is_some() && !residual;
-        if let Some(expr) = &storage_expr {
-            if self
-                .executor
-                .get_query_planner()
-                .can_prune_entire_scan(table, expr.as_ref())
-            {
-                return Ok(Passing::Pruned);
-            }
-        }
         if target == Some(0) {
             return Ok(Passing::Read);
         }

@@ -161,6 +161,8 @@ fn a_cached_dml_statement_follows_a_schema_change() {
 }
 
 static TICKS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+/// The counter is process-wide: the tests that read it take turns
+static TICK_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// 1 on its first call, then 2, 3 and on; registered as answering anew per call
 #[derive(Default)]
@@ -209,6 +211,7 @@ fn an_uncorrelated_subquery_answers_once_for_the_rows_it_chooses_and_writes() {
     ] {
         executor.execute(sql).unwrap();
     }
+    let _ticks = TICK_TURN.lock().unwrap_or_else(|e| e.into_inner());
     TICKS.store(0, std::sync::atomic::Ordering::Relaxed);
     executor
         .execute("UPDATE t SET b = 9 WHERE (SELECT TICK() FROM u) = 1")
@@ -221,5 +224,39 @@ fn an_uncorrelated_subquery_answers_once_for_the_rows_it_chooses_and_writes() {
         rows.row().get(0).cloned(),
         Some(stoolap::core::Value::Integer(3)),
         "the rows the subquery chose are the rows it let the update write"
+    );
+}
+
+#[test]
+fn a_correlated_volatile_where_answers_once_for_the_row_it_writes() {
+    use std::sync::Arc;
+    let registry = stoolap::functions::registry::FunctionRegistry::new();
+    registry.register_scalar::<Tick>();
+    let mut engine = stoolap::storage::mvcc::engine::MVCCEngine::in_memory();
+    stoolap::storage::traits::Engine::open(&mut engine).unwrap();
+    let executor =
+        stoolap::executor::Executor::with_function_registry(Arc::new(engine), Arc::new(registry));
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, b INTEGER)",
+        "INSERT INTO t VALUES (1, 0), (2, 0), (3, 0)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY)",
+        "INSERT INTO u VALUES (1)",
+    ] {
+        executor.execute(sql).unwrap();
+    }
+    let _ticks = TICK_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    TICKS.store(0, std::sync::atomic::Ordering::Relaxed);
+    executor
+        .execute(
+            "UPDATE t SET b = (SELECT u.id FROM u WHERE u.id = t.id) \
+             WHERE (SELECT TICK() FROM u WHERE u.id = t.id) = 1",
+        )
+        .unwrap();
+    let mut rows = executor.execute("SELECT b FROM t WHERE id = 1").unwrap();
+    assert!(rows.next());
+    assert_eq!(
+        rows.row().get(0).cloned(),
+        Some(stoolap::core::Value::Integer(1)),
+        "the row its WHERE passed is the row the update wrote"
     );
 }

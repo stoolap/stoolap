@@ -2121,6 +2121,15 @@ impl Executor {
                 .dml_family(stmt.where_clause.as_deref(), stmt.updates.values(), ctx)
                 .is_ok();
         let where_prepared = in_family && where_has_subqueries;
+        let snapshot_ctx;
+        let ctx = if in_family && should_auto_commit && ctx.statement_snapshot().is_none() {
+            let snapshot =
+                self.new_statement_snapshot(self.isolation_level(), ctx.statement_view())?;
+            snapshot_ctx = ctx.with_statement_snapshot(snapshot);
+            &snapshot_ctx
+        } else {
+            ctx
+        };
         let held_dml;
         let dml_run = if in_family {
             let col_map = schema.column_index_map();
@@ -2139,7 +2148,6 @@ impl Executor {
                 table_name,
                 stmt.where_clause.as_deref(),
                 &sets,
-                standalone_tx.as_deref(),
                 ctx,
             )?;
             held_dml = prepared;
@@ -2320,9 +2328,6 @@ impl Executor {
             Vec::new()
         };
 
-        // The row ids a prepared WHERE passes, when the precheck read them
-        let mut prepared_ids: Option<Vec<i64>> = None;
-
         // Pre-partition FKs by referenced column index for post-update dispatch.
         // This avoids re-borrowing schema after table.update().
         let fks_by_ref_col: FxHashMap<usize, Vec<(String, crate::core::ForeignKeyConstraint)>> =
@@ -2351,12 +2356,7 @@ impl Executor {
                 let parent_rows = match dml_run.as_ref().filter(|_| where_prepared) {
                     Some(run) => {
                         let mut rows = RowVec::new();
-                        let mut ids = Vec::new();
-                        run.passing_rows(&*table, ctx, &mut |id, row| {
-                            ids.push(id);
-                            rows.push((id, row));
-                        })?;
-                        prepared_ids = Some(ids);
+                        run.passing_rows(&*table, ctx, &mut |id, row| rows.push((id, row)))?;
                         rows
                     }
                     None => table.collect_all_rows(where_expr.as_deref())?,
@@ -2853,17 +2853,17 @@ impl Executor {
             // OPTIMIZATION: Use SELECT executor to find matching row_ids, then batch update.
             // This reuses ALL SELECT optimizations: indexes, semi-joins, parallel execution, etc.
             let rows = if let Some(run) = dml_run.as_ref().filter(|_| where_prepared) {
-                // One runner chooses the rows and asks each again as it is written
-                let mut row_ids = match prepared_ids.take() {
-                    Some(ids) => ids,
-                    None => {
-                        let mut ids = Vec::new();
-                        run.passing_rows(&*table, ctx, &mut |id, _| ids.push(id))?;
-                        ids
+                // The setter asks each candidate the WHERE once, as it is written
+                match run.candidates(&*table, ctx)? {
+                    super::prepared_select::Candidates::Pruned => 0,
+                    super::prepared_select::Candidates::Keyed(mut row_ids) => {
+                        row_ids.sort_unstable();
+                        table.update_by_row_ids(&row_ids, &mut setter)?
                     }
-                };
-                row_ids.sort_unstable();
-                table.update_by_row_ids(&row_ids, &mut setter)?
+                    super::prepared_select::Candidates::Scan(expr) => {
+                        table.update(expr.as_deref(), &mut setter)?
+                    }
+                }
             } else if let Some(ref where_clause) = memory_where_clause {
                 if let Some(row_ids) = self.select_row_ids_for_dml(
                     table_name,
@@ -3021,6 +3021,15 @@ impl Executor {
             && self
                 .dml_family(stmt.where_clause.as_deref(), [], ctx)
                 .is_ok();
+        let snapshot_ctx;
+        let ctx = if where_prepared && should_auto_commit && ctx.statement_snapshot().is_none() {
+            let snapshot =
+                self.new_statement_snapshot(self.isolation_level(), ctx.statement_view())?;
+            snapshot_ctx = ctx.with_statement_snapshot(snapshot);
+            &snapshot_ctx
+        } else {
+            ctx
+        };
         let held_dml;
         let dml_run = if where_prepared {
             let (prepared, tables) = self.open_prepared_dml(
@@ -3029,7 +3038,6 @@ impl Executor {
                 &SmartString::from(effective_name),
                 stmt.where_clause.as_deref(),
                 &[],
-                standalone_tx.as_deref(),
                 ctx,
             )?;
             held_dml = prepared;
