@@ -3952,6 +3952,73 @@ fn test_query_named_all_ad_hoc() {
 }
 
 #[test]
+fn test_query_named_all_late_error_in_transaction_and_buffer_reuse() {
+    unsafe {
+        let db = packed_test_db(3);
+        let lo = [named_param("lo", int_param(1))];
+        let mut buf: *const u8 = std::ptr::null();
+        let mut len = 0i64;
+
+        let mut tx: *mut StoolapTx = std::ptr::null_mut();
+        assert_eq!(stoolap_begin(db, &mut tx), STOOLAP_OK);
+        let late = cstr(
+            "SELECT id, 'x' REGEXP CASE WHEN id = 3 THEN '[' ELSE 'x' END FROM t WHERE id >= :lo",
+        );
+        let rc = stoolap_query_named_all(db, tx, late.as_ptr(), lo.as_ptr(), 1, &mut buf, &mut len);
+        assert_eq!(
+            rc, STOOLAP_ERROR,
+            "a result cut short by an error was returned as complete"
+        );
+        assert!(buf.is_null());
+        assert_eq!(len, 0);
+        assert!(!read_cstr(stoolap_errmsg(db)).is_empty());
+        assert_eq!(stoolap_tx_rollback(tx), STOOLAP_OK);
+
+        let big = cstr("SELECT id, REPEAT('x', 400000) FROM t WHERE id >= :lo");
+        let rc = stoolap_query_named_all(
+            db,
+            std::ptr::null_mut(),
+            big.as_ptr(),
+            lo.as_ptr(),
+            1,
+            &mut buf,
+            &mut len,
+        );
+        assert_eq!(rc, STOOLAP_OK);
+        assert!(len > 1 << 20);
+        assert_eq!(decode_packed(buf, len).1.len(), 3);
+
+        let positional = cstr("SELECT id FROM t WHERE id >= $1 ORDER BY id");
+        let params = [int_param(2)];
+        let rc = stoolap_query_params_all(
+            db,
+            std::ptr::null_mut(),
+            positional.as_ptr(),
+            params.as_ptr(),
+            1,
+            &mut buf,
+            &mut len,
+        );
+        assert_eq!(rc, STOOLAP_OK);
+        assert_eq!(decode_packed(buf, len).1, vec![vec!["2"], vec!["3"]]);
+
+        let small = cstr("SELECT id FROM t WHERE id >= :lo ORDER BY id LIMIT 1");
+        let rc = stoolap_query_named_all(
+            db,
+            std::ptr::null_mut(),
+            small.as_ptr(),
+            lo.as_ptr(),
+            1,
+            &mut buf,
+            &mut len,
+        );
+        assert_eq!(rc, STOOLAP_OK);
+        assert_eq!(decode_packed(buf, len).1, vec![vec!["1"]]);
+        stoolap_close(db);
+    }
+}
+
+#[test]
 fn test_json_parameter_the_engine_cannot_read_is_refused() {
     unsafe {
         let db = packed_test_db(0);
