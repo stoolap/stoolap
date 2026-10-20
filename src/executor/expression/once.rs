@@ -30,6 +30,8 @@ fn compile_error(e: CompileError) -> Error {
 
 /// Compile `expr` over no columns, as a one-shot evaluation does
 pub(crate) fn compile_once(expr: &Expression) -> Result<Program> {
+    #[cfg(feature = "test-failpoints")]
+    crate::test_failpoints::one_shot_compiled();
     let empty: &[String] = &[];
     ExprCompiler::new(&CompileContext::with_global_registry(empty))
         .compile(expr)
@@ -41,6 +43,8 @@ pub(crate) fn compile_once(expr: &Expression) -> Result<Program> {
 pub(crate) fn evaluate_once(expr: &Expression, ctx: Option<&ExecutionContext>) -> Result<Value> {
     // A literal or a parameter is the value its program would load
     if let Some(value) = literal_value(expr) {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::one_shot_literal_read();
         return Ok(value);
     }
     let row = Row::new();
@@ -53,11 +57,6 @@ pub(crate) fn evaluate_once(expr: &Expression, ctx: Option<&ExecutionContext>) -
         return Ok(value.clone());
     }
     run(&compile_once(expr)?, &exec)
-}
-
-/// A literal or a parameter: [`evaluate_once`] reads it without a program
-pub(crate) fn reads_without_program(expr: &Expression) -> bool {
-    literal_value(expr).is_some() || matches!(expr, Expression::Parameter(_))
 }
 
 /// What [`evaluate_once`] does after compiling

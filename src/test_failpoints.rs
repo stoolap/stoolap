@@ -864,6 +864,26 @@ thread_local! {
     static IN_SUBQUERY_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static QUANTIFIED_MEMBER_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static AGGREGATE_PATHS_TAKEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static ONE_SHOT_COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ONE_SHOT_LITERAL_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Programs compiled for a one-shot evaluation on this thread, so far
+pub fn one_shot_compiles() -> usize {
+    ONE_SHOT_COMPILES.with(std::cell::Cell::get)
+}
+
+pub(crate) fn one_shot_compiled() {
+    ONE_SHOT_COMPILES.with(|n| n.set(n.get() + 1));
+}
+
+/// Literals a one-shot evaluation read on this thread, so far
+pub fn one_shot_literal_reads() -> usize {
+    ONE_SHOT_LITERAL_READS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn one_shot_literal_read() {
+    ONE_SHOT_LITERAL_READS.with(|n| n.set(n.get() + 1));
 }
 
 /// The name of every path that builds an aggregate result

@@ -76,12 +76,31 @@ fn accumulate_ordered_frame(
     }
 }
 
-/// A window-function argument that cannot reference row columns, compiled
-/// the first time a partition reads it and kept for the call
+/// How a window argument is read: a literal by its value, resolved once
+/// for the call; a parameter from the statement; anything else by a
+/// program compiled the first time a partition reads it
+enum ArgSource {
+    Literal(Value),
+    Parameter,
+    Program(OnceLock<Result<Program>>),
+}
+
+impl ArgSource {
+    fn of(expr: &Expression) -> Self {
+        match literal_value(expr) {
+            Some(value) => ArgSource::Literal(value),
+            None if matches!(expr, Expression::Parameter(_)) => ArgSource::Parameter,
+            None => ArgSource::Program(OnceLock::new()),
+        }
+    }
+}
+
+/// A window-function argument that cannot reference row columns, read as
+/// its source says and kept for the call
 struct ConstArg<'w> {
     expr: &'w Expression,
     deterministic: bool,
-    program: OnceLock<Result<Program>>,
+    source: ArgSource,
 }
 
 impl<'w> ConstArg<'w> {
@@ -89,17 +108,18 @@ impl<'w> ConstArg<'w> {
         Self {
             expr,
             deterministic: expr_is_deterministic(expr, registry),
-            program: OnceLock::new(),
+            source: ArgSource::of(expr),
         }
     }
 
     fn evaluate(&self, ctx: &ExecutionContext) -> Result<Value> {
-        if reads_without_program(self.expr) {
-            return evaluate_once(self.expr, Some(ctx));
-        }
-        match self.program.get_or_init(|| compile_once(self.expr)) {
-            Ok(program) => execute_once(program, Some(ctx)),
-            Err(e) => Err(e.clone()),
+        match &self.source {
+            ArgSource::Literal(value) => Ok(value.clone()),
+            ArgSource::Parameter => evaluate_once(self.expr, Some(ctx)),
+            ArgSource::Program(program) => match program.get_or_init(|| compile_once(self.expr)) {
+                Ok(program) => execute_once(program, Some(ctx)),
+                Err(e) => Err(e.clone()),
+            },
         }
     }
 }
@@ -136,8 +156,8 @@ struct CallArgs<'w> {
     frame_start: Option<ConstArg<'w>>,
     frame_end: Option<ConstArg<'w>>,
     count: Option<ConstArg<'w>>,
-    /// LAG and LEAD's default, which reads the row
-    default: Option<(&'w Expression, OnceLock<Result<Program>>)>,
+    /// LAG and LEAD's default, which may read the row
+    default: Option<(&'w Expression, ArgSource)>,
 }
 
 impl<'w> CallArgs<'w> {
@@ -165,18 +185,14 @@ impl<'w> CallArgs<'w> {
                 .arguments
                 .get(2)
                 .filter(|_| lead_lag)
-                .map(|expr| (expr, OnceLock::new())),
+                .map(|expr| (expr, ArgSource::of(expr))),
         }
     }
 
     /// The default's program over the input `columns`, compiled on first
-    /// read; None when there is no default or it reads without a program
+    /// read; None when there is no default or it is read without one
     fn default_program(&self, columns: &[String]) -> Result<Option<&Program>> {
-        let Some((expr, program)) = self
-            .default
-            .as_ref()
-            .filter(|(expr, _)| !reads_without_program(expr))
-        else {
+        let Some((expr, ArgSource::Program(program))) = &self.default else {
             return Ok(None);
         };
         let program = program.get_or_init(|| {
@@ -197,6 +213,7 @@ impl<'w> CallArgs<'w> {
     ) -> Result<Value> {
         match (program, &self.default) {
             (Some(program), _) => vm.execute(program, &execute_context(row, Some(ctx))),
+            (None, Some((_, ArgSource::Literal(value)))) => Ok(value.clone()),
             (None, Some((expr, _))) => evaluate_once(expr, Some(ctx)),
             (None, None) => Ok(Value::null_unknown()),
         }
@@ -441,8 +458,8 @@ use super::context::ExecutionContext;
 use super::expr_key::ExprKey;
 use super::expression::{
     compile_once, compute_expression_hash, evaluate_once, execute_context, execute_once,
-    reads_without_program, CompileContext, ExprCompiler, ExprVM, ExpressionEval,
-    MultiExpressionEval, Program,
+    literal_value, CompileContext, ExprCompiler, ExprVM, ExpressionEval, MultiExpressionEval,
+    Program,
 };
 use super::query::{order_by_inputs, ColumnSource, OutputLayout};
 use super::result::{ColumnarResult, ExecutorResult};
@@ -1282,7 +1299,7 @@ impl Executor {
         let mut precomputed_agg: StringMap<Vec<Value>> = StringMap::new();
         let mut streaming_partition_cache: Vec<(OverClauseKey, SharedSortedPartitions)> =
             Vec::new();
-        for (wf, _, is_agg, _) in &resolved_wfs {
+        for (wf, _, is_agg, args) in &resolved_wfs {
             if *is_agg {
                 let cache_key = Self::order_by_cache_key(&wf.order_by);
                 let precomputed_order_by = order_by_cache
@@ -1299,6 +1316,7 @@ impl Executor {
                     None,
                     precomputed_order_by,
                     &mut streaming_partition_cache,
+                    args,
                 )?;
                 precomputed_agg.insert(wf.column_name.to_lowercase(), agg_results);
             }
@@ -1573,6 +1591,7 @@ impl Executor {
                         None,
                         precomputed_order_by,
                         &mut lazy_partition_cache,
+                        args,
                     )?;
                     // agg_results is already indexed by local row index
                     window_value_map.insert(wf.column_name.to_lowercase(), agg_results);
@@ -2577,6 +2596,7 @@ impl Executor {
                 pre_sorted,
                 cached_order_by,
                 partition_cache,
+                &CallArgs::of(wf_info, &self.function_registry),
             );
         }
 
@@ -3885,6 +3905,7 @@ impl Executor {
         pre_sorted: Option<&WindowPreSortedState>,
         cached_order_by: Option<&ColumnarOrderByValues>,
         partition_cache: &mut Vec<(OverClauseKey, SharedSortedPartitions)>,
+        args: &CallArgs,
     ) -> Result<Vec<Value>> {
         // Check if this is COUNT(*) - Star expression means count all rows
         let is_count_star =
@@ -3991,11 +4012,7 @@ impl Executor {
         if let Some(error) = &wf_info.extra_error {
             return Err(error.clone());
         }
-        let frame = Frame::read(
-            wf_info,
-            &CallArgs::of(wf_info, &self.function_registry),
-            ctx,
-        )?;
+        let frame = Frame::read(wf_info, args, ctx)?;
         let mut results: Vec<Option<Value>> = vec![None; rows.len()];
 
         for row_indices in partitions.iter() {
