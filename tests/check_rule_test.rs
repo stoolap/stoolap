@@ -203,6 +203,26 @@ fn rename_refuses_a_name_that_would_rebind_a_check() {
 }
 
 #[test]
+fn rename_refuses_a_name_that_would_not_read_back_as_one_name() {
+    let db = Database::open("memory://check_rename_shape").unwrap();
+    db.execute(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, v INTEGER CHECK (v > 0))",
+        (),
+    )
+    .unwrap();
+    for sql in [
+        "ALTER TABLE c RENAME COLUMN v TO \"2 + t.x\"",
+        "ALTER TABLE c RENAME COLUMN v TO \"-v\"",
+    ] {
+        assert!(db.execute(sql, ()).is_err(), "{sql} changed CHECK (v > 0)");
+    }
+    refused(&db, &["INSERT INTO c VALUES (1, -1)"]);
+    db.execute("ALTER TABLE c RENAME COLUMN v TO w", ())
+        .unwrap();
+    refused(&db, &["INSERT INTO c VALUES (1, -1)"]);
+}
+
+#[test]
 fn an_update_runs_a_volatile_check_whatever_it_sets() {
     let db = Database::open("memory://check_volatile").unwrap();
     db.execute(

@@ -42,7 +42,7 @@ Rename an existing column:
 ALTER TABLE users RENAME COLUMN old_name TO new_name;
 ```
 
-Data is preserved. The old name is no longer accessible after the rename. Every CHECK that reads the column is rewritten to the new name.
+Data is preserved. The old name is no longer accessible after the rename. Every CHECK that reads the column is rewritten to the new name. A rename is refused when a CHECK would no longer read back as written: when the new name holds a dot or an operator and a CHECK reads the column, or when another name in a CHECK would then read a different column.
 
 ## MODIFY COLUMN
 

@@ -772,6 +772,7 @@ impl Schema {
 
         // Every CHECK reads the row by name: each name bound to the column
         // follows it, and every name must bind as before once renamed
+        use crate::executor::expr_key::ExprKey;
         use crate::executor::expression::CompileContext;
         let before: Vec<String> = self.columns.iter().map(|c| c.name.clone()).collect();
         let mut after = before.clone();
@@ -796,10 +797,13 @@ impl Schema {
             };
             expr.rename_references(&binds, &new_name);
             let rewritten = expr.to_string();
-            let reread = parse(&rewritten, "CHECK", &self.table_name).ok();
-            if reread.map(|e| bound(&new_binding, &e)) != Some(reads) {
+            // The stored text must read back as the same tree, binding as before
+            let same = parse(&rewritten, "CHECK", &self.table_name).is_ok_and(|reread| {
+                ExprKey::of(&reread) == ExprKey::of(&expr) && bound(&new_binding, &reread) == reads
+            });
+            if !same {
                 return Err(Error::invalid_argument(format!(
-                    "cannot rename {old_name} to {new_name}: the CHECK {text} would read another column"
+                    "cannot rename {old_name} to {new_name}: the CHECK {text} would not read back as written"
                 )));
             }
             Ok((rewritten != *text).then_some(rewritten))
