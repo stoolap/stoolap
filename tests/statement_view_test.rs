@@ -129,13 +129,12 @@ fn test_read_committed_delete_subqueries_keep_one_view() {
     let db = setup("memory://statement_view_rc_delete");
     let committed = Rc::new(Cell::new(false));
     let (other, flag) = (db.clone(), Rc::clone(&committed));
+    // The subquery's table is opened before the statement reads a row
     stoolap::test_failpoints::after_select_table_opened(move || {
-        stoolap::test_failpoints::after_select_table_opened(move || {
-            other
-                .execute("UPDATE u SET v = 0 WHERE id IN (2, 5)", ())
-                .unwrap();
-            flag.set(true);
-        });
+        other
+            .execute("UPDATE u SET v = 0 WHERE id IN (2, 5)", ())
+            .unwrap();
+        flag.set(true);
     });
     db.execute(
         "DELETE FROM t WHERE b = 1 AND a > (SELECT v FROM u WHERE u.id = t.id)",

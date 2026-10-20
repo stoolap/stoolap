@@ -2657,6 +2657,159 @@ impl PreparedSelect {
     }
 }
 
+/// The WHERE and SET of an UPDATE or DELETE whose subqueries run prepared,
+/// compiled against its target's columns over one set of blocks
+#[derive(Debug)]
+pub struct PreparedDml {
+    cached_epoch: u64,
+    /// The target's columns at preparation
+    columns: CompactArc<Vec<String>>,
+    blocks: PreparedBlocks,
+    where_program: Option<SharedProgram>,
+    /// Each SET value with the column it writes
+    sets: Vec<(usize, SharedProgram)>,
+}
+
+impl PreparedDml {
+    /// Prepare the WHERE and `sets` of a statement over its target `schema`,
+    /// named `scope_name`, for executions with `param_count` parameters
+    fn prepare(
+        executor: &Executor,
+        schema: &Schema,
+        scope_name: &SmartString,
+        where_clause: Option<&Expression>,
+        sets: &[(usize, &Expression)],
+        param_count: usize,
+        epoch: u64,
+    ) -> Result<Self> {
+        let scope = ScopeTable::of(scope_name.clone(), schema);
+        let scopes = [&scope];
+        let chain = Chain { scopes: &scopes };
+        let mut builder = Builder {
+            executor,
+            next_slot: param_count,
+            subqueries: Vec::new(),
+            named: Vec::new(),
+            max_param: 0,
+        };
+        let mut work = Rewritten::default();
+        let where_clause = where_clause
+            .map(|w| builder.rewrite(&chain, None, w, &mut work))
+            .transpose()?;
+        // A value that reads no row is computed once per run, as a run slot
+        let mut run_slots = Vec::new();
+        let mut rewritten = Vec::with_capacity(sets.len());
+        for (column, value) in sets {
+            let mut value_work = Rewritten::default();
+            let rewritten_value = builder.rewrite(&chain, None, value, &mut value_work)?;
+            work.ids.extend(value_work.ids);
+            let value = if !value_work.reads_row
+                && !is_leaf(value)
+                && !volatile(value, &executor.function_registry)
+            {
+                let slot = builder.slot();
+                run_slots.push((slot, rewritten_value));
+                slot_parameter(slot)
+            } else {
+                rewritten_value
+            };
+            rewritten.push((*column, value));
+        }
+        let sets = rewritten;
+        let mut read_as = FxHashMap::default();
+        if let Some(where_clause) = &where_clause {
+            compare_as_scan(where_clause, schema, &mut read_as);
+        }
+        let own = CompileContext::new(&scope.columns, &executor.function_registry)
+            .with_subquery_ids(&work.ids)
+            .with_read_as(&read_as);
+        let where_program = where_clause
+            .as_ref()
+            .map(|w| compile_with(&own, w))
+            .transpose()?;
+        let sets = sets
+            .iter()
+            .map(|(column, value)| compile_with(&own, value).map(|p| (*column, p)))
+            .collect::<Result<Vec<_>>>()?;
+        let run_slots = run_slots
+            .iter()
+            .map(|(slot, value)| compile_with(&own, value).map(|p| (*slot, p)))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            cached_epoch: epoch,
+            columns: scope.columns.clone(),
+            blocks: builder.finish(param_count, run_slots)?,
+            where_program,
+            sets,
+        })
+    }
+}
+
+/// The tables a prepared UPDATE's or DELETE's blocks read, opened before
+/// the statement writes, and the context they read under
+pub(crate) struct DmlTables {
+    tables: Vec<Box<dyn Table>>,
+    inner_ctx: ExecutionContext,
+}
+
+/// One execution of a prepared UPDATE or DELETE over its target's rows
+pub(crate) struct DmlRunner<'a> {
+    runner: PreparedRunner<'a>,
+    prepared: &'a PreparedDml,
+}
+
+impl<'a> DmlRunner<'a> {
+    /// A run of `prepared` for a target of about `rows` rows, its run slots
+    /// computed before the statement reads a row
+    pub(crate) fn new(
+        executor: &'a Executor,
+        prepared: &'a PreparedDml,
+        ctx: &'a ExecutionContext,
+        tables: DmlTables,
+        rows: usize,
+    ) -> Result<Self> {
+        let mut runner = PreparedRunner::new(
+            executor,
+            &prepared.blocks,
+            ctx,
+            tables.inner_ctx,
+            tables.tables,
+            rows,
+            None,
+        );
+        for (slot, value) in runner.run_slot_values()? {
+            runner.base[slot] = value;
+        }
+        Ok(Self { runner, prepared })
+    }
+
+    /// What the statement's programs read for `row`: its parameters, its
+    /// run slots and its blocks
+    pub(crate) fn context<'r>(&'r self, row: &'r Row) -> ExecuteContext<'r> {
+        ExecuteContext::with_common_params(
+            row,
+            &self.runner.base,
+            Some(self.runner.named),
+            self.runner.transaction_id,
+        )
+        .with_subquery_executor(&self.runner)
+    }
+
+    /// Whether the row of `exec` passes the WHERE; every row passes a
+    /// statement without one
+    pub(crate) fn matches(&self, vm: &mut ExprVM, exec: &ExecuteContext) -> Result<bool> {
+        match &self.prepared.where_program {
+            Some(condition) => vm.execute_bool_checked(condition, exec),
+            None => Ok(true),
+        }
+    }
+
+    /// Each SET value's program with the column it writes
+    pub(crate) fn sets(&self) -> &'a [(usize, SharedProgram)] {
+        &self.prepared.sets
+    }
+}
+
 fn mentions_subquery(expr: &Expression) -> bool {
     match expr {
         Expression::ScalarSubquery(_) | Expression::Exists(_) | Expression::AllAny(_) => true,
@@ -2829,6 +2982,111 @@ impl Executor {
                 }
                 _ => false,
             })
+    }
+
+    /// Whether an UPDATE's or DELETE's WHERE and SET values run prepared:
+    /// they hold a subquery, and every form in them is the family's
+    pub(crate) fn dml_family<'e>(
+        &self,
+        where_clause: Option<&'e Expression>,
+        sets: impl IntoIterator<Item = &'e Expression>,
+        ctx: &'e ExecutionContext,
+    ) -> std::result::Result<(), OutOfFamily> {
+        if ctx.outer_row().is_some() {
+            return Err("it runs for a row of an enclosing statement");
+        }
+        let family = Family {
+            executor: self,
+            ctx: Some(ctx),
+            tables: RefCell::new(SmallVec::new()),
+        };
+        let mut found = false;
+        for expr in where_clause.into_iter().chain(sets) {
+            family.expression(expr, 1, Site::Subqueries, &mut found)?;
+        }
+        if !found {
+            return Err("the statement holds no subquery");
+        }
+        family.catalog()
+    }
+
+    /// The plan's prepared UPDATE or DELETE over a target of `schema`,
+    /// named `scope_name`, with its blocks' tables open; prepared now when
+    /// the plan holds none for this schema, these columns and this
+    /// parameter count
+    pub(crate) fn open_prepared_dml(
+        &self,
+        compiled: Option<&RwLock<CompiledExecution>>,
+        schema: &Schema,
+        scope_name: &SmartString,
+        where_clause: Option<&Expression>,
+        sets: &[(usize, &Expression)],
+        ctx: &ExecutionContext,
+    ) -> Result<(Arc<PreparedDml>, DmlTables)> {
+        let epoch = self.engine.schema_epoch();
+        let columns = schema.column_names_arc();
+        let fits = |p: &PreparedDml| {
+            p.cached_epoch == epoch
+                && p.blocks.param_count == ctx.params().len()
+                && (CompactArc::ptr_eq(&p.columns, &columns) || p.columns == columns)
+        };
+        let inner_ctx = ctx.with_incremented_query_depth();
+        // A column change between taking the plan and opening a block's
+        // table prepares again, against the table as it now is
+        let mut fresh = false;
+        loop {
+            let held = compiled
+                .filter(|_| !fresh)
+                .and_then(|slot| slot.read().ok())
+                .and_then(|guard| match &*guard {
+                    CompiledExecution::PreparedDml(p) if fits(p) => Some(Arc::clone(p)),
+                    _ => None,
+                });
+            let prepared = match held {
+                Some(prepared) => prepared,
+                None => {
+                    let prepared = Arc::new(PreparedDml::prepare(
+                        self,
+                        schema,
+                        scope_name,
+                        where_clause,
+                        sets,
+                        ctx.params().len(),
+                        epoch,
+                    )?);
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::prepared_dml_was_built();
+                    if let Some(mut guard) = compiled.and_then(|slot| slot.write().ok()) {
+                        if matches!(
+                            &*guard,
+                            CompiledExecution::Unknown
+                                | CompiledExecution::NotOptimizable(_)
+                                | CompiledExecution::PreparedDml(_)
+                        ) {
+                            *guard = CompiledExecution::PreparedDml(Arc::clone(&prepared));
+                        }
+                    }
+                    prepared
+                }
+            };
+            if let Some(tables) = PreparedRunner::open_tables(self, &prepared.blocks, &inner_ctx)? {
+                for name in &prepared.blocks.named {
+                    if !ctx.named_params().contains_key(name.as_str()) {
+                        return Err(Error::invalid_argument(format!(
+                            "named parameter :{} has no value",
+                            name
+                        )));
+                    }
+                }
+                return Ok((prepared, DmlTables { tables, inner_ctx }));
+            }
+            if fresh {
+                return Err(Error::internal(
+                    "a table's columns changed while the statement prepared",
+                ));
+            }
+            fresh = true;
+        }
     }
 
     /// Run an in-family statement: scan its table narrowed by the

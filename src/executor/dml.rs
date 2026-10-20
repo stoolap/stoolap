@@ -1927,6 +1927,7 @@ impl Executor {
         &self,
         stmt: &UpdateStatement,
         ctx: &ExecutionContext,
+        compiled: Option<&std::sync::RwLock<super::query_cache::CompiledExecution>>,
     ) -> Result<Box<dyn QueryResult>> {
         // A WITH clause is run first, so the subqueries can read it
         let ctx_with_ctes;
@@ -2109,17 +2110,70 @@ impl Executor {
             }
         }
 
+        // Subqueries of the prepared family run through one runner, which
+        // reads the tables as the statement found them
+        let where_has_subqueries = stmt
+            .where_clause
+            .as_deref()
+            .is_some_and(Self::has_subqueries);
+        let in_family = (where_has_subqueries || stmt.updates.values().any(Self::has_subqueries))
+            && self
+                .dml_family(stmt.where_clause.as_deref(), stmt.updates.values(), ctx)
+                .is_ok();
+        let where_prepared = in_family && where_has_subqueries;
+        let snapshot_ctx;
+        let ctx = if in_family && should_auto_commit && ctx.statement_snapshot().is_none() {
+            let snapshot =
+                self.new_statement_snapshot(self.isolation_level(), ctx.statement_view())?;
+            snapshot_ctx = ctx.with_statement_snapshot(snapshot);
+            &snapshot_ctx
+        } else {
+            ctx
+        };
+        let held_dml;
+        let dml_run = if in_family {
+            let col_map = schema.column_index_map();
+            let sets: Vec<(usize, &Expression)> = stmt
+                .updates
+                .iter()
+                .filter_map(|(name, expr)| {
+                    col_map
+                        .get(name.to_lowercase().as_str())
+                        .map(|&i| (i, expr))
+                })
+                .collect();
+            let (prepared, tables) = self.open_prepared_dml(
+                compiled,
+                schema,
+                table_name,
+                stmt.where_clause.as_deref(),
+                &sets,
+                ctx,
+            )?;
+            held_dml = prepared;
+            Some(super::prepared_select::DmlRunner::new(
+                self,
+                &held_dml,
+                ctx,
+                tables,
+                table.row_count_hint(),
+            )?)
+        } else {
+            None
+        };
+
         // Check if any update expressions contain subqueries
-        let has_update_subqueries = stmt
-            .updates
-            .iter()
-            .any(|(_, expr)| Self::has_subqueries(expr));
+        let has_update_subqueries = !in_family
+            && stmt
+                .updates
+                .iter()
+                .any(|(_, expr)| Self::has_subqueries(expr));
 
         // Check if any update expressions have correlated subqueries
-        let has_correlated_updates = stmt
-            .updates
-            .iter()
-            .any(|(_, expr)| Self::has_subqueries(expr) && Self::has_correlated_subqueries(expr));
+        let has_correlated_updates = !in_family
+            && stmt.updates.iter().any(|(_, expr)| {
+                Self::has_subqueries(expr) && Self::has_correlated_subqueries(expr)
+            });
 
         // Pre-process update expressions if they contain NON-correlated subqueries
         // Correlated subqueries must be processed per-row with outer row context
@@ -2183,7 +2237,9 @@ impl Executor {
             let has_correlated_where =
                 Self::has_subqueries(where_clause) && Self::has_correlated_subqueries(where_clause);
 
-            let processed_where = if has_correlated_where {
+            let processed_where = if where_prepared {
+                (**where_clause).clone()
+            } else if has_correlated_where {
                 // Try semi-join optimization for correlated EXISTS/IN
                 // Avoid cloning upfront - only clone if no optimization succeeds
                 let outer_tables = vec![table_name.to_string()];
@@ -2222,7 +2278,7 @@ impl Executor {
                 (**where_clause).clone()
             };
 
-            if where_is_correlated {
+            if where_is_correlated || where_prepared {
                 (None, true, Some(processed_where))
             } else {
                 // Try to push down predicate to storage layer
@@ -2313,8 +2369,13 @@ impl Executor {
                 } else {
                     Vec::new()
                 };
+                let mut check_vm = super::expression::ExprVM::new();
                 for (_rid, row) in parent_rows.iter() {
-                    if needs_memory_filter {
+                    if let Some(run) = dml_run.as_ref().filter(|_| where_prepared) {
+                        if !run.matches(&mut check_vm, &run.context(row))? {
+                            continue;
+                        }
+                    } else if needs_memory_filter {
                         if let Some(ref mem_where) = memory_where_clause {
                             evaluator.set_row_array(row);
                             let held = if where_is_correlated {
@@ -2547,7 +2608,19 @@ impl Executor {
 
             let col_map = schema.column_index_map();
             let compiled_updates: Vec<(usize, crate::core::DataType, u16, SharedProgram)> =
-                if let Some(ref processed) = processed_updates {
+                if let Some(run) = &dml_run {
+                    run.sets()
+                        .iter()
+                        .map(|(idx, program)| {
+                            (
+                                *idx,
+                                schema.columns[*idx].data_type,
+                                schema.columns[*idx].vector_dimensions,
+                                program.clone(),
+                            )
+                        })
+                        .collect()
+                } else if let Some(ref processed) = processed_updates {
                     // Use pre-processed expressions (subqueries already evaluated)
                     processed
                         .iter()
@@ -2642,13 +2715,24 @@ impl Executor {
             let mut setter = |mut row: Row| -> Result<(Row, bool)> {
                 // Execute pre-compiled programs (no recompilation per row)
                 let updates_to_apply: Vec<(usize, Value)> = {
-                    let exec_ctx = ExecuteContext::new(&row)
-                        .with_params(params)
-                        .with_named_params(named_params)
-                        .with_transaction_id(transaction_id);
+                    let exec_ctx = match &dml_run {
+                        Some(run) => run.context(&row),
+                        None => ExecuteContext::new(&row)
+                            .with_params(params)
+                            .with_named_params(named_params)
+                            .with_transaction_id(transaction_id),
+                    };
 
                     // In-memory WHERE filtering shares the row context
-                    if needs_memory_filter {
+                    if let Some(run) = dml_run.as_ref().filter(|_| where_prepared) {
+                        #[cfg(feature = "test-failpoints")]
+                        crate::test_failpoints::prepared_dml_site_ran(
+                            crate::test_failpoints::PreparedDmlSite::UpdateWhere,
+                        );
+                        if !run.matches(&mut vm, &exec_ctx)? {
+                            return Ok((row, false));
+                        }
+                    } else if needs_memory_filter {
                         if let Some(ref program) = memory_where_program {
                             if !vm.execute_bool_checked(program, &exec_ctx)? {
                                 return Ok((row, false));
@@ -2689,6 +2773,12 @@ impl Executor {
                         // skipping a SET column would half-apply the row.
                         // Coercion validates like INSERT and the fast path
                         // (vector dims, no silent non-null-to-NULL).
+                        #[cfg(feature = "test-failpoints")]
+                        if dml_run.is_some() {
+                            crate::test_failpoints::prepared_dml_site_ran(
+                                crate::test_failpoints::PreparedDmlSite::UpdateSet,
+                            );
+                        }
                         let v = vm.execute_cow(program, &exec_ctx)?;
                         let coerced = v.coerce_to_type(*col_type);
                         validate_coercion(
@@ -2846,6 +2936,7 @@ impl Executor {
         &self,
         stmt: &DeleteStatement,
         ctx: &ExecutionContext,
+        compiled: Option<&std::sync::RwLock<super::query_cache::CompiledExecution>>,
     ) -> Result<Box<dyn QueryResult>> {
         // A WITH clause is run first, so the subqueries can read it
         let ctx_with_ctes;
@@ -2905,10 +2996,52 @@ impl Executor {
         // If that fails (complex expression like a + b > 100), fall back to in-memory filtering
         let schema = table.schema();
 
+        // A WHERE whose subqueries are of the prepared family runs through
+        // one runner, which reads the tables as the statement found them
+        let where_prepared = stmt
+            .where_clause
+            .as_deref()
+            .is_some_and(Self::has_subqueries)
+            && self
+                .dml_family(stmt.where_clause.as_deref(), [], ctx)
+                .is_ok();
+        let snapshot_ctx;
+        let ctx = if where_prepared && should_auto_commit && ctx.statement_snapshot().is_none() {
+            let snapshot =
+                self.new_statement_snapshot(self.isolation_level(), ctx.statement_view())?;
+            snapshot_ctx = ctx.with_statement_snapshot(snapshot);
+            &snapshot_ctx
+        } else {
+            ctx
+        };
+        let held_dml;
+        let dml_run = if where_prepared {
+            let (prepared, tables) = self.open_prepared_dml(
+                compiled,
+                schema,
+                &SmartString::from(effective_name),
+                stmt.where_clause.as_deref(),
+                &[],
+                ctx,
+            )?;
+            held_dml = prepared;
+            Some(super::prepared_select::DmlRunner::new(
+                self,
+                &held_dml,
+                ctx,
+                tables,
+                table.row_count_hint(),
+            )?)
+        } else {
+            None
+        };
+
         // Check if WHERE has correlated subqueries (needs per-row evaluation)
         // This will be updated after semi-join optimization attempt
         let mut has_correlated = if let Some(ref where_clause) = stmt.where_clause {
-            Self::has_subqueries(where_clause) && Self::has_correlated_subqueries(where_clause)
+            !where_prepared
+                && Self::has_subqueries(where_clause)
+                && Self::has_correlated_subqueries(where_clause)
         } else {
             false
         };
@@ -2920,7 +3053,9 @@ impl Executor {
             bool,
             Option<Expression>,
         ) = if let Some(ref where_clause) = stmt.where_clause {
-            if has_correlated {
+            if where_prepared {
+                (None, true, Some((**where_clause).clone()))
+            } else if has_correlated {
                 // Try semi-join optimization for correlated EXISTS/IN
                 // Avoid cloning upfront - only clone if no optimization succeeds
                 let outer_tables = vec![table_name.to_string()];
@@ -3095,7 +3230,13 @@ impl Executor {
                 let row = scanner.row();
 
                 // Check memory filter if needed
-                let matches = if needs_memory_filter {
+                let matches = if let Some(run) = &dml_run {
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::prepared_dml_site_ran(
+                        crate::test_failpoints::PreparedDmlSite::DeleteWhere,
+                    );
+                    run.matches(&mut delete_vm, &run.context(row))?
+                } else if needs_memory_filter {
                     evaluator.set_row_array(row);
                     if let Some(ref where_expr) = memory_where_clause {
                         if has_correlated {

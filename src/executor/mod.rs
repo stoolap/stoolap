@@ -1058,8 +1058,8 @@ impl Executor {
 
             // DML statements
             Statement::Insert(stmt) => self.execute_insert(stmt, ctx, compiled),
-            Statement::Update(stmt) => self.execute_update(stmt, ctx),
-            Statement::Delete(stmt) => self.execute_delete(stmt, ctx),
+            Statement::Update(stmt) => self.execute_update(stmt, ctx, compiled),
+            Statement::Delete(stmt) => self.execute_delete(stmt, ctx, compiled),
             Statement::Truncate(stmt) => self.execute_truncate(stmt, ctx),
 
             // Query statements - try fast-path first for simple PK lookups
