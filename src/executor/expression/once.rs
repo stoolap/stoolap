@@ -44,7 +44,7 @@ pub(crate) fn evaluate_once(expr: &Expression, ctx: Option<&ExecutionContext>) -
         return Ok(value);
     }
     let row = Row::new();
-    let exec = context(&row, ctx);
+    let exec = execute_context(&row, ctx);
     if let Expression::Parameter(param) = expr {
         let value = match parameter_slot(param).map_err(compile_error)? {
             ParameterSlot::Named(name) => exec.named_param_ref(name),
@@ -55,13 +55,22 @@ pub(crate) fn evaluate_once(expr: &Expression, ctx: Option<&ExecutionContext>) -
     run(&compile_once(expr)?, &exec)
 }
 
+/// A literal or a parameter: [`evaluate_once`] reads it without a program
+pub(crate) fn reads_without_program(expr: &Expression) -> bool {
+    literal_value(expr).is_some() || matches!(expr, Expression::Parameter(_))
+}
+
 /// What [`evaluate_once`] does after compiling
 pub(crate) fn execute_once(program: &Program, ctx: Option<&ExecutionContext>) -> Result<Value> {
     let row = Row::new();
-    run(program, &context(&row, ctx))
+    run(program, &execute_context(&row, ctx))
 }
 
-fn context<'a>(row: &'a Row, ctx: Option<&'a ExecutionContext>) -> ExecuteContext<'a> {
+/// The VM context for `row` with `ctx`'s parameters, outer row and transaction
+pub(crate) fn execute_context<'a>(
+    row: &'a Row,
+    ctx: Option<&'a ExecutionContext>,
+) -> ExecuteContext<'a> {
     let mut exec = ExecuteContext::new(row);
     if let Some(ctx) = ctx {
         exec = exec
