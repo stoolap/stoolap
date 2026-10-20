@@ -4019,6 +4019,68 @@ fn test_query_named_all_late_error_in_transaction_and_buffer_reuse() {
 }
 
 #[test]
+fn test_query_all_refuses_a_transaction_from_another_database() {
+    unsafe {
+        let db = packed_test_db(2);
+        let other = packed_test_db(2);
+        let mut foreign: *mut StoolapTx = std::ptr::null_mut();
+        assert_eq!(stoolap_begin(other, &mut foreign), STOOLAP_OK);
+
+        let sql = cstr("SELECT id FROM t WHERE id >= $1");
+        let params = [int_param(1)];
+        let mut buf: *const u8 = std::ptr::null();
+        let mut len = 0i64;
+        let rc = stoolap_query_params_all(
+            db,
+            foreign,
+            sql.as_ptr(),
+            params.as_ptr(),
+            1,
+            &mut buf,
+            &mut len,
+        );
+        assert_eq!(rc, STOOLAP_ERROR, "query_params_all");
+        assert!(buf.is_null());
+        assert!(read_cstr(stoolap_errmsg(db)).contains("another database"));
+
+        let named_sql = cstr("SELECT id FROM t WHERE id >= :lo");
+        let named = [named_param("lo", int_param(1))];
+        let rc = stoolap_query_named_all(
+            db,
+            foreign,
+            named_sql.as_ptr(),
+            named.as_ptr(),
+            1,
+            &mut buf,
+            &mut len,
+        );
+        assert_eq!(rc, STOOLAP_ERROR, "query_named_all");
+        assert!(read_cstr(stoolap_errmsg(db)).contains("another database"));
+        assert_eq!(stoolap_tx_rollback(foreign), STOOLAP_OK);
+
+        let mut clone: *mut StoolapDB = std::ptr::null_mut();
+        assert_eq!(stoolap_clone(db, &mut clone), STOOLAP_OK);
+        let mut tx: *mut StoolapTx = std::ptr::null_mut();
+        assert_eq!(stoolap_begin(clone, &mut tx), STOOLAP_OK);
+        let ins = cstr("INSERT INTO t (id, name) VALUES (5, 'n5')");
+        assert_eq!(
+            stoolap_tx_exec(tx, ins.as_ptr(), std::ptr::null_mut()),
+            STOOLAP_OK
+        );
+        let five = [int_param(5)];
+        let rc =
+            stoolap_query_params_all(db, tx, sql.as_ptr(), five.as_ptr(), 1, &mut buf, &mut len);
+        assert_eq!(rc, STOOLAP_OK, "a clone's transaction is the same database");
+        assert_eq!(decode_packed(buf, len).1, vec![vec!["5"]]);
+        assert_eq!(stoolap_tx_rollback(tx), STOOLAP_OK);
+
+        stoolap_close(clone);
+        stoolap_close(other);
+        stoolap_close(db);
+    }
+}
+
+#[test]
 fn test_json_parameter_the_engine_cannot_read_is_refused() {
     unsafe {
         let db = packed_test_db(0);

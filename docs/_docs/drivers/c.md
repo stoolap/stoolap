@@ -751,7 +751,7 @@ stoolap_rows_close(rows);
 
 ### Query and Fetch in One Call
 
-`stoolap_stmt_query_all()` and `stoolap_query_params_all()` run a query and return all of its rows in the packed format in a single call. No rows handle is created, so a point lookup is one FFI call instead of four (query, fetch, free, close). Pass a transaction handle as `tx` to run inside it, or NULL to run outside a transaction. `stoolap_stmt_query_named_all()` and `stoolap_query_named_all()` are the same calls with named parameters.
+`stoolap_stmt_query_all()` and `stoolap_query_params_all()` run a query and return all of its rows in the packed format in a single call. No rows handle is created, so a point lookup is one FFI call instead of four (query, fetch, free, close). Pass a transaction handle as `tx` to run inside it, or NULL to run outside a transaction. For `stoolap_query_params_all()` and `stoolap_query_named_all()`, `tx` must be begun on the same database as `db`, or on a `stoolap_clone()` of it; a transaction from another database returns `STOOLAP_ERROR`. `stoolap_stmt_query_named_all()` and `stoolap_query_named_all()` are the same calls with named parameters.
 
 The buffer belongs to the statement (`stoolap_stmt_query_all`, `stoolap_stmt_query_named_all`) or the database handle (`stoolap_query_params_all`, `stoolap_query_named_all`) and is reused by the next call on that handle, so it must not be freed and must be read before that call. A buffer that grew beyond 1 MiB for a large result is released at the next call. Errors are read with `stoolap_stmt_errmsg(stmt)` or `stoolap_errmsg(db)`, including when the call ran inside `tx`.
 

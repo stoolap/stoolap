@@ -693,9 +693,11 @@ int32_t stoolap_stmt_query_named_all(
  * Run a query with positional parameters and pack every row, in the
  * stoolap_rows_fetch_all() format, in one call and without a rows handle.
  *
- * Runs inside tx when tx is not NULL. The buffer belongs to db: it stays
- * valid until the next call on db or stoolap_close(), and must NOT be freed.
- * On error, read stoolap_errmsg(db).
+ * Runs inside tx when tx is not NULL; a tx begun on another database than
+ * db (a stoolap_clone() of it is the same one) is an error. The buffer
+ * belongs to db: it stays valid until the next call on db or
+ * stoolap_close(), and must NOT be freed. On error, read
+ * stoolap_errmsg(db).
  */
 int32_t stoolap_query_params_all(
     StoolapDB* db,
