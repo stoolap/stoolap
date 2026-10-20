@@ -225,8 +225,7 @@ impl Executor {
             return Ok(None);
         };
 
-        // NULLS LAST for ASC and NULLS FIRST for DESC unless the query says
-        let nulls_first = order_by.nulls_first.unwrap_or(!ascending);
+        let nulls_first = crate::core::value::nulls_first(ascending, order_by.nulls_first);
 
         // Try to use index-ordered scan
         if let Some(rows) = table.collect_rows_ordered_by_index(
@@ -2299,7 +2298,7 @@ impl Executor {
         }
 
         let order_by = &stmt.order_by[0];
-        if !order_by.ascending || order_by.nulls_first == Some(true) {
+        if !order_by.ascending || crate::core::value::nulls_first(true, order_by.nulls_first) {
             return Ok(None); // Vector search returns closest first, NULLs last
         }
 

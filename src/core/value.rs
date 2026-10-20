@@ -1571,9 +1571,16 @@ pub fn parse_vector_str(s: &str) -> Option<Vec<f32>> {
     Some(result)
 }
 
+/// Whether NULLs sort first for a key in this direction with this written
+/// NULLS FIRST or LAST: when none is written, last ascending, first descending
+#[inline]
+pub fn nulls_first(ascending: bool, written: Option<bool>) -> bool {
+    written.unwrap_or(!ascending)
+}
+
 /// One sort key: values in the total order of `Value::cmp`, a missing or
-/// NULL value placed by `nulls_first` (default: last ascending, first
-/// descending). Every ORDER BY, MIN and MAX orders values by this rule
+/// NULL value placed by `nulls_first`. Every ORDER BY, MIN and MAX orders
+/// values by this rule
 #[inline]
 pub fn compare_order_key(
     a: Option<&Value>,
@@ -1594,7 +1601,7 @@ pub fn compare_order_key(
         }
         (None, None) => Ordering::Equal,
         (None, Some(_)) | (Some(_), None) => {
-            if a.is_none() == nulls_first.unwrap_or(!ascending) {
+            if a.is_none() == self::nulls_first(ascending, nulls_first) {
                 Ordering::Less
             } else {
                 Ordering::Greater
