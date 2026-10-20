@@ -206,7 +206,7 @@ fn relayout_history(
 
 /// Whether `row` passes `filter`, asked through `compiled` (whole when
 /// `fully`) when it cannot fail and by `evaluate` when it can, whose error
-/// is the statement's; a filter that can fail holds a dynamic leaf
+/// is the statement's; a filter compiled whole has no error to raise
 #[inline]
 fn compiled_passes(
     filter: &dyn crate::storage::expression::Expression,
@@ -215,7 +215,6 @@ fn compiled_passes(
     fully: bool,
     row: &Row,
 ) -> crate::core::Result<bool> {
-    debug_assert!(!(fully && fallible), "a fallible filter compiled whole");
     if fully {
         Ok(compiled.matches_arc_slice(row.as_slice()))
     } else if fallible {
@@ -4041,11 +4040,13 @@ impl VersionStore {
     /// to avoid allocating Row objects for non-matching rows.
     ///
     /// Returns (row_id, Row, RowVersion) tuples - the RowVersion is needed for
-    /// MVCC conflict detection during the update.
+    /// MVCC conflict detection during the update. A row `hidden` names is
+    /// left out before the filter is asked of it.
     pub fn get_all_visible_rows_for_update_filtered(
         &self,
         txn_id: i64,
         filter: &dyn crate::storage::expression::Expression,
+        hidden: impl Fn(i64) -> bool,
     ) -> crate::core::Result<Vec<(i64, Row, RowVersion)>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.get_all_visible_rows_for_update_filtered");
@@ -4064,8 +4065,8 @@ impl VersionStore {
         let schema = self.schema.read();
         let compiled_filter = CompiledFilter::compile(filter, &schema);
         drop(schema); // Release lock early
-        let fallible = filter.can_fail();
         let fully = compiled_filter.is_fully_compiled();
+        let fallible = !fully && filter.can_fail();
         let matches_row =
             |row: &Row| compiled_passes(filter, fallible, &compiled_filter, fully, row);
 
@@ -4076,6 +4077,9 @@ impl VersionStore {
         let mut result: Vec<(i64, Row, RowVersion)> = Vec::with_capacity(versions.len() / 4);
 
         for (&row_id, chain) in versions.iter() {
+            if hidden(row_id) {
+                continue;
+            }
             // FAST PATH: Check HEAD version first - O(1) for common case
             let head_txn_id = chain.version.txn_id;
             let head_deleted_at = chain.version.deleted_at_txn_id;
@@ -4716,8 +4720,8 @@ impl VersionStore {
         let schema = self.schema.read();
         let compiled_filter = CompiledFilter::compile(filter, &schema);
         drop(schema); // Release lock early
-        let fallible = filter.can_fail();
         let fully = compiled_filter.is_fully_compiled();
+        let fallible = !fully && filter.can_fail();
         let matches_row =
             |row: &Row| compiled_passes(filter, fallible, &compiled_filter, fully, row);
 
@@ -4780,8 +4784,8 @@ impl VersionStore {
         let schema = self.schema.read();
         let compiled_filter = CompiledFilter::compile(filter, &schema);
         drop(schema);
-        let fallible = filter.can_fail();
         let fully = compiled_filter.is_fully_compiled();
+        let fallible = !fully && filter.can_fail();
         let matches_row =
             |row: &Row| compiled_passes(filter, fallible, &compiled_filter, fully, row);
 
@@ -4844,8 +4848,8 @@ impl VersionStore {
         let schema = self.schema.read();
         let compiled_filter = CompiledFilter::compile(filter, &schema);
         drop(schema);
-        let fallible = filter.can_fail();
         let fully = compiled_filter.is_fully_compiled();
+        let fallible = !fully && filter.can_fail();
         let matches_row =
             |row: &Row| compiled_passes(filter, fallible, &compiled_filter, fully, row);
 

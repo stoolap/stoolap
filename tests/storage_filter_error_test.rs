@@ -26,7 +26,10 @@ fn answer(db: &Database, sql: &str) -> String {
             rows.map(|row| row.map(|row| format!("{:?}", row.as_row().as_slice())))
                 .collect::<stoolap::Result<Vec<_>>>()
         }) {
-            Ok(rows) => rows.join(" "),
+            Ok(mut rows) => {
+                rows.sort();
+                rows.join(" ")
+            }
             Err(_) => ERR.to_string(),
         }
     } else {
@@ -37,7 +40,7 @@ fn answer(db: &Database, sql: &str) -> String {
     }
 }
 
-const CASES: [(&str, &str); 15] = [
+const CASES: [(&str, &str); 17] = [
     ("SELECT id FROM t WHERE ABS(x) >= 0", ERR),
     ("SELECT id FROM t WHERE ABS(x) >= 0 LIMIT 2", ERR),
     (
@@ -58,9 +61,14 @@ const CASES: [(&str, &str); 15] = [
         "[Integer(1)] [Integer(2)]",
     ),
     (
+        "SELECT id FROM t WHERE s = 'a' OR ABS(x) >= 0 LIMIT 2",
+        "[Integer(1)] [Integer(2)]",
+    ),
+    (
         "SELECT id FROM t WHERE id = 2 AND ABS(x) >= 0",
         "[Integer(2)]",
     ),
+    ("SELECT id FROM t WHERE UPPER(s) = 'A'", "[Integer(1)]"),
     (
         "SELECT id FROM t WHERE CAST(s AS INTEGER) > 0",
         "[Integer(2)]",
@@ -74,6 +82,7 @@ fn filled(db: &Database) {
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, s TEXT, k INTEGER, o INTEGER NOT NULL)",
         "CREATE INDEX tk ON t(k, o)",
+        "CREATE INDEX ts ON t(s)",
         "INSERT INTO t VALUES (1, -9223372036854775808, 'a', 1, 1), (2, 5, '2', 2, 2)",
     ] {
         db.execute(sql, ()).unwrap();
@@ -130,6 +139,101 @@ fn a_filter_error_is_the_statements_on_a_transactions_own_rows() {
         }
     }
     db.execute("ROLLBACK", ()).unwrap();
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+const OWN_WRITES: [(&str, &str, &str); 12] = [
+    (
+        "DELETE FROM t WHERE id = 1",
+        "SELECT id FROM t WHERE ABS(x) >= 0",
+        "[Integer(2)]",
+    ),
+    (
+        "DELETE FROM t WHERE id = 1",
+        "SELECT id FROM t WHERE ABS(x) >= 0 LIMIT 2",
+        "[Integer(2)]",
+    ),
+    (
+        "DELETE FROM t WHERE id = 1",
+        "SELECT COUNT(*) FROM t WHERE ABS(x) >= 0",
+        "[Integer(1)]",
+    ),
+    (
+        "DELETE FROM t WHERE id = 1",
+        "UPDATE t SET o = 9 WHERE ABS(x) >= 0",
+        "affected 1",
+    ),
+    (
+        "DELETE FROM t WHERE id = 1",
+        "DELETE FROM t WHERE ABS(x) >= 0",
+        "affected 1",
+    ),
+    (
+        "UPDATE t SET x = 0 WHERE id = 1",
+        "SELECT id FROM t WHERE ABS(x) >= 0",
+        "[Integer(1)] [Integer(2)]",
+    ),
+    (
+        "UPDATE t SET x = 0 WHERE id = 1",
+        "SELECT COUNT(*) FROM t WHERE ABS(x) >= 0",
+        "[Integer(2)]",
+    ),
+    (
+        "UPDATE t SET x = 0 WHERE id = 1",
+        "UPDATE t SET o = 9 WHERE ABS(x) >= 0",
+        "affected 2",
+    ),
+    (
+        "UPDATE t SET x = 0 WHERE id = 1",
+        "DELETE FROM t WHERE ABS(x) >= 0",
+        "affected 2",
+    ),
+    (
+        "UPDATE t SET x = 7 WHERE id = 2",
+        "SELECT id FROM t WHERE x = 7",
+        "[Integer(2)]",
+    ),
+    (
+        "UPDATE t SET x = 7 WHERE id = 2",
+        "UPDATE t SET o = 9 WHERE x = 7",
+        "affected 1",
+    ),
+    (
+        "UPDATE t SET x = 7 WHERE id = 2",
+        "DELETE FROM t WHERE x = 7",
+        "affected 1",
+    ),
+];
+
+#[test]
+fn a_filter_judges_the_rows_a_transaction_wrote_by_its_own_versions() {
+    let mut wrong = Vec::new();
+    for sealed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = if sealed {
+            Database::open(&format!("file://{}", dir.path().display())).unwrap()
+        } else {
+            Database::open("memory://storage_filter_error_written").unwrap()
+        };
+        filled(&db);
+        if sealed {
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        for (write, sql, expected) in OWN_WRITES {
+            db.execute("BEGIN", ()).unwrap();
+            db.execute(write, ()).unwrap();
+            let got = answer(&db, sql);
+            db.execute("ROLLBACK", ()).unwrap();
+            if got != expected {
+                wrong.push(format!("sealed {sealed}: {write}; {sql} gave {got}"));
+            }
+        }
+    }
     assert!(
         wrong.is_empty(),
         "{} wrong:\n{}",

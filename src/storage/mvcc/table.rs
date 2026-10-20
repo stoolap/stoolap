@@ -1502,7 +1502,9 @@ impl MVCCTable {
             return Ok(Some(RowVec::new()));
         }
 
-        let Some(or_operands) = expr.get_or_operands() else {
+        // Phase 2 asks the unindexed operands of rows phase 1 already
+        // answered, which a filter that can fail must not be asked
+        let Some(or_operands) = expr.get_or_operands().filter(|_| !expr.can_fail()) else {
             return Ok(None);
         };
 
@@ -1586,35 +1588,23 @@ impl MVCCTable {
         // Fetch indexed rows
         let mut result = RowVec::with_capacity(limit.min(total_indexed + 64));
         let mut skipped = 0usize;
-        let fallible = expr.can_fail();
-        let mut failed = None;
 
         self.version_store
             .for_each_visible(&deduped_ids, self.reader(), |row_id, row_data| {
                 let row = self.normalize_row_to_schema(row_data, schema);
                 // Re-apply full OR filter to ensure correctness (index may return superset)
-                match passes(expr, fallible, &row) {
-                    Ok(true) => {
-                        if skipped < offset {
-                            skipped += 1;
-                        } else {
-                            result.push((row_id, row));
-                            if result.len() >= limit {
-                                return false;
-                            }
+                if expr.evaluate_fast(&row) {
+                    if skipped < offset {
+                        skipped += 1;
+                    } else {
+                        result.push((row_id, row));
+                        if result.len() >= limit {
+                            return false;
                         }
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        failed = Some(e);
-                        return false;
                     }
                 }
                 true
             });
-        if let Some(e) = failed {
-            return Err(e);
-        }
 
         if result.len() >= limit {
             return Ok(Some(result));
@@ -2588,11 +2578,26 @@ impl MVCCTable {
             }
         }
 
-        // Full scan: the filter is applied before rows are cloned
+        // Full scan: the filter is applied before rows are cloned, and not to a
+        // committed row the transaction wrote, whose own version it judges
+        let mut local_row_ids = I64Set::new();
+        let mut local_has_i64_min = false;
+        for (row_id, _) in self.txn_versions.read().unwrap().iter_local() {
+            if row_id == i64::MIN {
+                local_has_i64_min = true;
+            } else {
+                local_row_ids.insert(row_id);
+            }
+        }
+        let wrote_any = local_has_i64_min || !local_row_ids.is_empty();
+        let written = |row_id: i64| {
+            wrote_any
+                && ((row_id == i64::MIN && local_has_i64_min) || local_row_ids.contains(row_id))
+        };
         let committed = match where_expr {
             Some(expr) => self
                 .version_store
-                .get_all_visible_rows_for_update_filtered(self.txn_id, expr)?,
+                .get_all_visible_rows_for_update_filtered(self.txn_id, expr, written)?,
             None => self
                 .version_store
                 .get_all_visible_rows_for_update(self.txn_id),
@@ -2642,7 +2647,8 @@ impl MVCCTable {
             for (row_id, version) in txn_versions.iter_local() {
                 if skipped(row_id)
                     || version.is_deleted()
-                    || self.version_store.quick_check_row_existence(row_id)
+                    || (where_expr.is_none()
+                        && self.version_store.quick_check_row_existence(row_id))
                 {
                     continue;
                 }
