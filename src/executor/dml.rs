@@ -364,6 +364,8 @@ pub(crate) struct CompiledCheck {
     pub(crate) text: SmartString,
     /// The columns it reads, which a write into the row may change
     pub(crate) reads: SmallVec<[usize; 4]>,
+    /// Whether its answer may change with no column changing (NOW, RANDOM)
+    pub(crate) volatile: bool,
     pub(crate) program: super::expression::SharedProgram,
 }
 
@@ -374,6 +376,9 @@ pub(crate) struct CompiledCheck {
 /// cost of a bulk load. A constraint that fails to compile is an error rather
 /// than a silently skipped check.
 pub(crate) fn compile_check_programs(schema: &Schema) -> Result<Vec<CompiledCheck>> {
+    if schema.table_checks.is_empty() && schema.columns.iter().all(|c| c.check_expr.is_none()) {
+        return Ok(Vec::new());
+    }
     let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
     let column_checks = schema.columns.iter().filter_map(|c| {
         c.check_expr
@@ -387,13 +392,13 @@ pub(crate) fn compile_check_programs(schema: &Schema) -> Result<Vec<CompiledChec
         .collect()
 }
 
-/// The CHECK constraints of `checks` that read one of `columns`: those a
-/// write of these columns alone can change the answer of
+/// The CHECK constraints of `checks` a write of `columns` can change the
+/// answer of: those reading one of them, and every volatile one
 pub(crate) fn checks_reading(
     mut checks: Vec<CompiledCheck>,
     columns: impl Fn(usize) -> bool,
 ) -> Vec<CompiledCheck> {
-    checks.retain(|check| check.reads.iter().any(|&c| columns(c)));
+    checks.retain(|check| check.volatile || check.reads.iter().any(|&c| columns(c)));
     checks
 }
 
@@ -407,25 +412,24 @@ fn compile_check(
     let expr = parse_stored_expression(text, "CHECK", owner)?;
     let program = super::expression::compile_expression(&expr, columns)
         .map_err(|e| Error::internal(format!("the CHECK on {owner} failed to compile: {e}")))?;
-    let index = schema.column_index_map();
+    let binding = super::expression::CompileContext::with_global_registry(columns);
     let mut reads = SmallVec::new();
     super::utils::visit_column_refs(&expr, &mut |reference| {
-        let name = match reference {
-            Expression::Identifier(id) => id.value_lower.as_str(),
-            Expression::QualifiedIdentifier(q) => q.name.value_lower.as_str(),
-            _ => return,
-        };
-        if let Some(&i) = index.get(name) {
+        let read = binding.reference(reference).and_then(|r| r.row_column());
+        if let Some(i) = read.map(usize::from) {
             if !reads.contains(&i) {
                 reads.push(i);
             }
         }
     });
+    let registry = crate::functions::registry::global_registry();
     Ok(CompiledCheck {
         column: column.map(SmartString::from),
         table: SmartString::from(schema.table_name.as_str()),
         text: SmartString::from(text),
         reads,
+        volatile: super::volatility::expression_volatility(&expr, registry)
+            != crate::functions::Volatility::Fixed,
         program,
     })
 }
@@ -2478,6 +2482,11 @@ impl Executor {
             }
             drop(scanner);
 
+            let checks = checks_reading(compile_check_programs(schema)?, |c| {
+                update_indices.iter().any(|(idx, _, _, _, _)| *idx == c)
+            });
+            let mut vm = super::expression::ExprVM::new();
+
             // Now update using precomputed values
             let mut setter = |mut row: Row| -> Result<(Row, bool)> {
                 let pk_value = row.get(pk_idx).cloned().unwrap_or(Value::null_unknown());
@@ -2495,6 +2504,9 @@ impl Executor {
 
                     for (idx, new_value) in updates {
                         let _ = row.set(*idx, new_value.clone());
+                    }
+                    for check in &checks {
+                        run_check(&mut vm, check, &row)?;
                     }
 
                     // Track referenced column changes for FK cascade

@@ -809,9 +809,17 @@ fn cascade_update_recursive(
         old_value.clone(),
     );
     expr.prepare_for_schema(child_schema);
+    let checks =
+        super::dml::checks_reading(super::dml::compile_check_programs(child_schema)?, |c| {
+            c == col_idx
+        });
+    let mut vm = super::expression::ExprVM::new();
 
     let count = child.update(Some(&expr), &mut |mut row| {
         let _ = row.set(col_idx, new_val.clone());
+        for check in &checks {
+            super::dml::run_check(&mut vm, check, &row)?;
+        }
         Ok((row, true))
     })?;
 
@@ -897,9 +905,17 @@ fn set_null_on_delete(
         parent_pk_value.clone(),
     );
     expr.prepare_for_schema(child_schema);
+    let checks =
+        super::dml::checks_reading(super::dml::compile_check_programs(child_schema)?, |c| {
+            c == col_idx
+        });
+    let mut vm = super::expression::ExprVM::new();
 
     let count = child.update(Some(&expr), &mut |mut row| {
         let _ = row.set(col_idx, null_val.clone());
+        for check in &checks {
+            super::dml::run_check(&mut vm, check, &row)?;
+        }
         Ok((row, true))
     })?;
     // Do NOT commit here — changes committed atomically with parent transaction.

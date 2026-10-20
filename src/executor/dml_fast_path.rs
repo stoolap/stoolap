@@ -719,17 +719,18 @@ impl Executor {
             return None;
         }
 
-        // Bail if a CHECK, a column's or the table's, reads a column being
-        // updated: it runs on the general path
+        // Bail if this update must run a CHECK, a column's or the table's:
+        // it runs on the general path
         {
-            let col_map = schema.column_index_map();
-            let updated: Vec<usize> = stmt
-                .updates
-                .keys()
-                .filter_map(|name| col_map.get(name.to_lowercase().as_str()).copied())
-                .collect();
             let checked = match super::dml::compile_check_programs(&schema) {
+                Ok(checks) if checks.is_empty() => false,
                 Ok(checks) => {
+                    let col_map = schema.column_index_map();
+                    let updated: Vec<usize> = stmt
+                        .updates
+                        .keys()
+                        .filter_map(|name| col_map.get(name.to_lowercase().as_str()).copied())
+                        .collect();
                     !super::dml::checks_reading(checks, |c| updated.contains(&c)).is_empty()
                 }
                 Err(_) => true,

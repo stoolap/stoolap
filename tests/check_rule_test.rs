@@ -127,6 +127,108 @@ fn a_table_check_is_enforced_on_every_write_path() {
 }
 
 #[test]
+fn a_correlated_update_runs_the_checks() {
+    let db = table("check_correlated_update");
+    refused(
+        &db,
+        &[
+            "UPDATE c SET w = (SELECT c.v - 1) WHERE id = 1",
+            "UPDATE c SET w = (SELECT c.v + 100) WHERE id = 1",
+            "UPDATE c SET v = (SELECT c.w + 1) WHERE v > 0",
+        ],
+    );
+}
+
+#[test]
+fn a_check_reads_a_column_whose_name_holds_a_dot() {
+    let db = Database::open("memory://check_dotted_name").unwrap();
+    db.execute(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, \"a.b\" INTEGER CHECK (\"a.b\" > 0), w INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO c VALUES (1, 1, 1)", ()).unwrap();
+    refused(
+        &db,
+        &[
+            "INSERT INTO c VALUES (2, -1, 1)",
+            "UPDATE c SET \"a.b\" = -1 WHERE id = 1",
+            "UPDATE c SET \"a.b\" = -1 WHERE w > 0",
+        ],
+    );
+    assert!(
+        db.execute("ALTER TABLE c DROP COLUMN w", ()).is_ok(),
+        "a CHECK reading only \"a.b\" keeps w droppable"
+    );
+}
+
+#[test]
+fn an_update_runs_a_volatile_check_whatever_it_sets() {
+    let db = Database::open("memory://check_volatile").unwrap();
+    db.execute(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, v INTEGER, deadline TIMESTAMP CHECK (deadline > NOW()))",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO c VALUES (1, 1, NOW() + INTERVAL '1 second')",
+        (),
+    )
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    refused(
+        &db,
+        &[
+            "UPDATE c SET v = 2 WHERE id = 1",
+            "UPDATE c SET v = 2 WHERE v > 0",
+        ],
+    );
+    assert!(
+        db.execute("UPDATE c SET v = $1 WHERE id = $2", (2i64, 1i64))
+            .is_err(),
+        "the PK UPDATE with params was accepted past the deadline"
+    );
+}
+
+#[test]
+fn a_foreign_key_action_runs_the_child_checks() {
+    let db = Database::open("memory://check_fk_action").unwrap();
+    db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE k (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE SET NULL, CHECK (pid IS NOT NULL))",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO p VALUES (1)", ()).unwrap();
+    db.execute("INSERT INTO k VALUES (1, 1)", ()).unwrap();
+    assert!(
+        db.execute("DELETE FROM p WHERE id = 1", ()).is_err(),
+        "ON DELETE SET NULL broke CHECK (pid IS NOT NULL)"
+    );
+    assert_eq!(ids(&db, "SELECT pid FROM k"), vec![1]);
+
+    db.execute(
+        "CREATE TABLE q (id INTEGER PRIMARY KEY, code INTEGER UNIQUE)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, code INTEGER REFERENCES q(code) ON UPDATE CASCADE, CHECK (code < 10))",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO q VALUES (1, 1)", ()).unwrap();
+    db.execute("INSERT INTO m VALUES (1, 1)", ()).unwrap();
+    assert!(
+        db.execute("UPDATE q SET code = 20 WHERE id = 1", ())
+            .is_err(),
+        "ON UPDATE CASCADE broke CHECK (code < 10)"
+    );
+    assert_eq!(ids(&db, "SELECT code FROM m"), vec![1]);
+}
+
+#[test]
 fn copy_keeps_a_table_check() {
     let dir = tempfile::tempdir().unwrap();
     let db = table("check_copy");

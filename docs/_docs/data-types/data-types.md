@@ -279,7 +279,7 @@ INSERT INTO ranges VALUES (2, 10, 500);
 -- Error: CHECK constraint failed for table ranges: ((hi - lo) <= 100)
 ```
 
-Every write checks the row it stores: `INSERT`, `INSERT ... SELECT`, both branches of `ON CONFLICT` and `ON DUPLICATE KEY UPDATE`, `UPDATE` and `COPY`. An `UPDATE` runs the CHECKs that read a column it sets, against the row after all of its assignments.
+Every write checks the row it stores: `INSERT`, `INSERT ... SELECT`, both branches of `ON CONFLICT` and `ON DUPLICATE KEY UPDATE`, `UPDATE`, `COPY`, and the child rows a foreign key's `ON DELETE SET NULL` or `ON UPDATE CASCADE` rewrites. An `UPDATE` runs the CHECKs that read a column it sets, and every CHECK calling a function whose answer changes by itself, such as `NOW()` or `RANDOM()`, against the row after all of its assignments.
 
 `CREATE TABLE` refuses a CHECK that names a column the table does not have, or that holds a subquery, an aggregate or a window function. `RENAME COLUMN` rewrites the CHECKs that read the column, and `DROP COLUMN` refuses a column that another column's CHECK or a table CHECK reads.
 
