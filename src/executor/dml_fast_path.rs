@@ -719,19 +719,24 @@ impl Executor {
             return None;
         }
 
-        // Bail if any column being updated has a CHECK constraint
-        // CHECK validation requires expression evaluation — fall back to normal path
+        // Bail if a CHECK, a column's or the table's, reads a column being
+        // updated: it runs on the general path
         {
             let col_map = schema.column_index_map();
-            for col_name in stmt.updates.keys() {
-                let col_lower = col_name.to_lowercase();
-                if let Some(&idx) = col_map.get(col_lower.as_str()) {
-                    if schema.columns[idx].check_expr.is_some() {
-                        *compiled_guard =
-                            CompiledExecution::NotOptimizable(self.engine.schema_epoch());
-                        return None;
-                    }
+            let updated: Vec<usize> = stmt
+                .updates
+                .keys()
+                .filter_map(|name| col_map.get(name.to_lowercase().as_str()).copied())
+                .collect();
+            let checked = match super::dml::compile_check_programs(&schema) {
+                Ok(checks) => {
+                    !super::dml::checks_reading(checks, |c| updated.contains(&c)).is_empty()
                 }
+                Err(_) => true,
+            };
+            if checked {
+                *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                return None;
             }
         }
 

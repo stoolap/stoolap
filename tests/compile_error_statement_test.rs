@@ -93,7 +93,7 @@ fn test_offset_that_fails() {
 fn test_default_that_fails_to_compile() {
     let db = setup("compile_error_default");
     db.execute(
-        "CREATE TABLE d (id INTEGER PRIMARY KEY, v INTEGER DEFAULT (SELECT 5))",
+        "CREATE TABLE d (id INTEGER PRIMARY KEY, v INTEGER DEFAULT (nope + 5))",
         (),
     )
     .unwrap();

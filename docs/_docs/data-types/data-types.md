@@ -242,9 +242,11 @@ Supported default values:
 - `NULL`
 - `CURRENT_TIMESTAMP` or `NOW()` for timestamps
 
+`CREATE TABLE` and `ALTER TABLE ... ADD COLUMN` refuse a DEFAULT that holds a subquery, an aggregate or a window function.
+
 ### CHECK
 
-Validates that values satisfy a condition (column-level constraint):
+Validates that each row satisfies a condition. A CHECK is written on a column or on the table, and either form may read every column of the row:
 
 ```sql
 CREATE TABLE employees (
@@ -262,7 +264,24 @@ INSERT INTO employees VALUES (2, -5, 50000, 'active');
 -- Error: CHECK constraint failed for column age: (age >= 18 AND age <= 120)
 ```
 
-Note: CHECK must be specified as a column constraint (inline with column definition), not as a table-level constraint.
+A table-level CHECK follows the column definitions, and a column CHECK may name other columns of the row:
+
+```sql
+CREATE TABLE ranges (
+    id INTEGER PRIMARY KEY,
+    lo INTEGER,
+    hi INTEGER CHECK(hi >= lo),
+    CHECK(hi - lo <= 100)
+);
+
+INSERT INTO ranges VALUES (1, 10, 50);   -- valid
+INSERT INTO ranges VALUES (2, 10, 500);
+-- Error: CHECK constraint failed for table ranges: ((hi - lo) <= 100)
+```
+
+Every write checks the row it stores: `INSERT`, `INSERT ... SELECT`, both branches of `ON CONFLICT` and `ON DUPLICATE KEY UPDATE`, `UPDATE` and `COPY`. An `UPDATE` runs the CHECKs that read a column it sets, against the row after all of its assignments.
+
+`CREATE TABLE` refuses a CHECK that names a column the table does not have, or that holds a subquery, an aggregate or a window function. `RENAME COLUMN` rewrites the CHECKs that read the column, and `DROP COLUMN` refuses a column that another column's CHECK or a table CHECK reads.
 
 A CHECK runs on a NULL value too, and a CHECK whose result is NULL passes: `CHECK(salary > 0)` takes a NULL salary, while `CHECK(salary IS NOT NULL)` refuses it. A CHECK that fails to evaluate, for example on an overflow, fails the statement.
 

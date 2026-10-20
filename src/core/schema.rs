@@ -225,6 +225,9 @@ pub struct Schema {
     /// table is not clustered
     pub cluster_key: Vec<usize>,
 
+    /// The table's own CHECK constraints, each an expression over the row
+    pub table_checks: Vec<String>,
+
     /// Creation timestamp
     pub created_at: DateTime<Utc>,
 
@@ -283,6 +286,7 @@ impl Clone for Schema {
             columns: self.columns.clone(),
             foreign_keys: self.foreign_keys.clone(),
             cluster_key: self.cluster_key.clone(),
+            table_checks: self.table_checks.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
             column_names_cache,
@@ -300,6 +304,7 @@ impl PartialEq for Schema {
             && self.columns == other.columns
             && self.foreign_keys == other.foreign_keys
             && self.cluster_key == other.cluster_key
+            && self.table_checks == other.table_checks
             && self.created_at == other.created_at
             && self.updated_at == other.updated_at
     }
@@ -367,6 +372,7 @@ impl Schema {
             columns,
             foreign_keys,
             cluster_key: Vec::new(),
+            table_checks: Vec::new(),
             created_at: now,
             updated_at: now,
             column_names_cache,
@@ -448,6 +454,7 @@ impl Schema {
             columns,
             foreign_keys,
             cluster_key: Vec::new(),
+            table_checks: Vec::new(),
             created_at,
             updated_at,
             column_names_cache,
@@ -763,6 +770,48 @@ impl Schema {
             .get_column_index(old_name)
             .ok_or_else(|| Error::ColumnNotFound(old_name.to_string()))?;
 
+        // Every CHECK reads the row by name, so each follows the column
+        let old_lower = old_name.to_lowercase();
+        let renamed = |text: &String| -> Result<Option<String>> {
+            let parse = crate::parser::parse_stored_expression;
+            let mut expr = parse(text, "CHECK", &self.table_name)?;
+            let before = expr.to_string();
+            expr.rename_column(&old_lower, &new_name);
+            let after = expr.to_string();
+            if after == before {
+                return Ok(None);
+            }
+            // The stored text is read back by name: the new one must read as itself
+            match parse(&new_name, "CHECK", &self.table_name) {
+                Ok(crate::parser::ast::Expression::Identifier(id)) if id.value == new_name => {
+                    Ok(Some(after))
+                }
+                _ => Err(Error::invalid_argument(format!(
+                    "a CHECK reads {old_name}, and {new_name} does not read back as a column name"
+                ))),
+            }
+        };
+        let columns = self
+            .columns
+            .iter()
+            .map(|c| c.check_expr.as_ref().map(renamed).transpose())
+            .collect::<Result<Vec<_>>>()?;
+        let table = self
+            .table_checks
+            .iter()
+            .map(&renamed)
+            .collect::<Result<Vec<_>>>()?;
+        for (column, check) in self.columns.iter_mut().zip(columns) {
+            if let Some(check) = check.flatten() {
+                column.check_expr = Some(check);
+            }
+        }
+        for (stored, check) in self.table_checks.iter_mut().zip(table) {
+            if let Some(check) = check {
+                *stored = check;
+            }
+        }
+
         self.columns[idx].name_lower = new_name.to_lowercase();
         self.columns[idx].name = new_name;
         self.mark_updated();
@@ -826,6 +875,7 @@ pub struct SchemaBuilder {
     columns: Vec<SchemaColumn>,
     foreign_keys: Vec<ForeignKeyConstraint>,
     cluster_key: Vec<usize>,
+    table_checks: Vec<String>,
 }
 
 impl SchemaBuilder {
@@ -836,6 +886,7 @@ impl SchemaBuilder {
             columns: Vec::new(),
             foreign_keys: Vec::new(),
             cluster_key: Vec::new(),
+            table_checks: Vec::new(),
         }
     }
 
@@ -933,10 +984,17 @@ impl SchemaBuilder {
         self
     }
 
+    /// Add a table CHECK constraint, the text of an expression over the row
+    pub fn add_table_check(mut self, check: String) -> Self {
+        self.table_checks.push(check);
+        self
+    }
+
     pub fn build(self) -> Schema {
         let mut schema =
             Schema::with_foreign_keys(self.table_name, self.columns, self.foreign_keys);
         schema.cluster_key = self.cluster_key;
+        schema.table_checks = self.table_checks;
         schema
     }
 }

@@ -418,6 +418,9 @@ fn serialize_snapshot_schema(schema: &Schema) -> Vec<u8> {
         buf.extend_from_slice(&(column as u16).to_le_bytes());
     }
 
+    // Table CHECK constraints (after the clustering key; a reader without them stops there)
+    super::engine::write_table_checks(&mut buf, &schema.table_checks);
+
     buf
 }
 
@@ -738,6 +741,8 @@ fn deserialize_snapshot_schema(data: &[u8]) -> Result<Schema> {
         }
     }
 
+    let table_checks = super::engine::read_table_checks(data, &mut pos)?;
+
     let mut schema = Schema::with_timestamps_and_foreign_keys(
         table_name,
         columns,
@@ -746,6 +751,7 @@ fn deserialize_snapshot_schema(data: &[u8]) -> Result<Schema> {
         updated_at,
     );
     schema.cluster_key = cluster_key;
+    schema.table_checks = table_checks;
     Ok(schema)
 }
 

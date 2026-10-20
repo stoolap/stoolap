@@ -150,6 +150,9 @@ impl Executor {
             )
             .unwrap();
         }
+        for check in &schema.table_checks {
+            create_sql.push_str(&format!(", CHECK ({})", check));
+        }
 
         create_sql.push(')');
         if !schema.cluster_key.is_empty() {
