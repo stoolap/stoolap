@@ -205,6 +205,11 @@ fn an_order_by_name_binds_the_output_column_and_a_qualified_one_the_input() {
             vec![3, 2, 1],
         ),
         (
+            "SELECT \"ǅ\".*, -id AS rev FROM t AS \"ǅ\" ORDER BY rev",
+            vec![],
+            vec![3, 2, 1],
+        ),
+        (
             "WITH g (id, n) AS (SELECT id, COUNT(*) FROM t GROUP BY id) SELECT -g.id AS id FROM g LEFT JOIN s ON s.id = g.id ORDER BY id LIMIT 2",
             vec![],
             vec![-3, -2],

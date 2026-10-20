@@ -1461,7 +1461,7 @@ impl Executor {
         if inputs.is_empty() {
             return Vec::new();
         }
-        let copied = Self::select_layout(&stmt.columns, source_columns, None).sources;
+        let copied = Self::select_sources(&stmt.columns, source_columns, None);
         inputs
             .into_iter()
             .filter(|&idx| !copied.iter().any(|source| source.input == Some(idx)))

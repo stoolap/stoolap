@@ -236,9 +236,13 @@ fn qualified_prefix_len(column: &str, qualifier: &str) -> Option<usize> {
 }
 
 /// `name` as `eq_folded` takes it: borrowed when ASCII, which it compares
-/// ignoring case, or already lowercase
+/// ignoring case, or when lowercasing changes none of its characters
 fn folded(name: &str) -> std::borrow::Cow<'_, str> {
-    if !name.is_ascii() && name.chars().any(char::is_uppercase) {
+    let changes = |c: char| {
+        let mut lower = c.to_lowercase();
+        lower.next() != Some(c) || lower.next().is_some()
+    };
+    if !name.is_ascii() && name.chars().any(changes) {
         std::borrow::Cow::Owned(name.to_lowercase())
     } else {
         std::borrow::Cow::Borrowed(name)
@@ -5503,7 +5507,7 @@ impl Executor {
                                 &stmt.order_by,
                                 &stmt.distinct_on,
                                 final_rows,
-                                &all_columns,
+                                &CompactArc::new(all_columns.clone()),
                                 None,
                                 ctx,
                             )?;
@@ -6227,7 +6231,7 @@ impl Executor {
                 &stmt.order_by,
                 &stmt.distinct_on,
                 final_rows,
-                &final_columns,
+                &CompactArc::new(final_columns.clone()),
                 None,
                 ctx,
             )?;
@@ -6470,7 +6474,7 @@ impl Executor {
                     &stmt.order_by,
                     &stmt.distinct_on,
                     filtered_rows,
-                    &columns,
+                    &CompactArc::new(columns.clone()),
                     subquery_alias,
                     ctx,
                 )?;
@@ -6754,7 +6758,7 @@ impl Executor {
                 &stmt.order_by,
                 &stmt.distinct_on,
                 rows,
-                &view_columns,
+                &CompactArc::new(view_columns.clone()),
                 view_alias.as_deref(),
                 ctx,
             )?;
@@ -9637,7 +9641,7 @@ impl Executor {
         order_by: &[crate::parser::ast::OrderByExpression],
         distinct_on: &[Expression],
         mut rows: RowVec,
-        all_columns: &[String],
+        all_columns: &CompactArc<Vec<String>>,
         table_alias: Option<&str>,
         ctx: &ExecutionContext,
     ) -> Result<(RowVec, Vec<String>, OutputLayout)> {
@@ -9655,10 +9659,11 @@ impl Executor {
             )?;
             bound_exprs = Some(exprs);
             rows = bound_rows;
-            bound_columns = Some(columns);
+            bound_columns = Some(CompactArc::new(columns));
         }
         let select_exprs: &[Expression] = bound_exprs.as_deref().unwrap_or(select_exprs);
-        let all_columns: &[String] = bound_columns.as_deref().unwrap_or(all_columns);
+        let shared_columns = bound_columns.as_ref().unwrap_or(all_columns);
+        let all_columns: &[String] = shared_columns;
 
         // Process scalar subqueries in SELECT columns before evaluation (single-pass)
         let processed = self.try_process_select_subqueries(select_exprs, ctx)?;
@@ -9676,7 +9681,11 @@ impl Executor {
             extra_names,
             extra_sources,
         } = self.order_by_projection(&select_exprs, order_by, distinct_on, all_columns);
-        let mut layout = Self::select_layout(&select_exprs, all_columns, table_alias);
+        let mut layout = Self::shared_select_layout(
+            &select_exprs,
+            CompactArc::clone(shared_columns),
+            table_alias,
+        );
         layout.sources.extend(extra_sources);
 
         // Check if we can use fast path (all simple column refs, no computed DISTINCT ON)
@@ -10086,12 +10095,22 @@ impl Executor {
         all_columns: CompactArc<Vec<String>>,
         table_alias: Option<&str>,
     ) -> OutputLayout {
-        let mut sources = LayoutSources::new();
-        Self::output_columns(select_exprs, &all_columns, table_alias, Some(&mut sources));
         OutputLayout {
+            sources: Self::select_sources(select_exprs, &all_columns, table_alias),
             input_columns: all_columns,
-            sources,
         }
+    }
+
+    /// The source of each output column `select_exprs` give over the input
+    /// `all_columns`, without the input names a layout holds
+    pub(crate) fn select_sources(
+        select_exprs: &[Expression],
+        all_columns: &[String],
+        table_alias: Option<&str>,
+    ) -> LayoutSources {
+        let mut sources = LayoutSources::new();
+        Self::output_columns(select_exprs, all_columns, table_alias, Some(&mut sources));
+        sources
     }
 
     /// The layout of `stmt`'s output columns over the input `all_columns`,
