@@ -15,8 +15,6 @@
 //! Expressions a statement evaluates once, over no row: compiled for that
 //! one evaluation and kept nowhere, so they never enter a program cache
 
-use std::cell::RefCell;
-
 use super::compiler::{
     literal_value, parameter_slot, CompileContext, CompileError, ExprCompiler, ParameterSlot,
 };
@@ -25,10 +23,6 @@ use super::vm::{ExecuteContext, ExprVM};
 use crate::core::{Error, Result, Row, Value};
 use crate::executor::context::ExecutionContext;
 use crate::parser::ast::Expression;
-
-thread_local! {
-    static ONCE_VM: RefCell<ExprVM> = RefCell::new(ExprVM::new());
-}
 
 fn compile_error(e: CompileError) -> Error {
     Error::internal(format!("Compile error: {}", e))
@@ -81,12 +75,9 @@ fn context<'a>(row: &'a Row, ctx: Option<&'a ExecutionContext>) -> ExecuteContex
     exec
 }
 
+/// A VM of its own, dropped with every value it read: a new VM allocates nothing
 fn run(program: &Program, exec: &ExecuteContext) -> Result<Value> {
-    // A function that runs a statement of its own evaluates here again
-    ONCE_VM.with(|vm| match vm.try_borrow_mut() {
-        Ok(mut vm) => vm.execute(program, exec),
-        Err(_) => ExprVM::new().execute(program, exec),
-    })
+    ExprVM::new().execute(program, exec)
 }
 
 /// A column-free expression's value for pushdown, or None when it reads
@@ -175,6 +166,27 @@ mod tests {
     use crate::executor::Executor;
     use crate::parser::ast::Statement;
     use crate::storage::mvcc::engine::MVCCEngine;
+
+    #[test]
+    fn a_one_shot_evaluation_keeps_no_value_it_read() {
+        let vector = crate::core::Value::vector(vec![1.0; 1024]);
+        let crate::core::Value::Extension(bytes) = &vector else {
+            panic!("a vector is an extension value");
+        };
+        let bytes = crate::common::CompactArc::clone(bytes);
+        let ctx = crate::executor::context::ExecutionContextBuilder::new()
+            .params(vec![vector].into_iter().collect())
+            .build();
+        let distance =
+            super::evaluate_once(&expression("VEC_DISTANCE_L2($1, $1)"), Some(&ctx)).unwrap();
+        assert_eq!(distance, crate::core::Value::Float(0.0));
+        drop(ctx);
+        assert_eq!(
+            crate::common::CompactArc::strong_count(&bytes),
+            1,
+            "the evaluation still holds the parameter it read"
+        );
+    }
 
     /// The SELECT expression of `SELECT {text}`
     fn expression(text: &str) -> crate::parser::ast::Expression {
