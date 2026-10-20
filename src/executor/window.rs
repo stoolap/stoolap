@@ -1666,9 +1666,8 @@ impl Executor {
                                 ),
                             });
                         } else if let Expression::FunctionCall(_) = aliased.expression.as_ref() {
-                            // Aliased function call - check if it's an aggregate that's already in base_columns
-                            let alias_lower = aliased.alias.value_lower.as_str();
-                            if let Some(&idx) = col_index_map.get(alias_lower) {
+                            // An aggregate computed before the window reads its slot
+                            if let Some(&idx) = group_slots.get(&ExprKey::of(&aliased.expression)) {
                                 items.push(SelectItem {
                                     output_name: aliased.alias.value.to_string(),
                                     source: SelectItemSource::BaseColumn(idx),
