@@ -1011,29 +1011,35 @@ fn compile_with(ctx: &CompileContext<'_>, expr: &Expression) -> Result<SharedPro
         .map_err(compile_error)
 }
 
-/// One statement shape compiled against its tables' columns
+/// The subquery blocks of one statement and the slots they read, which a
+/// `PreparedRunner` runs for the statement's rows
 #[derive(Debug)]
-pub struct PreparedSelect {
-    cached_epoch: u64,
-    /// The statement table's columns at preparation
-    columns: CompactArc<Vec<String>>,
+struct PreparedBlocks {
     /// Positional parameters the statement takes; slots are numbered after them
     param_count: usize,
     /// The statement's parameters and every slot
     slot_count: usize,
     /// Named parameters read anywhere; each must have a value
     named: Vec<SmartString>,
-    where_program: SharedProgram,
-    /// Values the statement's conjuncts compare its columns with, each
-    /// computed once per run before the scan
+    /// Values computed once per run before the statement reads a row
     run_slots: Vec<(usize, SharedProgram)>,
+    /// Indexed by subquery id, nested ones included
+    subqueries: Vec<PreparedSubquery>,
+}
+
+/// One statement shape compiled against its tables' columns
+#[derive(Debug)]
+pub struct PreparedSelect {
+    cached_epoch: u64,
+    /// The statement table's columns at preparation
+    columns: CompactArc<Vec<String>>,
+    blocks: PreparedBlocks,
+    where_program: SharedProgram,
     /// The conjuncts without a subquery, which the scan is narrowed by
     pushdown: Option<Expression>,
     /// Every conjunct is in `pushdown`: a scan that takes it whole passes
     /// only rows the WHERE passes
     pushed_whole: bool,
-    /// Indexed by subquery id, nested ones included
-    subqueries: Vec<PreparedSubquery>,
     /// A top-level EXISTS or NOT EXISTS conjunct with one key, whose keyed
     /// set's keys name the rows the WHERE may pass
     narrowing: Option<Narrowing>,
@@ -1504,6 +1510,47 @@ struct Rewritten {
 }
 
 impl Builder<'_> {
+    /// The blocks prepared for a statement taking `param_count` positional
+    /// parameters, with its run slots compiled
+    fn finish(
+        self,
+        param_count: usize,
+        run_slots: Vec<(usize, SharedProgram)>,
+    ) -> Result<PreparedBlocks> {
+        // Slots are numbered after the values given, so a value not given would read one
+        if self.max_param > param_count {
+            return Err(Error::internal(format!(
+                "Query requires {} parameters but only {} provided",
+                self.max_param, param_count
+            )));
+        }
+        let mut subqueries = self
+            .subqueries
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| Error::internal("a prepared subquery left unfinished"))?;
+        // A block's tables include those of every block nested in it
+        for nested in 0..subqueries.len() {
+            let mut ancestor = subqueries[nested].parent;
+            while let Some(at) = ancestor {
+                let table = subqueries[nested].table.clone();
+                let (Answer::Value(_, kept) | Answer::Exists(kept) | Answer::Members(kept, _)) =
+                    &mut subqueries[at as usize].answer;
+                if !kept.tables.contains(&table) {
+                    kept.tables.push(table);
+                }
+                ancestor = subqueries[at as usize].parent;
+            }
+        }
+        Ok(PreparedBlocks {
+            param_count,
+            slot_count: self.next_slot,
+            named: self.named,
+            run_slots,
+            subqueries,
+        })
+    }
+
     fn slot(&mut self) -> usize {
         let slot = self.next_slot;
         self.next_slot += 1;
@@ -2546,13 +2593,7 @@ impl PreparedSelect {
         {
             builder.note_names(unaliased(column));
         }
-        // Slots are numbered after the values given, so a value not given would read one
-        if builder.max_param > param_count {
-            return Err(Error::internal(format!(
-                "Query requires {} parameters but only {} provided",
-                builder.max_param, param_count
-            )));
-        }
+        let blocks = builder.finish(param_count, run_slots)?;
         // Over one table `t.*` is `*`, the projection's expansion; the
         // names' prefix rule for a joined `t.*` would drop columns
         let select: std::borrow::Cow<[Expression]> = if stmt
@@ -2582,13 +2623,8 @@ impl PreparedSelect {
             layout.sources.extend(extra_sources);
             CompactArc::new(layout)
         });
-        let mut subqueries = builder
-            .subqueries
-            .into_iter()
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| Error::internal("a prepared subquery left unfinished"))?;
         let narrowing = exists_conjuncts.iter().find_map(|&(id, negated, column)| {
-            let sq = &subqueries[id as usize];
+            let sq = &blocks.subqueries[id as usize];
             let (column, members) = match (&sq.answer, column) {
                 (
                     Answer::Exists(Kept {
@@ -2611,30 +2647,13 @@ impl PreparedSelect {
                 members,
             })
         });
-        // A block's tables include those of every block nested in it
-        for nested in 0..subqueries.len() {
-            let mut ancestor = subqueries[nested].parent;
-            while let Some(at) = ancestor {
-                let table = subqueries[nested].table.clone();
-                let (Answer::Value(_, kept) | Answer::Exists(kept) | Answer::Members(kept, _)) =
-                    &mut subqueries[at as usize].answer;
-                if !kept.tables.contains(&table) {
-                    kept.tables.push(table);
-                }
-                ancestor = subqueries[at as usize].parent;
-            }
-        }
         Ok(Self {
             cached_epoch: epoch,
             columns: scope.columns.clone(),
-            param_count,
-            slot_count: builder.next_slot,
-            named: builder.named,
+            blocks,
             where_program,
-            run_slots,
             pushed_whole: pushed.len() == rewritten_count,
             pushdown: conjunction(pushed),
-            subqueries,
             narrowing,
             projection,
             output_columns: CompactArc::new(output_columns),
@@ -2763,7 +2782,7 @@ impl Executor {
         let columns = table.schema().column_names_arc();
         let fits = |p: &PreparedSelect| {
             p.cached_epoch == epoch
-                && p.param_count == ctx.params().len()
+                && p.blocks.param_count == ctx.params().len()
                 && (CompactArc::ptr_eq(&p.columns, &columns) || p.columns == columns)
         };
         if let Some(slot) = compiled.filter(|_| !fresh) {
@@ -2812,7 +2831,7 @@ impl Executor {
             .is_some_and(|guard| match &*guard {
                 CompiledExecution::PreparedSelect(p) => {
                     p.cached_epoch == self.engine.schema_epoch()
-                        && p.param_count == ctx.params().len()
+                        && p.blocks.param_count == ctx.params().len()
                         && ctx.outer_row().is_none()
                 }
                 _ => false,
@@ -2847,7 +2866,7 @@ impl Executor {
             let prepared = self.prepared_for(compiled, stmt, &*table, scope_name, ctx, fresh)?;
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::prepared_plan_taken();
-            if let Some(tables) = PreparedRunner::open_tables(self, &prepared, &inner_ctx)? {
+            if let Some(tables) = PreparedRunner::open_tables(self, &prepared.blocks, &inner_ctx)? {
                 break (prepared, tables);
             }
             if fresh {
@@ -2857,7 +2876,7 @@ impl Executor {
             }
             fresh = true;
         };
-        for name in &prepared.named {
+        for name in &prepared.blocks.named {
             if !ctx.named_params().contains_key(name.as_str()) {
                 return Err(Error::invalid_argument(format!(
                     "named parameter :{} has no value",
@@ -2871,21 +2890,21 @@ impl Executor {
             .map(|limit| i64::try_from(limit).unwrap_or(i64::MAX));
         let mut runner = PreparedRunner::new(
             self,
-            &prepared,
+            &prepared.blocks,
             ctx,
             inner_ctx,
             tables,
             table.row_count_hint(),
             statement_limit,
         );
-        if !prepared.run_slots.is_empty() {
+        if !prepared.blocks.run_slots.is_empty() {
             let values = runner.run_slot_values()?;
             for (slot, value) in values {
                 runner.base[slot] = value;
             }
         }
         let (storage_expr, residual) = match &prepared.pushdown {
-            Some(pushdown) if prepared.run_slots.is_empty() => {
+            Some(pushdown) if prepared.blocks.run_slots.is_empty() => {
                 pushdown::try_pushdown(pushdown, table.schema(), Some(ctx))
             }
             Some(pushdown) => {
@@ -2927,7 +2946,7 @@ impl Executor {
         // up to the LIMIT when it takes the whole WHERE, which are the rows;
         // or the scan
         let (mut rows, mut listed, mut scanner, judged, passed) =
-            match runner.narrowed_rows(&*table, target)? {
+            match runner.narrowed_rows(prepared.narrowing, &*table, target)? {
                 Some((candidates, passed)) => {
                     #[cfg(feature = "test-failpoints")]
                     crate::test_failpoints::prepared_rows_narrowed_by_keys(
@@ -2979,7 +2998,7 @@ impl Executor {
                 Some(Err(_)) => false,
                 Some(Ok(true)) | None => true,
             };
-            if (passed && taken) || runner.matches(&mut vm, &row)? {
+            if (passed && taken) || runner.matches(&mut vm, &prepared.where_program, &row)? {
                 rows.push((scanned as i64, row));
             }
         }
@@ -3012,7 +3031,7 @@ impl Executor {
 /// parent's values copied in before its own holes are filled
 pub(crate) struct PreparedRunner<'a> {
     executor: &'a Executor,
-    prepared: &'a PreparedSelect,
+    prepared: &'a PreparedBlocks,
     /// The statement's own context, whose view and parameters a kept answer is of
     statement: &'a ExecutionContext,
     /// The statement table's rows, by its hint
@@ -3059,7 +3078,7 @@ impl<'a> PreparedRunner<'a> {
     /// longer holds the columns its programs were prepared for
     fn open_tables(
         executor: &Executor,
-        prepared: &PreparedSelect,
+        prepared: &PreparedBlocks,
         inner_ctx: &ExecutionContext,
     ) -> Result<Option<Vec<Box<dyn Table>>>> {
         let mut tables = Vec::with_capacity(prepared.subqueries.len());
@@ -3075,7 +3094,7 @@ impl<'a> PreparedRunner<'a> {
 
     fn new(
         executor: &'a Executor,
-        prepared: &'a PreparedSelect,
+        prepared: &'a PreparedBlocks,
         ctx: &'a ExecutionContext,
         inner_ctx: ExecutionContext,
         tables: Vec<Box<dyn Table>>,
@@ -3131,8 +3150,8 @@ impl<'a> PreparedRunner<'a> {
             .collect()
     }
 
-    /// Whether `row` passes the WHERE
-    fn matches(&self, vm: &mut ExprVM, row: &Row) -> Result<bool> {
+    /// Whether `row` passes `condition`, a program over the statement's row
+    fn matches(&self, vm: &mut ExprVM, condition: &SharedProgram, row: &Row) -> Result<bool> {
         let exec = ExecuteContext::with_common_params(
             row,
             &self.base,
@@ -3140,7 +3159,7 @@ impl<'a> PreparedRunner<'a> {
             self.transaction_id,
         )
         .with_subquery_executor(self);
-        vm.execute_bool_checked(&self.prepared.where_program, &exec)
+        vm.execute_bool_checked(condition, &exec)
     }
 
     /// The subquery's pushed comparisons for this call, None when there
@@ -3174,6 +3193,7 @@ impl<'a> PreparedRunner<'a> {
     /// no key holds an error; None to scan
     fn narrowed_rows(
         &self,
+        narrowing: Option<Narrowing>,
         table: &dyn Table,
         target: Option<usize>,
     ) -> Result<Option<(RowVec, bool)>> {
@@ -3183,7 +3203,7 @@ impl<'a> PreparedRunner<'a> {
             whole,
             negated,
             members,
-        }) = self.prepared.narrowing
+        }) = narrowing
         else {
             return Ok(None);
         };
