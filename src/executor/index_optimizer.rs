@@ -200,6 +200,7 @@ impl Executor {
         stmt: &SelectStatement,
         table: &dyn Table,
         all_columns: &[String],
+        table_alias: Option<&str>,
         ctx: &ExecutionContext,
     ) -> Result<Option<(Box<dyn QueryResult>, CompactArc<Vec<String>>)>> {
         // Get the ORDER BY column name
@@ -236,12 +237,19 @@ impl Executor {
             offset,
         )? {
             // Project rows according to SELECT expressions
-            let projected_rows = self.project_rows(&stmt.columns, rows, all_columns, ctx)?;
-
-            // Note: This optimization path doesn't have table_alias available,
-            // so we pass None. The prefix-based matching will still work for JOINs.
-            let output_columns =
-                CompactArc::new(self.get_output_column_names(&stmt.columns, all_columns, None));
+            let projected_rows = self.project_rows_with_alias(
+                &stmt.columns,
+                rows,
+                all_columns,
+                None,
+                ctx,
+                table_alias,
+            )?;
+            let output_columns = CompactArc::new(self.get_output_column_names(
+                &stmt.columns,
+                all_columns,
+                table_alias,
+            ));
 
             let result = ExecutorResult::with_arc_columns(
                 CompactArc::clone(&output_columns),

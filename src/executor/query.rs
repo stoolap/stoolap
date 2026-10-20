@@ -225,40 +225,6 @@ fn input_column_index(columns: &[String], qualifier: Option<&str>, name: &str) -
         })
 }
 
-/// Where the bare name starts in `column` when a qualified star over
-/// `qualifier` takes it, by `star_takes_lowered`'s rule evaluated on the
-/// lowercased characters, which copies only a name holding `Σ`
-fn qualified_star_name_start(column: &str, qualifier: &str) -> Option<usize> {
-    if column.is_ascii() && qualifier.is_ascii() {
-        let q = qualifier.len();
-        return (column.len() > q
-            && column.as_bytes()[q] == b'.'
-            && column[..q].eq_ignore_ascii_case(qualifier))
-        .then_some(q + 1);
-    }
-    let takes = with_lowercase(column, |column| {
-        with_lowercase(qualifier, |qualifier| {
-            for q in qualifier {
-                if column.next() != Some(q) {
-                    return false;
-                }
-            }
-            true
-        }) && column.next() == Some('.')
-    });
-    takes.then(|| {
-        column
-            .match_indices('.')
-            .map(|(dot, _)| dot + 1)
-            .find(|&start| {
-                with_lowercase(&column[..start - 1], |prefix| {
-                    with_lowercase(qualifier, |qualifier| prefix.eq(qualifier))
-                })
-            })
-            .unwrap_or(0)
-    })
-}
-
 /// `name` as `eq_folded` takes it: borrowed when ASCII, which it compares
 /// ignoring case, or when lowercasing changes none of its characters
 fn folded(name: &str) -> std::borrow::Cow<'_, str> {
@@ -371,9 +337,10 @@ use super::utils::{
     collect_unqualified_columns, column_kinds, combine_predicates_with_and, dummy_token, eq_folded,
     eq_folded_qualified, expression_contains_aggregate, extract_and_conditions,
     extract_base_column_name, extract_join_keys_and_residual, filter_references_column,
-    flatten_and_predicates, flip_operator, get_table_alias_from_expr, index_join_residual,
-    infix_to_operator, order_by_names_an_alias, string_literal_value, strip_table_qualifier,
-    substitute_filter_column, visit_column_refs, with_lowercase,
+    flatten_and_predicates, flip_operator, for_each_qualified_star_column,
+    get_table_alias_from_expr, index_join_residual, infix_to_operator, order_by_names_an_alias,
+    star_takes_every_column, string_literal_value, strip_table_qualifier, substitute_filter_column,
+    visit_column_refs,
 };
 use super::volatility::{expression_volatility, statement_constant};
 use super::window::{WindowOutput, WindowPreGroupedState, WindowPreSortedState};
@@ -3129,9 +3096,13 @@ impl Executor {
             && storage_expr.is_none()
             && !needs_memory_filter
         {
-            if let Some((result, columns)) =
-                self.try_order_by_index_optimization(stmt, &*table, &all_columns, ctx)?
-            {
+            if let Some((result, columns)) = self.try_order_by_index_optimization(
+                stmt,
+                &*table,
+                &all_columns,
+                table_alias.as_deref(),
+                ctx,
+            )? {
                 // Note: ORDER BY + LIMIT already handles LIMIT at storage level
                 return Ok((result, columns, true, None));
             }
@@ -3480,8 +3451,13 @@ impl Executor {
                 let output_columns = CompactArc::new(output_columns);
 
                 result = Box::new(
-                    ExprMappedResult::new(result, stmt.columns.clone(), (*output_columns).clone())?
-                        .with_context(ctx),
+                    ExprMappedResult::new(
+                        result,
+                        stmt.columns.clone(),
+                        (*output_columns).clone(),
+                        table_alias.as_deref(),
+                    )?
+                    .with_context(ctx),
                 );
 
                 let shape = shape_of(&output_columns);
@@ -6486,7 +6462,7 @@ impl Executor {
                     &columns,
                     None,
                     ctx,
-                    None,
+                    subquery_alias,
                 )?;
                 let output_columns = CompactArc::new(self.get_output_column_names(
                     &stmt.columns,
@@ -6651,8 +6627,11 @@ impl Executor {
                 ctx,
                 view_alias.as_deref(),
             )?;
-            let output_columns =
-                CompactArc::new(self.get_output_column_names(&stmt.columns, &view_columns, None));
+            let output_columns = CompactArc::new(self.get_output_column_names(
+                &stmt.columns,
+                &view_columns,
+                view_alias.as_deref(),
+            ));
             let result = ExecutorResult::with_arc_columns(
                 CompactArc::clone(&output_columns),
                 projected_rows,
@@ -6690,10 +6669,7 @@ impl Executor {
         // Handle projection: apply outer query's column selection
         // Check if SELECT * or t.* - if so, return all view columns
         let is_select_star = stmt.columns.len() == 1
-            && matches!(
-                &stmt.columns[0],
-                Expression::Star(_) | Expression::QualifiedStar(_)
-            );
+            && star_takes_every_column(&stmt.columns[0], &view_columns, view_alias.as_deref());
 
         if is_select_star {
             // For SELECT *, just return the view result with WHERE applied
@@ -6751,10 +6727,7 @@ impl Executor {
         let mut has_complex_expressions = false;
         let mut column_indices = Vec::with_capacity(stmt.columns.len());
         let mut output_columns = Vec::with_capacity(stmt.columns.len());
-
-        // OPTIMIZATION: Pre-compute lowercase view column names once
-        let view_columns_lower: Vec<String> =
-            view_columns.iter().map(|c| c.to_lowercase()).collect();
+        let view_alias = view_alias.as_deref();
 
         // First pass: check if all are simple column references and build indices
         for col in &stmt.columns {
@@ -6767,20 +6740,15 @@ impl Executor {
                     }
                 }
                 Expression::QualifiedStar(qs) => {
-                    // Expand columns for specific table/alias
-                    let qualifier_lower = qs.qualifier.to_lowercase();
-                    let qualifier_len = qualifier_lower.len();
-                    for (idx, col_lower) in view_columns_lower.iter().enumerate() {
-                        // Inline prefix check: "qualifier." without format! allocation
-                        if col_lower.len() > qualifier_len
-                            && col_lower.starts_with(qualifier_lower.as_str())
-                            && col_lower.as_bytes()[qualifier_len] == b'.'
-                        {
+                    for_each_qualified_star_column(
+                        &view_columns,
+                        &qs.qualifier,
+                        view_alias,
+                        |idx, start| {
                             column_indices.push(idx);
-                            // Strip "qualifier." from the column name for the output
-                            output_columns.push(view_columns[idx][qualifier_len + 1..].to_string());
-                        }
-                    }
+                            output_columns.push(view_columns[idx][start..].to_string());
+                        },
+                    );
                 }
                 Expression::Identifier(id) => {
                     // Simple column reference
@@ -6837,20 +6805,14 @@ impl Executor {
                         }
                     }
                     Expression::QualifiedStar(qs) => {
-                        let qualifier_lower = qs.qualifier.to_lowercase();
-                        let qualifier_len = qualifier_lower.len();
-                        // Use pre-computed lowercase columns from earlier
-                        for (idx, col_lower) in view_columns_lower.iter().enumerate() {
-                            // Inline prefix check: "qualifier." without format! allocation
-                            if col_lower.len() > qualifier_len
-                                && col_lower.starts_with(qualifier_lower.as_str())
-                                && col_lower.as_bytes()[qualifier_len] == b'.'
-                            {
-                                // Strip "qualifier." from the column name for the output
-                                final_output_columns
-                                    .push(view_columns[idx][qualifier_len + 1..].to_string());
-                            }
-                        }
+                        for_each_qualified_star_column(
+                            &view_columns,
+                            &qs.qualifier,
+                            view_alias,
+                            |idx, start| {
+                                final_output_columns.push(view_columns[idx][start..].to_string())
+                            },
+                        );
                     }
                     Expression::Aliased(aliased) => {
                         final_output_columns.push(aliased.alias.value.to_string());
@@ -6862,10 +6824,11 @@ impl Executor {
             }
 
             Box::new(
-                ExprMappedResult::with_defaults(
+                ExprMappedResult::new(
                     result,
                     stmt.columns.clone(),
                     final_output_columns.clone(),
+                    view_alias,
                 )?
                 .with_context(ctx),
             )
@@ -6883,10 +6846,18 @@ impl Executor {
             let mut cols = Vec::with_capacity(stmt.columns.len());
             for col in &stmt.columns {
                 match col {
-                    Expression::Star(_) | Expression::QualifiedStar(_) => {
+                    Expression::Star(_) => {
                         for name in &view_columns {
                             cols.push(name.clone());
                         }
+                    }
+                    Expression::QualifiedStar(qs) => {
+                        for_each_qualified_star_column(
+                            &view_columns,
+                            &qs.qualifier,
+                            view_alias,
+                            |idx, start| cols.push(view_columns[idx][start..].to_string()),
+                        );
                     }
                     Expression::Aliased(aliased) => {
                         cols.push(aliased.alias.value.to_string());
@@ -6901,7 +6872,7 @@ impl Executor {
             output_columns
         };
 
-        let layout = Self::output_layout(stmt, &view_columns, view_alias.as_deref());
+        let layout = Self::output_layout(stmt, &view_columns, view_alias);
         Ok((
             result,
             CompactArc::new(final_columns),
@@ -7028,10 +6999,7 @@ impl Executor {
 
         // If the SELECT has projections, apply them
         if stmt.columns.len() == 1
-            && matches!(
-                &stmt.columns[0],
-                Expression::Star(_) | Expression::QualifiedStar(_)
-            )
+            && star_takes_every_column(&stmt.columns[0], &column_names_arc, values_alias)
         {
             // SELECT * or t.* - return all columns
             return Ok((
@@ -7053,9 +7021,15 @@ impl Executor {
                 Expression::Star(_) => {
                     projected_columns.extend(column_names_arc.iter().cloned());
                 }
-                Expression::QualifiedStar(_) => {
-                    // For single table, t.* is equivalent to *
-                    projected_columns.extend(column_names_arc.iter().cloned());
+                Expression::QualifiedStar(qs) => {
+                    for_each_qualified_star_column(
+                        &column_names_arc,
+                        &qs.qualifier,
+                        values_alias,
+                        |idx, start| {
+                            projected_columns.push(column_names_arc[idx][start..].to_string())
+                        },
+                    );
                 }
                 Expression::Aliased(a) => {
                     projected_columns.push(a.alias.value.to_string());
@@ -7122,6 +7096,23 @@ impl Executor {
         // Materialize and project
         // OPTIMIZATION: Pre-compute output size to avoid reallocation per row
         let output_cols = projected_columns.len();
+        // The columns each qualified star takes, found once for every row
+        let star_columns: Vec<Vec<usize>> = stmt
+            .columns
+            .iter()
+            .map(|col_expr| {
+                let mut taken = Vec::new();
+                if let Expression::QualifiedStar(qs) = col_expr {
+                    for_each_qualified_star_column(
+                        &column_names_arc,
+                        &qs.qualifier,
+                        values_alias,
+                        |idx, _| taken.push(idx),
+                    );
+                }
+                taken
+            })
+            .collect();
         let mut result_box: Box<dyn QueryResult> = Box::new(values_result);
         while result_box.next() {
             let row = result_box.row();
@@ -7129,9 +7120,16 @@ impl Executor {
 
             for (col_idx, col_expr) in stmt.columns.iter().enumerate() {
                 match col_expr {
-                    Expression::Star(_) | Expression::QualifiedStar(_) => {
+                    Expression::Star(_) => {
                         // Extend with all values from the row
                         new_values.extend(row.iter().cloned());
+                    }
+                    Expression::QualifiedStar(_) => {
+                        new_values.extend(
+                            star_columns[col_idx].iter().map(|&idx| {
+                                row.get(idx).cloned().unwrap_or_else(Value::null_unknown)
+                            }),
+                        );
                     }
                     Expression::Identifier(id) => {
                         // Use pre-computed lowercase
@@ -8353,22 +8351,6 @@ impl Executor {
         Ok(CompactArc::new(rows))
     }
 
-    /// Project rows by evaluating SELECT expressions
-    ///
-    /// Optimized to:
-    /// 1. Use FxHashMap for O(1) column lookup instead of O(n) position()
-    /// 2. Avoid allocating lowercase strings per call
-    /// 3. Use direct indexing for simple column references
-    pub(crate) fn project_rows(
-        &self,
-        select_exprs: &[Expression],
-        rows: RowVec,
-        all_columns: &[String],
-        ctx: &ExecutionContext,
-    ) -> Result<RowVec> {
-        self.project_rows_with_alias(select_exprs, rows, all_columns, None, ctx, None)
-    }
-
     /// Project rows with optional table alias for correlated subquery support
     ///
     /// If `all_columns_lower` is provided, it will be used directly instead of
@@ -8402,37 +8384,13 @@ impl Executor {
         // Handle SELECT t.* - filter to only columns matching the qualifier
         if select_exprs.len() == 1 {
             if let Expression::QualifiedStar(qs) = &select_exprs[0] {
-                // Compute lowercase once and reuse
-                let qualifier_lower: String = qs.qualifier.to_lowercase().into();
-                let prefix_lower_len = qualifier_lower.len() + 1; // "qualifier."
-
-                // Find indices of columns matching the qualifier (use pre-computed lowercase)
-                let matching_indices: Vec<usize> = columns_lower
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, c)| {
-                        c.len() > prefix_lower_len
-                            && c.starts_with(&qualifier_lower)
-                            && c.as_bytes().get(qualifier_lower.len()) == Some(&b'.')
-                    })
-                    .map(|(i, _)| i)
-                    .collect();
-
-                // If no columns matched the prefix (single-table query), check if
-                // the qualifier matches the table alias - if so, include all columns
-                let indices_to_use = if matching_indices.is_empty() {
-                    if let Some(alias) = table_alias {
-                        if alias.eq_ignore_ascii_case(&qualifier_lower) {
-                            (0..all_columns.len()).collect()
-                        } else {
-                            matching_indices
-                        }
-                    } else {
-                        matching_indices
-                    }
-                } else {
-                    matching_indices
-                };
+                let mut indices_to_use = Vec::new();
+                for_each_qualified_star_column(
+                    all_columns,
+                    &qs.qualifier,
+                    table_alias,
+                    |idx, _| indices_to_use.push(idx),
+                );
 
                 // OPTIMIZATION: If selecting all columns in order (identity), pass through directly
                 let is_identity = indices_to_use.len() == all_columns.len()
@@ -8504,32 +8462,12 @@ impl Executor {
                     }
                 }
                 Expression::QualifiedStar(qs) => {
-                    // Expand columns for specific table/alias
-                    // Compute lowercase once and reuse
-                    let qualifier_lower: String = qs.qualifier.to_lowercase().into();
-                    let mut found_any = false;
-                    // Use pre-computed lowercase columns to avoid per-column to_lowercase()
-                    for (idx, col_lower) in columns_lower.iter().enumerate() {
-                        // Check if column starts with "qualifier."
-                        if col_lower.len() > qualifier_lower.len()
-                            && col_lower.starts_with(&qualifier_lower)
-                            && col_lower.as_bytes().get(qualifier_lower.len()) == Some(&b'.')
-                        {
-                            simple_column_indices.push(idx);
-                            found_any = true;
-                        }
-                    }
-                    // If no columns matched the prefix (single-table query), check if
-                    // the qualifier matches the table alias - if so, include all columns
-                    if !found_any {
-                        if let Some(alias) = table_alias {
-                            if alias.eq_ignore_ascii_case(&qualifier_lower) {
-                                for idx in 0..all_columns.len() {
-                                    simple_column_indices.push(idx);
-                                }
-                            }
-                        }
-                    }
+                    for_each_qualified_star_column(
+                        all_columns,
+                        &qs.qualifier,
+                        table_alias,
+                        |idx, _| simple_column_indices.push(idx),
+                    );
                 }
                 Expression::Identifier(id) => {
                     // Use linear search for fast path check
@@ -8649,7 +8587,6 @@ impl Executor {
                 select_exprs,
                 rows,
                 all_columns,
-                columns_lower,
                 &col_index_map_lower,
                 table_alias_lower.as_deref(),
                 ctx,
@@ -8676,19 +8613,21 @@ impl Executor {
         // OPTIMIZATION: Wrap all_columns in CompactArc once, reuse for all rows
         let all_columns_arc: CompactArc<Vec<String>> = CompactArc::new(all_columns.to_vec());
 
-        // OPTIMIZATION: Pre-compute QualifiedStar lowercase qualifiers to avoid per-row to_lowercase()
-        // Key: original qualifier string, Value: qualifier_lower (no format! allocation needed)
-        let qualified_star_cache: FxHashMap<String, String> = select_exprs
+        // The columns each qualified star takes, found once for every row
+        let qualified_star_cache: FxHashMap<&str, Vec<usize>> = select_exprs
             .iter()
             .filter_map(|expr| {
-                if let Expression::QualifiedStar(qs) = expr {
-                    Some((
-                        qs.qualifier.to_string(),
-                        qs.qualifier.to_lowercase().to_string(),
-                    ))
-                } else {
-                    None
-                }
+                let Expression::QualifiedStar(qs) = expr else {
+                    return None;
+                };
+                let mut taken = Vec::new();
+                for_each_qualified_star_column(
+                    all_columns,
+                    &qs.qualifier,
+                    table_alias,
+                    |idx, _| taken.push(idx),
+                );
+                Some((qs.qualifier.as_str(), taken))
             })
             .collect();
 
@@ -8748,33 +8687,13 @@ impl Executor {
                         }
                     }
                     Expression::QualifiedStar(qs) => {
-                        // Expand columns for specific table/alias
-                        // Use pre-computed cache to avoid per-row to_lowercase()
-                        let qualifier_lower = qualified_star_cache
+                        for &idx in qualified_star_cache
                             .get(qs.qualifier.as_str())
-                            .map(|s| s.as_str())
-                            .unwrap_or("");
-                        let qualifier_len = qualifier_lower.len();
-                        let mut found_any = false;
-                        for (idx, col_lower) in columns_lower.iter().enumerate() {
-                            // Inline prefix check: "qualifier." without format! allocation
-                            if col_lower.len() > qualifier_len
-                                && col_lower.starts_with(qualifier_lower)
-                                && col_lower.as_bytes()[qualifier_len] == b'.'
-                            {
-                                if let Some(val) = row.get(idx) {
-                                    values.push(val.clone());
-                                    found_any = true;
-                                }
-                            }
-                        }
-                        if !found_any {
-                            if let Some(ref alias_lower) = table_alias_lower {
-                                if alias_lower.as_str() == qualifier_lower {
-                                    for val in row.iter() {
-                                        values.push(val.clone());
-                                    }
-                                }
+                            .into_iter()
+                            .flatten()
+                        {
+                            if let Some(val) = row.get(idx) {
+                                values.push(val.clone());
                             }
                         }
                     }
@@ -8804,7 +8723,6 @@ impl Executor {
         select_exprs: &[Expression],
         rows: RowVec,
         all_columns: &[String],
-        all_columns_lower: &[String],
         col_index_map_lower: &StringMap<usize>,
         table_alias_lower: Option<&str>,
         ctx: &ExecutionContext,
@@ -8843,9 +8761,8 @@ impl Executor {
         enum ExprAction {
             SimpleColumn(usize),
             StarExpand,
-            QualifiedStarExpand {
-                qualifier_lower: String,
-            },
+            /// The columns a qualified star takes, found once
+            QualifiedStarExpand(Vec<usize>),
             /// Inline COALESCE - bypasses VM for 7x speedup
             Coalesce(smallvec::SmallVec<[ArgSource; 4]>),
             /// Inline CASE - bypasses VM for simple equality/null checks
@@ -9100,9 +9017,16 @@ impl Executor {
         for expr in select_exprs.iter() {
             let action = match expr {
                 Expression::Star(_) => ExprAction::StarExpand,
-                Expression::QualifiedStar(qs) => ExprAction::QualifiedStarExpand {
-                    qualifier_lower: qs.qualifier.to_lowercase().to_string(),
-                },
+                Expression::QualifiedStar(qs) => {
+                    let mut taken = Vec::new();
+                    for_each_qualified_star_column(
+                        all_columns,
+                        &qs.qualifier,
+                        table_alias_lower,
+                        |idx, _| taken.push(idx),
+                    );
+                    ExprAction::QualifiedStarExpand(taken)
+                }
                 Expression::Identifier(id) => {
                     if let Some(&idx) = col_index_map_lower.get(id.value_lower.as_str()) {
                         ExprAction::SimpleColumn(idx)
@@ -9296,28 +9220,10 @@ impl Executor {
                                 values.push(val.clone());
                             }
                         }
-                        ExprAction::QualifiedStarExpand { qualifier_lower } => {
-                            let qualifier_len = qualifier_lower.len();
-                            let mut found_any = false;
-                            for (idx, col_lower) in all_columns_lower.iter().enumerate() {
-                                // Inline prefix check: "qualifier." without format! allocation
-                                if col_lower.len() > qualifier_len
-                                    && col_lower.starts_with(qualifier_lower)
-                                    && col_lower.as_bytes()[qualifier_len] == b'.'
-                                {
-                                    if let Some(val) = row.get(idx) {
-                                        values.push(val.clone());
-                                        found_any = true;
-                                    }
-                                }
-                            }
-                            if !found_any {
-                                if let Some(alias_lower) = table_alias_lower {
-                                    if alias_lower == qualifier_lower {
-                                        for val in row.iter() {
-                                            values.push(val.clone());
-                                        }
-                                    }
+                        ExprAction::QualifiedStarExpand(taken) => {
+                            for &idx in taken {
+                                if let Some(val) = row.get(idx) {
+                                    values.push(val.clone());
                                 }
                             }
                         }
@@ -10194,32 +10100,18 @@ impl Executor {
                     continue;
                 }
                 Expression::QualifiedStar(qs) => {
-                    // SELECT t.* - add columns matching the qualifier
-                    let qualifier = folded(&qs.qualifier);
-                    let mut found_any = false;
-                    for (idx, column) in all_columns.iter().enumerate() {
-                        if let Some(len) = qualified_star_name_start(column, &qs.qualifier) {
-                            // Strip "qualifier." from the column name for the output
-                            // e.g., "e.name" becomes "name"
+                    // SELECT t.*: the columns t names, each under its bare name
+                    for_each_qualified_star_column(
+                        all_columns,
+                        &qs.qualifier,
+                        table_alias,
+                        |idx, start| {
                             if !laid_out {
-                                names.push(column[len..].to_string());
+                                names.push(all_columns[idx][start..].to_string());
                             }
                             source(i, Some(idx));
-                            found_any = true;
-                        }
-                    }
-                    // If no columns matched the prefix (single-table query), check if
-                    // the qualifier matches the table alias - if so, include all columns
-                    if !found_any {
-                        if let Some(alias) = table_alias {
-                            if eq_folded(alias, &qualifier) {
-                                if !laid_out {
-                                    names.extend(all_columns.iter().cloned());
-                                }
-                                (0..all_columns.len()).for_each(|idx| source(i, Some(idx)));
-                            }
-                        }
-                    }
+                        },
+                    );
                     continue;
                 }
                 _ => {}
@@ -10281,13 +10173,8 @@ impl Executor {
         select_exprs: &[Expression],
         all_columns: &[String],
     ) -> Option<(Vec<usize>, Vec<String>)> {
-        // SELECT * or t.* is a simple case
-        if select_exprs.len() == 1
-            && matches!(
-                &select_exprs[0],
-                Expression::Star(_) | Expression::QualifiedStar(_)
-            )
-        {
+        // SELECT * is a simple case; t.* needs the alias this path lacks
+        if select_exprs.len() == 1 && matches!(&select_exprs[0], Expression::Star(_)) {
             return Some(((0..all_columns.len()).collect(), all_columns.to_vec()));
         }
 
@@ -11359,7 +11246,7 @@ impl Executor {
 
         // Project rows
         let (projected_rows, final_columns) =
-            self.project_rows_for_select(stmt, rows, &all_columns, ctx)?;
+            self.project_rows_for_select(stmt, rows, &all_columns, Some(table_name), ctx)?;
 
         let shape = shape_of(&final_columns);
         let final_columns_arc = CompactArc::new(final_columns);
@@ -11484,23 +11371,19 @@ impl Executor {
         stmt: &SelectStatement,
         rows: RowVec,
         all_columns: &[String],
+        table_alias: Option<&str>,
         ctx: &ExecutionContext,
     ) -> Result<(RowVec, Vec<String>)> {
-        // Check for SELECT * or t.*
+        // Check for SELECT * or a t.* that takes every column
         if stmt.columns.len() == 1
-            && matches!(
-                &stmt.columns[0],
-                Expression::Star(_) | Expression::QualifiedStar(_)
-            )
+            && star_takes_every_column(&stmt.columns[0], all_columns, table_alias)
         {
             return Ok((rows, all_columns.to_vec()));
         }
 
-        // Use existing project_rows method
-        let projected = self.project_rows(&stmt.columns, rows, all_columns, ctx)?;
-        // Note: This helper doesn't have table_alias available,
-        // so we pass None. The prefix-based matching will still work for JOINs.
-        let output_columns = self.get_output_column_names(&stmt.columns, all_columns, None);
+        let projected =
+            self.project_rows_with_alias(&stmt.columns, rows, all_columns, None, ctx, table_alias)?;
+        let output_columns = self.get_output_column_names(&stmt.columns, all_columns, table_alias);
 
         Ok((projected, output_columns))
     }

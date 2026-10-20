@@ -348,7 +348,10 @@ use super::expr_key::ExprKey;
 use super::expression::{compute_expression_hash, ExpressionEval, MultiExpressionEval};
 use super::query::{order_by_inputs, ColumnSource, OutputLayout};
 use super::result::{ColumnarResult, ExecutorResult};
-use super::utils::{build_column_index_map, derived_aggregate_column_name};
+use super::utils::{
+    build_column_index_map, derived_aggregate_column_name, for_each_qualified_star_column,
+    get_table_alias_from_expr,
+};
 use super::volatility::expression_volatility;
 use super::Executor;
 
@@ -1745,14 +1748,32 @@ impl Executor {
                         });
                     }
                 }
-                Expression::Star(_) | Expression::QualifiedStar(_) => {
-                    // SELECT * or t.* - include all base columns
+                Expression::Star(_) => {
+                    // SELECT * - include all base columns
                     for (idx, col) in base_columns.iter().take(visible_columns).enumerate() {
                         items.push(SelectItem {
                             output_name: col.clone(),
                             source: SelectItemSource::BaseColumn(idx),
                         });
                     }
+                }
+                Expression::QualifiedStar(qs) => {
+                    let table_alias = stmt
+                        .table_expr
+                        .as_deref()
+                        .and_then(get_table_alias_from_expr);
+                    let visible = &base_columns[..visible_columns.min(base_columns.len())];
+                    for_each_qualified_star_column(
+                        visible,
+                        &qs.qualifier,
+                        table_alias.as_deref(),
+                        |idx, start| {
+                            items.push(SelectItem {
+                                output_name: visible[idx][start..].to_string(),
+                                source: SelectItemSource::BaseColumn(idx),
+                            })
+                        },
+                    );
                 }
                 Expression::FunctionCall(func) => {
                     // First check for embedded window functions (e.g., ABS(ROW_NUMBER() OVER (...)))

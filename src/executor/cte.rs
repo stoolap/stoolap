@@ -44,7 +44,9 @@ use super::query::{order_by_inputs, ColumnSource, OutputLayout};
 use super::query_classification::get_classification;
 use super::result::ExecutorResult;
 use super::row_count::{row_counts, static_row_counts};
-use super::utils::{build_column_index_map, order_by_names_an_alias};
+use super::utils::{
+    build_column_index_map, for_each_qualified_star_column, order_by_names_an_alias,
+};
 use super::Executor;
 
 /// Type alias for CTE data: (columns, rows) with Arc for zero-copy sharing
@@ -682,8 +684,11 @@ impl Executor {
         let columns_to_use = processed_columns.as_ref().unwrap_or(&stmt.columns);
 
         // Determine output columns
-        let output_columns =
-            self.resolve_cte_output_columns_from_exprs(columns_to_use, &cte_columns)?;
+        let output_columns = self.resolve_cte_output_columns_from_exprs(
+            columns_to_use,
+            &cte_columns,
+            cte_alias.as_deref(),
+        )?;
 
         let needs_projection = self.needs_projection_for_columns(columns_to_use);
 
@@ -774,13 +779,22 @@ impl Executor {
         &self,
         columns: &[Expression],
         cte_columns: &[String],
+        table_alias: Option<&str>,
     ) -> Result<Vec<String>> {
         let mut output_columns = Vec::new();
 
         for (i, col_expr) in columns.iter().enumerate() {
             match col_expr {
-                Expression::Star(_) | Expression::QualifiedStar(_) => {
+                Expression::Star(_) => {
                     output_columns.extend(cte_columns.iter().cloned());
+                }
+                Expression::QualifiedStar(qs) => {
+                    for_each_qualified_star_column(
+                        cte_columns,
+                        &qs.qualifier,
+                        table_alias,
+                        |idx, start| output_columns.push(cte_columns[idx][start..].to_string()),
+                    );
                 }
                 Expression::Identifier(id) => {
                     output_columns.push(id.value.to_string());
@@ -846,6 +860,7 @@ impl Executor {
         // Store: Star -> None, Identifier -> column index, Complex -> compiled program
         enum CompiledColumn {
             Star,
+            Columns(Vec<usize>),
             Identifier(Option<usize>),
             Compiled(SharedProgram),
         }
@@ -854,6 +869,16 @@ impl Executor {
             .iter()
             .map(|col_expr| match col_expr {
                 Expression::Star(_) => Ok(CompiledColumn::Star),
+                Expression::QualifiedStar(qs) => {
+                    let mut taken = Vec::new();
+                    for_each_qualified_star_column(
+                        cte_columns,
+                        &qs.qualifier,
+                        table_alias,
+                        |idx, _| taken.push(idx),
+                    );
+                    Ok(CompiledColumn::Columns(taken))
+                }
                 Expression::Identifier(id) => {
                     let idx = col_index_map.get(id.value_lower.as_str()).copied();
                     Ok(CompiledColumn::Identifier(idx))
@@ -887,6 +912,13 @@ impl Executor {
                     CompiledColumn::Star => {
                         // OPTIMIZATION: Extend with row values
                         values.extend(row.iter().cloned());
+                    }
+                    CompiledColumn::Columns(taken) => {
+                        values.extend(
+                            taken.iter().map(|&idx| {
+                                row.get(idx).cloned().unwrap_or_else(Value::null_unknown)
+                            }),
+                        );
                     }
                     CompiledColumn::Identifier(Some(idx)) => {
                         values.push(row.get(*idx).cloned().unwrap_or_else(Value::null_unknown));

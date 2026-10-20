@@ -23,7 +23,7 @@ use crate::storage::traits::QueryResult;
 use rustc_hash::{FxHashMap, FxHasher};
 
 use super::expression::RowFilter;
-use super::utils::star_takes_lowered;
+use super::utils::for_each_qualified_star_column;
 
 /// Execution result for DML operations (INSERT, UPDATE, DELETE)
 ///
@@ -595,11 +595,8 @@ impl QueryResult for FilteredResult {
 enum CompiledProjection {
     /// Expand all columns from source (SELECT *)
     Star,
-    /// Expand columns for specific table/alias (SELECT t.*)
-    QualifiedStar {
-        /// Lowercase qualifier for matching (e.g., "t") - no format! allocation
-        qualifier_lower: String,
-    },
+    /// Expand the columns a qualifier names (SELECT t.*), found once
+    QualifiedStar(Vec<usize>),
     /// A pre-compiled expression program
     Compiled(super::expression::SharedProgram),
 }
@@ -619,8 +616,6 @@ pub struct ExprMappedResult {
     current_row: Row,
     /// Output column names
     output_columns: Vec<String>,
-    /// Pre-computed lowercase source columns (avoids per-row to_lowercase())
-    source_columns_lower: Vec<String>,
     /// The statement's parameters and transaction, for the projections
     params: Option<crate::common::CompactArc<crate::ParamVec>>,
     named_params: Option<std::sync::Arc<rustc_hash::FxHashMap<String, Value>>>,
@@ -643,12 +638,14 @@ impl ExprMappedResult {
     /// * `inner` - The source result to project
     /// * `expressions` - The projection expressions
     /// * `output_columns` - Names for the output columns
+    /// * `table_alias` - The name a qualified star may give the source
     ///
     /// Returns an error if any expression cannot be compiled.
     pub fn new(
         inner: Box<dyn QueryResult>,
         expressions: Vec<Expression>,
         output_columns: Vec<String>,
+        table_alias: Option<&str>,
     ) -> Result<Self> {
         use super::expression::compile_expression;
 
@@ -659,9 +656,16 @@ impl ExprMappedResult {
         for expr in &expressions {
             let projection = match expr {
                 Expression::Star(_) => CompiledProjection::Star,
-                Expression::QualifiedStar(qs) => CompiledProjection::QualifiedStar {
-                    qualifier_lower: qs.qualifier.to_lowercase().to_string(),
-                },
+                Expression::QualifiedStar(qs) => {
+                    let mut taken = Vec::new();
+                    for_each_qualified_star_column(
+                        &source_columns,
+                        &qs.qualifier,
+                        table_alias,
+                        |idx, _| taken.push(idx),
+                    );
+                    CompiledProjection::QualifiedStar(taken)
+                }
                 _ => {
                     let program = compile_expression(expr, &source_columns)?;
                     CompiledProjection::Compiled(program)
@@ -669,10 +673,6 @@ impl ExprMappedResult {
             };
             projections.push(projection);
         }
-
-        // Pre-compute lowercase source columns to avoid per-row to_lowercase() calls
-        let source_columns_lower: Vec<String> =
-            source_columns.iter().map(|c| c.to_lowercase()).collect();
 
         // Pre-allocate buffer with capacity for reuse
         let capacity = projections.len();
@@ -682,7 +682,6 @@ impl ExprMappedResult {
             vm: super::expression::ExprVM::new(),
             current_row: Row::with_capacity(capacity),
             output_columns,
-            source_columns_lower,
             params: None,
             named_params: None,
             transaction_id: None,
@@ -697,15 +696,6 @@ impl ExprMappedResult {
             (!ctx.named_params().is_empty()).then(|| std::sync::Arc::clone(ctx.named_params_arc()));
         self.transaction_id = ctx.transaction_id();
         self
-    }
-
-    /// Create with default function registry (static lifetime)
-    pub fn with_defaults(
-        inner: Box<dyn QueryResult>,
-        expressions: Vec<Expression>,
-        output_columns: Vec<String>,
-    ) -> Result<Self> {
-        Self::new(inner, expressions, output_columns)
     }
 }
 
@@ -733,14 +723,10 @@ impl QueryResult for ExprMappedResult {
                             self.current_row.push_inline(value.clone());
                         }
                     }
-                    CompiledProjection::QualifiedStar { qualifier_lower } => {
-                        // Expand columns for specific table/alias
-                        // Use pre-computed lowercase columns to avoid per-row to_lowercase()
-                        for (idx, col_lower) in self.source_columns_lower.iter().enumerate() {
-                            if star_takes_lowered(col_lower, qualifier_lower)
-                                && idx < source_row.len()
-                            {
-                                self.current_row.push_inline(source_row[idx].clone());
+                    CompiledProjection::QualifiedStar(taken) => {
+                        for &idx in taken {
+                            if let Some(value) = source_row.get(idx) {
+                                self.current_row.push_inline(value.clone());
                             }
                         }
                     }
