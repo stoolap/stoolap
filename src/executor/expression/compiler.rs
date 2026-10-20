@@ -443,15 +443,6 @@ impl<'a> ExprCompiler<'a> {
         Ok(builder.build())
     }
 
-    /// Compile an expression for use as a boolean filter
-    pub fn compile_filter(&self, expr: &Expression) -> Result<Program, CompileError> {
-        // For simple filter expressions, we can optimize
-        let mut builder = ProgramBuilder::new();
-        self.compile_expr(expr, &mut builder)?;
-        builder.emit(Op::Return);
-        Ok(builder.build())
-    }
-
     /// Flatten chained concatenation operators into a list of operands.
     /// For `a || b || c || d`, returns [a, b, c, d] in order.
     fn flatten_concat_chain_infix<'b>(

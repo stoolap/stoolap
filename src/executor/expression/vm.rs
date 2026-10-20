@@ -261,19 +261,6 @@ impl ExprVM {
         }
     }
 
-    /// Create a VM with specific stack capacity
-    /// If capacity > 16, will spill to heap when needed
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            stack: SmallVec::with_capacity(capacity),
-            args_buffer: SmallVec::new(),
-            cached_like: None,
-            cached_glob: None,
-            cached_regexp: None,
-            bool_error: None,
-        }
-    }
-
     /// Execute a program and return the result
     #[inline]
     /// Match a runtime pattern, caching the compiled form per (pattern, case, escape).
@@ -3743,12 +3730,6 @@ mod tests {
     fn test_vm_new() {
         let vm = ExprVM::new();
         assert_eq!(vm.stack.len(), 0);
-    }
-
-    #[test]
-    fn test_vm_with_capacity() {
-        let vm = ExprVM::with_capacity(16);
-        assert!(vm.stack.capacity() >= 16);
     }
 
     #[test]

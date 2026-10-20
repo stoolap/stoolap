@@ -443,10 +443,6 @@ pub fn compile_expression(expr: &Expression, columns: &[String]) -> Result<Share
 ///
 /// Note: this is distinct from compile-time constant folding (which rejects ALL
 /// non-deterministic functions to avoid caching stale values in the program LRU).
-pub fn try_eval_constant_expr(expr: &Expression) -> Option<Value> {
-    try_eval_constant_expr_with_context(expr, None)
-}
-
 pub(crate) fn try_eval_constant_expr_with_context(
     expr: &Expression,
     context: Option<&ExecutionContext>,
@@ -643,18 +639,6 @@ impl RowFilter {
         })
     }
 
-    /// Create a filter with query parameters.
-    pub fn with_params(mut self, params: ParamVec) -> Self {
-        self.params = CompactArc::new(params);
-        self
-    }
-
-    /// Create a filter with named parameters.
-    pub fn with_named_params(mut self, named_params: FxHashMap<String, Value>) -> Self {
-        self.named_params = Arc::new(named_params);
-        self
-    }
-
     /// Create a filter from execution context.
     ///
     /// PERF: Both `params` and `named_params` share the Arc - zero cloning.
@@ -667,51 +651,7 @@ impl RowFilter {
         self
     }
 
-    /// Create a filter from a pre-compiled program.
-    pub fn from_program(program: SharedProgram) -> Self {
-        Self {
-            program,
-            params: EMPTY_PARAMS.clone(),
-            named_params: EMPTY_NAMED_PARAMS.clone(),
-            transaction_id: None,
-        }
-    }
-
-    /// Check if a row matches the filter condition.
-    ///
-    /// This method is thread-safe and can be called from multiple threads.
-    /// Each call uses a thread-local VM for execution.
-    #[inline]
-    pub fn matches(&self, row: &Row) -> bool {
-        // Use thread-local VM for zero allocation in hot path
-        thread_local! {
-            static VM: std::cell::RefCell<ExprVM> = std::cell::RefCell::new(ExprVM::new());
-        }
-
-        VM.with(|vm| {
-            let mut ctx = ExecuteContext::new(row);
-
-            if !self.params.is_empty() {
-                ctx = ctx.with_params(&self.params);
-            }
-            if !self.named_params.is_empty() {
-                ctx = ctx.with_named_params(&self.named_params);
-            }
-            ctx = ctx.with_transaction_id(self.transaction_id);
-
-            // Use try_borrow_mut to avoid panic on recursive calls (e.g., nested subqueries).
-            // If the VM is already borrowed, create a temporary one for this call.
-            if let Ok(mut borrowed_vm) = vm.try_borrow_mut() {
-                borrowed_vm.execute_bool(&self.program, &ctx)
-            } else {
-                // Fallback: create a fresh VM for recursive calls
-                let mut temp_vm = ExprVM::new();
-                temp_vm.execute_bool(&self.program, &ctx)
-            }
-        })
-    }
-
-    /// Like matches() but returns errors instead of swallowing them.
+    /// Check a row against the filter, returning an evaluation error instead of swallowing it.
     ///
     /// Returns `Err` when the VM encounters a runtime error (e.g. invalid
     /// REGEXP pattern supplied via a parameter). Used by FilteredResult
@@ -763,41 +703,6 @@ impl RowFilter {
             Some(e) => Err(e),
             None => Ok(()),
         }
-    }
-
-    /// Evaluate the filter expression and return the value.
-    #[inline]
-    pub fn evaluate(&self, row: &Row) -> Result<Value> {
-        thread_local! {
-            static VM: std::cell::RefCell<ExprVM> = std::cell::RefCell::new(ExprVM::new());
-        }
-
-        VM.with(|vm| {
-            let mut ctx = ExecuteContext::new(row);
-
-            if !self.params.is_empty() {
-                ctx = ctx.with_params(&self.params);
-            }
-            if !self.named_params.is_empty() {
-                ctx = ctx.with_named_params(&self.named_params);
-            }
-            ctx = ctx.with_transaction_id(self.transaction_id);
-
-            // Use try_borrow_mut to avoid panic on recursive calls (e.g., nested subqueries).
-            // If the VM is already borrowed, create a temporary one for this call.
-            if let Ok(mut borrowed_vm) = vm.try_borrow_mut() {
-                borrowed_vm.execute_cow(&self.program, &ctx)
-            } else {
-                // Fallback: create a fresh VM for recursive calls
-                let mut temp_vm = ExprVM::new();
-                temp_vm.execute_cow(&self.program, &ctx)
-            }
-        })
-    }
-
-    /// Get the underlying program (for advanced use cases).
-    pub fn program(&self) -> &SharedProgram {
-        &self.program
     }
 }
 
@@ -1009,30 +914,6 @@ impl ExpressionEval {
         })
     }
 
-    /// Create from a pre-compiled program.
-    pub fn from_program(program: SharedProgram) -> Self {
-        Self {
-            program,
-            vm: ExprVM::new(),
-            params: EMPTY_PARAMS.clone(),
-            named_params: EMPTY_NAMED_PARAMS.clone(),
-            outer_row: None,
-            transaction_id: None,
-        }
-    }
-
-    /// Set query parameters.
-    pub fn with_params(mut self, params: ParamVec) -> Self {
-        self.params = CompactArc::new(params);
-        self
-    }
-
-    /// Set named parameters.
-    pub fn with_named_params(mut self, named_params: FxHashMap<String, Value>) -> Self {
-        self.named_params = Arc::new(named_params);
-        self
-    }
-
     /// Set context from ExecutionContext.
     ///
     /// PERF: Both `params` and `named_params` share the Arc - zero cloning.
@@ -1048,25 +929,6 @@ impl ExpressionEval {
         }
         self.transaction_id = ctx.transaction_id();
         self
-    }
-
-    /// Set transaction ID.
-    pub fn with_transaction_id(mut self, txn_id: Option<u64>) -> Self {
-        self.transaction_id = txn_id;
-        self
-    }
-
-    /// Set outer row for correlated subqueries.
-    /// Accepts CompactArc<str> keys directly to avoid conversion overhead.
-    pub fn set_outer_row(&mut self, outer: &FxHashMap<CompactArc<str>, Value>) {
-        // Clone the map (CompactArc clones are cheap, Value clones may be expensive but needed)
-        let map = outer.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        self.outer_row = Some(map);
-    }
-
-    /// Clear outer row.
-    pub fn clear_outer_row(&mut self) {
-        self.outer_row = None;
     }
 
     /// Evaluate the expression for a row.
@@ -1088,26 +950,7 @@ impl ExpressionEval {
         self.vm.execute_cow(&self.program, &ctx)
     }
 
-    /// Evaluate as boolean (for WHERE/HAVING).
-    #[inline]
-    pub fn eval_bool(&mut self, row: &Row) -> bool {
-        let mut ctx = ExecuteContext::new(row);
-
-        if !self.params.is_empty() {
-            ctx = ctx.with_params(&self.params);
-        }
-        if !self.named_params.is_empty() {
-            ctx = ctx.with_named_params(&self.named_params);
-        }
-        if let Some(ref outer) = self.outer_row {
-            ctx = ctx.with_outer_row(outer);
-        }
-        ctx = ctx.with_transaction_id(self.transaction_id);
-
-        self.vm.execute_bool(&self.program, &ctx)
-    }
-
-    /// Like eval_bool but returns errors instead of swallowing them.
+    /// Evaluate as boolean (for WHERE/HAVING), returning an evaluation error.
     #[inline]
     pub fn eval_bool_checked(&mut self, row: &Row) -> Result<bool> {
         let mut ctx = ExecuteContext::new(row);
@@ -1124,20 +967,6 @@ impl ExpressionEval {
         ctx = ctx.with_transaction_id(self.transaction_id);
 
         self.vm.execute_bool_checked(&self.program, &ctx)
-    }
-
-    /// Evaluate with two rows (for joins).
-    #[inline]
-    pub fn eval_join(&mut self, left: &Row, right: &Row) -> Result<Value> {
-        let ctx = ExecuteContext::for_join(left, right);
-        self.vm.execute_cow(&self.program, &ctx)
-    }
-
-    /// Evaluate join as boolean.
-    #[inline]
-    pub fn eval_join_bool(&mut self, left: &Row, right: &Row) -> bool {
-        let ctx = ExecuteContext::for_join(left, right);
-        self.vm.execute_bool(&self.program, &ctx)
     }
 
     /// Evaluate with a row reference.
@@ -1157,30 +986,6 @@ impl ExpressionEval {
         ctx = ctx.with_transaction_id(self.transaction_id);
 
         self.vm.execute_cow(&self.program, &ctx)
-    }
-
-    /// Evaluate as boolean.
-    #[inline]
-    pub fn eval_slice_bool(&mut self, row: &Row) -> bool {
-        let mut ctx = ExecuteContext::new(row);
-
-        if !self.params.is_empty() {
-            ctx = ctx.with_params(&self.params);
-        }
-        if !self.named_params.is_empty() {
-            ctx = ctx.with_named_params(&self.named_params);
-        }
-        if let Some(ref outer) = self.outer_row {
-            ctx = ctx.with_outer_row(outer);
-        }
-        ctx = ctx.with_transaction_id(self.transaction_id);
-
-        self.vm.execute_bool(&self.program, &ctx)
-    }
-
-    /// Get the underlying program.
-    pub fn program(&self) -> &SharedProgram {
-        &self.program
     }
 }
 
@@ -1205,30 +1010,6 @@ pub struct MultiExpressionEval {
 }
 
 impl MultiExpressionEval {
-    /// Compile multiple expressions.
-    pub fn compile(exprs: &[Expression], columns: &[String]) -> Result<Self> {
-        let ctx = CompileContext::with_global_registry(columns);
-        let compiler = ExprCompiler::new(&ctx);
-
-        let programs = exprs
-            .iter()
-            .map(|expr| {
-                compiler
-                    .compile(expr)
-                    .map(CompactArc::new)
-                    .map_err(|e| Error::internal(format!("Compile error: {}", e)))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(Self {
-            programs,
-            vm: ExprVM::new(),
-            params: EMPTY_PARAMS.clone(),
-            named_params: EMPTY_NAMED_PARAMS.clone(),
-            transaction_id: None,
-        })
-    }
-
     /// Compile expressions whose group items and aggregates are read from the
     /// row's slot for each expression's identity (for windows over groups)
     pub(crate) fn compile_with_aliases(
@@ -1257,12 +1038,6 @@ impl MultiExpressionEval {
             named_params: EMPTY_NAMED_PARAMS.clone(),
             transaction_id: None,
         })
-    }
-
-    /// Set query parameters.
-    pub fn with_params(mut self, params: ParamVec) -> Self {
-        self.params = CompactArc::new(params);
-        self
     }
 
     /// Set from execution context.
@@ -1314,16 +1089,6 @@ impl MultiExpressionEval {
             output.push(self.vm.execute_cow(prog, &ctx)?);
         }
         Ok(())
-    }
-
-    /// Number of expressions.
-    pub fn len(&self) -> usize {
-        self.programs.len()
-    }
-
-    /// Check if empty.
-    pub fn is_empty(&self) -> bool {
-        self.programs.is_empty()
     }
 }
 
@@ -1391,9 +1156,6 @@ pub struct CompiledEvaluator<'a> {
     /// Column names for compilation context (Arc for zero-copy sharing)
     columns: CompactArc<Vec<String>>,
 
-    /// Second row columns (for joins)
-    columns2: Option<Vec<String>>,
-
     /// Outer query columns (for correlated subqueries)
     outer_columns: Option<Vec<String>>,
 
@@ -1423,9 +1185,6 @@ pub struct CompiledEvaluator<'a> {
 
     /// Current row values for execution (owned copy for safety)
     current_row: Option<Row>,
-
-    /// Second row for joins (owned copy for safety)
-    current_row2: Option<Row>,
 }
 
 // CompiledEvaluator is Send + Sync because all fields are Send + Sync:
@@ -1438,7 +1197,6 @@ impl<'a> CompiledEvaluator<'a> {
         Self {
             function_registry,
             columns: CompactArc::new(Vec::new()),
-            columns2: None,
             outer_columns: None,
             params: EMPTY_PARAMS.clone(),
             named_params: EMPTY_NAMED_PARAMS.clone(),
@@ -1449,46 +1207,12 @@ impl<'a> CompiledEvaluator<'a> {
             vm: ExprVM::new(),
             local_cache: FxHashMap::default(),
             current_row: None,
-            current_row2: None,
         }
     }
 
     /// Create an evaluator using the global function registry.
     pub fn with_defaults() -> CompiledEvaluator<'static> {
         CompiledEvaluator::new(global_registry())
-    }
-
-    /// Clear all state for reuse.
-    pub fn clear(&mut self) {
-        self.columns = CompactArc::new(Vec::new());
-        self.columns2 = None;
-        self.outer_columns = None;
-        self.params = EMPTY_PARAMS.clone();
-        self.named_params = Arc::new(FxHashMap::default());
-        self.outer_row = None;
-        self.transaction_id = None;
-        self.expression_aliases.clear();
-        self.column_aliases.clear();
-        self.local_cache.clear();
-        self.current_row = None;
-        self.current_row2 = None;
-    }
-
-    /// Set the current transaction ID
-    pub fn set_transaction_id(&mut self, txn_id: u64) {
-        self.transaction_id = Some(txn_id);
-    }
-
-    /// Set query parameters (positional) - fluent API
-    pub fn with_params(mut self, params: ParamVec) -> Self {
-        self.params = CompactArc::new(params);
-        self
-    }
-
-    /// Set named query parameters - fluent API
-    pub fn with_named_params(mut self, named_params: FxHashMap<String, Value>) -> Self {
-        self.named_params = Arc::new(named_params);
-        self
     }
 
     /// Set parameters from execution context - fluent API
@@ -1516,20 +1240,6 @@ impl<'a> CompiledEvaluator<'a> {
         }
 
         self.transaction_id = ctx.transaction_id();
-        self
-    }
-
-    /// Set the current row from an array with column names - fluent API
-    ///
-    /// Note: This method stores a pointer to the row. The caller must ensure
-    /// the row outlives the evaluator or call set_row_array for each evaluation.
-    pub fn with_row(mut self, row: Row, columns: &[String]) -> Self {
-        self.init_columns(columns);
-        // For fluent API usage, just set the columns.
-        // The actual row should be set via set_row_array before evaluate.
-        // This matches the Evaluator pattern where with_row takes ownership
-        // but set_row_array is the hot path for per-row evaluation.
-        let _ = row; // Row will be set via set_row_array
         self
     }
 
@@ -1577,36 +1287,6 @@ impl<'a> CompiledEvaluator<'a> {
     #[inline]
     pub fn set_row_array(&mut self, row: &Row) {
         self.current_row = Some(row.clone());
-        // Clear join mode
-        self.current_row2 = None;
-    }
-
-    /// Set two rows for join condition evaluation
-    #[inline]
-    pub fn set_join_rows(&mut self, left_row: &Row, right_row: &Row) {
-        self.current_row = Some(left_row.clone());
-        self.current_row2 = Some(right_row.clone());
-    }
-
-    /// Initialize join columns
-    pub fn init_join_columns(&mut self, left_columns: &[String], right_columns: &[String]) {
-        self.columns = CompactArc::new(left_columns.to_vec());
-        self.columns2 = Some(right_columns.to_vec());
-        // Invalidate local cache since compilation context changed
-        self.local_cache.clear();
-    }
-
-    /// Set the outer row context for correlated subqueries
-    /// Accepts CompactArc<str> keys directly to avoid conversion overhead.
-    #[inline]
-    pub fn set_outer_row(&mut self, outer_row: Option<&FxHashMap<CompactArc<str>, Value>>) {
-        if let Some(outer) = outer_row {
-            // Clone the map (CompactArc clones are cheap)
-            let map = outer.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-            self.outer_row = Some(map);
-        } else {
-            self.outer_row = None;
-        }
     }
 
     /// Set the outer row context by taking ownership
@@ -1637,46 +1317,11 @@ impl<'a> CompiledEvaluator<'a> {
         self.outer_row = Some(outer_row);
     }
 
-    /// Compile an expression and return a shared program for parallel use.
-    /// The returned CompactArc<Program> can be cloned cheaply and shared across threads.
-    pub fn compile_shared(&mut self, expr: &Expression) -> Result<SharedProgram> {
-        self.get_or_compile(expr)
-    }
-
     /// Take ownership of the outer row back (for reuse)
     /// Returns CompactArc<str> keys directly to avoid conversion overhead.
     #[inline]
     pub fn take_outer_row(&mut self) -> FxHashMap<CompactArc<str>, Value> {
         self.outer_row.take().unwrap_or_default()
-    }
-
-    /// Clear the outer row context
-    #[inline]
-    pub fn clear_outer_row(&mut self) {
-        self.outer_row = None;
-    }
-
-    /// Initialize outer columns for correlated subquery compilation
-    pub fn init_outer_columns(&mut self, outer_columns: &[String]) {
-        self.outer_columns = Some(outer_columns.to_vec());
-        // Invalidate local cache
-        self.local_cache.clear();
-    }
-
-    /// Check if outer columns are set (for debugging)
-    pub fn has_outer_columns(&self) -> bool {
-        self.outer_columns.is_some()
-    }
-
-    /// Get outer columns (for debugging)
-    pub fn get_outer_columns(&self) -> Option<&Vec<String>> {
-        self.outer_columns.as_ref()
-    }
-
-    /// Clear the current row
-    pub fn clear_row(&mut self) {
-        self.current_row = None;
-        self.current_row2 = None;
     }
 
     /// Compute hash of expression content for local cache key.
@@ -1987,11 +1632,6 @@ impl<'a> CompiledEvaluator<'a> {
     fn compile_expression(&self, expr: &Expression) -> Result<Program> {
         let mut ctx = CompileContext::new(&self.columns, self.function_registry);
 
-        // Add second row columns if available
-        if let Some(ref cols2) = self.columns2 {
-            ctx = ctx.with_second_row(cols2);
-        }
-
         // Add outer columns if available
         if let Some(ref outer_cols) = self.outer_columns {
             ctx = ctx.with_outer_columns(outer_cols);
@@ -2024,15 +1664,8 @@ impl<'a> CompiledEvaluator<'a> {
         // Get row data from owned copy
         let row = self.current_row.as_ref().unwrap_or(&EMPTY_ROW);
 
-        // Get second row if in join mode
-        let row2 = self.current_row2.as_ref();
-
         // Build execution context
-        let mut ctx = if let Some(r2) = row2 {
-            ExecuteContext::for_join(row, r2)
-        } else {
-            ExecuteContext::new(row)
-        };
+        let mut ctx = ExecuteContext::new(row);
 
         // Add parameters
         if !self.params.is_empty() {
@@ -2064,12 +1697,8 @@ impl<'a> CompiledEvaluator<'a> {
 
     /// Evaluate a pre-compiled program against the given row directly,
     /// without storing a per-row copy in the evaluator and without
-    /// re-hashing the expression. Not for join mode (single row only).
+    /// re-hashing the expression
     pub fn evaluate_program(&mut self, program: &SharedProgram, row: &Row) -> Result<Value> {
-        debug_assert!(
-            self.current_row2.is_none() && self.columns2.is_none(),
-            "evaluate_program does not support join mode"
-        );
         let mut ctx = ExecuteContext::new(row);
         if !self.params.is_empty() {
             ctx = ctx.with_params(&self.params);
@@ -2097,15 +1726,8 @@ impl<'a> CompiledEvaluator<'a> {
         // Get row data from owned copy
         let row = self.current_row.as_ref().unwrap_or(&EMPTY_ROW);
 
-        // Get second row if in join mode
-        let row2 = self.current_row2.as_ref();
-
         // Build execution context
-        let mut ctx = if let Some(r2) = row2 {
-            ExecuteContext::for_join(row, r2)
-        } else {
-            ExecuteContext::new(row)
-        };
+        let mut ctx = ExecuteContext::new(row);
 
         // Add parameters
         if !self.params.is_empty() {
@@ -2208,8 +1830,14 @@ mod tests {
         let f1 = RowFilter::new(&e1, &cols).unwrap();
         let f2 = RowFilter::new(&e2, &cols).unwrap();
         let row = Row::from_values(vec![Value::Integer(2)]);
-        assert!(!f1.matches(&row), "a IN {{1}} must reject a = 2");
-        assert!(f2.matches(&row), "a IN {{2}} must accept a = 2");
+        assert!(
+            !f1.matches_checked(&row).unwrap(),
+            "a IN {{1}} must reject a = 2"
+        );
+        assert!(
+            f2.matches_checked(&row).unwrap(),
+            "a IN {{2}} must accept a = 2"
+        );
     }
 
     #[test]
@@ -2356,7 +1984,7 @@ mod tests {
 
         // Row with col = 10 (> 5)
         let row = Row::from(vec![Value::Integer(10)]);
-        assert!(filter.matches(&row));
+        assert!(filter.matches_checked(&row).unwrap());
     }
 
     #[test]
@@ -2372,23 +2000,7 @@ mod tests {
 
         // Row with col = 3 (not > 5)
         let row = Row::from(vec![Value::Integer(3)]);
-        assert!(!filter.matches(&row));
-    }
-
-    #[test]
-    fn test_row_filter_evaluate() {
-        // col + 10
-        let expr = make_infix(
-            make_identifier("col"),
-            InfixOperator::Add,
-            make_int_literal(10),
-        );
-        let columns = vec!["col".to_string()];
-        let filter = RowFilter::new(&expr, &columns).unwrap();
-
-        let row = Row::from(vec![Value::Integer(5)]);
-        let result = filter.evaluate(&row).unwrap();
-        assert_eq!(result, Value::Integer(15));
+        assert!(!filter.matches_checked(&row).unwrap());
     }
 
     #[test]
@@ -2403,8 +2015,8 @@ mod tests {
         let cloned = filter.clone();
 
         let row = Row::from(vec![Value::Integer(10)]);
-        assert!(filter.matches(&row));
-        assert!(cloned.matches(&row));
+        assert!(filter.matches_checked(&row).unwrap());
+        assert!(cloned.matches_checked(&row).unwrap());
     }
 
     // =========================================================================
@@ -2451,34 +2063,15 @@ mod tests {
         let mut eval = ExpressionEval::compile(&expr, &columns).unwrap();
 
         let row = Row::from(vec![Value::Integer(10)]);
-        assert!(eval.eval_bool(&row));
+        assert!(eval.eval_bool_checked(&row).unwrap());
 
         let row = Row::from(vec![Value::Integer(3)]);
-        assert!(!eval.eval_bool(&row));
+        assert!(!eval.eval_bool_checked(&row).unwrap());
     }
 
     // =========================================================================
     // MultiExpressionEval tests
     // =========================================================================
-
-    #[test]
-    fn test_multi_expression_eval_compile() {
-        let expr1 = make_infix(
-            make_identifier("col"),
-            InfixOperator::Add,
-            make_int_literal(10),
-        );
-        let expr2 = make_infix(
-            make_identifier("col"),
-            InfixOperator::Multiply,
-            make_int_literal(2),
-        );
-        let columns = vec!["col".to_string()];
-
-        let eval = MultiExpressionEval::compile(&[expr1, expr2], &columns);
-        assert!(eval.is_ok());
-        assert_eq!(eval.unwrap().len(), 2);
-    }
 
     #[test]
     fn test_multi_expression_eval_all() {
@@ -2493,7 +2086,12 @@ mod tests {
             make_int_literal(2),
         );
         let columns = vec!["col".to_string()];
-        let mut eval = MultiExpressionEval::compile(&[expr1, expr2], &columns).unwrap();
+        let mut eval = MultiExpressionEval::compile_with_aliases(
+            &[expr1, expr2],
+            &columns,
+            &FxHashMap::default(),
+        )
+        .unwrap();
 
         let row = Row::from(vec![Value::Integer(5)]);
         let results = eval.eval_all(&row).unwrap();
