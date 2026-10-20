@@ -1502,8 +1502,6 @@ struct Rewritten {
     reads_parent: bool,
     /// Whether anything read is a column of the block's own row
     reads_row: bool,
-    /// Ids of the subquery nodes made while rewriting, by node address
-    ids: FxHashMap<usize, u16>,
     /// The slot of each enclosing column read, by scope depth and column:
     /// one per column, so two reads of it are one expression
     outer: FxHashMap<(usize, usize), usize>,
@@ -1701,9 +1699,8 @@ impl Builder<'_> {
             limit: None,
             offset: None,
             set_operations: Vec::new(),
+            prepared: Some(nested_id),
         });
-        work.ids
-            .insert(&*mark as *const SelectStatement as usize, nested_id);
         Ok(mark)
     }
 
@@ -1861,7 +1858,7 @@ impl Builder<'_> {
             compare_as_scan(expr, &schema, &mut read_as);
         }
         let own = CompileContext::new(&scope.columns, registry)
-            .with_subquery_ids(&work.ids)
+            .with_prepared_subqueries()
             .with_read_as(&read_as);
         let compile = |expr: &Option<Expression>| match expr {
             Some(expr) => compile_with(&own, expr).map(Some),
@@ -2079,6 +2076,7 @@ impl Builder<'_> {
             limit: None,
             offset: None,
             set_operations: Vec::new(),
+            prepared: None,
         };
         let (aggregations, _) = executor.parse_aggregations(&calls_of, None)?;
         let calls = aggregations
@@ -2562,11 +2560,7 @@ impl PreparedSelect {
                 _ => None,
             };
             if let Some((mark, negated, column)) = set_test {
-                exists_conjuncts.extend(
-                    work.ids
-                        .get(&(&**mark as *const SelectStatement as usize))
-                        .map(|&id| (id, negated, column)),
-                );
+                exists_conjuncts.extend(mark.prepared.map(|id| (id, negated, column)));
             }
             rewritten.push(part);
         }
@@ -2576,7 +2570,7 @@ impl PreparedSelect {
         let mut read_as = FxHashMap::default();
         compare_as_scan(&where_clause, schema, &mut read_as);
         let own = CompileContext::new(&scope.columns, registry)
-            .with_subquery_ids(&work.ids)
+            .with_prepared_subqueries()
             .with_read_as(&read_as);
         let compile = |expr: &Expression| compile_with(&own, expr);
         let where_program = compile(&where_clause)?;
@@ -2703,7 +2697,6 @@ impl Builder<'_> {
         };
         let mut value_work = Rewritten::default();
         let rewritten_value = self.rewrite(chain, None, value, &mut value_work)?;
-        work.ids.extend(value_work.ids);
         let value = if !value_work.reads_row
             && !is_leaf(value)
             && !volatile(value, &self.executor.function_registry)

@@ -7364,6 +7364,7 @@ impl Executor {
                     limit: None,
                     offset: None,
                     set_operations: vec![],
+                    prepared: None,
                 };
                 // Get classification for the synthetic SELECT statement
                 let classification = get_classification(&select_all);
@@ -7403,6 +7404,7 @@ impl Executor {
                     limit: None,
                     offset: None,
                     set_operations: vec![],
+                    prepared: None,
                 };
                 // Get classification for the synthetic SELECT statement
                 let classification = get_classification(&select_all);
@@ -7463,6 +7465,7 @@ impl Executor {
                     limit: None,
                     offset: None,
                     set_operations: vec![],
+                    prepared: None,
                 };
                 // Get classification for the synthetic SELECT statement
                 let classification = get_classification(&select_all);
@@ -7580,6 +7583,7 @@ impl Executor {
                     ))
                 }),
                 set_operations: vec![],
+                prepared: None,
             };
             // Get classification for the synthetic SELECT statement
             let classification = get_classification(&select_all);

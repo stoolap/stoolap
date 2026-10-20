@@ -1759,6 +1759,8 @@ pub struct SelectStatement {
     pub offset: Option<Box<Expression>>,
     /// Set operations (UNION, INTERSECT, EXCEPT)
     pub set_operations: Vec<SetOperation>,
+    /// The prepared block this mark stands for; None for a written SELECT
+    pub prepared: Option<u16>,
 }
 
 impl fmt::Display for SelectStatement {
@@ -2812,6 +2814,7 @@ mod tests {
             limit: None,
             offset: None,
             set_operations: vec![],
+            prepared: None,
         };
         assert_eq!(stmt.to_string(), "SELECT * FROM users");
     }

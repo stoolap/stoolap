@@ -492,19 +492,19 @@ fn where_of(predicate: &str) -> Expression {
     }
 }
 
-/// The address of the one subquery block `expr` holds
-fn block_key(expr: &Expression) -> usize {
+/// Mark the one subquery block `expr` holds as the prepared block `id`
+fn prepare_block(expr: &mut Expression, id: u16) {
     let block = match expr {
-        Expression::Exists(exists) => &exists.subquery,
-        Expression::AllAny(all_any) => &all_any.subquery,
-        Expression::In(in_expr) => match &*in_expr.right {
-            Expression::ScalarSubquery(sq) => &sq.subquery,
+        Expression::Exists(exists) => &mut exists.subquery,
+        Expression::AllAny(all_any) => &mut all_any.subquery,
+        Expression::In(in_expr) => match &mut *in_expr.right {
+            Expression::ScalarSubquery(sq) => &mut sq.subquery,
             other => panic!("no block on the right: {other:?}"),
         },
-        Expression::Prefix(prefix) => return block_key(&prefix.right),
+        Expression::Prefix(prefix) => return prepare_block(&mut prefix.right, id),
         other => panic!("no block: {other:?}"),
     };
-    &**block as *const crate::parser::ast::SelectStatement as usize
+    block.prepared = Some(id);
 }
 
 #[test]
@@ -526,11 +526,17 @@ fn test_a_prepared_block_compiles_to_its_id() {
             vec!["ExecQuantified(4, Le, false)"],
         ),
     ] {
-        let expr = where_of(predicate);
-        let ids: rustc_hash::FxHashMap<usize, u16> = [(block_key(&expr), 4)].into_iter().collect();
-        let ctx = CompileContext::with_global_registry(&columns).with_subquery_ids(&ids);
+        let mut expr = where_of(predicate);
+        prepare_block(&mut expr, 4);
+        let ctx = CompileContext::with_global_registry(&columns).with_prepared_subqueries();
         let program = ExprCompiler::new(&ctx).compile(&expr).unwrap();
         let ops: Vec<String> = program.ops().iter().map(|op| format!("{op:?}")).collect();
+        let copied = ExprCompiler::new(&ctx).compile(&expr.clone()).unwrap();
+        let copied: Vec<String> = copied.ops().iter().map(|op| format!("{op:?}")).collect();
+        assert_eq!(
+            copied, ops,
+            "{predicate}: a copy of the mark is the same block"
+        );
         let at = ops
             .iter()
             .position(|op| *op == expected[0])
@@ -546,7 +552,6 @@ fn test_a_prepared_block_compiles_to_its_id() {
 #[test]
 fn test_a_block_outside_a_prepared_plan_does_not_compile() {
     let columns = vec!["x".to_string()];
-    let none = rustc_hash::FxHashMap::default();
     for predicate in [
         "x IN (SELECT y FROM u)",
         "EXISTS (SELECT 1 FROM u)",
@@ -559,7 +564,7 @@ fn test_a_block_outside_a_prepared_plan_does_not_compile() {
             ExprCompiler::new(&ctx).compile(&expr).is_err(),
             "{predicate}: without ids no subquery op is built"
         );
-        let ctx = CompileContext::with_global_registry(&columns).with_subquery_ids(&none);
+        let ctx = CompileContext::with_global_registry(&columns).with_prepared_subqueries();
         assert!(
             ExprCompiler::new(&ctx).compile(&expr).is_err(),
             "{predicate}: a block the plan did not prepare does not compile"

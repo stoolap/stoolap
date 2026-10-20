@@ -173,8 +173,8 @@ pub struct CompileContext<'a> {
     /// Column aliases
     column_aliases: StringMap<String>,
 
-    /// Ids a prepared statement gave its scalar subqueries, by node address
-    subquery_ids: Option<&'a FxHashMap<usize, u16>>,
+    /// A prepared plan compiles: a subquery mark compiles to its block's id
+    prepared_subqueries: bool,
 
     /// Identifiers read from the second row at a fixed position, by node address
     row2_bindings: Option<&'a FxHashMap<usize, u16>>,
@@ -217,7 +217,7 @@ impl<'a> CompileContext<'a> {
             functions,
             expression_aliases: FxHashMap::default(),
             column_aliases: StringMap::new(),
-            subquery_ids: None,
+            prepared_subqueries: false,
             row2_bindings: None,
             read_as: None,
         }
@@ -279,10 +279,10 @@ impl<'a> CompileContext<'a> {
         self
     }
 
-    /// Compile each listed subquery block to its prepared id; any other
+    /// Compile each subquery mark to the prepared id it carries; a written
     /// subquery is then a compile error
-    pub fn with_subquery_ids(mut self, ids: &'a FxHashMap<usize, u16>) -> Self {
-        self.subquery_ids = Some(ids);
+    pub fn with_prepared_subqueries(mut self) -> Self {
+        self.prepared_subqueries = true;
         self
     }
 
@@ -427,11 +427,13 @@ impl<'a> ExprCompiler<'a> {
     /// The prepared id of a subquery block. Only a prepared plan compiles one
     /// into the program; any other caller substitutes its result first
     fn subquery_id(&self, block: &SelectStatement, form: &str) -> Result<u16, CompileError> {
-        let ids = self.ctx.subquery_ids.ok_or_else(|| {
-            CompileError::UnsupportedExpression(format!("{form} outside a prepared plan"))
-        })?;
-        ids.get(&(block as *const SelectStatement as usize))
-            .copied()
+        if !self.ctx.prepared_subqueries {
+            return Err(CompileError::UnsupportedExpression(format!(
+                "{form} outside a prepared plan"
+            )));
+        }
+        block
+            .prepared
             .ok_or_else(|| CompileError::InvalidExpression(format!("unprepared {form}")))
     }
 

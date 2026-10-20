@@ -406,6 +406,7 @@ impl Executor {
             limit: None,
             offset: None,
             set_operations: vec![],
+            prepared: None,
         };
 
         let result = self.execute_select(&anchor_stmt, ctx)?;
@@ -557,6 +558,7 @@ impl Executor {
             limit: stmt.limit.clone(),
             offset: stmt.offset.clone(),
             set_operations: stmt.set_operations.clone(),
+            prepared: None,
         };
 
         self.execute_select(&stmt_without_with, &ctx_with_ctes)
@@ -1144,6 +1146,7 @@ impl Executor {
             limit: stmt.limit.clone(),
             offset: stmt.offset.clone(),
             set_operations: stmt.set_operations.clone(),
+            prepared: None,
         })
     }
 
