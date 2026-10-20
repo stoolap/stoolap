@@ -233,6 +233,7 @@ fn strip_fk_references(
                 );
                 std::mem::swap(&mut new_schema.foreign_keys, &mut new_fks);
                 new_schema.cluster_key = old_schema.cluster_key.clone();
+                new_schema.table_checks = old_schema.table_checks.clone();
                 let new_arc = CompactArc::new(new_schema);
 
                 if let Some(vs) = version_stores.get(child_name.as_str()) {
@@ -243,6 +244,43 @@ fn strip_fk_references(
             }
         }
     }
+}
+
+/// The table CHECK constraints a schema record ends with: a count, then
+/// each one's length-prefixed text
+pub(crate) fn write_table_checks(buf: &mut Vec<u8>, checks: &[String]) {
+    buf.extend_from_slice(&(checks.len() as u16).to_le_bytes());
+    for check in checks {
+        buf.extend_from_slice(&(check.len() as u16).to_le_bytes());
+        buf.extend_from_slice(check.as_bytes());
+    }
+}
+
+/// `write_table_checks` read back from `data` at `pos`; none in a record
+/// written before table CHECK constraints were kept
+pub(crate) fn read_table_checks(data: &[u8], pos: &mut usize) -> Result<Vec<String>> {
+    let mut checks = Vec::new();
+    let Some(count) = data.get(*pos..*pos + 2) else {
+        return Ok(checks);
+    };
+    let count = u16::from_le_bytes([count[0], count[1]]) as usize;
+    *pos += 2;
+    for _ in 0..count {
+        let len = data
+            .get(*pos..*pos + 2)
+            .map(|len| u16::from_le_bytes([len[0], len[1]]) as usize)
+            .ok_or_else(|| Error::internal("corrupted schema: truncated table CHECK"))?;
+        *pos += 2;
+        let text = data
+            .get(*pos..*pos + len)
+            .ok_or_else(|| Error::internal("corrupted schema: truncated table CHECK"))?;
+        checks.push(
+            String::from_utf8(text.to_vec())
+                .map_err(|e| Error::internal(format!("invalid table CHECK: {}", e)))?,
+        );
+        *pos += len;
+    }
+    Ok(checks)
 }
 
 /// Try to parse a default expression as a simple literal value.
@@ -2469,8 +2507,11 @@ impl MVCCEngine {
             }
         }
 
+        let table_checks = read_table_checks(data, &mut pos)?;
+
         let mut schema = Schema::with_foreign_keys(&table_name, columns, foreign_keys);
         schema.cluster_key = cluster_key;
+        schema.table_checks = table_checks;
         Ok(schema)
     }
 
@@ -3099,6 +3140,9 @@ impl MVCCEngine {
         for &column in &schema.cluster_key {
             buf.extend_from_slice(&(column as u16).to_le_bytes());
         }
+
+        // Table CHECK constraints (after the clustering key; a reader without them stops there)
+        write_table_checks(&mut buf, &schema.table_checks);
 
         buf
     }

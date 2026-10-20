@@ -566,7 +566,6 @@ A subquery in these positions is refused with an error rather than answered. Sup
 
 - `INSERT ... VALUES`, `ON CONFLICT ... DO UPDATE SET` and `RETURNING`
 - An `UPDATE` that sets one column from a correlated subquery and another from an uncorrelated one
-- A column `DEFAULT` or a `CHECK` constraint (the `DEFAULT` fails only for a row that takes it)
 - `GROUP BY` and `DISTINCT ON` expressions
 - `HAVING` in a query that also has window functions
 - A grouped `SELECT` list that holds both a correlated and an uncorrelated subquery
@@ -582,6 +581,8 @@ Compile error: Unsupported expression: scalar subquery outside a prepared plan
 ```
 
 with `EXISTS`, `IN (subquery)` or `ANY or ALL` in place of `scalar subquery` for those forms.
+
+A column `DEFAULT` and a `CHECK` constraint never hold a subquery: `CREATE TABLE` and `ALTER TABLE ... ADD COLUMN` refuse one when the constraint is declared.
 
 ## Best Practices
 

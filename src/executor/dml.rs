@@ -30,6 +30,7 @@ use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::traits::transaction::StatementTable;
 use crate::storage::traits::{Engine, QueryResult, Table, Transaction};
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 use std::sync::Arc;
 
 use super::context::ExecutionContext;
@@ -213,21 +214,7 @@ pub(crate) fn eval_default_slot(
 /// with, raised only when a row takes the default
 pub(crate) type DefaultSlot = Option<(Result<super::expression::SharedProgram>, DataType)>;
 
-/// The expression a column's stored DEFAULT or CHECK text holds; a text
-/// that does not parse to one expression is an error, never a dropped one
-pub(crate) fn parse_stored_expression(text: &str, kind: &str, column: &str) -> Result<Expression> {
-    let not_one = || {
-        Error::parse(format!(
-            "the {kind} of {column} is not an expression: {text}"
-        ))
-    };
-    let statements = crate::parser::parse_sql(&format!("SELECT {}", text))
-        .map_err(|e| Error::parse(format!("the {kind} of {column} does not parse: {e}")))?;
-    match statements.into_iter().next() {
-        Some(Statement::Select(select)) => select.columns.into_iter().next().ok_or_else(not_one),
-        _ => Err(not_one()),
-    }
-}
+use crate::parser::parse_stored_expression;
 
 /// Per-statement default machinery: constant defaults land in the value
 /// template; non-literal defaults compile ONCE and execute PER ROW, so
@@ -368,84 +355,130 @@ impl<'a> InsertPlan<'a> {
     }
 }
 
-/// A column's CHECK constraint, compiled once: (column index, column name,
-/// constraint text, program). The program runs against a one-column row
-/// holding the value under test.
-pub(crate) type CompiledCheck = (
-    usize,
-    SmartString,
-    SmartString,
-    super::expression::SharedProgram,
-);
+/// A CHECK constraint compiled once over the table's whole row: a column's,
+/// or the table's own when `column` is None
+#[derive(Clone)]
+pub(crate) struct CompiledCheck {
+    pub(crate) column: Option<SmartString>,
+    pub(crate) table: SmartString,
+    pub(crate) text: SmartString,
+    /// The columns it reads, which a write into the row may change
+    pub(crate) reads: SmallVec<[usize; 4]>,
+    /// Whether its answer may change with no column changing (NOW, RANDOM)
+    pub(crate) volatile: bool,
+    pub(crate) program: super::expression::SharedProgram,
+}
 
-/// Compile every CHECK constraint of `schema`.
+/// Compile every CHECK constraint of `schema`, the columns' and the table's.
 ///
 /// Parsing and compiling a constraint costs dozens of allocations. The COPY
 /// path used to do it again for every row, which made a CHECK the dominant
 /// cost of a bulk load. A constraint that fails to compile is an error rather
 /// than a silently skipped check.
 pub(crate) fn compile_check_programs(schema: &Schema) -> Result<Vec<CompiledCheck>> {
-    let mut compiled = Vec::new();
-    for idx in 0..schema.columns.len() {
-        if let Some(check) = compile_column_check(schema, idx)? {
-            compiled.push(check);
-        }
+    if schema.table_checks.is_empty() && schema.columns.iter().all(|c| c.check_expr.is_none()) {
+        return Ok(Vec::new());
     }
-    Ok(compiled)
+    let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+    let column_checks = schema.columns.iter().filter_map(|c| {
+        c.check_expr
+            .as_ref()
+            .map(|text| (Some(c.name.as_str()), text))
+    });
+    let table_checks = schema.table_checks.iter().map(|text| (None, text));
+    column_checks
+        .chain(table_checks)
+        .map(|(column, text)| compile_check(schema, &columns, column, text))
+        .collect()
 }
 
-/// Compile the CHECK constraint of column `idx`, if it has one
-fn compile_column_check(schema: &Schema, idx: usize) -> Result<Option<CompiledCheck>> {
-    let c = &schema.columns[idx];
-    let Some(check_expr) = c.check_expr.as_ref() else {
-        return Ok(None);
-    };
-    let expr = parse_stored_expression(check_expr, "CHECK", &c.name)?;
-    let columns = vec![c.name.to_string()];
-    let program = super::expression::compile_expression(&expr, &columns).map_err(|e| {
-        Error::internal(format!(
-            "CHECK constraint on column '{}' failed to compile: {}",
-            c.name, e
-        ))
-    })?;
-    Ok(Some((
-        idx,
-        SmartString::new(&c.name),
-        SmartString::new(check_expr),
+/// The CHECK constraints of `checks` a write of `columns` can change the
+/// answer of: those reading one of them, and every volatile one
+pub(crate) fn checks_reading(
+    mut checks: Vec<CompiledCheck>,
+    columns: impl Fn(usize) -> bool,
+) -> Vec<CompiledCheck> {
+    checks.retain(|check| check.volatile || check.reads.iter().any(|&c| columns(c)));
+    checks
+}
+
+fn compile_check(
+    schema: &Schema,
+    columns: &[String],
+    column: Option<&str>,
+    text: &str,
+) -> Result<CompiledCheck> {
+    let owner = column.unwrap_or(&schema.table_name);
+    let expr = parse_stored_expression(text, "CHECK", owner)?;
+    let program = super::expression::compile_expression(&expr, columns)
+        .map_err(|e| Error::internal(format!("the CHECK on {owner} failed to compile: {e}")))?;
+    let binding = super::expression::CompileContext::with_global_registry(columns);
+    let mut reads = SmallVec::new();
+    super::utils::visit_column_refs(&expr, &mut |reference| {
+        let read = binding.reference(reference).and_then(|r| r.row_column());
+        if let Some(i) = read.map(usize::from) {
+            if !reads.contains(&i) {
+                reads.push(i);
+            }
+        }
+    });
+    let registry = crate::functions::registry::global_registry();
+    Ok(CompiledCheck {
+        column: column.map(SmartString::from),
+        table: SmartString::from(schema.table_name.as_str()),
+        text: SmartString::from(text),
+        reads,
+        volatile: super::volatility::expression_volatility(&expr, registry)
+            != crate::functions::Volatility::Fixed,
         program,
-    )))
+    })
 }
 
-/// Run one compiled CHECK against `value`, held in `scratch`, a one-column
-/// row built on the statement's first CHECK and reused row to row. The
-/// CHECK runs on a NULL value too; a NULL result passes, per the standard.
-pub(crate) fn run_check_program(
+/// Run `check` over the row it guards. A NULL result passes, per the standard
+pub(crate) fn run_check(
     vm: &mut super::expression::ExprVM,
-    scratch: &mut Option<Row>,
-    program: &super::expression::SharedProgram,
-    col_name: &str,
-    check_expr: &str,
-    value: &Value,
+    check: &CompiledCheck,
+    row: &Row,
 ) -> Result<()> {
-    let scratch = scratch.get_or_insert_with(|| Row::from_values(vec![Value::null_unknown()]));
-    scratch.set(0, value.clone())?;
-    let check_ctx = super::expression::ExecuteContext::new(scratch);
-    let result = vm.execute_cow(program, &check_ctx)?;
-    let is_truthy = match &result {
+    let result = vm.execute_cow(&check.program, &super::expression::ExecuteContext::new(row))?;
+    let passes = match &result {
         Value::Boolean(b) => *b,
-        Value::Null(_) => true, // NULL passes CHECK (SQL standard)
+        Value::Null(_) => true,
         Value::Integer(i) => *i != 0,
         Value::Float(f) => *f != 0.0,
         Value::Text(t) => !t.is_empty(),
         _ => true, // Timestamp, Extension, etc. are truthy
     };
-    if !is_truthy {
-        return Err(Error::CheckConstraintViolation {
-            column: col_name.to_string(),
-            expression: check_expr.to_string(),
-        });
+    if passes {
+        return Ok(());
     }
-    Ok(())
+    Err(match &check.column {
+        Some(column) => Error::CheckConstraintViolation {
+            column: column.to_string(),
+            expression: check.text.to_string(),
+        },
+        None => Error::TableCheckViolation {
+            table: check.table.to_string(),
+            expression: check.text.to_string(),
+        },
+    })
+}
+
+/// `run_check` over a row still held as `values`, copying the columns the
+/// check reads into `scratch`, a row of the table's width built on the
+/// statement's first CHECK and reused row to row
+pub(crate) fn run_check_on_values(
+    vm: &mut super::expression::ExprVM,
+    scratch: &mut Option<Row>,
+    check: &CompiledCheck,
+    values: &[Value],
+) -> Result<()> {
+    let scratch =
+        scratch.get_or_insert_with(|| Row::from_values(vec![Value::null_unknown(); values.len()]));
+    for &column in &check.reads {
+        scratch.set(column, values[column].clone())?;
+    }
+    run_check(vm, check, scratch)
 }
 
 impl Executor {
@@ -850,15 +883,8 @@ impl Executor {
                 }
 
                 // Validate CHECK constraints (must happen before insert)
-                for (col_idx, col_name, check_expr, program) in check_programs.iter() {
-                    run_check_program(
-                        &mut check_vm,
-                        &mut check_row,
-                        program,
-                        col_name,
-                        check_expr,
-                        &row_values[*col_idx],
-                    )?;
+                for check in check_programs.iter() {
+                    run_check_on_values(&mut check_vm, &mut check_row, check, &row_values)?;
                 }
 
                 // Save row_values for ON DUPLICATE KEY UPDATE before moving into Row
@@ -1148,15 +1174,8 @@ impl Executor {
                 }
 
                 // Validate CHECK constraints (must happen before insert)
-                for (col_idx, col_name, check_expr, program) in check_programs.iter() {
-                    run_check_program(
-                        &mut check_vm,
-                        &mut check_row,
-                        program,
-                        col_name,
-                        check_expr,
-                        &row_values[*col_idx],
-                    )?;
+                for check in check_programs.iter() {
+                    run_check_on_values(&mut check_vm, &mut check_row, check, &row_values)?;
                 }
 
                 // Create row from values (ON DUPLICATE KEY needs values for error handling)
@@ -1361,15 +1380,8 @@ impl Executor {
                 }
 
                 // Validate CHECK constraints (only iterates columns that have CHECK constraints)
-                for (col_idx, col_name, check_expr, program) in check_programs.iter() {
-                    run_check_program(
-                        &mut check_vm,
-                        &mut check_row,
-                        program,
-                        col_name,
-                        check_expr,
-                        &row_values[*col_idx],
-                    )?;
+                for check in check_programs.iter() {
+                    run_check_on_values(&mut check_vm, &mut check_row, check, &row_values)?;
                 }
 
                 // Insert row
@@ -1749,15 +1761,8 @@ impl Executor {
 
                 // Validate CHECK constraints via the pre-compiled programs
                 // (NULL passes per the SQL standard)
-                for (col_idx, col_name, check_expr, program) in compiled_checks.iter() {
-                    run_check_program(
-                        &mut vm,
-                        &mut check_row,
-                        program,
-                        col_name,
-                        check_expr,
-                        &row_values[*col_idx],
-                    )?;
+                for check in compiled_checks.iter() {
+                    run_check_on_values(&mut vm, &mut check_row, check, &row_values)?;
                 }
 
                 // Insert row
@@ -1844,15 +1849,8 @@ impl Executor {
                 }
 
                 // Validate CHECK constraints via the pre-compiled programs
-                for (col_idx, col_name, check_expr, program) in compiled_checks.iter() {
-                    run_check_program(
-                        &mut vm,
-                        &mut check_row,
-                        program,
-                        col_name,
-                        check_expr,
-                        &row_values[*col_idx],
-                    )?;
+                for check in compiled_checks.iter() {
+                    run_check_on_values(&mut vm, &mut check_row, check, &row_values)?;
                 }
 
                 // Insert row
@@ -2484,6 +2482,11 @@ impl Executor {
             }
             drop(scanner);
 
+            let checks = checks_reading(compile_check_programs(schema)?, |c| {
+                update_indices.iter().any(|(idx, _, _, _, _)| *idx == c)
+            });
+            let mut vm = super::expression::ExprVM::new();
+
             // Now update using precomputed values
             let mut setter = |mut row: Row| -> Result<(Row, bool)> {
                 let pk_value = row.get(pk_idx).cloned().unwrap_or(Value::null_unknown());
@@ -2501,6 +2504,9 @@ impl Executor {
 
                     for (idx, new_value) in updates {
                         let _ = row.set(*idx, new_value.clone());
+                    }
+                    for check in &checks {
+                        run_check(&mut vm, check, &row)?;
                     }
 
                     // Track referenced column changes for FK cascade
@@ -2585,17 +2591,13 @@ impl Executor {
                 .map(|(idx, _, _, _)| schema.columns[*idx].name.to_string())
                 .collect();
 
-            // The CHECK constraints of the updated columns, compiled once
-            let mut compiled_check_exprs: Vec<CompiledCheck> = Vec::new();
-            for (idx, _, _, _) in &compiled_updates {
-                if let Some(check) = compile_column_check(schema, *idx)? {
-                    compiled_check_exprs.push(check);
-                }
-            }
+            // The CHECK constraints reading an updated column, compiled once
+            let compiled_check_exprs = checks_reading(compile_check_programs(schema)?, |c| {
+                compiled_updates.iter().any(|(idx, _, _, _)| *idx == c)
+            });
 
             // Create VM once and reuse for all rows
             let mut vm = ExprVM::new();
-            let mut check_row = None;
             // Extract params before the closure so they can be captured
             let params = ctx.params();
             let named_params = ctx.named_params();
@@ -2718,18 +2720,10 @@ impl Executor {
                     let _ = row.set(idx, new_value);
                 }
 
-                // The CHECK of each updated column, by the one check every write runs
+                // Each CHECK an updated column reads, over the row as it now is
                 if changed {
-                    for (col_idx, col_name, check_expr, program) in &compiled_check_exprs {
-                        let value = row.get(*col_idx).unwrap_or(&crate::core::NULL_VALUE);
-                        run_check_program(
-                            &mut vm,
-                            &mut check_row,
-                            program,
-                            col_name,
-                            check_expr,
-                            value,
-                        )?;
+                    for check in &compiled_check_exprs {
+                        run_check(&mut vm, check, &row)?;
                     }
                 }
 
@@ -3516,15 +3510,11 @@ impl Executor {
             None => None,
         };
 
-        // Compile CHECK constraints for columns being updated.
-        // Store as SharedProgram (not ExpressionEval) so the struct can be shared
-        // immutably — the VM used to execute the program lives in the setter closure.
-        let mut compiled_checks = Vec::new();
-        for (idx, _, _, _) in &update_specs {
-            if let Some(check) = compile_column_check(schema, *idx)? {
-                compiled_checks.push(check);
-            }
-        }
+        // The CHECK constraints reading an updated column, shared immutably:
+        // the VM that runs them lives in the setter closure
+        let compiled_checks = checks_reading(compile_check_programs(schema)?, |c| {
+            update_specs.iter().any(|(idx, _, _, _)| *idx == c)
+        });
 
         Ok(CompiledUpsert {
             compiled_updates,
@@ -3605,7 +3595,6 @@ impl Executor {
 
         // Create VM once and reuse for all rows
         let mut vm = ExprVM::new();
-        let mut check_row = None;
 
         // Extract params from execution context for use in the setter closure
         let params = ctx.params();
@@ -3669,23 +3658,15 @@ impl Executor {
                 updates
             };
 
-            // Apply updates and validate CHECK constraints on each new value
+            // Apply the updates, then each CHECK an updated column reads over the row
             let changed = !updates_to_apply.is_empty();
             for (idx, new_value) in updates_to_apply {
-                // Validate CHECK constraint using pre-compiled program via existing VM
-                for (check_idx, col_name, check_expr, program) in &effective.compiled_checks {
-                    if *check_idx == idx {
-                        run_check_program(
-                            &mut vm,
-                            &mut check_row,
-                            program,
-                            col_name,
-                            check_expr,
-                            &new_value,
-                        )?;
-                    }
-                }
                 let _ = row.set(idx, new_value);
+            }
+            if changed {
+                for check in &effective.compiled_checks {
+                    run_check(&mut vm, check, &row)?;
+                }
             }
 
             // Capture post-update row for RETURNING

@@ -164,6 +164,93 @@ impl fmt::Display for Expression {
 }
 
 impl Expression {
+    /// Replaces each name, bare or qualified, that `binds` says reads the
+    /// renamed column with the bare name `new`. A subquery is a scope of its
+    /// own and keeps its names; every variant is matched, so a new one has
+    /// to say what it reads
+    pub fn rename_references(&mut self, binds: &dyn Fn(&Expression) -> bool, new: &str) {
+        let each = |exprs: &mut [&mut Expression]| {
+            for expr in exprs {
+                expr.rename_references(binds, new);
+            }
+        };
+        match self {
+            Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => {
+                if binds(self) {
+                    *self = Expression::Identifier(Identifier {
+                        value: SmartString::from(new),
+                        value_lower: SmartString::from(new.to_lowercase()),
+                        position: self.position(),
+                        quoted: false,
+                    });
+                }
+            }
+            Expression::Prefix(e) => e.right.rename_references(binds, new),
+            Expression::Infix(e) => each(&mut [&mut *e.left, &mut *e.right]),
+            Expression::List(e) => e
+                .elements
+                .iter_mut()
+                .for_each(|e| e.rename_references(binds, new)),
+            Expression::ExpressionList(e) => e
+                .expressions
+                .iter_mut()
+                .for_each(|e| e.rename_references(binds, new)),
+            Expression::Distinct(e) => e.expr.rename_references(binds, new),
+            Expression::AllAny(e) => e.left.rename_references(binds, new),
+            Expression::In(e) => each(&mut [&mut *e.left, &mut *e.right]),
+            Expression::InHashSet(e) => e.column.rename_references(binds, new),
+            Expression::QuantifiedSet(e) => e.left.rename_references(binds, new),
+            Expression::Between(e) => each(&mut [&mut *e.expr, &mut *e.lower, &mut *e.upper]),
+            Expression::Like(e) => {
+                each(&mut [&mut *e.left, &mut *e.pattern]);
+                if let Some(escape) = e.escape.as_deref_mut() {
+                    escape.rename_references(binds, new);
+                }
+            }
+            Expression::Case(e) => {
+                if let Some(value) = e.value.as_deref_mut() {
+                    value.rename_references(binds, new);
+                }
+                for when in &mut e.when_clauses {
+                    each(&mut [&mut when.condition, &mut when.then_result]);
+                }
+                if let Some(other) = e.else_value.as_deref_mut() {
+                    other.rename_references(binds, new);
+                }
+            }
+            Expression::Cast(e) => e.expr.rename_references(binds, new),
+            Expression::FunctionCall(call) => call.rename_references(binds, new),
+            Expression::Aliased(e) => e.expression.rename_references(binds, new),
+            Expression::Window(e) => {
+                e.function.rename_references(binds, new);
+                e.partition_by
+                    .iter_mut()
+                    .for_each(|e| e.rename_references(binds, new));
+                e.order_by
+                    .iter_mut()
+                    .for_each(|o| o.expression.rename_references(binds, new));
+            }
+            Expression::IntegerLiteral(_)
+            | Expression::FloatLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::IntervalLiteral(_)
+            | Expression::Parameter(_)
+            | Expression::Exists(_)
+            | Expression::ScalarSubquery(_)
+            | Expression::TableSource(_)
+            | Expression::JoinSource(_)
+            | Expression::SubquerySource(_)
+            | Expression::ValuesSource(_)
+            | Expression::CteReference(_)
+            | Expression::FunctionTableSource(_)
+            | Expression::Star(_)
+            | Expression::QualifiedStar(_)
+            | Expression::Default(_) => {}
+        }
+    }
+
     /// Get the position of this expression
     pub fn position(&self) -> Position {
         match self {
@@ -1015,6 +1102,21 @@ pub struct FunctionCall {
     pub order_by: Vec<OrderByExpression>,
     /// FILTER clause for aggregate functions (e.g., COUNT(*) FILTER (WHERE condition))
     pub filter: Option<Box<Expression>>,
+}
+
+impl FunctionCall {
+    /// `Expression::rename_references` over the call's arguments, FILTER and ORDER BY
+    pub fn rename_references(&mut self, binds: &dyn Fn(&Expression) -> bool, new: &str) {
+        self.arguments
+            .iter_mut()
+            .for_each(|e| e.rename_references(binds, new));
+        if let Some(filter) = self.filter.as_deref_mut() {
+            filter.rename_references(binds, new);
+        }
+        self.order_by
+            .iter_mut()
+            .for_each(|o| o.expression.rename_references(binds, new));
+    }
 }
 
 impl fmt::Display for FunctionCall {

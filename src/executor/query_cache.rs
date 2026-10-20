@@ -213,18 +213,10 @@ pub struct CompiledInsert {
     /// Constant default values for all columns (null_unknown when the
     /// column has no default or a per-row program)
     pub default_row_template: Arc<Vec<crate::core::Value>>,
-    /// CHECK constraints, pre-compiled once per plan:
-    /// (column_idx, column_name, check_expr, program). Re-parsing the
+    /// CHECK constraints, pre-compiled once per plan. Re-parsing the
     /// check SQL per row costs a tokenizer plus parser run per inserted
-    /// row per constrained column.
-    pub compiled_checks: Arc<
-        Vec<(
-            usize,
-            SmartString,
-            SmartString,
-            crate::executor::expression::SharedProgram,
-        )>,
-    >,
+    /// row per constraint.
+    pub(crate) compiled_checks: Arc<Vec<crate::executor::dml::CompiledCheck>>,
     /// Schema epoch at compilation time (for fast cache invalidation)
     pub cached_epoch: u64,
     /// The table instance and layout the indices and templates describe

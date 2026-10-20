@@ -165,6 +165,10 @@ pub enum Error {
     #[error("CHECK constraint failed for column {column}: {expression}")]
     CheckConstraintViolation { column: String, expression: String },
 
+    /// A table CHECK constraint violation
+    #[error("CHECK constraint failed for table {table}: {expression}")]
+    TableCheckViolation { table: String, expression: String },
+
     /// Foreign key constraint violation
     #[error("foreign key constraint violation: column '{column}' in table '{table}' references '{ref_table}({ref_column})' — {detail}")]
     ForeignKeyViolation {

@@ -317,57 +317,26 @@ fn test_returning() {
 
 #[test]
 fn test_column_default() {
-    // Whether a DEFAULT may hold a subquery is open (plan 5.9)
+    // A DEFAULT may not hold a subquery: CREATE refuses it (plan 5.3)
     let db = setup("site_default");
-    db.execute(
-        "CREATE TABLE d (id INTEGER PRIMARY KEY, v INTEGER DEFAULT (SELECT MAX(x) FROM u))",
-        (),
-    )
-    .unwrap();
-    db.execute("INSERT INTO d VALUES (1, 7)", ())
-        .expect("a row that names the column takes no default");
-    let sql = "INSERT INTO d (id) VALUES (2)";
-    let got = db
-        .execute(sql, ())
-        .map_err(|e| e.to_string())
-        .and_then(|_| rows(&db, "SELECT v FROM d WHERE id = 2"));
-    if got.is_err() {
-        assert_eq!(
-            rows(&db, "SELECT COUNT(*) FROM d"),
-            Ok(vec![vec!["1".to_string()]]),
-            "{sql} failed but stored a row"
-        );
-    }
-    holds(
-        Fails("step 5, rule open (5.9)"),
-        got,
-        &vec![vec!["3".to_string()]],
-        "DEFAULT (SELECT MAX(x) FROM u)",
+    let sql = "CREATE TABLE d (id INTEGER PRIMARY KEY, v INTEGER DEFAULT (SELECT MAX(x) FROM u))";
+    assert!(db.execute(sql, ()).is_err(), "{sql} was accepted");
+    assert!(
+        db.execute("SELECT * FROM d", ()).is_err(),
+        "{sql} failed but created d"
     );
 }
 
 #[test]
 fn test_check() {
-    // Whether a CHECK may hold a subquery is open (plan 5.9)
+    // A CHECK may not hold a subquery: CREATE refuses it (plan 5.3)
     let db = setup("site_check");
-    db.execute(
-        "CREATE TABLE c (id INTEGER PRIMARY KEY, w INTEGER CHECK (w < (SELECT MAX(x) FROM u)))",
-        (),
-    )
-    .unwrap();
+    let sql =
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, w INTEGER CHECK (w < (SELECT MAX(x) FROM u)))";
+    assert!(db.execute(sql, ()).is_err(), "{sql} was accepted");
     assert!(
-        db.execute("INSERT INTO c VALUES (1, 10)", ()).is_err(),
-        "a row breaking CHECK (w < (SELECT MAX(x) FROM u)) was stored"
-    );
-    let got = db
-        .execute("INSERT INTO c VALUES (2, 1)", ())
-        .map_err(|e| e.to_string())
-        .and_then(|_| rows(&db, "SELECT id FROM c ORDER BY id"));
-    holds(
-        Fails("step 5, rule open (5.9)"),
-        got,
-        &vec![vec!["2".to_string()]],
-        "a row keeping CHECK (w < (SELECT MAX(x) FROM u))",
+        db.execute("SELECT * FROM c", ()).is_err(),
+        "{sql} failed but created c"
     );
 }
 

@@ -225,6 +225,9 @@ pub struct Schema {
     /// table is not clustered
     pub cluster_key: Vec<usize>,
 
+    /// The table's own CHECK constraints, each an expression over the row
+    pub table_checks: Vec<String>,
+
     /// Creation timestamp
     pub created_at: DateTime<Utc>,
 
@@ -283,6 +286,7 @@ impl Clone for Schema {
             columns: self.columns.clone(),
             foreign_keys: self.foreign_keys.clone(),
             cluster_key: self.cluster_key.clone(),
+            table_checks: self.table_checks.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
             column_names_cache,
@@ -300,6 +304,7 @@ impl PartialEq for Schema {
             && self.columns == other.columns
             && self.foreign_keys == other.foreign_keys
             && self.cluster_key == other.cluster_key
+            && self.table_checks == other.table_checks
             && self.created_at == other.created_at
             && self.updated_at == other.updated_at
     }
@@ -367,6 +372,7 @@ impl Schema {
             columns,
             foreign_keys,
             cluster_key: Vec::new(),
+            table_checks: Vec::new(),
             created_at: now,
             updated_at: now,
             column_names_cache,
@@ -448,6 +454,7 @@ impl Schema {
             columns,
             foreign_keys,
             cluster_key: Vec::new(),
+            table_checks: Vec::new(),
             created_at,
             updated_at,
             column_names_cache,
@@ -763,6 +770,65 @@ impl Schema {
             .get_column_index(old_name)
             .ok_or_else(|| Error::ColumnNotFound(old_name.to_string()))?;
 
+        // Every CHECK reads the row by name: each name bound to the column
+        // follows it, and every name must bind as before once renamed
+        use crate::executor::expr_key::ExprKey;
+        use crate::executor::expression::CompileContext;
+        let before: Vec<String> = self.columns.iter().map(|c| c.name.clone()).collect();
+        let mut after = before.clone();
+        after[idx] = new_name.clone();
+        let (old_binding, new_binding) = (
+            CompileContext::with_global_registry(&before),
+            CompileContext::with_global_registry(&after),
+        );
+        let bound = |binding: &CompileContext, expr: &crate::parser::ast::Expression| {
+            let mut columns = Vec::new();
+            crate::executor::utils::visit_column_refs(expr, &mut |e| {
+                columns.push(binding.reference(e).and_then(|r| r.row_column()));
+            });
+            columns
+        };
+        let renamed = |text: &String| -> Result<Option<String>> {
+            let parse = crate::parser::parse_stored_expression;
+            let mut expr = parse(text, "CHECK", &self.table_name)?;
+            let reads = bound(&old_binding, &expr);
+            let binds = |e: &crate::parser::ast::Expression| {
+                old_binding.reference(e).and_then(|r| r.row_column()) == Some(idx as u16)
+            };
+            expr.rename_references(&binds, &new_name);
+            let rewritten = expr.to_string();
+            // The stored text must read back as the same tree, binding as before
+            let same = parse(&rewritten, "CHECK", &self.table_name).is_ok_and(|reread| {
+                ExprKey::of(&reread) == ExprKey::of(&expr) && bound(&new_binding, &reread) == reads
+            });
+            if !same {
+                return Err(Error::invalid_argument(format!(
+                    "cannot rename {old_name} to {new_name}: the CHECK {text} would not read back as written"
+                )));
+            }
+            Ok((rewritten != *text).then_some(rewritten))
+        };
+        let columns = self
+            .columns
+            .iter()
+            .map(|c| c.check_expr.as_ref().map(renamed).transpose())
+            .collect::<Result<Vec<_>>>()?;
+        let table = self
+            .table_checks
+            .iter()
+            .map(&renamed)
+            .collect::<Result<Vec<_>>>()?;
+        for (column, check) in self.columns.iter_mut().zip(columns) {
+            if let Some(check) = check.flatten() {
+                column.check_expr = Some(check);
+            }
+        }
+        for (stored, check) in self.table_checks.iter_mut().zip(table) {
+            if let Some(check) = check {
+                *stored = check;
+            }
+        }
+
         self.columns[idx].name_lower = new_name.to_lowercase();
         self.columns[idx].name = new_name;
         self.mark_updated();
@@ -826,6 +892,7 @@ pub struct SchemaBuilder {
     columns: Vec<SchemaColumn>,
     foreign_keys: Vec<ForeignKeyConstraint>,
     cluster_key: Vec<usize>,
+    table_checks: Vec<String>,
 }
 
 impl SchemaBuilder {
@@ -836,6 +903,7 @@ impl SchemaBuilder {
             columns: Vec::new(),
             foreign_keys: Vec::new(),
             cluster_key: Vec::new(),
+            table_checks: Vec::new(),
         }
     }
 
@@ -933,10 +1001,17 @@ impl SchemaBuilder {
         self
     }
 
+    /// Add a table CHECK constraint, the text of an expression over the row
+    pub fn add_table_check(mut self, check: String) -> Self {
+        self.table_checks.push(check);
+        self
+    }
+
     pub fn build(self) -> Schema {
         let mut schema =
             Schema::with_foreign_keys(self.table_name, self.columns, self.foreign_keys);
         schema.cluster_key = self.cluster_key;
+        schema.table_checks = self.table_checks;
         schema
     }
 }

@@ -132,6 +132,37 @@ fn validate_fk_reference(
     })
 }
 
+/// A DEFAULT or CHECK of `owner` is one value of one row: a subquery, an
+/// aggregate or a window function in it is refused. A CHECK reads the row
+/// through `columns`, and one naming a column the table lacks is refused too
+fn constraint_expression(
+    kind: &str,
+    owner: &str,
+    expr: &Expression,
+    columns: Option<&[String]>,
+) -> Result<()> {
+    let aggregate = std::cell::Cell::new(false);
+    let one_row = super::utils::visit_column_refs_outside(
+        expr,
+        &|e| {
+            let call = matches!(e, Expression::FunctionCall(f) if super::utils::is_aggregate_function(&f.function));
+            aggregate.set(aggregate.get() || call);
+            call
+        },
+        &mut |_| {},
+    );
+    if !one_row || aggregate.get() {
+        return Err(Error::invalid_argument(format!(
+            "the {kind} of {owner} may not hold a subquery, an aggregate or a window function: {expr}"
+        )));
+    }
+    if let Some(columns) = columns {
+        super::expression::compile_expression(expr, columns)
+            .map_err(|e| Error::invalid_argument(format!("the {kind} of {owner}: {e}")))?;
+    }
+    Ok(())
+}
+
 use super::context::ExecutionContext;
 use super::result::ExecResult;
 use super::Executor;
@@ -174,6 +205,12 @@ impl Executor {
 
         // Build schema from column definitions
         let mut schema_builder = SchemaBuilder::new(table_name.as_str());
+        // The row a CHECK reads
+        let column_names: Vec<String> = stmt
+            .columns
+            .iter()
+            .map(|c| c.name.value.to_string())
+            .collect();
 
         // Collect columns with UNIQUE constraints to create indexes after table creation
         let mut unique_columns: Vec<String> = Vec::new();
@@ -234,20 +271,28 @@ impl Executor {
             // Extract DEFAULT expression
             let default_expr = col_def.constraints.iter().find_map(|c| {
                 if let ColumnConstraint::Default(expr) = c {
-                    Some(format!("{}", expr))
+                    Some(expr)
                 } else {
                     None
                 }
             });
+            if let Some(expr) = default_expr {
+                constraint_expression("DEFAULT", col_name, expr, None)?;
+            }
+            let default_expr = default_expr.map(|expr| format!("{}", expr));
 
-            // Extract CHECK expression
+            // Extract CHECK expression, which reads the row
             let check_expr = col_def.constraints.iter().find_map(|c| {
                 if let ColumnConstraint::Check(expr) = c {
-                    Some(format!("{}", expr))
+                    Some(expr)
                 } else {
                     None
                 }
             });
+            if let Some(expr) = check_expr {
+                constraint_expression("CHECK", col_name, expr, Some(&column_names))?;
+            }
+            let check_expr = check_expr.map(|expr| format!("{}", expr));
 
             // Use add_with_constraints to include DEFAULT and CHECK
             schema_builder = schema_builder.add_with_constraints(
@@ -327,6 +372,10 @@ impl Executor {
                         fk.on_update,
                     )?;
                     schema_builder = schema_builder.add_foreign_key(fk_constraint);
+                }
+                TableConstraint::Check(expr) => {
+                    constraint_expression("CHECK", table_name, expr, Some(&column_names))?;
+                    schema_builder = schema_builder.add_table_check(expr.to_string());
                 }
                 _ => {}
             }
@@ -1008,11 +1057,15 @@ impl Executor {
                     // Extract default expression if present
                     let default_expr = col_def.constraints.iter().find_map(|c| {
                         if let ColumnConstraint::Default(expr) = c {
-                            Some(expr.to_string())
+                            Some(expr)
                         } else {
                             None
                         }
                     });
+                    if let Some(expr) = default_expr {
+                        constraint_expression("DEFAULT", &col_def.name.value, expr, None)?;
+                    }
+                    let default_expr = default_expr.map(|expr| expr.to_string());
 
                     // Pre-compute the default value for schema evolution (backfilling existing rows)
                     // The default_expr string is also stored for new INSERTs
@@ -1087,6 +1140,21 @@ impl Executor {
             }
             AlterTableOperation::DropColumn => {
                 if let Some(ref col_name) = stmt.column_name {
+                    // A column another CHECK reads stays; its own CHECK goes with it
+                    let schema = self.engine.get_table_schema(table_name)?;
+                    if let Some(idx) = schema.get_column_index(&col_name.value) {
+                        let own = schema.columns[idx].name.as_str();
+                        let checks = super::dml::compile_check_programs(&schema)?;
+                        if let Some(check) = checks.iter().find(|check| {
+                            check.reads.contains(&idx) && check.column.as_deref() != Some(own)
+                        }) {
+                            let owner = check.column.as_deref().unwrap_or(table_name);
+                            return Err(Error::invalid_argument(format!(
+                                "cannot drop column {own}: the CHECK of {owner} reads it: {}",
+                                check.text
+                            )));
+                        }
+                    }
                     let mut change = self.engine.begin_column_change(table_name)?;
                     change.mark_changed();
                     let dropped =

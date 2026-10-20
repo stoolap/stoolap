@@ -296,15 +296,8 @@ impl Executor {
             }
 
             // Validate CHECK constraints with the programs compiled once above
-            for (col_idx, col_name, check_expr, program) in check_programs {
-                super::dml::run_check_program(
-                    &mut check_vm,
-                    &mut check_row,
-                    program,
-                    col_name,
-                    check_expr,
-                    &row_values[*col_idx],
-                )?;
+            for check in check_programs {
+                super::dml::run_check_on_values(&mut check_vm, &mut check_row, check, &row_values)?;
             }
 
             let row = Row::from_values(row_values);
@@ -462,15 +455,8 @@ impl Executor {
         }
 
         defaults.fill(check_vm, given, &mut row_values)?;
-        for (col_idx, col_name, check_expr, program) in check_programs {
-            super::dml::run_check_program(
-                check_vm,
-                check_row,
-                program,
-                col_name,
-                check_expr,
-                &row_values[*col_idx],
-            )?;
+        for check in check_programs {
+            super::dml::run_check_on_values(check_vm, check_row, check, &row_values)?;
         }
 
         let row = Row::from_values(row_values);

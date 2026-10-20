@@ -173,6 +173,27 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>, ParseErrors> {
     Ok(program.statements)
 }
 
+/// The expression a column's stored DEFAULT or CHECK text holds; a text
+/// that does not parse to one expression is an error, never a dropped one
+pub(crate) fn parse_stored_expression(
+    text: &str,
+    kind: &str,
+    column: &str,
+) -> crate::core::Result<Expression> {
+    use crate::core::Error;
+    let not_one = || {
+        Error::parse(format!(
+            "the {kind} of {column} is not an expression: {text}"
+        ))
+    };
+    let statements = parse_sql(&format!("SELECT {}", text))
+        .map_err(|e| Error::parse(format!("the {kind} of {column} does not parse: {e}")))?;
+    match statements.into_iter().next() {
+        Some(Statement::Select(select)) => select.columns.into_iter().next().ok_or_else(not_one),
+        _ => Err(not_one()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

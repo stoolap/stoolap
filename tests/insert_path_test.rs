@@ -130,20 +130,12 @@ fn volatile_defaults_evaluate_per_row() {
 }
 
 #[test]
-fn uncompilable_check_still_rejects_inserts() {
+fn uncompilable_check_is_refused_at_create() {
     let db = Database::open("memory://insert_path_badcheck").unwrap();
-    // The check references a column that cannot resolve in the check's
-    // single-column context; DDL does not validate it
-    db.execute(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER CHECK (nosuch > 0))",
-        (),
-    )
-    .unwrap();
-
-    // The old per-row path errored on every insert; a compile failure must
-    // not silently disable the constraint
-    let stmt = db.prepare("INSERT INTO t VALUES ($1, $2)").unwrap();
-    assert!(stmt.execute((1i64, 5i64)).is_err());
-    let n: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
-    assert_eq!(n, 0);
+    let sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER CHECK (nosuch > 0))";
+    assert!(db.execute(sql, ()).is_err(), "{sql} was accepted");
+    assert!(
+        db.execute("SELECT * FROM t", ()).is_err(),
+        "{sql} failed but created t"
+    );
 }

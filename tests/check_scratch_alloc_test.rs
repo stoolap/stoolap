@@ -79,6 +79,44 @@ fn check_cost(rows: usize) -> (isize, isize) {
     (insert[1] - insert[0], update[1] - update[2])
 }
 
+/// Allocations of a transaction INSERT, a general UPDATE and a PK UPDATE
+/// on a table of `width` columns without a CHECK
+fn unchecked_cost(width: usize) -> [usize; 3] {
+    let db = Database::open(&format!("memory://check_scratch_unchecked_{width}")).unwrap();
+    let columns: Vec<String> = (0..width).map(|i| format!("c{i} INTEGER")).collect();
+    db.execute(
+        &format!(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, {})",
+            columns.join(", ")
+        ),
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO t (id, c0) VALUES (1, 1)", ())
+        .unwrap();
+    let mut cost = [0; 3];
+    for _ in 0..2 {
+        let mut tx = db.begin().unwrap();
+        let before = CALLS.with(Cell::get);
+        tx.execute("INSERT INTO t (id, c0) VALUES (2, 2)", ())
+            .unwrap();
+        cost[0] = CALLS.with(Cell::get) - before;
+        tx.rollback().unwrap();
+        cost[1] = allocations(&db, "UPDATE t SET c0 = c0 + 1 WHERE c0 > 0");
+        cost[2] = allocations(&db, "UPDATE t SET c0 = 5 WHERE id = 1");
+    }
+    cost
+}
+
+#[test]
+fn a_table_without_a_check_pays_nothing_per_column_for_checks() {
+    assert_eq!(
+        unchecked_cost(2),
+        unchecked_cost(42),
+        "allocations of [tx INSERT, UPDATE, PK UPDATE] grew with the column count"
+    );
+}
+
 #[test]
 fn a_check_allocates_per_statement_not_per_row() {
     let (insert_few, update_few) = check_cost(10);

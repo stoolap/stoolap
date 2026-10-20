@@ -18,7 +18,7 @@ ALTER TABLE users ADD COLUMN last_login TIMESTAMP;
 ALTER TABLE users ADD COLUMN score INTEGER;
 ```
 
-Existing rows receive the column's DEFAULT, or NULL without one, whether they are still in memory or already in a frozen volume. The new column takes NOT NULL and DEFAULT; a CHECK, UNIQUE, PRIMARY KEY, AUTO_INCREMENT or REFERENCES constraint is refused with an error, and the table is left unchanged. Subsequent inserts can provide values for the new column:
+Existing rows receive the column's DEFAULT, or NULL without one, whether they are still in memory or already in a frozen volume. The new column takes NOT NULL and DEFAULT; a CHECK, UNIQUE, PRIMARY KEY, AUTO_INCREMENT or REFERENCES constraint is refused with an error, and so is a DEFAULT holding a subquery, an aggregate or a window function; the table is left unchanged. Subsequent inserts can provide values for the new column:
 
 ```sql
 INSERT INTO users (id, name, score) VALUES (1, 'Alice', 100);
@@ -32,7 +32,7 @@ Remove a column from a table:
 ALTER TABLE users DROP COLUMN last_login;
 ```
 
-The column data is physically removed from the rows in memory at once; a frozen volume drops it at its next compaction. Queries referencing the dropped column will return an error.
+The column data is physically removed from the rows in memory at once; a frozen volume drops it at its next compaction. Queries referencing the dropped column will return an error. A column that another column's CHECK or a table CHECK reads cannot be dropped: the statement fails and names the CHECK.
 
 ## RENAME COLUMN
 
@@ -42,7 +42,7 @@ Rename an existing column:
 ALTER TABLE users RENAME COLUMN old_name TO new_name;
 ```
 
-Data is preserved. The old name is no longer accessible after the rename.
+Data is preserved. The old name is no longer accessible after the rename. Every CHECK that reads the column is rewritten to the new name. A rename is refused when a CHECK would no longer read back as written: when the new name, written into the CHECK, would read as a different expression (`"2 + x"` reads as an addition) or another column, or when another name in a CHECK would then read a different column.
 
 ## MODIFY COLUMN
 

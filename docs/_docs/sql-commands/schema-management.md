@@ -35,7 +35,7 @@ When creating tables, you can specify the following constraints:
 - **NOT NULL** - Enforce that a column cannot contain NULL values
 - **UNIQUE** - Enforce uniqueness on a column (also available via `CREATE UNIQUE INDEX`)
 - **DEFAULT** - Specify a default value for a column
-- **CHECK** - Define a check constraint expression
+- **CHECK** - Define a check constraint expression over the row, on a column or on the table (see [CHECK]({% link _docs/data-types/data-types.md %}#check))
 - **REFERENCES** - Define a foreign key constraint referencing another table (see [Foreign Keys]({% link _docs/sql-features/foreign-keys.md %}))
 
 ```sql
