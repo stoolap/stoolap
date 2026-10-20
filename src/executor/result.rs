@@ -963,27 +963,23 @@ impl OrderedResult {
             return Err(err);
         }
 
-        // Check if any column has explicit NULLS FIRST/LAST setting
-        // If so, skip radix sort (which uses fixed NULL ordering) and use comparison sort
-        let has_explicit_nulls_ordering = order_specs.iter().any(|s| s.nulls_first.is_some());
-
-        if !has_explicit_nulls_ordering {
-            // Try radix sort for single integer column (most common case)
-            if order_specs.len() == 1 {
-                let spec = &order_specs[0];
-                if Self::try_radix_sort_single_int(&mut rows, spec.col_idx, spec.ascending) {
-                    return Ok(Self {
-                        inner: ExecutorResult::new(columns, rows),
-                    });
-                }
-            }
-
-            // Try radix sort for multiple integer columns
-            if order_specs.len() <= 4 && Self::try_radix_sort_multi_int(&mut rows, order_specs) {
+        // Try radix sort for single integer column (most common case)
+        if order_specs.len() == 1 {
+            let spec = &order_specs[0];
+            let nulls_first = crate::core::value::nulls_first(spec.ascending, spec.nulls_first);
+            if Self::try_radix_sort_single_int(&mut rows, spec.col_idx, spec.ascending, nulls_first)
+            {
                 return Ok(Self {
                     inner: ExecutorResult::new(columns, rows),
                 });
             }
+        }
+
+        // Try radix sort for multiple integer columns
+        if order_specs.len() <= 4 && Self::try_radix_sort_multi_int(&mut rows, order_specs) {
+            return Ok(Self {
+                inner: ExecutorResult::new(columns, rows),
+            });
         }
 
         // Fallback to comparison sort (use sort_unstable_by for better performance)
@@ -996,7 +992,12 @@ impl OrderedResult {
 
     /// Try to sort by a single integer column using radix sort
     /// Returns true if successful, false if column is not all integers
-    fn try_radix_sort_single_int(rows: &mut RowVec, col_idx: usize, ascending: bool) -> bool {
+    fn try_radix_sort_single_int(
+        rows: &mut RowVec,
+        col_idx: usize,
+        ascending: bool,
+        nulls_first: bool,
+    ) -> bool {
         // Check if all values in this column are integers
         for (_, row) in rows.iter() {
             match row.get(col_idx) {
@@ -1006,10 +1007,8 @@ impl OrderedResult {
             }
         }
 
-        // Partition NULL rows out before the radix pass: the default
-        // ordering is NULLS LAST for ASC and NULLS FIRST for DESC (like
-        // the comparison paths), and a sentinel key would both invert
-        // that and collide with real i64::MIN/MAX values.
+        // NULL rows are set apart: a sentinel key would collide with real
+        // i64::MIN/MAX values
         let mut nulls = RowVec::new();
         let mut non_nulls = RowVec::with_capacity(rows.len());
         for pair in rows.drain(..) {
@@ -1036,12 +1035,12 @@ impl OrderedResult {
             });
         }
 
-        if ascending {
-            rows.extend(non_nulls);
+        if nulls_first {
             rows.extend(nulls);
+            rows.extend(non_nulls);
         } else {
-            rows.extend(nulls);
             rows.extend(non_nulls);
+            rows.extend(nulls);
         }
 
         true
@@ -1055,9 +1054,8 @@ impl OrderedResult {
             for spec in order_specs {
                 match row.get(spec.col_idx) {
                     Some(Value::Integer(_)) => continue,
-                    // NULLs need FIRST/LAST placement the composite
-                    // sentinel keys cannot express; the comparison sort
-                    // fallback handles them with the correct default
+                    // NULLs need a placement the composite sentinel keys
+                    // cannot express; the comparison sort places them
                     Some(Value::Null(_)) => return false,
                     _ => return false,
                 }

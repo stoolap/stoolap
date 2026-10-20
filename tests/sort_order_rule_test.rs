@@ -236,3 +236,107 @@ fn values_sort_in_one_total_order_everywhere() {
         wrong.join("\n")
     );
 }
+
+fn open_nulls(db: Database, seal: bool) -> Database {
+    db.execute(
+        "CREATE TABLE n (id INTEGER PRIMARY KEY, k INTEGER, j INTEGER, s TEXT)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX n_k ON n(k)", ()).unwrap();
+    db.execute(
+        "INSERT INTO n VALUES (1, 3, 0, 'c'), (2, 1, 0, 'a'), (3, NULL, 0, NULL), (4, 2, 0, 'b')",
+        (),
+    )
+    .unwrap();
+    if seal {
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    }
+    db
+}
+
+fn check_nulls(db: &Database, ctx: &str, wrong: &mut Vec<String>) {
+    for (direction, ascending) in [("ASC", true), ("DESC", false)] {
+        for written in ["", " NULLS FIRST", " NULLS LAST"] {
+            let first = match written {
+                " NULLS FIRST" => true,
+                " NULLS LAST" => false,
+                _ => !ascending,
+            };
+            let order = format!("{direction}{written}");
+            let place = |mut values: Vec<&str>| {
+                if !ascending {
+                    values.reverse();
+                }
+                let mut out: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+                if first {
+                    out.insert(0, "null".to_string());
+                } else {
+                    out.push("null".to_string());
+                }
+                out
+            };
+            let ks = place(vec!["i:1", "i:2", "i:3"]);
+            let ss = place(vec!["t:a", "t:b", "t:c"]);
+            let ids = place(vec!["i:2", "i:4", "i:1"])
+                .into_iter()
+                .map(|v| if v == "null" { "i:3".to_string() } else { v })
+                .collect::<Vec<_>>();
+            let cases = [
+                (format!("SELECT k FROM n ORDER BY k {order}"), ks.clone()),
+                (format!("SELECT k FROM n ORDER BY k {order}, j"), ks.clone()),
+                (
+                    format!("SELECT k FROM n ORDER BY k {order} LIMIT 4"),
+                    ks.clone(),
+                ),
+                (format!("SELECT s FROM n ORDER BY s {order}"), ss.clone()),
+                (
+                    format!("SELECT id FROM n ORDER BY ROW_NUMBER() OVER (ORDER BY k {order})"),
+                    ids.clone(),
+                ),
+                (
+                    format!("SELECT STRING_AGG(CAST(id AS TEXT), ',' ORDER BY k {order}) FROM n"),
+                    vec![format!(
+                        "t:{}",
+                        ids.iter()
+                            .map(|v| v.trim_start_matches("i:"))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )],
+                ),
+            ];
+            for (sql, want) in cases {
+                let got = rows(db, &sql);
+                if got != want {
+                    wrong.push(format!("{ctx}: {sql}\n    got  {got:?}\n    want {want:?}"));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn nulls_sort_by_one_placement_rule_everywhere() {
+    let mut wrong = Vec::new();
+    check_nulls(
+        &open_nulls(Database::open("memory://null_order_rule").unwrap(), false),
+        "memory",
+        &mut wrong,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_nulls(
+        Database::open(&format!(
+            "file://{}?checkpoint_interval=0",
+            dir.path().display()
+        ))
+        .unwrap(),
+        true,
+    );
+    check_nulls(&db, "sealed", &mut wrong);
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}

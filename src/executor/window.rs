@@ -3251,7 +3251,7 @@ impl Executor {
         let ascending_flags: Vec<bool> = order_by.iter().map(|ob| ob.ascending).collect();
         let nulls_first_flags: Vec<bool> = order_by
             .iter()
-            .map(|ob| ob.nulls_first.unwrap_or(!ob.ascending))
+            .map(|ob| crate::core::value::nulls_first(ob.ascending, ob.nulls_first))
             .collect();
 
         // Check if any ORDER BY expression is complex (not a simple column reference)
