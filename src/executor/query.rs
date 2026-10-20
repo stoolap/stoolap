@@ -9647,7 +9647,15 @@ impl Executor {
 
             // Each value's source is found once for the statement; an error
             // is raised by the first row that reads it, as evaluating raised it
-            let compile_ctx = CompileContext::new(all_columns, &self.function_registry);
+            // A statement run for an outer row reads that row's columns by name
+            let outer_columns: Option<Vec<String>> = ctx
+                .outer_row()
+                .filter(|outer| !outer.is_empty())
+                .map(|outer| outer.keys().map(|k| k.to_string()).collect());
+            let mut compile_ctx = CompileContext::new(all_columns, &self.function_registry);
+            if let Some(outer) = &outer_columns {
+                compile_ctx = compile_ctx.with_outer_columns(outer);
+            }
             let compile = |expr: &Expression| -> Result<SharedProgram> {
                 ExprCompiler::new(&compile_ctx)
                     .compile(expr)

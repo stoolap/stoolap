@@ -1680,3 +1680,35 @@ fn an_aggregate_reads_the_rows_of_its_own_statement() {
         assert_eq!(s, expected);
     }
 }
+
+#[test]
+fn test_a_subquery_order_by_computed_from_an_outer_column() {
+    let db = Database::open("memory://correlated_order_by_outer_column").unwrap();
+    db.execute("CREATE TABLE o (id INTEGER PRIMARY KEY, delta INTEGER)", ())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE i (id INTEGER PRIMARY KEY, fk INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO o VALUES (1, 0), (2, -100)", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO i VALUES (1, 1, 10), (2, 1, 20), (3, 2, 10), (4, 2, 20)",
+        (),
+    )
+    .unwrap();
+    let rows: Vec<(i64, i64)> = db
+        .query(
+            "SELECT o.id, (SELECT i.v FROM i WHERE i.fk = o.id \
+             ORDER BY (i.v - 15) * o.delta, i.id LIMIT 1) FROM o ORDER BY o.id",
+            (),
+        )
+        .unwrap()
+        .map(|row| {
+            let row = row.unwrap();
+            (row.get(0).unwrap(), row.get(1).unwrap())
+        })
+        .collect();
+    assert_eq!(rows, vec![(1, 10), (2, 20)]);
+}
