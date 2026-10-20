@@ -258,6 +258,10 @@ impl Expression for FunctionExpr {
         self.evaluate(row).unwrap_or(false)
     }
 
+    fn can_fail(&self) -> bool {
+        true
+    }
+
     fn with_aliases(&self, aliases: &FxHashMap<String, String>) -> Box<dyn Expression> {
         let new_arguments: Vec<FunctionArg> = self
             .arguments

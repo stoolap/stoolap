@@ -204,6 +204,27 @@ fn relayout_history(
     below
 }
 
+/// Whether `row` passes `filter`, asked through `compiled` (whole when
+/// `fully`) when it cannot fail and by `evaluate` when it can, whose error
+/// is the statement's; a filter that can fail holds a dynamic leaf
+#[inline]
+fn compiled_passes(
+    filter: &dyn crate::storage::expression::Expression,
+    fallible: bool,
+    compiled: &CompiledFilter,
+    fully: bool,
+    row: &Row,
+) -> crate::core::Result<bool> {
+    debug_assert!(!(fully && fallible), "a fallible filter compiled whole");
+    if fully {
+        Ok(compiled.matches_arc_slice(row.as_slice()))
+    } else if fallible {
+        filter.evaluate(row)
+    } else {
+        Ok(compiled.matches(row))
+    }
+}
+
 /// Whether the chain from `entry` back holds at least `depth` versions,
 /// counting no further than that
 #[inline]
@@ -4025,16 +4046,16 @@ impl VersionStore {
         &self,
         txn_id: i64,
         filter: &dyn crate::storage::expression::Expression,
-    ) -> Vec<(i64, Row, RowVersion)> {
+    ) -> crate::core::Result<Vec<(i64, Row, RowVersion)>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.get_all_visible_rows_for_update_filtered");
         if self.closed.load(Ordering::Acquire) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => c,
-            None => return Vec::new(),
+            None => return Ok(Vec::new()),
         };
 
         let current_seq = checker.get_current_sequence();
@@ -4043,14 +4064,10 @@ impl VersionStore {
         let schema = self.schema.read();
         let compiled_filter = CompiledFilter::compile(filter, &schema);
         drop(schema); // Release lock early
-        let fully_compiled = compiled_filter.is_fully_compiled();
-        let matches_row = |row: &Row| {
-            if fully_compiled {
-                compiled_filter.matches_arc_slice(row.as_slice())
-            } else {
-                compiled_filter.matches(row)
-            }
-        };
+        let fallible = filter.can_fail();
+        let fully = compiled_filter.is_fully_compiled();
+        let matches_row =
+            |row: &Row| compiled_passes(filter, fallible, &compiled_filter, fully, row);
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
@@ -4066,7 +4083,7 @@ impl VersionStore {
             if checker.is_visible(head_txn_id, txn_id) {
                 // HEAD is visible - check if deleted
                 if (head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id))
-                    && matches_row(&chain.version.data)
+                    && matches_row(&chain.version.data)?
                 {
                     let mut version_copy = chain.version.clone();
                     version_copy.create_time = current_seq;
@@ -4083,7 +4100,7 @@ impl VersionStore {
 
                 if checker.is_visible(version_txn_id, txn_id) {
                     if (deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id))
-                        && matches_row(&e.version.data)
+                        && matches_row(&e.version.data)?
                     {
                         let mut version_copy = e.version.clone();
                         version_copy.create_time = current_seq;
@@ -4095,7 +4112,7 @@ impl VersionStore {
             }
         }
 
-        result
+        Ok(result)
     }
 
     /// Returns all visible rows.
@@ -4681,16 +4698,16 @@ impl VersionStore {
         &self,
         reader: Reader<'_>,
         filter: &dyn crate::storage::expression::Expression,
-    ) -> RowVec {
+    ) -> crate::core::Result<RowVec> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.get_all_visible_rows_filtered");
         if self.closed.load(Ordering::Acquire) {
-            return RowVec::new();
+            return Ok(RowVec::new());
         }
 
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => reader.over(&**c),
-            None => return RowVec::new(),
+            None => return Ok(RowVec::new()),
         };
         let txn_id = reader.txn_id;
 
@@ -4699,14 +4716,10 @@ impl VersionStore {
         let schema = self.schema.read();
         let compiled_filter = CompiledFilter::compile(filter, &schema);
         drop(schema); // Release lock early
-        let fully_compiled = compiled_filter.is_fully_compiled();
-        let matches_row = |row: &Row| {
-            if fully_compiled {
-                compiled_filter.matches_arc_slice(row.as_slice())
-            } else {
-                compiled_filter.matches(row)
-            }
-        };
+        let fallible = filter.can_fail();
+        let fully = compiled_filter.is_fully_compiled();
+        let matches_row =
+            |row: &Row| compiled_passes(filter, fallible, &compiled_filter, fully, row);
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
@@ -4726,7 +4739,7 @@ impl VersionStore {
                         break; // Row is deleted
                     }
 
-                    if matches_row(&e.version.data) {
+                    if matches_row(&e.version.data)? {
                         result.push((row_id, e.version.data.clone()));
                     }
                     break;
@@ -4735,7 +4748,7 @@ impl VersionStore {
             }
         }
 
-        result
+        Ok(result)
     }
 
     /// Iterate visible rows matching a filter with early termination via callback.
@@ -4748,32 +4761,29 @@ impl VersionStore {
         reader: Reader<'_>,
         filter: &dyn crate::storage::expression::Expression,
         mut callback: F,
-    ) where
+    ) -> crate::core::Result<()>
+    where
         F: FnMut(i64, Row) -> bool,
     {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.for_each_visible_filtered");
         if self.closed.load(Ordering::Acquire) {
-            return;
+            return Ok(());
         }
 
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => reader.over(&**c),
-            None => return,
+            None => return Ok(()),
         };
         let txn_id = reader.txn_id;
 
         let schema = self.schema.read();
         let compiled_filter = CompiledFilter::compile(filter, &schema);
         drop(schema);
-        let fully_compiled = compiled_filter.is_fully_compiled();
-        let matches_row = |row: &Row| {
-            if fully_compiled {
-                compiled_filter.matches_arc_slice(row.as_slice())
-            } else {
-                compiled_filter.matches(row)
-            }
-        };
+        let fallible = filter.can_fail();
+        let fully = compiled_filter.is_fully_compiled();
+        let matches_row =
+            |row: &Row| compiled_passes(filter, fallible, &compiled_filter, fully, row);
 
         let versions = self.snapshot_versions();
 
@@ -4789,14 +4799,15 @@ impl VersionStore {
                         break;
                     }
 
-                    if matches_row(&e.version.data) && !callback(row_id, e.version.data.clone()) {
-                        return;
+                    if matches_row(&e.version.data)? && !callback(row_id, e.version.data.clone()) {
+                        return Ok(());
                     }
                     break;
                 }
                 current = e.prev.as_deref();
             }
         }
+        Ok(())
     }
 
     /// Get visible rows with filter, limit and offset applied at the storage layer.
@@ -4816,16 +4827,16 @@ impl VersionStore {
         filter: &dyn crate::storage::expression::Expression,
         limit: usize,
         offset: usize,
-    ) -> RowVec {
+    ) -> crate::core::Result<RowVec> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.get_visible_rows_filtered_with_limit");
         if self.closed.load(Ordering::Acquire) || limit == 0 {
-            return RowVec::new();
+            return Ok(RowVec::new());
         }
 
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => reader.over(&**c),
-            None => return RowVec::new(),
+            None => return Ok(RowVec::new()),
         };
         let txn_id = reader.txn_id;
 
@@ -4833,14 +4844,10 @@ impl VersionStore {
         let schema = self.schema.read();
         let compiled_filter = CompiledFilter::compile(filter, &schema);
         drop(schema);
-        let fully_compiled = compiled_filter.is_fully_compiled();
-        let matches_row = |row: &Row| {
-            if fully_compiled {
-                compiled_filter.matches_arc_slice(row.as_slice())
-            } else {
-                compiled_filter.matches(row)
-            }
-        };
+        let fallible = filter.can_fail();
+        let fully = compiled_filter.is_fully_compiled();
+        let matches_row =
+            |row: &Row| compiled_passes(filter, fallible, &compiled_filter, fully, row);
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
@@ -4863,13 +4870,13 @@ impl VersionStore {
                         break; // Row is deleted
                     }
 
-                    if matches_row(&e.version.data) {
+                    if matches_row(&e.version.data)? {
                         if skipped < offset {
                             skipped += 1;
                         } else {
                             result.push((row_id, e.version.data.clone()));
                             if result.len() >= limit {
-                                return result; // Early termination!
+                                return Ok(result); // Early termination!
                             }
                         }
                     }
@@ -4879,7 +4886,7 @@ impl VersionStore {
             }
         }
 
-        result
+        Ok(result)
     }
 
     /// Get visible rows with filter and LIMIT (with early termination).
@@ -4892,7 +4899,7 @@ impl VersionStore {
         filter: &dyn crate::storage::expression::Expression,
         limit: usize,
         offset: usize,
-    ) -> RowVec {
+    ) -> crate::core::Result<RowVec> {
         // Delegate to the sorted version
         self.get_visible_rows_filtered_with_limit(reader, filter, limit, offset)
     }
