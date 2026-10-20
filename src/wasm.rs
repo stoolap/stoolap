@@ -116,7 +116,7 @@ impl StoolapDB {
         }
 
         let upper = trimmed.to_uppercase();
-        let upper = upper.trim();
+        let upper = upper.trim_end_matches(|c: char| c == ';' || c.is_whitespace());
 
         // Handle transaction commands (mirrors CLI's execute_query)
         if upper.starts_with("BEGIN") {

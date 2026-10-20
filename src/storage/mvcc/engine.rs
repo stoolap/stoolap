@@ -556,6 +556,8 @@ struct HotLimits {
     max_rows: AtomicUsize,
     max_bytes: AtomicUsize,
     seal_requested: AtomicBool,
+    /// The cleanup thread, which seals on request, is running
+    seal_worker: AtomicBool,
     admission: (Mutex<()>, Condvar),
     admission_waits: AtomicU64,
 }
@@ -566,6 +568,7 @@ impl HotLimits {
             max_rows: AtomicUsize::new(config.hot_max_rows),
             max_bytes: AtomicUsize::new(config.hot_max_bytes),
             seal_requested: AtomicBool::new(false),
+            seal_worker: AtomicBool::new(false),
             admission: (Mutex::new(()), Condvar::new()),
             admission_waits: AtomicU64::new(0),
         }
@@ -1089,6 +1092,11 @@ impl MVCCEngine {
     /// - Old previous versions no longer needed
     /// - Old transaction metadata (in Snapshot Isolation mode only)
     pub fn start_cleanup(self: &Arc<Self>) {
+        // A second start would stop the running thread, which clears seal_worker
+        let mut cleanup_handle = self.cleanup_handle.lock().unwrap();
+        if cleanup_handle.is_some() {
+            return;
+        }
         let config = self.config.read().unwrap();
         if !config.cleanup.enabled {
             return;
@@ -1103,8 +1111,6 @@ impl MVCCEngine {
 
         let handle =
             self.start_periodic_cleanup_internal(interval, deleted_row_retention, txn_retention);
-
-        let mut cleanup_handle = self.cleanup_handle.lock().unwrap();
         *cleanup_handle = Some(handle);
     }
 
@@ -1122,6 +1128,7 @@ impl MVCCEngine {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_clone = Arc::clone(&stop_flag);
         let engine = Arc::clone(self);
+        self.hot_limits.seal_worker.store(true, Ordering::Release);
 
         let handle = thread::spawn(move || {
             let mut time_since_cleanup = std::time::Duration::ZERO;
@@ -1209,6 +1216,11 @@ impl MVCCEngine {
                     engine.spawn_backfill();
                 }
             }
+            // Commits waiting for a seal stop waiting once no thread will run one
+            let limits = &engine.hot_limits;
+            limits.seal_worker.store(false, Ordering::Release);
+            let _admission = limits.admission.0.lock();
+            limits.admission.1.notify_all();
         });
 
         CleanupHandle {
@@ -2514,6 +2526,8 @@ impl MVCCEngine {
                             break;
                         }
                         if attempt < 4 {
+                            #[allow(clippy::disallowed_methods)]
+                            // persistence only: never in a browser
                             std::thread::sleep(std::time::Duration::from_millis(10));
                         }
                     }
@@ -2528,12 +2542,16 @@ impl MVCCEngine {
         // resources. Without this, a detached compaction thread could still
         // be rewriting manifests and deleting volume files after close returns.
         while self.compaction_running.load(Ordering::Acquire) {
+            #[allow(clippy::disallowed_methods)]
+            // only a background thread holds it; wasm32 has none
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         // No backfill starts from here, and one running stops at its next
         // volume; its files are this engine's until it has
         self.closing.store(true, Ordering::Release);
         while self.backfill_running.load(Ordering::Acquire) {
+            #[allow(clippy::disallowed_methods)]
+            // only a background thread holds it; wasm32 has none
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
@@ -4752,6 +4770,8 @@ impl MVCCEngine {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
+            #[allow(clippy::disallowed_methods)]
+            // only a background thread holds it; wasm32 has none
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let _compaction_guard = AtomicBoolGuard(&self.compaction_running);
@@ -4784,6 +4804,7 @@ impl MVCCEngine {
                         "PRAGMA SNAPSHOT timed out waiting for in-flight commits to complete",
                     ));
                 }
+                #[allow(clippy::disallowed_methods)] // persistence only: never in a browser
                 std::thread::sleep(std::time::Duration::from_micros(100));
             }
         }
@@ -5432,6 +5453,8 @@ impl MVCCEngine {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
+            #[allow(clippy::disallowed_methods)]
+            // only a background thread holds it; wasm32 has none
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         // Drop guard: release the compaction slot on any early return.
@@ -6463,6 +6486,8 @@ impl MVCCEngine {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
+            #[allow(clippy::disallowed_methods)]
+            // only a background thread holds it; wasm32 has none
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         self.run_compaction_guarded()
@@ -8820,7 +8845,7 @@ fn close_and_settle(
     let closure = super::version_store::ColumnClosure::close(store);
     #[cfg(feature = "test-failpoints")]
     crate::test_failpoints::column_change_waiting();
-    let deadline = std::time::Instant::now() + SETTLE_WAIT;
+    let deadline = Instant::now() + SETTLE_WAIT;
     let refused = || Error::TableHasOpenTransactionRows {
         table: name.to_string(),
     };
@@ -8829,9 +8854,11 @@ fn close_and_settle(
     }
     let open = |txn_id: i64| txn_id > 0 && registry.is_open(txn_id);
     while closure.store().holds_versions_of(&open) {
-        if std::time::Instant::now() >= deadline {
+        // Single-threaded: no other transaction can finish while this one waits
+        if cfg!(target_arch = "wasm32") || Instant::now() >= deadline {
             return Err(refused());
         }
+        #[cfg(not(target_arch = "wasm32"))]
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     Ok(closure)
@@ -10008,21 +10035,23 @@ impl TransactionEngineOperations for EngineOperations {
         if !over() {
             return;
         }
-        limits.admission_waits.fetch_add(1, Ordering::Relaxed);
         limits.seal_requested.store(true, Ordering::Release);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // No seal comes without the cleanup thread: cleanup is off, or wasm32
+        if !limits.seal_worker.load(Ordering::Acquire) {
+            return;
+        }
+        limits.admission_waits.fetch_add(1, Ordering::Relaxed);
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
         let mut guard = limits.admission.0.lock().unwrap();
-        while over() {
-            let now = std::time::Instant::now();
+        while over() && limits.seal_worker.load(Ordering::Acquire) {
+            let now = Instant::now();
             if now >= deadline {
                 break;
             }
-            guard = limits
-                .admission
-                .1
-                .wait_timeout(guard, deadline - now)
-                .unwrap()
-                .0;
+            // Only while the cleanup thread runs; wasm32 has none
+            #[allow(clippy::disallowed_methods)]
+            let waited = limits.admission.1.wait_timeout(guard, deadline - now);
+            guard = waited.unwrap().0;
         }
     }
 }

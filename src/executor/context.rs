@@ -1379,6 +1379,10 @@ impl ExecutionContext {
 
     /// Check if the query has been cancelled
     pub fn is_cancelled(&self) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        if let Some(manager) = TIMEOUT_MANAGER.get() {
+            manager.poll();
+        }
         self.cancelled.load(Ordering::Relaxed)
     }
 
@@ -1788,6 +1792,7 @@ struct TimeoutManagerState {
     /// Priority queue of pending timeouts (min-heap by deadline)
     timeouts: BinaryHeap<TimeoutEntry>,
     /// Whether the manager is shutting down
+    #[cfg(not(target_arch = "wasm32"))]
     shutdown: bool,
 }
 
@@ -1807,6 +1812,7 @@ impl TimeoutManager {
         let manager = Arc::new(Self {
             state: Mutex::new(TimeoutManagerState {
                 timeouts: BinaryHeap::new(),
+                #[cfg(not(target_arch = "wasm32"))]
                 shutdown: false,
             }),
             condvar: Condvar::new(),
@@ -1814,18 +1820,55 @@ impl TimeoutManager {
         });
 
         // Spawn the background timer thread
-        let manager_clone = Arc::clone(&manager);
-        std::thread::Builder::new()
-            .name("stoolap-timeout-manager".to_string())
-            .spawn(move || {
-                manager_clone.run();
-            })
-            .expect("Failed to spawn timeout manager thread");
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let manager_clone = Arc::clone(&manager);
+            std::thread::Builder::new()
+                .name("stoolap-timeout-manager".to_string())
+                .spawn(move || {
+                    manager_clone.run();
+                })
+                .expect("Failed to spawn timeout manager thread");
+        }
 
         manager
     }
 
+    /// Cancels every query whose deadline is at or before `now`
+    fn expire_due(state: &mut TimeoutManagerState, now: Instant) {
+        while let Some(entry) = state.timeouts.peek() {
+            if entry.deadline <= now {
+                let entry = state.timeouts.pop().unwrap();
+                // Only cancel if the timeout wasn't already cancelled
+                if !entry.cancelled.load(Ordering::Relaxed) {
+                    entry.cancel_handle.cancel();
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Without a timer thread: drops finished timeouts, then expires due ones
+    #[cfg(target_arch = "wasm32")]
+    fn poll(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        while state
+            .timeouts
+            .peek()
+            .is_some_and(|e| e.cancelled.load(Ordering::Relaxed))
+        {
+            state.timeouts.pop();
+        }
+        if !state.timeouts.is_empty() {
+            Self::expire_due(&mut state, Instant::now());
+        }
+    }
+
     /// Background thread loop
+    #[cfg(not(target_arch = "wasm32"))]
     fn run(&self) {
         loop {
             let mut state = self.state.lock().unwrap();
@@ -1837,17 +1880,7 @@ impl TimeoutManager {
 
             // Process expired timeouts
             let now = Instant::now();
-            while let Some(entry) = state.timeouts.peek() {
-                if entry.deadline <= now {
-                    let entry = state.timeouts.pop().unwrap();
-                    // Only cancel if the timeout wasn't already cancelled
-                    if !entry.cancelled.load(Ordering::Relaxed) {
-                        entry.cancel_handle.cancel();
-                    }
-                } else {
-                    break;
-                }
-            }
+            Self::expire_due(&mut state, now);
 
             // Calculate wait time until next timeout
             let wait_duration = if let Some(entry) = state.timeouts.peek() {
@@ -1906,10 +1939,10 @@ impl TimeoutManager {
 
 /// Get or create the global timeout manager
 fn global_timeout_manager() -> &'static Arc<TimeoutManager> {
-    use std::sync::OnceLock;
-    static MANAGER: OnceLock<Arc<TimeoutManager>> = OnceLock::new();
-    MANAGER.get_or_init(TimeoutManager::new)
+    TIMEOUT_MANAGER.get_or_init(TimeoutManager::new)
 }
+
+static TIMEOUT_MANAGER: std::sync::OnceLock<Arc<TimeoutManager>> = std::sync::OnceLock::new();
 
 /// Guard that automatically cancels a query after a timeout.
 /// Uses a global timeout manager for efficient handling of many concurrent timeouts.

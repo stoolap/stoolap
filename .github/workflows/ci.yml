@@ -55,7 +55,7 @@ jobs:
       run: cargo check --all-features
 
   wasm:
-    name: WASI build (C API)
+    name: WASM builds (WASI C API, browser)
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -63,13 +63,30 @@ jobs:
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
       with:
-        targets: wasm32-wasip1
+        targets: wasm32-wasip1, wasm32-unknown-unknown
+        components: clippy
 
     - name: Cache
       uses: Swatinem/rust-cache@v2
 
     - name: Check the C API for wasm32-wasip1
       run: cargo check --lib --target wasm32-wasip1 --no-default-features --features ffi
+
+    # std time, threads and sleeps compile on wasm32-unknown-unknown and panic when called
+    - name: Refuse APIs that panic in the browser
+      env:
+        CLIPPY_CONF_DIR: ${{ github.workspace }}/.github/wasm-clippy
+      run: >
+        cargo clippy --lib --target wasm32-unknown-unknown --no-default-features --features wasm,ffi
+        -- -D clippy::disallowed_methods -D clippy::disallowed_types
+
+    - name: Install wasm-pack
+      uses: taiki-e/install-action@wasm-pack
+
+    - name: Run SQL through the browser build
+      run: |
+        wasm-pack build --dev --target nodejs --out-dir target/wasm-smoke --no-pack . -- --no-default-features --features wasm
+        node .github/wasm-smoke/smoke.cjs target/wasm-smoke
 
   test:
     name: Test

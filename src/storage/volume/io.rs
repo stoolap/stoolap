@@ -541,8 +541,8 @@ pub fn delete_all_volumes(dir: &Path, table_name: &str) -> Result<()> {
 /// Generate a new volume ID. Monotonically increasing, unique across calls.
 /// Uses microseconds since epoch + CAS loop for uniqueness.
 pub fn next_volume_id() -> u64 {
+    use crate::common::time_compat::{SystemTime, UNIX_EPOCH};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let micros = SystemTime::now()
         .duration_since(UNIX_EPOCH)
