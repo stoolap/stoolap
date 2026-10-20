@@ -145,6 +145,7 @@ impl Parser<'_> {
             limit: None,
             offset: None,
             set_operations: Vec::new(),
+            prepared: None,
         };
 
         // Check for DISTINCT / DISTINCT ON (expr, ...)
@@ -357,6 +358,7 @@ impl Parser<'_> {
             limit: None,
             offset: None,
             set_operations: Vec::new(),
+            prepared: None,
         };
 
         // Check for DISTINCT / DISTINCT ON (expr, ...)

@@ -213,6 +213,7 @@ impl Walk<'_> {
             limit,
             offset,
             set_operations,
+            prepared: _,
         } = stmt;
         let grouping_sets = match &group_by.modifier {
             GroupByModifier::GroupingSets(sets) => most(sets.iter().map(|set| self.all(set))),

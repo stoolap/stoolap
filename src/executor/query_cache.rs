@@ -676,6 +676,7 @@ mod tests {
             limit: None,
             offset: None,
             set_operations: vec![],
+            prepared: None,
         }))
     }
 
