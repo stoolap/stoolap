@@ -30,6 +30,8 @@ fn compile_error(e: CompileError) -> Error {
 
 /// Compile `expr` over no columns, as a one-shot evaluation does
 pub(crate) fn compile_once(expr: &Expression) -> Result<Program> {
+    #[cfg(feature = "test-failpoints")]
+    crate::test_failpoints::one_shot_compiled();
     let empty: &[String] = &[];
     ExprCompiler::new(&CompileContext::with_global_registry(empty))
         .compile(expr)
@@ -41,10 +43,12 @@ pub(crate) fn compile_once(expr: &Expression) -> Result<Program> {
 pub(crate) fn evaluate_once(expr: &Expression, ctx: Option<&ExecutionContext>) -> Result<Value> {
     // A literal or a parameter is the value its program would load
     if let Some(value) = literal_value(expr) {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::one_shot_literal_read();
         return Ok(value);
     }
     let row = Row::new();
-    let exec = context(&row, ctx);
+    let exec = execute_context(&row, ctx);
     if let Expression::Parameter(param) = expr {
         let value = match parameter_slot(param).map_err(compile_error)? {
             ParameterSlot::Named(name) => exec.named_param_ref(name),
@@ -58,10 +62,14 @@ pub(crate) fn evaluate_once(expr: &Expression, ctx: Option<&ExecutionContext>) -
 /// What [`evaluate_once`] does after compiling
 pub(crate) fn execute_once(program: &Program, ctx: Option<&ExecutionContext>) -> Result<Value> {
     let row = Row::new();
-    run(program, &context(&row, ctx))
+    run(program, &execute_context(&row, ctx))
 }
 
-fn context<'a>(row: &'a Row, ctx: Option<&'a ExecutionContext>) -> ExecuteContext<'a> {
+/// The VM context for `row` with `ctx`'s parameters, outer row and transaction
+pub(crate) fn execute_context<'a>(
+    row: &'a Row,
+    ctx: Option<&'a ExecutionContext>,
+) -> ExecuteContext<'a> {
     let mut exec = ExecuteContext::new(row);
     if let Some(ctx) = ctx {
         exec = exec

@@ -38,11 +38,14 @@
 
 mod compiler;
 mod evaluator_bridge;
+#[cfg(test)]
+pub(crate) use evaluator_bridge::program_cached;
 mod once;
 mod ops;
 mod program;
 mod vm;
 
+pub(crate) use compiler::literal_value;
 pub use compiler::{CompileContext, CompileError, ExprCompiler};
 pub use evaluator_bridge::{
     clear_program_cache, compile_expression, compile_expression_with_context,
@@ -50,7 +53,7 @@ pub use evaluator_bridge::{
     RowFilter, SharedProgram,
 };
 pub(crate) use once::{
-    compile_once, evaluate_once, execute_once, try_eval_constant_expr_with_context,
+    compile_once, evaluate_once, execute_context, execute_once, try_eval_constant_expr_with_context,
 };
 pub use ops::{CompareOp, Op, QuantifiedMembers};
 pub use program::Program;

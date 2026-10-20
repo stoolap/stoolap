@@ -338,3 +338,69 @@ fn test_a_range_key_that_is_not_a_number_frames_to_its_peers() {
         }
     }
 }
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn an_aggregate_frame_offset_compiles_once_across_lazy_partitions() {
+    let db = Database::open("memory://window_args_lazy_frame_compile").unwrap();
+    db.execute(
+        "CREATE TABLE lazy (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX lazy_g ON lazy(g)", ()).unwrap();
+    for id in 1..=100i64 {
+        db.execute("INSERT INTO lazy VALUES ($1, $2, $1)", (id, id % 20))
+            .unwrap();
+    }
+    let before = stoolap::test_failpoints::one_shot_compiles();
+    let rows: Vec<_> = db
+        .query(
+            "SELECT g, SUM(v) OVER (PARTITION BY g ORDER BY id \
+             ROWS BETWEEN 1 + 1 PRECEDING AND CURRENT ROW) FROM lazy LIMIT 50",
+            (),
+        )
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(rows.len(), 50);
+    assert_eq!(
+        stoolap::test_failpoints::one_shot_compiles() - before,
+        1,
+        "the frame offset compiles once for the call, not once per partition"
+    );
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_literal_default_is_read_once_for_the_call() {
+    let db = Database::open("memory://window_args_literal_default").unwrap();
+    db.execute(
+        "CREATE TABLE stamps (id INTEGER PRIMARY KEY, ts TIMESTAMP)",
+        (),
+    )
+    .unwrap();
+    for id in 1..=50i64 {
+        db.execute(
+            "INSERT INTO stamps VALUES ($1, '2024-01-01 00:00:00')",
+            (id,),
+        )
+        .unwrap();
+    }
+    let before = stoolap::test_failpoints::one_shot_literal_reads();
+    let rows: Vec<_> = db
+        .query(
+            "SELECT LAG(ts, 1, TIMESTAMP '2000-01-01 00:00:00+02:00') OVER (ORDER BY id) \
+             FROM stamps",
+            (),
+        )
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(rows.len(), 50);
+    assert_eq!(
+        stoolap::test_failpoints::one_shot_literal_reads() - before,
+        0,
+        "the default's value is resolved when the call is set up, not per row"
+    );
+}

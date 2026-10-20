@@ -34,6 +34,7 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::cmp::Ordering;
+use std::sync::OnceLock;
 
 use crate::common::{CompactVec, StringMap};
 use crate::core::row_vec::RowVec;
@@ -75,38 +76,146 @@ fn accumulate_ordered_frame(
     }
 }
 
-/// A window-function argument that cannot reference row columns:
-/// compiled once, evaluated once when deterministic and per call when
-/// volatile (RANDOM and friends keep their per-row behavior)
-struct ConstArg {
-    eval: ExpressionEval,
+/// How a window argument is read: a literal by its value, resolved once
+/// for the call; a parameter from the statement; anything else by a
+/// program compiled the first time a partition reads it
+enum ArgSource {
+    Literal(Value),
+    Parameter,
+    Program(OnceLock<Result<Program>>),
+}
+
+impl ArgSource {
+    fn of(expr: &Expression) -> Self {
+        match literal_value(expr) {
+            Some(value) => ArgSource::Literal(value),
+            None if matches!(expr, Expression::Parameter(_)) => ArgSource::Parameter,
+            None => ArgSource::Program(OnceLock::new()),
+        }
+    }
+}
+
+/// A window-function argument that cannot reference row columns, read as
+/// its source says and kept for the call
+struct ConstArg<'w> {
+    expr: &'w Expression,
     deterministic: bool,
+    source: ArgSource,
+}
+
+impl<'w> ConstArg<'w> {
+    fn new(expr: &'w Expression, registry: &FunctionRegistry) -> Self {
+        Self {
+            expr,
+            deterministic: expr_is_deterministic(expr, registry),
+            source: ArgSource::of(expr),
+        }
+    }
+
+    fn evaluate(&self, ctx: &ExecutionContext) -> Result<Value> {
+        match &self.source {
+            ArgSource::Literal(value) => Ok(value.clone()),
+            ArgSource::Parameter => evaluate_once(self.expr, Some(ctx)),
+            ArgSource::Program(program) => match program.get_or_init(|| compile_once(self.expr)) {
+                Ok(program) => execute_once(program, Some(ctx)),
+                Err(e) => Err(e.clone()),
+            },
+        }
+    }
+}
+
+/// A constant argument as one partition reads it: a deterministic one
+/// evaluates once, a volatile one (RANDOM and friends) on every read
+struct PartitionArg<'a, 'w> {
+    arg: &'a ConstArg<'w>,
     cached: Option<Value>,
 }
 
-impl ConstArg {
-    fn compile(
-        expr: &Expression,
-        registry: &FunctionRegistry,
-        ctx: &ExecutionContext,
-    ) -> Result<Self> {
-        Ok(Self {
-            eval: ExpressionEval::compile(expr, &[])?.with_context(ctx),
-            deterministic: expr_is_deterministic(expr, registry),
-            cached: None,
-        })
+impl<'a, 'w> PartitionArg<'a, 'w> {
+    fn new(arg: &'a ConstArg<'w>) -> Self {
+        Self { arg, cached: None }
     }
 
-    fn value(&mut self) -> Result<Value> {
-        if self.deterministic {
-            if let Some(v) = &self.cached {
-                return Ok(v.clone());
+    fn value(&mut self, ctx: &ExecutionContext) -> Result<Value> {
+        if !self.arg.deterministic {
+            return self.arg.evaluate(ctx);
+        }
+        if let Some(v) = &self.cached {
+            return Ok(v.clone());
+        }
+        let v = self.arg.evaluate(ctx)?;
+        self.cached = Some(v.clone());
+        Ok(v)
+    }
+}
+
+/// The arguments of one window function call that are not its input:
+/// the frame offsets, LAG and LEAD's offset and default, NTILE's and
+/// NTH_VALUE's n. Built once per call; each compiles on first read
+struct CallArgs<'w> {
+    frame_start: Option<ConstArg<'w>>,
+    frame_end: Option<ConstArg<'w>>,
+    count: Option<ConstArg<'w>>,
+    /// LAG and LEAD's default, which may read the row
+    default: Option<(&'w Expression, ArgSource)>,
+}
+
+impl<'w> CallArgs<'w> {
+    fn of(wf_info: &'w WindowFunctionInfo, registry: &FunctionRegistry) -> Self {
+        let offset_of = |bound: &'w WindowFrameBound| match bound {
+            WindowFrameBound::Preceding(expr) | WindowFrameBound::Following(expr) => {
+                Some(ConstArg::new(expr, registry))
             }
-            let v = self.eval.eval_slice(&Row::new())?;
-            self.cached = Some(v.clone());
-            Ok(v)
-        } else {
-            self.eval.eval_slice(&Row::new())
+            _ => None,
+        };
+        let frame = wf_info.frame.as_ref();
+        let lead_lag = matches!(wf_info.name.as_str(), "LEAD" | "LAG");
+        let count_at = match wf_info.name.as_str() {
+            "LEAD" | "LAG" | "NTH_VALUE" => Some(1),
+            "NTILE" => Some(0),
+            _ => None,
+        };
+        Self {
+            frame_start: frame.and_then(|f| offset_of(&f.start)),
+            frame_end: frame.and_then(|f| f.end.as_ref()).and_then(offset_of),
+            count: count_at
+                .and_then(|at| wf_info.arguments.get(at))
+                .map(|expr| ConstArg::new(expr, registry)),
+            default: wf_info
+                .arguments
+                .get(2)
+                .filter(|_| lead_lag)
+                .map(|expr| (expr, ArgSource::of(expr))),
+        }
+    }
+
+    /// The default's program over the input `columns`, compiled on first
+    /// read; None when there is no default or it is read without one
+    fn default_program(&self, columns: &[String]) -> Result<Option<&Program>> {
+        let Some((expr, ArgSource::Program(program))) = &self.default else {
+            return Ok(None);
+        };
+        let program = program.get_or_init(|| {
+            ExprCompiler::new(&CompileContext::with_global_registry(columns))
+                .compile(expr)
+                .map_err(|e| Error::internal(format!("Compile error: {}", e)))
+        });
+        program.as_ref().map(Some).map_err(Clone::clone)
+    }
+
+    /// LAG and LEAD's default for the current `row`, NULL without one
+    fn default_value(
+        &self,
+        program: Option<&Program>,
+        vm: &mut ExprVM,
+        row: &Row,
+        ctx: &ExecutionContext,
+    ) -> Result<Value> {
+        match (program, &self.default) {
+            (Some(program), _) => vm.execute(program, &execute_context(row, Some(ctx))),
+            (None, Some((_, ArgSource::Literal(value)))) => Ok(value.clone()),
+            (None, Some((expr, _))) => evaluate_once(expr, Some(ctx)),
+            (None, None) => Ok(Value::null_unknown()),
         }
     }
 }
@@ -165,11 +274,7 @@ struct Frame {
 }
 
 impl Frame {
-    fn read(
-        wf_info: &WindowFunctionInfo,
-        registry: &FunctionRegistry,
-        ctx: &ExecutionContext,
-    ) -> Result<Self> {
+    fn read(wf_info: &WindowFunctionInfo, args: &CallArgs, ctx: &ExecutionContext) -> Result<Self> {
         let Some(frame) = &wf_info.frame else {
             let end = if wf_info.order_by.is_empty() {
                 FrameEdge::UnboundedFollowing
@@ -183,26 +288,32 @@ impl Frame {
             });
         };
         let range = frame.unit == WindowFrameUnit::Range;
-        let offset = |expr: &Expression| -> Result<FrameOffset> {
-            let value = ConstArg::compile(expr, registry, ctx)?.value()?;
+        let offset = |arg: &Option<ConstArg>| -> Result<FrameOffset> {
+            let arg = arg
+                .as_ref()
+                .ok_or_else(|| Error::internal("a frame offset with no argument"))?;
+            let value = arg.evaluate(ctx)?;
             Ok(if range {
                 FrameOffset::Range(range_distance(&value)?)
             } else {
                 FrameOffset::Rows(window_count(&value, "a ROWS frame offset", 0)?)
             })
         };
-        let edge = |bound: &WindowFrameBound| -> Result<FrameEdge> {
+        let edge = |bound: &WindowFrameBound, arg: &Option<ConstArg>| -> Result<FrameEdge> {
             Ok(match bound {
                 WindowFrameBound::UnboundedPreceding => FrameEdge::UnboundedPreceding,
-                WindowFrameBound::Preceding(expr) => FrameEdge::Preceding(offset(expr)?),
+                WindowFrameBound::Preceding(_) => FrameEdge::Preceding(offset(arg)?),
                 WindowFrameBound::CurrentRow => FrameEdge::CurrentRow,
-                WindowFrameBound::Following(expr) => FrameEdge::Following(offset(expr)?),
+                WindowFrameBound::Following(_) => FrameEdge::Following(offset(arg)?),
                 WindowFrameBound::UnboundedFollowing => FrameEdge::UnboundedFollowing,
             })
         };
         Ok(Frame {
-            start: edge(&frame.start)?,
-            end: frame.end.as_ref().map_or(Ok(FrameEdge::CurrentRow), edge)?,
+            start: edge(&frame.start, &args.frame_start)?,
+            end: match &frame.end {
+                Some(end) => edge(end, &args.frame_end)?,
+                None => FrameEdge::CurrentRow,
+            },
             range,
         })
     }
@@ -345,7 +456,11 @@ use crate::storage::traits::{QueryResult, Table};
 
 use super::context::ExecutionContext;
 use super::expr_key::ExprKey;
-use super::expression::{compute_expression_hash, ExpressionEval, MultiExpressionEval};
+use super::expression::{
+    compile_once, compute_expression_hash, evaluate_once, execute_context, execute_once,
+    literal_value, CompileContext, ExprCompiler, ExprVM, ExpressionEval, MultiExpressionEval,
+    Program,
+};
 use super::query::{order_by_inputs, ColumnSource, OutputLayout};
 use super::result::{ColumnarResult, ExecutorResult};
 use super::utils::{
@@ -1176,7 +1291,7 @@ impl Executor {
                 } else {
                     self.function_registry.get_window(&wf.name)
                 };
-                (wf, func, is_agg)
+                (wf, func, is_agg, CallArgs::of(wf, &self.function_registry))
             })
             .collect();
 
@@ -1184,7 +1299,7 @@ impl Executor {
         let mut precomputed_agg: StringMap<Vec<Value>> = StringMap::new();
         let mut streaming_partition_cache: Vec<(OverClauseKey, SharedSortedPartitions)> =
             Vec::new();
-        for (wf, _, is_agg) in &resolved_wfs {
+        for (wf, _, is_agg, args) in &resolved_wfs {
             if *is_agg {
                 let cache_key = Self::order_by_cache_key(&wf.order_by);
                 let precomputed_order_by = order_by_cache
@@ -1201,6 +1316,7 @@ impl Executor {
                     None,
                     precomputed_order_by,
                     &mut streaming_partition_cache,
+                    args,
                 )?;
                 precomputed_agg.insert(wf.column_name.to_lowercase(), agg_results);
             }
@@ -1222,7 +1338,7 @@ impl Executor {
             // Compute window functions for this partition.
             let mut window_value_map: StringMap<Vec<Value>> = StringMap::new();
 
-            for (wf, win_func_opt, is_agg) in &resolved_wfs {
+            for (wf, win_func_opt, is_agg, args) in &resolved_wfs {
                 if *is_agg {
                     // Slice precomputed aggregate results for this partition
                     let key = wf.column_name.to_lowercase();
@@ -1249,6 +1365,7 @@ impl Executor {
                         &col_index_map,
                         group_slots,
                         ctx,
+                        args,
                         false,
                     )?;
                     // Remap: sorted_values[pos] corresponds to row sorted_indices[pos].
@@ -1382,7 +1499,7 @@ impl Executor {
                 } else {
                     self.function_registry.get_window(&wf.name)
                 };
-                (wf, func, is_agg)
+                (wf, func, is_agg, CallArgs::of(wf, &self.function_registry))
             })
             .collect();
 
@@ -1456,7 +1573,7 @@ impl Executor {
             // clause while indices differ per partition, so keep it local
             let mut lazy_partition_cache: Vec<(OverClauseKey, SharedSortedPartitions)> = Vec::new();
 
-            for (wf, win_func_opt, is_agg) in &resolved_wfs {
+            for (wf, win_func_opt, is_agg, args) in &resolved_wfs {
                 let cache_key = Self::order_by_cache_key(&wf.order_by);
                 let precomputed_order_by = order_by_cache
                     .iter()
@@ -1474,6 +1591,7 @@ impl Executor {
                         None,
                         precomputed_order_by,
                         &mut lazy_partition_cache,
+                        args,
                     )?;
                     // agg_results is already indexed by local row index
                     window_value_map.insert(wf.column_name.to_lowercase(), agg_results);
@@ -1488,6 +1606,7 @@ impl Executor {
                         &col_index_map,
                         &group_slots,
                         ctx,
+                        args,
                         false,
                     )?;
                     // Remap from sorted order to local row order
@@ -2477,6 +2596,7 @@ impl Executor {
                 pre_sorted,
                 cached_order_by,
                 partition_cache,
+                &CallArgs::of(wf_info, &self.function_registry),
             );
         }
 
@@ -2517,7 +2637,8 @@ impl Executor {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
-        let frame = Frame::read(wf_info, &self.function_registry, ctx)?;
+        let args = CallArgs::of(wf_info, &self.function_registry);
+        let frame = Frame::read(wf_info, &args, ctx)?;
 
         // If there's no partitioning, all rows form one partition
         if wf_info.partition_by_exprs.is_empty() {
@@ -2536,6 +2657,7 @@ impl Executor {
                 group_slots,
                 ctx,
                 &frame,
+                &args,
                 &mut results,
             )?;
 
@@ -2574,6 +2696,7 @@ impl Executor {
                         group_slots,
                         ctx,
                         &frame,
+                        &args,
                         &parallel_results,
                     )
                 });
@@ -2592,6 +2715,7 @@ impl Executor {
                     group_slots,
                     ctx,
                     &frame,
+                    &args,
                     &parallel_results,
                 )
             });
@@ -2619,6 +2743,7 @@ impl Executor {
                     group_slots,
                     ctx,
                     &frame,
+                    &args,
                     &mut results,
                 )?;
             }
@@ -2648,6 +2773,7 @@ impl Executor {
         col_index_map: &StringMap<usize>,
         group_slots: &FxHashMap<ExprKey, usize>,
         ctx: &ExecutionContext,
+        args: &CallArgs,
         skip_sorting: bool,
     ) -> Result<(Vec<Value>, Vec<usize>)> {
         // Empty fallback for when no precomputed values are provided
@@ -2668,12 +2794,13 @@ impl Executor {
         if row_indices.is_empty() {
             return Ok((Vec::new(), row_indices));
         }
-        let frame = Frame::read(wf_info, &self.function_registry, ctx)?;
+        let frame = Frame::read(wf_info, args, ctx)?;
         let mut results = Vec::with_capacity(row_indices.len());
         self.compute_sorted_partition(
             window_func,
             wf_info,
             &frame,
+            args,
             all_rows,
             &row_indices,
             order_by_values,
@@ -2694,6 +2821,7 @@ impl Executor {
         window_func: &dyn WindowFunction,
         wf_info: &WindowFunctionInfo,
         frame: &Frame,
+        args: &CallArgs,
         all_rows: &[(i64, Row)],
         row_indices: &[usize],
         order_by_values: &ColumnarOrderByValues,
@@ -2727,34 +2855,10 @@ impl Executor {
         let partition_len = row_indices.len();
         let frames = PartitionFrames::new(frame, row_indices, order_by_values);
 
-        // Compile constant window-function arguments once; deterministic
-        // ones also evaluate once (memoized) while volatile ones (RANDOM
-        // and friends) re-evaluate per row like the old per-row scheme.
-        // NTH_VALUE's n evaluates only for a frame that is not empty.
-        let is_lead_lag = matches!(wf_info.name.as_str(), "LEAD" | "LAG");
-        let const_arg = |position: usize| -> Result<Option<ConstArg>> {
-            wf_info
-                .arguments
-                .get(position)
-                .map(|expr| ConstArg::compile(expr, &self.function_registry, ctx))
-                .transpose()
-        };
-        let mut lead_lag_offset_arg = if is_lead_lag { const_arg(1)? } else { None };
-        let mut lead_lag_default_eval = if is_lead_lag && wf_info.arguments.len() > 2 {
-            Some(ExpressionEval::compile(&wf_info.arguments[2], columns)?.with_context(ctx))
-        } else {
-            None
-        };
-        let mut ntile_arg = if wf_info.name == "NTILE" {
-            const_arg(0)?
-        } else {
-            None
-        };
-        let nth_expr = wf_info
-            .arguments
-            .get(1)
-            .filter(|_| wf_info.name == "NTH_VALUE");
-        let mut nth_arg: Option<ConstArg> = None;
+        // NTH_VALUE's n evaluates only for a frame that is not empty
+        let mut count_arg = args.count.as_ref().map(PartitionArg::new);
+        let lead_lag_default = args.default_program(columns)?;
+        let mut default_vm = ExprVM::new();
         let lead_lag_offset = if wf_info.name == "LEAD" {
             "the offset of LEAD"
         } else {
@@ -2768,20 +2872,26 @@ impl Executor {
                 // instead of cloning into partition_values Vec
                 "LEAD" | "LAG" => Self::compute_lead_lag_indexed(
                     wf_info.name == "LEAD",
-                    match &mut lead_lag_offset_arg {
-                        Some(arg) => window_count(&arg.value()?, lead_lag_offset, 0)?,
+                    match &mut count_arg {
+                        Some(arg) => window_count(&arg.value(ctx)?, lead_lag_offset, 0)?,
                         None => 1,
                     },
-                    &mut lead_lag_default_eval,
+                    args.default_value(
+                        lead_lag_default,
+                        &mut default_vm,
+                        &all_rows[row_idx].1,
+                        ctx,
+                    )?,
                     all_rows,
                     row_indices,
                     arg_col_idx,
                     i,
-                    &all_rows[row_idx].1,
                 )?,
                 "NTILE" => Self::compute_ntile(
-                    match &mut ntile_arg {
-                        Some(arg) => window_count(&arg.value()?, "the bucket count of NTILE", 1)?,
+                    match &mut count_arg {
+                        Some(arg) => {
+                            window_count(&arg.value(ctx)?, "the bucket count of NTILE", 1)?
+                        }
                         None => 1,
                     },
                     partition_len,
@@ -2807,15 +2917,9 @@ impl Executor {
                             frame_start,
                             frame_end,
                         )?,
-                        "NTH_VALUE" => match nth_expr {
-                            Some(expr) if frame_start < frame_end => {
-                                let mut arg = match nth_arg.take() {
-                                    Some(arg) => arg,
-                                    None => ConstArg::compile(expr, &self.function_registry, ctx)?,
-                                };
-                                let value = arg.value();
-                                nth_arg = Some(arg);
-                                let n = window_count(&value?, "the n of NTH_VALUE", 1)?;
+                        "NTH_VALUE" => match &mut count_arg {
+                            Some(arg) if frame_start < frame_end => {
+                                let n = window_count(&arg.value(ctx)?, "the n of NTH_VALUE", 1)?;
                                 Self::compute_nth_value_indexed(
                                     n,
                                     all_rows,
@@ -2871,6 +2975,7 @@ impl Executor {
         group_slots: &FxHashMap<ExprKey, usize>,
         ctx: &ExecutionContext,
         frame: &Frame,
+        args: &CallArgs,
         results: &mut [Value],
     ) -> Result<()> {
         // Empty fallback for when no precomputed values are provided
@@ -2896,6 +3001,7 @@ impl Executor {
             window_func,
             wf_info,
             frame,
+            args,
             all_rows,
             &row_indices,
             order_by_values,
@@ -2926,6 +3032,7 @@ impl Executor {
         group_slots: &FxHashMap<ExprKey, usize>,
         ctx: &ExecutionContext,
         frame: &Frame,
+        args: &CallArgs,
         results: &ParallelVec,
     ) -> Result<()> {
         // Empty fallback for when no precomputed values are provided
@@ -2951,6 +3058,7 @@ impl Executor {
             window_func,
             wf_info,
             frame,
+            args,
             all_rows,
             &row_indices,
             order_by_values,
@@ -3016,26 +3124,17 @@ impl Executor {
     }
 
     /// Compute LEAD or LAG using index-based access (no cloning).
-    /// The offset is pre-resolved and the default expression pre-compiled
-    /// by the caller; the default still evaluates per row because it can
-    /// reference row columns.
-    #[allow(clippy::too_many_arguments)]
+    /// The offset and the current row's default are read by the caller;
+    /// the default evaluates per row because it can reference row columns.
     fn compute_lead_lag_indexed(
         is_lead: bool,
         offset: usize,
-        default_eval: &mut Option<ExpressionEval>,
+        default_value: Value,
         all_rows: &[(i64, Row)],
         sorted_indices: &[usize],
         arg_col_idx: Option<usize>,
         current_pos: usize,
-        current_row_data: &Row,
     ) -> Result<Value> {
-        // Evaluated unconditionally to preserve error semantics
-        let default_value = match default_eval {
-            Some(eval) => eval.eval(current_row_data)?,
-            None => Value::null_unknown(),
-        };
-
         // Calculate target position in sorted order
         let target_pos = if is_lead {
             current_pos.checked_add(offset)
@@ -3806,6 +3905,7 @@ impl Executor {
         pre_sorted: Option<&WindowPreSortedState>,
         cached_order_by: Option<&ColumnarOrderByValues>,
         partition_cache: &mut Vec<(OverClauseKey, SharedSortedPartitions)>,
+        args: &CallArgs,
     ) -> Result<Vec<Value>> {
         // Check if this is COUNT(*) - Star expression means count all rows
         let is_count_star =
@@ -3912,7 +4012,7 @@ impl Executor {
         if let Some(error) = &wf_info.extra_error {
             return Err(error.clone());
         }
-        let frame = Frame::read(wf_info, &self.function_registry, ctx)?;
+        let frame = Frame::read(wf_info, args, ctx)?;
         let mut results: Vec<Option<Value>> = vec![None; rows.len()];
 
         for row_indices in partitions.iter() {
@@ -4198,6 +4298,57 @@ mod tests {
             assert!(
                 pct_ranks[i] >= pct_ranks[i - 1],
                 "pct_ranks should be non-decreasing"
+            );
+        }
+    }
+
+    /// The SELECT expression of `SELECT {text}`
+    fn select_expression(text: &str) -> Expression {
+        match &crate::parser::parse_sql(&format!("SELECT {text}")).unwrap()[0] {
+            Statement::Select(select) => select.columns[0].clone(),
+            other => panic!("not a SELECT: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_window_argument_is_compiled_for_its_call_outside_the_program_cache() {
+        let executor = create_test_executor();
+        setup_test_data(&executor);
+        for (sql, argument) in [
+            (
+                "SELECT NTILE(1 + 700201) OVER (PARTITION BY dept ORDER BY id) FROM employees",
+                "1 + 700201",
+            ),
+            (
+                "SELECT LAG(salary, 700203 - 700202) OVER (PARTITION BY dept ORDER BY id) \
+                 FROM employees",
+                "700203 - 700202",
+            ),
+            (
+                "SELECT NTH_VALUE(salary, 700205 - 700204) OVER (PARTITION BY dept ORDER BY id) \
+                 FROM employees",
+                "700205 - 700204",
+            ),
+            (
+                "SELECT FIRST_VALUE(salary) OVER (PARTITION BY dept ORDER BY id \
+                 ROWS BETWEEN 700207 - 700206 PRECEDING AND CURRENT ROW) FROM employees",
+                "700207 - 700206",
+            ),
+            (
+                "SELECT SUM(salary) OVER (PARTITION BY dept ORDER BY id \
+                 ROWS BETWEEN 700209 - 700208 PRECEDING AND CURRENT ROW) FROM employees",
+                "700209 - 700208",
+            ),
+            (
+                "SELECT NTILE(1 + 700210) OVER (PARTITION BY dept ORDER BY id) FROM employees \
+                 LIMIT 3",
+                "1 + 700210",
+            ),
+        ] {
+            let _ = executor.execute(sql).unwrap();
+            assert!(
+                !crate::executor::expression::program_cached(&select_expression(argument), &[]),
+                "{sql}: `{argument}` entered the program cache"
             );
         }
     }
