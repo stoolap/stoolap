@@ -92,7 +92,6 @@ use crate::executor::parallel::{
 use crate::executor::planner::{QueryPlanner, RuntimeJoinAlgorithm, RuntimeJoinDecision};
 use crate::executor::utils::{column_kinds, extract_join_keys_and_residual_keeping};
 use crate::functions::registry::global_registry;
-use crate::optimizer::bloom::RuntimeBloomFilter;
 use crate::parser::ast::Expression;
 
 /// Result of a streaming join execution.
@@ -193,9 +192,6 @@ pub struct StreamingJoinRequest<'a> {
     pub limit: Option<u64>,
     /// Execution context for expression evaluation.
     pub ctx: &'a ExecutionContext,
-    /// Optional bloom filter built from build side keys.
-    /// When provided, probe rows are filtered before hash lookup.
-    pub bloom_filter: Option<RuntimeBloomFilter>,
     /// Pre-built hash table (if available). When provided, skips the hash table
     /// build phase in HashJoinOperator, avoiding double iteration of build_rows.
     pub pre_built_hash_table: Option<JoinHashTable>,

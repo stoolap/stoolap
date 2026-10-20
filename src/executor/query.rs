@@ -5814,18 +5814,11 @@ impl Executor {
                         };
 
                     // Wrap probe with bloom filter if available
-                    let probe_source: Box<dyn Operator> = if let Some(ref bf) = bloom_filter {
-                        if !probe_key_indices.is_empty() {
-                            Box::new(BloomFilterOperator::new(
-                                probe_source,
-                                bf.clone(),
-                                probe_key_indices.clone(),
-                            ))
-                        } else {
-                            probe_source
-                        }
-                    } else {
-                        probe_source
+                    let probe_source: Box<dyn Operator> = match bloom_filter {
+                        Some(bf) if !probe_key_indices.is_empty() => Box::new(
+                            BloomFilterOperator::new(probe_source, bf, probe_key_indices),
+                        ),
+                        _ => probe_source,
                     };
 
                     // Execute streaming hash join
@@ -5840,7 +5833,6 @@ impl Executor {
                         build_is_left,
                         limit: Some(limit),
                         ctx,
-                        bloom_filter,
                         pre_built_hash_table,
                         cross_key,
                     };
