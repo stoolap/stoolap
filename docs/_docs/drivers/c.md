@@ -572,6 +572,9 @@ const uint8_t* buf = NULL;
 int64_t buf_len = 0;
 stoolap_stmt_query_named_all(lookup, NULL, qp, 1, &buf, &buf_len);
 stoolap_stmt_finalize(lookup);
+
+/* Ad-hoc SQL + named params, all rows in one call; buf belongs to db */
+stoolap_query_named_all(db, NULL, "SELECT name FROM t WHERE id = :id", qp, 1, &buf, &buf_len);
 ```
 
 The parameter name must be valid UTF-8 and match the `:name` placeholder in the SQL (without the `:` prefix). Names with invalid UTF-8 or zero length are silently skipped.
