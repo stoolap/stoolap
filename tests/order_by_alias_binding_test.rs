@@ -38,6 +38,10 @@ fn tables(name: &str) -> Database {
         "CREATE TABLE sb (id INTEGER PRIMARY KEY, k INTEGER)",
         "INSERT INTO sb VALUES (10, 0), (20, 0), (30, 0)",
         "CREATE VIEW v AS SELECT id FROM t",
+        "CREATE TABLE q (\"1\" INTEGER)",
+        "INSERT INTO q VALUES (1), (2), (3)",
+        "CREATE TABLE b1 (id INTEGER PRIMARY KEY)",
+        "INSERT INTO b1 VALUES (1)",
     ] {
         db.execute(sql, ()).unwrap();
     }
@@ -208,6 +212,16 @@ fn an_order_by_name_binds_the_output_column_and_a_qualified_one_the_input() {
             "SELECT \"ǅ\".*, -id AS rev FROM t AS \"ǅ\" ORDER BY rev",
             vec![],
             vec![3, 2, 1],
+        ),
+        (
+            "SELECT \"ΟΣ\".*, -\"ΟΣ\".\"1\" AS rev FROM q AS \"ΟΣ\" CROSS JOIN b1 ORDER BY rev",
+            vec![],
+            vec![3, 2, 1],
+        ),
+        (
+            "SELECT \"ΟΣ\".\"1\", -\"ΟΣ\".\"1\" AS \"1\" FROM q AS \"ΟΣ\" CROSS JOIN b1 ORDER BY \"ΟΣ\".\"1\"",
+            vec![],
+            vec![1, 2, 3],
         ),
         (
             "WITH g (id, n) AS (SELECT id, COUNT(*) FROM t GROUP BY id) SELECT -g.id AS id FROM g LEFT JOIN s ON s.id = g.id ORDER BY id LIMIT 2",

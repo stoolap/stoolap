@@ -225,14 +225,25 @@ fn input_column_index(columns: &[String], qualifier: Option<&str>, name: &str) -
         })
 }
 
-/// The length of `qualifier.` when `column` starts with it, the qualifier
-/// lowercased, so the bare name is what follows
-fn qualified_prefix_len(column: &str, qualifier: &str) -> Option<usize> {
-    column
-        .match_indices('.')
-        .map(|(dot, _)| dot)
-        .find(|&dot| eq_folded(&column[..dot], qualifier))
-        .map(|dot| dot + 1)
+/// Where the bare name starts in `column` when a qualified star over
+/// `qualifier` takes it, by `star_takes_lowered`; only a non-ASCII name is
+/// lowercased into a copy
+fn qualified_star_name_start(column: &str, qualifier: &str) -> Option<usize> {
+    if column.is_ascii() && qualifier.is_ascii() {
+        let q = qualifier.len();
+        return (column.len() > q
+            && column.as_bytes()[q] == b'.'
+            && column[..q].eq_ignore_ascii_case(qualifier))
+        .then_some(q + 1);
+    }
+    let qualifier = qualifier.to_lowercase();
+    star_takes_lowered(&column.to_lowercase(), &qualifier).then(|| {
+        column
+            .match_indices('.')
+            .map(|(dot, _)| dot + 1)
+            .find(|&start| column[..start - 1].to_lowercase() == qualifier)
+            .unwrap_or(0)
+    })
 }
 
 /// `name` as `eq_folded` takes it: borrowed when ASCII, which it compares
@@ -348,8 +359,8 @@ use super::utils::{
     eq_folded_qualified, expression_contains_aggregate, extract_and_conditions,
     extract_base_column_name, extract_join_keys_and_residual, filter_references_column,
     flatten_and_predicates, flip_operator, get_table_alias_from_expr, index_join_residual,
-    infix_to_operator, order_by_names_an_alias, string_literal_value, strip_table_qualifier,
-    substitute_filter_column, visit_column_refs,
+    infix_to_operator, order_by_names_an_alias, star_takes_lowered, string_literal_value,
+    strip_table_qualifier, substitute_filter_column, visit_column_refs,
 };
 use super::volatility::{expression_volatility, statement_constant};
 use super::window::{WindowPreGroupedState, WindowPreSortedState};
@@ -10220,7 +10231,7 @@ impl Executor {
                     let qualifier = folded(&qs.qualifier);
                     let mut found_any = false;
                     for (idx, column) in all_columns.iter().enumerate() {
-                        if let Some(len) = qualified_prefix_len(column, &qualifier) {
+                        if let Some(len) = qualified_star_name_start(column, &qs.qualifier) {
                             // Strip "qualifier." from the column name for the output
                             // e.g., "e.name" becomes "name"
                             if !laid_out {
