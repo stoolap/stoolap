@@ -146,7 +146,7 @@ PRAGMA hot_max_rows;                -- read current value
 
 #### hot_max_bytes
 
-When a table holds at least this many hot row bytes, a commit that writes to it requests a seal and waits, before it takes the seal fence, until the seal brings the table back under the limit. The wait is bounded at 10 seconds and counted (see `memory_stats`). A transaction that updates or deletes existing hot rows does not wait, since the seal skips rows it has claimed. In-memory databases never wait because nothing can seal. 0 turns the wait off. Default: 0.
+When a table holds at least this many hot row bytes, a commit that writes to it requests a seal and waits, before it takes the seal fence, until the seal brings the table back under the limit. The wait is bounded at 10 seconds and counted (see `memory_stats`). A transaction that updates or deletes existing hot rows does not wait, since the seal skips rows it has claimed. In-memory databases never wait because nothing can seal, and neither does a database whose background cleanup thread is not running (`cleanup=off`, or WASM), because that thread runs the seal. 0 turns the wait off. Default: 0.
 
 ```sql
 PRAGMA hot_max_bytes = 268435456;   -- 256 MB per table

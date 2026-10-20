@@ -556,6 +556,8 @@ struct HotLimits {
     max_rows: AtomicUsize,
     max_bytes: AtomicUsize,
     seal_requested: AtomicBool,
+    /// The cleanup thread, which seals on request, is running
+    seal_worker: AtomicBool,
     admission: (Mutex<()>, Condvar),
     admission_waits: AtomicU64,
 }
@@ -566,6 +568,7 @@ impl HotLimits {
             max_rows: AtomicUsize::new(config.hot_max_rows),
             max_bytes: AtomicUsize::new(config.hot_max_bytes),
             seal_requested: AtomicBool::new(false),
+            seal_worker: AtomicBool::new(false),
             admission: (Mutex::new(()), Condvar::new()),
             admission_waits: AtomicU64::new(0),
         }
@@ -1122,6 +1125,7 @@ impl MVCCEngine {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_clone = Arc::clone(&stop_flag);
         let engine = Arc::clone(self);
+        self.hot_limits.seal_worker.store(true, Ordering::Release);
 
         let handle = thread::spawn(move || {
             let mut time_since_cleanup = std::time::Duration::ZERO;
@@ -1209,6 +1213,11 @@ impl MVCCEngine {
                     engine.spawn_backfill();
                 }
             }
+            // Commits waiting for a seal stop waiting once no thread will run one
+            let limits = &engine.hot_limits;
+            limits.seal_worker.store(false, Ordering::Release);
+            let _admission = limits.admission.0.lock();
+            limits.admission.1.notify_all();
         });
 
         CleanupHandle {
@@ -10023,25 +10032,23 @@ impl TransactionEngineOperations for EngineOperations {
         if !over() {
             return;
         }
-        limits.admission_waits.fetch_add(1, Ordering::Relaxed);
         limits.seal_requested.store(true, Ordering::Release);
-        // wasm32 runs no seal thread, so nothing could end the wait
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let deadline = Instant::now() + std::time::Duration::from_secs(10);
-            let mut guard = limits.admission.0.lock().unwrap();
-            while over() {
-                let now = Instant::now();
-                if now >= deadline {
-                    break;
-                }
-                guard = limits
-                    .admission
-                    .1
-                    .wait_timeout(guard, deadline - now)
-                    .unwrap()
-                    .0;
+        // No seal comes without the cleanup thread: cleanup is off, or wasm32
+        if !limits.seal_worker.load(Ordering::Acquire) {
+            return;
+        }
+        limits.admission_waits.fetch_add(1, Ordering::Relaxed);
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        let mut guard = limits.admission.0.lock().unwrap();
+        while over() && limits.seal_worker.load(Ordering::Acquire) {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
             }
+            // Only while the cleanup thread runs; wasm32 has none
+            #[allow(clippy::disallowed_methods)]
+            let waited = limits.admission.1.wait_timeout(guard, deadline - now);
+            guard = waited.unwrap().0;
         }
     }
 }

@@ -45,6 +45,12 @@ run("BEGIN");
 run("INSERT INTO t VALUES (4, 40, 'd')");
 run("ALTER TABLE t MODIFY COLUMN s TEXT NOT NULL", "any");
 run("ROLLBACK");
+run("BEGIN;");
+run("INSERT INTO t VALUES (5, 50, 'e');");
+run("COMMIT;");
+run("BEGIN;");
+run("INSERT INTO t VALUES (6, 60, 'f')");
+run("ROLLBACK;");
 run("SELECT NOW(), CURRENT_TIMESTAMP, CURRENT_DATE, CURRENT_TIME, RANDOM()");
 run("SELECT SLEEP(1)", "error");
 run("UPDATE t SET v = v + 1 WHERE id = 2");
@@ -53,7 +59,11 @@ run("VACUUM");
 run("ANALYZE t");
 run("EXPLAIN ANALYZE SELECT * FROM t WHERE v > 0");
 run("PRAGMA CHECKPOINT", "any");
-run("SELECT COUNT(*) FROM t");
+const ids = JSON.parse(db.execute("SELECT id FROM t ORDER BY id")).rows.map((r) => r[0]);
+if (JSON.stringify(ids) !== "[1,2,5]") {
+  console.error(`FAIL  ids ${JSON.stringify(ids)}, expected [1,2,5]`);
+  failed++;
+}
 
 if (failed) {
   console.error(`${failed} statement(s) failed`);

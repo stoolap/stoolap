@@ -256,6 +256,28 @@ fn updates_that_grow_past_the_byte_limit_request_a_seal() {
     );
 }
 
+#[test]
+fn a_database_without_the_cleanup_thread_ignores_the_byte_limit() {
+    let dir = tempdir().expect("tempdir");
+    let db = Database::open(&format!(
+        "file://{}?cleanup=off&hot_max_rows=0&hot_max_bytes=1",
+        dir.path().display()
+    ))
+    .expect("open");
+    db.execute("CREATE TABLE c (id INTEGER PRIMARY KEY, t TEXT)", ())
+        .expect("create");
+    let started = Instant::now();
+    insert_batch(&db, "c", 1, 500);
+    insert_batch(&db, "c", 501, 500);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "a commit waited {:?} for a seal no thread runs",
+        started.elapsed()
+    );
+    assert_eq!(memory_stats(&db, "c").3, 0);
+    assert_eq!(int(&db, "SELECT COUNT(*) FROM c"), 1000);
+}
+
 /// Under `test-filedb` a memory DSN opens a file database, which can seal
 #[cfg(not(feature = "test-filedb"))]
 #[test]
