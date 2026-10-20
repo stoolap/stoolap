@@ -612,7 +612,7 @@ pub struct MVCCEngine {
     /// Transaction registry
     registry: Arc<TransactionRegistry>,
     /// Whether the engine is open
-    open: AtomicBool,
+    open: Arc<AtomicBool>,
     /// Cache of transaction version stores per (txn_id, table_name) for proper commit/rollback
     /// (Arc-wrapped for safe sharing with transactions)
     txn_version_stores: Arc<RwLock<TxnVersionStoreMap>>,
@@ -846,7 +846,7 @@ impl MVCCEngine {
             schemas: Arc::new(RwLock::new(FxHashMap::default())),
             version_stores: Arc::new(RwLock::new(FxHashMap::default())),
             registry: Arc::new(TransactionRegistry::new()),
-            open: AtomicBool::new(false),
+            open: Arc::new(AtomicBool::new(false)),
             txn_version_stores: Arc::new(RwLock::new(I64Map::new())),
             views: RwLock::new(FxHashMap::default()),
             persistence: Arc::new(persistence),
@@ -8890,6 +8890,8 @@ struct EngineOperations {
     hot_limits: Arc<HotLimits>,
     /// The engine's DDL guard and schema epoch
     ddl: Arc<DdlShared>,
+    /// The engine's open flag
+    open: Arc<AtomicBool>,
 }
 
 // EngineOperations is Send + Sync because all fields are Arc-wrapped thread-safe types
@@ -8918,6 +8920,7 @@ impl EngineOperations {
             seal_fence: Arc::clone(&engine.seal_fence),
             hot_limits: Arc::clone(&engine.hot_limits),
             ddl: Arc::clone(&engine.ddl),
+            open: Arc::clone(&engine.open),
         }
     }
 
@@ -9156,6 +9159,10 @@ impl EngineOperations {
 }
 
 impl TransactionEngineOperations for EngineOperations {
+    fn is_open(&self) -> bool {
+        self.open.load(Ordering::Acquire)
+    }
+
     fn get_table_for_transaction(
         &self,
         txn_id: i64,

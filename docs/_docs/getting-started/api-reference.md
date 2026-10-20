@@ -36,7 +36,7 @@ let db = Database::open("file:///path/to/database")?;
 let db = Database::open("file:///path/to/db?sync=full&checkpoint_interval=60")?;
 ```
 
-`open_in_memory()` creates a unique, isolated instance each time. `open("memory://")` returns the same shared engine for the same DSN. Each `open` returns a new session on that engine, with its own transaction state, like `clone()`. The engine closes when the last handle on it drops, or on `close()`.
+`open_in_memory()` creates a unique, isolated instance each time. `open("memory://")` returns the same shared engine for the same DSN. Each `open` returns a new session on that engine, with its own transaction state, like `clone()`. The engine closes when the last handle on it drops, or on `close()`. An open `Transaction` counts as a handle: it keeps the engine open until it commits, rolls back or drops.
 
 ### Connection String Options
 
@@ -341,7 +341,7 @@ tx.commit()?;
 // Or: tx.rollback()?;
 ```
 
-Transactions auto-rollback on drop if not committed.
+Transactions auto-rollback on drop if not committed. A transaction keeps its database open, so it can still commit after the last `Database` handle drops. After an explicit `close()`, its `commit()` returns `Error::EngineNotOpen` and nothing is written.
 
 ### Prepared Statements in Transactions
 

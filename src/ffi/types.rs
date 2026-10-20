@@ -99,9 +99,6 @@ pub struct StoolapStmt {
 pub struct StoolapTx {
     pub(crate) tx: Option<Transaction>,
     pub(crate) last_error: Option<CString>,
-    /// Keeps the originating `DatabaseInner` alive so the transaction's
-    /// storage references remain valid.
-    pub(crate) _db_keepalive: Arc<DatabaseInner>,
 }
 
 /// Opaque handle wrapping a [`Rows`] result set.
