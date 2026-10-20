@@ -310,8 +310,8 @@ use super::context::{
 };
 use super::expr_key::ExprKey;
 use super::expression::{
-    compile_expression, CompiledEvaluator, ExecuteContext, ExprVM, ExpressionEval, JoinFilter,
-    RowFilter, SharedProgram,
+    compile_expression, CompileContext, CompiledEvaluator, ExecuteContext, ExprCompiler, ExprVM,
+    ExpressionEval, JoinFilter, RowFilter, SharedProgram,
 };
 use super::hash_table::JoinHashTable;
 use super::join_executor::{JoinExecutor, StreamingJoinRequest};
@@ -483,6 +483,49 @@ pub(crate) fn split_join_where(
     };
 
     (safe_left, safe_right, remaining)
+}
+
+/// The input column a SELECT item names, its alias set aside: a bare name,
+/// or a qualified one by its full name and then its bare one; the error for
+/// a name no column has; None for any other expression
+fn select_column(expr: &Expression, col_index_map: &StringMap<usize>) -> Option<Result<usize>> {
+    match unaliased_item(expr) {
+        Expression::Identifier(id) => Some(
+            col_index_map
+                .get(id.value_lower.as_str())
+                .copied()
+                .ok_or_else(|| Error::ColumnNotFound(id.value.to_string())),
+        ),
+        Expression::QualifiedIdentifier(qid) => {
+            // The full name first: two tables in a join may share a column name
+            let full_name = format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
+            Some(
+                col_index_map
+                    .get(&full_name)
+                    .or_else(|| col_index_map.get(qid.name.value_lower.as_str()))
+                    .copied()
+                    .ok_or_else(|| {
+                        Error::ColumnNotFound(format!("{}.{}", qid.qualifier.value, qid.name.value))
+                    }),
+            )
+        }
+        _ => None,
+    }
+}
+
+/// Where one projected value comes from: a column of the input row, or a
+/// program compiled once for the statement
+enum ItemSource {
+    Column(usize),
+    Program(SharedProgram),
+}
+
+/// A SELECT item without its aliases
+fn unaliased_item(mut expr: &Expression) -> &Expression {
+    while let Expression::Aliased(aliased) = expr {
+        expr = &aliased.expression;
+    }
+    expr
 }
 
 /// Whether a WHERE `expr` keeps no row: one of its AND terms is a statement
@@ -9602,44 +9645,46 @@ impl Executor {
             );
             let mut projected = RowVec::with_capacity(rows.len());
 
-            // Create evaluator once and reuse for all rows
-            let mut evaluator = CompiledEvaluator::new(&self.function_registry);
-            evaluator = evaluator.with_context(ctx);
-            evaluator.init_columns(all_columns);
+            // Each value's source is found once for the statement; an error
+            // is raised by the first row that reads it, as evaluating raised it
+            let compile_ctx = CompileContext::new(all_columns, &self.function_registry);
+            let compile = |expr: &Expression| -> Result<SharedProgram> {
+                ExprCompiler::new(&compile_ctx)
+                    .compile(expr)
+                    .map(CompactArc::new)
+                    .map_err(|e| Error::internal(format!("Compile error: {}", e)))
+            };
+            let sources: Vec<Result<ItemSource>> = select_exprs
+                .iter()
+                .map(|expr| match select_column(expr, &col_index_map_lower) {
+                    Some(idx) => idx.map(ItemSource::Column),
+                    None => compile(unaliased_item(expr)).map(ItemSource::Program),
+                })
+                .chain(
+                    extra_order_indices
+                        .iter()
+                        .map(|&idx| Ok(ItemSource::Column(idx))),
+                )
+                .chain(
+                    computed_order_by
+                        .iter()
+                        .chain(&computed_distinct_on)
+                        .map(|expr| compile(expr).map(ItemSource::Program)),
+                )
+                .collect();
+            let mut vm = ExprVM::new();
 
-            let total_extra =
-                extra_order_indices.len() + computed_order_by.len() + computed_distinct_on.len();
-
-            // OPTIMIZATION: Reuse col_index_map_lower for O(1) lookup
             for (row_id, row) in rows.drain_rows().enumerate() {
-                let mut values = Vec::with_capacity(select_exprs.len() + total_extra);
-
-                evaluator.set_row_array(&row);
-
-                // Evaluate SELECT expressions
-                for expr in select_exprs.iter() {
-                    let value = self.evaluate_select_expr(
-                        &mut evaluator,
-                        expr,
-                        &row,
-                        &col_index_map_lower,
-                    )?;
-                    values.push(value);
-                }
-
-                // Add extra ORDER BY columns
-                for &idx in &extra_order_indices {
-                    values.push(row.get(idx).cloned().unwrap_or(Value::null_unknown()));
-                }
-
-                // Evaluate computed ORDER BY expressions
-                for expr in &computed_order_by {
-                    values.push(evaluator.evaluate(expr)?);
-                }
-
-                // Evaluate computed DISTINCT ON expressions
-                for expr in &computed_distinct_on {
-                    values.push(evaluator.evaluate(expr)?);
+                let exec = super::expression::execute_context(&row, Some(ctx));
+                let mut values = Vec::with_capacity(sources.len());
+                for source in &sources {
+                    values.push(match source {
+                        Ok(ItemSource::Column(idx)) => {
+                            row.get(*idx).cloned().unwrap_or(Value::null_unknown())
+                        }
+                        Ok(ItemSource::Program(program)) => vm.execute_cow(program, &exec)?,
+                        Err(e) => return Err(e.clone()),
+                    });
                 }
 
                 projected.push((row_id as i64, Row::from_values(values)));
@@ -9896,7 +9941,6 @@ impl Executor {
 
     /// Evaluate a single SELECT expression
     /// OPTIMIZATION: Takes pre-computed column index map for O(1) lookup instead of O(N) linear search
-    #[allow(clippy::only_used_in_recursion)]
     fn evaluate_select_expr(
         &self,
         evaluator: &mut CompiledEvaluator,
@@ -9904,40 +9948,9 @@ impl Executor {
         row: &Row,
         col_index_map: &StringMap<usize>,
     ) -> Result<Value> {
-        match expr {
-            // Simple column reference - get from row by index using O(1) HashMap lookup
-            Expression::Identifier(id) => {
-                // Use pre-computed value_lower for O(1) lookup - no allocation!
-                if let Some(&idx) = col_index_map.get(id.value_lower.as_str()) {
-                    Ok(row.get(idx).cloned().unwrap_or(Value::null_unknown()))
-                } else {
-                    Err(Error::ColumnNotFound(id.value.to_string()))
-                }
-            }
-            // Qualified identifier (table.column) - O(1) lookup
-            Expression::QualifiedIdentifier(qid) => {
-                // IMPORTANT: Try full qualified name FIRST to handle same-named columns
-                // across different tables (e.g., t1.name vs t2.name in JOINs)
-                let full_name = format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
-                if let Some(&idx) = col_index_map.get(&full_name) {
-                    Ok(row.get(idx).cloned().unwrap_or(Value::null_unknown()))
-                } else if let Some(&idx) = col_index_map.get(qid.name.value_lower.as_str()) {
-                    // Fallback to unqualified name for single-table queries or aliases
-                    Ok(row.get(idx).cloned().unwrap_or(Value::null_unknown()))
-                } else {
-                    Err(Error::ColumnNotFound(format!(
-                        "{}.{}",
-                        qid.qualifier.value, qid.name.value
-                    )))
-                }
-            }
-            // Aliased expression - evaluate the inner expression
-            Expression::Aliased(aliased) => {
-                self.evaluate_select_expr(evaluator, &aliased.expression, row, col_index_map)
-            }
-            // For all other expressions (CAST, arithmetic, function calls, etc.)
-            // use the evaluator
-            _ => evaluator.evaluate(expr),
+        match select_column(expr, col_index_map) {
+            Some(idx) => Ok(row.get(idx?).cloned().unwrap_or(Value::null_unknown())),
+            None => evaluator.evaluate(unaliased_item(expr)),
         }
     }
 
