@@ -22,17 +22,7 @@
 use rustc_hash::FxHashSet;
 
 use super::ops::Op;
-use crate::common::CompactArc;
 use crate::core::Value;
-
-/// Constant value stored in the program
-#[derive(Debug, Clone)]
-pub enum Constant {
-    /// A literal value
-    Value(Value),
-    /// A string (for patterns, column names, etc.)
-    String(CompactArc<str>),
-}
 
 /// Compiled expression program
 ///
@@ -995,28 +985,5 @@ mod tests {
         assert!(debug_str.contains("Program"));
         assert!(debug_str.contains("ops_count"));
         assert!(debug_str.contains("max_stack_depth"));
-    }
-
-    // =========================================================================
-    // Constant enum
-    // =========================================================================
-
-    #[test]
-    fn test_constant_value() {
-        let c = Constant::Value(Value::Integer(42));
-        assert!(matches!(c, Constant::Value(Value::Integer(42))));
-    }
-
-    #[test]
-    fn test_constant_string() {
-        let c = Constant::String("test".into());
-        assert!(matches!(c, Constant::String(_)));
-    }
-
-    #[test]
-    fn test_constant_clone() {
-        let c1 = Constant::Value(Value::Text("hello".into()));
-        let c2 = c1.clone();
-        assert!(matches!(c2, Constant::Value(Value::Text(_))));
     }
 }

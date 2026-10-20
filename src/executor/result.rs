@@ -458,26 +458,6 @@ pub struct FilteredResult {
 unsafe impl Send for FilteredResult {}
 
 impl FilteredResult {
-    /// Create a new expression-filtered result
-    ///
-    /// # Arguments
-    /// * `inner` - The source result to filter
-    /// * `filter_expr` - The WHERE clause expression
-    ///
-    /// Returns an error if the filter expression cannot be compiled.
-    pub fn new(inner: Box<dyn QueryResult>, filter_expr: &Expression) -> Result<Self> {
-        let columns = inner.columns().to_vec();
-        let filter = RowFilter::new(filter_expr, &columns)?;
-
-        Ok(Self {
-            inner,
-            filter,
-            current_row: None,
-            columns,
-            pending_error: None,
-        })
-    }
-
     /// Create from a pre-built RowFilter
     ///
     /// Use this when you have a RowFilter that was constructed with specific
@@ -491,20 +471,6 @@ impl FilteredResult {
             columns,
             pending_error: None,
         }
-    }
-
-    /// Create with default function registry (static lifetime)
-    pub fn with_defaults(inner: Box<dyn QueryResult>, filter_expr: Expression) -> Result<Self> {
-        let columns = inner.columns().to_vec();
-        let filter = RowFilter::new(&filter_expr, &columns)?;
-
-        Ok(Self {
-            inner,
-            filter,
-            current_row: None,
-            columns,
-            pending_error: None,
-        })
     }
 }
 
@@ -2259,7 +2225,8 @@ mod tests {
             })),
         });
 
-        let mut result = FilteredResult::with_defaults(inner, filter_expr).unwrap();
+        let filter = RowFilter::new(&filter_expr, inner.columns()).unwrap();
+        let mut result = FilteredResult::from_filter(inner, filter);
 
         // Should get rows with value 20 and 30
         assert!(result.next());

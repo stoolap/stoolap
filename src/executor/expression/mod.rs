@@ -46,11 +46,11 @@ pub use compiler::{CompileContext, CompileError, ExprCompiler};
 pub(crate) use evaluator_bridge::try_eval_constant_expr_with_context;
 pub use evaluator_bridge::{
     clear_program_cache, compile_expression, compile_expression_with_context,
-    compute_expression_hash, try_eval_constant_expr, CompiledEvaluator, ExpressionEval, JoinFilter,
-    MultiExpressionEval, RowFilter, SharedProgram,
+    compute_expression_hash, CompiledEvaluator, ExpressionEval, JoinFilter, MultiExpressionEval,
+    RowFilter, SharedProgram,
 };
 pub use ops::{CompareOp, Op, QuantifiedMembers};
-pub use program::{Constant, Program};
+pub use program::Program;
 pub use vm::{ExecuteContext, ExprVM, SubqueryExecutor};
 
 #[cfg(test)]
