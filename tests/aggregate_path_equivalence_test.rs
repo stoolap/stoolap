@@ -319,3 +319,21 @@ fn every_aggregate_path_answers_as_the_general_path() {
         wrong.join("\n")
     );
 }
+
+#[test]
+fn a_having_that_calls_a_scalar_function_is_not_judged_inside_the_index_walk() {
+    let db = open(
+        Database::open("memory://aggregate_path_having_scalar_call").unwrap(),
+        false,
+        true,
+    );
+    let sql = "SELECT g, COUNT(*) FROM t GROUP BY g HAVING SLEEP(0) IS NOT NULL LIMIT 10";
+    let (got, taken) = run(&db, sql);
+    assert_eq!(
+        taken,
+        ["general"],
+        "a memory table's B-tree walk holds its index lock while it judges HAVING"
+    );
+    let (plain, _) = run(&db, "SELECT g, COUNT(*) FROM t GROUP BY g LIMIT 10");
+    assert_eq!(got, plain);
+}

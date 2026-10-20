@@ -12502,7 +12502,9 @@ impl Executor {
         slot_columns.push(group_column.clone());
         slot_columns.extend(aggregations.iter().map(|agg| agg.get_column_name()));
 
-        // HAVING over the slot row, compiled as every aggregate path compiles it
+        // HAVING over the slot row, compiled as every aggregate path compiles
+        // it; a memory table walks under its index lock, so a HAVING that
+        // calls a scalar function, which may sleep or write, runs elsewhere
         let having_filter = match stmt.having.as_deref() {
             Some(having) if Self::has_subqueries(having) => return Ok(None),
             Some(having) => {
@@ -12511,13 +12513,21 @@ impl Executor {
                     &aggregations,
                     &stmt.columns,
                 );
-                Some(crate::executor::aggregation::compile_over_slots(
+                let filter = crate::executor::aggregation::compile_over_slots(
                     having,
                     &slot_columns,
                     crate::functions::registry::global_registry(),
                     Some(&slots),
                     None,
-                )?)
+                )?;
+                if filter
+                    .ops()
+                    .iter()
+                    .any(|op| matches!(op, crate::executor::expression::Op::CallScalar { .. }))
+                {
+                    return Ok(None);
+                }
+                Some(filter)
             }
             None => None,
         };
