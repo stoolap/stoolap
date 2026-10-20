@@ -1059,7 +1059,7 @@ impl Executor {
         // Every input column ORDER BY reads that no output column copies is
         // carried for the sort, which the expected-column trim then drops
         let (mut result_columns, mut column_data) = (result_columns, column_data);
-        let mut sources: Vec<ColumnSource> = select_items
+        let mut sources: super::query::LayoutSources = select_items
             .iter()
             .zip(&item_of)
             .map(|(select_item, &item)| ColumnSource {
@@ -1087,7 +1087,7 @@ impl Executor {
             });
         }
         let layout = laid_out.then(|| OutputLayout {
-            input_columns: base_columns.to_vec(),
+            input_columns: crate::common::CompactArc::new(base_columns.to_vec()),
             sources,
         });
 

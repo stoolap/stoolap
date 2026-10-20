@@ -23,6 +23,7 @@ use crate::storage::traits::QueryResult;
 use rustc_hash::{FxHashMap, FxHasher};
 
 use super::expression::RowFilter;
+use super::utils::star_takes_lowered;
 
 /// Execution result for DML operations (INSERT, UPDATE, DELETE)
 ///
@@ -735,12 +736,8 @@ impl QueryResult for ExprMappedResult {
                     CompiledProjection::QualifiedStar { qualifier_lower } => {
                         // Expand columns for specific table/alias
                         // Use pre-computed lowercase columns to avoid per-row to_lowercase()
-                        let qualifier_len = qualifier_lower.len();
                         for (idx, col_lower) in self.source_columns_lower.iter().enumerate() {
-                            // Inline prefix check: "qualifier." without format! allocation
-                            if col_lower.len() > qualifier_len
-                                && col_lower.starts_with(qualifier_lower.as_str())
-                                && col_lower.as_bytes()[qualifier_len] == b'.'
+                            if star_takes_lowered(col_lower, qualifier_lower)
                                 && idx < source_row.len()
                             {
                                 self.current_row.push_inline(source_row[idx].clone());

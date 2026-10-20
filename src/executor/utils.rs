@@ -2662,26 +2662,26 @@ pub fn compute_join_projection(
 }
 
 /// Case-insensitive comparison of a column name against an already
-/// lowercased name, folding the Unicode way without allocating.
+/// lowercased name, lowercasing the column as `str::to_lowercase` does,
+/// final sigma included; only a non-ASCII column is lowercased into a copy.
 #[inline]
-fn eq_folded(column: &str, lower: &str) -> bool {
-    if column.is_ascii() && lower.is_ascii() {
-        column.eq_ignore_ascii_case(lower)
+pub(crate) fn eq_folded(column: &str, lower: &str) -> bool {
+    if column.is_ascii() {
+        lower.is_ascii() && column.eq_ignore_ascii_case(lower)
     } else {
-        column
-            .chars()
-            .flat_map(char::to_lowercase)
-            .eq(lower.chars())
+        column.to_lowercase() == lower
     }
 }
 
 /// The same for `qualifier.name`, compared as one string so that a dot
 /// inside a quoted qualifier or name is not taken for the separator.
 #[inline]
-fn eq_folded_qualified(column: &str, qualifier: &str, name: &str) -> bool {
-    if column.is_ascii() && qualifier.is_ascii() && name.is_ascii() {
+pub(crate) fn eq_folded_qualified(column: &str, qualifier: &str, name: &str) -> bool {
+    if column.is_ascii() {
         let q = qualifier.len();
-        column.len() == q + 1 + name.len()
+        qualifier.is_ascii()
+            && name.is_ascii()
+            && column.len() == q + 1 + name.len()
             && column.as_bytes()[q] == b'.'
             && column[..q].eq_ignore_ascii_case(qualifier)
             && column[q + 1..].eq_ignore_ascii_case(name)
@@ -2690,8 +2690,19 @@ fn eq_folded_qualified(column: &str, qualifier: &str, name: &str) -> bool {
             .chars()
             .chain(std::iter::once('.'))
             .chain(name.chars());
-        column.chars().flat_map(char::to_lowercase).eq(expected)
+        column.to_lowercase().chars().eq(expected)
     }
+}
+
+/// Whether a qualified star over `qualifier_lower` takes the column whose
+/// whole name lowercased is `column_lower`: the rule the row projection
+/// and the output layout both expand a star by
+#[inline]
+pub(crate) fn star_takes_lowered(column_lower: &str, qualifier_lower: &str) -> bool {
+    let q = qualifier_lower.len();
+    column_lower.len() > q
+        && column_lower.as_bytes()[q] == b'.'
+        && column_lower.starts_with(qualifier_lower)
 }
 
 #[cfg(test)]
