@@ -12492,16 +12492,6 @@ impl Executor {
             return Ok(None); // Fall back to non-streaming (faster for SUM/AVG/MIN/MAX)
         }
 
-        // HAVING by the inline filter the other aggregate paths run, so every
-        // group passes or fails by the same comparison
-        let having_filter = match stmt.having.as_deref() {
-            Some(having) => match crate::executor::try_parse_simple_having(having, &aggregations) {
-                Some(filter) => Some(filter),
-                None => return Ok(None),
-            },
-            None => None,
-        };
-
         let Some(group_column) = all_columns
             .iter()
             .find(|c| c.eq_ignore_ascii_case(&group_col_name))
@@ -12511,6 +12501,38 @@ impl Executor {
         let mut slot_columns = Vec::with_capacity(1 + aggregations.len());
         slot_columns.push(group_column.clone());
         slot_columns.extend(aggregations.iter().map(|agg| agg.get_column_name()));
+
+        // HAVING over the slot row, compiled as every aggregate path compiles
+        // it; a memory table walks under its index lock, so a HAVING that
+        // calls a scalar function, which may sleep or write, runs elsewhere
+        let having_filter = match stmt.having.as_deref() {
+            Some(having) if Self::has_subqueries(having) => return Ok(None),
+            Some(having) => {
+                let slots = crate::executor::aggregation::aggregate_slot_keys(
+                    &self.parse_group_by(stmt, all_columns)?,
+                    &aggregations,
+                    &stmt.columns,
+                );
+                let filter = crate::executor::aggregation::compile_over_slots(
+                    having,
+                    &slot_columns,
+                    crate::functions::registry::global_registry(),
+                    Some(&slots),
+                    None,
+                )?;
+                use crate::executor::expression::Op;
+                if filter
+                    .ops()
+                    .iter()
+                    .any(|op| matches!(op, Op::CallScalar { .. } | Op::NativeFn1(_)))
+                {
+                    return Ok(None);
+                }
+                Some(filter)
+            }
+            None => None,
+        };
+        let mut having_vm = ExprVM::new();
 
         // Streaming aggregation: iterate through groups in sorted order
         let mut result_rows = RowVec::new();
@@ -12575,21 +12597,22 @@ impl Executor {
                 }
             }
 
-            // One value per aggregate slot, then HAVING over them; only a
-            // group that passes clones its group value
+            // The slot row, then HAVING over it
             let mut values = Vec::with_capacity(1 + runs.len());
-            values.push(Value::null_unknown());
+            values.push(group_value.clone());
             for run in &runs {
                 values.push(run.result()?);
             }
-            if having_filter
-                .as_ref()
-                .is_some_and(|filter| !filter.passes(&values[1..]))
-            {
-                return Ok(true); // Continue to next group
+            let row = Row::from_values(values);
+            if let Some(filter) = &having_filter {
+                if !having_vm.execute_bool_checked(
+                    filter,
+                    &crate::executor::aggregation::slot_context(&row, ctx),
+                )? {
+                    return Ok(true); // Continue to next group
+                }
             }
-            values[0] = group_value.clone();
-            result_rows.push((result_row_id, Row::from_values(values)));
+            result_rows.push((result_row_id, row));
             result_row_id += 1;
 
             // Early termination: stop once we have LIMIT groups that passed HAVING

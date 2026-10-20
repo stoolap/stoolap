@@ -19,6 +19,10 @@
 #![cfg(feature = "test-failpoints")]
 
 use stoolap::core::Value;
+use stoolap::functions::{
+    global_registry, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, NativeFn1,
+    ScalarFunction,
+};
 use stoolap::test_failpoints::{aggregate_paths, aggregate_paths_taken, reset_aggregate_paths};
 use stoolap::Database;
 
@@ -103,6 +107,13 @@ const CASES: &[(&str, &str, &str, &str)] = &[
         "streaming_group_by",
         "SELECT g, COUNT(*) FROM t GROUP BY g HAVING MIN(s) > 0 LIMIT 10",
         "SELECT g, COUNT(*) FROM t WHERE id + 0 = id GROUP BY g HAVING MIN(s) > 0 LIMIT 10",
+    ),
+    (
+        "memory",
+        "streaming_group_by",
+        "SELECT g, COUNT(*) FROM t GROUP BY g HAVING g > 1 OR COUNT(*) + 0 >= 2 * MIN(s) LIMIT 10",
+        "SELECT g, COUNT(*) FROM t WHERE id + 0 = id GROUP BY g \
+         HAVING g > 1 OR COUNT(*) + 0 >= 2 * MIN(s) LIMIT 10",
     ),
     (
         "memory",
@@ -311,4 +322,68 @@ fn every_aggregate_path_answers_as_the_general_path() {
         wrong.len(),
         wrong.join("\n")
     );
+}
+
+#[test]
+fn a_having_that_calls_a_scalar_function_is_not_judged_inside_the_index_walk() {
+    let db = open(
+        Database::open("memory://aggregate_path_having_scalar_call").unwrap(),
+        false,
+        true,
+    );
+    let sql = "SELECT g, COUNT(*) FROM t GROUP BY g HAVING SLEEP(0) IS NOT NULL LIMIT 10";
+    let (got, taken) = run(&db, sql);
+    assert_eq!(
+        taken,
+        ["general"],
+        "a memory table's B-tree walk holds its index lock while it judges HAVING"
+    );
+    let (plain, _) = run(&db, "SELECT g, COUNT(*) FROM t GROUP BY g LIMIT 10");
+    assert_eq!(got, plain);
+}
+
+#[derive(Default)]
+struct NativeHaving;
+
+impl ScalarFunction for NativeHaving {
+    fn name(&self) -> &str {
+        "NATIVE_HAVING_PROBE"
+    }
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "NATIVE_HAVING_PROBE",
+            FunctionType::Scalar,
+            "a one-argument function with a native pointer",
+            FunctionSignature::new(FunctionDataType::Any, vec![FunctionDataType::Any], 1, 1),
+        )
+    }
+    fn evaluate(&self, args: &[Value]) -> stoolap::core::Result<Value> {
+        Ok(args[0].clone())
+    }
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(NativeHaving)
+    }
+    fn native_fn1(&self) -> Option<NativeFn1> {
+        Some(|_| {})
+    }
+}
+
+#[test]
+fn a_having_that_calls_a_native_function_is_not_judged_inside_the_index_walk() {
+    global_registry().register_scalar::<NativeHaving>();
+    let db = open(
+        Database::open("memory://aggregate_path_having_native_call").unwrap(),
+        false,
+        true,
+    );
+    let sql =
+        "SELECT g, COUNT(*) FROM t GROUP BY g HAVING NATIVE_HAVING_PROBE(g) IS NOT NULL LIMIT 10";
+    let (got, taken) = run(&db, sql);
+    assert_eq!(
+        taken,
+        ["general"],
+        "a native pointer runs user code under the walk's index lock as well"
+    );
+    let (plain, _) = run(&db, "SELECT g, COUNT(*) FROM t GROUP BY g LIMIT 10");
+    assert_eq!(got, plain);
 }

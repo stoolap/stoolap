@@ -38,7 +38,7 @@ use crate::storage::traits::{Engine, QueryResult};
 
 use super::context::ExecutionContext;
 use super::expr_key::ExprKey;
-use super::expression::{ExprVM, Op};
+use super::expression::ExprVM;
 use super::query::order_by_inputs;
 use super::query_cache::{CompiledCountDistinct, CompiledExecution};
 use super::query_classification::QueryClassification;
@@ -130,155 +130,9 @@ pub(crate) struct AggregateSlots<'a> {
     pub source_columns: &'a [String],
 }
 
-/// Single condition in a HAVING clause
-#[derive(Clone, Debug)]
-struct HavingCondition {
-    /// Index of the aggregate in the aggregations array
-    agg_index: usize,
-    /// The column-constant comparison the general path compiles this
-    /// condition to, so both answer alike for every aggregate type
-    op: Op,
-}
-
-/// Simple HAVING filter for inline application during fast aggregation
-/// Supports: SUM(col) op value, COUNT(*) op value, COUNT(col) op value
-/// Also supports AND combinations: COUNT(*) > 10 AND SUM(x) > 100
-#[derive(Clone, Debug)]
-pub(crate) struct SimpleHavingFilter {
-    /// All conditions that must pass (AND semantics)
-    conditions: Vec<HavingCondition>,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum ComparisonOp {
-    Gt,
-    Gte,
-    Lt,
-    Lte,
-    Eq,
-    Neq,
-}
-
-impl HavingCondition {
-    /// Check if a value passes this condition
-    fn matches(&self, value: &Value) -> bool {
-        ExprVM::fused_cell(&self.op, Some(value)) == Some(true)
-    }
-}
-
-impl SimpleHavingFilter {
-    /// Create a filter with a single condition
-    fn single(agg_index: usize, op: ComparisonOp, threshold: Value) -> Self {
-        let op = match op {
-            ComparisonOp::Gt => Op::GtColumnConst(0, threshold),
-            ComparisonOp::Gte => Op::GeColumnConst(0, threshold),
-            ComparisonOp::Lt => Op::LtColumnConst(0, threshold),
-            ComparisonOp::Lte => Op::LeColumnConst(0, threshold),
-            ComparisonOp::Eq => Op::EqColumnConst(0, threshold),
-            ComparisonOp::Neq => Op::NeColumnConst(0, threshold),
-        };
-        Self {
-            conditions: vec![HavingCondition { agg_index, op }],
-        }
-    }
-
-    /// Combine two filters with AND semantics
-    fn and(mut self, other: Self) -> Self {
-        self.conditions.extend(other.conditions);
-        self
-    }
-
-    /// Whether a group whose aggregate slots hold `aggregates` passes
-    pub(crate) fn passes(&self, aggregates: &[Value]) -> bool {
-        self.conditions.iter().all(|cond| {
-            aggregates
-                .get(cond.agg_index)
-                .is_some_and(|value| cond.matches(value))
-        })
-    }
-}
-
-/// Try to parse a simple HAVING clause for inline filtering
-/// Returns None if the HAVING is too complex for inline optimization
-/// Supports: single conditions and AND combinations
-pub(crate) fn try_parse_simple_having(
-    having: &Expression,
-    aggregations: &[SqlAggregateFunction],
-) -> Option<SimpleHavingFilter> {
-    // Handle AND expressions: parse both sides and combine
-    if let Expression::Infix(binop) = having {
-        if binop.operator.eq_ignore_ascii_case("AND") {
-            let left = try_parse_simple_having(&binop.left, aggregations)?;
-            let right = try_parse_simple_having(&binop.right, aggregations)?;
-            return Some(left.and(right));
-        }
-    }
-
-    // Handle single comparison: AGG(col) op value
-    try_parse_single_having_condition(having, aggregations)
-        .map(|(agg_index, op, threshold)| SimpleHavingFilter::single(agg_index, op, threshold))
-}
-
-/// Parse a single HAVING condition (not AND/OR)
-fn try_parse_single_having_condition(
-    having: &Expression,
-    aggregations: &[SqlAggregateFunction],
-) -> Option<(usize, ComparisonOp, Value)> {
-    // Handle comparison: AGG(col) op value
-    if let Expression::Infix(binop) = having {
-        let (op, threshold) = match binop.operator.as_str() {
-            ">" => (ComparisonOp::Gt, extract_numeric_value(&binop.right)?),
-            ">=" => (ComparisonOp::Gte, extract_numeric_value(&binop.right)?),
-            "<" => (ComparisonOp::Lt, extract_numeric_value(&binop.right)?),
-            "<=" => (ComparisonOp::Lte, extract_numeric_value(&binop.right)?),
-            "=" => (ComparisonOp::Eq, extract_numeric_value(&binop.right)?),
-            "!=" | "<>" => (ComparisonOp::Neq, extract_numeric_value(&binop.right)?),
-            _ => return None,
-        };
-
-        // Left side should be an aggregate function
-        if let Expression::FunctionCall(func) = &*binop.left {
-            let func_upper = func.function.to_uppercase();
-            if matches!(func_upper.as_str(), "SUM" | "COUNT" | "AVG" | "MIN" | "MAX") {
-                // Find matching aggregate
-                for (i, agg) in aggregations.iter().enumerate() {
-                    if agg.name.to_uppercase() == func_upper && !agg.distinct {
-                        // Check if column matches (for non-COUNT(*))
-                        let col_matches = if func_upper == "COUNT" {
-                            // COUNT(*) must bind to a COUNT(*) aggregate;
-                            // matching any COUNT would read a COUNT(col)
-                            // slot, which no longer counts NULL rows.
-                            match func.arguments.first() {
-                                None => agg.column == "*",
-                                Some(Expression::Star(_)) => agg.column == "*",
-                                Some(Expression::Identifier(id)) => {
-                                    id.value_lower == agg.column_lower
-                                }
-                                Some(_) => false,
-                            }
-                        } else {
-                            // SUM, AVG, etc. - check column
-                            func.arguments.first().is_some_and(|arg| match arg {
-                                Expression::Identifier(id) => id.value_lower == agg.column_lower,
-                                _ => false,
-                            })
-                        };
-
-                        if col_matches {
-                            return Some((i, op, threshold));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    None
-}
-
 /// A program over aggregate slot rows: `aliases` read a group item or
 /// aggregate from its slot by identity, `outer_columns` the outer row by name
-fn compile_over_slots(
+pub(crate) fn compile_over_slots(
     expr: &Expression,
     columns: &[String],
     registry: &crate::functions::FunctionRegistry,
@@ -304,7 +158,7 @@ fn compile_over_slots(
 }
 
 /// The VM context for one slot row of `ctx`'s statement
-fn slot_context<'a>(
+pub(crate) fn slot_context<'a>(
     row: &'a Row,
     ctx: &'a ExecutionContext,
 ) -> super::expression::ExecuteContext<'a> {
@@ -317,22 +171,6 @@ fn slot_context<'a>(
     match ctx.outer_row() {
         Some(outer) => exec.with_outer_row(outer),
         None => exec,
-    }
-}
-
-/// Extract numeric value from expression, in its own type
-fn extract_numeric_value(expr: &Expression) -> Option<Value> {
-    match expr {
-        Expression::IntegerLiteral(lit) => Some(Value::Integer(lit.value)),
-        Expression::FloatLiteral(lit) => Some(Value::Float(lit.value)),
-        Expression::Prefix(unary) if unary.operator == "-" => {
-            match extract_numeric_value(&unary.right)? {
-                Value::Integer(i) => i.checked_neg().map(Value::Integer),
-                Value::Float(f) => Some(Value::Float(-f)),
-                _ => None,
-            }
-        }
-        _ => None,
     }
 }
 
