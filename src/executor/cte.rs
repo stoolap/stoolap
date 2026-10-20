@@ -654,24 +654,15 @@ impl Executor {
             cte_rows
         };
 
-        // Check for aggregation
-        if classification.has_aggregation {
-            let result =
-                self.execute_select_with_aggregation(stmt, ctx, filtered_rows, &cte_columns)?;
-            let columns = result.columns().to_vec();
-            let layout = Self::result_layout(stmt, &cte_columns, cte_alias.as_deref(), &columns);
-            let mut rows = Self::materialize_result(result)?;
-
-            if !skip_order_limit {
-                row_counts(stmt, ctx)?.apply(&mut rows);
-            }
-            return Ok((columns, rows, !skip_order_limit, layout));
-        }
-
-        // Check for window functions
-        if classification.has_window_functions {
-            let (result, layout) =
-                self.execute_select_with_window_functions(stmt, ctx, &filtered_rows, &cte_columns)?;
+        if classification.has_aggregation || classification.has_window_functions {
+            let (result, layout) = self.group_and_window_rows(
+                stmt,
+                ctx,
+                &classification,
+                filtered_rows,
+                &cte_columns,
+                |out| Self::result_layout(stmt, &cte_columns, cte_alias.as_deref(), out),
+            )?;
             let columns = result.columns().to_vec();
             let mut rows = Self::materialize_result(result)?;
 

@@ -376,7 +376,7 @@ use super::utils::{
     substitute_filter_column, visit_column_refs, with_lowercase,
 };
 use super::volatility::{expression_volatility, statement_constant};
-use super::window::{WindowPreGroupedState, WindowPreSortedState};
+use super::window::{WindowOutput, WindowPreGroupedState, WindowPreSortedState};
 use super::Executor;
 use crate::functions::{global_registry, Volatility};
 use crate::optimizer::bloom::BloomFilterBuilder;
@@ -2022,18 +2022,11 @@ impl Executor {
             }
         }
 
-        // Check if we have aggregations - if so, use aggregation path with single dummy row
-        // This handles cases like SELECT SUM(3+5) or SELECT COALESCE(SUM(1), 0)
-        if classification.has_aggregation {
-            // Create a single dummy row for aggregation to process
+        // Aggregates and windows read one empty row, as in SELECT SUM(3+5)
+        if classification.has_aggregation || classification.has_window_functions {
             let mut dummy_rows = RowVec::new();
             dummy_rows.push((0, Row::from_values(vec![])));
-            let empty_columns: Vec<String> = vec![];
-            let result =
-                self.execute_select_with_aggregation(stmt, ctx, dummy_rows, &empty_columns)?;
-            let columns = CompactArc::new(result.columns().to_vec());
-            let shape = SelectShape::laid_out(Self::result_layout(stmt, &[], None, &columns));
-            return Ok((result, columns, false, shape));
+            return self.grouped_select(stmt, ctx, classification, dummy_rows, &[], None);
         }
 
         // Process scalar subqueries in SELECT columns first (single-pass)
@@ -2660,17 +2653,6 @@ impl Executor {
             classification.has_aggregation,
             classification.has_window_functions,
         ) {
-            (true, true) => self.execute_aggregation_then_windows(stmt, ctx, &[], all_columns)?,
-            (false, true) => {
-                self.execute_select_with_window_functions(stmt, ctx, &[], all_columns)?
-            }
-            (true, false) => {
-                let result =
-                    self.execute_select_with_aggregation(stmt, ctx, RowVec::new(), all_columns)?;
-                let layout =
-                    Self::shared_result_layout(stmt, all_columns, table_alias, result.columns());
-                (result, layout)
-            }
             (false, false) => {
                 let (rows, columns, layout) = self.project_scanned_rows(
                     stmt,
@@ -2690,6 +2672,14 @@ impl Executor {
                     SelectShape::laid_out(layout),
                 ));
             }
+            _ => self.group_and_window_rows(
+                stmt,
+                ctx,
+                classification,
+                RowVec::new(),
+                all_columns,
+                |out| Self::shared_result_layout(stmt, all_columns, table_alias, out),
+            )?,
         };
         let columns = CompactArc::new(result.columns().to_vec());
         Ok((result, columns, false, SelectShape::laid_out(layout)))
@@ -4314,12 +4304,11 @@ impl Executor {
         let has_window = classification.has_window_functions;
         let has_agg = classification.has_aggregation;
 
-        if has_agg && has_window {
-            // Both aggregation and window functions:
-            // 1. First apply GROUP BY aggregation
-            // 2. Then apply window functions on the aggregated result
+        if has_agg {
             let (result, layout) =
-                self.execute_aggregation_then_windows(stmt, ctx, &rows, &all_columns)?;
+                self.group_and_window_rows(stmt, ctx, classification, rows, &all_columns, |out| {
+                    Self::shared_result_layout(stmt, &all_columns, table_alias.as_deref(), out)
+                })?;
             let columns = CompactArc::new(result.columns().to_vec());
             return Ok((result, columns, false, SelectShape::laid_out(layout)));
         }
@@ -4351,14 +4340,6 @@ impl Executor {
             };
             let columns = CompactArc::new(result.columns().to_vec());
             return Ok((result, columns, false, SelectShape::laid_out(layout)));
-        }
-
-        // Check if we need aggregation only (no window functions)
-        if has_agg {
-            let result = self.execute_select_with_aggregation(stmt, ctx, rows, &all_columns)?;
-            let columns = CompactArc::new(result.columns().to_vec());
-            let shape = shape_of(&columns);
-            return Ok((result, columns, false, shape));
         }
 
         // Project rows according to SELECT expressions
@@ -5505,12 +5486,13 @@ impl Executor {
                     }
 
                     if has_agg || has_window {
-                        return self.aggregate_joined_rows(
+                        return self.grouped_select(
                             stmt,
                             ctx,
                             classification,
                             final_rows,
                             &all_columns,
+                            None,
                         );
                     } else if let Some(proj) = projection_pushdown {
                         // Projection was pushed down - rows are already projected
@@ -6227,12 +6209,13 @@ impl Executor {
         };
 
         if classification.has_aggregation || classification.has_window_functions {
-            return self.aggregate_joined_rows(
+            return self.grouped_select(
                 stmt,
                 ctx,
                 classification,
                 final_rows,
                 &final_columns,
+                None,
             );
         }
 
@@ -6464,21 +6447,15 @@ impl Executor {
             .as_ref()
             .map(|a| a.value_lower.as_str());
 
-        // Check if we need window functions
-        if classification.has_window_functions {
-            let (result, layout) =
-                self.execute_select_with_window_functions(stmt, ctx, &filtered_rows, &columns)?;
-            let out_columns = CompactArc::new(result.columns().to_vec());
-            return Ok((result, out_columns, false, SelectShape::laid_out(layout)));
-        }
-
-        // Check if we need aggregation
-        if classification.has_aggregation {
-            let result =
-                self.execute_select_with_aggregation(stmt, ctx, filtered_rows, &columns)?;
-            let out_columns = CompactArc::new(result.columns().to_vec());
-            let layout = Self::result_layout(stmt, &columns, subquery_alias, &out_columns);
-            return Ok((result, out_columns, false, SelectShape::laid_out(layout)));
+        if classification.has_aggregation || classification.has_window_functions {
+            return self.grouped_select(
+                stmt,
+                ctx,
+                classification,
+                filtered_rows,
+                &columns,
+                subquery_alias,
+            );
         }
 
         // Project rows according to SELECT expressions; a column ORDER BY
@@ -6689,9 +6666,8 @@ impl Executor {
             ));
         }
 
-        // Handle aggregation: if outer query has aggregates, materialize view result and aggregate
-        if classification.has_aggregation {
-            // Materialize the view result into rows with synthetic IDs
+        // Aggregation and window functions run over the view's rows, materialized
+        if classification.has_aggregation || classification.has_window_functions {
             let mut rows = RowVec::with_capacity(64);
             let mut idx = 0i64;
             while result.next() {
@@ -6701,39 +6677,14 @@ impl Executor {
             if let Some(err) = result.last_error() {
                 return Err(err);
             }
-
-            // Execute aggregation on the view's rows
-            let agg_result =
-                self.execute_select_with_aggregation(stmt, ctx, rows, &view_columns)?;
-            let columns = CompactArc::new(agg_result.columns().to_vec());
-            let layout = Self::result_layout(stmt, &view_columns, None, &columns);
-            return Ok((agg_result, columns, false, SelectShape::laid_out(layout)));
-        }
-
-        // Handle window functions: materialize view result and delegate
-        if classification.has_window_functions {
-            let mut rows = RowVec::with_capacity(64);
-            let mut idx = 0i64;
-            while result.next() {
-                rows.push((idx, result.take_row()));
-                idx += 1;
-            }
-            if let Some(err) = result.last_error() {
-                return Err(err);
-            }
-
-            if classification.has_aggregation {
-                // Aggregation + window functions: aggregate first, then apply window functions
-                let (result, layout) =
-                    self.execute_aggregation_then_windows(stmt, ctx, &rows, &view_columns)?;
-                let columns = CompactArc::new(result.columns().to_vec());
-                return Ok((result, columns, false, SelectShape::laid_out(layout)));
-            }
-
-            let (result, layout) =
-                self.execute_select_with_window_functions(stmt, ctx, &rows, &view_columns)?;
-            let columns = CompactArc::new(result.columns().to_vec());
-            return Ok((result, columns, false, SelectShape::laid_out(layout)));
+            return self.grouped_select(
+                stmt,
+                ctx,
+                classification,
+                rows,
+                &view_columns,
+                view_alias.as_deref(),
+            );
         }
 
         // Handle projection: apply outer query's column selection
@@ -7057,21 +7008,15 @@ impl Executor {
 
         let values_alias = values_source.alias.as_ref().map(|a| a.value_lower.as_str());
 
-        // Check if we need window functions
-        if classification.has_window_functions {
-            let (result, layout) =
-                self.execute_select_with_window_functions(stmt, ctx, &result_rows, &column_names)?;
-            let columns = CompactArc::new(result.columns().to_vec());
-            return Ok((result, columns, false, SelectShape::laid_out(layout)));
-        }
-
-        // Check if we need aggregation
-        if classification.has_aggregation {
-            let result =
-                self.execute_select_with_aggregation(stmt, ctx, result_rows, &column_names)?;
-            let columns = CompactArc::new(result.columns().to_vec());
-            let layout = Self::result_layout(stmt, &column_names, values_alias, &columns);
-            return Ok((result, columns, false, SelectShape::laid_out(layout)));
+        if classification.has_aggregation || classification.has_window_functions {
+            return self.grouped_select(
+                stmt,
+                ctx,
+                classification,
+                result_rows,
+                &column_names,
+                values_alias,
+            );
         }
 
         let layout = Self::output_layout(stmt, &column_names, values_alias);
@@ -7777,31 +7722,48 @@ impl Executor {
         ))
     }
 
-    /// The aggregation and window functions of `stmt` over a join's rows, the
-    /// one tail every join operator hands its rows to
-    fn aggregate_joined_rows(
+    /// The aggregation and window functions of `stmt` over a source's rows,
+    /// the one dispatch every source hands its rows to: GROUP BY and then
+    /// the windows over the groups, the windows alone, or the aggregation
+    /// alone, whose layout `aggregate_layout` builds from its columns
+    pub(crate) fn group_and_window_rows(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         classification: &QueryClassification,
         rows: RowVec,
         columns: &[String],
-    ) -> SelectResult {
-        let (result, layout) = match (
+        aggregate_layout: impl FnOnce(&[String]) -> Option<OutputLayout>,
+    ) -> Result<WindowOutput> {
+        match (
             classification.has_aggregation,
             classification.has_window_functions,
         ) {
-            // GROUP BY first, then the windows over the groups
-            (true, true) => self.execute_aggregation_then_windows(stmt, ctx, &rows, columns)?,
-            (false, true) => {
-                self.execute_select_with_window_functions(stmt, ctx, &rows, columns)?
-            }
+            (true, true) => self.execute_aggregation_then_windows(stmt, ctx, &rows, columns),
+            (false, true) => self.execute_select_with_window_functions(stmt, ctx, &rows, columns),
             _ => {
                 let result = self.execute_select_with_aggregation(stmt, ctx, rows, columns)?;
-                let layout = Self::result_layout(stmt, columns, None, result.columns());
-                (result, layout)
+                let layout = aggregate_layout(result.columns());
+                Ok((result, layout))
             }
-        };
+        }
+    }
+
+    /// `group_and_window_rows` as the SELECT's output, its layout over the
+    /// input `columns` named under `table_alias`
+    fn grouped_select(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        classification: &QueryClassification,
+        rows: RowVec,
+        columns: &[String],
+        table_alias: Option<&str>,
+    ) -> SelectResult {
+        let (result, layout) =
+            self.group_and_window_rows(stmt, ctx, classification, rows, columns, |out| {
+                Self::result_layout(stmt, columns, table_alias, out)
+            })?;
         let columns = CompactArc::new(result.columns().to_vec());
         Ok((result, columns, false, SelectShape::laid_out(layout)))
     }
@@ -11384,20 +11346,15 @@ impl Executor {
             ))
         };
 
-        // Check for window functions
-        if classification.has_window_functions {
-            let (result, layout) =
-                self.execute_select_with_window_functions(stmt, ctx, &rows, &all_columns)?;
-            let columns = CompactArc::new(result.columns().to_vec());
-            return Ok((result, columns, false, SelectShape::laid_out(layout)));
-        }
-
-        // Check for aggregation
-        if classification.has_aggregation {
-            let result = self.execute_select_with_aggregation(stmt, ctx, rows, &all_columns)?;
-            let columns = CompactArc::new(result.columns().to_vec());
-            let shape = shape_of(&columns);
-            return Ok((result, columns, false, shape));
+        if classification.has_aggregation || classification.has_window_functions {
+            return self.grouped_select(
+                stmt,
+                ctx,
+                classification,
+                rows,
+                &all_columns,
+                Some(table_name),
+            );
         }
 
         // Project rows
