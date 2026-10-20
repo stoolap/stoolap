@@ -28,6 +28,9 @@ use crate::functions::{AggregateFunction, AggregateOrder};
 
 use super::{AggregateState, CompiledAggregate};
 
+/// One group's row, or its key values and the error a call's result gave
+pub type GroupResult = std::result::Result<Row, (CompactVec<Value>, crate::core::Error)>;
+
 static NULL_KEY: Value = NULL_VALUE;
 
 /// How every group runs one aggregate call
@@ -102,7 +105,7 @@ impl CallTemplate {
         }
     }
 
-    fn duplicate(&self) -> CallTemplate {
+    pub(crate) fn duplicate(&self) -> CallTemplate {
         match self {
             CallTemplate::Compiled(make) => CallTemplate::Compiled(*make),
             CallTemplate::Dynamic {
@@ -323,23 +326,57 @@ impl GroupedAggregates {
 
     /// One row per group: its key values, then the result of every call
     pub fn into_rows(self) -> Result<RowVec> {
+        let mut rows = RowVec::with_capacity(self.groups);
+        self.finish_each(|group, values| {
+            let values = values.map_err(|(_, error)| error)?;
+            rows.push((group as i64, Row::from_compact_vec(values)));
+            Ok(())
+        })?;
+        Ok(rows)
+    }
+
+    /// `into_rows` with each group's own error in its row's place, beside
+    /// the group's key values
+    pub fn into_group_results(self) -> Result<Vec<GroupResult>> {
+        let mut rows = Vec::with_capacity(self.groups);
+        self.finish_each(|_, values| {
+            rows.push(values.map(Row::from_compact_vec));
+            Ok(())
+        })?;
+        Ok(rows)
+    }
+
+    /// Hands `each` every group's key values and call results in order;
+    /// a call whose result fails leaves the key values and its error
+    fn finish_each(
+        self,
+        mut each: impl FnMut(
+            usize,
+            std::result::Result<CompactVec<Value>, (CompactVec<Value>, crate::core::Error)>,
+        ) -> Result<()>,
+    ) -> Result<()> {
         if self.groups > 0 {
             if let Some(error) = self.calls.iter().find_map(CallTemplate::failure) {
                 return Err(error.clone());
             }
         }
         let calls = self.calls.len();
-        let mut rows = RowVec::with_capacity(self.groups);
         let mut keys = self.keys.into_iter();
-        for group in 0..self.groups {
+        'groups: for group in 0..self.groups {
             let mut values = CompactVec::with_capacity(self.width + calls);
             values.extend(keys.by_ref().take(self.width));
             for run in &self.aggregates[group * calls..][..calls] {
-                values.push(run.result()?);
+                match run.result() {
+                    Ok(value) => values.push(value),
+                    Err(error) => {
+                        each(group, Err((values, error)))?;
+                        continue 'groups;
+                    }
+                }
             }
-            rows.push((group as i64, Row::from_compact_vec(values)));
+            each(group, Ok(values))?;
         }
-        Ok(rows)
+        Ok(())
     }
 }
 

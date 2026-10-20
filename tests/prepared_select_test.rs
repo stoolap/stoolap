@@ -1033,7 +1033,7 @@ fn test_classifier_rules() {
         ),
         (
             format!("SELECT COUNT(*) FROM t WHERE a > {sq}"),
-            "an aggregate",
+            "an aggregate outside a subquery block",
         ),
         (
             format!("SELECT id, {sq} FROM t WHERE a > {sq}"),
@@ -1064,8 +1064,9 @@ fn test_classifier_rules() {
             "FROM names a view",
         ),
         (
-            "SELECT id FROM t WHERE a > (SELECT MAX(v) FROM u WHERE u.id = t.id)".to_string(),
-            "an aggregate",
+            "SELECT id FROM t WHERE a > (SELECT MAX(v) FROM u WHERE u.id = t.id ORDER BY 1)"
+                .to_string(),
+            "a subquery block with a clause outside the family",
         ),
         (
             "SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id LIMIT 1)".to_string(),
@@ -1118,6 +1119,8 @@ fn test_in_family_statements_reach_no_general_path_mechanism() {
         "SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = 2) ORDER BY id LIMIT 2",
         "SELECT id FROM t WHERE CASE WHEN a > 20 THEN (SELECT v FROM u WHERE u.id = t.id) END IS NULL",
         "SELECT UPPER(CAST(a AS TEXT)) FROM t WHERE (SELECT v FROM u WHERE u.id = t.id) BETWEEN 1 AND 30",
+        "SELECT id FROM t WHERE a < (SELECT MAX(v) + t.a FROM u WHERE u.id = t.id)",
+        "SELECT id FROM t WHERE (SELECT COUNT(*) FROM u WHERE u.v > t.a HAVING COUNT(*) > 0) > 1",
     ];
     let built = prepared_selects_built();
     let runs = prepared_scalar_runs();

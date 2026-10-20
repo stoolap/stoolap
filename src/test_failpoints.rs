@@ -1434,10 +1434,16 @@ pub enum PreparedStrategy {
     NarrowedByKeys,
     /// The statement's rows read by its primary keys a set leaves out
     NarrowedOut,
+    /// A block that aggregates, its candidates fed to their groups per call
+    Grouped,
+    /// A correlated block that aggregates, its groups read by key once
+    KeyedGroups,
+    /// An uncorrelated block that aggregates, run once as a statement
+    Statement,
 }
 
 impl PreparedStrategy {
-    pub const ALL: [PreparedStrategy; 7] = [
+    pub const ALL: [PreparedStrategy; 10] = [
         PreparedStrategy::Probe,
         PreparedStrategy::Once,
         PreparedStrategy::KeyedSet,
@@ -1445,12 +1451,15 @@ impl PreparedStrategy {
         PreparedStrategy::KeyedMembers,
         PreparedStrategy::NarrowedByKeys,
         PreparedStrategy::NarrowedOut,
+        PreparedStrategy::Grouped,
+        PreparedStrategy::KeyedGroups,
+        PreparedStrategy::Statement,
     ];
 }
 
 /// Process-wide: how often each prepared strategy answered
-static PREPARED_STRATEGY_RUNS: [std::sync::atomic::AtomicUsize; 7] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; 7];
+static PREPARED_STRATEGY_RUNS: [std::sync::atomic::AtomicUsize; 10] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 10];
 
 /// How often `strategy` answered, so far
 pub fn prepared_strategy_runs(strategy: PreparedStrategy) -> usize {

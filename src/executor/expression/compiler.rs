@@ -118,6 +118,28 @@ pub enum ColumnSource {
     Row2(u16),
 }
 
+/// What a name reads
+#[derive(Debug)]
+pub(crate) enum Reference {
+    Column(ColumnSource),
+    /// A column of the outer row, by its name there
+    Outer(CompactArc<str>),
+    /// A double-quoted name no column has: its own text
+    Text,
+    /// No column has it: the name as the error spells it
+    Missing(String),
+}
+
+impl Reference {
+    /// The column of the first row it reads, when it reads one
+    pub(crate) fn row_column(&self) -> Option<u16> {
+        match self {
+            Reference::Column(ColumnSource::Row1(idx)) => Some(*idx),
+            _ => None,
+        }
+    }
+}
+
 /// Compilation context
 ///
 /// Contains all the information needed to compile expressions:
@@ -328,6 +350,42 @@ impl<'a> CompileContext<'a> {
 
         // Qualified name not in outer context - safe to fall back to unqualified lookup
         self.resolve_column(&column_lower)
+    }
+
+    /// What a bare or qualified name reads, by the one rule every compiled
+    /// name is read by; None for an expression that is not a name
+    pub(crate) fn reference(&self, expr: &Expression) -> Option<Reference> {
+        let found = |source: Option<ColumnSource>| source.map(Reference::Column);
+        Some(match expr {
+            Expression::Identifier(id) => match id.value_lower.rfind('.') {
+                Some(dot) => {
+                    let column = &id.value_lower[dot + 1..];
+                    found(self.resolve_qualified(&id.value_lower[..dot], column))
+                        .or_else(|| self.resolve_outer_column(column).map(Reference::Outer))
+                }
+                None => found(self.resolve_column(&id.value_lower)).or_else(|| {
+                    self.resolve_outer_column(&id.value_lower)
+                        .map(Reference::Outer)
+                }),
+            }
+            .unwrap_or_else(|| match id.quoted {
+                true => Reference::Text,
+                false => Reference::Missing(id.value.to_string()),
+            }),
+            Expression::QualifiedIdentifier(qid) => {
+                let (table, column) = (&qid.qualifier.value_lower, &qid.name.value_lower);
+                // The qualified name in the outer row first: its bare name may
+                // hold an inner row's column of the same name
+                found(self.resolve_qualified(table, column))
+                    .or_else(|| {
+                        self.resolve_outer_column(&format!("{table}.{column}"))
+                            .or_else(|| self.resolve_outer_column(column))
+                            .map(Reference::Outer)
+                    })
+                    .unwrap_or_else(|| Reference::Missing(format!("{table}.{column}")))
+            }
+            _ => return None,
+        })
     }
 
     /// Resolve outer column (for correlated subqueries)
@@ -554,69 +612,11 @@ impl<'a> ExprCompiler<'a> {
                     _ => {}
                 }
 
-                // Try to resolve as column
-                // First, check if the identifier contains a dot (qualified name like "table.column")
-                if let Some(dot_idx) = id.value_lower.rfind('.') {
-                    // Treat as qualified identifier
-                    let table = &id.value_lower[..dot_idx];
-                    let column = &id.value_lower[dot_idx + 1..];
-                    if let Some(source) = self.ctx.resolve_qualified(table, column) {
-                        match source {
-                            ColumnSource::Row1(idx) => builder.emit(Op::LoadColumn(idx)),
-                            ColumnSource::Row2(idx) => builder.emit(Op::LoadColumn2(idx)),
-                        }
-                    } else if let Some(name) = self.ctx.resolve_outer_column(column) {
-                        builder.emit(Op::LoadOuterColumn(name));
-                    } else if id.quoted {
-                        // Double-quoted identifier falls back to string literal
-                        builder.emit(Op::LoadConst(Value::text(id.value.as_str())));
-                    } else {
-                        return Err(CompileError::ColumnNotFound(id.value.to_string()));
-                    }
-                } else if let Some(source) = self.ctx.resolve_column(&id.value_lower) {
-                    match source {
-                        ColumnSource::Row1(idx) => builder.emit(Op::LoadColumn(idx)),
-                        ColumnSource::Row2(idx) => builder.emit(Op::LoadColumn2(idx)),
-                    }
-                } else if let Some(name) = self.ctx.resolve_outer_column(&id.value_lower) {
-                    builder.emit(Op::LoadOuterColumn(name));
-                } else if id.quoted {
-                    // Double-quoted identifier falls back to string literal
-                    builder.emit(Op::LoadConst(Value::text(id.value.as_str())));
-                } else {
-                    return Err(CompileError::ColumnNotFound(id.value.to_string()));
-                }
+                self.emit_reference(expr, builder)?;
             }
 
-            Expression::QualifiedIdentifier(qid) => {
-                let table = &qid.qualifier.value_lower;
-                let column = &qid.name.value_lower;
-
-                if let Some(source) = self.ctx.resolve_qualified(table, column) {
-                    match source {
-                        ColumnSource::Row1(idx) => builder.emit(Op::LoadColumn(idx)),
-                        ColumnSource::Row2(idx) => builder.emit(Op::LoadColumn2(idx)),
-                    }
-                } else {
-                    // For qualified identifiers (e.g., c.id), prefer the qualified
-                    // name in outer_columns over unqualified. This prevents incorrect
-                    // resolution when the unqualified key ("id") is overwritten in
-                    // outer_row by an inner row's column with the same name.
-                    let qualified_name =
-                        format!("{}.{}", table.to_lowercase(), column.to_lowercase());
-                    if let Some(name) = self
-                        .ctx
-                        .resolve_outer_column(&qualified_name)
-                        .or_else(|| self.ctx.resolve_outer_column(column))
-                    {
-                        builder.emit(Op::LoadOuterColumn(name));
-                    } else {
-                        return Err(CompileError::ColumnNotFound(format!(
-                            "{}.{}",
-                            table, column
-                        )));
-                    }
-                }
+            Expression::QualifiedIdentifier(_) => {
+                self.emit_reference(expr, builder)?;
             }
 
             // === PARAMETERS ===
@@ -799,6 +799,28 @@ impl<'a> ExprCompiler<'a> {
             }
         }
 
+        Ok(())
+    }
+
+    /// Emit the load of the name `expr`, as `CompileContext::reference` reads it
+    fn emit_reference(
+        &self,
+        expr: &Expression,
+        builder: &mut ProgramBuilder,
+    ) -> Result<(), CompileError> {
+        match self.ctx.reference(expr) {
+            Some(Reference::Column(ColumnSource::Row1(idx))) => builder.emit(Op::LoadColumn(idx)),
+            Some(Reference::Column(ColumnSource::Row2(idx))) => builder.emit(Op::LoadColumn2(idx)),
+            Some(Reference::Outer(name)) => builder.emit(Op::LoadOuterColumn(name)),
+            Some(Reference::Text) => {
+                let Expression::Identifier(id) = expr else {
+                    return Err(CompileError::InvalidExpression(expr.to_string()));
+                };
+                builder.emit(Op::LoadConst(Value::text(id.value.as_str())));
+            }
+            Some(Reference::Missing(name)) => return Err(CompileError::ColumnNotFound(name)),
+            None => return Err(CompileError::InvalidExpression(expr.to_string())),
+        }
         Ok(())
     }
 

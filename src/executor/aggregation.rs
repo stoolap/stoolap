@@ -68,6 +68,8 @@ pub(crate) enum AggregatePath {
     CompiledCountStar,
     /// COUNT(DISTINCT col) answered by a cached plan from the column's index
     CompiledCountDistinct,
+    /// A prepared subquery block that aggregates, per call or by key
+    PreparedBlock,
 }
 
 impl AggregatePath {
@@ -82,7 +84,7 @@ impl AggregatePath {
 
 #[cfg(any(test, feature = "test-failpoints"))]
 impl AggregatePath {
-    pub(crate) const ALL: [AggregatePath; 11] = [
+    pub(crate) const ALL: [AggregatePath; 12] = [
         AggregatePath::General,
         AggregatePath::Pushdown,
         AggregatePath::FilteredPushdown,
@@ -94,6 +96,7 @@ impl AggregatePath {
         AggregatePath::IndexMinMax,
         AggregatePath::CompiledCountStar,
         AggregatePath::CompiledCountDistinct,
+        AggregatePath::PreparedBlock,
     ];
 
     pub(crate) const fn name(self) -> &'static str {
@@ -109,6 +112,7 @@ impl AggregatePath {
             AggregatePath::IndexMinMax => "index_min_max",
             AggregatePath::CompiledCountStar => "compiled_count_star",
             AggregatePath::CompiledCountDistinct => "compiled_count_distinct",
+            AggregatePath::PreparedBlock => "prepared_block",
         }
     }
 }
@@ -121,6 +125,9 @@ pub(crate) struct AggregateSlots<'a> {
     pub written_stmt: &'a SelectStatement,
     pub aggregations: &'a [SqlAggregateFunction],
     pub group_by_count: usize,
+    /// The columns of the rows aggregated, which the statement may read
+    /// only through its groups
+    pub source_columns: &'a [String],
 }
 
 /// Single condition in a HAVING clause
@@ -343,9 +350,128 @@ struct GroupingSet {
 fn group_by_item_key(item: &GroupByItem) -> ExprKey {
     match item {
         GroupByItem::Column(name) => ExprKey::column(name),
-        GroupByItem::Position(pos) => ExprKey::position(*pos),
         GroupByItem::Expression { expr, .. } => ExprKey::of(expr),
     }
+}
+
+/// The error of a column a query that aggregates reads outside its groups
+pub(crate) fn ungrouped_column(name: &str) -> crate::core::Error {
+    crate::core::Error::internal(format!(
+        "Compile error: {}",
+        super::expression::CompileError::ColumnNotFound(name.to_string())
+    ))
+}
+
+/// A column of `source` that `stmt` reads outside every GROUP BY item and
+/// aggregate call, in its SELECT list, HAVING or ORDER BY. Each name binds
+/// as the compiler binds it, the outer row of `ctx` included; a HAVING name
+/// or a bare ORDER BY name a SELECT alias carries is the alias's
+fn ungrouped_read(
+    stmt: &SelectStatement,
+    items: &[GroupByItem],
+    source: &[String],
+    ctx: &ExecutionContext,
+) -> Option<String> {
+    use std::cell::OnceCell;
+    let grouped_exprs: smallvec::SmallVec<[ExprKey; 4]> = items
+        .iter()
+        .filter_map(|item| match item {
+            GroupByItem::Expression { expr, .. } => Some(ExprKey::of(expr)),
+            GroupByItem::Column(_) => None,
+        })
+        .collect();
+    let skip = |expr: &Expression| match expr {
+        Expression::FunctionCall(call) if is_aggregate_function(&call.function) => true,
+        _ => !grouped_exprs.is_empty() && grouped_exprs.contains(&ExprKey::of(expr)),
+    };
+    // A reference spelled as a group column binds as that column does
+    let spelled_grouped = |reference: &Expression| {
+        items.iter().any(|item| match (item, reference) {
+            (GroupByItem::Column(c), Expression::Identifier(id)) => {
+                c.eq_ignore_ascii_case(&id.value)
+            }
+            (GroupByItem::Column(c), Expression::QualifiedIdentifier(q)) => {
+                c.split_once('.').is_some_and(|(table, name)| {
+                    table.eq_ignore_ascii_case(&q.qualifier.value)
+                        && name.eq_ignore_ascii_case(&q.name.value)
+                })
+            }
+            _ => false,
+        })
+    };
+    let outer: OnceCell<Option<Vec<String>>> = OnceCell::new();
+    let compile: OnceCell<super::expression::CompileContext<'_>> = OnceCell::new();
+    let column_of = |reference: &Expression| {
+        let compile = compile.get_or_init(|| {
+            let outer = outer.get_or_init(|| {
+                ctx.outer_row()
+                    .map(|row| row.keys().map(|k| k.to_string()).collect())
+            });
+            let compile = super::expression::CompileContext::new(
+                source,
+                crate::functions::registry::global_registry(),
+            );
+            match outer {
+                Some(outer) => compile.with_outer_columns(outer),
+                None => compile,
+            }
+        });
+        compile.reference(reference).and_then(|r| r.row_column())
+    };
+    let grouped_columns: OnceCell<smallvec::SmallVec<[Option<u16>; 4]>> = OnceCell::new();
+    let is_alias = |reference: &Expression| match reference {
+        Expression::Identifier(id) => stmt
+            .columns
+            .iter()
+            .any(|c| matches!(c, Expression::Aliased(a) if a.alias.value_lower == id.value_lower)),
+        _ => false,
+    };
+    let mut found = None;
+    let mut check = |reference: &Expression, aliases: bool| {
+        if found.is_some() || spelled_grouped(reference) || (aliases && is_alias(reference)) {
+            return;
+        }
+        let Some(column) = column_of(reference) else {
+            return;
+        };
+        let grouped = grouped_columns.get_or_init(|| {
+            items
+                .iter()
+                .filter_map(|item| match item {
+                    GroupByItem::Column(name) => Some(column_of(&Expression::Identifier(
+                        crate::parser::ast::Identifier::new(
+                            crate::parser::token::Token::new(
+                                crate::parser::token::TokenType::Identifier,
+                                name,
+                                crate::parser::token::Position::default(),
+                            ),
+                            name.as_str(),
+                        ),
+                    ))),
+                    GroupByItem::Expression { .. } => None,
+                })
+                .collect()
+        });
+        if !grouped.contains(&Some(column)) {
+            found = Some(match reference {
+                Expression::Identifier(id) => id.value.to_string(),
+                other => other.to_string(),
+            });
+        }
+    };
+    for column in &stmt.columns {
+        super::utils::visit_column_refs_outside(column, &skip, &mut |r| check(r, false));
+    }
+    if let Some(having) = stmt.having.as_deref() {
+        super::utils::visit_column_refs_outside(having, &skip, &mut |r| check(r, true));
+    }
+    for ob in &stmt.order_by {
+        if super::utils::order_by_names_an_alias(&ob.expression, stmt) {
+            continue;
+        }
+        super::utils::visit_column_refs_outside(&ob.expression, &skip, &mut |r| check(r, false));
+    }
+    found
 }
 
 /// The slot of each group item and aggregate in an aggregated row, which
@@ -381,8 +507,6 @@ pub(crate) fn aggregate_slot_keys(
 pub enum GroupByItem {
     /// Simple column reference by name
     Column(String),
-    /// Positional reference like GROUP BY 1
-    Position(usize),
     /// Complex expression that needs to be evaluated
     Expression {
         /// The expression to evaluate
@@ -666,25 +790,26 @@ impl CallInputs {
         aggregations: &[SqlAggregateFunction],
         columns: &[String],
     ) -> Result<Vec<CallInputs>> {
-        use super::expression::compile_expression;
+        Self::compile_with(aggregations, |expr| {
+            super::expression::compile_expression(expr, columns)
+        })
+    }
+
+    /// The inputs of every call, each program made by `compile`
+    pub(crate) fn compile_with(
+        aggregations: &[SqlAggregateFunction],
+        compile: impl Fn(&Expression) -> Result<super::expression::SharedProgram>,
+    ) -> Result<Vec<CallInputs>> {
         aggregations
             .iter()
             .map(|agg| {
                 Ok(CallInputs {
-                    filter: agg
-                        .filter
-                        .as_ref()
-                        .map(|f| compile_expression(f, columns))
-                        .transpose()?,
-                    argument: agg
-                        .expression
-                        .as_ref()
-                        .map(|e| compile_expression(e, columns))
-                        .transpose()?,
+                    filter: agg.filter.as_ref().map(&compile).transpose()?,
+                    argument: agg.expression.as_ref().map(&compile).transpose()?,
                     order: agg
                         .order_by
                         .iter()
-                        .map(|o| compile_expression(&o.expression, columns))
+                        .map(|o| compile(&o.expression))
                         .collect::<Result<_>>()?,
                 })
             })
@@ -759,7 +884,7 @@ impl CallInputs {
 }
 
 /// The value COUNT(*) is fed for each row
-static COUNT_STAR: Value = Value::Integer(1);
+pub(crate) static COUNT_STAR: Value = Value::Integer(1);
 
 /// Rows at which an aggregation whose calls all merge splits its input
 #[cfg(feature = "parallel")]
@@ -827,7 +952,6 @@ impl<'a> RowFeed<'a> {
                             None => KeyItem::Null,
                         }
                     }
-                    GroupByItem::Position(pos) => KeyItem::Column(pos.saturating_sub(1)),
                     GroupByItem::Expression { expr, .. } => {
                         KeyItem::Program(super::expression::compile_expression(expr, columns)?)
                     }
@@ -1203,6 +1327,7 @@ impl Executor {
                 written_stmt,
                 aggregations: &aggregations,
                 group_by_count: group_by_columns.len(),
+                source_columns: base_columns,
             },
             ctx,
             having_columns,
@@ -1227,6 +1352,7 @@ impl Executor {
             written_stmt,
             aggregations,
             group_by_count,
+            source_columns,
         } = slots;
 
         // ORDER BY may name a grouped column the SELECT list drops. Capture
@@ -1250,6 +1376,7 @@ impl Executor {
             self.apply_post_aggregation_expressions(
                 stmt,
                 ctx,
+                source_columns,
                 aggregations,
                 having_columns,
                 having_rows,
@@ -1286,6 +1413,7 @@ impl Executor {
             let (mut cols, mut rows) = self.apply_post_aggregation_expressions(
                 stmt,
                 ctx,
+                source_columns,
                 aggregations,
                 having_columns,
                 having_rows,
@@ -1372,12 +1500,16 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
+        source_columns: &[String],
         aggregations: &[SqlAggregateFunction],
         agg_columns: Vec<String>,
         agg_rows: RowVec,
     ) -> Result<(Vec<String>, RowVec)> {
         // Parse GROUP BY items for GROUPING() function support
         let group_by_columns = self.parse_group_by(stmt, &agg_columns)?;
+        if let Some(name) = ungrouped_read(stmt, &group_by_columns, source_columns, ctx) {
+            return Err(ungrouped_column(&name));
+        }
 
         // Check which original columns have correlated subqueries
         // These need per-row evaluation with outer row context, not pre-processing
@@ -1489,9 +1621,11 @@ impl Executor {
                         .filter(|_| !agg_col_index_map.contains_key(id.value_lower.as_str()))
                     {
                         Some(slot) => column_sources.push(ColumnSource::AggSlot(slot)),
-                        None => {
+                        None if agg_col_index_map.contains_key(id.value_lower.as_str()) => {
                             column_sources.push(ColumnSource::AggColumn(id.value_lower.to_string()))
                         }
+                        // Neither grouped nor aggregated: the slot compiler refuses it
+                        None => column_sources.push(make_source(col_expr, is_correlated)),
                     }
                 }
                 Expression::QualifiedIdentifier(qid) => {
@@ -1504,8 +1638,10 @@ impl Executor {
                     let unqualified_lower: String = qid.name.value_lower.to_string();
                     if agg_col_index_map.contains_key(&qualified_lower) {
                         column_sources.push(ColumnSource::AggColumn(qualified_lower));
-                    } else {
+                    } else if agg_col_index_map.contains_key(&unqualified_lower) {
                         column_sources.push(ColumnSource::AggColumn(unqualified_lower));
+                    } else {
+                        column_sources.push(make_source(col_expr, is_correlated));
                     }
                 }
                 Expression::FunctionCall(func) => {
@@ -1518,8 +1654,7 @@ impl Executor {
                     } else if func.function.eq_ignore_ascii_case("GROUPING") {
                         // GROUPING() function - map to the appropriate grouping flag column
                         final_columns.push(self.get_aggregate_column_name(func));
-                        if let Some(idx) =
-                            self.find_grouping_column_index(func, &group_by_columns, &agg_columns)
+                        if let Some(idx) = self.find_grouping_column_index(func, &group_by_columns)
                         {
                             column_sources.push(ColumnSource::GroupingFlag(idx));
                         } else {
@@ -1583,11 +1718,9 @@ impl Executor {
                                 if func.function.eq_ignore_ascii_case("GROUPING") =>
                             {
                                 // Aliased GROUPING() function
-                                if let Some(idx) = self.find_grouping_column_index(
-                                    func,
-                                    &group_by_columns,
-                                    &agg_columns,
-                                ) {
+                                if let Some(idx) =
+                                    self.find_grouping_column_index(func, &group_by_columns)
+                                {
                                     column_sources.push(ColumnSource::GroupingFlag(idx));
                                 } else {
                                     column_sources.push(ColumnSource::Expression(Box::new(
@@ -1823,7 +1956,6 @@ impl Executor {
         &self,
         func: &crate::parser::ast::FunctionCall,
         group_by_columns: &[GroupByItem],
-        columns: &[String],
     ) -> Option<usize> {
         // GROUPING() takes one argument - the column name
         if func.arguments.is_empty() {
@@ -1841,15 +1973,6 @@ impl Executor {
         for (idx, item) in group_by_columns.iter().enumerate() {
             let matches = match item {
                 GroupByItem::Column(col_name) => col_name.to_lowercase() == arg_name,
-                GroupByItem::Position(pos) => {
-                    // Position is 1-indexed, convert to 0-indexed
-                    let col_idx = pos.saturating_sub(1);
-                    if col_idx < columns.len() {
-                        columns[col_idx].to_lowercase() == arg_name
-                    } else {
-                        false
-                    }
-                }
                 GroupByItem::Expression { display_name, .. } => {
                     display_name.to_lowercase() == arg_name
                 }
@@ -2458,8 +2581,10 @@ impl Executor {
                             }
                         }
                     } else {
-                        // Invalid position, fall back to storing position
-                        group_items.push(GroupByItem::Position(pos));
+                        return Err(crate::core::Error::invalid_argument(format!(
+                            "GROUP BY position {} is not in the select list",
+                            lit.value
+                        )));
                     }
                 }
                 Expression::FunctionCall(_) => {
@@ -2767,15 +2892,6 @@ impl Executor {
                         names.push(col_name.clone());
                     }
                 }
-                GroupByItem::Position(pos) => {
-                    // Position is 1-indexed
-                    let idx = pos.saturating_sub(1);
-                    if idx < columns.len() {
-                        names.push(columns[idx].clone());
-                    } else {
-                        names.push(format!("${}", pos));
-                    }
-                }
                 GroupByItem::Expression { display_name, .. } => {
                     // Use the display name (alias or generated name)
                     names.push(display_name.clone());
@@ -3031,6 +3147,7 @@ impl Executor {
             written_stmt: stmt,
             aggregations: &aggregations,
             group_by_count: 0,
+            source_columns: &table.schema().column_names_arc(),
         };
         self.finish_aggregation(AggregatePath::Pushdown, slots, ctx, result_columns, rows)
             .map(Some)
@@ -3259,6 +3376,7 @@ impl Executor {
             written_stmt: stmt,
             aggregations: &aggregations,
             group_by_count: 0,
+            source_columns: columns,
         };
         self.finish_aggregation(
             AggregatePath::FilteredPushdown,
@@ -3364,6 +3482,7 @@ impl Executor {
                     written_stmt: stmt,
                     aggregations: &aggregations,
                     group_by_count: 0,
+                    source_columns: &table.schema().column_names_arc(),
                 };
                 return self
                     .finish_aggregation(
@@ -3400,6 +3519,7 @@ impl Executor {
             written_stmt: stmt,
             aggregations: &aggregations,
             group_by_count: 0,
+            source_columns: &table.schema().column_names_arc(),
         };
         self.finish_aggregation(
             AggregatePath::StreamingGlobalScan,
@@ -3538,6 +3658,7 @@ impl Executor {
             written_stmt: stmt,
             aggregations: &aggregations,
             group_by_count: 1,
+            source_columns: &source_columns,
         };
         self.finish_aggregation(
             AggregatePath::StreamingDerivedTable,
@@ -3679,6 +3800,7 @@ impl Executor {
             written_stmt: stmt,
             aggregations: &aggregations,
             group_by_count: group_by_indices.len(),
+            source_columns: all_columns,
         };
         Some(self.finish_aggregation(
             AggregatePath::StorageGrouped,

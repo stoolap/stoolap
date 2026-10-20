@@ -8248,6 +8248,7 @@ impl Executor {
         let (final_columns, final_rows) = self.apply_post_aggregation_expressions(
             stmt,
             ctx,
+            &all_columns,
             &aggregations,
             result_columns,
             groups,
@@ -12655,6 +12656,7 @@ impl Executor {
             written_stmt: stmt,
             aggregations: &aggregations,
             group_by_count: 1,
+            source_columns: all_columns,
         };
         let result = self.finish_aggregation(
             crate::executor::AggregatePath::StreamingGroupBy,

@@ -180,6 +180,18 @@ const CASES: &[(&str, &str, &str, &str)] = &[
         "SELECT COUNT(DISTINCT s), COUNT(a) * 2 FROM t WHERE id + 0 = id",
     ),
     (
+        "memory",
+        "prepared_block",
+        "SELECT id FROM t WHERE a <= (SELECT MAX(a) FROM t AS u WHERE u.g = t.g AND u.id + 0 = u.id)",
+        "SELECT DISTINCT id FROM t WHERE a <= (SELECT MAX(a) FROM t AS u WHERE u.g = t.g AND u.id + 0 = u.id)",
+    ),
+    (
+        "sealed",
+        "prepared_block",
+        "SELECT id FROM t WHERE 1 < (SELECT COUNT(a) FROM t AS u WHERE u.g = t.g AND u.id + 0 = u.id)",
+        "SELECT DISTINCT id FROM t WHERE 1 < (SELECT COUNT(a) FROM t AS u WHERE u.g = t.g AND u.id + 0 = u.id)",
+    ),
+    (
         "empty",
         "streaming_derived_table",
         "SELECT COUNT(*) AS n, s, COUNT(*) AS m FROM (SELECT s FROM t) d GROUP BY s",

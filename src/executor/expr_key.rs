@@ -50,14 +50,6 @@ impl ExprKey {
         hasher.finish()
     }
 
-    /// The key of a GROUP BY position that names no SELECT column
-    pub(crate) fn position(position: usize) -> Self {
-        let mut hasher = KeyHasher::new();
-        hasher.tag(b'#');
-        hasher.write_usize(position);
-        hasher.finish()
-    }
-
     /// The name of a column carried only for ORDER BY and trimmed after the sort
     pub(crate) fn hidden_column_name(&self) -> String {
         format!("\u{0}{:016x}{:016x}", self.0, self.1)

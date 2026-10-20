@@ -223,6 +223,7 @@ fn test_a_set_test_belongs_to_the_family_wherever_where_holds_it() {
         "SELECT id FROM t WHERE CASE WHEN x > 1 THEN x = ANY (SELECT v FROM u) ELSE FALSE END",
         "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.v IN (SELECT x FROM w WHERE w.k = u.k))",
         "SELECT id FROM t WHERE x >= ALL (SELECT v + 1 FROM u WHERE u.k = t.k) LIMIT 2",
+        "SELECT id FROM t WHERE x IN (SELECT MAX(v) FROM u)",
     ] {
         assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
     }
@@ -234,10 +235,6 @@ fn test_a_set_test_belongs_to_the_family_wherever_where_holds_it() {
         (
             "SELECT id FROM t WHERE x IN (SELECT v, k FROM u)",
             "a subquery block without exactly one SELECT expression",
-        ),
-        (
-            "SELECT id FROM t WHERE x IN (SELECT MAX(v) FROM u)",
-            "an aggregate",
         ),
         (
             "SELECT id, x IN (SELECT v FROM u) FROM t WHERE x IN (SELECT v FROM u)",
@@ -537,4 +534,54 @@ fn test_a_cancel_inside_a_block_is_raised_and_never_kept() {
             count
         });
     assert_eq!(again.ok(), Some(0), "{sql} kept the cancel");
+}
+
+#[test]
+fn test_a_conjunct_beside_a_narrowing_in_raises_its_error() {
+    let _guard = serial();
+    let db = Database::open("memory://prepared_in_narrowed_error").unwrap();
+    for sql in [
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER)",
+        "INSERT INTO a VALUES (1, -9223372036854775808)",
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO b VALUES (1, 1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    for sql in [
+        "SELECT id FROM a WHERE id IN (SELECT k FROM b) AND ABS(x) >= 0",
+        "SELECT id FROM a WHERE id IN (SELECT MAX(k) FROM b) AND ABS(x) >= 0",
+    ] {
+        let got = ids(&db, sql);
+        assert!(
+            got.is_err(),
+            "{sql} answered {got:?} for a row whose ABS overflows"
+        );
+    }
+}
+
+#[test]
+fn test_a_cancel_before_the_scan_stops_at_its_limit_is_raised() {
+    use stoolap::test_failpoints::before_prepared_scalar;
+    let _guard = serial();
+    let db = Database::open("memory://prepared_in_cancel_limit").unwrap();
+    for sql in [
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO u VALUES (1, 1)",
+        "CREATE TABLE big (id INTEGER PRIMARY KEY, v INTEGER)",
+        "INSERT INTO big SELECT value, value FROM generate_series(1, 5000)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let executor = stoolap::Executor::new(std::sync::Arc::clone(db.engine()));
+    let sql = "SELECT id FROM big WHERE id >= (SELECT k FROM u WHERE u.id = 1) LIMIT 1000000";
+    let ctx = stoolap::ExecutionContext::new();
+    let handle = ctx.clone();
+    before_prepared_scalar(move || handle.cancel());
+    let result = executor.execute_with_context(sql, &ctx);
+    assert!(
+        matches!(result, Err(stoolap::Error::QueryCancelled)),
+        "{sql}: {:?}",
+        result.map(|_| ())
+    );
 }
