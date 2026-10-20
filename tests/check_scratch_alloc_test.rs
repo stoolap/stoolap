@@ -48,6 +48,10 @@ unsafe impl GlobalAlloc for ThreadCounting {
 #[global_allocator]
 static COUNTING: ThreadCounting = ThreadCounting;
 
+/// The compiled program cache is process-wide: a test compiling many
+/// expressions evicts the programs another measures
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn allocations(db: &Database, sql: &str) -> usize {
     let before = CALLS.with(Cell::get);
     db.execute(sql, ()).unwrap();
@@ -110,6 +114,7 @@ fn unchecked_cost(width: usize) -> [usize; 3] {
 
 #[test]
 fn a_table_without_a_check_pays_nothing_per_column_for_checks() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     assert_eq!(
         unchecked_cost(2),
         unchecked_cost(42),
@@ -119,6 +124,7 @@ fn a_table_without_a_check_pays_nothing_per_column_for_checks() {
 
 #[test]
 fn a_check_allocates_per_statement_not_per_row() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (insert_few, update_few) = check_cost(10);
     let (insert_many, update_many) = check_cost(1010);
     assert!(
