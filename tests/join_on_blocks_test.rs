@@ -534,3 +534,29 @@ fn a_where_block_after_the_join_chooses_its_strategy_by_the_joined_rows() {
         "1000 joined rows over 10000 rows of s2 read the keyed set once, not a probe per row"
     );
 }
+
+#[test]
+fn a_natural_join_binds_a_shared_dotted_column_beside_its_blocks() {
+    let db = Database::open("memory://join_on_blocks_natural_dotted").unwrap();
+    for sql in [
+        "CREATE TABLE l (id INTEGER PRIMARY KEY, \"x.y\" INTEGER)",
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, \"x.y\" INTEGER)",
+        "CREATE TABLE s (id INTEGER PRIMARY KEY)",
+        "INSERT INTO l VALUES (1, 7), (2, 8)",
+        "INSERT INTO r VALUES (1, 7), (2, 9)",
+        "INSERT INTO s VALUES (2), (4)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let sql = "SELECT l.id, r.id FROM l NATURAL JOIN r \
+               WHERE EXISTS (SELECT 1 FROM s WHERE s.id = l.id + r.id)";
+    for _ in 0..2 {
+        reset_join_paths();
+        assert_eq!(
+            rows(&db, sql),
+            Ok(vec!["Integer(1)|Integer(1)".to_string()]),
+            "{sql}"
+        );
+        assert_eq!(join_paths_taken(), ["hash"], "{sql}");
+    }
+}

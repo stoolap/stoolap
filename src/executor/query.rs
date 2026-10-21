@@ -439,13 +439,15 @@ impl CteNames<'_> {
 }
 
 /// The equalities a NATURAL join or a USING list makes of the sides'
-/// columns, the right columns SELECT * leaves out, and the left columns it
-/// names unqualified; none for any other join
+/// columns, each spelled by `column(right, index)`, the right columns
+/// SELECT * leaves out, and the left columns it names unqualified; none
+/// for any other join
 fn natural_join_condition(
     join_type: &str,
     join_source: &JoinTableSource,
     left_columns: &[String],
     right_columns: &[String],
+    column: impl Fn(bool, usize) -> Expression,
 ) -> (Option<Expression>, Vec<usize>, Vec<(usize, String)>) {
     if !join_type.contains("NATURAL") && join_source.using_columns.is_empty() {
         return (None, Vec::new(), Vec::new());
@@ -498,29 +500,11 @@ fn natural_join_condition(
                 join_column_renames.push((*left_idx, left_base.clone()));
 
                 // Create equality condition: left_col = right_col
-                let left_col_name = left_columns[*left_idx].clone();
-                let right_col_name = right_columns[*right_idx].clone();
-                let left_col = Expression::Identifier(Identifier::new(
-                    Token::new(
-                        TokenType::Identifier,
-                        left_col_name.clone(),
-                        Position::default(),
-                    ),
-                    left_col_name,
-                ));
-                let right_col = Expression::Identifier(Identifier::new(
-                    Token::new(
-                        TokenType::Identifier,
-                        right_col_name.clone(),
-                        Position::default(),
-                    ),
-                    right_col_name,
-                ));
                 conditions.push(Expression::Infix(InfixExpression::new(
                     Token::new(TokenType::Operator, "=", Position::default()),
-                    Box::new(left_col),
+                    Box::new(column(false, *left_idx)),
                     "=".to_string(),
-                    Box::new(right_col),
+                    Box::new(column(true, *right_idx)),
                 )));
             }
         }
@@ -4839,7 +4823,29 @@ impl Executor {
                 .collect();
             // The equalities of a NATURAL join or a USING list stand for its ON
             let (left, right) = columns.split_at(left_schema.columns.len());
-            let natural = natural_join_condition(join_type, join_source, left, right).0;
+            // Each column by its side and its own name, which may hold a dot
+            let natural =
+                natural_join_condition(join_type, join_source, left, right, |right, i| {
+                    let (alias, schema) = match right {
+                        true => (right_alias, right_schema),
+                        false => (left_alias, left_schema),
+                    };
+                    Expression::QualifiedIdentifier(QualifiedIdentifier {
+                        qualifier: Identifier::new(
+                            Token::new(TokenType::Identifier, alias, Position::default()),
+                            alias,
+                        ),
+                        name: Identifier::new(
+                            Token::new(
+                                TokenType::Identifier,
+                                schema.columns[i].name.as_str(),
+                                Position::default(),
+                            ),
+                            schema.columns[i].name.as_str(),
+                        ),
+                    })
+                })
+                .0;
             let on = natural.as_ref().or(join_source.condition.as_deref());
             let opened = cross.map(|cross| {
                 Self::with_select_aliases(stmt, cross, &columns).unwrap_or_else(|| cross.clone())
@@ -6438,8 +6444,23 @@ impl Executor {
         all_columns.extend(right_columns.clone());
 
         // Handle NATURAL JOIN or USING clause by automatically finding common columns
-        let natural_join_condition =
-            natural_join_condition(&join_type, join_source, &left_columns, &right_columns);
+        let natural_join_condition = natural_join_condition(
+            &join_type,
+            join_source,
+            &left_columns,
+            &right_columns,
+            |right, i| {
+                let name = if right {
+                    &right_columns[i]
+                } else {
+                    &left_columns[i]
+                };
+                Expression::Identifier(Identifier::new(
+                    Token::new(TokenType::Identifier, name.clone(), Position::default()),
+                    name.clone(),
+                ))
+            },
+        );
 
         // Destructure the tuple: (condition, excluded_column_indices, column_renames)
         let (natural_join_cond, excluded_column_indices, join_col_renames) = natural_join_condition;
