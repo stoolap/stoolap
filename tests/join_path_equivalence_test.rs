@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Every operator that produces a join's rows gives the rows of the join
-//! written so that no operator takes its keys, and every one registered has
-//! a case here
+//! Every operator that produces a join's rows answers as another operator
+//! does for the same join, and every one registered has a case here that it
+//! answers alone, without falling back to another
 
 #![cfg(feature = "test-failpoints")]
 
@@ -42,50 +42,106 @@ fn open() -> Database {
     db
 }
 
-/// Each path, a statement it answers, and the same statement with keys no
-/// path takes. A LIMIT without ORDER BY picks any rows, so those statements
-/// count or check their rows instead of listing them
-const CASES: &[(&str, &str, &str)] = &[
-    (
-        "index_nested_loop",
-        "SELECT COUNT(*) FROM (SELECT l.id FROM l JOIN r ON l.k = r.k LIMIT 40) j",
-        "SELECT COUNT(*) FROM (SELECT l.id FROM l JOIN r ON l.k + 0 = r.k + 0 LIMIT 40) j",
-    ),
-    (
-        "batch_index_nested_loop",
-        "SELECT l.id, r.id, r.w FROM l JOIN r ON l.k = r.id",
-        "SELECT l.id, r.id, r.w FROM l JOIN r ON l.k + 0 = r.id + 0",
-    ),
-    (
-        "grouped_index_join",
-        "SELECT COUNT(*) FROM (SELECT l.id, COUNT(*) FROM l JOIN r ON l.k = r.k GROUP BY l.id LIMIT 5) j",
-        "SELECT COUNT(*) FROM (SELECT l.id, COUNT(*) FROM l JOIN r ON l.k + 0 = r.k + 0 GROUP BY l.id LIMIT 5) j",
-    ),
-    (
-        "limit_hash",
-        "SELECT COUNT(*) FROM (SELECT l.id FROM l JOIN r ON l.g = r.w LIMIT 7) j",
-        "SELECT COUNT(*) FROM (SELECT l.id FROM l JOIN r ON l.g + 0 = r.w + 0 LIMIT 7) j",
-    ),
-    (
-        "parallel_hash",
-        "SELECT COUNT(*), SUM(bl.id), SUM(br.id) FROM bl JOIN br ON bl.u = br.u",
-        "SELECT COUNT(*), SUM(bl.id), SUM(br.id) FROM bl JOIN br ON bl.u = br.u + 0 AND br.v = bl.v",
-    ),
-    (
-        "hash",
-        "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w",
-        "SELECT l.id, r.id FROM l JOIN r ON l.g + 0 = r.w + 0",
-    ),
-    (
-        "nested_loop",
-        "SELECT l.id, r.id FROM l JOIN r ON l.g < r.w",
-        "SELECT l.id, r.id FROM l JOIN r ON l.g + 0 < r.w + 0",
-    ),
+/// The rows the reference answers with
+enum Reference {
+    /// A statement, with the one path it runs
+    Sql(&'static str, &'static str),
+    /// Rows computed here from the tables' contents
+    Computed(fn() -> Vec<String>),
+}
+
+/// A path, a statement it alone answers, the reference for it, and the
+/// statement's LIMIT: a LIMIT without ORDER BY may return any of the
+/// reference's rows, so they are checked as part of it with their counts
+struct Case {
+    path: &'static str,
+    sql: &'static str,
+    reference: Reference,
+    limit: Option<usize>,
+}
+
+/// `l JOIN r ON l.g < r.w`, from the contents `open` gives the tables
+fn l_g_below_r_w() -> Vec<String> {
+    let mut out = Vec::new();
+    for l in 1..=30i64 {
+        for r in 1..=50i64 {
+            if (l - 1) / 10 < r % 5 {
+                out.push(format!("Integer({l})|Integer({r})"));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+const CASES: &[Case] = &[
+    Case {
+        path: "index_nested_loop",
+        sql: "SELECT l.id, r.id, r.w FROM l JOIN r ON l.k = r.k LIMIT 40",
+        reference: Reference::Sql(
+            "SELECT l.id, r.id, r.w FROM l JOIN r ON l.k + 0 = r.k + 0",
+            "nested_loop",
+        ),
+        limit: Some(40),
+    },
+    Case {
+        path: "batch_index_nested_loop",
+        sql: "SELECT l.id, r.id, r.w FROM l JOIN r ON l.k = r.id",
+        reference: Reference::Sql(
+            "SELECT l.id, r.id, r.w FROM l JOIN r ON l.k + 0 = r.id + 0",
+            "nested_loop",
+        ),
+        limit: None,
+    },
+    Case {
+        path: "grouped_index_join",
+        sql: "SELECT l.id, COUNT(*), SUM(r.w) FROM l JOIN r ON l.k = r.k GROUP BY l.id LIMIT 5",
+        reference: Reference::Sql(
+            "SELECT l.id, COUNT(*), SUM(r.w) FROM l JOIN r ON l.k + 0 = r.k + 0 GROUP BY l.id",
+            "nested_loop",
+        ),
+        limit: Some(5),
+    },
+    Case {
+        path: "limit_hash",
+        sql: "SELECT l.id, r.id, r.w FROM l JOIN r ON l.g = r.w LIMIT 7",
+        reference: Reference::Sql(
+            "SELECT l.id, r.id, r.w FROM l JOIN r ON l.g + 0 = r.w + 0",
+            "nested_loop",
+        ),
+        limit: Some(7),
+    },
+    Case {
+        path: "parallel_hash",
+        sql: "SELECT COUNT(*), SUM(bl.id), SUM(br.v) FROM bl JOIN br ON bl.u = br.u",
+        // u equals id in both tables, so the primary key join holds the same pairs
+        reference: Reference::Sql(
+            "SELECT COUNT(*), SUM(bl.id), SUM(br.v) FROM bl JOIN br ON bl.id = br.id",
+            "batch_index_nested_loop",
+        ),
+        limit: None,
+    },
+    Case {
+        path: "hash",
+        sql: "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w",
+        reference: Reference::Sql(
+            "SELECT l.id, r.id FROM l JOIN r ON l.g + 0 = r.w + 0",
+            "nested_loop",
+        ),
+        limit: None,
+    },
+    Case {
+        path: "nested_loop",
+        sql: "SELECT l.id, r.id FROM l JOIN r ON l.g < r.w",
+        reference: Reference::Computed(l_g_below_r_w),
+        limit: None,
+    },
 ];
 
-/// The rows of `sql` as sorted text, or the error
-fn rows(db: &Database, sql: &str) -> Result<Vec<String>, String> {
+/// The column names of `sql` and its rows as sorted text, or the error
+fn rows(db: &Database, sql: &str) -> Result<(Vec<String>, Vec<String>), String> {
     let result = db.query(sql, ()).map_err(|e| e.to_string())?;
+    let columns = result.columns().to_vec();
     let mut out = Vec::new();
     for row in result {
         let row = row.map_err(|e| e.to_string())?;
@@ -97,26 +153,78 @@ fn rows(db: &Database, sql: &str) -> Result<Vec<String>, String> {
         );
     }
     out.sort();
-    Ok(out)
+    Ok((columns, out))
+}
+
+/// Whether every row of `part` is in `whole`, as often as it is there
+fn contained(part: &[String], whole: &[String]) -> bool {
+    let mut left = whole.to_vec();
+    part.iter()
+        .all(|row| match left.iter().position(|w| w == row) {
+            Some(at) => {
+                left.swap_remove(at);
+                true
+            }
+            None => false,
+        })
 }
 
 #[test]
-fn every_join_path_answers_as_the_keyless_join() {
+fn every_join_path_answers_as_another_path_does() {
     let db = open();
     let mut wrong = Vec::new();
     let mut covered: Vec<&str> = Vec::new();
-    for &(path, sql, reference) in CASES {
+    for case in CASES {
         reset_join_paths();
-        let got = rows(&db, sql);
+        let got = rows(&db, case.sql);
         let taken = join_paths_taken();
-        let want = rows(&db, reference);
-        if !taken.contains(&path) {
-            wrong.push(format!("{sql}: took {taken:?}, expected {path}"));
-        }
-        if got != want {
-            wrong.push(format!("{sql}: got {got:?}, keyless {want:?}"));
+        if taken != [case.path] {
+            wrong.push(format!(
+                "{}: took {taken:?}, expected only {}",
+                case.sql, case.path
+            ));
         }
         covered.extend(taken);
+        let (columns, want) = match &case.reference {
+            Reference::Sql(reference, reference_path) => {
+                reset_join_paths();
+                let want = rows(&db, reference);
+                let reference_taken = join_paths_taken();
+                if reference_taken != [*reference_path] {
+                    wrong.push(format!(
+                        "{reference}: took {reference_taken:?}, expected only {reference_path}"
+                    ));
+                }
+                match want {
+                    Ok((columns, want)) => (Some(columns), want),
+                    Err(e) => {
+                        wrong.push(format!("{reference}: {e}"));
+                        continue;
+                    }
+                }
+            }
+            Reference::Computed(rows) => (None, rows()),
+        };
+        let (got_columns, got) = match got {
+            Ok(got) => got,
+            Err(e) => {
+                wrong.push(format!("{}: {e}", case.sql));
+                continue;
+            }
+        };
+        if columns.is_some_and(|columns| columns != got_columns) {
+            wrong.push(format!("{}: columns {got_columns:?}", case.sql));
+        }
+        let answers = match case.limit {
+            Some(limit) => got.len() == limit.min(want.len()) && contained(&got, &want),
+            None => got == want,
+        };
+        if !answers {
+            wrong.push(format!(
+                "{}: got {got:?}, the reference has {want:?}",
+                case.sql
+            ));
+        }
     }
     for path in join_paths() {
         if !covered.contains(&path) {
