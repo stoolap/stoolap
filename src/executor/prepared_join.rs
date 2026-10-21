@@ -18,12 +18,13 @@
 
 use std::sync::{Arc, RwLock};
 
-use smallvec::{smallvec, SmallVec};
+use smallvec::SmallVec;
 
-use crate::core::{Error, Result};
+use crate::core::Result;
 
 use super::expression::SharedProgram;
 use super::join_executor::JoinAnalysis;
+use super::prepared_select::JoinWhere;
 use super::query::JoinOutput;
 
 /// The programs one compile builds, shared only once they are held
@@ -56,11 +57,6 @@ pub enum JoinProgramKey {
     },
     /// The ORDER BY keys an index join sorts its joined rows by
     OrderKeys { columns: Vec<String> },
-    /// The WHERE asked of each joined row, by where it is asked
-    Where {
-        site: WhereSite,
-        columns: Vec<String>,
-    },
 }
 
 /// Where a join asks its WHERE of the joined rows
@@ -70,6 +66,13 @@ pub enum WhereSite {
     IndexJoin,
     /// After the hash join or nested loop produced its rows
     AfterJoin,
+}
+
+/// The joined rows a WHERE was compiled over, by where it is asked
+#[derive(Debug)]
+struct WhereKey {
+    site: WhereSite,
+    columns: Vec<String>,
 }
 
 /// The key equalities a join's analysis was asked for: the sides' columns,
@@ -153,6 +156,10 @@ pub struct PreparedJoin {
     analyses: Shelf<AnalysisKey, JoinAnalysis>,
     /// None stands for a SELECT list each execution projects anew
     outputs: Shelf<OutputKey, Option<JoinOutput>>,
+    wheres: Shelf<WhereKey, JoinWhere>,
+    /// Whether the WHERE's subqueries all stand in what is asked of the
+    /// joined rows, as the statement's blocks; decided on first need
+    blocks_where: std::sync::OnceLock<bool>,
 }
 
 impl PreparedJoin {
@@ -162,7 +169,15 @@ impl PreparedJoin {
             programs: Shelf::new(),
             analyses: Shelf::new(),
             outputs: Shelf::new(),
+            wheres: Shelf::new(),
+            blocks_where: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Whether the WHERE's subqueries run as the statement's blocks, as
+    /// `decide` finds once
+    pub fn blocks_where(&self, decide: impl FnOnce() -> bool) -> bool {
+        *self.blocks_where.get_or_init(decide)
     }
 
     /// The output held for joined rows of `columns`, or the one `build`
@@ -238,26 +253,26 @@ impl PreparedJoin {
         Ok(read(&built))
     }
 
-    /// The WHERE program held for `site` over `columns`, or the one
-    /// `compile` builds
-    pub fn where_program(
+    /// The WHERE held for `site` over `columns`, or the one `build` makes
+    pub(crate) fn where_clause(
         &self,
         site: WhereSite,
         columns: &[String],
-        compile: impl FnOnce() -> Result<SharedProgram>,
-    ) -> Result<SharedProgram> {
-        self.programs(
-            |held| {
-                matches!(held, JoinProgramKey::Where { site: s, columns: c }
-                    if *s == site && c == columns)
-            },
-            || JoinProgramKey::Where {
+        build: impl FnOnce() -> Result<JoinWhere>,
+    ) -> Result<Arc<JoinWhere>> {
+        let wanted = |held: &WhereKey| held.site == site && held.columns == columns;
+        if let Some(held) = self.wheres.find(wanted) {
+            return Ok(held);
+        }
+        let built = Arc::new(build()?);
+        self.wheres.hold(
+            wanted,
+            || WhereKey {
                 site,
                 columns: columns.to_vec(),
             },
-            || Ok(smallvec![compile()?]),
-            |programs| programs.first().cloned(),
-        )?
-        .ok_or_else(|| Error::internal("a join WHERE held without its program"))
+            || Arc::clone(&built),
+        );
+        Ok(built)
     }
 }

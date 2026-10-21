@@ -474,10 +474,14 @@ impl Executor {
     }
 }
 
-/// One scope of a chain: the name that qualifies it and its columns
+/// One scope of a chain: the tables it reads, each by the name that
+/// qualifies it and the position of its first column, and their columns
+/// in that order; a join's statement scope holds its two sides
 struct ScopeTable {
-    name: SmartString,
+    tables: SmallVec<[(SmartString, usize); 2]>,
+    /// The names its programs compile against
     columns: CompactArc<Vec<String>>,
+    /// Each column's own name, lowercase, as a bare reference names it
     lower: CompactArc<Vec<String>>,
     types: Vec<DataType>,
 }
@@ -485,11 +489,65 @@ struct ScopeTable {
 impl ScopeTable {
     fn of(name: SmartString, schema: &Schema) -> Self {
         Self {
-            name,
+            tables: smallvec::smallvec![(name, 0)],
             columns: schema.column_names_arc(),
             lower: schema.column_names_lower_arc(),
             types: schema.columns.iter().map(|c| c.data_type).collect(),
         }
+    }
+
+    /// The joined row of `sides`, each a name and its table's schema, whose
+    /// columns the join names `columns`; None when they do not line up
+    fn joined(sides: [(SmartString, &Schema); 2], columns: &[String]) -> Option<Self> {
+        let width: usize = sides.iter().map(|(_, schema)| schema.columns.len()).sum();
+        if columns.len() != width {
+            return None;
+        }
+        let mut tables = SmallVec::new();
+        let mut lower = Vec::with_capacity(width);
+        let mut types = Vec::with_capacity(width);
+        for (name, schema) in sides {
+            tables.push((name, lower.len()));
+            lower.extend(schema.columns.iter().map(|c| c.name.to_lowercase()));
+            types.extend(schema.columns.iter().map(|c| c.data_type));
+        }
+        Some(Self {
+            tables,
+            columns: CompactArc::new(columns.to_vec()),
+            lower: CompactArc::new(lower),
+            types,
+        })
+    }
+
+    /// The name qualifying the table whose columns include `index`, and the
+    /// columns of that table
+    fn table(&self, index: usize) -> (&SmartString, std::ops::Range<usize>) {
+        let at = self
+            .tables
+            .iter()
+            .rposition(|(_, start)| *start <= index)
+            .unwrap_or(0);
+        let end = self
+            .tables
+            .get(at + 1)
+            .map_or(self.lower.len(), |(_, start)| *start);
+        (&self.tables[at].0, self.tables[at].1..end)
+    }
+
+    /// The column `expr` names as this scope spells its own columns
+    fn position(&self, expr: &Expression) -> Option<usize> {
+        let Expression::QualifiedIdentifier(q) = expr else {
+            return None;
+        };
+        if q.qualifier.value_lower == RESOLVED {
+            return self.lower.iter().position(|c| *c == q.name.value_lower);
+        }
+        let (_, start) = self
+            .tables
+            .iter()
+            .find(|(name, _)| *name == q.qualifier.value_lower)?;
+        let (_, mut range) = self.table(*start);
+        range.find(|i| self.lower[*i] == q.name.value_lower)
     }
 }
 
@@ -535,19 +593,26 @@ impl Chain<'_> {
         Err(Error::ColumnNotFound(id.value.to_string()))
     }
 
-    /// `qualifier.column` in the nearest scope the qualifier names
+    /// `qualifier.column` in the table of the nearest scope the qualifier names
     fn qualified(&self, qualifier: &str, column: &str, spelled: &str) -> Result<(usize, usize)> {
-        let depth = self
+        let (depth, start) = self
             .scopes
             .iter()
-            .position(|scope| scope.name == qualifier)
+            .enumerate()
+            .find_map(|(depth, scope)| {
+                scope
+                    .tables
+                    .iter()
+                    .find(|(name, _)| name == qualifier)
+                    .map(|(_, start)| (depth, *start))
+            })
             .ok_or_else(|| {
                 Error::invalid_argument(format!("unknown table or alias '{}'", qualifier))
             })?;
-        let index = self.scopes[depth]
-            .lower
-            .iter()
-            .position(|c| c == column)
+        let scope = self.scopes[depth];
+        let (_, mut range) = scope.table(start);
+        let index = range
+            .find(|i| scope.lower[*i] == column)
             .ok_or_else(|| Error::ColumnNotFound(spelled.to_string()))?;
         Ok((depth, index))
     }
@@ -567,8 +632,9 @@ impl Chain<'_> {
     }
 
     /// The column `index` of the scope at `depth`, as a name its own
-    /// programs compile against. Qualified by a name no table can have, so
-    /// the compiler reads it as a column wherever it stands, never a literal
+    /// programs compile against. Over one table, qualified by a name no
+    /// table can have, so the compiler reads it as a column wherever it
+    /// stands, never a literal; over a join, by its side's name
     fn column(&self, depth: usize, index: usize) -> Expression {
         let ident = |value: &str, lower: &str| {
             let mut id = Identifier::new(
@@ -578,12 +644,18 @@ impl Chain<'_> {
             id.value_lower = SmartString::from(lower);
             id
         };
-        Expression::QualifiedIdentifier(QualifiedIdentifier {
-            qualifier: ident(RESOLVED, RESOLVED),
-            name: ident(
-                &self.scopes[depth].columns[index],
-                &self.scopes[depth].lower[index],
+        let scope = self.scopes[depth];
+        let spelled = &scope.columns[index];
+        let (qualifier, name) = match scope.tables.len() {
+            1 => (RESOLVED, spelled.as_str()),
+            _ => (
+                scope.table(index).0.as_str(),
+                spelled.rsplit('.').next().unwrap_or(spelled),
             ),
+        };
+        Expression::QualifiedIdentifier(QualifiedIdentifier {
+            qualifier: ident(qualifier, qualifier),
+            name: ident(name, &scope.lower[index]),
         })
     }
 
@@ -1986,7 +2058,10 @@ impl Builder<'_> {
         // What the block answers and how its members are read is part of what is kept
         let mut scopes = signature;
         for scope in outer {
-            scopes.push_str(&scope.name);
+            for (name, _) in &scope.tables {
+                scopes.push_str(name);
+                scopes.push('\u{2}');
+            }
             for (column, data_type) in scope.lower.iter().zip(&scope.types) {
                 scopes.push_str(&format!("\u{0}{column}:{data_type:?}"));
             }
@@ -2049,12 +2124,9 @@ impl Builder<'_> {
             Vec::new()
         } else {
             let parent = CompileContext::new(&outer[0].columns, registry);
-            let column = |hole: &Expression| {
-                bound_column(hole).and_then(|name| outer[0].lower.iter().position(|c| c == name))
-            };
             work.holes
                 .iter()
-                .map(|(slot, hole)| match column(hole) {
+                .map(|(slot, hole)| match outer[0].position(hole) {
                     Some(index) => Ok((*slot, Hole::Column(index))),
                     None => compile_with(&parent, hole).map(|p| (*slot, Hole::Program(p))),
                 })
@@ -2455,7 +2527,7 @@ impl PreparedProjection {
                     select_exprs.extend((0..columns.len()).map(|i| chain.column(0, i)))
                 }
                 Expression::QualifiedStar(star) => {
-                    if star.qualifier.to_lowercase() != scope.name.as_str() {
+                    if star.qualifier.to_lowercase() != scope.tables[0].0.as_str() {
                         return Err(Error::invalid_argument(format!(
                             "unknown table or alias '{}'",
                             star.qualifier
@@ -2817,6 +2889,123 @@ impl PreparedDml {
             sets,
             values,
         })
+    }
+}
+
+/// The part of a join's WHERE asked of its joined rows, compiled over them
+/// with its subqueries as the statement's blocks
+#[derive(Debug)]
+pub(crate) struct JoinWhere {
+    pub(crate) program: SharedProgram,
+    /// The blocks its subqueries run as; None for a WHERE without one
+    blocks: Option<(PreparedBlocks, HoleSet)>,
+}
+
+impl JoinWhere {
+    /// A WHERE that holds no subquery
+    pub(crate) fn plain(program: SharedProgram) -> Self {
+        Self {
+            program,
+            blocks: None,
+        }
+    }
+
+    pub(crate) fn has_blocks(&self) -> bool {
+        self.blocks.is_some()
+    }
+
+    /// `clause` over the joined row of `sides`, each a name and its table's
+    /// schema, whose columns the join names `columns`; None when they do
+    /// not line up
+    fn prepare(
+        executor: &Executor,
+        clause: &Expression,
+        sides: [(SmartString, &Schema); 2],
+        columns: &[String],
+        param_count: usize,
+    ) -> Result<Option<Self>> {
+        let Some(scope) = ScopeTable::joined(sides, columns) else {
+            return Ok(None);
+        };
+        let scopes = [&scope];
+        let chain = Chain { scopes: &scopes };
+        let mut builder = Builder {
+            executor,
+            next_slot: param_count,
+            subqueries: Vec::new(),
+            named: Vec::new(),
+            max_param: 0,
+        };
+        let mut work = Rewritten::default();
+        let clause = builder.rewrite(&chain, None, clause, &mut work)?;
+        let own = CompileContext::new(&scope.columns, &executor.function_registry)
+            .with_prepared_subqueries();
+        let program = compile_with(&own, &clause)?;
+        let blocks = builder.finish(param_count, Vec::new())?;
+        Ok(Some(Self {
+            program,
+            blocks: Some(blocks),
+        }))
+    }
+}
+
+impl Executor {
+    /// Whether a join's WHERE asked of its joined rows holds subqueries
+    /// only of the family's forms, or why not
+    pub(crate) fn join_where_family(
+        &self,
+        clause: &Expression,
+        ctx: &ExecutionContext,
+    ) -> std::result::Result<(), OutOfFamily> {
+        let family = Family {
+            executor: self,
+            ctx: Some(ctx),
+            tables: RefCell::new(SmallVec::new()),
+        };
+        let mut found = false;
+        family.expression(clause, 1, Site::Subqueries, &mut found)?;
+        family.catalog()
+    }
+
+    /// `clause`, asked of the joined rows of `sides` named `columns`, with
+    /// its subqueries prepared as blocks
+    pub(crate) fn prepare_join_where(
+        &self,
+        clause: &Expression,
+        sides: [(SmartString, &Schema); 2],
+        columns: &[String],
+        ctx: &ExecutionContext,
+    ) -> Result<Option<JoinWhere>> {
+        JoinWhere::prepare(self, clause, sides, columns, ctx.params().len())
+    }
+
+    /// One execution's run of `held`'s blocks for about `rows` joined rows;
+    /// None for a WHERE without blocks, or when a table they read no
+    /// longer has the columns they were prepared for
+    pub(crate) fn join_where_runner<'a>(
+        &'a self,
+        held: &'a JoinWhere,
+        ctx: &'a ExecutionContext,
+        rows: usize,
+    ) -> Result<Option<PreparedRunner<'a>>> {
+        let Some((blocks, holes)) = &held.blocks else {
+            return Ok(None);
+        };
+        for name in &blocks.named {
+            if !ctx.named_params().contains_key(name.as_str()) {
+                return Err(Error::invalid_argument(format!(
+                    "named parameter :{} has no value",
+                    name
+                )));
+            }
+        }
+        let inner_ctx = ctx.with_incremented_query_depth();
+        let Some(tables) = PreparedRunner::open_tables(self, blocks, &inner_ctx)? else {
+            return Ok(None);
+        };
+        Ok(Some(PreparedRunner::new(
+            self, blocks, holes, ctx, inner_ctx, tables, rows, None,
+        )))
     }
 }
 

@@ -1,0 +1,181 @@
+// Copyright 2025 Stoolap Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! A join of two tables whose WHERE asks subqueries of its joined rows runs
+//! them as the plan's blocks: it answers as the general path does, hot and
+//! sealed, and run again compiles nothing
+
+#![cfg(feature = "test-failpoints")]
+
+use stoolap::test_failpoints::{
+    bridge_compiles, join_paths_taken, program_compiles, reset_join_paths,
+};
+use stoolap::Database;
+
+fn fill(db: &Database) {
+    for sql in [
+        "CREATE TABLE l (id INTEGER PRIMARY KEY, k INTEGER, g INTEGER)",
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, k INTEGER, w INTEGER)",
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+        "CREATE INDEX r_k ON r (k)",
+        "INSERT INTO l SELECT g.value, g.value % 7, (g.value - 1) / 10 FROM generate_series(1, 30) g",
+        "INSERT INTO r SELECT g.value, g.value % 7, g.value % 5 FROM generate_series(1, 50) g",
+        "INSERT INTO s SELECT g.value, g.value % 31, g.value % 51 FROM generate_series(1, 90) g",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+}
+
+/// Each statement, with `{l}` and `{r}` for its sides, and the join path
+/// it takes over the two tables
+const CASES: &[(&str, &str)] = &[
+    (
+        "SELECT l.id, r.id FROM {l} JOIN {r} ON l.g = r.w WHERE EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id)",
+        "hash",
+    ),
+    (
+        "SELECT l.id, r.id FROM {l} JOIN {r} ON l.g = r.w WHERE NOT EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id)",
+        "hash",
+    ),
+    (
+        "SELECT l.id, r.id FROM {l} JOIN {r} ON l.g = r.w WHERE r.id IN (SELECT s.b FROM s WHERE s.a = l.g)",
+        "hash",
+    ),
+    (
+        "SELECT l.id, r.id FROM {l} JOIN {r} ON l.g = r.w WHERE l.id < (SELECT MAX(s.b) FROM s WHERE s.a = r.w)",
+        "hash",
+    ),
+    (
+        "SELECT l.id, r.id FROM {l} JOIN {r} ON l.g = r.w WHERE l.id > ANY (SELECT s.b FROM s WHERE s.a = r.w)",
+        "hash",
+    ),
+    (
+        "SELECT l.id, r.id FROM {l} JOIN {r} ON l.g = r.w WHERE l.id < ALL (SELECT s.b FROM s WHERE s.a = r.w + 20)",
+        "hash",
+    ),
+    (
+        "SELECT l.id, r.id FROM {l} JOIN {r} ON l.g < r.w WHERE EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id)",
+        "nested_loop",
+    ),
+    (
+        "SELECT l.id, r.id FROM {l} LEFT JOIN {r} ON l.g = r.w AND r.id < 20 WHERE r.id IS NULL OR EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id)",
+        "hash",
+    ),
+    (
+        "SELECT l.id, r.id FROM {l} RIGHT JOIN {r} ON l.g = r.w AND l.id < 12 WHERE l.id IS NULL OR r.id IN (SELECT s.b FROM s WHERE s.a = l.g)",
+        "hash",
+    ),
+    (
+        "SELECT l.id, r.id FROM {l} JOIN {r} ON l.g = r.w WHERE l.id + r.id > (SELECT MIN(s.b) FROM s WHERE s.a = 5)",
+        "hash",
+    ),
+    (
+        "SELECT l.id, r.id FROM {l} JOIN {r} ON l.g = r.w WHERE l.id + r.id IN (SELECT s.b FROM s)",
+        "hash",
+    ),
+    (
+        "SELECT l.id, r.id FROM {l} JOIN {r} ON l.k = r.id WHERE l.id + r.id > (SELECT MIN(s.b) FROM s WHERE s.a = 5)",
+        "batch_index_nested_loop",
+    ),
+];
+
+/// The rows of `sql` as sorted text, or the error
+fn rows(db: &Database, sql: &str) -> Result<Vec<String>, String> {
+    let result = db.query(sql, ()).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in result {
+        let row = row.map_err(|e| e.to_string())?;
+        out.push(format!(
+            "{:?}|{:?}",
+            row.get_value(0).unwrap(),
+            row.get_value(1).unwrap()
+        ));
+    }
+    out.sort();
+    Ok(out)
+}
+
+#[test]
+fn a_join_where_runs_its_subqueries_as_blocks() {
+    let mut wrong = Vec::new();
+    for sealed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = if sealed {
+            let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+            fill(&db);
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+            db
+        } else {
+            let db = Database::open("memory://join_where_blocks").unwrap();
+            fill(&db);
+            db
+        };
+        for &(shape, path) in CASES {
+            let sql = shape.replace("{l}", "l").replace("{r}", "r");
+            let reference = shape
+                .replace("{l}", "(SELECT * FROM l) l")
+                .replace("{r}", "(SELECT * FROM r) r");
+            let first = rows(&db, &sql);
+            let bridge = bridge_compiles();
+            let programs = program_compiles();
+            reset_join_paths();
+            let again = rows(&db, &sql);
+            let taken = join_paths_taken();
+            let compiled = (bridge_compiles() - bridge, program_compiles() - programs);
+            let want = rows(&db, &reference);
+            if taken != [path] {
+                wrong.push(format!(
+                    "sealed {sealed}: {sql}: took {taken:?}, expected {path}"
+                ));
+            }
+            if compiled != (0, 0) {
+                wrong.push(format!(
+                    "sealed {sealed}: {sql}: run again, compiled {compiled:?}"
+                ));
+            }
+            if first != want || again != want {
+                wrong.push(format!(
+                    "sealed {sealed}: {sql}: gave {first:?} then {again:?}, the general path {want:?}"
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+#[test]
+fn an_uncorrelated_block_no_joined_row_reaches_is_not_read() {
+    let db = Database::open("memory://join_where_blocks_lazy").unwrap();
+    fill(&db);
+    let shape = "SELECT l.id, r.id FROM {l} JOIN {r} ON l.g = r.w AND l.id < 0 WHERE l.id + r.id > (SELECT s.b FROM s)";
+    let blocks = rows(&db, &shape.replace("{l}", "l").replace("{r}", "r"));
+    assert_eq!(blocks, Ok(Vec::new()), "no joined row reads the block");
+    let folded = rows(
+        &db,
+        &shape
+            .replace("{l}", "(SELECT * FROM l) l")
+            .replace("{r}", "(SELECT * FROM r) r"),
+    );
+    assert!(
+        folded
+            .as_ref()
+            .is_err_and(|e| e.contains("more than one row")),
+        "the general path folds the subquery before any row: {folded:?}"
+    );
+}

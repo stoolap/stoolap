@@ -395,6 +395,8 @@ Every subquery of an `UPDATE` or `DELETE`, the ones that read the target table i
 
 An `INSERT ... VALUES` is prepared the same way when a value holds a subquery and every value fits the shape above. Every value is read before the statement writes a row, so a subquery that reads the target table sees it as the statement found it, without the rows the statement inserts. A scalar subquery that answers more than one row fails the statement and writes no row.
 
+A join of two tables, neither a view, a CTE or a derived table and neither read `AS OF`, with no subquery in its `ON`, is prepared the same way when every subquery of its `WHERE` stands where the join asks it of the joined rows: in a condition that reads both tables, or that holds a correlated subquery. The subqueries fit the shape above, their enclosing query is the joined row, and an unqualified name both tables have resolves to the left one. The rules above hold for them, so an uncorrelated subquery runs at most once per execution and only when a joined row needs it: one that no joined row reaches raises no error. The sides and the subqueries read one snapshot of the tables. Any other join with a subquery in its `WHERE`, such as one whose uncorrelated subquery stands in a condition on one table, reads an uncorrelated subquery before the join and runs a correlated one for each joined row.
+
 ## Examples
 
 ### Example 1: Delete Orders from High-Value Customers
