@@ -275,6 +275,16 @@ pub(crate) struct CompiledUpsert {
     compiled_checks: Vec<CompiledCheck>,
 }
 
+/// An ON CONFLICT DO UPDATE whose programs are prepared: `upsert` holds
+/// them, over the row met joined with the excluded row, and `runner`
+/// answers their subqueries
+struct ConflictRun<'r, 'a> {
+    runner: &'r super::prepared_select::DmlRunner<'a>,
+    upsert: Arc<CompiledUpsert>,
+    /// The row met and the excluded row as one row, reused across conflicts
+    joined: std::cell::RefCell<Row>,
+}
+
 /// The CHECK programs of a table without CHECK constraints, shared
 static NO_CHECKS: std::sync::LazyLock<Arc<Vec<CompiledCheck>>> =
     std::sync::LazyLock::new(|| Arc::new(Vec::new()));
@@ -299,6 +309,7 @@ impl<'a> InsertPlan<'a> {
         token: LayoutToken,
         schema: &Schema,
         stmt: &InsertStatement,
+        prepared: Option<Arc<CompiledUpsert>>,
     ) -> Result<Self> {
         let cached = cache.and_then(|cache| match &*cache.read().ok()? {
             CompiledExecution::ConflictInsert(plan)
@@ -322,10 +333,12 @@ impl<'a> InsertPlan<'a> {
                 };
                 // Compiled before the first write, so an invalid clause
                 // fails the statement even when no row conflicts
-                let upsert = if stmt.on_duplicate {
-                    Some(Arc::new(Executor::compile_upsert(schema, stmt)?))
-                } else {
-                    None
+                let upsert = match prepared {
+                    Some(prepared) => Some(prepared),
+                    None if stmt.on_duplicate => {
+                        Some(Arc::new(Executor::compile_upsert(schema, stmt)?))
+                    }
+                    None => None,
                 };
                 (checks, upsert)
             }
@@ -630,117 +643,32 @@ impl Executor {
         Ok(Some(row_ids))
     }
 
-    /// The INSERT run with each VALUES value holding a subquery of the
-    /// prepared family read first and passed as a parameter, so the
-    /// subqueries see the tables as the statement found them and the rows
-    /// go through the plain INSERT; None when no such value is in it
+    /// Whether the INSERT's VALUES or ON CONFLICT DO UPDATE hold a subquery
+    /// of the prepared family, read before its first write
     #[inline(never)]
-    fn insert_with_values_read(
+    fn insert_reads_prepared(
         &self,
         stmt: &InsertStatement,
         ctx: &ExecutionContext,
         plan_cache: Option<&RwLock<CompiledExecution>>,
-    ) -> Option<Result<Box<dyn QueryResult>>> {
+    ) -> bool {
         let values = || {
             stmt.values
                 .iter()
                 .flatten()
                 .filter(|e| !matches!(e, Expression::Default(_)))
         };
-        if stmt.on_duplicate
-            || stmt.do_nothing
-            || !values().any(Self::has_subqueries)
-            || self.dml_family(None, values(), ctx).is_err()
-        {
-            return None;
-        }
-        Some(self.read_values_then_insert(stmt, ctx, plan_cache))
-    }
-
-    fn read_values_then_insert(
-        &self,
-        stmt: &InsertStatement,
-        ctx: &ExecutionContext,
-        plan_cache: Option<&RwLock<CompiledExecution>>,
-    ) -> Result<Box<dyn QueryResult>> {
-        let (active_txn_id, statement_rollback) = {
-            let active = self
-                .active_transaction
-                .lock()
-                .map_err(|_| Error::internal("active transaction lock poisoned"))?;
-            (
-                active.as_ref().map(|t| t.transaction.id()),
-                StatementRollback::new(&self.engine, active.as_ref()),
-            )
+        let conflict = || {
+            stmt.update_expressions
+                .iter()
+                .chain(stmt.update_where.as_deref())
         };
-        let ctx_with_txn;
-        let ctx = match active_txn_id {
-            Some(txn_id) => {
-                ctx_with_txn = ctx.with_transaction_id(txn_id as u64);
-                &ctx_with_txn
-            }
-            None => ctx,
-        };
-        let ctx_with_view;
-        let ctx = match self.statement_view(true, ctx, active_txn_id) {
-            Some(view) => {
-                ctx_with_view = ctx.with_statement_view(view);
-                &ctx_with_view
-            }
-            None => ctx,
-        };
-        let snapshot_ctx;
-        let ctx = if active_txn_id.is_none() && ctx.statement_snapshot().is_none() {
-            let snapshot =
-                self.new_statement_snapshot(self.isolation_level(), ctx.statement_view())?;
-            snapshot_ctx = ctx.with_statement_snapshot(snapshot);
-            &snapshot_ctx
-        } else {
-            ctx
-        };
-        let result = self.insert_read_values(stmt, ctx, plan_cache);
-        statement_rollback.finish(result)
-    }
-
-    fn insert_read_values(
-        &self,
-        stmt: &InsertStatement,
-        ctx: &ExecutionContext,
-        plan_cache: Option<&RwLock<CompiledExecution>>,
-    ) -> Result<Box<dyn QueryResult>> {
-        let table_name = &stmt.table_name.value_lower;
-        // A VALUES row has no target row: its scope is a table without columns
-        let unread = Schema::new(table_name.as_str(), Vec::new());
-        let (prepared, tables) = self.open_prepared_dml(
-            plan_cache,
-            &unread,
-            table_name,
-            None,
-            &[],
-            &stmt.values,
-            ctx,
-        )?;
-        let run = super::prepared_select::DmlRunner::new(self, &prepared, ctx, tables, 0)?;
-        let mut vm = super::expression::ExprVM::new();
-        let no_row = Row::new();
-        let exec = run.context(&no_row);
-        let mut written_ctx = ctx.clone();
-        let mut written = stmt.clone();
-        for (row, programs) in written.values.iter_mut().zip(run.values()) {
-            for (value, program) in row.iter_mut().zip(programs) {
-                if let Some(program) = program {
-                    #[cfg(feature = "test-failpoints")]
-                    crate::test_failpoints::prepared_dml_site_ran(
-                        crate::test_failpoints::PreparedDmlSite::InsertValues,
-                    );
-                    written_ctx.add_param(vm.execute_cow(program, &exec)?);
-                    *value = answer_parameter(written_ctx.params().len());
-                }
-            }
-        }
-        // Every value is read: the blocks' tables close before a row is written
-        drop(run);
-        self.execute_insert(&written, &written_ctx, None)
+        !stmt.returning.iter().any(Self::has_subqueries)
+            && (values().any(Self::has_subqueries) || conflict().any(Self::has_subqueries))
+            && (self.holds_prepared_dml(plan_cache, ctx)
+                || self
+                    .dml_family(None, values().chain(conflict()), ctx)
+                    .is_ok())
     }
 
     /// VALUES holding a subquery go the uncached way, whose plan slot keeps
@@ -772,11 +700,8 @@ impl Executor {
         // OPTIMIZATION: Use pre-computed lowercase name to avoid allocation per query
         let table_name = &stmt.table_name.value_lower;
         let reads_through_view = super::insert_reads_through_a_view(stmt);
-        if reads_through_view {
-            if let Some(inserted) = self.insert_with_values_read(stmt, ctx, plan_cache) {
-                return inserted;
-            }
-        }
+        let reads_prepared =
+            reads_through_view && self.insert_reads_prepared(stmt, ctx, plan_cache);
 
         // Check if there's an active explicit transaction
         let mut active_tx = self.active_transaction.lock().unwrap();
@@ -831,6 +756,93 @@ impl Executor {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::dml_table_opened();
 
+        // Prepared subqueries are read before the first write, through this
+        // statement's transaction; a commit-time retry runs the statement again
+        let retry_of = (stmt, ctx, plan_cache);
+        let prepared;
+        let mut runner = None;
+        let conflict_run;
+        let written_ctx;
+        let written;
+        let (stmt, ctx, plan_cache, conflict) = if reads_prepared {
+            let target = table.schema_arc();
+            let conflict_reads = stmt.on_duplicate
+                && stmt
+                    .update_expressions
+                    .iter()
+                    .chain(stmt.update_where.as_deref())
+                    .any(Self::has_subqueries);
+            let sites = conflict_reads.then(|| super::prepared_select::ConflictSites {
+                table: table_name,
+                schema: &target,
+                stmt,
+            });
+            // A VALUES row has no target row: its scope is a table without columns
+            let (plan, tables) = self.open_prepared_dml(
+                plan_cache,
+                &super::prepared_select::NO_COLUMNS,
+                table_name,
+                None,
+                &[],
+                &stmt.values,
+                sites.as_ref(),
+                standalone_tx.as_deref(),
+                ctx,
+            )?;
+            prepared = plan;
+            let run = &*runner.insert(super::prepared_select::DmlRunner::new(
+                self, &prepared, ctx, tables, 0,
+            )?);
+            if active_txn_id.is_some() && run.conflict_reads_target() {
+                return Err(Error::invalid_argument(
+                    "an ON CONFLICT subquery that reads the row met or the excluded row \
+                     cannot read the target table inside a transaction",
+                ));
+            }
+            // The statement is copied only for the VALUES answers it takes
+            let mut answered_ctx = std::borrow::Cow::Borrowed(ctx);
+            let mut answered = std::borrow::Cow::Borrowed(stmt);
+            if run.values().iter().flatten().any(Option::is_some) {
+                let mut vm = super::expression::ExprVM::new();
+                let no_row = Row::new();
+                let exec = run.context(&no_row);
+                let (answered_ctx, answered) = (answered_ctx.to_mut(), answered.to_mut());
+                for (row, programs) in answered.values.iter_mut().zip(run.values()) {
+                    for (value, program) in row.iter_mut().zip(programs) {
+                        if let Some(program) = program {
+                            #[cfg(feature = "test-failpoints")]
+                            crate::test_failpoints::prepared_dml_site_ran(
+                                crate::test_failpoints::PreparedDmlSite::InsertValues,
+                            );
+                            answered_ctx.add_param(vm.execute_cow(program, &exec)?);
+                            *value = answer_parameter(answered_ctx.params().len());
+                        }
+                    }
+                }
+            }
+            written_ctx = answered_ctx;
+            written = answered;
+            match run.conflict_upsert() {
+                Some(upsert) => {
+                    conflict_run = ConflictRun {
+                        runner: run,
+                        upsert: Arc::clone(upsert),
+                        joined: std::cell::RefCell::new(Row::with_capacity(
+                            2 * target.columns.len(),
+                        )),
+                    };
+                    (&*written, &*written_ctx, None, Some(&conflict_run))
+                }
+                None => {
+                    // Every value is read: the blocks' tables close before a row is written
+                    drop(runner.take());
+                    (&*written, &*written_ctx, None, None)
+                }
+            }
+        } else {
+            (stmt, ctx, plan_cache, None)
+        };
+
         // Acquire per-table upsert mutex for ON CONFLICT DO UPDATE only.
         // Serializes check+insert+commit to prevent TOCTOU races where two
         // concurrent upserts both detect the same conflict and try to UPDATE
@@ -877,6 +889,7 @@ impl Executor {
                 table.layout_token(),
                 schema,
                 stmt,
+                conflict.map(|conflict| Arc::clone(&conflict.upsert)),
             )?;
             check_programs = Arc::clone(&insert_plan.checks);
             all_column_types = schema.columns.iter().map(|c| c.data_type).collect();
@@ -1105,6 +1118,7 @@ impl Executor {
                                 &mut insert_plan,
                                 ctx,
                                 has_returning,
+                                conflict,
                             ) {
                                 Ok((updated, returned)) => {
                                     if let Some(updated_row) = returned {
@@ -1153,6 +1167,7 @@ impl Executor {
                                         &mut insert_plan,
                                         ctx,
                                         has_returning,
+                                        conflict,
                                     ) {
                                         Ok((updated, returned)) => {
                                             if let Some(updated_row) = returned {
@@ -1226,6 +1241,7 @@ impl Executor {
                                 // a concurrent plain INSERT committed first. Retry once.
                                 drop(returning_result);
                                 drop(_upsert_guard);
+                                let (stmt, ctx, plan_cache) = retry_of;
                                 let retry_ctx = ctx.with_incremented_query_depth();
                                 return self.execute_insert(stmt, &retry_ctx, plan_cache);
                             }
@@ -1388,6 +1404,7 @@ impl Executor {
                                 &mut insert_plan,
                                 ctx,
                                 has_returning,
+                                conflict,
                             ) {
                                 Ok((updated, returned)) => {
                                     if let Some(updated_row) = returned {
@@ -1437,6 +1454,7 @@ impl Executor {
                                         &mut insert_plan,
                                         ctx,
                                         has_returning,
+                                        conflict,
                                     ) {
                                         Ok((updated, returned)) => {
                                             if let Some(updated_row) = returned {
@@ -1581,6 +1599,7 @@ impl Executor {
                         if stmt.on_duplicate && ctx.query_depth == 0 {
                             drop(returning_result);
                             drop(_upsert_guard);
+                            let (stmt, ctx, plan_cache) = retry_of;
                             let retry_ctx = ctx.with_incremented_query_depth();
                             return self.execute_insert(stmt, &retry_ctx, plan_cache);
                         }
@@ -2300,6 +2319,8 @@ impl Executor {
                 stmt.where_clause.as_deref(),
                 &sets,
                 &[] as &[Vec<Expression>],
+                None,
+                None,
                 ctx,
             )?;
             held_dml = prepared;
@@ -3189,6 +3210,8 @@ impl Executor {
                 stmt.where_clause.as_deref(),
                 &[],
                 &[] as &[Vec<Expression>],
+                None,
+                None,
                 ctx,
             )?;
             held_dml = prepared;
@@ -3764,24 +3787,7 @@ impl Executor {
         use super::expression::{CompileContext, ExprCompiler, SharedProgram};
         use crate::functions::registry::global_registry;
 
-        let col_map = schema.column_index_map();
-
-        // Resolve each update column to its schema index, type, and AST expression.
-        let update_specs: Vec<(usize, DataType, u16, &Expression)> = stmt
-            .update_columns
-            .iter()
-            .zip(stmt.update_expressions.iter())
-            .filter_map(|(col, expr)| {
-                col_map.get(col.value_lower.as_str()).map(|&idx| {
-                    (
-                        idx,
-                        schema.columns[idx].data_type,
-                        schema.columns[idx].vector_dimensions,
-                        expr,
-                    )
-                })
-            })
-            .collect();
+        let update_specs = Self::conflict_sets(schema, stmt);
 
         let column_names: Vec<String> = schema.column_names_owned().to_vec();
 
@@ -3794,13 +3800,19 @@ impl Executor {
         // Compile each update expression with EXCLUDED as the second row source.
         let mut compiled_updates: Vec<(usize, DataType, u16, SharedProgram)> =
             Vec::with_capacity(update_specs.len());
-        for (idx, col_type, vec_dims, expr) in &update_specs {
+        for (idx, expr) in &update_specs {
             let compile_ctx = CompileContext::new(&column_names, global_registry())
                 .with_second_row(&excluded_columns);
             let compiler = ExprCompiler::new(&compile_ctx);
             match compiler.compile(expr) {
                 Ok(program) => {
-                    compiled_updates.push((*idx, *col_type, *vec_dims, CompactArc::new(program)));
+                    let column = &schema.columns[*idx];
+                    compiled_updates.push((
+                        *idx,
+                        column.data_type,
+                        column.vector_dimensions,
+                        CompactArc::new(program),
+                    ));
                 }
                 Err(e) => {
                     return Err(Error::internal(format!(
@@ -3828,12 +3840,39 @@ impl Executor {
             None => None,
         };
 
+        Self::upsert_of(schema, compiled_updates, compiled_where)
+    }
+
+    /// Each ON CONFLICT SET value of `stmt` with the column it writes
+    pub(super) fn conflict_sets<'s>(
+        schema: &crate::core::Schema,
+        stmt: &'s InsertStatement,
+    ) -> Vec<(usize, &'s Expression)> {
+        let col_map = schema.column_index_map();
+        stmt.update_columns
+            .iter()
+            .zip(stmt.update_expressions.iter())
+            .filter_map(|(col, expr)| {
+                col_map
+                    .get(col.value_lower.as_str())
+                    .map(|&idx| (idx, expr))
+            })
+            .collect()
+    }
+
+    /// The upsert writing each program of `compiled_updates` into its column,
+    /// of the type and vector width it gives, where `compiled_where` holds,
+    /// with the CHECK constraints of those columns
+    pub(super) fn upsert_of(
+        schema: &crate::core::Schema,
+        compiled_updates: Vec<(usize, DataType, u16, super::expression::SharedProgram)>,
+        compiled_where: Option<super::expression::SharedProgram>,
+    ) -> Result<CompiledUpsert> {
         // The CHECK constraints reading an updated column, shared immutably:
         // the VM that runs them lives in the setter closure
         let compiled_checks = checks_reading(compile_check_programs(schema)?, |c| {
-            update_specs.iter().any(|(idx, _, _, _)| *idx == c)
+            compiled_updates.iter().any(|(idx, _, _, _)| *idx == c)
         });
-
         Ok(CompiledUpsert {
             compiled_updates,
             compiled_where,
@@ -3859,6 +3898,7 @@ impl Executor {
         insert_plan: &mut InsertPlan<'_>,
         ctx: &ExecutionContext,
         capture_row: bool,
+        conflict: Option<&ConflictRun<'_, '_>>,
     ) -> Result<(bool, Option<Row>)> {
         // Build a WHERE clause to find the specific row
         // Use schema's cached pk_column_index for O(1) lookup
@@ -3908,8 +3948,11 @@ impl Executor {
 
         let effective = insert_plan.upsert(schema, stmt)?;
 
-        // Build the EXCLUDED row from insert_values
-        let excluded_row = Row::from_values(insert_values.to_vec());
+        // Build the EXCLUDED row from insert_values; prepared programs read it joined
+        let excluded_row = match conflict {
+            Some(_) => Row::new(),
+            None => Row::from_values(insert_values.to_vec()),
+        };
 
         // Create VM once and reuse for all rows
         let mut vm = ExprVM::new();
@@ -3921,15 +3964,34 @@ impl Executor {
         // Capture the post-update row for RETURNING clause
         let mut captured_row: Option<Row> = None;
 
+        // Prepared programs read the row met and the excluded row as one row
+        let mut joined = conflict.map(|conflict| conflict.joined.borrow_mut());
+        let conflict = conflict.map(|conflict| conflict.runner);
+
         // Create a setter function that applies the ON DUPLICATE KEY UPDATE
         let mut setter = |mut row: Row| -> Result<(Row, bool)> {
+            if let Some(joined) = joined.as_mut() {
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::prepared_dml_site_ran(
+                    crate::test_failpoints::PreparedDmlSite::ConflictUpdate,
+                );
+                joined.clear();
+                joined.extend_from_slice(row.as_slice());
+                joined.extend_from_slice(insert_values);
+            }
             // DO UPDATE ... WHERE leaves the row as it is where it does not hold
             if let Some(program) = &effective.compiled_where {
-                let mut exec_ctx = ExecuteContext::for_join(&row, &excluded_row)
-                    .with_transaction_id(transaction_id);
-                if !params.is_empty() {
-                    exec_ctx = exec_ctx.with_params(params);
-                }
+                let exec_ctx = match (conflict, joined.as_deref()) {
+                    (Some(run), Some(joined)) => run.context(joined),
+                    _ => {
+                        let mut exec_ctx = ExecuteContext::for_join(&row, &excluded_row)
+                            .with_transaction_id(transaction_id);
+                        if !params.is_empty() {
+                            exec_ctx = exec_ctx.with_params(params);
+                        }
+                        exec_ctx
+                    }
+                };
                 if !vm.execute_bool_checked(program, &exec_ctx)? {
                     return Ok((row, false));
                 }
@@ -3938,11 +4000,17 @@ impl Executor {
             // Collect all updates first to avoid borrow conflicts
             let updates_to_apply: Vec<(usize, Value)> = {
                 // Use for_join to make EXCLUDED columns available as row2
-                let mut exec_ctx = ExecuteContext::for_join(&row, &excluded_row)
-                    .with_transaction_id(transaction_id);
-                if !params.is_empty() {
-                    exec_ctx = exec_ctx.with_params(params);
-                }
+                let exec_ctx = match (conflict, joined.as_deref()) {
+                    (Some(run), Some(joined)) => run.context(joined),
+                    _ => {
+                        let mut exec_ctx = ExecuteContext::for_join(&row, &excluded_row)
+                            .with_transaction_id(transaction_id);
+                        if !params.is_empty() {
+                            exec_ctx = exec_ctx.with_params(params);
+                        }
+                        exec_ctx
+                    }
+                };
 
                 let mut updates = Vec::with_capacity(effective.compiled_updates.len());
                 for (idx, col_type, vec_dims, program) in &effective.compiled_updates {

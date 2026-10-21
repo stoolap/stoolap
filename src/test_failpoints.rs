@@ -1553,20 +1553,23 @@ pub enum PreparedDmlSite {
     DeleteWhere,
     /// An INSERT's VALUES
     InsertValues,
+    /// An INSERT's ON CONFLICT DO UPDATE, its SET values and its WHERE
+    ConflictUpdate,
 }
 
 impl PreparedDmlSite {
-    pub const ALL: [PreparedDmlSite; 4] = [
+    pub const ALL: [PreparedDmlSite; 5] = [
         PreparedDmlSite::UpdateWhere,
         PreparedDmlSite::UpdateSet,
         PreparedDmlSite::DeleteWhere,
         PreparedDmlSite::InsertValues,
+        PreparedDmlSite::ConflictUpdate,
     ];
 }
 
 /// Process-wide: how often each prepared DML site ran
-static PREPARED_DML_SITE_RUNS: [std::sync::atomic::AtomicUsize; 4] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; 4];
+static PREPARED_DML_SITE_RUNS: [std::sync::atomic::AtomicUsize; 5] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 5];
 
 static PREPARED_DML_BUILT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 

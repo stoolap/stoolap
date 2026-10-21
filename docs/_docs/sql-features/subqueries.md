@@ -359,6 +359,22 @@ SET price = (SELECT AVG(price) FROM products WHERE category = 'Electronics') * 1
 WHERE id = 5;
 ```
 
+### Subqueries in ON CONFLICT
+
+A subquery in `ON CONFLICT ... DO UPDATE SET`, in its `WHERE`, or in `ON DUPLICATE KEY UPDATE` sees the tables as the statement found them, as a subquery in `VALUES` does. A value that reads neither the row met nor the `excluded` row is read once, before the statement writes a row; one that reads them is read for each conflict, and a bare column name in it is the row met's:
+
+```sql
+-- The highest score the table held before this statement
+INSERT INTO scores VALUES (1, 0)
+ON CONFLICT (id) DO UPDATE SET best = (SELECT MAX(best) FROM scores);
+
+-- A lookup by the row that conflicted
+INSERT INTO orders VALUES (7, 'B', 0)
+ON CONFLICT (id) DO UPDATE SET price = (SELECT price FROM catalog WHERE catalog.code = excluded.code);
+```
+
+Outside an explicit transaction the statement reads one snapshot. Inside one, a value read for each conflict would see the rows this statement has already written, so such a value may not read the target table there; the statement fails with an error instead.
+
 ### Subqueries in LIMIT and OFFSET
 
 A subquery in `LIMIT` or `OFFSET` is read once, before the query reads a row, under the same snapshot as the query. Its value counts as the same value written as a literal: a whole number of zero or more, and anything else, NULL included (a subquery with no row is NULL), is an error. It reads no row of the query, or of an enclosing one:
@@ -597,6 +613,7 @@ Currently, Stoolap supports the following subquery features:
 - Subqueries in UPDATE WHERE clauses
 - Subqueries in UPDATE SET clauses
 - Subqueries in INSERT VALUES
+- Subqueries in ON CONFLICT DO UPDATE SET and WHERE, and in ON DUPLICATE KEY UPDATE
 - Subqueries in LIMIT and OFFSET
 - Proper NULL handling for subqueries returning no rows
 - Error detection for scalar subqueries returning multiple rows
@@ -607,7 +624,8 @@ Currently, Stoolap supports the following subquery features:
 
 A subquery in these positions is refused with an error rather than answered. Support arrives as each position moves to prepared plans:
 
-- `ON CONFLICT ... DO UPDATE SET` and `RETURNING`, and `INSERT ... VALUES` in a statement with `ON CONFLICT`
+- `RETURNING`
+- Inside an explicit transaction, a subquery in `ON CONFLICT ... DO UPDATE` that reads the target table, in a value that reads the row met or the excluded row
 - An `UPDATE` that sets one column from a correlated subquery and another from an uncorrelated one, when one of its subqueries is outside the [prepared](#prepared-subqueries) shape
 - `GROUP BY` and `DISTINCT ON` expressions
 - `HAVING` in a query that also has window functions

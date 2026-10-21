@@ -1054,16 +1054,16 @@ impl Executor {
             )));
         }
         // A count is read before any row: its scope is a table without columns
-        static NO_COLUMNS: std::sync::LazyLock<Schema> =
-            std::sync::LazyLock::new(|| Schema::new("", Vec::new()));
         let values = clauses.map(|(count, _)| count.map_or(&[][..], std::slice::from_ref));
         let (prepared, tables) = self.open_prepared_dml(
             slot.map(|slot| &slot.compiled),
-            &NO_COLUMNS,
+            &super::prepared_select::NO_COLUMNS,
             &SmartString::default(),
             None,
             &[],
             &values,
+            None,
+            None,
             ctx,
         )?;
         let run = super::prepared_select::DmlRunner::new(self, &prepared, ctx, tables, 0)?;
