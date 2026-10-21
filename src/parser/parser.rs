@@ -19,6 +19,7 @@ use super::error::{ParseError, ParseErrors};
 use super::lexer::Lexer;
 use super::precedence::Precedence;
 use super::token::{Keyword, Token, TokenType};
+use crate::common::SmartString;
 
 /// Reserved SQL keywords that cannot be used as identifiers
 fn is_reserved(keyword: Keyword) -> bool {
@@ -133,6 +134,10 @@ pub struct Parser<'a> {
     pub(crate) current_clause: &'static str,
     /// Parameter counter within current statement
     parameter_counter: usize,
+    /// The highest positional slot of the current statement
+    max_positional: usize,
+    /// The `:name` slots of the current statement, in slot order
+    named_slots: Vec<SmartString>,
 }
 
 impl<'a> Parser<'a> {
@@ -150,6 +155,8 @@ impl<'a> Parser<'a> {
             errors,
             current_clause: "",
             parameter_counter: 1,
+            max_positional: 0,
+            named_slots: Vec::new(),
         }
     }
 
@@ -157,9 +164,11 @@ impl<'a> Parser<'a> {
     pub fn parse_program(&mut self) -> Result<Program, ParseErrors> {
         // Pre-allocate for common case (most queries have 1 statement)
         let mut statements = Vec::with_capacity(1);
+        let mut params = Vec::with_capacity(1);
 
         while !self.cur_token_is(TokenType::Eof) {
             if let Some(stmt) = self.parse_statement() {
+                params.push(self.take_param_slots(&stmt));
                 statements.push(stmt);
             }
 
@@ -170,13 +179,76 @@ impl<'a> Parser<'a> {
 
             self.next_token();
             self.parameter_counter = 1;
+            self.max_positional = 0;
+            self.named_slots.clear();
         }
 
         if !self.errors.is_empty() {
             return Err(ParseErrors::from_errors(self.errors.clone()));
         }
 
-        Ok(Program { statements })
+        Ok(Program { statements, params })
+    }
+
+    /// The slots `stmt`, just parsed, takes; an EXPLAIN without ANALYZE
+    /// reads no value, it shows each parameter as written
+    fn take_param_slots(&mut self, stmt: &Statement) -> ParamSlots {
+        if matches!(stmt, Statement::Explain(explain) if !explain.analyze) {
+            self.named_slots.clear();
+            return ParamSlots::default();
+        }
+        if self.named_slots.is_empty() {
+            return ParamSlots {
+                count: self.max_positional,
+                names: None,
+            };
+        }
+        ParamSlots {
+            count: self.named_slots.len(),
+            names: Some(std::mem::take(&mut self.named_slots).into()),
+        }
+    }
+
+    /// The slot of the parameter spelled `name`: `?` takes the next one, `$n`
+    /// slot n, and each distinct `:name` the next one on its first appearance.
+    /// None, with an error added, for a slot a statement cannot have
+    pub(crate) fn parameter_slot(&mut self, name: &str) -> Option<usize> {
+        let named = name.starts_with(':');
+        if named && self.max_positional > 0 || !named && !self.named_slots.is_empty() {
+            self.add_error(
+                "a statement takes positional ($1, ?) or named (:name) parameters, not both"
+                    .to_string(),
+            );
+            return None;
+        }
+        if let Some(name) = name.strip_prefix(':') {
+            if let Some(at) = self.named_slots.iter().position(|slot| slot == name) {
+                return Some(at + 1);
+            }
+            self.named_slots.push(SmartString::new(name));
+            return Some(self.named_slots.len());
+        }
+        let index = if name == "?" {
+            self.next_parameter_index()
+        } else {
+            match name.strip_prefix('$').map(str::parse::<usize>) {
+                Some(Ok(index)) if index > 0 => index,
+                Some(Ok(_)) => {
+                    self.add_error("parameter $0: positions start at $1".to_string());
+                    return None;
+                }
+                Some(Err(e)) => {
+                    self.add_error(format!("invalid parameter index: {}", e));
+                    return None;
+                }
+                None => {
+                    self.add_error(format!("invalid parameter format: {}", name));
+                    return None;
+                }
+            }
+        };
+        self.max_positional = self.max_positional.max(index);
+        Some(index)
     }
 
     /// Advance to the next token

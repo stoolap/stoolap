@@ -7149,7 +7149,8 @@ impl Executor {
         let stmt_arc = Arc::new(statements.into_iter().next().unwrap());
 
         // Cache the parsed statement for future use
-        self.query_cache.put(view_query, stmt_arc.clone(), false, 0);
+        self.query_cache
+            .put(view_query, stmt_arc.clone(), ParamSlots::default());
 
         Ok(stmt_arc)
     }
@@ -9761,7 +9762,6 @@ impl Executor {
     ) -> Result<RowVec> {
         // Pre-fetch parameters for VM context
         let params = ctx.params();
-        let named_params = ctx.named_params();
         let transaction_id = ctx.transaction_id();
 
         // Create reusable VM
@@ -9793,13 +9793,6 @@ impl Executor {
             }
         } else {
             // General path: mixed actions
-            // Pre-compute named_params Option to avoid repeated checks
-            let named_params_opt = if named_params.is_empty() {
-                None
-            } else {
-                Some(named_params)
-            };
-
             // Pre-compute capacity outside loop to avoid repeated len() calls
             let values_capacity = actions.len();
 
@@ -9808,12 +9801,7 @@ impl Executor {
                 let mut values: CompactVec<Value> = CompactVec::with_capacity(values_capacity);
 
                 // Build VM context with all params in one call (faster than builder chain)
-                let vm_ctx = ExecuteContext::with_common_params(
-                    &row,
-                    params,
-                    named_params_opt,
-                    transaction_id,
-                );
+                let vm_ctx = ExecuteContext::with_common_params(&row, params, transaction_id);
 
                 for action in actions {
                     match action {

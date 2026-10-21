@@ -15,9 +15,7 @@
 //! Expressions a statement evaluates once, over no row: compiled for that
 //! one evaluation and kept nowhere, so they never enter a program cache
 
-use super::compiler::{
-    literal_value, parameter_slot, CompileContext, CompileError, ExprCompiler, ParameterSlot,
-};
+use super::compiler::{literal_value, parameter_slot, CompileContext, CompileError, ExprCompiler};
 use super::program::Program;
 use super::vm::{ExecuteContext, ExprVM};
 use crate::core::{Error, Result, Row, Value};
@@ -50,11 +48,8 @@ pub(crate) fn evaluate_once(expr: &Expression, ctx: Option<&ExecutionContext>) -
     let row = Row::new();
     let exec = execute_context(&row, ctx);
     if let Expression::Parameter(param) = expr {
-        let value = match parameter_slot(param).map_err(compile_error)? {
-            ParameterSlot::Named(name) => exec.named_param_ref(name),
-            ParameterSlot::Positional(index) => exec.param_ref(index as usize),
-        };
-        return Ok(value.clone());
+        let index = parameter_slot(param).map_err(compile_error)?;
+        return exec.param_ref(index as usize).cloned();
     }
     run(&compile_once(expr)?, &exec)
 }
@@ -74,7 +69,6 @@ pub(crate) fn execute_context<'a>(
     if let Some(ctx) = ctx {
         exec = exec
             .with_params(ctx.params())
-            .with_named_params(ctx.named_params())
             .with_transaction_id(ctx.transaction_id());
         if let Some(outer) = ctx.outer_row() {
             exec = exec.with_outer_row(outer);

@@ -75,25 +75,19 @@ impl Drop for StatementRollback<'_> {
     }
 }
 
-/// The named parameter holding a VALUES answer, under a name no SQL text
-/// spells, so no parameter of the statement reads it; it stays inline, so
-/// the name's key is the one allocation
-fn answer_parameter(answer: usize) -> (String, Expression) {
-    use std::fmt::Write;
-    let mut name = String::with_capacity(24);
-    let _ = write!(name, ":v {answer}");
-    let spelled = SmartString::new(&name);
-    name.remove(0);
-    let parameter = Expression::Parameter(Parameter {
+/// The parameter reading a VALUES answer from `slot`, one past the slots of
+/// the statement's own values, so no parameter of the statement reads it
+fn answer_parameter(slot: usize) -> Expression {
+    let spelled = SmartString::from(format!("${slot}"));
+    Expression::Parameter(Parameter {
         token: crate::parser::token::Token::new(
             crate::parser::token::TokenType::Parameter,
             spelled.clone(),
             crate::parser::token::Position::default(),
         ),
         name: spelled,
-        index: 0,
-    });
-    (name, parameter)
+        index: slot,
+    })
 }
 
 /// Check whether a constraint violation matches the ON CONFLICT target columns.
@@ -204,9 +198,6 @@ fn try_extract_simple_value(expr: &Expression, ctx: &ExecutionContext) -> Option
         return Some(v);
     }
     if let Expression::Parameter(param) = expr {
-        if let Some(name) = param.name.strip_prefix(':') {
-            return ctx.get_named_param(name).cloned();
-        }
         if param.index > 0 {
             return ctx.params().get(param.index - 1).cloned();
         }
@@ -734,7 +725,6 @@ impl Executor {
         let exec = run.context(&no_row);
         let mut written_ctx = ctx.clone();
         let mut written = stmt.clone();
-        let mut answers = 0;
         for (row, programs) in written.values.iter_mut().zip(run.values()) {
             for (value, program) in row.iter_mut().zip(programs) {
                 if let Some(program) = program {
@@ -742,10 +732,8 @@ impl Executor {
                     crate::test_failpoints::prepared_dml_site_ran(
                         crate::test_failpoints::PreparedDmlSite::InsertValues,
                     );
-                    let (name, parameter) = answer_parameter(answers);
-                    written_ctx.set_named_param(name, vm.execute_cow(program, &exec)?);
-                    *value = parameter;
-                    answers += 1;
+                    written_ctx.add_param(vm.execute_cow(program, &exec)?);
+                    *value = answer_parameter(written_ctx.params().len());
                 }
             }
         }
@@ -951,7 +939,6 @@ impl Executor {
         let mut vm = ExprVM::new();
         let mut check_row = None;
         let params = ctx.params();
-        let named_params = ctx.named_params();
         let empty_row = Row::new();
 
         // OPTIMIZATION: Pre-build ExecuteContext once (reused for all expressions)
@@ -959,9 +946,6 @@ impl Executor {
             ExecuteContext::new(&empty_row).with_transaction_id(ctx.transaction_id());
         if !params.is_empty() {
             base_exec_ctx = base_exec_ctx.with_params(params);
-        }
-        if !named_params.is_empty() {
-            base_exec_ctx = base_exec_ctx.with_named_params(named_params);
         }
 
         let mut rows_affected = 0i64;
@@ -1847,7 +1831,6 @@ impl Executor {
         let mut vm = ExprVM::new();
         let mut check_row = None;
         let params = ctx.params();
-        let named_params = ctx.named_params();
         let empty_row = Row::new();
 
         // OPTIMIZATION: Pre-build ExecuteContext once (reused for all expressions)
@@ -1855,9 +1838,6 @@ impl Executor {
             ExecuteContext::new(&empty_row).with_transaction_id(ctx.transaction_id());
         if !params.is_empty() {
             base_exec_ctx = base_exec_ctx.with_params(params);
-        }
-        if !named_params.is_empty() {
-            base_exec_ctx = base_exec_ctx.with_named_params(named_params);
         }
 
         let mut rows_affected = 0i64;
@@ -2849,7 +2829,6 @@ impl Executor {
             let mut vm = ExprVM::new();
             // Extract params before the closure so they can be captured
             let params = ctx.params();
-            let named_params = ctx.named_params();
             // Pre-compile the memory WHERE once: evaluate_bool re-hashes
             // the AST per row through the program cache. Subquery-bearing
             // clauses stay on the evaluator (compiled placeholder subquery
@@ -2894,7 +2873,6 @@ impl Executor {
                         Some(run) => run.context(&row),
                         None => ExecuteContext::new(&row)
                             .with_params(params)
-                            .with_named_params(named_params)
                             .with_transaction_id(transaction_id),
                     };
 
@@ -3352,7 +3330,6 @@ impl Executor {
             use super::expression::{ExecuteContext, ExprVM};
             let mut delete_vm = ExprVM::new();
             let params = ctx.params();
-            let named_params = ctx.named_params();
             let memory_where_program = memory_where_clause
                 .as_ref()
                 .filter(|expr| !Self::expr_contains_subquery(expr))
@@ -3495,9 +3472,6 @@ impl Executor {
                                 ExecuteContext::new(row).with_transaction_id(transaction_id);
                             if !params.is_empty() {
                                 exec_ctx = exec_ctx.with_params(params);
-                            }
-                            if !named_params.is_empty() {
-                                exec_ctx = exec_ctx.with_named_params(named_params);
                             }
                             delete_vm.execute_bool_checked(program, &exec_ctx)?
                         } else {
@@ -3941,7 +3915,6 @@ impl Executor {
 
         // Extract params from execution context for use in the setter closure
         let params = ctx.params();
-        let named_params = ctx.named_params();
         let transaction_id = ctx.transaction_id();
 
         // Capture the post-update row for RETURNING clause
@@ -3956,9 +3929,6 @@ impl Executor {
                 if !params.is_empty() {
                     exec_ctx = exec_ctx.with_params(params);
                 }
-                if !named_params.is_empty() {
-                    exec_ctx = exec_ctx.with_named_params(named_params);
-                }
                 if !vm.execute_bool_checked(program, &exec_ctx)? {
                     return Ok((row, false));
                 }
@@ -3971,9 +3941,6 @@ impl Executor {
                     .with_transaction_id(transaction_id);
                 if !params.is_empty() {
                     exec_ctx = exec_ctx.with_params(params);
-                }
-                if !named_params.is_empty() {
-                    exec_ctx = exec_ctx.with_named_params(named_params);
                 }
 
                 let mut updates = Vec::with_capacity(effective.compiled_updates.len());
@@ -4231,9 +4198,7 @@ impl Executor {
         let mut result_rows = RowVec::with_capacity(source_rows.len());
         for (row_id, row) in source_rows.into_iter().enumerate() {
             // CRITICAL: Include params from context for parameterized queries
-            let exec_ctx = ExecuteContext::new(&row)
-                .with_params(ctx.params())
-                .with_named_params(ctx.named_params());
+            let exec_ctx = ExecuteContext::new(&row).with_params(ctx.params());
 
             let mut row_values = Vec::with_capacity(compiled_exprs.len());
             for program in &compiled_exprs {

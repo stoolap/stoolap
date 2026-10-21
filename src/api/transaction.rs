@@ -35,10 +35,12 @@
 use std::sync::Arc;
 
 use crate::api::params::{NamedParams, ParamVec};
-use crate::core::{Error, Result};
+use crate::core::{Error, Result, Value};
 use crate::executor::context::ExecutionContext;
-use crate::executor::{CachedPlanRef, Executor};
-use crate::parser::ast::{RollbackStatement, Statement};
+use crate::executor::{
+    bind_named, bind_program, check_param_count, value_in, CachedPlanRef, Executor,
+};
+use crate::parser::ast::{Program, RollbackStatement, Statement};
 use crate::storage::traits::QueryResult;
 
 use super::database::{DatabaseInner, FromValue};
@@ -242,46 +244,24 @@ impl Transaction {
     /// tx.commit()?;
     /// ```
     pub fn execute_named(&mut self, sql: &str, params: NamedParams) -> Result<i64> {
-        self.check_active()?;
-        let ctx = ExecutionContext::with_named_params(params.into_inner());
-        let result = self.execute_sql_with_ctx(sql, ctx)?;
+        let result = self.run_named(sql, &mut value_in(params.as_map()))?;
         Ok(result.rows_affected())
     }
 
     /// Execute a query with named parameters within the transaction
     pub fn query_named(&mut self, sql: &str, params: NamedParams) -> Result<Rows> {
-        self.check_active()?;
-        let ctx = ExecutionContext::with_named_params(params.into_inner());
-        let result = self.execute_sql_with_ctx(sql, ctx)?;
+        let result = self.run_named(sql, &mut value_in(params.as_map()))?;
         Ok(Rows::new(result))
     }
 
-    /// Execute a pre-parsed statement with named parameters.
-    ///
-    /// Combines `execute_prepared` (skip parsing) with `execute_named` (named params).
-    pub fn execute_prepared_named(
+    /// Runs `sql` in the transaction, each value read by its name from `value_of`
+    pub(crate) fn run_named(
         &mut self,
-        statement: &Statement,
-        params: NamedParams,
-    ) -> Result<i64> {
+        sql: &str,
+        value_of: &mut impl FnMut(&str) -> Result<Option<Value>>,
+    ) -> Result<Box<dyn QueryResult>> {
         self.check_active()?;
-        let ctx = ExecutionContext::with_named_params(params.into_inner());
-        let result = self.execute_statement(statement, &ctx)?;
-        Ok(result.rows_affected())
-    }
-
-    /// Query using a pre-parsed statement with named parameters.
-    ///
-    /// Combines `query_prepared` (skip parsing) with `query_named` (named params).
-    pub fn query_prepared_named(
-        &mut self,
-        statement: &Statement,
-        params: NamedParams,
-    ) -> Result<Rows> {
-        self.check_active()?;
-        let ctx = ExecutionContext::with_named_params(params.into_inner());
-        let result = self.execute_statement(statement, &ctx)?;
-        Ok(Rows::new(result))
+        self.execute_sql_named(sql, value_of)
     }
 
     /// Internal SQL execution
@@ -304,9 +284,38 @@ impl Transaction {
             Ok(plan) => return self.execute_plan(&plan, ctx),
             Err(program) => program,
         };
+        for slots in &program.params {
+            check_param_count(slots, ctx.params().len())?;
+        }
+        self.execute_statements(&program, |_| &ctx)
+    }
+
+    /// Internal SQL execution, each value read by its name from `value_of`
+    fn execute_sql_named(
+        &mut self,
+        sql: &str,
+        value_of: &mut impl FnMut(&str) -> Result<Option<Value>>,
+    ) -> Result<Box<dyn QueryResult>> {
+        let program = match self.executor.plan_or_program(sql)? {
+            Ok(plan) => {
+                let values = bind_named(&plan.params, value_of)?;
+                return self.execute_plan(&plan, ExecutionContext::with_params(values));
+            }
+            Err(program) => program,
+        };
+        let contexts = bind_program(&program, value_of)?;
+        self.execute_statements(&program, |i| &contexts[i])
+    }
+
+    /// Runs every statement of `program`, the i-th in `ctx_of(i)`
+    fn execute_statements<'c>(
+        &mut self,
+        program: &Program,
+        ctx_of: impl Fn(usize) -> &'c ExecutionContext,
+    ) -> Result<Box<dyn QueryResult>> {
         let mut last_result: Option<Box<dyn QueryResult>> = None;
-        for statement in &program.statements {
-            last_result = Some(self.execute_statement(statement, &ctx)?);
+        for (i, statement) in program.statements.iter().enumerate() {
+            last_result = Some(self.execute_statement(statement, ctx_of(i))?);
         }
         last_result.ok_or(Error::NoStatementsToExecute)
     }
@@ -332,6 +341,22 @@ impl Transaction {
         match statement.plan_on(self.executor.engine()) {
             Some(plan) => self.execute_plan(plan, ctx),
             None => self.execute_sql_with_ctx(statement.sql(), ctx),
+        }
+    }
+
+    /// [`Self::execute_prepared_statement`] with the parameters bound by name
+    pub(crate) fn execute_prepared_statement_named(
+        &mut self,
+        statement: &super::Statement,
+        value_of: &mut impl FnMut(&str) -> Result<Option<Value>>,
+    ) -> Result<Box<dyn QueryResult>> {
+        self.check_active()?;
+        match statement.plan_on(self.executor.engine()) {
+            Some(plan) => {
+                let values = bind_named(&plan.params, value_of)?;
+                self.execute_plan(plan, ExecutionContext::with_params(values))
+            }
+            None => self.execute_sql_named(statement.sql(), value_of),
         }
     }
 

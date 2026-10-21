@@ -1131,8 +1131,6 @@ struct PreparedBlocks {
     param_count: usize,
     /// The statement's parameters and every slot
     slot_count: usize,
-    /// Named parameters read anywhere; each must have a value
-    named: Vec<SmartString>,
     /// Values computed once per run before the statement reads a row
     run_slots: Vec<(usize, SharedProgram)>,
     /// Indexed by subquery id, nested ones included
@@ -1548,9 +1546,8 @@ struct PreparedComparison {
 #[derive(Debug)]
 enum PreparedValue {
     Const(Value),
-    /// A positional parameter or a slot, zero-based
+    /// A parameter or a slot, zero-based
     Slot(usize),
-    Named(SmartString),
 }
 
 impl PreparedComparison {
@@ -1568,9 +1565,6 @@ impl PreparedComparison {
                 continue;
             };
             let value = match value.as_ref() {
-                Expression::Parameter(p) if p.name.starts_with(':') => {
-                    PreparedValue::Named(SmartString::from(&p.name[1..]))
-                }
                 Expression::Parameter(p) if p.index > 0 => PreparedValue::Slot(p.index - 1),
                 other => PreparedValue::Const(extract_literal_value(other)?),
             };
@@ -1591,11 +1585,10 @@ impl PreparedComparison {
 
     /// The value this call compares against, as the scan reads it, or
     /// None when the scan cannot read it by the comparison's own rule
-    fn value(&self, params: &[Value], named: &FxHashMap<String, Value>) -> Option<Value> {
+    fn value(&self, params: &[Value]) -> Option<Value> {
         let value = match &self.value {
             PreparedValue::Const(value) => value.clone(),
             PreparedValue::Slot(slot) => params.get(*slot)?.clone(),
-            PreparedValue::Named(name) => named.get(name.as_str())?.clone(),
         };
         coerce_constant(Some(self.data_type), value)
     }
@@ -1680,8 +1673,7 @@ struct Builder<'e> {
     next_slot: usize,
     /// Indexed by subquery id; None while that subquery is being prepared
     subqueries: Vec<Option<PreparedSubquery>>,
-    named: Vec<SmartString>,
-    /// The highest positional parameter the statement reads, one-based
+    /// The highest parameter the statement reads, one-based
     max_param: usize,
 }
 
@@ -1751,7 +1743,6 @@ impl Builder<'_> {
         let blocks = PreparedBlocks {
             param_count,
             slot_count: self.next_slot,
-            named: self.named,
             run_slots,
             subqueries,
         };
@@ -1764,16 +1755,9 @@ impl Builder<'_> {
         slot
     }
 
-    fn note_named(&mut self, expr: &Expression) {
+    fn note_param(&mut self, expr: &Expression) {
         if let Expression::Parameter(p) = expr {
-            match p.name.strip_prefix(':') {
-                Some(name) => {
-                    if !self.named.iter().any(|n| n == name) {
-                        self.named.push(SmartString::from(name));
-                    }
-                }
-                None => self.max_param = self.max_param.max(p.index),
-            }
+            self.max_param = self.max_param.max(p.index);
         }
     }
 
@@ -1787,7 +1771,7 @@ impl Builder<'_> {
         expr: &Expression,
         work: &mut Rewritten,
     ) -> Result<Expression> {
-        self.note_named(expr);
+        self.note_param(expr);
         match expr {
             Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => {
                 match chain.resolve(expr)? {
@@ -1938,7 +1922,7 @@ impl Builder<'_> {
                     let (value, reads) = sides[index];
                     let other = sides[1 - index].0;
                     if matches!(chain.resolve(other)?, Some((0, _))) {
-                        self.note_names(value);
+                        self.note_params(value);
                         let slot = self.slot();
                         let depth = reads.trailing_zeros() as usize;
                         let value_in_scope = chain.in_scope(value)?;
@@ -1965,11 +1949,11 @@ impl Builder<'_> {
         self.rewrite(chain, Some(id), conjunct, work)
     }
 
-    /// Record every named parameter `expr` reads
-    fn note_names(&mut self, expr: &Expression) {
-        self.note_named(expr);
+    /// Record every parameter `expr` reads
+    fn note_params(&mut self, expr: &Expression) {
+        self.note_param(expr);
         let _ = for_each_child(expr, &mut |child| {
-            self.note_names(child);
+            self.note_params(child);
             Ok(())
         });
     }
@@ -2503,7 +2487,7 @@ fn correlation_key(
 /// Every positional parameter or slot `expr` reads, zero-based
 fn slots_read(expr: &Expression, out: &mut SmallVec<[usize; 2]>) {
     match expr {
-        Expression::Parameter(p) if p.index > 0 && !p.name.starts_with(':') => {
+        Expression::Parameter(p) if p.index > 0 => {
             if !out.contains(&(p.index - 1)) {
                 out.push(p.index - 1);
             }
@@ -2525,9 +2509,7 @@ fn slot_compared(conjunct: &Expression) -> Option<usize> {
     [&infix.left, &infix.right]
         .into_iter()
         .find_map(|side| match side.as_ref() {
-            Expression::Parameter(p) if p.index > 0 && !p.name.starts_with(':') => {
-                Some(p.index - 1)
-            }
+            Expression::Parameter(p) if p.index > 0 => Some(p.index - 1),
             _ => None,
         })
 }
@@ -2692,12 +2674,7 @@ impl PreparedProjection {
         let mut vm = ExprVM::new();
         for (row_id, row) in rows.drain_rows().enumerate() {
             let mut values = Vec::with_capacity(self.outputs.len());
-            let exec = ExecuteContext::with_common_params(
-                &row,
-                ctx.params(),
-                Some(ctx.named_params()),
-                ctx.transaction_id(),
-            );
+            let exec = ExecuteContext::with_common_params(&row, ctx.params(), ctx.transaction_id());
             for output in &self.outputs {
                 values.push(match output {
                     Output::Column(i) => row.get(*i).cloned().unwrap_or_else(Value::null_unknown),
@@ -2712,7 +2689,6 @@ impl PreparedProjection {
                     let mut exec = ExecuteContext::with_common_params(
                         &row,
                         ctx.params(),
-                        Some(ctx.named_params()),
                         ctx.transaction_id(),
                     );
                     exec.row2 = Some(&out);
@@ -2745,7 +2721,6 @@ impl PreparedSelect {
             executor,
             next_slot: param_count,
             subqueries: Vec::new(),
-            named: Vec::new(),
             max_param: 0,
         };
         let where_clause = stmt
@@ -2775,7 +2750,7 @@ impl PreparedSelect {
             .iter()
             .chain(stmt.order_by.iter().map(|ob| &ob.expression))
         {
-            builder.note_names(unaliased(column));
+            builder.note_params(unaliased(column));
         }
         let (blocks, holes) = builder.finish(param_count, run_slots)?;
         // Over one table `t.*` is `*`, the projection's expansion; the
@@ -2861,7 +2836,6 @@ impl PreparedDml {
             executor,
             next_slot: param_count,
             subqueries: Vec::new(),
-            named: Vec::new(),
             max_param: 0,
         };
         let mut work = Rewritten::default();
@@ -3003,7 +2977,6 @@ impl JoinBlocks {
             executor,
             next_slot: param_count,
             subqueries: Vec::new(),
-            named: Vec::new(),
             max_param: 0,
         };
         let mut rewrite = |clause: Option<&Expression>| {
@@ -3133,14 +3106,6 @@ impl Executor {
         ctx: &'a ExecutionContext,
     ) -> Result<Option<PreparedRunner<'a>>> {
         let (blocks, holes) = (&held.blocks, &held.joined);
-        for name in &blocks.named {
-            if !ctx.named_params().contains_key(name.as_str()) {
-                return Err(Error::invalid_argument(format!(
-                    "named parameter :{} has no value",
-                    name
-                )));
-            }
-        }
         let inner_ctx = ctx.with_incremented_query_depth();
         let Some(tables) = PreparedRunner::open_tables(self, blocks, &inner_ctx)? else {
             return Ok(None);
@@ -3203,13 +3168,8 @@ impl<'a> DmlRunner<'a> {
     /// What the statement's programs read for `row`: its parameters, its
     /// run slots and its blocks
     pub(crate) fn context<'r>(&'r self, row: &'r Row) -> ExecuteContext<'r> {
-        ExecuteContext::with_common_params(
-            row,
-            &self.runner.base,
-            Some(self.runner.named),
-            self.runner.transaction_id,
-        )
-        .with_subquery_executor(&self.runner)
+        ExecuteContext::with_common_params(row, &self.runner.base, self.runner.transaction_id)
+            .with_subquery_executor(&self.runner)
     }
 
     /// Whether the row of `exec` passes the WHERE; every row passes a
@@ -3597,14 +3557,6 @@ impl Executor {
                 }
             };
             if let Some(tables) = PreparedRunner::open_tables(self, &prepared.blocks, &inner_ctx)? {
-                for name in &prepared.blocks.named {
-                    if !ctx.named_params().contains_key(name.as_str()) {
-                        return Err(Error::invalid_argument(format!(
-                            "named parameter :{} has no value",
-                            name
-                        )));
-                    }
-                }
                 return Ok((prepared, DmlTables { tables, inner_ctx }));
             }
             if fresh {
@@ -3654,14 +3606,6 @@ impl Executor {
             }
             fresh = true;
         };
-        for name in &prepared.blocks.named {
-            if !ctx.named_params().contains_key(name.as_str()) {
-                return Err(Error::invalid_argument(format!(
-                    "named parameter :{} has no value",
-                    name
-                )));
-            }
-        }
 
         let statement_limit = limit
             .filter(|_| stmt.order_by.is_empty())
@@ -3774,7 +3718,6 @@ pub(crate) struct PreparedRunner<'a> {
     statement_limit: Option<i64>,
     /// The statement's parameters, then its run slots; the other slots NULL
     base: ParamVec,
-    named: &'a FxHashMap<String, Value>,
     transaction_id: Option<u64>,
     /// The context the subqueries read their tables under
     ctx: ExecutionContext,
@@ -3883,7 +3826,6 @@ impl<'a> PreparedRunner<'a> {
                 })
                 .collect(),
             base,
-            named: ctx.named_params(),
             transaction_id: ctx.transaction_id(),
             ctx: inner_ctx,
             tables,
@@ -3894,13 +3836,8 @@ impl<'a> PreparedRunner<'a> {
     fn run_slot_values(&self) -> Result<Vec<(usize, Value)>> {
         let empty = Row::new();
         let mut vm = ExprVM::new();
-        let exec = ExecuteContext::with_common_params(
-            &empty,
-            &self.base,
-            Some(self.named),
-            self.transaction_id,
-        )
-        .with_subquery_executor(self);
+        let exec = ExecuteContext::with_common_params(&empty, &self.base, self.transaction_id)
+            .with_subquery_executor(self);
         self.prepared
             .run_slots
             .iter()
@@ -3910,13 +3847,8 @@ impl<'a> PreparedRunner<'a> {
 
     /// Whether `row` passes `condition`, a program over the statement's row
     fn matches(&self, vm: &mut ExprVM, condition: &SharedProgram, row: &Row) -> Result<bool> {
-        let exec = ExecuteContext::with_common_params(
-            row,
-            &self.base,
-            Some(self.named),
-            self.transaction_id,
-        )
-        .with_subquery_executor(self);
+        let exec = ExecuteContext::with_common_params(row, &self.base, self.transaction_id)
+            .with_subquery_executor(self);
         vm.execute_bool_checked(condition, &exec)
     }
 
@@ -3927,11 +3859,7 @@ impl<'a> PreparedRunner<'a> {
         if sq.pushdown.is_empty() {
             return false;
         }
-        let values: Option<Vec<Value>> = sq
-            .pushdown
-            .iter()
-            .map(|c| c.value(params, self.named))
-            .collect();
+        let values: Option<Vec<Value>> = sq.pushdown.iter().map(|c| c.value(params)).collect();
         match values {
             Some(values) => {
                 BoundPushdown::bind(
@@ -4111,12 +4039,7 @@ impl<'a> PreparedRunner<'a> {
             let mut failed = self.blocks[index].failed.borrow_mut();
             failed.clear();
             let empty = Row::new();
-            let exec = ExecuteContext::with_common_params(
-                &empty,
-                &self.base,
-                Some(self.named),
-                self.transaction_id,
-            );
+            let exec = ExecuteContext::with_common_params(&empty, &self.base, self.transaction_id);
             for (slot, hole) in self.holes_of(index, self.holes) {
                 if !plan.keys.iter().any(|(_, key, _)| key == slot) {
                     match hole.value(&mut vm, &empty, &exec) {
@@ -4176,12 +4099,8 @@ impl<'a> PreparedRunner<'a> {
             params.clone_from(&self.blocks[parent as usize].buffer.borrow());
             failed.extend(self.blocks[parent as usize].failed.borrow().iter().cloned());
         }
-        let mut hole_ctx = ExecuteContext::with_common_params(
-            caller.row,
-            &self.base,
-            Some(self.named),
-            self.transaction_id,
-        );
+        let mut hole_ctx =
+            ExecuteContext::with_common_params(caller.row, &self.base, self.transaction_id);
         hole_ctx.row2 = caller.row2;
         for (slot, hole) in self.holes_of(index, site) {
             match hole.value(vm, caller.row, &hole_ctx) {
@@ -4266,13 +4185,9 @@ impl<'a> PreparedRunner<'a> {
                 self.ctx.check_cancelled()?;
             }
             if !decided {
-                let exec = ExecuteContext::with_common_params(
-                    scanner.row(),
-                    &params,
-                    Some(self.named),
-                    self.transaction_id,
-                )
-                .with_subquery_executor(self);
+                let exec =
+                    ExecuteContext::with_common_params(scanner.row(), &params, self.transaction_id)
+                        .with_subquery_executor(self);
                 if let Some(candidates) = &sq.candidates {
                     if !vm.execute_bool_checked(candidates, &exec)? {
                         continue;
@@ -4412,11 +4327,7 @@ impl<'a> PreparedRunner<'a> {
         let mut vm = self.blocks[index].vm.borrow_mut();
         let params = self.blocks[index].buffer.borrow();
         let slots_failed = self.blocks[index].failed.borrow();
-        let values: Option<Vec<Value>> = plan
-            .pushdown
-            .iter()
-            .map(|c| c.value(&params, self.named))
-            .collect();
+        let values: Option<Vec<Value>> = plan.pushdown.iter().map(|c| c.value(&params)).collect();
         let mut bound = None;
         if let Some(values) =
             values.filter(|_| !plan.pushdown.is_empty() && slots_failed.is_empty())
@@ -4449,13 +4360,8 @@ impl<'a> PreparedRunner<'a> {
             let outcome = if decided {
                 ExistsOutcome::Passed
             } else {
-                let exec = ExecuteContext::with_common_params(
-                    row,
-                    &params,
-                    Some(self.named),
-                    self.transaction_id,
-                )
-                .with_subquery_executor(self);
+                let exec = ExecuteContext::with_common_params(row, &params, self.transaction_id)
+                    .with_subquery_executor(self);
                 match self.passes_rest(sq, &mut vm, &exec, &slots_failed) {
                     Ok(true) => ExistsOutcome::Passed,
                     Ok(false) => continue,
@@ -4505,7 +4411,6 @@ impl<'a> PreparedRunner<'a> {
             block_key: existence.identity_key,
             scopes: &existence.scopes,
             params: statement.params(),
-            named_params: statement.named_params(),
         };
         let key = origin.key();
         if let Some(stamp) = &stamp {
@@ -4679,13 +4584,9 @@ impl PreparedRunner<'_> {
             if scanned.is_multiple_of(100) {
                 self.ctx.check_cancelled()?;
             }
-            let exec = ExecuteContext::with_common_params(
-                scanner.row(),
-                &params,
-                Some(self.named),
-                self.transaction_id,
-            )
-            .with_subquery_executor(self);
+            let exec =
+                ExecuteContext::with_common_params(scanner.row(), &params, self.transaction_id)
+                    .with_subquery_executor(self);
             if let Some(filter) = filter {
                 if !vm.execute_bool_checked(filter, &exec)? {
                     continue;
@@ -4930,13 +4831,9 @@ impl PreparedRunner<'_> {
             if scanned.is_multiple_of(100) {
                 self.ctx.check_cancelled()?;
             }
-            let exec = ExecuteContext::with_common_params(
-                scanner.row(),
-                &params,
-                Some(self.named),
-                self.transaction_id,
-            )
-            .with_subquery_executor(self);
+            let exec =
+                ExecuteContext::with_common_params(scanner.row(), &params, self.transaction_id)
+                    .with_subquery_executor(self);
             if !decided {
                 if let Some(candidates) = &sq.candidates {
                     if !vm.execute_bool_checked(candidates, &exec)? {
@@ -5038,10 +4935,7 @@ impl PreparedRunner<'_> {
             Some(plan) => (&plan.pushdown, plan.pushed_whole),
             None => (&sq.pushdown, sq.pushed_whole),
         };
-        let values: Option<Vec<Value>> = pushdown
-            .iter()
-            .map(|c| c.value(&params, self.named))
-            .collect();
+        let values: Option<Vec<Value>> = pushdown.iter().map(|c| c.value(&params)).collect();
         let mut bound = None;
         if let Some(values) = values.filter(|_| !pushdown.is_empty() && slots_failed.is_empty()) {
             BoundPushdown::bind(pushdown, &mut bound, values);
@@ -5063,13 +4957,8 @@ impl PreparedRunner<'_> {
                     _ => continue 'rows,
                 }
             }
-            let exec = ExecuteContext::with_common_params(
-                row,
-                &params,
-                Some(self.named),
-                self.transaction_id,
-            )
-            .with_subquery_executor(self);
+            let exec = ExecuteContext::with_common_params(row, &params, self.transaction_id)
+                .with_subquery_executor(self);
             let passed = if decided {
                 Ok(true)
             } else {
@@ -5302,7 +5191,7 @@ impl PreparedRunner<'_> {
     /// The context a grouped block's HAVING and SELECT expression read a
     /// slot row in, with the buffer filled for the call
     fn slot_context<'r>(&'r self, slot_row: &'r Row, params: &'r [Value]) -> ExecuteContext<'r> {
-        ExecuteContext::with_common_params(slot_row, params, Some(self.named), self.transaction_id)
+        ExecuteContext::with_common_params(slot_row, params, self.transaction_id)
     }
 
     /// Whether a slot row passes the block's HAVING
@@ -5446,13 +5335,8 @@ impl PreparedRunner<'_> {
                 self.ctx.check_cancelled()?;
             }
             let row = scanner.row();
-            let exec = ExecuteContext::with_common_params(
-                row,
-                &params,
-                Some(self.named),
-                self.transaction_id,
-            )
-            .with_subquery_executor(self);
+            let exec = ExecuteContext::with_common_params(row, &params, self.transaction_id)
+                .with_subquery_executor(self);
             if !decided {
                 for program in sq.candidates.iter().chain(&sq.filter) {
                     if !vm.execute_bool_checked(program, &exec)? {
@@ -5495,11 +5379,7 @@ impl PreparedRunner<'_> {
         let mut vm = self.blocks[index].vm.borrow_mut();
         let mut feed_vm = self.blocks[index].feed_vm.borrow_mut();
         let params = self.blocks[index].buffer.borrow();
-        let values: Option<Vec<Value>> = plan
-            .pushdown
-            .iter()
-            .map(|c| c.value(&params, self.named))
-            .collect();
+        let values: Option<Vec<Value>> = plan.pushdown.iter().map(|c| c.value(&params)).collect();
         let mut bound = None;
         if let Some(values) = values.filter(|_| !plan.pushdown.is_empty()) {
             BoundPushdown::bind(&plan.pushdown, &mut bound, values);
@@ -5522,13 +5402,8 @@ impl PreparedRunner<'_> {
                     continue 'rows;
                 }
             }
-            let exec = ExecuteContext::with_common_params(
-                row,
-                &params,
-                Some(self.named),
-                self.transaction_id,
-            )
-            .with_subquery_executor(self);
+            let exec = ExecuteContext::with_common_params(row, &params, self.transaction_id)
+                .with_subquery_executor(self);
             let fed = (|| {
                 if let (false, Some(filter)) = (decided, &sq.filter) {
                     if !vm.execute_bool_checked(filter, &exec)? {

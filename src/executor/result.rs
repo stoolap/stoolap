@@ -584,7 +584,6 @@ pub struct ExprMappedResult {
     output_columns: Vec<String>,
     /// The statement's parameters and transaction, for the projections
     params: Option<crate::common::CompactArc<crate::ParamVec>>,
-    named_params: Option<std::sync::Arc<rustc_hash::FxHashMap<String, Value>>>,
     transaction_id: Option<u64>,
     /// Pending error from a projection, reported by `last_error`
     pending_error: Option<crate::core::Error>,
@@ -649,7 +648,6 @@ impl ExprMappedResult {
             current_row: Row::with_capacity(capacity),
             output_columns,
             params: None,
-            named_params: None,
             transaction_id: None,
             pending_error: None,
         })
@@ -658,8 +656,6 @@ impl ExprMappedResult {
     /// The projections see `ctx`'s parameters and transaction
     pub fn with_context(mut self, ctx: &super::context::ExecutionContext) -> Self {
         self.params = (!ctx.params().is_empty()).then(|| ctx.params_arc().clone());
-        self.named_params =
-            (!ctx.named_params().is_empty()).then(|| std::sync::Arc::clone(ctx.named_params_arc()));
         self.transaction_id = ctx.transaction_id();
         self
     }
@@ -701,9 +697,6 @@ impl QueryResult for ExprMappedResult {
                             .with_transaction_id(self.transaction_id);
                         if let Some(params) = &self.params {
                             ctx = ctx.with_params(params);
-                        }
-                        if let Some(named) = &self.named_params {
-                            ctx = ctx.with_named_params(named);
                         }
                         match self.vm.execute_cow(program, &ctx) {
                             Ok(value) => self.current_row.push_inline(value),

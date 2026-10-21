@@ -29,7 +29,7 @@
 //! } else {
 //!     // Parse and cache
 //!     let stmt = parse(sql);
-//!     cache.put(sql, stmt, false, 0);
+//!     cache.put(sql, stmt, ParamSlots::default());
 //! }
 //!
 //! // Second identical query - retrieved from cache
@@ -45,7 +45,7 @@ use rustc_hash::FxHashMap;
 
 use crate::common::CompactArc;
 use crate::core::Schema;
-use crate::parser::ast::Statement;
+use crate::parser::ast::{ParamSlots, Statement};
 use crate::storage::mvcc::version_store::LayoutToken;
 
 use super::query_classification::QueryClassification;
@@ -67,8 +67,6 @@ pub enum PkValueSource {
     Parameter(usize),
     /// Value is a literal integer
     Literal(i64),
-    /// Value comes from a named parameter (e.g., :id)
-    NamedParameter(SmartString),
 }
 
 /// Positions compiled under `token` run on `table` only while it still
@@ -136,8 +134,6 @@ pub enum UpdateValueSource {
     Literal(crate::core::Value),
     /// Value comes from a positional parameter (0-indexed)
     Parameter(usize),
-    /// Value comes from a named parameter (e.g., :new_name)
-    NamedParameter(SmartString),
     /// Value is a row expression (e.g. SET n = n + 1), compiled once per
     /// plan and executed per update against the current row
     Expression(crate::executor::expression::SharedProgram),
@@ -148,9 +144,6 @@ impl std::fmt::Debug for UpdateValueSource {
         match self {
             UpdateValueSource::Literal(v) => f.debug_tuple("Literal").field(v).finish(),
             UpdateValueSource::Parameter(i) => f.debug_tuple("Parameter").field(i).finish(),
-            UpdateValueSource::NamedParameter(n) => {
-                f.debug_tuple("NamedParameter").field(n).finish()
-            }
             UpdateValueSource::Expression(_) => f.write_str("Expression(<compiled>)"),
         }
     }
@@ -326,10 +319,8 @@ pub const DEFAULT_CACHE_SIZE: usize = 1000;
 pub struct CachedPlanRef {
     /// The parsed AST (cheap Arc clone)
     pub statement: Arc<Statement>,
-    /// Whether this query has parameter placeholders
-    pub has_params: bool,
-    /// Number of parameters required
-    pub param_count: usize,
+    /// The parameter slots the statement takes
+    pub params: ParamSlots,
     /// Shared reference to compiled execution state (lazily populated)
     pub compiled: Arc<RwLock<CompiledExecution>>,
     /// Classification of the SELECT, resolved once per plan (lazily populated)
@@ -377,10 +368,8 @@ pub struct CachedQueryPlan {
     pub last_used: Instant,
     /// Number of times this plan has been used
     pub usage_count: u64,
-    /// Whether this query has parameter placeholders
-    pub has_params: bool,
-    /// Number of parameters required
-    pub param_count: usize,
+    /// The parameter slots the statement takes
+    pub params: ParamSlots,
     /// Normalized query text (cache key)
     pub normalized_query: SmartString,
     /// Compiled execution state (lazily populated on first execution)
@@ -397,8 +386,7 @@ impl CachedQueryPlan {
     pub fn new(
         statement: Arc<Statement>,
         query_text: SmartString,
-        has_params: bool,
-        param_count: usize,
+        params: ParamSlots,
         normalized_query: SmartString,
     ) -> Self {
         Self {
@@ -407,8 +395,7 @@ impl CachedQueryPlan {
             query_text,
             last_used: Instant::now(),
             usage_count: 1,
-            has_params,
-            param_count,
+            params,
             normalized_query,
             compiled: Arc::new(RwLock::new(CompiledExecution::Unknown)),
             classification: Arc::new(std::sync::OnceLock::new()),
@@ -459,8 +446,7 @@ impl QueryCache {
         // Only clone the Arc (cheap) and copy the small fields
         Some(CachedPlanRef {
             statement: plan.statement.clone(),
-            has_params: plan.has_params,
-            param_count: plan.param_count,
+            params: plan.params.clone(),
             compiled: plan.compiled.clone(), // Share compiled state
             classification: plan.classification.clone(),
             counts: plan.counts.clone(),
@@ -472,13 +458,7 @@ impl QueryCache {
     /// Returns a lightweight reference to the cached plan (CachedPlanRef).
     /// This avoids cloning SmartStrings since callers only need the statement
     /// and compiled execution state.
-    pub fn put(
-        &self,
-        query: &str,
-        statement: Arc<Statement>,
-        has_params: bool,
-        param_count: usize,
-    ) -> CachedPlanRef {
+    pub fn put(&self, query: &str, statement: Arc<Statement>, params: ParamSlots) -> CachedPlanRef {
         let normalized_key = SmartString::new(normalize_query(query));
 
         // Create the compiled state upfront - shared between stored plan and returned ref
@@ -502,8 +482,7 @@ impl QueryCache {
                     query_text: SmartString::new(query),
                     last_used: Instant::now(),
                     usage_count: 1,
-                    has_params,
-                    param_count,
+                    params: params.clone(),
                     normalized_query: normalized_key, // moved, not cloned
                     compiled: compiled.clone(),       // Arc clone - cheap
                     classification: classification.clone(),
@@ -515,8 +494,7 @@ impl QueryCache {
         // Return lightweight reference - only Arc clones, no SmartString clones
         CachedPlanRef {
             statement,
-            has_params,
-            param_count,
+            params,
             compiled,
             classification,
             counts,
@@ -705,7 +683,7 @@ mod tests {
         let stmt = create_test_statement();
 
         // Put in cache
-        cache.put("SELECT * FROM users", stmt.clone(), false, 0);
+        cache.put("SELECT * FROM users", stmt.clone(), ParamSlots::default());
         assert_eq!(cache.size(), 1);
 
         // Get from cache
@@ -713,8 +691,7 @@ mod tests {
         assert!(plan.is_some());
 
         let plan = plan.unwrap();
-        assert!(!plan.has_params);
-        assert_eq!(plan.param_count, 0);
+        assert_eq!(plan.params, ParamSlots::default());
     }
 
     #[test]
@@ -730,7 +707,7 @@ mod tests {
         let cache = QueryCache::new(100);
         let stmt = create_test_statement();
 
-        cache.put("SELECT * FROM users", stmt, false, 0);
+        cache.put("SELECT * FROM users", stmt, ParamSlots::default());
 
         // Get multiple times - OPTIMIZATION: get() no longer updates stats
         // to avoid write lock contention
@@ -748,7 +725,7 @@ mod tests {
         let cache = QueryCache::new(100);
         let stmt = create_test_statement();
 
-        cache.put("SELECT * FROM users", stmt, false, 0);
+        cache.put("SELECT * FROM users", stmt, ParamSlots::default());
         assert_eq!(cache.size(), 1);
 
         cache.clear();
@@ -763,7 +740,7 @@ mod tests {
         // Fill the cache
         for i in 0..10 {
             let query = format!("SELECT * FROM table{}", i);
-            cache.put(&query, stmt.clone(), false, 0);
+            cache.put(&query, stmt.clone(), ParamSlots::default());
         }
 
         // Cache should have pruned some entries
@@ -797,7 +774,7 @@ mod tests {
         let cache = QueryCache::new(100);
         let stmt = create_test_statement();
 
-        cache.put("SELECT * FROM users", stmt, false, 0);
+        cache.put("SELECT * FROM users", stmt, ParamSlots::default());
 
         assert!(cache.get("  SELECT * FROM users\n").is_some());
         assert!(
@@ -811,11 +788,14 @@ mod tests {
         let cache = QueryCache::new(100);
         let stmt = create_test_statement();
 
-        cache.put("SELECT * FROM users WHERE id = $1", stmt, true, 1);
+        let params = ParamSlots {
+            count: 1,
+            names: None,
+        };
+        cache.put("SELECT * FROM users WHERE id = $1", stmt, params.clone());
 
         let plan = cache.get("SELECT * FROM users WHERE id = $1").unwrap();
-        assert!(plan.has_params);
-        assert_eq!(plan.param_count, 1);
+        assert_eq!(plan.params, params);
     }
 
     #[test]
@@ -823,8 +803,8 @@ mod tests {
         let cache = QueryCache::new(100);
         let stmt = create_test_statement();
 
-        cache.put("SELECT 1", stmt.clone(), false, 0);
-        cache.put("SELECT 2", stmt.clone(), false, 0);
+        cache.put("SELECT 1", stmt.clone(), ParamSlots::default());
+        cache.put("SELECT 2", stmt.clone(), ParamSlots::default());
 
         // Access first query more - get() no longer updates stats (OPTIMIZATION)
         for _ in 0..5 {
@@ -846,7 +826,7 @@ mod tests {
         let stmt = create_test_statement();
 
         // Pre-populate
-        cache.put("SELECT * FROM users", stmt.clone(), false, 0);
+        cache.put("SELECT * FROM users", stmt.clone(), ParamSlots::default());
 
         let mut handles = vec![];
 
@@ -867,7 +847,7 @@ mod tests {
             handles.push(thread::spawn(move || {
                 for j in 0..20 {
                     let query = format!("SELECT * FROM table{}_{}", i, j);
-                    cache.put(&query, stmt.clone(), false, 0);
+                    cache.put(&query, stmt.clone(), ParamSlots::default());
                 }
             }));
         }

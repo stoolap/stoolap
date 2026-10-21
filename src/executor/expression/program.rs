@@ -210,7 +210,6 @@ impl Program {
                 | Op::LoadOuterColumn(_)
                 | Op::LoadConst(_)
                 | Op::LoadParam(_)
-                | Op::LoadNamedParam(_)
                 | Op::LoadNull(_)
                 | Op::LoadAggregateResult(_)
                 | Op::LoadTransactionId

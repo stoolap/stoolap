@@ -292,12 +292,13 @@ fn returning_reads_the_parameters_the_statement_was_given() {
     let db = Database::open("memory://prepared_insert_returning_parameters").unwrap();
     setup(&db);
     let returned = |sql: &str| -> Option<i64> {
-        let row = db.query(sql, ()).unwrap().next().unwrap().unwrap();
+        let row = db.query(sql, (7,)).unwrap().next().unwrap().unwrap();
         row.get(0).unwrap()
     };
     let literal = returned("INSERT INTO t VALUES (10, 41) RETURNING $1");
     let read =
         returned("INSERT INTO t VALUES (11, (SELECT x + 40 FROM u WHERE id = 1)) RETURNING $1");
+    assert_eq!(literal, Some(7));
     assert_eq!(read, literal);
     assert_eq!(
         rows(db.query("SELECT id, b FROM t WHERE id >= 10 ORDER BY id", ())),

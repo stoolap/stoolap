@@ -46,17 +46,8 @@ fn extract_literal_with_ctx(expr: &ast::Expression, ctx: &PushdownContext<'_>) -
     // Try parameter reference
     if let ast::Expression::Parameter(param) = expr {
         if let Some(exec_ctx) = ctx.exec_ctx {
-            // Check if it's a named parameter (starts with :)
-            if param.name.starts_with(':') {
-                let name = &param.name[1..];
-                return exec_ctx.get_named_param(name).cloned();
-            } else {
-                // Positional parameter (1-indexed)
-                let params = exec_ctx.params();
-                if param.index > 0 && param.index <= params.len() {
-                    return Some(params[param.index - 1].clone());
-                }
-            }
+            // Slots are 1-indexed
+            return exec_ctx.params().get(param.index.checked_sub(1)?).cloned();
         }
     }
 

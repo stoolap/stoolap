@@ -309,10 +309,10 @@ pub unsafe extern "C" fn stoolap_stmt_query_named(
     handle.last_error = None;
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let named = value::named_params_from_ffi(params, params_len);
-        match named.and_then(|named| handle.stmt.query_named(named)) {
-            Ok(rows) => {
-                *out_rows = handle.rows_handle(rows);
+        let mut value_of = value::ffi_value_of(params, params_len);
+        match handle.stmt.run_named(&mut value_of) {
+            Ok(result) => {
+                *out_rows = handle.rows_handle(Rows::new(result));
                 STOOLAP_OK
             }
             Err(e) => {
@@ -349,11 +349,11 @@ pub unsafe extern "C" fn stoolap_stmt_exec_named(
     handle.last_error = None;
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let named = value::named_params_from_ffi(params, params_len);
-        match named.and_then(|named| handle.stmt.execute_named(named)) {
-            Ok(affected) => {
+        let mut value_of = value::ffi_value_of(params, params_len);
+        match handle.stmt.run_named(&mut value_of) {
+            Ok(result) => {
                 if !rows_affected.is_null() {
-                    *rows_affected = affected;
+                    *rows_affected = result.rows_affected();
                 }
                 STOOLAP_OK
             }
@@ -530,11 +530,14 @@ pub unsafe extern "C" fn stoolap_stmt_query_named_all(
     handle.last_error = None;
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let rows = value::named_params_from_ffi(params, params_len).and_then(|named| {
-            match open_transaction(tx)? {
-                None => handle.stmt.query_named(named),
-                Some(inner_tx) => handle.stmt.query_named_in(inner_tx, named),
-            }
+        let mut value_of = value::ffi_value_of(params, params_len);
+        let rows = open_transaction(tx).and_then(|inner_tx| {
+            Ok(Rows::new(match inner_tx {
+                None => handle.stmt.run_named(&mut value_of)?,
+                Some(inner_tx) => {
+                    inner_tx.execute_prepared_statement_named(&handle.stmt, &mut value_of)?
+                }
+            }))
         });
         handle.pack_into(rows, out_buf, out_len)
     }));

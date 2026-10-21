@@ -41,10 +41,11 @@
 
 use std::sync::{Arc, Weak};
 
-use crate::core::{Error, Result};
+use crate::core::{Error, Result, Value};
 use crate::executor::context::ExecutionContext;
 use crate::executor::query_cache::CachedPlanRef;
-use crate::parser::Parser;
+use crate::executor::{bind_named, value_in};
+use crate::storage::traits::QueryResult;
 
 use super::database::{Database, DatabaseInnerHandle, FromValue};
 use super::params::{NamedParams, Params};
@@ -88,52 +89,25 @@ impl Statement {
         sql: String,
         db: &Database,
     ) -> Result<Self> {
-        let plan = {
-            let executor = db.executor();
-
-            // Check if already cached (e.g. same SQL prepared twice)
-            if let Some(cached) = executor.query_cache().get(&sql) {
-                Some(cached)
-            } else {
-                let mut parser = Parser::new(&sql);
-                let mut program = parser
-                    .parse_program()
-                    .map_err(|e| Error::parse(e.to_string()))?;
-
-                if program.statements.len() == 1 {
-                    let stmt = program.statements.pop().unwrap();
-                    // Reject bare expression statements — they indicate
-                    // unrecognised SQL (e.g. "SELECTX INVALID").
-                    if matches!(stmt, crate::parser::ast::Statement::Expression(_)) {
-                        return Err(Error::parse(format!(
-                            "invalid SQL: unrecognised statement: {}",
-                            sql
-                        )));
-                    }
-                    let (has_params, param_count) = crate::executor::count_parameters(&stmt);
-                    let stmt_arc = Arc::new(stmt);
-                    let cached =
-                        executor
-                            .query_cache()
-                            .put(&sql, stmt_arc, has_params, param_count);
-                    Some(cached)
-                } else {
-                    // Reject if any statement is a bare expression
-                    // (indicates unrecognised SQL tokens).
-                    for s in &program.statements {
-                        if matches!(s, crate::parser::ast::Statement::Expression(_)) {
-                            return Err(Error::parse(format!(
-                                "invalid SQL: unrecognised statement: {}",
-                                sql
-                            )));
-                        }
-                    }
-                    // Multi-statement SQL: validated but not cacheable
-                    None
-                }
-            }
+        // A bare expression statement is SQL the parser did not recognise
+        // (e.g. "SELECTX INVALID")
+        let unrecognised = |statement: &crate::parser::ast::Statement| {
+            matches!(statement, crate::parser::ast::Statement::Expression(_))
         };
-
+        let (plan, recognised) = match db.executor().plan_or_program(&sql)? {
+            Ok(plan) => {
+                let recognised = !unrecognised(&plan.statement);
+                (Some(plan), recognised)
+            }
+            // Multi-statement SQL: validated but not cacheable
+            Err(program) => (None, !program.statements.iter().any(unrecognised)),
+        };
+        if !recognised {
+            return Err(Error::parse(format!(
+                "invalid SQL: unrecognised statement: {}",
+                sql
+            )));
+        }
         Ok(Self { db_weak, sql, plan })
     }
 
@@ -192,27 +166,25 @@ impl Statement {
 
     /// Execute the prepared statement with named parameters (`:name`)
     pub fn execute_named(&self, params: NamedParams) -> Result<i64> {
-        let db = self.get_db()?;
-        match &self.plan {
-            Some(plan) => {
-                let ctx = ExecutionContext::with_named_params(params.into_inner());
-                let result = db.executor().execute_with_cached_plan_owned(plan, ctx)?;
-                Ok(result.rows_affected())
-            }
-            None => db.execute_named(&self.sql, params),
-        }
+        Ok(self
+            .run_named(&mut value_in(params.as_map()))?
+            .rows_affected())
     }
 
     /// Query using the prepared statement with named parameters (`:name`)
     pub fn query_named(&self, params: NamedParams) -> Result<Rows> {
+        Ok(Rows::new(self.run_named(&mut value_in(params.as_map()))?))
+    }
+
+    /// Runs the statement with each value read by its name from `value_of`
+    pub(crate) fn run_named(
+        &self,
+        value_of: &mut impl FnMut(&str) -> Result<Option<Value>>,
+    ) -> Result<Box<dyn QueryResult>> {
         let db = self.get_db()?;
         match &self.plan {
-            Some(plan) => {
-                let ctx = ExecutionContext::with_named_params(params.into_inner());
-                let result = db.executor().execute_with_cached_plan_owned(plan, ctx)?;
-                Ok(Rows::new(result))
-            }
-            None => db.query_named(&self.sql, params),
+            Some(plan) => db.run_plan(plan, bind_named(&plan.params, value_of)?),
+            None => db.executor().execute_named_with(&self.sql, value_of),
         }
     }
 
@@ -276,14 +248,17 @@ impl Statement {
 
     /// Execute the prepared statement inside `tx` with named parameters
     pub fn execute_named_in(&self, tx: &mut Transaction, params: NamedParams) -> Result<i64> {
-        let ctx = ExecutionContext::with_named_params(params.into_inner());
-        Ok(tx.execute_prepared_statement(self, ctx)?.rows_affected())
+        Ok(tx
+            .execute_prepared_statement_named(self, &mut value_in(params.as_map()))?
+            .rows_affected())
     }
 
     /// Query using the prepared statement inside `tx` with named parameters
     pub fn query_named_in(&self, tx: &mut Transaction, params: NamedParams) -> Result<Rows> {
-        let ctx = ExecutionContext::with_named_params(params.into_inner());
-        Ok(Rows::new(tx.execute_prepared_statement(self, ctx)?))
+        Ok(Rows::new(tx.execute_prepared_statement_named(
+            self,
+            &mut value_in(params.as_map()),
+        )?))
     }
 }
 

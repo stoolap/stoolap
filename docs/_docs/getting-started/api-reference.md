@@ -124,7 +124,7 @@ match name {
 
 ### Named Parameters
 
-Use `:name` syntax with `named_params!` macro or the `NamedParams` builder.
+Use `:name` syntax with `named_params!` macro or the `NamedParams` builder. A name the statement reads and the call does not give is an error, as a missing positional parameter is; see [Parameter Binding]({% link _docs/sql-features/parameter-binding.md %}).
 
 ```rust
 use stoolap::named_params;
@@ -723,8 +723,6 @@ fn main() -> Result<()> {
 | `query_named(sql, params)` | `Result<Rows>` | Query with named params |
 | `execute_prepared(ast, params)` | `Result<i64>` | Execute a parsed AST statement |
 | `query_prepared(ast, params)` | `Result<Rows>` | Query with a parsed AST statement |
-| `execute_prepared_named(ast, params)` | `Result<i64>` | Execute a parsed AST statement with named params |
-| `query_prepared_named(ast, params)` | `Result<Rows>` | Query a parsed AST statement with named params |
 | `commit()` | `Result<()>` | Commit |
 | `rollback()` | `Result<()>` | Rollback |
 | `id()` | `i64` | Transaction ID |

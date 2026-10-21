@@ -165,7 +165,6 @@ pub(crate) fn slot_context<'a>(
     let exec = super::expression::ExecuteContext::with_common_params(
         row,
         ctx.params(),
-        Some(ctx.named_params()),
         ctx.transaction_id(),
     );
     match ctx.outer_row() {
@@ -917,9 +916,7 @@ impl<'a> RowFeed<'a> {
             self.run_columns(groups, row, columns);
             return Ok(());
         }
-        let exec = super::expression::ExecuteContext::new(row)
-            .with_params(ctx.params())
-            .with_named_params(ctx.named_params());
+        let exec = super::expression::ExecuteContext::new(row).with_params(ctx.params());
         let group = match &self.key_columns {
             Some(columns) => groups.group(&ColumnsKey {
                 values: row.as_slice(),
@@ -996,9 +993,7 @@ impl<'a> RowFeed<'a> {
     ) -> Result<()> {
         let mut state = FeedState::default();
         for (_, row) in rows {
-            let exec = super::expression::ExecuteContext::new(row)
-                .with_params(ctx.params())
-                .with_named_params(ctx.named_params());
+            let exec = super::expression::ExecuteContext::new(row).with_params(ctx.params());
             self.read_key(row, &exec, &mut state)?;
             for (groups, picks) in sets.iter_mut().zip(picks) {
                 let key = Picked {

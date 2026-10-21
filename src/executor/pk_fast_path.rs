@@ -286,17 +286,8 @@ impl Executor {
                 // Only lossless float keys qualify; see lossless_float_key
                 PkValueSource::Literal(Self::lossless_float_key(lit.value)?)
             }
-            Expression::Parameter(param) => {
-                // Named parameters (e.g., :name); positional ($1, $2, ...)
-                // are 1-indexed, the array is 0-indexed
-                if param.name.starts_with(':') {
-                    PkValueSource::NamedParameter(SmartString::new(&param.name[1..]))
-                } else if param.index > 0 {
-                    PkValueSource::Parameter(param.index - 1)
-                } else {
-                    return None;
-                }
-            }
+            // Slots are 1-indexed, the array is 0-indexed
+            Expression::Parameter(param) => PkValueSource::Parameter(param.index.checked_sub(1)?),
             _ => return None,
         };
 
@@ -513,14 +504,7 @@ impl Executor {
 
     /// Extract PK value using pre-compiled source (very fast - just array access)
     fn extract_pk_value_fast(&self, source: &PkValueSource, ctx: &ExecutionContext) -> Option<i64> {
-        match source {
-            PkValueSource::NamedParameter(name) => match ctx.get_named_param(name)? {
-                Value::Integer(i) => Some(*i),
-                Value::Float(f) => Self::lossless_float_key(*f),
-                _ => None,
-            },
-            _ => Self::extract_pk_value_from_slice(source, ctx.params()),
-        }
+        Self::extract_pk_value_from_slice(source, ctx.params())
     }
 
     /// A float key qualifies only when it converts to i64 without loss:
@@ -556,7 +540,6 @@ impl Executor {
                     _ => None,
                 }
             }
-            PkValueSource::NamedParameter(_) => None, // No ctx available in slice path
         }
     }
 

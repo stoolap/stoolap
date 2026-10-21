@@ -1596,10 +1596,20 @@ impl fmt::Display for Statement {
     }
 }
 
+/// A statement's parameter slots: how many values it takes and, when its
+/// parameters are `:name`, the name each slot is bound by, in slot order
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ParamSlots {
+    pub count: usize,
+    pub names: Option<std::sync::Arc<[SmartString]>>,
+}
+
 /// Program (collection of statements)
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     pub statements: Vec<Statement>,
+    /// The parameter slots of each statement, by position
+    pub params: Vec<ParamSlots>,
 }
 
 impl fmt::Display for Program {

@@ -45,8 +45,6 @@ use crate::core::{Result, Row, Value, ValueMap};
 // Note: cancelled is NOT shared - each context needs its own cancellation flag.
 static EMPTY_PARAMS: LazyLock<CompactArc<ParamVec>> =
     LazyLock::new(|| CompactArc::new(ParamVec::new()));
-static EMPTY_NAMED_PARAMS: LazyLock<Arc<FxHashMap<String, Value>>> =
-    LazyLock::new(|| Arc::new(FxHashMap::default()));
 static EMPTY_DATABASE: LazyLock<Arc<Option<String>>> = LazyLock::new(|| Arc::new(None));
 static EMPTY_SESSION_VARS: LazyLock<Arc<AHashMap<String, Value>>> =
     LazyLock::new(|| Arc::new(AHashMap::new()));
@@ -428,7 +426,6 @@ pub struct SemiJoinOrigin<'a> {
     pub alias: Option<&'a str>,
     pub filter: Option<&'a Arc<crate::parser::ast::Expression>>,
     pub params: &'a [Value],
-    pub named_params: &'a FxHashMap<String, Value>,
 }
 
 /// A `SemiJoinOrigin` as its cache entry keeps it
@@ -438,7 +435,6 @@ struct KeptOrigin {
     alias: Option<String>,
     filter: Option<Arc<crate::parser::ast::Expression>>,
     params: Vec<Value>,
-    named_params: FxHashMap<String, Value>,
 }
 
 /// Whether two parameter values are one input: of one type, a NULL of one
@@ -476,14 +472,6 @@ impl SemiJoinOrigin<'_> {
         for value in self.params {
             hash_parameter(value, &mut hasher);
         }
-        // Map order is not stable, so each pair is hashed alone and combined
-        let named = self.named_params.iter().fold(0u64, |acc, (name, value)| {
-            let mut pair_hasher = rustc_hash::FxHasher::default();
-            name.hash(&mut pair_hasher);
-            hash_parameter(value, &mut pair_hasher);
-            acc ^ pair_hasher.finish()
-        });
-        named.hash(&mut hasher);
         hasher.finish()
     }
 
@@ -503,12 +491,6 @@ impl SemiJoinOrigin<'_> {
                 .iter()
                 .zip(self.params)
                 .all(|(kept, value)| same_parameter(kept, value))
-            && kept.named_params.len() == self.named_params.len()
-            && self.named_params.iter().all(|(name, value)| {
-                kept.named_params
-                    .get(name)
-                    .is_some_and(|kept| same_parameter(kept, value))
-            })
     }
 
     fn keep(&self) -> KeptOrigin {
@@ -518,7 +500,6 @@ impl SemiJoinOrigin<'_> {
             alias: self.alias.map(str::to_string),
             filter: self.filter.cloned(),
             params: self.params.to_vec(),
-            named_params: self.named_params.clone(),
         }
     }
 }
@@ -632,7 +613,6 @@ pub(crate) struct BlockOrigin<'a> {
     pub block_key: super::expr_key::ExprKey,
     pub scopes: &'a Arc<str>,
     pub params: &'a [Value],
-    pub named_params: &'a FxHashMap<String, Value>,
 }
 
 /// An `BlockOrigin` as its cache entry keeps it
@@ -640,7 +620,6 @@ struct KeptBlockOrigin {
     block: Arc<crate::parser::ast::Expression>,
     scopes: Arc<str>,
     params: Vec<Value>,
-    named_params: FxHashMap<String, Value>,
 }
 
 impl BlockOrigin<'_> {
@@ -653,13 +632,6 @@ impl BlockOrigin<'_> {
         for value in self.params {
             hash_parameter(value, &mut hasher);
         }
-        let named = self.named_params.iter().fold(0u64, |acc, (name, value)| {
-            let mut pair_hasher = rustc_hash::FxHasher::default();
-            name.hash(&mut pair_hasher);
-            hash_parameter(value, &mut pair_hasher);
-            acc ^ pair_hasher.finish()
-        });
-        named.hash(&mut hasher);
         hasher.finish()
     }
 
@@ -672,12 +644,6 @@ impl BlockOrigin<'_> {
                 .iter()
                 .zip(self.params)
                 .all(|(kept, value)| same_parameter(kept, value))
-            && kept.named_params.len() == self.named_params.len()
-            && self.named_params.iter().all(|(name, value)| {
-                kept.named_params
-                    .get(name)
-                    .is_some_and(|kept| same_parameter(kept, value))
-            })
     }
 }
 
@@ -727,7 +693,6 @@ pub(crate) fn cache_block_answer(
         block: Arc::clone(origin.block),
         scopes: Arc::clone(origin.scopes),
         params: origin.params.to_vec(),
-        named_params: origin.named_params.clone(),
     };
     BLOCK_ANSWER_CACHE.with(|cache| cache.borrow_mut().put(key, (kept, stamp, answer)));
 }
@@ -1202,8 +1167,6 @@ impl std::fmt::Debug for StatementSnapshot {
 pub struct ExecutionContext {
     /// Query parameters ($1, $2, etc.) - wrapped in Arc for cheap cloning
     params: CompactArc<ParamVec>,
-    /// Named parameters (:name) - wrapped in Arc for cheap cloning
-    named_params: Arc<FxHashMap<String, Value>>,
     /// Whether to use auto-commit for DML statements
     auto_commit: bool,
     /// Cancellation flag
@@ -1298,7 +1261,6 @@ impl ExecutionContext {
     pub fn new() -> Self {
         Self {
             params: EMPTY_PARAMS.clone(),
-            named_params: EMPTY_NAMED_PARAMS.clone(),
             auto_commit: true,
             cancelled: Arc::new(AtomicBool::new(false)), // Each context needs own flag
             current_database: EMPTY_DATABASE.clone(),
@@ -1326,14 +1288,6 @@ impl ExecutionContext {
         }
     }
 
-    /// Create an execution context with named parameters
-    pub fn with_named_params(named_params: FxHashMap<String, Value>) -> Self {
-        Self {
-            named_params: Arc::new(named_params),
-            ..Self::new()
-        }
-    }
-
     /// Get a positional parameter by index (1-based)
     pub fn get_param(&self, index: usize) -> Option<&Value> {
         if index == 0 || index > self.params.len() {
@@ -1341,11 +1295,6 @@ impl ExecutionContext {
         } else {
             self.params.get(index - 1)
         }
-    }
-
-    /// Get a named parameter by name
-    pub fn get_named_param(&self, name: &str) -> Option<&Value> {
-        self.named_params.get(name)
     }
 
     /// Get all positional parameters
@@ -1357,17 +1306,6 @@ impl ExecutionContext {
     /// Used by evaluator bridge to avoid cloning params.
     pub fn params_arc(&self) -> &CompactArc<ParamVec> {
         &self.params
-    }
-
-    /// Get all named parameters
-    pub fn named_params(&self) -> &FxHashMap<String, Value> {
-        &self.named_params
-    }
-
-    /// Get the named_params Arc for zero-copy sharing.
-    /// Used by evaluator bridge to avoid cloning params.
-    pub fn named_params_arc(&self) -> &Arc<FxHashMap<String, Value>> {
-        &self.named_params
     }
 
     /// Get the number of positional parameters
@@ -1383,11 +1321,6 @@ impl ExecutionContext {
     /// Add a positional parameter
     pub fn add_param(&mut self, value: Value) {
         CompactArc::make_mut(&mut self.params).push(value);
-    }
-
-    /// Set a named parameter
-    pub fn set_named_param(&mut self, name: impl Into<String>, value: Value) {
-        Arc::make_mut(&mut self.named_params).insert(name.into(), value);
     }
 
     /// Check if auto-commit is enabled
@@ -1467,7 +1400,6 @@ impl ExecutionContext {
     pub fn with_incremented_view_depth(&self) -> Self {
         Self {
             params: self.params.clone(),
-            named_params: self.named_params.clone(),
             auto_commit: self.auto_commit,
             cancelled: self.cancelled.clone(),
             current_database: self.current_database.clone(),
@@ -1492,7 +1424,6 @@ impl ExecutionContext {
     pub fn with_incremented_query_depth(&self) -> Self {
         Self {
             params: self.params.clone(),
-            named_params: self.named_params.clone(),
             auto_commit: self.auto_commit,
             cancelled: self.cancelled.clone(),
             current_database: self.current_database.clone(),
@@ -1541,8 +1472,7 @@ impl ExecutionContext {
             _ => outer_row,
         };
         Self {
-            params: self.params.clone(),             // Arc clone = cheap
-            named_params: self.named_params.clone(), // Arc clone = cheap
+            params: self.params.clone(), // Arc clone = cheap
             auto_commit: self.auto_commit,
             cancelled: self.cancelled.clone(), // Arc clone = cheap
             current_database: self.current_database.clone(), // Arc clone = cheap
@@ -1599,7 +1529,6 @@ impl ExecutionContext {
     pub fn with_cte_data(&self, cte_data: Arc<CteDataMap>) -> Self {
         Self {
             params: self.params.clone(),
-            named_params: self.named_params.clone(),
             auto_commit: self.auto_commit,
             cancelled: self.cancelled.clone(),
             current_database: self.current_database.clone(),
@@ -1748,7 +1677,6 @@ impl ExecutionContext {
     pub fn with_transaction_id(&self, txn_id: u64) -> Self {
         Self {
             params: self.params.clone(),
-            named_params: self.named_params.clone(),
             auto_commit: self.auto_commit,
             cancelled: self.cancelled.clone(),
             current_database: self.current_database.clone(),
@@ -2067,20 +1995,6 @@ impl ExecutionContextBuilder {
         }
     }
 
-    /// Add a named parameter
-    pub fn named_param(self, name: impl Into<String>, value: Value) -> Self {
-        Self {
-            ctx: ExecutionContext {
-                named_params: Arc::new({
-                    let mut m = (*self.ctx.named_params).clone();
-                    m.insert(name.into(), value);
-                    m
-                }),
-                ..self.ctx
-            },
-        }
-    }
-
     /// Set auto-commit mode
     pub fn auto_commit(mut self, auto_commit: bool) -> Self {
         self.ctx.auto_commit = auto_commit;
@@ -2223,18 +2137,6 @@ mod tests {
     }
 
     #[test]
-    fn test_context_named_params() {
-        let mut params = FxHashMap::default();
-        params.insert("name".to_string(), Value::text("Alice"));
-        params.insert("age".to_string(), Value::Integer(30));
-
-        let ctx = ExecutionContext::with_named_params(params);
-        assert_eq!(ctx.get_named_param("name"), Some(&Value::text("Alice")));
-        assert_eq!(ctx.get_named_param("age"), Some(&Value::Integer(30)));
-        assert_eq!(ctx.get_named_param("unknown"), None);
-    }
-
-    #[test]
     fn test_context_cancellation() {
         let ctx = ExecutionContext::new();
         assert!(!ctx.is_cancelled());
@@ -2270,7 +2172,6 @@ mod tests {
         let ctx = ExecutionContextBuilder::new()
             .params(smallvec::smallvec![Value::Integer(1)])
             .param(Value::Integer(2))
-            .named_param("name", Value::text("test"))
             .auto_commit(false)
             .database("mydb")
             .timeout_ms(5000)
@@ -2279,7 +2180,6 @@ mod tests {
         assert_eq!(ctx.param_count(), 2);
         assert_eq!(ctx.get_param(1), Some(&Value::Integer(1)));
         assert_eq!(ctx.get_param(2), Some(&Value::Integer(2)));
-        assert_eq!(ctx.get_named_param("name"), Some(&Value::text("test")));
         assert!(!ctx.auto_commit());
         assert_eq!(ctx.current_database(), Some("mydb"));
         assert_eq!(ctx.timeout_ms(), 5000);
@@ -2287,14 +2187,12 @@ mod tests {
 
     #[test]
     fn a_semi_join_set_answers_only_its_own_origin_under_a_shared_key() {
-        let named = FxHashMap::default();
         let origin = |table, params| SemiJoinOrigin {
             table,
             column: "bid",
             alias: None,
             filter: None,
             params,
-            named_params: &named,
         };
         let taken = origin("semi_join_origin_test", &[Value::Integer(10)]);
         let key = taken.key();

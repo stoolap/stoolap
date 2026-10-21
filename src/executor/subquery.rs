@@ -2900,13 +2900,6 @@ impl Executor {
         for value in ctx.params() {
             let _ = write!(key, "\u{1}{value:?}");
         }
-        if !ctx.named_params().is_empty() {
-            let mut named: Vec<(&String, &Value)> = ctx.named_params().iter().collect();
-            named.sort_unstable_by_key(|(name, _)| *name);
-            for (name, value) in named {
-                let _ = write!(key, "\u{1}{name:?}={value:?}");
-            }
-        }
         Some(key)
     }
 
@@ -4312,7 +4305,6 @@ impl Executor {
             alias: info.inner_alias.as_deref(),
             filter: info.non_correlated_where.as_ref(),
             params: ctx.params(),
-            named_params: ctx.named_params(),
         };
         let cache_key = origin.key();
 

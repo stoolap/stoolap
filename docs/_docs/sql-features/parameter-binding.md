@@ -42,6 +42,24 @@ UPDATE products SET price = ? WHERE id = ?;
 
 Both styles work identically. Use whichever is more natural for your application.
 
+### How values are bound
+
+Every parameter is a slot. `$n` is slot n, each `?` takes the next slot, and each distinct `:name` takes the next slot the first time it appears, so a name written twice reads one value. A statement uses positional (`$n`, `?`) or named (`:name`) parameters, not both: mixing them is a parse error, and so is `$0`.
+
+A parameter the call gives no value for is an error, on every path (ad hoc, prepared, inside a transaction, cached plans) and in every clause, before the statement reads or writes a row:
+
+```rust
+db.query("SELECT * FROM users WHERE id = $1", ())?;
+// Error: Query requires 1 parameters but only 0 provided
+
+db.query_named("SELECT * FROM users WHERE id = :id", named_params!{})?;
+// Error: named parameter :id has no value
+```
+
+Names are matched as written (`:ID` is not `:id`). A name the statement does not read is ignored.
+
+`EXPLAIN` reads no value: it shows each parameter as written, so it runs without them. `EXPLAIN ANALYZE` runs the statement and needs every value.
+
 ## Using Parameters in Rust
 
 ### Basic Usage

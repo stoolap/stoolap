@@ -327,19 +327,21 @@ fn current_transaction_id_reads_the_open_transaction_on_every_path() {
 }
 
 #[test]
-fn a_missing_named_update_parameter_writes_what_the_general_path_writes() {
+fn a_missing_named_update_parameter_is_an_error_on_every_path() {
     // RETURNING keeps the statement off the compiled PK path
     let general = "UPDATE t SET v = :v WHERE id = :id RETURNING id";
     let compiled = "UPDATE t SET v = :v WHERE id = :id";
-    let outcome = |name: &str, sql: &str, in_tx: bool| {
+    for (name, sql, in_tx) in [
+        ("general", general, false),
+        ("autocommit", compiled, false),
+        ("transaction", compiled, true),
+    ] {
         let db = Database::open(&format!("memory://api_paths_missing_{name}")).unwrap();
         db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
             .unwrap();
-        let mut seen = Vec::new();
+        db.execute("INSERT INTO t VALUES (1, 9)", ()).unwrap();
         // The second run takes the plan compiled by the first
-        for _ in 0..2 {
-            db.execute("DELETE FROM t", ()).unwrap();
-            db.execute("INSERT INTO t VALUES (1, 9)", ()).unwrap();
+        for run in 0..2 {
             let affected = if in_tx {
                 let mut tx = db.begin().unwrap();
                 let affected = tx.execute_named(sql, stoolap::named_params! { id: 1 });
@@ -348,27 +350,15 @@ fn a_missing_named_update_parameter_writes_what_the_general_path_writes() {
             } else {
                 db.execute_named(sql, stoolap::named_params! { id: 1 })
             };
-            let table = key(&collect(db.query("SELECT id, v FROM t", ())));
-            assert!(affected.is_ok(), "{name}: {affected:?}");
-            seen.push(table);
+            let error = affected.expect_err(name).to_string();
+            assert!(error.contains(":v has no value"), "{name} {run}: {error}");
+            assert_eq!(
+                key(&collect(db.query("SELECT id, v FROM t", ()))),
+                key(&Ok(vec![vec![Value::Integer(1), Value::Integer(9)]])),
+                "{name} {run}: nothing written"
+            );
         }
-        seen
-    };
-    let expected = outcome("general", general, false);
-    assert!(
-        expected[1].contains("Null"),
-        "the general path wrote {expected:?}"
-    );
-    assert_eq!(
-        outcome("autocommit", compiled, false),
-        expected,
-        "autocommit"
-    );
-    assert_eq!(
-        outcome("transaction", compiled, true),
-        expected,
-        "transaction"
-    );
+    }
 }
 
 #[test]

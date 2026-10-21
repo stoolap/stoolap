@@ -29,7 +29,6 @@
 
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 
 use crate::api::params::ParamVec;
 
@@ -37,8 +36,6 @@ use crate::api::params::ParamVec;
 // instead of allocating fresh empty collections per instance
 static EMPTY_PARAMS: std::sync::LazyLock<CompactArc<ParamVec>> =
     std::sync::LazyLock::new(|| CompactArc::new(ParamVec::new()));
-static EMPTY_NAMED_PARAMS: std::sync::LazyLock<Arc<FxHashMap<String, Value>>> =
-    std::sync::LazyLock::new(|| Arc::new(FxHashMap::default()));
 use crate::common::{CompactArc, StringMap};
 use crate::executor::expr_key::ExprKey;
 use lru::LruCache;
@@ -486,8 +483,6 @@ pub struct RowFilter {
     program: SharedProgram,
     /// Query parameters (shared) - uses CompactArc<Vec<Value>> to match ExecutionContext
     params: CompactArc<ParamVec>,
-    /// Named parameters (shared)
-    named_params: Arc<FxHashMap<String, Value>>,
     /// Transaction ID for CURRENT_TRANSACTION_ID()
     transaction_id: Option<u64>,
 }
@@ -507,7 +502,6 @@ impl RowFilter {
         Self {
             program,
             params: EMPTY_PARAMS.clone(),
-            named_params: EMPTY_NAMED_PARAMS.clone(),
             transaction_id: None,
         }
     }
@@ -530,19 +524,16 @@ impl RowFilter {
         Ok(Self {
             program,
             params: EMPTY_PARAMS.clone(),
-            named_params: EMPTY_NAMED_PARAMS.clone(),
             transaction_id: None,
         })
     }
 
     /// Create a filter from execution context.
     ///
-    /// PERF: Both `params` and `named_params` share the Arc - zero cloning.
+    /// PERF: `params` shares the Arc - zero cloning.
     pub fn with_context(mut self, ctx: &ExecutionContext) -> Self {
         // Share params Arc - no cloning needed (both use CompactArc<Vec<Value>>)
         self.params = CompactArc::clone(ctx.params_arc());
-        // Share named_params Arc - no cloning needed
-        self.named_params = Arc::clone(ctx.named_params_arc());
         self.transaction_id = ctx.transaction_id();
         self
     }
@@ -574,9 +565,6 @@ impl RowFilter {
 
             if !self.params.is_empty() {
                 ctx = ctx.with_params(&self.params);
-            }
-            if !self.named_params.is_empty() {
-                ctx = ctx.with_named_params(&self.named_params);
             }
             ctx = ctx.with_transaction_id(self.transaction_id);
             if let Some(blocks) = blocks {
@@ -649,8 +637,6 @@ pub struct JoinFilter {
     program: SharedProgram,
     /// Query parameters (shared Arc to avoid cloning)
     params: CompactArc<ParamVec>,
-    /// Named parameters (shared Arc to avoid cloning)
-    named_params: Arc<FxHashMap<String, Value>>,
     /// Transaction ID for CURRENT_TRANSACTION_ID()
     transaction_id: Option<u64>,
 }
@@ -679,7 +665,6 @@ impl JoinFilter {
         Ok(Self {
             program: CompactArc::new(program),
             params: EMPTY_PARAMS.clone(),
-            named_params: EMPTY_NAMED_PARAMS.clone(),
             transaction_id: None,
         })
     }
@@ -689,7 +674,6 @@ impl JoinFilter {
         Self {
             program,
             params: EMPTY_PARAMS.clone(),
-            named_params: EMPTY_NAMED_PARAMS.clone(),
             transaction_id: None,
         }
     }
@@ -700,7 +684,6 @@ impl JoinFilter {
     #[inline]
     pub fn with_context(mut self, ctx: &ExecutionContext) -> Self {
         self.params = CompactArc::clone(ctx.params_arc());
-        self.named_params = Arc::clone(ctx.named_params_arc());
         self.transaction_id = ctx.transaction_id();
         self
     }
@@ -729,9 +712,6 @@ impl JoinFilter {
             // Apply params if present (required for parameter placeholders like $1, $2)
             if !self.params.is_empty() {
                 ctx = ctx.with_params(&self.params);
-            }
-            if !self.named_params.is_empty() {
-                ctx = ctx.with_named_params(&self.named_params);
             }
             ctx = ctx.with_transaction_id(self.transaction_id);
             if let Some(blocks) = blocks {
@@ -830,8 +810,6 @@ pub struct ExpressionEval {
     vm: ExprVM,
     /// Query parameters (shared) - uses CompactArc<Vec<Value>> to match ExecutionContext
     params: CompactArc<ParamVec>,
-    /// Named parameters (shared) - uses Arc to match ExecutionContext
-    named_params: Arc<FxHashMap<String, Value>>,
     /// Outer row context for correlated subqueries
     outer_row: Option<FxHashMap<CompactArc<str>, Value>>,
     /// Transaction ID
@@ -846,7 +824,6 @@ impl ExpressionEval {
             program,
             vm: ExprVM::new(),
             params: EMPTY_PARAMS.clone(),
-            named_params: EMPTY_NAMED_PARAMS.clone(),
             outer_row: None,
             transaction_id: None,
         })
@@ -854,12 +831,10 @@ impl ExpressionEval {
 
     /// Set context from ExecutionContext.
     ///
-    /// PERF: Both `params` and `named_params` share the Arc - zero cloning.
+    /// PERF: `params` shares the Arc - zero cloning.
     pub fn with_context(mut self, ctx: &ExecutionContext) -> Self {
         // Share params Arc - no cloning needed
         self.params = CompactArc::clone(ctx.params_arc());
-        // Share named_params Arc - no cloning needed
-        self.named_params = Arc::clone(ctx.named_params_arc());
         if let Some(outer) = ctx.outer_row() {
             // Clone the map directly (CompactArc<str> clones are cheap)
             let arc_map = outer.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -877,9 +852,6 @@ impl ExpressionEval {
         if !self.params.is_empty() {
             ctx = ctx.with_params(&self.params);
         }
-        if !self.named_params.is_empty() {
-            ctx = ctx.with_named_params(&self.named_params);
-        }
         if let Some(ref outer) = self.outer_row {
             ctx = ctx.with_outer_row(outer);
         }
@@ -896,9 +868,6 @@ impl ExpressionEval {
         if !self.params.is_empty() {
             ctx = ctx.with_params(&self.params);
         }
-        if !self.named_params.is_empty() {
-            ctx = ctx.with_named_params(&self.named_params);
-        }
         if let Some(ref outer) = self.outer_row {
             ctx = ctx.with_outer_row(outer);
         }
@@ -914,9 +883,6 @@ impl ExpressionEval {
 
         if !self.params.is_empty() {
             ctx = ctx.with_params(&self.params);
-        }
-        if !self.named_params.is_empty() {
-            ctx = ctx.with_named_params(&self.named_params);
         }
         if let Some(ref outer) = self.outer_row {
             ctx = ctx.with_outer_row(outer);
@@ -941,8 +907,6 @@ pub struct MultiExpressionEval {
     vm: ExprVM,
     /// Query parameters (shared) - uses CompactArc<Vec<Value>> to match ExecutionContext
     params: CompactArc<ParamVec>,
-    /// Named parameters (shared) - uses Arc to match ExecutionContext
-    named_params: Arc<FxHashMap<String, Value>>,
     /// Transaction ID
     transaction_id: Option<u64>,
 }
@@ -973,19 +937,16 @@ impl MultiExpressionEval {
             programs,
             vm: ExprVM::new(),
             params: EMPTY_PARAMS.clone(),
-            named_params: EMPTY_NAMED_PARAMS.clone(),
             transaction_id: None,
         })
     }
 
     /// Set from execution context.
     ///
-    /// PERF: Both `params` and `named_params` share the Arc - zero cloning.
+    /// PERF: `params` shares the Arc - zero cloning.
     pub fn with_context(mut self, ctx: &ExecutionContext) -> Self {
         // Share params Arc - no cloning needed
         self.params = CompactArc::clone(ctx.params_arc());
-        // Share named_params Arc - no cloning needed
-        self.named_params = Arc::clone(ctx.named_params_arc());
         self.transaction_id = ctx.transaction_id();
         self
     }
@@ -997,9 +958,6 @@ impl MultiExpressionEval {
 
         if !self.params.is_empty() {
             ctx = ctx.with_params(&self.params);
-        }
-        if !self.named_params.is_empty() {
-            ctx = ctx.with_named_params(&self.named_params);
         }
         ctx = ctx.with_transaction_id(self.transaction_id);
 
@@ -1016,9 +974,6 @@ impl MultiExpressionEval {
 
         if !self.params.is_empty() {
             ctx = ctx.with_params(&self.params);
-        }
-        if !self.named_params.is_empty() {
-            ctx = ctx.with_named_params(&self.named_params);
         }
         ctx = ctx.with_transaction_id(self.transaction_id);
 
@@ -1100,9 +1055,6 @@ pub struct CompiledEvaluator<'a> {
     /// Query parameters (positional) - uses CompactArc<Vec<Value>> to match ExecutionContext
     params: CompactArc<ParamVec>,
 
-    /// Query parameters (named) - uses Arc to match ExecutionContext
-    named_params: Arc<FxHashMap<String, Value>>,
-
     /// Outer row context for correlated subqueries
     outer_row: Option<FxHashMap<CompactArc<str>, Value>>,
 
@@ -1137,7 +1089,6 @@ impl<'a> CompiledEvaluator<'a> {
             columns: CompactArc::new(Vec::new()),
             outer_columns: None,
             params: EMPTY_PARAMS.clone(),
-            named_params: EMPTY_NAMED_PARAMS.clone(),
             outer_row: None,
             transaction_id: None,
             expression_aliases: FxHashMap::default(),
@@ -1155,12 +1106,10 @@ impl<'a> CompiledEvaluator<'a> {
 
     /// Set parameters from execution context - fluent API
     ///
-    /// PERF: Both `params` and `named_params` share the Arc - zero cloning.
+    /// PERF: `params` shares the Arc - zero cloning.
     pub fn with_context(mut self, ctx: &ExecutionContext) -> Self {
         // Share params Arc - no cloning needed
         self.params = CompactArc::clone(ctx.params_arc());
-        // Share named_params Arc - no cloning needed
-        self.named_params = Arc::clone(ctx.named_params_arc());
 
         // Set outer row context for correlated subqueries
         if let Some(outer) = ctx.outer_row() {
@@ -1610,11 +1559,6 @@ impl<'a> CompiledEvaluator<'a> {
             ctx = ctx.with_params(&self.params);
         }
 
-        // Add named parameters
-        if !self.named_params.is_empty() {
-            ctx = ctx.with_named_params(&self.named_params);
-        }
-
         // Add outer row
         if let Some(ref outer) = self.outer_row {
             ctx = ctx.with_outer_row(outer);
@@ -1640,9 +1584,6 @@ impl<'a> CompiledEvaluator<'a> {
         let mut ctx = ExecuteContext::new(row);
         if !self.params.is_empty() {
             ctx = ctx.with_params(&self.params);
-        }
-        if !self.named_params.is_empty() {
-            ctx = ctx.with_named_params(&self.named_params);
         }
         if let Some(ref outer) = self.outer_row {
             ctx = ctx.with_outer_row(outer);
@@ -1670,11 +1611,6 @@ impl<'a> CompiledEvaluator<'a> {
         // Add parameters
         if !self.params.is_empty() {
             ctx = ctx.with_params(&self.params);
-        }
-
-        // Add named parameters
-        if !self.named_params.is_empty() {
-            ctx = ctx.with_named_params(&self.named_params);
         }
 
         // Add outer row

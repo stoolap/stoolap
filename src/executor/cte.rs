@@ -905,9 +905,7 @@ impl Executor {
             let mut values: CompactVec<Value> =
                 CompactVec::with_capacity(columns.len().max(row.len()));
             // CRITICAL: Include params from context for parameterized queries
-            let exec_ctx = ExecuteContext::new(row)
-                .with_params(ctx.params())
-                .with_named_params(ctx.named_params());
+            let exec_ctx = ExecuteContext::new(row).with_params(ctx.params());
 
             for compiled in &compiled_columns {
                 match compiled {

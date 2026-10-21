@@ -532,6 +532,8 @@ stoolap_query_named(db, "SELECT name FROM t WHERE id = :id", qp, 1, &rows);
 stoolap_rows_close(rows);
 ```
 
+Each `:name` of the statement is bound to its slot from the array, by name, without building a map: a named call costs what the positional one does. A name the statement reads and the array does not hold makes the call return `STOOLAP_ERROR` ("named parameter :id has no value"). A name given twice reads its last value. A name the statement does not read is ignored and its value is not converted.
+
 Named parameters also work within transactions and with prepared statements:
 
 ```c

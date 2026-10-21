@@ -34,7 +34,7 @@ use crate::core::interval::{self, Interval, IntervalUnit};
 use crate::core::pattern::Pattern;
 use crate::core::predicate::{sql_compare, sql_distinct, sql_eq};
 use crate::core::value::{f64_eq, f64_ge, f64_gt, f64_le, f64_lt, f64_ne};
-use crate::core::{DataType, Result, Row, Value, NULL_VALUE};
+use crate::core::{DataType, Error, Result, Row, Value, NULL_VALUE};
 use crate::functions::scalar::extreme_position;
 use std::cmp::Ordering;
 
@@ -94,11 +94,8 @@ pub struct ExecuteContext<'a> {
     /// Outer row context for correlated subqueries
     pub outer_row: Option<&'a FxHashMap<CompactArc<str>, Value>>,
 
-    /// Positional parameters
+    /// Parameter values, by slot
     pub params: &'a [Value],
-
-    /// Named parameters
-    pub named_params: Option<&'a FxHashMap<String, Value>>,
 
     /// Subquery executor (for scalar subqueries, EXISTS, etc.)
     /// This is a callback that can execute subqueries
@@ -117,7 +114,6 @@ impl<'a> ExecuteContext<'a> {
             row2: None,
             outer_row: None,
             params: &[],
-            named_params: None,
             subquery_executor: None,
             transaction_id: None,
         }
@@ -129,7 +125,6 @@ impl<'a> ExecuteContext<'a> {
     pub fn with_common_params(
         row: &'a Row,
         params: &'a [Value],
-        named_params: Option<&'a FxHashMap<String, Value>>,
         transaction_id: Option<u64>,
     ) -> Self {
         Self {
@@ -137,7 +132,6 @@ impl<'a> ExecuteContext<'a> {
             row2: None,
             outer_row: None,
             params,
-            named_params,
             subquery_executor: None,
             transaction_id,
         }
@@ -150,7 +144,6 @@ impl<'a> ExecuteContext<'a> {
             row2: Some(row2),
             outer_row: None,
             params: &[],
-            named_params: None,
             subquery_executor: None,
             transaction_id: None,
         }
@@ -168,12 +161,6 @@ impl<'a> ExecuteContext<'a> {
         self
     }
 
-    /// Add named parameters
-    pub fn with_named_params(mut self, named_params: &'a FxHashMap<String, Value>) -> Self {
-        self.named_params = Some(named_params);
-        self
-    }
-
     /// Add outer row context
     pub fn with_outer_row(mut self, outer_row: &'a FxHashMap<CompactArc<str>, Value>) -> Self {
         self.outer_row = Some(outer_row);
@@ -186,19 +173,22 @@ impl<'a> ExecuteContext<'a> {
         self
     }
 
-    /// Positional parameter `index`, zero-based; NULL when it was not given
+    /// Parameter slot `index`, zero-based; a slot without a value is an error
     #[inline]
-    pub fn param_ref(&self, index: usize) -> &'a Value {
-        self.params.get(index).unwrap_or(&NULL_VALUE)
+    pub fn param_ref(&self, index: usize) -> Result<&'a Value> {
+        self.params
+            .get(index)
+            .ok_or_else(|| missing_parameter(index, self.params.len()))
     }
+}
 
-    /// Named parameter `name`; NULL when it was not given
-    #[inline]
-    pub fn named_param_ref(&self, name: &str) -> &'a Value {
-        self.named_params
-            .and_then(|params| params.get(name))
-            .unwrap_or(&NULL_VALUE)
-    }
+#[cold]
+fn missing_parameter(index: usize, provided: usize) -> Error {
+    Error::invalid_argument(format!(
+        "Query requires {} parameters but only {} provided",
+        index + 1,
+        provided
+    ))
 }
 
 /// Runs a prepared plan's subquery blocks for the context being evaluated,
@@ -410,12 +400,7 @@ impl ExprVM {
                 }
 
                 Op::LoadParam(idx) => {
-                    self.stack.push(ctx.param_ref(*idx as usize).clone());
-                    pc += 1;
-                }
-
-                Op::LoadNamedParam(name) => {
-                    self.stack.push(ctx.named_param_ref(name).clone());
+                    self.stack.push(ctx.param_ref(*idx as usize)?.clone());
                     pc += 1;
                 }
 
@@ -1983,7 +1968,7 @@ impl ExprVM {
                 }
 
                 Op::LoadParam(idx) => {
-                    stack.push(Cow::Borrowed(ctx.param_ref(*idx as usize)));
+                    stack.push(Cow::Borrowed(ctx.param_ref(*idx as usize)?));
                     pc += 1;
                 }
 
@@ -3701,15 +3686,6 @@ mod tests {
     }
 
     #[test]
-    fn test_context_with_named_params() {
-        let row = Row::from_values(vec![Value::Integer(1)]);
-        let mut named = FxHashMap::default();
-        named.insert("name".to_string(), Value::Text("value".into()));
-        let ctx = ExecuteContext::new(&row).with_named_params(&named);
-        assert!(ctx.named_params.is_some());
-    }
-
-    #[test]
     fn test_context_with_transaction_id() {
         let row = Row::from_values(vec![Value::Integer(1)]);
         let ctx = ExecuteContext::new(&row).with_transaction_id(Some(12345));
@@ -3801,17 +3777,14 @@ mod tests {
     }
 
     #[test]
-    fn test_load_named_param() {
+    fn test_load_param_without_a_value_is_an_error() {
         let mut vm = ExprVM::new();
-        let program = Program::new(vec![
-            Op::LoadNamedParam(CompactArc::from("myvar")),
-            Op::Return,
-        ]);
+        let program = Program::new(vec![Op::LoadParam(1), Op::Return]);
         let row = Row::new();
-        let mut named = FxHashMap::default();
-        named.insert("myvar".to_string(), Value::Integer(999));
-        let ctx = ExecuteContext::new(&row).with_named_params(&named);
-        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(999));
+        let params = [Value::Integer(1)];
+        let ctx = ExecuteContext::new(&row).with_params(&params);
+        assert!(vm.execute(&program, &ctx).is_err(), "execute");
+        assert!(vm.execute_cow(&program, &ctx).is_err(), "execute_cow");
     }
 
     #[test]

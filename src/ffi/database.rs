@@ -18,7 +18,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::panic;
 
-use crate::api::Database;
+use crate::api::{Database, Rows};
 use crate::common::version::VERSION;
 
 use super::error;
@@ -515,12 +515,15 @@ pub unsafe extern "C" fn stoolap_exec_named(
             }
         };
 
-        let named = value::named_params_from_ffi(params, params_len);
-
-        match named.and_then(|named| handle.db.execute_named(sql_str, named)) {
-            Ok(affected) => {
+        let mut value_of = value::ffi_value_of(params, params_len);
+        match handle
+            .db
+            .executor()
+            .execute_named_with(sql_str, &mut value_of)
+        {
+            Ok(result) => {
                 if !rows_affected.is_null() {
-                    *rows_affected = affected;
+                    *rows_affected = result.rows_affected();
                 }
                 STOOLAP_OK
             }
@@ -578,11 +581,14 @@ pub unsafe extern "C" fn stoolap_query_named(
             }
         };
 
-        let named = value::named_params_from_ffi(params, params_len);
-
-        match named.and_then(|named| handle.db.query_named(sql_str, named)) {
-            Ok(rows) => {
-                *out_rows = StoolapRows::boxed(rows, None);
+        let mut value_of = value::ffi_value_of(params, params_len);
+        match handle
+            .db
+            .executor()
+            .execute_named_with(sql_str, &mut value_of)
+        {
+            Ok(result) => {
+                *out_rows = StoolapRows::boxed(Rows::new(result), None);
                 STOOLAP_OK
             }
             Err(e) => {
@@ -643,11 +649,15 @@ pub unsafe extern "C" fn stoolap_query_named_all(
             }
         };
 
-        let rows = value::named_params_from_ffi(params, params_len).and_then(|named| {
-            match super::statement::open_transaction_on(&handle.db, tx)? {
-                None => handle.db.query_named(sql_str, named),
-                Some(inner_tx) => inner_tx.query_named(sql_str, named),
-            }
+        let mut value_of = value::ffi_value_of(params, params_len);
+        let rows = super::statement::open_transaction_on(&handle.db, tx).and_then(|inner_tx| {
+            Ok(Rows::new(match inner_tx {
+                None => handle
+                    .db
+                    .executor()
+                    .execute_named_with(sql_str, &mut value_of)?,
+                Some(inner_tx) => inner_tx.run_named(sql_str, &mut value_of)?,
+            }))
         });
         match rows.and_then(|mut rows| pack_all(&mut rows, &mut handle.packed)) {
             Ok(_) => {
