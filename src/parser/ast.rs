@@ -1634,7 +1634,7 @@ pub struct ParamSlots {
 pub struct Program {
     pub statements: Vec<Statement>,
     /// The parameter slots of each statement, by position
-    pub params: Vec<ParamSlots>,
+    pub params: smallvec::SmallVec<[ParamSlots; 1]>,
 }
 
 impl fmt::Display for Program {
