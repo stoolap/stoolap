@@ -29,7 +29,7 @@ use crate::core::predicate::{kind, sql_eq, KeySide, TextReading};
 use crate::core::value::NULL_VALUE;
 use crate::core::ValueMap;
 use crate::core::{Result, Row, RowVec, Value};
-use crate::executor::expression::JoinFilter;
+use crate::executor::expression::{JoinFilter, SubqueryExecutor};
 use crate::executor::operator::{ColumnInfo, Operator, RowRef};
 use crate::storage::expression::{ConstBoolExpr, Expression};
 use crate::storage::traits::{CappedEqual, Index, ProbeScratch, Table};
@@ -56,11 +56,12 @@ fn pair_matches(
     outer: &Row,
     inner: &Row,
     failed: &mut bool,
+    blocks: Option<&dyn SubqueryExecutor>,
 ) -> bool {
     if outer_on_right {
-        filter.matches(inner, outer, failed)
+        filter.matches_with(inner, outer, failed, blocks)
     } else {
-        filter.matches(outer, inner, failed)
+        filter.matches_with(outer, inner, failed, blocks)
     }
 }
 
@@ -243,7 +244,7 @@ pub struct JoinProjection {
 ///
 /// For each row in the outer input, looks up matching rows in the inner table
 /// using an index. This avoids full table scans of the inner table.
-pub struct IndexNestedLoopJoinOperator {
+pub struct IndexNestedLoopJoinOperator<'a> {
     // Outer input operator
     outer: Box<dyn Operator>,
 
@@ -270,6 +271,8 @@ pub struct IndexNestedLoopJoinOperator {
     // The outer side is the statement's right side: rows and the residual
     // pair read inner first
     outer_on_right: bool,
+    // The statement's subquery blocks, as the residual's site calls them
+    blocks: Option<&'a dyn SubqueryExecutor>,
     // Set when the residual filter read an error as false
     condition_failed: bool,
 
@@ -357,7 +360,7 @@ impl LocalRows {
     }
 }
 
-impl IndexNestedLoopJoinOperator {
+impl<'a> IndexNestedLoopJoinOperator<'a> {
     /// Create a new index nested loop join operator.
     ///
     /// # Arguments
@@ -408,6 +411,7 @@ impl IndexNestedLoopJoinOperator {
             inner_col_count,
             projection: None,
             outer_on_right: false,
+            blocks: None,
             condition_failed: false,
             current_outer_row: None,
             current_inner_rows: RowVec::new(),
@@ -464,6 +468,12 @@ impl IndexNestedLoopJoinOperator {
             self.schema.rotate_left(outer_len);
         }
         self.outer_on_right = true;
+        self
+    }
+
+    /// The statement's subquery blocks the residual calls
+    pub fn with_blocks(mut self, blocks: Option<&'a dyn SubqueryExecutor>) -> Self {
+        self.blocks = blocks;
         self
     }
 
@@ -773,7 +783,7 @@ impl IndexNestedLoopJoinOperator {
     }
 }
 
-impl Operator for IndexNestedLoopJoinOperator {
+impl Operator for IndexNestedLoopJoinOperator<'_> {
     fn open(&mut self) -> Result<()> {
         self.outer.open()?;
         self.local_rows = LocalRows::of(
@@ -831,6 +841,7 @@ impl Operator for IndexNestedLoopJoinOperator {
                             outer_row,
                             &inner_entry.1,
                             &mut self.condition_failed,
+                            self.blocks,
                         )
                     } else {
                         true
@@ -922,7 +933,7 @@ impl Operator for IndexNestedLoopJoinOperator {
 /// this collects all outer rows first, batches all row ID lookups into a single
 /// call, and builds all results at once. This reduces lock overhead from O(N)
 /// to O(1) for the inner table access.
-pub struct BatchIndexNestedLoopJoinOperator {
+pub struct BatchIndexNestedLoopJoinOperator<'a> {
     // Outer input operator
     outer: Box<dyn Operator>,
 
@@ -949,6 +960,8 @@ pub struct BatchIndexNestedLoopJoinOperator {
     // The outer side is the statement's right side: rows and the residual
     // pair read inner first
     outer_on_right: bool,
+    // The statement's subquery blocks, as the residual's site calls them
+    blocks: Option<&'a dyn SubqueryExecutor>,
 
     // Pre-computed results (built in open())
     results: Vec<Row>,
@@ -961,7 +974,7 @@ pub struct BatchIndexNestedLoopJoinOperator {
     opened: bool,
 }
 
-impl BatchIndexNestedLoopJoinOperator {
+impl<'a> BatchIndexNestedLoopJoinOperator<'a> {
     /// Create a new batch index nested loop join operator.
     pub fn new(
         outer: Box<dyn Operator>,
@@ -992,6 +1005,7 @@ impl BatchIndexNestedLoopJoinOperator {
             inner_col_count,
             projection: None,
             outer_on_right: false,
+            blocks: None,
             results: Vec::new(),
             result_idx: 0,
             // Pre-allocate buffer for typical number of matches
@@ -1016,6 +1030,12 @@ impl BatchIndexNestedLoopJoinOperator {
             self.schema.rotate_left(outer_len);
         }
         self.outer_on_right = true;
+        self
+    }
+
+    /// The statement's subquery blocks the residual calls
+    pub fn with_blocks(mut self, blocks: Option<&'a dyn SubqueryExecutor>) -> Self {
+        self.blocks = blocks;
         self
     }
 
@@ -1090,7 +1110,7 @@ impl BatchIndexNestedLoopJoinOperator {
     }
 }
 
-impl Operator for BatchIndexNestedLoopJoinOperator {
+impl Operator for BatchIndexNestedLoopJoinOperator<'_> {
     fn open(&mut self) -> Result<()> {
         use crate::common::I64Set;
 
@@ -1275,6 +1295,7 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
                             outer_row,
                             inner_row,
                             &mut condition_failed,
+                            self.blocks,
                         )
                     } else {
                         true

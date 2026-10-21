@@ -413,7 +413,7 @@ Every subquery of an `UPDATE` or `DELETE`, the ones that read the target table i
 
 An `INSERT ... VALUES` is prepared the same way when a value holds a subquery and every value fits the shape above. Every value is read before the statement writes a row, so a subquery that reads the target table sees it as the statement found it, without the rows the statement inserts. A scalar subquery that answers more than one row fails the statement and writes no row.
 
-A join of two tables, neither a view, a CTE or a derived table and neither read `AS OF`, with no subquery in its `ON`, is prepared the same way when every subquery of its `WHERE` stands where the join asks it of the joined rows: in a condition that reads both tables, or that holds a correlated subquery. The subqueries fit the shape above, their enclosing query is the joined row, and an unqualified name both tables have resolves to the left one. The rules above hold for them, so an uncorrelated subquery runs at most once per execution and only when a joined row needs it: one that no joined row reaches raises no error. The sides and the subqueries read one snapshot of the tables. Any other join with a subquery in its `WHERE`, such as one whose uncorrelated subquery stands in a condition on one table, reads an uncorrelated subquery before the join and runs a correlated one for each joined row.
+A join of two tables, neither a view, a CTE or a derived table and neither read `AS OF`, is prepared the same way when its `ON` or its `WHERE` holds a subquery, every subquery of its `ON` fits the shape above, and every subquery of its `WHERE` stands where the join asks it of the joined rows: in a condition that reads both tables, or that holds a correlated subquery. The subqueries fit the shape above, their enclosing query is the pair of rows the join tests, and an unqualified name both tables have resolves to the left one. The rules above hold for them, so an uncorrelated subquery runs at most once per execution and only when a pair needs it: one that no pair reaches raises no error. A subquery in the `ON` of an outer join decides whether a pair matches, as the rest of the `ON` does. The sides and the subqueries read one snapshot of the tables. Any other join with a subquery in its `WHERE`, such as one whose uncorrelated subquery stands in a condition on one table, reads an uncorrelated subquery before the join and runs a correlated one for each joined row.
 
 ## Examples
 
@@ -597,7 +597,7 @@ A subquery in these positions is refused with an error rather than answered. Sup
 - `HAVING` in a query that also has window functions
 - A grouped `SELECT` list that holds both a correlated and an uncorrelated subquery
 - An uncorrelated subquery in the `WHERE` or `SELECT` list of a query over a view, a derived table or a `VALUES` list
-- A correlated subquery in a `JOIN ... ON` condition
+- A correlated subquery in a `JOIN ... ON` condition, unless the join is [prepared](#prepared-subqueries)
 - The argument of `NTILE`, the offset of `LAG` and `LEAD`, or the position of `NTH_VALUE`, when the subquery reads the current row: the argument is one value per partition
 - `LIMIT` and `OFFSET`
 

@@ -86,9 +86,9 @@ impl ColumnInfo {
 ///
 /// # Thread Safety
 ///
-/// Operators are `Send` to allow execution on different threads,
-/// but individual operators are not `Sync` - they maintain mutable state.
-pub trait Operator: Send {
+/// An operator runs on the thread of the statement it serves: one may
+/// borrow that statement's subquery blocks for as long as it runs.
+pub trait Operator {
     /// Initialize the operator.
     ///
     /// Called once before the first `next()` call.

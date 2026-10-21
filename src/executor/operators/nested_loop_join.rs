@@ -24,7 +24,7 @@
 
 use crate::core::value::NULL_VALUE;
 use crate::core::{Result, Row};
-use crate::executor::expression::JoinFilter;
+use crate::executor::expression::{JoinFilter, SubqueryExecutor};
 use crate::executor::operator::{ColumnInfo, Operator, RowRef};
 use crate::functions::registry::global_registry;
 use crate::parser::ast::Expression;
@@ -35,7 +35,7 @@ use super::hash_join::JoinType;
 ///
 /// For each row in the outer (left) input, scans all rows in the inner (right)
 /// input and emits matches based on the join condition.
-pub struct NestedLoopJoinOperator {
+pub struct NestedLoopJoinOperator<'a> {
     // Input operators
     left: Box<dyn Operator>,
     right: Box<dyn Operator>,
@@ -46,6 +46,8 @@ pub struct NestedLoopJoinOperator {
 
     // Compiled filter (created in open())
     filter: Option<JoinFilter>,
+    // The statement's subquery blocks, as the filter's site calls them
+    blocks: Option<&'a dyn SubqueryExecutor>,
     // Set when the filter read an error as false; JoinFilter::take_error has it
     condition_failed: bool,
 
@@ -78,7 +80,7 @@ pub struct NestedLoopJoinOperator {
     left_exhausted: bool,
 }
 
-impl NestedLoopJoinOperator {
+impl<'a> NestedLoopJoinOperator<'a> {
     /// Create a new nested loop join operator.
     ///
     /// # Arguments
@@ -106,6 +108,7 @@ impl NestedLoopJoinOperator {
             join_type,
             condition,
             filter: None,
+            blocks: None,
             condition_failed: false,
             schema,
             left_col_count,
@@ -127,6 +130,12 @@ impl NestedLoopJoinOperator {
     /// Use a filter compiled for the condition, carrying the query's parameters.
     pub fn with_filter(mut self, filter: JoinFilter) -> Self {
         self.filter = Some(filter);
+        self
+    }
+
+    /// The statement's subquery blocks the filter calls
+    pub fn with_blocks(mut self, blocks: Option<&'a dyn SubqueryExecutor>) -> Self {
+        self.blocks = blocks;
         self
     }
 
@@ -175,7 +184,7 @@ impl NestedLoopJoinOperator {
     }
 }
 
-impl Operator for NestedLoopJoinOperator {
+impl Operator for NestedLoopJoinOperator<'_> {
     fn open(&mut self) -> Result<()> {
         // Open both inputs
         self.left.open()?;
@@ -293,7 +302,12 @@ impl Operator for NestedLoopJoinOperator {
 
                 // Check join condition
                 let matches = if let Some(ref filter) = self.filter {
-                    filter.matches(left_row, right_row, &mut self.condition_failed)
+                    filter.matches_with(
+                        left_row,
+                        right_row,
+                        &mut self.condition_failed,
+                        self.blocks,
+                    )
                 } else {
                     // CROSS JOIN or no condition
                     is_cross || self.condition.is_none()
