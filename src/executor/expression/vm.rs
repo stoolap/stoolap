@@ -201,17 +201,23 @@ impl<'a> ExecuteContext<'a> {
     }
 }
 
-/// Runs a prepared plan's subquery blocks for the row being evaluated; a
-/// `None` answer is UNKNOWN, and an error is the statement's error
+/// Runs a prepared plan's subquery blocks for the context being evaluated,
+/// whose row or pair of rows a correlated block reads; a `None` answer is
+/// UNKNOWN, and an error is the statement's error
 pub trait SubqueryExecutor {
     /// The scalar block's value
-    fn execute_scalar(&self, subquery_index: u16, row: &Row) -> Result<Value>;
+    fn execute_scalar(&self, subquery_index: u16, ctx: &ExecuteContext) -> Result<Value>;
 
     /// Whether a row passes the block's WHERE
-    fn execute_exists(&self, subquery_index: u16, row: &Row) -> Result<bool>;
+    fn execute_exists(&self, subquery_index: u16, ctx: &ExecuteContext) -> Result<bool>;
 
     /// `value IN (block)`
-    fn execute_in(&self, subquery_index: u16, value: &Value, row: &Row) -> Result<Option<bool>>;
+    fn execute_in(
+        &self,
+        subquery_index: u16,
+        value: &Value,
+        ctx: &ExecuteContext,
+    ) -> Result<Option<bool>>;
 
     /// `value op ALL (block)` when `all`, else `value op ANY (block)`
     fn execute_quantified(
@@ -220,7 +226,7 @@ pub trait SubqueryExecutor {
         value: &Value,
         op: CompareOp,
         all: bool,
-        row: &Row,
+        ctx: &ExecuteContext,
     ) -> Result<Option<bool>>;
 }
 
@@ -1781,13 +1787,13 @@ impl ExprVM {
                 // =============================================================
                 Op::ExecScalarSubquery(idx) => {
                     let executor = ctx.subquery_executor.ok_or_else(no_subquery_executor)?;
-                    self.stack.push(executor.execute_scalar(*idx, ctx.row)?);
+                    self.stack.push(executor.execute_scalar(*idx, ctx)?);
                     pc += 1;
                 }
 
                 Op::ExecExists(idx) => {
                     let executor = ctx.subquery_executor.ok_or_else(no_subquery_executor)?;
-                    let exists = executor.execute_exists(*idx, ctx.row)?;
+                    let exists = executor.execute_exists(*idx, ctx)?;
                     self.stack.push(Value::Boolean(exists));
                     pc += 1;
                 }
@@ -1796,8 +1802,7 @@ impl ExprVM {
                 Op::ExecInSubquery(idx) => {
                     let executor = ctx.subquery_executor.ok_or_else(no_subquery_executor)?;
                     let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    self.stack
-                        .push(truth(executor.execute_in(*idx, &v, ctx.row)?));
+                    self.stack.push(truth(executor.execute_in(*idx, &v, ctx)?));
                     pc += 1;
                 }
 
@@ -1810,7 +1815,7 @@ impl ExprVM {
                         &v,
                         *compare_op,
                         *all,
-                        ctx.row,
+                        ctx,
                     )?));
                     pc += 1;
                 }
@@ -5263,11 +5268,11 @@ mod tests {
     }
 
     impl SubqueryExecutor for Blocks {
-        fn execute_scalar(&self, _subquery_index: u16, _row: &Row) -> Result<Value> {
+        fn execute_scalar(&self, _subquery_index: u16, _ctx: &ExecuteContext) -> Result<Value> {
             self.result(Value::Integer(7))
         }
 
-        fn execute_exists(&self, _subquery_index: u16, _row: &Row) -> Result<bool> {
+        fn execute_exists(&self, _subquery_index: u16, _ctx: &ExecuteContext) -> Result<bool> {
             self.result(self.answer.unwrap_or(false))
         }
 
@@ -5275,7 +5280,7 @@ mod tests {
             &self,
             subquery_index: u16,
             value: &Value,
-            _row: &Row,
+            _ctx: &ExecuteContext,
         ) -> Result<Option<bool>> {
             self.asked
                 .borrow_mut()
@@ -5289,7 +5294,7 @@ mod tests {
             value: &Value,
             op: CompareOp,
             all: bool,
-            _row: &Row,
+            _ctx: &ExecuteContext,
         ) -> Result<Option<bool>> {
             self.asked
                 .borrow_mut()
@@ -5301,6 +5306,59 @@ mod tests {
     fn run_with(program: &Program, row: &Row, blocks: &Blocks) -> Result<Value> {
         let ctx = ExecuteContext::new(row).with_subquery_executor(blocks);
         ExprVM::new().execute(program, &ctx)
+    }
+
+    /// A block whose value is the first column of the caller's second row
+    struct SecondRow;
+
+    impl SubqueryExecutor for SecondRow {
+        fn execute_scalar(&self, _subquery_index: u16, ctx: &ExecuteContext) -> Result<Value> {
+            Ok(ctx
+                .row2
+                .and_then(|row| row.get(0).cloned())
+                .unwrap_or_else(Value::null_unknown))
+        }
+
+        fn execute_exists(&self, _subquery_index: u16, ctx: &ExecuteContext) -> Result<bool> {
+            Ok(ctx.row2.is_some())
+        }
+
+        fn execute_in(
+            &self,
+            _subquery_index: u16,
+            _value: &Value,
+            _ctx: &ExecuteContext,
+        ) -> Result<Option<bool>> {
+            Ok(None)
+        }
+
+        fn execute_quantified(
+            &self,
+            _subquery_index: u16,
+            _value: &Value,
+            _op: CompareOp,
+            _all: bool,
+            _ctx: &ExecuteContext,
+        ) -> Result<Option<bool>> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn test_a_block_called_over_a_pair_reads_both_rows() {
+        let left = Row::from_values(vec![Value::Integer(1)]);
+        let right = Row::from_values(vec![Value::Integer(2)]);
+        let ctx = ExecuteContext::for_join(&left, &right).with_subquery_executor(&SecondRow);
+        let scalar = Program::new(vec![Op::ExecScalarSubquery(0), Op::Return]);
+        assert_eq!(
+            ExprVM::new().execute(&scalar, &ctx).unwrap(),
+            Value::Integer(2)
+        );
+        let exists = Program::new(vec![Op::ExecExists(0), Op::Return]);
+        assert_eq!(
+            ExprVM::new().execute(&exists, &ctx).unwrap(),
+            Value::Boolean(true)
+        );
     }
 
     #[test]

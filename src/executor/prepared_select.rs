@@ -1107,6 +1107,7 @@ pub struct PreparedSelect {
     /// The statement table's columns at preparation
     columns: CompactArc<Vec<String>>,
     blocks: PreparedBlocks,
+    holes: HoleSet,
     where_: PreparedWhere,
     projection: PreparedProjection,
     output_columns: CompactArc<Vec<String>>,
@@ -1145,8 +1146,9 @@ struct PreparedSubquery {
     grouping: Option<Box<Grouping>>,
     /// The subquery whose row this one runs for; None for the statement's row
     parent: Option<u16>,
-    /// What fills each slot from that row, including values a deeper
-    /// subquery reads from it
+    /// What fills each slot from the parent's row, including values a
+    /// deeper subquery reads from it; empty for the statement's own blocks,
+    /// whose holes its `HoleSet` keeps
     holes: Vec<(usize, Hole)>,
     /// Reads no enclosing scope: its value is computed once per run
     uncorrelated: bool,
@@ -1197,6 +1199,13 @@ impl Hole {
             Hole::Program(program) => vm.execute(program, ctx),
         }
     }
+}
+
+/// What fills the slots of the statement's own blocks from the row its
+/// programs run over, by block id; a nested block's holes are its own
+#[derive(Debug, Default)]
+struct HoleSet {
+    holes: Vec<Vec<(usize, Hole)>>,
 }
 
 /// What a subquery block answers
@@ -1574,12 +1583,13 @@ struct Rewritten {
 
 impl Builder<'_> {
     /// The blocks prepared for a statement taking `param_count` positional
-    /// parameters, with its run slots compiled
+    /// parameters, with its run slots compiled, and the holes of its own
+    /// blocks over the statement's row
     fn finish(
         self,
         param_count: usize,
         run_slots: Vec<(usize, SharedProgram)>,
-    ) -> Result<PreparedBlocks> {
+    ) -> Result<(PreparedBlocks, HoleSet)> {
         // Slots are numbered after the values given, so a value not given would read one
         if self.max_param > param_count {
             return Err(Error::internal(format!(
@@ -1605,13 +1615,23 @@ impl Builder<'_> {
                 ancestor = subqueries[at as usize].parent;
             }
         }
-        Ok(PreparedBlocks {
+        let holes = HoleSet {
+            holes: subqueries
+                .iter_mut()
+                .map(|sq| match sq.parent {
+                    None => std::mem::take(&mut sq.holes),
+                    Some(_) => Vec::new(),
+                })
+                .collect(),
+        };
+        let blocks = PreparedBlocks {
             param_count,
             slot_count: self.next_slot,
             named: self.named,
             run_slots,
             subqueries,
-        })
+        };
+        Ok((blocks, holes))
     }
 
     fn slot(&mut self) -> usize {
@@ -2617,7 +2637,7 @@ impl PreparedSelect {
         {
             builder.note_names(unaliased(column));
         }
-        let blocks = builder.finish(param_count, run_slots)?;
+        let (blocks, holes) = builder.finish(param_count, run_slots)?;
         // Over one table `t.*` is `*`, the projection's expansion; the
         // names' prefix rule for a joined `t.*` would drop columns
         let select: std::borrow::Cow<[Expression]> = if stmt
@@ -2652,6 +2672,7 @@ impl PreparedSelect {
             cached_epoch: epoch,
             columns: scope.columns.clone(),
             blocks,
+            holes,
             where_,
             projection,
             output_columns: CompactArc::new(output_columns),
@@ -2669,6 +2690,7 @@ pub struct PreparedDml {
     /// The target's columns at preparation
     columns: CompactArc<Vec<String>>,
     blocks: PreparedBlocks,
+    holes: HoleSet,
     where_: Option<PreparedWhere>,
     /// Each SET value with the column it writes
     sets: Vec<(usize, SharedProgram)>,
@@ -2738,7 +2760,7 @@ impl PreparedDml {
             .iter()
             .map(|(slot, value)| compile_with(&own, value).map(|p| (*slot, p)))
             .collect::<Result<Vec<_>>>()?;
-        let blocks = builder.finish(param_count, run_slots)?;
+        let (blocks, holes) = builder.finish(param_count, run_slots)?;
         let where_ = where_parts
             .zip(where_program)
             .map(|(parts, program)| parts.prepare(program, &blocks));
@@ -2746,6 +2768,7 @@ impl PreparedDml {
             cached_epoch: epoch,
             columns: scope.columns.clone(),
             blocks,
+            holes,
             where_,
             sets,
         })
@@ -2788,6 +2811,7 @@ impl<'a> DmlRunner<'a> {
         let mut runner = PreparedRunner::new(
             executor,
             &prepared.blocks,
+            &prepared.holes,
             ctx,
             tables.inner_ctx,
             tables.tables,
@@ -3261,6 +3285,7 @@ impl Executor {
         let mut runner = PreparedRunner::new(
             self,
             &prepared.blocks,
+            &prepared.holes,
             ctx,
             inner_ctx,
             tables,
@@ -3327,6 +3352,8 @@ impl Executor {
 pub(crate) struct PreparedRunner<'a> {
     executor: &'a Executor,
     prepared: &'a PreparedBlocks,
+    /// The holes of the statement's own blocks
+    holes: &'a HoleSet,
     /// The statement's own context, whose view and parameters a kept answer is of
     statement: &'a ExecutionContext,
     /// The statement table's rows, by its hint
@@ -3387,9 +3414,11 @@ impl<'a> PreparedRunner<'a> {
         Ok(Some(tables))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new(
         executor: &'a Executor,
         prepared: &'a PreparedBlocks,
+        holes: &'a HoleSet,
         ctx: &'a ExecutionContext,
         inner_ctx: ExecutionContext,
         tables: Vec<Box<dyn Table>>,
@@ -3402,6 +3431,7 @@ impl<'a> PreparedRunner<'a> {
         Self {
             executor,
             prepared,
+            holes,
             statement: ctx,
             statement_rows,
             statement_limit,
@@ -3654,7 +3684,7 @@ impl<'a> PreparedRunner<'a> {
                 Some(self.named),
                 self.transaction_id,
             );
-            for (slot, hole) in &sq.holes {
+            for (slot, hole) in self.holes_of(index) {
                 if !plan.keys.iter().any(|(_, key, _)| key == slot) {
                     match hole.value(&mut vm, &empty, &exec) {
                         Ok(value) => params[*slot] = value,
@@ -3686,9 +3716,19 @@ impl<'a> PreparedRunner<'a> {
         Ok(rows.map(|rows| (rows, passed)))
     }
 
-    /// The subquery's parameter buffer for a call for `row`: its parent's
-    /// values, then its own holes
-    fn fill(&self, index: usize, vm: &mut ExprVM, row: &Row) -> Result<()> {
+    /// What fills the block's slots: the statement's holes for its own
+    /// blocks, the block's for a nested one
+    fn holes_of(&self, index: usize) -> &[(usize, Hole)] {
+        let sq = &self.prepared.subqueries[index];
+        match sq.parent {
+            None => self.holes.holes.get(index).map_or(&[], Vec::as_slice),
+            Some(_) => &sq.holes,
+        }
+    }
+
+    /// The subquery's parameter buffer for a call from `caller`: its
+    /// parent's values, then its own holes over the caller's row or pair
+    fn fill(&self, index: usize, vm: &mut ExprVM, caller: &ExecuteContext) -> Result<()> {
         let sq = &self.prepared.subqueries[index];
         let mut params = self.blocks[index].buffer.borrow_mut();
         let mut failed = self.blocks[index].failed.borrow_mut();
@@ -3697,14 +3737,15 @@ impl<'a> PreparedRunner<'a> {
             params.clone_from(&self.blocks[parent as usize].buffer.borrow());
             failed.extend(self.blocks[parent as usize].failed.borrow().iter().cloned());
         }
-        let hole_ctx = ExecuteContext::with_common_params(
-            row,
+        let mut hole_ctx = ExecuteContext::with_common_params(
+            caller.row,
             &self.base,
             Some(self.named),
             self.transaction_id,
         );
-        for (slot, hole) in &sq.holes {
-            match hole.value(vm, row, &hole_ctx) {
+        hole_ctx.row2 = caller.row2;
+        for (slot, hole) in self.holes_of(index) {
+            match hole.value(vm, caller.row, &hole_ctx) {
                 Ok(value) => params[*slot] = value,
                 Err(e) => {
                     params[*slot] = Value::null_unknown();
@@ -4036,7 +4077,7 @@ impl<'a> PreparedRunner<'a> {
 }
 
 impl SubqueryExecutor for PreparedRunner<'_> {
-    fn execute_scalar(&self, subquery_index: u16, row: &Row) -> Result<Value> {
+    fn execute_scalar(&self, subquery_index: u16, caller: &ExecuteContext) -> Result<Value> {
         let index = subquery_index as usize;
         let sq = self
             .prepared
@@ -4055,10 +4096,10 @@ impl SubqueryExecutor for PreparedRunner<'_> {
             return Err(Error::internal("an EXISTS block run for a value"));
         };
         if !sq.uncorrelated {
-            return self.scalar_value(index, sq, projection, row);
+            return self.scalar_value(index, sq, projection, caller);
         }
         let answer = self.kept(kept, || {
-            self.scalar_value(index, sq, projection, row)
+            self.scalar_value(index, sq, projection, caller)
                 .map(BlockAnswer::Value)
         })?;
         let BlockAnswer::Value(value) = answer else {
@@ -4068,12 +4109,17 @@ impl SubqueryExecutor for PreparedRunner<'_> {
         Ok(value)
     }
 
-    fn execute_exists(&self, subquery_index: u16, row: &Row) -> Result<bool> {
-        self.exists_answer(subquery_index as usize, row)
+    fn execute_exists(&self, subquery_index: u16, caller: &ExecuteContext) -> Result<bool> {
+        self.exists_answer(subquery_index as usize, caller)
     }
 
-    fn execute_in(&self, subquery_index: u16, value: &Value, row: &Row) -> Result<Option<bool>> {
-        self.members_answer(subquery_index as usize, value, row)
+    fn execute_in(
+        &self,
+        subquery_index: u16,
+        value: &Value,
+        caller: &ExecuteContext,
+    ) -> Result<Option<bool>> {
+        self.members_answer(subquery_index as usize, value, caller)
     }
 
     fn execute_quantified(
@@ -4082,25 +4128,25 @@ impl SubqueryExecutor for PreparedRunner<'_> {
         value: &Value,
         _op: CompareOp,
         _all: bool,
-        row: &Row,
+        caller: &ExecuteContext,
     ) -> Result<Option<bool>> {
-        self.members_answer(subquery_index as usize, value, row)
+        self.members_answer(subquery_index as usize, value, caller)
     }
 }
 
 impl PreparedRunner<'_> {
-    /// A scalar block's value for `row`: its one row's SELECT expression,
-    /// NULL for no row
+    /// A scalar block's value for the row of `caller`: its one row's
+    /// SELECT expression, NULL for no row
     fn scalar_value(
         &self,
         index: usize,
         sq: &PreparedSubquery,
         projection: &SharedProgram,
-        row: &Row,
+        caller: &ExecuteContext,
     ) -> Result<Value> {
         if let Some(grouping) = &sq.grouping {
             let Some(statement) = &grouping.statement else {
-                return self.grouped_value(index, grouping, projection, row);
+                return self.grouped_value(index, grouping, projection, caller);
             };
             let mut values = self.statement_values(statement)?;
             if values.len() > 1 {
@@ -4109,7 +4155,7 @@ impl PreparedRunner<'_> {
             return Ok(values.pop().unwrap_or_else(Value::null_unknown));
         }
         let mut vm = self.blocks[index].vm.borrow_mut();
-        self.fill(index, &mut vm, row)?;
+        self.fill(index, &mut vm, caller)?;
         // Read-only from here on: a nested subquery copies these values
         let params = self.blocks[index].buffer.borrow();
         let table = &*self.tables[index];
@@ -4153,7 +4199,7 @@ impl PreparedRunner<'_> {
         Ok(value.unwrap_or_else(Value::null_unknown))
     }
 
-    fn exists_answer(&self, index: usize, row: &Row) -> Result<bool> {
+    fn exists_answer(&self, index: usize, caller: &ExecuteContext) -> Result<bool> {
         let sq = self
             .prepared
             .subqueries
@@ -4169,7 +4215,7 @@ impl PreparedRunner<'_> {
         }
         let exists = match (&sq.grouping, sq.uncorrelated) {
             (Some(grouping), false) => {
-                self.with_groups(index, grouping, row, |rows, params, vm| {
+                self.with_groups(index, grouping, caller, |rows, params, vm| {
                     self.any_group_passes(grouping, rows, params, vm)
                 })?
             }
@@ -4185,11 +4231,13 @@ impl PreparedRunner<'_> {
                     }) => self
                         .statement_values(statement)
                         .map(|rows| !rows.is_empty()),
-                    Some(grouping) => self.with_groups(index, grouping, row, |rows, params, vm| {
-                        self.any_group_passes(grouping, rows, params, vm)
-                    }),
+                    Some(grouping) => {
+                        self.with_groups(index, grouping, caller, |rows, params, vm| {
+                            self.any_group_passes(grouping, rows, params, vm)
+                        })
+                    }
                     None => {
-                        self.fill(index, &mut self.blocks[index].vm.borrow_mut(), row)?;
+                        self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller)?;
                         self.probe(index)
                     }
                 };
@@ -4199,7 +4247,7 @@ impl PreparedRunner<'_> {
                 }
             }
             (None, false) => {
-                self.fill(index, &mut self.blocks[index].vm.borrow_mut(), row)?;
+                self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller)?;
                 match &existence.keyed {
                     Some(plan) if self.takes_keyed_set(index, plan) => {
                         self.keyed_lookup(index, existence, plan)?
@@ -4256,7 +4304,12 @@ fn member_set(test: MemberTest, values: Vec<Value>) -> MemberSet {
 
 impl PreparedRunner<'_> {
     /// A value block's answer to `value` for the row it runs for
-    fn members_answer(&self, index: usize, value: &Value, row: &Row) -> Result<Option<bool>> {
+    fn members_answer(
+        &self,
+        index: usize,
+        value: &Value,
+        caller: &ExecuteContext,
+    ) -> Result<Option<bool>> {
         let sq = self
             .prepared
             .subqueries
@@ -4267,7 +4320,7 @@ impl PreparedRunner<'_> {
         };
         let decides = members.test.decides();
         if sq.uncorrelated {
-            self.read_members(index, kept, members, row)?;
+            self.read_members(index, kept, members, caller)?;
             let sets = self.blocks[index].members.borrow();
             let Some(BlockAnswer::Members(set)) = sets.as_ref() else {
                 return Err(Error::internal("a value block's members not kept"));
@@ -4275,7 +4328,7 @@ impl PreparedRunner<'_> {
             return members_answer_of(set, value, decides);
         }
         if let Some(grouping) = &sq.grouping {
-            return self.with_groups(index, grouping, row, |rows, params, vm| {
+            return self.with_groups(index, grouping, caller, |rows, params, vm| {
                 let mut fold = MemberFold::new(members.test);
                 for slot_row in rows {
                     let exec = self.slot_context(slot_row, params);
@@ -4294,7 +4347,7 @@ impl PreparedRunner<'_> {
                 fold.finish()
             });
         }
-        self.fill(index, &mut self.blocks[index].vm.borrow_mut(), row)?;
+        self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller)?;
         match &kept.keyed {
             Some(plan) if self.takes_keyed_set(index, plan) => {
                 self.keyed_members_answer(index, kept, members, plan, value)
@@ -4305,7 +4358,13 @@ impl PreparedRunner<'_> {
 
     /// An uncorrelated value block's members, read once per run on first
     /// need, or taken from a run before whose stamp still holds
-    fn read_members(&self, index: usize, kept: &Kept, members: &Members, row: &Row) -> Result<()> {
+    fn read_members(
+        &self,
+        index: usize,
+        kept: &Kept,
+        members: &Members,
+        caller: &ExecuteContext,
+    ) -> Result<()> {
         if self.blocks[index].members.borrow().is_some() {
             return Ok(());
         }
@@ -4313,7 +4372,7 @@ impl PreparedRunner<'_> {
         crate::test_failpoints::prepared_strategy_ran(
             crate::test_failpoints::PreparedStrategy::MemberSet,
         );
-        self.fill(index, &mut self.blocks[index].vm.borrow_mut(), row)?;
+        self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller)?;
         let answer = self.kept(kept, || {
             self.collect_members(index, members, None)
                 .map(|set| BlockAnswer::Members(CompactArc::new(set)))
@@ -4562,7 +4621,8 @@ impl PreparedRunner<'_> {
         let Answer::Members(kept, members) = &sq.answer else {
             return Ok(None);
         };
-        self.read_members(index, kept, members, &Row::new())?;
+        let empty = Row::new();
+        self.read_members(index, kept, members, &ExecuteContext::new(&empty))?;
         let sets = self.blocks[index].members.borrow();
         let Some(BlockAnswer::Members(set)) = sets.as_ref() else {
             return Ok(None);
@@ -4757,9 +4817,9 @@ impl PreparedRunner<'_> {
         index: usize,
         grouping: &Grouping,
         projection: &SharedProgram,
-        row: &Row,
+        caller: &ExecuteContext,
     ) -> Result<Value> {
-        self.with_groups(index, grouping, row, |rows, params, vm| {
+        self.with_groups(index, grouping, caller, |rows, params, vm| {
             let mut value = None;
             for slot_row in rows {
                 let exec = self.slot_context(slot_row, params);
@@ -4804,10 +4864,10 @@ impl PreparedRunner<'_> {
         &self,
         index: usize,
         grouping: &Grouping,
-        row: &Row,
+        caller: &ExecuteContext,
         answer: impl FnOnce(&[Row], &[Value], &mut ExprVM) -> Result<T>,
     ) -> Result<T> {
-        self.fill(index, &mut self.blocks[index].vm.borrow_mut(), row)?;
+        self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller)?;
         if let Some(plan) = grouping.keyed.as_ref() {
             if self.takes_keyed_set(index, plan) {
                 if self.blocks[index].grouped.borrow().is_none() {
