@@ -24,7 +24,8 @@ use stoolap::test_failpoints::{
 };
 use stoolap::Database;
 
-/// The forced strategy is process-wide: tests that force one take turns
+/// The forced strategy and the preparation counts are process-wide: tests
+/// that force one or prepare a statement take turns
 static FORCED: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn setup(name: &str) -> Database {
@@ -195,6 +196,7 @@ fn test_a_prepared_dml_statement_is_kept_until_the_schema_changes() {
 
 #[test]
 fn a_keyed_update_after_a_write_of_its_transaction_reads_no_whole_table() {
+    let _turn = FORCED.lock().unwrap_or_else(|e| e.into_inner());
     let db = setup("prepared_dml_keyed_after_write");
     let mut tx = db.begin().unwrap();
     tx.execute("UPDATE t SET x = 9 WHERE id = 5", ()).unwrap();
