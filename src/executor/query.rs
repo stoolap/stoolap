@@ -4648,10 +4648,22 @@ impl Executor {
         };
         let (left, right, cross) =
             split_join_where(where_clause, left_alias, right_alias, schemas, join_type);
-        let in_side = |side: &Option<Expression>| side.as_ref().is_some_and(Self::has_subqueries);
-        !in_side(&left)
-            && !in_side(&right)
-            && cross.is_some_and(|cross| self.join_where_family(&cross, ctx).is_ok())
+        // Each part as its site reads it, the SELECT aliases it names opened
+        // over the joined columns the sides lay out
+        let mut columns = Vec::new();
+        for (alias, schema) in [(left_alias, schemas.0), (right_alias, schemas.1)] {
+            if let (Some(alias), Some(schema)) = (alias, schema) {
+                columns.extend(schema.columns.iter().map(|c| format!("{alias}.{}", c.name)));
+            }
+        }
+        let opened = |part: Option<Expression>| {
+            part.map(|part| Self::with_select_aliases(stmt, &part, &columns).unwrap_or(part))
+        };
+        let in_side =
+            |side: Option<Expression>| opened(side).is_some_and(|side| Self::has_subqueries(&side));
+        !in_side(left)
+            && !in_side(right)
+            && opened(cross).is_some_and(|cross| self.join_where_family(&cross, ctx).is_ok())
     }
 
     /// The WHERE `cross` a join asks at `site` of its joined rows named

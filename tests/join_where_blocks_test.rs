@@ -179,3 +179,66 @@ fn an_uncorrelated_block_no_joined_row_reaches_is_not_read() {
         "the general path folds the subquery before any row: {folded:?}"
     );
 }
+
+#[test]
+fn a_select_alias_the_where_names_is_checked_as_its_site_reads_it() {
+    let db = Database::open("memory://join_where_blocks_alias").unwrap();
+    for sql in [
+        "CREATE TABLE l (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE r (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, b INTEGER)",
+        "INSERT INTO l VALUES (1)",
+        "INSERT INTO r VALUES (1)",
+        "INSERT INTO s VALUES (1, 10), (2, 20)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let sql = "SELECT (SELECT b FROM s ORDER BY b LIMIT 1) AS x FROM l JOIN r ON l.id = r.id \
+               WHERE x > 0 AND EXISTS (SELECT 1 FROM s WHERE s.id = l.id AND s.id = r.id)";
+    for _ in 0..2 {
+        let got: Result<Vec<i64>, String> =
+            db.query(sql, ())
+                .map_err(|e| e.to_string())
+                .and_then(|rows| {
+                    rows.map(|row| {
+                        row.map_err(|e| e.to_string())?
+                            .get::<i64>(0)
+                            .map_err(|e| e.to_string())
+                    })
+                    .collect()
+                });
+        assert_eq!(
+            got,
+            Ok(vec![10]),
+            "the alias's ORDER BY and LIMIT keep one row"
+        );
+    }
+}
+
+#[test]
+fn a_column_named_with_a_dot_binds_by_position_inside_a_block() {
+    let db = Database::open("memory://join_where_blocks_dotted").unwrap();
+    for sql in [
+        "CREATE TABLE l (id INTEGER PRIMARY KEY, \"x.y\" INTEGER)",
+        "CREATE TABLE r (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE s (v INTEGER PRIMARY KEY)",
+        "INSERT INTO l VALUES (1, 10)",
+        "INSERT INTO r VALUES (1)",
+        "INSERT INTO s VALUES (11)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let shape = "SELECT l.id, r.id FROM {l} JOIN {r} ON l.id = r.id \
+                 WHERE EXISTS (SELECT 1 FROM s WHERE s.v = l.\"x.y\" + r.id)";
+    let want = rows(
+        &db,
+        &shape
+            .replace("{l}", "(SELECT * FROM l) l")
+            .replace("{r}", "(SELECT * FROM r) r"),
+    );
+    assert_eq!(want, Ok(vec!["Integer(1)|Integer(1)".to_string()]));
+    let sql = shape.replace("{l}", "l").replace("{r}", "r");
+    for _ in 0..2 {
+        assert_eq!(rows(&db, &sql), want, "{sql}");
+    }
+}

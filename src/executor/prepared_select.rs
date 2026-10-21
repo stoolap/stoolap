@@ -496,11 +496,17 @@ impl ScopeTable {
         }
     }
 
-    /// The joined row of `sides`, each a name and its table's schema, whose
-    /// columns the join names `columns`; None when they do not line up
-    fn joined(sides: [(SmartString, &Schema); 2], columns: &[String]) -> Option<Self> {
-        let width: usize = sides.iter().map(|(_, schema)| schema.columns.len()).sum();
-        if columns.len() != width {
+    /// The joined row of `sides`, each a name and its table's schema, as a
+    /// join of `width` columns lays it out; None when they do not line up.
+    /// Its programs read each column by position, under a name no column
+    /// can have, so no name a table chose can bind it elsewhere
+    fn joined(sides: [(SmartString, &Schema); 2], width: usize) -> Option<Self> {
+        if sides
+            .iter()
+            .map(|(_, schema)| schema.columns.len())
+            .sum::<usize>()
+            != width
+        {
             return None;
         }
         let mut tables = SmallVec::new();
@@ -513,7 +519,7 @@ impl ScopeTable {
         }
         Some(Self {
             tables,
-            columns: CompactArc::new(columns.to_vec()),
+            columns: CompactArc::new((0..width).map(|i| format!("{RESOLVED}#{i}")).collect()),
             lower: CompactArc::new(lower),
             types,
         })
@@ -536,18 +542,15 @@ impl ScopeTable {
 
     /// The column `expr` names as this scope spells its own columns
     fn position(&self, expr: &Expression) -> Option<usize> {
-        let Expression::QualifiedIdentifier(q) = expr else {
-            return None;
-        };
-        if q.qualifier.value_lower == RESOLVED {
-            return self.lower.iter().position(|c| *c == q.name.value_lower);
+        match expr {
+            Expression::Identifier(id) if self.tables.len() > 1 => {
+                self.columns.iter().position(|c| *c == id.value_lower)
+            }
+            Expression::QualifiedIdentifier(q) if q.qualifier.value_lower == RESOLVED => {
+                self.lower.iter().position(|c| *c == q.name.value_lower)
+            }
+            _ => None,
         }
-        let (_, start) = self
-            .tables
-            .iter()
-            .find(|(name, _)| *name == q.qualifier.value_lower)?;
-        let (_, mut range) = self.table(*start);
-        range.find(|i| self.lower[*i] == q.name.value_lower)
     }
 }
 
@@ -634,7 +637,7 @@ impl Chain<'_> {
     /// The column `index` of the scope at `depth`, as a name its own
     /// programs compile against. Over one table, qualified by a name no
     /// table can have, so the compiler reads it as a column wherever it
-    /// stands, never a literal; over a join, by its side's name
+    /// stands, never a literal; over a join, the scope's name for its position
     fn column(&self, depth: usize, index: usize) -> Expression {
         let ident = |value: &str, lower: &str| {
             let mut id = Identifier::new(
@@ -645,17 +648,13 @@ impl Chain<'_> {
             id
         };
         let scope = self.scopes[depth];
-        let spelled = &scope.columns[index];
-        let (qualifier, name) = match scope.tables.len() {
-            1 => (RESOLVED, spelled.as_str()),
-            _ => (
-                scope.table(index).0.as_str(),
-                spelled.rsplit('.').next().unwrap_or(spelled),
-            ),
-        };
+        let spelled = scope.columns[index].as_str();
+        if scope.tables.len() > 1 {
+            return Expression::Identifier(ident(spelled, spelled));
+        }
         Expression::QualifiedIdentifier(QualifiedIdentifier {
-            qualifier: ident(qualifier, qualifier),
-            name: ident(name, &scope.lower[index]),
+            qualifier: ident(RESOLVED, RESOLVED),
+            name: ident(spelled, &scope.lower[index]),
         })
     }
 
@@ -2924,7 +2923,7 @@ impl JoinWhere {
         columns: &[String],
         param_count: usize,
     ) -> Result<Option<Self>> {
-        let Some(scope) = ScopeTable::joined(sides, columns) else {
+        let Some(scope) = ScopeTable::joined(sides, columns.len()) else {
             return Ok(None);
         };
         let scopes = [&scope];
