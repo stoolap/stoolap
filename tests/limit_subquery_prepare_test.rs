@@ -17,11 +17,21 @@
 
 #![cfg(feature = "test-failpoints")]
 
+use std::sync::{Mutex, MutexGuard};
+
 use stoolap::test_failpoints::prepared_dml_built;
 use stoolap::Database;
 
+/// The preparation counter is process-wide: every test here takes a turn
+static TURNS: Mutex<()> = Mutex::new(());
+
+fn turn() -> MutexGuard<'static, ()> {
+    TURNS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[test]
 fn a_prepared_limit_subquery_is_prepared_once() {
+    let _turn = turn();
     let db = Database::open("memory://limit_subquery_prepare").unwrap();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
         .unwrap();
@@ -45,6 +55,7 @@ fn a_prepared_limit_subquery_is_prepared_once() {
 
 #[test]
 fn a_limit_subquery_reads_the_snapshot_its_ctes_read() {
+    let _turn = turn();
     let db = Database::open("memory://limit_subquery_snapshot").unwrap();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
         .unwrap();
