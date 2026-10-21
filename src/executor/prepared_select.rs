@@ -961,7 +961,7 @@ fn conjunction(parts: Vec<Expression>) -> Option<Expression> {
     })
 }
 
-pub(crate) fn slot_parameter(slot: usize) -> Expression {
+fn slot_parameter(slot: usize) -> Expression {
     let name = format!("${}", slot + 1);
     Expression::Parameter(Parameter {
         token: Token::new(TokenType::Parameter, &name, Position::default()),
@@ -2725,9 +2725,6 @@ impl PreparedDml {
             rewritten.push((*column, value));
         }
         let sets = rewritten;
-        // A VALUES row has no target row to read
-        let no_scopes: [&ScopeTable; 0] = [];
-        let no_row = Chain { scopes: &no_scopes };
         let mut rewritten_values = Vec::with_capacity(values.len());
         for row in values {
             let mut programs = Vec::with_capacity(row.len());
@@ -2738,7 +2735,7 @@ impl PreparedDml {
                 }
                 let mut value_work = Rewritten::default();
                 // Rewritten for its parameters too, so a slot never takes one not given
-                let rewritten_value = builder.rewrite(&no_row, None, value, &mut value_work)?;
+                let rewritten_value = builder.rewrite(&chain, None, value, &mut value_work)?;
                 if !mentions_subquery(value) {
                     programs.push(None);
                     continue;
@@ -2773,16 +2770,11 @@ impl PreparedDml {
             .iter()
             .map(|(column, value)| compile_with(&own, value).map(|p| (*column, p)))
             .collect::<Result<Vec<_>>>()?;
-        // A VALUES row reads no row, so a column it names fails as it does
-        // outside a prepared plan
-        let no_columns: [String; 0] = [];
-        let unread = CompileContext::new(&no_columns, &executor.function_registry)
-            .with_prepared_subqueries();
         let values = rewritten_values
             .iter()
             .map(|row| {
                 row.iter()
-                    .map(|value| value.as_ref().map(|v| compile_with(&unread, v)).transpose())
+                    .map(|value| value.as_ref().map(|v| compile_with(&own, v)).transpose())
                     .collect::<Result<Vec<_>>>()
             })
             .collect::<Result<Vec<_>>>()?;

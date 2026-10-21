@@ -75,6 +75,23 @@ impl Drop for StatementRollback<'_> {
     }
 }
 
+/// The named parameter holding a VALUES answer, under a name no SQL text
+/// spells, so no parameter of the statement reads it
+fn answer_parameter(answer: usize) -> (String, Expression) {
+    let name = format!("values answer {answer}");
+    let spelled = format!(":{name}");
+    let parameter = Expression::Parameter(Parameter {
+        token: crate::parser::token::Token::new(
+            crate::parser::token::TokenType::Parameter,
+            &spelled,
+            crate::parser::token::Position::default(),
+        ),
+        name: SmartString::from_string(spelled),
+        index: 0,
+    });
+    (name, parameter)
+}
+
 /// Check whether a constraint violation matches the ON CONFLICT target columns.
 /// Returns true if the conflict should be handled (DO UPDATE / DO NOTHING).
 /// Returns false if the violation is on a different constraint, meaning the
@@ -650,12 +667,16 @@ impl Executor {
         ctx: &ExecutionContext,
         plan_cache: Option<&RwLock<CompiledExecution>>,
     ) -> Result<Box<dyn QueryResult>> {
-        let active_txn_id = self
-            .active_transaction
-            .lock()
-            .map_err(|_| Error::internal("active transaction lock poisoned"))?
-            .as_ref()
-            .map(|t| t.transaction.id());
+        let (active_txn_id, statement_rollback) = {
+            let active = self
+                .active_transaction
+                .lock()
+                .map_err(|_| Error::internal("active transaction lock poisoned"))?;
+            (
+                active.as_ref().map(|t| t.transaction.id()),
+                StatementRollback::new(&self.engine, active.as_ref()),
+            )
+        };
         let ctx_with_txn;
         let ctx = match active_txn_id {
             Some(txn_id) => {
@@ -681,11 +702,22 @@ impl Executor {
         } else {
             ctx
         };
+        let result = self.insert_read_values(stmt, ctx, plan_cache);
+        statement_rollback.finish(result)
+    }
+
+    fn insert_read_values(
+        &self,
+        stmt: &InsertStatement,
+        ctx: &ExecutionContext,
+        plan_cache: Option<&RwLock<CompiledExecution>>,
+    ) -> Result<Box<dyn QueryResult>> {
         let table_name = &stmt.table_name.value_lower;
-        let schema = self.engine.get_table_schema(table_name)?;
+        // A VALUES row has no target row: its scope is a table without columns
+        let unread = Schema::new(table_name.as_str(), Vec::new());
         let (prepared, tables) = self.open_prepared_dml(
             plan_cache,
-            &schema,
+            &unread,
             table_name,
             None,
             &[],
@@ -696,8 +728,9 @@ impl Executor {
         let mut vm = super::expression::ExprVM::new();
         let no_row = Row::new();
         let exec = run.context(&no_row);
-        let mut params: crate::api::params::ParamVec = ctx.params().iter().cloned().collect();
+        let mut written_ctx = ctx.clone();
         let mut written = stmt.clone();
+        let mut answers = 0;
         for (row, programs) in written.values.iter_mut().zip(run.values()) {
             for (value, program) in row.iter_mut().zip(programs) {
                 if let Some(program) = program {
@@ -705,15 +738,15 @@ impl Executor {
                     crate::test_failpoints::prepared_dml_site_ran(
                         crate::test_failpoints::PreparedDmlSite::InsertValues,
                     );
-                    params.push(vm.execute_cow(program, &exec)?);
-                    *value = super::prepared_select::slot_parameter(params.len() - 1);
+                    let (name, parameter) = answer_parameter(answers);
+                    written_ctx.set_named_param(name, vm.execute_cow(program, &exec)?);
+                    *value = parameter;
+                    answers += 1;
                 }
             }
         }
         // Every value is read: the blocks' tables close before a row is written
         drop(run);
-        let mut written_ctx = ctx.clone();
-        written_ctx.set_params(params);
         self.execute_insert(&written, &written_ctx, None)
     }
 

@@ -245,3 +245,62 @@ fn a_values_subquery_reads_no_column_of_the_target() {
         }
     }
 }
+
+/// Each value with its parameter and the `b` it inserts
+const ENTRY_SHAPES: &[(&str, i64, &str)] = &[
+    ("LENGTH(\"b\") + (SELECT x FROM u WHERE id = 1)", 0, "2"),
+    ("(SELECT x FROM u WHERE u.id = $1 + 1)", 0, "1"),
+    ("(SELECT x FROM u WHERE u.id = $1)", 2, "2"),
+    ("LENGTH(\"b\") + (SELECT x FROM u WHERE id = 1)", 0, "2"),
+    ("$1 + (SELECT COUNT(*) FROM t)", 5, "9"),
+];
+
+#[test]
+fn a_values_subquery_answers_alike_on_every_entry() {
+    for (entry, run) in [("autocommit", 0), ("prepared", 1), ("transaction", 2)] {
+        let db = Database::open(&format!("memory://prepared_insert_entry_{entry}")).unwrap();
+        setup(&db);
+        for (value, param, want) in ENTRY_SHAPES {
+            let sql = format!("INSERT INTO t VALUES (10, {value})");
+            let inserted = match run {
+                0 => db.execute(&sql, (*param,)),
+                1 => db.prepare(&sql).and_then(|s| s.execute((*param,))),
+                _ => {
+                    let mut tx = db.begin().unwrap();
+                    let n = tx.execute(&sql, (*param,));
+                    tx.commit().unwrap();
+                    n
+                }
+            };
+            assert_eq!(
+                inserted.as_ref().ok(),
+                Some(&1),
+                "{entry} {value}: {inserted:?}"
+            );
+            assert_eq!(
+                rows(db.query("SELECT id, b FROM t WHERE id = 10", ())),
+                format!("10:{want}"),
+                "{entry} {value}"
+            );
+            db.execute("DELETE FROM t WHERE id = 10", ()).unwrap();
+        }
+    }
+}
+
+#[test]
+fn returning_reads_the_parameters_the_statement_was_given() {
+    let db = Database::open("memory://prepared_insert_returning_parameters").unwrap();
+    setup(&db);
+    let returned = |sql: &str| -> Option<i64> {
+        let row = db.query(sql, ()).unwrap().next().unwrap().unwrap();
+        row.get(0).unwrap()
+    };
+    let literal = returned("INSERT INTO t VALUES (10, 41) RETURNING $1");
+    let read =
+        returned("INSERT INTO t VALUES (11, (SELECT x + 40 FROM u WHERE id = 1)) RETURNING $1");
+    assert_eq!(read, literal);
+    assert_eq!(
+        rows(db.query("SELECT id, b FROM t WHERE id >= 10 ORDER BY id", ())),
+        "10:41 11:41"
+    );
+}
