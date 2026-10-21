@@ -99,7 +99,7 @@ fn default_function_registry() -> Arc<FunctionRegistry> {
         .get_or_init(|| Arc::new(FunctionRegistry::new()))
         .clone()
 }
-use crate::parser::ast::{Program, Statement};
+use crate::parser::ast::{ParamSlots, Program, Statement};
 use crate::parser::Parser;
 use crate::storage::mvcc::engine::MVCCEngine;
 use crate::storage::traits::{Engine, QueryResult, Table, Transaction};
@@ -468,9 +468,8 @@ impl Executor {
         plan: &CachedPlanRef,
         params: &[Value],
     ) -> Option<Result<Box<dyn QueryResult>>> {
-        // Validate parameter count
-        if plan.has_params && params.len() < plan.param_count {
-            return None; // Let normal path handle error
+        if let Err(e) = check_param_count(&plan.params, params.len()) {
+            return Some(Err(e));
         }
 
         // Try compiled fast paths based on statement type
@@ -497,8 +496,31 @@ impl Executor {
         sql: &str,
         params: FxHashMap<String, Value>,
     ) -> Result<Box<dyn QueryResult>> {
-        let ctx = ExecutionContext::with_named_params(params);
-        self.execute_cached(sql, std::borrow::Cow::Owned(ctx))
+        self.execute_named_with(sql, &mut value_in(&params))
+    }
+
+    /// [`Self::execute_with_named_params`] with each value read by its name
+    /// from `value_of`
+    pub(crate) fn execute_named_with(
+        &self,
+        sql: &str,
+        value_of: &mut impl FnMut(&str) -> Result<Option<Value>>,
+    ) -> Result<Box<dyn QueryResult>> {
+        match self.plan_or_program(sql)? {
+            Ok(plan) => {
+                let values = bind_named(&plan.params, value_of)?;
+                if let Some(result) = self.try_plan_fast_path(&plan, &values) {
+                    return result;
+                }
+                let ctx = ExecutionContext::with_params(values);
+                self.execute_plan_in(&plan, std::borrow::Cow::Owned(ctx))
+            }
+            Err(program) => {
+                let contexts = bind_program(&program, value_of)?;
+                let _gate = self.enter(true);
+                self.run_statements(&program, |i| &contexts[i])
+            }
+        }
     }
 
     /// Execute a SQL query with a full execution context
@@ -531,92 +553,18 @@ impl Executor {
         sql: &str,
         ctx: std::borrow::Cow<'_, ExecutionContext>,
     ) -> Result<Box<dyn QueryResult>> {
-        // Try to get from cache
-        if let Some(cached) = self.query_cache.get(sql) {
-            // Validate parameter count if query has parameters
-            if cached.has_params {
-                let provided = ctx.params().len();
-                if provided < cached.param_count {
-                    return Err(Error::internal(format!(
-                        "Query requires {} parameters but only {} provided",
-                        cached.param_count, provided
-                    )));
-                }
-            }
-
-            let gate = self.enter(changes_session(&cached.statement));
-            // INSERT takes the transaction and its id in one lock section
-            if let Statement::Insert(stmt) = cached.statement.as_ref() {
-                return self.execute_insert_with_compiled_cache(stmt, &ctx, &cached.compiled);
-            }
-            let (active_txn_id, ctx) = self.gated_txn_ctx(&gate, ctx);
-
-            if let Some(result) = self.compiled_fast_paths_until_held(
-                cached.statement.as_ref(),
-                &ctx,
-                &cached.compiled,
-                active_txn_id.is_some(),
-            ) {
-                return result;
-            }
-
-            // Execute the cached statement (standard path)
-            return self.execute_statement_inner(
-                &cached.statement,
-                ctx,
-                active_txn_id,
-                Some(&cached.classification),
-                Some(&cached.compiled),
-                cached.counts.as_deref(),
-            );
+        if let Some(plan) = self.query_cache.get(sql) {
+            return self.execute_plan_in(&plan, ctx);
         }
-
-        // Parse the query
-        let mut parser = Parser::new(sql);
-        let mut program = parser
-            .parse_program()
-            .map_err(|e| Error::parse(e.to_string()))?;
-
-        // Cache single-statement queries and execute directly from cache
-        if program.statements.len() == 1 {
-            // Take ownership of the statement to avoid clone
-            let stmt = program.statements.pop().unwrap();
-            let (has_params, param_count) = count_parameters(&stmt);
-            let stmt_arc = std::sync::Arc::new(stmt);
-            let cached_plan = self
-                .query_cache
-                .put(sql, stmt_arc.clone(), has_params, param_count);
-
-            let gate = self.enter(changes_session(&stmt_arc));
-            if let Statement::Insert(stmt) = stmt_arc.as_ref() {
-                return self.execute_insert_with_compiled_cache(stmt, &ctx, &cached_plan.compiled);
+        match self.plan_or_program(sql)? {
+            Ok(plan) => self.execute_plan_in(&plan, ctx),
+            Err(program) => {
+                // One gate for the whole program, so no other statement on
+                // this session runs between its statements
+                let _gate = self.enter(true);
+                self.run_program(&program, &ctx)
             }
-            let (active_txn_id, ctx) = self.gated_txn_ctx(&gate, ctx);
-
-            if let Some(result) = self.compiled_fast_paths_until_held(
-                stmt_arc.as_ref(),
-                &ctx,
-                &cached_plan.compiled,
-                active_txn_id.is_some(),
-            ) {
-                return result;
-            }
-
-            // Execute directly from the Arc (no clone needed)
-            return self.execute_statement_inner(
-                &stmt_arc,
-                ctx,
-                active_txn_id,
-                Some(&cached_plan.classification),
-                Some(&cached_plan.compiled),
-                cached_plan.counts.as_deref(),
-            );
         }
-
-        // One gate for the whole program, so no other statement on this
-        // session runs between its statements
-        let _gate = self.enter(true);
-        self.run_program(&program, &ctx)
     }
 
     /// Current explicit-transaction id, if one is active.
@@ -875,27 +823,40 @@ impl Executor {
         program: &Program,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        if program.statements.is_empty() {
-            return Ok(Box::new(ExecResult::empty()));
+        for slots in &program.params {
+            check_param_count(slots, ctx.params().len())?;
         }
+        self.run_statements(program, |_| ctx)
+    }
 
-        let mut last_result: Option<Box<dyn QueryResult>> = None;
-
-        for statement in &program.statements {
-            last_result = Some(self.run_statement(statement, ctx)?);
+    /// Runs every statement of `program`, the i-th in `ctx_of(i)`, under a
+    /// gate the caller holds; the parameters are checked
+    fn run_statements<'c>(
+        &self,
+        program: &Program,
+        ctx_of: impl Fn(usize) -> &'c ExecutionContext,
+    ) -> Result<Box<dyn QueryResult>> {
+        let mut last_result: Box<dyn QueryResult> = Box::new(ExecResult::empty());
+        for (i, statement) in program.statements.iter().enumerate() {
+            last_result = self.run_statement(statement, ctx_of(i))?;
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::program_statement_done();
         }
-
-        Ok(last_result.unwrap())
+        Ok(last_result)
     }
 
-    /// Execute a single statement
+    /// Execute a single statement; its parameters are checked against the
+    /// count the parser wrote on it
     pub fn execute_statement(
         &self,
         statement: &Statement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        let slots = ParamSlots {
+            count: statement.param_count(),
+            names: None,
+        };
+        check_param_count(&slots, ctx.params().len())?;
         let _gate = self.enter(changes_session(statement));
         self.run_statement(statement, ctx)
     }
@@ -1229,16 +1190,10 @@ impl Executor {
         if program.statements.len() != 1 {
             return Ok(Err(program));
         }
-        let Some(stmt) = program.statements.pop() else {
+        let (Some(stmt), Some(params)) = (program.statements.pop(), program.params.pop()) else {
             return Ok(Err(program));
         };
-        let (has_params, param_count) = count_parameters(&stmt);
-        Ok(Ok(self.query_cache.put(
-            sql,
-            Arc::new(stmt),
-            has_params,
-            param_count,
-        )))
+        Ok(Ok(self.query_cache.put(sql, Arc::new(stmt), params)))
     }
 
     /// Execute a pre-cached plan directly, skipping cache lookup.
@@ -1270,17 +1225,7 @@ impl Executor {
         plan: &CachedPlanRef,
         ctx: std::borrow::Cow<'_, ExecutionContext>,
     ) -> Result<Box<dyn QueryResult>> {
-        // Validate parameter count
-        if plan.has_params {
-            let provided = ctx.params().len();
-            if provided < plan.param_count {
-                return Err(Error::internal(format!(
-                    "Query requires {} parameters but only {} provided",
-                    plan.param_count, provided
-                )));
-            }
-        }
-
+        check_param_count(&plan.params, ctx.params().len())?;
         let gate = self.enter(changes_session(&plan.statement));
         if let Statement::Insert(stmt) = plan.statement.as_ref() {
             return self.execute_insert_with_compiled_cache(stmt, &ctx, &plan.compiled);
@@ -1306,160 +1251,72 @@ impl Executor {
     }
 }
 
-/// Count the number of parameter placeholders in a statement
-///
-/// Returns (has_params, max_param_index)
-pub(crate) fn count_parameters(stmt: &Statement) -> (bool, usize) {
-    use crate::parser::ast::*;
-
-    struct ParamCounter {
-        max_index: usize,
-        has_positional: bool,
+/// Refuses a statement taking `slots` that is given `provided` values: a
+/// parameter without a value is an error, never NULL
+#[inline]
+pub(crate) fn check_param_count(slots: &ParamSlots, provided: usize) -> Result<()> {
+    if provided < slots.count {
+        return Err(too_few_params(slots, provided));
     }
+    Ok(())
+}
 
-    impl ParamCounter {
-        fn new() -> Self {
-            Self {
-                max_index: 0,
-                has_positional: false,
-            }
-        }
-
-        fn visit_expr(&mut self, expr: &Expression) {
-            match expr {
-                Expression::Parameter(param) => {
-                    if param.index > 0 {
-                        self.max_index = self.max_index.max(param.index);
-                    } else {
-                        // Positional parameter (?)
-                        self.has_positional = true;
-                    }
-                }
-                Expression::Infix(infix) => {
-                    self.visit_expr(&infix.left);
-                    self.visit_expr(&infix.right);
-                }
-                Expression::Prefix(prefix) => {
-                    self.visit_expr(&prefix.right);
-                }
-                Expression::FunctionCall(func) => {
-                    for arg in &func.arguments {
-                        self.visit_expr(arg);
-                    }
-                }
-                Expression::Case(case) => {
-                    if let Some(val) = &case.value {
-                        self.visit_expr(val);
-                    }
-                    for when in &case.when_clauses {
-                        self.visit_expr(&when.condition);
-                        self.visit_expr(&when.then_result);
-                    }
-                    if let Some(el) = &case.else_value {
-                        self.visit_expr(el);
-                    }
-                }
-                Expression::In(in_expr) => {
-                    self.visit_expr(&in_expr.left);
-                    self.visit_expr(&in_expr.right);
-                }
-                Expression::Between(between) => {
-                    self.visit_expr(&between.expr);
-                    self.visit_expr(&between.lower);
-                    self.visit_expr(&between.upper);
-                }
-                Expression::Cast(cast) => {
-                    self.visit_expr(&cast.expr);
-                }
-                Expression::ScalarSubquery(subq) => {
-                    self.visit_select(&subq.subquery);
-                }
-                Expression::Exists(exists) => {
-                    self.visit_select(&exists.subquery);
-                }
-                Expression::List(list) => {
-                    for item in &list.elements {
-                        self.visit_expr(item);
-                    }
-                }
-                Expression::ExpressionList(list) => {
-                    for item in &list.expressions {
-                        self.visit_expr(item);
-                    }
-                }
-                Expression::Aliased(aliased) => {
-                    self.visit_expr(&aliased.expression);
-                }
-                Expression::Window(window) => {
-                    // WindowExpression.function is Box<FunctionCall>, visit its arguments
-                    for arg in &window.function.arguments {
-                        self.visit_expr(arg);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        fn visit_select(&mut self, select: &SelectStatement) {
-            // Visit columns
-            for col in &select.columns {
-                self.visit_expr(col);
-            }
-            // Visit table expression (may contain subqueries)
-            if let Some(table_expr) = &select.table_expr {
-                self.visit_expr(table_expr);
-            }
-            // Visit where clause
-            if let Some(where_clause) = &select.where_clause {
-                self.visit_expr(where_clause);
-            }
-            // Visit group by
-            for group in &select.group_by.columns {
-                self.visit_expr(group);
-            }
-            // Visit having
-            if let Some(having) = &select.having {
-                self.visit_expr(having);
-            }
-        }
+/// The error for the first slot of `slots` past the `provided` values
+#[cold]
+fn too_few_params(slots: &ParamSlots, provided: usize) -> Error {
+    match slots.names.as_deref().and_then(|names| names.get(provided)) {
+        Some(name) => missing_name(name),
+        None => Error::invalid_argument(format!(
+            "Query requires {} parameters but only {} provided",
+            slots.count, provided
+        )),
     }
+}
 
-    let mut counter = ParamCounter::new();
+#[cold]
+fn missing_name(name: &str) -> Error {
+    Error::invalid_argument(format!("named parameter :{} has no value", name))
+}
 
-    match stmt {
-        Statement::Select(select) => counter.visit_select(select),
-        Statement::Insert(insert) => {
-            for row in &insert.values {
-                for expr in row {
-                    counter.visit_expr(expr);
-                }
-            }
-        }
-        Statement::Update(update) => {
-            for expr in update.updates.values() {
-                counter.visit_expr(expr);
-            }
-            if let Some(where_clause) = &update.where_clause {
-                counter.visit_expr(where_clause);
-            }
-        }
-        Statement::Delete(delete) => {
-            if let Some(where_clause) = &delete.where_clause {
-                counter.visit_expr(where_clause);
-            }
-        }
-        _ => {}
-    }
-
-    let has_params = counter.max_index > 0 || counter.has_positional;
-    let param_count = if counter.has_positional {
-        // For positional params, we can't know the count statically
-        0
-    } else {
-        counter.max_index
+/// The values of a statement taking `slots`, in slot order, each read by
+/// its name from `value_of`, which may be asked for one name again by a
+/// later statement
+pub(crate) fn bind_named(
+    slots: &ParamSlots,
+    value_of: &mut impl FnMut(&str) -> Result<Option<Value>>,
+) -> Result<ParamVec> {
+    let Some(names) = &slots.names else {
+        check_param_count(slots, 0)?;
+        return Ok(ParamVec::new());
     };
+    let mut values = ParamVec::with_capacity(names.len());
+    for name in names.iter() {
+        match value_of(name)? {
+            Some(value) => values.push(value),
+            None => return Err(missing_name(name)),
+        }
+    }
+    Ok(values)
+}
 
-    (has_params, param_count)
+/// A context for each statement of `program`, its slots bound by name from
+/// `value_of`; every statement is bound before any runs
+pub(crate) fn bind_program(
+    program: &Program,
+    value_of: &mut impl FnMut(&str) -> Result<Option<Value>>,
+) -> Result<Vec<ExecutionContext>> {
+    program
+        .params
+        .iter()
+        .map(|slots| bind_named(slots, value_of).map(ExecutionContext::with_params))
+        .collect()
+}
+
+/// The `value_of` of a map of named values
+pub(crate) fn value_in(
+    params: &FxHashMap<String, Value>,
+) -> impl FnMut(&str) -> Result<Option<Value>> + '_ {
+    |name| Ok(params.get(name).cloned())
 }
 
 #[cfg(test)]

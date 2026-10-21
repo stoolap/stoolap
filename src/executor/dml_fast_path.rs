@@ -202,37 +202,15 @@ impl Executor {
                 (v, PkValueSource::Literal(v))
             }
             Expression::Parameter(param) => {
-                // Named parameters (e.g., :name) resolve via get_named_param() at execution time
-                // Positional parameters ($1, $2, ...) are 1-indexed, array is 0-indexed
-                if param.name.starts_with(':') {
-                    let name = &param.name[1..];
-                    let value = ctx.get_named_param(name)?;
-                    let pk_value = match value {
-                        Value::Integer(i) => *i,
-                        Value::Float(f) => Self::lossless_float_key(*f)?,
-                        _ => return None,
-                    };
-                    (
-                        pk_value,
-                        PkValueSource::NamedParameter(SmartString::new(name)),
-                    )
-                } else {
-                    let params = ctx.params();
-                    let param_idx = if param.index > 0 {
-                        param.index - 1
-                    } else {
-                        return None;
-                    };
-                    if param_idx >= params.len() {
-                        return None;
-                    }
-                    let pk_value = match &params[param_idx] {
-                        Value::Integer(i) => *i,
-                        Value::Float(f) => Self::lossless_float_key(*f)?,
-                        _ => return None,
-                    };
-                    (pk_value, PkValueSource::Parameter(param_idx))
-                }
+                // Slots are 1-indexed, the array is 0-indexed
+                let params = ctx.params();
+                let param_idx = param.index.checked_sub(1)?;
+                let pk_value = match params.get(param_idx)? {
+                    Value::Integer(i) => *i,
+                    Value::Float(f) => Self::lossless_float_key(*f)?,
+                    _ => return None,
+                };
+                (pk_value, PkValueSource::Parameter(param_idx))
             }
             _ => return None,
         };
@@ -246,14 +224,7 @@ impl Executor {
         source: &PkValueSource,
         ctx: &ExecutionContext,
     ) -> Option<i64> {
-        match source {
-            PkValueSource::NamedParameter(name) => match ctx.get_named_param(name)? {
-                Value::Integer(i) => Some(*i),
-                Value::Float(f) => Self::lossless_float_key(*f),
-                _ => None,
-            },
-            _ => Self::extract_pk_value_from_params(source, ctx.params()),
-        }
+        Self::extract_pk_value_from_params(source, ctx.params())
     }
 
     /// Extract PK value from params slice directly (avoids ExecutionContext overhead)
@@ -271,7 +242,6 @@ impl Executor {
                     _ => None,
                 }
             }
-            PkValueSource::NamedParameter(_) => None, // No ctx available in slice path
         }
     }
 
@@ -284,8 +254,7 @@ impl Executor {
         match source {
             UpdateValueSource::Literal(v) => Some(v.clone()),
             UpdateValueSource::Parameter(idx) => params.get(*idx).cloned(),
-            UpdateValueSource::NamedParameter(_) => None, // No ctx available in slice path
-            UpdateValueSource::Expression(_) => None,     // Needs a row context; normal path
+            UpdateValueSource::Expression(_) => None, // Needs a row context; normal path
         }
     }
 
@@ -463,9 +432,6 @@ impl Executor {
                         if !ctx.params().is_empty() {
                             exec_ctx = exec_ctx.with_params(ctx.params());
                         }
-                        if !ctx.named_params().is_empty() {
-                            exec_ctx = exec_ctx.with_named_params(ctx.named_params());
-                        }
                     }
                     for (idx, program, col_type, vector_dims) in expr_updates {
                         let value = vm.execute_cow(program, &exec_ctx)?;
@@ -571,16 +537,8 @@ impl Executor {
         for u in &compiled.updates {
             let value = match &u.value_source {
                 UpdateValueSource::Literal(v) => v.clone(),
-                // A parameter the call did not give is NULL, as on the general path
-                UpdateValueSource::Parameter(idx) => ctx
-                    .params()
-                    .get(*idx)
-                    .cloned()
-                    .unwrap_or_else(Value::null_unknown),
-                UpdateValueSource::NamedParameter(name) => ctx
-                    .get_named_param(name)
-                    .cloned()
-                    .unwrap_or_else(Value::null_unknown),
+                // A parameter the call did not give is the general path's error
+                UpdateValueSource::Parameter(idx) => ctx.params().get(*idx)?.clone(),
                 UpdateValueSource::Expression(program) => {
                     expr_updates.push((
                         u.column_idx,
@@ -920,17 +878,7 @@ impl Executor {
                 _ => None,
             },
             Expression::Parameter(param) => {
-                if param.name.starts_with(':') {
-                    let name = &param.name[1..];
-                    Some(UpdateValueSource::NamedParameter(SmartString::new(name)))
-                } else {
-                    let param_idx = if param.index > 0 {
-                        param.index - 1
-                    } else {
-                        return None;
-                    };
-                    Some(UpdateValueSource::Parameter(param_idx))
-                }
+                Some(UpdateValueSource::Parameter(param.index.checked_sub(1)?))
             }
             // Row expressions (e.g. SET n = n + 1) compile once per plan
             // against the schema columns. Subquery-bearing expressions must

@@ -14,9 +14,9 @@
 
 //! Conversion between FFI `StoolapValue` and Rust `Value`.
 
-use crate::api::params::NamedParams;
 use crate::api::ParamVec;
 use crate::core::{Error, Result, Value};
+use rustc_hash::FxHashMap;
 
 use super::types::{StoolapNamedParam, StoolapValue};
 use super::{
@@ -110,29 +110,55 @@ pub(crate) unsafe fn params_to_vec(params: *const StoolapValue, len: i32) -> Res
     slice.iter().map(|v| ffi_value_to_rust(v)).collect()
 }
 
-/// Convert an FFI named-parameter array to [`NamedParams`].
+/// Arrays up to this length are searched in place; a longer one is indexed
+/// by name once per call, so binding stays linear in its length
+const NAMED_SCAN_MAX: usize = 16;
+
+/// Reads an FFI named-parameter array by name, converting only the values a
+/// statement binds; a name given twice reads its last value.
 ///
 /// # Safety
 ///
 /// `params` must point to `len` valid `StoolapNamedParam` structs (or be null if `len <= 0`).
 /// Each `name` pointer must be valid for `name_len` bytes.
-pub(crate) unsafe fn named_params_from_ffi(
+pub(crate) unsafe fn ffi_value_of<'a>(
     params: *const StoolapNamedParam,
     len: i32,
-) -> Result<NamedParams> {
-    if params.is_null() || len <= 0 {
-        return Ok(NamedParams::new());
+) -> impl FnMut(&str) -> Result<Option<Value>> + 'a {
+    let slice: &'a [StoolapNamedParam] = if params.is_null() || len <= 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(params, len as usize)
+    };
+    // SAFETY: the caller keeps every name valid for `name_len` bytes and
+    // every value valid while the statement binds
+    let name_of = |p: &'a StoolapNamedParam| -> Option<&'a [u8]> {
+        (!p.name.is_null() && p.name_len > 0).then(|| unsafe {
+            std::slice::from_raw_parts(p.name as *const u8, p.name_len as usize)
+        })
+    };
+    let mut index: Option<FxHashMap<&'a [u8], &'a StoolapNamedParam>> = None;
+    move |name| {
+        let given = if slice.len() <= NAMED_SCAN_MAX {
+            slice
+                .iter()
+                .rev()
+                .find(|p| name_of(p) == Some(name.as_bytes()))
+        } else {
+            index
+                .get_or_insert_with(|| {
+                    // Later entries overwrite earlier ones: the last value wins
+                    slice
+                        .iter()
+                        .filter_map(|p| Some((name_of(p)?, p)))
+                        .collect()
+                })
+                .get(name.as_bytes())
+                .copied()
+        };
+        // SAFETY: as above, the value is valid while the statement binds
+        given
+            .map(|p| unsafe { ffi_value_to_rust(&p.value) })
+            .transpose()
     }
-    let slice = std::slice::from_raw_parts(params, len as usize);
-    let mut named = NamedParams::with_capacity(slice.len());
-    for p in slice {
-        if p.name.is_null() || p.name_len <= 0 {
-            continue;
-        }
-        let name_bytes = std::slice::from_raw_parts(p.name as *const u8, p.name_len as usize);
-        if let Ok(name) = std::str::from_utf8(name_bytes) {
-            named.insert(name, ffi_value_to_rust(&p.value)?);
-        }
-    }
-    Ok(named)
 }

@@ -608,12 +608,7 @@ impl<'a> ExprCompiler<'a> {
             }
 
             // === PARAMETERS ===
-            Expression::Parameter(param) => match parameter_slot(param)? {
-                ParameterSlot::Named(name) => {
-                    builder.emit(Op::LoadNamedParam(CompactArc::from(name)))
-                }
-                ParameterSlot::Positional(index) => builder.emit(Op::LoadParam(index)),
-            },
+            Expression::Parameter(param) => builder.emit(Op::LoadParam(parameter_slot(param)?)),
 
             // === INFIX EXPRESSIONS ===
             Expression::Infix(infix) => {
@@ -1951,25 +1946,15 @@ fn is_column_free(expr: &Expression) -> bool {
     }
 }
 
-/// Which value a parameter reads
-pub(crate) enum ParameterSlot<'p> {
-    /// `:name`, by its name without the colon
-    Named(&'p str),
-    /// `$n` or `?`, zero-based
-    Positional(u16),
-}
-
-/// The slot `param` reads
-pub(crate) fn parameter_slot(param: &Parameter) -> Result<ParameterSlot<'_>, CompileError> {
-    if let Some(name) = param.name.strip_prefix(':') {
-        Ok(ParameterSlot::Named(name))
-    } else if param.index > 0 {
-        Ok(ParameterSlot::Positional((param.index - 1) as u16))
-    } else {
-        Err(CompileError::InvalidExpression(
-            "Invalid parameter".to_string(),
-        ))
-    }
+/// The zero-based slot `param` reads; the parser numbers `$n`, `?` and
+/// `:name` alike from one. A slot a program cannot address is an error,
+/// never another slot
+pub(crate) fn parameter_slot(param: &Parameter) -> Result<u32, CompileError> {
+    param
+        .index
+        .checked_sub(1)
+        .and_then(|slot| u32::try_from(slot).ok())
+        .ok_or_else(|| CompileError::InvalidExpression(format!("Invalid parameter {}", param.name)))
 }
 
 /// The value a program loads for a literal; None for any other expression

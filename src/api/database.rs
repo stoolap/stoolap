@@ -48,7 +48,7 @@ use std::sync::{Arc, RwLock, Weak};
 
 use crate::core::{DataType, Error, IsolationLevel, Result, Value};
 use crate::executor::context::ExecutionContextBuilder;
-use crate::executor::{CachedPlanRef, ExecutionContext, Executor};
+use crate::executor::{bind_named, value_in, CachedPlanRef, ExecutionContext, Executor};
 use crate::storage::mvcc::engine::MVCCEngine;
 use crate::storage::traits::transaction::StatementTable;
 use crate::storage::traits::{Engine, QueryResult};
@@ -1046,18 +1046,14 @@ impl Database {
 
     /// Execute a pre-cached plan with named parameters (no parsing, no cache lookup).
     pub fn execute_named_plan(&self, plan: &CachedPlanRef, params: NamedParams) -> Result<i64> {
-        let executor = &self.inner.executor;
-        let ctx = ExecutionContext::with_named_params(params.into_inner());
-        let result = executor.execute_with_cached_plan_owned(plan, ctx)?;
-        Ok(result.rows_affected())
+        let values = bind_named(&plan.params, &mut value_in(params.as_map()))?;
+        Ok(self.run_plan(plan, values)?.rows_affected())
     }
 
     /// Query using a pre-cached plan with named parameters (no parsing, no cache lookup).
     pub fn query_named_plan(&self, plan: &CachedPlanRef, params: NamedParams) -> Result<Rows> {
-        let executor = &self.inner.executor;
-        let ctx = ExecutionContext::with_named_params(params.into_inner());
-        let result = executor.execute_with_cached_plan_owned(plan, ctx)?;
-        Ok(Rows::new(result))
+        let values = bind_named(&plan.params, &mut value_in(params.as_map()))?;
+        Ok(Rows::new(self.run_plan(plan, values)?))
     }
 
     /// Check if a table exists

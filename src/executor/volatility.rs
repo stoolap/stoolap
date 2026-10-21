@@ -200,6 +200,7 @@ impl Walk<'_> {
         };
         let SelectStatement {
             token: _,
+            param_count: _,
             distinct: _,
             distinct_on,
             columns,

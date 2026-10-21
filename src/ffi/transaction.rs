@@ -18,6 +18,7 @@ use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::panic;
 
+use crate::api::Rows;
 use crate::core::types::IsolationLevel;
 
 use super::types::{
@@ -542,12 +543,11 @@ pub unsafe extern "C" fn stoolap_tx_exec_named(
             }
         };
 
-        let named = value::named_params_from_ffi(params, params_len);
-
-        match named.and_then(|named| inner_tx.execute_named(sql_str, named)) {
-            Ok(affected) => {
+        let mut value_of = value::ffi_value_of(params, params_len);
+        match inner_tx.run_named(sql_str, &mut value_of) {
+            Ok(result) => {
                 if !rows_affected.is_null() {
-                    *rows_affected = affected;
+                    *rows_affected = result.rows_affected();
                 }
                 STOOLAP_OK
             }
@@ -613,11 +613,10 @@ pub unsafe extern "C" fn stoolap_tx_query_named(
             }
         };
 
-        let named = value::named_params_from_ffi(params, params_len);
-
-        match named.and_then(|named| inner_tx.query_named(sql_str, named)) {
-            Ok(rows) => {
-                *out_rows = StoolapRows::boxed(rows, None);
+        let mut value_of = value::ffi_value_of(params, params_len);
+        match inner_tx.run_named(sql_str, &mut value_of) {
+            Ok(result) => {
+                *out_rows = StoolapRows::boxed(Rows::new(result), None);
                 STOOLAP_OK
             }
             Err(e) => {
@@ -672,12 +671,11 @@ pub unsafe extern "C" fn stoolap_tx_stmt_exec_named(
             }
         };
 
-        let named = value::named_params_from_ffi(params, params_len);
-
-        match named.and_then(|named| stmt_handle.stmt.execute_named_in(inner_tx, named)) {
-            Ok(affected) => {
+        let mut value_of = value::ffi_value_of(params, params_len);
+        match inner_tx.execute_prepared_statement_named(&stmt_handle.stmt, &mut value_of) {
+            Ok(result) => {
                 if !rows_affected.is_null() {
-                    *rows_affected = affected;
+                    *rows_affected = result.rows_affected();
                 }
                 STOOLAP_OK
             }
@@ -738,11 +736,10 @@ pub unsafe extern "C" fn stoolap_tx_stmt_query_named(
             }
         };
 
-        let named = value::named_params_from_ffi(params, params_len);
-
-        match named.and_then(|named| stmt_handle.stmt.query_named_in(inner_tx, named)) {
-            Ok(rows) => {
-                *out_rows = StoolapRows::boxed(rows, None);
+        let mut value_of = value::ffi_value_of(params, params_len);
+        match inner_tx.execute_prepared_statement_named(&stmt_handle.stmt, &mut value_of) {
+            Ok(result) => {
+                *out_rows = StoolapRows::boxed(Rows::new(result), None);
                 STOOLAP_OK
             }
             Err(e) => {

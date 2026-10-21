@@ -111,11 +111,11 @@ Files: `transaction_test.rs`, `mvcc_isolation_sql_test.rs`, `dirty_read_test.rs`
 
 Snapshot isolation, transaction visibility, consistency, and the isolation level each session keeps.
 
-### API Paths (2 files)
+### API Paths (4 files)
 
-Files: `api_prepared_paths_test.rs`, `ffi_test.rs`
+Files: `api_prepared_paths_test.rs`, `ffi_test.rs`, `param_slots_test.rs`, `param_slots_matrix_test.rs`
 
-The same statement through SQL text, a prepared statement, a transaction and the C API answers alike; the C API's packed results, parameter checks and handle lifetimes.
+The same statement through SQL text, a prepared statement, a transaction and the C API answers alike; the C API's packed results, parameter checks and handle lifetimes. Positional and named parameters bind to one set of slots: every shape answers as it does with its values written as literals, on every path over hot and sealed rows, and a missing value is an error that writes nothing.
 
 ### Index Tests (8 files)
 

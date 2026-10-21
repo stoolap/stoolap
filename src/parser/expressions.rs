@@ -254,24 +254,7 @@ impl Parser<'_> {
     /// Parse a parameter ($1, ?, :name)
     fn parse_parameter(&mut self) -> Option<Expression> {
         let name = self.cur_token.literal.clone();
-        let index = if name == "?" {
-            self.next_parameter_index()
-        } else if let Some(stripped) = name.strip_prefix('$') {
-            match stripped.parse::<usize>() {
-                Ok(idx) => idx,
-                Err(e) => {
-                    self.add_error(format!("invalid parameter index: {}", e));
-                    return None;
-                }
-            }
-        } else if name.starts_with(':') {
-            // Named parameter - use 0 as index, will be resolved by name
-            0
-        } else {
-            self.add_error(format!("invalid parameter format: {}", name));
-            return None;
-        };
-
+        let index = self.parameter_slot(&name)?;
         Some(Expression::Parameter(Parameter {
             token: self.cur_token.clone(),
             name,

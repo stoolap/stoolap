@@ -65,11 +65,7 @@ pub enum Op {
 
     /// Load query parameter by index
     /// Stack: [] -> [value]
-    LoadParam(u16),
-
-    /// Load named parameter
-    /// Stack: [] -> [value]
-    LoadNamedParam(CompactArc<str>),
+    LoadParam(u32),
 
     /// Load NULL with type hint
     /// Stack: [] -> [null]
@@ -666,7 +662,6 @@ impl std::fmt::Debug for Op {
             Op::LoadOuterColumn(name) => write!(f, "LoadOuterColumn({})", name),
             Op::LoadConst(v) => write!(f, "LoadConst({:?})", v),
             Op::LoadParam(idx) => write!(f, "LoadParam({})", idx),
-            Op::LoadNamedParam(name) => write!(f, "LoadNamedParam({})", name),
             Op::LoadNull(dt) => write!(f, "LoadNull({:?})", dt),
             Op::Eq => write!(f, "Eq"),
             Op::Ne => write!(f, "Ne"),

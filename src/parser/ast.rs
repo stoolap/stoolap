@@ -1559,6 +1559,31 @@ pub enum Statement {
     Copy(CopyStatement),
 }
 
+impl Statement {
+    /// The parameter slots the statement takes, as the parser counted them
+    pub fn param_count(&self) -> usize {
+        match self {
+            Statement::Select(s) => s.param_count,
+            Statement::Insert(s) => s.param_count,
+            Statement::Update(s) => s.param_count,
+            Statement::Delete(s) => s.param_count,
+            Statement::Explain(s) if s.analyze => s.statement.param_count(),
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn set_param_count(&mut self, count: usize) {
+        match self {
+            Statement::Select(s) => s.param_count = count,
+            Statement::Insert(s) => s.param_count = count,
+            Statement::Update(s) => s.param_count = count,
+            Statement::Delete(s) => s.param_count = count,
+            Statement::Explain(s) => s.statement.set_param_count(count),
+            _ => {}
+        }
+    }
+}
+
 impl fmt::Display for Statement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1596,10 +1621,20 @@ impl fmt::Display for Statement {
     }
 }
 
+/// A statement's parameter slots: how many values it takes and, when its
+/// parameters are `:name`, the name each slot is bound by, in slot order
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ParamSlots {
+    pub count: usize,
+    pub names: Option<std::sync::Arc<[SmartString]>>,
+}
+
 /// Program (collection of statements)
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     pub statements: Vec<Statement>,
+    /// The parameter slots of each statement, by position
+    pub params: Vec<ParamSlots>,
 }
 
 impl fmt::Display for Program {
@@ -1743,6 +1778,9 @@ impl fmt::Display for GroupByClause {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStatement {
     pub token: Token,
+    /// The parameter slots the statement takes, written by the parser on a
+    /// statement it parsed whole; 0 on a part or a statement built in code
+    pub param_count: usize,
     pub distinct: bool,
     /// DISTINCT ON (expr1, expr2, ...) expressions. Empty for regular DISTINCT or no DISTINCT.
     pub distinct_on: Vec<Expression>,
@@ -1818,6 +1856,8 @@ impl fmt::Display for SelectStatement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct InsertStatement {
     pub token: Token,
+    /// As on [`SelectStatement`]
+    pub param_count: usize,
     pub table_name: Identifier,
     pub columns: Vec<Identifier>,
     /// VALUES clause rows (None if using SELECT)
@@ -1903,6 +1943,8 @@ impl fmt::Display for InsertStatement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateStatement {
     pub token: Token,
+    /// As on [`SelectStatement`]
+    pub param_count: usize,
     pub table_name: Identifier,
     pub updates: FxHashMap<SmartString, Expression>,
     pub where_clause: Option<Box<Expression>>,
@@ -1939,6 +1981,8 @@ impl fmt::Display for UpdateStatement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeleteStatement {
     pub token: Token,
+    /// As on [`SelectStatement`]
+    pub param_count: usize,
     pub table_name: Identifier,
     /// Optional table alias (e.g., DELETE FROM users AS u)
     pub alias: Option<Identifier>,
@@ -2791,6 +2835,7 @@ mod tests {
     #[test]
     fn test_select_statement_display() {
         let stmt = SelectStatement {
+            param_count: 0,
             token: make_token(TokenType::Keyword, "SELECT"),
             distinct: false,
             distinct_on: vec![],
@@ -2850,6 +2895,7 @@ mod tests {
     #[test]
     fn test_insert_statement_display() {
         let stmt = InsertStatement {
+            param_count: 0,
             token: make_token(TokenType::Keyword, "INSERT"),
             table_name: Identifier::new(make_token(TokenType::Identifier, "users"), "users"),
             columns: vec![

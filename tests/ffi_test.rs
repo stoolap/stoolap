@@ -4117,3 +4117,376 @@ fn test_json_parameter_the_engine_cannot_read_is_refused() {
         stoolap_close(db);
     }
 }
+
+/// Every named C entry point binds `:id` by name, refuses a statement whose
+/// name is not given, and reads the last value of a name given twice
+#[test]
+fn test_named_entry_points_bind_by_slot_and_refuse_a_missing_name() {
+    unsafe {
+        let db = packed_test_db(3);
+        let select = cstr("SELECT id FROM t WHERE id = :id");
+        let update = cstr("UPDATE t SET score = :s WHERE id = :id");
+        let mut sel_stmt: *mut StoolapStmt = std::ptr::null_mut();
+        assert_eq!(
+            stoolap_prepare(db, select.as_ptr(), &mut sel_stmt),
+            STOOLAP_OK
+        );
+        let mut upd_stmt: *mut StoolapStmt = std::ptr::null_mut();
+        assert_eq!(
+            stoolap_prepare(db, update.as_ptr(), &mut upd_stmt),
+            STOOLAP_OK
+        );
+        let read_rows = |rows: *mut StoolapRows| {
+            let mut ids = Vec::new();
+            while stoolap_rows_next(rows) == STOOLAP_ROW {
+                ids.push(stoolap_rows_column_int64(rows, 0));
+            }
+            stoolap_rows_close(rows);
+            ids
+        };
+        let packed_ids = |buf: *const u8, len: i64| -> Vec<i64> {
+            decode_packed(buf, len)
+                .1
+                .iter()
+                .map(|row| row[0].parse().unwrap())
+                .collect()
+        };
+        // Each entry point: the ids a query answers, or the rows an update
+        // writes, as one list; the error text when it fails
+        type Entry<'a> = Box<dyn Fn(&[StoolapNamedParam]) -> Result<Vec<i64>, String> + 'a>;
+        let with_tx = |run: &dyn Fn(*mut StoolapTx) -> (i32, Vec<i64>)| {
+            let mut tx: *mut StoolapTx = std::ptr::null_mut();
+            assert_eq!(stoolap_begin(db, &mut tx), STOOLAP_OK);
+            let (rc, out) = run(tx);
+            let error = read_cstr(stoolap_tx_errmsg(tx)).to_string();
+            let error = if error.is_empty() {
+                read_cstr(stoolap_errmsg(db)).to_string()
+            } else {
+                error
+            };
+            let error = if error.is_empty() {
+                read_cstr(stoolap_stmt_errmsg(sel_stmt)).to_string()
+                    + read_cstr(stoolap_stmt_errmsg(upd_stmt))
+            } else {
+                error
+            };
+            assert_eq!(stoolap_tx_rollback(tx), STOOLAP_OK);
+            if rc == STOOLAP_OK {
+                Ok(out)
+            } else {
+                Err(error)
+            }
+        };
+        let done = |rc: i32, out: Vec<i64>, error: &str| {
+            if rc == STOOLAP_OK {
+                Ok(out)
+            } else {
+                Err(error.to_string())
+            }
+        };
+        let entries: Vec<(&str, Entry)> = vec![
+            (
+                "stoolap_query_named",
+                Box::new(|p: &[StoolapNamedParam]| {
+                    let mut rows = std::ptr::null_mut();
+                    let rc = stoolap_query_named(
+                        db,
+                        select.as_ptr(),
+                        p.as_ptr(),
+                        p.len() as i32,
+                        &mut rows,
+                    );
+                    let out = if rc == STOOLAP_OK {
+                        read_rows(rows)
+                    } else {
+                        Vec::new()
+                    };
+                    done(rc, out, read_cstr(stoolap_errmsg(db)))
+                }),
+            ),
+            (
+                "stoolap_exec_named",
+                Box::new(|p: &[StoolapNamedParam]| {
+                    let mut n = 0i64;
+                    let rc =
+                        stoolap_exec_named(db, update.as_ptr(), p.as_ptr(), p.len() as i32, &mut n);
+                    done(rc, vec![n], read_cstr(stoolap_errmsg(db)))
+                }),
+            ),
+            (
+                "stoolap_query_named_all",
+                Box::new(|p: &[StoolapNamedParam]| {
+                    let (mut buf, mut len) = (std::ptr::null(), 0i64);
+                    let rc = stoolap_query_named_all(
+                        db,
+                        std::ptr::null_mut(),
+                        select.as_ptr(),
+                        p.as_ptr(),
+                        p.len() as i32,
+                        &mut buf,
+                        &mut len,
+                    );
+                    let out = if rc == STOOLAP_OK {
+                        packed_ids(buf, len)
+                    } else {
+                        Vec::new()
+                    };
+                    done(rc, out, read_cstr(stoolap_errmsg(db)))
+                }),
+            ),
+            (
+                "stoolap_query_named_all in tx",
+                Box::new(|p: &[StoolapNamedParam]| {
+                    with_tx(&|tx| {
+                        let (mut buf, mut len) = (std::ptr::null(), 0i64);
+                        let rc = stoolap_query_named_all(
+                            db,
+                            tx,
+                            select.as_ptr(),
+                            p.as_ptr(),
+                            p.len() as i32,
+                            &mut buf,
+                            &mut len,
+                        );
+                        let out = if rc == STOOLAP_OK {
+                            packed_ids(buf, len)
+                        } else {
+                            Vec::new()
+                        };
+                        (rc, out)
+                    })
+                }),
+            ),
+            (
+                "stoolap_stmt_query_named",
+                Box::new(|p: &[StoolapNamedParam]| {
+                    let mut rows = std::ptr::null_mut();
+                    let rc =
+                        stoolap_stmt_query_named(sel_stmt, p.as_ptr(), p.len() as i32, &mut rows);
+                    let out = if rc == STOOLAP_OK {
+                        read_rows(rows)
+                    } else {
+                        Vec::new()
+                    };
+                    done(rc, out, read_cstr(stoolap_stmt_errmsg(sel_stmt)))
+                }),
+            ),
+            (
+                "stoolap_stmt_exec_named",
+                Box::new(|p: &[StoolapNamedParam]| {
+                    let mut n = 0i64;
+                    let rc = stoolap_stmt_exec_named(upd_stmt, p.as_ptr(), p.len() as i32, &mut n);
+                    done(rc, vec![n], read_cstr(stoolap_stmt_errmsg(upd_stmt)))
+                }),
+            ),
+            (
+                "stoolap_stmt_query_named_all",
+                Box::new(|p: &[StoolapNamedParam]| {
+                    let (mut buf, mut len) = (std::ptr::null(), 0i64);
+                    let rc = stoolap_stmt_query_named_all(
+                        sel_stmt,
+                        std::ptr::null_mut(),
+                        p.as_ptr(),
+                        p.len() as i32,
+                        &mut buf,
+                        &mut len,
+                    );
+                    let out = if rc == STOOLAP_OK {
+                        packed_ids(buf, len)
+                    } else {
+                        Vec::new()
+                    };
+                    done(rc, out, read_cstr(stoolap_stmt_errmsg(sel_stmt)))
+                }),
+            ),
+            (
+                "stoolap_stmt_query_named_all in tx",
+                Box::new(|p: &[StoolapNamedParam]| {
+                    with_tx(&|tx| {
+                        let (mut buf, mut len) = (std::ptr::null(), 0i64);
+                        let rc = stoolap_stmt_query_named_all(
+                            sel_stmt,
+                            tx,
+                            p.as_ptr(),
+                            p.len() as i32,
+                            &mut buf,
+                            &mut len,
+                        );
+                        let out = if rc == STOOLAP_OK {
+                            packed_ids(buf, len)
+                        } else {
+                            Vec::new()
+                        };
+                        (rc, out)
+                    })
+                }),
+            ),
+            (
+                "stoolap_tx_query_named",
+                Box::new(|p: &[StoolapNamedParam]| {
+                    with_tx(&|tx| {
+                        let mut rows = std::ptr::null_mut();
+                        let rc = stoolap_tx_query_named(
+                            tx,
+                            select.as_ptr(),
+                            p.as_ptr(),
+                            p.len() as i32,
+                            &mut rows,
+                        );
+                        let out = if rc == STOOLAP_OK {
+                            read_rows(rows)
+                        } else {
+                            Vec::new()
+                        };
+                        (rc, out)
+                    })
+                }),
+            ),
+            (
+                "stoolap_tx_exec_named",
+                Box::new(|p: &[StoolapNamedParam]| {
+                    with_tx(&|tx| {
+                        let mut n = 0i64;
+                        let rc = stoolap_tx_exec_named(
+                            tx,
+                            update.as_ptr(),
+                            p.as_ptr(),
+                            p.len() as i32,
+                            &mut n,
+                        );
+                        (rc, vec![n])
+                    })
+                }),
+            ),
+            (
+                "stoolap_tx_stmt_query_named",
+                Box::new(|p: &[StoolapNamedParam]| {
+                    with_tx(&|tx| {
+                        let mut rows = std::ptr::null_mut();
+                        let rc = stoolap_tx_stmt_query_named(
+                            tx,
+                            sel_stmt,
+                            p.as_ptr(),
+                            p.len() as i32,
+                            &mut rows,
+                        );
+                        let out = if rc == STOOLAP_OK {
+                            read_rows(rows)
+                        } else {
+                            Vec::new()
+                        };
+                        (rc, out)
+                    })
+                }),
+            ),
+            (
+                "stoolap_tx_stmt_exec_named",
+                Box::new(|p: &[StoolapNamedParam]| {
+                    with_tx(&|tx| {
+                        let mut n = 0i64;
+                        let rc = stoolap_tx_stmt_exec_named(
+                            tx,
+                            upd_stmt,
+                            p.as_ptr(),
+                            p.len() as i32,
+                            &mut n,
+                        );
+                        (rc, vec![n])
+                    })
+                }),
+            ),
+        ];
+        let score = || StoolapValue {
+            value_type: STOOLAP_TYPE_FLOAT,
+            _padding: 0,
+            v: StoolapValueData { float64: 1.5 },
+        };
+        for (entry, call) in &entries {
+            let updates = entry.contains("exec");
+            // Given: :id = 2 (and :s for the update)
+            let given = [named_param("s", score()), named_param("id", int_param(2))];
+            let want = if updates { vec![1] } else { vec![2] };
+            assert_eq!(call(&given), Ok(want), "{entry}: given");
+            // A name given twice reads its last value
+            let twice = [
+                named_param("id", int_param(1)),
+                named_param("s", score()),
+                named_param("id", int_param(3)),
+            ];
+            let want = if updates { vec![1] } else { vec![3] };
+            assert_eq!(call(&twice), Ok(want), "{entry}: twice");
+            // A name the statement does not read is ignored, even one whose
+            // value would not convert
+            let extra = [
+                named_param("s", score()),
+                named_param("id", int_param(2)),
+                named_param("other", bad_text_param(b"\xff")),
+            ];
+            assert!(call(&extra).is_ok(), "{entry}: extra");
+            // Missing :id
+            let missing = [named_param("s", score())];
+            let error = call(&missing).expect_err(entry);
+            assert!(error.contains(":id has no value"), "{entry}: {error}");
+        }
+        stoolap_stmt_finalize(sel_stmt);
+        stoolap_stmt_finalize(upd_stmt);
+        stoolap_close(db);
+    }
+}
+
+/// A named array longer than the in-place search binds by its index: the
+/// last value of a name wins, a missing name is refused, an unused value
+/// is not converted
+#[test]
+fn test_a_long_named_array_binds_every_slot_by_name() {
+    unsafe {
+        let db = packed_test_db(1);
+        let names: Vec<String> = (0..40).map(|i| format!("p{i}")).collect();
+        let sql = cstr(&format!(
+            "SELECT {}",
+            names
+                .iter()
+                .map(|n| format!(":{n}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        let mut stmt: *mut StoolapStmt = std::ptr::null_mut();
+        assert_eq!(stoolap_prepare(db, sql.as_ptr(), &mut stmt), STOOLAP_OK);
+        // Reversed, p0 given twice (its last value is 100), one unused bad text
+        let mut params: Vec<StoolapNamedParam> = names
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(i, n)| named_param(n, int_param(i as i64)))
+            .collect();
+        params.push(named_param(&names[0], int_param(100)));
+        params.push(named_param("unused", bad_text_param(b"\xff")));
+        let (mut buf, mut len) = (std::ptr::null(), 0i64);
+        let rc = stoolap_stmt_query_named_all(
+            stmt,
+            std::ptr::null_mut(),
+            params.as_ptr(),
+            params.len() as i32,
+            &mut buf,
+            &mut len,
+        );
+        assert_eq!(rc, STOOLAP_OK, "{}", read_cstr(stoolap_stmt_errmsg(stmt)));
+        let mut want: Vec<String> = (0..40).map(|i| i.to_string()).collect();
+        want[0] = "100".to_string();
+        assert_eq!(decode_packed(buf, len).1, vec![want]);
+
+        // p39 down to p1: every name but p0
+        let rc = stoolap_stmt_query_named_all(
+            stmt,
+            std::ptr::null_mut(),
+            params.as_ptr(),
+            39,
+            &mut buf,
+            &mut len,
+        );
+        assert_eq!(rc, STOOLAP_ERROR);
+        assert!(read_cstr(stoolap_stmt_errmsg(stmt)).contains(":p0 has no value"));
+        stoolap_stmt_finalize(stmt);
+        stoolap_close(db);
+    }
+}

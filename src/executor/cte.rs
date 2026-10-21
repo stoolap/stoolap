@@ -392,6 +392,7 @@ impl Executor {
 
         // Execute the anchor member (the first SELECT before UNION ALL)
         let anchor_stmt = SelectStatement {
+            param_count: 0,
             token: stmt.token.clone(),
             distinct: stmt.distinct,
             distinct_on: stmt.distinct_on.clone(),
@@ -544,6 +545,7 @@ impl Executor {
 
         // Execute as a normal SELECT (strip the WITH clause)
         let stmt_without_with = SelectStatement {
+            param_count: 0,
             token: stmt.token.clone(),
             distinct: stmt.distinct,
             distinct_on: stmt.distinct_on.clone(),
@@ -905,9 +907,7 @@ impl Executor {
             let mut values: CompactVec<Value> =
                 CompactVec::with_capacity(columns.len().max(row.len()));
             // CRITICAL: Include params from context for parameterized queries
-            let exec_ctx = ExecuteContext::new(row)
-                .with_params(ctx.params())
-                .with_named_params(ctx.named_params());
+            let exec_ctx = ExecuteContext::new(row).with_params(ctx.params());
 
             for compiled in &compiled_columns {
                 match compiled {
@@ -1139,6 +1139,7 @@ impl Executor {
         let inlined_expr = self.try_inline_cte_references(table_expr, &cte_defs)?;
 
         Some(SelectStatement {
+            param_count: 0,
             token: stmt.token.clone(),
             distinct: stmt.distinct,
             distinct_on: stmt.distinct_on.clone(),
