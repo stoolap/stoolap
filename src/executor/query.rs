@@ -574,8 +574,11 @@ enum SelectProjection {
 /// What a projection keeping ORDER BY and DISTINCT ON values reads per row
 #[derive(Debug)]
 enum OrderedProjection {
-    /// Columns only: the SELECT list's, then the extra ORDER BY ones
-    Columns(Vec<usize>),
+    /// Columns only: the SELECT list's, every one a column, then the extra ORDER BY ones
+    Columns {
+        select: Vec<Option<usize>>,
+        extra: Vec<usize>,
+    },
     /// Each output value's source; a failed compile is raised by the first row
     Items(Vec<Result<ItemSource>>),
 }
@@ -594,6 +597,13 @@ enum OutputProjection {
     Select(SelectProjection),
     /// Keeps the ORDER BY and DISTINCT ON values the SELECT list leaves out
     Ordered(OrderedProjection),
+}
+
+/// The columns of the row a statement runs for, which its programs read by name
+fn outer_column_names(ctx: &ExecutionContext) -> Option<Vec<String>> {
+    ctx.outer_row()
+        .filter(|outer| !outer.is_empty())
+        .map(|outer| outer.keys().map(|k| k.to_string()).collect())
 }
 
 /// Each lowercase column name, and each qualified one's bare name, to its position
@@ -5540,8 +5550,12 @@ impl Executor {
                         // Compute sort keys and indices; compile and
                         // evaluation errors both defer to the standard path
                         let compile = || -> Result<BuiltPrograms> {
-                            let compile_ctx =
+                            let outer_columns = outer_column_names(ctx);
+                            let mut compile_ctx =
                                 CompileContext::new(&all_columns, &self.function_registry);
+                            if let Some(outer) = &outer_columns {
+                                compile_ctx = compile_ctx.with_outer_columns(outer);
+                            }
                             stmt.order_by
                                 .iter()
                                 .map(|ob| {
@@ -9799,23 +9813,17 @@ impl Executor {
             && computed_order_by.is_empty();
 
         if all_simple {
-            // SELECT columns, then the extra ORDER BY columns
-            let columns = select_column_indices
-                .iter()
-                .flatten()
-                .chain(&extra_order_indices)
-                .copied()
-                .collect();
-            return (OrderedProjection::Columns(columns), extra_names, layout);
+            let columns = OrderedProjection::Columns {
+                select: select_column_indices,
+                extra: extra_order_indices,
+            };
+            return (columns, extra_names, layout);
         }
 
         // Each value's source is found once for the statement; an error
         // is raised by the first row that reads it, as evaluating raised it
         // A statement run for an outer row reads that row's columns by name
-        let outer_columns: Option<Vec<String>> = ctx
-            .outer_row()
-            .filter(|outer| !outer.is_empty())
-            .map(|outer| outer.keys().map(|k| k.to_string()).collect());
+        let outer_columns = outer_column_names(ctx);
         let mut compile_ctx = CompileContext::new(all_columns, &self.function_registry);
         if let Some(outer) = &outer_columns {
             compile_ctx = compile_ctx.with_outer_columns(outer);
@@ -9941,10 +9949,10 @@ impl Executor {
     ) -> Result<RowVec> {
         let mut projected = RowVec::with_capacity(rows.len());
         match plan {
-            OrderedProjection::Columns(columns) => {
+            OrderedProjection::Columns { select, extra } => {
                 for (row_id, row) in rows.drain_rows().enumerate() {
-                    let mut values = Vec::with_capacity(columns.len());
-                    for &idx in columns {
+                    let mut values = Vec::with_capacity(select.len() + extra.len());
+                    for &idx in select.iter().flatten().chain(extra) {
                         values.push(row.get(idx).cloned().unwrap_or(Value::null_unknown()));
                     }
                     projected.push((row_id as i64, Row::from_values(values)));

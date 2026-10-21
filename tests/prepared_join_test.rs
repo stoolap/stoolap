@@ -22,8 +22,8 @@ use stoolap::test_failpoints::{
 };
 use stoolap::Database;
 
-fn open() -> Database {
-    let db = Database::open("memory://prepared_join").unwrap();
+fn open(name: &str) -> Database {
+    let db = Database::open(&format!("memory://{name}")).unwrap();
     for sql in [
         "CREATE TABLE l (id INTEGER PRIMARY KEY, k INTEGER, g INTEGER)",
         "CREATE TABLE r (id INTEGER PRIMARY KEY, k INTEGER, w INTEGER)",
@@ -88,8 +88,8 @@ const CASES: &[(&str, &str)] = &[
         "index_nested_loop",
     ),
     (
-        "SELECT l.id, r.id FROM l JOIN r ON l.k = r.k ORDER BY l.id + r.id, r.id LIMIT 40",
-        "index_nested_loop",
+        "SELECT l.id, r.id FROM l JOIN r ON l.k = r.id ORDER BY l.id + r.id, r.id LIMIT 40",
+        "batch_index_nested_loop",
     ),
     (
         "SELECT l.id + r.w, r.id FROM l JOIN r ON l.k = r.id",
@@ -120,7 +120,7 @@ fn rows(db: &Database, sql: &str) -> Vec<String> {
 
 #[test]
 fn a_join_run_again_compiles_nothing() {
-    let db = open();
+    let db = open("prepared_join_compiles_nothing");
     let mut wrong = Vec::new();
     for &(sql, path) in CASES {
         let first = rows(&db, sql);
@@ -167,7 +167,7 @@ fn prepared_rows(db: &Database, sql: &str, param: i64) -> Vec<(i64, i64)> {
 
 #[test]
 fn a_held_projection_reads_each_execution_s_parameter() {
-    let db = open();
+    let db = open("prepared_join_projection_parameter");
     for sql in [
         "SELECT l.id + $1, r.id FROM l JOIN r ON l.g = r.w ORDER BY l.id, r.id",
         "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w ORDER BY l.id * $1, r.id",
@@ -187,7 +187,7 @@ fn a_held_projection_reads_each_execution_s_parameter() {
 
 #[test]
 fn a_subquery_in_the_select_list_is_read_each_execution() {
-    let db = open();
+    let db = open("prepared_join_select_subquery");
     let sql = "SELECT (SELECT MAX(id) FROM r), l.id FROM l JOIN r ON l.g = r.w LIMIT 1";
     let before: Vec<i64> = db
         .query(sql, ())
