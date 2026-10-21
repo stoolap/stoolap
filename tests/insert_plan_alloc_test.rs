@@ -106,3 +106,28 @@ fn test_transaction_insert_checks_once_per_statement() {
     tx.commit().unwrap();
     assert!(per_row <= 9, "{per_row} allocations per inserted row");
 }
+
+#[test]
+fn test_values_subquery_answers_cost_a_bounded_count_per_row() {
+    let db = table("insert_plan_alloc_values_answers");
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1, 1)", ()).unwrap();
+    let per_run = |rows: i64| {
+        let values: Vec<String> = (0..rows)
+            .map(|id| format!("({id}, (SELECT x FROM u WHERE id = 1), 'x')"))
+            .collect();
+        let insert = db
+            .prepare(&format!("INSERT INTO t VALUES {}", values.join(", ")))
+            .unwrap();
+        insert.execute(()).unwrap();
+        db.execute("DELETE FROM t", ()).unwrap();
+        let before = allocations();
+        insert.execute(()).unwrap();
+        let spent = allocations() - before;
+        db.execute("DELETE FROM t", ()).unwrap();
+        spent
+    };
+    let per_row = (per_run(32) - per_run(8)) / 24;
+    assert!(per_row <= 21, "{per_row} allocations per answered row");
+}

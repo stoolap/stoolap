@@ -76,17 +76,21 @@ impl Drop for StatementRollback<'_> {
 }
 
 /// The named parameter holding a VALUES answer, under a name no SQL text
-/// spells, so no parameter of the statement reads it
+/// spells, so no parameter of the statement reads it; it stays inline, so
+/// the name's key is the one allocation
 fn answer_parameter(answer: usize) -> (String, Expression) {
-    let name = format!("values answer {answer}");
-    let spelled = format!(":{name}");
+    use std::fmt::Write;
+    let mut name = String::with_capacity(24);
+    let _ = write!(name, ":v {answer}");
+    let spelled = SmartString::new(&name);
+    name.remove(0);
     let parameter = Expression::Parameter(Parameter {
         token: crate::parser::token::Token::new(
             crate::parser::token::TokenType::Parameter,
-            &spelled,
+            spelled.clone(),
             crate::parser::token::Position::default(),
         ),
-        name: SmartString::from_string(spelled),
+        name: spelled,
         index: 0,
     });
     (name, parameter)

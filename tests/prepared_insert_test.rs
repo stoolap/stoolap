@@ -304,3 +304,72 @@ fn returning_reads_the_parameters_the_statement_was_given() {
         "10:41 11:41"
     );
 }
+
+static WRITE_THEN_FAIL: std::sync::Mutex<Option<Box<dyn stoolap::storage::traits::Table>>> =
+    std::sync::Mutex::new(None);
+
+#[derive(Default)]
+struct WriteThenFail;
+
+impl stoolap::functions::ScalarFunction for WriteThenFail {
+    fn name(&self) -> &str {
+        "WRITE_THEN_FAIL"
+    }
+
+    fn info(&self) -> stoolap::functions::FunctionInfo {
+        stoolap::functions::FunctionInfo {
+            name: "WRITE_THEN_FAIL".into(),
+            ..stoolap::functions::ScalarFunction::info(&stoolap::functions::scalar::SleepFunction)
+        }
+    }
+
+    fn evaluate(
+        &self,
+        _args: &[stoolap::core::Value],
+    ) -> stoolap::core::Result<stoolap::core::Value> {
+        if let Some(mut w) = WRITE_THEN_FAIL.lock().unwrap().take() {
+            w.insert(stoolap::core::Row::from_values(vec![
+                stoolap::core::Value::Integer(1),
+            ]))
+            .unwrap();
+        }
+        Err(stoolap::Error::internal("the value failed after a write"))
+    }
+
+    fn clone_box(&self) -> Box<dyn stoolap::functions::ScalarFunction> {
+        Box::new(Self)
+    }
+}
+
+#[test]
+fn a_values_read_that_fails_takes_back_what_it_wrote_in_the_transaction() {
+    let db = Database::open("memory://prepared_insert_values_rollback").unwrap();
+    setup(&db);
+    db.execute("CREATE TABLE w (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    stoolap::functions::global_registry().register_scalar::<WriteThenFail>();
+    let executor = stoolap::Executor::new(std::sync::Arc::clone(db.engine()));
+    executor
+        .function_registry()
+        .register_scalar::<WriteThenFail>();
+    let tx = executor.begin_transaction().unwrap();
+    *WRITE_THEN_FAIL.lock().unwrap() = Some(tx.get_table("w").unwrap());
+    executor.install_transaction(tx);
+    let statement = stoolap::parser::parse_sql(
+        "INSERT INTO t VALUES (10, (SELECT WRITE_THEN_FAIL(x) FROM u WHERE id = 1))",
+    )
+    .unwrap()
+    .remove(0);
+    let inserted = executor.execute_statement(&statement, &stoolap::ExecutionContext::new());
+    let message = inserted.err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(message.contains("failed after a write"), "{message:?}");
+    let mut count = executor.execute("SELECT COUNT(*) FROM w").unwrap();
+    assert!(count.next());
+    let written = format!("{:?}", count.row().get(0));
+    drop(count);
+    executor.take_transaction().unwrap().rollback().unwrap();
+    assert_eq!(
+        written, "Some(Integer(0))",
+        "the failed statement's write stayed"
+    );
+}
