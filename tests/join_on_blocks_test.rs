@@ -647,3 +647,48 @@ fn explain_says_whether_a_join_runs_its_subqueries_as_blocks() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+#[test]
+fn explain_says_no_for_a_join_outside_the_statement_s_own_select() {
+    let db = Database::open("memory://join_on_blocks_explain_sites").unwrap();
+    fill(&db);
+    db.execute("CREATE TABLE tgt (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    let join = "SELECT l.id, r.k FROM l JOIN r ON l.id = r.id \
+                WHERE EXISTS (SELECT 1 FROM s WHERE s.id = l.id)";
+    let outside = "Prepared: no (a join outside the statement's own SELECT)";
+    let lines = |sql: &str| -> Vec<String> {
+        db.query(&format!("EXPLAIN {sql}"), ())
+            .unwrap()
+            .map(|row| row.unwrap().get::<String>(0).unwrap().trim().to_string())
+            .filter(|line| line.starts_with("Prepared:"))
+            .collect()
+    };
+    let selects = [
+        (format!("SELECT 0, 0 UNION ALL {join}"), outside),
+        (format!("{join} UNION ALL SELECT 0, 0"), "Prepared: yes"),
+        (format!("SELECT d.id, d.k FROM ({join}) d"), outside),
+    ];
+    let mut wrong = Vec::new();
+    for (sql, want) in &selects {
+        let got = lines(sql);
+        if got != [*want] {
+            wrong.push(format!("{sql}: {got:?}, expected {want}"));
+        }
+        let ran = rows(&db, sql).and_then(|_| {
+            let compiles = (bridge_compiles(), program_compiles());
+            rows(&db, sql)?;
+            Ok((bridge_compiles(), program_compiles()) == compiles)
+        });
+        if ran != Ok(*want == "Prepared: yes") {
+            wrong.push(format!(
+                "{sql}: says {want}, run again it compiled nothing: {ran:?}"
+            ));
+        }
+    }
+    let insert = format!("INSERT INTO tgt {join}");
+    if lines(&insert) != [outside] {
+        wrong.push(format!("{insert}: {:?}", lines(&insert)));
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

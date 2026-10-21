@@ -263,7 +263,7 @@ impl Executor {
                 ));
                 if let Some(ref select) = insert.select {
                     lines.push(format!("{}  Source:", prefix));
-                    self.explain_select(select, lines, indent + 2);
+                    self.explain_select(select, lines, indent + 2, false);
                 } else {
                     lines.push(format!(
                         "{}  Values: {} row(s)",
@@ -438,7 +438,7 @@ impl Executor {
                 if let Some(wc) = where_clause {
                     lines.push(format!("{}     Filter: {}", prefix, wc));
                 }
-                self.explain_select(&subquery.subquery, lines, indent + 1);
+                self.explain_select(&subquery.subquery, lines, indent + 1, false);
             }
             Expression::JoinSource(join) => {
                 // Determine join algorithm including INLJ check
@@ -545,13 +545,13 @@ impl Executor {
 
         match stmt {
             Statement::Select(select) => {
-                self.explain_select(select, lines, indent);
+                self.explain_select(select, lines, indent, true);
             }
             Statement::Insert(insert) => {
                 lines.push(format!("{}INSERT INTO {}", prefix, insert.table_name));
                 if let Some(ref select) = insert.select {
                     lines.push(format!("{}  Source:", prefix));
-                    self.explain_select(select, lines, indent + 2);
+                    self.explain_select(select, lines, indent + 2, false);
                 } else {
                     lines.push(format!(
                         "{}  Values: {} row(s)",
@@ -584,12 +584,17 @@ impl Executor {
     }
 
     /// Whether the join `select` reads from runs its subqueries as prepared
-    /// blocks, as the statement run alone decides it, or why not
+    /// blocks, as the statement run alone decides it, or why not; `own`
+    /// when `select` is the statement's own, which alone holds a plan
     fn join_prepared(
         &self,
         select: &SelectStatement,
         join: &JoinTableSource,
+        own: bool,
     ) -> std::result::Result<(), OutOfFamily> {
+        if !own {
+            return Err("a join outside the statement's own SELECT");
+        }
         if self.has_cte(select) {
             return Err("a WITH clause");
         }
@@ -611,8 +616,15 @@ impl Executor {
         )
     }
 
-    /// Generate EXPLAIN output for a SELECT statement
-    fn explain_select(&self, select: &SelectStatement, lines: &mut Vec<String>, indent: usize) {
+    /// Generate EXPLAIN output for a SELECT statement; `own` when it is the
+    /// statement's own SELECT, not a branch, a FROM subquery or a source
+    fn explain_select(
+        &self,
+        select: &SelectStatement,
+        lines: &mut Vec<String>,
+        indent: usize,
+        own: bool,
+    ) {
         let prefix = "  ".repeat(indent);
 
         // CTE info
@@ -662,7 +674,7 @@ impl Executor {
                 .is_some_and(Self::has_subqueries)
         {
             let prepared = match join {
-                Some(join) => self.join_prepared(select, join),
+                Some(join) => self.join_prepared(select, join, own),
                 None => self.prepared_family(select, None),
             };
             match prepared {
@@ -736,7 +748,7 @@ impl Executor {
         if !select.set_operations.is_empty() {
             for set_op in &select.set_operations {
                 lines.push(format!("{}  {}", prefix, set_op.operation));
-                self.explain_select(&set_op.right, lines, indent + 2);
+                self.explain_select(&set_op.right, lines, indent + 2, false);
             }
         }
     }
@@ -846,7 +858,7 @@ impl Executor {
                 if let Some(wc) = where_clause {
                     lines.push(format!("{}     Filter: {}", prefix, wc));
                 }
-                self.explain_select(&subquery.subquery, lines, indent + 1);
+                self.explain_select(&subquery.subquery, lines, indent + 1, false);
             }
             Expression::JoinSource(join) => {
                 // Determine join algorithm including INLJ check
