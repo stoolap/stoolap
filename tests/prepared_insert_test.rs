@@ -347,11 +347,12 @@ fn a_values_read_that_fails_takes_back_what_it_wrote_in_the_transaction() {
     setup(&db);
     db.execute("CREATE TABLE w (id INTEGER PRIMARY KEY)", ())
         .unwrap();
-    stoolap::functions::global_registry().register_scalar::<WriteThenFail>();
-    let executor = stoolap::Executor::new(std::sync::Arc::clone(db.engine()));
-    executor
-        .function_registry()
-        .register_scalar::<WriteThenFail>();
+    let functions = stoolap::functions::FunctionRegistry::new();
+    functions.register_scalar::<WriteThenFail>();
+    let executor = stoolap::Executor::with_function_registry(
+        std::sync::Arc::clone(db.engine()),
+        std::sync::Arc::new(functions),
+    );
     let tx = executor.begin_transaction().unwrap();
     *WRITE_THEN_FAIL.lock().unwrap() = Some(tx.get_table("w").unwrap());
     executor.install_transaction(tx);
