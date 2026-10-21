@@ -22,7 +22,8 @@
 use std::collections::BTreeSet;
 
 use stoolap::test_failpoints::{
-    bridge_compiles, join_paths_taken, program_compiles, reset_join_paths,
+    bridge_compiles, join_paths_taken, prepared_strategy_runs, program_compiles, reset_join_paths,
+    PreparedStrategy,
 };
 use stoolap::Database;
 
@@ -397,5 +398,139 @@ fn an_on_block_reads_the_transaction_s_own_writes() {
         got,
         vec!["Integer(3)|Integer(5)".to_string()],
         "the block sees the row the transaction inserted"
+    );
+}
+
+/// Tuples stay outside the subquery family: an ON with a subquery beside
+/// one is not prepared
+const TUPLE_FORMS: &[&str] = &[
+    "(l.id, r.id) IN ((1, 1), (6, 1), (11, 11))",
+    "(l.g, l.k) = (r.w, r.k)",
+];
+
+const PAIR_FORMS: &[&str] = &[
+    "l.id + r.id BETWEEN 5 AND 40",
+    "l.id NOT BETWEEN 3 AND 5",
+    "CASE WHEN l.k > 3 THEN r.w ELSE l.g END = r.w",
+    "CAST(l.id AS TEXT) LIKE '1%'",
+    "COALESCE(l.k, 0) <= r.k",
+    "l.k IS NOT NULL AND r.k IS NOT NULL",
+    "NOT (l.id = r.id)",
+    "l.k IN (1, 2, 3)",
+    "l.id % 3 = r.id % 3",
+    "ABS(l.k - r.k) < 2",
+];
+
+const SIDE_FORMS: &[&str] = &[
+    "(l.k, l.g) IN ((1, 0), (2, 1), (3, 2))",
+    "(l.k, l.g) = (1, 0)",
+    "l.id NOT BETWEEN 3 AND 5",
+    "CASE WHEN l.k > 3 THEN 1 ELSE 0 END = 1",
+    "CAST(l.id AS TEXT) LIKE '1%'",
+    "l.k IN (1, 2, 3)",
+];
+
+#[test]
+fn a_join_rewrites_every_condition_form_beside_its_blocks() {
+    let db = Database::open("memory://join_on_blocks_forms").unwrap();
+    fill(&db);
+    let exists = "EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id)";
+    let mut shapes: Vec<(String, String)> = Vec::new();
+    for form in TUPLE_FORMS.iter().chain(PAIR_FORMS) {
+        let moved = format!(
+            "SELECT l.id, r.id FROM {{l}} JOIN {{r}} ON l.g = r.w AND {form} WHERE {exists}"
+        );
+        shapes.push((
+            format!("SELECT l.id, r.id FROM {{l}} JOIN {{r}} ON {form} WHERE {exists}"),
+            format!("SELECT l.id, r.id FROM {{l}} JOIN {{r}} ON {form} WHERE {exists}"),
+        ));
+        shapes.push((moved.clone(), moved.clone()));
+        if TUPLE_FORMS.contains(form) {
+            continue;
+        }
+        shapes.push((
+            format!("SELECT l.id, r.id FROM {{l}} JOIN {{r}} ON l.g = r.w AND {form} AND {exists}"),
+            moved,
+        ));
+    }
+    for form in SIDE_FORMS {
+        let sql = format!(
+            "SELECT l.id, r.id FROM {{l}} JOIN {{r}} ON l.g = r.w WHERE {form} AND {exists}"
+        );
+        shapes.push((sql.clone(), sql));
+    }
+    for using in ["USING (k)", "USING (k, id)"] {
+        let sql = format!("SELECT l.id, r.id FROM {{l}} JOIN {{r}} {using} WHERE {exists}");
+        shapes.push((sql.clone(), sql));
+    }
+    let sql = format!("SELECT l.id, r.id FROM {{l}} NATURAL JOIN {{r}} WHERE {exists}");
+    shapes.push((sql.clone(), sql));
+    let mut wrong = Vec::new();
+    for (shape, reference) in &shapes {
+        let sql = shape.replace("{l}", "l").replace("{r}", "r");
+        let want = rows(
+            &db,
+            &reference
+                .replace("{l}", "(SELECT * FROM l) l")
+                .replace("{r}", "(SELECT * FROM r) r"),
+        );
+        if want.is_err() {
+            wrong.push(format!("the reference of {sql} fails: {want:?}"));
+            continue;
+        }
+        let got = rows(&db, &sql);
+        if got != want {
+            wrong.push(format!("{sql}: gave {got:?}, the reference {want:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} of {} wrong:\n{}",
+        wrong.len(),
+        shapes.len(),
+        wrong.join("\n")
+    );
+}
+
+#[test]
+fn a_using_join_keeps_its_keys_beside_its_blocks() {
+    let db = Database::open("memory://join_on_blocks_using").unwrap();
+    fill(&db);
+    for sql in [
+        "SELECT l.id, r.id FROM l JOIN r USING (k) WHERE EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id)",
+        "SELECT l.id, r.id FROM l NATURAL JOIN r WHERE EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.k)",
+    ] {
+        reset_join_paths();
+        rows(&db, sql).unwrap();
+        assert_eq!(join_paths_taken(), ["hash"], "{sql}");
+    }
+}
+
+#[test]
+fn a_where_block_after_the_join_chooses_its_strategy_by_the_joined_rows() {
+    let db = Database::open("memory://join_on_blocks_strategy").unwrap();
+    for sql in [
+        "CREATE TABLE j1 (id INTEGER PRIMARY KEY, g INTEGER, k INTEGER)",
+        "CREATE TABLE j2 (id INTEGER PRIMARY KEY, g INTEGER, k INTEGER)",
+        "CREATE TABLE s2 (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE INDEX s2_k ON s2 (k)",
+        "INSERT INTO j1 SELECT g.value, 0, 1 FROM generate_series(1, 40) g",
+        "INSERT INTO j2 SELECT g.value, 0, 1 FROM generate_series(1, 25) g",
+        "INSERT INTO s2 SELECT g.value, 1 FROM generate_series(1, 10000) g",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let sql = "SELECT j1.id, j2.id FROM j1 JOIN j2 ON j1.g = j2.g \
+               WHERE EXISTS (SELECT 1 FROM s2 WHERE s2.k = j1.k)";
+    let probes = prepared_strategy_runs(PreparedStrategy::Probe);
+    let keyed = prepared_strategy_runs(PreparedStrategy::KeyedSet);
+    assert_eq!(rows(&db, sql).map(|rows| rows.len()), Ok(1000));
+    assert_eq!(
+        (
+            prepared_strategy_runs(PreparedStrategy::Probe) - probes,
+            prepared_strategy_runs(PreparedStrategy::KeyedSet) - keyed
+        ),
+        (0, 1),
+        "1000 joined rows over 10000 rows of s2 read the keyed set once, not a probe per row"
     );
 }

@@ -17,7 +17,7 @@
 //! once per cached plan into programs, and run with each subquery as a
 //! parameterised scan whose outer reads fill parameter slots.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::{Arc, RwLock};
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -762,6 +762,8 @@ fn for_each_child(expr: &Expression, f: &mut impl FnMut(&Expression) -> Result<(
             call.order_by.iter().try_for_each(|o| f(&o.expression))
         }
         Expression::AllAny(all_any) => f(&all_any.left),
+        Expression::List(list) => list.elements.iter().try_for_each(f),
+        Expression::ExpressionList(list) => list.expressions.iter().try_for_each(f),
         _ => Ok(()),
     }
 }
@@ -873,6 +875,18 @@ fn rebuild(
                 })
                 .collect::<Result<_>>()?,
             filter: call.filter.as_deref().map(|e| boxed(f, e)).transpose()?,
+        })),
+        Expression::List(list) => Expression::List(Box::new(ListExpression {
+            token: list.token.clone(),
+            elements: list.elements.iter().map(&mut *f).collect::<Result<_>>()?,
+        })),
+        Expression::ExpressionList(list) => Expression::ExpressionList(Box::new(ExpressionList {
+            token: list.token.clone(),
+            expressions: list
+                .expressions
+                .iter()
+                .map(&mut *f)
+                .collect::<Result<_>>()?,
         })),
         other => other.clone(),
     })
@@ -3104,14 +3118,13 @@ impl Executor {
         )
     }
 
-    /// One execution's run of a join statement's blocks for about `rows`
-    /// joined rows; None when a table they read no longer has the columns
-    /// they were prepared for
+    /// One execution's run of a join statement's blocks, its rows unknown
+    /// until a site has them; None when a table they read no longer has
+    /// the columns they were prepared for
     pub(crate) fn join_runner<'a>(
         &'a self,
         held: &'a JoinBlocks,
         ctx: &'a ExecutionContext,
-        rows: usize,
     ) -> Result<Option<PreparedRunner<'a>>> {
         let (blocks, holes) = (&held.blocks, &held.joined);
         for name in &blocks.named {
@@ -3127,7 +3140,7 @@ impl Executor {
             return Ok(None);
         };
         Ok(Some(PreparedRunner::new(
-            self, blocks, holes, ctx, inner_ctx, tables, rows, None,
+            self, blocks, holes, ctx, inner_ctx, tables, None, None,
         )))
     }
 }
@@ -3172,7 +3185,7 @@ impl<'a> DmlRunner<'a> {
             ctx,
             tables.inner_ctx,
             tables.tables,
-            rows,
+            Some(rows),
             None,
         );
         for (slot, value) in runner.run_slot_values()? {
@@ -3654,7 +3667,7 @@ impl Executor {
             ctx,
             inner_ctx,
             tables,
-            table.row_count_hint(),
+            Some(table.row_count_hint()),
             statement_limit,
         );
         if !prepared.blocks.run_slots.is_empty() {
@@ -3748,8 +3761,9 @@ pub(crate) struct PreparedRunner<'a> {
     holes: &'a HoleSet,
     /// The statement's own context, whose view and parameters a kept answer is of
     statement: &'a ExecutionContext,
-    /// The statement table's rows, by its hint
-    statement_rows: usize,
+    /// The rows the statement asks its blocks for, by its hint; a join
+    /// knows them only once a site has them
+    statement_rows: Cell<Option<usize>>,
     /// The rows the statement stops at, when no ORDER BY reads them all
     statement_limit: Option<i64>,
     /// The statement's parameters, then its run slots; the other slots NULL
@@ -3810,6 +3824,11 @@ impl<'a> PreparedRunner<'a> {
         Ok(Some(tables))
     }
 
+    /// Sets the rows a join's site asks its blocks for, before its first ask
+    pub(crate) fn ask_rows(&self, rows: Option<usize>) {
+        self.statement_rows.set(rows);
+    }
+
     /// The rows block `index` reads, through `expr` when its scan takes one:
     /// its table's, or the one row without columns of a block without FROM
     fn scan(&self, index: usize, expr: Option<&dyn StorageExpr>) -> Result<Box<dyn Scanner>> {
@@ -3830,7 +3849,7 @@ impl<'a> PreparedRunner<'a> {
         ctx: &'a ExecutionContext,
         inner_ctx: ExecutionContext,
         tables: BlockTables,
-        statement_rows: usize,
+        statement_rows: Option<usize>,
         statement_limit: Option<i64>,
     ) -> Self {
         let mut base: ParamVec = ctx.params().iter().cloned().collect();
@@ -3841,7 +3860,7 @@ impl<'a> PreparedRunner<'a> {
             prepared,
             holes,
             statement: ctx,
-            statement_rows,
+            statement_rows: Cell::new(statement_rows),
             statement_limit,
             blocks: (0..count)
                 .map(|_| BlockState {
@@ -4291,10 +4310,12 @@ impl<'a> PreparedRunner<'a> {
         let sq = &self.prepared.subqueries[index];
         let parent_rows = match sq.parent {
             // A parent without FROM reads one row
-            Some(parent) => self.tables[parent as usize]
-                .as_ref()
-                .map_or(1, |table| table.row_count_hint()),
-            None => self.statement_rows,
+            Some(parent) => Some(
+                self.tables[parent as usize]
+                    .as_ref()
+                    .map_or(1, |table| table.row_count_hint()),
+            ),
+            None => self.statement_rows.get(),
         };
         // A keyed plan reads a column, so its block has a table
         let Some(table) = &self.tables[index] else {
@@ -4304,7 +4325,7 @@ impl<'a> PreparedRunner<'a> {
             &**table,
             &sq.schema.columns[plan.keys[0].0].name,
             self.statement_limit.filter(|_| sq.parent.is_none()),
-            Some(parent_rows),
+            parent_rows,
         )
     }
 

@@ -438,6 +438,111 @@ impl CteNames<'_> {
     }
 }
 
+/// The equalities a NATURAL join or a USING list makes of the sides'
+/// columns, the right columns SELECT * leaves out, and the left columns it
+/// names unqualified; none for any other join
+fn natural_join_condition(
+    join_type: &str,
+    join_source: &JoinTableSource,
+    left_columns: &[String],
+    right_columns: &[String],
+) -> (Option<Expression>, Vec<usize>, Vec<(usize, String)>) {
+    if !join_type.contains("NATURAL") && join_source.using_columns.is_empty() {
+        return (None, Vec::new(), Vec::new());
+    }
+    // Find common columns between left and right tables
+    // For this, we extract the base column name (without table qualifier)
+    let left_base_cols: Vec<(usize, String)> = left_columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (i, extract_base_column_name(c)))
+        .collect();
+
+    let right_base_cols: Vec<(usize, String)> = right_columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (i, extract_base_column_name(c)))
+        .collect();
+
+    // Determine which columns to match
+    // For NATURAL JOIN: all common columns
+    // For USING clause: only specified columns
+    let using_col_names: Vec<String> = join_source
+        .using_columns
+        .iter()
+        .map(|c| c.value_lower.to_string())
+        .collect();
+
+    // Find matching column pairs and track excluded right-side columns
+    // Also track left columns to rename to unqualified names per SQL standard
+    let mut conditions: Vec<Expression> = Vec::new();
+    let mut excluded_right_indices: Vec<usize> = Vec::new();
+    let mut join_column_renames: Vec<(usize, String)> = Vec::new(); // (left_idx, base_name)
+    for (left_idx, left_base) in &left_base_cols {
+        for (right_idx, right_base) in &right_base_cols {
+            // For NATURAL JOIN, match all common columns
+            // For USING, only match specified columns
+            let should_match = if !using_col_names.is_empty() {
+                // USING clause - match only specified columns
+                using_col_names.contains(left_base) && left_base == right_base
+            } else {
+                // NATURAL JOIN - match all common columns
+                left_base == right_base
+            };
+
+            if should_match {
+                // Track right-side columns to exclude from SELECT *
+                // The index in all_columns is left_columns.len() + right_idx
+                excluded_right_indices.push(left_columns.len() + *right_idx);
+                // Track left column to rename to unqualified name
+                join_column_renames.push((*left_idx, left_base.clone()));
+
+                // Create equality condition: left_col = right_col
+                let left_col_name = left_columns[*left_idx].clone();
+                let right_col_name = right_columns[*right_idx].clone();
+                let left_col = Expression::Identifier(Identifier::new(
+                    Token::new(
+                        TokenType::Identifier,
+                        left_col_name.clone(),
+                        Position::default(),
+                    ),
+                    left_col_name,
+                ));
+                let right_col = Expression::Identifier(Identifier::new(
+                    Token::new(
+                        TokenType::Identifier,
+                        right_col_name.clone(),
+                        Position::default(),
+                    ),
+                    right_col_name,
+                ));
+                conditions.push(Expression::Infix(InfixExpression::new(
+                    Token::new(TokenType::Operator, "=", Position::default()),
+                    Box::new(left_col),
+                    "=".to_string(),
+                    Box::new(right_col),
+                )));
+            }
+        }
+    }
+
+    // Combine conditions with AND
+    if conditions.is_empty() {
+        (None, Vec::new(), Vec::new())
+    } else {
+        let mut combined = conditions.remove(0);
+        for cond in conditions {
+            combined = Expression::Infix(InfixExpression::new(
+                Token::new(TokenType::Keyword, "AND", Position::default()),
+                Box::new(combined),
+                "AND".to_string(),
+                Box::new(cond),
+            ));
+        }
+        (Some(combined), excluded_right_indices, join_column_renames)
+    }
+}
+
 /// A join's WHERE split as execution pushes it: a filter for each side it
 /// may narrow, never the side an outer join pads with NULLs, and the rest,
 /// asked of the joined rows. The schemas are the sides that are base tables
@@ -4703,7 +4808,7 @@ impl Executor {
         &self,
         prepared: Option<&PreparedJoin>,
         stmt: &SelectStatement,
-        on: Option<&Expression>,
+        (join_source, join_type): (&JoinTableSource, &str),
         cross: Option<&Expression>,
         side_filters: [Option<&Expression>; 2],
         (left_alias, right_alias): (Option<&str>, Option<&str>),
@@ -4732,6 +4837,10 @@ impl Executor {
                         .map(move |c| format!("{alias}.{}", c.name))
                 })
                 .collect();
+            // The equalities of a NATURAL join or a USING list stand for its ON
+            let (left, right) = columns.split_at(left_schema.columns.len());
+            let natural = natural_join_condition(join_type, join_source, left, right).0;
+            let on = natural.as_ref().or(join_source.condition.as_deref());
             let opened = cross.map(|cross| {
                 Self::with_select_aliases(stmt, cross, &columns).unwrap_or_else(|| cross.clone())
             });
@@ -4909,7 +5018,7 @@ impl Executor {
             true => self.statement_blocks(
                 prepared.as_deref(),
                 stmt,
-                join_source.condition.as_deref(),
+                (join_source, join_type.as_str()),
                 cross_filter.as_ref(),
                 [left_filter.as_ref(), right_filter.as_ref()],
                 (left_alias.as_deref(), right_alias.as_deref()),
@@ -4919,7 +5028,7 @@ impl Executor {
             false => None,
         };
         let blocks_run = match blocks.as_deref() {
-            Some(blocks) => Some(self.join_runner(blocks, ctx, 0)?.ok_or_else(|| {
+            Some(blocks) => Some(self.join_runner(blocks, ctx)?.ok_or_else(|| {
                 Error::internal("a table's columns changed while the statement prepared")
             })?),
             None => None,
@@ -5573,6 +5682,9 @@ impl Executor {
                         ),
                         None => None,
                     };
+                    if let Some(run) = &blocks_run {
+                        run.ask_rows(outer_result.estimated_count());
+                    }
                     let mut result_rows = RowVec::new();
                     // A primary key join without a limit fetches its rows in one
                     // batch; an index lookup streams, which costs less than the
@@ -6327,101 +6439,7 @@ impl Executor {
 
         // Handle NATURAL JOIN or USING clause by automatically finding common columns
         let natural_join_condition =
-            if join_type.contains("NATURAL") || !join_source.using_columns.is_empty() {
-                // Find common columns between left and right tables
-                // For this, we extract the base column name (without table qualifier)
-                let left_base_cols: Vec<(usize, String)> = left_columns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| (i, extract_base_column_name(c)))
-                    .collect();
-
-                let right_base_cols: Vec<(usize, String)> = right_columns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| (i, extract_base_column_name(c)))
-                    .collect();
-
-                // Determine which columns to match
-                // For NATURAL JOIN: all common columns
-                // For USING clause: only specified columns
-                let using_col_names: Vec<String> = join_source
-                    .using_columns
-                    .iter()
-                    .map(|c| c.value_lower.to_string())
-                    .collect();
-
-                // Find matching column pairs and track excluded right-side columns
-                // Also track left columns to rename to unqualified names per SQL standard
-                let mut conditions: Vec<Expression> = Vec::new();
-                let mut excluded_right_indices: Vec<usize> = Vec::new();
-                let mut join_column_renames: Vec<(usize, String)> = Vec::new(); // (left_idx, base_name)
-                for (left_idx, left_base) in &left_base_cols {
-                    for (right_idx, right_base) in &right_base_cols {
-                        // For NATURAL JOIN, match all common columns
-                        // For USING, only match specified columns
-                        let should_match = if !using_col_names.is_empty() {
-                            // USING clause - match only specified columns
-                            using_col_names.contains(left_base) && left_base == right_base
-                        } else {
-                            // NATURAL JOIN - match all common columns
-                            left_base == right_base
-                        };
-
-                        if should_match {
-                            // Track right-side columns to exclude from SELECT *
-                            // The index in all_columns is left_columns.len() + right_idx
-                            excluded_right_indices.push(left_columns.len() + *right_idx);
-                            // Track left column to rename to unqualified name
-                            join_column_renames.push((*left_idx, left_base.clone()));
-
-                            // Create equality condition: left_col = right_col
-                            let left_col_name = left_columns[*left_idx].clone();
-                            let right_col_name = right_columns[*right_idx].clone();
-                            let left_col = Expression::Identifier(Identifier::new(
-                                Token::new(
-                                    TokenType::Identifier,
-                                    left_col_name.clone(),
-                                    Position::default(),
-                                ),
-                                left_col_name,
-                            ));
-                            let right_col = Expression::Identifier(Identifier::new(
-                                Token::new(
-                                    TokenType::Identifier,
-                                    right_col_name.clone(),
-                                    Position::default(),
-                                ),
-                                right_col_name,
-                            ));
-                            conditions.push(Expression::Infix(InfixExpression::new(
-                                Token::new(TokenType::Operator, "=", Position::default()),
-                                Box::new(left_col),
-                                "=".to_string(),
-                                Box::new(right_col),
-                            )));
-                        }
-                    }
-                }
-
-                // Combine conditions with AND
-                if conditions.is_empty() {
-                    (None, Vec::new(), Vec::new())
-                } else {
-                    let mut combined = conditions.remove(0);
-                    for cond in conditions {
-                        combined = Expression::Infix(InfixExpression::new(
-                            Token::new(TokenType::Keyword, "AND", Position::default()),
-                            Box::new(combined),
-                            "AND".to_string(),
-                            Box::new(cond),
-                        ));
-                    }
-                    (Some(combined), excluded_right_indices, join_column_renames)
-                }
-            } else {
-                (None, Vec::new(), Vec::new())
-            };
+            natural_join_condition(&join_type, join_source, &left_columns, &right_columns);
 
         // Destructure the tuple: (condition, excluded_column_indices, column_renames)
         let (natural_join_cond, excluded_column_indices, join_col_renames) = natural_join_condition;
@@ -6567,6 +6585,9 @@ impl Executor {
                     blocks.as_deref(),
                 )?;
                 let where_filter = RowFilter::from_program(program).with_context(ctx);
+                if let Some(run) = &blocks_run {
+                    run.ask_rows(Some(result_rows.len()));
+                }
                 let mut filtered = RowVec::with_capacity(result_rows.len());
                 for (id, row) in result_rows {
                     if where_filter.matches_checked_with(&row, where_blocks)? {
