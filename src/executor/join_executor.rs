@@ -293,7 +293,14 @@ fn residual_filters(
             compile,
             read,
         )?,
-        None => read(&compile()?),
+        None => analysis
+            .residual_conditions
+            .iter()
+            .map(|cond| {
+                compile_expression(cond, all_columns)
+                    .map(|program| RowFilter::from_program(program).with_context(ctx))
+            })
+            .collect::<Result<_>>()?,
     })
 }
 

@@ -375,6 +375,8 @@ fn a_join_without_a_plan_builds_no_shared_list() {
     let zero = with(&[]);
     let one = with(&["l.id < 100"]);
     let two = with(&["l.id < 100", "r.id < 100"]);
+    let three = with(&["l.id < 100", "r.id < 100", "l.g < 100"]);
+    let four = with(&["l.id < 100", "r.id < 100", "l.g < 100", "r.w < 100"]);
     assert_eq!(
         (one - zero) - (two - one),
         2.0,
@@ -382,5 +384,13 @@ fn a_join_without_a_plan_builds_no_shared_list() {
          program, only the analysis's condition list and the filter list should",
         one - zero,
         two - one
+    );
+    assert_eq!(
+        (two - one, three - two),
+        (four - three, four - three),
+        "a second, third and fourth residual cost {}, {} and {} allocations per run",
+        two - one,
+        three - two,
+        four - three
     );
 }
