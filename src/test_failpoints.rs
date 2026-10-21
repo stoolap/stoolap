@@ -864,6 +864,7 @@ thread_local! {
     static IN_SUBQUERY_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static QUANTIFIED_MEMBER_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static AGGREGATE_PATHS_TAKEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static JOIN_PATHS_TAKEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static ONE_SHOT_COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ONE_SHOT_LITERAL_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -906,6 +907,32 @@ pub fn aggregate_paths_taken() -> Vec<&'static str> {
 
 pub fn reset_aggregate_paths() {
     AGGREGATE_PATHS_TAKEN.with(|taken| taken.set(0));
+}
+
+/// The name of every operator that produces a join's rows
+pub fn join_paths() -> Vec<&'static str> {
+    crate::executor::join_executor::JoinPath::ALL
+        .iter()
+        .map(|path| path.name())
+        .collect()
+}
+
+/// The join paths that ran on this thread since the last reset
+pub fn join_paths_taken() -> Vec<&'static str> {
+    let taken = JOIN_PATHS_TAKEN.with(std::cell::Cell::get);
+    crate::executor::join_executor::JoinPath::ALL
+        .iter()
+        .filter(|path| taken & (1 << **path as u32) != 0)
+        .map(|path| path.name())
+        .collect()
+}
+
+pub fn reset_join_paths() {
+    JOIN_PATHS_TAKEN.with(|taken| taken.set(0));
+}
+
+pub(crate) fn join_path_taken(index: usize) {
+    JOIN_PATHS_TAKEN.with(|taken| taken.set(taken.get() | 1 << index));
 }
 
 pub(crate) fn aggregate_path_taken(index: usize) {

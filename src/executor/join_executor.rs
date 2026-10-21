@@ -94,6 +94,57 @@ use crate::executor::utils::{column_kinds, extract_join_keys_and_residual_keepin
 use crate::functions::registry::global_registry;
 use crate::parser::ast::Expression;
 
+/// Every operator that produces a join's rows. Each notes, under
+/// test-failpoints, that it ran, for the join path equivalence test
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JoinPath {
+    /// Index nested loop, outer rows fetched in chunks
+    IndexNestedLoop,
+    /// Index nested loop over a primary key, one batch fetch
+    BatchIndexNestedLoop,
+    /// Index nested loop feeding a GROUP BY with LIMIT
+    GroupedIndexJoin,
+    /// Hash join that stops at a small LIMIT, probe side streamed
+    LimitHash,
+    /// Hash join built across threads
+    ParallelHash,
+    Hash,
+    NestedLoop,
+}
+
+impl JoinPath {
+    #[inline]
+    pub(crate) fn taken(self) {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::join_path_taken(self as usize);
+    }
+}
+
+#[cfg(any(test, feature = "test-failpoints"))]
+impl JoinPath {
+    pub(crate) const ALL: [JoinPath; 7] = [
+        JoinPath::IndexNestedLoop,
+        JoinPath::BatchIndexNestedLoop,
+        JoinPath::GroupedIndexJoin,
+        JoinPath::LimitHash,
+        JoinPath::ParallelHash,
+        JoinPath::Hash,
+        JoinPath::NestedLoop,
+    ];
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            JoinPath::IndexNestedLoop => "index_nested_loop",
+            JoinPath::BatchIndexNestedLoop => "batch_index_nested_loop",
+            JoinPath::GroupedIndexJoin => "grouped_index_join",
+            JoinPath::LimitHash => "limit_hash",
+            JoinPath::ParallelHash => "parallel_hash",
+            JoinPath::Hash => "hash",
+            JoinPath::NestedLoop => "nested_loop",
+        }
+    }
+}
+
 /// Result of a streaming join execution.
 #[derive(Debug)]
 pub struct JoinResult {
@@ -333,6 +384,7 @@ impl JoinExecutor {
     ///
     /// Memory usage is halved, and early termination actually stops work.
     pub fn execute_streaming(&self, request: StreamingJoinRequest<'_>) -> Result<JoinResult> {
+        JoinPath::LimitHash.taken();
         // Build combined column list based on build side position
         let (left_columns, right_columns) = if request.build_is_left {
             (
@@ -598,6 +650,7 @@ impl JoinExecutor {
         build_left: bool,
         ctx: &ExecutionContext,
     ) -> Result<RowVec> {
+        JoinPath::ParallelHash.taken();
         let config = ParallelConfig::default();
 
         // Determine probe and build sides - use Arc slices directly (zero-copy)
@@ -676,6 +729,7 @@ impl JoinExecutor {
         limit: Option<u64>,
         ctx: &ExecutionContext,
     ) -> Result<RowVec> {
+        JoinPath::Hash.taken();
         // Build schema for operators from column names
         let left_schema: Vec<ColumnInfo> = left_columns.iter().map(ColumnInfo::new).collect();
         let right_schema: Vec<ColumnInfo> = right_columns.iter().map(ColumnInfo::new).collect();
@@ -738,6 +792,7 @@ impl JoinExecutor {
         limit: Option<u64>,
         ctx: &ExecutionContext,
     ) -> Result<RowVec> {
+        JoinPath::NestedLoop.taken();
         // Build schema for operators
         let left_schema: Vec<ColumnInfo> = left_columns.iter().map(ColumnInfo::new).collect();
         let right_schema: Vec<ColumnInfo> = right_columns.iter().map(ColumnInfo::new).collect();

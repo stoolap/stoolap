@@ -314,7 +314,7 @@ use super::expression::{
     ExpressionEval, JoinFilter, RowFilter, SharedProgram,
 };
 use super::hash_table::JoinHashTable;
-use super::join_executor::{JoinExecutor, StreamingJoinRequest};
+use super::join_executor::{JoinExecutor, JoinPath, StreamingJoinRequest};
 use super::operator::{ColumnInfo, Operator, QueryResultOperator};
 use super::operators::hash_join::JoinType as OperatorJoinType;
 use super::operators::index_nested_loop::{
@@ -5220,6 +5220,7 @@ impl Executor {
                                     None => break 'index_nl,
                                 },
                             };
+                            JoinPath::IndexNestedLoop.taken();
                             let mut op = IndexNestedLoopJoinOperator::new(
                                 outer_op,
                                 table,
@@ -5327,6 +5328,7 @@ impl Executor {
                         // Batch INL for NO LIMIT - single batch fetch, O(1) lock overhead
                         let outer_op: Box<dyn Operator> =
                             Box::new(QueryResultOperator::new(outer_result, outer_cols.clone()));
+                        JoinPath::BatchIndexNestedLoop.taken();
                         let mut op = BatchIndexNestedLoopJoinOperator::new(
                             outer_op,
                             inner_table,
@@ -8182,6 +8184,7 @@ impl Executor {
                     None => return Ok(None),
                 },
             };
+            JoinPath::GroupedIndexJoin.taken();
             let mut op = IndexNestedLoopJoinOperator::new(
                 outer_op,
                 table,
