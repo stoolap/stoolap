@@ -2837,6 +2837,16 @@ impl<'a> DmlRunner<'a> {
         Ok(
             match self.runner.narrowed_rows(where_.narrowing, table, None)? {
                 Some((rows, _)) => Candidates::Keyed(rows.into_iter().map(|(id, _)| id).collect()),
+                // The storage UPDATE filters a row the transaction rewrote by
+                // its committed copy (#539), so its own rows are read as a
+                // SELECT reads them
+                None if storage_expr.is_some() && table.has_local_changes() => Candidates::Keyed(
+                    table
+                        .collect_all_rows(storage_expr.as_deref())?
+                        .into_iter()
+                        .map(|(id, _)| id)
+                        .collect(),
+                ),
                 None => Candidates::Scan(storage_expr),
             },
         )

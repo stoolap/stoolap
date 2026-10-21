@@ -134,6 +134,63 @@ const OVERFLOWING: &[&str] = &[
 ];
 
 #[test]
+fn a_row_the_transaction_rewrote_to_match_is_written() {
+    let mut wrong = Vec::new();
+    for sealed in [false, true] {
+        for (sql, want) in [
+            (
+                "UPDATE v SET b = 9 WHERE x = 1 AND (SELECT u.id FROM u WHERE u.id = v.id) = 1",
+                vec![(1, 9), (2, 0)],
+            ),
+            (
+                "DELETE FROM v WHERE x = 1 AND (SELECT u.id FROM u WHERE u.id = v.id) = 1",
+                vec![(2, 0)],
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = if sealed {
+                Database::open(&format!("file://{}", dir.path().display())).unwrap()
+            } else {
+                Database::open("memory://dml_rewritten_to_match").unwrap()
+            };
+            for setup in [
+                "CREATE TABLE v (id INTEGER PRIMARY KEY, x INTEGER, b INTEGER)",
+                "CREATE TABLE u (id INTEGER PRIMARY KEY)",
+                "INSERT INTO v VALUES (1, 0, 0), (2, 1, 0)",
+                "INSERT INTO u VALUES (1)",
+            ] {
+                db.execute(setup, ()).unwrap();
+            }
+            if sealed {
+                db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+            }
+            let mut tx = db.begin().unwrap();
+            tx.execute("UPDATE v SET x = 1 WHERE id = 1", ()).unwrap();
+            let written = tx.execute(sql, ()).unwrap();
+            let left = ids_and_b(tx.query("SELECT id, b FROM v ORDER BY id", ()));
+            tx.rollback().unwrap();
+            if written != 1 || left != want {
+                wrong.push(format!(
+                    "{sql} (sealed: {sealed}): wrote {written}, left {left:?}"
+                ));
+            }
+            db.execute("DROP TABLE v", ()).unwrap();
+            db.execute("DROP TABLE u", ()).unwrap();
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+fn ids_and_b(rows: stoolap::Result<stoolap::Rows>) -> Vec<(i64, i64)> {
+    rows.unwrap()
+        .map(|r| {
+            let r = r.unwrap();
+            (r.get(0).unwrap(), r.get(1).unwrap())
+        })
+        .collect()
+}
+
+#[test]
 fn a_where_error_fails_a_prepared_statement_and_writes_nothing() {
     let mut wrong = Vec::new();
     for (i, sql) in OVERFLOWING.iter().enumerate() {
@@ -149,7 +206,7 @@ fn a_where_error_fails_a_prepared_statement_and_writes_nothing() {
                 (),
             )
             .unwrap();
-            let failed = if explicit {
+            let (failed, left) = if explicit {
                 let mut tx = db.begin().unwrap();
                 let failed = if sql.starts_with("SELECT") {
                     tx.query(sql, ())
@@ -158,23 +215,22 @@ fn a_where_error_fails_a_prepared_statement_and_writes_nothing() {
                 } else {
                     tx.execute(sql, ()).is_err()
                 };
+                let left = ids_and_b(tx.query("SELECT id, b FROM v ORDER BY id", ()));
                 tx.rollback().unwrap();
-                failed
-            } else if sql.starts_with("SELECT") {
-                db.query(sql, ())
-                    .and_then(|rows| rows.collect::<stoolap::Result<Vec<_>>>())
-                    .is_err()
+                (failed, left)
             } else {
-                db.execute(sql, ()).is_err()
+                let failed = if sql.starts_with("SELECT") {
+                    db.query(sql, ())
+                        .and_then(|rows| rows.collect::<stoolap::Result<Vec<_>>>())
+                        .is_err()
+                } else {
+                    db.execute(sql, ()).is_err()
+                };
+                (
+                    failed,
+                    ids_and_b(db.query("SELECT id, b FROM v ORDER BY id", ())),
+                )
             };
-            let left: Vec<(i64, i64)> = db
-                .query("SELECT id, b FROM v ORDER BY id", ())
-                .unwrap()
-                .map(|r| {
-                    let r = r.unwrap();
-                    (r.get(0).unwrap(), r.get(1).unwrap())
-                })
-                .collect();
             if !failed || left != [(1, 0), (2, 0)] {
                 wrong.push(format!(
                     "{sql} (transaction: {explicit}): failed {failed}, left {left:?}"
