@@ -121,6 +121,70 @@ fn a_set_may_mix_correlated_and_uncorrelated_subqueries() {
     assert_eq!(got.join(" "), "1:3:1 2:3:1 4:3:0");
 }
 
+/// Each with a WHERE conjunct that overflows on the row it reaches, beside
+/// the subqueries the prepared statement runs
+const OVERFLOWING: &[&str] = &[
+    "SELECT id FROM v WHERE ABS(x) >= 0 AND (SELECT u.id FROM u WHERE u.id = v.id) = 1",
+    "SELECT id FROM v WHERE ABS(x) >= 0 AND EXISTS (SELECT 1 FROM u WHERE u.id = v.id)",
+    "UPDATE v SET b = (SELECT u.id FROM u WHERE u.id = v.id) WHERE ABS(v.x) >= 0 AND (SELECT u.id FROM u WHERE u.id = v.id) = 1",
+    "UPDATE v SET b = 5 WHERE ABS(v.x) >= 0 AND (SELECT u.id FROM u WHERE u.id = v.id) = 1",
+    "UPDATE v SET b = (SELECT u.id FROM u WHERE u.id = v.id) WHERE ABS(v.x) >= 0",
+    "DELETE FROM v WHERE ABS(v.x) >= 0 AND (SELECT u.id FROM u WHERE u.id = v.id) = 1",
+    "DELETE FROM v WHERE ABS(v.x) >= 0 AND EXISTS (SELECT 1 FROM u WHERE u.id = v.id)",
+];
+
+#[test]
+fn a_where_error_fails_a_prepared_statement_and_writes_nothing() {
+    let mut wrong = Vec::new();
+    for (i, sql) in OVERFLOWING.iter().enumerate() {
+        for explicit in [false, true] {
+            let db = setup(&format!("dml_where_error_{i}_{explicit}"));
+            db.execute(
+                "CREATE TABLE v (id INTEGER PRIMARY KEY, x INTEGER, b INTEGER)",
+                (),
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO v VALUES (1, -9223372036854775808, 0), (2, 5, 0)",
+                (),
+            )
+            .unwrap();
+            let failed = if explicit {
+                let mut tx = db.begin().unwrap();
+                let failed = if sql.starts_with("SELECT") {
+                    tx.query(sql, ())
+                        .and_then(|rows| rows.collect::<stoolap::Result<Vec<_>>>())
+                        .is_err()
+                } else {
+                    tx.execute(sql, ()).is_err()
+                };
+                tx.rollback().unwrap();
+                failed
+            } else if sql.starts_with("SELECT") {
+                db.query(sql, ())
+                    .and_then(|rows| rows.collect::<stoolap::Result<Vec<_>>>())
+                    .is_err()
+            } else {
+                db.execute(sql, ()).is_err()
+            };
+            let left: Vec<(i64, i64)> = db
+                .query("SELECT id, b FROM v ORDER BY id", ())
+                .unwrap()
+                .map(|r| {
+                    let r = r.unwrap();
+                    (r.get(0).unwrap(), r.get(1).unwrap())
+                })
+                .collect();
+            if !failed || left != [(1, 0), (2, 0)] {
+                wrong.push(format!(
+                    "{sql} (transaction: {explicit}): failed {failed}, left {left:?}"
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 #[test]
 fn a_scalar_subquery_of_two_rows_fails_the_statement_and_writes_nothing() {
     let db = setup("dml_two_rows");
