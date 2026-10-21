@@ -334,6 +334,8 @@ pub enum CompiledExecution {
     JoinResidual(CompiledJoinResidual),
     /// A statement of the prepared family (general SELECT path)
     PreparedSelect(Arc<super::prepared_select::PreparedSelect>),
+    /// An UPDATE or DELETE whose subqueries run prepared
+    PreparedDml(Arc<super::prepared_select::PreparedDml>),
 }
 
 /// Default cache size (number of cached plans)

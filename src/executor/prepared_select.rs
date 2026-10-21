@@ -1027,14 +1027,11 @@ struct PreparedBlocks {
     subqueries: Vec<PreparedSubquery>,
 }
 
-/// One statement shape compiled against its tables' columns
+/// A statement's WHERE over its table's row: its program, what of it a scan
+/// takes, and the rows a set test's keys may narrow it to
 #[derive(Debug)]
-pub struct PreparedSelect {
-    cached_epoch: u64,
-    /// The statement table's columns at preparation
-    columns: CompactArc<Vec<String>>,
-    blocks: PreparedBlocks,
-    where_program: SharedProgram,
+struct PreparedWhere {
+    program: SharedProgram,
     /// The conjuncts without a subquery, which the scan is narrowed by
     pushdown: Option<Expression>,
     /// Every conjunct is in `pushdown`: a scan that takes it whole passes
@@ -1043,6 +1040,74 @@ pub struct PreparedSelect {
     /// A top-level EXISTS or NOT EXISTS conjunct with one key, whose keyed
     /// set's keys name the rows the WHERE may pass
     narrowing: Option<Narrowing>,
+}
+
+/// How a prepared WHERE's rows were read
+enum Passing {
+    /// The scan proves that no row passes
+    Pruned,
+    /// The scan took the whole WHERE: its answers up to the target
+    Answers(RowVec),
+    /// Every row read that passes went to the caller
+    Read,
+}
+
+/// A statement's WHERE rewritten for its blocks, before it compiles
+struct WhereParts {
+    clause: Expression,
+    pushed: Vec<Expression>,
+    /// Each top-level EXISTS or IN test: its block, whether negated, and
+    /// the statement column an IN tests
+    set_tests: Vec<(u16, bool, Option<usize>)>,
+    conjuncts: usize,
+}
+
+impl WhereParts {
+    /// The WHERE as `program`, narrowed by the first set test whose block
+    /// in `blocks` can name its rows
+    fn prepare(self, program: SharedProgram, blocks: &PreparedBlocks) -> PreparedWhere {
+        let whole = self.conjuncts == 1;
+        let narrowing = self.set_tests.iter().find_map(|&(id, negated, column)| {
+            let sq = &blocks.subqueries[id as usize];
+            let (column, members) = match (&sq.answer, column) {
+                (
+                    Answer::Exists(Kept {
+                        keyed: Some(plan), ..
+                    }),
+                    None,
+                ) if plan.keys.len() == 1 => (plan.keys[0].2, false),
+                (Answer::Members(_, members), Some(column))
+                    if sq.uncorrelated && members.test == MemberTest::In =>
+                {
+                    (column, true)
+                }
+                _ => return None,
+            };
+            Some(Narrowing {
+                id,
+                column,
+                whole,
+                negated,
+                members,
+            })
+        });
+        PreparedWhere {
+            program,
+            pushed_whole: self.pushed.len() == self.conjuncts,
+            pushdown: conjunction(self.pushed),
+            narrowing,
+        }
+    }
+}
+
+/// One statement shape compiled against its tables' columns
+#[derive(Debug)]
+pub struct PreparedSelect {
+    cached_epoch: u64,
+    /// The statement table's columns at preparation
+    columns: CompactArc<Vec<String>>,
+    blocks: PreparedBlocks,
+    where_: PreparedWhere,
     projection: PreparedProjection,
     output_columns: CompactArc<Vec<String>>,
     /// The output columns the statement shows; the sort's keys follow them
@@ -2528,52 +2593,17 @@ impl PreparedSelect {
             .as_deref()
             .ok_or_else(|| Error::internal("a prepared statement without WHERE"))?;
         let where_clause = with_aliases(where_clause, &stmt.columns, &scope.columns);
-        let mut parts = Vec::new();
-        conjuncts(&where_clause, &mut parts);
-
         let mut work = Rewritten::default();
-        let mut rewritten = Vec::with_capacity(parts.len());
         let mut run_slots = Vec::new();
-        let mut pushed = Vec::new();
-        let mut exists_conjuncts = Vec::new();
-        for part in parts {
-            let part = builder.statement_conjunct(&chain, part, &mut work, &mut run_slots)?;
-            if !mentions_subquery(&part) && !needs_folding(&part) && scans_whole(&part, schema) {
-                pushed.push(part.clone());
-            }
-            // The block, whether negated, and the column an IN tests
-            let set_test = match &part {
-                Expression::Exists(mark) => Some((&mark.subquery, false, None)),
-                Expression::Prefix(prefix) if prefix.op_type == PrefixOperator::Not => {
-                    match prefix.right.as_ref() {
-                        Expression::Exists(mark) => Some((&mark.subquery, true, None)),
-                        _ => None,
-                    }
-                }
-                Expression::In(in_expr) => match (&*in_expr.right, bound_column(&in_expr.left)) {
-                    (Expression::ScalarSubquery(mark), Some(name)) => schema
-                        .column_index_map()
-                        .get(name)
-                        .map(|&column| (&mark.subquery, in_expr.not, Some(column))),
-                    _ => None,
-                },
-                _ => None,
-            };
-            if let Some((mark, negated, column)) = set_test {
-                exists_conjuncts.extend(mark.prepared.map(|id| (id, negated, column)));
-            }
-            rewritten.push(part);
-        }
-        let rewritten_count = rewritten.len();
-        let where_clause = conjunction(rewritten)
-            .ok_or_else(|| Error::internal("a prepared statement without WHERE"))?;
+        let parts =
+            builder.statement_where(&chain, schema, &where_clause, &mut work, &mut run_slots)?;
         let mut read_as = FxHashMap::default();
-        compare_as_scan(&where_clause, schema, &mut read_as);
+        compare_as_scan(&parts.clause, schema, &mut read_as);
         let own = CompileContext::new(&scope.columns, registry)
             .with_prepared_subqueries()
             .with_read_as(&read_as);
         let compile = |expr: &Expression| compile_with(&own, expr);
-        let where_program = compile(&where_clause)?;
+        let where_program = compile(&parts.clause)?;
         let run_slots = run_slots
             .iter()
             .map(|(slot, value)| compile(value).map(|p| (*slot, p)))
@@ -2617,43 +2647,231 @@ impl PreparedSelect {
             layout.sources.extend(extra_sources);
             CompactArc::new(layout)
         });
-        let narrowing = exists_conjuncts.iter().find_map(|&(id, negated, column)| {
-            let sq = &blocks.subqueries[id as usize];
-            let (column, members) = match (&sq.answer, column) {
-                (
-                    Answer::Exists(Kept {
-                        keyed: Some(plan), ..
-                    }),
-                    None,
-                ) if plan.keys.len() == 1 => (plan.keys[0].2, false),
-                (Answer::Members(_, members), Some(column))
-                    if sq.uncorrelated && members.test == MemberTest::In =>
-                {
-                    (column, true)
-                }
-                _ => return None,
-            };
-            Some(Narrowing {
-                id,
-                column,
-                whole: rewritten_count == 1,
-                negated,
-                members,
-            })
-        });
+        let where_ = parts.prepare(where_program, &blocks);
         Ok(Self {
             cached_epoch: epoch,
             columns: scope.columns.clone(),
             blocks,
-            where_program,
-            pushed_whole: pushed.len() == rewritten_count,
-            pushdown: conjunction(pushed),
-            narrowing,
+            where_,
             projection,
             output_columns: CompactArc::new(output_columns),
             visible,
             layout,
         })
+    }
+}
+
+/// The WHERE and SET of an UPDATE or DELETE whose subqueries run prepared,
+/// compiled against its target's columns over one set of blocks
+#[derive(Debug)]
+pub struct PreparedDml {
+    cached_epoch: u64,
+    /// The target's columns at preparation
+    columns: CompactArc<Vec<String>>,
+    blocks: PreparedBlocks,
+    where_: Option<PreparedWhere>,
+    /// Each SET value with the column it writes
+    sets: Vec<(usize, SharedProgram)>,
+}
+
+impl PreparedDml {
+    /// Prepare the WHERE and `sets` of a statement over its target `schema`,
+    /// named `scope_name`, for executions with `param_count` parameters
+    fn prepare(
+        executor: &Executor,
+        schema: &Schema,
+        scope_name: &SmartString,
+        where_clause: Option<&Expression>,
+        sets: &[(usize, &Expression)],
+        param_count: usize,
+        epoch: u64,
+    ) -> Result<Self> {
+        let scope = ScopeTable::of(scope_name.clone(), schema);
+        let scopes = [&scope];
+        let chain = Chain { scopes: &scopes };
+        let mut builder = Builder {
+            executor,
+            next_slot: param_count,
+            subqueries: Vec::new(),
+            named: Vec::new(),
+            max_param: 0,
+        };
+        let mut work = Rewritten::default();
+        // A value that reads no row is computed once per run, as a run slot
+        let mut run_slots = Vec::new();
+        let where_parts = where_clause
+            .map(|w| builder.statement_where(&chain, schema, w, &mut work, &mut run_slots))
+            .transpose()?;
+        let mut rewritten = Vec::with_capacity(sets.len());
+        for (column, value) in sets {
+            let mut value_work = Rewritten::default();
+            let rewritten_value = builder.rewrite(&chain, None, value, &mut value_work)?;
+            let value = if !value_work.reads_row
+                && !is_leaf(value)
+                && !volatile(value, &executor.function_registry)
+            {
+                let slot = builder.slot();
+                run_slots.push((slot, rewritten_value));
+                slot_parameter(slot)
+            } else {
+                rewritten_value
+            };
+            rewritten.push((*column, value));
+        }
+        let sets = rewritten;
+        let mut read_as = FxHashMap::default();
+        if let Some(parts) = &where_parts {
+            compare_as_scan(&parts.clause, schema, &mut read_as);
+        }
+        let own = CompileContext::new(&scope.columns, &executor.function_registry)
+            .with_prepared_subqueries()
+            .with_read_as(&read_as);
+        let where_program = where_parts
+            .as_ref()
+            .map(|parts| compile_with(&own, &parts.clause))
+            .transpose()?;
+        let sets = sets
+            .iter()
+            .map(|(column, value)| compile_with(&own, value).map(|p| (*column, p)))
+            .collect::<Result<Vec<_>>>()?;
+        let run_slots = run_slots
+            .iter()
+            .map(|(slot, value)| compile_with(&own, value).map(|p| (*slot, p)))
+            .collect::<Result<Vec<_>>>()?;
+        let blocks = builder.finish(param_count, run_slots)?;
+        let where_ = where_parts
+            .zip(where_program)
+            .map(|(parts, program)| parts.prepare(program, &blocks));
+        Ok(Self {
+            cached_epoch: epoch,
+            columns: scope.columns.clone(),
+            blocks,
+            where_,
+            sets,
+        })
+    }
+}
+
+/// The tables a prepared UPDATE's or DELETE's blocks read, opened before
+/// the statement writes, and the context they read under
+pub(crate) struct DmlTables {
+    tables: Vec<Box<dyn Table>>,
+    inner_ctx: ExecutionContext,
+}
+
+/// The rows an UPDATE may write, each asked its WHERE as it is written
+pub(crate) enum Candidates {
+    /// The scan proves that no row passes
+    Pruned,
+    /// The rows a set test's keys name, by row id
+    Keyed(Vec<i64>),
+    /// A scan narrowed by the conjuncts without a subquery
+    Scan(Option<Box<dyn StorageExpr>>),
+}
+
+/// One execution of a prepared UPDATE or DELETE over its target's rows
+pub(crate) struct DmlRunner<'a> {
+    runner: PreparedRunner<'a>,
+    prepared: &'a PreparedDml,
+}
+
+impl<'a> DmlRunner<'a> {
+    /// A run of `prepared` for a target of about `rows` rows, its run slots
+    /// computed before the statement reads a row
+    pub(crate) fn new(
+        executor: &'a Executor,
+        prepared: &'a PreparedDml,
+        ctx: &'a ExecutionContext,
+        tables: DmlTables,
+        rows: usize,
+    ) -> Result<Self> {
+        let mut runner = PreparedRunner::new(
+            executor,
+            &prepared.blocks,
+            ctx,
+            tables.inner_ctx,
+            tables.tables,
+            rows,
+            None,
+        );
+        for (slot, value) in runner.run_slot_values()? {
+            runner.base[slot] = value;
+        }
+        Ok(Self { runner, prepared })
+    }
+
+    /// What the statement's programs read for `row`: its parameters, its
+    /// run slots and its blocks
+    pub(crate) fn context<'r>(&'r self, row: &'r Row) -> ExecuteContext<'r> {
+        ExecuteContext::with_common_params(
+            row,
+            &self.runner.base,
+            Some(self.runner.named),
+            self.runner.transaction_id,
+        )
+        .with_subquery_executor(&self.runner)
+    }
+
+    /// Whether the row of `exec` passes the WHERE; every row passes a
+    /// statement without one
+    pub(crate) fn matches(&self, vm: &mut ExprVM, exec: &ExecuteContext) -> Result<bool> {
+        match &self.prepared.where_ {
+            Some(where_) => vm.execute_bool_checked(&where_.program, exec),
+            None => Ok(true),
+        }
+    }
+
+    /// The rows of `table` the WHERE may pass, read as a prepared SELECT
+    /// reads them but not yet asked the WHERE
+    pub(crate) fn candidates(
+        &self,
+        table: &dyn Table,
+        ctx: &ExecutionContext,
+    ) -> Result<Candidates> {
+        let Some(where_) = &self.prepared.where_ else {
+            return Ok(Candidates::Scan(None));
+        };
+        let Some((storage_expr, _)) = self.runner.where_scan(where_, table, ctx) else {
+            return Ok(Candidates::Pruned);
+        };
+        Ok(
+            match self.runner.narrowed_rows(where_.narrowing, table, None)? {
+                Some((rows, _)) => Candidates::Keyed(rows.into_iter().map(|(id, _)| id).collect()),
+                None => Candidates::Scan(storage_expr),
+            },
+        )
+    }
+
+    /// Hand `keep` the row id and row of each row of `table` the WHERE
+    /// passes, read as a prepared SELECT reads its rows: through its
+    /// narrowing, or a scan the conjuncts without a subquery narrow
+    pub(crate) fn passing_rows(
+        &self,
+        table: &dyn Table,
+        ctx: &ExecutionContext,
+        mut keep: impl FnMut(i64, Row),
+    ) -> Result<()> {
+        let Some(where_) = &self.prepared.where_ else {
+            return Err(Error::internal("a prepared statement without WHERE"));
+        };
+        let mut each = |id: i64, _: u64, row: Row| {
+            keep(id, row);
+            true
+        };
+        match self
+            .runner
+            .passing_rows(where_, table, ctx, None, &mut each)?
+        {
+            Passing::Pruned | Passing::Read => Ok(()),
+            Passing::Answers(_) => Err(Error::internal(
+                "a statement without a LIMIT read the scan's answers",
+            )),
+        }
+    }
+
+    /// Each SET value's program with the column it writes
+    pub(crate) fn sets(&self) -> &'a [(usize, SharedProgram)] {
+        &self.prepared.sets
     }
 }
 
@@ -2672,6 +2890,60 @@ fn mentions_subquery(expr: &Expression) -> bool {
 }
 
 impl Builder<'_> {
+    /// The WHERE of the statement whose row is `chain`'s first scope, over
+    /// `schema`: each conjunct rewritten, the ones a scan takes, and the
+    /// EXISTS and IN tests whose keys may name its rows
+    fn statement_where(
+        &mut self,
+        chain: &Chain<'_>,
+        schema: &Schema,
+        where_clause: &Expression,
+        work: &mut Rewritten,
+        run_slots: &mut Vec<(usize, Expression)>,
+    ) -> Result<WhereParts> {
+        let mut parts = Vec::new();
+        conjuncts(where_clause, &mut parts);
+        let mut rewritten = Vec::with_capacity(parts.len());
+        let mut pushed = Vec::new();
+        let mut set_tests = Vec::new();
+        for part in parts {
+            let part = self.statement_conjunct(chain, part, work, run_slots)?;
+            if !mentions_subquery(&part) && !needs_folding(&part) && scans_whole(&part, schema) {
+                pushed.push(part.clone());
+            }
+            let set_test = match &part {
+                Expression::Exists(mark) => Some((&mark.subquery, false, None)),
+                Expression::Prefix(prefix) if prefix.op_type == PrefixOperator::Not => {
+                    match prefix.right.as_ref() {
+                        Expression::Exists(mark) => Some((&mark.subquery, true, None)),
+                        _ => None,
+                    }
+                }
+                Expression::In(in_expr) => match (&*in_expr.right, bound_column(&in_expr.left)) {
+                    (Expression::ScalarSubquery(mark), Some(name)) => schema
+                        .column_index_map()
+                        .get(name)
+                        .map(|&column| (&mark.subquery, in_expr.not, Some(column))),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some((mark, negated, column)) = set_test {
+                set_tests.extend(mark.prepared.map(|id| (id, negated, column)));
+            }
+            rewritten.push(part);
+        }
+        let conjuncts = rewritten.len();
+        let clause = conjunction(rewritten)
+            .ok_or_else(|| Error::internal("a prepared statement without WHERE"))?;
+        Ok(WhereParts {
+            clause,
+            pushed,
+            set_tests,
+            conjuncts,
+        })
+    }
+
     /// A top-level conjunct of the statement's WHERE. The value a column
     /// is compared with becomes a run slot when it reads no row, so the
     /// scan can take the comparison; it may read uncorrelated subqueries
@@ -2831,6 +3103,111 @@ impl Executor {
             })
     }
 
+    /// Whether an UPDATE's or DELETE's WHERE and SET values run prepared:
+    /// they hold a subquery, and every form in them is the family's
+    pub(crate) fn dml_family<'e>(
+        &self,
+        where_clause: Option<&'e Expression>,
+        sets: impl IntoIterator<Item = &'e Expression>,
+        ctx: &'e ExecutionContext,
+    ) -> std::result::Result<(), OutOfFamily> {
+        if ctx.outer_row().is_some() {
+            return Err("it runs for a row of an enclosing statement");
+        }
+        let family = Family {
+            executor: self,
+            ctx: Some(ctx),
+            tables: RefCell::new(SmallVec::new()),
+        };
+        let mut found = false;
+        for expr in where_clause.into_iter().chain(sets) {
+            family.expression(expr, 1, Site::Subqueries, &mut found)?;
+        }
+        if !found {
+            return Err("the statement holds no subquery");
+        }
+        family.catalog()
+    }
+
+    /// The plan's prepared UPDATE or DELETE over a target of `schema`,
+    /// named `scope_name`, with its blocks' tables open; prepared now when
+    /// the plan holds none for this schema, these columns and this
+    /// parameter count
+    pub(crate) fn open_prepared_dml(
+        &self,
+        compiled: Option<&RwLock<CompiledExecution>>,
+        schema: &Schema,
+        scope_name: &SmartString,
+        where_clause: Option<&Expression>,
+        sets: &[(usize, &Expression)],
+        ctx: &ExecutionContext,
+    ) -> Result<(Arc<PreparedDml>, DmlTables)> {
+        let epoch = self.engine.schema_epoch();
+        let columns = schema.column_names_arc();
+        let fits = |p: &PreparedDml| {
+            p.cached_epoch == epoch
+                && p.blocks.param_count == ctx.params().len()
+                && (CompactArc::ptr_eq(&p.columns, &columns) || p.columns == columns)
+        };
+        let inner_ctx = ctx.with_incremented_query_depth();
+        // A column change between taking the plan and opening a block's
+        // table prepares again, against the table as it now is
+        let mut fresh = false;
+        loop {
+            let held = compiled
+                .filter(|_| !fresh)
+                .and_then(|slot| slot.read().ok())
+                .and_then(|guard| match &*guard {
+                    CompiledExecution::PreparedDml(p) if fits(p) => Some(Arc::clone(p)),
+                    _ => None,
+                });
+            let prepared = match held {
+                Some(prepared) => prepared,
+                None => {
+                    let prepared = Arc::new(PreparedDml::prepare(
+                        self,
+                        schema,
+                        scope_name,
+                        where_clause,
+                        sets,
+                        ctx.params().len(),
+                        epoch,
+                    )?);
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::prepared_dml_was_built();
+                    if let Some(mut guard) = compiled.and_then(|slot| slot.write().ok()) {
+                        if matches!(
+                            &*guard,
+                            CompiledExecution::Unknown
+                                | CompiledExecution::NotOptimizable(_)
+                                | CompiledExecution::PreparedDml(_)
+                        ) {
+                            *guard = CompiledExecution::PreparedDml(Arc::clone(&prepared));
+                        }
+                    }
+                    prepared
+                }
+            };
+            if let Some(tables) = PreparedRunner::open_tables(self, &prepared.blocks, &inner_ctx)? {
+                for name in &prepared.blocks.named {
+                    if !ctx.named_params().contains_key(name.as_str()) {
+                        return Err(Error::invalid_argument(format!(
+                            "named parameter :{} has no value",
+                            name
+                        )));
+                    }
+                }
+                return Ok((prepared, DmlTables { tables, inner_ctx }));
+            }
+            if fresh {
+                return Err(Error::internal(
+                    "a table's columns changed while the statement prepared",
+                ));
+            }
+            fresh = true;
+        }
+    }
+
     /// Run an in-family statement: scan its table narrowed by the
     /// conjuncts without a subquery, keep the rows the WHERE program
     /// passes, and project them. With no ORDER BY the scan stops once
@@ -2896,110 +3273,35 @@ impl Executor {
                 runner.base[slot] = value;
             }
         }
-        let (storage_expr, residual) = match &prepared.pushdown {
-            Some(pushdown) if prepared.blocks.run_slots.is_empty() => {
-                pushdown::try_pushdown(pushdown, table.schema(), Some(ctx))
-            }
-            Some(pushdown) => {
-                let mut run_ctx = ctx.clone();
-                run_ctx.set_params(runner.base.clone());
-                pushdown::try_pushdown(pushdown, table.schema(), Some(&run_ctx))
-            }
-            None => (None, true),
-        };
-        // The scan took the whole WHERE: its rows need no second look
-        let scanned_whole = prepared.pushed_whole && storage_expr.is_some() && !residual;
         let output_columns = CompactArc::clone(&prepared.output_columns);
-        if let Some(expr) = &storage_expr {
-            if self
-                .get_query_planner()
-                .can_prune_entire_scan(&*table, expr.as_ref())
-            {
-                let result = ExecutorResult::with_arc_columns(
-                    CompactArc::clone(&output_columns),
-                    RowVec::new(),
-                );
-                return Ok((
-                    Box::new(result),
-                    output_columns,
-                    true,
-                    prepared.visible,
-                    None,
-                ));
-            }
-        }
-
         let target = limit
             .filter(|_| stmt.order_by.is_empty())
             .map(|limit| limit.saturating_add(offset));
-        let mut vm = ExprVM::new();
-        let mut scanned = 0u64;
-        // The rows the statement reads: the ones its narrowing names, which
-        // the conjuncts the scan would take still judge; the scan's answers
-        // up to the LIMIT when it takes the whole WHERE, which are the rows;
-        // or the scan
-        let (mut rows, mut listed, mut scanner, judged, passed) =
-            match runner.narrowed_rows(prepared.narrowing, &*table, target)? {
-                Some((candidates, passed)) => {
-                    #[cfg(feature = "test-failpoints")]
-                    crate::test_failpoints::prepared_rows_narrowed_by_keys(
-                        prepared.narrowing.is_some_and(|n| n.negated),
+        // Made on the first row: the scan's own answers need none
+        let mut kept: Option<RowVec> = None;
+        let mut keep = |_: i64, scanned: u64, row: Row| {
+            let rows = kept.get_or_insert_with(|| RowVec::with_capacity(64));
+            rows.push((scanned as i64, row));
+            target.is_none_or(|target| rows.len() < target)
+        };
+        let mut rows =
+            match runner.passing_rows(&prepared.where_, &*table, ctx, target, &mut keep)? {
+                Passing::Pruned => {
+                    let result = ExecutorResult::with_arc_columns(
+                        CompactArc::clone(&output_columns),
+                        RowVec::new(),
                     );
-                    let rows = RowVec::with_capacity(64);
-                    (rows, Some(candidates.into_iter()), None, true, passed)
+                    return Ok((
+                        Box::new(result),
+                        output_columns,
+                        true,
+                        prepared.visible,
+                        None,
+                    ));
                 }
-                None => match target.filter(|_| scanned_whole) {
-                    Some(target) => {
-                        let answers = table.collect_rows_with_limit_unordered(
-                            storage_expr.as_deref(),
-                            target,
-                            0,
-                        )?;
-                        (answers, None, None, false, true)
-                    }
-                    None => {
-                        let all: Vec<usize> = (0..prepared.columns.len()).collect();
-                        let scan = table.scan(&all, storage_expr.as_deref())?;
-                        let rows = RowVec::with_capacity(64);
-                        (rows, None, Some(scan), false, scanned_whole)
-                    }
-                },
+                Passing::Answers(answers) => answers,
+                Passing::Read => kept.unwrap_or_else(|| RowVec::with_capacity(64)),
             };
-        while target.is_none_or(|target| rows.len() < target) {
-            let row = match (&mut listed, &mut scanner) {
-                (Some(listed), _) => match listed.next() {
-                    Some((_, row)) => row,
-                    None => break,
-                },
-                (None, Some(scanner)) => match scanner.next() {
-                    true => scanner.take_row(),
-                    false => break,
-                },
-                (None, None) => break,
-            };
-            scanned += 1;
-            if scanned.is_multiple_of(100) {
-                ctx.check_cancelled()?;
-            }
-            // One that fails to evaluate leaves the answer to the WHERE
-            let taken = match storage_expr
-                .as_ref()
-                .filter(|_| judged)
-                .map(|e| e.evaluate(&row))
-            {
-                Some(Ok(false)) => continue,
-                Some(Err(_)) => false,
-                Some(Ok(true)) | None => true,
-            };
-            if (passed && taken) || runner.matches(&mut vm, &prepared.where_program, &row)? {
-                rows.push((scanned as i64, row));
-            }
-        }
-        if let Some(err) = scanner.as_ref().and_then(|scanner| scanner.err()) {
-            return Err(err.clone());
-        }
-        // A read that checks for no cancel is the statement's all the same
-        ctx.check_cancelled()?;
         let limit_applied = target.is_some();
         if limit_applied {
             let keep = limit.unwrap_or(usize::MAX);
@@ -3178,6 +3480,131 @@ impl<'a> PreparedRunner<'a> {
             }
             None => false,
         }
+    }
+
+    /// The scan `where_`'s conjuncts without a subquery narrow, with
+    /// whether it takes the whole WHERE; None when it proves no row passes
+    fn where_scan(
+        &self,
+        where_: &PreparedWhere,
+        table: &dyn Table,
+        ctx: &ExecutionContext,
+    ) -> Option<(Option<Box<dyn StorageExpr>>, bool)> {
+        let (storage_expr, residual) = match &where_.pushdown {
+            Some(pushdown) if self.prepared.run_slots.is_empty() => {
+                pushdown::try_pushdown(pushdown, table.schema(), Some(ctx))
+            }
+            Some(pushdown) => {
+                let mut run_ctx = ctx.clone();
+                run_ctx.set_params(self.base.clone());
+                pushdown::try_pushdown(pushdown, table.schema(), Some(&run_ctx))
+            }
+            None => (None, true),
+        };
+        if let Some(expr) = &storage_expr {
+            if self
+                .executor
+                .get_query_planner()
+                .can_prune_entire_scan(table, expr.as_ref())
+            {
+                return None;
+            }
+        }
+        // The scan took the whole WHERE: its rows need no second look
+        let scanned_whole = where_.pushed_whole && storage_expr.is_some() && !residual;
+        Some((storage_expr, scanned_whole))
+    }
+
+    /// Hand `keep` each row of `table` that passes `where_`, with its row
+    /// id and the count of rows read so far, until `keep` says stop: the
+    /// rows its narrowing names, or a scan the conjuncts without a subquery
+    /// narrow. With a `target` and a scan that takes the whole WHERE, the
+    /// scan's own answers up to it instead
+    fn passing_rows(
+        &self,
+        where_: &PreparedWhere,
+        table: &dyn Table,
+        ctx: &ExecutionContext,
+        target: Option<usize>,
+        mut keep: impl FnMut(i64, u64, Row) -> bool,
+    ) -> Result<Passing> {
+        let Some((storage_expr, scanned_whole)) = self.where_scan(where_, table, ctx) else {
+            return Ok(Passing::Pruned);
+        };
+        if target == Some(0) {
+            return Ok(Passing::Read);
+        }
+        let mut vm = ExprVM::new();
+        let mut scanned = 0u64;
+        // The rows the statement reads: the ones its narrowing names, which
+        // the conjuncts the scan would take still judge; the scan's answers
+        // up to the LIMIT when it takes the whole WHERE, which are the rows;
+        // or the scan
+        let (mut listed, mut scanner, judged, passed) =
+            match self.narrowed_rows(where_.narrowing, table, target)? {
+                Some((candidates, passed)) => {
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::prepared_rows_narrowed_by_keys(
+                        where_.narrowing.is_some_and(|n| n.negated),
+                    );
+                    (Some(candidates.into_iter()), None, true, passed)
+                }
+                None => match target.filter(|_| scanned_whole) {
+                    Some(target) => {
+                        let answers = table.collect_rows_with_limit_unordered(
+                            storage_expr.as_deref(),
+                            target,
+                            0,
+                        )?;
+                        // A read that checks for no cancel is the statement's all the same
+                        ctx.check_cancelled()?;
+                        return Ok(Passing::Answers(answers));
+                    }
+                    None => {
+                        let all: Vec<usize> = (0..table.schema().columns.len()).collect();
+                        let scan = table.scan(&all, storage_expr.as_deref())?;
+                        (None, Some(scan), false, scanned_whole)
+                    }
+                },
+            };
+        loop {
+            let (id, row) = match (&mut listed, &mut scanner) {
+                (Some(listed), _) => match listed.next() {
+                    Some(entry) => entry,
+                    None => break,
+                },
+                (None, Some(scanner)) => match scanner.next() {
+                    true => (scanner.current_row_id(), scanner.take_row()),
+                    false => break,
+                },
+                (None, None) => break,
+            };
+            scanned += 1;
+            if scanned.is_multiple_of(100) {
+                ctx.check_cancelled()?;
+            }
+            // One that fails to evaluate leaves the answer to the WHERE
+            let taken = match storage_expr
+                .as_ref()
+                .filter(|_| judged)
+                .map(|e| e.evaluate(&row))
+            {
+                Some(Ok(false)) => continue,
+                Some(Err(_)) => false,
+                Some(Ok(true)) | None => true,
+            };
+            if ((passed && taken) || self.matches(&mut vm, &where_.program, &row)?)
+                && !keep(id, scanned, row)
+            {
+                break;
+            }
+        }
+        if let Some(err) = scanner.as_ref().and_then(|scanner| scanner.err()) {
+            return Err(err.clone());
+        }
+        // A read that checks for no cancel is the statement's all the same
+        ctx.check_cancelled()?;
+        Ok(Passing::Read)
     }
 
     /// The statement's rows its narrowing EXISTS may pass, read by the keys

@@ -389,6 +389,10 @@ A SELECT of one shape is prepared once per cached plan instead of rebuilt for ev
 - an error a row of an `EXISTS`, `IN`, `ANY` or `ALL` subquery raises is the statement's error only when no other row settles the answer: TRUE for `EXISTS`, `IN` and `ANY` once a row passes or a value matches, FALSE for `ALL` once a value compares FALSE. A row of another key, or of a NULL key, raises nothing for the outer row. A subquery that aggregates reads every row its `WHERE` passes, so an error one raises is the outer row's error, and the same holds for an error in a value it reads from an enclosing query
 - the value of a scalar subquery, the answer of an `EXISTS` and the values of an `IN`, `ANY` or `ALL` read once per execution are kept for the next execution of the same statement with the same parameters, until a write to one of the tables they read; not inside a transaction
 
+An `UPDATE` or `DELETE` is prepared the same way when its `WHERE` or a `SET` value holds a subquery and every expression and subquery in them fits the shape above; the statement's target table is the enclosing query of its subqueries. Its `SET` values may mix subqueries that read the target row with subqueries that do not, in one value or across several. A `SET` value that reads no column of the target row and holds no volatile call, such as `RANDOM()`, runs once per execution, before the statement reads a row.
+
+Every subquery of an `UPDATE` or `DELETE`, the ones that read the target table included, sees the tables as the statement found them: a row the statement updates or deletes does not change what a subquery answers for the next row.
+
 ## Examples
 
 ### Example 1: Delete Orders from High-Value Customers
@@ -565,7 +569,7 @@ Currently, Stoolap supports the following subquery features:
 A subquery in these positions is refused with an error rather than answered. Support arrives as each position moves to prepared plans:
 
 - `INSERT ... VALUES`, `ON CONFLICT ... DO UPDATE SET` and `RETURNING`
-- An `UPDATE` that sets one column from a correlated subquery and another from an uncorrelated one
+- An `UPDATE` that sets one column from a correlated subquery and another from an uncorrelated one, when one of its subqueries is outside the [prepared](#prepared-subqueries) shape
 - `GROUP BY` and `DISTINCT ON` expressions
 - `HAVING` in a query that also has window functions
 - A grouped `SELECT` list that holds both a correlated and an uncorrelated subquery

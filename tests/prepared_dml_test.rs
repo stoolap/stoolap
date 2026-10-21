@@ -1,0 +1,217 @@
+// Copyright 2025 Stoolap Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! An UPDATE or DELETE whose subqueries are in the prepared family leaves
+//! the table the general path computes for the same expressions over the
+//! table as the statement found it, under every EXISTS strategy, and the
+//! corpus reaches every registered prepared DML site.
+
+#![cfg(feature = "test-failpoints")]
+
+use stoolap::test_failpoints::{
+    force_exists_strategy, prepared_dml_built, prepared_dml_site_runs, PreparedDmlSite,
+};
+use stoolap::Database;
+
+/// The forced strategy is process-wide: tests that force one take turns
+static FORCED: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn setup(name: &str) -> Database {
+    let db = Database::open(&format!("memory://{name}")).unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, x INTEGER, s TEXT)",
+        "INSERT INTO t VALUES (1, 1, 1, '1'), (2, 2, 2, '2'), (3, NULL, NULL, NULL), (4, 4, 4, '4'), (5, 5, 5, '5')",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER, d INTEGER)",
+        "INSERT INTO u VALUES (1, 1, 1, 2), (2, 1, 10, 1), (3, 2, NULL, 1), (4, NULL, 4, 1), (5, 4, 4, 1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    db
+}
+
+fn table(db: &Database, sql: &str) -> Vec<String> {
+    db.query(sql, ())
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        .map(|row| {
+            let row = row.unwrap_or_else(|e| panic!("{sql}: {e}"));
+            // A stored NULL carries its column's type, a selected one none
+            (0..row.len())
+                .map(|i| match row.get_value(i).unwrap() {
+                    v if v.is_null() => "NULL".to_string(),
+                    v => format!("{v:?}"),
+                })
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect()
+}
+
+const ROWS: &str = "SELECT id, k, x, s FROM t ORDER BY id";
+
+/// Each statement with the general path's SELECT of the rows it leaves:
+/// an UPDATE's as a CASE in the select list, a DELETE's as the ids it keeps
+const CORPUS: &[(&str, &str)] = &[
+    (
+        "UPDATE t SET x = (SELECT MAX(v) FROM u WHERE u.k = t.k)",
+        "SELECT id, k, (SELECT MAX(v) FROM u WHERE u.k = t.k), s FROM t ORDER BY id",
+    ),
+    (
+        "UPDATE t SET x = (SELECT MAX(v) FROM u), s = (SELECT CAST(COUNT(*) AS TEXT) FROM u WHERE u.k = t.k)",
+        "SELECT id, k, (SELECT MAX(v) FROM u), (SELECT CAST(COUNT(*) AS TEXT) FROM u WHERE u.k = t.k) FROM t ORDER BY id",
+    ),
+    (
+        "UPDATE t SET x = x + 100 WHERE x < (SELECT MAX(v) FROM u WHERE u.k = t.k)",
+        "SELECT id, k, CASE WHEN x < (SELECT MAX(v) FROM u WHERE u.k = t.k) THEN x + 100 ELSE x END, s FROM t ORDER BY id",
+    ),
+    (
+        "UPDATE t SET s = 'hit' WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k)",
+        "SELECT id, k, x, CASE WHEN EXISTS (SELECT 1 FROM u WHERE u.k = t.k) THEN 'hit' ELSE s END FROM t ORDER BY id",
+    ),
+    (
+        "UPDATE t SET s = 'hit' WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.id = t.id AND u.d = 1)",
+        "SELECT id, k, x, CASE WHEN NOT EXISTS (SELECT 1 FROM u WHERE u.id = t.id AND u.d = 1) THEN 'hit' ELSE s END FROM t ORDER BY id",
+    ),
+    (
+        "UPDATE t SET x = (SELECT COUNT(*) FROM u WHERE u.k = t.k) WHERE x IN (SELECT v FROM u)",
+        "SELECT id, k, CASE WHEN x IN (SELECT v FROM u) THEN (SELECT COUNT(*) FROM u WHERE u.k = t.k) ELSE x END, s FROM t ORDER BY id",
+    ),
+    (
+        "UPDATE t SET x = (SELECT SUM(t2.x) FROM t t2 WHERE t2.id < t.id)",
+        "SELECT id, k, (SELECT SUM(t2.x) FROM t t2 WHERE t2.id < t.id), s FROM t ORDER BY id",
+    ),
+    (
+        "DELETE FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k)",
+        "SELECT id, CASE WHEN EXISTS (SELECT 1 FROM u WHERE u.k = t.k) THEN 1 ELSE 0 END FROM t ORDER BY id",
+    ),
+    (
+        "DELETE FROM t WHERE x NOT IN (SELECT v FROM u WHERE u.k = t.k)",
+        "SELECT id, CASE WHEN x NOT IN (SELECT v FROM u WHERE u.k = t.k) THEN 1 ELSE 0 END FROM t ORDER BY id",
+    ),
+    (
+        "DELETE FROM t WHERE x > (SELECT AVG(v) FROM u) OR (SELECT COUNT(*) FROM u WHERE u.k = t.k) = 0",
+        "SELECT id, CASE WHEN x > (SELECT AVG(v) FROM u) OR (SELECT COUNT(*) FROM u WHERE u.k = t.k) = 0 THEN 1 ELSE 0 END FROM t ORDER BY id",
+    ),
+    (
+        "DELETE FROM t a WHERE EXISTS (SELECT 1 FROM u WHERE u.k = a.k AND u.d = 1)",
+        "SELECT id, CASE WHEN EXISTS (SELECT 1 FROM u WHERE u.k = a.k AND u.d = 1) THEN 1 ELSE 0 END FROM t a ORDER BY id",
+    ),
+    (
+        "DELETE FROM t WHERE EXISTS (SELECT 1 FROM t t2 WHERE t2.id = t.id - 1)",
+        "SELECT id, CASE WHEN EXISTS (SELECT 1 FROM t t2 WHERE t2.id = t.id - 1) THEN 1 ELSE 0 END FROM t ORDER BY id",
+    ),
+];
+
+/// The rows `expected` names: an UPDATE's whole rows, or the rows of t
+/// whose id a DELETE's CASE marks 0
+fn expected_rows(db: &Database, dml: &str, expected: &str) -> Vec<String> {
+    let rows = table(db, expected);
+    if !dml.starts_with("DELETE") {
+        return rows;
+    }
+    let all = table(db, ROWS);
+    rows.iter()
+        .zip(all)
+        .filter(|(marked, _)| marked.ends_with("|Integer(0)"))
+        .map(|(_, row)| row)
+        .collect()
+}
+
+#[test]
+fn test_every_prepared_dml_site_leaves_the_general_answer_and_is_reached() {
+    let _turn = FORCED.lock().unwrap_or_else(|e| e.into_inner());
+    let before: Vec<usize> = PreparedDmlSite::ALL
+        .iter()
+        .map(|s| prepared_dml_site_runs(*s))
+        .collect();
+    for (n, strategy) in [None, Some(false), Some(true)].into_iter().enumerate() {
+        force_exists_strategy(strategy);
+        for (i, (dml, expected)) in CORPUS.iter().enumerate() {
+            let db = setup(&format!("prepared_dml_corpus_{n}_{i}"));
+            let want = expected_rows(&db, dml, expected);
+            db.execute(dml, ())
+                .unwrap_or_else(|e| panic!("{dml} under {strategy:?}: {e}"));
+            assert_eq!(table(&db, ROWS), want, "{dml} under {strategy:?}");
+        }
+    }
+    force_exists_strategy(None);
+    for (site, before) in PreparedDmlSite::ALL.iter().zip(before) {
+        assert!(
+            prepared_dml_site_runs(*site) > before,
+            "no case of the corpus reaches {site:?}"
+        );
+    }
+}
+
+#[test]
+fn test_a_prepared_dml_statement_is_kept_until_the_schema_changes() {
+    let _turn = FORCED.lock().unwrap_or_else(|e| e.into_inner());
+    let db = setup("prepared_dml_kept");
+    let update = db
+        .prepare("UPDATE t SET x = (SELECT MAX(v) FROM u WHERE u.k = t.k) WHERE id = $1")
+        .unwrap();
+    let delete = db
+        .prepare("DELETE FROM t WHERE x > (SELECT MAX(v) FROM u WHERE u.k = t.k) + $1")
+        .unwrap();
+    let start = prepared_dml_built();
+    for id in [1i64, 2, 4] {
+        update.execute((id,)).unwrap();
+        delete.execute((100i64,)).unwrap();
+    }
+    assert_eq!(
+        prepared_dml_built() - start,
+        2,
+        "each statement prepared once"
+    );
+    db.execute("ALTER TABLE u ADD COLUMN w INTEGER", ())
+        .unwrap();
+    update.execute((5i64,)).unwrap();
+    assert_eq!(
+        prepared_dml_built() - start,
+        3,
+        "a schema change prepares the statement again"
+    );
+    assert_eq!(
+        table(&db, ROWS),
+        [
+            "Integer(1)|Integer(1)|Integer(10)|Text(\"1\")",
+            "Integer(2)|Integer(2)|NULL|Text(\"2\")",
+            "Integer(3)|NULL|NULL|NULL",
+            "Integer(4)|Integer(4)|Integer(4)|Text(\"4\")",
+            "Integer(5)|Integer(5)|NULL|Text(\"5\")",
+        ]
+    );
+}
+
+#[test]
+fn a_keyed_update_after_a_write_of_its_transaction_reads_no_whole_table() {
+    let db = setup("prepared_dml_keyed_after_write");
+    let mut tx = db.begin().unwrap();
+    tx.execute("UPDATE t SET x = 9 WHERE id = 5", ()).unwrap();
+    stoolap::test_failpoints::take_read_paths();
+    let updated = tx
+        .execute(
+            "UPDATE t SET x = x + 1 WHERE id = (SELECT u.id FROM u WHERE u.id = 1)",
+            (),
+        )
+        .unwrap();
+    let paths = stoolap::test_failpoints::take_read_paths();
+    tx.rollback().unwrap();
+    assert_eq!(updated, 1);
+    assert!(
+        !paths
+            .iter()
+            .any(|path| path.starts_with("vs.get_all_visible_rows")),
+        "a keyed update read the whole table: {paths:?}"
+    );
+}

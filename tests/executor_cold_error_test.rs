@@ -201,17 +201,63 @@ fn delete_returning_does_not_delete_readable_prefix() {
 }
 
 #[test]
-fn correlated_update_precompute_propagates_late_scan_error() {
+fn correlated_update_propagates_late_scan_error() {
     let fixture = Fixture::new();
     let db = fixture.open();
     add_target(&db);
-    assert_read_error(
-        &db,
-        "UPDATE t SET v = (SELECT target.v FROM target WHERE target.id = t.id) WHERE id = 1",
+    let plain = db
+        .execute("UPDATE t SET v = v + 1 WHERE id > 0", ())
+        .unwrap_err();
+    let correlated = db
+        .execute(
+            "UPDATE t SET v = (SELECT target.v FROM target WHERE target.id = t.id) WHERE id > 0",
+            (),
+        )
+        .unwrap_err();
+    assert!(
+        plain.to_string().contains("invalid column block length"),
+        "{plain:?}"
+    );
+    assert_eq!(
+        format!("{correlated:?}"),
+        format!("{plain:?}"),
+        "a SET subquery leaves the scan's error as the update raises it"
     );
     assert_target_unchanged(&db);
     db.execute("COMMIT", ()).unwrap();
     fixture.assert_cold_unchanged(db);
+}
+
+#[test]
+fn correlated_update_by_key_reads_only_its_volume() {
+    let fixture = Fixture::new();
+    let db = fixture.open();
+    add_target(&db);
+    db.execute(
+        "UPDATE t SET v = (SELECT target.v FROM target WHERE target.id = t.id) WHERE id = 1",
+        (),
+    )
+    .unwrap();
+    assert_eq!(pairs(&db, "SELECT * FROM t WHERE id = 1"), [(1, 101)]);
+    db.execute("ROLLBACK", ()).unwrap();
+}
+
+#[test]
+fn prepared_dml_by_key_reads_only_its_volume() {
+    let fixture = Fixture::new();
+    let db = fixture.open();
+    add_target(&db);
+    db.execute(
+        "UPDATE t SET v = 11 WHERE id = (SELECT target.id FROM target WHERE target.v = 101)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "DELETE FROM t WHERE id = (SELECT target.id FROM target WHERE target.v = 101)",
+        (),
+    )
+    .unwrap();
+    db.execute("ROLLBACK", ()).unwrap();
 }
 
 #[test]

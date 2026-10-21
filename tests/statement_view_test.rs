@@ -129,13 +129,12 @@ fn test_read_committed_delete_subqueries_keep_one_view() {
     let db = setup("memory://statement_view_rc_delete");
     let committed = Rc::new(Cell::new(false));
     let (other, flag) = (db.clone(), Rc::clone(&committed));
+    // The subquery's table is opened before the statement reads a row
     stoolap::test_failpoints::after_select_table_opened(move || {
-        stoolap::test_failpoints::after_select_table_opened(move || {
-            other
-                .execute("UPDATE u SET v = 0 WHERE id IN (2, 5)", ())
-                .unwrap();
-            flag.set(true);
-        });
+        other
+            .execute("UPDATE u SET v = 0 WHERE id IN (2, 5)", ())
+            .unwrap();
+        flag.set(true);
     });
     db.execute(
         "DELETE FROM t WHERE b = 1 AND a > (SELECT v FROM u WHERE u.id = t.id)",
@@ -372,4 +371,30 @@ fn the_inner_reads_of_a_read_committed_snapshot_without_a_view_use_the_statement
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn test_snapshot_update_keeps_no_answer_of_its_older_view() {
+    let db = setup("memory://statement_view_snapshot_update_kept");
+    db.execute("SET isolation_level = 'SNAPSHOT'", ()).unwrap();
+    let committed = Rc::new(Cell::new(false));
+    let (other, flag) = (db.clone(), Rc::clone(&committed));
+    stoolap::test_failpoints::after_select_table_opened(move || {
+        other
+            .execute("UPDATE u SET v = 99 WHERE id = 1", ())
+            .unwrap();
+        flag.set(true);
+    });
+    let sql = "UPDATE t SET b = (SELECT v FROM u WHERE id = 1) WHERE id = 1";
+    db.execute(sql, ()).unwrap();
+    assert!(
+        committed.get(),
+        "the commit did not land inside the statement"
+    );
+    db.execute(sql, ()).unwrap();
+    let b: i64 = db.query_one("SELECT b FROM t WHERE id = 1", ()).unwrap();
+    assert_eq!(
+        b, 99,
+        "the next statement reads the commit, not a kept older answer"
+    );
 }

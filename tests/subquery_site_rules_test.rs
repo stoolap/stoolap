@@ -296,7 +296,7 @@ fn test_on_conflict_set() {
 fn test_update_set_mixing_correlated_and_uncorrelated() {
     write_site(
         "site_update_mixed",
-        Fails("step 5"),
+        Right,
         "UPDATE t SET b = (SELECT MAX(x) FROM u), a = (SELECT COUNT(*) FROM u WHERE u.id = t.id)",
         "UPDATE t SET b = 3, a = CASE WHEN id <= 3 THEN 1 ELSE 0 END",
     );
