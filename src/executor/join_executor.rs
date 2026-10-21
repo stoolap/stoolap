@@ -90,7 +90,7 @@ use crate::executor::parallel::{
     parallel_hash_join, ParallelConfig, DEFAULT_PARALLEL_JOIN_THRESHOLD,
 };
 use crate::executor::planner::{QueryPlanner, RuntimeJoinAlgorithm, RuntimeJoinDecision};
-use crate::executor::prepared_join::{BuiltPrograms, JoinProgramKey, PreparedJoin};
+use crate::executor::prepared_join::{BuiltPrograms, Held, JoinProgramKey, PreparedJoin};
 use crate::executor::utils::{column_kinds, extract_join_keys_and_residual_keeping};
 use crate::functions::registry::global_registry;
 use crate::parser::ast::Expression;
@@ -331,12 +331,13 @@ impl JoinExecutor {
         all_columns.extend(request.right_columns.iter().cloned());
 
         // Analyze the join (key extraction)
-        let mut analysis = self.analyze(
+        let mut analysis = self.analysis_of(
+            request.prepared,
             request.left_columns,
             request.right_columns,
             request.condition,
             request.join_type,
-            &|_, _| true,
+            &[],
         );
 
         // A key pair that can meet as a TEXT the comparison reads as the other
@@ -367,12 +368,13 @@ impl JoinExecutor {
             .map(|(l, r)| (*l, *r))
             .collect();
         if !cross_pairs.is_empty() {
-            analysis = self.analyze(
+            analysis = self.analysis_of(
+                request.prepared,
                 request.left_columns,
                 request.right_columns,
                 request.condition,
                 request.join_type,
-                &|l, r| !cross_pairs.contains(&(l, r)),
+                &cross_pairs,
             );
         }
 
@@ -457,12 +459,13 @@ impl JoinExecutor {
         all_columns.extend(right_columns.iter().cloned());
 
         // Analyze the join condition
-        let analysis = self.analyze(
+        let analysis = self.analysis_of(
+            request.prepared,
             &left_columns,
             &right_columns,
             request.condition,
             request.join_type,
-            &|_, _| true,
+            &[],
         );
 
         // Probe side is already a streaming operator
@@ -546,6 +549,34 @@ impl JoinExecutor {
             rows,
             columns: all_columns,
         })
+    }
+
+    /// The analysis that leaves the key pairs of `kept_out` in the residual,
+    /// held with the statement's plan when it has one
+    fn analysis_of(
+        &self,
+        prepared: Option<&PreparedJoin>,
+        left_columns: &[String],
+        right_columns: &[String],
+        condition: Option<&Expression>,
+        join_type_str: &str,
+        kept_out: &[(usize, usize)],
+    ) -> Held<JoinAnalysis> {
+        let analyze = || {
+            self.analyze(
+                left_columns,
+                right_columns,
+                condition,
+                join_type_str,
+                &|l, r| !kept_out.contains(&(l, r)),
+            )
+        };
+        match prepared {
+            Some(prepared) => {
+                Held::Shared(prepared.analysis(left_columns, right_columns, kept_out, analyze))
+            }
+            None => Held::Own(analyze()),
+        }
     }
 
     /// Analyze join for algorithm selection and key extraction.

@@ -394,3 +394,32 @@ fn a_join_without_a_plan_builds_no_shared_list() {
         four - three
     );
 }
+
+#[test]
+fn a_held_join_analysis_copies_no_condition_per_run() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let db = Database::open("memory://join_residual_held_analysis").unwrap();
+    for sql in [
+        "CREATE TABLE l (id INTEGER PRIMARY KEY, g INTEGER)",
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, w INTEGER)",
+        "INSERT INTO l SELECT g.value, (g.value - 1) / 10 FROM generate_series(1, 30) g",
+        "INSERT INTO r SELECT g.value, g.value % 5 FROM generate_series(1, 50) g",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let with = |conditions: &[&str]| {
+        allocations_per_run(
+            &db,
+            &format!(
+                "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w AND {}",
+                conditions.join(" AND ")
+            ),
+        )
+    };
+    let one = with(&["l.id < 100"]);
+    let four = with(&["l.id < 100", "r.id < 100", "l.g < 100", "r.w < 100"]);
+    assert_eq!(
+        one, four,
+        "a join with one residual condition costs {one} allocations per run, with four {four}"
+    );
+}

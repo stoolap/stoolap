@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The programs a join statement compiles, held with its plan: each one by
-//! the operator's choice it was compiled for and the columns it reads
+//! What a join statement builds once, held with its plan: programs by the
+//! operator's choice they were compiled for, the join's analysis and its
+//! output, each by the columns it reads
 
 use std::sync::{Arc, RwLock};
 
@@ -22,9 +23,8 @@ use smallvec::{smallvec, SmallVec};
 use crate::core::{Error, Result};
 
 use super::expression::SharedProgram;
-
-/// The programs held under one key, shared: reading them allocates nothing
-type HeldPrograms = Arc<[SharedProgram]>;
+use super::join_executor::JoinAnalysis;
+use super::query::JoinOutput;
 
 /// The programs one compile builds, shared only once they are held
 pub type BuiltPrograms = SmallVec<[SharedProgram; 2]>;
@@ -35,7 +35,7 @@ pub type BuiltPrograms = SmallVec<[SharedProgram; 2]>;
 #[derive(Debug)]
 pub enum JoinProgramKey {
     /// The ON clause without the equality an index probe answers, and the
-    /// WHERE's filter on the inner table, over an (outer, inner) pair
+    /// WHERE's filter on the inner table, over a (left, right) pair
     IndexResidual {
         swapped: bool,
         outer_col: String,
@@ -54,6 +54,8 @@ pub enum JoinProgramKey {
         left_cols: Vec<String>,
         right_cols: Vec<String>,
     },
+    /// The ORDER BY keys an index join sorts its joined rows by
+    OrderKeys { columns: Vec<String> },
     /// The WHERE asked of each joined row, by where it is asked
     Where {
         site: WhereSite,
@@ -70,23 +72,151 @@ pub enum WhereSite {
     AfterJoin,
 }
 
-/// More programs than one statement's joins compile are not kept
-const MAX_PROGRAMS: usize = 16;
+/// The key equalities a join's analysis was asked for: the sides' columns,
+/// and the key pairs it was told to leave in the residual
+#[derive(Debug)]
+struct AnalysisKey {
+    left_cols: Vec<String>,
+    right_cols: Vec<String>,
+    kept_out: Vec<(usize, usize)>,
+}
+
+/// The joined rows a statement's output was built for: their columns, and
+/// whether the join ordered them already
+#[derive(Debug)]
+struct OutputKey {
+    columns: Vec<String>,
+    sorted: bool,
+}
+
+/// A value held with the plan, or built for this execution alone
+pub enum Held<T> {
+    Shared(Arc<T>),
+    Own(T),
+}
+
+impl<T> std::ops::Deref for Held<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        match self {
+            Held::Shared(value) => value,
+            Held::Own(value) => value,
+        }
+    }
+}
+
+/// More of one kind than one statement's joins build are not kept
+const MAX_HELD: usize = 16;
+
+/// Values of one kind held by key; a lookup copies no key
+#[derive(Debug)]
+struct Shelf<K, T: ?Sized> {
+    held: RwLock<Vec<(K, Arc<T>)>>,
+}
+
+impl<K, T: ?Sized> Shelf<K, T> {
+    fn new() -> Self {
+        Self {
+            held: RwLock::new(Vec::new()),
+        }
+    }
+
+    fn find(&self, wanted: impl Fn(&K) -> bool) -> Option<Arc<T>> {
+        let held = self.held.read().ok()?;
+        held.iter()
+            .find(|(key, _)| wanted(key))
+            .map(|(_, value)| Arc::clone(value))
+    }
+
+    /// Holds `value` under `key` while there is room and no key `wanted` accepts
+    fn hold(
+        &self,
+        wanted: impl Fn(&K) -> bool,
+        key: impl FnOnce() -> K,
+        value: impl FnOnce() -> Arc<T>,
+    ) {
+        if let Ok(mut held) = self.held.write() {
+            if held.len() < MAX_HELD && !held.iter().any(|(k, _)| wanted(k)) {
+                held.push((key(), value()));
+            }
+        }
+    }
+}
 
 /// The programs one join statement compiled, valid for one schema epoch
 #[derive(Debug)]
 pub struct PreparedJoin {
     pub cached_epoch: u64,
     /// An empty list stands for a clause that leaves nothing to ask
-    programs: RwLock<Vec<(JoinProgramKey, HeldPrograms)>>,
+    programs: Shelf<JoinProgramKey, [SharedProgram]>,
+    analyses: Shelf<AnalysisKey, JoinAnalysis>,
+    /// None stands for a SELECT list each execution projects anew
+    outputs: Shelf<OutputKey, Option<JoinOutput>>,
 }
 
 impl PreparedJoin {
     pub fn new(cached_epoch: u64) -> Self {
         Self {
             cached_epoch,
-            programs: RwLock::new(Vec::new()),
+            programs: Shelf::new(),
+            analyses: Shelf::new(),
+            outputs: Shelf::new(),
         }
+    }
+
+    /// The output held for joined rows of `columns`, or the one `build`
+    /// makes; none when the statement's output is not held
+    pub(crate) fn output(
+        &self,
+        columns: &[String],
+        sorted: bool,
+        build: impl FnOnce() -> Result<Option<JoinOutput>>,
+    ) -> Result<Arc<Option<JoinOutput>>> {
+        let wanted = |held: &OutputKey| held.sorted == sorted && held.columns == columns;
+        if let Some(held) = self.outputs.find(wanted) {
+            return Ok(held);
+        }
+        let output = Arc::new(build()?);
+        self.outputs.hold(
+            wanted,
+            || OutputKey {
+                columns: columns.to_vec(),
+                sorted,
+            },
+            || Arc::clone(&output),
+        );
+        Ok(output)
+    }
+
+    /// The analysis of the join of `left_cols` and `right_cols` that leaves
+    /// the key pairs of `kept_out` in the residual, or the one `analyze` makes
+    pub fn analysis(
+        &self,
+        left_cols: &[String],
+        right_cols: &[String],
+        kept_out: &[(usize, usize)],
+        analyze: impl FnOnce() -> JoinAnalysis,
+    ) -> Arc<JoinAnalysis> {
+        let wanted = |held: &AnalysisKey| {
+            held.left_cols == left_cols
+                && held.right_cols == right_cols
+                && held.kept_out == kept_out
+        };
+        if let Some(held) = self.analyses.find(wanted) {
+            return held;
+        }
+        let analysis = Arc::new(analyze());
+        self.analyses.hold(
+            wanted,
+            || AnalysisKey {
+                left_cols: left_cols.to_vec(),
+                right_cols: right_cols.to_vec(),
+                kept_out: kept_out.to_vec(),
+            },
+            || Arc::clone(&analysis),
+        );
+        analysis
     }
 
     /// `read` over the programs held under a key `wanted` accepts, or over
@@ -99,21 +229,12 @@ impl PreparedJoin {
         compile: impl FnOnce() -> Result<BuiltPrograms>,
         read: impl FnOnce(&[SharedProgram]) -> R,
     ) -> Result<R> {
-        let held = self.programs.read().ok().and_then(|programs| {
-            programs
-                .iter()
-                .find(|(held, _)| wanted(held))
-                .map(|(_, programs)| Arc::clone(programs))
-        });
-        if let Some(held) = held {
+        if let Some(held) = self.programs.find(&wanted) {
             return Ok(read(&held));
         }
         let built = compile()?;
-        if let Ok(mut programs) = self.programs.write() {
-            if programs.len() < MAX_PROGRAMS && !programs.iter().any(|(held, _)| wanted(held)) {
-                programs.push((key(), built.iter().cloned().collect()));
-            }
-        }
+        self.programs
+            .hold(&wanted, key, || built.iter().cloned().collect());
         Ok(read(&built))
     }
 

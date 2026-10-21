@@ -514,8 +514,120 @@ fn select_column(expr: &Expression, col_index_map: &StringMap<usize>) -> Option<
     }
 }
 
+// Argument source for inline function evaluation
+#[derive(Debug)]
+enum ArgSource {
+    Column(usize),
+    Const(Value),
+}
+
+// Simple condition for inline CASE: column comparisons
+#[derive(Debug)]
+enum CaseCondition {
+    Equals { col_idx: usize, value: Value },
+    NotEquals { col_idx: usize, value: Value },
+    GreaterThan { col_idx: usize, value: Value },
+    GreaterOrEqual { col_idx: usize, value: Value },
+    LessThan { col_idx: usize, value: Value },
+    LessOrEqual { col_idx: usize, value: Value },
+    IsNull { col_idx: usize },
+}
+
+// A single WHEN branch for inline CASE
+#[derive(Debug)]
+struct CaseBranch {
+    condition: CaseCondition,
+    result: ArgSource,
+}
+
+/// How one SELECT expression of an uncorrelated projection is evaluated
+#[derive(Debug)]
+enum ExprAction {
+    SimpleColumn(usize),
+    StarExpand,
+    /// The columns a qualified star takes, found once
+    QualifiedStarExpand(Vec<usize>),
+    /// Inline COALESCE - bypasses VM for 7x speedup
+    Coalesce(smallvec::SmallVec<[ArgSource; 4]>),
+    /// Inline CASE - bypasses VM for simple equality/null checks
+    Case {
+        branches: smallvec::SmallVec<[CaseBranch; 4]>,
+        else_result: Option<ArgSource>,
+    },
+    /// Inline string concatenation (||) - bypasses VM
+    Concat(smallvec::SmallVec<[ArgSource; 6]>),
+    Compiled(SharedProgram),
+}
+
+/// How a SELECT list without correlated subqueries projects its input rows
+#[derive(Debug)]
+enum SelectProjection {
+    /// The rows are their own projection
+    Whole,
+    /// The columns at these positions, cloned
+    Subset(Vec<usize>),
+    /// The columns at these positions, moved; none appears twice
+    Take(Vec<usize>),
+    Actions(Vec<ExprAction>),
+}
+
+/// What a projection keeping ORDER BY and DISTINCT ON values reads per row
+#[derive(Debug)]
+enum OrderedProjection {
+    /// Columns only: the SELECT list's, then the extra ORDER BY ones
+    Columns(Vec<usize>),
+    /// Each output value's source; a failed compile is raised by the first row
+    Items(Vec<Result<ItemSource>>),
+}
+
+/// A join statement's output over joined rows of one layout: how each row
+/// is projected, the output column names, and where each comes from
+#[derive(Debug)]
+pub(crate) struct JoinOutput {
+    projection: OutputProjection,
+    columns: CompactArc<Vec<String>>,
+    layout: Option<CompactArc<OutputLayout>>,
+}
+
+#[derive(Debug)]
+enum OutputProjection {
+    Select(SelectProjection),
+    /// Keeps the ORDER BY and DISTINCT ON values the SELECT list leaves out
+    Ordered(OrderedProjection),
+}
+
+/// Each lowercase column name, and each qualified one's bare name, to its position
+fn lower_index_map(
+    all_columns: &[String],
+    all_columns_lower: Option<&[String]>,
+) -> StringMap<usize> {
+    let computed_lower: Vec<String>;
+    let columns_lower: &[String] = match all_columns_lower {
+        Some(lower) => lower,
+        None => {
+            computed_lower = all_columns.iter().map(|c| c.to_lowercase()).collect();
+            &computed_lower
+        }
+    };
+    // Pre-size HashMap to avoid rehashing (estimate 1.5x for qualified names)
+    let mut col_index_map_lower: StringMap<usize> =
+        StringMap::with_capacity(all_columns.len() * 3 / 2);
+    for (i, lower) in columns_lower.iter().enumerate() {
+        col_index_map_lower.insert(lower.clone(), i);
+        // Also add unqualified column names for qualified columns
+        if let Some(dot_idx) = lower.rfind('.') {
+            let column_part = &lower[dot_idx + 1..];
+            col_index_map_lower
+                .entry(column_part.to_string())
+                .or_insert(i);
+        }
+    }
+    col_index_map_lower
+}
+
 /// Where one projected value comes from: a column of the input row, or a
 /// program compiled once for the statement
+#[derive(Debug)]
 enum ItemSource {
     Column(usize),
     Program(SharedProgram),
@@ -5085,11 +5197,15 @@ impl Executor {
                         .map(|col| format!("{}.{}", inner_alias, col.name))
                         .collect();
 
-                    // Build all_columns to match physical row order (outer, inner)
-                    // This avoids expensive per-row rotation - projections find columns by name
+                    // Joined rows read the sides in the statement's order
+                    let (left_cols, right_cols) = if swapped {
+                        (&inner_cols, &outer_cols)
+                    } else {
+                        (&outer_cols, &inner_cols)
+                    };
                     let all_columns = {
-                        let mut all = outer_cols.clone();
-                        all.extend(inner_cols.clone());
+                        let mut all = left_cols.clone();
+                        all.extend(right_cols.iter().cloned());
                         all
                     };
 
@@ -5140,8 +5256,8 @@ impl Executor {
                             .map(|expr| {
                                 JoinFilter::new(
                                     &expr,
-                                    &outer_cols,
-                                    &inner_cols,
+                                    left_cols,
+                                    right_cols,
                                     &self.function_registry,
                                 )
                                 .map(|f| CompactArc::clone(f.program()))
@@ -5265,6 +5381,9 @@ impl Executor {
                                 build_residual_filter()?,
                             )
                             .with_inner_key(inner_key_idx);
+                            if swapped {
+                                op = op.with_outer_on_right();
+                            }
                             if let Some(ref proj) = projection_pushdown {
                                 let projected_schema: Vec<ColumnInfo> =
                                     proj.output_columns.iter().map(ColumnInfo::new).collect();
@@ -5373,6 +5492,9 @@ impl Executor {
                             build_residual_filter()?,
                         )
                         .with_inner_key(inner_key_idx);
+                        if swapped {
+                            op = op.with_outer_on_right();
+                        }
                         if let Some(ref proj) = projection_pushdown {
                             let projected_schema: Vec<ColumnInfo> =
                                 proj.output_columns.iter().map(ColumnInfo::new).collect();
@@ -5387,26 +5509,6 @@ impl Executor {
                     }
 
                     let mut final_rows = result_rows;
-                    // Columns are found by name, so rows keep the physical
-                    // outer-then-inner order, except where `*` lists the
-                    // columns in the order the statement wrote the sides
-                    let star = stmt
-                        .columns
-                        .iter()
-                        .any(|c| matches!(c, Expression::Star(_)));
-                    let all_columns = if swapped && star && projection_pushdown.is_none() {
-                        let outer_len = outer_cols.len();
-                        for (_, row) in final_rows.iter_mut() {
-                            let mut values = std::mem::take(row).into_values();
-                            values.rotate_left(outer_len);
-                            *row = Row::from_values(values);
-                        }
-                        let mut logical = inner_cols.clone();
-                        logical.extend(outer_cols.iter().cloned());
-                        logical
-                    } else {
-                        all_columns
-                    };
 
                     // Check for aggregation/window functions that need special handling
                     let has_agg = classification.has_aggregation;
@@ -5435,41 +5537,52 @@ impl Executor {
                         && !distinct
                         && !stmt.order_by.is_empty()
                     {
-                        // Build sort specs by evaluating ORDER BY expressions
-                        let mut evaluator = CompiledEvaluator::new(&self.function_registry);
-                        evaluator = evaluator.with_context(ctx);
-                        evaluator.init_columns(&all_columns);
-
                         // Compute sort keys and indices; compile and
                         // evaluation errors both defer to the standard path
-                        let mut keys_ok = true;
-                        let mut programs = Vec::with_capacity(stmt.order_by.len());
-                        for ob in &stmt.order_by {
-                            match evaluator.compile_cached(&ob.expression) {
-                                Ok(p) => programs.push(p),
-                                Err(_) => {
-                                    keys_ok = false;
-                                    break;
-                                }
-                            }
-                        }
-                        let mut sort_keys: Vec<Vec<Value>> = Vec::with_capacity(final_rows.len());
-                        if keys_ok {
-                            'keys: for (_, row) in final_rows.iter() {
+                        let compile = || -> Result<BuiltPrograms> {
+                            let compile_ctx =
+                                CompileContext::new(&all_columns, &self.function_registry);
+                            stmt.order_by
+                                .iter()
+                                .map(|ob| {
+                                    ExprCompiler::new(&compile_ctx)
+                                        .compile(&ob.expression)
+                                        .map(CompactArc::new)
+                                        .map_err(|e| {
+                                            Error::internal(format!("Compile error: {}", e))
+                                        })
+                                })
+                                .collect()
+                        };
+                        let keys_of = |programs: &[SharedProgram]| {
+                            let mut vm = ExprVM::new();
+                            let mut sort_keys: Vec<Vec<Value>> =
+                                Vec::with_capacity(final_rows.len());
+                            for (_, row) in final_rows.iter() {
+                                let exec = super::expression::execute_context(row, Some(ctx));
                                 let mut keys = Vec::with_capacity(programs.len());
-                                for p in &programs {
-                                    match evaluator.evaluate_program(p, row) {
-                                        Ok(v) => keys.push(v),
-                                        Err(_) => {
-                                            keys_ok = false;
-                                            break 'keys;
-                                        }
-                                    }
+                                for p in programs {
+                                    keys.push(vm.execute_cow(p, &exec).ok()?);
                                 }
                                 sort_keys.push(keys);
                             }
-                        }
-                        if keys_ok {
+                            Some(sort_keys)
+                        };
+                        let sort_keys = match &prepared {
+                            Some(prepared) => prepared.programs(
+                                |held| {
+                                    matches!(held, JoinProgramKey::OrderKeys { columns }
+                                        if *columns == all_columns)
+                                },
+                                || JoinProgramKey::OrderKeys {
+                                    columns: all_columns.clone(),
+                                },
+                                compile,
+                                keys_of,
+                            ),
+                            None => compile().map(|programs| keys_of(&programs)),
+                        };
+                        if let Ok(Some(sort_keys)) = sort_keys {
                             // Sort by indices with the shared NULL-aware
                             // comparator (the standard path's semantics)
                             let mut indices: Vec<usize> = (0..final_rows.len()).collect();
@@ -5528,6 +5641,17 @@ impl Executor {
                         }
                     }
 
+                    let held = if has_agg || has_window || projection_pushdown.is_some() {
+                        None
+                    } else {
+                        self.held_join_output(
+                            prepared.as_deref(),
+                            stmt,
+                            &all_columns,
+                            order_limit_applied,
+                            ctx,
+                        )?
+                    };
                     if has_agg || has_window {
                         return self.grouped_select(
                             stmt,
@@ -5536,6 +5660,13 @@ impl Executor {
                             final_rows,
                             &all_columns,
                             None,
+                        );
+                    } else if let Some(output) = held.as_deref().and_then(Option::as_ref) {
+                        return Self::join_output_result(
+                            output,
+                            final_rows,
+                            order_limit_applied,
+                            ctx,
                         );
                     } else if let Some(proj) = projection_pushdown {
                         // Projection was pushed down - rows are already projected
@@ -5866,6 +5997,11 @@ impl Executor {
                     #[cfg(any(test, feature = "test-failpoints"))]
                     crate::test_failpoints::streaming_join_streamed();
                     let join_result = join_executor.execute_streaming(streaming_request)?;
+                    let held =
+                        self.held_join_output(prepared.as_deref(), stmt, &all_cols, false, ctx)?;
+                    if let Some(output) = held.as_deref().and_then(Option::as_ref) {
+                        return Self::join_output_result(output, join_result.rows, false, ctx);
+                    }
 
                     // Project and return results
                     let projected_rows = self.project_rows_with_alias(
@@ -6269,6 +6405,11 @@ impl Executor {
                 &final_columns,
                 None,
             );
+        }
+
+        let held = self.held_join_output(prepared.as_deref(), stmt, &final_columns, false, ctx)?;
+        if let Some(output) = held.as_deref().and_then(Option::as_ref) {
+            return Self::join_output_result(output, final_rows, false, ctx);
         }
 
         // Check if ORDER BY or DISTINCT ON references columns not in SELECT
@@ -8446,21 +8587,42 @@ impl Executor {
         ctx: &ExecutionContext,
         table_alias: Option<&str>,
     ) -> Result<RowVec> {
+        // Correlated subqueries are evaluated per row
+        if Self::has_correlated_select_subqueries(select_exprs) {
+            return self.project_rows_correlated(
+                select_exprs,
+                rows,
+                all_columns,
+                all_columns_lower,
+                ctx,
+                table_alias,
+            );
+        }
+        // Process scalar subqueries in SELECT columns before evaluation (single-pass)
+        let processed = self.try_process_select_subqueries(select_exprs, ctx)?;
+        let plan = self.select_projection(
+            processed.as_deref().unwrap_or(select_exprs),
+            all_columns,
+            all_columns_lower,
+            table_alias,
+        )?;
+        Self::run_select_projection(&plan, rows, ctx)
+    }
+
+    /// How a SELECT list without correlated subqueries projects rows of
+    /// `all_columns`, found before any row
+    fn select_projection(
+        &self,
+        select_exprs: &[Expression],
+        all_columns: &[String],
+        all_columns_lower: Option<&[String]>,
+        table_alias: Option<&str>,
+    ) -> Result<SelectProjection> {
         // Check if this is SELECT * (no projection needed)
         // Note: QualifiedStar (t.*) DOES need projection to filter columns
         if select_exprs.len() == 1 && matches!(&select_exprs[0], Expression::Star(_)) {
-            return Ok(rows); // Pass through directly - pooled
+            return Ok(SelectProjection::Whole);
         }
-
-        // OPTIMIZATION: Compute lowercase columns once at the start
-        // This avoids per-column to_lowercase() calls in loops below
-        let computed_lower_early: Vec<String>;
-        let columns_lower: &[String] = if let Some(lower) = all_columns_lower {
-            lower
-        } else {
-            computed_lower_early = all_columns.iter().map(|c| c.to_lowercase()).collect();
-            &computed_lower_early
-        };
 
         // Handle SELECT t.* - filter to only columns matching the qualifier
         if select_exprs.len() == 1 {
@@ -8478,33 +8640,11 @@ impl Executor {
                     && indices_to_use.iter().enumerate().all(|(i, &idx)| i == idx);
 
                 if is_identity {
-                    return Ok(rows); // Pass through directly - no allocation needed
+                    return Ok(SelectProjection::Whole);
                 }
-
-                // Project rows to only include matching columns
-                let mut projected = RowVec::with_capacity(rows.len());
-                for (id, row) in rows.into_iter() {
-                    projected.push((id, row.clone_subset(&indices_to_use)));
-                }
-                return Ok(projected);
+                return Ok(SelectProjection::Subset(indices_to_use));
             }
         }
-
-        // Check if SELECT columns contain correlated scalar subqueries
-        let has_correlated_select = Self::has_correlated_select_subqueries(select_exprs);
-
-        // Process scalar subqueries in SELECT columns before evaluation (single-pass)
-        // but only if they're NOT correlated (correlated ones must be evaluated per-row)
-        let processed = if has_correlated_select {
-            None
-        } else {
-            self.try_process_select_subqueries(select_exprs, ctx)?
-        };
-        let select_exprs_cow = match &processed {
-            Some(p) => std::borrow::Cow::Borrowed(p.as_slice()),
-            None => std::borrow::Cow::Borrowed(select_exprs),
-        };
-        let select_exprs = select_exprs_cow.as_ref();
 
         // OPTIMIZATION: For fast path check, use linear search to avoid HashMap allocation.
         // Linear search with eq_ignore_ascii_case is faster than HashMap for small N
@@ -8631,48 +8771,67 @@ impl Executor {
                         .all(|(i, &idx)| i == idx);
 
                 if is_identity {
-                    return Ok(rows); // Pass through directly - pooled
+                    return Ok(SelectProjection::Whole);
                 }
 
                 // OPTIMIZATION: Use take_columns to move values instead of cloning
-                let mut projected = RowVec::with_capacity(rows.len());
-                for (id, row) in rows.into_iter() {
-                    projected.push((id, row.take_columns(&simple_column_indices)));
-                }
-                return Ok(projected);
+                return Ok(SelectProjection::Take(simple_column_indices));
             }
             // Fall through to slow path if there are duplicates
         }
 
         // OPTIMIZATION: Pre-compute table alias lowercase
         let table_alias_lower: Option<String> = table_alias.map(|a| a.to_lowercase());
+        let col_index_map_lower = lower_index_map(all_columns, all_columns_lower);
 
-        // Pre-size HashMap to avoid rehashing (estimate 1.5x for qualified names)
-        // Use columns_lower which was computed early in the function
-        let mut col_index_map_lower: StringMap<usize> =
-            StringMap::with_capacity(all_columns.len() * 3 / 2);
-        for (i, lower) in columns_lower.iter().enumerate() {
-            col_index_map_lower.insert(lower.clone(), i);
-            // Also add unqualified column names for qualified columns
-            if let Some(dot_idx) = lower.rfind('.') {
-                let column_part = &lower[dot_idx + 1..];
-                col_index_map_lower
-                    .entry(column_part.to_string())
-                    .or_insert(i);
+        // Use the optimized path with pre-compiled expressions
+        Ok(SelectProjection::Actions(self.projection_actions(
+            select_exprs,
+            all_columns,
+            &col_index_map_lower,
+            table_alias_lower.as_deref(),
+        )?))
+    }
+
+    /// The rows `plan` projects
+    fn run_select_projection(
+        plan: &SelectProjection,
+        rows: RowVec,
+        ctx: &ExecutionContext,
+    ) -> Result<RowVec> {
+        match plan {
+            SelectProjection::Whole => Ok(rows),
+            SelectProjection::Subset(indices) => {
+                // Project rows to only include matching columns
+                let mut projected = RowVec::with_capacity(rows.len());
+                for (id, row) in rows.into_iter() {
+                    projected.push((id, row.clone_subset(indices)));
+                }
+                Ok(projected)
             }
+            SelectProjection::Take(indices) => {
+                let mut projected = RowVec::with_capacity(rows.len());
+                for (id, row) in rows.into_iter() {
+                    projected.push((id, row.take_columns(indices)));
+                }
+                Ok(projected)
+            }
+            SelectProjection::Actions(actions) => Self::run_projection_actions(actions, rows, ctx),
         }
+    }
 
-        // For non-correlated queries, use the optimized path with pre-compiled expressions
-        if !has_correlated_select {
-            return self.project_rows_optimized(
-                select_exprs,
-                rows,
-                all_columns,
-                &col_index_map_lower,
-                table_alias_lower.as_deref(),
-                ctx,
-            );
-        }
+    /// Project rows whose SELECT list holds a correlated subquery, binding
+    /// each row as the subquery's outer row
+    fn project_rows_correlated(
+        &self,
+        select_exprs: &[Expression],
+        rows: RowVec,
+        all_columns: &[String],
+        all_columns_lower: Option<&[String]>,
+        ctx: &ExecutionContext,
+        table_alias: Option<&str>,
+    ) -> Result<RowVec> {
+        let col_index_map_lower = lower_index_map(all_columns, all_columns_lower);
 
         // Correlated subquery path: expressions change per-row, use CompiledEvaluator
         let mut projected = RowVec::with_capacity(rows.len());
@@ -8796,66 +8955,15 @@ impl Executor {
         Ok(projected)
     }
 
-    /// Optimized projection for non-correlated queries.
-    /// Pre-compiles all expressions once and uses direct VM execution.
-    #[allow(clippy::too_many_arguments)]
-    fn project_rows_optimized(
+    /// How each expression of a non-correlated projection is evaluated:
+    /// complex ones are compiled once, before any row
+    fn projection_actions(
         &self,
         select_exprs: &[Expression],
-        rows: RowVec,
         all_columns: &[String],
         col_index_map_lower: &StringMap<usize>,
         table_alias_lower: Option<&str>,
-        ctx: &ExecutionContext,
-    ) -> Result<RowVec> {
-        // Analyze expressions and pre-compile complex ones
-        // Each element represents how to evaluate each SELECT expression:
-        // - SimpleColumn: direct column index lookup
-        // - StarExpand: expand all columns
-        // - QualifiedStarExpand: expand columns for specific qualifier
-        // - Coalesce: inline COALESCE evaluation (no VM overhead)
-        // - Compiled: pre-compiled program to execute via VM
-
-        // Argument source for inline function evaluation
-        enum ArgSource {
-            Column(usize),
-            Const(Value),
-        }
-
-        // Simple condition for inline CASE: column comparisons
-        enum CaseCondition {
-            Equals { col_idx: usize, value: Value },
-            NotEquals { col_idx: usize, value: Value },
-            GreaterThan { col_idx: usize, value: Value },
-            GreaterOrEqual { col_idx: usize, value: Value },
-            LessThan { col_idx: usize, value: Value },
-            LessOrEqual { col_idx: usize, value: Value },
-            IsNull { col_idx: usize },
-        }
-
-        // A single WHEN branch for inline CASE
-        struct CaseBranch {
-            condition: CaseCondition,
-            result: ArgSource,
-        }
-
-        enum ExprAction {
-            SimpleColumn(usize),
-            StarExpand,
-            /// The columns a qualified star takes, found once
-            QualifiedStarExpand(Vec<usize>),
-            /// Inline COALESCE - bypasses VM for 7x speedup
-            Coalesce(smallvec::SmallVec<[ArgSource; 4]>),
-            /// Inline CASE - bypasses VM for simple equality/null checks
-            Case {
-                branches: smallvec::SmallVec<[CaseBranch; 4]>,
-                else_result: Option<ArgSource>,
-            },
-            /// Inline string concatenation (||) - bypasses VM
-            Concat(smallvec::SmallVec<[ArgSource; 6]>),
-            Compiled(SharedProgram),
-        }
-
+    ) -> Result<Vec<ExprAction>> {
         // Helper to try building inline COALESCE action (bypasses VM for 7x speedup)
         fn try_build_coalesce_action(
             func: &crate::parser::ast::FunctionCall,
@@ -9229,7 +9337,15 @@ impl Executor {
             };
             actions.push(action);
         }
+        Ok(actions)
+    }
 
+    /// The rows `actions` project, run directly on the VM
+    fn run_projection_actions(
+        actions: &[ExprAction],
+        rows: RowVec,
+        ctx: &ExecutionContext,
+    ) -> Result<RowVec> {
         // Pre-fetch parameters for VM context
         let params = ctx.params();
         let named_params = ctx.named_params();
@@ -9286,7 +9402,7 @@ impl Executor {
                     transaction_id,
                 );
 
-                for action in &actions {
+                for action in actions {
                     match action {
                         ExprAction::SimpleColumn(idx) => {
                             // Direct index access with bounds check
@@ -9628,7 +9744,6 @@ impl Executor {
         }
         let select_exprs: &[Expression] = bound_exprs.as_deref().unwrap_or(select_exprs);
         let shared_columns = bound_columns.as_ref().unwrap_or(all_columns);
-        let all_columns: &[String] = shared_columns;
 
         // Process scalar subqueries in SELECT columns before evaluation (single-pass)
         let processed = self.try_process_select_subqueries(select_exprs, ctx)?;
@@ -9637,6 +9752,31 @@ impl Executor {
             None => std::borrow::Cow::Borrowed(select_exprs),
         };
 
+        let (plan, extra_names, layout) = self.ordered_projection(
+            &select_exprs,
+            order_by,
+            distinct_on,
+            shared_columns,
+            table_alias,
+            ctx,
+        );
+        let projected = Self::run_ordered_projection(&plan, rows, ctx)?;
+        Ok((projected, extra_names, layout))
+    }
+
+    /// What a projection keeping the ORDER BY and DISTINCT ON values the
+    /// SELECT list leaves out reads per row, the names it appends, and
+    /// where each output column comes from
+    fn ordered_projection(
+        &self,
+        select_exprs: &[Expression],
+        order_by: &[crate::parser::ast::OrderByExpression],
+        distinct_on: &[Expression],
+        shared_columns: &CompactArc<Vec<String>>,
+        table_alias: Option<&str>,
+        ctx: &ExecutionContext,
+    ) -> (OrderedProjection, Vec<String>, OutputLayout) {
+        let all_columns: &[String] = shared_columns;
         let OrderByProjection {
             col_index_map_lower,
             select_column_indices,
@@ -9645,9 +9785,9 @@ impl Executor {
             computed_distinct_on,
             extra_names,
             extra_sources,
-        } = self.order_by_projection(&select_exprs, order_by, distinct_on, all_columns);
+        } = self.order_by_projection(select_exprs, order_by, distinct_on, all_columns);
         let mut layout = Self::shared_select_layout(
-            &select_exprs,
+            select_exprs,
             CompactArc::clone(shared_columns),
             table_alias,
         );
@@ -9659,93 +9799,181 @@ impl Executor {
             && computed_order_by.is_empty();
 
         if all_simple {
-            // Fast path
-            let mut projected = RowVec::with_capacity(rows.len());
-            let num_select_cols = select_column_indices.len();
-            let num_extra_cols = extra_order_indices.len();
-
-            for (row_id, row) in rows.drain_rows().enumerate() {
-                let mut values = Vec::with_capacity(num_select_cols + num_extra_cols);
-                // Add SELECT columns
-                for idx in &select_column_indices {
-                    values.push(
-                        row.get(idx.unwrap())
-                            .cloned()
-                            .unwrap_or(Value::null_unknown()),
-                    );
-                }
-                // Add extra ORDER BY columns
-                for &idx in &extra_order_indices {
-                    values.push(row.get(idx).cloned().unwrap_or(Value::null_unknown()));
-                }
-                projected.push((row_id as i64, Row::from_values(values)));
-            }
-
-            // Output column names will be computed in caller
-            Ok((projected, extra_names, layout))
-        } else {
-            // Slow path: Use Evaluator for complex expressions
-            #[cfg(feature = "test-failpoints")]
-            crate::test_failpoints::general_path_reached(
-                crate::test_failpoints::GeneralPath::ProjectionEvaluator,
-            );
-            let mut projected = RowVec::with_capacity(rows.len());
-
-            // Each value's source is found once for the statement; an error
-            // is raised by the first row that reads it, as evaluating raised it
-            // A statement run for an outer row reads that row's columns by name
-            let outer_columns: Option<Vec<String>> = ctx
-                .outer_row()
-                .filter(|outer| !outer.is_empty())
-                .map(|outer| outer.keys().map(|k| k.to_string()).collect());
-            let mut compile_ctx = CompileContext::new(all_columns, &self.function_registry);
-            if let Some(outer) = &outer_columns {
-                compile_ctx = compile_ctx.with_outer_columns(outer);
-            }
-            let compile = |expr: &Expression| -> Result<SharedProgram> {
-                ExprCompiler::new(&compile_ctx)
-                    .compile(expr)
-                    .map(CompactArc::new)
-                    .map_err(|e| Error::internal(format!("Compile error: {}", e)))
-            };
-            let sources: Vec<Result<ItemSource>> = select_exprs
+            // SELECT columns, then the extra ORDER BY columns
+            let columns = select_column_indices
                 .iter()
-                .map(|expr| match select_column(expr, &col_index_map_lower) {
-                    Some(idx) => idx.map(ItemSource::Column),
-                    None => compile(unaliased_item(expr)).map(ItemSource::Program),
-                })
-                .chain(
-                    extra_order_indices
-                        .iter()
-                        .map(|&idx| Ok(ItemSource::Column(idx))),
-                )
-                .chain(
-                    computed_order_by
-                        .iter()
-                        .chain(&computed_distinct_on)
-                        .map(|expr| compile(expr).map(ItemSource::Program)),
-                )
+                .flatten()
+                .chain(&extra_order_indices)
+                .copied()
                 .collect();
-            let mut vm = ExprVM::new();
-
-            for (row_id, row) in rows.drain_rows().enumerate() {
-                let exec = super::expression::execute_context(&row, Some(ctx));
-                let mut values = Vec::with_capacity(sources.len());
-                for source in &sources {
-                    values.push(match source {
-                        Ok(ItemSource::Column(idx)) => {
-                            row.get(*idx).cloned().unwrap_or(Value::null_unknown())
-                        }
-                        Ok(ItemSource::Program(program)) => vm.execute_cow(program, &exec)?,
-                        Err(e) => return Err(e.clone()),
-                    });
-                }
-
-                projected.push((row_id as i64, Row::from_values(values)));
-            }
-
-            Ok((projected, extra_names, layout))
+            return (OrderedProjection::Columns(columns), extra_names, layout);
         }
+
+        // Each value's source is found once for the statement; an error
+        // is raised by the first row that reads it, as evaluating raised it
+        // A statement run for an outer row reads that row's columns by name
+        let outer_columns: Option<Vec<String>> = ctx
+            .outer_row()
+            .filter(|outer| !outer.is_empty())
+            .map(|outer| outer.keys().map(|k| k.to_string()).collect());
+        let mut compile_ctx = CompileContext::new(all_columns, &self.function_registry);
+        if let Some(outer) = &outer_columns {
+            compile_ctx = compile_ctx.with_outer_columns(outer);
+        }
+        let compile = |expr: &Expression| -> Result<SharedProgram> {
+            ExprCompiler::new(&compile_ctx)
+                .compile(expr)
+                .map(CompactArc::new)
+                .map_err(|e| Error::internal(format!("Compile error: {}", e)))
+        };
+        let sources: Vec<Result<ItemSource>> = select_exprs
+            .iter()
+            .map(|expr| match select_column(expr, &col_index_map_lower) {
+                Some(idx) => idx.map(ItemSource::Column),
+                None => compile(unaliased_item(expr)).map(ItemSource::Program),
+            })
+            .chain(
+                extra_order_indices
+                    .iter()
+                    .map(|&idx| Ok(ItemSource::Column(idx))),
+            )
+            .chain(
+                computed_order_by
+                    .iter()
+                    .chain(&computed_distinct_on)
+                    .map(|expr| compile(expr).map(ItemSource::Program)),
+            )
+            .collect();
+        (OrderedProjection::Items(sources), extra_names, layout)
+    }
+
+    /// The output `stmt` builds from joined rows of `all_columns`, ordered
+    /// already when `sorted`; none for a SELECT list holding a subquery,
+    /// whose values each execution finds again
+    fn join_output(
+        &self,
+        stmt: &SelectStatement,
+        all_columns: &[String],
+        sorted: bool,
+        ctx: &ExecutionContext,
+    ) -> Result<Option<JoinOutput>> {
+        if stmt.columns.iter().any(Self::has_subqueries)
+            || self
+                .try_process_select_subqueries(&stmt.columns, ctx)?
+                .is_some()
+        {
+            return Ok(None);
+        }
+        let mut columns = self.get_output_column_names(&stmt.columns, all_columns, None);
+        if !sorted && self.order_by_needs_extra_columns(stmt, all_columns) {
+            let (plan, extra_names, layout) = self.ordered_projection(
+                &stmt.columns,
+                &stmt.order_by,
+                &stmt.distinct_on,
+                &CompactArc::new(all_columns.to_vec()),
+                None,
+                ctx,
+            );
+            columns.extend(extra_names);
+            return Ok(Some(JoinOutput {
+                projection: OutputProjection::Ordered(plan),
+                columns: CompactArc::new(columns),
+                layout: Some(CompactArc::new(layout)),
+            }));
+        }
+        let plan = self.select_projection(&stmt.columns, all_columns, None, None)?;
+        Ok(Some(JoinOutput {
+            projection: OutputProjection::Select(plan),
+            columns: CompactArc::new(columns),
+            layout: Self::output_layout(stmt, all_columns, None).map(CompactArc::new),
+        }))
+    }
+
+    /// The output the statement's plan holds for joined rows of
+    /// `all_columns`; none without a plan
+    fn held_join_output(
+        &self,
+        prepared: Option<&PreparedJoin>,
+        stmt: &SelectStatement,
+        all_columns: &[String],
+        sorted: bool,
+        ctx: &ExecutionContext,
+    ) -> Result<Option<Arc<Option<JoinOutput>>>> {
+        prepared
+            .map(|prepared| {
+                prepared.output(all_columns, sorted, || {
+                    self.join_output(stmt, all_columns, sorted, ctx)
+                })
+            })
+            .transpose()
+    }
+
+    /// The result `output` builds from joined rows; `applied` when the join
+    /// applied the LIMIT and OFFSET
+    fn join_output_result(
+        output: &JoinOutput,
+        rows: RowVec,
+        applied: bool,
+        ctx: &ExecutionContext,
+    ) -> SelectResult {
+        let rows = match &output.projection {
+            OutputProjection::Select(plan) => Self::run_select_projection(plan, rows, ctx)?,
+            OutputProjection::Ordered(plan) => Self::run_ordered_projection(plan, rows, ctx)?,
+        };
+        let result = ExecutorResult::with_arc_columns(CompactArc::clone(&output.columns), rows);
+        let shape = output.layout.as_ref().map(|layout| SelectShape {
+            deferred: None,
+            layout: Some(LaidOut::Shared(CompactArc::clone(layout))),
+        });
+        Ok((
+            Box::new(result),
+            CompactArc::clone(&output.columns),
+            applied,
+            shape,
+        ))
+    }
+
+    /// The rows `plan` projects, each with its position as its id
+    fn run_ordered_projection(
+        plan: &OrderedProjection,
+        mut rows: RowVec,
+        ctx: &ExecutionContext,
+    ) -> Result<RowVec> {
+        let mut projected = RowVec::with_capacity(rows.len());
+        match plan {
+            OrderedProjection::Columns(columns) => {
+                for (row_id, row) in rows.drain_rows().enumerate() {
+                    let mut values = Vec::with_capacity(columns.len());
+                    for &idx in columns {
+                        values.push(row.get(idx).cloned().unwrap_or(Value::null_unknown()));
+                    }
+                    projected.push((row_id as i64, Row::from_values(values)));
+                }
+            }
+            OrderedProjection::Items(sources) => {
+                // Slow path: Use Evaluator for complex expressions
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::general_path_reached(
+                    crate::test_failpoints::GeneralPath::ProjectionEvaluator,
+                );
+                let mut vm = ExprVM::new();
+                for (row_id, row) in rows.drain_rows().enumerate() {
+                    let exec = super::expression::execute_context(&row, Some(ctx));
+                    let mut values = Vec::with_capacity(sources.len());
+                    for source in sources {
+                        values.push(match source {
+                            Ok(ItemSource::Column(idx)) => {
+                                row.get(*idx).cloned().unwrap_or(Value::null_unknown())
+                            }
+                            Ok(ItemSource::Program(program)) => vm.execute_cow(program, &exec)?,
+                            Err(e) => return Err(e.clone()),
+                        });
+                    }
+                    projected.push((row_id as i64, Row::from_values(values)));
+                }
+            }
+        }
+        Ok(projected)
     }
 
     /// Which columns an ORDER BY or DISTINCT ON projection reads by index,

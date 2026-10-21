@@ -47,6 +47,23 @@ fn residual_failed(filter: &Option<JoinFilter>, failed: bool) -> Result<()> {
     }
 }
 
+/// The residual over the pair in the statement's order: inner first when
+/// the outer side is the right one
+#[inline]
+fn pair_matches(
+    filter: &JoinFilter,
+    outer_on_right: bool,
+    outer: &Row,
+    inner: &Row,
+    failed: &mut bool,
+) -> bool {
+    if outer_on_right {
+        filter.matches(inner, outer, failed)
+    } else {
+        filter.matches(outer, inner, failed)
+    }
+}
+
 /// Index Nested Loop Join lookup strategy.
 /// Determines how to find matching rows in the inner (right) table.
 #[derive(Clone)]
@@ -250,6 +267,9 @@ pub struct IndexNestedLoopJoinOperator {
 
     // Optional projection pushdown: create projected rows during combine
     projection: Option<JoinProjection>,
+    // The outer side is the statement's right side: rows and the residual
+    // pair read inner first
+    outer_on_right: bool,
     // Set when the residual filter read an error as false
     condition_failed: bool,
 
@@ -387,6 +407,7 @@ impl IndexNestedLoopJoinOperator {
             schema,
             inner_col_count,
             projection: None,
+            outer_on_right: false,
             condition_failed: false,
             current_outer_row: None,
             current_inner_rows: RowVec::new(),
@@ -432,6 +453,17 @@ impl IndexNestedLoopJoinOperator {
             repeats_source,
         });
         self.schema = projected_schema;
+        self
+    }
+
+    /// The outer side is the statement's right side, so each joined row and
+    /// the residual's pair read the inner side first
+    pub fn with_outer_on_right(mut self) -> Self {
+        if self.projection.is_none() {
+            let outer_len = self.schema.len() - self.inner_col_count;
+            self.schema.rotate_left(outer_len);
+        }
+        self.outer_on_right = true;
         self
     }
 
@@ -490,6 +522,7 @@ impl IndexNestedLoopJoinOperator {
                     }
                 }
             }
+            None if self.outer_on_right => self.row_buffer.combine_into_owned(inner, outer),
             None => {
                 // Combine both rows into buffer
                 self.row_buffer.combine_into_owned(outer, inner);
@@ -535,6 +568,7 @@ impl IndexNestedLoopJoinOperator {
 
                 Row::from_compact_vec(values)
             }
+            None if self.outer_on_right => Row::from_combined_move_clone(inner, outer),
             None => Row::from_combined_clone_move(outer, inner),
         }
     }
@@ -791,7 +825,13 @@ impl Operator for IndexNestedLoopJoinOperator {
                     // SAFETY: inner_idx < inner_len checked by while condition
                     let inner_entry = unsafe { self.current_inner_rows.get_unchecked(inner_idx) };
                     if let Some(ref filter) = self.residual_filter {
-                        filter.matches(outer_row, &inner_entry.1, &mut self.condition_failed)
+                        pair_matches(
+                            filter,
+                            self.outer_on_right,
+                            outer_row,
+                            &inner_entry.1,
+                            &mut self.condition_failed,
+                        )
                     } else {
                         true
                     }
@@ -906,6 +946,9 @@ pub struct BatchIndexNestedLoopJoinOperator {
 
     // Optional projection pushdown: create projected rows during combine
     projection: Option<JoinProjection>,
+    // The outer side is the statement's right side: rows and the residual
+    // pair read inner first
+    outer_on_right: bool,
 
     // Pre-computed results (built in open())
     results: Vec<Row>,
@@ -948,6 +991,7 @@ impl BatchIndexNestedLoopJoinOperator {
             schema,
             inner_col_count,
             projection: None,
+            outer_on_right: false,
             results: Vec::new(),
             result_idx: 0,
             // Pre-allocate buffer for typical number of matches
@@ -961,6 +1005,17 @@ impl BatchIndexNestedLoopJoinOperator {
     pub fn with_inner_key(mut self, inner_key_idx: Option<usize>) -> Self {
         self.inner_key_idx = inner_key_idx;
         self.inner_side = inner_key_side(&*self.inner_table, &self.lookup_strategy, inner_key_idx);
+        self
+    }
+
+    /// The outer side is the statement's right side, so each joined row and
+    /// the residual's pair read the inner side first
+    pub fn with_outer_on_right(mut self) -> Self {
+        if self.projection.is_none() {
+            let outer_len = self.schema.len() - self.inner_col_count;
+            self.schema.rotate_left(outer_len);
+        }
+        self.outer_on_right = true;
         self
     }
 
@@ -1021,6 +1076,7 @@ impl BatchIndexNestedLoopJoinOperator {
 
                 Row::from_compact_vec(values)
             }
+            None if self.outer_on_right => Row::from_combined(inner, outer),
             None => Row::from_combined(outer, inner),
         }
     }
@@ -1213,7 +1269,13 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
 
                     // Apply residual filter if present
                     let passes_filter = if let Some(ref filter) = self.residual_filter {
-                        filter.matches(outer_row, inner_row, &mut condition_failed)
+                        pair_matches(
+                            filter,
+                            self.outer_on_right,
+                            outer_row,
+                            inner_row,
+                            &mut condition_failed,
+                        )
                     } else {
                         true
                     };

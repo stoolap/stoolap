@@ -93,6 +93,25 @@ const CASES: &[Case] = &[
         ),
         limit: None,
     },
+    // The filtered right side runs as the outer one, probing the left key
+    Case {
+        path: "batch_index_nested_loop",
+        sql: "SELECT * FROM r JOIN l ON r.id = l.k AND r.w + 10 < l.id WHERE l.g = 1",
+        reference: Reference::Sql(
+            "SELECT * FROM r JOIN l ON r.id + 0 = l.k + 0 AND r.w + 10 < l.id WHERE l.g = 1",
+            "nested_loop",
+        ),
+        limit: None,
+    },
+    Case {
+        path: "index_nested_loop",
+        sql: "SELECT *, l.id - r.w FROM r JOIN l ON r.id = l.k AND r.w > l.id - 15 WHERE l.g = 1 LIMIT 5",
+        reference: Reference::Sql(
+            "SELECT *, l.id - r.w FROM r JOIN l ON r.id + 0 = l.k + 0 AND r.w > l.id - 15 WHERE l.g = 1",
+            "nested_loop",
+        ),
+        limit: Some(5),
+    },
     Case {
         path: "grouped_index_join",
         sql: "SELECT l.id, COUNT(*), SUM(r.w) FROM l JOIN r ON l.k = r.k GROUP BY l.id LIMIT 5",

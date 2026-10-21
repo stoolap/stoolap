@@ -439,6 +439,8 @@ impl<'a> ExprCompiler<'a> {
 
     /// Compile an expression into a Program
     pub fn compile(&self, expr: &Expression) -> Result<Program, CompileError> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::program_compiled();
         let mut builder = ProgramBuilder::new();
         self.compile_expr(expr, &mut builder)?;
         builder.emit(Op::Return);
