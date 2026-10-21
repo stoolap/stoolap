@@ -68,3 +68,26 @@ fn test_three_table_join_inside_correlated_subquery() {
         [[Some(2)]]
     );
 }
+
+#[test]
+fn an_index_join_orders_by_the_outer_row_s_column() {
+    let db = Database::open("memory://index_join_outer_order").unwrap();
+    for sql in [
+        "CREATE TABLE o (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE l (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE TABLE r (id INTEGER PRIMARY KEY)",
+        "INSERT INTO o VALUES (-1)",
+        "INSERT INTO l VALUES (1, 1), (2, 2)",
+        "INSERT INTO r VALUES (1), (2)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT (SELECT l.id FROM l JOIN r ON l.k = r.id ORDER BY o.id * l.id LIMIT 1) FROM o"
+        ),
+        [[Some(2)]],
+        "o.id is the outer row's -1, so the largest l.id sorts first"
+    );
+}

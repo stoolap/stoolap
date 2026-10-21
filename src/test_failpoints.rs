@@ -868,6 +868,16 @@ thread_local! {
     static BRIDGE_COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ONE_SHOT_COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ONE_SHOT_LITERAL_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PROGRAM_COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Expressions this thread compiled into programs, so far
+pub fn program_compiles() -> usize {
+    PROGRAM_COMPILES.with(std::cell::Cell::get)
+}
+
+pub(crate) fn program_compiled() {
+    PROGRAM_COMPILES.with(|n| n.set(n.get() + 1));
 }
 
 /// Expressions this thread handed the evaluation bridge to compile or look

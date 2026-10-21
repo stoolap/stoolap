@@ -297,6 +297,21 @@ impl Row {
         }
     }
 
+    /// Combine rows: move left, clone right (for JOINs)
+    #[inline]
+    pub fn from_combined_move_clone(left: Row, right: &Row) -> Self {
+        let total_len = left.len() + right.len();
+        let mut values = CompactVec::with_capacity(total_len);
+        match left.storage {
+            RowStorage::Owned(left_vec) => values.extend(left_vec),
+            RowStorage::Shared(arc) => values.extend_clone(&arc),
+        }
+        values.extend_clone(right.as_slice());
+        Self {
+            storage: RowStorage::Owned(values),
+        }
+    }
+
     /// Combine rows: clone left, move right (for JOINs)
     #[inline]
     pub fn from_combined_clone_move(left: &Row, right: Row) -> Self {

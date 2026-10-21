@@ -98,3 +98,15 @@ fn computed_items_allocate_per_row_as_bare_columns_do() {
         );
     }
 }
+
+#[test]
+fn an_extra_order_by_column_costs_a_query_no_list_of_its_own() {
+    let ordered = allocations("SELECT id FROM t ORDER BY b", 10);
+    let plain = allocations("SELECT id, b FROM t ORDER BY b", 10);
+    // 18 on main 24fbda2, before the projection was split
+    assert!(
+        ordered - plain <= 18,
+        "keeping b for the sort costs {} allocations beyond selecting it",
+        ordered - plain
+    );
+}
