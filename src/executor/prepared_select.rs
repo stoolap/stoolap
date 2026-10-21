@@ -3084,11 +3084,11 @@ impl Executor {
     pub(crate) fn join_where_family(
         &self,
         clause: &Expression,
-        ctx: &ExecutionContext,
+        ctx: Option<&ExecutionContext>,
     ) -> std::result::Result<(), OutOfFamily> {
         let family = Family {
             executor: self,
-            ctx: Some(ctx),
+            ctx,
             tables: RefCell::new(SmallVec::new()),
         };
         let mut found = false;

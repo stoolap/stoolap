@@ -1052,8 +1052,8 @@ fn test_classifier_rules() {
             "a window function",
         ),
         (
-            format!("SELECT t.id FROM t JOIN u ON u.id = t.id WHERE a > {sq}"),
-            "FROM is not one table",
+            format!("SELECT t.id FROM t JOIN (SELECT * FROM u) u ON u.id = t.id WHERE a > {sq}"),
+            "a side that is not a table read without AS OF",
         ),
         (
             "SELECT id FROM uv WHERE v > (SELECT a FROM t WHERE t.id = uv.id)".to_string(),

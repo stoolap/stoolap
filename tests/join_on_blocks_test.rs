@@ -560,3 +560,90 @@ fn a_natural_join_binds_a_shared_dotted_column_beside_its_blocks() {
         assert_eq!(join_paths_taken(), ["hash"], "{sql}");
     }
 }
+
+fn prepared_line(db: &Database, sql: &str) -> String {
+    db.query(&format!("EXPLAIN {sql}"), ())
+        .unwrap()
+        .map(|row| row.unwrap().get::<String>(0).unwrap())
+        .find(|line| line.trim_start().starts_with("Prepared:"))
+        .map(|line| line.trim().to_string())
+        .unwrap_or_default()
+}
+
+#[test]
+fn explain_says_whether_a_join_runs_its_subqueries_as_blocks() {
+    let db = Database::open("memory://join_on_blocks_explain").unwrap();
+    fill(&db);
+    let exists = "EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id)";
+    let cases = [
+        (
+            format!("SELECT l.id, r.id FROM l JOIN r ON l.g = r.w AND {exists}"),
+            "Prepared: yes".to_string(),
+        ),
+        (
+            format!("SELECT l.id, r.id FROM l LEFT JOIN r ON l.g = r.w AND {exists}"),
+            "Prepared: yes".to_string(),
+        ),
+        (
+            format!("SELECT l.id, r.id FROM l JOIN r ON l.g = r.w WHERE {exists}"),
+            "Prepared: yes".to_string(),
+        ),
+        (
+            format!("SELECT l.id, r.id FROM l JOIN r USING (k) WHERE {exists}"),
+            "Prepared: yes".to_string(),
+        ),
+        (
+            "SELECT l.id FROM l JOIN r ON r.id = l.id WHERE l.k > (SELECT s.b FROM s WHERE s.id = l.id)"
+                .to_string(),
+            "Prepared: yes".to_string(),
+        ),
+        (
+            format!("SELECT l.id, r.id FROM l JOIN (SELECT * FROM r) r ON l.g = r.w WHERE {exists}"),
+            "Prepared: no (a side that is not a table read without AS OF)".to_string(),
+        ),
+        (
+            "WITH c AS (SELECT * FROM r) SELECT l.id, c.id FROM l JOIN c ON l.g = c.w \
+             WHERE EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = c.id)"
+                .to_string(),
+            "Prepared: no (a side that is not a table read without AS OF)".to_string(),
+        ),
+        (
+            "WITH c AS (SELECT * FROM s) SELECT l.id, r.id FROM l JOIN r ON l.g = r.w \
+             WHERE EXISTS (SELECT 1 FROM c WHERE c.a = l.id AND c.b = r.id) \
+             AND EXISTS (SELECT 1 FROM c WHERE c.a = r.id)"
+                .to_string(),
+            "Prepared: no (a WITH clause)".to_string(),
+        ),
+        (
+            format!(
+                "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w \
+                 WHERE l.id > (SELECT MIN(s.b) FROM s) AND {exists}"
+            ),
+            "Prepared: no (a WHERE subquery in a condition on one table)".to_string(),
+        ),
+        (
+            format!("SELECT COUNT(*), (SELECT MAX(s.b) FROM s) FROM l JOIN r ON l.g = r.w WHERE {exists}"),
+            "Prepared: no (a grouped SELECT list whose subqueries are read first)".to_string(),
+        ),
+        (
+            format!("SELECT l.id, r.id FROM l JOIN r ON l.g = r.w AND (l.g, l.k) = (r.w, r.k) AND {exists}"),
+            "Prepared: no (an expression form outside the family)".to_string(),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (sql, want) in &cases {
+        let got = prepared_line(&db, sql);
+        if got != *want {
+            wrong.push(format!("{sql}: {got}, expected {want}"));
+        }
+        let ran = rows(&db, sql).and_then(|_| {
+            let compiles = (bridge_compiles(), program_compiles());
+            rows(&db, sql)?;
+            Ok((bridge_compiles(), program_compiles()) == compiles)
+        });
+        if got == "Prepared: yes" && ran != Ok(true) {
+            wrong.push(format!("{sql}: says yes, run again it compiled ({ran:?})"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
