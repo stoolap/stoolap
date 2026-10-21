@@ -67,6 +67,11 @@ const WHERE_TWINS: &[(&str, &str)] = &[
     ("EXISTS (SELECT COUNT(*) WHERE t.a > 5)", "1 = 1"),
     ("a = (SELECT a)", "a = a"),
     ("a = (SELECT a AS z WHERE z > 1)", "a > 1"),
+    ("(SELECT COUNT(*) WHERE 1 = 0) = 0", "1 = 1"),
+    ("a IN (SELECT COUNT(*) + 1 WHERE 1 = 0)", "a = 1"),
+    ("EXISTS (SELECT COUNT(*) WHERE 1 = 0)", "1 = 1"),
+    ("EXISTS (SELECT 1 HAVING 1 = 0)", "1 = 0"),
+    ("NOT EXISTS (SELECT 1 HAVING 1 = 0)", "1 = 1"),
 ];
 
 #[test]
@@ -123,8 +128,8 @@ fn a_block_without_from_writes_as_one_row() {
             "1:1 2:2 3:3 4:NULL 10:2",
         ),
         (
-            "INSERT INTO t VALUES (11, (SELECT COUNT(*))), (12, (SELECT 2 WHERE 1 = 0))",
-            "1:1 2:2 3:3 4:NULL 11:1 12:NULL",
+            "INSERT INTO t VALUES (11, (SELECT COUNT(*))), (12, (SELECT 2 WHERE 1 = 0)), (13, (SELECT COUNT(*) WHERE 1 = 0))",
+            "1:1 2:2 3:3 4:NULL 11:1 12:NULL 13:0",
         ),
         (
             "UPDATE t SET a = (SELECT t.a + 10) WHERE id = 1",
@@ -188,4 +193,16 @@ fn a_block_without_from_reads_again_the_tables_of_its_nested_blocks() {
         answer(db.query(sql, ())),
         Ok(vec!["Integer(3)".to_string()])
     );
+}
+
+#[test]
+fn a_block_without_from_takes_no_name_of_the_enclosing_query() {
+    let db = Database::open("memory://prepared_fromless_unnamed").unwrap();
+    setup(&db);
+    let got = answer(db.query(
+        "SELECT a FROM t AS \"\" WHERE a = (SELECT \"\".a) ORDER BY a",
+        (),
+    ));
+    let want = answer(db.query("SELECT a FROM t WHERE a = a ORDER BY a", ()));
+    assert_eq!(got, want);
 }

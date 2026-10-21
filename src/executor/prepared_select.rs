@@ -507,6 +507,17 @@ impl ScopeTable {
         }
     }
 
+    /// The scope of a block without FROM: no columns, and no name a
+    /// qualifier could find, so every name reads an enclosing scope
+    fn unnamed() -> Self {
+        Self {
+            tables: SmallVec::new(),
+            columns: CompactArc::new(Vec::new()),
+            lower: CompactArc::new(Vec::new()),
+            types: Vec::new(),
+        }
+    }
+
     /// The joined row of `sides`, each a name and its table's schema, as a
     /// join of `width` columns lays it out; None when they do not line up.
     /// Its programs read each column by position, under a name no column
@@ -1948,7 +1959,7 @@ impl Builder<'_> {
         let picks = grouped_block(sq) || !matches!(form, Form::Scalar);
         let executor = self.executor;
         let registry = &executor.function_registry;
-        let (table, schema, scope_name) = match sq.table_expr.as_deref() {
+        let (table, schema, scope) = match sq.table_expr.as_deref() {
             Some(Expression::TableSource(ts)) => {
                 let schema = executor
                     .engine
@@ -1960,17 +1971,17 @@ impl Builder<'_> {
                         other => other,
                     })?;
                 let name = ts.alias.as_ref().unwrap_or(&ts.name).value_lower.clone();
-                (Some(ts.name.value_lower.clone()), schema, name)
+                let scope = ScopeTable::of(name, &schema);
+                (Some(ts.name.value_lower.clone()), schema, scope)
             }
             // A block without FROM reads one row without columns, under no name
             None => (
                 None,
                 CompactArc::new(Schema::new("", Vec::new())),
-                SmartString::default(),
+                ScopeTable::unnamed(),
             ),
             Some(_) => return Err(Error::internal("a prepared subquery without one table")),
         };
-        let scope = ScopeTable::of(scope_name, &schema);
         let id = u16::try_from(self.subqueries.len())
             .map_err(|_| Error::internal("too many prepared subqueries"))?;
         self.subqueries.push(None);
@@ -2153,7 +2164,11 @@ impl Builder<'_> {
         let correlated = work.reads_parent || !work.delegated.is_empty();
         let mut grouping = grouping;
         if let Some(grouping) = grouping.as_mut() {
-            if !correlated && !sq.where_clause.as_deref().is_some_and(mentions_subquery) {
+            // Without FROM it groups its one row here, as its correlated form does
+            if table.is_some()
+                && !correlated
+                && !sq.where_clause.as_deref().is_some_and(mentions_subquery)
+            {
                 grouping.statement = Some(Box::new(sq.clone()));
             }
         }
