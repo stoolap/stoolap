@@ -4667,8 +4667,9 @@ impl Executor {
     }
 
     /// The WHERE `cross` a join asks at `site` of its joined rows named
-    /// `all_columns`, held with the plan when it has one; its subqueries run
-    /// as blocks over `sides`, each an alias and its table's schema, when given
+    /// `all_columns`, as written: its SELECT aliases are opened here, once.
+    /// Held with the plan when it has one; its subqueries run as blocks over
+    /// `sides`, each an alias and its table's schema, when given
     #[allow(clippy::too_many_arguments)]
     fn join_where(
         &self,
@@ -6413,15 +6414,12 @@ impl Executor {
             where_for_join.clone()
         };
 
-        let resolved_where_clause = effective_where.map(|where_expr| {
-            Box::new(
-                Self::with_select_aliases(stmt, &where_expr, &all_columns).unwrap_or(where_expr),
-            )
-        });
-
         // Apply WHERE clause if present
-        let filtered_rows = if let Some(ref where_clause) = resolved_where_clause {
+        let filtered_rows = if let Some(where_expr) = effective_where {
             if correlated_where && block_sides.is_none() {
+                let resolved = Self::with_select_aliases(stmt, &where_expr, &all_columns)
+                    .unwrap_or(where_expr);
+                let where_clause = &resolved;
                 // Each joined row is the outer row of the subqueries in the
                 // WHERE, so they are resolved and the predicate compiled per row
                 let keys = ColumnKeyMapping::build_mappings(&all_columns, None);
@@ -6484,7 +6482,7 @@ impl Executor {
                     prepared.as_deref(),
                     WhereSite::AfterJoin,
                     stmt,
-                    where_clause,
+                    &where_expr,
                     &all_columns,
                     block_sides,
                     ctx,

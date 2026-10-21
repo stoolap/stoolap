@@ -242,3 +242,36 @@ fn a_column_named_with_a_dot_binds_by_position_inside_a_block() {
         assert_eq!(rows(&db, &sql), want, "{sql}");
     }
 }
+
+#[test]
+fn a_join_opens_the_where_s_select_aliases_once() {
+    let db = Database::open("memory://join_where_aliases_once").unwrap();
+    for sql in [
+        "CREATE TABLE l (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE r (id INTEGER PRIMARY KEY)",
+        "INSERT INTO l VALUES (1)",
+        "INSERT INTO r VALUES (2)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let sql = "SELECT 1 AS x, \"x\" AS y FROM l JOIN r ON l.id < r.id WHERE y = 'x'";
+    for _ in 0..2 {
+        let got: Vec<String> = db
+            .query(sql, ())
+            .unwrap()
+            .map(|row| {
+                let row = row.unwrap();
+                format!(
+                    "{:?}|{:?}",
+                    row.get_value(0).unwrap(),
+                    row.get_value(1).unwrap()
+                )
+            })
+            .collect();
+        assert_eq!(
+            got.len(),
+            1,
+            "y opens to the text \"x\", not to the alias x: {got:?}"
+        );
+    }
+}
