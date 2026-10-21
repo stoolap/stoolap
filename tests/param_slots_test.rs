@@ -449,27 +449,97 @@ fn a_parsed_statement_run_by_its_ast_checks_every_slot_before_it_writes() {
 }
 
 #[test]
-fn a_statement_takes_at_most_65535_parameter_slots() {
-    let db = open("param_slots_limit");
-    let named = |n: usize| {
-        let list: Vec<String> = (1..=n).map(|i| format!(":p{i}")).collect();
-        format!("SELECT {}", list.join(", "))
-    };
-    let error = db.prepare(&named(65_536)).err().expect("one slot too many");
-    assert!(
-        error.to_string().contains("at most 65535 parameters"),
-        "{error}"
+fn every_slot_past_65535_reads_its_own_value() {
+    let db = open("param_slots_wide");
+    // 65537 names: the last two would wrap onto slots 0 and 1 in a u16
+    let names: Vec<String> = (1..=65_537).map(|i| format!("p{i}")).collect();
+    let sql = format!(
+        "SELECT :p65537, :p65536, :p1, {}",
+        names
+            .iter()
+            .map(|n| format!(":{n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
-    let error = db.prepare("SELECT $65536").err().expect("$65536");
-    assert!(
-        error.to_string().contains("at most 65535 parameters"),
-        "{error}"
-    );
-    // The last slot reads its own value, not slot 1's
-    let last = db.prepare("SELECT $65535, $1").unwrap();
-    let values: Vec<Value> = (1..=65_535).map(Value::Integer).collect();
+    let mut params = NamedParams::new();
+    for (i, name) in names.iter().enumerate() {
+        params.insert(name.as_str(), (i + 1) as i64);
+    }
+    let got = rows(db.query_named(&sql, params)).unwrap();
+    assert_eq!(&got[0][..3], &[int(65_537), int(65_536), int(1)]);
+    let last = db.prepare("SELECT $65537, $1").unwrap();
+    let values: Vec<Value> = (1..=65_537).map(Value::Integer).collect();
     assert_eq!(
         rows(last.query(values)).unwrap(),
-        vec![vec![int(65_535), int(1)]]
+        vec![vec![int(65_537), int(1)]]
     );
+}
+
+#[test]
+fn slots_made_after_the_statement_s_own_read_their_own_values() {
+    let db = open("param_slots_made_slots");
+    db.execute("CREATE TABLE f (v FLOAT)", ()).unwrap();
+    // The VALUES answers take the slots after $65535
+    let sql = "INSERT INTO f (v) VALUES ($65535), ((SELECT 7) + RANDOM() * 0), \
+               ((SELECT 8) + RANDOM() * 0)";
+    let zeros: Vec<Value> = (0..65_535).map(|_| int(0)).collect();
+    assert_eq!(db.execute(sql, zeros.clone()).unwrap(), 3);
+    assert_eq!(
+        rows(db.query("SELECT v FROM f ORDER BY v", ())).unwrap(),
+        vec![
+            vec![Value::Float(0.0)],
+            vec![Value::Float(7.0)],
+            vec![Value::Float(8.0)]
+        ]
+    );
+    // A correlated block's two values take the slots after $65535
+    let sql = "SELECT o.id FROM t AS o WHERE o.v > $65535 \
+               AND o.id = (SELECT i.id FROM t AS i WHERE i.id = o.id AND i.v = o.v) ORDER BY o.id";
+    let mut values = zeros;
+    values[65_534] = int(15);
+    assert_eq!(
+        rows(db.query(sql, values)).unwrap(),
+        vec![vec![int(2)], vec![int(3)]],
+        "{sql}"
+    );
+}
+
+#[test]
+fn a_statement_parsed_alone_carries_its_slot_count() {
+    let db = open("param_slots_parse_statement");
+    let insert = stoolap::parser::Parser::new(
+        "INSERT INTO t VALUES (9, CASE WHEN TRUE THEN 1 ELSE $1 END, 'x')",
+    )
+    .parse_statement()
+    .unwrap();
+    assert_eq!(insert.param_count(), 1);
+    let mut tx = db.begin().unwrap();
+    let error = tx
+        .execute_prepared(&insert, ())
+        .expect_err("$1 has no value");
+    assert!(error.to_string().contains("parameters but only"), "{error}");
+    tx.rollback().unwrap();
+    assert_eq!(
+        rows(db.query("SELECT COUNT(*) FROM t WHERE id = 9", ())).unwrap(),
+        vec![vec![int(0)]]
+    );
+}
+
+#[test]
+fn explain_analyze_of_a_view_with_a_parameter_creates_nothing() {
+    let db = open("param_slots_explain_view");
+    for sql in [
+        "EXPLAIN ANALYZE CREATE VIEW v AS SELECT :x AS n",
+        "EXPLAIN CREATE VIEW v AS SELECT $1 AS n",
+    ] {
+        let error = rows(db.query_named(sql, named_params! { x: 1 }))
+            .expect_err(sql)
+            .to_string();
+        assert!(
+            error.contains("a view cannot take parameters"),
+            "{sql}: {error}"
+        );
+    }
+    let error = rows(db.query("SELECT * FROM v", ())).expect_err("no view v");
+    assert!(!error.to_string().contains("parameters"), "{error}");
 }

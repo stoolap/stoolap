@@ -1947,14 +1947,14 @@ fn is_column_free(expr: &Expression) -> bool {
 }
 
 /// The zero-based slot `param` reads; the parser numbers `$n`, `?` and
-/// `:name` alike from one
-pub(crate) fn parameter_slot(param: &Parameter) -> Result<u16, CompileError> {
-    match param.index {
-        0 => Err(CompileError::InvalidExpression(
-            "Invalid parameter".to_string(),
-        )),
-        index => Ok((index - 1) as u16),
-    }
+/// `:name` alike from one. A slot a program cannot address is an error,
+/// never another slot
+pub(crate) fn parameter_slot(param: &Parameter) -> Result<u32, CompileError> {
+    param
+        .index
+        .checked_sub(1)
+        .and_then(|slot| u32::try_from(slot).ok())
+        .ok_or_else(|| CompileError::InvalidExpression(format!("Invalid parameter {}", param.name)))
 }
 
 /// The value a program loads for a literal; None for any other expression

@@ -70,8 +70,22 @@ fn is_reserved_alias_keyword(upper: &str) -> bool {
 }
 
 impl Parser<'_> {
-    /// Parse a statement
+    /// Parse a whole statement, with the parameter slot count it takes
+    /// written on it
     pub fn parse_statement(&mut self) -> Option<Statement> {
+        self.parse_statement_with_slots().map(|(stmt, _)| stmt)
+    }
+
+    /// [`Self::parse_statement`] and the slots the statement takes
+    pub(crate) fn parse_statement_with_slots(&mut self) -> Option<(Statement, ParamSlots)> {
+        let mut stmt = self.parse_statement_body()?;
+        let slots = self.take_param_slots(&stmt);
+        stmt.set_param_count(slots.count);
+        Some((stmt, slots))
+    }
+
+    /// Parse a statement, whole or inside another
+    fn parse_statement_body(&mut self) -> Option<Statement> {
         if self.cur_token_is(TokenType::Eof) {
             return None;
         }
@@ -3002,7 +3016,7 @@ impl Parser<'_> {
         self.next_token();
 
         // Parse the inner statement (SELECT, INSERT, UPDATE, DELETE)
-        let statement = self.parse_statement()?;
+        let statement = self.parse_statement_body()?;
 
         Some(ExplainStatement {
             token,

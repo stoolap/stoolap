@@ -65,7 +65,7 @@ pub enum Op {
 
     /// Load query parameter by index
     /// Stack: [] -> [value]
-    LoadParam(u16),
+    LoadParam(u32),
 
     /// Load NULL with type hint
     /// Stack: [] -> [null]

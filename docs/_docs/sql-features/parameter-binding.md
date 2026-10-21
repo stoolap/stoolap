@@ -44,7 +44,7 @@ Both styles work identically. Use whichever is more natural for your application
 
 ### How values are bound
 
-Every parameter is a slot. `$n` is slot n, each `?` takes the next slot, and each distinct `:name` takes the next slot the first time it appears, so a name written twice reads one value. A statement uses positional (`$n`, `?`) or named (`:name`) parameters, not both: mixing them is a parse error, and so is `$0`. A statement takes at most 65535 slots. A view cannot take parameters.
+Every parameter is a slot. `$n` is slot n, each `?` takes the next slot, and each distinct `:name` takes the next slot the first time it appears, so a name written twice reads one value. A statement uses positional (`$n`, `?`) or named (`:name`) parameters, not both: mixing them is a parse error, and so is `$0`. A view cannot take parameters, nor can `EXPLAIN ANALYZE` of a `CREATE VIEW`.
 
 A parameter the call gives no value for is an error, on every path (ad hoc, prepared, inside a transaction, cached plans) and in every clause, before the statement reads or writes a row:
 
