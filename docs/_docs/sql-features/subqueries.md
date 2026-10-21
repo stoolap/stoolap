@@ -226,6 +226,24 @@ SELECT * FROM products
 WHERE price > (SELECT MAX(price) FROM products WHERE category = 'Electronics');
 ```
 
+#### Subqueries without FROM
+
+A subquery without FROM reads one row that has no columns. Its WHERE, GROUP BY, HAVING and aggregates apply to that row as they would to a table holding it, and a bare name in it refers to the enclosing query:
+
+```sql
+-- 2, for each row of t
+SELECT * FROM t WHERE a = (SELECT 2);
+
+-- TRUE where a > 1: the one row passes HAVING only there
+SELECT * FROM t WHERE EXISTS (SELECT 1 HAVING t.a > 1);
+
+-- TRUE for every row: an aggregate without GROUP BY answers one row
+SELECT * FROM t WHERE EXISTS (SELECT COUNT(*) WHERE t.a > 5);
+
+-- reads t.a
+SELECT * FROM t WHERE a = (SELECT a);
+```
+
 ### Correlated Subqueries
 
 Correlated subqueries reference columns from the outer query, allowing row-by-row evaluation. The subquery is re-executed for each row of the outer query.

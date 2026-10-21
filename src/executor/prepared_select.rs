@@ -32,7 +32,7 @@ use crate::functions::{FunctionRegistry, Volatility};
 use crate::parser::ast::*;
 use crate::parser::token::{Position, Token, TokenType};
 use crate::storage::expression::{AndExpr, ComparisonExpr, Expression as StorageExpr};
-use crate::storage::traits::{Engine, Table};
+use crate::storage::traits::{Engine, Scanner, Table};
 
 use super::aggregation::{
     ungrouped_column, AggregatePath, CallInputs, GroupByItem, SqlAggregateFunction, COUNT_STAR,
@@ -96,6 +96,17 @@ impl<'a> Family<'a> {
         }
         self.tables.borrow_mut().push(ts);
         Ok(())
+    }
+
+    /// A block's FROM: one table, or none, which reads one row without columns
+    fn block_from(
+        &self,
+        table_expr: Option<&'a Expression>,
+    ) -> std::result::Result<(), OutOfFamily> {
+        match table_expr {
+            None => Ok(()),
+            some => self.from(some),
+        }
     }
 
     /// Every FROM met names a base table, not a CTE or a view
@@ -271,7 +282,7 @@ impl<'a> Family<'a> {
         {
             return Err("a subquery block with a clause outside the family");
         }
-        self.from(sq.table_expr.as_deref())?;
+        self.block_from(sq.table_expr.as_deref())?;
         let [column] = sq.columns.as_slice() else {
             return Err("a subquery block without exactly one SELECT expression");
         };
@@ -351,7 +362,7 @@ impl<'a> Family<'a> {
         {
             return Err("a subquery block with a clause outside the family");
         }
-        self.from(sq.table_expr.as_deref())?;
+        self.block_from(sq.table_expr.as_deref())?;
         let mut found = false;
         for column in &sq.columns {
             if !matches!(column, Expression::Star(_) | Expression::QualifiedStar(_)) {
@@ -1193,8 +1204,8 @@ pub struct PreparedSelect {
 /// by a hole program over the row it runs for
 #[derive(Debug)]
 struct PreparedSubquery {
-    /// The inner table's name as the catalog knows it
-    table: SmartString,
+    /// The inner table's name as the catalog knows it; None without FROM
+    table: Option<SmartString>,
     column_indices: Vec<usize>,
     /// The table's schema the programs read positions of
     schema: CompactArc<Schema>,
@@ -1677,7 +1688,9 @@ impl Builder<'_> {
         for nested in 0..subqueries.len() {
             let mut ancestor = subqueries[nested].parent;
             while let Some(at) = ancestor {
-                let table = subqueries[nested].table.clone();
+                let Some(table) = subqueries[nested].table.clone() else {
+                    break;
+                };
                 let (Answer::Value(_, kept) | Answer::Exists(kept) | Answer::Members(kept, _)) =
                     &mut subqueries[at as usize].answer;
                 if !kept.tables.contains(&table) {
@@ -1935,23 +1948,29 @@ impl Builder<'_> {
         let picks = grouped_block(sq) || !matches!(form, Form::Scalar);
         let executor = self.executor;
         let registry = &executor.function_registry;
-        let Some(Expression::TableSource(ts)) = sq.table_expr.as_deref() else {
-            return Err(Error::internal("a prepared subquery without one table"));
+        let (table, schema, scope_name) = match sq.table_expr.as_deref() {
+            Some(Expression::TableSource(ts)) => {
+                let schema = executor
+                    .engine
+                    .get_table_schema(&ts.name.value_lower)
+                    .map_err(|e| match e {
+                        Error::TableNotFound(_) => {
+                            Error::TableOrViewNotFound(ts.name.value.to_string())
+                        }
+                        other => other,
+                    })?;
+                let name = ts.alias.as_ref().unwrap_or(&ts.name).value_lower.clone();
+                (Some(ts.name.value_lower.clone()), schema, name)
+            }
+            // A block without FROM reads one row without columns, under no name
+            None => (
+                None,
+                CompactArc::new(Schema::new("", Vec::new())),
+                SmartString::default(),
+            ),
+            Some(_) => return Err(Error::internal("a prepared subquery without one table")),
         };
-        let schema = executor
-            .engine
-            .get_table_schema(&ts.name.value_lower)
-            .map_err(|e| match e {
-                Error::TableNotFound(_) => Error::TableOrViewNotFound(ts.name.value.to_string()),
-                other => other,
-            })?;
-        let scope = ScopeTable::of(
-            ts.alias
-                .as_ref()
-                .map_or(&ts.name.value_lower, |alias| &alias.value_lower)
-                .clone(),
-            &schema,
-        );
+        let scope = ScopeTable::of(scope_name, &schema);
         let id = u16::try_from(self.subqueries.len())
             .map_err(|_| Error::internal("too many prepared subqueries"))?;
         self.subqueries.push(None);
@@ -2070,7 +2089,7 @@ impl Builder<'_> {
             identity_key: ExprKey::of(&identity),
             identity: Arc::new(identity),
             scopes: Arc::from(scopes),
-            tables: vec![ts.name.value_lower.clone()],
+            tables: table.iter().cloned().collect(),
             keyed,
         };
         let answer = match form {
@@ -2139,7 +2158,7 @@ impl Builder<'_> {
             }
         }
         self.subqueries[id as usize] = Some(PreparedSubquery {
-            table: ts.name.value_lower.clone(),
+            table,
             column_indices: (0..scope.columns.len()).collect(),
             schema: CompactArc::clone(&schema),
             pushdown,
@@ -3011,7 +3030,7 @@ impl Executor {
 /// The tables a prepared UPDATE's or DELETE's blocks read, opened before
 /// the statement writes, and the context they read under
 pub(crate) struct DmlTables {
-    tables: Vec<Box<dyn Table>>,
+    tables: BlockTables,
     inner_ctx: ExecutionContext,
 }
 
@@ -3587,6 +3606,33 @@ impl Executor {
     }
 }
 
+/// Each subquery's table by its id; None for a block without FROM
+type BlockTables = Vec<Option<Box<dyn Table>>>;
+
+/// The one row without columns a block without FROM reads
+struct OneRow {
+    row: Row,
+    read: bool,
+}
+
+impl Scanner for OneRow {
+    fn next(&mut self) -> bool {
+        !std::mem::replace(&mut self.read, true)
+    }
+
+    fn row(&self) -> &Row {
+        &self.row
+    }
+
+    fn err(&self) -> Option<&Error> {
+        None
+    }
+
+    fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// One execution of a prepared statement. Each subquery has its own
 /// parameter buffer: the statement's parameters, then every slot, its
 /// parent's values copied in before its own holes are filled
@@ -3608,7 +3654,7 @@ pub(crate) struct PreparedRunner<'a> {
     /// The context the subqueries read their tables under
     ctx: ExecutionContext,
     /// Each subquery's table, opened before the run reads a row
-    tables: Vec<Box<dyn Table>>,
+    tables: BlockTables,
     /// Each subquery's state for this run, by its id
     blocks: Vec<BlockState>,
 }
@@ -3643,16 +3689,32 @@ impl<'a> PreparedRunner<'a> {
         executor: &Executor,
         prepared: &PreparedBlocks,
         inner_ctx: &ExecutionContext,
-    ) -> Result<Option<Vec<Box<dyn Table>>>> {
+    ) -> Result<Option<BlockTables>> {
         let mut tables = Vec::with_capacity(prepared.subqueries.len());
         for sq in &prepared.subqueries {
-            let table = executor.prepared_table(&sq.table, inner_ctx)?;
+            let Some(name) = &sq.table else {
+                tables.push(None);
+                continue;
+            };
+            let table = executor.prepared_table(name, inner_ctx)?;
             if table.schema().columns != sq.schema.columns {
                 return Ok(None);
             }
-            tables.push(table);
+            tables.push(Some(table));
         }
         Ok(Some(tables))
+    }
+
+    /// The rows block `index` reads, through `expr` when its scan takes one:
+    /// its table's, or the one row without columns of a block without FROM
+    fn scan(&self, index: usize, expr: Option<&dyn StorageExpr>) -> Result<Box<dyn Scanner>> {
+        match &self.tables[index] {
+            Some(table) => table.scan(&self.prepared.subqueries[index].column_indices, expr),
+            None => Ok(Box::new(OneRow {
+                row: Row::new(),
+                read: false,
+            })),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3662,7 +3724,7 @@ impl<'a> PreparedRunner<'a> {
         holes: &'a HoleSet,
         ctx: &'a ExecutionContext,
         inner_ctx: ExecutionContext,
-        tables: Vec<Box<dyn Table>>,
+        tables: BlockTables,
         statement_rows: usize,
         statement_limit: Option<i64>,
     ) -> Self {
@@ -4051,14 +4113,13 @@ impl<'a> PreparedRunner<'a> {
         let mut vm = self.blocks[index].vm.borrow_mut();
         let params = self.blocks[index].buffer.borrow();
         let slots_failed = self.blocks[index].failed.borrow();
-        let table = &*self.tables[index];
         // A failed slot holds NULL, which the scan must not compare with
         let pushed = slots_failed.is_empty() && self.bind_pushdown(index, &params);
         let mut scanner = if pushed {
             let bound = self.blocks[index].bound.borrow();
-            table.scan(&sq.column_indices, bound.as_ref().map(BoundPushdown::expr))?
+            self.scan(index, bound.as_ref().map(BoundPushdown::expr))?
         } else {
-            table.scan(&sq.column_indices, None)?
+            self.scan(index, None)?
         };
         let decided = pushed && sq.pushed_whole;
         let mut failed = None;
@@ -4118,11 +4179,18 @@ impl<'a> PreparedRunner<'a> {
     fn probe_cheaper(&self, index: usize, plan: &KeyedPlan) -> bool {
         let sq = &self.prepared.subqueries[index];
         let parent_rows = match sq.parent {
-            Some(parent) => self.tables[parent as usize].row_count_hint(),
+            // A parent without FROM reads one row
+            Some(parent) => self.tables[parent as usize]
+                .as_ref()
+                .map_or(1, |table| table.row_count_hint()),
             None => self.statement_rows,
         };
+        // A keyed plan reads a column, so its block has a table
+        let Some(table) = &self.tables[index] else {
+            return true;
+        };
         Executor::probe_cheaper(
-            &*self.tables[index],
+            &**table,
             &sq.schema.columns[plan.keys[0].0].name,
             self.statement_limit.filter(|_| sq.parent.is_none()),
             Some(parent_rows),
@@ -4217,9 +4285,7 @@ impl<'a> PreparedRunner<'a> {
         {
             BoundPushdown::bind(&plan.pushdown, &mut bound, values);
         }
-        let table = &*self.tables[index];
-        let mut scanner =
-            table.scan(&sq.column_indices, bound.as_ref().map(BoundPushdown::expr))?;
+        let mut scanner = self.scan(index, bound.as_ref().map(BoundPushdown::expr))?;
         let decided = sq.filter.is_none() || (bound.is_some() && plan.pushed_whole);
         let mut set = ExistsKeys::default();
         let mut scanned = 0u64;
@@ -4399,15 +4465,14 @@ impl PreparedRunner<'_> {
         self.fill(index, &mut vm, caller)?;
         // Read-only from here on: a nested subquery copies these values
         let params = self.blocks[index].buffer.borrow();
-        let table = &*self.tables[index];
         // The scanner keeps what it needs of the expression, so the next
         // call may rebind it once this scan is set up
         let pushed = self.bind_pushdown(index, &params);
         let mut scanner = if pushed {
             let bound = self.blocks[index].bound.borrow();
-            table.scan(&sq.column_indices, bound.as_ref().map(BoundPushdown::expr))?
+            self.scan(index, bound.as_ref().map(BoundPushdown::expr))?
         } else {
-            table.scan(&sq.column_indices, None)?
+            self.scan(index, None)?
         };
         let filter = sq.filter.as_ref().filter(|_| !(pushed && sq.pushed_whole));
         let mut value = None;
@@ -4651,13 +4716,12 @@ impl PreparedRunner<'_> {
         let mut vm = self.blocks[index].vm.borrow_mut();
         let params = self.blocks[index].buffer.borrow();
         let slots_failed = self.blocks[index].failed.borrow();
-        let table = &*self.tables[index];
         let pushed = slots_failed.is_empty() && self.bind_pushdown(index, &params);
         let mut scanner = if pushed {
             let bound = self.blocks[index].bound.borrow();
-            table.scan(&sq.column_indices, bound.as_ref().map(BoundPushdown::expr))?
+            self.scan(index, bound.as_ref().map(BoundPushdown::expr))?
         } else {
-            table.scan(&sq.column_indices, None)?
+            self.scan(index, None)?
         };
         let decided = pushed && sq.pushed_whole;
         let mut fold = MemberFold::new(members.test);
@@ -4783,9 +4847,7 @@ impl PreparedRunner<'_> {
         if let Some(values) = values.filter(|_| !pushdown.is_empty() && slots_failed.is_empty()) {
             BoundPushdown::bind(pushdown, &mut bound, values);
         }
-        let table = &*self.tables[index];
-        let mut scanner =
-            table.scan(&sq.column_indices, bound.as_ref().map(BoundPushdown::expr))?;
+        let mut scanner = self.scan(index, bound.as_ref().map(BoundPushdown::expr))?;
         let decided = sq.filter.is_none() || (bound.is_some() && pushed_whole);
         let mut groups: FxHashMap<SmallVec<[Value; 1]>, MemberGroup> = FxHashMap::default();
         let mut scanned = 0u64;
@@ -5160,13 +5222,12 @@ impl PreparedRunner<'_> {
         let mut vm = self.blocks[index].vm.borrow_mut();
         let mut feed_vm = self.blocks[index].feed_vm.borrow_mut();
         let params = self.blocks[index].buffer.borrow();
-        let table = &*self.tables[index];
         let pushed = self.bind_pushdown(index, &params);
         let mut scanner = if pushed {
             let bound = self.blocks[index].bound.borrow();
-            table.scan(&sq.column_indices, bound.as_ref().map(BoundPushdown::expr))?
+            self.scan(index, bound.as_ref().map(BoundPushdown::expr))?
         } else {
-            table.scan(&sq.column_indices, None)?
+            self.scan(index, None)?
         };
         let decided = pushed && sq.pushed_whole;
         let mut groups = grouping.groups(0);
@@ -5236,9 +5297,7 @@ impl PreparedRunner<'_> {
         if let Some(values) = values.filter(|_| !plan.pushdown.is_empty()) {
             BoundPushdown::bind(&plan.pushdown, &mut bound, values);
         }
-        let table = &*self.tables[index];
-        let mut scanner =
-            table.scan(&sq.column_indices, bound.as_ref().map(BoundPushdown::expr))?;
+        let mut scanner = self.scan(index, bound.as_ref().map(BoundPushdown::expr))?;
         let decided = sq.filter.is_none() || (bound.is_some() && plan.pushed_whole);
         let prefix: Vec<usize> = plan.keys.iter().map(|(own, _, _)| *own).collect();
         let mut groups = grouping.groups(prefix.len());
