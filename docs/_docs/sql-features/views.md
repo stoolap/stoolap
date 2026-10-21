@@ -142,3 +142,4 @@ SHOW CREATE VIEW engineering;
 - View names and table names share the same namespace and cannot conflict
 - Views are read-only (INSERT, UPDATE, DELETE on views are not supported)
 - View definitions are stored in the WAL and persist across restarts
+- A view cannot take parameters (`$1`, `?`, `:name`): it is stored SQL with no values of its own, so `CREATE VIEW` refuses one, and reading a view stored with one is an error

@@ -1878,6 +1878,7 @@ impl Builder<'_> {
             }
         }
         let mark = Box::new(SelectStatement {
+            param_count: 0,
             token: sq.token.clone(),
             distinct: false,
             distinct_on: Vec::new(),
@@ -2271,6 +2272,7 @@ impl Builder<'_> {
         }
 
         let calls_of = SelectStatement {
+            param_count: 0,
             token: sq.token.clone(),
             distinct: false,
             distinct_on: Vec::new(),

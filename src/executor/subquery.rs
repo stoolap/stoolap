@@ -1136,6 +1136,7 @@ impl Executor {
         }
 
         let batch_query = SelectStatement {
+            param_count: 0,
             token: dummy_token("SELECT", TokenType::Keyword),
             columns: vec![inner_col_expr.clone(), agg_expr],
             table_expr: subquery.table_expr.clone(),
@@ -4368,6 +4369,7 @@ impl Executor {
         }));
 
         let select_stmt = SelectStatement {
+            param_count: 0,
             token: dummy_token_clone(),
             // Don't use DISTINCT here - it's slower in Stoolap because it requires
             // additional hashing/sorting overhead. Instead, we collect into HashSet
@@ -5881,6 +5883,7 @@ mod tests {
     // ── Subqueries return true ─────────────────────────────────
     fn dummy_select() -> SelectStatement {
         SelectStatement {
+            param_count: 0,
             token: tok(),
             distinct: false,
             distinct_on: vec![],

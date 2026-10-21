@@ -845,12 +845,18 @@ impl Executor {
         Ok(last_result)
     }
 
-    /// Execute a single statement
+    /// Execute a single statement; its parameters are checked against the
+    /// count the parser wrote on it
     pub fn execute_statement(
         &self,
         statement: &Statement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        let slots = ParamSlots {
+            count: statement.param_count(),
+            names: None,
+        };
+        check_param_count(&slots, ctx.params().len())?;
         let _gate = self.enter(changes_session(statement));
         self.run_statement(statement, ctx)
     }

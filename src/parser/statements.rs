@@ -131,6 +131,7 @@ impl Parser<'_> {
         let token = self.cur_token.clone();
 
         let mut stmt = SelectStatement {
+            param_count: 0,
             token,
             distinct: false,
             distinct_on: vec![],
@@ -344,6 +345,7 @@ impl Parser<'_> {
         let token = self.cur_token.clone();
 
         let mut stmt = SelectStatement {
+            param_count: 0,
             token,
             distinct: false,
             distinct_on: vec![],
@@ -949,6 +951,7 @@ impl Parser<'_> {
             let returning = self.parse_returning_clause();
 
             return Some(InsertStatement {
+                param_count: 0,
                 token,
                 table_name,
                 columns,
@@ -987,6 +990,7 @@ impl Parser<'_> {
             let returning = self.parse_returning_clause();
 
             return Some(InsertStatement {
+                param_count: 0,
                 token,
                 table_name,
                 columns,
@@ -1017,6 +1021,7 @@ impl Parser<'_> {
         let returning = self.parse_returning_clause();
 
         Some(InsertStatement {
+            param_count: 0,
             token,
             table_name,
             columns,
@@ -1514,6 +1519,7 @@ impl Parser<'_> {
         let returning = self.parse_returning_clause();
 
         Some(UpdateStatement {
+            param_count: 0,
             token,
             table_name,
             updates,
@@ -1584,6 +1590,7 @@ impl Parser<'_> {
         let returning = self.parse_returning_clause();
 
         Some(DeleteStatement {
+            param_count: 0,
             token,
             table_name,
             alias,

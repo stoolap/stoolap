@@ -386,3 +386,90 @@ fn explain_reads_no_value_and_explain_analyze_needs_them_all() {
     assert!(error.contains(":v has no value"), "{error}");
     assert!(rows(db.query("EXPLAIN ANALYZE SELECT id FROM t WHERE id = $1", (1,))).is_ok());
 }
+
+#[test]
+fn a_view_cannot_take_parameters() {
+    let db = open("param_slots_view");
+    for sql in [
+        "CREATE VIEW v AS SELECT :x AS n",
+        "CREATE VIEW v AS SELECT id FROM t WHERE id = $1",
+        "CREATE VIEW v AS SELECT id FROM t WHERE id = ?",
+    ] {
+        let error = db.execute(sql, ()).expect_err(sql).to_string();
+        assert!(
+            error.contains("a view cannot take parameters"),
+            "{sql}: {error}"
+        );
+    }
+    // A view stored before the rule: its own :x would take the caller's slot 1
+    db.engine()
+        .create_view("old_v", "SELECT :x AS n".to_string(), false)
+        .unwrap();
+    let error = rows(db.query_named("SELECT :y AS a, n FROM old_v", named_params! { x: 7, y: 1 }))
+        .expect_err("the old view's parameter")
+        .to_string();
+    assert!(error.contains("a view cannot take parameters"), "{error}");
+    // Run directly first, so the view's text is in the plan cache with its slots
+    db.engine()
+        .create_view("old_w", "SELECT $1 AS n".to_string(), false)
+        .unwrap();
+    assert_eq!(
+        rows(db.query("SELECT $1 AS n", (5,))).unwrap(),
+        vec![vec![int(5)]]
+    );
+    assert!(rows(db.query("SELECT n FROM old_w", ())).is_err(), "cached");
+    db.execute("DROP VIEW old_v", ()).unwrap();
+    db.execute("DROP VIEW old_w", ()).unwrap();
+}
+
+#[test]
+fn a_parsed_statement_run_by_its_ast_checks_every_slot_before_it_writes() {
+    let db = open("param_slots_raw_ast");
+    let parse = |sql: &str| {
+        stoolap::parser::Parser::new(sql)
+            .parse_program()
+            .unwrap()
+            .statements
+            .remove(0)
+    };
+    let insert = parse("INSERT INTO t VALUES (9, CASE WHEN TRUE THEN 1 ELSE $1 END, 'x')");
+    let select = parse("SELECT id FROM t WHERE id = 1 OR v = CASE WHEN TRUE THEN 0 ELSE $1 END");
+    let mut tx = db.begin().unwrap();
+    let error = tx
+        .execute_prepared(&insert, ())
+        .expect_err("$1 has no value");
+    assert!(error.to_string().contains("parameters but only"), "{error}");
+    assert!(tx.query_prepared(&select, ()).is_err(), "query_prepared");
+    assert_eq!(tx.execute_prepared(&insert, (0,)).unwrap(), 1, "given");
+    tx.rollback().unwrap();
+    assert_eq!(
+        rows(db.query("SELECT COUNT(*) FROM t WHERE id = 9", ())).unwrap(),
+        vec![vec![int(0)]]
+    );
+}
+
+#[test]
+fn a_statement_takes_at_most_65535_parameter_slots() {
+    let db = open("param_slots_limit");
+    let named = |n: usize| {
+        let list: Vec<String> = (1..=n).map(|i| format!(":p{i}")).collect();
+        format!("SELECT {}", list.join(", "))
+    };
+    let error = db.prepare(&named(65_536)).err().expect("one slot too many");
+    assert!(
+        error.to_string().contains("at most 65535 parameters"),
+        "{error}"
+    );
+    let error = db.prepare("SELECT $65536").err().expect("$65536");
+    assert!(
+        error.to_string().contains("at most 65535 parameters"),
+        "{error}"
+    );
+    // The last slot reads its own value, not slot 1's
+    let last = db.prepare("SELECT $65535, $1").unwrap();
+    let values: Vec<Value> = (1..=65_535).map(Value::Integer).collect();
+    assert_eq!(
+        rows(last.query(values)).unwrap(),
+        vec![vec![int(65_535), int(1)]]
+    );
+}

@@ -734,6 +734,11 @@ enum ItemSource {
     Program(SharedProgram),
 }
 
+#[cold]
+fn view_parameters() -> Error {
+    Error::InvalidArgument(crate::parser::parser::VIEW_TAKES_NO_PARAMETERS.to_string())
+}
+
 /// A SELECT item without its aliases
 fn unaliased_item(mut expr: &Expression) -> &Expression {
     while let Expression::Aliased(aliased) = expr {
@@ -7124,6 +7129,9 @@ impl Executor {
                     "View definition is not a SELECT statement".to_string(),
                 ));
             }
+            if cached.params.count > 0 {
+                return Err(view_parameters());
+            }
             return Ok(cached.statement);
         }
 
@@ -7143,6 +7151,10 @@ impl Executor {
             return Err(Error::InvalidArgument(
                 "View definition is not a SELECT statement".to_string(),
             ));
+        }
+
+        if statements[0].param_count() > 0 {
+            return Err(view_parameters());
         }
 
         // Wrap in Arc and cache (single allocation, no clone)
@@ -7978,6 +7990,7 @@ impl Executor {
 
                 // Create a SELECT * statement with optional WHERE clause
                 let select_all = SelectStatement {
+                    param_count: 0,
                     token: dummy_token("SELECT", TokenType::Keyword),
                     distinct: false,
                     distinct_on: vec![],
@@ -8018,6 +8031,7 @@ impl Executor {
             }
             Expression::JoinSource(js) => {
                 let select_all = SelectStatement {
+                    param_count: 0,
                     token: dummy_token("SELECT", TokenType::Keyword),
                     distinct: false,
                     distinct_on: vec![],
@@ -8079,6 +8093,7 @@ impl Executor {
             Expression::ValuesSource(vs) => {
                 // Create a simple SELECT * statement to execute the VALUES
                 let select_all = SelectStatement {
+                    param_count: 0,
                     token: dummy_token("SELECT", TokenType::Keyword),
                     distinct: false,
                     distinct_on: vec![],
@@ -8185,6 +8200,7 @@ impl Executor {
             // Create a SELECT * statement with WHERE clause AND LIMIT
             // This triggers the LIMIT pushdown optimization in execute_simple_table_scan
             let select_all = SelectStatement {
+                param_count: 0,
                 token: dummy_token("SELECT", TokenType::Keyword),
                 distinct: false,
                 distinct_on: vec![],

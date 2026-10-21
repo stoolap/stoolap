@@ -657,6 +657,7 @@ mod tests {
 
     fn create_test_statement() -> Arc<Statement> {
         Arc::new(Statement::Select(SelectStatement {
+            param_count: 0,
             token: dummy_token(),
             with: None,
             distinct: false,

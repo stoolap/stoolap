@@ -16,6 +16,7 @@
 
 use crate::api::ParamVec;
 use crate::core::{Error, Result, Value};
+use rustc_hash::FxHashMap;
 
 use super::types::{StoolapNamedParam, StoolapValue};
 use super::{
@@ -109,6 +110,10 @@ pub(crate) unsafe fn params_to_vec(params: *const StoolapValue, len: i32) -> Res
     slice.iter().map(|v| ffi_value_to_rust(v)).collect()
 }
 
+/// Arrays up to this length are searched in place; a longer one is indexed
+/// by name once per call, so binding stays linear in its length
+const NAMED_SCAN_MAX: usize = 16;
+
 /// Reads an FFI named-parameter array by name, converting only the values a
 /// statement binds; a name given twice reads its last value.
 ///
@@ -125,17 +130,35 @@ pub(crate) unsafe fn ffi_value_of<'a>(
     } else {
         std::slice::from_raw_parts(params, len as usize)
     };
+    // SAFETY: the caller keeps every name valid for `name_len` bytes and
+    // every value valid while the statement binds
+    let name_of = |p: &'a StoolapNamedParam| -> Option<&'a [u8]> {
+        (!p.name.is_null() && p.name_len > 0).then(|| unsafe {
+            std::slice::from_raw_parts(p.name as *const u8, p.name_len as usize)
+        })
+    };
+    let mut index: Option<FxHashMap<&'a [u8], &'a StoolapNamedParam>> = None;
     move |name| {
-        // SAFETY: the caller keeps every name valid for `name_len` bytes and
-        // every value valid while the statement binds
-        unsafe {
-            let given = slice.iter().rev().find(|p| {
-                !p.name.is_null()
-                    && p.name_len > 0
-                    && std::slice::from_raw_parts(p.name as *const u8, p.name_len as usize)
-                        == name.as_bytes()
-            });
-            given.map(|p| ffi_value_to_rust(&p.value)).transpose()
-        }
+        let given = if slice.len() <= NAMED_SCAN_MAX {
+            slice
+                .iter()
+                .rev()
+                .find(|p| name_of(p) == Some(name.as_bytes()))
+        } else {
+            index
+                .get_or_insert_with(|| {
+                    // Later entries overwrite earlier ones: the last value wins
+                    slice
+                        .iter()
+                        .filter_map(|p| Some((name_of(p)?, p)))
+                        .collect()
+                })
+                .get(name.as_bytes())
+                .copied()
+        };
+        // SAFETY: as above, the value is valid while the statement binds
+        given
+            .map(|p| unsafe { ffi_value_to_rust(&p.value) })
+            .transpose()
     }
 }

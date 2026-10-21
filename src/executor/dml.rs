@@ -574,6 +574,7 @@ impl Executor {
 
         // GENERAL PATH: Build SELECT query and use full executor
         let select_stmt = SelectStatement {
+            param_count: 0,
             token: dummy_token_clone(),
             distinct: false,
             distinct_on: vec![],

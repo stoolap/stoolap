@@ -120,6 +120,16 @@ fn next_significant_token(lexer: &mut Lexer, errors: &mut Vec<ParseError>) -> To
     }
 }
 
+/// The slots a statement can take: a program reads its slot as a `u16`
+pub(crate) const MAX_PARAMETER_SLOTS: usize = u16::MAX as usize;
+
+/// A view is stored SQL, read inside other statements: it has no values of its own
+pub(crate) const VIEW_TAKES_NO_PARAMETERS: &str = "a view cannot take parameters";
+
+fn too_many_parameters() -> String {
+    format!("a statement takes at most {MAX_PARAMETER_SLOTS} parameters")
+}
+
 /// SQL Parser using Pratt parsing algorithm
 pub struct Parser<'a> {
     /// The lexer providing tokens
@@ -167,8 +177,10 @@ impl<'a> Parser<'a> {
         let mut params = Vec::with_capacity(1);
 
         while !self.cur_token_is(TokenType::Eof) {
-            if let Some(stmt) = self.parse_statement() {
-                params.push(self.take_param_slots(&stmt));
+            if let Some(mut stmt) = self.parse_statement() {
+                let slots = self.take_param_slots(&stmt);
+                stmt.set_param_count(slots.count);
+                params.push(slots);
                 statements.push(stmt);
             }
 
@@ -196,6 +208,11 @@ impl<'a> Parser<'a> {
         if matches!(stmt, Statement::Explain(explain) if !explain.analyze) {
             self.named_slots.clear();
             return ParamSlots::default();
+        }
+        if matches!(stmt, Statement::CreateView(_))
+            && (self.max_positional > 0 || !self.named_slots.is_empty())
+        {
+            self.add_error(VIEW_TAKES_NO_PARAMETERS.to_string());
         }
         if self.named_slots.is_empty() {
             return ParamSlots {
@@ -225,6 +242,10 @@ impl<'a> Parser<'a> {
             if let Some(at) = self.named_slots.iter().position(|slot| slot == name) {
                 return Some(at + 1);
             }
+            if self.named_slots.len() == MAX_PARAMETER_SLOTS {
+                self.add_error(too_many_parameters());
+                return None;
+            }
             self.named_slots.push(SmartString::new(name));
             return Some(self.named_slots.len());
         }
@@ -247,6 +268,10 @@ impl<'a> Parser<'a> {
                 }
             }
         };
+        if index > MAX_PARAMETER_SLOTS {
+            self.add_error(too_many_parameters());
+            return None;
+        }
         self.max_positional = self.max_positional.max(index);
         Some(index)
     }

@@ -388,7 +388,7 @@ tx.commit()?;
 
 SQL text passed to `tx.execute` and `tx.query` is parsed once and kept in the same plan cache as the database's own statements, so repeating it inside a transaction does not parse it again. A transaction runs `SELECT`, `INSERT`, `UPDATE`, `DELETE` and savepoint statements; other statements return `Error::NotSupported`.
 
-`tx.execute_prepared` and `tx.query_prepared` (and their `_named` forms) take a parsed `parser::ast::Statement` rather than a prepared `Statement`, and run without a cached plan.
+`tx.execute_prepared` and `tx.query_prepared` take a parsed `parser::ast::Statement` rather than a prepared `Statement`, and run without a cached plan. They take positional values only and check them against the count the parser wrote on the statement before it runs; for named values, prepare the SQL and use `execute_named_in` / `query_named_in`.
 
 ### SQL-based Transactions
 

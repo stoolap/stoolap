@@ -1521,6 +1521,7 @@ mod tests {
 
     fn create_select_star() -> SelectStatement {
         SelectStatement {
+            param_count: 0,
             token: dummy_token(),
             with: None,
             distinct: false,

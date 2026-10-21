@@ -4433,3 +4433,60 @@ fn test_named_entry_points_bind_by_slot_and_refuse_a_missing_name() {
         stoolap_close(db);
     }
 }
+
+/// A named array longer than the in-place search binds by its index: the
+/// last value of a name wins, a missing name is refused, an unused value
+/// is not converted
+#[test]
+fn test_a_long_named_array_binds_every_slot_by_name() {
+    unsafe {
+        let db = packed_test_db(1);
+        let names: Vec<String> = (0..40).map(|i| format!("p{i}")).collect();
+        let sql = cstr(&format!(
+            "SELECT {}",
+            names
+                .iter()
+                .map(|n| format!(":{n}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        let mut stmt: *mut StoolapStmt = std::ptr::null_mut();
+        assert_eq!(stoolap_prepare(db, sql.as_ptr(), &mut stmt), STOOLAP_OK);
+        // Reversed, p0 given twice (its last value is 100), one unused bad text
+        let mut params: Vec<StoolapNamedParam> = names
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(i, n)| named_param(n, int_param(i as i64)))
+            .collect();
+        params.push(named_param(&names[0], int_param(100)));
+        params.push(named_param("unused", bad_text_param(b"\xff")));
+        let (mut buf, mut len) = (std::ptr::null(), 0i64);
+        let rc = stoolap_stmt_query_named_all(
+            stmt,
+            std::ptr::null_mut(),
+            params.as_ptr(),
+            params.len() as i32,
+            &mut buf,
+            &mut len,
+        );
+        assert_eq!(rc, STOOLAP_OK, "{}", read_cstr(stoolap_stmt_errmsg(stmt)));
+        let mut want: Vec<String> = (0..40).map(|i| i.to_string()).collect();
+        want[0] = "100".to_string();
+        assert_eq!(decode_packed(buf, len).1, vec![want]);
+
+        // p39 down to p1: every name but p0
+        let rc = stoolap_stmt_query_named_all(
+            stmt,
+            std::ptr::null_mut(),
+            params.as_ptr(),
+            39,
+            &mut buf,
+            &mut len,
+        );
+        assert_eq!(rc, STOOLAP_ERROR);
+        assert!(read_cstr(stoolap_stmt_errmsg(stmt)).contains(":p0 has no value"));
+        stoolap_stmt_finalize(stmt);
+        stoolap_close(db);
+    }
+}
