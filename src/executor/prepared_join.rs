@@ -15,16 +15,14 @@
 //! The programs a join statement compiles, held with its plan: each one by
 //! the operator's choice it was compiled for and the columns it reads
 
-use std::sync::RwLock;
-
-use smallvec::SmallVec;
+use std::sync::{Arc, RwLock};
 
 use crate::core::{Error, Result};
 
 use super::expression::SharedProgram;
 
-/// The programs held under one key, read without an allocation for two
-pub type HeldPrograms = SmallVec<[SharedProgram; 2]>;
+/// The programs held under one key, shared: reading them allocates nothing
+pub type HeldPrograms = Arc<[SharedProgram]>;
 
 /// What a held program was compiled for: the part of the ON clause an
 /// operator asks of each pair, by the keys it answers itself, or the WHERE
@@ -125,11 +123,11 @@ impl PreparedJoin {
                 site,
                 columns: columns.to_vec(),
             },
-            || Ok(std::iter::once(compile()?).collect()),
+            || Ok(Arc::from([compile()?])),
         )?;
         programs
-            .into_iter()
-            .next()
+            .first()
+            .cloned()
             .ok_or_else(|| Error::internal("a join WHERE held without its program"))
     }
 }

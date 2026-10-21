@@ -872,6 +872,8 @@ impl Executor {
         // path reads the statement's own columns; a correlated one is
         // resolved per input row at the aggregation entry
         let bound_stmt;
+        // A statement holding this execution's values keeps nothing in its plan
+        let mut folded_select = false;
         let stmt = if (classification.has_aggregation || classification.has_window_functions)
             && stmt.columns.iter().any(Self::has_subqueries)
             && !Self::has_correlated_select_subqueries(&stmt.columns)
@@ -882,6 +884,7 @@ impl Executor {
                         columns,
                         ..stmt.clone()
                     };
+                    folded_select = true;
                     &bound_stmt
                 }
                 None => stmt,
@@ -949,6 +952,7 @@ impl Executor {
             };
             (result, columns, applied, Some(shape))
         } else {
+            let compiled = compiled.filter(|_| !folded_select);
             self.execute_select_internal(branch, ctx, &classification, compiled)?
         };
         let SelectShape {
@@ -5166,10 +5170,9 @@ impl Executor {
                             )?,
                             None => compile_residual()?,
                         };
-                        Ok(programs
-                            .into_iter()
-                            .next()
-                            .map(|p| JoinFilter::from_program(p).with_context(ctx)))
+                        Ok(programs.first().map(|p| {
+                            JoinFilter::from_program(CompactArc::clone(p)).with_context(ctx)
+                        }))
                     };
 
                     // Execute Index Nested Loop Join using operators

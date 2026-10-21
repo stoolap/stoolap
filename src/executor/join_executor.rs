@@ -289,8 +289,8 @@ fn residual_filters(
         None => compile()?,
     };
     Ok(programs
-        .into_iter()
-        .map(|program| RowFilter::from_program(program).with_context(ctx))
+        .iter()
+        .map(|program| RowFilter::from_program(CompactArc::clone(program)).with_context(ctx))
         .collect())
 }
 
@@ -883,8 +883,9 @@ impl JoinExecutor {
                 )?,
                 None => compile()?,
             };
-            if let Some(program) = programs.into_iter().next() {
-                nl_op = nl_op.with_filter(JoinFilter::from_program(program).with_context(ctx));
+            if let Some(program) = programs.first() {
+                let filter = JoinFilter::from_program(CompactArc::clone(program));
+                nl_op = nl_op.with_filter(filter.with_context(ctx));
             }
         }
 
