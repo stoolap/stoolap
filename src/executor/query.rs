@@ -322,8 +322,9 @@ use super::operators::index_nested_loop::{
 };
 use super::operators::BloomFilterOperator;
 use super::parallel::{self, ParallelConfig};
+use super::prepared_join::{BuiltPrograms, JoinProgramKey, PreparedJoin, WhereSite};
 use super::pushdown;
-use super::query_cache::{CompiledExecution, CompiledJoinResidual};
+use super::query_cache::CompiledExecution;
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::{
     DistinctOnResult, DistinctResult, ExecResult, ExecutorResult, ExprMappedResult, FilteredResult,
@@ -871,6 +872,8 @@ impl Executor {
         // path reads the statement's own columns; a correlated one is
         // resolved per input row at the aggregation entry
         let bound_stmt;
+        // A statement holding this execution's values keeps nothing in its plan
+        let mut folded_select = false;
         let stmt = if (classification.has_aggregation || classification.has_window_functions)
             && stmt.columns.iter().any(Self::has_subqueries)
             && !Self::has_correlated_select_subqueries(&stmt.columns)
@@ -881,6 +884,7 @@ impl Executor {
                         columns,
                         ..stmt.clone()
                     };
+                    folded_select = true;
                     &bound_stmt
                 }
                 None => stmt,
@@ -948,6 +952,7 @@ impl Executor {
             };
             (result, columns, applied, Some(shape))
         } else {
+            let compiled = compiled.filter(|_| !folded_select);
             self.execute_select_internal(branch, ctx, &classification, compiled)?
         };
         let SelectShape {
@@ -4464,6 +4469,31 @@ impl Executor {
         }
     }
 
+    /// The join programs `slot` holds for the current schema epoch; a slot
+    /// holding none for it holds an empty set from now on
+    fn prepared_join(
+        &self,
+        slot: &std::sync::RwLock<CompiledExecution>,
+    ) -> Option<std::sync::Arc<PreparedJoin>> {
+        let epoch = self.engine.schema_epoch();
+        let current = |guard: &CompiledExecution| match guard {
+            CompiledExecution::PreparedJoin(held) if held.cached_epoch == epoch => {
+                Some(std::sync::Arc::clone(held))
+            }
+            _ => None,
+        };
+        if let Some(held) = slot.read().ok().and_then(|guard| current(&guard)) {
+            return Some(held);
+        }
+        let mut guard = slot.write().ok()?;
+        if let Some(held) = current(&guard) {
+            return Some(held);
+        }
+        let held = std::sync::Arc::new(PreparedJoin::new(epoch));
+        *guard = CompiledExecution::PreparedJoin(std::sync::Arc::clone(&held));
+        Some(held)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn execute_join_source_capped(
         &self,
@@ -4492,6 +4522,15 @@ impl Executor {
         };
         let on_condition: Option<&Expression> =
             processed_on.as_ref().or(join_source.condition.as_deref());
+        // The plan holds what the join compiles, unless this execution read a
+        // value into its clauses: a folded subquery or an outer row
+        let prepared = compiled
+            .filter(|_| {
+                processed_on.is_none()
+                    && !classification.where_has_subqueries
+                    && ctx.outer_row().is_none()
+            })
+            .and_then(|slot| self.prepared_join(slot));
 
         // Determine join type early for filter pushdown decisions
         let join_type = join_source.join_type.to_uppercase();
@@ -5067,35 +5106,11 @@ impl Executor {
                             .next()
                             .is_some_and(|name| name.eq_ignore_ascii_case(&inner_col))
                     });
-                    // The program lives on the plan, keyed by the schema epoch,
-                    // the outer columns and the key equality it leaves out. A
-                    // clause that read a subquery or an outer row this execution
-                    // holds that value, so it is not kept
-                    let residual_slot = compiled.filter(|_| {
-                        processed_on.is_none()
-                            && !classification.where_has_subqueries
-                            && ctx.outer_row().is_none()
-                    });
                     #[cfg(feature = "test-failpoints")]
                     crate::test_failpoints::join_inner_opened();
-                    let epoch = self.engine.schema_epoch();
-                    let build_residual_filter = || -> Result<Option<JoinFilter>> {
-                        if let Some(guard) = residual_slot.and_then(|slot| slot.read().ok()) {
-                            if let CompiledExecution::JoinResidual(kept) = &*guard {
-                                if kept.cached_epoch == epoch
-                                    && kept.swapped == swapped
-                                    && kept.outer_col == outer_col
-                                    && kept.inner_col == inner_col
-                                    && kept.outer_cols == outer_cols
-                                    && kept.inner_cols == inner_cols
-                                {
-                                    return Ok(kept.program.as_ref().map(|program| {
-                                        JoinFilter::from_program(CompactArc::clone(program))
-                                            .with_context(ctx)
-                                    }));
-                                }
-                            }
-                        }
+                    // The program is held with the plan, by the key equality
+                    // it leaves out and the columns it reads
+                    let compile_residual = || -> Result<BuiltPrograms> {
                         let inner_filter = nl_right_filter
                             .as_ref()
                             .map(|rf| add_table_qualifier(rf, inner_alias));
@@ -5121,7 +5136,7 @@ impl Executor {
                             (None, Some(f)) => Some(f),
                             (None, None) => None,
                         };
-                        let filter = combined
+                        combined
                             .map(|expr| {
                                 JoinFilter::new(
                                     &expr,
@@ -5129,29 +5144,38 @@ impl Executor {
                                     &inner_cols,
                                     &self.function_registry,
                                 )
-                                .map(|f| f.with_context(ctx))
+                                .map(|f| CompactArc::clone(f.program()))
                             })
-                            .transpose()?;
-                        if let Some(mut guard) = residual_slot.and_then(|slot| slot.write().ok()) {
-                            // A plan with two index joins keeps the first one's
-                            // program rather than swapping them every execution
-                            let taken = matches!(&*guard,
-                                CompiledExecution::JoinResidual(kept) if kept.cached_epoch == epoch);
-                            if !taken {
-                                *guard = CompiledExecution::JoinResidual(CompiledJoinResidual {
+                            .into_iter()
+                            .collect()
+                    };
+                    let build_residual_filter = || -> Result<Option<JoinFilter>> {
+                        let read = |programs: &[SharedProgram]| {
+                            programs.first().map(|p| {
+                                JoinFilter::from_program(CompactArc::clone(p)).with_context(ctx)
+                            })
+                        };
+                        Ok(match &prepared {
+                            Some(prepared) => prepared.programs(
+                                |held| {
+                                    matches!(held, JoinProgramKey::IndexResidual {
+                                        swapped: s, outer_col: oc, inner_col: ic,
+                                        outer_cols: ocs, inner_cols: ics,
+                                    } if *s == swapped && *oc == outer_col && *ic == inner_col
+                                        && *ocs == outer_cols && *ics == inner_cols)
+                                },
+                                || JoinProgramKey::IndexResidual {
                                     swapped,
-                                    outer_cols: outer_cols.clone(),
-                                    inner_cols: inner_cols.clone(),
                                     outer_col: outer_col.clone(),
                                     inner_col: inner_col.clone(),
-                                    program: filter
-                                        .as_ref()
-                                        .map(|f| CompactArc::clone(f.program())),
-                                    cached_epoch: epoch,
-                                });
-                            }
-                        }
-                        Ok(filter)
+                                    outer_cols: outer_cols.clone(),
+                                    inner_cols: inner_cols.clone(),
+                                },
+                                compile_residual,
+                                read,
+                            )?,
+                            None => read(&compile_residual()?),
+                        })
                     };
 
                     // Execute Index Nested Loop Join using operators
@@ -5179,9 +5203,19 @@ impl Executor {
                     // applied per joined row rather than after collection
                     let cross_row_filter = match cross_filter {
                         Some(ref cross) => {
-                            let resolved = Self::with_select_aliases(stmt, cross, &all_columns);
-                            let cross = resolved.as_ref().unwrap_or(cross);
-                            Some(RowFilter::new(cross, &all_columns)?.with_context(ctx))
+                            let compile = || {
+                                let resolved = Self::with_select_aliases(stmt, cross, &all_columns);
+                                compile_expression(resolved.as_ref().unwrap_or(cross), &all_columns)
+                            };
+                            let program = match &prepared {
+                                Some(prepared) => prepared.where_program(
+                                    WhereSite::IndexJoin,
+                                    &all_columns,
+                                    compile,
+                                )?,
+                                None => compile()?,
+                            };
+                            Some(RowFilter::from_program(program).with_context(ctx))
                         }
                         None => None,
                     };
@@ -5826,6 +5860,7 @@ impl Executor {
                         ctx,
                         pre_built_hash_table,
                         cross_key,
+                        prepared: prepared.as_deref(),
                     };
 
                     #[cfg(any(test, feature = "test-failpoints"))]
@@ -6055,6 +6090,7 @@ impl Executor {
             ctx,
             left_schema: self.base_table_side_schema(&join_source.left, CteNames::Context(ctx)),
             right_schema: self.base_table_side_schema(&join_source.right, CteNames::Context(ctx)),
+            prepared: prepared.as_deref(),
         };
 
         let join_result = join_executor.execute(join_request)?;
@@ -6140,7 +6176,14 @@ impl Executor {
                 filtered
             } else {
                 // Uncorrelated subqueries were folded before the filters were split
-                let where_filter = RowFilter::new(where_clause, &all_columns)?.with_context(ctx);
+                let compile = || compile_expression(where_clause, &all_columns);
+                let program = match &prepared {
+                    Some(prepared) => {
+                        prepared.where_program(WhereSite::AfterJoin, &all_columns, compile)?
+                    }
+                    None => compile()?,
+                };
+                let where_filter = RowFilter::from_program(program).with_context(ctx);
                 let mut filtered = RowVec::with_capacity(result_rows.len());
                 for (id, row) in result_rows {
                     if where_filter.matches_checked(&row)? {

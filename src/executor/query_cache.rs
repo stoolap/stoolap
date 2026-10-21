@@ -48,7 +48,6 @@ use crate::core::Schema;
 use crate::parser::ast::Statement;
 use crate::storage::mvcc::version_store::LayoutToken;
 
-use super::expression::SharedProgram;
 use super::query_classification::QueryClassification;
 
 /// Convert to lowercase without allocation if already lowercase.
@@ -288,26 +287,6 @@ pub struct CompiledCountStar {
     pub cached_epoch: u64,
 }
 
-/// The rest of an index join's ON clause, compiled once per plan against
-/// the outer and inner column lists it was built for
-#[derive(Debug, Clone)]
-pub struct CompiledJoinResidual {
-    /// Whether the join ran with its sides swapped
-    pub swapped: bool,
-    /// The outer columns the program reads by position; a nested join
-    /// can reorder them without a schema change
-    pub outer_cols: Vec<String>,
-    /// The inner columns it reads by position, from the inner handle's schema
-    pub inner_cols: Vec<String>,
-    /// The key equality the probe answers, left out of the program
-    pub outer_col: String,
-    pub inner_col: String,
-    /// None when nothing beyond the key equality remains to ask
-    pub program: Option<SharedProgram>,
-    /// Schema epoch at compilation time (for fast cache invalidation)
-    pub cached_epoch: u64,
-}
-
 /// Pre-compiled execution state for fast paths
 #[derive(Debug, Clone, Default)]
 pub enum CompiledExecution {
@@ -330,8 +309,8 @@ pub enum CompiledExecution {
     CountDistinct(CompiledCountDistinct),
     /// COUNT(*) fast path
     CountStar(CompiledCountStar),
-    /// The rest of an index join's ON clause (general SELECT path)
-    JoinResidual(CompiledJoinResidual),
+    /// The programs a join statement compiles (general SELECT path)
+    PreparedJoin(Arc<super::prepared_join::PreparedJoin>),
     /// A statement of the prepared family (general SELECT path)
     PreparedSelect(Arc<super::prepared_select::PreparedSelect>),
     /// An UPDATE or DELETE whose subqueries run prepared

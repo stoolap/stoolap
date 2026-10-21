@@ -399,3 +399,28 @@ fn test_inl_join_projects_a_repeated_column_twice() {
         assert_eq!(name, name2, "name must be projected twice");
     }
 }
+
+#[test]
+fn test_a_select_alias_folded_from_a_subquery_is_read_each_execution() {
+    let db = Database::open("memory://join_folded_select_alias").unwrap();
+    db.execute("CREATE TABLE l (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE TABLE r (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE INDEX r_k ON r (k)", ()).unwrap();
+    db.execute("INSERT INTO l VALUES (1, 7)", ()).unwrap();
+    db.execute("INSERT INTO r VALUES (1, 7)", ()).unwrap();
+    let stmt = db
+        .prepare(
+            "SELECT COUNT(*), (SELECT $1) AS cutoff FROM l JOIN r ON l.k = r.k \
+             WHERE l.id + r.id > cutoff",
+        )
+        .unwrap();
+    let count = |cutoff: i64| -> i64 {
+        let row = stmt.query((cutoff,)).unwrap().next().unwrap().unwrap();
+        row.get(0).unwrap()
+    };
+    assert_eq!(count(0), 1);
+    assert_eq!(count(10), 0, "the WHERE kept the first execution's cutoff");
+    assert_eq!(count(0), 1);
+}
