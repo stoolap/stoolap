@@ -29,6 +29,8 @@ Stoolap supports a comprehensive set of SQL operators for building expressions i
 | `XOR` | Exactly one condition true | `WHERE a XOR b` |
 | `NOT` | Negates a condition | `WHERE NOT deleted` |
 
+An error a condition raises on a row, such as an `Integer overflow` from `ABS`, fails the statement, for `SELECT`, `UPDATE` and `DELETE`, on recent and on checkpointed rows alike. `AND` and `OR` evaluate their operands left to right and stop at the first one that decides the result, so `WHERE id = 1 OR ABS(x) >= 0` raises nothing for the row with `id = 1`, while `WHERE ABS(x) >= 0 OR id = 1` fails on it. `NOT` passes an error on. A row an index or a `LIMIT` leaves unread is never asked, so it raises nothing. A function of your own that writes to its transaction from inside a WHERE is not covered yet; see [Known Limitations]({{ '/docs/development/known-limitations/' | relative_url }}).
+
 `XOR` returns true when exactly one operand is true:
 
 ```sql

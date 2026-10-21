@@ -26,6 +26,7 @@
 use std::sync::Arc;
 
 use crate::core::{Error, Result, Row, Value};
+use crate::storage::expression::passes;
 use crate::storage::mvcc::registry::StatementView;
 use crate::storage::traits::Scanner;
 
@@ -137,6 +138,8 @@ pub struct VolumeScanner {
     error: Option<Error>,
     /// Optional predicate filter (from WHERE clause pushdown)
     filter: Option<Box<dyn crate::storage::expression::Expression>>,
+    /// Whether the filter can raise an error, taken once when it is set
+    filter_fallible: bool,
     /// Pre-resolved dictionary filters: (col_idx, dict_id) pairs.
     /// Enables O(1) u32 comparison per row instead of full Value reconstruction.
     dict_filters: Vec<(usize, u32)>,
@@ -451,6 +454,7 @@ impl VolumeScanner {
             has_current: false,
             error: None,
             filter: None,
+            filter_fallible: false,
             column_mapping: None,
             dict_filters: Vec::new(),
             matching_indices: None,
@@ -513,6 +517,7 @@ impl VolumeScanner {
             has_current: false,
             error: None,
             filter: None,
+            filter_fallible: false,
             column_mapping: None,
             dict_filters: Vec::new(),
             matching_indices: None,
@@ -607,6 +612,7 @@ impl VolumeScanner {
             has_current: false,
             error: None,
             filter: None,
+            filter_fallible: false,
             column_mapping: None,
             dict_filters: Vec::new(),
             matching_indices: None,
@@ -646,6 +652,7 @@ impl VolumeScanner {
         &mut self,
         filter: Box<dyn crate::storage::expression::Expression>,
     ) -> Result<()> {
+        self.filter_fallible = filter.can_fail();
         // Extract dictionary filters for fast pre-filtering.
         // Uses CompressedBlockStore's shared dict when available (no column decompression).
         let comparisons = filter.collect_comparisons();
@@ -1296,7 +1303,7 @@ impl VolumeScanner {
                 (None, Some(mapping)) => self.volume.get_row_mapped(idx, mapping),
                 (None, None) => self.volume.get_row(idx),
             }?;
-            if !filter.evaluate_fast(&full_row) {
+            if !passes(filter.as_ref(), self.filter_fallible, &full_row)? {
                 return Ok(false);
             }
             if self.is_full_projection {
@@ -1381,7 +1388,7 @@ impl VolumeScanner {
 
         // Apply filter if present
         if let Some(ref filter) = self.filter {
-            if !filter.evaluate_fast(&full_row) {
+            if !passes(filter.as_ref(), self.filter_fallible, &full_row)? {
                 return Ok(false);
             }
         }

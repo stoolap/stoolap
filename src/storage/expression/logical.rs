@@ -22,6 +22,17 @@ use rustc_hash::FxHashMap;
 use super::Expression;
 use crate::core::{Result, Row, Schema};
 
+/// A child's answer as `evaluate_fast` gives it, except that an error from
+/// a child that can fail is the statement's
+#[inline]
+fn child_answer(expr: &dyn Expression, row: &Row) -> Result<bool> {
+    match expr.evaluate(row) {
+        Err(error) if expr.can_fail() => Err(error),
+        Err(_) => Ok(expr.evaluate_fast(row)),
+        answer => answer,
+    }
+}
+
 /// AND expression - evaluates to true if all child expressions are true
 ///
 /// # Short-circuit evaluation
@@ -76,11 +87,15 @@ impl AndExpr {
 impl Expression for AndExpr {
     fn evaluate(&self, row: &Row) -> Result<bool> {
         for expr in &self.expressions {
-            if !expr.evaluate(row)? {
+            if !child_answer(expr.as_ref(), row)? {
                 return Ok(false); // Short-circuit on first false
             }
         }
         Ok(true) // All expressions were true
+    }
+
+    fn can_fail(&self) -> bool {
+        self.expressions.iter().any(|expr| expr.can_fail())
     }
 
     fn evaluate_fast(&self, row: &Row) -> bool {
@@ -194,15 +209,17 @@ impl OrExpr {
 
 impl Expression for OrExpr {
     fn evaluate(&self, row: &Row) -> Result<bool> {
+        // Left to right, as the executor: an error is raised once reached
         for expr in &self.expressions {
-            // Note: Errors in OR are skipped to allow short-circuit evaluation
-            match expr.evaluate(row) {
-                Ok(true) => return Ok(true), // Short-circuit on first true
-                Ok(false) => continue,
-                Err(_) => continue, // Skip errors in OR
+            if child_answer(expr.as_ref(), row)? {
+                return Ok(true); // Short-circuit on first true
             }
         }
         Ok(false) // No expression was true
+    }
+
+    fn can_fail(&self) -> bool {
+        self.expressions.iter().any(|expr| expr.can_fail())
     }
 
     fn evaluate_fast(&self, row: &Row) -> bool {
@@ -305,7 +322,11 @@ impl Expression for NotExpr {
         if self.inner.is_unknown_due_to_null(row) {
             return Ok(false);
         }
-        Ok(!self.inner.evaluate(row)?)
+        Ok(!child_answer(self.inner.as_ref(), row)?)
+    }
+
+    fn can_fail(&self) -> bool {
+        self.inner.can_fail()
     }
 
     fn evaluate_fast(&self, row: &Row) -> bool {

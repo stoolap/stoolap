@@ -94,6 +94,8 @@ These are deliberate design decisions, not bugs:
 ## Transactions
 
 - **No primary key updates**: UPDATE on primary key columns is rejected with an error. The engine uses row_id == pk_value as a core invariant. Use DELETE + INSERT to change a row's primary key value.
+- **UPDATE after the transaction rewrote a row**: an UPDATE whose WHERE matches a row only in the version the same transaction wrote, for example `UPDATE t SET x = 7 WHERE id = 2` followed by `UPDATE t SET o = 9 WHERE x = 7`, does not change that row.
+- **Functions that write inside a WHERE**: a scalar function registered through the API that writes to its own transaction while an UPDATE's WHERE runs can make the statement wait forever, and if it writes the row it is asked about and then fails, the UPDATE may finish without its error.
 
 ## General SQL
 

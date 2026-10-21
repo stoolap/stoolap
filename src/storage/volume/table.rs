@@ -36,7 +36,7 @@ use crate::core::{
     DataType, IndexType, Result, Row, RowVec, Schema, SumAccumulator, Value, ValueMap, ValueSet,
 };
 use crate::functions::aggregate::{CompiledAggregate, GroupedAggregates};
-use crate::storage::expression::Expression;
+use crate::storage::expression::{passes, Expression};
 use crate::storage::index::id_list::GroupIds;
 use crate::storage::mvcc::registry::StatementView;
 use crate::storage::mvcc::txn_gate::{GateRef, TxnGate};
@@ -1405,6 +1405,7 @@ impl SegmentedTable {
         self.hot.collect_hot_row_ids_into(&mut hot_skip);
         self.segment_mgr
             .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+        let fallible = where_expr.is_some_and(|expr| expr.can_fail());
         for (seg_id, cs) in snap.volumes_newest_first().iter() {
             if prep.seen_segments.contains(seg_id) {
                 continue;
@@ -1432,7 +1433,7 @@ impl SegmentedTable {
                 }
                 let row = reader.row(i, &mapping)?;
                 if let Some(expr) = where_expr {
-                    if !expr.evaluate_fast(&row) {
+                    if !passes(expr, fallible, &row)? {
                         continue;
                     }
                 }
@@ -2946,6 +2947,7 @@ impl SegmentedTable {
         }
         let hot_skip_ref = &hot_skip;
         let tombstones_ref = tombstones_arc;
+        let fallible = where_expr.is_some_and(|expr| expr.can_fail());
 
         // Per-volume row collection closure. Returns Some(vol_rows) or None if pruned.
         let ask = if comparisons.is_empty() {
@@ -3145,7 +3147,7 @@ impl SegmentedTable {
 
                     let row = reader.row(i, mapping)?;
                     if let Some(expr) = where_expr {
-                        if !expr.evaluate_fast(&row) {
+                        if !passes(expr, fallible, &row)? {
                             continue;
                         }
                     }
@@ -3439,6 +3441,7 @@ impl SegmentedTable {
         });
         // Reused for every row: the buffer is allocated once
         let mut reusable_row = Row::with_capacity(schema.columns.len());
+        let fallible = where_expr.is_some_and(|expr| expr.can_fail());
         for (seg_id, cs) in volumes.iter() {
             if prep.seen_segments.contains(seg_id) {
                 continue;
@@ -3518,7 +3521,7 @@ impl SegmentedTable {
                             }
                         }
                     };
-                    if !expr.evaluate_fast(&reusable_row) {
+                    if !passes(expr, fallible, &reusable_row)? {
                         continue;
                     }
                 }
@@ -4252,6 +4255,7 @@ impl Table for SegmentedTable {
         }
 
         let schema = self.hot.schema();
+        let fallible = filter.can_fail();
         // An id decided hot before a seal and read after it finds nothing,
         // so the read is settled: a seal landing across it starts it over
         self.settled_across_seals(|| {
@@ -4275,7 +4279,7 @@ impl Table for SegmentedTable {
                         .map(|(reader, mapping)| (reader, &*mapping))
                         .expect("reader just set");
                     let row = reader.row(idx, mapping)?;
-                    if filter.evaluate_fast(&row) {
+                    if passes(filter, fallible, &row)? {
                         buffer.push((row_id, row));
                     }
                 } else {
@@ -4311,6 +4315,7 @@ impl Table for SegmentedTable {
         }
 
         let target = limit + offset;
+        let fallible = where_expr.is_some_and(|expr| expr.can_fail());
 
         // The cold view is taken before the hot rows are read, so a seal
         // landing between them would leave its rows in neither
@@ -4472,7 +4477,7 @@ impl Table for SegmentedTable {
                     }
                     let row = reader.row(i, &cs.mapping)?;
                     if let Some(expr) = where_expr {
-                        if !expr.evaluate_fast(&row) {
+                        if !passes(expr, fallible, &row)? {
                             continue;
                         }
                     }
@@ -4515,6 +4520,7 @@ impl Table for SegmentedTable {
         }
 
         let target = limit + offset;
+        let fallible = where_expr.is_some_and(|expr| expr.can_fail());
 
         // The hot rows are read before the cold view is taken, so a seal
         // landing between them would show its rows twice
@@ -4651,7 +4657,7 @@ impl Table for SegmentedTable {
                     if where_expr.is_some() {
                         let row = reader.row(i, &cs.mapping)?;
                         if let Some(expr) = where_expr {
-                            if !expr.evaluate_fast(&row) {
+                            if !passes(expr, fallible, &row)? {
                                 continue;
                             }
                         }
@@ -7325,6 +7331,7 @@ impl Table for SegmentedTable {
                     return Ok(None);
                 }
 
+                let fallible = expr.is_some_and(|e| e.can_fail());
                 for (seg_id, cs) in volumes.iter() {
                     let vol = &cs.volume;
                     let mapping = self.segment_mgr.get_volume_mapping(*seg_id, &schema);
@@ -7366,7 +7373,7 @@ impl Table for SegmentedTable {
                         }
                         let row = reader.row(i, &mapping)?;
                         if let Some(e) = expr {
-                            if !e.evaluate_fast(&row) {
+                            if !passes(e, fallible, &row)? {
                                 continue;
                             }
                         }

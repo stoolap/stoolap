@@ -119,7 +119,9 @@ captured_rows_test!(captured_update_rows, |store, id| update_rows(
     store.get_all_visible_rows_for_update(id)
 ));
 captured_rows_test!(captured_filtered_update, |store, id| update_rows(
-    store.get_all_visible_rows_for_update_filtered(id, &balance_filter())
+    store
+        .get_all_visible_rows_for_update_filtered(id, &balance_filter(), |_| false, |_| false)
+        .unwrap()
 ));
 captured_rows_test!(captured_limited_rows, |store, id| store
     .get_visible_rows_with_limit(id.into(), 1, 0));
@@ -142,17 +144,26 @@ captured_rows_test!(captured_keyset, |store, id| store.collect_rows_keyset(
     1
 ));
 captured_rows_test!(captured_filtered_rows, |store, id| store
-    .get_all_visible_rows_filtered(id.into(), &balance_filter()));
+    .get_all_visible_rows_filtered(id.into(), &balance_filter())
+    .unwrap());
 captured_rows_test!(captured_filtered_callback, |store, id| {
     let mut rows = RowVec::new();
-    store.for_each_visible_filtered(id.into(), &balance_filter(), |row_id, row| {
-        rows.push((row_id, row));
-        true
-    });
+    store
+        .for_each_visible_filtered(
+            id.into(),
+            &balance_filter(),
+            |_| false,
+            |row_id, row| {
+                rows.push((row_id, row));
+                true
+            },
+        )
+        .unwrap();
     rows
 });
 captured_rows_test!(captured_filtered_limit, |store, id| store
-    .get_visible_rows_filtered_with_limit(id.into(), &balance_filter(), 1, 0));
+    .get_visible_rows_filtered_with_limit(id.into(), &balance_filter(), 1, 0)
+    .unwrap());
 
 #[test]
 fn captured_aggregate() {

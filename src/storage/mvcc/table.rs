@@ -25,7 +25,7 @@ use crate::core::{
     DataType, Error, IndexType, Result, Row, RowIdVec, RowVec, Schema, SchemaColumn, Value,
 };
 use crate::storage::expression::logical::OrExpr;
-use crate::storage::expression::Expression;
+use crate::storage::expression::{passes, Expression};
 use crate::storage::index::id_list::GroupIds;
 use crate::storage::index::{BTreeIndex, BitmapIndex, HashIndex, HnswIndex, MultiColumnIndex};
 use crate::storage::mvcc::registry::StatementView;
@@ -1438,37 +1438,49 @@ impl MVCCTable {
         schema: &Schema,
         limit: usize,
         offset: usize,
-    ) -> Option<RowVec> {
+    ) -> Result<Option<RowVec>> {
         if limit == 0 {
-            return Some(RowVec::new());
+            return Ok(Some(RowVec::new()));
         }
 
         let txn_versions = self.txn_versions.read().unwrap();
         if txn_versions.has_local_changes() {
-            return None; // Fall through to full path
+            return Ok(None); // Fall through to full path
         }
 
         // No local changes - use for_each_visible for single lock acquisition + early termination
         let mut result = RowVec::with_capacity(limit.min(row_ids.len()));
         let mut skipped = 0usize;
+        let fallible = expr.can_fail();
+        let mut failed = None;
 
         self.version_store
             .for_each_visible(&row_ids, self.reader(), |row_id, row_data| {
                 // Re-apply filter (index may return superset for complex expressions)
                 let row = self.normalize_row_to_schema(row_data, schema);
-                if expr.evaluate_fast(&row) {
-                    if skipped < offset {
-                        skipped += 1;
-                    } else {
-                        result.push((row_id, row));
-                        if result.len() >= limit {
-                            return false; // Stop: LIMIT reached
+                match passes(expr, fallible, &row) {
+                    Ok(true) => {
+                        if skipped < offset {
+                            skipped += 1;
+                        } else {
+                            result.push((row_id, row));
+                            if result.len() >= limit {
+                                return false; // Stop: LIMIT reached
+                            }
                         }
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        failed = Some(e);
+                        return false;
                     }
                 }
                 true // Continue
             });
-        Some(result)
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(Some(result)),
+        }
     }
 
     /// Hybrid optimization for mixed OR predicates (some indexed, some not).
@@ -1485,12 +1497,14 @@ impl MVCCTable {
         schema: &Schema,
         limit: usize,
         offset: usize,
-    ) -> Option<RowVec> {
+    ) -> Result<Option<RowVec>> {
         if limit == 0 {
-            return Some(RowVec::new());
+            return Ok(Some(RowVec::new()));
         }
 
-        let or_operands = expr.get_or_operands()?;
+        let Some(or_operands) = expr.get_or_operands() else {
+            return Ok(None);
+        };
 
         // Partition operands into indexed and non-indexed
         let mut indexed_row_ids: Vec<RowIdVec> = Vec::new();
@@ -1506,13 +1520,13 @@ impl MVCCTable {
 
         // Only useful when we have BOTH indexed and non-indexed operands
         if indexed_row_ids.is_empty() || unindexed_operands.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         // Bail if there are local transaction changes (complex merge needed)
         let txn_versions = self.txn_versions.read().unwrap();
         if txn_versions.has_local_changes() {
-            return None;
+            return Ok(None);
         }
         drop(txn_versions);
 
@@ -1572,26 +1586,38 @@ impl MVCCTable {
         // Fetch indexed rows
         let mut result = RowVec::with_capacity(limit.min(total_indexed + 64));
         let mut skipped = 0usize;
+        let fallible = expr.can_fail();
+        let mut failed = None;
 
         self.version_store
             .for_each_visible(&deduped_ids, self.reader(), |row_id, row_data| {
                 let row = self.normalize_row_to_schema(row_data, schema);
                 // Re-apply full OR filter to ensure correctness (index may return superset)
-                if expr.evaluate_fast(&row) {
-                    if skipped < offset {
-                        skipped += 1;
-                    } else {
-                        result.push((row_id, row));
-                        if result.len() >= limit {
-                            return false;
+                match passes(expr, fallible, &row) {
+                    Ok(true) => {
+                        if skipped < offset {
+                            skipped += 1;
+                        } else {
+                            result.push((row_id, row));
+                            if result.len() >= limit {
+                                return false;
+                            }
                         }
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        failed = Some(e);
+                        return false;
                     }
                 }
                 true
             });
+        if let Some(e) = failed {
+            return Err(e);
+        }
 
         if result.len() >= limit {
-            return Some(result);
+            return Ok(Some(result));
         }
 
         // Phase 2: Scan for rows matching non-indexed branches (skip already-found rows)
@@ -1606,26 +1632,22 @@ impl MVCCTable {
         let remaining_offset = offset.saturating_sub(skipped);
         let mut scan_skipped = 0usize;
 
+        // Rows phase 1 answered, left out before the filter is asked of them
+        let already_found = |row_id: i64| {
+            if use_bitset {
+                let idx = row_id as usize;
+                idx / 64 < bitset.len() && (bitset[idx / 64] & (1u64 << (idx % 64))) != 0
+            } else {
+                id_set.contains(row_id)
+            }
+        };
+
         // Streaming scan: filter + dedup + limit inline, no bulk materialization
         self.version_store.for_each_visible_filtered(
             self.reader(),
             unindexed_filter.as_ref(),
+            already_found,
             |row_id, row_data| {
-                // Skip rows already found by index
-                let already_found = if use_bitset {
-                    let idx = row_id as usize;
-                    if idx / 64 < bitset.len() {
-                        (bitset[idx / 64] & (1u64 << (idx % 64))) != 0
-                    } else {
-                        false
-                    }
-                } else {
-                    id_set.contains(row_id)
-                };
-                if already_found {
-                    return true; // continue
-                }
-
                 let row = self.normalize_row_to_schema(row_data, schema);
                 if scan_skipped < remaining_offset {
                     scan_skipped += 1;
@@ -1637,9 +1659,9 @@ impl MVCCTable {
                 }
                 true // continue
             },
-        );
+        )?;
 
-        Some(result)
+        Ok(Some(result))
     }
 
     /// Validates and coerces a row against the schema
@@ -2040,7 +2062,7 @@ impl MVCCTable {
     /// then merge the results.
     /// Returns RowVec for zero-allocation reuse across queries.
     #[inline]
-    fn collect_visible_rows(&self, filter: Option<&dyn Expression>) -> RowVec {
+    fn collect_visible_rows(&self, filter: Option<&dyn Expression>) -> Result<RowVec> {
         let txn_versions = self.txn_versions.read().unwrap();
         let schema = &self.cached_schema;
 
@@ -2070,16 +2092,17 @@ impl MVCCTable {
                 .is_none_or(|(_, row)| row.len() == schema_cols)
             {
                 // Fast path: all rows should have same column count, skip normalization
-                return raw_rows;
+                return Ok(raw_rows);
             }
 
             // Slow path: need to normalize rows for schema evolution
             // Iterate over cached vec (drains it), collect into RowVec
-            return raw_rows
+            return Ok(raw_rows
                 .into_iter()
                 .map(|(row_id, row)| (row_id, self.normalize_row_to_schema(row, schema)))
-                .collect();
+                .collect());
         }
+        let fallible = filter.is_some_and(|expr| expr.can_fail());
 
         // Has local versions - use batch fetch then merge
         // Step 1: Get all global rows in one batch (single lock acquisition)
@@ -2110,7 +2133,7 @@ impl MVCCTable {
             // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
             let row = self.normalize_row_to_schema(row, schema);
             if let Some(expr) = filter {
-                if !expr.evaluate_fast(&row) {
+                if !passes(expr, fallible, &row)? {
                     continue;
                 }
             }
@@ -2125,14 +2148,14 @@ impl MVCCTable {
             // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
             let row = self.normalize_row_to_schema(version.data.clone(), schema);
             if let Some(expr) = filter {
-                if !expr.evaluate_fast(&row) {
+                if !passes(expr, fallible, &row)? {
                     continue;
                 }
             }
             rows.push((row_id, row));
         }
 
-        rows
+        Ok(rows)
     }
 
     /// Collect visible rows WITHOUT sorting for GROUP BY optimization.
@@ -2140,7 +2163,7 @@ impl MVCCTable {
     /// This skips the O(n log n) sort since GROUP BY doesn't care about row order.
     /// Returns rows in version store iteration order.
     #[inline]
-    fn collect_visible_rows_unsorted(&self) -> RowVec {
+    fn collect_visible_rows_unsorted(&self) -> Result<RowVec> {
         // For GROUP BY, order doesn't matter - use same cached path
         self.collect_visible_rows(None)
     }
@@ -2152,7 +2175,7 @@ impl MVCCTable {
         filter: Option<&dyn Expression>,
         limit: usize,
         offset: usize,
-    ) -> RowVec {
+    ) -> Result<RowVec> {
         let schema = &self.cached_schema;
 
         // FAST PATH: Check if this is a primary key equality lookup (WHERE id = X)
@@ -2183,30 +2206,30 @@ impl MVCCTable {
                     None
                 };
 
-                return match row {
+                return Ok(match row {
                     Some((row_id, r)) if offset == 0 && limit >= 1 => {
                         let mut rv = RowVec::with_capacity(1);
                         rv.push((row_id, self.normalize_row_to_schema(r, schema)));
                         rv
                     }
                     _ => RowVec::new(),
-                };
+                });
             }
 
             // OPTIMIZATION: Try secondary index lookup for OR/AND expressions on indexed columns
             // This handles queries like: WHERE age = 25 OR age = 50 OR age = 75
             if let Some(row_ids) = self.try_index_lookup(expr) {
                 if let Some(result) =
-                    self.try_fetch_from_index(row_ids, expr, schema, limit, offset)
+                    self.try_fetch_from_index(row_ids, expr, schema, limit, offset)?
                 {
-                    return result;
+                    return Ok(result);
                 }
                 // Has local changes - fall through to full path
             }
 
             // OPTIMIZATION: Mixed OR (indexed OR non-indexed) hybrid scan
-            if let Some(result) = self.try_mixed_or_fetch(expr, schema, limit, offset) {
-                return result;
+            if let Some(result) = self.try_mixed_or_fetch(expr, schema, limit, offset)? {
+                return Ok(result);
             }
         }
 
@@ -2225,7 +2248,7 @@ impl MVCCTable {
                     expr,
                     limit,
                     offset,
-                )
+                )?
             } else {
                 // No filter: use simple LIMIT pushdown
                 // This avoids scanning all 10K rows for LIMIT 10 queries - ~30x speedup
@@ -2234,11 +2257,12 @@ impl MVCCTable {
             };
 
             // Keep row IDs in RowVec
-            return raw_rows
+            return Ok(raw_rows
                 .into_iter()
                 .map(|(row_id, row)| (row_id, self.normalize_row_to_schema(row, schema)))
-                .collect();
+                .collect());
         }
+        let fallible = filter.is_some_and(|expr| expr.can_fail());
 
         // Has local versions - use batch fetch then merge with early termination
         // Uses thread-local cached Vec for zero-allocation reuse
@@ -2269,14 +2293,14 @@ impl MVCCTable {
             }
             let row = self.normalize_row_to_schema(row, schema);
             if let Some(expr) = filter {
-                if !expr.evaluate_fast(&row) {
+                if !passes(expr, fallible, &row)? {
                     continue;
                 }
             }
             if count >= offset {
                 result.push((row_id, row));
                 if result.len() >= limit {
-                    return result;
+                    return Ok(result);
                 }
             }
             count += 1;
@@ -2289,20 +2313,20 @@ impl MVCCTable {
             }
             let row = self.normalize_row_to_schema(version.data.clone(), schema);
             if let Some(expr) = filter {
-                if !expr.evaluate_fast(&row) {
+                if !passes(expr, fallible, &row)? {
                     continue;
                 }
             }
             if count >= offset {
                 result.push((row_id, row));
                 if result.len() >= limit {
-                    return result;
+                    return Ok(result);
                 }
             }
             count += 1;
         }
 
-        result
+        Ok(result)
     }
 
     /// Collect visible rows with LIMIT without guaranteeing deterministic order.
@@ -2314,7 +2338,7 @@ impl MVCCTable {
         filter: Option<&dyn Expression>,
         limit: usize,
         offset: usize,
-    ) -> RowVec {
+    ) -> Result<RowVec> {
         let schema = &self.cached_schema;
 
         // FAST PATH: Check if this is a primary key equality lookup (WHERE id = X)
@@ -2345,30 +2369,30 @@ impl MVCCTable {
                     None
                 };
 
-                return match row {
+                return Ok(match row {
                     Some((row_id, r)) if offset == 0 && limit >= 1 => {
                         let mut rv = RowVec::with_capacity(1);
                         rv.push((row_id, self.normalize_row_to_schema(r, schema)));
                         rv
                     }
                     _ => RowVec::new(),
-                };
+                });
             }
 
             // OPTIMIZATION: Try secondary index lookup for OR/AND expressions on indexed columns
             // This handles queries like: WHERE age = 25 OR age = 50 OR age = 75
             if let Some(row_ids) = self.try_index_lookup(expr) {
                 if let Some(result) =
-                    self.try_fetch_from_index(row_ids, expr, schema, limit, offset)
+                    self.try_fetch_from_index(row_ids, expr, schema, limit, offset)?
                 {
-                    return result;
+                    return Ok(result);
                 }
                 // Has local changes - fall through to full path
             }
 
             // OPTIMIZATION: Mixed OR (indexed OR non-indexed) hybrid scan
-            if let Some(result) = self.try_mixed_or_fetch(expr, schema, limit, offset) {
-                return result;
+            if let Some(result) = self.try_mixed_or_fetch(expr, schema, limit, offset)? {
+                return Ok(result);
             }
         }
 
@@ -2386,7 +2410,7 @@ impl MVCCTable {
                         expr,
                         limit,
                         offset,
-                    )
+                    )?
             } else {
                 self.version_store.get_visible_rows_with_limit_unordered(
                     self.reader(),
@@ -2396,10 +2420,10 @@ impl MVCCTable {
             };
 
             // Keep row IDs in RowVec
-            return raw_rows
+            return Ok(raw_rows
                 .into_iter()
                 .map(|(row_id, row)| (row_id, self.normalize_row_to_schema(row, schema)))
-                .collect();
+                .collect());
         }
 
         // Has local versions - use same path as ordered (local changes are rare)
@@ -2453,6 +2477,7 @@ impl MVCCTable {
         let schema = &self.cached_schema;
         let skipped = |row_id: i64| skip.is_some_and(|skip| skip.contains_key(&row_id));
         let start = plan.hot.len();
+        let fallible = where_expr.is_some_and(|expr| expr.can_fail());
 
         if let Some(expr) = where_expr {
             // Fast path: primary key equality (WHERE id = X)
@@ -2534,7 +2559,7 @@ impl MVCCTable {
                             if !local.is_deleted() {
                                 let row = self.normalize_row_to_schema(local.data.clone(), schema);
                                 // The index may match in part
-                                if expr.evaluate(&row).unwrap_or(false) {
+                                if passes(expr, fallible, &row)? {
                                     plan.hot.push((row_id, row, self.local_read(local)));
                                 }
                             }
@@ -2549,7 +2574,7 @@ impl MVCCTable {
                         .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
                     for (row_id, row, original) in batch_rows {
                         let row = self.normalize_row_to_schema(row, schema);
-                        if expr.evaluate(&row).unwrap_or(false) {
+                        if passes(expr, fallible, &row)? {
                             plan.hot.push((row_id, row, original));
                         }
                     }
@@ -2559,11 +2584,29 @@ impl MVCCTable {
             }
         }
 
-        // Full scan: the filter is applied before rows are cloned
+        // Full scan: the filter is applied before rows are cloned. One that
+        // can fail is not asked of a row already planned, and an error on
+        // the committed copy of a row the transaction wrote is not the
+        // statement's, since its own version stands for it
+        let written = |row_id: i64| {
+            self.txn_versions
+                .read()
+                .unwrap()
+                .get_latest_local(row_id)
+                .is_some()
+        };
         let committed = match where_expr {
+            Some(expr) if fallible => self
+                .version_store
+                .get_all_visible_rows_for_update_filtered(self.txn_id, expr, skipped, written)?,
             Some(expr) => self
                 .version_store
-                .get_all_visible_rows_for_update_filtered(self.txn_id, expr),
+                .get_all_visible_rows_for_update_filtered(
+                    self.txn_id,
+                    expr,
+                    |_| false,
+                    |_| false,
+                )?,
             None => self
                 .version_store
                 .get_all_visible_rows_for_update(self.txn_id),
@@ -2597,8 +2640,10 @@ impl MVCCTable {
                             continue;
                         }
                         let row = self.normalize_row_to_schema(local.data.clone(), schema);
-                        if where_expr.is_some_and(|expr| !expr.evaluate(&row).unwrap_or(false)) {
-                            continue;
+                        if let Some(expr) = where_expr {
+                            if !passes(expr, fallible, &row)? {
+                                continue;
+                            }
                         }
                         plan.hot[i].1 = row;
                         plan.hot[i].2 = self.local_read(local);
@@ -2616,8 +2661,10 @@ impl MVCCTable {
                     continue;
                 }
                 let row = self.normalize_row_to_schema(version.data.clone(), schema);
-                if where_expr.is_some_and(|expr| !expr.evaluate(&row).unwrap_or(false)) {
-                    continue;
+                if let Some(expr) = where_expr {
+                    if !passes(expr, fallible, &row)? {
+                        continue;
+                    }
                 }
                 plan.hot.push((row_id, row, self.local_read(version)));
             }
@@ -2950,6 +2997,7 @@ impl Table for MVCCTable {
     ) -> Result<()> {
         let txn_versions = self.txn_versions.read().unwrap();
         let schema = &self.cached_schema;
+        let fallible = filter.can_fail();
 
         // Without local changes every id reads the global store, as given
         let mut global_row_ids = Vec::new();
@@ -2966,7 +3014,7 @@ impl Table for MVCCTable {
                     if !version.is_deleted() {
                         // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
                         let row = self.normalize_row_to_schema(version.data.clone(), schema);
-                        if filter.evaluate_fast(&row) {
+                        if passes(filter, fallible, &row)? {
                             rows.push((row_id, row));
                         }
                     }
@@ -2992,7 +3040,7 @@ impl Table for MVCCTable {
             for (row_id, row) in global_rows {
                 // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
                 let row = self.normalize_row_to_schema(row, schema);
-                if filter.evaluate_fast(&row) {
+                if passes(filter, fallible, &row)? {
                     rows.push((row_id, row));
                 }
             }
@@ -3255,6 +3303,7 @@ impl Table for MVCCTable {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         // OPTIMIZATION: Borrow schema instead of cloning - saves allocation per delete
         let schema = &self.cached_schema;
+        let fallible = where_expr.is_some_and(|expr| expr.can_fail());
 
         // Fast path: Check if this is a primary key equality lookup (WHERE id = X)
         if let Some(expr) = where_expr {
@@ -3366,7 +3415,7 @@ impl Table for MVCCTable {
                             if !local.is_deleted() {
                                 let row = local.data.clone();
                                 // Re-apply filter (index may be partial match)
-                                if expr.evaluate(&row).unwrap_or(false) {
+                                if passes(expr, fallible, &row)? {
                                     rows_to_delete.push((row_id, row));
                                 }
                             }
@@ -3384,7 +3433,7 @@ impl Table for MVCCTable {
                         .get_visible_versions_batch(&remaining_row_ids, self.reader());
                     for (row_id, row) in batch_rows {
                         // Re-apply filter (index may be partial match)
-                        if expr.evaluate(&row).unwrap_or(false) {
+                        if passes(expr, fallible, &row)? {
                             rows_to_delete.push((row_id, row));
                         }
                     }
@@ -3425,10 +3474,8 @@ impl Table for MVCCTable {
                 }
                 // Apply filter on local row
                 if let Some(expr) = where_expr {
-                    match expr.evaluate(&row) {
-                        Ok(true) => {}
-                        Ok(false) => continue,
-                        Err(_) => continue,
+                    if !passes(expr, fallible, &row)? {
+                        continue;
                     }
                 }
                 // Mark as deleted
@@ -3444,10 +3491,8 @@ impl Table for MVCCTable {
 
                 // Apply filter BEFORE cloning - evaluate on reference
                 if let Some(expr) = where_expr {
-                    match expr.evaluate(&version.data) {
-                        Ok(true) => {}
-                        Ok(false) => continue, // Skip clone entirely!
-                        Err(_) => continue,
+                    if !passes(expr, fallible, &version.data)? {
+                        continue; // Skip clone entirely!
                     }
                 }
 
@@ -3476,10 +3521,8 @@ impl Table for MVCCTable {
             if let Some(row) = row {
                 // Apply filter
                 if let Some(expr) = where_expr {
-                    match expr.evaluate(&row) {
-                        Ok(true) => {}
-                        Ok(false) => continue,
-                        Err(_) => continue,
+                    if !passes(expr, fallible, &row)? {
+                        continue;
                     }
                 }
 
@@ -3571,7 +3614,7 @@ impl Table for MVCCTable {
         #[cfg(test)]
         self.full_scans
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let rows = self.collect_visible_rows(where_expr);
+        let rows = self.collect_visible_rows(where_expr)?;
         self.check_read()?;
         let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
         Ok(Box::new(scanner))
@@ -3639,6 +3682,8 @@ impl Table for MVCCTable {
         // between the index and the version this transaction sees: the walk
         // order does not hold for it, and the full scan answers instead
         let mut stale = false;
+        let fallible = expr.can_fail();
+        let mut failed = None;
         let walked = plan.index.walk_prefix_ordered(
             &plan.prefix,
             plan.lower
@@ -3665,13 +3710,21 @@ impl Table for MVCCTable {
                     }
                     // The index may be ahead of this transaction's view of
                     // the row, so the whole WHERE is checked on the row
-                    if expr.evaluate_fast(&row) {
-                        rows.push((row_id, row));
+                    match passes(expr, fallible, &row) {
+                        Ok(true) => rows.push((row_id, row)),
+                        Ok(false) => {}
+                        Err(e) => {
+                            failed = Some(e);
+                            return false;
+                        }
                     }
                 }
                 rows.len() < needed
             },
         );
+        if let Some(e) = failed {
+            return Err(e);
+        }
         if !walked || stale || self.committed_index_epoch() != Some(epoch) {
             return Ok(None);
         }
@@ -3681,13 +3734,13 @@ impl Table for MVCCTable {
 
     fn collect_all_rows(&self, where_expr: Option<&dyn Expression>) -> Result<RowVec> {
         // Return cached row vector directly - caller iterates (i64, Row) tuples
-        let rows = self.collect_visible_rows(where_expr);
+        let rows = self.collect_visible_rows(where_expr)?;
         self.check_read()?;
         Ok(rows)
     }
 
     fn collect_all_rows_unsorted(&self) -> Result<RowVec> {
-        let rows = self.collect_visible_rows_unsorted();
+        let rows = self.collect_visible_rows_unsorted()?;
         self.check_read()?;
         Ok(rows)
     }
@@ -3715,7 +3768,7 @@ impl Table for MVCCTable {
         offset: usize,
     ) -> Result<RowVec> {
         // Use the optimized version with limit/offset
-        let rows = self.collect_visible_rows_with_limit(where_expr, limit, offset);
+        let rows = self.collect_visible_rows_with_limit(where_expr, limit, offset)?;
         self.check_read()?;
         Ok(rows)
     }
@@ -3727,7 +3780,7 @@ impl Table for MVCCTable {
         offset: usize,
     ) -> Result<RowVec> {
         // Use the optimized unordered version with true early termination
-        let rows = self.collect_visible_rows_with_limit_unordered(where_expr, limit, offset);
+        let rows = self.collect_visible_rows_with_limit_unordered(where_expr, limit, offset)?;
         self.check_read()?;
         Ok(rows)
     }
@@ -5124,6 +5177,7 @@ impl Table for MVCCTable {
 
         // Collect temporal rows
         let mut rows = Vec::new();
+        let fallible = expr.is_some_and(|e| e.can_fail());
         for row_id in row_ids {
             let version = match temporal_type.to_uppercase().as_str() {
                 "TRANSACTION" => self
@@ -5144,10 +5198,8 @@ impl Table for MVCCTable {
                 if !v.is_deleted() {
                     // Apply filter
                     if let Some(e) = expr {
-                        match e.evaluate(&v.data) {
-                            Ok(true) => {}
-                            Ok(false) => continue,
-                            Err(_) => continue,
+                        if !passes(e, fallible, &v.data)? {
+                            continue;
                         }
                     }
 

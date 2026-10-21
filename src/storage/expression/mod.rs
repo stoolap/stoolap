@@ -75,6 +75,12 @@ pub trait Expression: Send + Sync + Debug {
     /// Returns `false` on any error condition.
     fn evaluate_fast(&self, row: &Row) -> bool;
 
+    /// Whether evaluating a row can raise an error the statement must
+    /// report, as a function call can; `evaluate_fast` reads one as false
+    fn can_fail(&self) -> bool {
+        false
+    }
+
     /// Create a copy of this expression with column aliases resolved
     ///
     /// The aliases map maps alias names to original column names.
@@ -220,6 +226,19 @@ pub trait Expression: Send + Sync + Debug {
 impl Clone for Box<dyn Expression> {
     fn clone(&self) -> Self {
         self.clone_box()
+    }
+}
+
+/// Whether `row` passes `expr`, the one test every storage filter asks: an
+/// error `evaluate` raises is the statement's when `fallible`, which is
+/// `expr.can_fail()` taken once per scan, so a filter that cannot fail
+/// keeps the fast path
+#[inline]
+pub fn passes(expr: &dyn Expression, fallible: bool, row: &Row) -> Result<bool> {
+    if fallible {
+        expr.evaluate(row)
+    } else {
+        Ok(expr.evaluate_fast(row))
     }
 }
 
