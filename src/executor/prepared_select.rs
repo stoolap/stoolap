@@ -961,7 +961,7 @@ fn conjunction(parts: Vec<Expression>) -> Option<Expression> {
     })
 }
 
-fn slot_parameter(slot: usize) -> Expression {
+pub(crate) fn slot_parameter(slot: usize) -> Expression {
     let name = format!("${}", slot + 1);
     Expression::Parameter(Parameter {
         token: Token::new(TokenType::Parameter, &name, Position::default()),
@@ -2661,8 +2661,9 @@ impl PreparedSelect {
     }
 }
 
-/// The WHERE and SET of an UPDATE or DELETE whose subqueries run prepared,
-/// compiled against its target's columns over one set of blocks
+/// The WHERE and SET of an UPDATE or DELETE, or the VALUES of an INSERT,
+/// whose subqueries run prepared, compiled against its target's columns over
+/// one set of blocks
 #[derive(Debug)]
 pub struct PreparedDml {
     cached_epoch: u64,
@@ -2672,17 +2673,22 @@ pub struct PreparedDml {
     where_: Option<PreparedWhere>,
     /// Each SET value with the column it writes
     sets: Vec<(usize, SharedProgram)>,
+    /// Each VALUES row's programs, None for a value without a subquery
+    values: Vec<Vec<Option<SharedProgram>>>,
 }
 
 impl PreparedDml {
-    /// Prepare the WHERE and `sets` of a statement over its target `schema`,
-    /// named `scope_name`, for executions with `param_count` parameters
+    /// Prepare the WHERE, `sets` and `values` of a statement over its
+    /// target `schema`, named `scope_name`, for executions with
+    /// `param_count` parameters
+    #[allow(clippy::too_many_arguments)]
     fn prepare(
         executor: &Executor,
         schema: &Schema,
         scope_name: &SmartString,
         where_clause: Option<&Expression>,
         sets: &[(usize, &Expression)],
+        values: &[Vec<Expression>],
         param_count: usize,
         epoch: u64,
     ) -> Result<Self> {
@@ -2719,6 +2725,31 @@ impl PreparedDml {
             rewritten.push((*column, value));
         }
         let sets = rewritten;
+        let mut rewritten_values = Vec::with_capacity(values.len());
+        for row in values {
+            let mut programs = Vec::with_capacity(row.len());
+            for value in row {
+                if matches!(value, Expression::Default(_)) || !mentions_subquery(value) {
+                    programs.push(None);
+                    continue;
+                }
+                let mut value_work = Rewritten::default();
+                let rewritten_value = builder.rewrite(&chain, None, value, &mut value_work)?;
+                programs.push(Some(
+                    if !value_work.reads_row
+                        && !is_leaf(value)
+                        && !volatile(value, &executor.function_registry)
+                    {
+                        let slot = builder.slot();
+                        run_slots.push((slot, rewritten_value));
+                        slot_parameter(slot)
+                    } else {
+                        rewritten_value
+                    },
+                ));
+            }
+            rewritten_values.push(programs);
+        }
         let mut read_as = FxHashMap::default();
         if let Some(parts) = &where_parts {
             compare_as_scan(&parts.clause, schema, &mut read_as);
@@ -2734,6 +2765,19 @@ impl PreparedDml {
             .iter()
             .map(|(column, value)| compile_with(&own, value).map(|p| (*column, p)))
             .collect::<Result<Vec<_>>>()?;
+        // A VALUES row reads no row, so a column it names fails as it does
+        // outside a prepared plan
+        let no_columns: [String; 0] = [];
+        let unread = CompileContext::new(&no_columns, &executor.function_registry)
+            .with_prepared_subqueries();
+        let values = rewritten_values
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|value| value.as_ref().map(|v| compile_with(&unread, v)).transpose())
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
         let run_slots = run_slots
             .iter()
             .map(|(slot, value)| compile_with(&own, value).map(|p| (*slot, p)))
@@ -2748,6 +2792,7 @@ impl PreparedDml {
             blocks,
             where_,
             sets,
+            values,
         })
     }
 }
@@ -2872,6 +2917,11 @@ impl<'a> DmlRunner<'a> {
     /// Each SET value's program with the column it writes
     pub(crate) fn sets(&self) -> &'a [(usize, SharedProgram)] {
         &self.prepared.sets
+    }
+
+    /// The programs of each VALUES row, None for a value without a subquery
+    pub(crate) fn values(&self) -> &'a [Vec<Option<SharedProgram>>] {
+        &self.prepared.values
     }
 }
 
@@ -3129,10 +3179,11 @@ impl Executor {
         family.catalog()
     }
 
-    /// The plan's prepared UPDATE or DELETE over a target of `schema`,
-    /// named `scope_name`, with its blocks' tables open; prepared now when
-    /// the plan holds none for this schema, these columns and this
+    /// The plan's prepared UPDATE, DELETE or INSERT over a target of
+    /// `schema`, named `scope_name`, with its blocks' tables open; prepared
+    /// now when the plan holds none for this schema, these columns and this
     /// parameter count
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_prepared_dml(
         &self,
         compiled: Option<&RwLock<CompiledExecution>>,
@@ -3140,6 +3191,7 @@ impl Executor {
         scope_name: &SmartString,
         where_clause: Option<&Expression>,
         sets: &[(usize, &Expression)],
+        values: &[Vec<Expression>],
         ctx: &ExecutionContext,
     ) -> Result<(Arc<PreparedDml>, DmlTables)> {
         let epoch = self.engine.schema_epoch();
@@ -3170,6 +3222,7 @@ impl Executor {
                         scope_name,
                         where_clause,
                         sets,
+                        values,
                         ctx.params().len(),
                         epoch,
                     )?);

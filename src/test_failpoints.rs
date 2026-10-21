@@ -1528,8 +1528,8 @@ pub(crate) fn prepared_strategy_ran(strategy: PreparedStrategy) {
     PREPARED_STRATEGY_RUNS[strategy as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Every site of an UPDATE or DELETE whose subqueries run prepared. The
-/// equivalence test fails for a variant no case of it reaches
+/// Every site of an UPDATE, DELETE or INSERT whose subqueries run prepared.
+/// The equivalence test fails for a variant no case of it reaches
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreparedDmlSite {
     /// An UPDATE's WHERE, asked of each row it writes
@@ -1538,23 +1538,26 @@ pub enum PreparedDmlSite {
     UpdateSet,
     /// A DELETE's WHERE
     DeleteWhere,
+    /// An INSERT's VALUES
+    InsertValues,
 }
 
 impl PreparedDmlSite {
-    pub const ALL: [PreparedDmlSite; 3] = [
+    pub const ALL: [PreparedDmlSite; 4] = [
         PreparedDmlSite::UpdateWhere,
         PreparedDmlSite::UpdateSet,
         PreparedDmlSite::DeleteWhere,
+        PreparedDmlSite::InsertValues,
     ];
 }
 
 /// Process-wide: how often each prepared DML site ran
-static PREPARED_DML_SITE_RUNS: [std::sync::atomic::AtomicUsize; 3] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; 3];
+static PREPARED_DML_SITE_RUNS: [std::sync::atomic::AtomicUsize; 4] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 4];
 
 static PREPARED_DML_BUILT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// UPDATE and DELETE statements prepared, so far
+/// UPDATE, DELETE and INSERT statements prepared, so far
 pub fn prepared_dml_built() -> usize {
     PREPARED_DML_BUILT.load(std::sync::atomic::Ordering::Relaxed)
 }

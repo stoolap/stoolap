@@ -393,6 +393,8 @@ An `UPDATE` or `DELETE` is prepared the same way when its `WHERE` or a `SET` val
 
 Every subquery of an `UPDATE` or `DELETE`, the ones that read the target table included, sees the tables as the statement found them: a row the statement updates or deletes does not change what a subquery answers for the next row.
 
+An `INSERT ... VALUES` is prepared the same way when a value holds a subquery and every value fits the shape above. Every value is read before the statement writes a row, so a subquery that reads the target table sees it as the statement found it, without the rows the statement inserts. A scalar subquery that answers more than one row fails the statement and writes no row.
+
 ## Examples
 
 ### Example 1: Delete Orders from High-Value Customers
@@ -559,6 +561,7 @@ Currently, Stoolap supports the following subquery features:
 - Subqueries in DELETE WHERE clauses
 - Subqueries in UPDATE WHERE clauses
 - Subqueries in UPDATE SET clauses
+- Subqueries in INSERT VALUES
 - Proper NULL handling for subqueries returning no rows
 - Error detection for scalar subqueries returning multiple rows
 - Optimization for EXISTS (stops on first row found)
@@ -568,7 +571,7 @@ Currently, Stoolap supports the following subquery features:
 
 A subquery in these positions is refused with an error rather than answered. Support arrives as each position moves to prepared plans:
 
-- `INSERT ... VALUES`, `ON CONFLICT ... DO UPDATE SET` and `RETURNING`
+- `ON CONFLICT ... DO UPDATE SET` and `RETURNING`, and `INSERT ... VALUES` in a statement with `ON CONFLICT`
 - An `UPDATE` that sets one column from a correlated subquery and another from an uncorrelated one, when one of its subqueries is outside the [prepared](#prepared-subqueries) shape
 - `GROUP BY` and `DISTINCT ON` expressions
 - `HAVING` in a query that also has window functions
