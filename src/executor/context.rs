@@ -1255,10 +1255,12 @@ pub(crate) struct ReadCounts {
     pub(crate) counts: smallvec::SmallVec<[ReadCount; 2]>,
 }
 
-/// One LIMIT or OFFSET count, by its expression: the statement's own at
-/// `address`, or a copy of it built for a rebuilt statement, by `key`
+/// One count of `clause`, LIMIT or OFFSET, by its expression: the
+/// statement's own at `address`, or a copy built for a rebuilt statement,
+/// by `key`
 #[derive(Debug)]
 pub(crate) struct ReadCount {
+    pub(crate) clause: &'static str,
     pub(crate) address: usize,
     pub(crate) key: super::expr_key::ExprKey,
     pub(crate) count: usize,
@@ -1716,22 +1718,24 @@ impl ExecutionContext {
         self
     }
 
-    /// The count a statement at this depth read for its LIMIT or OFFSET
-    /// expression `expr` before its rows, if it read one
-    pub(crate) fn read_count(&self, expr: &crate::parser::ast::Expression) -> Option<usize> {
+    /// The count a statement at this depth read for its `clause`, LIMIT or
+    /// OFFSET, written `expr`, before its rows, if it read one
+    pub(crate) fn read_count(
+        &self,
+        expr: &crate::parser::ast::Expression,
+        clause: &'static str,
+    ) -> Option<usize> {
         let read = self.read_counts.as_deref()?;
         if read.depth != self.query_depth {
             return None;
         }
+        let mut counts = read.counts.iter().filter(|read| read.clause == clause);
         let address = expr as *const _ as usize;
-        if let Some(read) = read.counts.iter().find(|read| read.address == address) {
+        if let Some(read) = counts.clone().find(|read| read.address == address) {
             return Some(read.count);
         }
         let key = super::expr_key::ExprKey::of(expr);
-        read.counts
-            .iter()
-            .find(|read| read.key == key)
-            .map(|read| read.count)
+        counts.find(|read| read.key == key).map(|read| read.count)
     }
 
     /// This context carrying `counts`, read for a statement at its depth

@@ -947,9 +947,16 @@ impl Executor {
 
     /// Whether the query-on-CTE-result path can finish a statement by
     /// itself: it leaves set operations, DISTINCT and ORDER BY, which the
-    /// standard sort binds by the output's layout, to execute_select
+    /// standard sort binds by the output's layout, and a LIMIT or OFFSET
+    /// subquery, which execute_select reads first, to execute_select
     fn cte_result_path_finishes(stmt: &SelectStatement) -> bool {
-        stmt.set_operations.is_empty() && !stmt.distinct && stmt.order_by.is_empty()
+        stmt.set_operations.is_empty()
+            && !stmt.distinct
+            && stmt.order_by.is_empty()
+            && ![stmt.limit.as_deref(), stmt.offset.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(Self::has_subqueries)
     }
 
     // =========================================================================

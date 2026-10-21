@@ -372,7 +372,7 @@ LIMIT (SELECT COUNT(*) FROM categories WHERE featured = true);
 SELECT * FROM products LIMIT (SELECT MAX(id) FROM categories WHERE 1 = 0);
 ```
 
-A subquery block that runs once for each row of its enclosing query, because its `WHERE` reads that row, cannot hold a `LIMIT` or `OFFSET` subquery, and such a subquery cannot read a CTE of its own statement: it is read before the CTEs are.
+A subquery block that runs once for each row of its enclosing query, because its `WHERE` reads that row, cannot hold a `LIMIT` or `OFFSET` subquery, and such a subquery cannot read a CTE: naming one is an error, even where a table of that name exists.
 
 ## How Subqueries Work
 

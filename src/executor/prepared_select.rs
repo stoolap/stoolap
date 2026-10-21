@@ -472,12 +472,15 @@ impl Executor {
         for ob in &stmt.order_by {
             family.expression(&ob.expression, 1, Site::Values, &mut found)?;
         }
-        for clause in [&stmt.limit, &stmt.offset].into_iter().flatten() {
+        for (count, clause) in [(&stmt.limit, "LIMIT"), (&stmt.offset, "OFFSET")] {
+            let Some(count) = count else {
+                continue;
+            };
             // A count holding a subquery was read before the statement's rows
             if !matches!(
-                **clause,
+                **count,
                 Expression::IntegerLiteral(_) | Expression::Parameter(_)
-            ) && !ctx.is_some_and(|ctx| ctx.read_count(clause).is_some())
+            ) && !ctx.is_some_and(|ctx| ctx.read_count(count, clause).is_some())
             {
                 return Err("LIMIT or OFFSET that is not a literal or a parameter");
             }

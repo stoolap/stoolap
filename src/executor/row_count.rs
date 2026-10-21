@@ -89,7 +89,7 @@ pub(crate) fn row_count(
     let value = match expr {
         Expression::IntegerLiteral(lit) => Value::Integer(lit.value),
         // A count holding a subquery was read before the statement's rows
-        _ => match ctx.read_count(expr) {
+        _ => match ctx.read_count(expr, clause) {
             Some(count) => return Ok(count),
             None => evaluate_once(expr, Some(ctx))?,
         },

@@ -101,6 +101,18 @@ const TWINS: &[(&str, &str)] = &[
         "SELECT * FROM (SELECT id FROM t ORDER BY id LIMIT (SELECT 2)) d ORDER BY id DESC LIMIT (SELECT 1)",
         "SELECT * FROM (SELECT id FROM t ORDER BY id LIMIT 2) d ORDER BY id DESC LIMIT 1",
     ),
+    (
+        "WITH c(id) AS (SELECT id FROM t ORDER BY id LIMIT (SELECT 1) OFFSET (SELECT 2)) SELECT id FROM c LIMIT (SELECT 1)",
+        "WITH c(id) AS (SELECT id FROM t ORDER BY id LIMIT 1 OFFSET 2) SELECT id FROM c LIMIT 1",
+    ),
+    (
+        "WITH c(id) AS (SELECT id FROM t), d(id) AS (SELECT id FROM c LIMIT (SELECT 2)) SELECT id FROM d ORDER BY id",
+        "WITH c(id) AS (SELECT id FROM t), d(id) AS (SELECT id FROM c LIMIT 2) SELECT id FROM d ORDER BY id",
+    ),
+    (
+        "WITH c AS (SELECT id FROM t) SELECT id FROM c LIMIT (SELECT 3) OFFSET (SELECT 1)",
+        "WITH c AS (SELECT id FROM t) SELECT id FROM c LIMIT 3 OFFSET 1",
+    ),
 ];
 
 #[test]
@@ -173,7 +185,11 @@ fn a_limit_subquery_takes_the_rule_of_a_count() {
         ("SELECT id FROM t LIMIT (SELECT a)", "column 'a' not found"),
         (
             "WITH c AS (SELECT id FROM t) SELECT id FROM c LIMIT (SELECT COUNT(*) FROM c)",
-            "not found",
+            "FROM names a CTE",
+        ),
+        (
+            "WITH u AS (SELECT 1 AS x) SELECT id FROM t ORDER BY id LIMIT (SELECT COUNT(*) FROM u)",
+            "FROM names a CTE",
         ),
     ] {
         let got = answer(db.query(sql, ()));

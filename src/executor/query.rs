@@ -1076,6 +1076,7 @@ impl Executor {
             if let (Some(count), Some(key), Some(Some(program))) = (count, key, programs.first()) {
                 let value = vm.execute_cow(program, &exec)?;
                 counts.push(super::context::ReadCount {
+                    clause,
                     address: *count as *const Expression as usize,
                     key,
                     count: super::row_count::count_of(value, clause)?,
@@ -1117,20 +1118,6 @@ impl Executor {
         // Check for cancellation at entry point
         ctx.check_cancelled()?;
 
-        // A LIMIT or OFFSET subquery is read once, before any path reads a row
-        let counts_ctx;
-        let ctx = match [stmt.limit.as_deref(), stmt.offset.as_deref()]
-            .into_iter()
-            .flatten()
-            .find(|count| Self::has_subqueries(count))
-        {
-            Some(count) if ctx.read_count(count).is_none() => {
-                counts_ctx = self.read_row_counts(stmt, ctx, counts)?;
-                &counts_ctx
-            }
-            _ => ctx,
-        };
-
         // Validate: aggregate functions are not allowed in WHERE clause
         if let Some(ref where_clause) = stmt.where_clause {
             if expression_contains_aggregate(where_clause) {
@@ -1145,6 +1132,20 @@ impl Executor {
         if self.has_cte(stmt) {
             return self.execute_select_with_ctes(stmt, ctx);
         }
+
+        // A LIMIT or OFFSET subquery is read once, before any path reads a
+        // row, with the CTEs of the statement bound
+        let counts_ctx;
+        let ctx = if [stmt.limit.as_deref(), stmt.offset.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(Self::has_subqueries)
+        {
+            counts_ctx = self.read_row_counts(stmt, ctx, counts)?;
+            &counts_ctx
+        } else {
+            ctx
+        };
 
         // OPTIMIZATION: Get cached query classification ONCE at entry point
         // This classification is passed through the call chain to avoid
