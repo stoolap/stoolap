@@ -24,7 +24,7 @@ use crate::core::Result;
 
 use super::expression::SharedProgram;
 use super::join_executor::JoinAnalysis;
-use super::prepared_select::JoinWhere;
+use super::prepared_select::JoinBlocks;
 use super::query::JoinOutput;
 
 /// The programs one compile builds, shared only once they are held
@@ -156,10 +156,11 @@ pub struct PreparedJoin {
     analyses: Shelf<AnalysisKey, JoinAnalysis>,
     /// None stands for a SELECT list each execution projects anew
     outputs: Shelf<OutputKey, Option<JoinOutput>>,
-    wheres: Shelf<WhereKey, JoinWhere>,
-    /// Whether the WHERE's subqueries all stand in what is asked of the
-    /// joined rows, as the statement's blocks; decided on first need
+    wheres: Shelf<WhereKey, SharedProgram>,
+    /// Whether the ON's and the WHERE's subqueries run as the statement's
+    /// blocks; decided on first need
     blocks_where: std::sync::OnceLock<bool>,
+    join_blocks: RwLock<Option<Arc<JoinBlocks>>>,
 }
 
 impl PreparedJoin {
@@ -171,6 +172,7 @@ impl PreparedJoin {
             outputs: Shelf::new(),
             wheres: Shelf::new(),
             blocks_where: std::sync::OnceLock::new(),
+            join_blocks: RwLock::new(None),
         }
     }
 
@@ -253,26 +255,46 @@ impl PreparedJoin {
         Ok(read(&built))
     }
 
-    /// The WHERE held for `site` over `columns`, or the one `build` makes
-    pub(crate) fn where_clause(
+    /// The WHERE program held for `site` over `columns`, or the one
+    /// `compile` builds
+    pub(crate) fn where_program(
         &self,
         site: WhereSite,
         columns: &[String],
-        build: impl FnOnce() -> Result<JoinWhere>,
-    ) -> Result<Arc<JoinWhere>> {
+        compile: impl FnOnce() -> Result<SharedProgram>,
+    ) -> Result<SharedProgram> {
         let wanted = |held: &WhereKey| held.site == site && held.columns == columns;
         if let Some(held) = self.wheres.find(wanted) {
-            return Ok(held);
+            return Ok(SharedProgram::clone(&held));
         }
-        let built = Arc::new(build()?);
+        let built = compile()?;
         self.wheres.hold(
             wanted,
             || WhereKey {
                 site,
                 columns: columns.to_vec(),
             },
-            || Arc::clone(&built),
+            || Arc::new(SharedProgram::clone(&built)),
         );
         Ok(built)
+    }
+
+    /// The statement's blocks, or the ones `build` prepares, then held;
+    /// none when `build` prepares none
+    pub(crate) fn join_blocks(
+        &self,
+        build: impl FnOnce() -> Result<Option<JoinBlocks>>,
+    ) -> Result<Option<Arc<JoinBlocks>>> {
+        if let Some(held) = self.join_blocks.read().ok().and_then(|held| held.clone()) {
+            return Ok(Some(held));
+        }
+        let Some(built) = build()? else {
+            return Ok(None);
+        };
+        let built = Arc::new(built);
+        if let Ok(mut held) = self.join_blocks.write() {
+            held.get_or_insert_with(|| Arc::clone(&built));
+        }
+        Ok(Some(built))
     }
 }

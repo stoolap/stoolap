@@ -1,0 +1,401 @@
+// Copyright 2025 Stoolap Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! A join of two tables whose ON holds subqueries runs them as the plan's
+//! blocks, inside every join algorithm: over the pair an index join or a
+//! nested loop asks, over the joined row a hash join asks. It answers as
+//! the general path does, hot and sealed, and run again compiles nothing
+
+#![cfg(feature = "test-failpoints")]
+
+use std::collections::BTreeSet;
+
+use stoolap::test_failpoints::{
+    bridge_compiles, join_paths_taken, program_compiles, reset_join_paths,
+};
+use stoolap::Database;
+
+/// l: id 1..30, k = id % 7, g = (id - 1) / 10; r: id 1..50, k = id % 7
+/// (indexed), w = id % 5; s: id 1..90, a = id % 31, b = id % 51;
+/// bl and br: 12000 rows each, u = id, v = id % 100
+fn fill(db: &Database) {
+    for sql in [
+        "CREATE TABLE l (id INTEGER PRIMARY KEY, k INTEGER, g INTEGER)",
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, k INTEGER, w INTEGER)",
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+        "CREATE INDEX r_k ON r (k)",
+        "INSERT INTO l SELECT g.value, g.value % 7, (g.value - 1) / 10 FROM generate_series(1, 30) g",
+        "INSERT INTO r SELECT g.value, g.value % 7, g.value % 5 FROM generate_series(1, 50) g",
+        "INSERT INTO s SELECT g.value, g.value % 31, g.value % 51 FROM generate_series(1, 90) g",
+        "CREATE TABLE bl (id INTEGER PRIMARY KEY, u INTEGER, v INTEGER)",
+        "CREATE TABLE br (id INTEGER PRIMARY KEY, u INTEGER, v INTEGER)",
+        "INSERT INTO bl SELECT g.value, g.value, g.value % 100 FROM generate_series(1, 12000) g",
+        "INSERT INTO br SELECT g.value, g.value, g.value % 100 FROM generate_series(1, 12000) g",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+}
+
+/// The (a, b) pairs of s
+fn s_pairs() -> BTreeSet<(i64, i64)> {
+    (1..=90).map(|id| (id % 31, id % 51)).collect()
+}
+
+fn row(left: Option<i64>, right: Option<i64>) -> String {
+    let show = |v: Option<i64>| v.map_or("Null(Null)".to_string(), |v| format!("Integer({v})"));
+    format!("{}|{}", show(left), show(right))
+}
+
+/// `l LEFT JOIN r ON l.g = r.w AND r.id IN (SELECT s.b FROM s WHERE s.a = l.g)`
+fn left_in() -> Vec<String> {
+    let s = s_pairs();
+    let mut out = Vec::new();
+    for l in 1..=30i64 {
+        let g = (l - 1) / 10;
+        let matched: Vec<i64> = (1..=50i64)
+            .filter(|r| g == r % 5 && s.contains(&(g, *r)))
+            .collect();
+        match matched.is_empty() {
+            true => out.push(row(Some(l), None)),
+            false => out.extend(matched.into_iter().map(|r| row(Some(l), Some(r)))),
+        }
+    }
+    out.sort();
+    out
+}
+
+/// `l RIGHT JOIN r ON l.g = r.w AND EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id)`
+fn right_exists() -> Vec<String> {
+    let s = s_pairs();
+    let mut out = Vec::new();
+    for r in 1..=50i64 {
+        let matched: Vec<i64> = (1..=30i64)
+            .filter(|l| (l - 1) / 10 == r % 5 && s.contains(&(*l, r)))
+            .collect();
+        match matched.is_empty() {
+            true => out.push(row(None, Some(r))),
+            false => out.extend(matched.into_iter().map(|l| row(Some(l), Some(r)))),
+        }
+    }
+    out.sort();
+    out
+}
+
+/// `l LEFT JOIN r ON l.g < r.w AND EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id)`
+fn left_nested_exists() -> Vec<String> {
+    let s = s_pairs();
+    let mut out = Vec::new();
+    for l in 1..=30i64 {
+        let matched: Vec<i64> = (1..=50i64)
+            .filter(|r| (l - 1) / 10 < r % 5 && s.contains(&(l, *r)))
+            .collect();
+        match matched.is_empty() {
+            true => out.push(row(Some(l), None)),
+            false => out.extend(matched.into_iter().map(|r| row(Some(l), Some(r)))),
+        }
+    }
+    out.sort();
+    out
+}
+
+enum Reference {
+    /// The same statement with the ON's subquery moved to a WHERE over
+    /// derived sides, which the general path answers per joined row
+    Moved(&'static str),
+    Computed(fn() -> Vec<String>),
+}
+
+struct Case {
+    sql: &'static str,
+    path: &'static str,
+    reference: Reference,
+    /// A LIMIT without ORDER BY may return any of the reference's rows
+    limit: Option<usize>,
+}
+
+const CASES: &[Case] = &[
+    Case {
+        sql: "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w AND EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id)",
+        path: "hash",
+        reference: Reference::Moved(
+            "SELECT l.id, r.id FROM (SELECT * FROM l) l JOIN (SELECT * FROM r) r ON l.g = r.w WHERE EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id)",
+        ),
+        limit: None,
+    },
+    Case {
+        sql: "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w AND l.id < (SELECT MAX(s.b) FROM s WHERE s.a = r.w)",
+        path: "hash",
+        reference: Reference::Moved(
+            "SELECT l.id, r.id FROM (SELECT * FROM l) l JOIN (SELECT * FROM r) r ON l.g = r.w WHERE l.id < (SELECT MAX(s.b) FROM s WHERE s.a = r.w)",
+        ),
+        limit: None,
+    },
+    Case {
+        sql: "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w AND l.id > ANY (SELECT s.b FROM s WHERE s.a = r.w)",
+        path: "hash",
+        reference: Reference::Moved(
+            "SELECT l.id, r.id FROM (SELECT * FROM l) l JOIN (SELECT * FROM r) r ON l.g = r.w WHERE l.id > ANY (SELECT s.b FROM s WHERE s.a = r.w)",
+        ),
+        limit: None,
+    },
+    Case {
+        sql: "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w AND l.id + r.id > (SELECT MIN(s.b) FROM s WHERE s.a = 5)",
+        path: "hash",
+        reference: Reference::Moved(
+            "SELECT l.id, r.id FROM (SELECT * FROM l) l JOIN (SELECT * FROM r) r ON l.g = r.w WHERE l.id + r.id > (SELECT MIN(s.b) FROM s WHERE s.a = 5)",
+        ),
+        limit: None,
+    },
+    Case {
+        sql: "SELECT l.id, r.id FROM l LEFT JOIN r ON l.g = r.w AND r.id IN (SELECT s.b FROM s WHERE s.a = l.g)",
+        path: "hash",
+        reference: Reference::Computed(left_in),
+        limit: None,
+    },
+    Case {
+        sql: "SELECT l.id, r.id FROM l RIGHT JOIN r ON l.g = r.w AND EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id)",
+        path: "hash",
+        reference: Reference::Computed(right_exists),
+        limit: None,
+    },
+    Case {
+        sql: "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w AND l.id < (SELECT MAX(s.b) FROM s WHERE s.a = r.w) LIMIT 7",
+        path: "limit_hash",
+        reference: Reference::Moved(
+            "SELECT l.id, r.id FROM (SELECT * FROM l) l JOIN (SELECT * FROM r) r ON l.g = r.w WHERE l.id < (SELECT MAX(s.b) FROM s WHERE s.a = r.w)",
+        ),
+        limit: Some(7),
+    },
+    Case {
+        sql: "SELECT l.id, r.id FROM l JOIN r ON l.g < r.w AND EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id)",
+        path: "nested_loop",
+        reference: Reference::Moved(
+            "SELECT l.id, r.id FROM (SELECT * FROM l) l JOIN (SELECT * FROM r) r ON l.g < r.w WHERE EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id)",
+        ),
+        limit: None,
+    },
+    Case {
+        sql: "SELECT l.id, r.id FROM l LEFT JOIN r ON l.g < r.w AND EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id)",
+        path: "nested_loop",
+        reference: Reference::Computed(left_nested_exists),
+        limit: None,
+    },
+    Case {
+        sql: "SELECT l.id, r.id FROM l JOIN r ON l.k = r.id AND r.w IN (SELECT s.b FROM s WHERE s.a = l.id)",
+        path: "batch_index_nested_loop",
+        reference: Reference::Moved(
+            "SELECT l.id, r.id FROM (SELECT * FROM l) l JOIN (SELECT * FROM r) r ON l.k = r.id WHERE r.w IN (SELECT s.b FROM s WHERE s.a = l.id)",
+        ),
+        limit: None,
+    },
+    Case {
+        sql: "SELECT r.id, l.id FROM r JOIN l ON r.id = l.k AND EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b > r.w) WHERE l.g = 1",
+        path: "batch_index_nested_loop",
+        reference: Reference::Moved(
+            "SELECT r.id, l.id FROM (SELECT * FROM r) r JOIN (SELECT * FROM l) l ON r.id = l.k WHERE l.g = 1 AND EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b > r.w)",
+        ),
+        limit: None,
+    },
+    Case {
+        sql: "SELECT l.id, r.id FROM l JOIN r ON l.k = r.k AND r.id > (SELECT MIN(s.b) FROM s WHERE s.a = l.id) LIMIT 30",
+        path: "index_nested_loop",
+        reference: Reference::Moved(
+            "SELECT l.id, r.id FROM (SELECT * FROM l) l JOIN (SELECT * FROM r) r ON l.k = r.k WHERE r.id > (SELECT MIN(s.b) FROM s WHERE s.a = l.id)",
+        ),
+        limit: Some(30),
+    },
+    Case {
+        sql: "SELECT COUNT(*), SUM(bl.id) FROM bl JOIN br ON bl.u = br.u AND br.v IN (SELECT s.b FROM s WHERE s.a < 9)",
+        path: "parallel_hash",
+        reference: Reference::Moved(
+            "SELECT COUNT(*), SUM(bl.id) FROM (SELECT * FROM bl) bl JOIN (SELECT * FROM br) br ON bl.u = br.u WHERE br.v IN (SELECT s.b FROM s WHERE s.a < 9)",
+        ),
+        limit: None,
+    },
+];
+
+/// The first two values of each row of `sql` as sorted text, or the error
+fn rows(db: &Database, sql: &str) -> Result<Vec<String>, String> {
+    let result = db.query(sql, ()).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in result {
+        let row = row.map_err(|e| e.to_string())?;
+        out.push(format!(
+            "{:?}|{:?}",
+            row.get_value(0).unwrap(),
+            row.get_value(1).unwrap()
+        ));
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Whether every row of `part` is in `whole`, as often as it is there
+fn contained(part: &[String], whole: &[String]) -> bool {
+    let mut left = whole.to_vec();
+    part.iter()
+        .all(|row| match left.iter().position(|w| w == row) {
+            Some(at) => {
+                left.swap_remove(at);
+                true
+            }
+            None => false,
+        })
+}
+
+#[test]
+fn a_join_on_runs_its_subqueries_as_blocks() {
+    let mut wrong = Vec::new();
+    for sealed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = if sealed {
+            let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+            fill(&db);
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+            db
+        } else {
+            let db = Database::open("memory://join_on_blocks").unwrap();
+            fill(&db);
+            db
+        };
+        for case in CASES {
+            let first = rows(&db, case.sql);
+            let bridge = bridge_compiles();
+            let programs = program_compiles();
+            reset_join_paths();
+            let again = rows(&db, case.sql);
+            let taken = join_paths_taken();
+            let compiled = (bridge_compiles() - bridge, program_compiles() - programs);
+            let want = match &case.reference {
+                Reference::Moved(sql) => rows(&db, sql),
+                Reference::Computed(rows) => Ok(rows()),
+            };
+            if taken != [case.path] {
+                wrong.push(format!(
+                    "sealed {sealed}: {}: took {taken:?}, expected {}",
+                    case.sql, case.path
+                ));
+            }
+            if compiled != (0, 0) {
+                wrong.push(format!(
+                    "sealed {sealed}: {}: run again, compiled {compiled:?}",
+                    case.sql
+                ));
+            }
+            let answers = |got: &Result<Vec<String>, String>| match (got, &want, case.limit) {
+                (Ok(got), Ok(want), Some(limit)) => {
+                    got.len() == limit.min(want.len()) && contained(got, want)
+                }
+                (got, want, None) => got == want,
+                _ => false,
+            };
+            if !answers(&first) || !answers(&again) {
+                wrong.push(format!(
+                    "sealed {sealed}: {}: gave {first:?} then {again:?}, the reference {want:?}",
+                    case.sql
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+#[test]
+fn an_on_block_that_errors_errors_as_the_general_path_does() {
+    let db = Database::open("memory://join_on_blocks_error").unwrap();
+    fill(&db);
+    let want = rows(
+        &db,
+        "SELECT l.id, r.id FROM (SELECT * FROM l) l JOIN (SELECT * FROM r) r ON l.g = r.w \
+         WHERE l.id < (SELECT s.b FROM s WHERE s.a = r.w)",
+    );
+    assert!(
+        want.as_ref()
+            .is_err_and(|e| e.contains("more than one row")),
+        "the general path errors: {want:?}"
+    );
+    let sql = "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w AND l.id < (SELECT s.b FROM s WHERE s.a = r.w)";
+    for _ in 0..2 {
+        assert_eq!(rows(&db, sql), want, "{sql}");
+    }
+}
+
+#[test]
+fn an_uncorrelated_on_block_no_pair_reaches_is_not_read() {
+    let db = Database::open("memory://join_on_blocks_lazy").unwrap();
+    fill(&db);
+    let sql =
+        "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w AND l.id < 0 AND l.id < (SELECT s.b FROM s)";
+    for _ in 0..2 {
+        assert_eq!(rows(&db, sql), Ok(Vec::new()), "no pair reads the block");
+    }
+}
+
+#[test]
+fn an_on_block_binds_a_dotted_column_by_position() {
+    let db = Database::open("memory://join_on_blocks_dotted").unwrap();
+    for sql in [
+        "CREATE TABLE l (id INTEGER PRIMARY KEY, \"x.y\" INTEGER)",
+        "CREATE TABLE r (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE s (v INTEGER PRIMARY KEY)",
+        "INSERT INTO l VALUES (1, 10), (2, 20)",
+        "INSERT INTO r VALUES (1), (2)",
+        "INSERT INTO s VALUES (11)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let sql = "SELECT l.id, r.id FROM l JOIN r ON l.id = r.id \
+               AND EXISTS (SELECT 1 FROM s WHERE s.v = l.\"x.y\" + r.id)";
+    for _ in 0..2 {
+        assert_eq!(
+            rows(&db, sql),
+            Ok(vec!["Integer(1)|Integer(1)".to_string()]),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn an_on_block_reads_the_transaction_s_own_writes() {
+    let db = Database::open("memory://join_on_blocks_tx").unwrap();
+    fill(&db);
+    let sql = "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w \
+               AND EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id + 1000)";
+    let mut tx = db.begin().unwrap();
+    tx.execute("INSERT INTO s VALUES (1000, 3, 1005)", ())
+        .unwrap();
+    let got: Vec<String> = tx
+        .query(sql, ())
+        .unwrap()
+        .map(|row| {
+            let row = row.unwrap();
+            format!(
+                "{:?}|{:?}",
+                row.get_value(0).unwrap(),
+                row.get_value(1).unwrap()
+            )
+        })
+        .collect();
+    tx.rollback().unwrap();
+    assert_eq!(
+        got,
+        vec!["Integer(3)|Integer(5)".to_string()],
+        "the block sees the row the transaction inserted"
+    );
+}

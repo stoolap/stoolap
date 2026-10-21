@@ -214,7 +214,7 @@ fn test_correlated_conjunct_beside_an_indexed_in() {
 fn test_correlated_join_on() {
     site(
         "site_correlated_on",
-        Fails("step 3"),
+        Right,
         "SELECT t.id, u.id FROM t JOIN u ON u.id = (SELECT MIN(w.id) FROM u w WHERE w.x = t.a) ORDER BY t.id",
         "SELECT t.id, u.id FROM t JOIN u ON u.id = t.a ORDER BY t.id",
     );

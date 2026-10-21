@@ -596,12 +596,22 @@ impl RowFilter {
     /// Returns Err if the filter expression produces a runtime error
     /// (e.g. invalid REGEXP pattern supplied via a parameter).
     pub fn retain_checked(&self, rows: &mut crate::core::RowVec) -> Result<()> {
+        self.retain_checked_with(rows, None)
+    }
+
+    /// `retain_checked` for a program whose subqueries run as the
+    /// statement's prepared blocks, which `blocks` answers
+    pub fn retain_checked_with(
+        &self,
+        rows: &mut crate::core::RowVec,
+        blocks: Option<&dyn SubqueryExecutor>,
+    ) -> Result<()> {
         let mut error: Option<crate::core::Error> = None;
         rows.retain(|(_, row)| {
             if error.is_some() {
                 return false;
             }
-            match self.matches_checked(row) {
+            match self.matches_checked_with(row, blocks) {
                 Ok(b) => b,
                 Err(e) => {
                     error = Some(e);
@@ -700,6 +710,19 @@ impl JoinFilter {
     /// `take_error`
     #[inline]
     pub fn matches(&self, left_row: &Row, right_row: &Row, failed: &mut bool) -> bool {
+        self.matches_with(left_row, right_row, failed, None)
+    }
+
+    /// `matches` for a condition whose subqueries run as the statement's
+    /// prepared blocks, which `blocks` answers for the pair
+    #[inline]
+    pub fn matches_with(
+        &self,
+        left_row: &Row,
+        right_row: &Row,
+        failed: &mut bool,
+        blocks: Option<&dyn SubqueryExecutor>,
+    ) -> bool {
         JOIN_VM.with(|vm| {
             let mut ctx = ExecuteContext::for_join(left_row, right_row);
 
@@ -711,6 +734,9 @@ impl JoinFilter {
                 ctx = ctx.with_named_params(&self.named_params);
             }
             ctx = ctx.with_transaction_id(self.transaction_id);
+            if let Some(blocks) = blocks {
+                ctx = ctx.with_subquery_executor(blocks);
+            }
 
             // Use try_borrow_mut to avoid panic on recursive calls (e.g., nested subqueries).
             // If the VM is already borrowed, create a temporary one for this call.

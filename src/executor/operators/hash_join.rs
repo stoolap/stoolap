@@ -38,7 +38,7 @@ use crate::common::CompactArc;
 use crate::core::predicate::{sql_eq, KeySide, TextReading};
 use crate::core::value::NULL_VALUE;
 use crate::core::{Result, Row, Value, ValueMap};
-use crate::executor::expression::RowFilter;
+use crate::executor::expression::{RowFilter, SubqueryExecutor};
 use crate::executor::hash_table::{
     hash_key_value, hash_row_keys, verify_key_equality, JoinHashTable,
 };
@@ -207,7 +207,7 @@ impl JoinType {
 ///
 /// For OUTER joins, additional tracking is used to ensure unmatched
 /// rows are returned with NULL padding.
-pub struct HashJoinOperator {
+pub struct HashJoinOperator<'a> {
     // Input operators
     left: Box<dyn Operator>,
     right: Box<dyn Operator>,
@@ -240,6 +240,8 @@ pub struct HashJoinOperator {
     // Non-equality ON conditions, applied to each candidate pair before it
     // counts as a match. Empty when the whole ON clause is equi-keys.
     residual: Vec<RowFilter>,
+    // The statement's subquery blocks, as the residual's site calls them
+    blocks: Option<&'a dyn SubqueryExecutor>,
 
     // For OUTER joins: track which build rows were matched
     build_matched: Vec<bool>,
@@ -273,7 +275,7 @@ struct CrossKey {
     text_reads: [Option<ValueMap<SmallVec<[usize; 2]>>>; 3],
 }
 
-impl HashJoinOperator {
+impl<'a> HashJoinOperator<'a> {
     /// Create a new hash join operator.
     ///
     /// # Arguments
@@ -322,6 +324,7 @@ impl HashJoinOperator {
             current_matches: Vec::new(),
             probe_had_match: false,
             residual: Vec::new(),
+            blocks: None,
             build_matched: Vec::new(),
             returning_unmatched_build: false,
             unmatched_build_idx: 0,
@@ -435,6 +438,7 @@ impl HashJoinOperator {
             current_matches: Vec::new(),
             probe_had_match: false,
             residual: Vec::new(),
+            blocks: None,
             build_matched,
             returning_unmatched_build: false,
             unmatched_build_idx: 0,
@@ -485,6 +489,7 @@ impl HashJoinOperator {
             current_matches: Vec::new(),
             probe_had_match: false,
             residual: Vec::new(),
+            blocks: None,
             build_matched: Vec::new(),
             returning_unmatched_build: false,
             unmatched_build_idx: 0,
@@ -507,6 +512,12 @@ impl HashJoinOperator {
     /// rows an OUTER join has to NULL-pad.
     pub fn with_residual(mut self, residual: Vec<RowFilter>) -> Self {
         self.residual = residual;
+        self
+    }
+
+    /// The statement's subquery blocks the residual calls
+    pub fn with_blocks(mut self, blocks: Option<&'a dyn SubqueryExecutor>) -> Self {
+        self.blocks = blocks;
         self
     }
 
@@ -568,7 +579,7 @@ impl HashJoinOperator {
         };
         let candidate = self.combine_rows_direct(probe_row, build_idx).into_owned();
         for filter in &self.residual {
-            if !filter.matches_checked(&candidate)? {
+            if !filter.matches_checked_with(&candidate, self.blocks)? {
                 return Ok(false);
             }
         }
@@ -689,7 +700,7 @@ impl HashJoinOperator {
     }
 }
 
-impl Operator for HashJoinOperator {
+impl Operator for HashJoinOperator<'_> {
     fn open(&mut self) -> Result<()> {
         // Check if hash table was pre-built (via with_prebuilt constructor)
         if self.hash_table.is_some() {

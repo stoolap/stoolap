@@ -81,7 +81,9 @@ use crate::common::CompactArc;
 use crate::core::predicate::{kind, KeySide};
 use crate::core::{Result, Row, RowVec, Schema};
 use crate::executor::context::ExecutionContext;
-use crate::executor::expression::{compile_expression, JoinFilter, RowFilter, SharedProgram};
+use crate::executor::expression::{
+    compile_expression, JoinFilter, RowFilter, SharedProgram, SubqueryExecutor,
+};
 use crate::executor::hash_table::JoinHashTable;
 use crate::executor::operator::{ColumnInfo, MaterializedOperator, Operator};
 use crate::executor::operators::hash_join::{HashJoinOperator, JoinSide, JoinType};
@@ -91,6 +93,7 @@ use crate::executor::parallel::{
 };
 use crate::executor::planner::{QueryPlanner, RuntimeJoinAlgorithm, RuntimeJoinDecision};
 use crate::executor::prepared_join::{BuiltPrograms, Held, JoinProgramKey, PreparedJoin};
+use crate::executor::prepared_select::{JoinBlocks, PreparedRunner, SiteRunner};
 use crate::executor::utils::{column_kinds, extract_join_keys_and_residual_keeping};
 use crate::functions::registry::global_registry;
 use crate::parser::ast::Expression;
@@ -208,6 +211,8 @@ pub struct JoinRequest<'a> {
     pub right_schema: Option<CompactArc<Schema>>,
     /// The programs the statement's plan holds for its join
     pub prepared: Option<&'a PreparedJoin>,
+    /// The statement's blocks and their run, when its ON holds a subquery
+    pub(crate) blocks: Option<StatementRun<'a>>,
 }
 
 /// Request to execute a streaming hash join.
@@ -254,21 +259,44 @@ pub struct StreamingJoinRequest<'a> {
     pub cross_key: Option<KeySide>,
     /// The programs the statement's plan holds for its join
     pub prepared: Option<&'a PreparedJoin>,
+    /// The statement's blocks and their run, when its ON holds a subquery
+    pub(crate) blocks: Option<StatementRun<'a>>,
+}
+
+/// A join statement's blocks, rewritten with its ON, and this execution's
+/// one run of them
+#[derive(Clone, Copy)]
+pub(crate) struct StatementRun<'a> {
+    pub(crate) blocks: &'a JoinBlocks,
+    pub(crate) run: &'a PreparedRunner<'a>,
+}
+
+impl<'a> StatementRun<'a> {
+    /// The run as a site over the joined row, or over the pair when `pair`
+    pub(crate) fn site(self, pair: bool) -> SiteRunner<'a> {
+        SiteRunner::new(self.run, self.blocks.holes(pair))
+    }
 }
 
 /// The residual conditions of `analysis` as filters over `all_columns`,
-/// held with the statement's plan when it has one
+/// held with the statement's plan when it has one; with the statement's
+/// `blocks`, conditions of the ON they rewrote
 fn residual_filters(
     analysis: &JoinAnalysis,
     all_columns: &[String],
     ctx: &ExecutionContext,
     prepared: Option<&PreparedJoin>,
+    blocks: Option<StatementRun<'_>>,
 ) -> Result<Vec<RowFilter>> {
+    let compile_one = |cond: &Expression| match blocks {
+        Some(blocks) => blocks.blocks.compile(cond, false, global_registry()),
+        None => compile_expression(cond, all_columns),
+    };
     let compile = || {
         analysis
             .residual_conditions
             .iter()
-            .map(|cond| compile_expression(cond, all_columns))
+            .map(compile_one)
             .collect::<Result<BuiltPrograms>>()
     };
     let read = |programs: &[SharedProgram]| {
@@ -297,8 +325,7 @@ fn residual_filters(
             .residual_conditions
             .iter()
             .map(|cond| {
-                compile_expression(cond, all_columns)
-                    .map(|program| RowFilter::from_program(program).with_context(ctx))
+                compile_one(cond).map(|program| RowFilter::from_program(program).with_context(ctx))
             })
             .collect::<Result<_>>()?,
     })
@@ -338,6 +365,7 @@ impl JoinExecutor {
             request.condition,
             request.join_type,
             &[],
+            request.blocks,
         );
 
         // A key pair that can meet as a TEXT the comparison reads as the other
@@ -375,6 +403,7 @@ impl JoinExecutor {
                 request.condition,
                 request.join_type,
                 &cross_pairs,
+                request.blocks,
             );
         }
 
@@ -411,6 +440,7 @@ impl JoinExecutor {
                 request.limit,
                 request.ctx,
                 request.prepared,
+                request.blocks,
             ),
             RuntimeJoinAlgorithm::NestedLoop => self.execute_nested_loop(
                 request.left_rows,
@@ -422,6 +452,7 @@ impl JoinExecutor {
                 request.limit,
                 request.ctx,
                 request.prepared,
+                request.blocks,
             ),
         }
     }
@@ -466,6 +497,7 @@ impl JoinExecutor {
             request.condition,
             request.join_type,
             &[],
+            request.blocks,
         );
 
         // Probe side is already a streaming operator
@@ -528,8 +560,15 @@ impl JoinExecutor {
             && !analysis.join_type_str.contains("RIGHT")
             && !analysis.join_type_str.contains("FULL");
 
-        let residual_filters =
-            residual_filters(&analysis, &all_columns, request.ctx, request.prepared)?;
+        let residual_filters = residual_filters(
+            &analysis,
+            &all_columns,
+            request.ctx,
+            request.prepared,
+            request.blocks,
+        )?;
+        let site = request.blocks.map(|blocks| blocks.site(false));
+        let site = site.as_ref().map(|site| site as &dyn SubqueryExecutor);
 
         // OUTER joins have to reject a pair inside the operator so the row it
         // came from still counts as unmatched; INNER joins can filter the
@@ -537,13 +576,13 @@ impl JoinExecutor {
         let inline_filters: &[RowFilter] = if is_inner {
             &residual_filters
         } else {
-            join_op = join_op.with_residual(residual_filters);
+            join_op = join_op.with_residual(residual_filters).with_blocks(site);
             &[]
         };
 
         // Execute with Volcano model - this is where true streaming happens!
         let rows =
-            self.execute_operator_with_filter(&mut join_op, request.limit, inline_filters)?;
+            self.execute_operator_with_filter(&mut join_op, request.limit, inline_filters, site)?;
 
         Ok(JoinResult {
             rows,
@@ -553,6 +592,7 @@ impl JoinExecutor {
 
     /// The analysis that leaves the key pairs of `kept_out` in the residual,
     /// held with the statement's plan when it has one
+    #[allow(clippy::too_many_arguments)]
     fn analysis_of(
         &self,
         prepared: Option<&PreparedJoin>,
@@ -561,15 +601,25 @@ impl JoinExecutor {
         condition: Option<&Expression>,
         join_type_str: &str,
         kept_out: &[(usize, usize)],
+        blocks: Option<StatementRun<'_>>,
     ) -> Held<JoinAnalysis> {
-        let analyze = || {
-            self.analyze(
+        // With the statement's blocks, the ON they rewrote over the scope's
+        // names, which lay the columns out as the sides do
+        let analyze = || match blocks {
+            Some(blocks) => self.analyze(
+                &blocks.blocks.left,
+                &blocks.blocks.right,
+                blocks.blocks.on.as_ref(),
+                join_type_str,
+                &|l, r| !kept_out.contains(&(l, r)),
+            ),
+            None => self.analyze(
                 left_columns,
                 right_columns,
                 condition,
                 join_type_str,
                 &|l, r| !kept_out.contains(&(l, r)),
-            )
+            ),
         };
         match prepared {
             Some(prepared) => {
@@ -663,6 +713,7 @@ impl JoinExecutor {
         limit: Option<u64>,
         ctx: &ExecutionContext,
         prepared: Option<&PreparedJoin>,
+        blocks: Option<StatementRun<'_>>,
     ) -> Result<RowVec> {
         // Use schema for column counts (not row data - handles empty tables correctly)
         let left_col_count = left_columns.len();
@@ -702,6 +753,7 @@ impl JoinExecutor {
                 build_left,
                 ctx,
                 prepared,
+                blocks,
             )
         } else {
             // Streaming Volcano execution path
@@ -716,6 +768,7 @@ impl JoinExecutor {
                 limit,
                 ctx,
                 prepared,
+                blocks,
             )
         }
     }
@@ -736,6 +789,7 @@ impl JoinExecutor {
         build_left: bool,
         ctx: &ExecutionContext,
         prepared: Option<&PreparedJoin>,
+        blocks: Option<StatementRun<'_>>,
     ) -> Result<RowVec> {
         JoinPath::ParallelHash.taken();
         let config = ParallelConfig::default();
@@ -791,8 +845,10 @@ impl JoinExecutor {
 
         // Only INNER joins reach this path: execute_hash_join() routes OUTER
         // joins carrying a residual to the streaming operator.
-        for filter in residual_filters(analysis, all_columns, ctx, prepared)? {
-            filter.retain_checked(&mut rows)?;
+        let site = blocks.map(|blocks| blocks.site(false));
+        let site = site.as_ref().map(|site| site as &dyn SubqueryExecutor);
+        for filter in residual_filters(analysis, all_columns, ctx, prepared, blocks)? {
+            filter.retain_checked_with(&mut rows, site)?;
         }
 
         Ok(rows)
@@ -815,6 +871,7 @@ impl JoinExecutor {
         limit: Option<u64>,
         ctx: &ExecutionContext,
         prepared: Option<&PreparedJoin>,
+        blocks: Option<StatementRun<'_>>,
     ) -> Result<RowVec> {
         JoinPath::Hash.taken();
         // Build schema for operators from column names
@@ -846,7 +903,9 @@ impl JoinExecutor {
             && !analysis.join_type_str.contains("RIGHT")
             && !analysis.join_type_str.contains("FULL");
 
-        let residual_filters = residual_filters(analysis, all_columns, ctx, prepared)?;
+        let residual_filters = residual_filters(analysis, all_columns, ctx, prepared, blocks)?;
+        let site = blocks.map(|blocks| blocks.site(false));
+        let site = site.as_ref().map(|site| site as &dyn SubqueryExecutor);
 
         // OUTER joins have to reject a pair inside the operator so the row it
         // came from still counts as unmatched; INNER joins can filter the
@@ -854,12 +913,12 @@ impl JoinExecutor {
         let inline_filters: &[RowFilter] = if is_inner {
             &residual_filters
         } else {
-            join_op = join_op.with_residual(residual_filters);
+            join_op = join_op.with_residual(residual_filters).with_blocks(site);
             &[]
         };
 
         // Execute with Volcano model
-        self.execute_operator_with_filter(&mut join_op, limit, inline_filters)
+        self.execute_operator_with_filter(&mut join_op, limit, inline_filters, site)
     }
 
     /// Execute nested loop join using NestedLoopJoinOperator.
@@ -875,6 +934,7 @@ impl JoinExecutor {
         limit: Option<u64>,
         ctx: &ExecutionContext,
         prepared: Option<&PreparedJoin>,
+        blocks: Option<StatementRun<'_>>,
     ) -> Result<RowVec> {
         JoinPath::NestedLoop.taken();
         // Build schema for operators
@@ -905,10 +965,19 @@ impl JoinExecutor {
         // Create nested loop join operator
         let mut nl_op =
             NestedLoopJoinOperator::new(left_op, right_op, join_type, condition.cloned());
+        let site = blocks.map(|blocks| blocks.site(true));
+        let site = site.as_ref().map(|site| site as &dyn SubqueryExecutor);
         if let Some(cond) = condition {
+            // With the statement's blocks, the ON they rewrote, over the pair
             let compile = || -> Result<BuiltPrograms> {
-                let filter = JoinFilter::new(cond, left_columns, right_columns, global_registry())?;
-                Ok(std::iter::once(CompactArc::clone(filter.program())).collect())
+                let program = match blocks.and_then(|b| Some((b, b.blocks.on.as_ref()?))) {
+                    Some((blocks, on)) => blocks.blocks.compile(on, true, global_registry())?,
+                    None => CompactArc::clone(
+                        JoinFilter::new(cond, left_columns, right_columns, global_registry())?
+                            .program(),
+                    ),
+                };
+                Ok(std::iter::once(program).collect())
             };
             let read = |programs: &[SharedProgram]| {
                 programs
@@ -931,12 +1000,14 @@ impl JoinExecutor {
                 None => read(&compile()?),
             };
             if let Some(filter) = filter {
-                nl_op = nl_op.with_filter(filter.with_context(ctx));
+                nl_op = nl_op
+                    .with_filter(filter.with_context(ctx))
+                    .with_blocks(site);
             }
         }
 
         // Execute with Volcano model
-        self.execute_operator_with_filter(&mut nl_op, limit, &[])
+        self.execute_operator_with_filter(&mut nl_op, limit, &[], None)
     }
 
     /// Execute operator with Volcano model and optional residual filter.
@@ -945,6 +1016,7 @@ impl JoinExecutor {
         op: &mut dyn Operator,
         limit: Option<u64>,
         residual_filters: &[RowFilter],
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<RowVec> {
         op.open()?;
 
@@ -959,26 +1031,26 @@ impl JoinExecutor {
             // Apply residual filters - specialized unrolling for common cases (1-4 filters)
             if has_filters {
                 let pass = match residual_filters.len() {
-                    1 => residual_filters[0].matches_checked(&row)?,
+                    1 => residual_filters[0].matches_checked_with(&row, blocks)?,
                     2 => {
-                        residual_filters[0].matches_checked(&row)?
-                            && residual_filters[1].matches_checked(&row)?
+                        residual_filters[0].matches_checked_with(&row, blocks)?
+                            && residual_filters[1].matches_checked_with(&row, blocks)?
                     }
                     3 => {
-                        residual_filters[0].matches_checked(&row)?
-                            && residual_filters[1].matches_checked(&row)?
-                            && residual_filters[2].matches_checked(&row)?
+                        residual_filters[0].matches_checked_with(&row, blocks)?
+                            && residual_filters[1].matches_checked_with(&row, blocks)?
+                            && residual_filters[2].matches_checked_with(&row, blocks)?
                     }
                     4 => {
-                        residual_filters[0].matches_checked(&row)?
-                            && residual_filters[1].matches_checked(&row)?
-                            && residual_filters[2].matches_checked(&row)?
-                            && residual_filters[3].matches_checked(&row)?
+                        residual_filters[0].matches_checked_with(&row, blocks)?
+                            && residual_filters[1].matches_checked_with(&row, blocks)?
+                            && residual_filters[2].matches_checked_with(&row, blocks)?
+                            && residual_filters[3].matches_checked_with(&row, blocks)?
                     }
                     _ => {
                         let mut all_pass = true;
                         for f in residual_filters {
-                            if !f.matches_checked(&row)? {
+                            if !f.matches_checked_with(&row, blocks)? {
                                 all_pass = false;
                                 break;
                             }
@@ -1062,6 +1134,7 @@ mod tests {
             left_schema: None,
             right_schema: None,
             prepared: None,
+            blocks: None,
         };
 
         let result = executor.execute(request).unwrap();
@@ -1109,6 +1182,7 @@ mod tests {
             left_schema: None,
             right_schema: None,
             prepared: None,
+            blocks: None,
         };
 
         let result = executor.execute(request).unwrap();
@@ -1156,6 +1230,7 @@ mod tests {
             left_schema: None,
             right_schema: None,
             prepared: None,
+            blocks: None,
         };
 
         let result = executor.execute(request).unwrap();
@@ -1187,6 +1262,7 @@ mod tests {
             left_schema: None,
             right_schema: None,
             prepared: None,
+            blocks: None,
         };
 
         let result = executor.execute(request).unwrap();
@@ -1270,6 +1346,7 @@ mod tests {
                         left_schema: None,
                         right_schema: None,
                         prepared: None,
+                        blocks: None,
                     };
                     let rows = executor.run(&config, request, &analysis).unwrap();
                     let mut rows: Vec<String> = rows

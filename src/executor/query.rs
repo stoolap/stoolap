@@ -315,7 +315,7 @@ use super::expression::{
     ExpressionEval, JoinFilter, RowFilter, SharedProgram,
 };
 use super::hash_table::JoinHashTable;
-use super::join_executor::{JoinExecutor, JoinPath, StreamingJoinRequest};
+use super::join_executor::{JoinExecutor, JoinPath, StatementRun, StreamingJoinRequest};
 use super::operator::{ColumnInfo, Operator, QueryResultOperator};
 use super::operators::hash_join::JoinType as OperatorJoinType;
 use super::operators::index_nested_loop::{
@@ -323,8 +323,8 @@ use super::operators::index_nested_loop::{
 };
 use super::operators::BloomFilterOperator;
 use super::parallel::{self, ParallelConfig};
-use super::prepared_join::{BuiltPrograms, Held, JoinProgramKey, PreparedJoin, WhereSite};
-use super::prepared_select::{JoinWhere, PreparedRunner};
+use super::prepared_join::{BuiltPrograms, JoinProgramKey, PreparedJoin, WhereSite};
+use super::prepared_select::JoinBlocks;
 use super::pushdown;
 use super::query_cache::CompiledExecution;
 use super::query_classification::{get_classification, QueryClassification};
@@ -4618,9 +4618,9 @@ impl Executor {
         Some(held)
     }
 
-    /// Whether a join of two base tables, its ON holding no subquery, finds
-    /// every subquery of its WHERE in what it asks of the joined rows, of
-    /// the forms the prepared blocks run
+    /// Whether a join of two base tables holds subqueries in its ON or its
+    /// WHERE, all of the forms the prepared blocks run, those of the WHERE
+    /// in what it asks of the joined rows
     fn where_runs_as_blocks(
         &self,
         stmt: &SelectStatement,
@@ -4632,19 +4632,18 @@ impl Executor {
     ) -> bool {
         let plain_table =
             |side: &Expression| matches!(side, Expression::TableSource(ts) if ts.as_of.is_none());
+        let on = join_source.condition.as_deref();
+        let on_subqueries = on.is_some_and(Self::has_subqueries);
         if !plain_table(&join_source.left)
             || !plain_table(&join_source.right)
             || schemas.0.is_none()
             || schemas.1.is_none()
-            || join_source
-                .condition
-                .as_deref()
-                .is_some_and(Self::has_subqueries)
+            || (on_subqueries && !on.is_some_and(|on| self.join_where_family(on, ctx).is_ok()))
         {
             return false;
         }
         let Some(where_clause) = stmt.where_clause.as_deref() else {
-            return false;
+            return on_subqueries;
         };
         let (left, right, cross) =
             split_join_where(where_clause, left_alias, right_alias, schemas, join_type);
@@ -4661,15 +4660,18 @@ impl Executor {
         };
         let in_side =
             |side: Option<Expression>| opened(side).is_some_and(|side| Self::has_subqueries(&side));
+        let cross = opened(cross);
+        let cross_subqueries = cross.as_ref().is_some_and(Self::has_subqueries);
         !in_side(left)
             && !in_side(right)
-            && opened(cross).is_some_and(|cross| self.join_where_family(&cross, ctx).is_ok())
+            && (on_subqueries || cross_subqueries)
+            && cross.is_none_or(|cross| self.join_where_family(&cross, ctx).is_ok())
     }
 
-    /// The WHERE `cross` a join asks at `site` of its joined rows named
-    /// `all_columns`, as written: its SELECT aliases are opened here, once.
-    /// Held with the plan when it has one; its subqueries run as blocks over
-    /// `sides`, each an alias and its table's schema, when given
+    /// The program of the WHERE `cross` a join asks at `site` of its joined
+    /// rows named `all_columns`, held with the plan when it has one. With
+    /// the statement's `blocks`, the WHERE they rewrote; else `cross` as
+    /// written, its SELECT aliases opened here, once
     #[allow(clippy::too_many_arguments)]
     fn join_where(
         &self,
@@ -4678,50 +4680,85 @@ impl Executor {
         stmt: &SelectStatement,
         cross: &Expression,
         all_columns: &[String],
-        sides: Option<[(&str, &Schema); 2]>,
-        ctx: &ExecutionContext,
-    ) -> Result<Held<JoinWhere>> {
-        let build = || -> Result<JoinWhere> {
-            let resolved = Self::with_select_aliases(stmt, cross, all_columns);
-            let clause = resolved.as_ref().unwrap_or(cross);
-            match sides {
-                Some([(left, left_schema), (right, right_schema)]) => {
-                    let sides = [
-                        (SmartString::from(left.to_lowercase().as_str()), left_schema),
-                        (
-                            SmartString::from(right.to_lowercase().as_str()),
-                            right_schema,
-                        ),
-                    ];
-                    self.prepare_join_where(clause, sides, all_columns, ctx)?
-                        .ok_or_else(|| {
-                            Error::internal("a join's columns do not line up with its tables")
-                        })
-                }
-                None => compile_expression(clause, all_columns).map(JoinWhere::plain),
+        blocks: Option<&JoinBlocks>,
+    ) -> Result<SharedProgram> {
+        let compile = || match blocks.and_then(|blocks| Some((blocks, blocks.cross.as_ref()?))) {
+            Some((blocks, cross)) => blocks.compile(cross, false, &self.function_registry),
+            None => {
+                let resolved = Self::with_select_aliases(stmt, cross, all_columns);
+                compile_expression(resolved.as_ref().unwrap_or(cross), all_columns)
             }
         };
-        Ok(match prepared {
-            Some(prepared) => Held::Shared(prepared.where_clause(site, all_columns, build)?),
-            None => Held::Own(build()?),
-        })
+        match prepared {
+            Some(prepared) => prepared.where_program(site, all_columns, compile),
+            None => compile(),
+        }
     }
 
-    /// One execution's run of the blocks `held` calls, for about `rows`
-    /// joined rows; None for a WHERE without blocks
-    fn join_where_blocks<'a>(
-        &'a self,
-        held: &'a JoinWhere,
-        ctx: &'a ExecutionContext,
-        rows: usize,
-    ) -> Result<Option<PreparedRunner<'a>>> {
-        let runner = self.join_where_runner(held, ctx, rows)?;
-        if held.has_blocks() && runner.is_none() {
-            return Err(Error::internal(
-                "a table's columns changed while the statement prepared",
-            ));
-        }
-        Ok(runner)
+    /// The statement's blocks, prepared once with its plan from its ON, the
+    /// WHERE `cross` it asks of the joined rows and the WHERE's conditions on
+    /// one side, `side_filters`; none without them
+    #[allow(clippy::too_many_arguments)]
+    fn statement_blocks(
+        &self,
+        prepared: Option<&PreparedJoin>,
+        stmt: &SelectStatement,
+        on: Option<&Expression>,
+        cross: Option<&Expression>,
+        side_filters: [Option<&Expression>; 2],
+        (left_alias, right_alias): (Option<&str>, Option<&str>),
+        (left_schema, right_schema): (Option<&Schema>, Option<&Schema>),
+        ctx: &ExecutionContext,
+    ) -> Result<Option<std::sync::Arc<JoinBlocks>>> {
+        let (
+            Some(prepared),
+            Some(left_alias),
+            Some(right_alias),
+            Some(left_schema),
+            Some(right_schema),
+        ) = (prepared, left_alias, right_alias, left_schema, right_schema)
+        else {
+            return Ok(None);
+        };
+        prepared.join_blocks(|| {
+            // The WHERE's SELECT aliases open over the columns the sides lay
+            // out, as the decision to run blocks read them
+            let columns: Vec<String> = [(left_alias, left_schema), (right_alias, right_schema)]
+                .iter()
+                .flat_map(|(alias, schema)| {
+                    schema
+                        .columns
+                        .iter()
+                        .map(move |c| format!("{alias}.{}", c.name))
+                })
+                .collect();
+            let opened = cross.map(|cross| {
+                Self::with_select_aliases(stmt, cross, &columns).unwrap_or_else(|| cross.clone())
+            });
+            // A side's conditions come without their qualifier; it is put
+            // back, as the index join puts it back on its inner side's
+            let [left_filter, right_filter] = side_filters;
+            let left_filter = left_filter.map(|f| add_table_qualifier(f, left_alias));
+            let right_filter = right_filter.map(|f| add_table_qualifier(f, right_alias));
+            let sides = [
+                (
+                    SmartString::from(left_alias.to_lowercase().as_str()),
+                    left_schema,
+                ),
+                (
+                    SmartString::from(right_alias.to_lowercase().as_str()),
+                    right_schema,
+                ),
+            ];
+            self.prepare_join_blocks(
+                on,
+                opened.as_ref(),
+                [left_filter.as_ref(), right_filter.as_ref()],
+                sides,
+                columns.len(),
+                ctx,
+            )
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4741,30 +4778,23 @@ impl Executor {
         let left_alias = get_table_alias_from_expr(&join_source.left);
         let right_alias = get_table_alias_from_expr(&join_source.right);
 
-        // A subquery in the ON clause is read once, the way the WHERE clause
-        // reads one, so every path below compares each pair against a value
-        // rather than against something it never evaluated
-        let processed_on: Option<Expression> = match join_source.condition.as_deref() {
-            Some(cond) if Self::has_subqueries(cond) && !Self::has_correlated_subqueries(cond) => {
-                Some(self.process_where_subqueries(cond, ctx)?)
-            }
-            _ => None,
-        };
-        let on_condition: Option<&Expression> =
-            processed_on.as_ref().or(join_source.condition.as_deref());
         // Determine join type early for filter pushdown decisions
         let join_type = join_source.join_type.to_uppercase();
         let left_schema = self.base_table_side_schema(&join_source.left, CteNames::Context(ctx));
         let right_schema = self.base_table_side_schema(&join_source.right, CteNames::Context(ctx));
 
         // The plan holds what the join compiles, unless this execution read a
-        // value into its clauses: a folded subquery or an outer row. A WHERE
-        // whose subqueries all stand in what is asked of the joined rows runs
-        // them as the plan's blocks; any other is read per execution
+        // value into its clauses: a folded subquery or an outer row. A join
+        // whose ON and WHERE subqueries the blocks run runs them so; any
+        // other reads them per execution
+        let on_subqueries = join_source
+            .condition
+            .as_deref()
+            .is_some_and(Self::has_subqueries);
         let plan = compiled
-            .filter(|_| processed_on.is_none() && ctx.outer_row().is_none())
+            .filter(|_| ctx.outer_row().is_none())
             .and_then(|slot| self.prepared_join(slot));
-        let blocks_where = classification.where_has_subqueries
+        let blocks_where = (classification.where_has_subqueries || on_subqueries)
             && plan.as_ref().is_some_and(|plan| {
                 plan.blocks_where(|| {
                     self.where_runs_as_blocks(
@@ -4777,7 +4807,24 @@ impl Executor {
                     )
                 })
             });
-        let prepared = plan.filter(|_| !classification.where_has_subqueries || blocks_where);
+        // Outside the blocks, an uncorrelated subquery in the ON clause is read
+        // once, the way the WHERE clause reads one, so every path below
+        // compares each pair against a value rather than against something it
+        // never evaluated
+        let processed_on: Option<Expression> = match join_source.condition.as_deref() {
+            Some(cond)
+                if !blocks_where && on_subqueries && !Self::has_correlated_subqueries(cond) =>
+            {
+                Some(self.process_where_subqueries(cond, ctx)?)
+            }
+            _ => None,
+        };
+        let on_condition: Option<&Expression> =
+            processed_on.as_ref().or(join_source.condition.as_deref());
+        let prepared = plan.filter(|_| {
+            processed_on.is_none()
+                && ((!classification.where_has_subqueries && !on_subqueries) || blocks_where)
+        });
         // The sides and the blocks read one snapshot, as correlated probes do
         let snapshot_ctx;
         let ctx = if blocks_where
@@ -4790,17 +4837,6 @@ impl Executor {
             &snapshot_ctx
         } else {
             ctx
-        };
-        let block_sides = match (
-            &left_alias,
-            &right_alias,
-            left_schema.as_deref(),
-            right_schema.as_deref(),
-        ) {
-            (Some(left), Some(right), Some(left_schema), Some(right_schema)) if blocks_where => {
-                Some([(left.as_str(), left_schema), (right.as_str(), right_schema)])
-            }
-            _ => None,
         };
 
         // Partition WHERE clause predicates for pushdown
@@ -4868,6 +4904,38 @@ impl Executor {
             ),
             None => (None, None, None),
         };
+        // The statement's blocks, and the one run of them every site calls
+        let blocks = match blocks_where {
+            true => self.statement_blocks(
+                prepared.as_deref(),
+                stmt,
+                join_source.condition.as_deref(),
+                cross_filter.as_ref(),
+                [left_filter.as_ref(), right_filter.as_ref()],
+                (left_alias.as_deref(), right_alias.as_deref()),
+                (left_schema.as_deref(), right_schema.as_deref()),
+                ctx,
+            )?,
+            false => None,
+        };
+        let blocks_run = match blocks.as_deref() {
+            Some(blocks) => Some(self.join_runner(blocks, ctx, 0)?.ok_or_else(|| {
+                Error::internal("a table's columns changed while the statement prepared")
+            })?),
+            None => None,
+        };
+        let statement_run = match (blocks.as_deref(), blocks_run.as_ref()) {
+            (Some(blocks), Some(run)) => Some(StatementRun { blocks, run }),
+            _ => None,
+        };
+        let where_blocks = statement_run.map(|run| run.site(false));
+        let where_blocks = where_blocks
+            .as_ref()
+            .map(|site| site as &dyn SubqueryExecutor);
+        let pair_blocks = statement_run.map(|run| run.site(true));
+        let pair_blocks = pair_blocks
+            .as_ref()
+            .map(|site| site as &dyn SubqueryExecutor);
         // A WHERE that keeps no row joins no rows whatever the join type; the
         // sides run with no rows only to name their columns
         let never = where_for_join
@@ -5381,16 +5449,33 @@ impl Executor {
                     // The program is held with the plan, by the key equality
                     // it leaves out and the columns it reads
                     let compile_residual = || -> Result<BuiltPrograms> {
-                        let inner_filter = nl_right_filter
-                            .as_ref()
-                            .map(|rf| add_table_qualifier(rf, inner_alias));
-                        // The equality the probe answers is left out, so
-                        // only the rest of the clause is asked of each pair
-                        let rest = on_condition.and_then(|on| {
-                            index_join_residual(
-                                on,
+                        // With the statement's blocks, the clauses they
+                        // rewrote, over the scope's names for each side
+                        let (on, outer_names, inner_names, inner_filter) = match blocks.as_deref() {
+                            Some(blocks) => {
+                                let (outer, inner) = match swapped {
+                                    true => (&blocks.right, &blocks.left),
+                                    false => (&blocks.left, &blocks.right),
+                                };
+                                let inner_filter = blocks.sides[usize::from(!swapped)].clone();
+                                (blocks.on.as_ref(), outer, inner, inner_filter)
+                            }
+                            None => (
+                                on_condition,
                                 &outer_cols,
                                 &inner_cols,
+                                nl_right_filter
+                                    .as_ref()
+                                    .map(|rf| add_table_qualifier(rf, inner_alias)),
+                            ),
+                        };
+                        // The equality the probe answers is left out, so
+                        // only the rest of the clause is asked of each pair
+                        let rest = on.and_then(|on| {
+                            index_join_residual(
+                                on,
+                                outer_names,
+                                inner_names,
                                 outer_idx,
                                 inner_key_idx,
                             )
@@ -5407,14 +5492,17 @@ impl Executor {
                             (None, None) => None,
                         };
                         combined
-                            .map(|expr| {
-                                JoinFilter::new(
+                            .map(|expr| match blocks.as_deref() {
+                                Some(blocks) => {
+                                    blocks.compile(&expr, true, &self.function_registry)
+                                }
+                                None => JoinFilter::new(
                                     &expr,
                                     left_cols,
                                     right_cols,
                                     &self.function_registry,
                                 )
-                                .map(|f| CompactArc::clone(f.program()))
+                                .map(|f| CompactArc::clone(f.program())),
                             })
                             .into_iter()
                             .collect()
@@ -5471,32 +5559,20 @@ impl Executor {
 
                     // A cross-table WHERE filter counts toward LIMIT, so it is
                     // applied per joined row rather than after collection
-                    let cross_where = match cross_filter {
-                        Some(ref cross) => Some(self.join_where(
-                            prepared.as_deref(),
-                            WhereSite::IndexJoin,
-                            stmt,
-                            cross,
-                            &all_columns,
-                            block_sides,
-                            ctx,
-                        )?),
+                    let cross_row_filter = match cross_filter {
+                        Some(ref cross) => Some(
+                            RowFilter::from_program(self.join_where(
+                                prepared.as_deref(),
+                                WhereSite::IndexJoin,
+                                stmt,
+                                cross,
+                                &all_columns,
+                                blocks.as_deref(),
+                            )?)
+                            .with_context(ctx),
+                        ),
                         None => None,
                     };
-                    let cross_row_filter = cross_where.as_ref().map(|held| {
-                        RowFilter::from_program(CompactArc::clone(&held.program)).with_context(ctx)
-                    });
-                    let cross_blocks = match &cross_where {
-                        Some(held) => self.join_where_blocks(
-                            held,
-                            ctx,
-                            outer_result.estimated_count().unwrap_or(0),
-                        )?,
-                        None => None,
-                    };
-                    let cross_blocks = cross_blocks
-                        .as_ref()
-                        .map(|runner| runner as &dyn SubqueryExecutor);
                     let mut result_rows = RowVec::new();
                     // A primary key join without a limit fetches its rows in one
                     // batch; an index lookup streams, which costs less than the
@@ -5542,7 +5618,8 @@ impl Executor {
                                 lookup_strategy.clone(),
                                 build_residual_filter()?,
                             )
-                            .with_inner_key(inner_key_idx);
+                            .with_inner_key(inner_key_idx)
+                            .with_blocks(pair_blocks);
                             if swapped {
                                 op = op.with_outer_on_right();
                             }
@@ -5555,7 +5632,7 @@ impl Executor {
                                 &mut op,
                                 join_limit,
                                 cross_row_filter.as_ref(),
-                                cross_blocks,
+                                where_blocks,
                                 &mut result_rows,
                             )?;
                             // A probe the inner table could not answer: the rows
@@ -5654,7 +5731,8 @@ impl Executor {
                             lookup_strategy.clone(),
                             build_residual_filter()?,
                         )
-                        .with_inner_key(inner_key_idx);
+                        .with_inner_key(inner_key_idx)
+                        .with_blocks(pair_blocks);
                         if swapped {
                             op = op.with_outer_on_right();
                         }
@@ -5667,7 +5745,7 @@ impl Executor {
                             &mut op,
                             None,
                             cross_row_filter.as_ref(),
-                            cross_blocks,
+                            where_blocks,
                             &mut result_rows,
                         )?;
                     }
@@ -6160,6 +6238,7 @@ impl Executor {
                         pre_built_hash_table,
                         cross_key,
                         prepared: prepared.as_deref(),
+                        blocks: statement_run,
                     };
 
                     #[cfg(any(test, feature = "test-failpoints"))]
@@ -6395,6 +6474,7 @@ impl Executor {
             left_schema: self.base_table_side_schema(&join_source.left, CteNames::Context(ctx)),
             right_schema: self.base_table_side_schema(&join_source.right, CteNames::Context(ctx)),
             prepared: prepared.as_deref(),
+            blocks: statement_run,
         };
 
         let join_result = join_executor.execute(join_request)?;
@@ -6416,7 +6496,7 @@ impl Executor {
 
         // Apply WHERE clause if present
         let filtered_rows = if let Some(where_expr) = effective_where {
-            if correlated_where && block_sides.is_none() {
+            if correlated_where && blocks.is_none() {
                 let resolved = Self::with_select_aliases(stmt, &where_expr, &all_columns)
                     .unwrap_or(where_expr);
                 let where_clause = &resolved;
@@ -6478,24 +6558,18 @@ impl Executor {
             } else {
                 // Its subqueries run as the plan's blocks, or were folded
                 // before the filters were split
-                let held = self.join_where(
+                let program = self.join_where(
                     prepared.as_deref(),
                     WhereSite::AfterJoin,
                     stmt,
                     &where_expr,
                     &all_columns,
-                    block_sides,
-                    ctx,
+                    blocks.as_deref(),
                 )?;
-                let runner = self.join_where_blocks(&held, ctx, result_rows.len())?;
-                let blocks = runner
-                    .as_ref()
-                    .map(|runner| runner as &dyn SubqueryExecutor);
-                let where_filter =
-                    RowFilter::from_program(CompactArc::clone(&held.program)).with_context(ctx);
+                let where_filter = RowFilter::from_program(program).with_context(ctx);
                 let mut filtered = RowVec::with_capacity(result_rows.len());
                 for (id, row) in result_rows {
-                    if where_filter.matches_checked_with(&row, blocks)? {
+                    if where_filter.matches_checked_with(&row, where_blocks)? {
                         filtered.push((id, row));
                     }
                 }

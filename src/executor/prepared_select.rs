@@ -1243,6 +1243,9 @@ struct PreparedSubquery {
     /// deeper subquery reads from it; empty for the statement's own blocks,
     /// whose holes its `HoleSet` keeps
     holes: Vec<(usize, Hole)>,
+    /// A join statement's own block's holes as written, compiled again for
+    /// each layout of the row its sites run over
+    hole_exprs: Vec<(usize, Expression)>,
     /// Reads no enclosing scope: its value is computed once per run
     uncorrelated: bool,
 }
@@ -1282,6 +1285,8 @@ type FailedSlots = SmallVec<[(usize, Error); 1]>;
 enum Hole {
     /// A column of that row, copied without a program
     Column(usize),
+    /// A column of the second row of a pair, copied without a program
+    Column2(usize),
     Program(SharedProgram),
 }
 
@@ -1289,6 +1294,11 @@ impl Hole {
     fn value(&self, vm: &mut ExprVM, row: &Row, ctx: &ExecuteContext) -> Result<Value> {
         match self {
             Hole::Column(index) => Ok(row.get(*index).cloned().unwrap_or_else(Value::null_unknown)),
+            Hole::Column2(index) => Ok(ctx
+                .row2
+                .and_then(|row| row.get(*index))
+                .cloned()
+                .unwrap_or_else(Value::null_unknown)),
             Hole::Program(program) => vm.execute(program, ctx),
         }
     }
@@ -1297,7 +1307,7 @@ impl Hole {
 /// What fills the slots of the statement's own blocks from the row its
 /// programs run over, by block id; a nested block's holes are its own
 #[derive(Debug, Default)]
-struct HoleSet {
+pub(crate) struct HoleSet {
     holes: Vec<Vec<(usize, Hole)>>,
 }
 
@@ -1391,7 +1401,7 @@ impl KeyReader {
             .iter()
             .map(|item| match item {
                 Hole::Column(column) => Some(*column),
-                Hole::Program(_) => None,
+                Hole::Column2(_) | Hole::Program(_) => None,
             })
             .collect::<Option<Vec<_>>>()
             .map(|items| prefix.iter().copied().chain(items).collect());
@@ -2161,6 +2171,11 @@ impl Builder<'_> {
                 })
                 .collect::<Result<Vec<_>>>()?
         };
+        let hole_exprs = if parent.is_none() && outer[0].tables.len() > 1 {
+            work.holes.clone()
+        } else {
+            Vec::new()
+        };
         let correlated = work.reads_parent || !work.delegated.is_empty();
         let mut grouping = grouping;
         if let Some(grouping) = grouping.as_mut() {
@@ -2186,6 +2201,7 @@ impl Builder<'_> {
             grouping,
             parent,
             holes,
+            hole_exprs,
             uncorrelated: !correlated,
         });
         Ok((id, work.delegated, work.reads_parent))
@@ -2925,39 +2941,40 @@ impl PreparedDml {
     }
 }
 
-/// The part of a join's WHERE asked of its joined rows, compiled over them
-/// with its subqueries as the statement's blocks
+/// The subqueries of a join statement's ON and of the WHERE it asks of its
+/// joined rows, prepared once over the joined scope as one set of blocks.
+/// The clauses keep their shape, each column spelled by its position
 #[derive(Debug)]
-pub(crate) struct JoinWhere {
-    pub(crate) program: SharedProgram,
-    /// The blocks its subqueries run as; None for a WHERE without one
-    blocks: Option<(PreparedBlocks, HoleSet)>,
+pub(crate) struct JoinBlocks {
+    blocks: PreparedBlocks,
+    /// The holes of sites over the joined row, and over a (left, right) pair
+    joined: HoleSet,
+    pair: HoleSet,
+    pub(crate) on: Option<Expression>,
+    pub(crate) cross: Option<Expression>,
+    /// The WHERE's conditions on the left side alone, and on the right
+    pub(crate) sides: [Option<Expression>; 2],
+    /// The scope's names for the left side's columns, then the right side's
+    pub(crate) left: Vec<String>,
+    pub(crate) right: Vec<String>,
+    all: CompactArc<Vec<String>>,
 }
 
-impl JoinWhere {
-    /// A WHERE that holds no subquery
-    pub(crate) fn plain(program: SharedProgram) -> Self {
-        Self {
-            program,
-            blocks: None,
-        }
-    }
-
-    pub(crate) fn has_blocks(&self) -> bool {
-        self.blocks.is_some()
-    }
-
-    /// `clause` over the joined row of `sides`, each a name and its table's
-    /// schema, whose columns the join names `columns`; None when they do
-    /// not line up
+impl JoinBlocks {
+    /// `on`, `cross` and the conditions on one side, `side_filters`, over the
+    /// joined row of `sides`, each a name and its table's schema; None when
+    /// the join's `width` columns do not line up
     fn prepare(
         executor: &Executor,
-        clause: &Expression,
+        on: Option<&Expression>,
+        cross: Option<&Expression>,
+        side_filters: [Option<&Expression>; 2],
         sides: [(SmartString, &Schema); 2],
-        columns: &[String],
+        width: usize,
         param_count: usize,
     ) -> Result<Option<Self>> {
-        let Some(scope) = ScopeTable::joined(sides, columns.len()) else {
+        let left_width = sides[0].1.columns.len();
+        let Some(scope) = ScopeTable::joined(sides, width) else {
             return Ok(None);
         };
         let scopes = [&scope];
@@ -2969,16 +2986,81 @@ impl JoinWhere {
             named: Vec::new(),
             max_param: 0,
         };
-        let mut work = Rewritten::default();
-        let clause = builder.rewrite(&chain, None, clause, &mut work)?;
-        let own = CompileContext::new(&scope.columns, &executor.function_registry)
-            .with_prepared_subqueries();
-        let program = compile_with(&own, &clause)?;
-        let blocks = builder.finish(param_count, Vec::new())?;
+        let mut rewrite = |clause: Option<&Expression>| {
+            clause
+                .map(|clause| builder.rewrite(&chain, None, clause, &mut Rewritten::default()))
+                .transpose()
+        };
+        let on = rewrite(on)?;
+        let cross = rewrite(cross)?;
+        let side_filters = [rewrite(side_filters[0])?, rewrite(side_filters[1])?];
+        let (blocks, joined) = builder.finish(param_count, Vec::new())?;
+        let left = scope.columns[..left_width].to_vec();
+        let right = scope.columns[left_width..].to_vec();
+        let registry = &executor.function_registry;
+        let pair_ctx = CompileContext::new(&left, registry).with_second_row(&right);
+        let position = |hole: &Expression| match hole {
+            Expression::Identifier(id) => scope
+                .columns
+                .iter()
+                .position(|c| *c == id.value_lower)
+                .map(|i| match i.checked_sub(left_width) {
+                    Some(i) => Hole::Column2(i),
+                    None => Hole::Column(i),
+                }),
+            _ => None,
+        };
+        let pair = HoleSet {
+            holes: blocks
+                .subqueries
+                .iter()
+                .map(|sq| {
+                    sq.hole_exprs
+                        .iter()
+                        .map(|(slot, hole)| match position(hole) {
+                            Some(hole) => Ok((*slot, hole)),
+                            None => {
+                                compile_with(&pair_ctx, hole).map(|p| (*slot, Hole::Program(p)))
+                            }
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .collect::<Result<Vec<_>>>()?,
+        };
         Ok(Some(Self {
-            program,
-            blocks: Some(blocks),
+            blocks,
+            joined,
+            pair,
+            on,
+            cross,
+            sides: side_filters,
+            left,
+            right,
+            all: CompactArc::clone(&scope.columns),
         }))
+    }
+
+    /// `clause`, one of the rewritten clauses or a part of one, compiled
+    /// over the joined row, or over the (left, right) pair when `pair`
+    pub(crate) fn compile(
+        &self,
+        clause: &Expression,
+        pair: bool,
+        registry: &FunctionRegistry,
+    ) -> Result<SharedProgram> {
+        let ctx = match pair {
+            true => CompileContext::new(&self.left, registry).with_second_row(&self.right),
+            false => CompileContext::new(&self.all, registry),
+        };
+        compile_with(&ctx.with_prepared_subqueries(), clause)
+    }
+
+    /// The holes of sites over the joined row, or over the pair when `pair`
+    pub(crate) fn holes(&self, pair: bool) -> &HoleSet {
+        match pair {
+            true => &self.pair,
+            false => &self.joined,
+        }
     }
 }
 
@@ -3000,30 +3082,38 @@ impl Executor {
         family.catalog()
     }
 
-    /// `clause`, asked of the joined rows of `sides` named `columns`, with
-    /// its subqueries prepared as blocks
-    pub(crate) fn prepare_join_where(
+    /// A join statement's `on` and `cross`, over the joined rows of `sides`
+    /// laid out as `width` columns, with their subqueries prepared as blocks
+    pub(crate) fn prepare_join_blocks(
         &self,
-        clause: &Expression,
+        on: Option<&Expression>,
+        cross: Option<&Expression>,
+        side_filters: [Option<&Expression>; 2],
         sides: [(SmartString, &Schema); 2],
-        columns: &[String],
+        width: usize,
         ctx: &ExecutionContext,
-    ) -> Result<Option<JoinWhere>> {
-        JoinWhere::prepare(self, clause, sides, columns, ctx.params().len())
+    ) -> Result<Option<JoinBlocks>> {
+        JoinBlocks::prepare(
+            self,
+            on,
+            cross,
+            side_filters,
+            sides,
+            width,
+            ctx.params().len(),
+        )
     }
 
-    /// One execution's run of `held`'s blocks for about `rows` joined rows;
-    /// None for a WHERE without blocks, or when a table they read no
-    /// longer has the columns they were prepared for
-    pub(crate) fn join_where_runner<'a>(
+    /// One execution's run of a join statement's blocks for about `rows`
+    /// joined rows; None when a table they read no longer has the columns
+    /// they were prepared for
+    pub(crate) fn join_runner<'a>(
         &'a self,
-        held: &'a JoinWhere,
+        held: &'a JoinBlocks,
         ctx: &'a ExecutionContext,
         rows: usize,
     ) -> Result<Option<PreparedRunner<'a>>> {
-        let Some((blocks, holes)) = &held.blocks else {
-            return Ok(None);
-        };
+        let (blocks, holes) = (&held.blocks, &held.joined);
         for name in &blocks.named {
             if !ctx.named_params().contains_key(name.as_str()) {
                 return Err(Error::invalid_argument(format!(
@@ -4002,7 +4092,7 @@ impl<'a> PreparedRunner<'a> {
                 Some(self.named),
                 self.transaction_id,
             );
-            for (slot, hole) in self.holes_of(index) {
+            for (slot, hole) in self.holes_of(index, self.holes) {
                 if !plan.keys.iter().any(|(_, key, _)| key == slot) {
                     match hole.value(&mut vm, &empty, &exec) {
                         Ok(value) => params[*slot] = value,
@@ -4034,19 +4124,25 @@ impl<'a> PreparedRunner<'a> {
         Ok(rows.map(|rows| (rows, passed)))
     }
 
-    /// What fills the block's slots: the statement's holes for its own
-    /// blocks, the block's for a nested one
-    fn holes_of(&self, index: usize) -> &[(usize, Hole)] {
+    /// What fills the block's slots: the calling site's holes for one of
+    /// the statement's own blocks, the block's for a nested one
+    fn holes_of<'s>(&'s self, index: usize, site: &'s HoleSet) -> &'s [(usize, Hole)] {
         let sq = &self.prepared.subqueries[index];
         match sq.parent {
-            None => self.holes.holes.get(index).map_or(&[], Vec::as_slice),
+            None => site.holes.get(index).map_or(&[], Vec::as_slice),
             Some(_) => &sq.holes,
         }
     }
 
-    /// The subquery's parameter buffer for a call from `caller`: its
-    /// parent's values, then its own holes over the caller's row or pair
-    fn fill(&self, index: usize, vm: &mut ExprVM, caller: &ExecuteContext) -> Result<()> {
+    /// The subquery's parameter buffer for a call from `caller` at `site`:
+    /// its parent's values, then its own holes over the caller's row or pair
+    fn fill(
+        &self,
+        index: usize,
+        vm: &mut ExprVM,
+        caller: &ExecuteContext,
+        site: &HoleSet,
+    ) -> Result<()> {
         let sq = &self.prepared.subqueries[index];
         let mut params = self.blocks[index].buffer.borrow_mut();
         let mut failed = self.blocks[index].failed.borrow_mut();
@@ -4062,7 +4158,7 @@ impl<'a> PreparedRunner<'a> {
             self.transaction_id,
         );
         hole_ctx.row2 = caller.row2;
-        for (slot, hole) in self.holes_of(index) {
+        for (slot, hole) in self.holes_of(index, site) {
             match hole.value(vm, caller.row, &hole_ctx) {
                 Ok(value) => params[*slot] = value,
                 Err(e) => {
@@ -4400,6 +4496,88 @@ impl<'a> PreparedRunner<'a> {
 
 impl SubqueryExecutor for PreparedRunner<'_> {
     fn execute_scalar(&self, subquery_index: u16, caller: &ExecuteContext) -> Result<Value> {
+        self.scalar_at(subquery_index, caller, self.holes)
+    }
+
+    fn execute_exists(&self, subquery_index: u16, caller: &ExecuteContext) -> Result<bool> {
+        self.exists_answer(subquery_index as usize, caller, self.holes)
+    }
+
+    fn execute_in(
+        &self,
+        subquery_index: u16,
+        value: &Value,
+        caller: &ExecuteContext,
+    ) -> Result<Option<bool>> {
+        self.members_answer(subquery_index as usize, value, caller, self.holes)
+    }
+
+    fn execute_quantified(
+        &self,
+        subquery_index: u16,
+        value: &Value,
+        _op: CompareOp,
+        _all: bool,
+        caller: &ExecuteContext,
+    ) -> Result<Option<bool>> {
+        self.members_answer(subquery_index as usize, value, caller, self.holes)
+    }
+}
+
+/// A run's blocks as one site of a join statement calls them: the run's
+/// state, and the holes compiled for the layout of the row the site reads
+pub(crate) struct SiteRunner<'r> {
+    runner: &'r PreparedRunner<'r>,
+    holes: &'r HoleSet,
+}
+
+impl<'r> SiteRunner<'r> {
+    pub(crate) fn new(runner: &'r PreparedRunner<'r>, holes: &'r HoleSet) -> Self {
+        Self { runner, holes }
+    }
+}
+
+impl SubqueryExecutor for SiteRunner<'_> {
+    fn execute_scalar(&self, subquery_index: u16, caller: &ExecuteContext) -> Result<Value> {
+        self.runner.scalar_at(subquery_index, caller, self.holes)
+    }
+
+    fn execute_exists(&self, subquery_index: u16, caller: &ExecuteContext) -> Result<bool> {
+        self.runner
+            .exists_answer(subquery_index as usize, caller, self.holes)
+    }
+
+    fn execute_in(
+        &self,
+        subquery_index: u16,
+        value: &Value,
+        caller: &ExecuteContext,
+    ) -> Result<Option<bool>> {
+        self.runner
+            .members_answer(subquery_index as usize, value, caller, self.holes)
+    }
+
+    fn execute_quantified(
+        &self,
+        subquery_index: u16,
+        value: &Value,
+        _op: CompareOp,
+        _all: bool,
+        caller: &ExecuteContext,
+    ) -> Result<Option<bool>> {
+        self.runner
+            .members_answer(subquery_index as usize, value, caller, self.holes)
+    }
+}
+
+impl PreparedRunner<'_> {
+    /// A scalar block's value for a call from `caller` at `site`
+    fn scalar_at(
+        &self,
+        subquery_index: u16,
+        caller: &ExecuteContext,
+        site: &HoleSet,
+    ) -> Result<Value> {
         let index = subquery_index as usize;
         let sq = self
             .prepared
@@ -4418,10 +4596,10 @@ impl SubqueryExecutor for PreparedRunner<'_> {
             return Err(Error::internal("an EXISTS block run for a value"));
         };
         if !sq.uncorrelated {
-            return self.scalar_value(index, sq, projection, caller);
+            return self.scalar_value(index, sq, projection, caller, site);
         }
         let answer = self.kept(kept, || {
-            self.scalar_value(index, sq, projection, caller)
+            self.scalar_value(index, sq, projection, caller, site)
                 .map(BlockAnswer::Value)
         })?;
         let BlockAnswer::Value(value) = answer else {
@@ -4429,30 +4607,6 @@ impl SubqueryExecutor for PreparedRunner<'_> {
         };
         *self.blocks[index].value.borrow_mut() = Some(value.clone());
         Ok(value)
-    }
-
-    fn execute_exists(&self, subquery_index: u16, caller: &ExecuteContext) -> Result<bool> {
-        self.exists_answer(subquery_index as usize, caller)
-    }
-
-    fn execute_in(
-        &self,
-        subquery_index: u16,
-        value: &Value,
-        caller: &ExecuteContext,
-    ) -> Result<Option<bool>> {
-        self.members_answer(subquery_index as usize, value, caller)
-    }
-
-    fn execute_quantified(
-        &self,
-        subquery_index: u16,
-        value: &Value,
-        _op: CompareOp,
-        _all: bool,
-        caller: &ExecuteContext,
-    ) -> Result<Option<bool>> {
-        self.members_answer(subquery_index as usize, value, caller)
     }
 }
 
@@ -4465,10 +4619,11 @@ impl PreparedRunner<'_> {
         sq: &PreparedSubquery,
         projection: &SharedProgram,
         caller: &ExecuteContext,
+        site: &HoleSet,
     ) -> Result<Value> {
         if let Some(grouping) = &sq.grouping {
             let Some(statement) = &grouping.statement else {
-                return self.grouped_value(index, grouping, projection, caller);
+                return self.grouped_value(index, grouping, projection, caller, site);
             };
             let mut values = self.statement_values(statement)?;
             if values.len() > 1 {
@@ -4477,7 +4632,7 @@ impl PreparedRunner<'_> {
             return Ok(values.pop().unwrap_or_else(Value::null_unknown));
         }
         let mut vm = self.blocks[index].vm.borrow_mut();
-        self.fill(index, &mut vm, caller)?;
+        self.fill(index, &mut vm, caller, site)?;
         // Read-only from here on: a nested subquery copies these values
         let params = self.blocks[index].buffer.borrow();
         // The scanner keeps what it needs of the expression, so the next
@@ -4520,7 +4675,7 @@ impl PreparedRunner<'_> {
         Ok(value.unwrap_or_else(Value::null_unknown))
     }
 
-    fn exists_answer(&self, index: usize, caller: &ExecuteContext) -> Result<bool> {
+    fn exists_answer(&self, index: usize, caller: &ExecuteContext, site: &HoleSet) -> Result<bool> {
         let sq = self
             .prepared
             .subqueries
@@ -4536,7 +4691,7 @@ impl PreparedRunner<'_> {
         }
         let exists = match (&sq.grouping, sq.uncorrelated) {
             (Some(grouping), false) => {
-                self.with_groups(index, grouping, caller, |rows, params, vm| {
+                self.with_groups(index, grouping, caller, site, |rows, params, vm| {
                     self.any_group_passes(grouping, rows, params, vm)
                 })?
             }
@@ -4553,12 +4708,12 @@ impl PreparedRunner<'_> {
                         .statement_values(statement)
                         .map(|rows| !rows.is_empty()),
                     Some(grouping) => {
-                        self.with_groups(index, grouping, caller, |rows, params, vm| {
+                        self.with_groups(index, grouping, caller, site, |rows, params, vm| {
                             self.any_group_passes(grouping, rows, params, vm)
                         })
                     }
                     None => {
-                        self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller)?;
+                        self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller, site)?;
                         self.probe(index)
                     }
                 };
@@ -4568,7 +4723,7 @@ impl PreparedRunner<'_> {
                 }
             }
             (None, false) => {
-                self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller)?;
+                self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller, site)?;
                 match &existence.keyed {
                     Some(plan) if self.takes_keyed_set(index, plan) => {
                         self.keyed_lookup(index, existence, plan)?
@@ -4630,6 +4785,7 @@ impl PreparedRunner<'_> {
         index: usize,
         value: &Value,
         caller: &ExecuteContext,
+        site: &HoleSet,
     ) -> Result<Option<bool>> {
         let sq = self
             .prepared
@@ -4641,7 +4797,7 @@ impl PreparedRunner<'_> {
         };
         let decides = members.test.decides();
         if sq.uncorrelated {
-            self.read_members(index, kept, members, caller)?;
+            self.read_members(index, kept, members, caller, site)?;
             let sets = self.blocks[index].members.borrow();
             let Some(BlockAnswer::Members(set)) = sets.as_ref() else {
                 return Err(Error::internal("a value block's members not kept"));
@@ -4649,7 +4805,7 @@ impl PreparedRunner<'_> {
             return members_answer_of(set, value, decides);
         }
         if let Some(grouping) = &sq.grouping {
-            return self.with_groups(index, grouping, caller, |rows, params, vm| {
+            return self.with_groups(index, grouping, caller, site, |rows, params, vm| {
                 let mut fold = MemberFold::new(members.test);
                 for slot_row in rows {
                     let exec = self.slot_context(slot_row, params);
@@ -4668,7 +4824,7 @@ impl PreparedRunner<'_> {
                 fold.finish()
             });
         }
-        self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller)?;
+        self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller, site)?;
         match &kept.keyed {
             Some(plan) if self.takes_keyed_set(index, plan) => {
                 self.keyed_members_answer(index, kept, members, plan, value)
@@ -4685,6 +4841,7 @@ impl PreparedRunner<'_> {
         kept: &Kept,
         members: &Members,
         caller: &ExecuteContext,
+        site: &HoleSet,
     ) -> Result<()> {
         if self.blocks[index].members.borrow().is_some() {
             return Ok(());
@@ -4693,7 +4850,7 @@ impl PreparedRunner<'_> {
         crate::test_failpoints::prepared_strategy_ran(
             crate::test_failpoints::PreparedStrategy::MemberSet,
         );
-        self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller)?;
+        self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller, site)?;
         let answer = self.kept(kept, || {
             self.collect_members(index, members, None)
                 .map(|set| BlockAnswer::Members(CompactArc::new(set)))
@@ -4940,7 +5097,13 @@ impl PreparedRunner<'_> {
             return Ok(None);
         };
         let empty = Row::new();
-        self.read_members(index, kept, members, &ExecuteContext::new(&empty))?;
+        self.read_members(
+            index,
+            kept,
+            members,
+            &ExecuteContext::new(&empty),
+            self.holes,
+        )?;
         let sets = self.blocks[index].members.borrow();
         let Some(BlockAnswer::Members(set)) = sets.as_ref() else {
             return Ok(None);
@@ -5136,8 +5299,9 @@ impl PreparedRunner<'_> {
         grouping: &Grouping,
         projection: &SharedProgram,
         caller: &ExecuteContext,
+        site: &HoleSet,
     ) -> Result<Value> {
-        self.with_groups(index, grouping, caller, |rows, params, vm| {
+        self.with_groups(index, grouping, caller, site, |rows, params, vm| {
             let mut value = None;
             for slot_row in rows {
                 let exec = self.slot_context(slot_row, params);
@@ -5183,9 +5347,10 @@ impl PreparedRunner<'_> {
         index: usize,
         grouping: &Grouping,
         caller: &ExecuteContext,
+        site: &HoleSet,
         answer: impl FnOnce(&[Row], &[Value], &mut ExprVM) -> Result<T>,
     ) -> Result<T> {
-        self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller)?;
+        self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller, site)?;
         if let Some(plan) = grouping.keyed.as_ref() {
             if self.takes_keyed_set(index, plan) {
                 if self.blocks[index].grouped.borrow().is_none() {
