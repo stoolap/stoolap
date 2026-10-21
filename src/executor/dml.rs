@@ -75,6 +75,27 @@ impl Drop for StatementRollback<'_> {
     }
 }
 
+/// The named parameter holding a VALUES answer, under a name no SQL text
+/// spells, so no parameter of the statement reads it; it stays inline, so
+/// the name's key is the one allocation
+fn answer_parameter(answer: usize) -> (String, Expression) {
+    use std::fmt::Write;
+    let mut name = String::with_capacity(24);
+    let _ = write!(name, ":v {answer}");
+    let spelled = SmartString::new(&name);
+    name.remove(0);
+    let parameter = Expression::Parameter(Parameter {
+        token: crate::parser::token::Token::new(
+            crate::parser::token::TokenType::Parameter,
+            spelled.clone(),
+            crate::parser::token::Position::default(),
+        ),
+        name: spelled,
+        index: 0,
+    });
+    (name, parameter)
+}
+
 /// Check whether a constraint violation matches the ON CONFLICT target columns.
 /// Returns true if the conflict should be handled (DO UPDATE / DO NOTHING).
 /// Returns false if the violation is on a different constraint, meaning the
@@ -617,6 +638,141 @@ impl Executor {
         Ok(Some(row_ids))
     }
 
+    /// The INSERT run with each VALUES value holding a subquery of the
+    /// prepared family read first and passed as a parameter, so the
+    /// subqueries see the tables as the statement found them and the rows
+    /// go through the plain INSERT; None when no such value is in it
+    #[inline(never)]
+    fn insert_with_values_read(
+        &self,
+        stmt: &InsertStatement,
+        ctx: &ExecutionContext,
+        plan_cache: Option<&RwLock<CompiledExecution>>,
+    ) -> Option<Result<Box<dyn QueryResult>>> {
+        let values = || {
+            stmt.values
+                .iter()
+                .flatten()
+                .filter(|e| !matches!(e, Expression::Default(_)))
+        };
+        if stmt.on_duplicate
+            || stmt.do_nothing
+            || !values().any(Self::has_subqueries)
+            || self.dml_family(None, values(), ctx).is_err()
+        {
+            return None;
+        }
+        Some(self.read_values_then_insert(stmt, ctx, plan_cache))
+    }
+
+    fn read_values_then_insert(
+        &self,
+        stmt: &InsertStatement,
+        ctx: &ExecutionContext,
+        plan_cache: Option<&RwLock<CompiledExecution>>,
+    ) -> Result<Box<dyn QueryResult>> {
+        let (active_txn_id, statement_rollback) = {
+            let active = self
+                .active_transaction
+                .lock()
+                .map_err(|_| Error::internal("active transaction lock poisoned"))?;
+            (
+                active.as_ref().map(|t| t.transaction.id()),
+                StatementRollback::new(&self.engine, active.as_ref()),
+            )
+        };
+        let ctx_with_txn;
+        let ctx = match active_txn_id {
+            Some(txn_id) => {
+                ctx_with_txn = ctx.with_transaction_id(txn_id as u64);
+                &ctx_with_txn
+            }
+            None => ctx,
+        };
+        let ctx_with_view;
+        let ctx = match self.statement_view(true, ctx, active_txn_id) {
+            Some(view) => {
+                ctx_with_view = ctx.with_statement_view(view);
+                &ctx_with_view
+            }
+            None => ctx,
+        };
+        let snapshot_ctx;
+        let ctx = if active_txn_id.is_none() && ctx.statement_snapshot().is_none() {
+            let snapshot =
+                self.new_statement_snapshot(self.isolation_level(), ctx.statement_view())?;
+            snapshot_ctx = ctx.with_statement_snapshot(snapshot);
+            &snapshot_ctx
+        } else {
+            ctx
+        };
+        let result = self.insert_read_values(stmt, ctx, plan_cache);
+        statement_rollback.finish(result)
+    }
+
+    fn insert_read_values(
+        &self,
+        stmt: &InsertStatement,
+        ctx: &ExecutionContext,
+        plan_cache: Option<&RwLock<CompiledExecution>>,
+    ) -> Result<Box<dyn QueryResult>> {
+        let table_name = &stmt.table_name.value_lower;
+        // A VALUES row has no target row: its scope is a table without columns
+        let unread = Schema::new(table_name.as_str(), Vec::new());
+        let (prepared, tables) = self.open_prepared_dml(
+            plan_cache,
+            &unread,
+            table_name,
+            None,
+            &[],
+            &stmt.values,
+            ctx,
+        )?;
+        let run = super::prepared_select::DmlRunner::new(self, &prepared, ctx, tables, 0)?;
+        let mut vm = super::expression::ExprVM::new();
+        let no_row = Row::new();
+        let exec = run.context(&no_row);
+        let mut written_ctx = ctx.clone();
+        let mut written = stmt.clone();
+        let mut answers = 0;
+        for (row, programs) in written.values.iter_mut().zip(run.values()) {
+            for (value, program) in row.iter_mut().zip(programs) {
+                if let Some(program) = program {
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::prepared_dml_site_ran(
+                        crate::test_failpoints::PreparedDmlSite::InsertValues,
+                    );
+                    let (name, parameter) = answer_parameter(answers);
+                    written_ctx.set_named_param(name, vm.execute_cow(program, &exec)?);
+                    *value = parameter;
+                    answers += 1;
+                }
+            }
+        }
+        // Every value is read: the blocks' tables close before a row is written
+        drop(run);
+        self.execute_insert(&written, &written_ctx, None)
+    }
+
+    /// VALUES holding a subquery go the uncached way, whose plan slot keeps
+    /// the prepared statement; the rollback is disarmed on success, so it
+    /// takes back nothing the inner statement wrote
+    #[cold]
+    #[inline(never)]
+    fn insert_values_read_uncached(
+        &self,
+        stmt: &InsertStatement,
+        ctx: &ExecutionContext,
+        compiled_cache: &Arc<RwLock<CompiledExecution>>,
+        table: Box<dyn Table>,
+        standalone_tx: Option<Box<dyn Transaction>>,
+        statement_rollback: StatementRollback<'_>,
+    ) -> Result<Box<dyn QueryResult>> {
+        drop(table);
+        drop(standalone_tx);
+        statement_rollback.finish(self.execute_insert(stmt, ctx, Some(compiled_cache)))
+    }
+
     /// Execute an INSERT statement
     pub(crate) fn execute_insert(
         &self,
@@ -626,6 +782,12 @@ impl Executor {
     ) -> Result<Box<dyn QueryResult>> {
         // OPTIMIZATION: Use pre-computed lowercase name to avoid allocation per query
         let table_name = &stmt.table_name.value_lower;
+        let reads_through_view = super::insert_reads_through_a_view(stmt);
+        if reads_through_view {
+            if let Some(inserted) = self.insert_with_values_read(stmt, ctx, plan_cache) {
+                return inserted;
+            }
+        }
 
         // Check if there's an active explicit transaction
         let mut active_tx = self.active_transaction.lock().unwrap();
@@ -643,15 +805,13 @@ impl Executor {
         };
         // Its query and subqueries read through one view; the target keeps the newest
         let ctx_with_view;
-        let ctx =
-            match self.statement_view(super::insert_reads_through_a_view(stmt), ctx, active_txn_id)
-            {
-                Some(view) => {
-                    ctx_with_view = ctx.with_statement_view(view);
-                    &ctx_with_view
-                }
-                None => ctx,
-            };
+        let ctx = match self.statement_view(reads_through_view, ctx, active_txn_id) {
+            Some(view) => {
+                ctx_with_view = ctx.with_statement_view(view);
+                &ctx_with_view
+            }
+            None => ctx,
+        };
 
         let statement_rollback = StatementRollback::new(&self.engine, active_tx.as_ref());
 
@@ -1553,6 +1713,17 @@ impl Executor {
                 cached.reads_through_view,
             )
         } else {
+            let reads_through_view = super::insert_reads_through_a_view(stmt);
+            if reads_through_view && stmt.values.iter().flatten().any(Self::has_subqueries) {
+                return self.insert_values_read_uncached(
+                    stmt,
+                    ctx,
+                    compiled_cache,
+                    table,
+                    standalone_tx,
+                    statement_rollback,
+                );
+            }
             // Compile and cache
             let schema = table.schema();
             let schema_column_count = schema.columns.len();
@@ -1612,7 +1783,6 @@ impl Executor {
                 };
 
             // Store in cache for next execution
-            let reads_through_view = super::insert_reads_through_a_view(stmt);
             let compiled = CompiledInsert {
                 table_name: SmartString::new(table_name),
                 column_indices: Arc::new(column_indices.clone()),
@@ -2148,6 +2318,7 @@ impl Executor {
                 table_name,
                 stmt.where_clause.as_deref(),
                 &sets,
+                &[],
                 ctx,
             )?;
             held_dml = prepared;
@@ -3037,6 +3208,7 @@ impl Executor {
                 schema,
                 &SmartString::from(effective_name),
                 stmt.where_clause.as_deref(),
+                &[],
                 &[],
                 ctx,
             )?;

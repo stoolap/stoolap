@@ -276,7 +276,7 @@ fn test_window_control_argument_reading_the_row() {
 fn test_insert_values() {
     write_site(
         "site_insert_values",
-        Fails("step 5"),
+        Right,
         "INSERT INTO t VALUES (7, (SELECT MAX(x) FROM u), 0)",
         "INSERT INTO t VALUES (7, 3, 0)",
     );
