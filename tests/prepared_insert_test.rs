@@ -202,3 +202,46 @@ fn a_values_subquery_fills_its_column_beside_the_defaults() {
         .collect();
     assert_eq!(got.join(" "), "1:7:4 2:7:NULL");
 }
+
+#[test]
+fn a_missing_parameter_fails_beside_a_values_subquery() {
+    let db = Database::open("memory://prepared_insert_missing_parameter").unwrap();
+    setup(&db);
+    for _ in 0..2 {
+        let got = db.execute(
+            "INSERT INTO t VALUES ($1, (SELECT x + 40 FROM u WHERE id = 1))",
+            (),
+        );
+        let message = got.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(message.contains("parameters"), "{message:?}");
+    }
+    assert_eq!(
+        rows(db.query("SELECT id, b FROM t ORDER BY id", ())),
+        "1:10 2:20 3:30 4:40"
+    );
+}
+
+#[test]
+fn a_values_subquery_reads_no_column_of_the_target() {
+    let db = Database::open("memory://prepared_insert_no_target_row").unwrap();
+    setup(&db);
+    db.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, b TEXT)", ())
+        .unwrap();
+    for (id, value, want) in [
+        (1, "(SELECT \"b\" FROM u WHERE u.id = 1)", Some("b")),
+        (2, "(SELECT s.id FROM u WHERE u.id = 1)", None),
+        (3, "(SELECT b FROM u WHERE u.id = 1)", None),
+        (4, "b || (SELECT 'x')", None),
+    ] {
+        let insert = db.execute(&format!("INSERT INTO s VALUES ({id}, {value})"), ());
+        let got: Option<Option<String>> = db
+            .query(&format!("SELECT b FROM s WHERE id = {id}"), ())
+            .unwrap()
+            .next()
+            .map(|r| r.unwrap().get(0).unwrap());
+        match want {
+            Some(want) => assert_eq!(got, Some(Some(want.to_string())), "{value}: {insert:?}"),
+            None => assert!(insert.is_err() && got.is_none(), "{value} inserted {got:?}"),
+        }
+    }
+}

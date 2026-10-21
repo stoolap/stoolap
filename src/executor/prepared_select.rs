@@ -2725,16 +2725,24 @@ impl PreparedDml {
             rewritten.push((*column, value));
         }
         let sets = rewritten;
+        // A VALUES row has no target row to read
+        let no_scopes: [&ScopeTable; 0] = [];
+        let no_row = Chain { scopes: &no_scopes };
         let mut rewritten_values = Vec::with_capacity(values.len());
         for row in values {
             let mut programs = Vec::with_capacity(row.len());
             for value in row {
-                if matches!(value, Expression::Default(_)) || !mentions_subquery(value) {
+                if matches!(value, Expression::Default(_)) {
                     programs.push(None);
                     continue;
                 }
                 let mut value_work = Rewritten::default();
-                let rewritten_value = builder.rewrite(&chain, None, value, &mut value_work)?;
+                // Rewritten for its parameters too, so a slot never takes one not given
+                let rewritten_value = builder.rewrite(&no_row, None, value, &mut value_work)?;
+                if !mentions_subquery(value) {
+                    programs.push(None);
+                    continue;
+                }
                 programs.push(Some(
                     if !value_work.reads_row
                         && !is_leaf(value)
