@@ -176,7 +176,7 @@ impl<'a> Parser<'a> {
     pub fn parse_program(&mut self) -> Result<Program, ParseErrors> {
         // Pre-allocate for common case (most queries have 1 statement)
         let mut statements = Vec::with_capacity(1);
-        let mut params = Vec::with_capacity(1);
+        let mut params = smallvec::SmallVec::new();
 
         while !self.cur_token_is(TokenType::Eof) {
             if let Some((stmt, slots)) = self.parse_statement_with_slots() {
