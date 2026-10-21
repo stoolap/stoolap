@@ -567,6 +567,7 @@ impl Executor {
                 active_txn_id,
                 Some(&cached.classification),
                 Some(&cached.compiled),
+                cached.counts.as_deref(),
             );
         }
 
@@ -608,6 +609,7 @@ impl Executor {
                 active_txn_id,
                 Some(&cached_plan.classification),
                 Some(&cached_plan.compiled),
+                cached_plan.counts.as_deref(),
             );
         }
 
@@ -910,6 +912,7 @@ impl Executor {
             self.active_txn_id(),
             None,
             None,
+            None,
         )
     }
 
@@ -929,6 +932,7 @@ impl Executor {
             &std::sync::OnceLock<Arc<query_classification::QueryClassification>>,
         >,
         compiled: Option<&std::sync::RwLock<query_cache::CompiledExecution>>,
+        counts: Option<&query_cache::CountsSlot>,
     ) -> Result<Box<dyn QueryResult>> {
         // A SELECT clears them where its top level starts
         if !matches!(statement, Statement::Select(_)) {
@@ -982,9 +986,10 @@ impl Executor {
                 started,
                 plan_classification,
                 compiled,
+                counts,
             );
         }
-        self.dispatch_statement(statement, &ctx, plan_classification, compiled)
+        self.dispatch_statement(statement, &ctx, plan_classification, compiled, None)
     }
 
     /// A SELECT, run again with a fresh view when a truncate or drop
@@ -992,6 +997,7 @@ impl Executor {
     /// deadline of the first. A view the caller gave, or one a function
     /// registered after the built-ins may not survive running twice, ends
     /// it with the error instead
+    #[allow(clippy::too_many_arguments)]
     fn select_until_held(
         &self,
         statement: &Statement,
@@ -1002,10 +1008,12 @@ impl Executor {
             &std::sync::OnceLock<Arc<query_classification::QueryClassification>>,
         >,
         compiled: Option<&std::sync::RwLock<query_cache::CompiledExecution>>,
+        counts: Option<&query_cache::CountsSlot>,
     ) -> Result<Box<dyn QueryResult>> {
         let mut _deadline = None;
         for attempt in 1..=STATEMENT_RUNS {
-            let result = self.dispatch_statement(statement, &ctx, plan_classification, compiled);
+            let result =
+                self.dispatch_statement(statement, &ctx, plan_classification, compiled, counts);
             // A result read whole through an overtaken view may hold what went
             let overtaken = match &result {
                 Err(Error::ViewOvertaken) => true,
@@ -1046,6 +1054,7 @@ impl Executor {
             &std::sync::OnceLock<Arc<query_classification::QueryClassification>>,
         >,
         compiled: Option<&std::sync::RwLock<query_cache::CompiledExecution>>,
+        counts: Option<&query_cache::CountsSlot>,
     ) -> Result<Box<dyn QueryResult>> {
         match statement {
             // DDL statements
@@ -1073,7 +1082,7 @@ impl Executor {
                     }
                 }
                 // Fall back to full query execution
-                self.execute_select_with_plan(stmt, ctx, plan_classification, compiled)
+                self.execute_select_with_plan(stmt, ctx, plan_classification, compiled, counts)
             }
 
             // Transaction control
@@ -1292,6 +1301,7 @@ impl Executor {
             active_txn_id,
             Some(&plan.classification),
             Some(&plan.compiled),
+            plan.counts.as_deref(),
         )
     }
 }

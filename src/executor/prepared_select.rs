@@ -472,11 +472,16 @@ impl Executor {
         for ob in &stmt.order_by {
             family.expression(&ob.expression, 1, Site::Values, &mut found)?;
         }
-        for clause in [&stmt.limit, &stmt.offset].into_iter().flatten() {
+        for (count, clause) in [(&stmt.limit, "LIMIT"), (&stmt.offset, "OFFSET")] {
+            let Some(count) = count else {
+                continue;
+            };
+            // A count holding a subquery was read before the statement's rows
             if !matches!(
-                **clause,
+                **count,
                 Expression::IntegerLiteral(_) | Expression::Parameter(_)
-            ) {
+            ) && !ctx.is_some_and(|ctx| ctx.read_count(count, clause).is_some())
+            {
                 return Err("LIMIT or OFFSET that is not a literal or a parameter");
             }
         }
@@ -2845,7 +2850,7 @@ impl PreparedDml {
         scope_name: &SmartString,
         where_clause: Option<&Expression>,
         sets: &[(usize, &Expression)],
-        values: &[Vec<Expression>],
+        values: &[impl AsRef<[Expression]>],
         param_count: usize,
         epoch: u64,
     ) -> Result<Self> {
@@ -2884,6 +2889,7 @@ impl PreparedDml {
         let sets = rewritten;
         let mut rewritten_values = Vec::with_capacity(values.len());
         for row in values {
+            let row = row.as_ref();
             let mut programs = Vec::with_capacity(row.len());
             for value in row {
                 if matches!(value, Expression::Default(_)) {
@@ -3540,7 +3546,7 @@ impl Executor {
         scope_name: &SmartString,
         where_clause: Option<&Expression>,
         sets: &[(usize, &Expression)],
-        values: &[Vec<Expression>],
+        values: &[impl AsRef<[Expression]>],
         ctx: &ExecutionContext,
     ) -> Result<(Arc<PreparedDml>, DmlTables)> {
         let epoch = self.engine.schema_epoch();

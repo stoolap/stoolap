@@ -2318,7 +2318,7 @@ impl Executor {
                 table_name,
                 stmt.where_clause.as_deref(),
                 &sets,
-                &[],
+                &[] as &[Vec<Expression>],
                 ctx,
             )?;
             held_dml = prepared;
@@ -3209,7 +3209,7 @@ impl Executor {
                 &SmartString::from(effective_name),
                 stmt.where_clause.as_deref(),
                 &[],
-                &[],
+                &[] as &[Vec<Expression>],
                 ctx,
             )?;
             held_dml = prepared;

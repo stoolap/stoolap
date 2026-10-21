@@ -88,8 +88,18 @@ pub(crate) fn row_count(
 ) -> Result<usize> {
     let value = match expr {
         Expression::IntegerLiteral(lit) => Value::Integer(lit.value),
-        _ => evaluate_once(expr, Some(ctx))?,
+        // A count holding a subquery was read before the statement's rows
+        _ => match ctx.read_count(expr, clause) {
+            Some(count) => return Ok(count),
+            None => evaluate_once(expr, Some(ctx))?,
+        },
     };
+    count_of(value, clause)
+}
+
+/// The row count `value` is, for `clause`: an INTEGER of zero or more, or
+/// a FLOAT holding one
+pub(crate) fn count_of(value: Value, clause: &'static str) -> Result<usize> {
     // 2^63, the first FLOAT above every INTEGER
     const ABOVE_INTEGERS: f64 = 9_223_372_036_854_775_808.0;
     let count = match value {

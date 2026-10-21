@@ -1005,7 +1005,89 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        self.execute_select_with_plan(stmt, ctx, None, None)
+        self.execute_select_with_plan(stmt, ctx, None, None, None)
+    }
+
+    /// `ctx` with the snapshot a statement reading its LIMIT or OFFSET
+    /// subqueries reads; None in an explicit transaction, read through itself
+    #[cold]
+    #[inline(never)]
+    fn with_counts_snapshot(&self, ctx: &ExecutionContext) -> Result<Option<ExecutionContext>> {
+        let in_transaction = self
+            .active_transaction
+            .lock()
+            .map_err(|_| Error::internal("active transaction lock poisoned"))?
+            .is_some();
+        if in_transaction {
+            return Ok(None);
+        }
+        let snapshot = self.new_statement_snapshot(self.isolation_level(), ctx.statement_view())?;
+        Ok(Some(ctx.with_statement_snapshot(snapshot)))
+    }
+
+    /// `ctx` with the counts the subqueries of `stmt`'s LIMIT and OFFSET
+    /// answer, read once before the statement reads a row, under its
+    /// snapshot; their blocks are held in `slot`
+    #[cold]
+    #[inline(never)]
+    fn read_row_counts(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        slot: Option<&super::query_cache::CountsSlot>,
+    ) -> Result<ExecutionContext> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::row_counts_read();
+        let clauses = [
+            (stmt.limit.as_deref(), "LIMIT"),
+            (stmt.offset.as_deref(), "OFFSET"),
+        ];
+        let counts = clauses.iter().filter_map(|(count, _)| *count);
+        if let Err(reason) = self.dml_family(None, counts, ctx) {
+            return Err(Error::invalid_argument(format!(
+                "a LIMIT or OFFSET subquery is not supported here: {reason}"
+            )));
+        }
+        // A count is read before any row: its scope is a table without columns
+        static NO_COLUMNS: std::sync::LazyLock<Schema> =
+            std::sync::LazyLock::new(|| Schema::new("", Vec::new()));
+        let values = clauses.map(|(count, _)| count.map_or(&[][..], std::slice::from_ref));
+        let (prepared, tables) = self.open_prepared_dml(
+            slot.map(|slot| &slot.compiled),
+            &NO_COLUMNS,
+            &SmartString::default(),
+            None,
+            &[],
+            &values,
+            ctx,
+        )?;
+        let run = super::prepared_select::DmlRunner::new(self, &prepared, ctx, tables, 0)?;
+        let mut vm = super::expression::ExprVM::new();
+        let no_row = Row::new();
+        let exec = run.context(&no_row);
+        // A plan keeps the expressions' identities; only a statement run
+        // without one hashes them here
+        let keys = match slot {
+            Some(slot) => slot.keys,
+            None => clauses.map(|(count, _)| count.map(ExprKey::of)),
+        };
+        let mut counts = smallvec::SmallVec::new();
+        for (((count, clause), key), programs) in clauses.iter().zip(keys).zip(run.values()) {
+            if let (Some(count), Some(key), Some(Some(program))) = (count, key, programs.first()) {
+                let value = vm.execute_cow(program, &exec)?;
+                counts.push(super::context::ReadCount {
+                    clause,
+                    address: *count as *const Expression as usize,
+                    key,
+                    count: super::row_count::count_of(value, clause)?,
+                });
+            }
+        }
+        drop(run);
+        Ok(ctx.with_read_counts(super::context::ReadCounts {
+            depth: ctx.query_depth,
+            counts,
+        }))
     }
 
     /// `execute_select` with the cached plan's classification slot, so
@@ -1017,6 +1099,7 @@ impl Executor {
         ctx: &ExecutionContext,
         plan_classification: Option<&std::sync::OnceLock<Arc<QueryClassification>>>,
         compiled: Option<&std::sync::RwLock<CompiledExecution>>,
+        counts: Option<&super::query_cache::CountsSlot>,
     ) -> Result<Box<dyn QueryResult>> {
         // Start timeout guard ONLY at the top level (query_depth == 0).
         // For nested queries (subqueries, views), the parent's TimeoutGuard handles timeout.
@@ -1044,11 +1127,35 @@ impl Executor {
             }
         }
 
+        // A LIMIT or OFFSET subquery reads the snapshot the statement's CTEs
+        // and rows read, so it is taken before the CTEs run
+        let reads_counts = [stmt.limit.as_deref(), stmt.offset.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(Self::has_subqueries);
+        let snapshot_ctx;
+        let ctx = if reads_counts && ctx.statement_snapshot().is_none() {
+            snapshot_ctx = self.with_counts_snapshot(ctx)?;
+            snapshot_ctx.as_ref().unwrap_or(ctx)
+        } else {
+            ctx
+        };
+
         // Check for CTEs (WITH clause). A statement with one keeps every
         // subquery for the aggregation entry, which runs with the CTEs bound
         if self.has_cte(stmt) {
             return self.execute_select_with_ctes(stmt, ctx);
         }
+
+        // The subquery is read once, before any path reads a row, with the
+        // CTEs of the statement bound
+        let counts_ctx;
+        let ctx = if reads_counts {
+            counts_ctx = self.read_row_counts(stmt, ctx, counts)?;
+            &counts_ctx
+        } else {
+            ctx
+        };
 
         // OPTIMIZATION: Get cached query classification ONCE at entry point
         // This classification is passed through the call chain to avoid

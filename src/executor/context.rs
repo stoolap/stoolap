@@ -1243,6 +1243,27 @@ pub struct ExecutionContext {
     newest_target: Option<Arc<(SmartString, usize)>>,
     /// A semantic cache miss at the statement's start, for its scan
     semantic_miss: Option<SemanticMiss>,
+    /// The LIMIT and OFFSET subqueries a statement read before its rows,
+    /// behind an Arc, as few statements have one
+    read_counts: Option<Arc<ReadCounts>>,
+}
+
+/// The counts a statement at `depth` read before its rows
+#[derive(Debug)]
+pub(crate) struct ReadCounts {
+    pub(crate) depth: usize,
+    pub(crate) counts: smallvec::SmallVec<[ReadCount; 2]>,
+}
+
+/// One count of `clause`, LIMIT or OFFSET, by its expression: the
+/// statement's own at `address`, or a copy built for a rebuilt statement,
+/// by `key`
+#[derive(Debug)]
+pub(crate) struct ReadCount {
+    pub(crate) clause: &'static str,
+    pub(crate) address: usize,
+    pub(crate) key: super::expr_key::ExprKey,
+    pub(crate) count: usize,
 }
 
 /// What a semantic cache lookup that missed before the statement's view
@@ -1293,6 +1314,7 @@ impl ExecutionContext {
             statement_view: None,
             newest_target: None,
             semantic_miss: None,
+            read_counts: None,
         }
     }
 
@@ -1461,6 +1483,7 @@ impl ExecutionContext {
             statement_view: self.statement_view.clone(),
             newest_target: self.newest_target.clone(),
             semantic_miss: None,
+            read_counts: None,
         }
     }
 
@@ -1485,6 +1508,7 @@ impl ExecutionContext {
             statement_view: self.statement_view.clone(),
             newest_target: self.newest_target.clone(),
             semantic_miss: None,
+            read_counts: None,
         }
     }
 
@@ -1534,6 +1558,7 @@ impl ExecutionContext {
             statement_view: self.statement_view.clone(),
             newest_target: self.newest_target.clone(),
             semantic_miss: None,
+            read_counts: None,
         }
     }
 
@@ -1590,6 +1615,7 @@ impl ExecutionContext {
             statement_view: self.statement_view.clone(),
             newest_target: self.newest_target.clone(),
             semantic_miss: None,
+            read_counts: self.read_counts.clone(),
         }
     }
 
@@ -1692,6 +1718,33 @@ impl ExecutionContext {
         self
     }
 
+    /// The count a statement at this depth read for its `clause`, LIMIT or
+    /// OFFSET, written `expr`, before its rows, if it read one
+    pub(crate) fn read_count(
+        &self,
+        expr: &crate::parser::ast::Expression,
+        clause: &'static str,
+    ) -> Option<usize> {
+        let read = self.read_counts.as_deref()?;
+        if read.depth != self.query_depth {
+            return None;
+        }
+        let mut counts = read.counts.iter().filter(|read| read.clause == clause);
+        let address = expr as *const _ as usize;
+        if let Some(read) = counts.clone().find(|read| read.address == address) {
+            return Some(read.count);
+        }
+        let key = super::expr_key::ExprKey::of(expr);
+        counts.find(|read| read.key == key).map(|read| read.count)
+    }
+
+    /// This context carrying `counts`, read for a statement at its depth
+    pub(crate) fn with_read_counts(&self, counts: ReadCounts) -> Self {
+        let mut ctx = self.clone();
+        ctx.read_counts = Some(Arc::new(counts));
+        ctx
+    }
+
     pub fn with_transaction_id(&self, txn_id: u64) -> Self {
         Self {
             params: self.params.clone(),
@@ -1711,6 +1764,7 @@ impl ExecutionContext {
             statement_view: self.statement_view.clone(),
             newest_target: self.newest_target.clone(),
             semantic_miss: self.semantic_miss.clone(),
+            read_counts: self.read_counts.clone(),
         }
     }
 

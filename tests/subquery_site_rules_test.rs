@@ -154,13 +154,13 @@ fn test_constant_arithmetic_on_a_subquery() {
 fn test_limit_and_offset() {
     site(
         "site_offset",
-        Fails("step 1"),
+        Right,
         "SELECT id FROM t ORDER BY id OFFSET (SELECT 2)",
         "SELECT id FROM t ORDER BY id OFFSET 2",
     );
     site(
         "site_limit",
-        Fails("step 1"),
+        Right,
         "SELECT id FROM t ORDER BY id LIMIT (SELECT 2)",
         "SELECT id FROM t ORDER BY id LIMIT 2",
     );
