@@ -324,7 +324,7 @@ use super::operators::index_nested_loop::{
 use super::operators::BloomFilterOperator;
 use super::parallel::{self, ParallelConfig};
 use super::prepared_join::{BuiltPrograms, JoinProgramKey, PreparedJoin, WhereSite};
-use super::prepared_select::JoinBlocks;
+use super::prepared_select::{JoinBlocks, OutOfFamily};
 use super::pushdown;
 use super::query_cache::CompiledExecution;
 use super::query_classification::{get_classification, QueryClassification};
@@ -1087,10 +1087,7 @@ impl Executor {
         let bound_stmt;
         // A statement holding this execution's values keeps nothing in its plan
         let mut folded_select = false;
-        let stmt = if (classification.has_aggregation || classification.has_window_functions)
-            && stmt.columns.iter().any(Self::has_subqueries)
-            && !Self::has_correlated_select_subqueries(&stmt.columns)
-        {
+        let stmt = if Self::folds_select_subqueries(stmt, &classification) {
             match self.try_process_select_subqueries(&stmt.columns, ctx)? {
                 Some(columns) => {
                     bound_stmt = SelectStatement {
@@ -4707,32 +4704,48 @@ impl Executor {
         Some(held)
     }
 
+    /// Whether a grouped or windowed statement reads its SELECT list's
+    /// uncorrelated subqueries before it runs, keeping nothing in its plan
+    pub(crate) fn folds_select_subqueries(
+        stmt: &SelectStatement,
+        classification: &QueryClassification,
+    ) -> bool {
+        (classification.has_aggregation || classification.has_window_functions)
+            && stmt.columns.iter().any(Self::has_subqueries)
+            && !Self::has_correlated_select_subqueries(&stmt.columns)
+    }
+
     /// Whether a join of two base tables holds subqueries in its ON or its
     /// WHERE, all of the forms the prepared blocks run, those of the WHERE
-    /// in what it asks of the joined rows
-    fn where_runs_as_blocks(
+    /// in what it asks of the joined rows, or why not. `ctx` names the CTEs
+    /// the subqueries read, when the statement runs
+    pub(crate) fn join_blocks_family(
         &self,
         stmt: &SelectStatement,
         join_source: &JoinTableSource,
         join_type: &str,
         (left_alias, right_alias): (Option<&str>, Option<&str>),
         schemas: (Option<&Schema>, Option<&Schema>),
-        ctx: &ExecutionContext,
-    ) -> bool {
+        ctx: Option<&ExecutionContext>,
+    ) -> std::result::Result<(), OutOfFamily> {
         let plain_table =
             |side: &Expression| matches!(side, Expression::TableSource(ts) if ts.as_of.is_none());
+        if !plain_table(&join_source.left) || !plain_table(&join_source.right) {
+            return Err("a side that is not a table read without AS OF");
+        }
+        if schemas.0.is_none() || schemas.1.is_none() {
+            return Err("a side that names a CTE");
+        }
         let on = join_source.condition.as_deref();
         let on_subqueries = on.is_some_and(Self::has_subqueries);
-        if !plain_table(&join_source.left)
-            || !plain_table(&join_source.right)
-            || schemas.0.is_none()
-            || schemas.1.is_none()
-            || (on_subqueries && !on.is_some_and(|on| self.join_where_family(on, ctx).is_ok()))
-        {
-            return false;
+        if let Some(on) = on.filter(|_| on_subqueries) {
+            self.join_where_family(on, ctx)?;
         }
         let Some(where_clause) = stmt.where_clause.as_deref() else {
-            return on_subqueries;
+            return match on_subqueries {
+                true => Ok(()),
+                false => Err("neither ON nor WHERE holds a subquery"),
+            };
         };
         let (left, right, cross) =
             split_join_where(where_clause, left_alias, right_alias, schemas, join_type);
@@ -4749,12 +4762,14 @@ impl Executor {
         };
         let in_side =
             |side: Option<Expression>| opened(side).is_some_and(|side| Self::has_subqueries(&side));
+        if in_side(left) || in_side(right) {
+            return Err("a WHERE subquery in a condition on one table");
+        }
         let cross = opened(cross);
-        let cross_subqueries = cross.as_ref().is_some_and(Self::has_subqueries);
-        !in_side(left)
-            && !in_side(right)
-            && (on_subqueries || cross_subqueries)
-            && cross.is_none_or(|cross| self.join_where_family(&cross, ctx).is_ok())
+        if !on_subqueries && !cross.as_ref().is_some_and(Self::has_subqueries) {
+            return Err("neither ON nor WHERE holds a subquery");
+        }
+        cross.map_or(Ok(()), |cross| self.join_where_family(&cross, ctx))
     }
 
     /// The program of the WHERE `cross` a join asks at `site` of its joined
@@ -4912,14 +4927,15 @@ impl Executor {
         let blocks_where = (classification.where_has_subqueries || on_subqueries)
             && plan.as_ref().is_some_and(|plan| {
                 plan.blocks_where(|| {
-                    self.where_runs_as_blocks(
+                    self.join_blocks_family(
                         stmt,
                         join_source,
                         &join_type,
                         (left_alias.as_deref(), right_alias.as_deref()),
                         (left_schema.as_deref(), right_schema.as_deref()),
-                        ctx,
+                        Some(ctx),
                     )
+                    .is_ok()
                 })
             });
         // Outside the blocks, an uncorrelated subquery in the ON clause is read

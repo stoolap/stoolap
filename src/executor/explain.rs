@@ -29,8 +29,10 @@ use super::context::ExecutionContext;
 use super::operators::index_nested_loop::IndexLookupStrategy;
 use super::parallel;
 use super::planner::{QueryPlanner, RuntimeJoinAlgorithm};
+use super::prepared_select::OutOfFamily;
 use super::pushdown;
 use super::query::{pick_index_join_side, split_join_where, CteNames, JoinIndexUse};
+use super::query_classification::get_classification;
 use super::result::ExecutorResult;
 use super::utils::{
     collect_table_qualifiers, collect_unqualified_columns, combine_predicates_with_and,
@@ -261,7 +263,7 @@ impl Executor {
                 ));
                 if let Some(ref select) = insert.select {
                     lines.push(format!("{}  Source:", prefix));
-                    self.explain_select(select, lines, indent + 2);
+                    self.explain_select(select, lines, indent + 2, false);
                 } else {
                     lines.push(format!(
                         "{}  Values: {} row(s)",
@@ -436,7 +438,7 @@ impl Executor {
                 if let Some(wc) = where_clause {
                     lines.push(format!("{}     Filter: {}", prefix, wc));
                 }
-                self.explain_select(&subquery.subquery, lines, indent + 1);
+                self.explain_select(&subquery.subquery, lines, indent + 1, false);
             }
             Expression::JoinSource(join) => {
                 // Determine join algorithm including INLJ check
@@ -543,13 +545,13 @@ impl Executor {
 
         match stmt {
             Statement::Select(select) => {
-                self.explain_select(select, lines, indent);
+                self.explain_select(select, lines, indent, true);
             }
             Statement::Insert(insert) => {
                 lines.push(format!("{}INSERT INTO {}", prefix, insert.table_name));
                 if let Some(ref select) = insert.select {
                     lines.push(format!("{}  Source:", prefix));
-                    self.explain_select(select, lines, indent + 2);
+                    self.explain_select(select, lines, indent + 2, false);
                 } else {
                     lines.push(format!(
                         "{}  Values: {} row(s)",
@@ -581,8 +583,48 @@ impl Executor {
         }
     }
 
-    /// Generate EXPLAIN output for a SELECT statement
-    fn explain_select(&self, select: &SelectStatement, lines: &mut Vec<String>, indent: usize) {
+    /// Whether the join `select` reads from runs its subqueries as prepared
+    /// blocks, as the statement run alone decides it, or why not; `own`
+    /// when `select` is the statement's own, which alone holds a plan
+    fn join_prepared(
+        &self,
+        select: &SelectStatement,
+        join: &JoinTableSource,
+        own: bool,
+    ) -> std::result::Result<(), OutOfFamily> {
+        if !own {
+            return Err("a join outside the statement's own SELECT");
+        }
+        if self.has_cte(select) {
+            return Err("a WITH clause");
+        }
+        if Self::folds_select_subqueries(select, &get_classification(select)) {
+            return Err("a grouped SELECT list whose subqueries are read first");
+        }
+        let side = |expr: &Expression| self.base_table_side_schema(expr, CteNames::Listed(&[]));
+        let (left_schema, right_schema) = (side(&join.left), side(&join.right));
+        self.join_blocks_family(
+            select,
+            join,
+            &join.join_type.to_uppercase(),
+            (
+                get_table_alias_from_expr(&join.left).as_deref(),
+                get_table_alias_from_expr(&join.right).as_deref(),
+            ),
+            (left_schema.as_deref(), right_schema.as_deref()),
+            None,
+        )
+    }
+
+    /// Generate EXPLAIN output for a SELECT statement; `own` when it is the
+    /// statement's own SELECT, not a branch, a FROM subquery or a source
+    fn explain_select(
+        &self,
+        select: &SelectStatement,
+        lines: &mut Vec<String>,
+        indent: usize,
+        own: bool,
+    ) {
         let prefix = "  ".repeat(indent);
 
         // CTE info
@@ -618,12 +660,24 @@ impl Executor {
             lines.push(format!("{}  Columns: {} column(s)", prefix, col_count));
         }
 
-        if select
-            .where_clause
-            .as_deref()
-            .is_some_and(Self::has_subqueries)
+        let join = match select.table_expr.as_deref() {
+            Some(Expression::JoinSource(join)) => Some(&**join),
+            _ => None,
+        };
+        let on_subqueries = join
+            .and_then(|join| join.condition.as_deref())
+            .is_some_and(Self::has_subqueries);
+        if on_subqueries
+            || select
+                .where_clause
+                .as_deref()
+                .is_some_and(Self::has_subqueries)
         {
-            match self.prepared_family(select, None) {
+            let prepared = match join {
+                Some(join) => self.join_prepared(select, join, own),
+                None => self.prepared_family(select, None),
+            };
+            match prepared {
                 Ok(()) => lines.push(format!("{}  Prepared: yes", prefix)),
                 Err(reason) => lines.push(format!("{}  Prepared: no ({})", prefix, reason)),
             }
@@ -694,7 +748,7 @@ impl Executor {
         if !select.set_operations.is_empty() {
             for set_op in &select.set_operations {
                 lines.push(format!("{}  {}", prefix, set_op.operation));
-                self.explain_select(&set_op.right, lines, indent + 2);
+                self.explain_select(&set_op.right, lines, indent + 2, false);
             }
         }
     }
@@ -804,7 +858,7 @@ impl Executor {
                 if let Some(wc) = where_clause {
                     lines.push(format!("{}     Filter: {}", prefix, wc));
                 }
-                self.explain_select(&subquery.subquery, lines, indent + 1);
+                self.explain_select(&subquery.subquery, lines, indent + 1, false);
             }
             Expression::JoinSource(join) => {
                 // Determine join algorithm including INLJ check
