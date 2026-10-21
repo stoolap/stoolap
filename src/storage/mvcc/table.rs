@@ -2628,7 +2628,8 @@ impl MVCCTable {
 
         // The transaction's own versions overlay the committed rows: a row
         // it deleted leaves, a row it rewrote is read as it wrote it, and a
-        // row only it inserted joins
+        // row only it inserted joins. With a WHERE, a committed row it wrote
+        // leaves too, and its own version is judged with the rows it inserted
         {
             let txn_versions = self.txn_versions.read().unwrap();
             if txn_versions.has_local_changes() {
@@ -2636,16 +2637,10 @@ impl MVCCTable {
                 for i in start..plan.hot.len() {
                     let row_id = plan.hot[i].0;
                     if let Some(local) = txn_versions.get_latest_local(row_id) {
-                        if local.is_deleted() {
+                        if local.is_deleted() || where_expr.is_some() {
                             continue;
                         }
-                        let row = self.normalize_row_to_schema(local.data.clone(), schema);
-                        if let Some(expr) = where_expr {
-                            if !passes(expr, fallible, &row)? {
-                                continue;
-                            }
-                        }
-                        plan.hot[i].1 = row;
+                        plan.hot[i].1 = self.normalize_row_to_schema(local.data.clone(), schema);
                         plan.hot[i].2 = self.local_read(local);
                     }
                     plan.hot.swap(kept, i);
@@ -2656,7 +2651,8 @@ impl MVCCTable {
             for (row_id, version) in txn_versions.iter_local() {
                 if skipped(row_id)
                     || version.is_deleted()
-                    || self.version_store.quick_check_row_existence(row_id)
+                    || (where_expr.is_none()
+                        && self.version_store.quick_check_row_existence(row_id))
                 {
                     continue;
                 }

@@ -147,7 +147,7 @@ fn a_filter_error_is_the_statements_on_a_transactions_own_rows() {
     );
 }
 
-const OWN_WRITES: [(&str, &str, &str); 10] = [
+const OWN_WRITES: [(&str, &str, &str); 12] = [
     (
         "DELETE FROM t WHERE id = 1",
         "SELECT id FROM t WHERE ABS(x) >= 0",
@@ -185,6 +185,11 @@ const OWN_WRITES: [(&str, &str, &str); 10] = [
     ),
     (
         "UPDATE t SET x = 0 WHERE id = 1",
+        "UPDATE t SET o = 9 WHERE ABS(x) >= 0",
+        "affected 2",
+    ),
+    (
+        "UPDATE t SET x = 0 WHERE id = 1",
         "DELETE FROM t WHERE ABS(x) >= 0",
         "affected 2",
     ),
@@ -192,6 +197,11 @@ const OWN_WRITES: [(&str, &str, &str); 10] = [
         "UPDATE t SET x = 7 WHERE id = 2",
         "SELECT id FROM t WHERE x = 7",
         "[Integer(2)]",
+    ),
+    (
+        "UPDATE t SET x = 7 WHERE id = 2",
+        "UPDATE t SET o = 9 WHERE x = 7",
+        "affected 1",
     ),
     (
         "UPDATE t SET x = 7 WHERE id = 2",
