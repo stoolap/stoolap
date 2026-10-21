@@ -347,3 +347,40 @@ fn a_hash_join_reads_any_number_of_held_residuals_without_allocating() {
         four - three
     );
 }
+
+#[test]
+fn a_join_without_a_plan_builds_no_shared_list() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let db = Database::open("memory://join_residual_without_a_plan").unwrap();
+    for sql in [
+        "CREATE TABLE l (id INTEGER PRIMARY KEY, g INTEGER)",
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, w INTEGER)",
+        "CREATE TABLE s (id INTEGER PRIMARY KEY)",
+        "INSERT INTO l SELECT g.value, (g.value - 1) / 10 FROM generate_series(1, 30) g",
+        "INSERT INTO r SELECT g.value, g.value % 5 FROM generate_series(1, 50) g",
+        "INSERT INTO s SELECT g.value FROM generate_series(1, 50) g",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    // The inner join of a nested join runs without the statement's plan
+    let with = |conditions: &[&str]| {
+        let on: String = conditions.iter().map(|c| format!(" AND {c}")).collect();
+        allocations_per_run(
+            &db,
+            &format!(
+                "SELECT l.id, r.id, s.id FROM l JOIN r ON l.g = r.w{on} JOIN s ON s.id = r.id"
+            ),
+        )
+    };
+    let zero = with(&[]);
+    let one = with(&["l.id < 100"]);
+    let two = with(&["l.id < 100", "r.id < 100"]);
+    assert_eq!(
+        (one - zero) - (two - one),
+        2.0,
+        "a first residual costs {} allocations per run, a second {}: beyond its \
+         program, only the analysis's condition list and the filter list should",
+        one - zero,
+        two - one
+    );
+}

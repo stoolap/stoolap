@@ -17,12 +17,17 @@
 
 use std::sync::{Arc, RwLock};
 
+use smallvec::{smallvec, SmallVec};
+
 use crate::core::{Error, Result};
 
 use super::expression::SharedProgram;
 
 /// The programs held under one key, shared: reading them allocates nothing
-pub type HeldPrograms = Arc<[SharedProgram]>;
+type HeldPrograms = Arc<[SharedProgram]>;
+
+/// The programs one compile builds, shared only once they are held
+pub type BuiltPrograms = SmallVec<[SharedProgram; 2]>;
 
 /// What a held program was compiled for: the part of the ON clause an
 /// operator asks of each pair, by the keys it answers itself, or the WHERE
@@ -84,26 +89,32 @@ impl PreparedJoin {
         }
     }
 
-    /// The programs held under a key `wanted` accepts, or the ones `compile`
-    /// builds, which are then held under `key`; a lookup copies no key
-    pub fn programs(
+    /// `read` over the programs held under a key `wanted` accepts, or over
+    /// the ones `compile` builds, which are then held under `key`; a lookup
+    /// copies no key
+    pub fn programs<R>(
         &self,
         wanted: impl Fn(&JoinProgramKey) -> bool,
         key: impl FnOnce() -> JoinProgramKey,
-        compile: impl FnOnce() -> Result<HeldPrograms>,
-    ) -> Result<HeldPrograms> {
-        if let Ok(programs) = self.programs.read() {
-            if let Some((_, program)) = programs.iter().find(|(held, _)| wanted(held)) {
-                return Ok(program.clone());
-            }
+        compile: impl FnOnce() -> Result<BuiltPrograms>,
+        read: impl FnOnce(&[SharedProgram]) -> R,
+    ) -> Result<R> {
+        let held = self.programs.read().ok().and_then(|programs| {
+            programs
+                .iter()
+                .find(|(held, _)| wanted(held))
+                .map(|(_, programs)| Arc::clone(programs))
+        });
+        if let Some(held) = held {
+            return Ok(read(&held));
         }
-        let program = compile()?;
+        let built = compile()?;
         if let Ok(mut programs) = self.programs.write() {
             if programs.len() < MAX_PROGRAMS && !programs.iter().any(|(held, _)| wanted(held)) {
-                programs.push((key(), program.clone()));
+                programs.push((key(), built.iter().cloned().collect()));
             }
         }
-        Ok(program)
+        Ok(read(&built))
     }
 
     /// The WHERE program held for `site` over `columns`, or the one
@@ -114,7 +125,7 @@ impl PreparedJoin {
         columns: &[String],
         compile: impl FnOnce() -> Result<SharedProgram>,
     ) -> Result<SharedProgram> {
-        let programs = self.programs(
+        self.programs(
             |held| {
                 matches!(held, JoinProgramKey::Where { site: s, columns: c }
                     if *s == site && c == columns)
@@ -123,11 +134,9 @@ impl PreparedJoin {
                 site,
                 columns: columns.to_vec(),
             },
-            || Ok(Arc::from([compile()?])),
-        )?;
-        programs
-            .first()
-            .cloned()
-            .ok_or_else(|| Error::internal("a join WHERE held without its program"))
+            || Ok(smallvec![compile()?]),
+            |programs| programs.first().cloned(),
+        )?
+        .ok_or_else(|| Error::internal("a join WHERE held without its program"))
     }
 }

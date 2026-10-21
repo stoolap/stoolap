@@ -322,7 +322,7 @@ use super::operators::index_nested_loop::{
 };
 use super::operators::BloomFilterOperator;
 use super::parallel::{self, ParallelConfig};
-use super::prepared_join::{HeldPrograms, JoinProgramKey, PreparedJoin, WhereSite};
+use super::prepared_join::{BuiltPrograms, JoinProgramKey, PreparedJoin, WhereSite};
 use super::pushdown;
 use super::query_cache::CompiledExecution;
 use super::query_classification::{get_classification, QueryClassification};
@@ -5110,7 +5110,7 @@ impl Executor {
                     crate::test_failpoints::join_inner_opened();
                     // The program is held with the plan, by the key equality
                     // it leaves out and the columns it reads
-                    let compile_residual = || -> Result<HeldPrograms> {
+                    let compile_residual = || -> Result<BuiltPrograms> {
                         let inner_filter = nl_right_filter
                             .as_ref()
                             .map(|rf| add_table_qualifier(rf, inner_alias));
@@ -5150,7 +5150,12 @@ impl Executor {
                             .collect()
                     };
                     let build_residual_filter = || -> Result<Option<JoinFilter>> {
-                        let programs = match &prepared {
+                        let read = |programs: &[SharedProgram]| {
+                            programs.first().map(|p| {
+                                JoinFilter::from_program(CompactArc::clone(p)).with_context(ctx)
+                            })
+                        };
+                        Ok(match &prepared {
                             Some(prepared) => prepared.programs(
                                 |held| {
                                     matches!(held, JoinProgramKey::IndexResidual {
@@ -5167,12 +5172,10 @@ impl Executor {
                                     inner_cols: inner_cols.clone(),
                                 },
                                 compile_residual,
+                                read,
                             )?,
-                            None => compile_residual()?,
-                        };
-                        Ok(programs.first().map(|p| {
-                            JoinFilter::from_program(CompactArc::clone(p)).with_context(ctx)
-                        }))
+                            None => read(&compile_residual()?),
+                        })
                     };
 
                     // Execute Index Nested Loop Join using operators

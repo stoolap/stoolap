@@ -81,7 +81,7 @@ use crate::common::CompactArc;
 use crate::core::predicate::{kind, KeySide};
 use crate::core::{Result, Row, RowVec, Schema};
 use crate::executor::context::ExecutionContext;
-use crate::executor::expression::{compile_expression, JoinFilter, RowFilter};
+use crate::executor::expression::{compile_expression, JoinFilter, RowFilter, SharedProgram};
 use crate::executor::hash_table::JoinHashTable;
 use crate::executor::operator::{ColumnInfo, MaterializedOperator, Operator};
 use crate::executor::operators::hash_join::{HashJoinOperator, JoinSide, JoinType};
@@ -90,7 +90,7 @@ use crate::executor::parallel::{
     parallel_hash_join, ParallelConfig, DEFAULT_PARALLEL_JOIN_THRESHOLD,
 };
 use crate::executor::planner::{QueryPlanner, RuntimeJoinAlgorithm, RuntimeJoinDecision};
-use crate::executor::prepared_join::{HeldPrograms, JoinProgramKey, PreparedJoin};
+use crate::executor::prepared_join::{BuiltPrograms, JoinProgramKey, PreparedJoin};
 use crate::executor::utils::{column_kinds, extract_join_keys_and_residual_keeping};
 use crate::functions::registry::global_registry;
 use crate::parser::ast::Expression;
@@ -269,9 +269,15 @@ fn residual_filters(
             .residual_conditions
             .iter()
             .map(|cond| compile_expression(cond, all_columns))
-            .collect::<Result<HeldPrograms>>()
+            .collect::<Result<BuiltPrograms>>()
     };
-    let programs = match prepared {
+    let read = |programs: &[SharedProgram]| {
+        programs
+            .iter()
+            .map(|program| RowFilter::from_program(CompactArc::clone(program)).with_context(ctx))
+            .collect()
+    };
+    Ok(match prepared {
         Some(prepared) => prepared.programs(
             |held| {
                 matches!(held, JoinProgramKey::HashResidual { left_keys, right_keys, columns }
@@ -285,13 +291,10 @@ fn residual_filters(
                 columns: all_columns.to_vec(),
             },
             compile,
+            read,
         )?,
-        None => compile()?,
-    };
-    Ok(programs
-        .iter()
-        .map(|program| RowFilter::from_program(CompactArc::clone(program)).with_context(ctx))
-        .collect())
+        None => read(&compile()?),
+    })
 }
 
 /// Modern streaming join executor.
@@ -865,11 +868,16 @@ impl JoinExecutor {
         let mut nl_op =
             NestedLoopJoinOperator::new(left_op, right_op, join_type, condition.cloned());
         if let Some(cond) = condition {
-            let compile = || -> Result<HeldPrograms> {
+            let compile = || -> Result<BuiltPrograms> {
                 let filter = JoinFilter::new(cond, left_columns, right_columns, global_registry())?;
                 Ok(std::iter::once(CompactArc::clone(filter.program())).collect())
             };
-            let programs = match prepared {
+            let read = |programs: &[SharedProgram]| {
+                programs
+                    .first()
+                    .map(|program| JoinFilter::from_program(CompactArc::clone(program)))
+            };
+            let filter = match prepared {
                 Some(prepared) => prepared.programs(
                     |held| {
                         matches!(held, JoinProgramKey::Pair { left_cols, right_cols }
@@ -880,11 +888,11 @@ impl JoinExecutor {
                         right_cols: right_columns.to_vec(),
                     },
                     compile,
+                    read,
                 )?,
-                None => compile()?,
+                None => read(&compile()?),
             };
-            if let Some(program) = programs.first() {
-                let filter = JoinFilter::from_program(CompactArc::clone(program));
+            if let Some(filter) = filter {
                 nl_op = nl_op.with_filter(filter.with_context(ctx));
             }
         }
