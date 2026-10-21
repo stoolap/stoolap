@@ -359,6 +359,21 @@ SET price = (SELECT AVG(price) FROM products WHERE category = 'Electronics') * 1
 WHERE id = 5;
 ```
 
+### Subqueries in LIMIT and OFFSET
+
+A subquery in `LIMIT` or `OFFSET` is read once, before the query reads a row, under the same snapshot as the query. Its value counts as the same value written as a literal: a whole number of zero or more, and anything else, NULL included (a subquery with no row is NULL), is an error. It reads no row of the query, or of an enclosing one:
+
+```sql
+-- As many products as there are featured categories
+SELECT * FROM products ORDER BY price DESC
+LIMIT (SELECT COUNT(*) FROM categories WHERE featured = true);
+
+-- Error: LIMIT must be an integer (the subquery's MAX over no row is NULL)
+SELECT * FROM products LIMIT (SELECT MAX(id) FROM categories WHERE 1 = 0);
+```
+
+A subquery block that runs once for each row of its enclosing query, because its `WHERE` reads that row, cannot hold a `LIMIT` or `OFFSET` subquery, and such a subquery cannot read a CTE of its own statement: it is read before the CTEs are.
+
 ## How Subqueries Work
 
 Stoolap processes subqueries differently based on their type:
@@ -582,6 +597,7 @@ Currently, Stoolap supports the following subquery features:
 - Subqueries in UPDATE WHERE clauses
 - Subqueries in UPDATE SET clauses
 - Subqueries in INSERT VALUES
+- Subqueries in LIMIT and OFFSET
 - Proper NULL handling for subqueries returning no rows
 - Error detection for scalar subqueries returning multiple rows
 - Optimization for EXISTS (stops on first row found)
@@ -599,7 +615,6 @@ A subquery in these positions is refused with an error rather than answered. Sup
 - An uncorrelated subquery in the `WHERE` or `SELECT` list of a query over a view, a derived table or a `VALUES` list
 - A correlated subquery in a `JOIN ... ON` condition, unless the join is [prepared](#prepared-subqueries)
 - The argument of `NTILE`, the offset of `LAG` and `LEAD`, or the position of `NTH_VALUE`, when the subquery reads the current row: the argument is one value per partition
-- `LIMIT` and `OFFSET`
 
 The error reads, for example:
 

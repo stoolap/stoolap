@@ -334,6 +334,36 @@ pub struct CachedPlanRef {
     pub compiled: Arc<RwLock<CompiledExecution>>,
     /// Classification of the SELECT, resolved once per plan (lazily populated)
     pub classification: Arc<std::sync::OnceLock<Arc<QueryClassification>>>,
+    /// The prepared subqueries of a SELECT's LIMIT and OFFSET; None
+    /// without one
+    pub counts: Option<Arc<CountsSlot>>,
+}
+
+/// What a plan keeps for a SELECT whose LIMIT or OFFSET holds a subquery
+#[derive(Debug)]
+pub struct CountsSlot {
+    /// The subqueries' prepared blocks
+    pub(crate) compiled: RwLock<CompiledExecution>,
+    /// The identity of the LIMIT and of the OFFSET expression
+    pub(crate) keys: [Option<super::expr_key::ExprKey>; 2],
+}
+
+/// The slot of `statement`, for a SELECT whose LIMIT or OFFSET holds a subquery
+fn counts_slot(statement: &Statement) -> Option<Arc<CountsSlot>> {
+    let Statement::Select(select) = statement else {
+        return None;
+    };
+    let counts = [select.limit.as_deref(), select.offset.as_deref()];
+    counts
+        .into_iter()
+        .flatten()
+        .any(super::Executor::has_subqueries)
+        .then(|| {
+            Arc::new(CountsSlot {
+                compiled: RwLock::new(CompiledExecution::Unknown),
+                keys: counts.map(|count| count.map(super::expr_key::ExprKey::of)),
+            })
+        })
 }
 
 /// Represents a parsed and prepared statement stored in the cache
@@ -357,6 +387,9 @@ pub struct CachedQueryPlan {
     pub compiled: Arc<RwLock<CompiledExecution>>,
     /// Classification of the SELECT, resolved once per plan (lazily populated)
     pub classification: Arc<std::sync::OnceLock<Arc<QueryClassification>>>,
+    /// The prepared subqueries of a SELECT's LIMIT and OFFSET; None
+    /// without one
+    pub counts: Option<Arc<CountsSlot>>,
 }
 
 impl CachedQueryPlan {
@@ -369,6 +402,7 @@ impl CachedQueryPlan {
         normalized_query: SmartString,
     ) -> Self {
         Self {
+            counts: counts_slot(&statement),
             statement,
             query_text,
             last_used: Instant::now(),
@@ -429,6 +463,7 @@ impl QueryCache {
             param_count: plan.param_count,
             compiled: plan.compiled.clone(), // Share compiled state
             classification: plan.classification.clone(),
+            counts: plan.counts.clone(),
         })
     }
 
@@ -449,6 +484,7 @@ impl QueryCache {
         // Create the compiled state upfront - shared between stored plan and returned ref
         let compiled = Arc::new(RwLock::new(CompiledExecution::Unknown));
         let classification = Arc::new(std::sync::OnceLock::new());
+        let counts = counts_slot(&statement);
 
         if let Ok(mut plans) = self.plans.write() {
             // Check if we need to prune the cache
@@ -471,6 +507,7 @@ impl QueryCache {
                     normalized_query: normalized_key, // moved, not cloned
                     compiled: compiled.clone(),       // Arc clone - cheap
                     classification: classification.clone(),
+                    counts: counts.clone(),
                 },
             );
         }
@@ -482,6 +519,7 @@ impl QueryCache {
             param_count,
             compiled,
             classification,
+            counts,
         }
     }
 
