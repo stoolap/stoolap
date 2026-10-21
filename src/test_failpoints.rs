@@ -1795,6 +1795,17 @@ pub(crate) fn statement_view_taken() {
 
 thread_local! {
     static STATEMENT_VIEWS_TAKEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ROW_COUNTS_READ_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next statement is about to read the
+/// subqueries of its LIMIT and OFFSET
+pub fn before_row_counts_read(hook: impl FnOnce() + 'static) {
+    ROW_COUNTS_READ_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn row_counts_read() {
+    run_hook(&ROW_COUNTS_READ_HOOK);
 }
 
 /// Statement views the executor took on this thread so far

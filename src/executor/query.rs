@@ -1008,6 +1008,23 @@ impl Executor {
         self.execute_select_with_plan(stmt, ctx, None, None, None)
     }
 
+    /// `ctx` with the snapshot a statement reading its LIMIT or OFFSET
+    /// subqueries reads; None in an explicit transaction, read through itself
+    #[cold]
+    #[inline(never)]
+    fn with_counts_snapshot(&self, ctx: &ExecutionContext) -> Result<Option<ExecutionContext>> {
+        let in_transaction = self
+            .active_transaction
+            .lock()
+            .map_err(|_| Error::internal("active transaction lock poisoned"))?
+            .is_some();
+        if in_transaction {
+            return Ok(None);
+        }
+        let snapshot = self.new_statement_snapshot(self.isolation_level(), ctx.statement_view())?;
+        Ok(Some(ctx.with_statement_snapshot(snapshot)))
+    }
+
     /// `ctx` with the counts the subqueries of `stmt`'s LIMIT and OFFSET
     /// answer, read once before the statement reads a row, under its
     /// snapshot; their blocks are held in `slot`
@@ -1019,6 +1036,8 @@ impl Executor {
         ctx: &ExecutionContext,
         slot: Option<&super::query_cache::CountsSlot>,
     ) -> Result<ExecutionContext> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::row_counts_read();
         let clauses = [
             (stmt.limit.as_deref(), "LIMIT"),
             (stmt.offset.as_deref(), "OFFSET"),
@@ -1029,25 +1048,6 @@ impl Executor {
                 "a LIMIT or OFFSET subquery is not supported here: {reason}"
             )));
         }
-        let snapshot = match ctx.statement_snapshot() {
-            None if self
-                .active_transaction
-                .lock()
-                .map_err(|_| Error::internal("active transaction lock poisoned"))?
-                .is_none() =>
-            {
-                Some(self.new_statement_snapshot(self.isolation_level(), ctx.statement_view())?)
-            }
-            _ => None,
-        };
-        let snapshot_ctx;
-        let read_ctx = match snapshot {
-            Some(snapshot) => {
-                snapshot_ctx = ctx.with_statement_snapshot(snapshot);
-                &snapshot_ctx
-            }
-            None => ctx,
-        };
         // A count is read before any row: its scope is a table without columns
         static NO_COLUMNS: std::sync::LazyLock<Schema> =
             std::sync::LazyLock::new(|| Schema::new("", Vec::new()));
@@ -1059,9 +1059,9 @@ impl Executor {
             None,
             &[],
             &values,
-            read_ctx,
+            ctx,
         )?;
-        let run = super::prepared_select::DmlRunner::new(self, &prepared, read_ctx, tables, 0)?;
+        let run = super::prepared_select::DmlRunner::new(self, &prepared, ctx, tables, 0)?;
         let mut vm = super::expression::ExprVM::new();
         let no_row = Row::new();
         let exec = run.context(&no_row);
@@ -1084,7 +1084,7 @@ impl Executor {
             }
         }
         drop(run);
-        Ok(read_ctx.with_read_counts(super::context::ReadCounts {
+        Ok(ctx.with_read_counts(super::context::ReadCounts {
             depth: ctx.query_depth,
             counts,
         }))
@@ -1127,20 +1127,30 @@ impl Executor {
             }
         }
 
+        // A LIMIT or OFFSET subquery reads the snapshot the statement's CTEs
+        // and rows read, so it is taken before the CTEs run
+        let reads_counts = [stmt.limit.as_deref(), stmt.offset.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(Self::has_subqueries);
+        let snapshot_ctx;
+        let ctx = if reads_counts && ctx.statement_snapshot().is_none() {
+            snapshot_ctx = self.with_counts_snapshot(ctx)?;
+            snapshot_ctx.as_ref().unwrap_or(ctx)
+        } else {
+            ctx
+        };
+
         // Check for CTEs (WITH clause). A statement with one keeps every
         // subquery for the aggregation entry, which runs with the CTEs bound
         if self.has_cte(stmt) {
             return self.execute_select_with_ctes(stmt, ctx);
         }
 
-        // A LIMIT or OFFSET subquery is read once, before any path reads a
-        // row, with the CTEs of the statement bound
+        // The subquery is read once, before any path reads a row, with the
+        // CTEs of the statement bound
         let counts_ctx;
-        let ctx = if [stmt.limit.as_deref(), stmt.offset.as_deref()]
-            .into_iter()
-            .flatten()
-            .any(Self::has_subqueries)
-        {
+        let ctx = if reads_counts {
             counts_ctx = self.read_row_counts(stmt, ctx, counts)?;
             &counts_ctx
         } else {
