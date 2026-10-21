@@ -381,6 +381,8 @@ fn hash_expression<H: std::hash::Hasher>(expr: &Expression, hasher: &mut H) {
 /// Try to get a cached program, or compile and cache it.
 /// Uses O(1) LRU cache with parking_lot::Mutex for efficient concurrent access.
 fn compile_expression_cached(expr: &Expression, columns: &[String]) -> Result<SharedProgram> {
+    #[cfg(feature = "test-failpoints")]
+    crate::test_failpoints::bridge_compiled();
     let cache_key = compute_cache_key(expr, columns);
 
     // Try cache first (O(1) lookup and LRU update)
@@ -497,13 +499,17 @@ impl RowFilter {
     /// * `expr` - The boolean expression to use as filter
     /// * `columns` - Column names matching the row schema
     pub fn new(expr: &Expression, columns: &[String]) -> Result<Self> {
-        let program = compile_expression(expr, columns)?;
-        Ok(Self {
+        Ok(Self::from_program(compile_expression(expr, columns)?))
+    }
+
+    /// A filter over a program compiled earlier for the same columns
+    pub fn from_program(program: SharedProgram) -> Self {
+        Self {
             program,
             params: EMPTY_PARAMS.clone(),
             named_params: EMPTY_NAMED_PARAMS.clone(),
             transaction_id: None,
-        })
+        }
     }
 
     /// Create a row filter whose group items and aggregates are read from
@@ -638,6 +644,8 @@ impl JoinFilter {
         right_columns: &[String],
         function_registry: &FunctionRegistry,
     ) -> Result<Self> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::bridge_compiled();
         let ctx =
             CompileContext::new(left_columns, function_registry).with_second_row(right_columns);
         let compiler = ExprCompiler::new(&ctx);

@@ -501,7 +501,7 @@ impl Executor {
                 | CompiledExecution::ConflictInsert(_)
                 | CompiledExecution::CountDistinct(_)
                 | CompiledExecution::CountStar(_)
-                | CompiledExecution::JoinResidual(_)
+                | CompiledExecution::PreparedJoin(_)
                 | CompiledExecution::PreparedSelect(_)
                 | CompiledExecution::PreparedDml(_) => return None,
             }
@@ -657,7 +657,7 @@ impl Executor {
             | CompiledExecution::ConflictInsert(_)
             | CompiledExecution::CountDistinct(_)
             | CompiledExecution::CountStar(_)
-            | CompiledExecution::JoinResidual(_)
+            | CompiledExecution::PreparedJoin(_)
             | CompiledExecution::PreparedSelect(_)
             | CompiledExecution::PreparedDml(_) => return None,
         }

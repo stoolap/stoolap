@@ -865,8 +865,19 @@ thread_local! {
     static QUANTIFIED_MEMBER_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static AGGREGATE_PATHS_TAKEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static JOIN_PATHS_TAKEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static BRIDGE_COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ONE_SHOT_COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ONE_SHOT_LITERAL_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Expressions this thread handed the evaluation bridge to compile or look
+/// up in its program cache, so far
+pub fn bridge_compiles() -> usize {
+    BRIDGE_COMPILES.with(std::cell::Cell::get)
+}
+
+pub(crate) fn bridge_compiled() {
+    BRIDGE_COMPILES.with(|n| n.set(n.get() + 1));
 }
 
 /// Programs compiled for a one-shot evaluation on this thread, so far
