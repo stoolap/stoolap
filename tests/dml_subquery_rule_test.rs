@@ -181,6 +181,32 @@ fn a_row_the_transaction_rewrote_to_match_is_written() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+#[test]
+fn a_set_subquery_is_asked_of_a_row_the_transaction_rewrote_to_match() {
+    let db = Database::open("memory://dml_set_on_rewritten_row").unwrap();
+    for sql in [
+        "CREATE TABLE v (id INTEGER PRIMARY KEY, x INTEGER, b INTEGER)",
+        "CREATE TABLE w (k INTEGER, b INTEGER)",
+        "INSERT INTO v VALUES (1, 0, 0), (2, 1, 0)",
+        "INSERT INTO w VALUES (1, 10), (1, 20), (2, 30)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let mut tx = db.begin().unwrap();
+    tx.execute("UPDATE v SET x = 1 WHERE id = 1", ()).unwrap();
+    let updated = tx.execute(
+        "UPDATE v SET b = (SELECT w.b FROM w WHERE w.k = v.id) WHERE x = 1",
+        (),
+    );
+    let left = ids_and_b(tx.query("SELECT id, b FROM v ORDER BY id", ()));
+    tx.rollback().unwrap();
+    assert!(
+        updated.is_err(),
+        "row 1 has two answers, yet the update gave {updated:?}"
+    );
+    assert_eq!(left, [(1, 0), (2, 0)], "the failed update wrote");
+}
+
 fn ids_and_b(rows: stoolap::Result<stoolap::Rows>) -> Vec<(i64, i64)> {
     rows.unwrap()
         .map(|r| {

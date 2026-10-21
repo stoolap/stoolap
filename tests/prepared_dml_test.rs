@@ -192,3 +192,26 @@ fn test_a_prepared_dml_statement_is_kept_until_the_schema_changes() {
         ]
     );
 }
+
+#[test]
+fn a_keyed_update_after_a_write_of_its_transaction_reads_no_whole_table() {
+    let db = setup("prepared_dml_keyed_after_write");
+    let mut tx = db.begin().unwrap();
+    tx.execute("UPDATE t SET x = 9 WHERE id = 5", ()).unwrap();
+    stoolap::test_failpoints::take_read_paths();
+    let updated = tx
+        .execute(
+            "UPDATE t SET x = x + 1 WHERE id = (SELECT u.id FROM u WHERE u.id = 1)",
+            (),
+        )
+        .unwrap();
+    let paths = stoolap::test_failpoints::take_read_paths();
+    tx.rollback().unwrap();
+    assert_eq!(updated, 1);
+    assert!(
+        !paths
+            .iter()
+            .any(|path| path.starts_with("vs.get_all_visible_rows")),
+        "a keyed update read the whole table: {paths:?}"
+    );
+}
