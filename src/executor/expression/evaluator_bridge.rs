@@ -47,7 +47,7 @@ use rustc_hash::{FxHashMap, FxHasher};
 
 use super::compiler::{CompileContext, ExprCompiler};
 use super::program::Program;
-use super::vm::{ExecuteContext, ExprVM};
+use super::vm::{ExecuteContext, ExprVM, SubqueryExecutor};
 use crate::core::{Error, Result, Row, Value};
 use crate::functions::{global_registry, FunctionRegistry};
 use crate::parser::ast::Expression;
@@ -554,6 +554,17 @@ impl RowFilter {
     /// to surface errors through the Rows iterator.
     #[inline]
     pub fn matches_checked(&self, row: &Row) -> Result<bool> {
+        self.matches_checked_with(row, None)
+    }
+
+    /// `matches_checked` for a program whose subqueries run as the
+    /// statement's prepared blocks, which `blocks` answers
+    #[inline]
+    pub fn matches_checked_with(
+        &self,
+        row: &Row,
+        blocks: Option<&dyn SubqueryExecutor>,
+    ) -> Result<bool> {
         thread_local! {
             static VM: std::cell::RefCell<ExprVM> = std::cell::RefCell::new(ExprVM::new());
         }
@@ -568,6 +579,9 @@ impl RowFilter {
                 ctx = ctx.with_named_params(&self.named_params);
             }
             ctx = ctx.with_transaction_id(self.transaction_id);
+            if let Some(blocks) = blocks {
+                ctx = ctx.with_subquery_executor(blocks);
+            }
 
             if let Ok(mut borrowed_vm) = vm.try_borrow_mut() {
                 borrowed_vm.execute_bool_checked(&self.program, &ctx)
