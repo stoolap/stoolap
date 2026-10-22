@@ -397,4 +397,16 @@ fn excluded_names_the_excluded_row_when_the_target_bears_that_name() {
             "{set}"
         );
     }
+    db.execute("DELETE FROM excluded", ()).unwrap();
+    db.execute("INSERT INTO excluded VALUES (1, 10)", ())
+        .unwrap();
+    let unnamed = db.execute(
+        "INSERT INTO excluded VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET b = (SELECT \"\".b + 1)",
+        (),
+    );
+    assert!(
+        unnamed.is_err(),
+        "an empty qualifier bound the target: {unnamed:?}"
+    );
+    assert_eq!(rows(db.query("SELECT id, b FROM excluded", ())), "1:10");
 }

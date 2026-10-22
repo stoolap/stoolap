@@ -3047,9 +3047,10 @@ impl PreparedDml {
             .map(|sites| {
                 let width = sites.schema.columns.len();
                 let excluded = SmartString::from("excluded");
-                // `excluded` names the excluded row, also when the target bears that name
+                // `excluded` names the excluded row, also when the target bears
+                // that name; the target then has a name no qualifier can spell
                 let target = if *sites.table == excluded {
-                    SmartString::default()
+                    SmartString::from(format!("{RESOLVED}{excluded}"))
                 } else {
                     sites.table.clone()
                 };
