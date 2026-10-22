@@ -643,8 +643,8 @@ impl Executor {
         Ok(Some(row_ids))
     }
 
-    /// Whether the INSERT's VALUES or ON CONFLICT DO UPDATE hold a subquery
-    /// of the prepared family, read before its first write
+    /// Whether the INSERT's VALUES, ON CONFLICT DO UPDATE or RETURNING hold
+    /// a subquery of the prepared family
     #[inline(never)]
     fn insert_reads_prepared(
         &self,
@@ -663,15 +663,33 @@ impl Executor {
                 .iter()
                 .chain(stmt.update_where.as_deref())
         };
-        !stmt.returning.iter().any(Self::has_subqueries)
-            && (values().any(Self::has_subqueries) || conflict().any(Self::has_subqueries))
+        let returning = || {
+            stmt.returning
+                .iter()
+                .any(Self::has_subqueries)
+                .then(|| super::prepared_select::returning_values(&stmt.returning))
+                .into_iter()
+                .flatten()
+        };
+        (values().any(Self::has_subqueries)
+            || conflict().any(Self::has_subqueries)
+            || returning().next().is_some())
             && (self.holds_prepared_dml(plan_cache, ctx)
                 || self
-                    .dml_family(None, values().chain(conflict()), ctx)
+                    .dml_family(None, values().chain(conflict()).chain(returning()), ctx)
                     .is_ok())
     }
 
-    /// VALUES holding a subquery go the uncached way, whose plan slot keeps
+    /// The refusal of a RETURNING value read for each row returned whose
+    /// block reads the target inside a transaction
+    fn returning_reads_target() -> Error {
+        Error::invalid_argument(
+            "a RETURNING subquery that reads the row returned cannot read the target table \
+             inside a transaction",
+        )
+    }
+
+    /// VALUES or RETURNING holding a subquery go the uncached way, whose plan slot keeps
     /// the prepared statement; the rollback is disarmed on success, so it
     /// takes back nothing the inner statement wrote
     #[cold]
@@ -777,7 +795,7 @@ impl Executor {
         let conflict_run;
         let written_ctx;
         let written;
-        let (stmt, ctx, plan_cache, conflict) = if reads_prepared {
+        let (stmt, ctx, plan_cache, conflict, returned) = if reads_prepared {
             let target = table.schema_arc();
             let conflict_reads = stmt.on_duplicate
                 && stmt
@@ -790,6 +808,13 @@ impl Executor {
                 schema: &target,
                 stmt,
             });
+            let returning = stmt.returning.iter().any(Self::has_subqueries).then(|| {
+                super::prepared_select::ReturningSites {
+                    table: table_name,
+                    schema: &target,
+                    values: &stmt.returning,
+                }
+            });
             // A VALUES row has no target row: its scope is a table without columns
             let (plan, tables) = self.open_prepared_dml(
                 plan_cache,
@@ -799,6 +824,7 @@ impl Executor {
                 &[],
                 &stmt.values,
                 sites.as_ref(),
+                returning.as_ref(),
                 standalone_tx
                     .as_deref()
                     .filter(|_| ctx.statement_snapshot().is_none()),
@@ -813,6 +839,9 @@ impl Executor {
                     "an ON CONFLICT subquery that reads the row met or the excluded row \
                      cannot read the target table inside a transaction",
                 ));
+            }
+            if active_txn_id.is_some() && run.returning_reads_target() {
+                return Err(Self::returning_reads_target());
             }
             // The statement is copied only for the VALUES answers it takes
             let mut answered_ctx = std::borrow::Cow::Borrowed(ctx);
@@ -837,6 +866,7 @@ impl Executor {
             }
             written_ctx = answered_ctx;
             written = answered;
+            let returned = run.returning().map(|_| run);
             match run.conflict_upsert() {
                 Some(upsert) => {
                     conflict_run = ConflictRun {
@@ -846,16 +876,23 @@ impl Executor {
                             2 * target.columns.len(),
                         )),
                     };
-                    (&*written, &*written_ctx, None, Some(&conflict_run))
+                    (
+                        &*written,
+                        &*written_ctx,
+                        None,
+                        Some(&conflict_run),
+                        returned,
+                    )
                 }
-                None => {
+                None if returned.is_none() => {
                     // Every value is read: the blocks' tables close before a row is written
                     drop(runner.take());
-                    (&*written, &*written_ctx, None, None)
+                    (&*written, &*written_ctx, None, None, None)
                 }
+                None => (&*written, &*written_ctx, None, None, returned),
             }
         } else {
-            (stmt, ctx, plan_cache, None)
+            (stmt, ctx, plan_cache, None, None)
         };
 
         // Acquire per-table upsert mutex for ON CONFLICT DO UPDATE only.
@@ -1235,6 +1272,7 @@ impl Executor {
                     returning_rows,
                     column_names,
                     ctx,
+                    returned,
                 )?)
             } else {
                 None
@@ -1595,7 +1633,13 @@ impl Executor {
         }
 
         let mut returning_result = if let Some(column_names) = &schema_column_names_arc {
-            Some(self.build_returning_result(&stmt.returning, returning_rows, column_names, ctx)?)
+            Some(self.build_returning_result(
+                &stmt.returning,
+                returning_rows,
+                column_names,
+                ctx,
+                returned,
+            )?)
         } else {
             None
         };
@@ -1733,7 +1777,10 @@ impl Executor {
             )
         } else {
             let reads_through_view = super::insert_reads_through_a_view(stmt);
-            if reads_through_view && stmt.values.iter().flatten().any(Self::has_subqueries) {
+            if reads_through_view
+                && (stmt.values.iter().flatten().any(Self::has_subqueries)
+                    || stmt.returning.iter().any(Self::has_subqueries))
+            {
                 return self.insert_values_read_uncached(
                     stmt,
                     ctx,
@@ -2074,6 +2121,7 @@ impl Executor {
                 column_names,
                 ctx,
                 standalone_tx,
+                None,
             ));
         }
 
@@ -2140,13 +2188,22 @@ impl Executor {
                 .where_clause
                 .as_deref()
                 .is_some_and(Self::has_subqueries)
-                || stmt.updates.values().any(Self::has_subqueries))
+                || stmt.updates.values().any(Self::has_subqueries)
+                || stmt.returning.iter().any(Self::has_subqueries))
             && self
                 .dml_family(
                     stmt.where_clause.as_deref(),
                     stmt.updates
                         .values()
-                        .filter(|e| !matches!(e, Expression::Default(_))),
+                        .filter(|e| !matches!(e, Expression::Default(_)))
+                        .chain(
+                            stmt.returning
+                                .iter()
+                                .any(Self::has_subqueries)
+                                .then(|| super::prepared_select::returning_values(&stmt.returning))
+                                .into_iter()
+                                .flatten(),
+                        ),
                     ctx,
                 )
                 .is_ok()
@@ -2328,9 +2385,20 @@ impl Executor {
             .where_clause
             .as_deref()
             .is_some_and(Self::has_subqueries);
-        let in_family = (where_has_subqueries || stmt.updates.values().any(Self::has_subqueries))
+        let returning_has_subqueries = stmt.returning.iter().any(Self::has_subqueries);
+        let returning_values = returning_has_subqueries
+            .then(|| super::prepared_select::returning_values(&stmt.returning))
+            .into_iter()
+            .flatten();
+        let in_family = (where_has_subqueries
+            || stmt.updates.values().any(Self::has_subqueries)
+            || returning_has_subqueries)
             && self
-                .dml_family(stmt.where_clause.as_deref(), stmt.updates.values(), ctx)
+                .dml_family(
+                    stmt.where_clause.as_deref(),
+                    stmt.updates.values().chain(returning_values),
+                    ctx,
+                )
                 .is_ok();
         let where_prepared = in_family && where_has_subqueries;
         let held_dml;
@@ -2353,19 +2421,30 @@ impl Executor {
                 &sets,
                 &[] as &[Vec<Expression>],
                 None,
+                returning_has_subqueries
+                    .then_some(super::prepared_select::ReturningSites {
+                        table: table_name,
+                        schema,
+                        values: &stmt.returning,
+                    })
+                    .as_ref(),
                 standalone_tx
                     .as_deref()
                     .filter(|_| ctx.statement_snapshot().is_none()),
                 ctx,
             )?;
             held_dml = prepared;
-            Some(super::prepared_select::DmlRunner::new(
+            let run = super::prepared_select::DmlRunner::new(
                 self,
                 &held_dml,
                 ctx,
                 tables,
                 table.row_count_hint(),
-            )?)
+            )?;
+            if !should_auto_commit && run.returning_reads_target() {
+                return Err(Self::returning_reads_target());
+            }
+            Some(run)
         } else {
             None
         };
@@ -3135,6 +3214,7 @@ impl Executor {
                 &column_names,
                 ctx,
                 standalone_tx,
+                dml_run.as_ref(),
             ));
         }
 
@@ -3183,18 +3263,31 @@ impl Executor {
         let mut active_tx = self.active_transaction.lock().unwrap();
         let statement_rollback = StatementRollback::new(&self.engine, active_tx.as_ref());
 
-        // A WHERE whose subqueries are of the prepared family runs through
-        // one runner, which reads the tables as the statement found them
-        let where_prepared = stmt
+        // A WHERE and a RETURNING whose subqueries are of the prepared family
+        // run through one runner, which reads the tables as the statement found them
+        let where_has_subqueries = stmt
             .where_clause
             .as_deref()
-            .is_some_and(Self::has_subqueries)
+            .is_some_and(Self::has_subqueries);
+        let returning_has_subqueries = stmt.returning.iter().any(Self::has_subqueries);
+        let returning_values = returning_has_subqueries
+            .then(|| super::prepared_select::returning_values(&stmt.returning))
+            .into_iter()
+            .flatten();
+        let in_family = (where_has_subqueries || returning_has_subqueries)
             && self
-                .dml_family(stmt.where_clause.as_deref(), [], ctx)
+                .dml_family(
+                    stmt.where_clause
+                        .as_deref()
+                        .filter(|_| where_has_subqueries),
+                    returning_values,
+                    ctx,
+                )
                 .is_ok();
+        let where_prepared = in_family && where_has_subqueries;
         // Without a view the prepared subqueries read a snapshot taken before the write
         let snapshot_ctx;
-        let ctx = if where_prepared
+        let ctx = if in_family
             && active_tx.is_none()
             && ctx.statement_view().is_none()
             && ctx.statement_snapshot().is_none()
@@ -3242,28 +3335,39 @@ impl Executor {
         let schema = table.schema();
 
         let held_dml;
-        let dml_run = if where_prepared {
+        let dml_run = if in_family {
             let (prepared, tables) = self.open_prepared_dml(
                 compiled,
                 schema,
                 &SmartString::from(effective_name),
-                stmt.where_clause.as_deref(),
+                stmt.where_clause.as_deref().filter(|_| where_prepared),
                 &[],
                 &[] as &[Vec<Expression>],
                 None,
+                returning_has_subqueries
+                    .then_some(super::prepared_select::ReturningSites {
+                        table: table_name,
+                        schema,
+                        values: &stmt.returning,
+                    })
+                    .as_ref(),
                 standalone_tx
                     .as_deref()
                     .filter(|_| ctx.statement_snapshot().is_none()),
                 ctx,
             )?;
             held_dml = prepared;
-            Some(super::prepared_select::DmlRunner::new(
+            let run = super::prepared_select::DmlRunner::new(
                 self,
                 &held_dml,
                 ctx,
                 tables,
                 table.row_count_hint(),
-            )?)
+            )?;
+            if !should_auto_commit && run.returning_reads_target() {
+                return Err(Self::returning_reads_target());
+            }
+            Some(run)
         } else {
             None
         };
@@ -3431,7 +3535,7 @@ impl Executor {
                 }
             };
             // A prepared WHERE's rows are read as a prepared SELECT reads them
-            if let Some(run) = &dml_run {
+            if let Some(run) = dml_run.as_ref().filter(|_| where_prepared) {
                 run.passing_rows(&*table, ctx, &mut |row_id, row| {
                     #[cfg(feature = "test-failpoints")]
                     crate::test_failpoints::prepared_dml_site_ran(
@@ -3443,9 +3547,10 @@ impl Executor {
 
             // Scan all rows and collect IDs of rows to delete
             let column_indices: Vec<usize> = (0..column_count).collect();
-            let mut scanner = match dml_run {
-                Some(_) => None,
-                None => Some(table.scan(&column_indices, where_expr.as_deref())?),
+            let mut scanner = if where_prepared {
+                None
+            } else {
+                Some(table.scan(&column_indices, where_expr.as_deref())?)
             };
 
             // Pre-compute column name mappings for correlated subqueries
@@ -3713,6 +3818,7 @@ impl Executor {
                 &column_names_owned,
                 ctx,
                 standalone_tx,
+                dml_run.as_ref(),
             ));
         }
 
@@ -4236,8 +4342,10 @@ impl Executor {
         column_names: &[String],
         ctx: &ExecutionContext,
         standalone_tx: Option<Box<dyn Transaction>>,
+        prepared: Option<&super::prepared_select::DmlRunner<'_>>,
     ) -> Result<Box<dyn QueryResult>> {
-        let result = self.build_returning_result(returning, source_rows, column_names, ctx)?;
+        let result =
+            self.build_returning_result(returning, source_rows, column_names, ctx, prepared)?;
         // A statement whose reads a truncate or drop overtook commits nothing
         ctx.view_held()?;
         if let Some(mut tx) = standalone_tx {
@@ -4249,13 +4357,15 @@ impl Executor {
     /// Build a result from RETURNING clause expressions
     ///
     /// Evaluates the RETURNING expressions for each affected row and returns
-    /// the results as a QueryResult.
+    /// the results as a QueryResult; a `prepared` RETURNING runs its own
+    /// programs, which read its blocks.
     fn build_returning_result(
         &self,
         returning: &[Expression],
         source_rows: Vec<Row>,
         column_names: &[String],
         ctx: &ExecutionContext,
+        prepared: Option<&super::prepared_select::DmlRunner<'_>>,
     ) -> Result<Box<dyn QueryResult>> {
         use crate::parser::{Identifier, Position, Token, TokenType};
 
@@ -4281,6 +4391,24 @@ impl Executor {
         }
 
         use super::expression::{compile_expression, ExecuteContext, ExprVM, SharedProgram};
+
+        if let Some((run, programs)) = prepared.and_then(|run| Some((run, run.returning()?))) {
+            let mut vm = ExprVM::new();
+            let mut result_rows = RowVec::with_capacity(source_rows.len());
+            for (row_id, row) in source_rows.into_iter().enumerate() {
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::prepared_dml_site_ran(
+                    crate::test_failpoints::PreparedDmlSite::Returning,
+                );
+                let exec_ctx = run.context(&row);
+                let mut row_values = Vec::with_capacity(programs.len());
+                for program in programs {
+                    row_values.push(vm.execute_cow(program, &exec_ctx)?);
+                }
+                result_rows.push((row_id as i64, Row::from_values(row_values)));
+            }
+            return Ok(Box::new(ExecutorResult::new(result_columns, result_rows)));
+        }
 
         // Pre-compile all RETURNING expressions
         let mut compiled_exprs: Vec<SharedProgram> = Vec::with_capacity(result_columns.len());

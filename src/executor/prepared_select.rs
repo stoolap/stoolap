@@ -2935,6 +2935,19 @@ pub struct PreparedDml {
     values: Vec<Vec<Option<SharedProgram>>>,
     /// An INSERT's ON CONFLICT DO UPDATE, None without a subquery there
     conflict: Option<PreparedConflict>,
+    /// The RETURNING, None without a subquery there
+    returning: Option<PreparedReturning>,
+}
+
+/// A statement's RETURNING values over the row it returns, one program for
+/// each column of its result
+#[derive(Debug)]
+struct PreparedReturning {
+    /// The target's columns the row returned is laid out for
+    columns: CompactArc<Vec<String>>,
+    programs: Vec<SharedProgram>,
+    /// A value read for each row returned holds a block that reads the target
+    reads_target: bool,
 }
 
 /// An INSERT's ON CONFLICT SET values and DO UPDATE WHERE, over the row
@@ -2963,9 +2976,25 @@ pub(crate) struct ConflictSites<'e> {
     pub(crate) stmt: &'e InsertStatement,
 }
 
+/// The RETURNING `values` of a statement writing `table` of `schema`
+pub(crate) struct ReturningSites<'e> {
+    pub(crate) table: &'e str,
+    pub(crate) schema: &'e Schema,
+    pub(crate) values: &'e [Expression],
+}
+
+/// The values of a RETURNING the family walks: each without its alias, a
+/// `*` left out
+pub(crate) fn returning_values(returning: &[Expression]) -> impl Iterator<Item = &Expression> {
+    returning
+        .iter()
+        .map(unaliased)
+        .filter(|value| !matches!(value, Expression::Star(_)))
+}
+
 impl PreparedDml {
-    /// Prepare the WHERE, `sets` and `values` of a statement over its
-    /// target `schema`, named `scope_name`, for executions with
+    /// Prepare the WHERE, `sets`, `values`, `conflict` and `returning` of a
+    /// statement over its target `schema`, named `scope_name`, for executions with
     /// `param_count` parameters
     #[allow(clippy::too_many_arguments)]
     fn prepare(
@@ -2976,6 +3005,7 @@ impl PreparedDml {
         sets: &[(usize, &Expression)],
         values: &[impl AsRef<[Expression]>],
         conflict: Option<&ConflictSites<'_>>,
+        returning: Option<&ReturningSites<'_>>,
         param_count: usize,
         epoch: u64,
     ) -> Result<Self> {
@@ -3098,6 +3128,45 @@ impl PreparedDml {
                 .transpose()?;
             conflict_parts = Some((sets, where_, reads_target));
         }
+        // RETURNING reads the row returned, `*` each of its columns
+        let returning_scope =
+            returning.map(|sites| ScopeTable::of(scope_name.clone(), sites.schema));
+        let mut returning_parts = None;
+        if let (Some(sites), Some(returning_scope)) = (returning, &returning_scope) {
+            let scopes = [returning_scope];
+            let chain = Chain { scopes: &scopes };
+            let mut reads_target = false;
+            let mut values = Vec::with_capacity(sites.values.len());
+            for value in sites.values.iter().map(unaliased) {
+                if matches!(value, Expression::Star(_)) {
+                    values.extend(sites.schema.columns.iter().map(|column| {
+                        let token =
+                            Token::new(TokenType::Identifier, &column.name, Position::default());
+                        Expression::Identifier(Identifier::new(token, column.name.as_str()))
+                    }));
+                    continue;
+                }
+                let first = builder.subqueries.len();
+                let mut value_work = Rewritten::default();
+                let rewritten_value = builder.rewrite(&chain, None, value, &mut value_work)?;
+                if !value_work.reads_row
+                    && !is_leaf(value)
+                    && !volatile(value, &executor.function_registry)
+                {
+                    let slot = builder.slot();
+                    run_slots.push((slot, rewritten_value));
+                    values.push(slot_parameter(slot));
+                    continue;
+                }
+                // Read for each row returned, after the statement's writes
+                reads_target |= builder.subqueries[first..]
+                    .iter()
+                    .flatten()
+                    .any(|sq| sq.table.as_deref() == Some(sites.table));
+                values.push(rewritten_value);
+            }
+            returning_parts = Some((values, reads_target));
+        }
         let mut read_as = FxHashMap::default();
         if let Some(parts) = &where_parts {
             compare_as_scan(&parts.clause, schema, &mut read_as);
@@ -3145,6 +3214,22 @@ impl PreparedDml {
             }
             _ => None,
         };
+        let prepared_returning = match (returning, &returning_scope, returning_parts) {
+            (Some(sites), Some(scope), Some((values, reads_target))) => {
+                let over_returned =
+                    CompileContext::new(&scope.columns, &executor.function_registry)
+                        .with_prepared_subqueries();
+                Some(PreparedReturning {
+                    columns: sites.schema.column_names_arc(),
+                    programs: values
+                        .iter()
+                        .map(|value| compile_with(&over_returned, value))
+                        .collect::<Result<Vec<_>>>()?,
+                    reads_target,
+                })
+            }
+            _ => None,
+        };
         let run_slots = run_slots
             .iter()
             .map(|(slot, value)| compile_with(&own, value).map(|p| (*slot, p)))
@@ -3162,6 +3247,7 @@ impl PreparedDml {
             sets,
             values,
             conflict: prepared_conflict,
+            returning: prepared_returning,
         })
     }
 }
@@ -3495,6 +3581,25 @@ impl<'a> DmlRunner<'a> {
             .as_ref()
             .is_some_and(|conflict| conflict.reads_target)
     }
+
+    /// The RETURNING's programs over the row returned, one for each column
+    /// of its result; None without a prepared one
+    pub(crate) fn returning(&self) -> Option<&'a [SharedProgram]> {
+        self.prepared
+            .returning
+            .as_ref()
+            .map(|returning| returning.programs.as_slice())
+    }
+
+    /// Whether a RETURNING value read for each row returned holds a block
+    /// that reads the target, which inside a transaction would see the
+    /// statement's writes
+    pub(crate) fn returning_reads_target(&self) -> bool {
+        self.prepared
+            .returning
+            .as_ref()
+            .is_some_and(|returning| returning.reads_target)
+    }
 }
 
 fn mentions_subquery(expr: &Expression) -> bool {
@@ -3799,6 +3904,7 @@ impl Executor {
         sets: &[(usize, &Expression)],
         values: &[impl AsRef<[Expression]>],
         conflict: Option<&ConflictSites<'_>>,
+        returning: Option<&ReturningSites<'_>>,
         through: Option<&dyn Transaction>,
         ctx: &ExecutionContext,
     ) -> Result<(Arc<PreparedDml>, DmlTables)> {
@@ -3808,11 +3914,17 @@ impl Executor {
             CompactArc::ptr_eq(held, now) || held == now
         };
         let conflict_columns = conflict.map(|sites| sites.schema.column_names_arc());
+        let returning_columns = returning.map(|sites| sites.schema.column_names_arc());
         let fits = |p: &PreparedDml| {
             p.cached_epoch == epoch
                 && p.blocks.param_count == ctx.params().len()
                 && same(&p.columns, &columns)
                 && match (&p.conflict, &conflict_columns) {
+                    (Some(held), Some(now)) => same(&held.columns, now),
+                    (None, None) => true,
+                    _ => false,
+                }
+                && match (&p.returning, &returning_columns) {
                     (Some(held), Some(now)) => same(&held.columns, now),
                     (None, None) => true,
                     _ => false,
@@ -3841,6 +3953,7 @@ impl Executor {
                         sets,
                         values,
                         conflict,
+                        returning,
                         ctx.params().len(),
                         epoch,
                     )?);
@@ -3859,9 +3972,10 @@ impl Executor {
                     prepared
                 }
             };
-            // A block read for each conflict that reads the target would see
-            // the statement's writes: it reads a snapshot taken before them
-            let reads_target = prepared.conflict.as_ref().is_some_and(|c| c.reads_target);
+            // A block read for each conflict or row returned that reads the
+            // target would see the statement's writes: it reads a snapshot taken before them
+            let reads_target = prepared.conflict.as_ref().is_some_and(|c| c.reads_target)
+                || prepared.returning.as_ref().is_some_and(|r| r.reads_target);
             let snapshot_ctx = match through {
                 Some(_) if reads_target => {
                     let snapshot = self.new_statement_snapshot(

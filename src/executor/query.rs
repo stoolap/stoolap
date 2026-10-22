@@ -1064,6 +1064,7 @@ impl Executor {
             &values,
             None,
             None,
+            None,
             ctx,
         )?;
         let run = super::prepared_select::DmlRunner::new(self, &prepared, ctx, tables, 0)?;

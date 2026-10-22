@@ -79,6 +79,17 @@ RETURNING id, name, price;
 -- Returns all deleted rows
 ```
 
+## Subqueries in RETURNING
+
+A `RETURNING` value may hold a subquery. It sees the tables as the statement found them, and a column of the target in it names the row returned:
+
+```sql
+UPDATE products SET price = price * 1.1 WHERE category_id = 3
+RETURNING id, price, (SELECT name FROM categories WHERE categories.id = products.category_id);
+```
+
+See [Subqueries in RETURNING]({% link _docs/sql-features/subqueries.md %}#subqueries-in-returning) for the rules.
+
 ## Use Cases
 
 - **Get auto-generated IDs** after INSERT without a separate SELECT

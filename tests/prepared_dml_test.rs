@@ -145,6 +145,31 @@ const CORPUS: &[(&str, &str)] = &[
     ),
 ];
 
+/// Each statement with RETURNING with the general path's SELECT of the rows
+/// it returns, read before the statement runs
+const RETURNING_CORPUS: &[(&str, &str)] = &[
+    (
+        "UPDATE t SET x = 0 WHERE id <= 2 RETURNING id, x, (SELECT MAX(v) FROM u WHERE u.k = t.k)",
+        "SELECT id, 0, (SELECT MAX(v) FROM u WHERE u.k = t.k) FROM t WHERE id <= 2",
+    ),
+    (
+        "UPDATE t SET s = 'z' WHERE id = 1 RETURNING *, (SELECT MAX(v) FROM u)",
+        "SELECT id, k, x, 'z', (SELECT MAX(v) FROM u) FROM t WHERE id = 1",
+    ),
+    (
+        "DELETE FROM t WHERE id >= 4 RETURNING id, (SELECT COUNT(*) FROM u WHERE u.k = t.k), (SELECT MAX(id) FROM t)",
+        "SELECT id, (SELECT COUNT(*) FROM u WHERE u.k = t.k), (SELECT MAX(id) FROM t) FROM t WHERE id >= 4",
+    ),
+    (
+        "INSERT INTO t VALUES (9, 1, 9, 'r') RETURNING id, CASE WHEN EXISTS (SELECT 1 FROM u WHERE u.k = t.k) THEN 1 ELSE 0 END, k IN (SELECT k FROM u)",
+        "SELECT 9, CASE WHEN EXISTS (SELECT 1 FROM u WHERE u.k = 1) THEN 1 ELSE 0 END, 1 IN (SELECT k FROM u)",
+    ),
+    (
+        "INSERT INTO t VALUES (2, 2, 0, 'n') ON CONFLICT (id) DO UPDATE SET x = 7 RETURNING id, x, (SELECT SUM(v) FROM u WHERE u.k = t.k)",
+        "SELECT 2, 7, (SELECT SUM(v) FROM u WHERE u.k = 2)",
+    ),
+];
+
 /// The rows `expected` names: an UPDATE's or an upsert's whole rows, the
 /// rows of t whose id a DELETE's CASE marks 0, or t with the rows an INSERT
 /// adds after it
@@ -181,6 +206,14 @@ fn test_every_prepared_dml_site_leaves_the_general_answer_and_is_reached() {
             db.execute(dml, ())
                 .unwrap_or_else(|e| panic!("{dml} under {strategy:?}: {e}"));
             assert_eq!(table(&db, ROWS), want, "{dml} under {strategy:?}");
+        }
+        for (i, (dml, expected)) in RETURNING_CORPUS.iter().enumerate() {
+            let db = setup(&format!("prepared_dml_returning_{n}_{i}"));
+            let mut want = table(&db, expected);
+            let mut got = table(&db, dml);
+            want.sort();
+            got.sort();
+            assert_eq!(got, want, "{dml} under {strategy:?}");
         }
     }
     force_exists_strategy(None);

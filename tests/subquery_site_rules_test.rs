@@ -312,7 +312,7 @@ fn test_returning() {
         assert_eq!(table(&db), before, "{sql} failed but deleted");
     }
     let want = vec![vec!["1".to_string(), "3".to_string()]];
-    holds(Fails("step 5"), got, &want, sql);
+    holds(Right, got, &want, sql);
 }
 
 #[test]
