@@ -296,6 +296,9 @@ type SelectResult = Result<SelectOutput>;
 /// whether the limit and offset were applied, and the layout of a table
 type OuterFetch = (Box<dyn QueryResult>, Vec<String>, bool, Option<LayoutToken>);
 
+/// The layout a table's rows were read in and the schema they were read with
+type ReadSchema = (LayoutToken, CompactArc<Schema>);
+
 /// How a join reads one of its sides: its conditions as the WHERE gives
 /// them, and the statement's run with the side's number when the blocks
 /// hold those conditions
@@ -3066,7 +3069,7 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
-        token_out: Option<&mut Option<LayoutToken>>,
+        read_out: Option<&mut Option<ReadSchema>>,
     ) -> SelectResult {
         // OPTIMIZATION: Use pre-computed lowercase name to avoid allocation per query
         let table_name = &table_source.name.value_lower;
@@ -3166,9 +3169,9 @@ impl Executor {
         };
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::select_table_opened();
-        // The layout this handle's reads are checked against
-        if let Some(out) = token_out {
-            *out = Some(table.layout_token());
+        // The layout this handle's reads are checked against, and its schema
+        if let Some(out) = read_out {
+            *out = Some((table.layout_token(), table.schema_arc()));
         }
 
         // Build column list from schema: refcount bump, not a per-statement
@@ -5366,6 +5369,7 @@ impl Executor {
                 Some(&none),
                 Some(0),
                 0,
+                None,
             )?;
             let (_, right_cols, _, _) = self.execute_table_expression_with_filter_limit(
                 &join_source.right,
@@ -5373,6 +5377,7 @@ impl Executor {
                 Some(&none),
                 Some(0),
                 0,
+                None,
             )?;
             if let Some(where_clause) = &where_for_join {
                 let joined: Vec<String> = left_cols.iter().chain(&right_cols).cloned().collect();
@@ -5766,7 +5771,8 @@ impl Executor {
                     let inner_token = inner_table.layout_token();
                     let inner_schema = inner_table.schema();
                     if let Some(run) = statement_run {
-                        run.blocks.side_fits(usize::from(!swapped), &*inner_table)?;
+                        run.blocks
+                            .side_fits(usize::from(!swapped), &inner_table.schema_arc())?;
                     }
                     // The WHERE's conditions on the inner table, fetched through
                     // when its scan takes them whole, else asked with the residual
@@ -8044,6 +8050,7 @@ impl Executor {
         expr: &Expression,
         ctx: &ExecutionContext,
         filter: Option<&Expression>,
+        read_out: Option<&mut Option<ReadSchema>>,
     ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
         match expr {
             Expression::TableSource(ts) => {
@@ -8161,8 +8168,13 @@ impl Executor {
                 };
                 // Get classification for the synthetic SELECT statement
                 let classification = get_classification(&select_all);
-                let (result, columns, _, _) =
-                    self.execute_simple_table_scan(ts, &select_all, ctx, &classification, None)?;
+                let (result, columns, _, _) = self.execute_simple_table_scan(
+                    ts,
+                    &select_all,
+                    ctx,
+                    &classification,
+                    read_out,
+                )?;
 
                 // Prefix column names with table alias (or table name if no alias)
                 // This is needed for proper qualified identifier resolution in JOINs
@@ -8321,15 +8333,21 @@ impl Executor {
         if side.run.is_some() {
             crate::test_failpoints::join_side_opening();
         }
-        let fetched =
-            self.execute_table_expression_with_filter_limit(expr, ctx, filter, limit, offset)?;
-        if let (Some((run, index)), Expression::TableSource(ts)) = (side.run, expr) {
-            run.blocks
-                .side_named(index, &ts.name.value_lower, &fetched.1, fetched.3)?;
+        let mut read = None;
+        let read_out = side.run.is_some().then_some(&mut read);
+        let fetched = self.execute_table_expression_with_filter_limit(
+            expr, ctx, filter, limit, offset, read_out,
+        )?;
+        if let Some((run, index)) = side.run {
+            let (_, schema) =
+                read.ok_or_else(|| Error::internal("a join side read without its schema"))?;
+            run.blocks.side_fits(index, &schema)?;
         }
         Ok(fetched)
     }
 
+    /// `read_out` takes the layout and schema a plain table's rows were read
+    /// with
     pub(crate) fn execute_table_expression_with_filter_limit(
         &self,
         expr: &Expression,
@@ -8337,6 +8355,7 @@ impl Executor {
         filter: Option<&Expression>,
         row_limit: Option<usize>,
         row_offset: usize,
+        read_out: Option<&mut Option<ReadSchema>>,
     ) -> Result<OuterFetch> {
         // Handle FunctionTableSource with limit passthrough
         let tvf_source = match expr {
@@ -8364,14 +8383,14 @@ impl Executor {
                 } else {
                     // Not a table source, fall back to standard execution
                     return self
-                        .execute_table_expression_with_filter(expr, ctx, filter)
+                        .execute_table_expression_with_filter(expr, ctx, filter, None)
                         .map(|(result, columns)| (result, columns, false, None));
                 }
             }
             _ => {
                 // Not a table source, fall back to standard execution
                 return self
-                    .execute_table_expression_with_filter(expr, ctx, filter)
+                    .execute_table_expression_with_filter(expr, ctx, filter, None)
                     .map(|(result, columns)| (result, columns, false, None));
             }
         };
@@ -8383,14 +8402,14 @@ impl Executor {
             // Skip if this is a CTE reference - CTEs are already materialized
             if ctx.get_cte_by_lower(table_name).is_some() {
                 return self
-                    .execute_table_expression_with_filter(expr, ctx, filter)
+                    .execute_table_expression_with_filter(expr, ctx, filter, None)
                     .map(|(result, columns)| (result, columns, false, None));
             }
 
             // Skip if this is a view
             if self.engine.get_view_lowercase(table_name)?.is_some() {
                 return self
-                    .execute_table_expression_with_filter(expr, ctx, filter)
+                    .execute_table_expression_with_filter(expr, ctx, filter, None)
                     .map(|(result, columns)| (result, columns, false, None));
             }
 
@@ -8433,14 +8452,18 @@ impl Executor {
             // The scan says whether it applied the synthetic LIMIT and OFFSET. A
             // path that did not may still have stopped early at their sum, so
             // the pair is applied here, as the select layer would
-            let mut token = None;
+            let mut opened = None;
             let (result, columns, applied, _) = self.execute_simple_table_scan(
                 ts,
                 &select_all,
                 ctx,
                 &classification,
-                Some(&mut token),
+                Some(&mut opened),
             )?;
+            let token = opened.as_ref().map(|(token, _)| *token);
+            if let Some(out) = read_out {
+                *out = opened;
+            }
             let result: Box<dyn QueryResult> = if applied {
                 result
             } else {
@@ -8465,7 +8488,7 @@ impl Executor {
         }
 
         // Fall back to standard execution for other cases
-        self.execute_table_expression_with_filter(expr, ctx, filter)
+        self.execute_table_expression_with_filter(expr, ctx, filter, read_out)
             .map(|(result, columns)| (result, columns, false, None))
     }
 
@@ -8792,7 +8815,7 @@ impl Executor {
             return Ok(None);
         };
         if let Some(run) = run {
-            run.blocks.side_fits(1, &*inner_table)?;
+            run.blocks.side_fits(1, &inner_table.schema_arc())?;
         }
         let inner_token = inner_table.layout_token();
         let inner_alias = right_alias.unwrap_or(&table_name);

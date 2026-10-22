@@ -3337,10 +3337,9 @@ pub(crate) struct JoinBlocks {
     side_wheres: [Option<PreparedWhere>; 2],
     /// The columns of each side the clauses were prepared over
     side_columns: [Vec<SchemaColumn>; 2],
-    /// The layout each side's table was found to hold those columns in, by
-    /// the whole schema and by name, which a later open of it skips checking
-    fitted: [std::sync::OnceLock<LayoutToken>; 2],
-    named: [std::sync::OnceLock<LayoutToken>; 2],
+    /// The schema each side was found to hold those columns with; held, any
+    /// change to the table's schema replaces it, so the same one skips the check
+    fitted: [std::sync::OnceLock<CompactArc<Schema>>; 2],
     /// Each SELECT item and ORDER BY key holding a subquery, over the joined row
     pub(crate) select: Vec<Option<Expression>>,
     pub(crate) order_by: Vec<Option<Expression>>,
@@ -3354,50 +3353,21 @@ pub(crate) struct JoinBlocks {
 }
 
 impl JoinBlocks {
-    /// SchemaChanged when `table`, opened for side `side`, no longer holds
-    /// the columns the clauses were prepared over
-    pub(crate) fn side_fits(&self, side: usize, table: &dyn Table) -> Result<()> {
-        let token = table.layout_token();
-        if self.fitted[side].get() == Some(&token) {
+    /// SchemaChanged when `schema`, which side `side` was read with, does not
+    /// hold the columns the clauses were prepared over
+    pub(crate) fn side_fits(&self, side: usize, schema: &CompactArc<Schema>) -> Result<()> {
+        if self.fitted[side]
+            .get()
+            .is_some_and(|fitted| CompactArc::ptr_eq(fitted, schema))
+        {
             return Ok(());
         }
-        if table.schema().columns == self.side_columns[side] {
-            let _ = self.fitted[side].set(token);
-            return Ok(());
-        }
-        Err(Error::SchemaChanged {
-            table: table.name().to_string(),
-        })
-    }
-
-    /// SchemaChanged when the rows read for side `side` of table `table`,
-    /// named `columns` and laid out as `token`, are not laid out as the
-    /// clauses were prepared over
-    pub(crate) fn side_named(
-        &self,
-        side: usize,
-        table: &str,
-        columns: &[String],
-        token: Option<LayoutToken>,
-    ) -> Result<()> {
-        if token.is_some() && self.named[side].get() == token.as_ref() {
-            return Ok(());
-        }
-        let prepared = &self.side_columns[side];
-        let named = |(column, prepared): (&String, &SchemaColumn)| {
-            let name = prepared.name.as_str();
-            column.len() > name.len()
-                && column.ends_with(name)
-                && column.as_bytes()[column.len() - name.len() - 1] == b'.'
-        };
-        if columns.len() == prepared.len() && columns.iter().zip(prepared).all(named) {
-            if let Some(token) = token {
-                let _ = self.named[side].set(token);
-            }
+        if schema.columns == self.side_columns[side] {
+            let _ = self.fitted[side].set(CompactArc::clone(schema));
             return Ok(());
         }
         Err(Error::SchemaChanged {
-            table: table.to_string(),
+            table: schema.table_name.clone(),
         })
     }
 
@@ -3548,7 +3518,6 @@ impl JoinBlocks {
             side_wheres,
             side_columns,
             fitted: Default::default(),
-            named: Default::default(),
             select,
             order_by,
             ahead,
@@ -3700,7 +3669,7 @@ impl Executor {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::join_side_opening();
         let table = self.prepared_table(name, ctx, None)?;
-        held.side_fits(side, &*table)?;
+        held.side_fits(side, &table.schema_arc())?;
         let token = table.layout_token();
         let columns = table.schema().column_names_arc();
         let extra = extra.map(|extra| strip_table_qualifier(extra, alias));

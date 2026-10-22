@@ -379,21 +379,35 @@ fn a_join_output_s_subqueries_read_parameters_and_the_transaction_s_writes() {
 #[test]
 fn a_side_whose_columns_changed_after_preparing_raises_schema_changed() {
     let _guard = serial();
-    for (name, sql, table) in [
+    for (name, sql, changes) in [
         (
             "join_output_blocks_drop_outer",
             "SELECT l.id, (SELECT s.a FROM s WHERE s.id = l.k) FROM l JOIN r ON l.id = r.id",
-            "l",
+            &["ALTER TABLE l DROP COLUMN pad"][..],
         ),
         (
             "join_output_blocks_drop_inner",
             "SELECT l.id, (SELECT s.a FROM s WHERE s.id = r.w) FROM l JOIN r ON l.id = r.id",
-            "r",
+            &["ALTER TABLE r DROP COLUMN pad"],
         ),
         (
             "join_output_blocks_drop_hashed",
             "SELECT l.id, (SELECT s.a FROM s WHERE s.id = r.w) FROM l JOIN r ON l.k = r.w",
-            "r",
+            &["ALTER TABLE r DROP COLUMN pad"],
+        ),
+        (
+            "join_output_blocks_rename_swap",
+            "SELECT l.k, (SELECT s.a FROM s WHERE s.id = l.k) FROM l JOIN r ON l.id = r.id LIMIT 1",
+            &[
+                "ALTER TABLE l RENAME COLUMN k TO tmp",
+                "ALTER TABLE l RENAME COLUMN spare TO k",
+                "ALTER TABLE l RENAME COLUMN tmp TO spare",
+            ],
+        ),
+        (
+            "join_output_blocks_retype",
+            "SELECT l.id, l.k IN (SELECT u.t FROM u) FROM l LEFT JOIN r ON l.id = r.id",
+            &["ALTER TABLE l MODIFY COLUMN k TEXT"],
         ),
     ] {
         let db = Database::open(&format!("memory://{name}")).unwrap();
@@ -401,35 +415,34 @@ fn a_side_whose_columns_changed_after_preparing_raises_schema_changed() {
             "CREATE TABLE l (id INTEGER PRIMARY KEY, pad INTEGER, k INTEGER, spare INTEGER)",
             "CREATE TABLE r (id INTEGER PRIMARY KEY, pad INTEGER, w INTEGER, spare INTEGER)",
             "CREATE TABLE s (id INTEGER PRIMARY KEY, a INTEGER)",
+            "CREATE TABLE u (id INTEGER PRIMARY KEY, t TEXT)",
             "INSERT INTO l VALUES (1, 0, 2, 3)",
             "INSERT INTO r VALUES (1, 0, 2, 3)",
             "INSERT INTO s VALUES (2, 20), (3, 30)",
+            "INSERT INTO u VALUES (1, '02')",
         ] {
             db.execute(setup, ()).unwrap();
         }
-        assert_eq!(
-            rows(&db, sql).unwrap()[1..],
-            ["Integer(1)|Integer(20)".to_string()],
-            "{sql}: prepared"
-        );
+        // Twice, so a check the first run passed is kept for the next
+        for _ in 0..2 {
+            assert_eq!(rows(&db, sql), rows(&db, &general(sql)), "{sql}: prepared");
+        }
         let writer = db.clone();
         let done = Rc::new(Cell::new(false));
         let flag = Rc::clone(&done);
-        let alter = format!("ALTER TABLE {table} DROP COLUMN pad");
+        let changes = changes.to_vec();
         before_join_side_opened(move || {
-            writer.execute(&alter, ()).unwrap();
+            for change in changes {
+                writer.execute(change, ()).unwrap();
+            }
             flag.set(true);
         });
         let got = rows(&db, sql);
-        assert!(done.get(), "{sql}: the column dropped inside the statement");
+        assert!(done.get(), "{sql}: the columns changed inside the statement");
         assert!(
             got.as_ref().is_err_and(|e| e.contains("schema changed")),
             "{sql}: {got:?}"
         );
-        assert_eq!(
-            rows(&db, sql).unwrap()[1..],
-            ["Integer(1)|Integer(20)".to_string()],
-            "{sql}: run again"
-        );
+        assert_eq!(rows(&db, sql), rows(&db, &general(sql)), "{sql}: run again");
     }
 }
