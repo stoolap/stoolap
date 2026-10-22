@@ -35,6 +35,7 @@ use crate::core::pattern::Pattern;
 use crate::core::predicate::{sql_compare, sql_distinct, sql_eq};
 use crate::core::value::{f64_eq, f64_ge, f64_gt, f64_le, f64_lt, f64_ne};
 use crate::core::{DataType, Error, Result, Row, Value, NULL_VALUE};
+use crate::executor::context::KeptMembers;
 use crate::functions::scalar::extreme_position;
 use std::cmp::Ordering;
 
@@ -218,6 +219,12 @@ pub trait SubqueryExecutor {
         all: bool,
         ctx: &ExecuteContext,
     ) -> Result<Option<bool>>;
+
+    /// An uncorrelated block's members once this run has read them, which
+    /// the VM tests in place of calling the block
+    fn kept_members(&self, _subquery_index: u16) -> Option<&KeptMembers> {
+        None
+    }
 }
 
 /// A subquery op compiles only into a prepared plan, which runs with its executor
@@ -1787,7 +1794,11 @@ impl ExprVM {
                 Op::ExecInSubquery(idx) => {
                     let executor = ctx.subquery_executor.ok_or_else(no_subquery_executor)?;
                     let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    self.stack.push(truth(executor.execute_in(*idx, &v, ctx)?));
+                    let answer = match executor.kept_members(*idx) {
+                        Some(kept) => kept.answer(&v)?,
+                        None => executor.execute_in(*idx, &v, ctx)?,
+                    };
+                    self.stack.push(truth(answer));
                     pc += 1;
                 }
 
@@ -1795,13 +1806,11 @@ impl ExprVM {
                 Op::ExecQuantified(idx, compare_op, all) => {
                     let executor = ctx.subquery_executor.ok_or_else(no_subquery_executor)?;
                     let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    self.stack.push(truth(executor.execute_quantified(
-                        *idx,
-                        &v,
-                        *compare_op,
-                        *all,
-                        ctx,
-                    )?));
+                    let answer = match executor.kept_members(*idx) {
+                        Some(kept) => kept.answer(&v)?,
+                        None => executor.execute_quantified(*idx, &v, *compare_op, *all, ctx)?,
+                    };
+                    self.stack.push(truth(answer));
                     pc += 1;
                 }
 

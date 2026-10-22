@@ -4207,8 +4207,8 @@ struct BlockState {
     keyed_choice: std::cell::Cell<Option<bool>>,
     keyed_set: RefCell<Option<CompactArc<ExistsKeys>>>,
     /// A value block's members: an uncorrelated block's, or a keyed IN
-    /// block's grouped by key
-    members: RefCell<Option<BlockAnswer>>,
+    /// block's grouped by key, set once per run
+    members: std::cell::OnceCell<BlockAnswer>,
     /// The error a read of the members or of the keyed set raised in this
     /// run, which every row that needs them raises without reading again
     read_error: RefCell<Option<Error>>,
@@ -4315,7 +4315,7 @@ impl<'a> PreparedRunner<'a> {
                     value: RefCell::new(None),
                     keyed_choice: std::cell::Cell::new(None),
                     keyed_set: RefCell::new(None),
-                    members: RefCell::new(None),
+                    members: std::cell::OnceCell::new(),
                     read_error: RefCell::new(None),
                     failed: RefCell::new(SmallVec::new()),
                     grouped: RefCell::new(None),
@@ -4482,8 +4482,7 @@ impl<'a> PreparedRunner<'a> {
         if read.is_err() {
             return Ok(SetScan::Program);
         }
-        let sets = self.blocks[index].members.borrow();
-        let Some(BlockAnswer::Members(set)) = sets.as_ref() else {
+        let Some(BlockAnswer::Members(set)) = self.blocks[index].members.get() else {
             return Ok(SetScan::Program);
         };
         if set.failed.is_some() {
@@ -5102,6 +5101,13 @@ impl SubqueryExecutor for PreparedRunner<'_> {
     ) -> Result<Option<bool>> {
         self.members_answer(subquery_index as usize, value, caller, self.holes)
     }
+
+    fn kept_members(&self, subquery_index: u16) -> Option<&KeptMembers> {
+        match self.blocks.get(subquery_index as usize)?.members.get()? {
+            BlockAnswer::Members(set) => Some(set),
+            _ => None,
+        }
+    }
 }
 
 /// A run's blocks as one site of a join statement calls them: the run's
@@ -5147,6 +5153,10 @@ impl SubqueryExecutor for SiteRunner<'_> {
     ) -> Result<Option<bool>> {
         self.runner
             .members_answer(subquery_index as usize, value, caller, self.holes)
+    }
+
+    fn kept_members(&self, subquery_index: u16) -> Option<&KeptMembers> {
+        self.runner.kept_members(subquery_index)
     }
 }
 
@@ -5365,20 +5375,6 @@ fn more_than_one_row() -> Error {
     }
 }
 
-/// `value` tested against kept members: a member that settles the test
-/// wins; else the first error a candidate raised; else what the members say
-fn members_answer_of(kept: &KeptMembers, value: &Value, decides: bool) -> Result<Option<bool>> {
-    let answer = match &kept.set {
-        MemberSet::In(set) => set.contains(value),
-        MemberSet::Quantified(members) => members.answer(value),
-    };
-    match (&kept.failed, answer) {
-        (_, Some(answer)) if answer == decides => Ok(Some(answer)),
-        (Some(e), _) => Err(e.clone()),
-        (None, answer) => Ok(answer),
-    }
-}
-
 /// `values` as `test` asks them, NULL members included
 fn member_set(test: MemberTest, values: Vec<Value>) -> MemberSet {
     match test {
@@ -5415,17 +5411,17 @@ impl PreparedRunner<'_> {
         let Answer::Members(kept, members) = &sq.answer else {
             return Err(Error::internal("a block run for its members that has none"));
         };
-        let decides = members.test.decides();
         if sq.uncorrelated {
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::kept_member_called();
             // Read on the first row; every row after takes the kept members
-            if self.blocks[index].members.borrow().is_none() {
+            if self.blocks[index].members.get().is_none() {
                 self.read_members(index, kept, members, caller, site)?;
             }
-            let sets = self.blocks[index].members.borrow();
-            let Some(BlockAnswer::Members(set)) = sets.as_ref() else {
+            let Some(BlockAnswer::Members(set)) = self.blocks[index].members.get() else {
                 return Err(Error::internal("a value block's members not kept"));
             };
-            return members_answer_of(set, value, decides);
+            return set.answer(value);
         }
         if let Some(grouping) = &sq.grouping {
             return self.with_groups(index, grouping, caller, site, |rows, params, vm| {
@@ -5466,7 +5462,7 @@ impl PreparedRunner<'_> {
         caller: &ExecuteContext,
         site: &HoleSet,
     ) -> Result<()> {
-        if self.blocks[index].members.borrow().is_some() {
+        if self.blocks[index].members.get().is_some() {
             return Ok(());
         }
         #[cfg(feature = "test-failpoints")]
@@ -5480,7 +5476,7 @@ impl PreparedRunner<'_> {
                     .map(|set| BlockAnswer::Members(CompactArc::new(set)))
             })
         })?;
-        *self.blocks[index].members.borrow_mut() = Some(answer);
+        let _ = self.blocks[index].members.set(answer);
         Ok(())
     }
 
@@ -5730,8 +5726,7 @@ impl PreparedRunner<'_> {
         if read.is_err() {
             return Ok(None);
         }
-        let sets = self.blocks[index].members.borrow();
-        let Some(BlockAnswer::Members(set)) = sets.as_ref() else {
+        let Some(BlockAnswer::Members(set)) = self.blocks[index].members.get() else {
             return Ok(None);
         };
         let MemberSet::In(set_of) = &set.set else {
@@ -5777,7 +5772,7 @@ impl PreparedRunner<'_> {
         plan: &KeyedPlan,
         value: &Value,
     ) -> Result<Option<bool>> {
-        if self.blocks[index].members.borrow().is_none() {
+        if self.blocks[index].members.get().is_none() {
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::prepared_strategy_ran(
                 crate::test_failpoints::PreparedStrategy::KeyedMembers,
@@ -5786,12 +5781,11 @@ impl PreparedRunner<'_> {
                 self.group_members(index, members, Some(plan))
                     .map(|groups| BlockAnswer::KeyedMembers(CompactArc::new(groups)))
             })?;
-            *self.blocks[index].members.borrow_mut() = Some(answer);
+            let _ = self.blocks[index].members.set(answer);
         }
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::prepared_exists_looked_up();
-        let sets = self.blocks[index].members.borrow();
-        let Some(BlockAnswer::KeyedMembers(groups)) = sets.as_ref() else {
+        let Some(BlockAnswer::KeyedMembers(groups)) = self.blocks[index].members.get() else {
             return Err(Error::internal("a keyed IN block's members not kept"));
         };
         let params = self.blocks[index].buffer.borrow();
@@ -5810,7 +5804,7 @@ impl PreparedRunner<'_> {
             }
         };
         match group {
-            Some(group) => members_answer_of(group, value, members.test.decides()),
+            Some(group) => group.answer(value),
             None => no_candidates,
         }
     }
