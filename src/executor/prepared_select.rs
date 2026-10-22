@@ -102,6 +102,18 @@ impl<'a> Family<'a> {
         Ok(())
     }
 
+    /// The statement's FROM: one table as a block's, or a derived table,
+    /// whose own statement runs as any statement does
+    fn statement_from(
+        &self,
+        table_expr: Option<&'a Expression>,
+    ) -> std::result::Result<(), OutOfFamily> {
+        match table_expr {
+            Some(Expression::SubquerySource(_)) => Ok(()),
+            other => self.from(other),
+        }
+    }
+
     /// A block's FROM: one table, or none, which reads one row without columns
     fn block_from(
         &self,
@@ -489,7 +501,7 @@ impl Executor {
                 return Err("LIMIT or OFFSET that is not a literal or a parameter");
             }
         }
-        family.from(stmt.table_expr.as_deref())?;
+        family.statement_from(stmt.table_expr.as_deref())?;
         family.catalog()
     }
 }
@@ -1309,7 +1321,7 @@ impl WhereParts {
 #[derive(Debug)]
 pub struct PreparedSelect {
     cached_epoch: u64,
-    /// The statement table's columns at preparation
+    /// The columns of the statement's table or derived table at preparation
     columns: CompactArc<Vec<String>>,
     blocks: PreparedBlocks,
     holes: HoleSet,
@@ -4086,23 +4098,25 @@ impl Executor {
         Ok(table)
     }
 
-    /// The plan's prepared statement, prepared now when the plan holds
-    /// none for this schema, these columns and this parameter count
-    fn prepared_for(
+    /// The plan's prepared statement, prepared now over the source `schema`
+    /// gives when the plan holds none for this schema, these `columns` and
+    /// this parameter count
+    #[allow(clippy::too_many_arguments)]
+    fn prepared_for<'s>(
         &self,
         compiled: Option<&RwLock<CompiledExecution>>,
         stmt: &SelectStatement,
-        table: &dyn Table,
+        columns: &[String],
+        schema: impl FnOnce() -> std::borrow::Cow<'s, Schema>,
         scope_name: &SmartString,
         ctx: &ExecutionContext,
         fresh: bool,
     ) -> Result<Arc<PreparedSelect>> {
         let epoch = self.engine.schema_epoch();
-        let columns = table.schema().column_names_arc();
         let fits = |p: &PreparedSelect| {
             p.cached_epoch == epoch
                 && p.blocks.param_count == ctx.params().len()
-                && (CompactArc::ptr_eq(&p.columns, &columns) || p.columns == columns)
+                && (std::ptr::eq(p.columns.as_slice(), columns) || p.columns.as_slice() == columns)
         };
         if let Some(slot) = compiled.filter(|_| !fresh) {
             if let Ok(guard) = slot.read() {
@@ -4116,7 +4130,7 @@ impl Executor {
         let prepared = Arc::new(PreparedSelect::prepare(
             self,
             stmt,
-            table.schema(),
+            &schema(),
             scope_name,
             ctx.params().len(),
             epoch,
@@ -4338,20 +4352,50 @@ impl Executor {
         limit: Option<usize>,
         offset: usize,
     ) -> Result<PreparedOutput> {
-        let Some(Expression::TableSource(ts)) = stmt.table_expr.as_deref() else {
-            return Err(Error::internal("a prepared statement without one table"));
-        };
-        let table = self.prepared_table(&ts.name.value_lower, ctx, None)?;
-        let scope_name = ts
-            .alias
-            .as_ref()
-            .map_or(&ts.name.value_lower, |alias| &alias.value_lower);
         let inner_ctx = ctx.with_incremented_query_depth();
+        let unnamed = SmartString::new("");
+        // A derived table's rows are read once, under the statement's
+        // snapshot, before the plan is taken
+        let (source, scope_name) = match stmt.table_expr.as_deref() {
+            Some(Expression::TableSource(ts)) => (
+                StatementSource::Table(self.prepared_table(&ts.name.value_lower, ctx, None)?),
+                ts.alias
+                    .as_ref()
+                    .map_or(&ts.name.value_lower, |alias| &alias.value_lower),
+            ),
+            Some(Expression::SubquerySource(ss)) => {
+                let result = self.execute_select(&ss.subquery, &inner_ctx)?;
+                let columns = result.columns().to_vec();
+                let rows = Self::materialize_result(result)?;
+                (
+                    StatementSource::Rows(columns, rows),
+                    ss.alias
+                        .as_ref()
+                        .map_or(&unnamed, |alias| &alias.value_lower),
+                )
+            }
+            _ => return Err(Error::internal("a prepared statement without one table")),
+        };
+        let table_columns;
+        let columns: &[String] = match &source {
+            StatementSource::Table(table) => {
+                table_columns = table.schema().column_names_arc();
+                &table_columns
+            }
+            StatementSource::Rows(columns, _) => columns,
+        };
+        let schema = || match &source {
+            StatementSource::Table(table) => std::borrow::Cow::Borrowed(table.schema()),
+            StatementSource::Rows(columns, _) => {
+                std::borrow::Cow::Owned(untyped_schema(scope_name, columns))
+            }
+        };
         // A column change between taking the plan and opening a subquery's
         // table prepares again, against the table as it now is
         let mut fresh = false;
         let (prepared, tables) = loop {
-            let prepared = self.prepared_for(compiled, stmt, &*table, scope_name, ctx, fresh)?;
+            let prepared =
+                self.prepared_for(compiled, stmt, columns, schema, scope_name, ctx, fresh)?;
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::prepared_plan_taken();
             if let Some(tables) =
@@ -4370,6 +4414,10 @@ impl Executor {
         let statement_limit = limit
             .filter(|_| stmt.order_by.is_empty())
             .map(|limit| i64::try_from(limit).unwrap_or(i64::MAX));
+        let statement_rows = match &source {
+            StatementSource::Table(table) => table.row_count_hint(),
+            StatementSource::Rows(_, rows) => rows.len(),
+        };
         let mut runner = PreparedRunner::new(
             self,
             &prepared.blocks,
@@ -4377,7 +4425,7 @@ impl Executor {
             ctx,
             inner_ctx,
             tables,
-            Some(table.row_count_hint()),
+            Some(statement_rows),
             statement_limit,
         );
         if !prepared.blocks.run_slots.is_empty() {
@@ -4397,15 +4445,20 @@ impl Executor {
             rows.push((scanned as i64, row));
             target.is_none_or(|target| rows.len() < target)
         };
-        let read = runner.passing_rows(
-            &prepared.where_,
-            None,
-            &*table,
-            ctx,
-            target,
-            false,
-            &mut keep,
-        );
+        let read = match source {
+            StatementSource::Table(table) => runner.passing_rows(
+                &prepared.where_,
+                None,
+                &*table,
+                ctx,
+                target,
+                false,
+                &mut keep,
+            ),
+            StatementSource::Rows(_, rows) => {
+                runner.rows_passing(&prepared.where_, rows, ctx, target, &mut keep)
+            }
+        };
         let mut rows = match read? {
             Passing::Pruned => {
                 let result = ExecutorResult::with_arc_columns(
@@ -4443,6 +4496,24 @@ impl Executor {
             prepared.layout.clone(),
         ))
     }
+}
+
+/// What a prepared statement reads its rows from
+enum StatementSource {
+    Table(Box<dyn Table>),
+    /// A derived table's columns and rows, read once
+    Rows(Vec<String>, RowVec),
+}
+
+/// A derived table's columns as its scope's schema: their names and no
+/// type, so a value compared with one is not read as a column's type
+fn untyped_schema(name: &str, columns: &[String]) -> Schema {
+    let columns = columns
+        .iter()
+        .enumerate()
+        .map(|(i, name)| SchemaColumn::new(i, name.as_str(), DataType::Null, true, false))
+        .collect();
+    Schema::new(name, columns)
 }
 
 /// The rows a primary key equality read by key, in place of a scan
@@ -5004,6 +5075,32 @@ impl<'a> PreparedRunner<'a> {
             return Err(err.clone());
         }
         // A read that checks for no cancel is the statement's all the same
+        ctx.check_cancelled()?;
+        Ok(Passing::Read)
+    }
+
+    /// Hand `keep` each of `rows` that passes `where_`, with the count of
+    /// rows read so far, until `keep` says stop
+    fn rows_passing(
+        &self,
+        where_: &PreparedWhere,
+        rows: RowVec,
+        ctx: &ExecutionContext,
+        target: Option<usize>,
+        mut keep: impl FnMut(i64, u64, Row) -> bool,
+    ) -> Result<Passing> {
+        if target == Some(0) {
+            return Ok(Passing::Read);
+        }
+        let mut vm = ExprVM::new();
+        for (scanned, (id, row)) in (1u64..).zip(rows) {
+            if scanned.is_multiple_of(100) {
+                ctx.check_cancelled()?;
+            }
+            if self.matches(&mut vm, &where_.program, &row)? && !keep(id, scanned, row) {
+                break;
+            }
+        }
         ctx.check_cancelled()?;
         Ok(Passing::Read)
     }

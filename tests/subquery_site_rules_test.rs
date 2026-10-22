@@ -344,7 +344,7 @@ fn test_check() {
 fn test_derived_table_where() {
     site(
         "site_derived_where",
-        Fails("step 6"),
+        Right,
         "SELECT id FROM (SELECT id, a FROM t) s WHERE id > (SELECT MAX(x) FROM u) ORDER BY id",
         "SELECT id FROM (SELECT id, a FROM t) s WHERE id > 3 ORDER BY id",
     );

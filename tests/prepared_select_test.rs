@@ -2005,3 +2005,25 @@ fn test_rewritten_columns_never_read_as_literals() {
         assert_eq!(found, vec![7], "{shape}: a column, not a literal");
     }
 }
+
+#[test]
+fn test_a_derived_table_runs_prepared_over_its_rows() {
+    let _guard = serial();
+    let db = setup("prepared_derived");
+    const DERIVED: &str = "SELECT s.id FROM (SELECT id, a, b FROM t) AS s \
+                           WHERE s.b = $1 AND s.a > (SELECT v FROM u WHERE u.id = s.id) ORDER BY s.id";
+    assert_eq!(prepared_line(&db, DERIVED), "Prepared: yes");
+    let built = prepared_selects_built();
+    let general = general_hits();
+    for (param, want) in [(1, vec![1]), (2, vec![6]), (1, vec![1])] {
+        let (found, runs) = ids(&db, DERIVED, (param,));
+        assert_eq!(found, want, "b = {param}");
+        assert_eq!(runs, 3, "b = {param} runs once per derived row");
+    }
+    assert_eq!(
+        prepared_selects_built() - built,
+        1,
+        "prepared once across three runs"
+    );
+    assert_eq!(general_hits(), general, "no general path ran");
+}
