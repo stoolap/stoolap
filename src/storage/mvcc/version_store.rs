@@ -224,6 +224,49 @@ fn compiled_passes(
     }
 }
 
+/// The filter `compiled_passes` is given for one that cannot fail, which
+/// it never evaluates
+static UNASKED: crate::storage::expression::ConstBoolExpr =
+    crate::storage::expression::ConstBoolExpr::new(true);
+
+/// A scan's filter: compiled once for the schema of the rows the scan took
+/// when it cannot fail, kept to evaluate when it can
+pub(crate) struct ScanFilter {
+    fallible: Option<Box<dyn crate::storage::expression::Expression>>,
+    compiled: CompiledFilter,
+    fully: bool,
+}
+
+impl ScanFilter {
+    pub(crate) fn new(
+        schema: &Schema,
+        filter: &dyn crate::storage::expression::Expression,
+    ) -> Self {
+        if filter.can_fail() {
+            return Self {
+                fallible: Some(filter.clone_box()),
+                compiled: CompiledFilter::True,
+                fully: false,
+            };
+        }
+        let compiled = CompiledFilter::compile(filter, schema);
+        Self {
+            fallible: None,
+            fully: compiled.is_fully_compiled(),
+            compiled,
+        }
+    }
+
+    /// Whether `row` passes, as `compiled_passes` asks it
+    #[inline]
+    pub(crate) fn passes(&self, row: &Row) -> crate::core::Result<bool> {
+        match &self.fallible {
+            Some(filter) => compiled_passes(&**filter, true, &self.compiled, false, row),
+            None => compiled_passes(&UNASKED, false, &self.compiled, self.fully, row),
+        }
+    }
+}
+
 /// Whether the chain from `entry` back holds at least `depth` versions,
 /// counting no further than that
 #[inline]
@@ -596,6 +639,104 @@ fn chain_seen<C: VisibilityChecker + ?Sized>(
         current = node.prev.as_deref();
     }
     false
+}
+
+/// The row of `chain` that `txn_id` sees through `checker`, unless a
+/// deletion it sees hides it. `last` is the last head transaction asked
+/// and its answer, so a run of heads from one transaction asks once
+#[inline(always)]
+fn seen_row<'v, C: VisibilityChecker + ?Sized>(
+    chain: &'v VersionChainEntry,
+    checker: &ReaderChecker<'_, '_, C>,
+    txn_id: i64,
+    last: &mut (i64, bool),
+) -> Option<&'v Row> {
+    let head_txn_id = chain.version.txn_id;
+    if head_txn_id != last.0 {
+        *last = (head_txn_id, checker.is_visible(head_txn_id, txn_id));
+    }
+    let mut seen = last.1.then_some(chain);
+    if seen.is_none() {
+        let mut current = chain.prev.as_deref();
+        while let Some(e) = current {
+            if checker.is_visible(e.version.txn_id, txn_id) {
+                seen = Some(e);
+                break;
+            }
+            current = e.prev.as_deref();
+        }
+    }
+    let e = seen?;
+    let deleted_at = e.version.deleted_at_txn_id;
+    if deleted_at != 0 && checker.is_visible(deleted_at, txn_id) {
+        return None;
+    }
+    Some(&e.version.data)
+}
+
+/// Passes `each` the row `seen_row` gives of every chain of `chunks`
+#[inline(always)]
+fn visit_visible<'v, C: VisibilityChecker + ?Sized>(
+    chunks: impl Iterator<Item = (&'v [i64], &'v [VersionChainEntry])>,
+    checker: &ReaderChecker<'_, '_, C>,
+    txn_id: i64,
+    mut each: impl FnMut(i64, &'v Row) -> crate::core::Result<()>,
+) -> crate::core::Result<()> {
+    let mut last = (0i64, false);
+    for (ids, chains) in chunks {
+        for (&row_id, chain) in ids.iter().zip(chains) {
+            if let Some(row) = seen_row(chain, checker, txn_id, &mut last) {
+                each(row_id, row)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The store's rows as they were when a scan took them, whatever commits,
+/// seals or truncates after, read a leaf at a time
+pub(crate) struct HotRows {
+    store: Arc<VersionStore>,
+    leaves: crate::common::LeafCursor<VersionChainEntry>,
+    last: (i64, bool),
+    held: usize,
+}
+
+impl HotRows {
+    /// The rows taken, seen or not: an upper bound of the rows read
+    pub(crate) fn held(&self) -> usize {
+        self.held
+    }
+
+    /// Adds to `out` the rows of the next leaves that `reader` sees and
+    /// `keep` keeps, until `out` holds `rows` rows: false once the leaves
+    /// ran out
+    pub(crate) fn fill(
+        &mut self,
+        reader: Reader<'_>,
+        out: &mut RowVec,
+        rows: usize,
+        mut keep: impl FnMut(&Row) -> crate::core::Result<bool>,
+    ) -> crate::core::Result<bool> {
+        let Some(checker) = self.store.visibility_checker.as_ref() else {
+            return Ok(false);
+        };
+        let checker = reader.over(&**checker);
+        while out.len() < rows {
+            let Some((ids, chains)) = self.leaves.leaf() else {
+                return Ok(false);
+            };
+            for (&id, chain) in ids.iter().zip(chains) {
+                if let Some(row) = seen_row(chain, &checker, reader.txn_id, &mut self.last) {
+                    if keep(row)? {
+                        out.push((id, row.clone()));
+                    }
+                }
+            }
+            self.leaves.advance();
+        }
+        Ok(self.leaves.leaf().is_some())
+    }
 }
 
 /// Who reads the store: the transaction, and the statement view its reads
@@ -3929,42 +4070,11 @@ impl VersionStore {
         if current_capacity < needed {
             result.reserve(needed - current_capacity);
         }
-        // A head's visibility is asked once per run of heads from one transaction
-        let (mut last_txn_id, mut last_visible) = (0i64, false);
-
-        for (&row_id, chain) in versions.iter() {
-            // FAST PATH: Check HEAD version first - O(1) for common case
-            let head_txn_id = chain.version.txn_id;
-            let head_deleted_at = chain.version.deleted_at_txn_id;
-
-            if head_txn_id != last_txn_id {
-                last_txn_id = head_txn_id;
-                last_visible = checker.is_visible(head_txn_id, txn_id);
-            }
-            if last_visible {
-                // HEAD is visible - check if deleted
-                if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                    result.push((row_id, chain.version.data.clone()));
-                }
-                continue;
-            }
-
-            // SLOW PATH: HEAD not visible - traverse chain for older versions
-            let mut current: Option<&VersionChainEntry> = chain.prev.as_ref().map(|b| b.as_ref());
-            while let Some(e) = current {
-                let version_txn_id = e.version.txn_id;
-                let deleted_at_txn_id = e.version.deleted_at_txn_id;
-
-                if checker.is_visible(version_txn_id, txn_id) {
-                    if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
-                        result.push((row_id, e.version.data.clone()));
-                    }
-                    break;
-                }
-                current = e.prev.as_ref().map(|b| b.as_ref());
-            }
-        }
-
+        let collected = visit_visible(versions.iter_chunks(), &checker, txn_id, |row_id, row| {
+            result.push((row_id, row.clone()));
+            Ok(())
+        });
+        debug_assert!(collected.is_ok());
         result
     }
 
@@ -4747,29 +4857,28 @@ impl VersionStore {
 
         // Single-pass: read, filter, and collect in one loop
         let mut result = RowVec::with_capacity(versions.len() / 4);
-
-        for (&row_id, chain) in versions.iter() {
-            let mut current: Option<&VersionChainEntry> = Some(chain);
-
-            while let Some(e) = current {
-                let version_txn_id = e.version.txn_id;
-                let deleted_at_txn_id = e.version.deleted_at_txn_id;
-
-                if checker.is_visible(version_txn_id, txn_id) {
-                    if deleted_at_txn_id != 0 && checker.is_visible(deleted_at_txn_id, txn_id) {
-                        break; // Row is deleted
-                    }
-
-                    if matches_row(&e.version.data)? {
-                        result.push((row_id, e.version.data.clone()));
-                    }
-                    break;
-                }
-                current = e.prev.as_deref();
+        visit_visible(versions.iter_chunks(), &checker, txn_id, |row_id, row| {
+            if matches_row(row)? {
+                result.push((row_id, row.clone()));
             }
-        }
-
+            Ok(())
+        })?;
         Ok(result)
+    }
+
+    /// The rows a scan reads a leaf at a time, taken now; None when the
+    /// store reads no row
+    pub(crate) fn hot_rows(self: &Arc<Self>) -> Option<HotRows> {
+        if self.closed.load(Ordering::Acquire) || self.visibility_checker.is_none() {
+            return None;
+        }
+        let versions = self.snapshot_versions();
+        Some(HotRows {
+            store: Arc::clone(self),
+            leaves: versions.leaves(),
+            last: (0, false),
+            held: versions.len(),
+        })
     }
 
     /// Iterate visible rows matching a filter with early termination via callback.

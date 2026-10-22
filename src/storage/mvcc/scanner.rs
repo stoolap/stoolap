@@ -17,9 +17,13 @@
 //! Provides scanner implementations for MVCC query results.
 //!
 
+use crate::common::cow_btree::MAX_KEYS;
 use crate::common::CompactArc;
 use crate::core::{Result, Row, RowVec, Schema};
 use crate::storage::expression::Expression;
+use crate::storage::mvcc::registry::StatementView;
+use crate::storage::mvcc::table::normalize_row_to_schema;
+use crate::storage::mvcc::version_store::{HotRows, Reader, ScanFilter};
 use crate::storage::traits::Scanner;
 
 /// MVCC Scanner for iterating over versioned rows
@@ -59,27 +63,13 @@ impl MVCCScanner {
     /// Creates scanner from RowVec
     #[inline]
     pub fn from_rows(rows: RowVec, schema: CompactArc<Schema>, column_indices: Vec<usize>) -> Self {
-        let num_schema_cols = schema.columns.len();
-
-        // Check if we need projection (column_indices is a proper subset)
-        let needs_projection = !column_indices.is_empty()
-            && column_indices.len() < num_schema_cols
-            && !column_indices.iter().enumerate().all(|(i, &idx)| i == idx);
+        let cut = projection(&schema, &column_indices);
+        let needs_projection = !cut.is_empty();
 
         // Project rows upfront if needed
         let projected_rows: RowVec = if needs_projection {
             rows.into_iter()
-                .map(|(id, row)| {
-                    let projected_values: Vec<crate::core::Value> = column_indices
-                        .iter()
-                        .map(|&idx| {
-                            row.get(idx)
-                                .cloned()
-                                .unwrap_or_else(crate::core::Value::null_unknown)
-                        })
-                        .collect();
-                    (id, Row::from_values(projected_values))
-                })
+                .map(|(id, row)| (id, projected(&row, &cut)))
                 .collect()
         } else {
             rows
@@ -207,6 +197,193 @@ impl Scanner for MVCCScanner {
     fn estimated_count(&self) -> Option<usize> {
         Some(self.rows.len())
     }
+}
+
+/// The rows the first step of a hot scan reads at least; each step reads
+/// twice as many as the one before, up to `MAX_STEP_ROWS`
+const FIRST_STEP_ROWS: usize = 64;
+const MAX_STEP_ROWS: usize = 4096;
+
+/// A scan of the hot rows a statement view sees, read in steps from the
+/// rows taken when the scan began, so a reader that stops early reads no
+/// further
+pub(crate) struct HotScanner {
+    /// The rows taken and the view that reads them, let go on close
+    source: Option<(HotRows, StatementView)>,
+    txn_id: i64,
+    filter: Option<ScanFilter>,
+    schema: CompactArc<Schema>,
+    /// The columns each row is cut to, empty for the whole row
+    projection: Vec<usize>,
+    /// Whether a read without a filter normalizes its rows, which its
+    /// first row decides, as the store's whole read decides it
+    normalize: Option<bool>,
+    rows: RowVec,
+    /// One past the current row of `rows`
+    at: usize,
+    step: usize,
+    /// The source ran out, or a step failed
+    finished: bool,
+    error: Option<crate::core::Error>,
+}
+
+impl HotScanner {
+    /// A scan of `source` through `view`, its filter read as `schema`, the
+    /// schema of the rows taken
+    pub(crate) fn new(
+        source: HotRows,
+        reader: Reader<'_>,
+        view: StatementView,
+        filter: Option<&dyn Expression>,
+        schema: CompactArc<Schema>,
+        column_indices: &[usize],
+    ) -> Self {
+        // A step stops at the end of a leaf, so it may read a leaf more
+        let rows = RowVec::with_capacity((MAX_STEP_ROWS + MAX_KEYS).min(source.held()));
+        Self {
+            source: Some((source, view)),
+            txn_id: reader.txn_id,
+            filter: filter.map(|filter| ScanFilter::new(&schema, filter)),
+            projection: projection(&schema, column_indices),
+            schema,
+            normalize: None,
+            rows,
+            at: 0,
+            step: FIRST_STEP_ROWS,
+            finished: false,
+            error: None,
+        }
+    }
+
+    /// Reads the next step into `rows`, as the scan hands them on: a
+    /// filtered read's as the store holds them
+    fn read_step(&mut self) -> Result<()> {
+        self.rows.clear();
+        self.at = 0;
+        let Some((source, view)) = &mut self.source else {
+            self.finished = true;
+            return Ok(());
+        };
+        let reader = Reader {
+            txn_id: self.txn_id,
+            view: Some(view),
+        };
+        let more = match &self.filter {
+            None => source.fill(reader, &mut self.rows, self.step, |_| {
+                stepped();
+                Ok(true)
+            })?,
+            Some(filter) => source.fill(reader, &mut self.rows, self.step, |row| {
+                stepped();
+                filter.passes(row)
+            })?,
+        };
+        self.finished = !more;
+        self.step = (self.step * 2).min(MAX_STEP_ROWS);
+        let columns = self.schema.columns.len();
+        if let Some((_, first)) = self.rows.first() {
+            if self.filter.is_none() && *self.normalize.get_or_insert(first.len() != columns) {
+                for (_, row) in self.rows.iter_mut() {
+                    *row = normalize_row_to_schema(std::mem::take(row), &self.schema);
+                }
+            }
+        }
+        if !self.projection.is_empty() {
+            for (_, row) in self.rows.iter_mut() {
+                *row = projected(row, &self.projection);
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads steps until one holds a row: false once the rows run out or
+    /// a step failed
+    #[inline(never)]
+    fn refill(&mut self) -> bool {
+        while !self.finished {
+            if let Err(error) = self.read_step() {
+                self.error = Some(error);
+                self.finished = true;
+                return false;
+            }
+            if !self.rows.is_empty() {
+                self.at = 1;
+                return true;
+            }
+        }
+        false
+    }
+}
+
+#[inline(always)]
+fn stepped() {
+    #[cfg(feature = "test-failpoints")]
+    crate::test_failpoints::hot_scan_stepped();
+}
+
+impl Scanner for HotScanner {
+    fn next(&mut self) -> bool {
+        self.at += 1;
+        self.at <= self.rows.len() || self.refill()
+    }
+
+    fn row(&self) -> &Row {
+        &self.rows[self.at - 1].1
+    }
+
+    fn err(&self) -> Option<&crate::core::Error> {
+        self.error.as_ref()
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.finished = true;
+        self.source = None;
+        self.rows.clear();
+        self.at = 0;
+        Ok(())
+    }
+
+    fn take_row(&mut self) -> Row {
+        std::mem::take(&mut self.rows[self.at - 1].1)
+    }
+
+    fn current_row_id(&self) -> i64 {
+        self.rows[self.at - 1].0
+    }
+
+    fn estimated_count(&self) -> Option<usize> {
+        match (&self.filter, &self.source) {
+            (None, Some((source, _))) => Some(source.held()),
+            _ => None,
+        }
+    }
+}
+
+/// The columns `column_indices` cuts a row of `schema` to, empty when it
+/// keeps the whole row in order
+fn projection(schema: &Schema, column_indices: &[usize]) -> Vec<usize> {
+    let cuts = !column_indices.is_empty()
+        && column_indices.len() < schema.columns.len()
+        && !column_indices.iter().enumerate().all(|(i, &idx)| i == idx);
+    if cuts {
+        column_indices.to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
+/// `row` cut to the columns `projection` names, NULL for one it lacks
+fn projected(row: &Row, projection: &[usize]) -> Row {
+    Row::from_values(
+        projection
+            .iter()
+            .map(|&idx| {
+                row.get(idx)
+                    .cloned()
+                    .unwrap_or_else(crate::core::Value::null_unknown)
+            })
+            .collect(),
+    )
 }
 
 /// Empty scanner that returns no rows

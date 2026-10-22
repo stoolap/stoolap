@@ -29,7 +29,7 @@ use crate::storage::expression::{passes, Expression};
 use crate::storage::index::id_list::GroupIds;
 use crate::storage::index::{BTreeIndex, BitmapIndex, HashIndex, HnswIndex, MultiColumnIndex};
 use crate::storage::mvcc::registry::StatementView;
-use crate::storage::mvcc::scanner::MVCCScanner;
+use crate::storage::mvcc::scanner::{HotScanner, MVCCScanner};
 use crate::storage::mvcc::txn_gate::{GateRef, TxnGate};
 use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::mvcc::version_store::Reader;
@@ -228,6 +228,25 @@ pub(crate) fn pk_equality_id(expr: &dyn Expression, schema: &Schema) -> Option<i
     }
 }
 
+/// `row` as a row of `schema` after ALTER TABLE ADD or DROP COLUMN: the
+/// default value, or NULL, for a column it lacks; one past the schema's
+/// last column dropped
+pub(crate) fn normalize_row_to_schema(mut row: Row, schema: &Schema) -> Row {
+    let schema_cols = schema.columns.len();
+    let row_cols = row.len();
+    if row_cols < schema_cols {
+        for col in &schema.columns[row_cols..] {
+            match &col.default_value {
+                Some(default_val) => row.push(default_val.clone()),
+                None => row.push(Value::null(col.data_type)),
+            }
+        }
+    } else if row_cols > schema_cols {
+        row.truncate(schema_cols);
+    }
+    row
+}
+
 impl MVCCTable {
     /// Creates a new MVCC table with an owned transaction version store
     /// (wraps it in a shared `TxnTableStore` internally)
@@ -388,31 +407,8 @@ impl MVCCTable {
     }
 
     /// Normalize a row to match the current schema
-    ///
-    /// This handles schema evolution (ALTER TABLE ADD/DROP COLUMN):
-    /// - If row has fewer columns than schema, append default values (or NULLs) for missing columns
-    /// - If row has more columns than schema, truncate the row
-    fn normalize_row_to_schema(&self, mut row: Row, schema: &Schema) -> Row {
-        let schema_cols = schema.columns.len();
-        let row_cols = row.len();
-
-        if row_cols < schema_cols {
-            // Row has fewer columns - add default values (or NULLs) for new columns
-            for i in row_cols..schema_cols {
-                let col = &schema.columns[i];
-                // Use pre-computed default value if available, otherwise use NULL
-                if let Some(ref default_val) = col.default_value {
-                    row.push(default_val.clone());
-                } else {
-                    row.push(Value::null(col.data_type));
-                }
-            }
-        } else if row_cols > schema_cols {
-            // Row has more columns - truncate (columns were dropped)
-            row.truncate(schema_cols);
-        }
-
-        row
+    fn normalize_row_to_schema(&self, row: Row, schema: &Schema) -> Row {
+        normalize_row_to_schema(row, schema)
     }
 
     /// Deletes `row_ids`. With `scanned` None an id no version of this
@@ -3610,6 +3606,27 @@ impl Table for MVCCTable {
         #[cfg(test)]
         self.full_scans
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Through a statement view the rows read later are the ones read now
+        let shared = self
+            .txn_versions
+            .read()
+            .is_ok_and(|versions| !versions.has_local_changes());
+        if let Some(view) = self.view.as_ref().filter(|_| shared) {
+            let Some(rows) = self.version_store.hot_rows() else {
+                return Ok(Box::new(MVCCScanner::empty(column_indices.to_vec())));
+            };
+            self.check_read()?;
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::hot_scan_checked();
+            return Ok(Box::new(HotScanner::new(
+                rows,
+                self.reader(),
+                view.clone(),
+                where_expr,
+                schema,
+                column_indices,
+            )));
+        }
         let rows = self.collect_visible_rows(where_expr)?;
         self.check_read()?;
         let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
