@@ -565,3 +565,68 @@ fn test_values_large_dataset() {
     assert_eq!(count, 100);
     assert_eq!(sum, 5050); // Sum of 1 to 100
 }
+
+#[test]
+fn test_values_join_side_keeps_its_where_conditions() {
+    let db = create_test_db("values_join_side_where");
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
+        "INSERT INTO t VALUES (1, 1), (2, 2), (3, 0), (4, 1), (5, 5)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER)",
+        "INSERT INTO u VALUES (1, 1), (2, 2), (3, 3)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let ids = |sql: &str, param: Option<i64>| -> Vec<i64> {
+        let rows = match param {
+            Some(p) => db.query(sql, (p,)).unwrap(),
+            None => db.query(sql, ()).unwrap(),
+        };
+        rows.map(|row| row.unwrap().get::<i64>(0).unwrap())
+            .collect()
+    };
+    let mut wrong = Vec::new();
+    for (sql, param, want) in [
+        (
+            "SELECT t.id FROM t JOIN (VALUES (1), (5)) AS w(n) ON w.n = t.a WHERE w.n = 5 ORDER BY t.id",
+            None,
+            vec![5],
+        ),
+        (
+            "SELECT t.id FROM t JOIN (VALUES (1), (5)) AS w(n) ON w.n = t.a WHERE w.n IS NULL ORDER BY t.id",
+            None,
+            vec![],
+        ),
+        (
+            "SELECT w.n FROM (VALUES (1), (5)) AS w(n) JOIN t ON w.n = t.a WHERE w.n <> 1 ORDER BY w.n",
+            None,
+            vec![5],
+        ),
+        (
+            "SELECT t.id FROM t JOIN (VALUES (1, 'a'), (5, 'b')) AS w(n, s) ON w.n = t.a WHERE w.s = 'b' ORDER BY t.id",
+            None,
+            vec![5],
+        ),
+        (
+            "SELECT t.id FROM t JOIN (VALUES (1), (5)) AS w(n) ON w.n = t.a WHERE w.n = $1 ORDER BY t.id",
+            Some(1),
+            vec![1, 4],
+        ),
+        (
+            "SELECT t.id FROM t JOIN (VALUES (1), (5)) AS w(n) ON w.n = t.a WHERE w.n > (SELECT MAX(x) FROM u) ORDER BY t.id",
+            None,
+            vec![5],
+        ),
+        (
+            "SELECT t.id FROM t JOIN (VALUES (1), (5)) AS w(n) ON w.n = t.a WHERE w.n IN (SELECT x FROM u) ORDER BY t.id",
+            None,
+            vec![1, 4],
+        ),
+    ] {
+        let got = ids(sql, param);
+        if got != want {
+            wrong.push(format!("{sql}: {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

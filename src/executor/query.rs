@@ -8106,7 +8106,7 @@ impl Executor {
                 Ok((result, qualified_columns))
             }
             Expression::ValuesSource(vs) => {
-                // Create a simple SELECT * statement to execute the VALUES
+                // A SELECT * of the VALUES, with the filter pushed to this side
                 let select_all = SelectStatement {
                     param_count: 0,
                     token: dummy_token("SELECT", TokenType::Keyword),
@@ -8117,7 +8117,7 @@ impl Executor {
                     })],
                     with: None,
                     table_expr: Some(Box::new(Expression::ValuesSource(vs.clone()))),
-                    where_clause: None,
+                    where_clause: filter.map(|f| Box::new(f.clone())),
                     group_by: GroupByClause::default(),
                     having: None,
                     window_defs: vec![],
