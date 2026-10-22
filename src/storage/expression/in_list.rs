@@ -30,6 +30,10 @@ use super::{find_column_index, resolve_alias, Expression};
 use crate::common::I64Set;
 use crate::core::{Result, Row, Schema, Value};
 
+/// The most members a list over a FLOAT column holds for a scan to take
+/// it cheaply: a float is compared with every member, never hashed
+pub(crate) const SEARCHED_FLOAT_MEMBERS: usize = 8;
+
 /// Pre-computed hash sets for O(1) IN list lookup
 #[derive(Debug, Clone)]
 enum HashedValues {

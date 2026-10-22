@@ -126,18 +126,84 @@ fn a_block_error_belongs_to_the_row_that_needs_the_answer() {
     fill(&db);
     db.execute("CREATE TABLE e (id INTEGER PRIMARY KEY, i INTEGER)", ())
         .unwrap();
-    for test in ["IN", "NOT IN", "> ANY", ">= ALL", "= ANY", "<> ALL"] {
-        let block = "(SELECT v * 9223372036854775807 FROM m WHERE k = 1)";
-        let empty = format!("SELECT id FROM e WHERE i {test} {block}");
-        assert_eq!(ids(&db, &empty), Ok(vec![]), "{empty}: no row needs it");
-        let rows = format!("SELECT id FROM t WHERE i {test} {block}");
-        let got = ids(&db, &rows);
-        let per_row = ids(&db, &rows.replace("WHERE i", "WHERE id < 0 OR i"));
-        assert!(
-            got.as_ref().is_err_and(|e| e.contains("overflow")),
-            "{rows}: {got:?}"
+    db.execute("CREATE TABLE o (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO o VALUES (1, 9223372036854775807), (2, 1)", ())
+        .unwrap();
+    for block in [
+        "(SELECT v * 9223372036854775807 FROM m WHERE k = 1)",
+        "(SELECT SUM(v) FROM o)",
+    ] {
+        for test in ["IN", "NOT IN", "> ANY", ">= ALL", "= ANY", "<> ALL"] {
+            let empty = format!("SELECT id FROM e WHERE i {test} {block}");
+            assert_eq!(ids(&db, &empty), Ok(vec![]), "{empty}: no row needs it");
+            let rows = format!("SELECT id FROM t WHERE i {test} {block}");
+            let got = ids(&db, &rows);
+            let per_row = ids(&db, &rows.replace("WHERE i", "WHERE id < 0 OR i"));
+            assert!(
+                got.as_ref().is_err_and(|e| e.contains("overflow")),
+                "{rows}: {got:?}"
+            );
+            assert_eq!(got, per_row, "{rows}: as it errs asked of each row");
+        }
+    }
+    let exists = "EXISTS (SELECT 1 FROM o WHERE o.id = {t}.id AND o.v * 2 > 0)";
+    let empty = format!("SELECT id FROM e WHERE {}", exists.replace("{t}", "e"));
+    assert_eq!(ids(&db, &empty), Ok(vec![]), "{empty}: no row needs it");
+    let rows = format!("SELECT id FROM t WHERE {}", exists.replace("{t}", "t"));
+    let got = ids(&db, &rows);
+    assert!(
+        got.as_ref().is_err_and(|e| e.contains("overflow")),
+        "{rows}: {got:?}"
+    );
+    let per_row = format!(
+        "SELECT id FROM t WHERE ({}) OR id < 0",
+        exists.replace("{t}", "t")
+    );
+    assert_eq!(
+        got,
+        ids(&db, &per_row),
+        "{rows}: as it errs asked of each row"
+    );
+}
+
+#[test]
+fn a_float_column_tests_a_large_set_as_the_program_does() {
+    let db = Database::open("memory://prepared_set_scan_float").unwrap();
+    for sql in [
+        "CREATE TABLE fl (id INTEGER PRIMARY KEY, f FLOAT)",
+        "INSERT INTO fl SELECT g.value, CASE WHEN g.value % 13 = 0 THEN NULL \
+         ELSE (g.value % 400) * 0.5 END FROM generate_series(1, 3000) g",
+        "CREATE TABLE fm (id INTEGER PRIMARY KEY, v FLOAT, n INTEGER)",
+        "INSERT INTO fm SELECT g.value, g.value * 0.75, g.value FROM generate_series(1, 200) g",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    // Whether the scan takes each set: a float is compared with every
+    // member, so a long set stays the program's; a positive IN is read by
+    // its members' rows
+    for (condition, scan_takes) in [
+        ("f IN (SELECT v FROM fm)", false),
+        ("f NOT IN (SELECT v FROM fm)", false),
+        ("f IN (SELECT n FROM fm)", false),
+        ("f NOT IN (SELECT n FROM fm)", false),
+        ("f = ANY (SELECT v FROM fm WHERE id > 20)", false),
+        ("f <> ALL (SELECT n FROM fm WHERE id > 20)", false),
+        ("f IN (SELECT v FROM fm WHERE id <= 8)", false),
+        ("f NOT IN (SELECT v FROM fm WHERE id <= 8)", true),
+        ("f <> ALL (SELECT v FROM fm WHERE id <= 8)", true),
+    ] {
+        let sql = format!("SELECT id FROM fl WHERE {condition}");
+        let before = prepared_strategy_runs(PreparedStrategy::ScanTakesMembers);
+        let got = ids(&db, &sql);
+        let taken = prepared_strategy_runs(PreparedStrategy::ScanTakesMembers) > before;
+        let per_row = ids(
+            &db,
+            &format!("SELECT id FROM fl WHERE ({condition}) OR id < 0"),
         );
-        assert_eq!(got, per_row, "{rows}: as it errs asked of each row");
+        assert!(got.as_ref().is_ok_and(|rows| !rows.is_empty()), "{sql}");
+        assert_eq!(got, per_row, "{sql}");
+        assert_eq!(taken, scan_takes, "{sql}: taken by the scan");
     }
 }
 

@@ -31,6 +31,7 @@ use crate::functions::aggregate::{CallTemplate, ColumnsKey, GroupedAggregates};
 use crate::functions::{FunctionRegistry, Volatility};
 use crate::parser::ast::*;
 use crate::parser::token::{Position, Token, TokenType};
+use crate::storage::expression::in_list::SEARCHED_FLOAT_MEMBERS;
 use crate::storage::expression::{AndExpr, ComparisonExpr, Expression as StorageExpr};
 use crate::storage::traits::{Engine, Scanner, Table};
 
@@ -4040,14 +4041,19 @@ impl<'a> PreparedRunner<'a> {
         let Answer::Members(kept, members) = &self.prepared.subqueries[index].answer else {
             return Ok(SetScan::Program);
         };
+        // An error reading the members, or one a member raised, belongs to
+        // the row that needs the answer: the program asks the block then
         let empty = Row::new();
-        self.read_members(
+        let read = self.read_members(
             index,
             kept,
             members,
             &ExecuteContext::new(&empty),
             self.holes,
-        )?;
+        );
+        if read.is_err() {
+            return Ok(SetScan::Program);
+        }
         let sets = self.blocks[index].members.borrow();
         let Some(BlockAnswer::Members(set)) = sets.as_ref() else {
             return Ok(SetScan::Program);
@@ -4062,6 +4068,11 @@ impl<'a> PreparedRunner<'a> {
             Some(filter) => SetScan::Filter(filter),
             None => SetScan::Program,
         };
+        // The scan compares a float with every member of a list
+        let long_floats = |members: usize| {
+            schema.columns[slot.column].data_type == DataType::Float
+                && members > SEARCHED_FLOAT_MEMBERS
+        };
         Ok(match &set.set {
             MemberSet::In(set_of) => {
                 let members = set_of.members();
@@ -4070,11 +4081,11 @@ impl<'a> PreparedRunner<'a> {
                     // Over no member NOT IN holds for every value, NULL too
                     (true, _) if members.is_empty() => SetScan::Every,
                     (true, true) => SetScan::None,
-                    (true, false) => {
-                        filter(pushdown::in_list_filter(column(), values, true, &scan))
-                    }
                     (false, _) if members.iter().all(Value::is_null) => SetScan::None,
-                    (false, _) => filter(pushdown::in_list_filter(column(), values, false, &scan)),
+                    _ if long_floats(members.len()) => SetScan::Program,
+                    (negated, _) => {
+                        filter(pushdown::in_list_filter(column(), values, negated, &scan))
+                    }
                 }
             }
             MemberSet::Quantified(quantified) => {
@@ -4086,6 +4097,9 @@ impl<'a> PreparedRunner<'a> {
                         false => SetScan::None,
                     },
                     _ if values.is_empty() || (all && has_null) => SetScan::None,
+                    (CompareOp::Eq, false) | (CompareOp::Ne, true) if long_floats(values.len()) => {
+                        SetScan::Program
+                    }
                     (CompareOp::Eq, false) => filter(pushdown::in_list_filter(
                         column(),
                         values.iter().cloned(),
@@ -4266,7 +4280,10 @@ impl<'a> PreparedRunner<'a> {
                 }
             }
         }
-        let set = self.keyed_set(index, existence, plan)?;
+        // An error building the set belongs to the row that needs it
+        let Ok(set) = self.keyed_set(index, existence, plan) else {
+            return Ok(None);
+        };
         let passed = whole && !set.failed;
         // Only rows that pass without the WHERE may stop at the LIMIT
         let enough = target.filter(|_| passed);
@@ -5229,14 +5246,18 @@ impl PreparedRunner<'_> {
         let Answer::Members(kept, members) = &sq.answer else {
             return Ok(None);
         };
+        // An error reading the members belongs to the row that needs them
         let empty = Row::new();
-        self.read_members(
+        let read = self.read_members(
             index,
             kept,
             members,
             &ExecuteContext::new(&empty),
             self.holes,
-        )?;
+        );
+        if read.is_err() {
+            return Ok(None);
+        }
         let sets = self.blocks[index].members.borrow();
         let Some(BlockAnswer::Members(set)) = sets.as_ref() else {
             return Ok(None);
