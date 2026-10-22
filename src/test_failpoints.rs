@@ -1555,21 +1555,24 @@ pub enum PreparedDmlSite {
     InsertValues,
     /// An INSERT's ON CONFLICT DO UPDATE, its SET values and its WHERE
     ConflictUpdate,
+    /// The RETURNING of an INSERT, UPDATE or DELETE, for each row returned
+    Returning,
 }
 
 impl PreparedDmlSite {
-    pub const ALL: [PreparedDmlSite; 5] = [
+    pub const ALL: [PreparedDmlSite; 6] = [
         PreparedDmlSite::UpdateWhere,
         PreparedDmlSite::UpdateSet,
         PreparedDmlSite::DeleteWhere,
         PreparedDmlSite::InsertValues,
         PreparedDmlSite::ConflictUpdate,
+        PreparedDmlSite::Returning,
     ];
 }
 
 /// Process-wide: how often each prepared DML site ran
-static PREPARED_DML_SITE_RUNS: [std::sync::atomic::AtomicUsize; 5] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; 5];
+static PREPARED_DML_SITE_RUNS: [std::sync::atomic::AtomicUsize; 6] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 6];
 
 static PREPARED_DML_BUILT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 

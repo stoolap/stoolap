@@ -67,3 +67,38 @@ fn a_prepared_update_or_delete_reads_one_point() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+#[test]
+fn a_kept_returning_answer_is_not_one_read_before_a_commit() {
+    let mut wrong = Vec::new();
+    for level in ["READ COMMITTED", "SNAPSHOT"] {
+        let db = Database::open(&format!("memory://prepared_dml_snapshot_kept_{level}")).unwrap();
+        for setup in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, b INTEGER)",
+            "INSERT INTO t VALUES (1, 10)",
+            "CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER)",
+            "INSERT INTO u VALUES (1, 1)",
+        ] {
+            db.execute(setup, ()).unwrap();
+        }
+        db.execute(&format!("SET isolation_level = '{level}'"), ())
+            .unwrap();
+        let update = db
+            .prepare("UPDATE t SET b = b + 1 WHERE id = 1 RETURNING id, (SELECT MAX(x) FROM u)")
+            .unwrap();
+        let returned = || -> i64 {
+            let row = update.query(()).unwrap().next().unwrap().unwrap();
+            row.get(1).unwrap()
+        };
+        let other = db.clone();
+        stoolap::test_failpoints::after_transaction_begun(move || {
+            other.execute("UPDATE u SET x = 100", ()).unwrap();
+        });
+        let first = returned();
+        let second = returned();
+        if (first, second) != (1, 100) {
+            wrong.push(format!("{level}: {first}, then {second}, want 1, then 100"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

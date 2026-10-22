@@ -375,6 +375,22 @@ ON CONFLICT (id) DO UPDATE SET price = (SELECT price FROM catalog WHERE catalog.
 
 Outside an explicit transaction the statement reads one snapshot. Inside one, a value read for each conflict would see the rows this statement has already written, so such a value may not read the target table there; the statement fails with an error instead.
 
+### Subqueries in RETURNING
+
+A subquery in the `RETURNING` of an `INSERT`, `UPDATE` or `DELETE` sees the tables as the statement found them, and a column of the target in it names the row returned: the row written, or for `DELETE` the row deleted. A value that reads no row returned is read once, before the statement writes a row; one that reads it is read for each row returned:
+
+```sql
+-- The category's name for each product the statement changed
+UPDATE products SET price = price * 1.1 WHERE category_id = 3
+RETURNING id, (SELECT name FROM categories WHERE categories.id = products.category_id);
+
+-- How many orders the table held before this statement
+DELETE FROM orders WHERE created < '2024-01-01'
+RETURNING id, (SELECT COUNT(*) FROM orders);
+```
+
+A subquery that reads the target table reads it as the statement found it, so for an `UPDATE` it returns a row's old values. Inside an explicit transaction a value read for each row returned may not read the target table, as in `ON CONFLICT`; the statement fails with an error instead.
+
 ### Subqueries in LIMIT and OFFSET
 
 A subquery in `LIMIT` or `OFFSET` is read once, before the query reads a row, under the same snapshot as the query. Its value counts as the same value written as a literal: a whole number of zero or more, and anything else, NULL included (a subquery with no row is NULL), is an error. It reads no row of the query, or of an enclosing one:
@@ -438,7 +454,7 @@ A SELECT of one shape is prepared once per cached plan instead of rebuilt for ev
 - an error a row of an `EXISTS`, `IN`, `ANY` or `ALL` subquery raises is the statement's error only when no other row settles the answer: TRUE for `EXISTS`, `IN` and `ANY` once a row passes or a value matches, FALSE for `ALL` once a value compares FALSE. A row of another key, or of a NULL key, raises nothing for the outer row. A subquery that aggregates reads every row its `WHERE` passes, so an error one raises is the outer row's error, and the same holds for an error in a value it reads from an enclosing query
 - the value of a scalar subquery, the answer of an `EXISTS` and the values of an `IN`, `ANY` or `ALL` read once per execution are kept for the next execution of the same statement with the same parameters, until a write to one of the tables they read; not inside a transaction
 
-An `UPDATE` or `DELETE` is prepared the same way when its `WHERE` or a `SET` value holds a subquery and every expression and subquery in them fits the shape above; the statement's target table is the enclosing query of its subqueries. Its `SET` values may mix subqueries that read the target row with subqueries that do not, in one value or across several. A `SET` value that reads no column of the target row and holds no volatile call, such as `RANDOM()`, runs once per execution, before the statement reads a row.
+An `UPDATE` or `DELETE` is prepared the same way when its `WHERE`, a `SET` value or its `RETURNING` holds a subquery and every expression and subquery in them fits the shape above; the statement's target table is the enclosing query of its subqueries. Its `SET` values may mix subqueries that read the target row with subqueries that do not, in one value or across several. A `SET` value that reads no column of the target row and holds no volatile call, such as `RANDOM()`, runs once per execution, before the statement reads a row.
 
 Every subquery of an `UPDATE` or `DELETE`, the ones that read the target table included, sees the tables as the statement found them: a row the statement updates or deletes does not change what a subquery answers for the next row.
 
@@ -614,6 +630,7 @@ Currently, Stoolap supports the following subquery features:
 - Subqueries in UPDATE SET clauses
 - Subqueries in INSERT VALUES
 - Subqueries in ON CONFLICT DO UPDATE SET and WHERE, and in ON DUPLICATE KEY UPDATE
+- Subqueries in RETURNING
 - Subqueries in LIMIT and OFFSET
 - Proper NULL handling for subqueries returning no rows
 - Error detection for scalar subqueries returning multiple rows
@@ -624,8 +641,9 @@ Currently, Stoolap supports the following subquery features:
 
 A subquery in these positions is refused with an error rather than answered. Support arrives as each position moves to prepared plans:
 
-- `RETURNING`
+- A subquery in `RETURNING` outside the [prepared](#prepared-subqueries) shape
 - Inside an explicit transaction, a subquery in `ON CONFLICT ... DO UPDATE` that reads the target table, in a value that reads the row met or the excluded row
+- Inside an explicit transaction, a subquery in `RETURNING` that reads the target table, in a value that reads the row returned
 - An `UPDATE` that sets one column from a correlated subquery and another from an uncorrelated one, when one of its subqueries is outside the [prepared](#prepared-subqueries) shape
 - `GROUP BY` and `DISTINCT ON` expressions
 - `HAVING` in a query that also has window functions
