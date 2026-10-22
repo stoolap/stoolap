@@ -4450,7 +4450,7 @@ impl Executor {
                 rows.push((row_count as i64, scanner.take_row()));
             }
             if let Some(e) = scanner.err() {
-                return Err(crate::core::Error::internal(format!("scan error: {}", e)));
+                return Err(e.clone());
             }
             (rows, None, None)
         } else {

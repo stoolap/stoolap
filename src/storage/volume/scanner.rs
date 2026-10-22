@@ -298,9 +298,7 @@ impl VolumeScanner {
         if let Some(st) = store {
             for &(col_idx, _) in &self.dict_filters {
                 if blocks.iter().all(|&(c, _)| c != col_idx) {
-                    let col = st
-                        .group_column(col_idx, group_idx)
-                        .map_err(|e| Error::internal(format!("corrupt V4 block: {}", e)))?;
+                    let col = st.group_column(col_idx, group_idx).map_err(Error::from)?;
                     blocks.push((col_idx, col));
                 }
             }
@@ -758,20 +756,19 @@ impl VolumeScanner {
                         continue;
                     }
                     let mut group_cols = Vec::with_capacity(self.dict_filters.len());
-                    let mut corrupt = false;
+                    let mut failed = None;
                     for &(ci, _) in &self.dict_filters {
                         match st.group_column(ci, gi) {
                             Ok(col) => group_cols.push(col),
-                            Err(_) => {
-                                corrupt = true;
+                            Err(e) => {
+                                failed = Some(Error::from(e));
                                 break;
                             }
                         }
                     }
-                    if corrupt {
+                    if let Some(error) = failed {
                         self.current_idx = self.end_idx;
-                        self.error =
-                            Some(Error::internal("corrupt V4 block during dictionary filter"));
+                        self.error = Some(error);
                         self.filter = Some(filter);
                         return Ok(());
                     }
@@ -1215,7 +1212,7 @@ impl VolumeScanner {
             match store.group_column(ci, group_idx) {
                 Ok(col) => columns[ci] = Some(col),
                 Err(e) => {
-                    self.error = Some(Error::internal(format!("corrupt V4 block: {}", e)));
+                    self.error = Some(Error::from(e));
                     return;
                 }
             }
