@@ -1065,6 +1065,9 @@ fn copied_bytes(source: &ColumnDirectory, target: &SideTarget) -> usize {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Directory {
     pub generation: u64,
+    /// The format the file was written in: the current version, or one
+    /// of the earlier ones a reader still opens
+    pub version: u32,
     pub columns: Vec<ColumnDirectory>,
 }
 
@@ -1354,6 +1357,7 @@ impl Directory {
         Ok((
             Self {
                 generation,
+                version,
                 columns,
             },
             charges,
@@ -1642,6 +1646,12 @@ impl IndexFile {
 
     pub fn generation(&self) -> u64 {
         self.directory.generation
+    }
+
+    /// The format the file was written in: the current version, or one
+    /// of the earlier ones still read
+    pub fn version(&self) -> u32 {
+        self.directory.version
     }
 
     /// The handle the pages are read through
@@ -3269,6 +3279,7 @@ fn build_side_file_staged(
     let mut offset = HEADER_LEN;
     let mut directory = Directory {
         generation,
+        version: VERSION,
         columns: Vec::with_capacity(entries),
     };
     // The reservations of the columns' page metadata, kept while the
@@ -4962,10 +4973,82 @@ pub fn retire_side_of(volume_path: &Path) {
     }
 }
 
+/// Rewrites a built side file in the version 5 layout, the format of the
+/// release before the current one, as a database upgraded from that
+/// release holds beside its volumes: a test's way to give a volume a side
+/// file of an older format
+#[cfg(any(test, feature = "test-failpoints"))]
+pub fn rewrite_as_legacy(path: &Path) {
+    rewrite_in_legacy_layout(path, VERSION_WITH_HEAVY_KEYS)
+}
+
+/// Rewrites a built file of ordered i64 entries in the version 5
+/// layout, or the version 4 one without heavy keys, as the releases
+/// before the current version wrote them
+#[cfg(any(test, feature = "test-failpoints"))]
+fn rewrite_in_legacy_layout(path: &Path, version: u32) {
+    let mut bytes = std::fs::read(path).unwrap();
+    let footer = bytes.len() - FOOTER_LEN as usize;
+    let dir_offset = u64::from_le_bytes(bytes[footer..footer + 8].try_into().unwrap());
+    let dir_len = u32::from_le_bytes(bytes[footer + 8..footer + 12].try_into().unwrap());
+    let start = dir_offset as usize;
+    let (directory, _) = Directory::decode(
+        VERSION,
+        0,
+        &bytes[start..start + dir_len as usize],
+        dir_offset,
+    )
+    .unwrap();
+    let mut dir = (directory.columns.len() as u32).to_le_bytes().to_vec();
+    for c in &directory.columns {
+        dir.extend_from_slice(&c.column.to_le_bytes());
+        dir.push(KEY_I64);
+        dir.extend_from_slice(&c.identity.to_le_bytes());
+        dir.extend_from_slice(&c.n_keys.to_le_bytes());
+        dir.extend_from_slice(&c.n_positions.to_le_bytes());
+        dir.extend_from_slice(&(c.key_pages.len() as u32).to_le_bytes());
+        dir.extend_from_slice(&(c.pos_pages.len() as u32).to_le_bytes());
+        for p in &c.key_pages {
+            for v in [p.first_key as u64, p.last_key as u64, p.offset] {
+                dir.extend_from_slice(&v.to_le_bytes());
+            }
+            dir.extend_from_slice(&p.len.to_le_bytes());
+            dir.extend_from_slice(&p.key_start.to_le_bytes());
+            dir.extend_from_slice(&p.pos_start.to_le_bytes());
+        }
+        for p in &c.pos_pages {
+            dir.extend_from_slice(&p.offset.to_le_bytes());
+            dir.extend_from_slice(&p.len.to_le_bytes());
+            dir.extend_from_slice(&p.pos_start.to_le_bytes());
+        }
+        if version == VERSION_WITH_HEAVY_KEYS {
+            let heavy = c.heavy_keys.as_deref().unwrap_or_default();
+            dir.push(heavy.len() as u8);
+            for (key, count) in heavy {
+                dir.extend_from_slice(&key.to_le_bytes());
+                dir.extend_from_slice(&count.to_le_bytes());
+            }
+        }
+    }
+    bytes.truncate(start);
+    bytes[4..8].copy_from_slice(&version.to_le_bytes());
+    let crc = crc32fast::hash(&dir);
+    let len = dir.len() as u32;
+    bytes.extend_from_slice(&dir);
+    bytes.extend_from_slice(&dir_offset.to_le_bytes());
+    bytes.extend_from_slice(&len.to_le_bytes());
+    bytes.extend_from_slice(&crc.to_le_bytes());
+    bytes.extend_from_slice(&MAGIC);
+    std::fs::write(path, bytes).unwrap();
+}
+
 /// Whether `built` may take the place of `before`: it records every entry
-/// of `wanted` that `before` records, and one at least that it does not
+/// of `wanted` that `before` records, and one at least that it does not,
+/// or it is of a newer format than `before`
 pub fn advances(built: &IndexFile, before: Option<&IndexFile>, wanted: &[SideTarget]) -> bool {
-    let mut gained = false;
+    // A file of an earlier format gives way to the current one even when
+    // it records every entry the new one does: the format is the gain
+    let mut gained = before.is_some_and(|before| before.version() < built.version());
     for target in wanted {
         let had = before.is_some_and(|before| before.records(target));
         let has = built.records(target);
@@ -4988,6 +5071,15 @@ pub fn still_covers(side: &IndexFile, current: &[SideTarget]) -> bool {
 /// alone
 pub fn covers_all(side: &IndexFile, wanted: &[SideTarget]) -> bool {
     wanted.iter().all(|target| side.records(target))
+}
+
+/// Whether `side` still serves `wanted` in the current format: it records
+/// every entry in `wanted`, and it is of the version the engine writes
+/// now. What a backfill asks of a volume's file before leaving it alone:
+/// a file of an earlier format is read as it was written, and the query
+/// path loses what the newer format added to it
+pub fn serves_all(side: &IndexFile, wanted: &[SideTarget]) -> bool {
+    side.version() == VERSION && covers_all(side, wanted)
 }
 
 // =============================================================================
@@ -5612,6 +5704,39 @@ mod tests {
     }
 
     #[test]
+    fn a_rebuild_in_the_current_format_advances_over_an_older_one() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let (legacy, fresh) = (dir.path().join("a.sidx"), dir.path().join("b.sidx"));
+        build_side_file(&legacy, next_generation(), two_columns(), WORKSPACE).unwrap();
+        let [a] = integer_target(1, 11);
+        let key = (7 * 104_729 % 100_004) as i64;
+        let built = IndexFile::open(&legacy, 1).unwrap();
+        let want = all_positions_of(&built, 11, built.equal(11, key).unwrap().unwrap());
+        drop(built);
+        rewrite_as_legacy(&legacy);
+        let earlier = IndexFile::open(&legacy, 2).unwrap();
+        assert!(
+            earlier.version() < VERSION,
+            "the rewrite left an older format"
+        );
+        assert!(earlier.records(&a), "the older file records the entry");
+        // The same entry again, copied into the current format: nothing is
+        // added, and the format is the gain
+        build_with_copies(&fresh, &[(&earlier, &a)], Vec::new()).unwrap();
+        let rebuilt = IndexFile::open(&fresh, 3).unwrap();
+        assert_eq!(rebuilt.version(), VERSION);
+        assert!(advances(&rebuilt, Some(&earlier), std::slice::from_ref(&a)));
+        assert!(!advances(
+            &earlier,
+            Some(&rebuilt),
+            std::slice::from_ref(&a)
+        ));
+        let got = all_positions_of(&rebuilt, 11, rebuilt.equal(11, key).unwrap().unwrap());
+        assert_eq!(got, want, "the copied entry reads as it did");
+    }
+
+    #[test]
     fn a_build_whose_every_entry_is_refused_is_refused() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
@@ -5734,6 +5859,7 @@ mod tests {
             let mut out = Vec::new();
             Directory {
                 generation: 7,
+                version: VERSION,
                 columns,
             }
             .encode_into(&mut out);
@@ -5742,6 +5868,7 @@ mod tests {
         let built = encode(vec![entry(Outcome::Built, 0)]);
         let (read, _) = Directory::decode(VERSION, 7, &built, 1 << 20).unwrap();
         assert_eq!(read.columns, vec![entry(Outcome::Built, 0)]);
+        assert_eq!(read.version, VERSION, "the version is carried");
         let unsupported = encode(vec![entry(Outcome::Unsupported, 0)]);
         let (read, _) = Directory::decode(VERSION, 7, &unsupported, 1 << 20).unwrap();
         assert_eq!(read.columns[0].outcome, Outcome::Unsupported);
@@ -6846,65 +6973,6 @@ mod tests {
         assert!(err.to_string().contains("version"), "{err}");
     }
 
-    /// Rewrites a built file of ordered i64 entries in the version 5
-    /// layout, or the version 4 one without heavy keys, as the releases
-    /// before version 6 wrote them
-    fn rewrite_as_legacy(path: &Path, version: u32) {
-        let mut bytes = std::fs::read(path).unwrap();
-        let footer = bytes.len() - FOOTER_LEN as usize;
-        let dir_offset = u64::from_le_bytes(bytes[footer..footer + 8].try_into().unwrap());
-        let dir_len = u32::from_le_bytes(bytes[footer + 8..footer + 12].try_into().unwrap());
-        let start = dir_offset as usize;
-        let (directory, _) = Directory::decode(
-            VERSION,
-            0,
-            &bytes[start..start + dir_len as usize],
-            dir_offset,
-        )
-        .unwrap();
-        let mut dir = (directory.columns.len() as u32).to_le_bytes().to_vec();
-        for c in &directory.columns {
-            dir.extend_from_slice(&c.column.to_le_bytes());
-            dir.push(KEY_I64);
-            dir.extend_from_slice(&c.identity.to_le_bytes());
-            dir.extend_from_slice(&c.n_keys.to_le_bytes());
-            dir.extend_from_slice(&c.n_positions.to_le_bytes());
-            dir.extend_from_slice(&(c.key_pages.len() as u32).to_le_bytes());
-            dir.extend_from_slice(&(c.pos_pages.len() as u32).to_le_bytes());
-            for p in &c.key_pages {
-                for v in [p.first_key as u64, p.last_key as u64, p.offset] {
-                    dir.extend_from_slice(&v.to_le_bytes());
-                }
-                dir.extend_from_slice(&p.len.to_le_bytes());
-                dir.extend_from_slice(&p.key_start.to_le_bytes());
-                dir.extend_from_slice(&p.pos_start.to_le_bytes());
-            }
-            for p in &c.pos_pages {
-                dir.extend_from_slice(&p.offset.to_le_bytes());
-                dir.extend_from_slice(&p.len.to_le_bytes());
-                dir.extend_from_slice(&p.pos_start.to_le_bytes());
-            }
-            if version == VERSION_WITH_HEAVY_KEYS {
-                let heavy = c.heavy_keys.as_deref().unwrap_or_default();
-                dir.push(heavy.len() as u8);
-                for (key, count) in heavy {
-                    dir.extend_from_slice(&key.to_le_bytes());
-                    dir.extend_from_slice(&count.to_le_bytes());
-                }
-            }
-        }
-        bytes.truncate(start);
-        bytes[4..8].copy_from_slice(&version.to_le_bytes());
-        let crc = crc32fast::hash(&dir);
-        let len = dir.len() as u32;
-        bytes.extend_from_slice(&dir);
-        bytes.extend_from_slice(&dir_offset.to_le_bytes());
-        bytes.extend_from_slice(&len.to_le_bytes());
-        bytes.extend_from_slice(&crc.to_le_bytes());
-        bytes.extend_from_slice(&MAGIC);
-        std::fs::write(path, bytes).unwrap();
-    }
-
     #[test]
     fn a_version_5_file_is_still_served() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -6916,7 +6984,7 @@ mod tests {
         let want = built.equal(1, key).unwrap().expect("the key is present");
         let want_positions = all_positions_of(&built, 1, want);
         drop(built);
-        rewrite_as_legacy(&path, VERSION_WITH_HEAVY_KEYS);
+        rewrite_as_legacy(&path);
         let old = Arc::new(IndexFile::open(&path, 42).unwrap());
         let entry = old.directory().entry(1).unwrap();
         assert_eq!(entry.domain, None, "a version 5 entry records no domain");
@@ -7061,7 +7129,7 @@ mod tests {
             assert_eq!(heavy.as_ref().map(Vec::len), Some(2));
             let want = all_positions_of(&built, 11, built.equal(11, 8).unwrap().unwrap());
             drop(built);
-            rewrite_as_legacy(&first, version);
+            rewrite_in_legacy_layout(&first, version);
             let earlier = IndexFile::open(&first, 2).unwrap();
             let old = earlier.directory().entry(11).unwrap();
             assert_eq!(old.domain, None);
@@ -7132,7 +7200,7 @@ mod tests {
             build_side_for(&volume, &path, 1, std::slice::from_ref(&a))
                 .unwrap()
                 .expect("A built");
-            rewrite_as_legacy(&side_path(&path), version);
+            rewrite_in_legacy_layout(&side_path(&path), version);
             let earlier = IndexFile::open(&side_path(&path), 1).unwrap();
             let key = (5 * 104_729) % 65_521;
             let want = all_positions_of(&earlier, 41, earlier.equal(41, key).unwrap().unwrap());
