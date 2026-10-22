@@ -3616,8 +3616,9 @@ impl Table for MVCCTable {
                 return Ok(Box::new(MVCCScanner::empty(column_indices.to_vec())));
             };
             self.check_read()?;
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::hot_scan_checked();
             return Ok(Box::new(HotScanner::new(
-                &self.version_store,
                 rows,
                 self.reader(),
                 view.clone(),

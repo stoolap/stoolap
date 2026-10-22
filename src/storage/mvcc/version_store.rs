@@ -229,8 +229,8 @@ fn compiled_passes(
 static UNASKED: crate::storage::expression::ConstBoolExpr =
     crate::storage::expression::ConstBoolExpr::new(true);
 
-/// A scan's filter: compiled once for the store's schema when it cannot
-/// fail, kept to evaluate when it can
+/// A scan's filter: compiled once for the schema of the rows the scan took
+/// when it cannot fail, kept to evaluate when it can
 pub(crate) struct ScanFilter {
     fallible: Option<Box<dyn crate::storage::expression::Expression>>,
     compiled: CompiledFilter,
@@ -239,7 +239,7 @@ pub(crate) struct ScanFilter {
 
 impl ScanFilter {
     pub(crate) fn new(
-        store: &VersionStore,
+        schema: &Schema,
         filter: &dyn crate::storage::expression::Expression,
     ) -> Self {
         if filter.can_fail() {
@@ -249,7 +249,7 @@ impl ScanFilter {
                 fully: false,
             };
         }
-        let compiled = CompiledFilter::compile(filter, &store.schema.read());
+        let compiled = CompiledFilter::compile(filter, schema);
         Self {
             fallible: None,
             fully: compiled.is_fully_compiled(),

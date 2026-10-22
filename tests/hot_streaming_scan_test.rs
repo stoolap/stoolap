@@ -18,7 +18,14 @@
 
 #![cfg(feature = "test-failpoints")]
 
-use stoolap::test_failpoints::hot_scan_step_rows;
+use std::cell::Cell;
+use std::rc::Rc;
+use std::sync::mpsc;
+use std::time::Duration;
+
+use stoolap::test_failpoints::{
+    after_hot_scan_checked, hot_scan_step_rows, on_last_view_lease_released,
+};
 use stoolap::Database;
 
 const ROWS: i64 = 20_000;
@@ -190,4 +197,42 @@ fn a_stepped_scan_answers_as_a_whole_read() {
         vec![11, 12, 13]
     );
     db.execute("ROLLBACK", ()).unwrap();
+}
+
+#[test]
+fn a_column_dropped_once_the_scan_took_its_rows_leaves_the_filter_on_them() {
+    let db = Database::open("memory://hot_streaming_scan_drop_column").unwrap();
+    db.execute(
+        "CREATE TABLE d (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO d VALUES (1, 10, 20), (2, 11, 21)", ())
+        .unwrap();
+    let writer = db.clone();
+    let dropped = Rc::new(Cell::new(false));
+    let seen = Rc::clone(&dropped);
+    after_hot_scan_checked(move || {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(writer.execute("ALTER TABLE d DROP COLUMN a", ()).is_ok());
+        });
+        seen.set(rx.recv_timeout(Duration::from_secs(5)) == Ok(true));
+    });
+    assert_eq!(ids(&db, "SELECT id FROM d WHERE b = 20"), vec![1]);
+    assert!(dropped.get(), "the column was dropped inside the scan");
+}
+
+#[test]
+fn a_closed_scan_lets_go_of_its_view_while_its_result_lives() {
+    let db = Database::open("memory://hot_streaming_scan_close").unwrap();
+    fill(&db);
+    let mut rows = db.query("SELECT id FROM t WHERE k + 0 >= 0", ()).unwrap();
+    assert_eq!(rows.next().unwrap().unwrap().get::<i64>(0).unwrap(), 1);
+    let released = Rc::new(Cell::new(false));
+    let seen = Rc::clone(&released);
+    on_last_view_lease_released(move || seen.set(true));
+    rows.close();
+    assert!(released.get(), "the view was let go on close");
+    drop(rows);
 }

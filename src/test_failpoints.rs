@@ -2915,6 +2915,20 @@ pub(crate) fn hot_top_k_visited() {
     }
 }
 
+thread_local! {
+    static HOT_SCAN_CHECKED_HOOK: HookSlot = RefCell::new(None);
+}
+
+/// Run once on this thread when its next stepped hot scan has checked the
+/// layout of the rows it took and has not yet prepared its filter
+pub fn after_hot_scan_checked(hook: impl FnOnce() + 'static) {
+    HOT_SCAN_CHECKED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn hot_scan_checked() {
+    run_hook(&HOT_SCAN_CHECKED_HOOK);
+}
+
 /// Rows this thread's hot scans read in steps, so far
 pub fn hot_scan_step_rows() -> usize {
     HOT_SCAN_STEP_ROWS.with(std::cell::Cell::get)

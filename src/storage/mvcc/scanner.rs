@@ -23,7 +23,7 @@ use crate::core::{Result, Row, RowVec, Schema};
 use crate::storage::expression::Expression;
 use crate::storage::mvcc::registry::StatementView;
 use crate::storage::mvcc::table::normalize_row_to_schema;
-use crate::storage::mvcc::version_store::{HotRows, Reader, ScanFilter, VersionStore};
+use crate::storage::mvcc::version_store::{HotRows, Reader, ScanFilter};
 use crate::storage::traits::Scanner;
 
 /// MVCC Scanner for iterating over versioned rows
@@ -208,9 +208,9 @@ const MAX_STEP_ROWS: usize = 4096;
 /// rows taken when the scan began, so a reader that stops early reads no
 /// further
 pub(crate) struct HotScanner {
-    source: HotRows,
+    /// The rows taken and the view that reads them, let go on close
+    source: Option<(HotRows, StatementView)>,
     txn_id: i64,
-    view: StatementView,
     filter: Option<ScanFilter>,
     schema: CompactArc<Schema>,
     /// The columns each row is cut to, empty for the whole row
@@ -228,8 +228,9 @@ pub(crate) struct HotScanner {
 }
 
 impl HotScanner {
+    /// A scan of `source` through `view`, its filter read as `schema`, the
+    /// schema of the rows taken
     pub(crate) fn new(
-        store: &VersionStore,
         source: HotRows,
         reader: Reader<'_>,
         view: StatementView,
@@ -240,10 +241,9 @@ impl HotScanner {
         // A step stops at the end of a leaf, so it may read a leaf more
         let rows = RowVec::with_capacity((MAX_STEP_ROWS + MAX_KEYS).min(source.held()));
         Self {
-            source,
+            source: Some((source, view)),
             txn_id: reader.txn_id,
-            view,
-            filter: filter.map(|filter| ScanFilter::new(store, filter)),
+            filter: filter.map(|filter| ScanFilter::new(&schema, filter)),
             projection: projection(&schema, column_indices),
             schema,
             normalize: None,
@@ -260,16 +260,20 @@ impl HotScanner {
     fn read_step(&mut self) -> Result<()> {
         self.rows.clear();
         self.at = 0;
+        let Some((source, view)) = &mut self.source else {
+            self.finished = true;
+            return Ok(());
+        };
         let reader = Reader {
             txn_id: self.txn_id,
-            view: Some(&self.view),
+            view: Some(view),
         };
         let more = match &self.filter {
-            None => self.source.fill(reader, &mut self.rows, self.step, |_| {
+            None => source.fill(reader, &mut self.rows, self.step, |_| {
                 stepped();
                 Ok(true)
             })?,
-            Some(filter) => self.source.fill(reader, &mut self.rows, self.step, |row| {
+            Some(filter) => source.fill(reader, &mut self.rows, self.step, |row| {
                 stepped();
                 filter.passes(row)
             })?,
@@ -333,6 +337,7 @@ impl Scanner for HotScanner {
 
     fn close(&mut self) -> Result<()> {
         self.finished = true;
+        self.source = None;
         self.rows.clear();
         self.at = 0;
         Ok(())
@@ -347,7 +352,10 @@ impl Scanner for HotScanner {
     }
 
     fn estimated_count(&self) -> Option<usize> {
-        self.filter.is_none().then(|| self.source.held())
+        match (&self.filter, &self.source) {
+            (None, Some((source, _))) => Some(source.held()),
+            _ => None,
+        }
     }
 }
 
