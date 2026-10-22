@@ -5765,6 +5765,9 @@ impl Executor {
                     };
                     let inner_token = inner_table.layout_token();
                     let inner_schema = inner_table.schema();
+                    if let Some(run) = statement_run {
+                        run.blocks.side_fits(usize::from(!swapped), &*inner_table)?;
+                    }
                     // The WHERE's conditions on the inner table, fetched through
                     // when its scan takes them whole, else asked with the residual
                     let inner_taken = match statement_run {
@@ -8314,7 +8317,17 @@ impl Executor {
             }
             (filter, extra) => filter.or(extra),
         };
-        self.execute_table_expression_with_filter_limit(expr, ctx, filter, limit, offset)
+        #[cfg(feature = "test-failpoints")]
+        if side.run.is_some() {
+            crate::test_failpoints::join_side_opening();
+        }
+        let fetched =
+            self.execute_table_expression_with_filter_limit(expr, ctx, filter, limit, offset)?;
+        if let (Some((run, index)), Expression::TableSource(ts)) = (side.run, expr) {
+            run.blocks
+                .side_named(index, &ts.name.value_lower, &fetched.1, fetched.3)?;
+        }
+        Ok(fetched)
     }
 
     pub(crate) fn execute_table_expression_with_filter_limit(
@@ -8778,6 +8791,9 @@ impl Executor {
         else {
             return Ok(None);
         };
+        if let Some(run) = run {
+            run.blocks.side_fits(1, &*inner_table)?;
+        }
         let inner_token = inner_table.layout_token();
         let inner_alias = right_alias.unwrap_or(&table_name);
         let inner_cols: Vec<String> = inner_table

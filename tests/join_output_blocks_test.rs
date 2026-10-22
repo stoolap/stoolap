@@ -18,11 +18,13 @@
 
 #![cfg(feature = "test-failpoints")]
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::{Mutex, MutexGuard};
 
 use stoolap::test_failpoints::{
-    bridge_compiles, general_path_hits, join_paths_taken, program_compiles, reset_join_paths,
-    GeneralPath,
+    before_join_side_opened, bridge_compiles, general_path_hits, join_paths_taken,
+    program_compiles, reset_join_paths, GeneralPath,
 };
 use stoolap::Database;
 
@@ -372,4 +374,62 @@ fn a_join_output_s_subqueries_read_parameters_and_the_transaction_s_writes() {
     assert_eq!(row.get::<i64>(1).unwrap(), 99, "the transaction's own row");
     drop(seen);
     tx.rollback().unwrap();
+}
+
+#[test]
+fn a_side_whose_columns_changed_after_preparing_raises_schema_changed() {
+    let _guard = serial();
+    for (name, sql, table) in [
+        (
+            "join_output_blocks_drop_outer",
+            "SELECT l.id, (SELECT s.a FROM s WHERE s.id = l.k) FROM l JOIN r ON l.id = r.id",
+            "l",
+        ),
+        (
+            "join_output_blocks_drop_inner",
+            "SELECT l.id, (SELECT s.a FROM s WHERE s.id = r.w) FROM l JOIN r ON l.id = r.id",
+            "r",
+        ),
+        (
+            "join_output_blocks_drop_hashed",
+            "SELECT l.id, (SELECT s.a FROM s WHERE s.id = r.w) FROM l JOIN r ON l.k = r.w",
+            "r",
+        ),
+    ] {
+        let db = Database::open(&format!("memory://{name}")).unwrap();
+        for setup in [
+            "CREATE TABLE l (id INTEGER PRIMARY KEY, pad INTEGER, k INTEGER, spare INTEGER)",
+            "CREATE TABLE r (id INTEGER PRIMARY KEY, pad INTEGER, w INTEGER, spare INTEGER)",
+            "CREATE TABLE s (id INTEGER PRIMARY KEY, a INTEGER)",
+            "INSERT INTO l VALUES (1, 0, 2, 3)",
+            "INSERT INTO r VALUES (1, 0, 2, 3)",
+            "INSERT INTO s VALUES (2, 20), (3, 30)",
+        ] {
+            db.execute(setup, ()).unwrap();
+        }
+        assert_eq!(
+            rows(&db, sql).unwrap()[1..],
+            ["Integer(1)|Integer(20)".to_string()],
+            "{sql}: prepared"
+        );
+        let writer = db.clone();
+        let done = Rc::new(Cell::new(false));
+        let flag = Rc::clone(&done);
+        let alter = format!("ALTER TABLE {table} DROP COLUMN pad");
+        before_join_side_opened(move || {
+            writer.execute(&alter, ()).unwrap();
+            flag.set(true);
+        });
+        let got = rows(&db, sql);
+        assert!(done.get(), "{sql}: the column dropped inside the statement");
+        assert!(
+            got.as_ref().is_err_and(|e| e.contains("schema changed")),
+            "{sql}: {got:?}"
+        );
+        assert_eq!(
+            rows(&db, sql).unwrap()[1..],
+            ["Integer(1)|Integer(20)".to_string()],
+            "{sql}: run again"
+        );
+    }
 }

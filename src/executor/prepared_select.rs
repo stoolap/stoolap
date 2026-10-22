@@ -3335,8 +3335,12 @@ pub(crate) struct JoinBlocks {
     pub(crate) sides: [Option<Expression>; 2],
     /// The same conditions as their side's scan reads them
     side_wheres: [Option<PreparedWhere>; 2],
-    /// The columns of each side the conditions above were prepared over
+    /// The columns of each side the clauses were prepared over
     side_columns: [Vec<SchemaColumn>; 2],
+    /// The layout each side's table was found to hold those columns in, by
+    /// the whole schema and by name, which a later open of it skips checking
+    fitted: [std::sync::OnceLock<LayoutToken>; 2],
+    named: [std::sync::OnceLock<LayoutToken>; 2],
     /// Each SELECT item and ORDER BY key holding a subquery, over the joined row
     pub(crate) select: Vec<Option<Expression>>,
     pub(crate) order_by: Vec<Option<Expression>>,
@@ -3351,13 +3355,49 @@ pub(crate) struct JoinBlocks {
 
 impl JoinBlocks {
     /// SchemaChanged when `table`, opened for side `side`, no longer holds
-    /// the columns that side's conditions were prepared over
-    fn side_fits(&self, side: usize, table: &dyn Table) -> Result<()> {
+    /// the columns the clauses were prepared over
+    pub(crate) fn side_fits(&self, side: usize, table: &dyn Table) -> Result<()> {
+        let token = table.layout_token();
+        if self.fitted[side].get() == Some(&token) {
+            return Ok(());
+        }
         if table.schema().columns == self.side_columns[side] {
+            let _ = self.fitted[side].set(token);
             return Ok(());
         }
         Err(Error::SchemaChanged {
             table: table.name().to_string(),
+        })
+    }
+
+    /// SchemaChanged when the rows read for side `side` of table `table`,
+    /// named `columns` and laid out as `token`, are not laid out as the
+    /// clauses were prepared over
+    pub(crate) fn side_named(
+        &self,
+        side: usize,
+        table: &str,
+        columns: &[String],
+        token: Option<LayoutToken>,
+    ) -> Result<()> {
+        if token.is_some() && self.named[side].get() == token.as_ref() {
+            return Ok(());
+        }
+        let prepared = &self.side_columns[side];
+        let named = |(column, prepared): (&String, &SchemaColumn)| {
+            let name = prepared.name.as_str();
+            column.len() > name.len()
+                && column.ends_with(name)
+                && column.as_bytes()[column.len() - name.len() - 1] == b'.'
+        };
+        if columns.len() == prepared.len() && columns.iter().zip(prepared).all(named) {
+            if let Some(token) = token {
+                let _ = self.named[side].set(token);
+            }
+            return Ok(());
+        }
+        Err(Error::SchemaChanged {
+            table: table.to_string(),
         })
     }
 
@@ -3460,11 +3500,10 @@ impl JoinBlocks {
             .collect::<Result<Vec<_>>>()?;
         let mut side_filters = [None, None];
         let mut side_wheres = [None, None];
-        let mut side_columns = [Vec::new(), Vec::new()];
+        let side_columns = [sides[0].1.columns.clone(), sides[1].1.columns.clone()];
         for (i, part) in side_parts.into_iter().enumerate() {
             if let Some((parts, program, joined_clause)) = part {
                 side_wheres[i] = Some(parts.prepare(program, &blocks));
-                side_columns[i] = sides[i].1.columns.clone();
                 side_filters[i] = Some(joined_clause);
             }
         }
@@ -3508,6 +3547,8 @@ impl JoinBlocks {
             sides: side_filters,
             side_wheres,
             side_columns,
+            fitted: Default::default(),
+            named: Default::default(),
             select,
             order_by,
             ahead,
@@ -3627,7 +3668,6 @@ impl Executor {
         else {
             return Ok(None);
         };
-        held.side_fits(side, table)?;
         Ok(
             match run.where_scan(where_, None, where_.narrowing_set, table, ctx)? {
                 None => Some(Some(Box::new(ConstBoolExpr::new(false)))),
