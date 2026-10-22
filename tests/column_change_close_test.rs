@@ -88,7 +88,12 @@ fn applied_and_open(db: &Database, id: i64, k: i64) -> Box<dyn Transaction> {
     table
         .insert(Row::from(vec![Value::Integer(id), Value::Integer(k)]))
         .unwrap();
-    table.txn_versions().write_store().commit().unwrap();
+    table
+        .txn_versions()
+        .unwrap()
+        .write_store()
+        .commit()
+        .unwrap();
     txn
 }
 
@@ -361,7 +366,7 @@ fn a_store_commit_begun_while_a_change_waits_is_refused() {
         .insert(Row::from(vec![Value::Integer(3), Value::Integer(9)]))
         .unwrap();
     let changing = change_waiting(&db);
-    let committed = table.txn_versions().write_store().commit();
+    let committed = table.txn_versions().unwrap().write_store().commit();
     assert!(
         matches!(committed, Err(stoolap::core::Error::SchemaChanged { .. })),
         "{committed:?}"

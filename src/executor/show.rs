@@ -28,7 +28,7 @@ use crate::common::SmartString;
 use crate::core::row_vec::RowVec;
 use crate::core::{Error, Result, Row, Value};
 use crate::parser::ast::*;
-use crate::storage::traits::transaction::StatementTable;
+use crate::storage::traits::transaction::{StatementTable, TableUse};
 use crate::storage::traits::{Engine, QueryResult};
 
 use super::context::ExecutionContext;
@@ -85,7 +85,7 @@ impl Executor {
     ) -> Result<Box<dyn QueryResult>> {
         let table_name = &stmt.table_name.value;
         let tx = self.begin_transaction()?;
-        let table = tx.get_statement_table(table_name)?;
+        let table = tx.get_read_table_at(table_name, None, TableUse::Read)?;
         let schema = table.schema();
 
         // Get unique column names from indexes
@@ -220,7 +220,7 @@ impl Executor {
 
         // Get a table reference to access indexes
         let tx = self.begin_transaction()?;
-        let table = tx.get_statement_table(table_name)?;
+        let table = tx.get_read_table_at(table_name, None, TableUse::Read)?;
 
         // Get index info from version store through the table
         let index_names = {
@@ -297,7 +297,7 @@ impl Executor {
     ) -> Result<Box<dyn QueryResult>> {
         let table_name = &stmt.table_name.value;
         let tx = self.begin_transaction()?;
-        let table = tx.get_statement_table(table_name)?;
+        let table = tx.get_read_table_at(table_name, None, TableUse::Read)?;
         let schema = table.schema();
 
         // Column headers: Field, Type, Null, Key, Default, Extra

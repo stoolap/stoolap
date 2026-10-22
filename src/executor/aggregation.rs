@@ -33,7 +33,7 @@ use crate::functions::aggregate::{
     AggregateState, CallTemplate, ColumnsKey, CompiledAggregate, GroupKey, GroupedAggregates,
 };
 use crate::parser::ast::*;
-use crate::storage::traits::transaction::StatementTable;
+use crate::storage::traits::transaction::{StatementTable, TableUse};
 use crate::storage::traits::{Engine, QueryResult};
 
 use super::context::ExecutionContext;
@@ -3713,7 +3713,7 @@ impl Executor {
         // reads. Else the count is read through a view
         let quiet_count = || -> Result<Option<usize>> {
             let tx = self.begin_transaction()?;
-            let table = tx.get_statement_table_at(&cd.table_name, None)?;
+            let table = tx.get_read_table_at(&cd.table_name, None, TableUse::Read)?;
             table.get_partition_count(&cd.column_name)
         };
         let read_committed = self.isolation_level() == crate::core::IsolationLevel::ReadCommitted;
@@ -3722,7 +3722,7 @@ impl Executor {
             None => {
                 let view = self.autocommit_view();
                 let tx = self.begin_transaction()?;
-                let table = tx.get_statement_table_at(&cd.table_name, view.as_ref())?;
+                let table = tx.get_read_table_at(&cd.table_name, view.as_ref(), TableUse::Read)?;
                 let Some(count) = table.get_partition_count(&cd.column_name)? else {
                     return Ok(None);
                 };
@@ -3903,7 +3903,11 @@ impl Executor {
             }
         };
 
-        let table = match tx.get_statement_table_at(&table_name, self.autocommit_view().as_ref()) {
+        let table = match tx.get_read_table_at(
+            &table_name,
+            self.autocommit_view().as_ref(),
+            TableUse::Read,
+        ) {
             Ok(t) => t,
             Err(_) => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
@@ -4008,7 +4012,7 @@ impl Executor {
         // Else the count is read through a view
         let quiet_count = || -> Result<Option<usize>> {
             let tx = self.begin_transaction()?;
-            let table = tx.get_statement_table_at(&cs.table_name, None)?;
+            let table = tx.get_read_table_at(&cs.table_name, None, TableUse::Read)?;
             table.fast_row_count()
         };
         let read_committed = self.isolation_level() == crate::core::IsolationLevel::ReadCommitted;
@@ -4017,7 +4021,7 @@ impl Executor {
             None => {
                 let view = self.autocommit_view();
                 let tx = self.begin_transaction()?;
-                let table = tx.get_statement_table_at(&cs.table_name, view.as_ref())?;
+                let table = tx.get_read_table_at(&cs.table_name, view.as_ref(), TableUse::Read)?;
                 let count = table.row_count()?;
                 view.as_ref()
                     .map_or(Ok(()), crate::storage::mvcc::registry::StatementView::held)?;
@@ -4234,7 +4238,7 @@ impl Executor {
         };
 
         let view = self.autocommit_view();
-        let table = match tx.get_statement_table_at(&table_name, view.as_ref()) {
+        let table = match tx.get_read_table_at(&table_name, view.as_ref(), TableUse::Read) {
             Ok(t) => t,
             Err(_) => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());

@@ -45,7 +45,12 @@ fn rows_published_before_a_rollback_stay_hidden() {
     handle
         .insert(Row::from(vec![Value::Integer(1), Value::Integer(7)]))
         .unwrap();
-    handle.txn_versions().write_store().commit().unwrap();
+    handle
+        .txn_versions()
+        .unwrap()
+        .write_store()
+        .commit()
+        .unwrap();
     drop(handle);
     txn.rollback().unwrap();
     assert_eq!(
@@ -66,7 +71,12 @@ fn a_store_held_past_its_rollback_cannot_publish() {
         .insert(Row::from(vec![Value::Integer(1), Value::Integer(7)]))
         .unwrap();
     txn.rollback().unwrap();
-    assert!(handle.txn_versions().write_store().commit().is_err());
+    assert!(handle
+        .txn_versions()
+        .unwrap()
+        .write_store()
+        .commit()
+        .is_err());
     assert_eq!(rows(&db), 0, "an ended transaction published a row");
 }
 
@@ -81,7 +91,12 @@ fn a_store_held_past_its_drop_cannot_publish() {
         .insert(Row::from(vec![Value::Integer(1), Value::Integer(7)]))
         .unwrap();
     drop(txn);
-    assert!(handle.txn_versions().write_store().commit().is_err());
+    assert!(handle
+        .txn_versions()
+        .unwrap()
+        .write_store()
+        .commit()
+        .is_err());
     assert_eq!(rows(&db), 0, "an ended transaction published a row");
 }
 
@@ -95,7 +110,12 @@ fn rows_of_a_transaction_dropped_after_publishing_stay_hidden() {
     handle
         .insert(Row::from(vec![Value::Integer(1), Value::Integer(7)]))
         .unwrap();
-    handle.txn_versions().write_store().commit().unwrap();
+    handle
+        .txn_versions()
+        .unwrap()
+        .write_store()
+        .commit()
+        .unwrap();
     drop(handle);
     drop(txn);
     assert_eq!(rows(&db), 0, "a dropped transaction's row became visible");
@@ -184,7 +204,7 @@ fn a_late_publication_cannot_take_the_slot_of_the_transaction_that_reused_it() {
             break;
         }
     });
-    let published = handle.txn_versions().write_store().commit();
+    let published = handle.txn_versions().unwrap().write_store().commit();
     let reused = reuser.borrow_mut().take();
     assert!(reused.is_some(), "the segment was handed to a later run");
     assert!(published.is_err(), "the ended transaction was let in");

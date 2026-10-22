@@ -19,7 +19,7 @@
 
 use crate::common::time_compat::Instant;
 use crate::storage::mvcc::registry::StatementView;
-use crate::storage::traits::transaction::StatementTable;
+use crate::storage::traits::transaction::{StatementTable, TableUse};
 use lru::LruCache;
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
@@ -1075,6 +1075,9 @@ struct SnapshotState {
     reads_latest: bool,
     /// The statement view its tables are read through
     view: Option<StatementView>,
+    /// What is written through its transaction: nothing for the executor's
+    /// own, maybe anything for one a caller gave through `get_table`
+    table_use: TableUse,
     /// The first table the statement's correlated probes read, read without a lock
     first_probe_table: std::sync::OnceLock<ProbeTable>,
     /// Any further tables they read, taken once each
@@ -1091,10 +1094,30 @@ impl StatementSnapshot {
         isolation: crate::core::IsolationLevel,
         view: Option<StatementView>,
     ) -> Self {
+        Self::with_use(transaction, isolation, view, TableUse::Write)
+    }
+
+    /// [`Self::new`] for the executor's own reads: nothing writes through
+    /// the transaction, so its tables open without a local store
+    pub(crate) fn for_reads(
+        transaction: Box<dyn crate::storage::traits::Transaction>,
+        isolation: crate::core::IsolationLevel,
+        view: Option<StatementView>,
+    ) -> Self {
+        Self::with_use(transaction, isolation, view, TableUse::Read)
+    }
+
+    fn with_use(
+        transaction: Box<dyn crate::storage::traits::Transaction>,
+        isolation: crate::core::IsolationLevel,
+        view: Option<StatementView>,
+        table_use: TableUse,
+    ) -> Self {
         Self(Arc::new(SnapshotState {
             transaction: Mutex::new(transaction),
             reads_latest: isolation == crate::core::IsolationLevel::ReadCommitted && view.is_none(),
             view,
+            table_use,
             first_probe_table: std::sync::OnceLock::new(),
             probe_tables: Mutex::new(SmallVec::new()),
         }))
@@ -1140,7 +1163,7 @@ impl StatementSnapshot {
             .transaction
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get_statement_table_at(name, view)
+            .get_read_table_at(name, view, self.0.table_use)
     }
 
     /// Runs `f` on the table every correlated probe of the statement reads,
@@ -1234,6 +1257,9 @@ pub struct ExecutionContext {
     /// this query depth reads the newest state, the query's subqueries the
     /// view. Behind an Arc, as few statements set it and every one carries it
     newest_target: Option<Arc<(SmartString, usize)>>,
+    /// What the statement writes beside the tables its reads open: reads
+    /// open a handle that registers nothing where it cannot write
+    table_use: TableUse,
     /// A semantic cache miss at the statement's start, for its scan
     semantic_miss: Option<SemanticMiss>,
     /// The LIMIT and OFFSET subqueries a statement read before its rows,
@@ -1305,6 +1331,7 @@ impl ExecutionContext {
             statement_snapshot: None,
             statement_view: None,
             newest_target: None,
+            table_use: TableUse::Write,
             semantic_miss: None,
             read_counts: None,
         }
@@ -1444,6 +1471,7 @@ impl ExecutionContext {
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
             newest_target: self.newest_target.clone(),
+            table_use: self.table_use,
             semantic_miss: None,
             read_counts: None,
         }
@@ -1468,6 +1496,7 @@ impl ExecutionContext {
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
             newest_target: self.newest_target.clone(),
+            table_use: self.table_use,
             semantic_miss: None,
             read_counts: None,
         }
@@ -1517,6 +1546,7 @@ impl ExecutionContext {
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
             newest_target: self.newest_target.clone(),
+            table_use: self.table_use,
             semantic_miss: None,
             read_counts: None,
         }
@@ -1573,6 +1603,7 @@ impl ExecutionContext {
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
             newest_target: self.newest_target.clone(),
+            table_use: self.table_use,
             semantic_miss: None,
             read_counts: self.read_counts.clone(),
         }
@@ -1644,6 +1675,18 @@ impl ExecutionContext {
         let mut ctx = self.clone();
         ctx.newest_target = Some(Arc::new((SmartString::from(table), self.query_depth)));
         ctx
+    }
+
+    /// What the statement writes beside the tables its reads open
+    pub(crate) fn table_use(&self) -> TableUse {
+        self.table_use
+    }
+
+    /// This context for a statement that writes what `table_use` says,
+    /// beside the tables its reads open
+    pub(crate) fn with_table_use(mut self, table_use: TableUse) -> Self {
+        self.table_use = table_use;
+        self
     }
 
     /// The view a scan of `table` at this depth reads through: none for the
@@ -1721,6 +1764,7 @@ impl ExecutionContext {
             statement_snapshot: self.statement_snapshot.clone(),
             statement_view: self.statement_view.clone(),
             newest_target: self.newest_target.clone(),
+            table_use: self.table_use,
             semantic_miss: self.semantic_miss.clone(),
             read_counts: self.read_counts.clone(),
         }

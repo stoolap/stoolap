@@ -34,7 +34,7 @@ use crate::parser::ast::{Expression, SelectStatement};
 use crate::storage::expression::ConstBoolExpr;
 use crate::storage::mvcc::registry::StatementView;
 use crate::storage::mvcc::version_store::LayoutToken;
-use crate::storage::traits::transaction::StatementTable;
+use crate::storage::traits::transaction::{StatementTable, TableUse};
 use crate::storage::traits::{Engine, QueryResult};
 
 use super::context::ExecutionContext;
@@ -363,7 +363,7 @@ impl Executor {
                 }
             }
             let tx = self.begin_transaction()?;
-            let table = tx.get_statement_table_at(table_name, view.as_ref())?;
+            let table = tx.get_read_table_at(table_name, view.as_ref(), TableUse::Read)?;
             check_compiled_token(&*table, token)?;
             let rows = table.fetch_rows_by_ids(&[pk_value], &ConstBoolExpr::true_expr())?;
             view.as_ref().map_or(Ok(()), StatementView::held)?;
@@ -384,8 +384,9 @@ impl Executor {
                     Some(view) => Some(view.clone()),
                     None => read_committed(level).then(|| self.capture_view()),
                 };
+                // The lookup is a SELECT: it writes no table
                 tx.transaction
-                    .get_statement_table_at(table_name, view.as_ref())
+                    .get_read_table_at(table_name, view.as_ref(), TableUse::Read)
                     .ok()
                     .map(|table| (table, view))
             });

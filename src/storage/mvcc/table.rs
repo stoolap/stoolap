@@ -50,8 +50,9 @@ pub struct MVCCTable {
     txn_id: i64,
     /// Reference to the version store
     version_store: Arc<VersionStore>,
-    /// Transaction-local version store (shared between multiple MVCCTable instances for same txn+table)
-    txn_versions: Arc<TxnTableStore>,
+    /// Transaction-local version store (shared between multiple MVCCTable instances for same txn+table);
+    /// None for a read handle of a table the transaction holds no rows of
+    txn_versions: Option<Arc<TxnTableStore>>,
     /// Cached schema for returning references (Arc clone from version_store - O(1) instead of cloning)
     cached_schema: CompactArc<Schema>,
     /// The rows' layout when the cached schema was taken: what the rows
@@ -66,6 +67,32 @@ pub struct MVCCTable {
     /// Scans that fell through to the full visible-row walk
     #[cfg(test)]
     full_scans: std::sync::atomic::AtomicU64,
+}
+
+/// The transaction's rows of a table as a read sees them: none through a
+/// read handle, which has no store
+struct LocalRows<'a>(Option<std::sync::RwLockReadGuard<'a, TransactionVersionStore>>);
+
+impl LocalRows<'_> {
+    fn has_local_changes(&self) -> bool {
+        self.0.as_ref().is_some_and(|rows| rows.has_local_changes())
+    }
+
+    fn get_local_version(&self, row_id: i64) -> Option<&RowVersion> {
+        self.0.as_ref()?.get_local_version(row_id)
+    }
+
+    fn get_latest_local(&self, row_id: i64) -> Option<&RowVersion> {
+        self.0.as_ref()?.get_latest_local(row_id)
+    }
+
+    fn get(&self, row_id: i64) -> Option<Row> {
+        self.0.as_ref()?.get(row_id)
+    }
+
+    fn iter_local(&self) -> impl Iterator<Item = (i64, &RowVersion)> {
+        self.0.iter().flat_map(|rows| rows.iter_local())
+    }
 }
 
 /// Where a WHERE conjunction sits on a multi-column index: equalities on the
@@ -260,7 +287,7 @@ impl MVCCTable {
         Self {
             txn_id,
             version_store,
-            txn_versions: Arc::new(TxnTableStore::new(txn_versions)),
+            txn_versions: Some(Arc::new(TxnTableStore::new(txn_versions))),
             #[cfg(test)]
             full_scans: std::sync::atomic::AtomicU64::new(0),
             cached_schema,
@@ -282,7 +309,24 @@ impl MVCCTable {
         Self {
             txn_id,
             version_store,
-            txn_versions,
+            txn_versions: Some(txn_versions),
+            #[cfg(test)]
+            full_scans: std::sync::atomic::AtomicU64::new(0),
+            cached_schema,
+            layout,
+            gate: None,
+            view: None,
+        }
+    }
+
+    /// A handle for reading a table its transaction holds no rows of and
+    /// does not write while the handle lives: nothing is registered for it
+    pub(crate) fn new_for_read(txn_id: i64, version_store: Arc<VersionStore>) -> Self {
+        let (cached_schema, layout) = version_store.schema_and_layout();
+        Self {
+            txn_id,
+            version_store,
+            txn_versions: None,
             #[cfg(test)]
             full_scans: std::sync::atomic::AtomicU64::new(0),
             cached_schema,
@@ -323,7 +367,19 @@ impl MVCCTable {
     /// Admits this handle to the transaction's rows it shares with earlier
     /// handles: they must be held in the layout this handle reads with
     pub(crate) fn admit_local_rows(&self) -> Result<()> {
-        self.txn_versions.admit(&self.version_store, self.layout)
+        match &self.txn_versions {
+            Some(store) => store.admit(&self.version_store, self.layout),
+            None => Ok(()),
+        }
+    }
+
+    /// The transaction's rows of this table, held for reading
+    fn local(&self) -> LocalRows<'_> {
+        LocalRows(self.txn_versions.as_ref().map(|store| {
+            store
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }))
     }
 
     /// The layout this handle reads with
@@ -347,8 +403,16 @@ impl MVCCTable {
 
     /// The transaction's local store for a write: the rows it writes now
     /// are laid out as this handle's schema says
-    fn writes(&self) -> TxnStoreWrite<'_> {
-        self.txn_versions.write_for(self.layout)
+    fn writes(&self) -> Result<TxnStoreWrite<'_>> {
+        self.local_store().map(|store| store.write_for(self.layout))
+    }
+
+    /// The transaction's local store of this table: a read handle has none
+    /// and takes no write
+    fn local_store(&self) -> Result<&TxnTableStore> {
+        self.txn_versions
+            .as_deref()
+            .ok_or_else(|| Error::internal("a read handle of a table took a write"))
     }
 
     /// Returns a reference to the version store
@@ -356,9 +420,10 @@ impl MVCCTable {
         &self.version_store
     }
 
-    /// Returns a reference to the shared transaction version store
-    pub fn txn_versions(&self) -> &Arc<TxnTableStore> {
-        &self.txn_versions
+    /// Returns a reference to the shared transaction version store; None
+    /// for a read handle
+    pub fn txn_versions(&self) -> Option<&Arc<TxnTableStore>> {
+        self.txn_versions.as_ref()
     }
 
     /// Auto-selects the optimal index type based on column data types
@@ -426,7 +491,7 @@ impl MVCCTable {
         let mut seen = (row_ids.len() > 1).then(I64Set::new);
 
         {
-            let txn_versions = self.txn_versions.read().unwrap();
+            let txn_versions = self.local();
             for &row_id in row_ids {
                 if seen.as_mut().is_some_and(|seen| !seen.insert(row_id)) {
                     continue;
@@ -492,7 +557,7 @@ impl MVCCTable {
             (local_deletes.len() + rows_with_originals.len() + cold_only_ids.len()) as i32;
         if !local_deletes.is_empty() || !rows_with_originals.is_empty() || !cold_only_ids.is_empty()
         {
-            let mut txn_versions = self.writes();
+            let mut txn_versions = self.writes()?;
             for (row_id, row) in local_deletes {
                 txn_versions.put(row_id, row, true)?;
             }
@@ -570,7 +635,7 @@ impl MVCCTable {
     /// expression runs exactly once, in the caller's own per-id handling, as
     /// it does for rows the index returned.
     fn local_ids_missing_from(&self, indexed: &[i64]) -> Vec<i64> {
-        let txn_versions = self.txn_versions.read().unwrap();
+        let txn_versions = self.local();
         if !txn_versions.has_local_changes() {
             return Vec::new();
         }
@@ -1395,7 +1460,7 @@ impl MVCCTable {
                 // before its versions are visible). Otherwise the scan decides.
                 let settled = quiet.is_some()
                     && self.committed_candidate_epoch() == quiet
-                    && !self.txn_versions.read().unwrap().has_local_changes();
+                    && !self.local().has_local_changes();
                 settled.then_some(row_ids)
             }
             Operator::Gt | Operator::Gte | Operator::Lt | Operator::Lte => {
@@ -1439,7 +1504,7 @@ impl MVCCTable {
             return Ok(Some(RowVec::new()));
         }
 
-        let txn_versions = self.txn_versions.read().unwrap();
+        let txn_versions = self.local();
         if txn_versions.has_local_changes() {
             return Ok(None); // Fall through to full path
         }
@@ -1520,7 +1585,7 @@ impl MVCCTable {
         }
 
         // Bail if there are local transaction changes (complex merge needed)
-        let txn_versions = self.txn_versions.read().unwrap();
+        let txn_versions = self.local();
         if txn_versions.has_local_changes() {
             return Ok(None);
         }
@@ -1775,10 +1840,13 @@ impl MVCCTable {
     fn check_unique_constraints(&self, row: &Row, _row_id: i64) -> Result<()> {
         let unique = self.unique_indexes()?;
         self.find_unique_conflict(row, &unique, &mut |entries, column_ids, values| {
-            let txn_versions = self.txn_versions.read().unwrap();
+            let txn_versions = self.local();
             entries
                 .iter()
-                .find(|entry| Self::local_holds(&txn_versions, entry.row_id, column_ids, values))
+                .find(|entry| {
+                    let latest = txn_versions.get_latest_local(entry.row_id);
+                    Self::local_holds(latest, column_ids, values)
+                })
                 .map(|entry| entry.row_id)
         })
     }
@@ -1799,13 +1867,8 @@ impl MVCCTable {
     /// The index holds the committed rows. A row this transaction has
     /// deleted no longer holds the value against it, and one it has
     /// rewritten holds only what its latest version says
-    fn local_holds(
-        txn_versions: &TransactionVersionStore,
-        row_id: i64,
-        column_ids: &[i32],
-        values: &[Value],
-    ) -> bool {
-        match txn_versions.get_latest_local(row_id) {
+    fn local_holds(latest: Option<&RowVersion>, column_ids: &[i32], values: &[Value]) -> bool {
+        match latest {
             None => true,
             Some(version) if version.is_deleted() => false,
             Some(version) => Self::row_holds(&version.data, column_ids, values),
@@ -1872,7 +1935,7 @@ impl MVCCTable {
     /// Inserts a row for a statement already admitted
     fn insert_admitted(&mut self, mut row: Row) -> Result<()> {
         let row_id = self.prepare_insert(&mut row)?;
-        self.writes().put(row_id, row, false)?;
+        self.writes()?.put(row_id, row, false)?;
         Ok(())
     }
 
@@ -1943,7 +2006,10 @@ impl MVCCTable {
         // transaction has deleted is gone for it, whatever the global
         // store still holds, so the key may be taken again
         let deleted_locally = {
-            let txn_versions = self.txn_versions.read().unwrap();
+            let txn_versions = self
+                .local_store()?
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if txn_versions.has_locally_seen(row_id) && txn_versions.get(row_id).is_some() {
                 return Err(Error::primary_key_constraint(row_id));
             }
@@ -1985,12 +2051,17 @@ impl MVCCTable {
     /// operations to reduce lock acquisitions from O(rows × indexes) to O(indexes).
     pub(crate) fn commit_published(&mut self) -> Result<()> {
         // Commit versions to the version store (this also updates indexes)
-        self.txn_versions.write_store().commit()
+        match &self.txn_versions {
+            Some(store) => store.write_store().commit(),
+            None => Ok(()),
+        }
     }
 
     /// Rolls back the transaction's local changes
     pub fn rollback(&mut self) {
-        self.txn_versions.write_store().rollback();
+        if let Some(store) = &self.txn_versions {
+            store.write_store().rollback();
+        }
     }
 
     /// Returns the row count visible to this transaction
@@ -2002,7 +2073,7 @@ impl MVCCTable {
         let mut count = self.version_store.count_visible_rows(self.reader());
 
         // Adjust for local changes (uncommitted in this transaction)
-        let txn_versions = self.txn_versions.read().unwrap();
+        let txn_versions = self.local();
         for (row_id, version) in txn_versions.iter_local() {
             // Check if this row exists in global store
             let exists_in_global = self.version_store.quick_check_row_existence(row_id);
@@ -2033,7 +2104,7 @@ impl MVCCTable {
     #[inline]
     pub fn fast_row_count(&self) -> Option<usize> {
         // Check if there are any local changes
-        let txn_versions = self.txn_versions.read().unwrap();
+        let txn_versions = self.local();
         if txn_versions.has_local_changes() {
             return None;
         }
@@ -2059,7 +2130,7 @@ impl MVCCTable {
     /// Returns RowVec for zero-allocation reuse across queries.
     #[inline]
     fn collect_visible_rows(&self, filter: Option<&dyn Expression>) -> Result<RowVec> {
-        let txn_versions = self.txn_versions.read().unwrap();
+        let txn_versions = self.local();
         let schema = &self.cached_schema;
 
         // Check if we have local versions (uncommitted changes in this transaction)
@@ -2179,7 +2250,7 @@ impl MVCCTable {
         if let Some(expr) = filter {
             if let Some(pk_id) = self.try_pk_lookup(expr, schema) {
                 // Direct O(1) lookup by primary key
-                let txn_versions = self.txn_versions.read().unwrap();
+                let txn_versions = self.local();
                 // Check local versions first via get_local_version (preserves
                 // delete signal). txn_versions.get() swallows deletes as None,
                 // which would cause a fallback to the committed store and miss
@@ -2229,7 +2300,7 @@ impl MVCCTable {
             }
         }
 
-        let txn_versions = self.txn_versions.read().unwrap();
+        let txn_versions = self.local();
 
         // Check if we have local versions (uncommitted changes in this transaction)
         let has_local = txn_versions.has_local_changes();
@@ -2342,7 +2413,7 @@ impl MVCCTable {
         if let Some(expr) = filter {
             if let Some(pk_id) = self.try_pk_lookup(expr, schema) {
                 // Direct O(1) lookup by primary key
-                let txn_versions = self.txn_versions.read().unwrap();
+                let txn_versions = self.local();
                 // Check local versions first via get_local_version (preserves
                 // delete signal). txn_versions.get() swallows deletes as None,
                 // which would cause a fallback to the committed store and miss
@@ -2392,7 +2463,7 @@ impl MVCCTable {
             }
         }
 
-        let txn_versions = self.txn_versions.read().unwrap();
+        let txn_versions = self.local();
 
         // Check if we have local versions (uncommitted changes in this transaction)
         let has_local = txn_versions.has_local_changes();
@@ -2484,7 +2555,7 @@ impl MVCCTable {
                 // get_local_version keeps a local delete, which txn_versions.get()
                 // would hide behind the committed row
                 let read = {
-                    let txn_versions = self.txn_versions.read().unwrap();
+                    let txn_versions = self.local();
                     if let Some(local) = txn_versions.get_local_version(pk_id) {
                         (!local.is_deleted()).then(|| (local.data.clone(), self.local_read(local)))
                     } else {
@@ -2508,7 +2579,7 @@ impl MVCCTable {
                 plan.hot.reserve_exact(pk_range_ids.len());
                 let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(pk_range_ids.len());
                 {
-                    let txn_versions = self.txn_versions.read().unwrap();
+                    let txn_versions = self.local();
                     self.check_read()?;
                     for row_id in pk_range_ids {
                         if skipped(row_id) {
@@ -2546,7 +2617,7 @@ impl MVCCTable {
                 plan.hot.reserve_exact(filtered_row_ids.len());
                 let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(filtered_row_ids.len());
                 {
-                    let txn_versions = self.txn_versions.read().unwrap();
+                    let txn_versions = self.local();
                     for &row_id in &filtered_row_ids {
                         if skipped(row_id) {
                             continue;
@@ -2584,13 +2655,7 @@ impl MVCCTable {
         // can fail is not asked of a row already planned, and an error on
         // the committed copy of a row the transaction wrote is not the
         // statement's, since its own version stands for it
-        let written = |row_id: i64| {
-            self.txn_versions
-                .read()
-                .unwrap()
-                .get_latest_local(row_id)
-                .is_some()
-        };
+        let written = |row_id: i64| self.local().get_latest_local(row_id).is_some();
         let committed = match where_expr {
             Some(expr) if fallible => self
                 .version_store
@@ -2627,7 +2692,7 @@ impl MVCCTable {
         // row only it inserted joins. With a WHERE, a committed row it wrote
         // leaves too, and its own version is judged with the rows it inserted
         {
-            let txn_versions = self.txn_versions.read().unwrap();
+            let txn_versions = self.local();
             if txn_versions.has_local_changes() {
                 let mut kept = start;
                 for i in start..plan.hot.len() {
@@ -2677,7 +2742,7 @@ impl MVCCTable {
         plan.hot.reserve_exact(row_ids.len());
         let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(row_ids.len());
         {
-            let txn_versions = self.txn_versions.read().unwrap();
+            let txn_versions = self.local();
             self.check_read()?;
             for &row_id in row_ids {
                 if let Some(local) = txn_versions.get_local_version(row_id) {
@@ -2722,7 +2787,7 @@ impl MVCCTable {
         } else {
             self.unique_indexes()?
         };
-        let mut txn_versions = self.writes();
+        let mut txn_versions = self.writes()?;
         let layout = txn_versions.check_planned(plan)?;
         if !unique.is_empty() {
             self.check_planned_unique(&unique, &txn_versions, plan)?;
@@ -2792,7 +2857,8 @@ impl MVCCTable {
                         .find(|entry| match planned.get(&entry.row_id) {
                             Some(row) => Self::row_holds(row, column_ids, values),
                             None => {
-                                Self::local_holds(txn_versions, entry.row_id, column_ids, values)
+                                let latest = txn_versions.get_latest_local(entry.row_id);
+                                Self::local_holds(latest, column_ids, values)
                             }
                         })
                         .map(|entry| entry.row_id)
@@ -2987,7 +3053,7 @@ impl Table for MVCCTable {
         filter: &dyn Expression,
         rows: &mut RowVec,
     ) -> Result<()> {
-        let txn_versions = self.txn_versions.read().unwrap();
+        let txn_versions = self.local();
         let schema = &self.cached_schema;
         let fallible = filter.can_fail();
 
@@ -3095,7 +3161,7 @@ impl Table for MVCCTable {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         let row_id = self.prepare_insert(&mut row)?;
         let inserted_row = row.clone();
-        self.writes().put(row_id, row, false)?;
+        self.writes()?.put(row_id, row, false)?;
         Ok(inserted_row)
     }
 
@@ -3196,7 +3262,7 @@ impl Table for MVCCTable {
             usize::MAX,
         );
         // The transaction's own inserts and deletes are part of what it sees
-        let txn_versions = self.txn_versions.read().unwrap();
+        let txn_versions = self.local();
         if txn_versions.has_local_changes() {
             let mut deleted = crate::common::I64Set::new();
             let mut inserted = Vec::new();
@@ -3221,7 +3287,7 @@ impl Table for MVCCTable {
         limit: usize,
     ) -> Result<Vec<i64>> {
         // A transaction with writes of its own reads the whole key list
-        if self.txn_versions.read().unwrap().has_local_changes() {
+        if self.local().has_local_changes() {
             let mut ids = self.get_active_row_ids()?;
             ids.sort_unstable();
             return Ok(ids
@@ -3250,10 +3316,7 @@ impl Table for MVCCTable {
     }
 
     fn has_visible_row(&self, row_id: i64) -> Result<bool> {
-        let txn_versions = self
-            .txn_versions
-            .read()
-            .map_err(|_| Error::internal("transaction versions lock poisoned"))?;
+        let txn_versions = self.local();
         if txn_versions.get_local_version(row_id).is_some() {
             return Ok(true);
         }
@@ -3271,7 +3334,7 @@ impl Table for MVCCTable {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         // The claim and its write set entry change together, so a failed
         // statement's release cannot fall between them
-        let mut writes = self.writes();
+        let mut writes = self.writes()?;
         self.version_store
             .try_claim_row(row_id, self.txn_id)
             .map_err(|e| Error::internal(e.to_string()))?;
@@ -3288,7 +3351,10 @@ impl Table for MVCCTable {
         let Ok(_admitted) = TxnGate::admit_for(&self.gate) else {
             return;
         };
-        self.writes().release_external_claim(row_id);
+        // A read handle holds no claim
+        if let Ok(mut writes) = self.writes() {
+            writes.release_external_claim(row_id);
+        }
     }
 
     fn delete(&mut self, where_expr: Option<&dyn Expression>) -> Result<i32> {
@@ -3305,7 +3371,7 @@ impl Table for MVCCTable {
                 // swallows deletes as None, causing fallback to committed store and
                 // missing uncommitted deletes in the current transaction.
                 let row_with_original = {
-                    let txn_versions = self.txn_versions.read().unwrap();
+                    let txn_versions = self.local();
                     if let Some(local) = txn_versions.get_local_version(pk_id) {
                         if local.is_deleted() {
                             None // Already locally deleted — don't double-count
@@ -3331,10 +3397,10 @@ impl Table for MVCCTable {
                 if let Some((row, original_version)) = row_with_original {
                     if let Some(orig) = original_version {
                         // Use optimized put that skips redundant get_visible_version
-                        self.writes().put_with_original(pk_id, row, orig, true)?;
+                        self.writes()?.put_with_original(pk_id, row, orig, true)?;
                     } else {
                         // Local version - use regular put
-                        self.writes().put(pk_id, row, true)?;
+                        self.writes()?.put(pk_id, row, true)?;
                     }
                     return Ok(1);
                 }
@@ -3353,7 +3419,7 @@ impl Table for MVCCTable {
                 // Use get_local_version to distinguish "no local version" from "locally deleted"
                 let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(pk_range_ids.len());
                 {
-                    let txn_versions = self.txn_versions.read().unwrap();
+                    let txn_versions = self.local();
                     for row_id in pk_range_ids {
                         if let Some(local) = txn_versions.get_local_version(row_id) {
                             if !local.is_deleted() {
@@ -3379,7 +3445,7 @@ impl Table for MVCCTable {
 
                 let delete_count = (local_rows.len() + rows_with_originals.len()) as i32;
                 if !local_rows.is_empty() || !rows_with_originals.is_empty() {
-                    let mut txn_versions = self.writes();
+                    let mut txn_versions = self.writes()?;
                     if !local_rows.is_empty() {
                         txn_versions.put_batch_deleted(local_rows)?;
                     }
@@ -3401,7 +3467,7 @@ impl Table for MVCCTable {
                 // Use get_local_version to distinguish "no local version" from "locally deleted"
                 let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(filtered_row_ids.len());
                 {
-                    let txn_versions = self.txn_versions.read().unwrap();
+                    let txn_versions = self.local();
                     for row_id in filtered_row_ids {
                         if let Some(local) = txn_versions.get_local_version(row_id) {
                             if !local.is_deleted() {
@@ -3435,7 +3501,7 @@ impl Table for MVCCTable {
                 // Single batch write for all deletes
                 let delete_count = rows_to_delete.len() as i32;
                 if !rows_to_delete.is_empty() {
-                    self.writes().put_batch_deleted(rows_to_delete)?;
+                    self.writes()?.put_batch_deleted(rows_to_delete)?;
                 }
                 return Ok(delete_count);
             }
@@ -3454,7 +3520,7 @@ impl Table for MVCCTable {
             // First, check local versions
             // Use get_local_version to distinguish "no local version" from "locally deleted"
             let local_version = {
-                let txn_versions = self.txn_versions.read().unwrap();
+                let txn_versions = self.local();
                 txn_versions
                     .get_local_version(row_id)
                     .map(|v| (v.is_deleted(), v.data.clone()))
@@ -3471,7 +3537,7 @@ impl Table for MVCCTable {
                     }
                 }
                 // Mark as deleted
-                self.writes().put(row_id, row, true)?;
+                self.writes()?.put(row_id, row, true)?;
                 delete_count += 1;
             } else if let Some(version) = self
                 .version_store
@@ -3489,7 +3555,7 @@ impl Table for MVCCTable {
                 }
 
                 // Only clone AFTER filter passes
-                self.writes().put(row_id, version.data.clone(), true)?;
+                self.writes()?.put(row_id, version.data.clone(), true)?;
                 delete_count += 1;
             }
         }
@@ -3497,7 +3563,7 @@ impl Table for MVCCTable {
 
         // Also check local inserts that might not be in global store
         let local_ids: Vec<i64> = {
-            let txn_versions = self.txn_versions.read().unwrap();
+            let txn_versions = self.local();
             txn_versions.iter_local().map(|(id, _)| id).collect()
         };
         for row_id in local_ids {
@@ -3507,7 +3573,7 @@ impl Table for MVCCTable {
             }
 
             let row = {
-                let txn_versions = self.txn_versions.read().unwrap();
+                let txn_versions = self.local();
                 txn_versions.get(row_id)
             };
             if let Some(row) = row {
@@ -3519,7 +3585,7 @@ impl Table for MVCCTable {
                 }
 
                 // Row is already owned from txn_versions.get(), no extra clone needed
-                self.writes().put(row_id, row, true)?;
+                self.writes()?.put(row_id, row, true)?;
                 delete_count += 1;
             }
         }
@@ -3556,7 +3622,7 @@ impl Table for MVCCTable {
                 // swallows deletes as None, causing fallback to committed store and
                 // missing uncommitted deletes in the current transaction.
                 let row = {
-                    let txn_versions = self.txn_versions.read().unwrap();
+                    let txn_versions = self.local();
                     if let Some(local) = txn_versions.get_local_version(pk_lookup) {
                         if local.is_deleted() {
                             None // Locally deleted in this transaction
@@ -3607,10 +3673,7 @@ impl Table for MVCCTable {
         self.full_scans
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Through a statement view the rows read later are the ones read now
-        let shared = self
-            .txn_versions
-            .read()
-            .is_ok_and(|versions| !versions.has_local_changes());
+        let shared = !self.local().has_local_changes();
         if let Some(view) = self.view.as_ref().filter(|_| shared) {
             let Some(rows) = self.version_store.hot_rows() else {
                 return Ok(Box::new(MVCCScanner::empty(column_indices.to_vec())));
@@ -3649,7 +3712,7 @@ impl Table for MVCCTable {
             return Ok(Some(RowVec::new()));
         }
         // Rows this transaction wrote are not in the shared indexes yet
-        if self.txn_versions.read().unwrap().has_local_changes() {
+        if self.local().has_local_changes() {
             return Ok(None);
         }
         let Some(expr) = where_expr else {
@@ -3804,7 +3867,9 @@ impl Table for MVCCTable {
             return Ok(());
         };
         // Rollback any uncommitted changes
-        self.txn_versions.write_store().rollback();
+        if let Some(store) = &self.txn_versions {
+            store.write_store().rollback();
+        }
         Ok(())
     }
 
@@ -3816,25 +3881,29 @@ impl Table for MVCCTable {
         let Ok(_admitted) = TxnGate::admit_for(&self.gate) else {
             return;
         };
-        self.txn_versions.write_store().rollback();
+        if let Some(store) = &self.txn_versions {
+            store.write_store().rollback();
+        }
     }
 
     fn rollback_to_timestamp_with_pending(&self, timestamp: i64, pending: &[i64]) {
         let Ok(_admitted) = TxnGate::admit_for(&self.gate) else {
             return;
         };
-        self.txn_versions
-            .write_store()
-            .rollback_to_timestamp_with_pending(timestamp, pending);
+        if let Some(store) = &self.txn_versions {
+            store
+                .write_store()
+                .rollback_to_timestamp_with_pending(timestamp, pending);
+        }
     }
 
     fn has_local_changes(&self) -> bool {
-        self.txn_versions.read().unwrap().has_local_changes()
+        self.local().has_local_changes()
     }
 
     fn index_view_epoch(&self) -> Option<u64> {
         let epoch = self.committed_index_epoch()?;
-        if self.txn_versions.read().unwrap().has_local_changes() {
+        if self.local().has_local_changes() {
             return None;
         }
         Some(epoch)
@@ -3933,14 +4002,13 @@ impl Table for MVCCTable {
         out: &mut Vec<(Value, i64)>,
         written: &mut crate::common::I64Set,
     ) {
-        self.txn_versions
-            .read()
-            .unwrap()
-            .local_values(column, out, written);
+        if let Some(rows) = &self.local().0 {
+            rows.local_values(column, out, written);
+        }
     }
 
     fn get_pending_versions(&self) -> Vec<(i64, Row, bool, i64)> {
-        let txn_versions = self.txn_versions.read().unwrap();
+        let txn_versions = self.local();
         txn_versions
             .iter_local()
             .map(|(row_id, version)| {
@@ -4191,7 +4259,7 @@ impl Table for MVCCTable {
 
         // Also collect any local uncommitted data
         {
-            let txn_versions = self.txn_versions.read().unwrap();
+            let txn_versions = self.local();
             for (row_id, version) in txn_versions.iter_local() {
                 if !version.is_deleted() && !self.version_store.quick_check_row_existence(row_id) {
                     let values: Vec<Value> = col_indices
@@ -4298,7 +4366,7 @@ impl Table for MVCCTable {
             }
         }
         {
-            let txn_versions = self.txn_versions.read().unwrap();
+            let txn_versions = self.local();
             for (row_id, version) in txn_versions.iter_local() {
                 if !version.is_deleted() && !self.version_store.quick_check_row_existence(row_id) {
                     let val = version
@@ -4438,7 +4506,7 @@ impl Table for MVCCTable {
 
     fn mark_sealed_original(&mut self, row_id: i64, old_row: Row) -> Result<()> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
-        self.writes().mark_sealed_original(row_id, old_row)
+        self.writes()?.mark_sealed_original(row_id, old_row)
     }
 
     fn get_index(&self, name: &str) -> Option<std::sync::Arc<dyn Index>> {
@@ -4594,7 +4662,7 @@ impl Table for MVCCTable {
 
         // Also collect any local uncommitted data
         {
-            let txn_versions = self.txn_versions.read().unwrap();
+            let txn_versions = self.local();
             for (row_id, version) in txn_versions.iter_local() {
                 if !version.is_deleted() {
                     if let Some(value) = version.data.get(col_idx) {
@@ -4691,7 +4759,7 @@ impl Table for MVCCTable {
 
         // Also collect any local uncommitted data
         {
-            let txn_versions = self.txn_versions.read().unwrap();
+            let txn_versions = self.local();
             for (row_id, version) in txn_versions.iter_local() {
                 if !version.is_deleted() {
                     // Skip if already added from global store
@@ -4791,7 +4859,7 @@ impl Table for MVCCTable {
         // the regular path which correctly merges local changes via collect_visible_rows.
         // This optimization only reads from the global version store and indexes.
         {
-            let txn_versions = self.txn_versions.read().unwrap();
+            let txn_versions = self.local();
             if txn_versions.has_local_changes() {
                 return Ok(None);
             }
@@ -4973,7 +5041,7 @@ impl Table for MVCCTable {
 
         // If transaction has local changes, fall back to regular path
         {
-            let txn_versions = self.txn_versions.read().unwrap();
+            let txn_versions = self.local();
             if txn_versions.has_local_changes() {
                 return None;
             }
@@ -5569,7 +5637,7 @@ impl Table for MVCCTable {
     fn sum_column(&self, col_idx: usize) -> Result<Option<crate::core::SumAccumulator>> {
         // Only use deferred aggregation if no uncommitted local changes
         // (local changes are in txn_versions, not the main version_store)
-        let txn_versions = self.txn_versions.read().unwrap();
+        let txn_versions = self.local();
         if txn_versions.has_local_changes() {
             return Ok(None);
         }
@@ -5582,7 +5650,7 @@ impl Table for MVCCTable {
 
     fn min_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
         // Only use deferred aggregation if no uncommitted local changes
-        let txn_versions = self.txn_versions.read().unwrap();
+        let txn_versions = self.local();
         if txn_versions.has_local_changes() {
             return Ok(None);
         }
@@ -5595,7 +5663,7 @@ impl Table for MVCCTable {
 
     fn max_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
         // Only use deferred aggregation if no uncommitted local changes
-        let txn_versions = self.txn_versions.read().unwrap();
+        let txn_versions = self.local();
         if txn_versions.has_local_changes() {
             return Ok(None);
         }
@@ -5612,7 +5680,7 @@ impl Table for MVCCTable {
         aggregates: &[(crate::storage::mvcc::version_store::AggregateOp, usize)],
     ) -> Result<Option<crate::functions::aggregate::GroupedAggregates>> {
         // Only use storage-level aggregation if no uncommitted local changes
-        let txn_versions = self.txn_versions.read().unwrap();
+        let txn_versions = self.local();
         if txn_versions.has_local_changes() {
             return Ok(None);
         }

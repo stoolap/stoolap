@@ -1217,9 +1217,10 @@ impl Executor {
         }
         let active = self.active_transaction.lock().unwrap();
         let table = match active.as_ref() {
-            Some(tx) => tx
-                .transaction
-                .get_statement_table_at(name, ctx.statement_view()),
+            Some(tx) => {
+                tx.transaction
+                    .get_read_table_at(name, ctx.statement_view(), ctx.table_use())
+            }
             None => {
                 drop(active);
                 return match ctx.statement_snapshot() {
