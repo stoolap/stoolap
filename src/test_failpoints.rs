@@ -2122,6 +2122,8 @@ thread_local! {
     static TOP_K_COLD_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static HOT_TOP_K_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static KEPT_MEMBER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INNER_FETCH_FILTERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BOUND_SIDE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static HOT_SCAN_STEP_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ORDERED_VALUES_SORTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static INNER_TABLE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -2928,6 +2930,40 @@ pub fn after_hot_scan_checked(hook: impl FnOnce() + 'static) {
 
 pub(crate) fn hot_scan_checked() {
     run_hook(&HOT_SCAN_CHECKED_HOOK);
+}
+
+thread_local! {
+    static JOIN_SIDE_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next join with prepared side
+/// conditions is about to open a side's table
+pub fn before_join_side_opened(hook: impl FnOnce() + 'static) {
+    JOIN_SIDE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn join_side_opening() {
+    run_hook(&JOIN_SIDE_HOOK);
+}
+
+/// Join side reads on this thread that streamed their rows through the
+/// WHERE bound to the sets the run read, so far
+pub fn bound_side_reads() -> usize {
+    BOUND_SIDE_READS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn bound_side_read() {
+    BOUND_SIDE_READS.with(|n| n.set(n.get() + 1));
+}
+
+/// Index joins on this thread whose inner fetch took the WHERE's
+/// conditions on the inner table, so far
+pub fn inner_fetch_filters() -> usize {
+    INNER_FETCH_FILTERS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn inner_fetch_filtered() {
+    INNER_FETCH_FILTERS.with(|n| n.set(n.get() + 1));
 }
 
 /// Calls this thread made to an uncorrelated block for a member test, so far

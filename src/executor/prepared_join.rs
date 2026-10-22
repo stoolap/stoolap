@@ -43,6 +43,8 @@ pub enum JoinProgramKey {
         inner_col: String,
         outer_cols: Vec<String>,
         inner_cols: Vec<String>,
+        /// The inner fetch takes the WHERE's filter on the inner table
+        inner_taken: bool,
     },
     /// The ON clause without the keys a hash join matches, over the joined row
     HashResidual {

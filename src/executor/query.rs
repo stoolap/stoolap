@@ -292,6 +292,15 @@ type SelectResult = Result<SelectOutput>;
 /// whether the limit and offset were applied, and the layout of a table
 type OuterFetch = (Box<dyn QueryResult>, Vec<String>, bool, Option<LayoutToken>);
 
+/// How a join reads one of its sides: its conditions as the WHERE gives
+/// them, and the statement's run with the side's number when the blocks
+/// hold those conditions
+#[derive(Clone, Copy)]
+struct SideRead<'a> {
+    filter: Option<&'a Expression>,
+    run: Option<(StatementRun<'a>, usize)>,
+}
+
 /// A semantic cache answer and its output columns
 type CachedAnswer = (Box<dyn QueryResult>, CompactArc<Vec<String>>);
 
@@ -4830,9 +4839,8 @@ impl Executor {
     }
 
     /// Whether a join of two base tables holds subqueries in its ON or its
-    /// WHERE, all of the forms the prepared blocks run, those of the WHERE
-    /// in what it asks of the joined rows, or why not. `ctx` names the CTEs
-    /// the subqueries read, when the statement runs
+    /// WHERE, all of the forms the prepared blocks run, or why not. `ctx`
+    /// names the CTEs the subqueries read, when the statement runs
     pub(crate) fn join_blocks_family(
         &self,
         stmt: &SelectStatement,
@@ -4874,16 +4882,18 @@ impl Executor {
         let opened = |part: Option<Expression>| {
             part.map(|part| Self::with_select_aliases(stmt, &part, &columns).unwrap_or(part))
         };
-        let in_side =
-            |side: Option<Expression>| opened(side).is_some_and(|side| Self::has_subqueries(&side));
-        if in_side(left) || in_side(right) {
-            return Err("a WHERE subquery in a condition on one table");
+        let parts = [opened(left), opened(right), opened(cross)];
+        let mut subqueries = on_subqueries;
+        for part in parts.iter().flatten() {
+            if Self::has_subqueries(part) {
+                self.join_where_family(part, ctx)?;
+                subqueries = true;
+            }
         }
-        let cross = opened(cross);
-        if !on_subqueries && !cross.as_ref().is_some_and(Self::has_subqueries) {
-            return Err("neither ON nor WHERE holds a subquery");
+        match subqueries {
+            true => Ok(()),
+            false => Err("neither ON nor WHERE holds a subquery"),
         }
-        cross.map_or(Ok(()), |cross| self.join_where_family(&cross, ctx))
     }
 
     /// The program of the WHERE `cross` a join asks at `site` of its joined
@@ -5173,6 +5183,14 @@ impl Executor {
             (Some(blocks), Some(run)) => Some(StatementRun { blocks, run }),
             _ => None,
         };
+        let left_read = SideRead {
+            filter: left_filter.as_ref(),
+            run: statement_run.map(|run| (run, 0)),
+        };
+        let right_read = SideRead {
+            filter: right_filter.as_ref(),
+            run: statement_run.map(|run| (run, 1)),
+        };
         let where_blocks = statement_run.map(|run| run.site(false));
         let where_blocks = where_blocks
             .as_ref()
@@ -5196,7 +5214,9 @@ impl Executor {
             Expression::TableSource(ts) => Some(ts.name.value.as_str()),
             _ => None,
         };
-        let semijoin_limit = if correlated_where {
+        // Outside the blocks a correlated WHERE runs per row on the general path
+        let per_row_where = correlated_where && statement_run.is_none();
+        let semijoin_limit = if per_row_where {
             None
         } else {
             self.get_semijoin_reduction_limit(
@@ -5249,9 +5269,10 @@ impl Executor {
                 &join_type,
                 left_alias.as_deref(),
                 right_alias.as_deref(),
-                left_filter.as_ref(),
+                left_read,
                 right_filter.as_ref(),
                 cross_filter.as_ref(),
+                prepared.as_deref(),
                 &plan,
             )? {
                 return Ok(result);
@@ -5269,14 +5290,8 @@ impl Executor {
             let left_cap = left_cap_override.unwrap_or(cap);
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::join_side_ran();
-            let (left_result, left_cols, left_bounded, _) = self
-                .execute_table_expression_with_filter_limit(
-                    &join_source.left,
-                    ctx,
-                    left_filter.as_ref(),
-                    Some(left_cap),
-                    0,
-                )?;
+            let (left_result, left_cols, left_bounded, _) =
+                self.read_join_side(&join_source.left, ctx, left_read, None, Some(left_cap), 0)?;
             let left_rows = Self::materialize_result_arc(left_result)?;
             let left_key_idx = Self::find_column_index_by_name(&left_key_col, &left_cols);
             let join_key_values: Vec<Value> = if let Some(idx) = left_key_idx {
@@ -5288,29 +5303,19 @@ impl Executor {
             } else {
                 Vec::new()
             };
-            let right_filter_with_in = if !join_key_values.is_empty() {
-                let in_expr = self.build_in_filter_expression(&right_key_col, &join_key_values);
-                match (right_filter.clone(), in_expr) {
-                    (Some(existing), Some(in_filter)) => {
-                        Some(Expression::Infix(InfixExpression::new(
-                            Token::new(TokenType::Keyword, "AND", Position::default()),
-                            Box::new(existing),
-                            "AND".to_string(),
-                            Box::new(in_filter),
-                        )))
-                    }
-                    (None, Some(in_filter)) => Some(in_filter),
-                    (existing, None) => existing,
-                }
-            } else {
-                right_filter.clone()
+            let keys_in = match join_key_values.is_empty() {
+                true => None,
+                false => self.build_in_filter_expression(&right_key_col, &join_key_values),
             };
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::join_side_ran();
-            let (right_result, right_cols) = self.execute_table_expression_with_filter(
+            let (right_result, right_cols, _, _) = self.read_join_side(
                 &join_source.right,
                 ctx,
-                right_filter_with_in.as_ref(),
+                right_read,
+                keys_in.as_ref(),
+                None,
+                0,
             )?;
             let right_rows = Self::materialize_result_arc(right_result)?;
             reduction.set(Some(ReductionPass {
@@ -5328,7 +5333,7 @@ impl Executor {
             // An INNER join without a limit narrows its inner side by a table's
             // candidates only for an outer side found small once it runs
             let small_outer = pushed_limit.is_none() && join_type == "INNER";
-            let picked = if correlated_where {
+            let picked = if per_row_where {
                 None
             } else {
                 let ctes = CteNames::Context(ctx);
@@ -5368,21 +5373,17 @@ impl Executor {
                 )
             };
             // A swapped join reads the right side as its outer, with its filter
-            let (index_nl_info, nl_left_filter, nl_right_filter, swapped) = match picked {
-                Some((info, true)) => (Some(info), right_filter.clone(), left_filter.clone(), true),
-                picked => (
-                    picked.map(|(info, _)| info),
-                    left_filter.clone(),
-                    right_filter.clone(),
-                    false,
-                ),
+            let (index_nl_info, nl_right_filter, swapped) = match picked {
+                Some((info, true)) => (Some(info), left_filter.clone(), true),
+                picked => (picked.map(|(info, _)| info), right_filter.clone(), false),
             };
 
             // A join the inner table stops answering leaves through the label
             // to the hash join below, with the side it ran and its context
             let mut prepared_side: Option<PreparedSide> = None;
             let mut prepared_ctx: Option<ExecutionContext> = None;
-            let mut reduced_inner: Option<Expression> = None;
+            // The small outer's keys the inner side's read is narrowed by
+            let mut inner_keys: Option<Expression> = None;
             'index_nl: {
                 let Some((table_name, lookup_strategy, inner_col, outer_col)) = index_nl_info
                 else {
@@ -5391,7 +5392,7 @@ impl Executor {
                 let small_outer = small_outer
                     && matches!(lookup_strategy, IndexLookupStrategy::TableEquality { .. });
                 // Index Nested Loop path: stream outer side for early termination
-                // When swapped, execute right side as outer (with original right filter, now in nl_left_filter)
+                // When swapped, execute right side as outer (with original right filter, now in outer_read)
                 let outer_expr = if swapped {
                     &join_source.right
                 } else {
@@ -5433,35 +5434,31 @@ impl Executor {
                         _ => false,
                     }
                 };
-                let nl_left_filter = if small_outer {
-                    nl_left_filter
-                } else if let Some(ref right_f) = nl_right_filter {
+                // The inner filter's conjuncts a subquery holds stay with the
+                // blocks that read them on their own side
+                let transferable = nl_right_filter.as_ref().and_then(|right_f| {
+                    combine_predicates_with_and(
+                        flatten_and_predicates(right_f)
+                            .into_iter()
+                            .filter(|pred| !Self::has_subqueries(pred))
+                            .collect(),
+                    )
+                });
+                let outer_extra = if small_outer {
+                    None
+                } else if let Some(ref right_f) = transferable {
                     // Check if right filter references the inner join key column
                     let references = filter_references_column(right_f, &inner_col);
                     if references && same_family() {
                         // Create equivalent filter for outer side by substituting the column
-                        if let Some(outer_filter) =
-                            substitute_filter_column(right_f, &inner_col, &outer_col)
-                        {
-                            // Combine with existing left filter if any
-                            match nl_left_filter {
-                                Some(existing) => Some(Expression::Infix(InfixExpression::new(
-                                    Token::new(TokenType::Keyword, "AND", Position::default()),
-                                    Box::new(existing),
-                                    "AND".to_string(),
-                                    Box::new(outer_filter),
-                                ))),
-                                None => Some(outer_filter),
-                            }
-                        } else {
-                            nl_left_filter
-                        }
+                        substitute_filter_column(right_f, &inner_col, &outer_col)
                     } else {
-                        nl_left_filter
+                        None
                     }
                 } else {
-                    nl_left_filter
+                    None
                 };
+                let outer_read = if swapped { right_read } else { left_read };
 
                 // The limit the join is bounded by, decided with the strategy
                 let join_limit = pushed_limit;
@@ -5485,11 +5482,8 @@ impl Executor {
                 if small_outer {
                     #[cfg(any(test, feature = "test-failpoints"))]
                     crate::test_failpoints::join_side_ran();
-                    let (result, columns) = self.execute_table_expression_with_filter(
-                        outer_expr,
-                        &ctx_join,
-                        nl_left_filter.as_ref(),
-                    )?;
+                    let (result, columns, _, _) =
+                        self.read_join_side(outer_expr, &ctx_join, outer_read, None, None, 0)?;
                     // A small outer's keys narrow the inner side to the rows
                     // its candidates name; the standard join runs either way
                     let rows = match PreparedRows::read_small(result)? {
@@ -5562,13 +5556,7 @@ impl Executor {
                             let members =
                                 keys.and_then(|keys| Self::in_list_expression(column, &keys));
                             if let Some(members) = members {
-                                reduced_inner = combine_predicates_with_and(
-                                    nl_right_filter
-                                        .clone()
-                                        .into_iter()
-                                        .chain([members])
-                                        .collect(),
-                                );
+                                inner_keys = Some(members);
                                 #[cfg(any(test, feature = "test-failpoints"))]
                                 crate::test_failpoints::small_outer_joined();
                             }
@@ -5600,14 +5588,14 @@ impl Executor {
                 // Execute outer side with limit optimization for true early termination
                 #[cfg(any(test, feature = "test-failpoints"))]
                 crate::test_failpoints::join_side_ran();
-                let (outer_result, outer_cols, outer_bounded, outer_token) = self
-                    .execute_table_expression_with_filter_limit(
-                        outer_expr,
-                        &ctx_join,
-                        nl_left_filter.as_ref(),
-                        outer_limit,
-                        0,
-                    )?;
+                let (outer_result, outer_cols, outer_bounded, outer_token) = self.read_join_side(
+                    outer_expr,
+                    &ctx_join,
+                    outer_read,
+                    outer_extra.as_ref(),
+                    outer_limit,
+                    0,
+                )?;
                 if !outer_bounded {
                     outer_limit = None;
                 }
@@ -5637,6 +5625,10 @@ impl Executor {
 
                 if let Some(outer_idx) = outer_key_idx {
                     // Get inner table for schema and row fetching
+                    #[cfg(feature = "test-failpoints")]
+                    if statement_run.is_some() {
+                        crate::test_failpoints::join_side_opening();
+                    }
                     let Some(inner_table) = self.index_join_inner(
                         &snapshot,
                         ctx,
@@ -5650,6 +5642,23 @@ impl Executor {
                     };
                     let inner_token = inner_table.layout_token();
                     let inner_schema = inner_table.schema();
+                    // The WHERE's conditions on the inner table, fetched through
+                    // when its scan takes them whole, else asked with the residual
+                    let inner_taken = match statement_run {
+                        Some(run) => self.join_side_filter(
+                            run.blocks,
+                            run.run,
+                            usize::from(!swapped),
+                            &*inner_table,
+                            &ctx_join,
+                        )?,
+                        None => None,
+                    };
+                    let taken = inner_taken.is_some();
+                    #[cfg(feature = "test-failpoints")]
+                    if taken {
+                        crate::test_failpoints::inner_fetch_filtered();
+                    }
 
                     // Build inner columns list (qualified)
                     // When swapped, inner table alias is the original left alias
@@ -5702,7 +5711,10 @@ impl Executor {
                                     true => (&blocks.right, &blocks.left),
                                     false => (&blocks.left, &blocks.right),
                                 };
-                                let inner_filter = blocks.sides[usize::from(!swapped)].clone();
+                                let inner_filter = match taken {
+                                    true => None,
+                                    false => blocks.sides[usize::from(!swapped)].clone(),
+                                };
                                 (blocks.on.as_ref(), outer, inner, inner_filter)
                             }
                             None => (
@@ -5763,9 +5775,9 @@ impl Executor {
                                 |held| {
                                     matches!(held, JoinProgramKey::IndexResidual {
                                         swapped: s, outer_col: oc, inner_col: ic,
-                                        outer_cols: ocs, inner_cols: ics,
+                                        outer_cols: ocs, inner_cols: ics, inner_taken: t,
                                     } if *s == swapped && *oc == outer_col && *ic == inner_col
-                                        && *ocs == outer_cols && *ics == inner_cols)
+                                        && *ocs == outer_cols && *ics == inner_cols && *t == taken)
                                 },
                                 || JoinProgramKey::IndexResidual {
                                     swapped,
@@ -5773,6 +5785,7 @@ impl Executor {
                                     inner_col: inner_col.clone(),
                                     outer_cols: outer_cols.clone(),
                                     inner_cols: inner_cols.clone(),
+                                    inner_taken: taken,
                                 },
                                 compile_residual,
                                 read,
@@ -5868,6 +5881,9 @@ impl Executor {
                             )
                             .with_inner_key(inner_key_idx)
                             .with_blocks(pair_blocks);
+                            if let Some(Some(filter)) = &inner_taken {
+                                op = op.with_inner_filter(filter.clone_box());
+                            }
                             if swapped {
                                 op = op.with_outer_on_right();
                             }
@@ -5911,14 +5927,14 @@ impl Executor {
                             #[cfg(feature = "test-failpoints")]
                             crate::test_failpoints::join_next_chunk();
                             if consistent {
-                                let (more, _, bounded, token) = self
-                                    .execute_table_expression_with_filter_limit(
-                                        outer_expr,
-                                        &ctx_join,
-                                        nl_left_filter.as_ref(),
-                                        Some(next),
-                                        fetched,
-                                    )?;
+                                let (more, _, bounded, token) = self.read_join_side(
+                                    outer_expr,
+                                    &ctx_join,
+                                    outer_read,
+                                    outer_extra.as_ref(),
+                                    Some(next),
+                                    fetched,
+                                )?;
                                 same_outer_source(outer_expr, outer_token, token, bounded)?;
                                 outer_result = more;
                                 continue;
@@ -5928,14 +5944,14 @@ impl Executor {
                             // the row the chunk ended on, the rows after it are the
                             // continuation; otherwise the join restarts on snapshot
                             // isolation, where the chunks line up by construction
-                            let (mut more, _, bounded, token) = self
-                                .execute_table_expression_with_filter_limit(
-                                    outer_expr,
-                                    &ctx_join,
-                                    nl_left_filter.as_ref(),
-                                    Some(next + 1),
-                                    fetched - 1,
-                                )?;
+                            let (mut more, _, bounded, token) = self.read_join_side(
+                                outer_expr,
+                                &ctx_join,
+                                outer_read,
+                                outer_extra.as_ref(),
+                                Some(next + 1),
+                                fetched - 1,
+                            )?;
                             same_outer_source(outer_expr, outer_token, token, bounded)?;
                             let unmoved = more.next()
                                 && boundary
@@ -5954,14 +5970,14 @@ impl Executor {
                             result_rows.clear();
                             outer_limit = Some(fetched.saturating_add(next));
                             fetched = 0;
-                            let (restarted, _, bounded, token) = self
-                                .execute_table_expression_with_filter_limit(
-                                    outer_expr,
-                                    &ctx_join,
-                                    nl_left_filter.as_ref(),
-                                    outer_limit,
-                                    0,
-                                )?;
+                            let (restarted, _, bounded, token) = self.read_join_side(
+                                outer_expr,
+                                &ctx_join,
+                                outer_read,
+                                outer_extra.as_ref(),
+                                outer_limit,
+                                0,
+                            )?;
                             same_outer_source(outer_expr, outer_token, token, bounded)?;
                             outer_result = restarted;
                         }
@@ -5981,6 +5997,9 @@ impl Executor {
                         )
                         .with_inner_key(inner_key_idx)
                         .with_blocks(pair_blocks);
+                        if let Some(Some(filter)) = inner_taken {
+                            op = op.with_inner_filter(filter);
+                        }
                         if swapped {
                             op = op.with_outer_on_right();
                         }
@@ -6292,19 +6311,13 @@ impl Executor {
                     // Execute both sides
                     #[cfg(any(test, feature = "test-failpoints"))]
                     crate::test_failpoints::join_side_ran();
-                    let (left_result, left_cols) = self.execute_table_expression_with_filter(
-                        &join_source.left,
-                        ctx,
-                        left_filter.as_ref(),
-                    )?;
+                    let (left_result, left_cols, _, _) =
+                        self.read_join_side(&join_source.left, ctx, left_read, None, None, 0)?;
 
                     #[cfg(any(test, feature = "test-failpoints"))]
                     crate::test_failpoints::join_side_ran();
-                    let (right_result, right_cols) = self.execute_table_expression_with_filter(
-                        &join_source.right,
-                        ctx,
-                        right_filter.as_ref(),
-                    )?;
+                    let (right_result, right_cols, _, _) =
+                        self.read_join_side(&join_source.right, ctx, right_read, None, None, 0)?;
 
                     // Extract join keys BEFORE moving columns (uses original left/right positions)
                     let (left_key_indices, right_key_indices, _) = if let Some(cond) = on_condition
@@ -6532,21 +6545,22 @@ impl Executor {
                 // Execute both sides; a side the index join already ran is taken
                 // as it left it, and the other side is read in the same context
                 let side_ctx = prepared_ctx.as_ref().unwrap_or(ctx);
-                let run_side = |expr: &Expression, filter: Option<&Expression>| {
-                    #[cfg(any(test, feature = "test-failpoints"))]
-                    crate::test_failpoints::join_side_ran();
-                    let (result, columns) =
-                        self.execute_table_expression_with_filter(expr, side_ctx, filter)?;
-                    Ok::<_, Error>((Self::materialize_result_arc(result)?, columns))
-                };
+                let run_side =
+                    |expr: &Expression, read: SideRead<'_>, keys: Option<&Expression>| {
+                        #[cfg(any(test, feature = "test-failpoints"))]
+                        crate::test_failpoints::join_side_ran();
+                        let (result, columns, _, _) =
+                            self.read_join_side(expr, side_ctx, read, keys, None, 0)?;
+                        Ok::<_, Error>((Self::materialize_result_arc(result)?, columns))
+                    };
                 match prepared_side.take() {
                     Some(PreparedSide {
                         rows,
                         columns,
                         is_right: true,
                     }) => {
-                        let filter = reduced_inner.as_ref().or(left_filter.as_ref());
-                        let (left_rows, left_cols) = run_side(&join_source.left, filter)?;
+                        let (left_rows, left_cols) =
+                            run_side(&join_source.left, left_read, inner_keys.as_ref())?;
                         (left_rows, left_cols, rows.into_rows()?, columns)
                     }
                     Some(PreparedSide {
@@ -6554,15 +6568,14 @@ impl Executor {
                         columns,
                         is_right: false,
                     }) => {
-                        let filter = reduced_inner.as_ref().or(right_filter.as_ref());
-                        let (right_rows, right_cols) = run_side(&join_source.right, filter)?;
+                        let (right_rows, right_cols) =
+                            run_side(&join_source.right, right_read, inner_keys.as_ref())?;
                         (rows.into_rows()?, columns, right_rows, right_cols)
                     }
                     None => {
-                        let (left_rows, left_cols) =
-                            run_side(&join_source.left, left_filter.as_ref())?;
+                        let (left_rows, left_cols) = run_side(&join_source.left, left_read, None)?;
                         let (right_rows, right_cols) =
-                            run_side(&join_source.right, right_filter.as_ref())?;
+                            run_side(&join_source.right, right_read, None)?;
                         (left_rows, left_cols, right_rows, right_cols)
                     }
                 }
@@ -6665,7 +6678,7 @@ impl Executor {
 
         // Apply WHERE clause if present
         let filtered_rows = if let Some(where_expr) = effective_where {
-            if correlated_where && blocks.is_none() {
+            if per_row_where {
                 let resolved = Self::with_select_aliases(stmt, &where_expr, &all_columns)
                     .unwrap_or(where_expr);
                 let where_clause = &resolved;
@@ -8135,6 +8148,43 @@ impl Executor {
     /// table takes them; a CTE, a view, a subquery or a table function comes
     /// back whole and cannot be fetched again from an offset. A plain table
     /// also gives the layout its rows were read in.
+    /// A join side's rows with the `extra` conditions the join adds: read
+    /// through the statement's blocks when they hold the side's conditions,
+    /// else with its filter, from the `offset`-th up to `limit` rows
+    fn read_join_side(
+        &self,
+        expr: &Expression,
+        ctx: &ExecutionContext,
+        side: SideRead<'_>,
+        extra: Option<&Expression>,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<OuterFetch> {
+        if let (Some((run, index)), Expression::TableSource(ts)) = (side.run, expr) {
+            let alias = ts.alias.as_ref().unwrap_or(&ts.name).value.as_str();
+            let table = (ts.name.value_lower.as_str(), alias);
+            let read =
+                self.join_side_rows(run.blocks, run.run, index, table, ctx, extra, limit, offset)?;
+            if let Some((result, token)) = read {
+                let columns = result
+                    .columns()
+                    .iter()
+                    .map(|c| format!("{alias}.{c}"))
+                    .collect();
+                return Ok((result, columns, limit.is_some(), Some(token)));
+            }
+        }
+        let both;
+        let filter = match (side.filter, extra) {
+            (Some(filter), Some(extra)) => {
+                both = combine_predicates_with_and(vec![filter.clone(), extra.clone()]);
+                both.as_ref()
+            }
+            (filter, extra) => filter.or(extra),
+        };
+        self.execute_table_expression_with_filter_limit(expr, ctx, filter, limit, offset)
+    }
+
     pub(crate) fn execute_table_expression_with_filter_limit(
         &self,
         expr: &Expression,
@@ -8511,15 +8561,19 @@ impl Executor {
         join_type: &str,
         left_alias: Option<&str>,
         right_alias: Option<&str>,
-        left_filter: Option<&Expression>,
+        left: SideRead<'_>,
         right_filter: Option<&Expression>,
         cross_filter: Option<&Expression>,
+        prepared: Option<&PreparedJoin>,
         plan: &SemijoinReduction,
     ) -> Result<Option<SelectOutput>> {
-        let filters_have_subquery = [left_filter, right_filter, cross_filter]
-            .into_iter()
-            .flatten()
-            .any(Self::filter_has_subquery);
+        // The statement's blocks run the filters' subqueries, on each site
+        let run = left.run.map(|(run, _)| run);
+        let filters_have_subquery = run.is_none()
+            && [left.filter, right_filter, cross_filter]
+                .into_iter()
+                .flatten()
+                .any(Self::filter_has_subquery);
         let Some((aggregations, group_names)) = self.grouped_index_join_applies(
             stmt,
             join_type,
@@ -8562,14 +8616,8 @@ impl Executor {
         };
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::join_side_ran();
-        let (outer_result, outer_cols, outer_bounded, outer_token) = self
-            .execute_table_expression_with_filter_limit(
-                &join_source.left,
-                &ctx_join,
-                left_filter,
-                outer_limit,
-                0,
-            )?;
+        let (outer_result, outer_cols, outer_bounded, outer_token) =
+            self.read_join_side(&join_source.left, &ctx_join, left, None, outer_limit, 0)?;
         if !outer_bounded {
             outer_limit = None;
         }
@@ -8698,45 +8746,74 @@ impl Executor {
         };
         let cross = match cross_filter {
             Some(cross) => {
-                let resolved = Self::with_select_aliases(stmt, cross, &all_columns);
-                let cross = resolved.as_ref().unwrap_or(cross);
-                Some(RowFilter::new(cross, &all_columns)?.with_context(ctx))
+                let blocks = run.map(|run| run.blocks);
+                let program = self.join_where(
+                    prepared,
+                    WhereSite::IndexJoin,
+                    stmt,
+                    cross,
+                    &all_columns,
+                    blocks,
+                )?;
+                Some(RowFilter::from_program(program).with_context(ctx))
             }
             None => None,
         };
+        let cross_site = run.map(|run| run.site(false));
+        let cross_blocks = cross_site
+            .as_ref()
+            .map(|site| site as &dyn SubqueryExecutor);
+        let pair_site = run.map(|run| run.site(true));
+        let pair_blocks = pair_site.as_ref().map(|site| site as &dyn SubqueryExecutor);
         // A right-side filter the storage layer takes whole runs inside the
         // inner fetch, built once so every chunk sees the same predicate; a
         // partial or refused one stays a residual on the joined row
-        let inner_filter = right_filter.and_then(|rf| {
-            let rf = crate::executor::utils::strip_table_qualifier(rf, inner_alias);
-            match pushdown::try_pushdown(&rf, inner_table.schema(), Some(ctx)) {
-                (Some(expr), false) => Some(expr),
-                _ => None,
-            }
-        });
+        let inner_filter = right_filter
+            .filter(|rf| run.is_none() || !Self::has_subqueries(rf))
+            .and_then(|rf| {
+                let rf = crate::executor::utils::strip_table_qualifier(rf, inner_alias);
+                match pushdown::try_pushdown(&rf, inner_table.schema(), Some(ctx)) {
+                    (Some(expr), false) => Some(expr),
+                    _ => None,
+                }
+            });
         // The probe answers one equality, so the rest of the ON clause and a
-        // right-side filter the fetch did not take are asked of each pair
+        // right-side filter the fetch did not take are asked of each pair;
+        // with the statement's blocks, the clauses they rewrote
+        let (on, outer_names, inner_names, right) = match run {
+            Some(run) => (
+                run.blocks.on.as_ref(),
+                &run.blocks.left,
+                &run.blocks.right,
+                run.blocks.sides[1].clone(),
+            ),
+            None => (
+                join_source.condition.as_deref(),
+                &outer_cols,
+                &inner_cols,
+                right_filter.map(|rf| add_table_qualifier(rf, inner_alias)),
+            ),
+        };
         let residual = combine_predicates_with_and(
-            join_source
-                .condition
-                .as_deref()
-                .and_then(|on| {
-                    index_join_residual(on, &outer_cols, &inner_cols, outer_key_idx, inner_key_idx)
-                })
-                .into_iter()
-                .chain(
-                    right_filter
-                        .filter(|_| inner_filter.is_none())
-                        .map(|rf| add_table_qualifier(rf, inner_alias)),
-                )
-                .collect(),
+            on.and_then(|on| {
+                index_join_residual(on, outer_names, inner_names, outer_key_idx, inner_key_idx)
+            })
+            .into_iter()
+            .chain(right.filter(|_| inner_filter.is_none()))
+            .collect(),
         );
         let build_residual_filter = || {
             residual
                 .as_ref()
-                .map(|expr| {
-                    JoinFilter::new(expr, &outer_cols, &inner_cols, &self.function_registry)
-                        .map(|f| f.with_context(ctx))
+                .map(|expr| match run {
+                    Some(run) => run
+                        .blocks
+                        .compile(expr, true, &self.function_registry)
+                        .map(|p| JoinFilter::from_program(p).with_context(ctx)),
+                    None => {
+                        JoinFilter::new(expr, &outer_cols, &inner_cols, &self.function_registry)
+                            .map(|f| f.with_context(ctx))
+                    }
                 })
                 .transpose()
         };
@@ -8810,7 +8887,8 @@ impl Executor {
                 lookup_strategy.clone(),
                 build_residual_filter()?,
             )
-            .with_inner_key(inner_key_idx);
+            .with_inner_key(inner_key_idx)
+            .with_blocks(pair_blocks);
             if let Some(filter) = &inner_filter {
                 op = op.with_inner_filter(filter.clone());
             }
@@ -8825,7 +8903,7 @@ impl Executor {
             while let Some(row_ref) = op.next()? {
                 let row = row_ref.into_owned();
                 if let Some(cross) = &cross {
-                    if !cross.matches_checked(&row)? {
+                    if !cross.matches_checked_with(&row, cross_blocks)? {
                         continue;
                     }
                 }
@@ -8887,10 +8965,11 @@ impl Executor {
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::join_next_chunk();
             if consistent {
-                let (more, _, bounded, token) = self.execute_table_expression_with_filter_limit(
+                let (more, _, bounded, token) = self.read_join_side(
                     &join_source.left,
                     &ctx_join,
-                    left_filter,
+                    left,
+                    None,
                     Some(next),
                     fetched,
                 )?;
@@ -8900,10 +8979,11 @@ impl Executor {
             }
             // Read committed: one row of overlap tells whether a commit moved the
             // boundary; if it did, restart on snapshot isolation
-            let (mut more, _, bounded, token) = self.execute_table_expression_with_filter_limit(
+            let (mut more, _, bounded, token) = self.read_join_side(
                 &join_source.left,
                 &ctx_join,
-                left_filter,
+                left,
+                None,
                 Some(next + 1),
                 fetched - 1,
             )?;
@@ -8925,13 +9005,8 @@ impl Executor {
             groups.clear();
             outer_limit = Some(fetched.saturating_add(next));
             fetched = 0;
-            let (restarted, _, bounded, token) = self.execute_table_expression_with_filter_limit(
-                &join_source.left,
-                &ctx_join,
-                left_filter,
-                outer_limit,
-                0,
-            )?;
+            let (restarted, _, bounded, token) =
+                self.read_join_side(&join_source.left, &ctx_join, left, None, outer_limit, 0)?;
             same_outer_source(&join_source.left, outer_token, token, bounded)?;
             outer_result = restarted;
         }
@@ -12589,15 +12664,17 @@ impl Executor {
     /// the join and its shape is the grouped operator's, no index join for
     /// the other shapes of that plan, else the streaming or batch index join,
     /// bounded when the executor pushes the limit. EXPLAIN asks this so it
-    /// reports the strategy execution would choose.
-    pub(crate) fn join_index_use(&self, stmt: &SelectStatement) -> JoinIndexUse {
+    /// reports the strategy execution would choose; `blocks` when the join
+    /// runs its subqueries as prepared blocks.
+    pub(crate) fn join_index_use(&self, stmt: &SelectStatement, blocks: bool) -> JoinIndexUse {
         let Some(Expression::JoinSource(join)) = stmt.table_expr.as_deref() else {
             return JoinIndexUse::None;
         };
         let classification = get_classification(stmt);
         let join_type = join.join_type.to_uppercase();
-        // A WHERE that reaches into the outer query keeps both operators out
-        if classification.where_has_correlated_subqueries {
+        // A WHERE that reaches into the outer query outside the blocks keeps
+        // both operators out
+        if classification.where_has_correlated_subqueries && !blocks {
             return JoinIndexUse::None;
         }
         let left_table = match join.left.as_ref() {
@@ -12632,7 +12709,10 @@ impl Executor {
                     (left_schema.as_deref(), right_schema.as_deref()),
                     &join_type,
                 );
-                (right.is_some(), Self::filter_has_subquery(where_clause))
+                (
+                    right.is_some(),
+                    !blocks && Self::filter_has_subquery(where_clause),
+                )
             }
             None => (false, false),
         };

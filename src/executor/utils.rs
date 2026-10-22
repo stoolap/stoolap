@@ -1388,6 +1388,19 @@ fn collect_table_qualifiers_impl(expr: &Expression, qualifiers: &mut FxHashSet<S
         Expression::QuantifiedSet(quantified) => {
             collect_table_qualifiers_impl(&quantified.left, qualifiers);
         }
+        Expression::AllAny(all_any) => {
+            collect_table_qualifiers_impl(&all_any.left, qualifiers);
+        }
+        Expression::ExpressionList(el) => {
+            for elem in &el.expressions {
+                collect_table_qualifiers_impl(elem, qualifiers);
+            }
+        }
+        Expression::List(list) => {
+            for elem in &list.elements {
+                collect_table_qualifiers_impl(elem, qualifiers);
+            }
+        }
         Expression::Between(between) => {
             collect_table_qualifiers_impl(&between.expr, qualifiers);
             collect_table_qualifiers_impl(&between.lower, qualifiers);
@@ -1489,6 +1502,19 @@ pub fn collect_unqualified_columns(expr: &Expression, columns: &mut FxHashSet<St
         }
         Expression::QuantifiedSet(quantified) => {
             collect_unqualified_columns(&quantified.left, columns);
+        }
+        Expression::AllAny(all_any) => {
+            collect_unqualified_columns(&all_any.left, columns);
+        }
+        Expression::ExpressionList(el) => {
+            for elem in &el.expressions {
+                collect_unqualified_columns(elem, columns);
+            }
+        }
+        Expression::List(list) => {
+            for elem in &list.elements {
+                collect_unqualified_columns(elem, columns);
+            }
         }
         Expression::Between(between) => {
             collect_unqualified_columns(&between.expr, columns);
