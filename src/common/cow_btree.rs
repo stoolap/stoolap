@@ -44,7 +44,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 ///
 /// CONSTRAINT: MAX_KEYS <= 255 because NodePath uses u8 for child indices.
 /// Internal nodes have MAX_KEYS + 1 children, so index can be at most MAX_KEYS.
-const MAX_KEYS: usize = 128;
+pub(crate) const MAX_KEYS: usize = 128;
 
 // Compile-time assertion: MAX_KEYS must fit in u8 (NodePath uses [u8; MAX_TREE_DEPTH])
 const _: () = assert!(
@@ -1846,6 +1846,66 @@ impl<'a, V: Clone> Iterator for CowBTreeChunkIter<'a, V> {
                 self.stack.pop();
             }
         }
+    }
+}
+
+/// The leaves of a tree in key order, walked by a cursor that holds the
+/// nodes it stands on: the leaves stay as they were when it was made,
+/// whatever the tree it came from becomes
+pub struct LeafCursor<V: Clone> {
+    /// The internal nodes above the leaf, each with its next child
+    stack: smallvec::SmallVec<[(NodePtr<V>, usize); 8]>,
+    leaf: Option<NodePtr<V>>,
+}
+
+impl<V: Clone> LeafCursor<V> {
+    fn new(root: Option<&NodePtr<V>>) -> Self {
+        let mut cursor = Self {
+            stack: smallvec::SmallVec::new(),
+            leaf: None,
+        };
+        if let Some(root) = root {
+            cursor.descend(root.clone());
+        }
+        cursor
+    }
+
+    fn descend(&mut self, mut node: NodePtr<V>) {
+        while !node.is_leaf() {
+            let child = node.child(0).clone();
+            self.stack.push((node, 1));
+            node = child;
+        }
+        self.leaf = Some(node);
+    }
+
+    /// The keys and values of the leaf the cursor stands on; None past
+    /// the last leaf
+    #[inline]
+    pub fn leaf(&self) -> Option<(&[i64], &[V])> {
+        self.leaf.as_ref().map(|leaf| (leaf.keys(), leaf.values()))
+    }
+
+    /// Moves to the next leaf: false past the last one
+    pub fn advance(&mut self) -> bool {
+        self.leaf = None;
+        while let Some((node, next)) = self.stack.last_mut() {
+            if *next <= node.len() {
+                let child = node.child(*next).clone();
+                *next += 1;
+                self.descend(child);
+                return true;
+            }
+            self.stack.pop();
+        }
+        false
+    }
+}
+
+impl<V: Clone> CowBTree<V> {
+    /// A cursor on the tree's first leaf
+    pub fn leaves(&self) -> LeafCursor<V> {
+        LeafCursor::new(self.root.as_ref())
     }
 }
 

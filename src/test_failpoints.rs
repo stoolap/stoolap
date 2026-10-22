@@ -2121,6 +2121,7 @@ thread_local! {
     static ROW_ID_ORDER_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TOP_K_COLD_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static HOT_TOP_K_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static HOT_SCAN_STEP_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ORDERED_VALUES_SORTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static INNER_TABLE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static MIN_MAX_INDEX_ANSWERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -2912,6 +2913,15 @@ pub(crate) fn hot_top_k_visited() {
     if let Some(hook) = hook {
         hook();
     }
+}
+
+/// Rows this thread's hot scans read in steps, so far
+pub fn hot_scan_step_rows() -> usize {
+    HOT_SCAN_STEP_ROWS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn hot_scan_stepped() {
+    HOT_SCAN_STEP_ROWS.with(|n| n.set(n.get() + 1));
 }
 
 /// Row groups whose needed columns this thread's volume scanners loaded

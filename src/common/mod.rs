@@ -33,7 +33,7 @@ pub mod version;
 // Re-export main types for convenience
 pub use compact_arc::{CompactArc, CompactArcDrop};
 pub use compact_vec::CompactVec;
-pub use cow_btree::CowBTree;
+pub use cow_btree::{CowBTree, LeafCursor};
 pub use i64_map::{I64Map, I64Set};
 pub use maps::{
     new_cow_btree_map, new_i64_map, new_i64_map_with_capacity, CowBTreeMap, StringMap, StringSet,

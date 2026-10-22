@@ -383,7 +383,7 @@ pub struct ConstBoolExpr {
 
 impl ConstBoolExpr {
     /// Create a new constant boolean expression
-    pub fn new(value: bool) -> Self {
+    pub const fn new(value: bool) -> Self {
         Self { value }
     }
 
