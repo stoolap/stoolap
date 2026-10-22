@@ -245,6 +245,9 @@ fn folded(name: &str) -> std::borrow::Cow<'_, str> {
 pub(crate) struct SelectShape {
     deferred: Option<DeferredProjection>,
     layout: Option<LaidOut>,
+    /// How many columns the statement shows, when a star leaves that unknown
+    /// and the ORDER BY keys follow them
+    visible: Option<usize>,
 }
 
 /// A layout the rows carry: built for this execution, or the one a
@@ -274,6 +277,7 @@ impl SelectShape {
         layout.map(|layout| Self {
             deferred: None,
             layout: Some(LaidOut::Built(layout)),
+            visible: None,
         })
     }
 }
@@ -291,6 +295,9 @@ type SelectResult = Result<SelectOutput>;
 /// An outer side fetched for a join: the result, its qualified columns,
 /// whether the limit and offset were applied, and the layout of a table
 type OuterFetch = (Box<dyn QueryResult>, Vec<String>, bool, Option<LayoutToken>);
+
+/// The layout a table's rows were read in and the schema they were read with
+type ReadSchema = (LayoutToken, CompactArc<Schema>);
 
 /// How a join reads one of its sides: its conditions as the WHERE gives
 /// them, and the statement's run with the side's number when the blocks
@@ -333,7 +340,7 @@ use super::operators::index_nested_loop::{
 use super::operators::BloomFilterOperator;
 use super::parallel::{self, ParallelConfig};
 use super::prepared_join::{BuiltPrograms, JoinProgramKey, PreparedJoin, WhereSite};
-use super::prepared_select::{JoinBlocks, OutOfFamily};
+use super::prepared_select::{names_any, JoinBlocks, OutOfFamily};
 use super::pushdown;
 use super::query_cache::CompiledExecution;
 use super::query_classification::{get_classification, QueryClassification};
@@ -690,6 +697,8 @@ pub(crate) struct JoinOutput {
     projection: OutputProjection,
     columns: CompactArc<Vec<String>>,
     layout: Option<CompactArc<OutputLayout>>,
+    /// The columns shown, when ORDER BY keys follow a star's
+    visible: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -697,6 +706,36 @@ enum OutputProjection {
     Select(SelectProjection),
     /// Keeps the ORDER BY and DISTINCT ON values the SELECT list leaves out
     Ordered(OrderedProjection),
+}
+
+impl JoinOutput {
+    /// This output with its member tests bound to the sets `run` read; None
+    /// when no program tests a block's members
+    fn bound_to(&self, run: &super::prepared_select::PreparedRunner<'_>) -> Option<JoinOutput> {
+        let OutputProjection::Ordered(OrderedProjection::Items(sources)) = &self.projection else {
+            return None;
+        };
+        let asks = |source: &Result<ItemSource>| matches!(source, Ok(ItemSource::Program(p)) if p.has_subqueries());
+        if !sources.iter().any(asks) {
+            return None;
+        }
+        let sources = sources
+            .iter()
+            .map(|source| match source {
+                Ok(ItemSource::Program(p)) => Ok(ItemSource::Program(
+                    run.bound_program(p).unwrap_or_else(|| CompactArc::clone(p)),
+                )),
+                Ok(ItemSource::Column(i)) => Ok(ItemSource::Column(*i)),
+                Err(e) => Err(e.clone()),
+            })
+            .collect();
+        Some(JoinOutput {
+            projection: OutputProjection::Ordered(OrderedProjection::Items(sources)),
+            columns: CompactArc::clone(&self.columns),
+            layout: self.layout.clone(),
+            visible: self.visible,
+        })
+    }
 }
 
 /// The columns of the row a statement runs for, which its programs read by name
@@ -1281,6 +1320,7 @@ impl Executor {
             let shape = SelectShape {
                 deferred: None,
                 layout: layout.map(LaidOut::Shared),
+                visible: None,
             };
             (result, columns, applied, Some(shape))
         } else {
@@ -1290,7 +1330,9 @@ impl Executor {
         let SelectShape {
             deferred: deferred_projection,
             layout,
+            visible,
         } = shape.unwrap_or_default();
+        let prepared_visible = prepared_visible.or(visible);
 
         // Apply set operations (UNION, INTERSECT, EXCEPT)
         // Pass limit+offset to enable early termination for UNION ALL
@@ -3027,7 +3069,7 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
-        token_out: Option<&mut Option<LayoutToken>>,
+        read_out: Option<&mut Option<ReadSchema>>,
     ) -> SelectResult {
         // OPTIMIZATION: Use pre-computed lowercase name to avoid allocation per query
         let table_name = &table_source.name.value_lower;
@@ -3127,9 +3169,9 @@ impl Executor {
         };
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::select_table_opened();
-        // The layout this handle's reads are checked against
-        if let Some(out) = token_out {
-            *out = Some(table.layout_token());
+        // The layout this handle's reads are checked against, and its schema
+        if let Some(out) = read_out {
+            *out = Some((table.layout_token(), table.schema_arc()));
         }
 
         // Build column list from schema: refcount bump, not a per-statement
@@ -4707,6 +4749,7 @@ impl Executor {
                     SelectShape {
                         deferred: Some((col_indices, output_names)),
                         layout: Some(LaidOut::Built(OutputLayout::of_shared_input(&all_columns))),
+                        visible: None,
                     },
                 )
             }
@@ -4863,10 +4906,11 @@ impl Executor {
         if let Some(on) = on.filter(|_| on_subqueries) {
             self.join_where_family(on, ctx)?;
         }
+        let output_subqueries = self.join_output_family(stmt, join_source, join_type, ctx)?;
         let Some(where_clause) = stmt.where_clause.as_deref() else {
-            return match on_subqueries {
+            return match on_subqueries || output_subqueries {
                 true => Ok(()),
-                false => Err("neither ON nor WHERE holds a subquery"),
+                false => Err("no ON, WHERE, SELECT list or ORDER BY holds a subquery"),
             };
         };
         let (left, right, cross) =
@@ -4883,7 +4927,7 @@ impl Executor {
             part.map(|part| Self::with_select_aliases(stmt, &part, &columns).unwrap_or(part))
         };
         let parts = [opened(left), opened(right), opened(cross)];
-        let mut subqueries = on_subqueries;
+        let mut subqueries = on_subqueries || output_subqueries;
         for part in parts.iter().flatten() {
             if Self::has_subqueries(part) {
                 self.join_where_family(part, ctx)?;
@@ -4892,8 +4936,62 @@ impl Executor {
         }
         match subqueries {
             true => Ok(()),
-            false => Err("neither ON nor WHERE holds a subquery"),
+            false => Err("no ON, WHERE, SELECT list or ORDER BY holds a subquery"),
         }
+    }
+
+    /// Whether the SELECT list or the ORDER BY of a join holds subqueries,
+    /// all of the forms the prepared blocks run over the joined rows, or
+    /// why the blocks cannot run them
+    fn join_output_family(
+        &self,
+        stmt: &SelectStatement,
+        join_source: &JoinTableSource,
+        join_type: &str,
+        ctx: Option<&ExecutionContext>,
+    ) -> std::result::Result<bool, OutOfFamily> {
+        let items = stmt
+            .columns
+            .iter()
+            .filter(|c| !matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)))
+            .map(unaliased_item);
+        let keys = stmt.order_by.iter().map(|ob| &ob.expression);
+        let mut found = false;
+        for expr in items.chain(keys) {
+            if Self::has_subqueries(expr) {
+                self.join_where_family(expr, ctx)?;
+                found = true;
+            }
+        }
+        if !found {
+            return Ok(false);
+        }
+        if join_type.contains("NATURAL") || !join_source.using_columns.is_empty() {
+            return Err("a NATURAL or USING join whose output holds a subquery");
+        }
+        let classification = get_classification(stmt);
+        if classification.has_aggregation
+            || classification.has_window_functions
+            || !stmt.group_by.columns.is_empty()
+            || stmt.having.is_some()
+        {
+            return Err("a grouped statement whose output holds a subquery");
+        }
+        let aliases: Vec<&str> = stmt
+            .columns
+            .iter()
+            .filter_map(|c| match c {
+                Expression::Aliased(a) => Some(a.alias.value_lower.as_str()),
+                _ => None,
+            })
+            .collect();
+        if stmt.order_by.iter().any(|ob| {
+            Self::has_subqueries(&ob.expression)
+                && names_any(&ob.expression, &|name| aliases.contains(&name))
+        }) {
+            return Err("an ORDER BY subquery that names a SELECT alias");
+        }
+        Ok(true)
     }
 
     /// The program of the WHERE `cross` a join asks at `site` of its joined
@@ -5004,10 +5102,22 @@ impl Executor {
                     right_schema,
                 ),
             ];
+            // The SELECT items and ORDER BY keys whose subqueries the blocks run
+            let select: Vec<Option<&Expression>> = stmt
+                .columns
+                .iter()
+                .map(|c| Some(unaliased_item(c)).filter(|e| Self::has_subqueries(e)))
+                .collect();
+            let keys: Vec<Option<&Expression>> = stmt
+                .order_by
+                .iter()
+                .map(|ob| Some(&ob.expression).filter(|e| Self::has_subqueries(e)))
+                .collect();
             self.prepare_join_blocks(
                 on,
                 opened.as_ref(),
                 [left_filter.as_ref(), right_filter.as_ref()],
+                [&select, &keys],
                 sides,
                 columns.len(),
                 ctx,
@@ -5048,20 +5158,26 @@ impl Executor {
         let plan = compiled
             .filter(|_| ctx.outer_row().is_none())
             .and_then(|slot| self.prepared_join(slot));
-        let blocks_where = (classification.where_has_subqueries || on_subqueries)
-            && plan.as_ref().is_some_and(|plan| {
-                plan.blocks_where(|| {
-                    self.join_blocks_family(
-                        stmt,
-                        join_source,
-                        &join_type,
-                        (left_alias.as_deref(), right_alias.as_deref()),
-                        (left_schema.as_deref(), right_schema.as_deref()),
-                        Some(ctx),
-                    )
-                    .is_ok()
-                })
-            });
+        let output_subqueries = stmt.columns.iter().any(Self::has_subqueries)
+            || stmt
+                .order_by
+                .iter()
+                .any(|ob| Self::has_subqueries(&ob.expression));
+        let blocks_where =
+            (classification.where_has_subqueries || on_subqueries || output_subqueries)
+                && plan.as_ref().is_some_and(|plan| {
+                    plan.blocks_where(|| {
+                        self.join_blocks_family(
+                            stmt,
+                            join_source,
+                            &join_type,
+                            (left_alias.as_deref(), right_alias.as_deref()),
+                            (left_schema.as_deref(), right_schema.as_deref()),
+                            Some(ctx),
+                        )
+                        .is_ok()
+                    })
+                });
         // Outside the blocks, an uncorrelated subquery in the ON clause is read
         // once, the way the WHERE clause reads one, so every path below
         // compares each pair against a value rather than against something it
@@ -5199,6 +5315,16 @@ impl Executor {
         let pair_blocks = pair_blocks
             .as_ref()
             .map(|site| site as &dyn SubqueryExecutor);
+        // The result a held output builds, its blocks told how many rows ask
+        // and its member tests bound to the sets the run read
+        let output_result = |output: &JoinOutput, rows: RowVec, applied: bool| {
+            let bound = blocks_run.as_ref().and_then(|run| {
+                run.ask_rows(Some(rows.len()));
+                output.bound_to(run)
+            });
+            let output = bound.as_ref().unwrap_or(output);
+            Self::join_output_result(output, rows, applied, ctx, where_blocks)
+        };
         // A WHERE that keeps no row joins no rows whatever the join type; the
         // sides run with no rows only to name their columns
         let never = where_for_join
@@ -5237,20 +5363,17 @@ impl Executor {
                 token: dummy_token("FALSE", TokenType::Keyword),
                 value: false,
             });
-            let (_, left_cols, _, _) = self.execute_table_expression_with_filter_limit(
-                &join_source.left,
-                ctx,
-                Some(&none),
-                Some(0),
-                0,
-            )?;
-            let (_, right_cols, _, _) = self.execute_table_expression_with_filter_limit(
-                &join_source.right,
-                ctx,
-                Some(&none),
-                Some(0),
-                0,
-            )?;
+            // Each read as the blocks check it, without the side's own filter
+            let columns_of = |expr: &Expression, side: SideRead<'_>| {
+                let side = SideRead {
+                    filter: None,
+                    ..side
+                };
+                self.read_join_side(expr, ctx, side, Some(&none), Some(0), 0)
+                    .map(|(_, columns, _, _)| columns)
+            };
+            let left_cols = columns_of(&join_source.left, left_read)?;
+            let right_cols = columns_of(&join_source.right, right_read)?;
             if let Some(where_clause) = &where_for_join {
                 let joined: Vec<String> = left_cols.iter().chain(&right_cols).cloned().collect();
                 Self::bind_empty_where(stmt, where_clause, &joined)?;
@@ -5642,6 +5765,10 @@ impl Executor {
                     };
                     let inner_token = inner_table.layout_token();
                     let inner_schema = inner_table.schema();
+                    if let Some(run) = statement_run {
+                        run.blocks
+                            .side_fits(usize::from(!swapped), &inner_table.schema_arc())?;
+                    }
                     // The WHERE's conditions on the inner table, fetched through
                     // when its scan takes them whole, else asked with the residual
                     let inner_taken = match statement_run {
@@ -6162,6 +6289,7 @@ impl Executor {
                             stmt,
                             &all_columns,
                             order_limit_applied,
+                            blocks.as_deref(),
                             ctx,
                         )?
                     };
@@ -6175,12 +6303,7 @@ impl Executor {
                             None,
                         );
                     } else if let Some(output) = held.as_deref().and_then(Option::as_ref) {
-                        return Self::join_output_result(
-                            output,
-                            final_rows,
-                            order_limit_applied,
-                            ctx,
-                        );
+                        return output_result(output, final_rows, order_limit_applied);
                     } else if let Some(proj) = projection_pushdown {
                         // Projection was pushed down - rows are already projected
                         let output_columns = CompactArc::new(proj.output_columns);
@@ -6505,10 +6628,16 @@ impl Executor {
                     #[cfg(any(test, feature = "test-failpoints"))]
                     crate::test_failpoints::streaming_join_streamed();
                     let join_result = join_executor.execute_streaming(streaming_request)?;
-                    let held =
-                        self.held_join_output(prepared.as_deref(), stmt, &all_cols, false, ctx)?;
+                    let held = self.held_join_output(
+                        prepared.as_deref(),
+                        stmt,
+                        &all_cols,
+                        false,
+                        blocks.as_deref(),
+                        ctx,
+                    )?;
                     if let Some(output) = held.as_deref().and_then(Option::as_ref) {
-                        return Self::join_output_result(output, join_result.rows, false, ctx);
+                        return output_result(output, join_result.rows, false);
                     }
 
                     // Project and return results
@@ -6839,9 +6968,16 @@ impl Executor {
             );
         }
 
-        let held = self.held_join_output(prepared.as_deref(), stmt, &final_columns, false, ctx)?;
+        let held = self.held_join_output(
+            prepared.as_deref(),
+            stmt,
+            &final_columns,
+            false,
+            blocks.as_deref(),
+            ctx,
+        )?;
         if let Some(output) = held.as_deref().and_then(Option::as_ref) {
-            return Self::join_output_result(output, final_rows, false, ctx);
+            return output_result(output, final_rows, false);
         }
 
         // Check if ORDER BY or DISTINCT ON references columns not in SELECT
@@ -7909,6 +8045,7 @@ impl Executor {
         expr: &Expression,
         ctx: &ExecutionContext,
         filter: Option<&Expression>,
+        read_out: Option<&mut Option<ReadSchema>>,
     ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
         match expr {
             Expression::TableSource(ts) => {
@@ -8026,8 +8163,13 @@ impl Executor {
                 };
                 // Get classification for the synthetic SELECT statement
                 let classification = get_classification(&select_all);
-                let (result, columns, _, _) =
-                    self.execute_simple_table_scan(ts, &select_all, ctx, &classification, None)?;
+                let (result, columns, _, _) = self.execute_simple_table_scan(
+                    ts,
+                    &select_all,
+                    ctx,
+                    &classification,
+                    read_out,
+                )?;
 
                 // Prefix column names with table alias (or table name if no alias)
                 // This is needed for proper qualified identifier resolution in JOINs
@@ -8182,9 +8324,25 @@ impl Executor {
             }
             (filter, extra) => filter.or(extra),
         };
-        self.execute_table_expression_with_filter_limit(expr, ctx, filter, limit, offset)
+        #[cfg(feature = "test-failpoints")]
+        if side.run.is_some() {
+            crate::test_failpoints::join_side_opening();
+        }
+        let mut read = None;
+        let read_out = side.run.is_some().then_some(&mut read);
+        let fetched = self.execute_table_expression_with_filter_limit(
+            expr, ctx, filter, limit, offset, read_out,
+        )?;
+        if let Some((run, index)) = side.run {
+            let (_, schema) =
+                read.ok_or_else(|| Error::internal("a join side read without its schema"))?;
+            run.blocks.side_fits(index, &schema)?;
+        }
+        Ok(fetched)
     }
 
+    /// `read_out` takes the layout and schema a plain table's rows were read
+    /// with
     pub(crate) fn execute_table_expression_with_filter_limit(
         &self,
         expr: &Expression,
@@ -8192,6 +8350,7 @@ impl Executor {
         filter: Option<&Expression>,
         row_limit: Option<usize>,
         row_offset: usize,
+        read_out: Option<&mut Option<ReadSchema>>,
     ) -> Result<OuterFetch> {
         // Handle FunctionTableSource with limit passthrough
         let tvf_source = match expr {
@@ -8219,14 +8378,14 @@ impl Executor {
                 } else {
                     // Not a table source, fall back to standard execution
                     return self
-                        .execute_table_expression_with_filter(expr, ctx, filter)
+                        .execute_table_expression_with_filter(expr, ctx, filter, None)
                         .map(|(result, columns)| (result, columns, false, None));
                 }
             }
             _ => {
                 // Not a table source, fall back to standard execution
                 return self
-                    .execute_table_expression_with_filter(expr, ctx, filter)
+                    .execute_table_expression_with_filter(expr, ctx, filter, None)
                     .map(|(result, columns)| (result, columns, false, None));
             }
         };
@@ -8238,14 +8397,14 @@ impl Executor {
             // Skip if this is a CTE reference - CTEs are already materialized
             if ctx.get_cte_by_lower(table_name).is_some() {
                 return self
-                    .execute_table_expression_with_filter(expr, ctx, filter)
+                    .execute_table_expression_with_filter(expr, ctx, filter, None)
                     .map(|(result, columns)| (result, columns, false, None));
             }
 
             // Skip if this is a view
             if self.engine.get_view_lowercase(table_name)?.is_some() {
                 return self
-                    .execute_table_expression_with_filter(expr, ctx, filter)
+                    .execute_table_expression_with_filter(expr, ctx, filter, None)
                     .map(|(result, columns)| (result, columns, false, None));
             }
 
@@ -8288,14 +8447,18 @@ impl Executor {
             // The scan says whether it applied the synthetic LIMIT and OFFSET. A
             // path that did not may still have stopped early at their sum, so
             // the pair is applied here, as the select layer would
-            let mut token = None;
+            let mut opened = None;
             let (result, columns, applied, _) = self.execute_simple_table_scan(
                 ts,
                 &select_all,
                 ctx,
                 &classification,
-                Some(&mut token),
+                Some(&mut opened),
             )?;
+            let token = opened.as_ref().map(|(token, _)| *token);
+            if let Some(out) = read_out {
+                *out = opened;
+            }
             let result: Box<dyn QueryResult> = if applied {
                 result
             } else {
@@ -8320,7 +8483,7 @@ impl Executor {
         }
 
         // Fall back to standard execution for other cases
-        self.execute_table_expression_with_filter(expr, ctx, filter)
+        self.execute_table_expression_with_filter(expr, ctx, filter, read_out)
             .map(|(result, columns)| (result, columns, false, None))
     }
 
@@ -8646,6 +8809,9 @@ impl Executor {
         else {
             return Ok(None);
         };
+        if let Some(run) = run {
+            run.blocks.side_fits(1, &inner_table.schema_arc())?;
+        }
         let inner_token = inner_table.layout_token();
         let inner_alias = right_alias.unwrap_or(&table_name);
         let inner_cols: Vec<String> = inner_table
@@ -10255,7 +10421,7 @@ impl Executor {
             table_alias,
             ctx,
         );
-        let projected = Self::run_ordered_projection(&plan, rows, ctx)?;
+        let projected = Self::run_ordered_projection(&plan, rows, ctx, None)?;
         Ok((projected, extra_names, layout))
     }
 
@@ -10280,7 +10446,7 @@ impl Executor {
             computed_distinct_on,
             extra_names,
             extra_sources,
-        } = self.order_by_projection(select_exprs, order_by, distinct_on, all_columns);
+        } = self.order_by_projection(select_exprs, order_by, distinct_on, all_columns, false);
         let mut layout = Self::shared_select_layout(
             select_exprs,
             CompactArc::clone(shared_columns),
@@ -10337,20 +10503,35 @@ impl Executor {
     }
 
     /// The output `stmt` builds from joined rows of `all_columns`, ordered
-    /// already when `sorted`; none for a SELECT list holding a subquery,
-    /// whose values each execution finds again
+    /// already when `sorted`, its subqueries run by the statement's
+    /// `blocks`; none for a SELECT list holding a subquery the blocks do
+    /// not run, whose values each execution finds again
     fn join_output(
         &self,
         stmt: &SelectStatement,
         all_columns: &[String],
         sorted: bool,
+        blocks: Option<&JoinBlocks>,
         ctx: &ExecutionContext,
     ) -> Result<Option<JoinOutput>> {
-        if stmt.columns.iter().any(Self::has_subqueries)
-            || self
-                .try_process_select_subqueries(&stmt.columns, ctx)?
-                .is_some()
-        {
+        let runs_output = |blocks: &&JoinBlocks| {
+            blocks
+                .select
+                .iter()
+                .chain(&blocks.order_by)
+                .any(Option::is_some)
+        };
+        if let Some(blocks) = blocks.filter(runs_output) {
+            debug_assert_eq!(
+                blocks.all.len(),
+                all_columns.len(),
+                "joined rows of {all_columns:?} for blocks over another layout"
+            );
+            return self
+                .blocks_output(stmt, all_columns, sorted, blocks)
+                .map(Some);
+        }
+        if stmt.columns.iter().any(Self::has_subqueries) {
             return Ok(None);
         }
         let mut columns = self.get_output_column_names(&stmt.columns, all_columns, None);
@@ -10368,6 +10549,7 @@ impl Executor {
                 projection: OutputProjection::Ordered(plan),
                 columns: CompactArc::new(columns),
                 layout: Some(CompactArc::new(layout)),
+                visible: None,
             }));
         }
         let plan = self.select_projection(&stmt.columns, all_columns, None, None)?;
@@ -10375,44 +10557,138 @@ impl Executor {
             projection: OutputProjection::Select(plan),
             columns: CompactArc::new(columns),
             layout: Self::output_layout(stmt, all_columns, None).map(CompactArc::new),
+            visible: None,
         }))
     }
 
+    /// The output of a join whose SELECT list or ORDER BY holds subqueries
+    /// the statement's `blocks` run: each item and each key that holds one
+    /// compiled as the blocks rewrote it, each key a column of its own
+    fn blocks_output(
+        &self,
+        stmt: &SelectStatement,
+        all_columns: &[String],
+        sorted: bool,
+        blocks: &JoinBlocks,
+    ) -> Result<JoinOutput> {
+        let registry = &self.function_registry;
+        let plain = CompileContext::new(all_columns, registry);
+        let compile = |rewritten: Option<&Expression>, expr: &Expression| {
+            match rewritten {
+                Some(rewritten) => blocks.compile(rewritten, false, registry),
+                None => ExprCompiler::new(&plain)
+                    .compile(expr)
+                    .map(CompactArc::new)
+                    .map_err(|e| Error::internal(format!("Compile error: {}", e))),
+            }
+            .map(ItemSource::Program)
+        };
+        let index_map = build_column_index_map(all_columns);
+        let mut sources: Vec<Result<ItemSource>> = Vec::with_capacity(stmt.columns.len());
+        for (item, rewritten) in stmt.columns.iter().zip(&blocks.select) {
+            match item {
+                Expression::Star(_) => {
+                    sources.extend((0..all_columns.len()).map(|i| Ok(ItemSource::Column(i))))
+                }
+                Expression::QualifiedStar(star) => {
+                    for_each_qualified_star_column(all_columns, &star.qualifier, None, |i, _| {
+                        sources.push(Ok(ItemSource::Column(i)))
+                    })
+                }
+                _ => sources.push(match (rewritten, select_column(item, &index_map)) {
+                    (None, Some(index)) => index.map(ItemSource::Column),
+                    (rewritten, _) => compile(rewritten.as_ref(), unaliased_item(item)),
+                }),
+            }
+        }
+        let mut columns = self.get_output_column_names(&stmt.columns, all_columns, None);
+        let keys_hold_subqueries = blocks.order_by.iter().any(Option::is_some);
+        if sorted || !(keys_hold_subqueries || self.order_by_needs_extra_columns(stmt, all_columns))
+        {
+            return Ok(JoinOutput {
+                projection: OutputProjection::Ordered(OrderedProjection::Items(sources)),
+                columns: CompactArc::new(columns),
+                layout: Self::output_layout(stmt, all_columns, None).map(CompactArc::new),
+                visible: None,
+            });
+        }
+        let visible = columns.len();
+        let plan = self.order_by_projection(
+            &stmt.columns,
+            &stmt.order_by,
+            &stmt.distinct_on,
+            all_columns,
+            true,
+        );
+        sources.extend(
+            plan.extra_order_indices
+                .iter()
+                .map(|&i| Ok(ItemSource::Column(i))),
+        );
+        for key in &plan.computed_order_by {
+            let at = stmt
+                .order_by
+                .iter()
+                .position(|ob| std::ptr::eq(&ob.expression, *key));
+            let rewritten = at.and_then(|at| blocks.order_by[at].as_ref());
+            sources.push(compile(rewritten, key));
+        }
+        for expr in &plan.computed_distinct_on {
+            sources.push(compile(None, expr));
+        }
+        let mut layout =
+            Self::shared_select_layout(&stmt.columns, CompactArc::new(all_columns.to_vec()), None);
+        layout.sources.extend(plan.extra_sources);
+        columns.extend(plan.extra_names);
+        Ok(JoinOutput {
+            projection: OutputProjection::Ordered(OrderedProjection::Items(sources)),
+            columns: CompactArc::new(columns),
+            layout: Some(CompactArc::new(layout)),
+            visible: Some(visible),
+        })
+    }
+
     /// The output the statement's plan holds for joined rows of
-    /// `all_columns`; none without a plan
+    /// `all_columns`, its subqueries run by `blocks`; none without a plan
     fn held_join_output(
         &self,
         prepared: Option<&PreparedJoin>,
         stmt: &SelectStatement,
         all_columns: &[String],
         sorted: bool,
+        blocks: Option<&JoinBlocks>,
         ctx: &ExecutionContext,
     ) -> Result<Option<Arc<Option<JoinOutput>>>> {
         prepared
             .map(|prepared| {
                 prepared.output(all_columns, sorted, || {
-                    self.join_output(stmt, all_columns, sorted, ctx)
+                    self.join_output(stmt, all_columns, sorted, blocks, ctx)
                 })
             })
             .transpose()
     }
 
-    /// The result `output` builds from joined rows; `applied` when the join
-    /// applied the LIMIT and OFFSET
+    /// The result `output` builds from joined rows, its subqueries answered
+    /// by the statement's `blocks`; `applied` when the join applied the
+    /// LIMIT and OFFSET
     fn join_output_result(
         output: &JoinOutput,
         rows: RowVec,
         applied: bool,
         ctx: &ExecutionContext,
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> SelectResult {
         let rows = match &output.projection {
             OutputProjection::Select(plan) => Self::run_select_projection(plan, rows, ctx)?,
-            OutputProjection::Ordered(plan) => Self::run_ordered_projection(plan, rows, ctx)?,
+            OutputProjection::Ordered(plan) => {
+                Self::run_ordered_projection(plan, rows, ctx, blocks)?
+            }
         };
         let result = ExecutorResult::with_arc_columns(CompactArc::clone(&output.columns), rows);
         let shape = output.layout.as_ref().map(|layout| SelectShape {
             deferred: None,
             layout: Some(LaidOut::Shared(CompactArc::clone(layout))),
+            visible: output.visible,
         });
         Ok((
             Box::new(result),
@@ -10422,12 +10698,15 @@ impl Executor {
         ))
     }
 
-    /// The rows `plan` projects, each with its position as its id
+    /// The rows `plan` projects, each with its position as its id, its
+    /// subqueries answered by the statement's `blocks`
     fn run_ordered_projection(
         plan: &OrderedProjection,
         mut rows: RowVec,
         ctx: &ExecutionContext,
+        blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<RowVec> {
+        let params = blocks.and_then(|b| b.params()).unwrap_or(ctx.params());
         let mut projected = RowVec::with_capacity(rows.len());
         match plan {
             OrderedProjection::Columns { select, extra } => {
@@ -10446,9 +10725,16 @@ impl Executor {
                     crate::test_failpoints::GeneralPath::ProjectionEvaluator,
                 );
                 let mut vm = ExprVM::new();
+                let (transaction_id, outer) = (ctx.transaction_id(), ctx.outer_row());
                 for (row_id, row) in rows.drain_rows().enumerate() {
-                    let exec = super::expression::execute_context(&row, Some(ctx));
-                    let mut values = Vec::with_capacity(sources.len());
+                    let mut exec = ExecuteContext::with_common_params(&row, params, transaction_id);
+                    if let Some(outer) = outer {
+                        exec = exec.with_outer_row(outer);
+                    }
+                    if let Some(blocks) = blocks {
+                        exec = exec.with_subquery_executor(blocks);
+                    }
+                    let mut values: CompactVec<Value> = CompactVec::with_capacity(sources.len());
                     for source in sources {
                         values.push(match source {
                             Ok(ItemSource::Column(idx)) => {
@@ -10458,7 +10744,7 @@ impl Executor {
                             Err(e) => return Err(e.clone()),
                         });
                     }
-                    projected.push((row_id as i64, Row::from_values(values)));
+                    projected.push((row_id as i64, Row::from_compact_vec(values)));
                 }
             }
         }
@@ -10466,13 +10752,15 @@ impl Executor {
     }
 
     /// Which columns an ORDER BY or DISTINCT ON projection reads by index,
-    /// which it computes, and the names of what it appends after the SELECT
+    /// which it computes, and the names of what it appends after the SELECT;
+    /// a key holding a subquery is computed too with `computes_subqueries`
     pub(super) fn order_by_projection<'e>(
         &self,
         select_exprs: &'e [Expression],
         order_by: &'e [crate::parser::ast::OrderByExpression],
         distinct_on: &'e [Expression],
         all_columns: &[String],
+        computes_subqueries: bool,
     ) -> OrderByProjection<'e> {
         // Build column index map ONCE with FxHashMap for O(1) lookup
         let col_index_map_lower = build_column_index_map(all_columns);
@@ -10558,12 +10846,15 @@ impl Executor {
                     if !matches!(
                         other,
                         Expression::Identifier(_) | Expression::QualifiedIdentifier(_)
-                    ) && !Self::has_subqueries(other)
-                        && !Self::reads_a_select_alias(
+                    ) && match Self::has_subqueries(other) {
+                        // The blocks' family keeps out a key naming an alias
+                        true => computes_subqueries,
+                        false => !Self::reads_a_select_alias(
                             other,
                             &select_aliases,
                             &col_index_map_lower,
-                        ) =>
+                        ),
+                    } =>
                 {
                     let name = other.to_string();
                     if !select_column_names
@@ -10593,9 +10884,10 @@ impl Executor {
 
         // A correlated subquery in ORDER BY reads the parent row, so every
         // column rides along until the sort has run
-        if order_by
-            .iter()
-            .any(|ob| Self::has_correlated_subqueries(&ob.expression))
+        if !computes_subqueries
+            && order_by
+                .iter()
+                .any(|ob| Self::has_correlated_subqueries(&ob.expression))
         {
             for idx in 0..all_columns.len() {
                 if !extra_order_indices.contains(&idx) {

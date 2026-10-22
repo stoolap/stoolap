@@ -1134,7 +1134,7 @@ fn with_aliases<'e>(
 }
 
 /// Whether a bare name outside any subquery of `expr` passes `matches`
-fn names_any(expr: &Expression, matches: &impl Fn(&str) -> bool) -> bool {
+pub(super) fn names_any(expr: &Expression, matches: &impl Fn(&str) -> bool) -> bool {
     match expr {
         Expression::Identifier(id) => matches(&id.value_lower),
         other => {
@@ -1904,6 +1904,36 @@ impl Builder<'_> {
     fn note_param(&mut self, expr: &Expression) {
         if let Expression::Parameter(p) = expr {
             self.max_param = self.max_param.max(p.index);
+        }
+    }
+
+    /// `expr`, rewritten for the statement's row, with each uncorrelated
+    /// block it reads for a value or an existence test a run slot
+    fn slotted(
+        &mut self,
+        expr: &Expression,
+        run_slots: &mut Vec<(usize, Expression)>,
+    ) -> Result<Expression> {
+        let block = match expr {
+            Expression::ScalarSubquery(sq) => sq.subquery.prepared,
+            Expression::Exists(exists) => exists.subquery.prepared,
+            _ => None,
+        };
+        let once = block
+            .and_then(|id| self.subqueries.get(usize::from(id))?.as_ref())
+            .is_some_and(|sq| {
+                sq.uncorrelated
+                    && sq.parent.is_none()
+                    && matches!(sq.answer, Answer::Value(..) | Answer::Exists(_))
+            });
+        match (block, once) {
+            (Some(_), true) => {
+                let slot = self.slot();
+                run_slots.push((slot, expr.clone()));
+                Ok(slot_parameter(slot))
+            }
+            (Some(_), false) => Ok(expr.clone()),
+            (None, _) => rebuild(expr, &mut |child| self.slotted(child, run_slots)),
         }
     }
 
@@ -2752,7 +2782,7 @@ impl PreparedProjection {
         for ob in &stmt.order_by {
             check_names(chain, &ob.expression, &aliases)?;
         }
-        let plan = executor.order_by_projection(&select_exprs, &stmt.order_by, &[], columns);
+        let plan = executor.order_by_projection(&select_exprs, &stmt.order_by, &[], columns, false);
         let registry = &executor.function_registry;
         let ctx = std::cell::OnceCell::new();
         let compile = |expr: &Expression| {
@@ -3305,34 +3335,53 @@ pub(crate) struct JoinBlocks {
     pub(crate) sides: [Option<Expression>; 2],
     /// The same conditions as their side's scan reads them
     side_wheres: [Option<PreparedWhere>; 2],
-    /// The columns of each side the conditions above were prepared over
+    /// The columns of each side the clauses were prepared over
     side_columns: [Vec<SchemaColumn>; 2],
+    /// The schema each side was found to hold those columns with; held, any
+    /// change to the table's schema replaces it, so the same one skips the check
+    fitted: [std::sync::OnceLock<CompactArc<Schema>>; 2],
+    /// Each SELECT item and ORDER BY key holding a subquery, over the joined row
+    pub(crate) select: Vec<Option<Expression>>,
+    pub(crate) order_by: Vec<Option<Expression>>,
+    /// The uncorrelated member blocks those read, read before the join
+    /// reads a row; a value block they read is a run slot
+    ahead: Vec<u16>,
     /// The scope's names for the left side's columns, then the right side's
     pub(crate) left: Vec<String>,
     pub(crate) right: Vec<String>,
-    all: CompactArc<Vec<String>>,
+    pub(crate) all: CompactArc<Vec<String>>,
 }
 
 impl JoinBlocks {
-    /// SchemaChanged when `table`, opened for side `side`, no longer holds
-    /// the columns that side's conditions were prepared over
-    fn side_fits(&self, side: usize, table: &dyn Table) -> Result<()> {
-        if table.schema().columns == self.side_columns[side] {
+    /// SchemaChanged when `schema`, which side `side` was read with, does not
+    /// hold the columns the clauses were prepared over
+    pub(crate) fn side_fits(&self, side: usize, schema: &CompactArc<Schema>) -> Result<()> {
+        if self.fitted[side]
+            .get()
+            .is_some_and(|fitted| CompactArc::ptr_eq(fitted, schema))
+        {
+            return Ok(());
+        }
+        if schema.columns == self.side_columns[side] {
+            let _ = self.fitted[side].set(CompactArc::clone(schema));
             return Ok(());
         }
         Err(Error::SchemaChanged {
-            table: table.name().to_string(),
+            table: schema.table_name.clone(),
         })
     }
 
-    /// `on`, `cross` and the conditions on one side, `side_filters`, over the
+    /// `on`, `cross`, the conditions on one side, `side_filters`, and the
+    /// SELECT items and ORDER BY keys holding a subquery, `output`, over the
     /// joined row of `sides`, each a name and its table's schema; None when
     /// the join's `width` columns do not line up
+    #[allow(clippy::too_many_arguments)]
     fn prepare(
         executor: &Executor,
         on: Option<&Expression>,
         cross: Option<&Expression>,
         side_filters: [Option<&Expression>; 2],
+        output: [&[Option<&Expression>]; 2],
         sides: [(SmartString, &Schema); 2],
         width: usize,
         param_count: usize,
@@ -3356,10 +3405,28 @@ impl JoinBlocks {
         };
         let on = rewrite(on)?;
         let cross = rewrite(cross)?;
+        // An uncorrelated value the output reads is a run slot, read once
+        // before the join reads a row
+        let mut run_slots = Vec::new();
+        let first_output_block = builder.subqueries.len();
+        let [select, order_by] = output.map(|exprs| {
+            exprs
+                .iter()
+                .map(|expr| {
+                    expr.map(|expr| {
+                        let rewritten =
+                            builder.rewrite(&chain, None, expr, &mut Rewritten::default())?;
+                        builder.slotted(&rewritten, &mut run_slots)
+                    })
+                    .transpose()
+                })
+                .collect::<Result<Vec<_>>>()
+        });
+        let (select, order_by) = (select?, order_by?);
+        let output_blocks = first_output_block..builder.subqueries.len();
         // Each side's conditions as its own scan reads them, a value a column
         // is compared with a run slot; the joined row reads the same blocks
         let registry = &executor.function_registry;
-        let mut run_slots = Vec::new();
         let mut side_parts = [None, None];
         for (i, filter) in side_filters.into_iter().enumerate() {
             let Some(filter) = filter else {
@@ -3394,13 +3461,19 @@ impl JoinBlocks {
             .map(|(slot, value)| compile_with(&values, value).map(|p| (*slot, p)))
             .collect::<Result<Vec<_>>>()?;
         let (blocks, joined) = builder.finish(param_count, run_slots)?;
+        let ahead = output_blocks
+            .filter(|&id| {
+                let sq = &blocks.subqueries[id];
+                sq.uncorrelated && sq.parent.is_none() && matches!(sq.answer, Answer::Members(..))
+            })
+            .map(|id| u16::try_from(id).map_err(|_| Error::internal("too many subqueries")))
+            .collect::<Result<Vec<_>>>()?;
         let mut side_filters = [None, None];
         let mut side_wheres = [None, None];
-        let mut side_columns = [Vec::new(), Vec::new()];
+        let side_columns = [sides[0].1.columns.clone(), sides[1].1.columns.clone()];
         for (i, part) in side_parts.into_iter().enumerate() {
             if let Some((parts, program, joined_clause)) = part {
                 side_wheres[i] = Some(parts.prepare(program, &blocks));
-                side_columns[i] = sides[i].1.columns.clone();
                 side_filters[i] = Some(joined_clause);
             }
         }
@@ -3444,6 +3517,10 @@ impl JoinBlocks {
             sides: side_filters,
             side_wheres,
             side_columns,
+            fitted: Default::default(),
+            select,
+            order_by,
+            ahead,
             left,
             right,
             all: CompactArc::clone(&scope.columns),
@@ -3492,13 +3569,16 @@ impl Executor {
         family.catalog()
     }
 
-    /// A join statement's `on` and `cross`, over the joined rows of `sides`
-    /// laid out as `width` columns, with their subqueries prepared as blocks
+    /// A join statement's `on`, `cross` and `output`, over the joined rows of
+    /// `sides` laid out as `width` columns, with their subqueries prepared
+    /// as blocks
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_join_blocks(
         &self,
         on: Option<&Expression>,
         cross: Option<&Expression>,
         side_filters: [Option<&Expression>; 2],
+        output: [&[Option<&Expression>]; 2],
         sides: [(SmartString, &Schema); 2],
         width: usize,
         ctx: &ExecutionContext,
@@ -3508,6 +3588,7 @@ impl Executor {
             on,
             cross,
             side_filters,
+            output,
             sides,
             width,
             ctx.params().len(),
@@ -3532,6 +3613,7 @@ impl Executor {
         for (slot, value) in runner.run_slot_values()? {
             runner.base[slot] = value;
         }
+        runner.read_ahead(&held.ahead, holes)?;
         Ok(Some(runner))
     }
 
@@ -3555,7 +3637,6 @@ impl Executor {
         else {
             return Ok(None);
         };
-        held.side_fits(side, table)?;
         Ok(
             match run.where_scan(where_, None, where_.narrowing_set, table, ctx)? {
                 None => Some(Some(Box::new(ConstBoolExpr::new(false)))),
@@ -3588,7 +3669,7 @@ impl Executor {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::join_side_opening();
         let table = self.prepared_table(name, ctx, None)?;
-        held.side_fits(side, &*table)?;
+        held.side_fits(side, &table.schema_arc())?;
         let token = table.layout_token();
         let columns = table.schema().column_names_arc();
         let extra = extra.map(|extra| strip_table_qualifier(extra, alias));
@@ -4581,6 +4662,17 @@ impl<'a> PreparedRunner<'a> {
             ctx: inner_ctx,
             tables,
         }
+    }
+
+    /// Read the members of each uncorrelated block of `ids` now, which keeps
+    /// them for every row that asks later
+    fn read_ahead(&self, ids: &[u16], holes: &HoleSet) -> Result<()> {
+        let empty = Row::new();
+        let caller = ExecuteContext::with_common_params(&empty, &self.base, self.transaction_id);
+        for &id in ids {
+            self.members_answer(usize::from(id), &Value::null_unknown(), &caller, holes)?;
+        }
+        Ok(())
     }
 
     /// The statement's run slots, each computed once over no row
@@ -5769,7 +5861,7 @@ impl PreparedRunner<'_> {
     /// it answers without the run as a test over a literal set does; None
     /// when it asks another block, a read fails or a candidate failed,
     /// whose error stays with the row that needs it
-    fn bound_program(&self, program: &SharedProgram) -> Option<SharedProgram> {
+    pub(crate) fn bound_program(&self, program: &SharedProgram) -> Option<SharedProgram> {
         if !program.has_subqueries() {
             return Some(CompactArc::clone(program));
         }
@@ -5805,9 +5897,7 @@ impl PreparedRunner<'_> {
                 MemberSet::Quantified(set) => Op::QuantifiedSet(CompactArc::new(set.clone())),
             });
         }
-        Some(CompactArc::new(
-            super::expression::Program::new_unoptimized(ops),
-        ))
+        Some(CompactArc::new(super::expression::Program::new(ops)))
     }
 
     /// `read` of block `index`'s set, or the error a read of it raised
