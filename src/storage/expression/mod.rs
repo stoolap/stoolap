@@ -246,10 +246,10 @@ pub fn passes(expr: &dyn Expression, fallible: bool, row: &Row) -> Result<bool> 
 /// OPTIMIZATION: Uses Schema's cached column index map for O(1) lookup
 pub(crate) fn find_column_index(schema: &Schema, column: &str) -> Option<usize> {
     // Use cached lowercase column index map from Schema for O(1) lookup
-    // The map uses lowercase keys, so we need to lowercase the input
-    schema
-        .column_index_map()
-        .get(&column.to_lowercase())
+    // The map uses lowercase keys: a name already lowercase needs no copy
+    let map = schema.column_index_map();
+    map.get(column)
+        .or_else(|| map.get(&column.to_lowercase()))
         .copied()
 }
 

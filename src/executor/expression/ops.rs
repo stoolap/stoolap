@@ -551,6 +551,12 @@ impl QuantifiedMembers {
         }
     }
 
+    /// The comparison, whether it is ALL, the members without NULL, and
+    /// whether the subquery yielded a NULL
+    pub fn parts(&self) -> (CompareOp, bool, &[Value], bool) {
+        (self.op, self.all, &self.members, self.has_null)
+    }
+
     /// The member a numeric value is compared with in place of every
     /// member, when one exists: see the field of that name
     pub fn bound(op: CompareOp, all: bool, members: &[Value]) -> Option<Value> {
