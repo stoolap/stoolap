@@ -1798,8 +1798,10 @@ impl Executor {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::dml_table_opened();
 
-        // Use cached metadata or compile fresh
+        // Use cached metadata or compile fresh; a rename since the plan was
+        // read keeps the token but not the epoch
         let token = table.layout_token();
+        let opened_epoch = self.engine.schema_epoch();
         let (
             column_indices,
             column_types,
@@ -1808,7 +1810,9 @@ impl Executor {
             default_programs,
             default_row_template,
             compiled_checks,
-        ) = if let Some(cached) = cached_insert.filter(|cached| cached.token == token) {
+        ) = if let Some(cached) = cached_insert
+            .filter(|cached| cached.token == token && cached.cached_epoch == opened_epoch)
+        {
             // Use cached values (Arc clone is cheap)
             (
                 cached.column_indices,
