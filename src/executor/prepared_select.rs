@@ -583,6 +583,18 @@ impl ScopeTable {
         (&self.tables[at].0, self.tables[at].1..end)
     }
 
+    /// An error when a column in `rest` of one table is also named `name`:
+    /// a derived table may repeat a name, and a reference to it is ambiguous
+    fn unique(&self, mut rest: std::ops::Range<usize>, name: &str, spelled: &str) -> Result<()> {
+        match rest.any(|i| self.lower[i] == name) {
+            true => Err(Error::invalid_argument(format!(
+                "column reference '{}' is ambiguous",
+                spelled
+            ))),
+            false => Ok(()),
+        }
+    }
+
     /// The column `expr` names as this scope spells its own columns
     fn position(&self, expr: &Expression) -> Option<usize> {
         match expr {
@@ -619,6 +631,8 @@ impl Chain<'_> {
         // A name is a column's whole name before its dot is a qualifier's
         for (depth, scope) in self.scopes.iter().enumerate() {
             if let Some(index) = scope.lower.iter().position(|c| *c == id.value_lower) {
+                let (_, range) = scope.table(index);
+                scope.unique(index + 1..range.end, &id.value_lower, &id.value)?;
                 return Ok(Some((depth, index)));
             }
         }
@@ -660,6 +674,7 @@ impl Chain<'_> {
         let index = range
             .find(|i| scope.lower[*i] == column)
             .ok_or_else(|| Error::ColumnNotFound(spelled.to_string()))?;
+        scope.unique(range, column, spelled)?;
         Ok((depth, index))
     }
 
@@ -2771,10 +2786,13 @@ impl PreparedProjection {
             })
             .collect();
         let mut select_exprs = Vec::with_capacity(stmt.columns.len());
+        // The column each item of a `*` is, by position: names may repeat
+        let mut star_columns: Vec<Option<usize>> = Vec::with_capacity(stmt.columns.len());
         for column in &stmt.columns {
             match column {
                 Expression::Star(_) => {
-                    select_exprs.extend((0..columns.len()).map(|i| chain.column(0, i)))
+                    select_exprs.extend((0..columns.len()).map(|i| chain.column(0, i)));
+                    star_columns.extend((0..columns.len()).map(Some));
                 }
                 Expression::QualifiedStar(star) => {
                     if star.qualifier.to_lowercase() != scope.tables[0].0.as_str() {
@@ -2783,11 +2801,13 @@ impl PreparedProjection {
                             star.qualifier
                         )));
                     }
-                    select_exprs.extend((0..columns.len()).map(|i| chain.column(0, i)))
+                    select_exprs.extend((0..columns.len()).map(|i| chain.column(0, i)));
+                    star_columns.extend((0..columns.len()).map(Some));
                 }
                 other => {
                     check_names(chain, unaliased(other), &[])?;
                     select_exprs.push(other.clone());
+                    star_columns.push(None);
                 }
             }
         }
@@ -2804,9 +2824,13 @@ impl PreparedProjection {
             )
         };
         let mut outputs = Vec::with_capacity(select_exprs.len() + plan.extra_names.len());
-        for (expr, index) in select_exprs.iter().zip(&plan.select_column_indices) {
-            outputs.push(match index {
-                Some(index) => Output::Column(*index),
+        for ((expr, index), star) in select_exprs
+            .iter()
+            .zip(&plan.select_column_indices)
+            .zip(&star_columns)
+        {
+            outputs.push(match star.or(*index) {
+                Some(index) => Output::Column(index),
                 None => Output::Program(compile(expr)?),
             });
         }
