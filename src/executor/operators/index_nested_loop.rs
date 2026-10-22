@@ -945,6 +945,8 @@ pub struct BatchIndexNestedLoopJoinOperator<'a> {
     outer_key_idx: usize,
     lookup_strategy: IndexLookupStrategy,
     residual_filter: Option<JoinFilter>,
+    // A filter the inner fetch applies to each candidate row
+    inner_filter: Option<Box<dyn Expression>>,
     // The inner key column, checked on each fetched row: inside a
     // transaction an index entry may be older than the row it points at
     inner_key_idx: Option<usize>,
@@ -999,6 +1001,7 @@ impl<'a> BatchIndexNestedLoopJoinOperator<'a> {
             outer_key_idx,
             lookup_strategy,
             residual_filter,
+            inner_filter: None,
             inner_key_idx: None,
             inner_side,
             schema,
@@ -1036,6 +1039,13 @@ impl<'a> BatchIndexNestedLoopJoinOperator<'a> {
     /// The statement's subquery blocks the residual calls
     pub fn with_blocks(mut self, blocks: Option<&'a dyn SubqueryExecutor>) -> Self {
         self.blocks = blocks;
+        self
+    }
+
+    /// A filter the inner fetch applies to each candidate row, for a
+    /// predicate on inner columns only
+    pub fn with_inner_filter(mut self, filter: Box<dyn Expression>) -> Self {
+        self.inner_filter = Some(filter);
         self
     }
 
@@ -1254,9 +1264,11 @@ impl Operator for BatchIndexNestedLoopJoinOperator<'_> {
 
         // Step 2: Single batch fetch of ALL inner rows at once
         let all_row_ids: Vec<i64> = row_id_set.into_iter().collect();
-        let inner_rows_batch = self
-            .inner_table
-            .fetch_rows_by_ids(&all_row_ids, &true_expr)?;
+        let filter: &dyn Expression = match &self.inner_filter {
+            Some(filter) => filter.as_ref(),
+            None => &true_expr,
+        };
+        let inner_rows_batch = self.inner_table.fetch_rows_by_ids(&all_row_ids, filter)?;
 
         // Step 3: Build results by matching outer rows with inner rows.
         // Row ids are already deduplicated, so the fetched batch is

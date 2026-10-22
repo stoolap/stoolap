@@ -225,6 +225,13 @@ pub trait SubqueryExecutor {
     fn kept_members(&self, _subquery_index: u16) -> Option<&KeptMembers> {
         None
     }
+
+    /// The parameters the statement's programs read beside these blocks:
+    /// its own, then the values its run computed once; None when the
+    /// caller's own parameters are all there are
+    fn params(&self) -> Option<&[Value]> {
+        None
+    }
 }
 
 /// A subquery op compiles only into a prepared plan, which runs with its executor

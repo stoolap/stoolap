@@ -526,7 +526,7 @@ pub enum Op {
 
 /// The members of `value op ANY` or `value op ALL`, each compared with the
 /// value by the comparison contract
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct QuantifiedMembers {
     op: CompareOp,
     all: bool,

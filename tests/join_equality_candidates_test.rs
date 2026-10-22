@@ -309,9 +309,16 @@ fn explain_reports_the_grouped_index_join_only_for_the_shape_it_takes() {
     let correlated = "SELECT u.id, o.id FROM users u INNER JOIN orders o ON u.id = o.user_id \
         WHERE EXISTS (SELECT 1 FROM flags f WHERE f.uid = u.id) LIMIT 1";
     assert!(
-        !plan(correlated).contains("Index Nested Loop"),
-        "a correlated WHERE keeps the index join out: {}",
+        plan(correlated).contains("Index Nested Loop"),
+        "the blocks ask a correlated WHERE of the index join's rows: {}",
         plan(correlated)
+    );
+    let per_row = "SELECT u.id, o.id FROM (SELECT * FROM users) u INNER JOIN orders o \
+        ON u.id = o.user_id WHERE EXISTS (SELECT 1 FROM flags f WHERE f.uid = u.id) LIMIT 1";
+    assert!(
+        !plan(per_row).contains("Index Nested Loop"),
+        "a correlated WHERE outside the blocks keeps the index join out: {}",
+        plan(per_row)
     );
     let having = "SELECT u.id, SUM(o.amount) FROM users u INNER JOIN orders o ON u.id = o.user_id \
         GROUP BY u.id HAVING EXISTS (SELECT 1 FROM flags f WHERE f.uid = u.id) LIMIT 1";

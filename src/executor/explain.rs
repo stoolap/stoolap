@@ -225,7 +225,7 @@ impl Executor {
                         lines,
                         indent + 1,
                         row_count,
-                        self.join_index_use(select),
+                        self.join_index_use(select, self.join_runs_blocks(select, true)),
                         &cte_names(select),
                     );
                 }
@@ -620,6 +620,15 @@ impl Executor {
         )
     }
 
+    /// Whether the join `select` reads from runs its subqueries as prepared
+    /// blocks, `own` when `select` is the statement's own
+    fn join_runs_blocks(&self, select: &SelectStatement, own: bool) -> bool {
+        match select.table_expr.as_deref() {
+            Some(Expression::JoinSource(join)) => self.join_prepared(select, join, own).is_ok(),
+            _ => false,
+        }
+    }
+
     /// Generate EXPLAIN output for a SELECT statement; `own` when it is the
     /// statement's own SELECT, not a branch, a FROM subquery or a source
     fn explain_select(
@@ -716,7 +725,7 @@ impl Executor {
                 select.where_clause.as_deref(),
                 lines,
                 indent + 1,
-                self.join_index_use(select),
+                self.join_index_use(select, self.join_runs_blocks(select, own)),
                 &cte_names(select),
             );
         }

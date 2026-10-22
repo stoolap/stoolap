@@ -27,6 +27,14 @@ use stoolap::test_failpoints::{
 };
 use stoolap::Database;
 
+/// The strategy and path counts are process-wide: every test here runs
+/// prepared blocks, so they take turns
+static COUNTED: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn turn() -> std::sync::MutexGuard<'static, ()> {
+    COUNTED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// l: id 1..30, k = id % 7, g = (id - 1) / 10; r: id 1..50, k = id % 7
 /// (indexed), w = id % 5; s: id 1..90, a = id % 31, b = id % 51;
 /// bl and br: 12000 rows each, u = id, v = id % 100
@@ -257,6 +265,7 @@ fn contained(part: &[String], whole: &[String]) -> bool {
 
 #[test]
 fn a_join_on_runs_its_subqueries_as_blocks() {
+    let _turn = turn();
     let mut wrong = Vec::new();
     for sealed in [false, true] {
         let dir = tempfile::tempdir().unwrap();
@@ -319,6 +328,7 @@ fn a_join_on_runs_its_subqueries_as_blocks() {
 
 #[test]
 fn an_on_block_that_errors_errors_as_the_general_path_does() {
+    let _turn = turn();
     let db = Database::open("memory://join_on_blocks_error").unwrap();
     fill(&db);
     let want = rows(
@@ -339,6 +349,7 @@ fn an_on_block_that_errors_errors_as_the_general_path_does() {
 
 #[test]
 fn an_uncorrelated_on_block_no_pair_reaches_is_not_read() {
+    let _turn = turn();
     let db = Database::open("memory://join_on_blocks_lazy").unwrap();
     fill(&db);
     let sql =
@@ -350,6 +361,7 @@ fn an_uncorrelated_on_block_no_pair_reaches_is_not_read() {
 
 #[test]
 fn an_on_block_binds_a_dotted_column_by_position() {
+    let _turn = turn();
     let db = Database::open("memory://join_on_blocks_dotted").unwrap();
     for sql in [
         "CREATE TABLE l (id INTEGER PRIMARY KEY, \"x.y\" INTEGER)",
@@ -374,6 +386,7 @@ fn an_on_block_binds_a_dotted_column_by_position() {
 
 #[test]
 fn an_on_block_reads_the_transaction_s_own_writes() {
+    let _turn = turn();
     let db = Database::open("memory://join_on_blocks_tx").unwrap();
     fill(&db);
     let sql = "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w \
@@ -432,6 +445,7 @@ const SIDE_FORMS: &[&str] = &[
 
 #[test]
 fn a_join_rewrites_every_condition_form_beside_its_blocks() {
+    let _turn = turn();
     let db = Database::open("memory://join_on_blocks_forms").unwrap();
     fill(&db);
     let exists = "EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id)";
@@ -494,6 +508,7 @@ fn a_join_rewrites_every_condition_form_beside_its_blocks() {
 
 #[test]
 fn a_using_join_keeps_its_keys_beside_its_blocks() {
+    let _turn = turn();
     let db = Database::open("memory://join_on_blocks_using").unwrap();
     fill(&db);
     for sql in [
@@ -508,6 +523,7 @@ fn a_using_join_keeps_its_keys_beside_its_blocks() {
 
 #[test]
 fn a_where_block_after_the_join_chooses_its_strategy_by_the_joined_rows() {
+    let _turn = turn();
     let db = Database::open("memory://join_on_blocks_strategy").unwrap();
     for sql in [
         "CREATE TABLE j1 (id INTEGER PRIMARY KEY, g INTEGER, k INTEGER)",
@@ -537,6 +553,7 @@ fn a_where_block_after_the_join_chooses_its_strategy_by_the_joined_rows() {
 
 #[test]
 fn a_natural_join_binds_a_shared_dotted_column_beside_its_blocks() {
+    let _turn = turn();
     let db = Database::open("memory://join_on_blocks_natural_dotted").unwrap();
     for sql in [
         "CREATE TABLE l (id INTEGER PRIMARY KEY, \"x.y\" INTEGER)",
@@ -572,6 +589,7 @@ fn prepared_line(db: &Database, sql: &str) -> String {
 
 #[test]
 fn explain_says_whether_a_join_runs_its_subqueries_as_blocks() {
+    let _turn = turn();
     let db = Database::open("memory://join_on_blocks_explain").unwrap();
     fill(&db);
     let exists = "EXISTS (SELECT 1 FROM s WHERE s.a = l.id AND s.b = r.id)";
@@ -619,7 +637,7 @@ fn explain_says_whether_a_join_runs_its_subqueries_as_blocks() {
                 "SELECT l.id, r.id FROM l JOIN r ON l.g = r.w \
                  WHERE l.id > (SELECT MIN(s.b) FROM s) AND {exists}"
             ),
-            "Prepared: no (a WHERE subquery in a condition on one table)".to_string(),
+            "Prepared: yes".to_string(),
         ),
         (
             format!("SELECT COUNT(*), (SELECT MAX(s.b) FROM s) FROM l JOIN r ON l.g = r.w WHERE {exists}"),
@@ -650,6 +668,7 @@ fn explain_says_whether_a_join_runs_its_subqueries_as_blocks() {
 
 #[test]
 fn explain_says_no_for_a_join_outside_the_statement_s_own_select() {
+    let _turn = turn();
     let db = Database::open("memory://join_on_blocks_explain_sites").unwrap();
     fill(&db);
     db.execute("CREATE TABLE tgt (id INTEGER PRIMARY KEY, k INTEGER)", ())

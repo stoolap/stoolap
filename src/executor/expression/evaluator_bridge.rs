@@ -538,6 +538,12 @@ impl RowFilter {
         self
     }
 
+    /// The parameters the program reads, in place of the context's
+    pub(crate) fn with_params(mut self, params: CompactArc<ParamVec>) -> Self {
+        self.params = params;
+        self
+    }
+
     /// Check a row against the filter, returning an evaluation error instead of swallowing it.
     ///
     /// Returns `Err` when the VM encounters a runtime error (e.g. invalid
@@ -563,8 +569,9 @@ impl RowFilter {
         VM.with(|vm| {
             let mut ctx = ExecuteContext::new(row);
 
-            if !self.params.is_empty() {
-                ctx = ctx.with_params(&self.params);
+            let params = blocks.and_then(|b| b.params()).unwrap_or(&self.params);
+            if !params.is_empty() {
+                ctx = ctx.with_params(params);
             }
             ctx = ctx.with_transaction_id(self.transaction_id);
             if let Some(blocks) = blocks {
@@ -710,8 +717,9 @@ impl JoinFilter {
             let mut ctx = ExecuteContext::for_join(left_row, right_row);
 
             // Apply params if present (required for parameter placeholders like $1, $2)
-            if !self.params.is_empty() {
-                ctx = ctx.with_params(&self.params);
+            let params = blocks.and_then(|b| b.params()).unwrap_or(&self.params);
+            if !params.is_empty() {
+                ctx = ctx.with_params(params);
             }
             ctx = ctx.with_transaction_id(self.transaction_id);
             if let Some(blocks) = blocks {
