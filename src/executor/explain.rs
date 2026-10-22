@@ -680,7 +680,14 @@ impl Executor {
         let on_subqueries = join
             .and_then(|join| join.condition.as_deref())
             .is_some_and(Self::has_subqueries);
+        let output_subqueries = join.is_some()
+            && (select.columns.iter().any(Self::has_subqueries)
+                || select
+                    .order_by
+                    .iter()
+                    .any(|ob| Self::has_subqueries(&ob.expression)));
         if on_subqueries
+            || output_subqueries
             || select
                 .where_clause
                 .as_deref()
